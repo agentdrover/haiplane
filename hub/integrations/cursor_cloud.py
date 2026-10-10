@@ -15,6 +15,7 @@ behavior, the same shadow-step pattern as #581 and #743.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
@@ -32,6 +33,50 @@ _TIMEOUT = 30.0
 _CREATE_TIMEOUT = 120.0
 #: Публично для брони запуска исполнителя (#1412): сколько длится один заказ.
 CREATE_TIMEOUT_S = _CREATE_TIMEOUT
+
+
+#: Эвристика по env: короче этого значение не считается секретом, иначе
+#: вычистятся обычные слова. Явно объявленные секреты порогу не подчиняются.
+_MIN_SECRET_LEN = 6
+_SECRET_NAME_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+
+
+def _explicit_secrets() -> set[str]:
+    """Секреты, объявленные настройкой: вычищаются при любой длине (#1222).
+
+    В составной настройке (``name:token[:role]``) секрет — только поле токена,
+    имя пользователя и роль остаются в диагностике.
+    """
+    found: set[str] = {
+        (config.CURSOR_API_KEY or "").strip(),
+        (config.STEWARD_HUB_TOKEN or "").strip(),
+    }
+    found.update(config.HUB_TOKENS)
+    found.update(config.parse_tokens(config.HUB_TOKENS_RAW))
+    found.update(
+        config.parse_tokens(os.environ.get(brand.ENV_PREFIX + "HUB_TOKENS", ""))
+    )
+    found.discard("")
+    return found
+
+
+def known_secrets() -> list[str]:
+    """Известные секреты процесса, длинные первыми; значения — только для замены."""
+    found = _explicit_secrets()
+    for name, value in os.environ.items():
+        value = value.strip()
+        if len(value) >= _MIN_SECRET_LEN and name.upper().endswith(
+            _SECRET_NAME_SUFFIXES
+        ):
+            found.add(value)
+    return sorted(found, key=len, reverse=True)
+
+
+def scrub_secrets(text: str) -> str:
+    """Текст без известных секретов: эхо ключа в теле ошибки не попадает в журнал."""
+    for secret in known_secrets():
+        text = text.replace(secret, "[redacted]")
+    return text
 
 
 def is_configured() -> bool:
@@ -116,12 +161,12 @@ async def _attempt(
                 method,
                 path,
                 resp.status_code,
-                resp.text[:300],
+                scrub_secrets(resp.text)[:300],
             )
             return None, Refusal(
                 status=resp.status_code,
                 code=_error_code(resp),
-                detail=resp.text[:300],
+                detail=scrub_secrets(resp.text)[:300],
             )
         body = resp.json()
         if not isinstance(body, dict):
@@ -133,7 +178,9 @@ async def _attempt(
         # ``str(exc)`` ПУСТ — в журнале оставалось «failed:» и ничего, и
         # причину пришлось восстанавливать по арифметике времени. Класс
         # называет её сразу: ReadTimeout и ConnectError — разные разговоры.
-        detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        detail = scrub_secrets(
+            f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        )
         log.warning("cursor cloud %s %s failed: %s", method, path, detail)
         return None, Refusal(detail=detail[:300])
 
