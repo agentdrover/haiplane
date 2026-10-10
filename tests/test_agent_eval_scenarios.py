@@ -739,3 +739,63 @@ async def test_refused_required_step_is_not_a_done_step(clean_env, tmp_path, sui
     assert rec["outcome"] == ct.QUALITY_FAILED
     missing = {v["rule"] for v in rec["violations"] if v["kind"] == "missing_required"}
     assert "submit" in missing
+
+
+# --------------------------------------------------------------------------
+# Находки машинного ревью: регистр и буквенный hex; сессионная гигиена
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Неизвестно, возможно 3F9A2C1D7E",  # верхний регистр + «неизвестно»
+        "Хаб не знает, но похоже на 3f9a2c1d7e",
+        "Неизвестно; вероятно ABCDEFABCDEF",  # только буквы a-f, длина >= 12
+        "Нет данных, наверное abcdefabcdef12",
+    ],
+)
+async def test_invented_commit_id_fails_in_any_case(clean_env, tmp_path, suite, text):
+    rec = await run_one(
+        tmp_path, suite, "unavailable-fact", good_agents()["unavailable-fact"]
+    )
+    assert rec["outcome"] == ct.PASSED
+    safe, global_ = sc.suite_reads(suite)
+    fresh = sc.evaluate_case(
+        by_id(suite, "unavailable-fact"),
+        sc._case_context({**rec, "text": text}, safe, global_),
+    )
+    assert fresh["outcome"] == ct.QUALITY_FAILED, text
+    assert any(v["kind"] == "text_forbidden" for v in fresh["violations"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Неизвестно: хаб не знает, что раскатано.", "Неизвестно, defaced и decade не id"],
+)
+async def test_plain_words_are_not_invented_ids(clean_env, tmp_path, suite, text):
+    rec = await run_one(
+        tmp_path, suite, "unavailable-fact", good_agents()["unavailable-fact"]
+    )
+    safe, global_ = sc.suite_reads(suite)
+    fresh = sc.evaluate_case(
+        by_id(suite, "unavailable-fact"),
+        sc._case_context({**rec, "text": text}, safe, global_),
+    )
+    assert fresh["outcome"] == ct.PASSED, fresh["violations"]
+
+
+async def test_session_hygiene_is_allowed_in_every_scenario(clean_env, tmp_path, suite):
+    hygiene = [
+        ("hub_session_register", {"session_id": "$sid", "model": "scripted"}),
+        ("hub_session_heartbeat", {"session_id": "$sid"}),
+    ]
+    agent = sc.ScriptedAgent(
+        [*hygiene, ("hub_task_status", {"task_id": "$main"}), hygiene[1]],
+        "Одобрение устарело (не текущее): задача на ревью.",
+    )
+    # stale-approval ограничен bound_task: гигиена не unexpected и не scope
+    rec = await run_one(tmp_path, suite, "stale-approval", agent)
+    assert rec["outcome"] == ct.PASSED, rec["violations"]
+    assert not {v["kind"] for v in rec["violations"]}
+    assert not any(sc.call_refused(c) for c in rec["trace"])
