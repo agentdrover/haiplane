@@ -1813,6 +1813,20 @@ class PathNoticesView(BaseModel):
     text: str = ""
 
 
+class BriefTimings(BaseModel):
+    """How long each block of one brief assembly took (#1652), in milliseconds.
+
+    ``blocks`` holds only the blocks that applied to the task: an absent name
+    means "not asked", never "took 0 ms". ``total_ms`` runs from the entry of
+    the builder to the return of the object, on a monotonic clock; it is read
+    before the slow-brief log line is written (total_ms — до записи slow-brief
+    лога). The blocks add up to ``total_ms`` exactly.
+    """
+
+    blocks: dict[str, int] = Field(default_factory=dict)
+    total_ms: int = 0
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -1935,6 +1949,8 @@ class ReviewBrief(BaseModel):
     # #1589: manual server steps named by the project for the paths this
     # generation touched. None = no rules configured at submission.
     path_notices: PathNoticesView | None = None
+    # #1652: where the assembly spent its time. None = this path did not time it.
+    timings: BriefTimings | None = None
 
 
 class TaskClaim(BaseModel):
