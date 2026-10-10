@@ -83,6 +83,25 @@ class MockGitOps(NoopGitOps):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_mcp_session_manager():
+    """Менеджер сессий MCP глобального app запускается тестами по разу на тест.
+
+    ``StreamableHTTPSessionManager.run()`` по контракту SDK вызывается один раз
+    на экземпляр; несколько тестов (test_csrf, test_mcp_transport) входят в его
+    lifespan на реальном приложении, и на одном воркере xdist второй из них
+    падал «can only be called once» в зависимости от раскладки (#1667). Перед
+    каждым тестом флаг запуска сбрасывается; менеджер после выхода из
+    ``run()`` чист (task group закрыта, реестры очищены).
+    """
+    from hub import mcp_server
+
+    manager = getattr(mcp_server.mcp, "_session_manager", None)
+    if manager is not None:
+        manager._has_started = False
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_random_deep_lot(monkeypatch):
     """Жребий deep (#1403) выключен: тесты профилей не должны зависеть от хеша.
 
