@@ -988,12 +988,13 @@ async def hub_create_task(
     client_request_id: str = "",
     work_type: str = "feature",
     freeze_rationale: str = "",
+    result_kind: str = "commit",
+    rollback: str = "",
 ) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
-    Creates work that is already approved, so an agent token gets 403
-    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which drafts
-    for human approval. Enforced by the API, so it holds for POST /api/tasks too.
+    Already-approved work: an agent token gets 403 ``agent_create_forbidden``
+    (API-enforced); agents use ``hub_propose_task`` (a draft).
 
     Args:
         title: Short title (required)
@@ -1003,11 +1004,13 @@ async def hub_create_task(
         priority: 'critical', 'high', 'medium', or 'low'
         runtime: 'auto' or 'openrouter'
         run_immediately: Dispatch at once (not for epic/feature)
-        human_owner: Who is accountable for this task
-        human_reviewer: Who accepts the result
-        client_request_id: Optional idempotency key; safe to retry on timeout
+        human_owner: Accountable person
+        human_reviewer: Accepting person
+        client_request_id: Idempotency key (retry-safe)
         work_type: feature, bug, refactor, chore, docs, spike, incident
         freeze_rationale: Why it may enter a frozen project
+        result_kind: commit | state (world state, human-accepted; leaf only)
+        rollback: Undo text; DoR requires it for state
     """
     body: dict[str, Any] = {
         "title": title,
@@ -1022,6 +1025,10 @@ async def hub_create_task(
         "work_type": work_type,
         "freeze_rationale": freeze_rationale,
     }
+    if result_kind != "commit":
+        body["result_kind"] = result_kind
+    if rollback:
+        body["rollback"] = rollback
     if parent_id is not None:
         body["parent_id"] = parent_id
     extra_headers: dict[str, str] = {}
@@ -1052,7 +1059,8 @@ async def hub_create_subtasks(
     Args:
         parent_id: Parent task ID (must match hierarchy rules for task_type).
         items: List of dicts with title, optional description, priority,
-            work_type, freeze_rationale, and optional acceptance_criteria (list of Given/When/Then dicts) and
+            work_type, freeze_rationale, result_kind (commit|state), rollback,
+            and optional acceptance_criteria (list of Given/When/Then dicts) and
             risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
         source: agent (draft) or human (open; human-only, #360).
@@ -2540,6 +2548,7 @@ async def hub_submit_for_review(
     finding_outcomes: list[dict[str, Any]] | None = None,
     mutations: list[dict[str, Any]] | None = None,
     prevention: dict[str, Any] | None = None,
+    evidence: Any = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
@@ -2565,6 +2574,8 @@ async def hub_submit_for_review(
         mutations: [{ac, mutation, failed_test}] per test AC (#1436); not
             evidence for bug_red_test: CI baseline must fail it (#913).
         prevention: see hub_report_done (#919).
+        evidence: State task, required: [{ac_id, action, observed, target,
+            observed_at}] per AC; no secrets.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2586,6 +2597,8 @@ async def hub_submit_for_review(
         body["mutations"] = mutations
     if prevention:
         body["prevention"] = prevention
+    if evidence is not None:
+        body["evidence"] = evidence
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
@@ -2882,13 +2895,14 @@ async def hub_submit_review(
     findings: list[dict[str, Any]] | None = None,
     create_tasks_for_out_of_scope: bool = False,
     acknowledge_repeat: bool = False,
+    expected_generation: int | None = None,
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
     Not for the task's own implementer — such a verdict is refused. Binds to
-    the current submission generation and does NOT complete the task: it
-    returns to running, where APPROVED lets the author take the done path and
-    CHANGES_REQUESTED sends them back to hub_submit_for_review.
+    the current submission generation. Commit task: does NOT complete it, it
+    returns to running (APPROVED: author takes the done path; CHANGES_REQUESTED:
+    back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
     in_scope one — all-out-of-scope means approve and keep them as linked
@@ -2911,6 +2925,8 @@ async def hub_submit_review(
             unlinked out_of_scope findings (default false).
         acknowledge_repeat: A verdict repeating the previous one word for
             word is refused without it (#1057).
+        expected_generation: State task: generation judged (required); only a
+            human approves.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2925,6 +2941,8 @@ async def hub_submit_review(
         body["create_tasks_for_out_of_scope"] = True
     if acknowledge_repeat:
         body["acknowledge_repeat"] = True
+    if expected_generation is not None:
+        body["expected_generation"] = expected_generation
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:
@@ -3440,6 +3458,8 @@ async def hub_propose_task(
     project: str = "",
     defect_verify: str = "",
     affected_areas: list[str] | None = None,
+    result_kind: str = "commit",
+    rollback: str = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -3459,6 +3479,8 @@ async def hub_propose_task(
         project: Project slug — only when proposing an epic (#346)
         defect_verify: Prod defect (#915): how to check the fix; needs areas
         affected_areas: Where it broke (prod defect)
+        result_kind: commit | state (leaf only)
+        rollback: Undo text for state
     """
     if defect_verify:
         return await _propose_prod_defect(
@@ -3480,6 +3502,10 @@ async def hub_propose_task(
     }
     if project:
         body["project"] = project
+    if result_kind != "commit":
+        body["result_kind"] = result_kind
+    if rollback:
+        body["rollback"] = rollback
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
@@ -5143,6 +5169,8 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
     Hidden("release_id", "паспорт дефекта (#917): релиз, а не поле доводки"),
     Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    Hidden("result_kind", "вид результата (#1647) задают при создании и в draft"),
+    Hidden("rollback", "откат результата-состояния (#1647) правят через refine"),
     # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
     # стояла в пяти символах от потолка, а потолок двигается только вниз.
     # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
@@ -5426,45 +5454,47 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
 async def hub_refine_task(
     task_id: int, include_task: bool = False, **fields: Any
 ) -> HubRefineTaskResult:
-    """PATCH a task's structured fields (Definition of Ready inputs).
+    """PATCH a task's DoR fields.
 
     Only fields you pass are written; every list REPLACES the stored one.
 
     Args:
         task_id: Task to refine.
-        title: New title (1–500 chars).
+        title: New title.
         description: Statement text; "" clears it.
         work_type: Kind of work (a frozen project admits by type).
-        class_of_service: Kanban class of service.
+        class_of_service: Class of service.
         size: T-shirt size.
         wip_tag: WIP bucket.
         due_date: ISO date (fixed_date).
-        user_story: "As a <role>, I want <X> so that <Y>".
-        problem_statement: What's broken and why.
-        outcome_metric: Which number moves (3d -> 1d).
+        user_story: As a / I want / so that.
+        problem_statement: What is broken.
+        outcome_metric: Which number moves.
         outcome_indicator: Leading signal.
-        outcome_deadline: When the outcome is checked.
-        outcome_revisit_condition: What reopens this decision.
+        outcome_deadline: When checked.
+        outcome_revisit_condition: What reopens it.
         redesign_decision: adapt | redesign.
-        redesign_rationale: Why that choice.
-        agent_fit: How well an agent fits.
-        found_in: Defect stage: unknown | review | ci | test | staging | prod (prod: not feature).
-        caused_by_task_id: Task that caused the defect.
+        redesign_rationale: Why.
+        agent_fit: Agent fit.
+        found_in: Defect stage (prod: not feature).
+        caused_by_task_id: Causing task.
         technical_hints: Hints, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        affected_areas: Modules/paths impacted.
-        validation_commands: Commands proving it works.
-        live_probe: Read-only probe run after delivery; a registry name.
-        out_of_scope_for_review: What the reviewer ignores.
-        review_checklist: What the reviewer verifies.
+        affected_areas: Paths impacted.
+        validation_commands: Proof commands.
+        live_probe: Post-delivery probe (registry name).
+        result_kind: commit|state; draft only.
+        rollback: Undo of a state result.
+        out_of_scope_for_review: Reviewer ignores.
+        review_checklist: Reviewer verifies.
         human_owner: Who is accountable.
-        human_reviewer: Who accepts the result.
-        freeze_rationale: Why it may enter a frozen project.
+        human_reviewer: Who accepts.
+        freeze_rationale: Why it may enter a freeze.
         acceptance_criteria: Full AC replacement.
         risks: Full replacement.
-        include_task: Echo the whole task back.
+        include_task: Echo the task.
     """
     # Один источник вместо двух списков. До #1068 поля были выписаны и в
     # сигнатуре, и здесь, а комментарий рядом называл цену расхождения:

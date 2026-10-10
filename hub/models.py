@@ -136,6 +136,19 @@ class WorkType(str, Enum):
     incident = "incident"
 
 
+class ResultKind(str, Enum):
+    """Что является результатом работы (#1647).
+
+    ``commit`` — коммит в репозитории (все существующие задачи). ``state`` —
+    состояние мира (сервер настроен, ключ сменён, DNS переключён): у такой
+    задачи нет ветки, PR и CI, сдача — доказательства по каждому AC, а
+    вердикт выносит только человек на конкретное поколение.
+    """
+
+    commit = "commit"
+    state = "state"
+
+
 class DefectFoundIn(str, Enum):
     """Stage at which a defect was caught (#909, epic #900).
 
@@ -979,11 +992,29 @@ class TaskCreate(BaseModel):
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
+    # #1647: результат — коммит или состояние мира. Только у листовых
+    # task/subtask; feature/epic остаются агрегатами. Меняется потом только в
+    # draft (refine). rollback — как вернуть состояние назад; обязателен для
+    # DoR state-задачи, у commit-задачи не читается.
+    result_kind: ResultKind = ResultKind.commit
+    rollback: str = Field("", max_length=2000)
     client_request_id: str | None = Field(
         default=None,
         max_length=128,
         description="Optional idempotency key; duplicates return the original task",
     )
+
+    @model_validator(mode="after")
+    def _state_only_for_leaves(self) -> "TaskCreate":
+        if self.result_kind == ResultKind.state and self.task_type in (
+            TaskType.epic,
+            TaskType.feature,
+        ):
+            raise ValueError(
+                "result_kind=state is allowed for task and subtask only: "
+                "feature and epic stay aggregates"
+            )
+        return self
 
 
 MAX_BULK_CHILD_TASKS = 20
@@ -1004,6 +1035,9 @@ class BulkChildTaskItem(BaseModel):
     # ребёнок становился feature; при заморозке проекта этого мало.
     work_type: WorkType = WorkType.feature
     freeze_rationale: str = Field("", max_length=1000)
+    # #1647: те же два поля, что у TaskCreate; тип родителя — task/subtask.
+    result_kind: ResultKind = ResultKind.commit
+    rollback: str = Field("", max_length=2000)
 
 
 class BulkChildTasksCreate(BaseModel):
@@ -1181,6 +1215,13 @@ class TaskSubmitReview(BaseModel):
     # #919: the prevention output of a production defect. The pair author's
     # last word before the poller delivers, so it rides the submission.
     prevention: DefectPrevention | None = None
+    # #1647: доказательства задачи-состояния — список записей {ac_id, action,
+    # observed, target, observed_at}, ровно по одной на каждый AC. Тип нарочно
+    # свободный: разбор и ошибки делает hub.services.state_task, а не pydantic —
+    # его 422 возвращает входное значение, а ошибка контракта доказательств не
+    # имеет права его вернуть (в observed может лежать секрет). У commit-задачи
+    # поле не читается.
+    evidence: Any = None
 
 
 class ReviewFinding(BaseModel):
@@ -1229,6 +1270,11 @@ class TaskReviewVerdict(BaseModel):
     # the defect was not fixed; pasting the old text over a complaint the
     # author already closed is not, and only the reviewer can tell them apart.
     acknowledge_repeat: bool = False
+    # #1647: поколение сдачи, о котором судят. У задачи-состояния обязателен:
+    # запись вердикта и завершение условны по нему, расхождение — 409 без
+    # записей. У commit-задачи не читается (там вердикт и так пишется на
+    # текущее поколение, а стюард передаёт своё отдельным аргументом #1601).
+    expected_generation: int | None = None
 
 
 class LatestReview(BaseModel):
@@ -2286,6 +2332,11 @@ class TaskRefine(BaseModel):
     # ложится текст из карточки, а исполняет его служба с ключами, — это не
     # поле, а канал исполнения. "" очищает объявление.
     live_probe: str | None = Field(default=None, max_length=64)
+    # #1647: результат работы и способ отката. result_kind меняется только в
+    # draft; после сдачи state-задачи rollback и AC заморожены до возврата в
+    # работу (refinement._guard_state_statement).
+    result_kind: ResultKind | None = None
+    rollback: str | None = Field(default=None, max_length=2000)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
@@ -2881,6 +2932,24 @@ class AgentBootstrap(BaseModel):
     text: str
 
 
+class TaskEvidenceView(BaseModel):
+    """Одна запись доказательства сдачи state-задачи (#1647).
+
+    ``principal_id`` — автор из идентичности вызывающего; ``agent`` — подпись,
+    которую назвал клиент, и доказательством авторства она не является.
+    """
+
+    generation: int
+    ac_id: str
+    action: str
+    observed: str
+    target: str
+    observed_at: str
+    principal_id: int | None = None
+    agent: str = ""
+    created_at: str = ""
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -3017,6 +3086,11 @@ class TaskView(BaseModel):
     review_checklist: list[str] = Field(default_factory=list)
     # #1236: имя объявленного живого зонда; "" — не объявлен.
     live_probe: str = ""
+    # #1647: результат работы и способ отката; evidence — доказательства всех
+    # поколений сдачи state-задачи (у commit-задачи None).
+    result_kind: str = "commit"
+    rollback: str = ""
+    evidence: list["TaskEvidenceView"] | None = None
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None

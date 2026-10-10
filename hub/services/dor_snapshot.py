@@ -44,6 +44,9 @@ TASK_FIELDS: tuple[str, ...] = (
     "redesign_decision",
     "agent_fit",
     "risks",
+    # #1647: профиль DoR задачи-состояния читает эти два поля.
+    "result_kind",
+    "rollback",
 )
 
 #: Поля критерия приёмки (строка acceptance_criteria).

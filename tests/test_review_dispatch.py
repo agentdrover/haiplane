@@ -17445,3 +17445,185 @@ def test_the_snapshot_edits_of_the_capability_block_really_apply() -> None:
         None,
     ):
         assert rd.local_capabilities_block(state) == rd.LOCAL_CAPABILITIES_BLOCK
+
+
+# ---- #1647: автоматика не трогает задачу-состояние ----
+
+
+async def _state_with_git_residue(
+    db: aiosqlite.Connection,
+    slug: str,
+    *,
+    policy: dict,
+    forge: str = "github",
+    repo_name: str = "mrPDA/spike-repo",
+) -> int:
+    """State-задача в review С ОСТАТКАМИ git (ветка, sha) — как их оставил бы сбой.
+
+    Остатки поставлены намеренно: у честной state-задачи ветки нет, и ранний
+    возврат «нет ветки» отказал бы автоматике случайно. Здесь её может
+    остановить только предикат result_kind. На коде до задачи result_kind
+    молча отбрасывается, и задача читается как commit-задача, которой всё это
+    положено, — тест на нём красный.
+    """
+    pid = await repo.create_project(
+        db, slug=slug, name=slug.title(), repo_name=repo_name, workspace_path="/tmp/ws"
+    )
+    if forge != "github":
+        await repo.update_project(db, pid, forge=forge)
+    await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
+    task_id = await _node(db, title="state", task_type="task", parent_id=feature)
+    areas = ["docs/notes.md"]
+    await repo.update_task_structured(
+        db,
+        task_id,
+        TaskRefine(affected_areas=areas, result_kind="state", rollback="откат"),
+    )
+    await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
+    await db.execute(
+        "UPDATE tasks SET status='review', branch=?, submission_sha=?, "
+        "submission_generation=1, submission_model='claude-fable-5', "
+        "assigned_agent='dev' WHERE id=?",
+        (f"task-{task_id}/residue", _TIP, task_id),
+    )
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=_TIP, base_branch="develop"
+    )
+    await db.commit()
+    plugins.git_ops = _PinnedGitOps(_TIP, areas, None, {})
+    return task_id
+
+
+async def test_no_automation_touches_state_tasks(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-7: ни заказа ревью, ни старта стюарда, ни авто-APPROVED у state.
+
+    Двери: облачный и локальный заказ ревью (в т.ч. deep-добор), заказы
+    стюарда (судья, советник), свип due-заказов, ручной отчёт machine-review
+    (auto_verdict не зовётся, добор не покупается), автовердикт и применение
+    стюарда (запись вердикта не от человека отказана).
+    """
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services import auto_verdict, steward_advisor, steward_applied
+    from hub.services import steward_dispatch
+    from hub.services.review_dispatch import (
+        DEEP,
+        maybe_dispatch_review,
+        wait_for_local_runs,
+    )
+
+    # --- облако: заказа нет, оплаченных прогонов нет ---
+    recorder = _DispatchRecorder({"agent": {"id": "bc-state"}, "run": {"id": "r-st"}})
+    _wire(monkeypatch, recorder)
+    cloud_id = await _state_with_git_residue(
+        db, "state-cloud", policy={"verdict": "auto", "steward_shadow": True}
+    )
+    assert not await maybe_dispatch_review(db, cloud_id)
+    assert not await maybe_dispatch_review(db, cloud_id, force_profile=DEEP)
+    assert recorder.calls == [], "облачный ревьюер заказан для state-задачи"
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (cloud_id,)
+    )
+
+    # --- ручной отчёт machine-review: записан, автоматика молчит ---
+    real_auto_verdict = auto_verdict.maybe_auto_verdict
+    spy = AsyncMock(return_value=True)
+    monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", spy)
+    await _machine_report(client, cloud_id, incomplete=True)
+    assert len(await repo.machine_reviews_of_generation(db, cloud_id, 1)) == 1
+    spy.assert_not_awaited()
+    assert recorder.calls == [], "добор лестницы купил прогон для state"
+
+    # --- локальный путь: форж без облака ---
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    local_id = await _state_with_git_residue(
+        db,
+        "state-local",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    assert not await maybe_dispatch_review(db, local_id)
+    await wait_for_local_runs()
+    assert await _local_dispatches(db, local_id) == []
+    assert not await repo.machine_reviews_of_generation(db, local_id, 1)
+
+    # --- стюард: заказы и свип ---
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("gpt-5.3-codex",))
+    assert await steward_dispatch.order_run(db, cloud_id, 1) is None
+    assert (
+        await steward_dispatch.order_run(db, cloud_id, 1, steward_dispatch.KIND_ADVISOR)
+        is None
+    )
+    assert not await steward_advisor._order_one(db, cloud_id, 1)
+    assert await steward_dispatch.order_due_runs(db) == 0
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM steward_runs WHERE task_id IN (?, ?) AND status != 'refused'",
+        (cloud_id, local_id),
+    )
+
+    # --- запись вердикта не от человека: автопилот и применение стюарда ---
+    from hub.services.lifecycle import record_review_verdict
+
+    for writer in (
+        lambda: steward_applied._record(db, cloud_id, ReviewVerdict.approved, 1),
+        lambda: record_review_verdict(
+            db,
+            cloud_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="policy"),
+        ),
+    ):
+        with pytest.raises(HTTPException):
+            await writer()
+    stored = dict(await repo.get_task(db, cloud_id))
+    assert stored["status"] == "review" and not stored["review_verdict"]
+    assert not await real_auto_verdict(db, cloud_id)
+    assert dict(await repo.get_task(db, cloud_id))["status"] == "review"
+
+
+async def test_the_local_door_and_the_ladder_top_up_refuse_a_state_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1647: dispatch_local_review и maybe_top_up_incomplete — свои двери."""
+    from hub.services.review_dispatch import (
+        dispatch_local_review,
+        maybe_top_up_incomplete,
+        wait_for_local_runs,
+    )
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-st2"}, "run": {"id": "r-st2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _state_with_git_residue(
+        db, "state-ladder", policy={"verdict": "auto"}
+    )
+    await _machine_report(client, task_id, incomplete=True)
+    feed_before = len(await repo.get_task_updates(db, task_id))
+    assert not await maybe_top_up_incomplete(db, task_id)
+    assert len(await repo.get_task_updates(db, task_id)) == feed_before, (
+        "добор лестницы не пишет по state-задаче даже отказов"
+    )
+    assert recorder.calls == []
+
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    local_id = await _state_with_git_residue(
+        db,
+        "state-local-door",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    task = dict(await repo.get_task(db, local_id))
+    assert not await dispatch_local_review(db, task, "gitverse", task["branch"], 1)
+    await wait_for_local_runs()
+    assert await _local_dispatches(db, local_id) == []

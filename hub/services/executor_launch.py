@@ -43,6 +43,10 @@ from hub.services import chat_pair, orchestrator_queue, project_policy
 from hub.db import write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
+from hub.services.result_kind import (
+    automation_not_applicable,
+    task_automation_not_applicable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -181,8 +185,30 @@ def _reservation_abandoned(row: dict[str, Any]) -> bool:
     return datetime.now(UTC) - at > timedelta(seconds=budget + 60)
 
 
+#: #1647: исполнитель не берёт задачу-состояние ни одной из пяти дверей.
+REASON_STATE_TASK = "задача-состояние: облачный исполнитель неприменим"
+
+
+async def _state_door_refusal(
+    db: aiosqlite.Connection, task_id: int
+) -> LaunchResult | None:
+    """Отказ двери, если задача — состояние; ничего не читает, кроме строки (#1647).
+
+    Стоит В НАЧАЛЕ каждой двери и ещё раз внутри брони: repair_executor
+    возвращает задачу в работу ДО брони, и позднее место отказа оставило бы за
+    собой смену статуса.
+    """
+    if await task_automation_not_applicable(db, task_id):
+        return _refused(
+            f"{REASON_STATE_TASK}: #{task_id}. Её берёт человек или агент "
+            "вручную: claim, pair-start, submit-review с evidence",
+            task_id,
+        )
+    return None
+
+
 async def _candidate(db: aiosqlite.Connection, project: Any) -> tuple[int | None, str]:
-    answer = await orchestrator_queue.next_task(db, project)
+    answer = await orchestrator_queue.next_task(db, project, exclude_state=True)
     task_id = answer.get("next_task_id")
     if task_id is None:
         return None, f"{REASON_NO_CANDIDATE}: {answer.get('summary') or ''}".strip()
@@ -391,6 +417,8 @@ async def _reserve(
         if row is None:
             return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
         task = dict(row)
+        if automation_not_applicable(task):
+            return _refused(f"{REASON_STATE_TASK}: #{task_id}", task_id)
         # #1443 (F5.1): суммарный бюджет задачи — под той же транзакцией, что
         # и бронь, чтобы два нажатия не прошли проверку оба.
         refusal = await _budget_refusal(
@@ -638,6 +666,8 @@ async def repair_executor(
     if row is None:
         return _refused(f"{REASON_NOT_RETURNABLE}: #{task_id} не найдена", task_id)
     task = dict(row)
+    if (state_refusal := await _state_door_refusal(db, task_id)) is not None:
+        return state_refusal
     project = await repo.resolve_project_for_task(db, task_id)
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
@@ -784,6 +814,8 @@ async def merge_executor(
     if row is None:
         return _refused(f"{REASON_NOT_BASE_CONFLICT}: #{task_id} не найдена", task_id)
     task = dict(row)
+    if (state_refusal := await _state_door_refusal(db, task_id)) is not None:
+        return state_refusal
     project = await repo.resolve_project_for_task(db, task_id)
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
@@ -888,6 +920,8 @@ async def submit_only_executor(
     хаб). Под бронью задача перечитывается: сдача, легшая между тиками,
     вопрос (needs_info) или другой держатель повтор отменяют.
     """
+    if (state_refusal := await _state_door_refusal(db, task_id)) is not None:
+        return state_refusal
     project = await repo.resolve_project_for_task(db, task_id)
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
@@ -1039,6 +1073,8 @@ async def continue_executor(
     """
     from hub.services.executor_dispatch import settle_continuation
 
+    if (state_refusal := await _state_door_refusal(db, task_id)) is not None:
+        return state_refusal
     project = await repo.resolve_project_for_task(db, task_id)
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):

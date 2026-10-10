@@ -54,6 +54,7 @@ from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall
 from hub.models import ACTIVE_STATUSES, FINAL_STATUSES, QUEUED_STATUSES
 from hub.services import project_policy
+from hub.services.result_kind import automation_not_applicable
 from hub.services.delivery_state import with_cached_delivery
 
 EVENT_NEXT_CANDIDATE = "orchestrator_next_candidate"
@@ -168,7 +169,7 @@ async def _project_tasks(
     rows = await fetchall(
         db,
         "SELECT id, title, status, task_type, priority, position, dor_passed, "
-        "waiting_for, waiting_until, "
+        "waiting_for, waiting_until, result_kind, "
         f"affected_areas FROM tasks WHERE archived=0 AND status IN ({marks}) "  # nosec B608 - placeholders only, values are params
         "ORDER BY id",
         tuple(statuses),
@@ -189,6 +190,9 @@ async def _project_tasks(
             task["areas"] = [
                 p for p in deserialize_str_list(task.get("affected_areas")) if p.strip()
             ]
+            # #1647: задача-состояние не область кода — у неё нечего пересекать,
+            # и пустые области не означают «может править что угодно».
+            task["state"] = automation_not_applicable(task)
             tasks.append(task)
     return tasks
 
@@ -235,13 +239,16 @@ def area_conflict(
     (``_skip_reason``), и захват задачи (``capture_hold``). Незнание с
     любой стороны — не «не пересекается».
     """
+    if candidate.get("state"):
+        # #1647: проверка пересечения путей репозитория для state неприменима.
+        return None
     if not candidate["areas"]:
         return {
             "reason": SKIP_UNDECLARED,
             "detail": "область не объявлена: affected_areas пусты, "
             "пересечение с работой в полёте не проверить",
         }
-    blind = [t for t in active if not t["areas"]]
+    blind = [t for t in active if not t["areas"] and not t.get("state")]
     if blind:
         # Незнание с той стороны — не «не пересекается» (находка ревью #1274):
         # задача в работе без объявленных областей может править что угодно.
@@ -317,6 +324,11 @@ async def capture_hold(
         return
     project_id = int(project["id"])
     candidate: dict[str, Any] = {"id": task_id, "areas": _areas_of(row)}
+    if automation_not_applicable(row):
+        # #1647: state не бронирует области и не сверяется ни с бронями, ни с
+        # начатыми задачами — путей репозитория у неё нет.
+        yield mode, None
+        return
     # --- синхронный участок: без await до записи брони ---
     held = _CAPTURES.setdefault(project_id, {})
     in_flight = [{"id": t, "areas": a} for t, a in held.items() if t != task_id]
@@ -437,11 +449,15 @@ async def next_task(
     project: Any,
     *,
     known_blockers: dict[int, list[dict[str, Any]]] | None = None,
+    exclude_state: bool = False,
 ) -> dict[str, Any]:
     """Ответ очереди для одного проекта. Ничего не пишет.
 
     ``known_blockers`` (#1527): страница пути уже прочитала доставку всех
     зависимостей графа; правило выбора остаётся этим, читатель не повторяется.
+
+    ``exclude_state`` (#1647): кандидат для облачного исполнителя — задачи-
+    состояния ему не отдаются, и очередь не упирается в такую в голове списка.
     """
     policy = project_policy.gate_policy_of(project)
     limit = project_policy.wip_limit_of(policy)
@@ -452,7 +468,9 @@ async def next_task(
             t
             for t in tasks
             # #1455: эпик и фича здесь есть — их пропуск назван (_skip_reason).
-            if t["status"] == "open" and t["dor_passed"]
+            if t["status"] == "open"
+            and t["dor_passed"]
+            and not (exclude_state and t["state"])
         ),
         key=_sort_key,
     )

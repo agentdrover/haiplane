@@ -51,8 +51,10 @@ from hub.services.steward_exit import (  # noqa: F401 — re-export for consumer
     REASON_SAMPLE_TOO_SMALL,
     REASON_STAMPING,
 )
+from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicable
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
+    KIND_DOR,
     KIND_VERDICT,
     PENDING_PREFIX,
     RUN_OPEN,
@@ -796,6 +798,22 @@ async def _refuse_without_a_judge(
     await _refuse_transiently(db, order, code, detail)
 
 
+async def _refused_before_paying(
+    db: aiosqlite.Connection, order: dict, task: dict[str, Any]
+) -> bool:
+    """Отказы, которые не стоят ничего: True — заказ закрыт или отложен.
+
+    #1647: задача-состояние — перепроверка перед оплачиваемым стартом (заказ мог
+    лечь до правила или мимо ``order_run``): заказ закрывается, провайдер не
+    зовётся. Суждение о постановке (dor) state-задаче положено. Дальше — #1600:
+    отчёт ревью положен и ещё может прийти.
+    """
+    if order.get("kind") != KIND_DOR and automation_not_applicable(task):
+        await close_run(db, order, RUN_REFUSED, AUTOMATION_REFUSAL)
+        return True
+    return await hold_start_for_review(db, order, task)
+
+
 async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     """Start one run for this order, or refuse it with a named reason.
 
@@ -815,7 +833,7 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     # #1600: прежде всего остального — отчёт ревью положен и ещё может прийти?
     # Повтор после undeclared_model, ошибки провайдера или нехватки
     # конфигурации не должен покупать прогон, исход которого предрешён.
-    if await hold_start_for_review(db, order, task):
+    if await _refused_before_paying(db, order, task):
         return False
 
     steward = (order.get("model") or config.STEWARD_MODEL or "").strip()

@@ -185,6 +185,31 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Templates of the two state-task checks (#1647). Kept apart from
+# CHECK_RECOMMENDATIONS on purpose: that table is pinned to DOR_CHECK_KEYS (a
+# commit task's table), and these two checks exist only on the state profile.
+STATE_CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
+    "has_rollback": {
+        "field": "rollback",
+        "message": (
+            "Write how to undo the result if the state turns out wrong "
+            "(e.g. 'put the old A record back: ns1.registrar, value from the "
+            "card'). A task about the state of the world must say how to go "
+            "back before anyone changes that state."
+        ),
+        "minutes": 3,
+    },
+    "has_state_ac": {
+        "field": "acceptance_criteria",
+        "message": (
+            "Add at least one acceptance criterion a person can check by "
+            "hand: verifiable_by manual, log_check or ui_check. A 'test' "
+            "criterion alone proves nothing about the outside world here."
+        ),
+        "minutes": 5,
+    },
+}
+
 # Sort order for rendering — blocking first, low last.
 SEVERITY_ORDER: dict[RecommendationSeverity, int] = {
     "blocking": 0,
@@ -838,7 +863,9 @@ def _recommendation_for(
     config: ReadinessConfig,
 ) -> Recommendation | None:
     """Build a recommendation for one failed DoR check."""
-    template = CHECK_RECOMMENDATIONS.get(check.key)
+    template = CHECK_RECOMMENDATIONS.get(check.key) or STATE_CHECK_RECOMMENDATIONS.get(
+        check.key
+    )
     if template is None:
         return None
     severity: RecommendationSeverity = "blocking" if is_required else "low"
