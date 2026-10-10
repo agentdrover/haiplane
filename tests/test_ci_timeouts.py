@@ -58,4 +58,5 @@ def test_ci_and_pytest_have_explicit_time_limits() -> None:
     assert job["timeout-minutes"] == 90
     steps = {s.get("name"): s for s in job["steps"]}
     assert steps["Test"]["timeout-minutes"] == 25
+    assert "--durations=30" in steps["Test"]["run"]  # AC-3: the CI log carries them
     assert steps["Report AC tests and validation to Hub"]["timeout-minutes"] == 20
