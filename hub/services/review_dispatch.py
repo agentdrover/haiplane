@@ -4994,6 +4994,12 @@ async def open_second_door(
     reach = await review_reach(db, forge)
     if LOCAL_CHANNEL not in reach.ways:
         return False
+    # #1653: первое из двух мест проверки согласия проекта (второе — перед
+    # вставкой в dispatch_local_review). После review_reach намеренно:
+    # сообщение «выключено политикой» честно только там, где локальный путь
+    # в самом деле мог быть заказан.
+    if await _second_door_forbidden(db, task, generation, late_report_recheck):
+        return False
     return await dispatch_local_review(
         db,
         task,
@@ -5003,7 +5009,97 @@ async def open_second_door(
         force_profile,
         cloud_refusal=cloud_refusal,
         late_report_recheck=late_report_recheck,
+        second_door=True,
     )
+
+
+#: Причина закрытия долга второй двери по политике проекта (#1653): имя
+#: события в ленте и ``reason`` в его payload.
+LOCAL_FALLBACK_OFF_REASON = "local_fallback_off_by_policy"
+
+_LOCAL_FALLBACK_OFF_TEXT = (
+    "Запасной локальный ревьюер выключен политикой проекта "
+    "(local_review_fallback=off). Вердикт остаётся человеку."
+)
+
+
+async def _local_fallback_allowed(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Разрешил ли проект задачи запасной локальный путь: ключ читается свежим."""
+    project = await repo.resolve_project_for_task(db, task_id)
+    return (
+        project is not None
+        and project_policy.local_review_fallback_of(gate_policy_of(project))
+        == project_policy.LOCAL_REVIEW_FALLBACK_ON
+    )
+
+
+async def _second_door_forbidden(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    debt: dict[str, Any] | None,
+) -> bool:
+    """Вторая дверь запрещена политикой — закрыть долг и назвать причину (#1653).
+
+    True — заказывать нельзя, вызывающий возвращает False. Один читатель
+    (``_local_fallback_allowed``) на оба места проверки: вход в
+    ``open_second_door`` и последнее слово перед вставкой в
+    ``dispatch_local_review``.
+    """
+    task_id = int(task["id"])
+    if await _local_fallback_allowed(db, task_id):
+        return False
+    await _close_second_door_by_policy(db, task_id, generation, debt)
+    return True
+
+
+async def _close_second_door_by_policy(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    debt: dict[str, Any] | None,
+) -> None:
+    """Причина, сообщение и закрытие долга — ОДНА транзакция (#1653).
+
+    Сбой до коммита откатывает всё: долг остаётся видимым свипу, и следующий
+    проход пишет причину заново; сбой после коммита оставляет долг закрытым.
+    Сообщение — одно на dispatch_id: событие причины и есть ключ дедупа.
+    Исходный ``run_status`` не трогается; своего позднего отчёта у заказа
+    нет — ``failed``, есть — ``done`` (так же, как закрывает _settle_second_door).
+    """
+    debt_id = int(debt["id"]) if debt is not None else None
+    try:
+        told = await fetchall(
+            db,
+            "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+            "AND json_extract(payload, '$.generation')=? "
+            "AND json_extract(payload, '$.dispatch_id') IS ?",
+            (LOCAL_FALLBACK_OFF_REASON, task_id, generation, debt_id),
+        )
+        if not told:
+            await repo.insert_event(
+                db,
+                kind=LOCAL_FALLBACK_OFF_REASON,
+                task_id=task_id,
+                actor="policy",
+                payload={
+                    "reason": LOCAL_FALLBACK_OFF_REASON,
+                    "dispatch_id": debt_id,
+                    "generation": generation,
+                },
+            )
+            await repo.add_task_update(
+                db, task_id, "hub", "alert", _LOCAL_FALLBACK_OFF_TEXT
+            )
+        if debt is not None and debt_id is not None:
+            own_report = await _dispatch_report(db, task_id, generation, debt)
+            await repo.set_review_dispatch_status(
+                db, debt_id, "done" if own_report is not None else "failed"
+            )
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
 
 
 async def _submission_still_live(
@@ -5039,6 +5135,7 @@ async def dispatch_local_review(
     cloud_refusal: str = "",
     late_report_recheck: dict[str, Any] | None = None,
     local_first: bool = False,
+    second_door: bool = False,
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -5055,6 +5152,11 @@ async def dispatch_local_review(
     репозитория. Отчёт, доехавший за это время, ту раннюю проверку не видит
     вовсе. Здесь — ПОСЛЕДНЕЕ слово, ближе к вставке уже некуда: деньги тратит
     именно она.
+
+    ``second_door`` (#1653) — заказ идёт ПОСЛЕ отказа облака: последнее слово
+    перед вставкой включает и согласие проекта (local_review_fallback), потому
+    что политику могли выключить, пока готовился заказ. Прямой путь форжа без
+    облака и local-first этим ключом не управляются.
 
     ``local_first`` (#1561) — заказ идёт по ключу проекта deep_reviewer=local,
     а не после отказа облака. Отказ тогда НЕ алерт «вердикт остаётся
@@ -5142,6 +5244,10 @@ async def dispatch_local_review(
         return False
     if late_report_recheck is not None and (
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
+    ):
+        return False
+    if second_door and await _second_door_forbidden(
+        db, task, generation, late_report_recheck
     ):
         return False
     run_id = uuid.uuid4().hex[:12]

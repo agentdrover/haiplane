@@ -726,7 +726,8 @@ def ci_before_submit_of(policy: dict) -> str:
 
 
 # Кто читает deep первым (#1561). ``cloud`` — как всегда: облако первым,
-# локальный путь только второй дверью после наблюдённого отказа (#1252).
+# локальный путь только второй дверью после наблюдённого отказа (#1252) и
+# только если проект это разрешил: local_review_fallback=on (#1653).
 # ``local`` — deep сначала в локальный путь, облако только после его отказа.
 # Нет ключа и нечитаемое значение — ``cloud``: опечатка не должна молча
 # уводить платное ревью с облака на хост хаба.
@@ -741,6 +742,30 @@ def deep_reviewer_of(policy: dict) -> str:
     if isinstance(policy, dict) and policy.get(DEEP_REVIEWER_KEY) in DEEP_REVIEWERS:
         return str(policy[DEEP_REVIEWER_KEY])
     return DEEP_REVIEWER_CLOUD
+
+
+# Запасной локальный ревьюер (#1653). Согласие проекта на то, чтобы локальный
+# путь заменил отказавшее облако (вторая дверь, #1252): платный прогон решает
+# политика проекта, а не env хоста. Нет ключа и нечитаемое значение — ``off``:
+# опечатка не должна молча включать расход. Прямой локальный путь форжа без
+# облака и ``deep_reviewer=local`` этим ключом не управляются.
+LOCAL_REVIEW_FALLBACK_KEY = "local_review_fallback"
+LOCAL_REVIEW_FALLBACK_OFF = "off"
+LOCAL_REVIEW_FALLBACK_ON = "on"
+LOCAL_REVIEW_FALLBACKS: tuple[str, ...] = (
+    LOCAL_REVIEW_FALLBACK_OFF,
+    LOCAL_REVIEW_FALLBACK_ON,
+)
+
+
+def local_review_fallback_of(policy: dict) -> str:
+    """Разрешена ли вторая дверь: нет ключа или нечитаемое значение — off."""
+    if (
+        isinstance(policy, dict)
+        and policy.get(LOCAL_REVIEW_FALLBACK_KEY) == LOCAL_REVIEW_FALLBACK_ON
+    ):
+        return LOCAL_REVIEW_FALLBACK_ON
+    return LOCAL_REVIEW_FALLBACK_OFF
 
 
 # «Мерж = доставка» (#1572). У проекта без релиз-PR (ветка работы совпадает с
