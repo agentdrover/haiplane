@@ -62,11 +62,24 @@ TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # unknown with its text, never as a failure.
 COMMAND_TOKEN = re.compile(r"^[A-Za-z0-9._/-]+$")
 _RUN_TIMEOUT = 900
+# #1666: the CI step that runs this script is capped at 20 minutes, while the
+# budgets above are per call (AC run 900 s, then 900 s for EACH validation
+# command). Without one overall deadline GitHub could kill the step before the
+# POST and the evidence would vanish silently. Past 17 minutes from start no
+# further command is launched, what was left is named as not run, and the
+# report is still sent.
+_REPORT_DEADLINE = 17 * 60
+_STARTED = time.monotonic()
 _LOG_TAIL = 4000
 # The default is this repository's own runner. A satellite repository sets
 # HAIPLANE_HUB_CI_PYTEST to whatever runs ITS tests; an unparsable or missing
 # runner reports not_found with a reason, never a failure about the work.
 _DEFAULT_AC_RUNNER = "uv run pytest"
+
+
+def _remaining() -> float:
+    """Seconds left before the reporter must stop launching work and send."""
+    return _REPORT_DEADLINE - (time.monotonic() - _STARTED)
 
 
 def env_get(suffix: str) -> str:
@@ -241,9 +254,14 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
     runner = ac_runner()
     if not runner:
         return {}
-    deadline = time.monotonic() + _RUN_TIMEOUT
+    deadline = time.monotonic() + min(_RUN_TIMEOUT, max(1.0, _remaining()))
     pending = list(nodeids)
     while pending:
+        if _remaining() <= 0:
+            log(
+                "report deadline reached — the AC tests were not run, they stay not_found"
+            )
+            return {}
         cmd = [*runner, *pending, "-v", "--no-header", "-p", "no:cacheprovider"]
         try:
             proc = subprocess.run(  # nosec B603 - fixed argv, nodeids come from the hub
@@ -326,6 +344,9 @@ _NON_SELECTING_FLAGS = {
     "-n",
     "--numprocesses",
     "--dist",
+    # #1666: only prints the slowest tests, selects nothing.
+    "--durations",
+    "--durations-min",
 }
 
 
@@ -333,7 +354,16 @@ _NON_SELECTING_FLAGS = {
 # an "=". Kept separate from the whitelist itself: membership here decides
 # whether a token is EATEN, and eating one too many is how a narrowed run gets
 # mistaken for the whole suite.
-_VALUE_TAKING_FLAGS = {"-n", "--numprocesses", "--dist", "--tb", "--color", "-r"}
+_VALUE_TAKING_FLAGS = {
+    "-n",
+    "--numprocesses",
+    "--dist",
+    "--tb",
+    "--color",
+    "-r",
+    "--durations",
+    "--durations-min",
+}
 
 
 def _looks_like_a_test_path(token: str) -> bool:
@@ -480,13 +510,27 @@ def run_validation(
             if outcome == "fail":
                 return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
             continue
+        if _remaining() <= 0:
+            # #1666: the deadline is spent: do not launch this one or the rest.
+            idx = commands.index(cmd)
+            skipped = [c for c in commands[idx:] if is_command(c)]
+            for c in skipped:
+                logs.append(f"$ {c}\n[не выполнена: deadline отчёта исчерпан]")
+            log(f"report deadline reached — {len(skipped)} command(s) not run")
+            return (
+                "unknown",
+                "\n".join(logs)[-_LOG_TAIL:],
+                f"deadline отчёта исчерпан; исполнено {executed} из "
+                f"{len(commands)}, не выполнены по deadline ({len(skipped)}): "
+                + ", ".join(repr(c[:80]) for c in skipped[:3]),
+            )
         try:
             proc = subprocess.run(  # nosec B602 - the task's own declared commands, run in a disposable CI runner
                 cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=_RUN_TIMEOUT,
+                timeout=min(_RUN_TIMEOUT, max(1.0, _remaining())),
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
