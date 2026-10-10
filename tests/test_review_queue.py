@@ -600,3 +600,135 @@ def test_a_fresh_observation_is_named_once() -> None:
     )
     assert "ветка ушла" in diverged, diverged
     assert diverged.count("3 мин назад") == 1, diverged
+
+
+# --- #1648: задача-состояние в очереди, входящих и маршруте вердикта ---------
+
+
+async def test_state_task_in_review_is_ready_for_a_human_by_evidence(
+    client: AsyncClient, db: aiosqlite.Connection, git: _Git
+):
+    """AC-1 (#1648): state в review с полным комплектом поколения 2, машинных
+    отчётов нет; рядом commit-задача без отчёта.
+
+    Очередь называет state готовой к вердикту ПО ДОКАЗАТЕЛЬСТВАМ, а не по
+    машинному отчёту; входящие предлагают человеку вердикт; маршрут — человек
+    с названной причиной state. Commit-задача остаётся «ждёт отчёта».
+    """
+    from hub.services import dashboard
+    from hub.services.verdict_route import DECIDER_HUMAN, verdict_route
+    from tests.state_support import (
+        drive_to_second_generation,
+        make_state_task,
+    )
+
+    state_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, state_id)
+    commit_id = await _submitted(client, git, "commit без отчёта", "aaa111")
+    assert await repo.get_latest_machine_review(db, state_id) is None
+
+    queue = await review_queue.review_queue(db)
+    rows = {r.task_id: r for r in queue.rows}
+    assert rows[state_id].readiness == "ready", rows[state_id].readiness
+    assert rows[state_id].submission_generation == 2
+    assert rows[state_id].result_kind == "state"
+    assert rows[state_id].sha_check == "not_applicable"
+    assert rows[state_id].report_status == "not_applicable"
+    assert rows[state_id].evidence_count == 2, "только поколение 2, не оба"
+    assert rows[state_id].evidence_complete is True
+    assert rows[commit_id].readiness == "awaiting_report", "commit — как сейчас"
+    assert rows[commit_id].result_kind == "commit"
+    assert queue.rows.index(rows[state_id]) < queue.rows.index(rows[commit_id])
+
+    route = await verdict_route(db, state_id)
+    assert (route.decider, route.final) == (DECIDER_HUMAN, DECIDER_HUMAN)
+    assert route.code == "state_task_no_automation", route.code
+    assert "состояни" in route.reason
+
+    inbox = await dashboard.get_inbox_data(db)
+    by_task = inbox["decision_by_task"]
+    assert by_task[state_id]["action"] == "verdict"
+    assert by_task[state_id]["offer"] is True, by_task[state_id]
+    assert "поколения 2" in by_task[state_id]["grounds"]
+    assert "отчёт не пришёл" not in by_task[state_id]["grounds"]
+    assert by_task[commit_id]["offer"] is False, "commit без отчёта вердикта не ждёт"
+    assert by_task[commit_id]["grounds"].startswith("отчёт не пришёл")
+
+
+async def test_state_queue_row_is_blocked_when_the_evidence_kit_is_incomplete(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1648: полнота — по снимку СДАЧИ, а не по числу строк. Снимок, называющий
+    AC без записи, не даёт готовности и не предлагает вердикт; отчёта, который
+    «дозрел бы», у такой задачи нет."""
+    from hub.services import dashboard
+    from tests.state_support import drive_to_review, make_state_task
+
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id)
+    snapshot = json.loads(
+        dict(await repo.get_submission(db, task_id, 1))["state_snapshot"]
+    )
+    snapshot["acceptance_criteria"].append(
+        {
+            "id": "AC-3",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "verifiable_by": "manual",
+        }
+    )
+    await db.execute(
+        "UPDATE submissions SET state_snapshot=? WHERE task_id=? AND generation=1",
+        (json.dumps(snapshot), task_id),
+    )
+    await db.commit()
+
+    (row,) = (await review_queue.review_queue(db)).rows
+    assert row.readiness == "blocked" and row.evidence_complete is False
+    entry = (await dashboard.get_inbox_data(db))["decision_by_task"][task_id]
+    assert entry["offer"] is False and "AC-3" in entry["grounds"]
+
+
+async def test_state_task_is_not_a_provider_outage_waiter_and_names_its_reason(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1648: сторож провайдера не считает state ждущим машинного ревью, а
+    ответ «есть ли ревью» называет вид задачи, не «не заказано»."""
+    from hub.services import review_availability
+    from tests.state_support import drive_to_review, make_state_task
+
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id)
+    task = dict(await repo.get_task(db, task_id))
+
+    answer = await review_availability.generation_review(db, task)
+    assert answer.has_review is False and answer.reason == "state_task"
+    assert "вердикт выносит человек" in answer.headline
+    waiting, _starts = await review_availability._review_queue(db, "")
+    assert waiting == []
+
+
+def test_the_human_line_of_a_state_task_names_the_evidence_kit() -> None:
+    """#1648: у state нет sha и отчёта — строка называет комплект доказательств."""
+    text = _queue_text(
+        [
+            _queue_row(
+                result_kind="state",
+                readiness="ready",
+                sha_check="not_applicable",
+                evidence_count=2,
+                evidence_complete=True,
+            ),
+            _queue_row(
+                task_id=2,
+                result_kind="state",
+                readiness="blocked",
+                sha_check="not_applicable",
+                evidence_count=1,
+                evidence_complete=False,
+            ),
+        ]
+    )
+    assert "задача-состояние: комплект доказательств полный (2 AC)" in text, text
+    assert "НЕПОЛНЫЙ (1 AC)" in text and "sha" not in text

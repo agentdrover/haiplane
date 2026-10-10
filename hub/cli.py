@@ -1640,6 +1640,17 @@ def _review_queue_line(row: dict) -> str:
     readiness = row.get("readiness")
     if readiness == "ready_sha_unverified":
         readiness = "ready, sha не проверен"
+    if row.get("result_kind") == "state":
+        # #1648: у задачи-состояния нет ни sha, ни машинного отчёта — строка
+        # называет то, по чему человек судит: доказательства поколения.
+        kit = "полный" if row.get("evidence_complete") else "НЕПОЛНЫЙ"
+        return (
+            f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
+            f"{row.get('status')}, сдача {row.get('submission_generation')}, "
+            f"задача-состояние: комплект доказательств {kit} "
+            f"({row.get('evidence_count') or 0} AC), {verdict}, "
+            f"ждёт {row.get('waiting_minutes', '?')} мин"
+        )
     sha = f"sha {row.get('sha_check')}"
     # Not a match: the reason says why, and when the tip is fresh it already
     # opens with the observation age — so it replaces the minutes, not joins them.

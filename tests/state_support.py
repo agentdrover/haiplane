@@ -282,3 +282,62 @@ async def drive_to_review(
     sent = await submit(client, task_id, evidence_for(ac_ids), headers=headers)
     assert sent.status_code == 200, sent.text
     assert sent.json()["status"] == "review", sent.text
+
+
+async def human_verdict(
+    client: AsyncClient,
+    task_id: int,
+    verdict: str,
+    *,
+    generation: int | None,
+    headers: dict[str, str] | None = None,
+    comments: str = "",
+):
+    """Вердикт человека по REST; ``generation`` — то, что назвала форма."""
+    body: dict[str, Any] = {"verdict": verdict, "agent": "denis", "comments": comments}
+    if generation is not None:
+        body["expected_generation"] = generation
+    return await client.post(
+        f"/api/tasks/{task_id}/review-verdict", json=body, headers=headers or {}
+    )
+
+
+async def drive_to_second_generation(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    headers: dict[str, str] | None = None,
+    human_headers: dict[str, str] | None = None,
+) -> None:
+    """Сдача №1, отказ человека, возврат в работу, сдача №2: ожидает review/2.
+
+    Доказательства поколения 1 остаются в таблице (insert-only), поэтому
+    читатель обязан брать только поколение 2.
+    """
+    await drive_to_review(client, db, task_id, headers=headers)
+    sent_back = await human_verdict(
+        client,
+        task_id,
+        "changes_requested",
+        generation=1,
+        headers=human_headers or headers,
+        comments="AC-2: нет наблюдения с резолвера",
+    )
+    assert sent_back.status_code == 200, sent_back.text
+    returned = await client.post(
+        f"/api/tasks/{task_id}/return-to-work",
+        json={"reason": "уточняем"},
+        headers=human_headers or headers or {},
+    )
+    assert returned.status_code == 200, returned.text
+    started = await pair_start(client, task_id, headers=headers)
+    assert started.status_code == 200, started.text
+    second = await submit(
+        client,
+        task_id,
+        evidence_for(("AC-1", "AC-2"), observed="повторное наблюдение, поколение 2"),
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["submission_generation"] == 2, second.text
