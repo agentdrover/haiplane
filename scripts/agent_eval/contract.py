@@ -576,12 +576,11 @@ def validate_run(run: dict[str, Any], manifest: Manifest | None = None) -> list[
 # --- Хэши рабочих артефактов -------------------------------------------------
 
 
-def working_prompt_hash() -> str:
-    """Хэш промпта, который реально получает стюард.
+def working_prompt_text() -> str:
+    """Текст рабочего промпта стюарда с зафиксированными переменными частями.
 
-    Берётся у фактического builder (``steward_shadow._prompt``), а не из копии:
-    правка рабочего промпта обязана менять и хэш. Переменные части (номер
-    задачи, адрес хаба, блок доступа) заменены заглушками — хэшируется шаблон.
+    Единственное место сборки для хэша и для runner (#1222): отправленное и
+    захэшированное не могут разойтись.
     """
     from hub.services import steward_shadow
 
@@ -589,7 +588,17 @@ def working_prompt_hash() -> str:
     # Блок доступа собирает штатный builder: правка его статического текста
     # обязана менять хэш. Задача, код и адрес зафиксированы.
     delivery = steward_shadow.delivery_block(1, "CODE", base)
-    return _sha256(steward_shadow._prompt(1, 1, base, delivery))
+    return steward_shadow._prompt(1, 1, base, delivery)
+
+
+def working_prompt_hash() -> str:
+    """Хэш промпта, который реально получает стюард.
+
+    Берётся у фактического builder (``steward_shadow._prompt``), а не из копии:
+    правка рабочего промпта обязана менять и хэш. Переменные части (номер
+    задачи, адрес хаба, блок доступа) заменены заглушками — хэшируется шаблон.
+    """
+    return _sha256(working_prompt_text())
 
 
 async def working_catalog_hash() -> str:
@@ -616,4 +625,5 @@ __all__ = [
     "validate_run",
     "working_catalog_hash",
     "working_prompt_hash",
+    "working_prompt_text",
 ]
