@@ -1,0 +1,454 @@
+"""Версионированный набор канареек и контракт артефакта eval-прогона (#1221).
+
+Оценщик ОДИН — ``steward_canaries.evaluate`` (#1108). Здесь нет второго
+способа решить, поймана ли канарейка; есть то, что вокруг него:
+
+* манифест: устойчивые ID, версия набора, критичность, хэш данных;
+* схема прогона: кто, на чём, с каким промптом и каталогом, что ответил по
+  каждому case, сколько стоило;
+* итог, который не даёт неполным данным выглядеть зелёными.
+
+Четыре исхода прогона и порядок их приоритета:
+
+``quality_failed``  судья ответил, и ответ неверен (в первую очередь —
+                    одобрен заложенный дефект). Побеждает всё: известный
+                    провал не прячется за неполнотой данных.
+``incomplete``      набор или ответы неполны: пустой манифест, пропавший,
+                    дублированный или чужой case, битый ответ, пустые поля
+                    идентичности. Такой прогон нельзя сравнивать.
+``infrastructure_error`` судья не ответил (таймаут, сбой провайдера) — это не
+                    суждение о качестве.
+``passed``          все case отвечены, ни одной проблемы, ни одного провала.
+
+Платная модель здесь не вызывается: ответы приходят снаружи.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from hub.services.steward_canaries import (
+    MUST_NOT_APPROVE,
+    MUST_NOT_ESCALATE,
+    VALID_VERDICTS,
+    Canary,
+    CanaryResult,
+    all_canaries,
+    evaluate,
+)
+
+SCHEMA_VERSION = 1
+# Меняется вручную, когда меняется СМЫСЛ набора (не только факты: их ловит
+# хэш). Два прогона с разной версией набора несопоставимы.
+SUITE_VERSION = "1"
+
+PASSED = "passed"
+QUALITY_FAILED = "quality_failed"
+INFRASTRUCTURE_ERROR = "infrastructure_error"
+INCOMPLETE = "incomplete"
+OUTCOMES = (PASSED, QUALITY_FAILED, INFRASTRUCTURE_ERROR, INCOMPLETE)
+
+USAGE_KEYS = ("input_tokens", "output_tokens")
+META_REQUIRED = (
+    "commit",
+    "provider",
+    "model",
+    "prompt_hash",
+    "catalog_hash",
+    "run_id",
+    "session_id",
+)
+
+
+def _sha256(payload: Any) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _problem(kind: str, path: str, message: str, case_id: str = "") -> dict[str, str]:
+    return {"kind": kind, "case_id": case_id, "path": path, "message": message}
+
+
+# --- Манифест ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ManifestCase:
+    case_id: str
+    expectation: str
+    origin: str
+    critical: bool
+    planted: str
+    facts_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
+
+@dataclass(frozen=True)
+class Manifest:
+    suite_version: str
+    cases: tuple[ManifestCase, ...]
+    canaries: tuple[Canary, ...]
+    manifest_hash: str
+
+    def problems(self) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        if not self.cases:
+            found.append(
+                _problem("manifest_empty", "manifest.cases", "набор канареек пуст")
+            )
+        seen: set[str] = set()
+        for case in self.cases:
+            if case.case_id in seen:
+                found.append(
+                    _problem(
+                        "manifest_duplicate_case",
+                        f"manifest.cases[{case.case_id}]",
+                        "ID case повторяется в манифесте",
+                        case.case_id,
+                    )
+                )
+            seen.add(case.case_id)
+        return found
+
+
+def case_id_of(canary: Canary) -> str:
+    """Устойчивый ID: происхождение + имя, не позиция в списке."""
+    return f"{canary.origin}:{canary.name}"
+
+
+def _is_critical(canary: Canary) -> bool:
+    """Критичен case, где ошибка — одобрение заложенного дефекта."""
+    if canary.expectation == MUST_NOT_APPROVE:
+        return True
+    if canary.expectation == MUST_NOT_ESCALATE:
+        return False
+    raise ValueError(f"unknown expectation {canary.expectation!r}")
+
+
+def build_manifest(
+    canaries: Iterable[Canary] | None = None, *, suite_version: str = SUITE_VERSION
+) -> Manifest:
+    items = tuple(all_canaries() if canaries is None else canaries)
+    cases = tuple(
+        ManifestCase(
+            case_id=case_id_of(c),
+            expectation=c.expectation,
+            origin=c.origin,
+            critical=_is_critical(c),
+            planted=c.planted,
+            facts_hash=_sha256(c.facts),
+        )
+        for c in items
+    )
+    digest = _sha256(
+        {
+            "schema": SCHEMA_VERSION,
+            "suite_version": suite_version,
+            "cases": [case.to_dict() for case in cases],
+        }
+    )
+    return Manifest(suite_version, cases, items, digest)
+
+
+# --- Схема прогона -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunMeta:
+    commit: str
+    provider: str
+    model: str
+    params: dict[str, Any]
+    prompt_hash: str
+    catalog_hash: str
+    run_id: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class CaseResponse:
+    """Что вернул судья по одному case. Неизвестное остаётся None."""
+
+    case_id: str
+    judgement: Any = None
+    latency_ms: float | None = None
+    usage: dict[str, Any] | None = None
+    error: str | None = None
+
+
+def _meta_problems(meta: RunMeta) -> list[dict[str, str]]:
+    return [
+        _problem("meta_missing", f"meta.{name}", f"поле {name} пусто")
+        for name in META_REQUIRED
+        if not str(getattr(meta, name) or "").strip()
+    ]
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _usage_problem(usage: Any, base: str) -> str | None:
+    if usage is None:
+        return None
+    if not isinstance(usage, dict):
+        return f"{base}.usage"
+    for key in USAGE_KEYS:
+        value = usage.get(key)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            return f"{base}.usage.{key}"
+    return None
+
+
+def _shape_problem(resp: CaseResponse, base: str) -> tuple[str, str] | None:
+    """(path, why) первой найденной порчи ответа, иначе None."""
+    judgement = resp.judgement
+    if not isinstance(judgement, dict):
+        return f"{base}.judgement", "суждение не объект"
+    verdict = judgement.get("verdict")
+    if verdict not in VALID_VERDICTS:
+        return f"{base}.judgement.verdict", f"вердикт {verdict!r} вне словаря"
+    confidence = judgement.get("confidence")
+    if confidence is not None and not isinstance(confidence, str):
+        return f"{base}.judgement.confidence", "confidence не строка"
+    lat = resp.latency_ms
+    if lat is not None and (not _is_number(lat) or lat < 0):
+        return f"{base}.latency_ms", "latency не неотрицательное число"
+    bad_usage = _usage_problem(resp.usage, base)
+    if bad_usage:
+        return bad_usage, "usage повреждён"
+    return None
+
+
+def _normalize_usage(usage: dict[str, Any] | None) -> dict[str, int | None] | None:
+    if usage is None:
+        return None
+    return {key: usage.get(key) for key in USAGE_KEYS}
+
+
+def _record(case: ManifestCase, outcome: str, **fields: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "case_id": case.case_id,
+        "expectation": case.expectation,
+        "critical": case.critical,
+        "outcome": outcome,
+        "verdict": None,
+        "detail": "",
+        "error": None,
+        "latency_ms": None,
+        "usage": None,
+    }
+    base.update(fields)
+    return base
+
+
+def _judged_record(
+    case: ManifestCase, canary: Canary, resp: CaseResponse
+) -> dict[str, Any]:
+    result: CanaryResult = evaluate(canary, resp.judgement)
+    return _record(
+        case,
+        PASSED if result.caught else QUALITY_FAILED,
+        verdict=result.verdict,
+        detail=result.detail,
+        latency_ms=resp.latency_ms,
+        usage=_normalize_usage(resp.usage),
+    )
+
+
+def _case_record(
+    case: ManifestCase,
+    canary: Canary,
+    group: list[CaseResponse],
+    problems: list[dict[str, str]],
+) -> dict[str, Any]:
+    base = f"cases[{case.case_id}]"
+    if not group:
+        problems.append(
+            _problem("missing_case", base, "ответа на case нет", case.case_id)
+        )
+        return _record(case, INCOMPLETE, detail="ответа нет")
+    if len(group) > 1:
+        problems.append(
+            _problem(
+                "duplicate_response",
+                base,
+                f"ответов на case: {len(group)}",
+                case.case_id,
+            )
+        )
+        return _record(case, INCOMPLETE, detail="ответов больше одного")
+    resp = group[0]
+    if resp.error:
+        return _record(
+            case, INFRASTRUCTURE_ERROR, error=resp.error, detail="судья не ответил"
+        )
+    shape = _shape_problem(resp, base)
+    if shape:
+        problems.append(
+            _problem("malformed_response", shape[0], shape[1], case.case_id)
+        )
+        return _record(case, INCOMPLETE, detail=shape[1])
+    return _judged_record(case, canary, resp)
+
+
+def _group_responses(
+    manifest: Manifest, responses: Sequence[CaseResponse]
+) -> tuple[dict[str, list[CaseResponse]], list[dict[str, str]]]:
+    known = {c.case_id for c in manifest.cases}
+    groups: dict[str, list[CaseResponse]] = {}
+    problems: list[dict[str, str]] = []
+    for resp in responses:
+        if resp.case_id not in known:
+            problems.append(
+                _problem(
+                    "unknown_case",
+                    f"cases[{resp.case_id}]",
+                    "case нет в манифесте",
+                    resp.case_id,
+                )
+            )
+            continue
+        groups.setdefault(resp.case_id, []).append(resp)
+    return groups, problems
+
+
+# --- Итог --------------------------------------------------------------------
+
+
+def _all_known_sum(values: list[Any]) -> int | float | None:
+    """Сумма, только если известно каждое слагаемое: иначе None, не 0."""
+    if not values or any(v is None for v in values):
+        return None
+    return sum(values)
+
+
+def summarize(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Итог считается ТОЛЬКО по per-case записям — второго источника нет."""
+    count = {o: sum(c["outcome"] == o for c in cases) for o in OUTCOMES}
+    failed = [c for c in cases if c["outcome"] == QUALITY_FAILED]
+    total = len(cases)
+    usages = [c["usage"] for c in cases]
+    return {
+        "total": total,
+        **count,
+        "score": count[PASSED] / total if total else None,
+        "critical_failures": [c["case_id"] for c in failed if c["critical"]],
+        "false_approvals": sum(c["expectation"] == MUST_NOT_APPROVE for c in failed),
+        "false_alarms": sum(c["expectation"] == MUST_NOT_ESCALATE for c in failed),
+        "latency_ms_total": _all_known_sum([c["latency_ms"] for c in cases]),
+        "usage": {
+            key: _all_known_sum([u.get(key) if u else None for u in usages])
+            for key in USAGE_KEYS
+        },
+    }
+
+
+def derive_status(summary: dict[str, Any], problems: list[Any]) -> str:
+    if summary["quality_failed"]:
+        return QUALITY_FAILED
+    if problems or summary["incomplete"] or not summary["total"]:
+        return INCOMPLETE
+    if summary["infrastructure_error"]:
+        return INFRASTRUCTURE_ERROR
+    return PASSED
+
+
+def build_run(
+    manifest: Manifest, responses: Sequence[CaseResponse], meta: RunMeta
+) -> dict[str, Any]:
+    problems = manifest.problems() + _meta_problems(meta)
+    groups, extra = _group_responses(manifest, responses)
+    problems += extra
+    cases = [
+        _case_record(case, canary, groups.get(case.case_id, []), problems)
+        for case, canary in zip(manifest.cases, manifest.canaries, strict=True)
+    ]
+    summary = summarize(cases)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": derive_status(summary, problems),
+        "meta": dict(meta.__dict__),
+        "manifest": {
+            "suite_version": manifest.suite_version,
+            "manifest_hash": manifest.manifest_hash,
+            "case_ids": [c.case_id for c in manifest.cases],
+        },
+        "cases": cases,
+        "summary": summary,
+        "problems": problems,
+    }
+
+
+def validate_run(run: dict[str, Any]) -> list[str]:
+    """Перепроверить готовый артефакт: итог обязан сходиться с case-записями."""
+    errors: list[str] = []
+    cases = run.get("cases") or []
+    ids = [c.get("case_id") for c in cases]
+    if len(ids) != len(set(ids)):
+        errors.append("cases: повторяющиеся case_id")
+    if ids != (run.get("manifest") or {}).get("case_ids"):
+        errors.append("cases не совпадают с manifest.case_ids")
+    if any(c.get("outcome") not in OUTCOMES for c in cases):
+        errors.append("cases: неизвестный outcome")
+        return errors
+    summary = summarize(cases)
+    if summary != run.get("summary"):
+        errors.append("summary не сходится с per-case результатами")
+    expected = derive_status(summary, run.get("problems") or [])
+    if run.get("status") != expected:
+        errors.append(f"status {run.get('status')!r} != {expected!r}")
+    return errors
+
+
+# --- Хэши рабочих артефактов -------------------------------------------------
+
+
+def working_prompt_hash() -> str:
+    """Хэш промпта, который реально получает стюард.
+
+    Берётся у фактического builder (``steward_shadow._prompt``), а не из копии:
+    правка рабочего промпта обязана менять и хэш. Переменные части (номер
+    задачи, адрес хаба, блок доступа) заменены заглушками — хэшируется шаблон.
+    """
+    from hub.services import steward_shadow
+
+    return _sha256(steward_shadow._prompt(0, 0, "<hub_base>", "<delivery>"))
+
+
+async def working_catalog_hash() -> str:
+    """Хэш каталога MCP-инструментов в том виде, как его получает агент."""
+    from hub.mcp_server import mcp
+
+    tools = await mcp.list_tools_for("agent")
+    entries = sorted(
+        (
+            getattr(t, "name", ""),
+            getattr(t, "description", "") or "",
+            getattr(t, "inputSchema", None),
+        )
+        for t in tools
+    )
+    return _sha256({"instructions": mcp.instructions or "", "tools": entries})
+
+
+__all__ = [
+    "CaseResponse",
+    "Manifest",
+    "ManifestCase",
+    "RunMeta",
+    "SUITE_VERSION",
+    "build_manifest",
+    "build_run",
+    "validate_run",
+    "working_catalog_hash",
+    "working_prompt_hash",
+]
