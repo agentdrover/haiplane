@@ -295,18 +295,15 @@ async def _draft(db: aiosqlite.Connection, task_type: str, locator: str) -> int:
     return tv.id
 
 
-def _collector(found: set[str] | None):
-    async def collect(nodeids, repo_path):
-        return found
-
-    return collect
-
-
-async def _approve_with(db, monkeypatch, task_id: int, found: set[str] | None):
+async def _approve_with(db, monkeypatch, task_id: int, source: str | None):
+    """Approve with every locator file reading as ``source`` (None = unreadable)."""
     from hub.models import TaskApprove
-    from hub.services import ac_tests
+    from hub.services.test_existence import LocatorEvidence
 
-    monkeypatch.setattr(ac_tests, "default_locator_collector", _collector(found))
+    async def _evidence(git, repo_path, files, **_kw):
+        return LocatorEvidence(sources=dict.fromkeys(files, source), ref_label="fx")
+
+    monkeypatch.setattr("hub.services.test_existence.read_locator_evidence", _evidence)
     return await services.approve_task(db, task_id, TaskApprove(force=True))
 
 
@@ -326,7 +323,7 @@ async def test_epic_approval_warns_on_dead_locator(
     dead = "tests/test_api.py::test_worktree_path_only_when_tree_exists"
     task_id = await _draft(db, "epic", dead)
 
-    view = await _approve_with(db, monkeypatch, task_id, found=set())
+    view = await _approve_with(db, monkeypatch, task_id, source="")
 
     assert view.status.value == "open", "the warning must not block the approval"
     alerts = _alerts(await repo.get_task_updates(db, task_id))
@@ -343,7 +340,12 @@ async def test_live_locator_is_silent_on_upper_levels(
     live = "tests/test_ac_locator_gate.py::test_epic_approval_warns_on_dead_locator"
     task_id = await _draft(db, "feature", live)
 
-    await _approve_with(db, monkeypatch, task_id, found={live})
+    await _approve_with(
+        db,
+        monkeypatch,
+        task_id,
+        source="def test_epic_approval_warns_on_dead_locator():\n    pass\n",
+    )
 
     assert not _alerts(await repo.get_task_updates(db, task_id))
 
@@ -355,7 +357,7 @@ async def test_unreadable_collection_says_nothing(
     # clean". A collector that could not run produces no verdict at all.
     task_id = await _draft(db, "epic", "tests/test_api.py::test_gone")
 
-    await _approve_with(db, monkeypatch, task_id, found=None)
+    await _approve_with(db, monkeypatch, task_id, source=None)
 
     assert not _alerts(await repo.get_task_updates(db, task_id))
 
@@ -371,3 +373,86 @@ async def test_task_level_require_is_unchanged(db: aiosqlite.Connection, require
 
     assert exc.value.status_code == 422
     assert not await repo.list_acceptance_criteria(db, task_id)
+
+
+# --- #1650: the approval reads the clone, it does not run it -----------------
+
+_TWO_KINDS = (
+    "from somewhere import ImportedBase\n\n\n"
+    "class TestA:\n    def test_here(self):\n        assert True\n\n\n"
+    "class TestB(ImportedBase):\n    pass\n"
+)
+
+
+async def test_epic_approve_flags_dead_locators_without_running_pytest(
+    db: aiosqlite.Connection, tmp_path, spawn_spy
+):
+    """#1650 AC-3: a missing locator is named, an unknown one is not, nothing runs.
+
+    The shared clone holds a conftest.py that writes a marker outside the tree
+    of the pytest running this test. TestA::test_gone is provably absent (the
+    class is written out and has no base); TestB::test_x hangs on a base class
+    imported from elsewhere, so nobody can say it is absent.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+    from hub.models import TaskApprove
+    from tests.branch_code_support import TEST_FILE, make_clone
+
+    marker = tmp_path / "outside" / "marker"
+    marker.parent.mkdir()
+    workspace, _ = make_clone(tmp_path, marker, test_source=_TWO_KINDS, on_branch=False)
+    plugins.git_ops = GitOpsIntegration()
+    project_id = await repo.create_project(
+        db,
+        slug="clone-proj",
+        name="Clone",
+        repo_name="o/r",
+        workspace_path=str(workspace),
+        default_branch="main",
+    )
+    tv = await services.create_task(db, TaskCreate(title="epic", task_type="epic"))
+    await repo.update_task(db, tv.id, project_id=project_id)
+    for idx, node in ((1, "TestA::test_gone"), (2, "TestB::test_x")):
+        await repo.upsert_acceptance_criterion(
+            db,
+            tv.id,
+            AcceptanceCriterion(
+                id=f"AC-{idx}",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref=f"{TEST_FILE}::{node}",
+            ),
+        )
+    await db.execute("UPDATE tasks SET status='draft' WHERE id=?", (tv.id,))
+    await db.commit()
+
+    view = await services.approve_task(db, tv.id, TaskApprove(force=True))
+
+    assert view.status.value == "open", "the warning must not block the approval"
+    assert not marker.exists(), "the clone's conftest.py ran on the hub host"
+    assert spawn_spy.pytest_runs() == [], "the hub started pytest"
+    alerts = _alerts(await repo.get_task_updates(db, tv.id))
+    assert len(alerts) == 1, alerts
+    assert "AC-1" in alerts[0] and "AC-2" not in alerts[0], alerts[0]
+
+
+async def test_epic_approve_does_not_accuse_an_ambiguous_definition(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # #1650 round 2: Base is defined on both branches of an if. Which one the
+    # module ends up with is not decidable without running it, so the locator is
+    # neither found nor dead — and the approval says nothing about it.
+    ambiguous = (
+        "import sys\n\nif sys.platform == 'linux':\n"
+        "    class Base:\n        def test_x(self):\n            pass\n"
+        "else:\n    class Base:\n        pass\n\n\n"
+        "class TestX(Base):\n    pass\n"
+    )
+    task_id = await _draft(db, "epic", "tests/test_api.py::TestX::test_x")
+
+    await _approve_with(db, monkeypatch, task_id, source=ambiguous)
+
+    assert not _alerts(await repo.get_task_updates(db, task_id))

@@ -572,6 +572,21 @@ class _RealFiles(NoopGitOps):
 
         return await GitOpsIntegration().files_at_ref(repo, ref)
 
+    async def read_file_at_ref(self, repo: str, ref: str, path: str, **kw):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().read_file_at_ref(repo, ref, path, **kw)
+
+    async def head_sha(self, repo: str, base: str) -> str:
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().head_sha(repo, base)
+
+    async def resolve_ref(self, name: str, repo: str):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().resolve_ref(name, repo)
+
 
 async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -> int:
     task_id = await _project_with(db, client, workspace, "main")
@@ -593,40 +608,29 @@ async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -
     return task_id
 
 
-async def test_locator_resolves_in_the_tasks_own_worktree(
-    db, client: AsyncClient, workspace, monkeypatch
+async def test_locator_resolves_at_the_ref_not_in_a_working_tree(
+    db, client: AsyncClient, workspace
 ):
-    """#764 AC-1: collection is attempted where the task's branch lives.
+    """#764 AC-1 / #1650: the file is read at the task's ref, wherever HEAD is.
 
-    The shared clone sits on the base branch — that is the normal state under
-    worktree-per-task, not an accident — so a check that only ever looked
-    there could not have resolved anything.
+    The shared clone sits on the base branch for every task under
+    worktree-per-task, so a check that depended on what is checked out could
+    not have resolved anything; reading the ref does not care.
     """
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_a.py").write_text("def test_ok():\n    pass\n")
+    _git(workspace, "add", ".")
+    _git(workspace, "commit", "-m", "the test the submission adds")
+    _git(workspace, "checkout", "main")  # HEAD is NOT the task's branch
     task_id = await _task_with_test_ac(
         db, client, workspace, "tests/test_a.py::test_ok"
     )
-    looked_in: list[str] = []
-
-    async def _fake_collect(path):
-        looked_in.append(path)
-        return {"tests/test_a.py::test_ok"}
-
-    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _fake_collect)
-    monkeypatch.setattr(
-        "hub.services.orchestration.live_pair_worktree_info",
-        lambda _db, _tid: _awaitable(("worktree", "/tmp/wt/task-42")),
-    )
-
-    class _OnBranch(_RealFiles):
-        async def current_branch(self, repo: str | None = None) -> str:
-            return "task-42/work" if repo == "/tmp/wt/task-42" else "main"
-
-    plugins.git_ops = _OnBranch()
+    plugins.git_ops = _RealFiles()
 
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
 
-    assert looked_in == ["/tmp/wt/task-42"], "collection must run where the code is"
     assert brief["locator_resolution"][0]["status"] == "resolvable"
+    assert "[ref: task branch task-42/work" in brief["locator_resolution"][0]["reason"]
 
 
 async def test_no_readable_tree_reports_unknown_not_missing(
@@ -743,18 +747,14 @@ class _OnTaskBranch(_RealFiles):
         return "task-42/work"
 
 
-async def test_foreign_locator_is_read_even_when_collection_succeeded(
-    db, client: AsyncClient, workspace, monkeypatch
+async def test_foreign_locator_is_read_from_its_file(
+    db, client: AsyncClient, workspace
 ):
-    """#1203: a successful pytest collection does not excuse reading the file.
+    """#1203: a locator of another runner is judged by its own reader.
 
-    The resolver is right to refuse to judge a vitest locator by a pytest
-    collection. But the brief fetched file text ONLY when collection had
-    failed, so on the path that actually runs in production the resolver was
-    handed nothing and answered "could not read at the submitted commit" —
-    about a file no one had opened. The resolver's own unit test passed a
-    collection AND the sources together, which is exactly why it could not
-    see this: the defect lived between the two, not inside either.
+    Nothing pytest could list speaks for a vitest test, and the file text must
+    actually be fetched — a resolver handed nothing answered "could not read"
+    about a file no one had opened.
     """
     (workspace / "frontend").mkdir()
     (workspace / "frontend" / "recent.test.ts").write_text(
@@ -765,13 +765,6 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
 
     task_id = await _task_with_test_ac(
         db, client, workspace, "frontend/recent.test.ts::still toggles"
-    )
-
-    async def _collection_succeeds(path):
-        return {"tests/test_a.py::test_ok"}
-
-    monkeypatch.setattr(
-        "hub.services.review_brief.collect_test_nodeids", _collection_succeeds
     )
     plugins.git_ops = _OnTaskBranch()
 
@@ -1669,3 +1662,42 @@ async def test_brief_rejects_foreign_evidence_and_keeps_error_reasons(
     both = await evidence()
     assert both["mutations"]["state"] == "received"
     assert "прогон неизвестен" in both["mutations"]["run"]
+
+
+# ---- #1650: the hub never runs the task branch's code to list its tests ----
+
+
+async def test_brief_never_imports_task_branch_code(
+    db, client: AsyncClient, tmp_path: Path, spawn_spy
+):
+    """#1650 AC-1: the brief and the steward packet read the branch, not run it.
+
+    The branch carries a conftest.py that writes a marker outside the tree of
+    the pytest running this test. HEAD of the clone stands on the task branch,
+    which is exactly the condition under which the old collector ran
+    ``uv run pytest --collect-only`` with the hub's whole environment.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services.steward_evidence import build_evidence_packet
+    from tests.branch_code_support import TEST_FILE, make_clone
+
+    marker = tmp_path / "outside" / "marker"
+    marker.parent.mkdir()
+    workspace, tip = make_clone(tmp_path, marker)
+    plugins.git_ops = GitOpsIntegration()
+    task_id = await _task_with_test_ac(db, client, workspace, f"{TEST_FILE}::test_ok")
+    await repo.update_task(db, task_id, submission_sha=tip)
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    packet = await build_evidence_packet(db, task_id)
+
+    assert not marker.exists(), "the branch's conftest.py ran on the hub host"
+    assert spawn_spy.pytest_runs() == [], "the hub started pytest"
+    assert packet is not None and packet.brief is not None
+    for resolution in (
+        brief["locator_resolution"][0],
+        packet.brief.locator_resolution[0].model_dump(),
+    ):
+        assert resolution["status"] == "resolvable", resolution
+        assert "without running" in resolution["reason"], resolution

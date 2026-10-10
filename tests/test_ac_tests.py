@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+import signal
+import stat
+import time
+from pathlib import Path
+
+import pytest
+
 from hub import repository as repo
 from hub.models import AcceptanceCriterion
+from hub.services.ac_tests import default_test_runner as real_default_test_runner
+from tests.test_auth import run_routes_hub  # noqa: F401 - pytest fixture
 from hub.services.ac_tests import (
     FAIL,
     NOT_FOUND,
@@ -101,13 +113,26 @@ async def test_run_ac_tests_not_found_when_runner_unavailable(db):
 # ---- default_test_runner output parsing (#507 machine-review HIGH) ----
 
 
+class _Stream:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
 class _FakeProc:
     def __init__(self, out: str, rc: int = 0):
-        self._out = out.encode()
+        self.stdout = _Stream(out.encode())
         self.returncode = rc
+        self.pid = 4_190_001  # not a real process: killing its group is a no-op
 
-    async def communicate(self):
-        return self._out, b""
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        raise ProcessLookupError
 
 
 async def _run_with_output(monkeypatch, nodeids, output):
@@ -314,3 +339,294 @@ async def test_unrunnable_locator_gets_no_recorded_result(db):
     # And the runner was never called with it — not called and told "missing"
     # are different facts, and only one of them is true here.
     assert handed_to_runner == []
+
+
+# ---- #1650: a manual AC run gets a minimal environment and dies as a group ----
+
+_FAKE_UV = """#!/bin/sh
+env > "$PWD/child-env.txt"
+sleep 300 &
+echo $! > "$PWD/child.pid"
+wait
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.usefixtures("run_routes_hub")
+async def test_manual_ac_run_has_a_minimal_env_and_kills_its_group(
+    tmp_path: Path, monkeypatch, request
+):
+    """#1650 AC-4: no hub secrets reach the child, and the timeout kills the group.
+
+    `uv` here is a stand-in script that records its environment and leaves a
+    `sleep` running — the shape of a hung test with a child. A secret is named
+    with and without TOKEN in it: the old filter let the second one through.
+    """
+    from hub.services import ac_tests
+
+    hub = request.getfixturevalue("run_routes_hub")
+    # Machines still get 403 (#1646): the route is a human's, so the run below
+    # is only ever started by one.
+    denied = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-ac-tests", headers=hub.keys["agent"]
+    )
+    assert denied.status_code == 403, denied.text
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "uv"
+    fake.write_text(_FAKE_UV)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    work = tmp_path / "work"
+    work.mkdir()
+    real_home = os.environ.get("HOME", "")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("SYNTH_HUB_SIGNING_SALT", "synthetic-plain-secret")
+    monkeypatch.setenv("SYNTH_API_TOKEN", "synthetic-token-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/synthetic/agent.sock")
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 3)
+
+    try:
+        # A runner that does not kill the group blocks on the pipe the child
+        # holds: bound the wait so that is a red test, not a hung one.
+        result = await asyncio.wait_for(
+            real_default_test_runner(["tests/t.py::test_a"], str(work)), timeout=25
+        )
+        assert result is None, "a hung run is 'could not run', not a verdict"
+        child_env = (work / "child-env.txt").read_text()
+        for leaked in (
+            "SYNTH_HUB_SIGNING_SALT",
+            "SYNTH_API_TOKEN",
+            "synthetic-plain-secret",
+            "synthetic-token-secret",
+            "SSH_AUTH_SOCK",
+            "/synthetic/agent.sock",
+        ):
+            assert leaked not in child_env, leaked
+        home_line = [ln for ln in child_env.splitlines() if ln.startswith("HOME=")]
+        assert home_line and home_line[0] != f"HOME={real_home}"
+        assert not Path(home_line[0][5:]).exists(), "the temporary HOME is removed"
+        pid = int((work / "child.pid").read_text())
+        deadline = time.monotonic() + 5
+        while _alive(pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        assert not _alive(pid), "the process group survived the timeout"
+    finally:
+        pid_file = work / "child.pid"
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+async def test_manual_ac_run_streams_a_long_output(monkeypatch, tmp_path: Path):
+    _fake_uv(
+        tmp_path,
+        "yes 'tests/t.py::test_a PASSED' | head -n 200000\n"
+        "echo 'tests/t.py::test_b PASSED'\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(
+        ["tests/t.py::test_a", "tests/t.py::test_b"], str(tmp_path)
+    )
+
+    assert res == {"tests/t.py::test_a": True, "tests/t.py::test_b": True}
+
+
+# ---- #1650 round 2: a lost FAILED is not a pass; a group outlives its leader ----
+
+
+def _fake_uv(tmp_path: Path, body: str) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "uv"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+
+async def test_a_failure_after_the_log_limit_still_fails_the_ac(
+    monkeypatch, tmp_path: Path
+):
+    from hub.services import validation_run
+
+    monkeypatch.setattr(validation_run, "_MAX_OUTPUT", 1000)
+    _fake_uv(
+        tmp_path,
+        "yes 'noise noise noise noise' | head -c 3000000\n"
+        "echo 'tests/t.py::test_a FAILED [100%]'\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert res == {"tests/t.py::test_a": False}
+
+
+async def test_incomplete_output_gives_no_positive_result(monkeypatch, tmp_path: Path):
+    # A line longer than the buffer can hide an outcome: nothing may pass on it.
+    _fake_uv(
+        tmp_path,
+        "echo 'tests/t.py::test_a PASSED'\n"
+        "head -c 3000000 /dev/zero | tr '\\0' 'x'\n"
+        "echo\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert not res or not any(res.values()), res
+
+
+_LAUNCHER = """sleep 300 &
+echo $! > "$PWD/child.pid"
+exit 0
+"""
+
+
+def _kill_quietly(work: Path) -> None:
+    pid_file = work / "child.pid"
+    if pid_file.exists():
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+async def _alive_after(work: Path, seconds: float = 5) -> bool:
+    deadline = time.monotonic() + seconds
+    pid = int((work / "child.pid").read_text())
+    while _alive(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return _alive(pid)
+
+
+async def test_the_group_dies_on_timeout_even_if_the_leader_already_exited(
+    monkeypatch, tmp_path: Path
+):
+    from hub.services import ac_tests
+
+    _fake_uv(tmp_path, _LAUNCHER)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 3)
+    try:
+        res = await asyncio.wait_for(
+            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path)), 25
+        )
+        assert res is None or not any(res.values())
+        assert not await _alive_after(tmp_path), "the orphan outlived the run"
+    finally:
+        _kill_quietly(tmp_path)
+
+
+async def test_the_group_dies_on_cancel_even_if_the_leader_already_exited(
+    monkeypatch, tmp_path: Path
+):
+    _fake_uv(tmp_path, _LAUNCHER)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    try:
+        task = asyncio.create_task(
+            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+        )
+        for _ in range(100):
+            if (tmp_path / "child.pid").exists():
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)  # the launcher has exited by now
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert not await _alive_after(tmp_path), "the orphan outlived the cancel"
+    finally:
+        _kill_quietly(tmp_path)
+
+
+# ---- #1650 round 3: the outcome is the last token; a pgid is not reused -----------
+
+
+async def test_an_outcome_word_inside_a_param_id_does_not_decide_the_result(
+    monkeypatch, tmp_path: Path
+):
+    _fake_uv(
+        tmp_path,
+        "echo 'tests/t.py::test_p[case PASSED] FAILED [100%]'\n"
+        "echo 'tests/t.py::test_q[ok FAILED] PASSED [100%]'\n"
+        "echo 'FAILED tests/t.py::test_r - assert PASSED'\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(
+        ["tests/t.py::test_p", "tests/t.py::test_q", "tests/t.py::test_r"],
+        str(tmp_path),
+    )
+
+    assert res == {"tests/t.py::test_p": False, "tests/t.py::test_q": True}
+
+
+async def test_the_saved_group_number_is_not_used_after_a_normal_exit(
+    monkeypatch, tmp_path: Path
+):
+    import hub.process_kill as process_kill
+
+    calls: list[int] = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(
+        process_kill.os,
+        "killpg",
+        lambda pgid, sig: (calls.append(pgid), real_killpg(pgid, sig))[1],
+    )
+    _fake_uv(tmp_path, "echo 'tests/t.py::test_a PASSED [100%]'\n")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert res == {"tests/t.py::test_a": True}
+    assert calls == [], "a finished run must not be signalled by a stale group number"
+
+
+async def test_the_group_is_signalled_before_the_leader_is_waited_for():
+    import hub.process_kill as process_kill
+
+    events: list[str] = []
+
+    class Proc:
+        returncode = None
+        pid = 4_190_002
+
+        def kill(self):
+            events.append("kill")
+
+        async def wait(self):
+            events.append("wait")
+
+    real = process_kill.os.killpg
+    process_kill.os.killpg = lambda pgid, sig: events.append("killpg")
+    try:
+        await process_kill.kill_process_group(Proc(), pgid=4_190_002)
+    finally:
+        process_kill.os.killpg = real
+
+    assert events[0] == "killpg" and events[-1] == "wait", events
+
+
+async def test_killing_a_group_whose_output_was_never_drained_still_finishes():
+    # Python 3.11 only wakes wait() when the pipes are closed; a child blocked
+    # on a full pipe that nobody reads never closes it (found in CI on 3.11).
+    import hub.process_kill as process_kill
+
+    proc = await asyncio.create_subprocess_exec(
+        "python3",
+        "-c",
+        "import sys, time; sys.stdout.write('x' * 3000000); time.sleep(60)",
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    await asyncio.sleep(0.3)
+    await asyncio.wait_for(
+        process_kill.kill_process_group(proc, pgid=proc.pid), timeout=10
+    )
+    assert proc.returncode is not None

@@ -4707,3 +4707,93 @@ async def test_the_pure_report_does_not_write_a_sticky_row(db: aiosqlite.Connect
 
     assert report["contour"]["false_approve"] == 1
     assert await _rows(db) == []
+
+
+async def test_a_local_advisor_pair_is_applied_and_counted_like_a_cloud_one(
+    db: aiosqlite.Connection, monkeypatch, local_spool, local_identity, local_service
+):
+    """#1649 AC-9: пара с локальным советником применяется и считается как облачная.
+
+    Пара собирается НАСТОЯЩИМ локальным стартом (заказ glm-5.1, служба,
+    сессия советника), а не строками вручную: проверяется именно то, что
+    локальный канал не завёл ни отдельного применения, ни отдельного счёта.
+    """
+    from hub.services.steward_advisor import (
+        apply_advisor_outcomes,
+        order_due_advisors,
+        start_advisor_run,
+    )
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+    from hub.services.steward_exit import contour_counts
+    from tests.test_steward_advisor import (
+        _advise,
+        _advisor_row,
+        _judge_row,
+        _no_verdict,
+        _patched_converged,
+        _real_packet_hash,
+    )
+    from tests.test_steward_apply import _green
+
+    svc = local_service()
+    await _patched_converged(monkeypatch)
+
+    async def _pair(slug: str, verdict: str, *, stale_packet: bool = False) -> int:
+        project_id = await _project(db, slug)
+        task_id = await _task(db, project_id)
+        await _green(db, task_id)
+        real = await _real_packet_hash(db, task_id)
+        await _judge_run(db, task_id, model="composer-2.5", packet=real)
+        await _judge(db, task_id)
+        assert await order_due_advisors(db) == 1
+        order = await _advisor_row(db, task_id)
+        assert order["model"] == "glm-5.1"
+
+        async def _cli() -> None:
+            seen = "stale-packet" if stale_packet else real
+            await db.execute(
+                "UPDATE steward_runs SET packet_hash=? WHERE id=?", (seen, order["id"])
+            )
+            await db.commit()
+            await _advise(db, task_id, verdict=verdict)
+
+        svc.judge = _cli
+        assert await start_advisor_run(db, dict(order)) is True
+        await wait_for_local_advisors()
+        assert (await _advisor_row(db, task_id))["agent_id"].startswith("local:")
+        return task_id
+
+    concur = await _pair("local-pair-concur", "concur")
+    objection = await _pair("local-pair-object", "object")
+    changed = await _pair("local-pair-changed", "concur", stale_packet=True)
+
+    # Тень: пары копятся, ничего не применяется.
+    assert await apply_advisor_outcomes(db) == 0
+    for task_id in (concur, objection, changed):
+        assert await _no_verdict(db, task_id)
+
+    # act: concur применён ровно один раз; object и изменившийся пакет — к человеку.
+    async def _granted(_db):
+        return "act"
+
+    monkeypatch.setattr(sh, "effective_mode", _granted)
+    assert await apply_advisor_outcomes(db) == 3
+    assert dict(await repo.get_task(db, concur))["review_verdict"] == "approved"
+    assert (await _judge_row(db, concur))["advisor_outcome"] == "approved"
+    for task_id in (objection, changed):
+        assert await _no_verdict(db, task_id)
+        assert (await _judge_row(db, task_id))["advisor_outcome"] == "escalated"
+    assert await apply_advisor_outcomes(db) == 0, "повторный тик и перезапуск"
+    verdicts = [
+        e
+        for e in await _events(db, "review_verdict_recorded")
+        if e["task_id"] == concur
+    ]
+    assert len(verdicts) == 1
+
+    # Человеческий возврат после одобрения парой — ошибочное одобрение, записанное триггером.
+    await _human(db, concur, "changes_requested")
+    assert [item[0] for item in await _active(db)] == [concur]
+    # Сводка считает pairs = concur + object, локальные пары не выпадают.
+    counts = await contour_counts(db)
+    assert (counts.concur, counts.object, counts.pairs) == (2, 1, 3)

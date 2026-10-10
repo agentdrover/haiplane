@@ -23,6 +23,7 @@ from hub import repository as repo
 from hub.auth import chat_pair_route_allowed
 from hub.services import chat_pair
 from hub.services import steward_shadow as sh
+from hub.db import fetchall
 from hub.services import admin as admin_svc
 
 STEWARD_OPS = (
@@ -922,3 +923,114 @@ async def test_the_judgement_response_carries_the_contour(
 
     assert filed.status_code == 200, filed.text
     assert filed.json()["contour"] == 2
+
+
+async def test_the_local_advisor_exchange_works_over_real_codes_and_http(
+    db: aiosqlite.Connection, client, monkeypatch, local_spool, local_service
+):
+    """#1649 (Codex): без подмены issue_code — настоящий код, обмен и запись по HTTP.
+
+    «CLI» локального советника делает ровно то, что велит промт: обменивает код
+    (POST redeem), читает пакет, сдаёт суждение. Проверяется погашение (второй
+    обмен того же кода отказан), привязка сессии к задаче и поколению (чужая
+    задача и чужое поколение — отказ) и запись суждения через /steward-judgement
+    под принципалом стюарда, вид сессии — steward_advisor.
+    """
+    import asyncio
+
+    from hub.services.steward_advisor import advisor_state, order_due_advisors
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+    from tests.test_steward_shadow import _judge, _judge_run, _project
+    from tests.test_steward_shadow import _task as shadow_task
+
+    principal_id = await _steward_principal(db, monkeypatch)
+    project_id = await _project(db, "real-exchange")
+    task_id = await shadow_task(db, project_id)
+    other_id = await shadow_task(db, project_id)
+    await _judge_run(db, task_id, model="composer-2.5")
+    await _judge(db, task_id)
+    assert await order_due_advisors(db) == 1
+    order = [
+        r
+        for r in await fetchall(
+            db,
+            "SELECT * FROM steward_runs WHERE task_id=? AND kind='advisor'",
+            (task_id,),
+        )
+    ][0]
+    seen: dict = {}
+    svc = local_service()
+
+    async def _cli() -> None:
+        code = re.search(r'"code":"([^"]+)"', svc.prompts[-1]).group(1)
+        redeem = await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+        seen["redeem"] = redeem.status_code
+        token = redeem.json()["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+        pinned = await chat_pair.resolve_session(db, token)
+        seen["pin"] = (
+            pinned.chat_pair_kind,
+            pinned.chat_pair_task_id,
+            pinned.chat_pair_generation,
+        )
+        seen["again"] = (
+            await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+        ).status_code
+        seen["evidence"] = (
+            await client.get(f"/api/tasks/{task_id}/steward-evidence", headers=auth)
+        ).status_code
+        seen["other_task"] = (
+            await client.get(f"/api/tasks/{other_id}/steward-evidence", headers=auth)
+        ).status_code
+        body = {
+            "kind": "advisor",
+            "verdict": "concur",
+            "confidence": "high",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        }
+        seen["wrong_generation"] = (
+            await client.post(
+                f"/api/tasks/{task_id}/steward-judgement",
+                headers=auth,
+                json={**body, "generation": 2},
+            )
+        ).status_code
+        seen["other_task_write"] = (
+            await client.post(
+                f"/api/tasks/{other_id}/steward-judgement",
+                headers=auth,
+                json={**body, "generation": 1},
+            )
+        ).status_code
+        filed = await client.post(
+            f"/api/tasks/{task_id}/steward-judgement",
+            headers=auth,
+            json={**body, "generation": 1},
+        )
+        seen["filed"] = filed.status_code
+
+    svc.judge = _cli
+    assert await start_advisor_run(db, dict(order)) is True
+    await asyncio.wait_for(wait_for_local_advisors(), 20)
+
+    assert seen["redeem"] == 200, seen
+    assert seen["pin"] == ("steward_advisor", task_id, 1), (
+        "сессия привязана к задаче и поколению"
+    )
+    assert seen["again"] in (401, 403, 404), "код погашается один раз"
+    assert seen["evidence"] == 200
+    assert seen["other_task"] == 403 and seen["other_task_write"] == 403
+    assert seen["wrong_generation"] in (403, 409, 422)
+    assert seen["filed"] == 200, seen
+    answer = await repo.get_steward_judgement(db, task_id, 1, "advisor")
+    assert answer is not None
+    answer = dict(answer)
+    assert answer["verdict"] == "concur" and answer["model"] == "glm-5.1"
+    assert answer["principal_id"] == principal_id
+    assert answer["tokens_unknown_reason"] == "local_no_provider_usage"
+    assert (await advisor_state(db, task_id, 1)).state == "received"
+    rows = await fetchall(
+        db, "SELECT redeemed_at FROM chat_pair_codes WHERE kind='steward_advisor'"
+    )
+    assert rows and all(dict(r)["redeemed_at"] for r in rows)
