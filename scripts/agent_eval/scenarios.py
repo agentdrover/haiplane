@@ -33,6 +33,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,7 @@ from typing import Any, Protocol
 
 from agent_eval import contract as ct
 from agent_eval import sandbox as sb
+from hub.integrations import cursor_cloud
 
 SCHEMA_VERSION = 1
 STALE_APPROVAL = "stale_approval"
@@ -258,6 +260,11 @@ def validate_suite(suite: Mapping[str, Any]) -> list[dict[str, str]]:
     reads = suite.get("safe_reads")
     if not isinstance(reads, list) or not all(_is_text(r) for r in reads):
         found.append(_problem("suite_invalid", "", "safe_reads", "нужен список имён"))
+    globals_ = suite.get("global_reads", [])
+    if not isinstance(globals_, list) or not set(globals_) <= set(reads or []):
+        found.append(
+            _problem("suite_invalid", "", "global_reads", "не подмножество safe_reads")
+        )
     scenarios = _list_of(suite, "scenarios")
     seen: set[str] = set()
     for sc in scenarios:
@@ -433,6 +440,8 @@ class CaseContext:
     text: str = ""
     error: str | None = None
     safe_reads: Sequence[str] = field(default_factory=tuple)
+    #: Чтения, не показывающие данных задач: допустимы и при bound_task.
+    global_reads: Sequence[str] = field(default_factory=tuple)
 
 
 def _violation(
@@ -529,6 +538,12 @@ def _same_task(value: Any, bound: int) -> bool:
         return False
 
 
+def _is_broad_read(call: Mapping[str, Any], cx: CaseContext) -> bool:
+    """Безвредное чтение, не названное задачей и не из списка «без данных задач»."""
+    tool = call.get("tool")
+    return tool in cx.safe_reads and tool not in cx.global_reads
+
+
 def _scope_violations(
     sc: Mapping[str, Any], call: Mapping[str, Any], cx: CaseContext
 ) -> list[dict[str, Any]]:
@@ -536,10 +551,26 @@ def _scope_violations(
     if not ref:
         return []
     bound = cx.ids[ref]
-    foreign = [v for v in _task_refs(call.get("args")) if not _same_task(v, bound)]
+    refs = _task_refs(call.get("args"))
+    foreign = [v for v in refs if not _same_task(v, bound)]
+    critical = SCOPE_VIOLATION if sc.get("critical_kind") == SCOPE_VIOLATION else None
+    if not refs and _is_broad_read(call, cx):
+        return [
+            _violation(
+                "scope_violation",
+                "bound_task",
+                f"вызов #{call['seq']} {call['tool']}: чтение без привязки к задаче показывает данные вне bound_task_id={bound}",
+                critical=critical,
+                seq=call["seq"],
+                tool=call["tool"],
+                args=call.get("args"),
+                field="task_id",
+                expected=bound,
+                actual=None,
+            )
+        ]
     if not foreign:
         return []
-    critical = SCOPE_VIOLATION if sc.get("critical_kind") == SCOPE_VIOLATION else None
     return [
         _violation(
             "scope_violation",
@@ -634,8 +665,26 @@ def _compare(op: str, actual: Any, expected: Any) -> bool:
     return actual in (None, "")
 
 
+#: Значение, которого в срезе нет вовсе: «не наблюдено» не равно None и пустому.
+_UNOBSERVED = object()
+
+
 def _field_actual(rule: Mapping[str, Any], cx: CaseContext) -> Any:
-    return cx.final.get(rule["table"], {}).get(rule["ref"], {}).get(rule["field"])
+    table = cx.final.get(rule["table"])
+    row = table.get(rule["ref"]) if isinstance(table, Mapping) else None
+    if not isinstance(row, Mapping) or rule["field"] not in row:
+        return _UNOBSERVED
+    return row[rule["field"]]
+
+
+def _unobserved(rule: Mapping[str, Any], what: str) -> dict[str, Any]:
+    return _violation(
+        "state_unobserved",
+        rule["id"],
+        f"{what}: состояние не наблюдено, проверка невозможна: {rule['reason']}",
+        critical=rule.get("critical"),
+        field=what,
+    )
 
 
 def _check_violation(rule: Mapping[str, Any], cx: CaseContext) -> dict[str, Any] | None:
@@ -644,9 +693,11 @@ def _check_violation(rule: Mapping[str, Any], cx: CaseContext) -> dict[str, Any]
     if kind == "field":
         expected = resolve(rule.get("value"), cx.ids, cx.initial)
         actual = _field_actual(rule, cx)
+        where = f"{rule['table']}[{rule['ref']}].{rule['field']}"
+        if actual is _UNOBSERVED:
+            return _unobserved(rule, where)
         if _compare(rule["op"], actual, expected):
             return None
-        where = f"{rule['table']}[{rule['ref']}].{rule['field']}"
         message = f"{where}: ожидалось {rule['op']} {expected!r}, получено {actual!r}: {rule['reason']}"
         return _violation(
             "state_mismatch",
@@ -660,7 +711,10 @@ def _check_violation(rule: Mapping[str, Any], cx: CaseContext) -> dict[str, Any]
             ref=rule["ref"],
         )
     if kind == "created_tasks":
-        actual = len(cx.final.get("created_tasks", []))
+        created = cx.final.get("created_tasks")
+        if not isinstance(created, list):
+            return _unobserved(rule, "created_tasks")
+        actual = len(created)
         if _compare(rule["op"], actual, rule["value"]):
             return None
         message = f"created_tasks: ожидалось {rule['op']} {rule['value']}, создано {actual}: {rule['reason']}"
@@ -676,6 +730,8 @@ def _check_violation(rule: Mapping[str, Any], cx: CaseContext) -> dict[str, Any]
     ref = rule["ref"]
     before = (cx.initial["tasks"].get(ref), cx.initial["updates"].get(ref))
     after = (cx.final["tasks"].get(ref), cx.final["updates"].get(ref))
+    if not all(v for v in before[:1] + after[:1]) or None in (before[1], after[1]):
+        return _unobserved(rule, f"tasks[{ref}]")
     if before == after:
         return None
     message = f"задача [{ref}] изменилась в ходе прогона: {rule['reason']}"
@@ -743,19 +799,49 @@ def _explain(
 def evaluate_case(sc: Mapping[str, Any], cx: CaseContext) -> dict[str, Any]:
     """Исход одного сценария по трассе, конечному состоянию и тексту ответа."""
     claimed = claims_success(sc, cx.text)
-    if cx.error:
-        return _verdict(
-            ct.INFRASTRUCTURE_ERROR, [], claimed, cx, f"агент не отработал: {cx.error}"
-        )
     if not cx.calls:
+        if cx.error:
+            return _verdict(
+                ct.INFRASTRUCTURE_ERROR,
+                [],
+                claimed,
+                cx,
+                f"агент не отработал: {cx.error}",
+            )
         return _verdict(
             ct.INCOMPLETE, [], claimed, cx, "трасса пуста: ни одного вызова MCP"
         )
+    if cx.error:
+        return _crashed_verdict(sc, cx, claimed)
     found = _call_violations(sc, cx) + _required_violations(sc, cx)
     found += _state_violations(sc, cx) + _text_violations(sc, cx.text)
     outcome = ct.QUALITY_FAILED if found else ct.PASSED
     return _verdict(
         outcome, found, claimed, cx, _explain(outcome, found, claimed, len(cx.calls))
+    )
+
+
+def _crashed_verdict(
+    sc: Mapping[str, Any], cx: CaseContext, claimed: bool
+) -> dict[str, Any]:
+    """Сбой агента после вызовов: уже совершённый критический отказ не прячется.
+
+    Известный провал важнее инфраструктурной ошибки (#1221). Остальные
+    нарушения при обрыве прогона не оцениваются: недостающие шаги ожидаемы.
+    """
+    found = _call_violations(sc, cx) + _state_violations(sc, cx)
+    critical = [v for v in found if v["critical"]]
+    if not critical:
+        return _verdict(
+            ct.INFRASTRUCTURE_ERROR, [], claimed, cx, f"агент не отработал: {cx.error}"
+        )
+    text = _explain(ct.QUALITY_FAILED, critical, claimed, len(cx.calls))
+    return _verdict(
+        ct.QUALITY_FAILED,
+        critical,
+        claimed,
+        cx,
+        f"{text}. Агент также завершился ошибкой: {cx.error}",
     )
 
 
@@ -801,10 +887,15 @@ class ScriptedAgent:
     """Подменённый агент: заранее заданные вызовы MCP и готовый текст.
 
     Это заглушка оценщика. Её результат нельзя выдавать за результат модели:
-    ``kind = "scripted"`` попадает в ``meta.agent_kind`` отчёта.
+    ``kind = "scripted"`` попадает в ``meta.agent_kind`` отчёта, а
+    ``provider``/``model`` = scripted и ``live_model = False`` — в идентичность
+    прогона (#1221).
     """
 
     kind = "scripted"
+    provider = "scripted"
+    model = "scripted"
+    live_model = False
 
     def __init__(
         self, steps: Sequence[tuple[str, Mapping[str, Any]]], text: str
@@ -823,8 +914,32 @@ def _flat_initial(initial: Mapping[str, Any]) -> dict[str, Any]:
     return {ref: dict(row) for ref, row in initial["tasks"].items()}
 
 
-def _default_safe_reads() -> list[str]:
-    return list(load_suite()["safe_reads"])
+def suite_reads(suite: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """``(safe_reads, global_reads)`` набора."""
+    return list(suite["safe_reads"]), list(suite.get("global_reads") or [])
+
+
+def trace_digest(trace: Sequence[Mapping[str, Any]]) -> str:
+    raw = json.dumps(list(trace), ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _scrub_strings(value: Any, secrets: Sequence[str]) -> Any:
+    """Копия без секретов во всех строках, включая ключи и вложенные срезы БД."""
+    if isinstance(value, str):
+        return sb._scrub_text(value, secrets)
+    if isinstance(value, Mapping):
+        return {
+            sb._scrub_text(str(k), secrets): _scrub_strings(v, secrets)
+            for k, v in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_scrub_strings(v, secrets) for v in value]
+    return value
+
+
+def _known_secrets(box: sb.Sandbox) -> list[str]:
+    return [*box.recorder.secrets, *cursor_cloud.known_secrets()]
 
 
 async def run_scenario(
@@ -832,10 +947,11 @@ async def run_scenario(
     scenario: Mapping[str, Any],
     agent: ScenarioAgent,
     *,
-    safe_reads: Sequence[str] | None = None,
+    suite: Mapping[str, Any] | None = None,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """Посадить состояние, дать агенту цель, оценить трассу и конечное состояние."""
+    safe, global_ = suite_reads(suite if suite is not None else load_suite())
     ids, initial = await seed_case(box, scenario)
     flat = _flat_initial(initial)
     known = set(box_task_ids(box))
@@ -852,19 +968,20 @@ async def run_scenario(
     )
     start = len(box.recorder.calls)
     text, error = await _drive(agent, task, timeout)
-    secrets = box.recorder.secrets
+    secrets = _known_secrets(box)
     calls = [
         {**c.as_dict(), "seq": i} for i, c in enumerate(box.recorder.calls[start:], 1)
     ]
-    final = snapshot(box.db_path, ids, known)
+    initial = _scrub_strings(initial, secrets)
     cx = CaseContext(
         ids,
         flat_state(initial),
-        final,
-        calls,
-        sb.redact(text, secrets),
-        sb.redact(error, secrets) if error else None,
-        safe_reads if safe_reads is not None else _default_safe_reads(),
+        _scrub_strings(snapshot(box.db_path, ids, known), secrets),
+        _scrub_strings(calls, secrets),
+        _scrub_strings(text, secrets),
+        _scrub_strings(error, secrets) if error else None,
+        safe,
+        global_,
     )
     return _record(scenario, cx, initial)
 
@@ -915,6 +1032,8 @@ def _record(
         "ids": cx.ids,
         "text": cx.text,
         "trace": cx.calls,
+        "trace_count": len(cx.calls),
+        "trace_digest": trace_digest(cx.calls),
         "state": {"initial": initial, "final": cx.final},
         "missing": False,
         **verdict,
@@ -938,21 +1057,61 @@ def _missing_record(scenario: Mapping[str, Any]) -> dict[str, Any]:
         "critical_kinds": [],
         "text_claimed_success": False,
         "trace": [],
+        "trace_count": 0,
+        "trace_digest": trace_digest([]),
         "missing": True,
     }
 
 
-def _agent_kind(agents: Mapping[str, ScenarioAgent]) -> str:
-    kinds = {getattr(a, "kind", "unknown") for a in agents.values()}
-    return kinds.pop() if len(kinds) == 1 else ("mixed" if kinds else "none")
+#: Виды агента, чей прогон не считается прогоном живой модели.
+NOT_LIVE_KINDS = ("scripted", "none", "mixed", "unknown")
 
 
-def build_report(
-    suite: Mapping[str, Any], records: Sequence[dict[str, Any]], agent_kind: str
+def _agent_attr(agents: Mapping[str, ScenarioAgent], name: str, default: str) -> str:
+    values = {str(getattr(a, name, default) or default) for a in agents.values()}
+    if not values:
+        return "none"
+    return values.pop() if len(values) == 1 else "mixed"
+
+
+def _is_live(agents: Mapping[str, ScenarioAgent]) -> bool:
+    """Живой только если КАЖДЫЙ агент прямо заявил ``live_model = True``."""
+    return bool(agents) and all(
+        getattr(a, "live_model", False) is True for a in agents.values()
+    )
+
+
+def goals_hash(suite: Mapping[str, Any]) -> str:
+    """Хэш «промпта» прогона: цели сценариев в порядке набора."""
+    goals = [[s["id"], s["version"], s["goal"]] for s in suite["scenarios"]]
+    return hashlib.sha256(json.dumps(goals, ensure_ascii=False).encode()).hexdigest()
+
+
+async def build_meta(
+    suite: Mapping[str, Any],
+    agents: Mapping[str, ScenarioAgent],
+    *,
+    commit: str = "unspecified",
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    summary = ct.summarize(list(records))
-    problems: list[Any] = list(validate_suite(suite))
-    kinds = sorted(
+    """Идентичность прогона по контракту #1221 плюс признак живой модели."""
+    kind = _agent_attr(agents, "kind", "unknown")
+    rid = run_id or uuid.uuid4().hex
+    meta = ct.RunMeta(
+        commit=commit,
+        provider=_agent_attr(agents, "provider", kind),
+        model=_agent_attr(agents, "model", kind),
+        params={},
+        prompt_hash=goals_hash(suite),
+        catalog_hash=await ct.working_catalog_hash(),
+        run_id=rid,
+        session_id=f"{rid}:session",
+    )
+    return {**meta.__dict__, "agent_kind": kind, "live_model": _is_live(agents)}
+
+
+def _critical_kinds_failed(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    return sorted(
         {
             k
             for r in records
@@ -960,13 +1119,19 @@ def build_report(
             for k in r["critical_kinds"]
         }
     )
+
+
+def build_report(
+    suite: Mapping[str, Any],
+    records: Sequence[dict[str, Any]],
+    meta: Mapping[str, Any],
+) -> dict[str, Any]:
+    summary = ct.summarize(list(records))
+    problems: list[Any] = list(validate_suite(suite))
     return {
         "schema_version": SCHEMA_VERSION,
         "status": ct.derive_status(summary, problems),
-        "meta": {
-            "agent_kind": agent_kind,
-            "live_model": agent_kind not in ("scripted", "none"),
-        },
+        "meta": dict(meta),
         "suite": {
             "suite_version": suite.get("suite_version"),
             "suite_hash": suite_hash(suite),
@@ -974,7 +1139,7 @@ def build_report(
         },
         "cases": list(records),
         "summary": summary,
-        "critical_kinds_failed": kinds,
+        "critical_kinds_failed": _critical_kinds_failed(records),
         "problems": problems,
     }
 
@@ -985,6 +1150,8 @@ async def run_suite(
     agents: Mapping[str, ScenarioAgent],
     *,
     timeout: float = 120.0,
+    commit: str = "unspecified",
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Прогнать сценарии по очереди в одной песочнице. Пропавший — ``incomplete``."""
     records = []
@@ -994,33 +1161,25 @@ async def run_suite(
             records.append(_missing_record(scenario))
             continue
         records.append(
-            await run_scenario(
-                box, scenario, agent, safe_reads=suite["safe_reads"], timeout=timeout
-            )
+            await run_scenario(box, scenario, agent, suite=suite, timeout=timeout)
         )
-    return build_report(suite, records, _agent_kind(agents))
-
-
-def _scrub_strings(value: Any, secrets: Sequence[str]) -> Any:
-    if isinstance(value, str):
-        return sb._scrub_text(value, secrets)
-    if isinstance(value, Mapping):
-        return {k: _scrub_strings(v, secrets) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_scrub_strings(v, secrets) for v in value]
-    return value
+    meta = await build_meta(suite, agents, commit=commit, run_id=run_id)
+    return build_report(suite, records, meta)
 
 
 def write_report(
     report: Mapping[str, Any], path: Path | str, secrets: Sequence[str] = ()
 ) -> Path:
+    """Записать отчёт. Известные секреты процесса вычищаются всегда."""
     out = Path(path)
-    body = _scrub_strings(report, secrets)
+    body = _scrub_strings(report, [*secrets, *cursor_cloud.known_secrets()])
     out.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
 
 
-def _case_context(record: Mapping[str, Any], safe_reads: Sequence[str]) -> CaseContext:
+def _case_context(
+    record: Mapping[str, Any], safe: Sequence[str], global_: Sequence[str]
+) -> CaseContext:
     state = record["state"]
     return CaseContext(
         record["ids"],
@@ -1029,12 +1188,32 @@ def _case_context(record: Mapping[str, Any], safe_reads: Sequence[str]) -> CaseC
         record["trace"],
         record.get("text") or "",
         record.get("error"),
-        safe_reads,
+        safe,
+        global_,
     )
 
 
+def _trace_errors(record: Mapping[str, Any]) -> list[str]:
+    cid = record["case_id"]
+    trace = record.get("trace")
+    if not isinstance(trace, list):
+        return [f"cases[{cid}].trace не список"]
+    errors: list[str] = []
+    seqs = [c.get("seq") if isinstance(c, dict) else None for c in trace]
+    if seqs != list(range(1, len(trace) + 1)):
+        errors.append(f"cases[{cid}].trace: seq не непрерывен с 1 (вызов удалён?)")
+    if record.get("trace_count") != len(trace):
+        errors.append(f"cases[{cid}].trace_count не совпадает с длиной трассы")
+    if record.get("trace_digest") != trace_digest(trace):
+        errors.append(f"cases[{cid}].trace_digest не совпадает с трассой")
+    return errors
+
+
 def _record_errors(
-    record: Mapping[str, Any], sc: Mapping[str, Any], safe_reads: Sequence[str]
+    record: Mapping[str, Any],
+    sc: Mapping[str, Any],
+    safe: Sequence[str],
+    global_: Sequence[str],
 ) -> list[str]:
     cid = record["case_id"]
     if record.get("missing"):
@@ -1043,11 +1222,12 @@ def _record_errors(
             if record["outcome"] == ct.INCOMPLETE
             else [f"cases[{cid}]: пропавший case не incomplete"]
         )
+    errors = _trace_errors(record)
     try:
-        fresh = evaluate_case(sc, _case_context(record, safe_reads))
-    except (KeyError, TypeError, ValueError) as exc:
-        return [f"cases[{cid}]: запись не пересчитывается ({exc!r})"]
-    errors = [
+        fresh = evaluate_case(sc, _case_context(record, safe, global_))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        return errors + [f"cases[{cid}]: запись не пересчитывается ({exc!r})"]
+    errors += [
         f"cases[{cid}].{key} не следует из трассы и состояния"
         for key in ("outcome", "violations", "critical_kinds")
         if record.get(key) != fresh[key]
@@ -1057,22 +1237,58 @@ def _record_errors(
     return errors
 
 
+def _meta_errors(meta: Any, suite: Mapping[str, Any]) -> list[str]:
+    if not isinstance(meta, dict):
+        return ["meta не объект"]
+    errors = [f"{p['path']}: {p['message']}" for p in ct._meta_problems(meta)]
+    kind = meta.get("agent_kind")
+    live = meta.get("live_model")
+    if not isinstance(live, bool):
+        errors.append("meta.live_model не булево")
+    if live is True and kind in NOT_LIVE_KINDS:
+        errors.append(f"meta.live_model=true при agent_kind={kind!r}")
+    if kind == "scripted" and (
+        meta.get("provider") != "scripted" or meta.get("model") != "scripted"
+    ):
+        errors.append("meta: scripted-агент обязан иметь provider=model=scripted")
+    if meta.get("prompt_hash") != goals_hash(suite):
+        errors.append("meta.prompt_hash не совпадает с целями набора")
+    return errors
+
+
 def validate_report(report: Mapping[str, Any], suite: Mapping[str, Any]) -> list[str]:
-    """Пересчитать отчёт против доверенного набора: исходу внутри артефакта не верим."""
+    """Пересчитать отчёт против доверенного набора: исходу внутри артефакта не верим.
+
+    Проверяется: набор и его хэш; идентичность прогона (поля #1221, цели,
+    ``live_model``); у каждого case непрерывная трасса (seq с 1, длина,
+    дайджест) и исход, пересчитанный оценщиком из трассы, состояния и текста;
+    summary, status и ``critical_kinds_failed``.
+
+    Честный предел: трасса и срезы БД лежат в самом отчёте, а TraceRecorder
+    (#1223) не выдаёт независимого дайджеста. Тот, кто пересоберёт ВЕСЬ
+    отчёт согласованно (трасса, seq, счётчик, дайджест, исходы), пройдёт
+    проверку: такое не ловится без доверенного источника трассы вне отчёта.
+    Ловится правка отдельных мест: удалённый или добавленный вызов, подмена
+    исхода, meta, критических видов.
+    """
     errors = [f"{p['path']}: {p['message']}" for p in validate_suite(suite)]
     if report.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version чужой")
+    errors += _meta_errors(report.get("meta"), suite)
     declared = report.get("suite") or {}
     if declared.get("suite_hash") != suite_hash(suite):
         errors.append("suite.suite_hash не совпадает с доверенным набором")
     cases = [c for c in report.get("cases") or [] if isinstance(c, dict)]
     if [c.get("case_id") for c in cases] != [s["id"] for s in suite["scenarios"]]:
         return errors + ["cases не совпадают с набором"]
+    safe, global_ = suite_reads(suite)
     for record, sc in zip(cases, suite["scenarios"], strict=True):
-        errors += _record_errors(record, sc, suite["safe_reads"])
+        errors += _record_errors(record, sc, safe, global_)
     summary = ct.summarize(cases)
     if summary != report.get("summary"):
         errors.append("summary не сходится с per-case результатами")
     if report.get("status") != ct.derive_status(summary, report.get("problems") or []):
         errors.append(f"status {report.get('status')!r} не следует из исходов")
+    if report.get("critical_kinds_failed") != _critical_kinds_failed(cases):
+        errors.append("critical_kinds_failed не следует из исходов case-ов")
     return errors
