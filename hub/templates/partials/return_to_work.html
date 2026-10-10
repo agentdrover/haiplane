@@ -2,7 +2,7 @@
    места показа — доску ревью (review) и карточку действий (fix_requested).
    Тот же сервис, что REST и `oc-hub return-to-work`; причина обязательна и
    здесь, и на сервере. #}
-{% if task.status.value in ('review', 'fix_requested') %}
+{% if task.status.value in ('review', 'fix_requested') or (task.result_kind == 'state' and task.status.value == 'completed') %}
 <form method="post" action="/tasks/{{ task.id }}/web-return-to-work" class="task-action-stack task-action-stack--separated">
     <label class="task-action-label" for="task-return-reason">Вернуть в работу{% if task.claimed_by %} (сейчас держит {{ task.claimed_by }}){% endif %}</label>
     <textarea id="task-return-reason" name="reason" class="task-action-control task-action-textarea" required placeholder="Почему сдачу забирают у держателя..."></textarea>

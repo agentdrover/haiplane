@@ -5335,8 +5335,12 @@ async def return_to_work(
     # #1647: задачу-состояние возвращают и из running после отказного вердикта,
     # и из needs_info, и из open (ушла по реестру сессий): без этой двери
     # замороженную постановку нельзя было бы править.
+    # #1648: и из completed. Завершённую без действующего одобрения (force-
+    # complete, decide accept) state-задачу иначе нельзя ни сдать, ни одобрить:
+    # зависимые ждут принятия, а пути к нему нет. Вызывающий — человек (REST и
+    # веб-форма проверяют роль); commit-задача из completed по-прежнему 400.
     allowed = RETURN_TO_WORK_STATUSES | (
-        {"running", "needs_info", "open"} if state_task else frozenset()
+        {"running", "needs_info", "open", "completed"} if state_task else frozenset()
     )
     if from_status not in allowed:
         raise HTTPException(
@@ -5370,8 +5374,13 @@ async def return_to_work(
         job_id=None,
         review_job_id=None,
         # #1647: явный возврат размораживает постановку на этом поколении.
+        # #1648: из completed ещё и снимается метка завершения — задача снова
+        # не завершена, и новая сдача завершит её заново.
         **(
-            {"unfrozen_generation": int(task.get("submission_generation") or 0)}
+            {
+                "unfrozen_generation": int(task.get("submission_generation") or 0),
+                **({"completed_at": None} if from_status == "completed" else {}),
+            }
             if state_task
             else {}
         ),
