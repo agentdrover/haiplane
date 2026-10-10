@@ -1823,14 +1823,14 @@ def _cursor_never_called():
 async def test_a_local_glm_advisor_is_launchable_only_when_its_path_is_ready(
     db: aiosqlite.Connection, local_spool, local_identity, monkeypatch
 ):
-    """#1649 AC-2: заказ советника glm-5.1 идёт, только когда готов весь путь.
+    """#1649 AC-2: заказ советника glm-5.3 идёт, только когда готов весь путь.
 
     Судья composer, ревьюер grok, исполнитель claude: облачного кандидата нет.
     Отказ при неготовом пути называет причину в строке заказа и в событии:
     незапускаемый транспорт, несовпадение модели, нет принципала — и это не
     ``undeclared_model``.
     """
-    # 1. Путь готов: советник glm-5.1 заказан.
+    # 1. Путь готов: советник glm-5.3 заказан.
     ready_task, _ = await _ordered_advisor(db, "local-ready")
     row = await _advisor_row(db, ready_task)
     assert row["model"] == _GLM and row["status"] == RUN_OPEN
