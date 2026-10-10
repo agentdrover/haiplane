@@ -987,3 +987,31 @@ def test_a_spent_deadline_still_sends_the_report_naming_what_did_not_run(
     assert "deadline" in sent["reason"]
     assert "ruff --version" in sent["reason"]
     assert "не выполнена" in sent["validation_log"]
+
+
+def test_durations_flags_do_not_change_what_a_pytest_run_selects(script):
+    """#1666: the Test step prints --durations=30; that must not break reuse.
+
+    The step's outcome is handed to the reporter under its exact command line.
+    If the flag made the selection key None, the task's `uv run pytest -q`
+    would no longer be proven and the whole suite would run a second time
+    inside the 20 minute step (#1081).
+    """
+    plain = script._selection_key("uv run pytest -q")
+    assert plain is not None
+    for cmd in (
+        "uv run pytest -q -n auto --durations=30",
+        "uv run pytest -q -n auto --durations 30",
+        "uv run pytest -q --durations=30 --durations-min=1.0",
+        "uv run pytest -q --durations 30 --durations-min 1.0",
+    ):
+        assert script._selection_key(cmd) == plain, cmd
+    ran = {"uv run pytest -q -n auto --durations=30": "pass"}
+    assert script.already_proven("uv run pytest -q", ran) == (
+        "pass",
+        "uv run pytest -q -n auto --durations=30",
+    )
+    # a path after the flag is still a selection, never swallowed as its value
+    assert (
+        script._selection_key("uv run pytest -q --durations tests/test_web.py") != plain
+    )
