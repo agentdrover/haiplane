@@ -20,6 +20,7 @@ import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
+import aiosqlite
 import pytest
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -875,3 +876,72 @@ async def test_authenticated_login_page_keeps_the_pre_session_token(world):
     )
     assert sent.status_code == 303
     assert "Invalid%20form" not in sent.headers["Location"], sent.headers["Location"]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_event_count_is_unknown_not_zero(world, monkeypatch):
+    import sqlite3
+
+    import aiosqlite
+
+    real_execute = aiosqlite.Connection.execute
+
+    async def failing_execute(self, sql, parameters=None):
+        if "FROM events WHERE kind = ?" in sql and parameters == ("csrf_would_reject",):
+            raise sqlite3.OperationalError("disk I/O error")
+        return await real_execute(self, sql, parameters)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", failing_execute)
+    health = (await world.client.get("/health")).json()
+    assert health["csrf_would_reject_24h"] is None
+    assert "unknown" in health["csrf_warning"]
+
+
+@pytest.mark.asyncio
+async def test_warn_event_does_not_commit_the_shared_connection(world, monkeypatch):
+    from hub.app import app
+
+    _set_mode(monkeypatch, "warn")
+    db = world.db
+
+    async def open_a_transaction(_request):
+        await db.execute("BEGIN")
+        await (await db.execute("SELECT COUNT(*) FROM events")).fetchall()
+
+    world.client.event_hooks["request"].append(open_a_transaction)
+    try:
+        # An env-token cookie: a DB session would let the auth layer itself commit
+        # the shared connection (last_seen), which is not what is under test.
+        resp = await world.client.post(
+            "/__csrf_echo", headers={**_cookie(ENV_TOKEN), **world.own}
+        )
+    finally:
+        world.client.event_hooks["request"].pop()
+    assert resp.status_code == 200
+    still_open = db.in_transaction
+    await db.rollback()
+    assert still_open, "the event write committed someone else's transaction"
+    other = await aiosqlite.connect(app.state.dsn)
+    try:
+        cur = await other.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = 'csrf_would_reject'"
+        )
+        assert (await cur.fetchone())[0] == 1, "the event must still be written"
+    finally:
+        await other.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_event_write_does_not_refuse_the_request(world, monkeypatch):
+    from hub import csrf
+
+    _set_mode(monkeypatch, "warn")
+
+    async def broken(*_args):
+        raise OSError("cannot write")
+
+    monkeypatch.setattr(csrf, "_insert_would_reject", broken)
+    resp = await world.client.post(
+        "/__csrf_echo", headers={**_cookie(world.session_a), **world.own}
+    )
+    assert resp.status_code == 200, resp.text

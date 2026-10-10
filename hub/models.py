@@ -4765,7 +4765,8 @@ class HealthView(BaseModel):
     # CSRF for cookie sessions (#1664): the mode, how many requests warn mode
     # let through that require would refuse, and where the key comes from.
     csrf_mode: str = "warn"
-    csrf_would_reject_24h: int = 0
+    # None = the count could not be read (not "zero").
+    csrf_would_reject_24h: int | None = 0
     csrf_key_source: str = ""
     csrf_warning: str = ""
 

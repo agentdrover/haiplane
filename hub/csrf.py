@@ -433,31 +433,57 @@ def _mcp_cookie_refusal() -> Response:
     )
 
 
-async def _record_would_reject(scope: Scope, request: Request, reason: str) -> None:
-    """Best effort: a failure to write the event must never refuse the request."""
-    db = getattr(getattr(scope.get("app"), "state", None), "db", None)
-    if db is None:
-        return
-    try:
-        from hub import repository as repo
+async def _insert_would_reject(db: Any, request: Request, reason: str) -> None:
+    from hub import repository as repo
 
-        identity = getattr(request.state, "identity", None)
-        await repo.insert_event(
-            db,
-            kind=CSRF_WOULD_REJECT,
-            actor=getattr(identity, "username", "") or "",
-            payload={
-                "method": request.method,
-                "path": request.url.path,
-                "reason": reason,
-            },
-        )
-        await db.commit()
+    identity = getattr(request.state, "identity", None)
+    await repo.insert_event(
+        db,
+        kind=CSRF_WOULD_REJECT,
+        actor=getattr(identity, "username", "") or "",
+        payload={
+            "method": request.method,
+            "path": request.url.path,
+            "reason": reason,
+        },
+    )
+    await db.commit()
+
+
+async def _record_would_reject(scope: Scope, request: Request, reason: str) -> None:
+    """Best effort: a failure to write the event must never refuse the request.
+
+    The event goes through a short connection of its own: this middleware runs
+    before the request connection exists, and a ``commit`` on the shared
+    ``app.state.db`` would close whatever implicit transaction another task has
+    open on it (the class of #1065). Only an app started without a DSN, which
+    has that one connection and nothing else, falls back to it.
+    """
+    state = getattr(scope.get("app"), "state", None)
+    dsn = getattr(state, "dsn", None)
+    try:
+        if dsn:
+            from hub import db as db_module
+
+            conn = await db_module.connect(dsn)
+            try:
+                await _insert_would_reject(conn, request, reason)
+            finally:
+                await conn.close()
+            return
+        shared = getattr(state, "db", None)
+        if shared is not None:
+            await _insert_would_reject(shared, request, reason)
     except Exception:  # noqa: BLE001
         log.warning("csrf_would_reject not recorded: %s", request.url.path)
 
 
-async def would_reject_count_24h(db: Any) -> int:
+async def would_reject_count_24h(db: Any) -> int | None:
+    """Events written by warn mode in the last day; ``None`` when unknown.
+
+    The owner decides on this number whether to switch to ``require``: a read
+    that failed must not look like a quiet day.
+    """
     try:
         cur = await db.execute(
             "SELECT COUNT(*) FROM events WHERE kind = ? "
@@ -467,7 +493,8 @@ async def would_reject_count_24h(db: Any) -> int:
         row = await cur.fetchone()
         return int(row[0]) if row else 0
     except Exception:  # noqa: BLE001
-        return 0
+        log.warning("csrf_would_reject count unreadable", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------

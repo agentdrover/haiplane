@@ -538,7 +538,15 @@ async def health(request: Request) -> HealthView:
     from hub.services.egress_watch import egress_status
 
     view = build_health(await egress_status(_db(request)))
-    view.csrf_would_reject_24h = await would_reject_count_24h(_db(request))
+    count = await would_reject_count_24h(_db(request))
+    view.csrf_would_reject_24h = count
+    if count is None:
+        unknown = (
+            "csrf_would_reject count is unknown: the events table could not be read"
+        )
+        view.csrf_warning = (
+            f"{view.csrf_warning}; {unknown}" if view.csrf_warning else unknown
+        )
     return view
 
 
