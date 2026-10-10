@@ -203,6 +203,15 @@ def _finish(
     return rows
 
 
+def _complete(todo: list[dict], results: dict[str, list[str]] | None) -> bool:
+    """Whether the worker answered EVERY asked key with a known status (#1651)."""
+    return results is not None and all(
+        len(results.get(t["key"]) or ()) == 2
+        and results[t["key"]][0] in (RESOLVABLE, MISSING, UNKNOWN, UNPARSEABLE)
+        for t in todo
+    )
+
+
 def resolve_ac_locators(
     acs: Any,
     sources: dict[str, str | None] | None = None,
@@ -648,7 +657,8 @@ async def _compute(
 
     Not cached: a failure of the worker, the read deadline, and any transient
     read failure (the tree listing, a locator file, a pytest config or
-    conftest.py that could not be read) even when other files were read fine.
+    conftest.py that could not be read) even when other files were read fine,
+    and a worker answer that misses a key or carries an unknown status.
     """
     try:
         evidence = await asyncio.wait_for(
@@ -684,6 +694,9 @@ async def _compute(
         if evidence.aux is not None:
             request["aux"] = evidence.aux
         results = await analyse_in_worker(request)
+        if not _complete(todo, results):  # a partial answer is a failed worker
+            log.warning("locator worker answer is incomplete or has a bad status")
+            results = None
     cacheable = not evidence.transient and (not todo or results is not None)
     return _finish(rows, results, evidence.ref_label), cacheable
 

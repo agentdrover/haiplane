@@ -23,6 +23,7 @@ from hub.services.test_existence import (
     OVER_BUDGET,
     RESOLVABLE,
     UNKNOWN,
+    UNPARSEABLE,
     resolve_locators_at_ref,
 )
 from tests.branch_code_support import FakeGit
@@ -412,24 +413,84 @@ async def test_a_failed_read_is_never_cached(how: str):
     assert git.calls - calls <= 2  # only the ref is resolved again
 
 
-async def test_deterministic_outcomes_stay_cached():
-    big = "x = 1\n" * 100000  # over MAX_FILE_BYTES
-    files = {_PATH: "def test_a():\n    pass\n", _SECOND: big}
-    acs = [
-        _ac("test_a"),
-        _ac("test_b", ac_id="AC-2"),  # the file is there, the test is not
-        _ac("test_a", "tests/test_gone.py", "AC-3"),  # the file is not there
-        _ac("test_a", _SECOND, "AC-4"),  # the file is over the limit
-    ]
+def _limit_cases() -> dict:
+    ok = "def test_a():\n    pass\n"
+    pad = "# pad\n" * 40000  # ~240 KB, under the per-file limit
+    return {
+        "missing-and-toobig": (
+            {_PATH: ok, _SECOND: "x = 1\n" * 100000},
+            [
+                _ac("test_a"),
+                _ac("test_b", ac_id="AC-2"),  # the file is there, the test is not
+                _ac("test_a", "tests/test_gone.py", "AC-3"),  # no such file
+                _ac("test_a", _SECOND, "AC-4"),  # over MAX_FILE_BYTES
+            ],
+            [RESOLVABLE, MISSING, MISSING, UNKNOWN],
+        ),
+        "unparseable": (
+            {_PATH: "def test_a(:\n"},
+            [_ac("test_a")],
+            [UNPARSEABLE],
+        ),
+        "total-bytes": (
+            {f"tests/t{i}.py": ok + pad for i in range(8)},
+            [_ac("test_a", f"tests/t{i}.py", f"AC-{i}") for i in range(8)],
+            None,
+        ),
+        "read-count": (
+            {f"tests/t{i}.py": ok for i in range(100)},
+            [_ac("test_a", f"tests/t{i}.py", f"AC-{i}") for i in range(100)],
+            None,
+        ),
+    }
+
+
+@pytest.mark.parametrize("case", list(_limit_cases()))
+async def test_deterministic_outcomes_stay_cached(case: str):
+    files, acs, expected = _limit_cases()[case]
     git = FakeGit(files)
     first = await _resolve(files, acs, git)
-    assert [r["status"] for r in first] == [RESOLVABLE, MISSING, MISSING, UNKNOWN]
+    if expected is not None:
+        assert [r["status"] for r in first] == expected
+    else:
+        assert any(r["status"] != RESOLVABLE for r in first)
     calls = git.calls
 
     second = await _resolve(files, acs, git, fresh=False)
 
     assert second == first
     assert git.calls - calls <= 2  # no tree listing and no file reads
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, {"0": [RESOLVABLE, "ok"]}, {"0": ["bogus", "x"], "1": [RESOLVABLE, "ok"]}],
+)
+async def test_an_incomplete_worker_answer_is_never_cached(monkeypatch, answer):
+    code = "def test_a():\n    pass\n"
+    files = {_PATH: code}
+    acs = [_ac("test_a"), _ac("test_a", ac_id="AC-2")]
+    real = test_existence.analyse_in_worker
+    broken = {"on": True}
+    runs = []
+
+    async def worker(request):
+        runs.append(1)
+        return answer if broken["on"] else await real(request)
+
+    monkeypatch.setattr(test_existence, "analyse_in_worker", worker)
+    git = FakeGit(files)
+
+    first = await _resolve(files, acs, git)
+    assert [r["status"] for r in first] == [UNKNOWN, UNKNOWN], first
+
+    broken["on"] = False
+    second = await _resolve(files, acs, git, fresh=False)
+    assert [r["status"] for r in second] == [RESOLVABLE, RESOLVABLE], second
+
+    third = await _resolve(files, acs, git, fresh=False)
+    assert third == second
+    assert len(runs) == 2
 
 
 async def test_no_workspace_and_an_unresolvable_ref_bypass_the_cache():
