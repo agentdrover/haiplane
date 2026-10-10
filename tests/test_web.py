@@ -7643,7 +7643,7 @@ async def test_web_key_form_can_scope_the_key_to_a_project(
 
 
 async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
-    client: AsyncClient, db
+    client: AsyncClient, db, monkeypatch
 ):
     """AC-3 (#1648): карточка state-задачи в review — метка «результат:
     состояние», rollback и таблица доказательств поколения; нет «тесты 0 из 0»
@@ -7659,6 +7659,23 @@ async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
 
     task_id = await make_state_task(db, title="Переключить DNS")
     await drive_to_second_generation(client, db, task_id)
+    # Карточка state не вычисляет блоки кода: ни отчёт, ни дифф, ни доставку,
+    # ни суждение стюарда — любое такое чтение здесь падает.
+    from hub import web
+    from hub.services import delivery_state, review_evidence, task_diff
+
+    def _refuse(name):
+        async def refuse(*_args, **_kwargs):
+            raise AssertionError(f"карточка state вычислила блок кода: {name}")
+
+        return refuse
+
+    monkeypatch.setattr(review_evidence, "review_report", _refuse("review_report"))
+    monkeypatch.setattr(task_diff, "submission_files", _refuse("submission_files"))
+    monkeypatch.setattr(delivery_state, "delivery_state", _refuse("delivery_state"))
+    monkeypatch.setattr(
+        web, "_steward_recommendation", _refuse("_steward_recommendation")
+    )
     original_git = plugins.git_ops
     spy = GitSpy()
     plugins.git_ops = spy
@@ -7669,11 +7686,16 @@ async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
 
     text = html.unescape(page)
     assert "результат: состояние" in text
-    assert ROLLBACK in text
+    block = text.split('id="state-evidence"', 1)[1]
+    assert ROLLBACK in block.split("<table", 1)[0], "rollback в блоке принятия"
+    assert "task-review-board--review" not in text, "секции машинного ревью нет"
     assert "повторное наблюдение, поколение 2" in text, "доказательство поколения 2"
     assert "отвечает 203.0.113.7" not in text, "поколение 1 на карточке не показано"
     assert "2026-10-09T12:00:00Z" in text
     for absent in (
+        "Ревью за эту сдачу не проводилось",
+        "Машинное ревью",
+        "Request machine review",
         "0 из 0",
         "CI по коммиту",
         "CI по закреплённому коммиту",
