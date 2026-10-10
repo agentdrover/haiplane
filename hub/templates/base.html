@@ -73,6 +73,7 @@
             <div class="sidebar-user">
                 <span class="sidebar-user-name">{{ current_user }}</span>
                 <form method="post" action="/logout" class="sidebar-user-form">
+                  {{ csrf_field() }}
                     <button type="submit" class="sidebar-user-logout" title="Sign out">&times;</button>
                 </form>
             </div>

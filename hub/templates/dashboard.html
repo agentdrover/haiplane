@@ -120,6 +120,7 @@
             <div class="collapsible-body" id="create-body">
                 <div class="new-task-card">
                     <form method="post" action="/tasks/create" id="create-form">
+                      {{ csrf_field() }}
 
                         <!-- Type pills -->
                         <div class="nt-row">
