@@ -35,6 +35,9 @@ jobs:
   test:
     name: Ruff and pytest
     runs-on: ubuntu-latest
+    # #1666: above the sum of the step ceilings (Test 25 + mutations 15 +
+    # baseline 10 + report 20 + the rest), so the job never dies before its steps.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -149,6 +152,9 @@ jobs:
       - name: Test
         id: tests
         if: ${{ steps.treedup.outputs.skip != 'true' }}
+        # #1666: a hung test must not hold the run for the 360 min default;
+        # pytest-timeout (300 s per test) names the test well before this.
+        timeout-minutes: 25
         run: uv run pytest -q -n auto
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
@@ -277,6 +283,8 @@ jobs:
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
+        # #1666: the reporter's own budget is 900 s; 20 min lets it finish.
+        timeout-minutes: 20
         uses: ./.github/actions/hub-ci-report
         with:
           hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
