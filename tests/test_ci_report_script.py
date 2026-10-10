@@ -947,3 +947,71 @@ def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
         assert key not in _capture_payload(script, monkeypatch)
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
+
+
+def test_a_spent_deadline_still_sends_the_report_naming_what_did_not_run(
+    script, monkeypatch
+):
+    """#1666: the step is capped by CI; the reporter must send before that.
+
+    With the clock past the overall deadline no command is launched, the
+    commands left are named as not run (never as pass), and the POST happens.
+    """
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-1666/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(script.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(script, "_STARTED", 1000.0)
+    sent: dict = {}
+
+    def fake_request(url, token, payload=None):
+        if payload is None:
+            return {
+                "acceptance_criteria": [],
+                "validation_commands": ["ruff --version", "ruff check hub"],
+            }
+        sent.update(payload)
+        return {"applied": True, "reason": "ok"}
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("no command may start after the deadline")
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    clock["now"] += script._REPORT_DEADLINE + 1  # 17 minutes spent before validation
+    assert script.main() == 0
+    assert sent, "the report must be sent even when the deadline is spent"
+    assert sent["validation_status"] == "unknown"
+    assert "deadline" in sent["reason"]
+    assert "ruff --version" in sent["reason"]
+    assert "не выполнена" in sent["validation_log"]
+
+
+def test_durations_flags_do_not_change_what_a_pytest_run_selects(script):
+    """#1666: the Test step prints --durations=30; that must not break reuse.
+
+    The step's outcome is handed to the reporter under its exact command line.
+    If the flag made the selection key None, the task's `uv run pytest -q`
+    would no longer be proven and the whole suite would run a second time
+    inside the 20 minute step (#1081).
+    """
+    plain = script._selection_key("uv run pytest -q")
+    assert plain is not None
+    for cmd in (
+        "uv run pytest -q -n auto --durations=30",
+        "uv run pytest -q -n auto --durations 30",
+        "uv run pytest -q --durations=30 --durations-min=1.0",
+        "uv run pytest -q --durations 30 --durations-min 1.0",
+    ):
+        assert script._selection_key(cmd) == plain, cmd
+    ran = {"uv run pytest -q -n auto --durations=30": "pass"}
+    assert script.already_proven("uv run pytest -q", ran) == (
+        "pass",
+        "uv run pytest -q -n auto --durations=30",
+    )
+    # a path after the flag is still a selection, never swallowed as its value
+    assert (
+        script._selection_key("uv run pytest -q --durations tests/test_web.py") != plain
+    )

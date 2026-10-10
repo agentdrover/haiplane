@@ -688,6 +688,19 @@ HUB_COOKIE_MAX_AGE = int(env_get("HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
 HUB_COOKIE_SECURE = env_get("HUB_COOKIE_SECURE", "0") == "1"
 
 
+# CSRF for cookie-session mutations (#1664): off | warn | require. An unknown
+# value falls back to warn, never to off — a typo must not switch protection off.
+CSRF_MODES = ("off", "warn", "require")
+_csrf_mode_raw = (env_get("CSRF_MODE", "warn") or "warn").strip().lower()
+CSRF_MODE = _csrf_mode_raw if _csrf_mode_raw in CSRF_MODES else "warn"
+# Key of the session-bound token. Empty: a 0600 file next to the database.
+CSRF_SECRET = env_get("HUB_CSRF_SECRET", "")
+# A form body is buffered up to this size to find the csrf_token field.
+CSRF_BODY_LIMIT = 1024 * 1024
+# ... and read for at most this many seconds (a slow body holds a worker).
+CSRF_BODY_DEADLINE = 10.0
+
+
 HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")
 
 # ---------------------------------------------------------------------------
@@ -798,6 +811,7 @@ class TokenIdentity:
         "chat_pair_generation",
         "scopes",
         "scopes_damaged",
+        "transport",
     )
 
     def __init__(
@@ -813,6 +827,7 @@ class TokenIdentity:
         chat_pair_generation: int | None = None,
         scopes: tuple[str, ...] | None = None,
         scopes_damaged: bool = False,
+        transport: str = "",
     ) -> None:
         self.username = username
         self.role = role
@@ -828,6 +843,11 @@ class TokenIdentity:
         # sets ``scopes_damaged`` so the CI entrances can refuse (fail closed).
         self.scopes = scopes
         self.scopes_damaged = scopes_damaged
+        # #1664: how the caller proved who it is — "bearer" (Authorization
+        # header), "cookie" (browser session), "open" (open mode) or ""
+        # (anonymous / not resolved by the request resolver). Only "cookie"
+        # makes a request forgeable from another site, so CSRF reads this.
+        self.transport = transport
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"
