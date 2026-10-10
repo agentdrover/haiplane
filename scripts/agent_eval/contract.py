@@ -301,7 +301,7 @@ def _has_verdict(resp: CaseResponse) -> bool:
     «одобряю» на заложенном дефекте.
     """
     judgement = resp.judgement
-    if resp.error or not isinstance(judgement, dict):
+    if not isinstance(judgement, dict):
         return False
     verdict = judgement.get("verdict")
     if not isinstance(verdict, str) or verdict not in VALID_VERDICTS:
@@ -346,7 +346,7 @@ def _group_record(
         )
     )
     for resp in group:
-        if False:
+        if _has_verdict(resp) and not evaluate(canary, resp.judgement).caught:
             return _evaluated_record(case, canary, resp, QUALITY_FAILED)
     return _record(case, INCOMPLETE, detail="ответов больше одного")
 
@@ -527,7 +527,7 @@ def _case_errors(
     ]
     outcome = record.get("outcome")
     verdict = record.get("verdict")
-    if outcome in (PASSED, QUALITY_FAILED) and isinstance(verdict, str) and verdict in VALID_VERDICTS:
+    if isinstance(verdict, str) and verdict in VALID_VERDICTS:
         # Любая запись с вердиктом пересчитывается, какой бы исход в ней ни
         # стоял: подмена quality_failed на infrastructure_error не проходит.
         caught = evaluate(canary, {"verdict": verdict}).caught
