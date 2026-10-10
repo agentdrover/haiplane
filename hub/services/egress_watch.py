@@ -137,6 +137,9 @@ def _head_in_thread(url: str, deadline: float) -> str:
         return reason_code_of(exc)
 
 
+_probe_thread: threading.Thread | None = None
+
+
 async def _probe_in_daemon_thread(url: str, deadline: float) -> str:
     """Run the blocking probe in a DAEMON thread and wait for it cancellably.
 
@@ -148,6 +151,13 @@ async def _probe_in_daemon_thread(url: str, deadline: float) -> str:
     task cancellation both reach it, and the interpreter leaves without the
     thread.
     """
+    global _probe_thread
+    # At most one unfinished worker: a resolver that hangs must not collect a
+    # new thread per interval. While the previous probe is alive the answer
+    # is "timeout" without a new request — the way out did not answer yet.
+    if _probe_thread is not None and _probe_thread.is_alive():
+        log.warning("Egress watch: the previous probe has not finished")
+        return "timeout"
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()
 
@@ -162,7 +172,8 @@ async def _probe_in_daemon_thread(url: str, deadline: float) -> str:
         except RuntimeError:  # the loop is already closed: nobody waits
             pass
 
-    threading.Thread(target=work, name="egress-probe", daemon=True).start()
+    _probe_thread = threading.Thread(target=work, name="egress-probe", daemon=True)
+    _probe_thread.start()
     return await future
 
 

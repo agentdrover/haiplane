@@ -5598,7 +5598,11 @@ async def cancel_local_runs() -> None:
         handle.task.cancel()
     if not handles:
         return
-    await asyncio.gather(*[h.task for h in handles], return_exceptions=True)
+    # shield: вторая отмена (предел остановки хаба, #1667) не должна повторно
+    # отменить сами прогоны, пока они отзывают задание у службы.
+    await asyncio.shield(
+        asyncio.gather(*[h.task for h in handles], return_exceptions=True)
+    )
     for handle in handles:
         await _close_cancelled_run(handle)
 

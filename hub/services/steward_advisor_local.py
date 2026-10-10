@@ -819,7 +819,9 @@ async def cancel_local_advisors() -> None:
             handle.task.cancel()
     if not handles:
         return
-    await asyncio.gather(*[h.task for h in handles if h.task], return_exceptions=True)
+    await asyncio.shield(
+        asyncio.gather(*[h.task for h in handles if h.task], return_exceptions=True)
+    )
     for handle in handles:
         await _close_stopped(handle)
 

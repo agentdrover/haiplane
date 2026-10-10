@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from collections.abc import Awaitable
 from typing import Any, Literal
 
 import aiosqlite
@@ -341,19 +343,38 @@ async def _startup_checks(db: aiosqlite.Connection) -> None:
             )
 
 
+def _log_late_step(name: str, step: "asyncio.Future[Any]") -> None:
+    """Результат шага остановки: ошибка названа, а не «never retrieved»."""
+    if step.cancelled():
+        return
+    exc = step.exception()
+    if exc is not None:
+        log.error("shutdown step %s ended with an error", name, exc_info=exc)
+
+
 async def _stop_background(
-    app: FastAPI, poll_task: "asyncio.Task[None]", deadline: float | None = None
+    app: FastAPI,
+    poll_task: "asyncio.Task[None]",
+    deadline: float | None = None,
+    steps: "dict[str, Awaitable[Any]] | None" = None,
 ) -> None:
-    """Остановка фоновой работы: все задачи отменяются и ожидаются под ОДНИМ пределом.
+    """Остановка фоновой работы: всё стартует разом и ждётся под ОДНИМ пределом.
 
     Раньше поллер отменялся без ожидания, задачи reaper/drift/red-base не имели
     handles, а ожидание наблюдателя egress не имело предела (#1667): одна
     зависшая задача держала выход процесса часами. Теперь предел общий
     (``config.STOP_TIMEOUT_SECONDS``), не на задачу; не успевшая названа в логе,
     остановка идёт дальше.
+
+    ``steps`` — работа остановки, которой нельзя дать урезанный бюджет: снятие
+    локальных прогонов и советников. Она стартует ВМЕСТЕ с отменой задач, а не
+    после неё, и по истечении предела не отменяется (повторная отмена прервала
+    бы отзыв опубликованного задания у службы). Ошибка шага читается и
+    пишется в лог с его именем.
     """
     if deadline is None:
         deadline = time.monotonic() + config.STOP_TIMEOUT_SECONDS
+    step_futures = {n: asyncio.ensure_future(c) for n, c in (steps or {}).items()}
     handles = dict(getattr(app.state, "background_tasks", None) or {})
     egress_task = getattr(app.state, "egress_task", None)
     for name, task in (("hub-poller", poll_task), ("hub-egress-watch", egress_task)):
@@ -369,40 +390,29 @@ async def _stop_background(
     }
     if not isinstance(poll_task, asyncio.Future):
         poll_task.cancel()  # a stand-in for the poller, not a task
-    running = {t for t in tasks.values() if not t.done()}
-    for task in running:
+    cancelled = {t for t in tasks.values() if not t.done()}
+    for task in cancelled:
         task.cancel()
     app.state.background_tasks = {}
     app.state.egress_task = None
+    waiting = cancelled | set(step_futures.values())
     pending: set[asyncio.Future[Any]] = set()
-    if running:
+    if waiting:
         _done, pending = await asyncio.wait(
-            running, timeout=max(0.0, deadline - time.monotonic())
+            waiting, timeout=max(0.0, deadline - time.monotonic())
         )
-    for name, task in tasks.items():
-        if task in pending:
+    by_name = {**tasks, **step_futures}
+    for name, fut in by_name.items():
+        if fut in pending:
             log.warning(
                 "background task %s did not stop within %ds",
                 name,
                 config.STOP_TIMEOUT_SECONDS,
             )
-        elif not task.cancelled() and task.exception() is not None:
-            log.error(
-                "background task %s ended with an error",
-                name,
-                exc_info=task.exception(),
-            )
-
-
-async def _bounded_stop(name: str, coro: Any, deadline: float) -> None:
-    """Шаг остановки под общим пределом: по его истечении назван в логе и брошен."""
-    step = asyncio.ensure_future(coro)
-    _done, pending = await asyncio.wait(
-        {step}, timeout=max(0.0, deadline - time.monotonic())
-    )
-    if pending:
-        log.warning("%s did not stop within the shutdown limit", name)
-        step.cancel()
+            if fut in step_futures.values():
+                fut.add_done_callback(functools.partial(_log_late_step, name))
+        elif fut.done() and not fut.cancelled():
+            _log_late_step(name, fut)
 
 
 async def _cancel_local_advisors() -> None:
@@ -446,14 +456,19 @@ async def lifespan(app: FastAPI):
             await _startup_checks(app.state.db)
             yield
     finally:
-        deadline = time.monotonic() + config.STOP_TIMEOUT_SECONDS
-        await _stop_background(app, poll_task, deadline)
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
-        # некому смотреть, и всё это время будет жечь процессор.
-        await _bounded_stop("local review runs", cancel_local_runs(), deadline)
-        await _bounded_stop("local advisors", _cancel_local_advisors(), deadline)
+        # некому смотреть, и всё это время будет жечь процессор. Снятие идёт
+        # ВМЕСТЕ с отменой поллера (#1667): после неё бюджета могло не остаться.
+        await _stop_background(
+            app,
+            poll_task,
+            steps={
+                "local review runs": cancel_local_runs(),
+                "local advisors": _cancel_local_advisors(),
+            },
+        )
         set_telemetry_sink(None)
         await app.state.db.close()
 

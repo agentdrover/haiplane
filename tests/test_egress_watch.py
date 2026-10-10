@@ -716,3 +716,36 @@ def test_the_watcher_is_on_unless_switched_off(monkeypatch, value):
 def test_the_watcher_off_switch_values(monkeypatch, value):
     monkeypatch.setenv("HAIPLANE_EGRESS_WATCH", value)
     assert ew.watch_enabled() is False
+
+
+async def test_hung_probes_do_not_pile_up_worker_threads():
+    """P2 (#1667): не больше одного незавершённого worker пробы."""
+    import threading
+
+    release = threading.Event()
+    started = []
+
+    def blocked(url, deadline):
+        started.append(1)
+        release.wait(30)
+        return ""
+
+    def alive() -> int:
+        return sum(
+            1
+            for t in threading.enumerate()
+            if t.name == "egress-probe" and t.is_alive()
+        )
+
+    ew._probe_thread = None
+    try:
+        with patch.object(ew, "_head_in_thread", blocked):
+            codes = [await ew.probe(deadline=0.1) for _ in range(5)]
+            assert alive() <= 1
+        assert codes == ["timeout"] * 5
+        assert len(started) == 1  # the other four did not start a request
+    finally:
+        release.set()
+        if ew._probe_thread is not None:
+            ew._probe_thread.join(5)
+        ew._probe_thread = None
