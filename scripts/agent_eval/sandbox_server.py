@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -89,8 +90,57 @@ def _file_audit(path: str) -> Callable[[str], None]:
     return write
 
 
+def _denied_runner(audit: Callable[[str], None], label: str) -> Callable[..., Any]:
+    async def refuse(*args: Any, **kwargs: Any) -> Any:
+        audit(label)
+        raise PermissionError(f"{label}: запуск процессов запрещён в eval-песочнице")
+
+    return refuse
+
+
+def deny_execution(audit: Callable[[str], None]) -> Callable[[], None]:
+    """Запретить хабу-ребёнку порождать процессы вообще. Возвращает откат.
+
+    Пустой PATH не запрещает запуск: ``/usr/bin/git`` по абсолютному пути его
+    обходит. Поэтому закрыт сам вход: ``Popen.__init__`` (через него идут
+    ``subprocess.run`` и все ``asyncio.create_subprocess_*``), ``os.system``,
+    ``os.posix_spawn*``, ``os.fork*``. Попытка пишется в журнал и отклоняется
+    ДО системного вызова: процесс не рождается.
+    """
+    import subprocess
+
+    saved: list[tuple[Any, str, Any]] = []
+
+    def swap(owner: Any, name: str, label: str) -> None:
+        if not hasattr(owner, name):
+            return
+        saved.append((owner, name, getattr(owner, name)))
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            audit(label)
+            raise PermissionError(
+                f"{label}: запуск процессов запрещён в eval-песочнице"
+            )
+
+        setattr(owner, name, refuse)
+
+    swap(subprocess.Popen, "__init__", "exec.subprocess.Popen")
+    for name in ("system", "posix_spawn", "posix_spawnp", "fork", "forkpty"):
+        swap(os, name, f"exec.os.{name}")
+
+    def restore() -> None:
+        for owner, name, original in reversed(saved):
+            setattr(owner, name, original)
+        saved.clear()
+
+    return restore
+
+
 def configure(app_mod: Any, registry: Any, audit: Callable[[str], None]) -> None:
     """Подменить в приложении всё, что ходит наружу. Вынесено ради теста."""
+    from fastapi import HTTPException
+
+    from hub.services import ac_tests, validation_run
 
     def register_denied() -> None:
         install_denied(registry, audit)
@@ -99,8 +149,28 @@ def configure(app_mod: Any, registry: Any, audit: Callable[[str], None]) -> None
         # Поллер — единственный источник фоновых проб наружу и автодействий.
         return asyncio.ensure_future(asyncio.sleep(10**9))
 
+    def refuse_route(label: str) -> Callable[..., Any]:
+        async def refuse(*args: Any, **kwargs: Any) -> Any:
+            audit(label)
+            raise HTTPException(
+                403, detail=f"{label}: запуск проверок запрещён в eval-песочнице"
+            )
+
+        return refuse
+
     app_mod._register_plugins = register_denied
     app_mod.start_poller = no_poller
+    # Маршруты, запускающие код на хосте хаба (доступны тестовому human):
+    # заглушка пишет попытку и отказывает. Раннеры по умолчанию закрыты так же —
+    # на случай вызова не через маршрут.
+    app_mod.run_validation_commands = refuse_route(
+        "validation_run.run_validation_commands"
+    )
+    app_mod.run_ac_tests = refuse_route("ac_tests.run_ac_tests")
+    validation_run.default_validation_runner = _denied_runner(
+        audit, "validation_run.default_validation_runner"
+    )
+    ac_tests.default_test_runner = _denied_runner(audit, "ac_tests.default_test_runner")
     register_denied()
 
 
@@ -112,7 +182,9 @@ def main(argv: list[str]) -> int:
     from hub import app as app_mod
     from hub.integrations.registry import plugins
 
-    configure(app_mod, plugins, _file_audit(audit_path))
+    audit = _file_audit(audit_path)
+    configure(app_mod, plugins, audit)
+    deny_execution(audit)
     uvicorn.run(app_mod.app, fd=fd, log_level="warning", lifespan="on")
     return 0
 

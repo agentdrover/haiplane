@@ -51,12 +51,28 @@ REDACTED = "[redacted]"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-#: Имена переменных, наличие которых в окружении запрещает запуск. Совпадение
-#: по имени, значение не читается и в сообщение не попадает.
-_FORBIDDEN_NAME = re.compile(
-    r"(^|_)(HUB_TOKENS?|STEWARD_HUB_TOKEN|GITVERSE_TOKEN|GITHUB_TOKEN|GH_TOKEN"
-    r"|CURSOR_API_KEY)$"
+#: Имена вне префиксов хаба, наличие которых запрещает запуск (токены форжей
+#: и облачного агента). Совпадение по имени, значение не читается.
+_FORBIDDEN_EXACT = frozenset(
+    {
+        "GITVERSE_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "CURSOR_API_KEY",
+        "CURSOR_REVIEWER_HUB_TOKEN",
+    }
 )
+#: Любое имя, оканчивающееся на HUB_TOKEN(S), под любым префиксом.
+_FORBIDDEN_HUB_TOKEN = re.compile(r"(^|_)HUB_TOKENS?$")
+#: Последний сегмент имени настройки хаба, означающий секрет: например
+#: HUB_BOOTSTRAP_ADMIN_TOKEN, HUB_CSRF_SECRET, STEWARD_HUB_TOKEN. Бюджеты вида
+#: REVIEW_TOKEN_BUDGET под правило не попадают: секрет стоит в конце имени.
+_SECRET_LAST_SEGMENT = frozenset({"TOKEN", "TOKENS", "SECRET", "PASSWORD", "KEY"})
+
+#: Префиксы настроек хаба: действующий и снятые с поддержки (#964). Снятый
+#: префикс хаб сам не читает, но оператор мог оставить его drop-in'ом, и
+#: он выдаёт production-доступ так же, как действующий.
+_HUB_PREFIXES: tuple[str, ...] = (brand.ENV_PREFIX, *brand.RETIRED_ENV_PREFIXES)
 
 #: Ключи JSON, значения которых вычищаются независимо от содержимого.
 _SECRET_KEY = re.compile(
@@ -95,18 +111,37 @@ def _is_loopback_url(url: str) -> bool:
     return parts.scheme in {"http", "https"} and _is_loopback_host(parts.hostname or "")
 
 
-def check_environment(env: Mapping[str, str]) -> None:
-    """Отказать, если окружение выглядит как production. Значения не читаются."""
+def _forbidden_reason(name: str, value: str) -> str | None:
+    up = name.upper()
+    for prefix in _HUB_PREFIXES:
+        if up == prefix + "HUB_URL":
+            if not _is_loopback_url(value):
+                return f"{name} указывает не на loopback"
+            return None
+    if up in _FORBIDDEN_EXACT or _FORBIDDEN_HUB_TOKEN.search(up):
+        return f"{name} содержит токен"
+    for prefix in _HUB_PREFIXES:
+        if up.startswith(prefix) and up.rsplit("_", 1)[-1] in _SECRET_LAST_SEGMENT:
+            return f"{name} содержит секрет"
+    return None
+
+
+def check_environment(env: Mapping[str, str], *, allow: Iterable[str] = ()) -> None:
+    """Отказать, если окружение выглядит как production. Значения не читаются.
+
+    ``allow`` — явный список ИМЁН, которые вызывающий разрешает оставить в
+    окружении (по умолчанию пуст). Разрешённое имя в окружение хаба-ребёнка
+    всё равно не попадает: оно только не мешает запуску.
+    """
+    allowed = {a.upper() for a in allow}
     problems: list[str] = []
     for name, value in env.items():
-        if not str(value).strip():
+        value = str(value).strip()
+        if not value or name.upper() in allowed:
             continue
-        up = name.upper()
-        if up == brand.ENV_PREFIX + "HUB_URL":
-            if not _is_loopback_url(str(value).strip()):
-                problems.append(f"{name} указывает не на loopback")
-        elif _FORBIDDEN_NAME.search(up):
-            problems.append(f"{name} содержит токен")
+        reason = _forbidden_reason(name, value)
+        if reason:
+            problems.append(reason)
     if problems:
         raise SandboxRefused(
             "sandbox не запускается в окружении с production-доступом: "
@@ -179,8 +214,8 @@ class TraceRecorder:
     ) -> TraceCall:
         call = TraceCall(
             seq=len(self.calls) + 1,
-            session_id=session_id,
-            tool=tool,
+            session_id=redact(session_id, self.secrets),
+            tool=redact(tool, self.secrets),
             args=redact(args, self.secrets),
             result=redact(result, self.secrets),
             ok=ok,
@@ -246,7 +281,7 @@ class SyntheticSession:
         }
         ok, result = False, None
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.base_url}/mcp", json=payload, headers=headers
                 )
@@ -282,22 +317,65 @@ class Principal:
     token: str
 
 
+def _descendants(root_pid: int) -> list[int]:
+    """PID всех потомков процесса (любой глубины, любых сессий), без самого root.
+
+    Читается таблица процессов целиком: внук в отдельной сессии (setsid) не
+    состоит в группе ребёнка, и убийство группы его не достанет.
+    """
+    try:
+        out = subprocess.run(  # nosec B603 - fixed argv
+            ["/bin/ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    stack = [root_pid]
+    while stack:
+        for kid in children.get(stack.pop(), []):
+            if kid not in found:
+                found.append(kid)
+                stack.append(kid)
+    return found
+
+
+def _kill(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _release(proc: subprocess.Popen[bytes] | None, root: Path | None) -> None:
-    """Остановить процесс (вся его группа) и снести каталог. Идемпотентно."""
-    if proc is not None and proc.poll() is None:
-        for sig, wait in ((signal.SIGTERM, _TERM_GRACE), (signal.SIGKILL, 5.0)):
-            try:
-                os.killpg(proc.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                break
-            try:
-                proc.wait(timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+    """Остановить процесс, его группу и ВСЕХ потомков; снести каталог. Идемпотентно."""
     if proc is not None:
+        # Снимок потомков до остановки ребёнка: после его смерти они осиротеют
+        # и по дереву уже не найдутся.
+        offspring = _descendants(proc.pid) if proc.poll() is None else []
+        if proc.poll() is None:
+            for sig, wait in ((signal.SIGTERM, _TERM_GRACE), (signal.SIGKILL, 5.0)):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    break
+                try:
+                    proc.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        for pid in reversed(offspring):
+            _kill(pid, signal.SIGKILL)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)  # потомки, если остались
+            os.killpg(proc.pid, signal.SIGKILL)  # остатки группы
         except (ProcessLookupError, PermissionError):
             pass
         proc.poll()
@@ -312,11 +390,19 @@ class Sandbox:
         self,
         *,
         env: Mapping[str, str] | None = None,
+        allow_env: Iterable[str] = (),
         base_dir: Path | str | None = None,
         extra_secrets: Iterable[str] = (),
         start_timeout: float = _START_TIMEOUT,
+        server_script: Path | str | None = None,
     ) -> None:
-        self._env = dict(os.environ if env is None else env)
+        self._server_script = Path(
+            server_script or Path(__file__).with_name("sandbox_server.py")
+        )
+        #: Дополнительные переменные ДЛЯ ХАБА-РЕБЁНКА. На проверку окружения
+        #: родителя не влияют: проверяется фактический os.environ.
+        self._extra_env = dict(env or {})
+        self._allow_env = tuple(allow_env)
         self._base_dir = Path(base_dir) if base_dir is not None else None
         self._start_timeout = start_timeout
         self.recorder = TraceRecorder(secrets=[s for s in extra_secrets if s])
@@ -334,7 +420,12 @@ class Sandbox:
     # -- жизненный цикл ---------------------------------------------------
 
     async def __aenter__(self) -> "Sandbox":
-        check_environment(self._env)  # до любого побочного эффекта
+        # Фактическое окружение процесса В МОМЕНТ запуска (не при создании
+        # объекта) плюс то, что вызывающий хочет дать ребёнку: словарь env не
+        # может скрыть production из os.environ.
+        check_environment(
+            {**os.environ, **self._extra_env}, allow=self._allow_env
+        )  # до любого побочного эффекта
         try:
             await self._start()
         except BaseException:
@@ -387,7 +478,7 @@ class Sandbox:
             self._proc = subprocess.Popen(
                 [
                     sys.executable,
-                    str(Path(__file__).with_name("sandbox_server.py")),
+                    str(self._server_script),
                     str(listener.fileno()),
                     str(self._audit_path),
                 ],
@@ -416,6 +507,11 @@ class Sandbox:
         )
         prefix = brand.ENV_PREFIX
         return {
+            **{
+                k: v
+                for k, v in self._extra_env.items()
+                if k.upper() not in {a.upper() for a in self._allow_env}
+            },
             "PATH": str(self.root / "bin"),
             "HOME": str(self.root / "home"),
             "LANG": "C.UTF-8",
@@ -433,7 +529,7 @@ class Sandbox:
     async def _wait_ready(self) -> None:
         assert self._proc is not None
         deadline = time.monotonic() + self._start_timeout
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
             while time.monotonic() < deadline:
                 if self._proc.poll() is not None:
                     raise SandboxStartError(
@@ -468,7 +564,7 @@ class Sandbox:
     async def seed_task(self, title: str, description: str = "") -> int:
         """Синтетическая задача от тестового человека. Возвращает её id."""
         human = self.principals["human"]
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             resp = await client.post(
                 f"{self.url}/api/tasks",
                 json={"title": title, "description": description},
@@ -480,6 +576,19 @@ class Sandbox:
                 + _scrub_text(resp.text[:300], self.recorder.secrets)
             )
         return int(resp.json()["id"])
+
+    async def request(
+        self, role: str, method: str, path: str, json_body: Any = None
+    ) -> httpx.Response:
+        """REST-вызов песочницы от тестового принципала (для проверок границ)."""
+        principal = self.principals[role]
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            return await client.request(
+                method,
+                f"{self.url}{path}",
+                json=json_body,
+                headers={"Authorization": f"Bearer {principal.token}"},
+            )
 
     def denied_effects(self) -> list[str]:
         """Какие внешние адаптеры пытались вызвать (только имена методов)."""
