@@ -149,7 +149,15 @@ def test_glm_models_are_their_own_family():
     Ни одно имя GLM не совпадает с семействами исполнителя, ревьюера и судьи,
     которые стоят рядом на проде; неопознанное имя по-прежнему не разнообразие.
     """
-    for name in ("glm-5.3", "glm-5.3-flash", "glm-5.1", "z-ai/glm-4.7", "chatglm", "zai-glm-5", "GLM-4.6"):
+    for name in (
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.1",
+        "z-ai/glm-4.7",
+        "chatglm",
+        "zai-glm-5",
+        "GLM-4.6",
+    ):
         assert family(name) == "zhipu", name
     for glm in ("glm-5.3", "glm-5.1", "z-ai/glm-4.7", "chatglm"):
         for other in ("claude-opus-5", "gpt-5.3-codex", "grok-4.6", "deepseek-v4"):

@@ -2971,7 +2971,9 @@ def test_the_advisor_image_recipe_pins_opencode() -> None:
     assert "localhost/haiplane-reviewer" not in text
     assert "ENTRYPOINT []" in text and "WORKDIR /work" in text
     assert "OPENCODE_CONFIG=" in text and "node" in text.lower()
-    conf = json.loads((_ROOT / "deploy/review-runner/advisor-opencode.json").read_text())
+    conf = json.loads(
+        (_ROOT / "deploy/review-runner/advisor-opencode.json").read_text()
+    )
     assert conf["share"] == "disabled" and conf["autoupdate"] is False
     assert conf["plugin"] == [] and conf["mcp"] == {} and conf["lsp"] is False
 
