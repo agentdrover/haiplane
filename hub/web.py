@@ -15,6 +15,8 @@ import aiosqlite
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from jinja2 import pass_context
+from markupsafe import Markup
 from pydantic import ValidationError
 
 from hub import brand
@@ -40,6 +42,7 @@ from hub.auth import (
     require_permission,
     verify_csrf,
 )
+from hub.csrf import CSRF_FIELD_NAME
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
@@ -101,6 +104,25 @@ TEMPLATES = Jinja2Templates(
     directory=str(HERE / "templates"),
     context_processors=[_user_context],
 )
+
+
+@pass_context
+def _csrf_field(context: Any) -> Markup:
+    """Hidden session-bound token field for a POST form (#1665).
+
+    Empty when the page has no token (a Bearer caller or a login page), so a
+    form never carries a stale value. Every POST form calls this and the
+    static check in tests/test_csrf_templates.py fails one that does not.
+    """
+    token = context.get("csrf_token")
+    if not token:
+        return Markup("")
+    return Markup('<input type="hidden" name="{}" value="{}">').format(
+        CSRF_FIELD_NAME, token
+    )
+
+
+TEMPLATES.env.globals["csrf_field"] = _csrf_field
 TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
 TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
 TEMPLATES.env.globals["app_version"] = get_app_version()
