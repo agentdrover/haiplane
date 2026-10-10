@@ -2969,6 +2969,12 @@ def test_the_advisor_image_recipe_pins_opencode() -> None:
         assert re.fullmatch(r"\d+\.\d+\.\d+", spec.group(1)), line
         assert "latest" not in line and "^" not in line and "~" not in line
     assert "localhost/haiplane-reviewer" not in text
+    assert re.search(
+        r"^COPY\s+advisor-opencode\.json\s+/etc/opencode/opencode\.json", text, re.M
+    )
+    assert "OPENCODE_CONFIG=/etc/opencode/opencode.json" in text
+    version = re.search(r"opencode-ai@(\d+\.\d+\.\d+)", text)
+    assert version and f"opencode-ai@{version.group(1)}" in _DOC.read_text()
     assert "ENTRYPOINT []" in text and "WORKDIR /work" in text
     assert "OPENCODE_CONFIG=" in text and "node" in text.lower()
     conf = json.loads(

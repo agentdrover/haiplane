@@ -1316,7 +1316,8 @@ endpoint `https://api.z.ai/api/coding/paas/v4` (каталог models.dev; от�
 `WORKDIR /work`) и не зависит от неописанного образа ревью:
 
 ```text
-# под пользователем ревьюера, из корня репозитория
+# сборка и проверки — под пользователем ревьюера, из корня репозитория;
+# запись в /etc/haiplane-review — от root (каталог и файлы root-овые)
 podman build -t localhost/haiplane-advisor:1 \
     -f deploy/review-runner/advisor.Containerfile deploy/review-runner
 podman run --rm localhost/haiplane-advisor:1 opencode --version   # 1.18.35
@@ -1428,8 +1429,9 @@ haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run "
 Служба — серверная копия под `release_artifacts` (#1591). Правка #1654 код
 службы (`haiplane-review-runner.py`) не меняет, службу не заменяют. Порядок:
 
-1. Советник **выключен** (`HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` не задан или
-   `HAIPLANE_STEWARD_ADVISOR_MODELS` без `glm-5.3`).
+1. Советник **выключен**: `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` не задан.
+   Убрать `glm-5.3` только из `HAIPLANE_STEWARD_ADVISOR_MODELS` мало: заданную
+   локальную модель хаб добавляет в кандидаты последней.
 2. Сборка образа под пользователем ревьюера (раздел «Образ советника»), файлы
    `advisor-image`, `advisor-model` (`glm-5.3`), `advisor-timeout`,
    `advisor.env` с `ZHIPU_API_KEY`; обёртка
