@@ -149,16 +149,19 @@ def test_glm_models_are_their_own_family():
     Ни одно имя GLM не совпадает с семействами исполнителя, ревьюера и судьи,
     которые стоят рядом на проде; неопознанное имя по-прежнему не разнообразие.
     """
-    for name in ("glm-5.1", "z-ai/glm-4.7", "chatglm", "zai-glm-5", "GLM-4.6"):
+    for name in ("glm-5.3", "glm-5.3-flash", "glm-5.1", "z-ai/glm-4.7", "chatglm", "zai-glm-5", "GLM-4.6"):
         assert family(name) == "zhipu", name
-    for glm in ("glm-5.1", "z-ai/glm-4.7", "chatglm"):
+    for glm in ("glm-5.3", "glm-5.1", "z-ai/glm-4.7", "chatglm"):
         for other in ("claude-opus-5", "gpt-5.3-codex", "grok-4.6", "deepseek-v4"):
             assert same_family(glm, other) is False, (glm, other)
         assert same_family(glm, "composer-2.5") is False, glm
         assert same_family(glm, "cursor-glm-5.1") is True, "обёртка не прячет GLM"
+        assert same_family(glm, "zai-coding-plan/glm-5.3") is True, glm
     assert same_family("glm-5.1", "z-ai/glm-4.7") is True
+    assert same_family("glm-5.3", "glm-5.1") is True
     # Неопознанное по-прежнему не разнообразие: GLM не «лечит» чужую неизвестность.
     assert same_family("glm-5.1", "mystery-9000") is None
+    assert same_family("glm-5.3", "mystery-9000") is None
     assert family("glamour-1") == "unknown:glamour-1", "префикс — токен, не подстрока"
 
 

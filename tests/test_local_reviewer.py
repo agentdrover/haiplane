@@ -1997,6 +1997,7 @@ def _run_wrapper_template(tmp_path: Path, *, with_src: bool, conf: dict[str, str
     stub.write_text(
         "#!/usr/bin/env python3\nimport os, shlex, sys\n"
         "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+        "open(os.environ['ARGV_LOG'] + '.stdin', 'wb').write(sys.stdin.buffer.read())\n"
     )
     stub.chmod(0o755)
     script = tmp_path / "haiplane-review-run"
@@ -2139,7 +2140,7 @@ def test_the_runner_accepts_only_the_known_job_versions(runner_mod) -> None:
         job = json.dumps({"version": version, "timeout_sec": 5}).encode()
         assert runner_mod.parse_job_ex(job, 60) == (5, version)
     advisor = json.dumps(
-        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"}
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"}
     ).encode()
     assert runner_mod.parse_job_ex(advisor, 60) == (5, 3)
 
@@ -2528,7 +2529,7 @@ def _load_frozen(path: Path, name: str):
     return module
 
 
-def _advisor_conf(tmp_path: Path, model: str = "glm-5.1", timeout: int = 5) -> Path:
+def _advisor_conf(tmp_path: Path, model: str = "glm-5.3", timeout: int = 5) -> Path:
     """Доверенная конфигурация обёртки advisor: те же файлы, что читает обёртка."""
     conf = tmp_path / "conf"
     conf.mkdir(exist_ok=True)
@@ -2538,7 +2539,7 @@ def _advisor_conf(tmp_path: Path, model: str = "glm-5.1", timeout: int = 5) -> P
     for name in ("advisor-model", "advisor-timeout"):
         os.chmod(conf / name, 0o644)
     # Ключи: у каждого контейнера свой файл, оба закрыты от мира.
-    (conf / "advisor.env").write_text("OPENAI_API_KEY=z\n")
+    (conf / "advisor.env").write_text("ZHIPU_API_KEY=z\n")
     (conf / "model.env").write_text("CURSOR_API_KEY=r\n")
     for name in ("advisor.env", "model.env"):
         os.chmod(conf / name, 0o640)
@@ -2589,7 +2590,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
     ok = _write_job(
         spool,
         "job-" + "1" * 16,
-        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
         "ПРОМТ-СОВЕТНИКА",
     )
     await runner_mod.run_pending(cfg)
@@ -2602,7 +2603,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
     # --- недопустимые сочетания: отказ до запуска модели
     bad = {
         "v3-src": (
-            {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+            {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
             "src.tar",
         ),
         "v3-review": ({"version": 3, "timeout_sec": 5, "profile": "review"}, "profile"),
@@ -2612,7 +2613,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
                 "version": 3,
                 "timeout_sec": 5,
                 "profile": "advisor",
-                "model": "glm-5.1",
+                "model": "glm-5.3",
                 "command": "id",
             },
             "command",
@@ -2630,7 +2631,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
             "не совпадает",
         ),
         "v3-short": (
-            {"version": 3, "timeout_sec": 3, "profile": "advisor", "model": "glm-5.1"},
+            {"version": 3, "timeout_sec": 3, "profile": "advisor", "model": "glm-5.3"},
             "срок",
         ),
         "v1-profile": (
@@ -2658,7 +2659,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
     jobdir = _write_job(
         spool,
         "job-" + "9" * 16,
-        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
     )
     await runner_mod.run_pending(plain)
     assert _result(jobdir)["status"] == "rejected"
@@ -2671,7 +2672,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
     caps = local_reviewer.parse_capabilities(runner_mod.heartbeat_payload(cfg))
     assert caps is not None
     assert caps.job_versions == (1, 2, 3) and caps.profiles == ("review", "advisor")
-    assert caps.advisor_model == "glm-5.1" and caps.advisor_timeout_sec == 5
+    assert caps.advisor_model == "glm-5.3" and caps.advisor_timeout_sec == 5
     assert caps.max_timeout_sec == 60
 
     # --- доверенная конфигурация: чужой владелец и запись группе/миру снимают профиль
@@ -2705,7 +2706,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
     (conf / "advisor-timeout").write_text("5\n")
     (conf / "advisor-model").write_text("glm; id\n")
     assert _profiles(cfg) == ("review",), "недопустимое имя модели"
-    (conf / "advisor-model").write_text("glm-5.1\n")
+    (conf / "advisor-model").write_text("glm-5.3\n")
     assert _profiles(cfg) == ("review", "advisor")
     problem_caps = local_reviewer.parse_capabilities(
         runner_mod.heartbeat_payload(stranger)
@@ -2731,7 +2732,7 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
         jobdir = _write_job(
             spool,
             "job-" + ("a" if label == "v1" else "b") * 16,
-            {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+            {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
         )
         await old.run_pending(old_cfg)
         assert _result(jobdir)["status"] == "rejected", label
@@ -2741,6 +2742,28 @@ async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
 _ADVISOR_WRAPPER = _ROOT / "deploy/review-runner/haiplane-advisor-run"
 _SUDOERS_ADVISOR = (
     'haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run ""'
+)
+
+
+_ADVISOR_KEY = "zk-test-0123456789abcdef"
+_ADVISOR_KEY_LINE = f"ZHIPU_API_KEY={_ADVISOR_KEY}\n"
+_ADVISOR_PROMPT = "КОНТРОЛЬНЫЙ-ПРОМТ-7f3a: код ABCD-2345\n\x00бинарный хвост\n".encode()
+_ADVISOR_ARGV = [
+    "opencode",
+    "run",
+    "--model",
+    "zai-coding-plan/glm-5.3",
+    "--auto",
+]
+_ADVISOR_PINNED_ENV = (
+    "OPENCODE_DISABLE_AUTOUPDATE=1",
+    "OPENCODE_AUTO_SHARE=false",
+    "OPENCODE_DISABLE_MODELS_FETCH=1",
+    "OPENCODE_PURE=1",
+    "OPENCODE_DISABLE_DEFAULT_PLUGINS=1",
+    "OPENCODE_DISABLE_LSP_DOWNLOAD=1",
+    "OPENCODE_DISABLE_PROJECT_CONFIG=1",
+    "OPENCODE_DISABLE_EXTERNAL_SKILLS=1",
 )
 
 
@@ -2757,9 +2780,10 @@ def _run_advisor_wrapper(
     confdir.mkdir(parents=True, exist_ok=True)
     files = {
         "image": "localhost/haiplane-reviewer:2\n",
-        "advisor-model": "glm-5.1\n",
+        "advisor-model": "glm-5.3\n",
         "advisor-timeout": "900\n",
-        "advisor.env": "OPENAI_API_KEY=z\nOPENAI_BASE_URL=https://api.z.ai/api/coding/paas/v4\n",
+        "advisor-image": "localhost/haiplane-advisor:1\n",
+        "advisor.env": _ADVISOR_KEY_LINE,
         "model.env": "CURSOR_API_KEY=review-key\n",
     }
     files.update({k: v for k, v in conf.items()})
@@ -2775,6 +2799,7 @@ def _run_advisor_wrapper(
     stub.write_text(
         "#!/usr/bin/env python3\nimport os, shlex, sys\n"
         "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+        "open(os.environ['ARGV_LOG'] + '.stdin', 'wb').write(sys.stdin.buffer.read())\n"
     )
     stub.chmod(0o755)
     text = _ADVISOR_WRAPPER.read_text()
@@ -2793,10 +2818,15 @@ def _run_advisor_wrapper(
     done = subprocess.run(
         [str(script), *args],
         cwd=tmp_path,
+        input=_ADVISOR_PROMPT,
         capture_output=True,
-        text=True,
         timeout=30,
         env={**os.environ, "ARGV_LOG": str(log)},
+    )
+    done.stdin_seen = (  # type: ignore[attr-defined]
+        Path(str(log) + ".stdin").read_bytes()
+        if Path(str(log) + ".stdin").exists()
+        else None
     )
     return done, shlex.split(log.read_text()) if log.exists() else [], confdir
 
@@ -2847,16 +2877,19 @@ def test_the_advisor_wrapper_pins_its_image_env_file_timeout_and_cli(tmp_path) -
         "/home",
     ):
         assert forbidden not in joined + " ", f"в запуске {forbidden!r}"
-    image = argv.index("localhost/haiplane-reviewer:2")
-    assert argv[image + 1 :] == [
-        "qwen",
-        "--model",
-        "glm-5.1",
-        "--approval-mode",
-        "yolo",
-        "--output-format",
-        "text",
-    ], "argv CLI закреплён обёрткой"
+    image = argv.index("localhost/haiplane-advisor:1")
+    assert "localhost/haiplane-reviewer:2" not in argv, "образ ревью не берётся"
+    assert argv[image + 1 :] == _ADVISOR_ARGV, "argv CLI закреплён обёрткой"
+    # Закреплённые -e: литералы обёртки, до образа, а не из advisor.env.
+    pinned = [argv[i + 1] for i, a in enumerate(argv[:image]) if a == "-e"]
+    assert pinned == list(_ADVISOR_PINNED_ENV), pinned
+    # Промт дошёл побайтно через stdin и ни в какой части argv не виден.
+    assert done.stdin_seen == _ADVISOR_PROMPT, "stdin не дошёл побайтно"
+    for secret in ("КОНТРОЛЬНЫЙ-ПРОМТ", "ABCD-2345", _ADVISOR_KEY):
+        assert all(secret not in a for a in argv), secret
+    for banned in ("qwen", "OPENAI_", "approval-mode", "yolo", "sh -c", "$(cat"):
+        assert banned not in joined, banned
+    assert "-v" not in argv and not any(a.startswith("--volume") for a in argv)
 
     # Аргументы вызывающего (хаб/агент) в CLI не проходят и обёртку не запускают.
     done, argv, _ = _run_advisor_wrapper(
@@ -2877,6 +2910,145 @@ def test_the_advisor_wrapper_pins_its_image_env_file_timeout_and_cli(tmp_path) -
             tmp_path / f"b{abs(hash(str(broken)))}", **broken
         )
         assert done.returncode != 0 and argv == [], (broken, done.returncode, argv)
+
+
+def test_the_advisor_wrapper_refuses_without_its_own_image(tmp_path) -> None:
+    """#1654 AC-2: образ советника — свой файл advisor-image, не образ ревью.
+
+    При разных image и advisor-image берётся advisor-image; без image запуск
+    успешен; пустой или отсутствующий advisor-image, нет advisor.env и
+    advisor.env = model.env — ненулевой код без вызова podman; прежние отказы
+    (аргументы, срок, имя модели) сохраняются.
+    """
+    done, argv, _ = _run_advisor_wrapper(
+        tmp_path / "both",
+        image="localhost/haiplane-reviewer:2\n",
+        **{"advisor-image": "localhost/haiplane-advisor:1\n"},
+    )
+    assert done.returncode == 0 and "localhost/haiplane-advisor:1" in argv
+    assert "localhost/haiplane-reviewer:2" not in argv
+
+    done, argv, _ = _run_advisor_wrapper(tmp_path / "no-image", image=None)
+    assert done.returncode == 0 and "localhost/haiplane-advisor:1" in argv, done.stderr
+
+    def same_key_file(conf: Path) -> None:
+        (conf / "advisor.env").unlink()
+        os.link(conf / "model.env", conf / "advisor.env")
+
+    refusals = {
+        "empty": {"advisor-image": "\n"},
+        "blank": {"advisor-image": ""},
+        "missing": {"advisor-image": None},
+        "bad-name": {"advisor-image": "img; id\n"},
+        "no-env": {"advisor.env": None},
+        "env-is-model-env": {"prepare": same_key_file},
+        "args": {},
+        "timeout": {"advisor-timeout": "много\n"},
+        "model": {"advisor-model": "zai-coding-plan/glm-5.3\n"},
+    }
+    for label, kwargs in refusals.items():
+        args = ("--model", "evil") if label == "args" else ()
+        done, argv, _ = _run_advisor_wrapper(tmp_path / label, args, **kwargs)
+        assert done.returncode != 0 and argv == [], (label, done.returncode, argv)
+        assert done.stdin_seen is None, f"{label}: podman вызван"
+
+
+_RECIPE = _ROOT / "deploy/review-runner/advisor.Containerfile"
+
+
+def test_the_advisor_image_recipe_pins_opencode() -> None:
+    """#1654 AC-3: рецепт образа самостоятелен, opencode-ai ставится точной версией."""
+    text = _RECIPE.read_text()
+    froms = re.findall(r"^FROM\s+(\S+)", text, re.M)
+    assert froms and all(f.startswith("docker.io/library/debian") for f in froms), froms
+    installs = re.findall(r"npm install\b[^\n]*", text)
+    assert installs, "opencode-ai не ставится"
+    for line in installs:
+        spec = re.search(r"opencode-ai@(\S+)", line)
+        assert spec, line
+        assert re.fullmatch(r"\d+\.\d+\.\d+", spec.group(1)), line
+        assert "latest" not in line and "^" not in line and "~" not in line
+    assert "localhost/haiplane-reviewer" not in text
+    assert "ENTRYPOINT []" in text and "WORKDIR /work" in text
+    assert "OPENCODE_CONFIG=" in text and "node" in text.lower()
+    conf = json.loads((_ROOT / "deploy/review-runner/advisor-opencode.json").read_text())
+    assert conf["share"] == "disabled" and conf["autoupdate"] is False
+    assert conf["plugin"] == [] and conf["mcp"] == {} and conf["lsp"] is False
+
+
+async def test_the_runner_and_hub_agree_on_glm_5_3_for_the_advisor(
+    local_spool, runner_mod, tmp_path
+) -> None:
+    """#1654 AC-4: служба с advisor-model=glm-5.3 и хаб с моделью glm-5.3 согласны.
+
+    Heartbeat службы объявляет glm-5.3; хаб считает путь готовым; задание v3 с
+    glm-5.3 запускается, с другой моделью отклоняется до запуска; хаб с другой
+    моделью получает именованное несовпадение.
+    """
+    spool = local_spool
+    rec = tmp_path / "ran"
+    advisor = _fake_cli(
+        tmp_path, f"import pathlib\npathlib.Path({str(rec)!r}).write_text('x')\n"
+    )
+    conf = _advisor_conf(tmp_path, model="glm-5.3")
+    cfg = _runner_cfg(
+        runner_mod,
+        tmp_path,
+        spool,
+        advisor,
+        advisor_argv=advisor,
+        advisor_conf=str(conf),
+        conf_trusted_uid=os.getuid(),
+    )
+    caps = local_reviewer.parse_capabilities(runner_mod.heartbeat_payload(cfg))
+    assert caps is not None and caps.advisor_model == "glm-5.3"
+    assert "advisor" in caps.profiles
+
+    # Хаб: heartbeat настоящей службы кладётся в тот же spool, что читает хаб.
+    (local_spool / "heartbeat").write_bytes(runner_mod.heartbeat_payload(cfg))
+    assert config.STEWARD_ADVISOR_LOCAL_MODEL == "glm-5.3"
+    assert local_reviewer.advisor_path_problem("glm-5.3") is None
+    other = local_reviewer.advisor_path_problem("glm-5.1")
+    assert other is not None and other[0] == local_reviewer.PATH_MODEL_MISMATCH
+
+    ok = _write_job(
+        spool,
+        "job-" + "a" * 16,
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
+    )
+    await runner_mod.run_pending(cfg)
+    assert json.loads((ok / "result.json").read_text())["status"] == "ok"
+    assert rec.exists(), "задание с glm-5.3 не запущено"
+    rec.unlink()
+    wrong = _write_job(
+        spool,
+        "job-" + "b" * 16,
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+    )
+    await runner_mod.run_pending(cfg)
+    result = json.loads((wrong / "result.json").read_text())
+    assert result["status"] == "rejected" and "не совпадает" in result["reason"]
+    assert not rec.exists(), "модель запущена при несовпадении"
+
+
+def test_the_advisor_doc_names_opencode_and_the_subscription_rule() -> None:
+    """#1654 AC-5: раздел советника говорит про OpenCode, ZHIPU_API_KEY и правило z.ai."""
+    doc = _DOC.read_text()
+    start = doc.index("## Советник стюарда на GLM")
+    end = doc.index("\n## ", start + 1)
+    section = doc[start:end]
+    for banned in ("qwen --", "--approval-mode", "OPENAI_API_KEY"):
+        assert banned not in section, banned
+    for needed in (
+        "ZHIPU_API_KEY",
+        "glm-5.3",
+        "https://docs.z.ai/devpack/usage-policy",
+        "opencode run",
+        "advisor.Containerfile",
+        "advisor-image",
+    ):
+        assert needed in section, needed
+    assert "glm-5.1" not in section.replace("5.1 и 5.2", "")
 
 
 def test_the_advisor_wrapper_refuses_an_unsafe_key_file(tmp_path) -> None:
@@ -2944,7 +3116,7 @@ def test_the_service_trusts_its_config_only_through_a_checked_chain(
         )
         return runner_mod.advisor_settings(cfg)
 
-    assert settings(conf) == ("glm-5.1", 5, "")
+    assert settings(conf) == ("glm-5.3", 5, "")
 
     # ссылка в ПРЕДКЕ пути: последний компонент — не ссылка, но цепочка подменяема
     os.symlink(tmp_path / "real", tmp_path / "alias")
@@ -2979,7 +3151,7 @@ def test_the_service_trusts_its_config_only_through_a_checked_chain(
         return real_open(path, *a, **k)
 
     monkeypatch.setattr(runner_mod.os, "open", counting)
-    assert settings(conf)[0] == "glm-5.1"
+    assert settings(conf)[0] == "glm-5.3"
     assert sum(o.endswith("advisor-model") for o in opened) == 1, opened
 
 
@@ -3006,8 +3178,8 @@ async def test_a_forged_heartbeat_does_not_launch_another_model(
 ) -> None:
     """#1649 (Codex P2-1): heartbeat — подсказка; модель задания сверяет служба.
 
-    Хаб пишет heartbeat тем же uid и может объявить glm-5.1; пока в защищённой
-    конфигурации стоит другая модель, задание с model=glm-5.1 отказано до
+    Хаб пишет heartbeat тем же uid и может объявить glm-5.3; пока в защищённой
+    конфигурации стоит другая модель, задание с model=glm-5.3 отказано до
     запуска, а задание с model=эталон проходит.
     """
     rec = tmp_path / "ran"
@@ -3029,7 +3201,7 @@ async def test_a_forged_heartbeat_does_not_launch_another_model(
             {
                 "capabilities": {
                     "profiles": ["review", "advisor"],
-                    "advisor_model": "glm-5.1",
+                    "advisor_model": "glm-5.3",
                 }
             }
         )
@@ -3037,7 +3209,7 @@ async def test_a_forged_heartbeat_does_not_launch_another_model(
     forged = _write_job(
         spool,
         "job-" + "7" * 16,
-        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.1"},
+        {"version": 3, "timeout_sec": 5, "profile": "advisor", "model": "glm-5.3"},
     )
     await runner_mod.run_pending(cfg)
     result = json.loads((forged / "result.json").read_text())
