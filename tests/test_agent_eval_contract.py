@@ -273,3 +273,178 @@ def test_unknown_expectation_is_rejected_loudly():
     odd = Canary(name="odd", expectation="whatever", facts={}, planted="x")
     with pytest.raises(ValueError):
         ct.build_manifest([odd])
+
+
+# --- Обходы, найденные ревью (Codex на ea7dcac) ---------------------------------
+
+
+def _passed_run():
+    manifest = ct.build_manifest()
+    return manifest, ct.build_run(manifest, _responses(manifest), META)
+
+
+def test_validate_rejects_forged_verdict_with_passed_outcome():
+    """P1-1: исход пересчитывается evaluate по доверенной expectation."""
+    manifest, run = _passed_run()
+    for forged_verdict in ("approve", None):
+        forged = copy.deepcopy(run)
+        rec = next(c for c in forged["cases"] if c["critical"])
+        rec["verdict"] = forged_verdict
+        rec["outcome"] = "passed"
+        assert ct.validate_run(forged, manifest), forged_verdict
+    # подмена expectation/critical у записи тоже видна
+    forged = copy.deepcopy(run)
+    next(c for c in forged["cases"] if c["critical"])["critical"] = False
+    assert ct.validate_run(forged, manifest)
+    assert ct.validate_run(run, manifest) == []
+
+
+def test_validate_rejects_consistent_case_removal():
+    """P1-2: согласованное удаление case и пересчёт summary не проходят."""
+    manifest, run = _passed_run()
+    forged = copy.deepcopy(run)
+    gone = forged["cases"].pop(0)["case_id"]
+    forged["manifest"]["case_ids"].remove(gone)
+    forged["summary"] = ct.summarize(forged["cases"])
+    assert forged["status"] == "passed"
+    errors = ct.validate_run(forged, manifest)
+    assert errors and any("case_ids" in e or "cases" in e for e in errors)
+    # хэш и версия сверяются с доверенными
+    for key, value in (("manifest_hash", "0" * 64), ("suite_version", "other")):
+        bad = copy.deepcopy(run)
+        bad["manifest"][key] = value
+        assert any(key in e for e in ct.validate_run(bad, manifest))
+    # без явного манифеста — доверенный собирается из all_canaries()
+    assert ct.validate_run(forged)
+
+
+def test_required_identity_fields_in_build_and_validate():
+    """P2-3: версия, params, meta, schema_version обязательны и в build_run, и в validate_run."""
+    manifest, run = _passed_run()
+    no_params = ct.RunMeta(**{**META.__dict__, "params": None})
+    built = ct.build_run(manifest, _responses(manifest), no_params)
+    assert built["status"] == "incomplete"
+    assert "meta.params" in {p["path"] for p in built["problems"]}
+
+    blank = ct.build_manifest(suite_version=" ")
+    built = ct.build_run(blank, _responses(blank), META)
+    assert built["status"] == "incomplete"
+    assert "manifest_invalid" in _problem_kinds(built)
+
+    for mutate in (
+        lambda r: r.pop("meta"),
+        lambda r: r["meta"].pop("model"),
+        lambda r: r["meta"].__setitem__("params", None),
+        lambda r: r.pop("schema_version"),
+    ):
+        forged = copy.deepcopy(run)
+        mutate(forged)
+        assert ct.validate_run(forged, manifest)
+
+
+@pytest.mark.parametrize(
+    "bad, field",
+    [
+        ({"verdict": "approve", "confidence": "maybe"}, "confidence"),
+        ({"verdict": "approve", "confidence": ["high"]}, "confidence"),
+        ({"verdict": []}, "verdict"),
+        ({"verdict": {"a": 1}}, "verdict"),
+    ],
+)
+def test_broken_judgement_is_a_problem_not_an_exception(bad, field):
+    """P2-4: битые данные называют case и путь, исключения нет."""
+    manifest = ct.build_manifest()
+    victim = manifest.cases[0].case_id
+    good = _responses(manifest)
+    broken = [ct.CaseResponse(case_id=victim, judgement=bad)] + good[1:]
+    run = ct.build_run(manifest, broken, META)
+    assert run["status"] == "incomplete"
+    prob = next(p for p in run["problems"] if p["kind"] == "malformed_response")
+    assert prob["case_id"] == victim and field in prob["path"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"latency_ms": float("nan")},
+        {"latency_ms": float("inf")},
+        {"latency_ms": -1.0},
+        {"usage": {"input_tokens": float("inf")}},
+        {"usage": {"input_tokens": float("nan")}},
+        {"usage": {"input_tokens": -3}},
+    ],
+)
+def test_non_finite_numbers_are_problems(extra):
+    manifest = ct.build_manifest()
+    victim = manifest.cases[0].case_id
+    good = _responses(manifest)
+    bad = ct.CaseResponse(case_id=victim, judgement=good[0].judgement, **extra)
+    run = ct.build_run(manifest, [bad] + good[1:], META)
+    assert run["status"] == "incomplete"
+    prob = next(p for p in run["problems"] if p["kind"] == "malformed_response")
+    assert prob["case_id"] == victim
+    json.dumps(run, allow_nan=False)
+
+
+def test_prompt_hash_covers_delivery_block(monkeypatch):
+    """P2-5: статический текст блока доступа входит в хэш промпта."""
+    from hub.services import steward_shadow
+
+    before = ct.working_prompt_hash()
+    original = steward_shadow.delivery_block
+    monkeypatch.setattr(
+        steward_shadow,
+        "delivery_block",
+        lambda *a, **k: original(*a, **k) + "\nновое правило",
+    )
+    assert ct.working_prompt_hash() != before
+
+
+def test_catalog_hash_covers_whole_tool_contract(monkeypatch):
+    """P2-6: хэш каталога чувствителен к outputSchema и описанию, не к константе."""
+    from hub import mcp_server
+    from mcp import types
+
+    def tool(**extra):
+        return types.Tool(
+            name="t", description="d", inputSchema={"type": "object"}, **extra
+        )
+
+    async def hash_for(*tools):
+        async def listing(_view):
+            return list(tools)
+
+        monkeypatch.setattr(mcp_server.mcp, "list_tools_for", listing)
+        return await ct.working_catalog_hash()
+
+    base = asyncio.run(hash_for(tool()))
+    with_out = asyncio.run(hash_for(tool(outputSchema={"type": "object"})))
+    other_out = asyncio.run(
+        hash_for(tool(outputSchema={"type": "object", "required": ["a"]}))
+    )
+    described = asyncio.run(
+        hash_for(types.Tool(name="t", description="e", inputSchema={"type": "object"}))
+    )
+    assert len({base, with_out, other_out, described}) == 4
+
+
+def test_manifest_hash_ignores_input_order():
+    """P2-7: порядок канареек не меняет хэш."""
+    forward = ct.build_manifest(all_canaries())
+    backward = ct.build_manifest(list(reversed(all_canaries())))
+    assert forward.manifest_hash == backward.manifest_hash
+    assert [c.case_id for c in forward.cases] == [c.case_id for c in backward.cases]
+
+
+def test_manifest_is_a_snapshot_of_facts():
+    """P2-8: правка facts после сборки не меняет манифест; порча снимка видна."""
+    source = list(all_canaries())
+    manifest = ct.build_manifest(source)
+    source[0].facts["injected"] = {"state": "present", "value": {}}
+    assert ct.build_manifest(all_canaries()).manifest_hash == manifest.manifest_hash
+    assert ct.build_run(manifest, _responses(manifest), META)["status"] == "passed"
+    # порча самого снимка ловится сверкой facts_hash в build_run
+    manifest.canaries[0].facts["injected"] = 1
+    run = ct.build_run(manifest, _responses(manifest), META)
+    assert run["status"] == "incomplete"
+    assert "manifest_tampered" in _problem_kinds(run)
