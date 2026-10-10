@@ -2686,6 +2686,22 @@ def _review_circle_line(brief: dict[str, Any]) -> str:
     return line
 
 
+# #1652: the assembly time is named in the text only when it was slow. The
+# threshold is the hub's own (the log record uses the same one).
+def _brief_timings_line(brief: dict[str, Any]) -> str:
+    """Slow-assembly line of the text brief; empty when the assembly was fast."""
+    from hub.services.review_brief import SLOW_BRIEF_MS
+
+    timings = brief.get("timings") or {}
+    total = int(timings.get("total_ms") or 0)
+    if total <= SLOW_BRIEF_MS:
+        return ""
+    blocks = timings.get("blocks") or {}
+    slowest = sorted(blocks.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:3]
+    named = ", ".join(f"{name} {int(ms)} мс" for name, ms in slowest)
+    return f"сборка {total} мс; самые долгие: {named}"
+
+
 def _profile_downgrade_line(brief: dict[str, Any]) -> str:
     """Строка о том, что deep понижен до lite потолком или кругом (#1587)."""
     block = brief.get("profile_downgrade") or {}
@@ -2822,6 +2838,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             _generation_review_line(brief),
             _review_circle_line(brief),
             _profile_downgrade_line(brief),
+            _brief_timings_line(brief),
         )
         if line
     )
