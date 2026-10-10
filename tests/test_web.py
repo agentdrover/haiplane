@@ -7728,3 +7728,85 @@ async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
     )
     assert ok.status_code == 303 and "review_error" not in ok.headers["location"]
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_project_form_saves_local_review_fallback(client: AsyncClient):
+    """AC-8 (#1653): on/off сохранены, нет поля — ключ цел, пусто — снят, мусор — отказ."""
+    from urllib.parse import unquote_plus
+
+    other = {"ci_runner": "make test", "wip_limit": 2, "deep_reviewer": "local"}
+    pid = await _project_with_policy(client, "lrf-form", dict(other))
+    page = (await client.get("/projects")).text
+    block = _cost_form_block(page, pid)
+    assert 'name="gate_policy_local_review_fallback"' in block
+    assert "off" in _now_text(block, "local_review_fallback")
+
+    async def _post(data):
+        return await client.post(
+            f"/projects/{pid}/web-edit", data=data, follow_redirects=False
+        )
+
+    resp = await _post(
+        {"gate_policy_local_review_fallback": "on", "gate_policy_deep_daily_cap": "3"}
+    )
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy["local_review_fallback"] == "on" and policy["deep_daily_cap"] == 3
+    assert {k: policy[k] for k in other} == other, "соседние настройки не потеряны"
+    page = (await client.get("/projects")).text
+    assert "on (project)" in _now_text(
+        _cost_form_block(page, pid), "local_review_fallback"
+    )
+    assert re.search(r'<option value="on"\s+selected', _cost_form_block(page, pid)), (
+        "выбор отражает сохранённое"
+    )
+
+    resp = await _post({"gate_policy_local_review_fallback": "off"})
+    assert (await _policy_of(client, pid))["local_review_fallback"] == "off"
+
+    await _post({"gate_policy_local_review_fallback": "on"})
+    resp = await _post({"gate_policy_review": "off"})  # форма без поля
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert (await _policy_of(client, pid))["local_review_fallback"] == "on"
+
+    before = await _policy_of(client, pid)
+    resp = await _post({"gate_policy_local_review_fallback": "maybe"})
+    assert "project_error" in unquote_plus(resp.headers.get("location", ""))
+    assert await _policy_of(client, pid) == before, "отказ не меняет политику"
+
+    resp = await _post({"gate_policy_local_review_fallback": ""})  # пустой выбор
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert "local_review_fallback" not in policy
+    assert {k: policy[k] for k in other} == other
+
+
+async def test_project_form_local_review_fallback_keeps_the_full_form_neighbours(
+    client: AsyncClient,
+):
+    """#1653 P3: полная форма — review, verdict, release и соседние ключи не теряются."""
+    other = {"ci_runner": "make test", "deep_reviewer": "local", "wip_limit": 2}
+    pid = await _project_with_policy(client, "lrf-full", dict(other))
+    full = {
+        "gate_policy_dor": "human",
+        "gate_policy_verdict": "human",
+        "gate_policy_review": "dispatch",
+        "gate_policy_release": "auto",
+        "gate_policy_deep_reviewer": "local",
+    }
+    for value in ("on", "off", ""):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={**full, "gate_policy_local_review_fallback": value},
+            follow_redirects=False,
+        )
+        assert "project_error" not in resp.headers.get("location", ""), resp.headers
+        policy = await _policy_of(client, pid)
+        assert policy.get("local_review_fallback") == (value or None), policy
+        assert policy["review"] == "dispatch" and policy["release"] == "auto"
+        assert policy["verdict"] == "human" and policy["dor"] == "human"
+        assert policy["deep_reviewer"] == "local"
+        assert {k: policy[k] for k in ("ci_runner", "wip_limit")} == {
+            "ci_runner": "make test",
+            "wip_limit": 2,
+        }
