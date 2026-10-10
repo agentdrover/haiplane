@@ -1736,6 +1736,10 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
     assert brief["call_sites"]["status"] == "not_applicable"
     assert brief["ac_test_results"] == [] and brief["locator_resolution"] == []
     assert brief["path_notices"] is None
+    for block in ("mutations", "baseline"):
+        ci = brief["ci_evidence"][block]
+        assert ci["state"] == "not_applicable", (block, ci)
+        assert "не получено" not in ci["reason"] and "не прислан" not in ci["reason"]
     assert brief["evidence_coverage"]["state"] == "complete"
     missing = {c["check"] for c in brief["evidence_coverage"]["checks_missing"]}
     assert not missing, "ничего из кода не «отсутствует»: оно не применимо"

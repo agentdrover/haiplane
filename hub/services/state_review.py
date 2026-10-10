@@ -34,6 +34,8 @@ from hub import repository as repo
 from hub.models import (
     BaseMergeState,
     CallSiteSection,
+    CIEvidenceBlock,
+    CIEvidenceState,
     CIRunReportState,
     EvidenceCoverage,
     GenerationReview,
@@ -224,6 +226,10 @@ def state_coverage(view: StateReviewView) -> EvidenceCoverage:
     )
 
 
+def _ci_block(reason: str) -> CIEvidenceBlock:
+    return CIEvidenceBlock(state=NOT_APPLICABLE, reason=reason)
+
+
 async def build_state_brief(
     db: aiosqlite.Connection, task_id: int, row: Any
 ) -> ReviewBrief:
@@ -262,6 +268,12 @@ async def build_state_brief(
         call_sites=CallSiteSection(status=NOT_APPLICABLE, reason=reasons["call_sites"]),
         ci_run_report=CIRunReportState(
             state=NOT_APPLICABLE, reason=reasons["ci_run_report"]
+        ),
+        # Мутации и baseline приходят из отчёта CI; CI у state нет — это не
+        # «не получено» (так читалась бы потеря), а «не применимо».
+        ci_evidence=CIEvidenceState(
+            mutations=_ci_block(reasons["ci_run_report"]),
+            baseline=_ci_block(reasons["ci_run_report"]),
         ),
         prepass=PrepassState(state=NOT_APPLICABLE, reason=reasons["ci_run_report"]),
         validation=ValidationStanding(

@@ -93,8 +93,8 @@ def _field(task: Mapping[str, Any] | Any, name: str) -> Any:
 def state_accepted(task: Mapping[str, Any] | Any | None) -> bool:
     """State-задача ПРИНЯТА на текущем поколении (#1648). Единый признак.
 
-    Принята = ``result_kind=state``, статус ``completed`` и вердикт APPROVED,
-    записанный на ТЕКУЩЕЕ поколение сдачи (так завершает вердикт человека,
+    Принята = ``result_kind=state``, статус ``completed`` и ДЕЙСТВУЮЩЕЕ
+    одобрение: APPROVED на ТЕКУЩЕЕ поколение сдачи при незакрытом окне (так завершает вердикт человека,
     ``via=state_approved``). Читатели готовности зависимостей зовут ТОЛЬКО это
     имя: статус сам по себе принятия не доказывает (задачу закрывает и
     force-complete), а чужое поколение — не принятие сегодняшней сдачи.
@@ -104,11 +104,27 @@ def state_accepted(task: Mapping[str, Any] | Any | None) -> bool:
         return False
     if _text_of(_field(task, "status")) != "completed":
         return False
-    if _text_of(_field(task, "review_verdict")) != "approved":
-        return False
-    generation = int(_field(task, "submission_generation") or 0)
-    return generation > 0 and (
-        int(_field(task, "review_verdict_generation") or 0) == generation
+    # ЕДИНЫЙ читатель «одобрение ещё действует» (#1286): APPROVED на текущее
+    # поколение и окно одобрения не закрыто решением человека (rework). Своей
+    # копии правила здесь нет — иначе карточка (latest_review.is_current) и
+    # готовность зависимых разошлись бы: отозванное одобрение разблокировало бы
+    # зависимые после force-complete.
+    from hub.services.orchestration import review_approved_for_current_submission
+
+    return review_approved_for_current_submission(
+        {
+            name: (
+                _text_of(_field(task, name))
+                if name == "review_verdict"
+                else _field(task, name)
+            )
+            for name in (
+                "submission_generation",
+                "review_verdict",
+                "review_verdict_generation",
+                "review_verdict_closed_generation",
+            )
+        }
     )
 
 
