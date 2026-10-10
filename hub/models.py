@@ -1818,7 +1818,9 @@ class BriefTimings(BaseModel):
 
     ``blocks`` holds only the blocks that applied to the task: an absent name
     means "not asked", never "took 0 ms". ``total_ms`` runs from the entry of
-    the builder to the return of the object, on a monotonic clock.
+    the builder to the return of the object, on a monotonic clock; it is read
+    before the slow-brief log line is written (total_ms — до записи slow-brief
+    лога). The blocks add up to ``total_ms`` exactly.
     """
 
     blocks: dict[str, int] = Field(default_factory=dict)

@@ -708,6 +708,40 @@ def _add_ignored(root, monkeypatch, tmp_path):
     return root, False
 
 
+def _renamed_py(root, monkeypatch, tmp_path):
+    _git(root, "mv", "hub/bulk.py", "hub/bulk.txt")  # staged: "R  old -> new"
+    return root, False
+
+
+def _gitlink(root, monkeypatch, tmp_path):
+    head = _git(root, "rev-parse", "HEAD").stdout.strip()
+    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{head},hub/vendor")
+    return root, False
+
+
+def _symlinked_py(root, monkeypatch, tmp_path):
+    (root / "hub" / "linked.py").symlink_to("core.py")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "a tracked symlink")
+    return root, False
+
+
+def _head_moves_between_head_and_status(root, monkeypatch, tmp_path):
+    real = call_sites._indexed_tree_is_clean
+    moved = []
+
+    def status_after_a_checkout(path, subdirs):
+        if not moved:
+            moved.append(True)
+            (root / "hub" / "late.py").write_text("def late():\n    return guard(5)\n")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-qm", "checked out between HEAD and status")
+        return real(path, subdirs)
+
+    monkeypatch.setattr(call_sites, "_indexed_tree_is_clean", status_after_a_checkout)
+    return root, False
+
+
 def _head_moves_during_build(root, monkeypatch, tmp_path):
     call_sites.clear_index_cache()  # the build below must really happen
     real = call_sites.build_call_index
@@ -741,6 +775,12 @@ def _not_a_repository(root, monkeypatch, tmp_path):
         pytest.param(_edit_tracked, id="modified-tracked"),
         pytest.param(_add_untracked, id="untracked"),
         pytest.param(_add_ignored, id="ignored"),
+        pytest.param(_renamed_py, id="renamed-py"),
+        pytest.param(_gitlink, id="gitlink"),
+        pytest.param(_symlinked_py, id="symlinked-py"),
+        pytest.param(
+            _head_moves_between_head_and_status, id="head-moves-before-status"
+        ),
         pytest.param(_head_moves_during_build, id="head-moves-during-build"),
         pytest.param(_not_a_repository, id="not-a-repository"),
     ],
@@ -755,7 +795,9 @@ def test_call_index_cache_never_serves_a_stale_tree(
 
     target, grows = scenario(root, monkeypatch, tmp_path)
 
+    builder = _CountingBuilder(monkeypatch)
     got = call_sites.analyse(str(target), core_diff)
+    assert builder.calls == 1, "the warm entry was not served"
     assert got == _uncached(monkeypatch, target, core_diff)
     if scenario is _head_moves_during_build:
         assert len(call_sites._index_cache) == 0, "a build that straddled a commit"

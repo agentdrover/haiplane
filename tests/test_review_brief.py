@@ -1797,10 +1797,11 @@ async def test_brief_reports_block_timings(
         "call_sites": 60,
         "verdict_route": 70,
         "db_reads": 5 + 3,
-        "assemble": 7 + 1,
+        # 4 ms of sha_check_of, a pure transformation, sit in assemble too.
+        "assemble": 7 + 1 + 4,
     }
-    # 4 ms spent outside every zone: the total is the interval, not a sum.
-    assert brief.timings.total_ms == 10 + 20 + 30 + 40 + 50 + 60 + 70 + 8 + 8 + 4
+    assert brief.timings.total_ms == 10 + 20 + 30 + 40 + 50 + 60 + 70 + 8 + 12
+    assert sum(brief.timings.blocks.values()) == brief.timings.total_ms, "no gap"
 
     clock.advance_ms(0)
     second = await rb.build_review_brief(db, plain)
@@ -1812,6 +1813,7 @@ async def test_brief_reports_block_timings(
         "assemble",
     }, "a block that did not apply is absent, not zero"
     assert "test_locators" not in second.timings.blocks
+    assert sum(second.timings.blocks.values()) == second.timings.total_ms
     assert "base_merge" not in second.timings.blocks
 
     # The three readers: REST, MCP structuredContent, CLI.

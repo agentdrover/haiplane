@@ -81,15 +81,21 @@ def _now_ns() -> int:
 
 
 def _ns_to_ms(ns: int) -> int:
-    return (ns + 500_000) // 1_000_000
+    # Floor, never round: the blocks then cannot add up to more than the total,
+    # and ``assemble`` takes the remainder exactly.
+    return ns // 1_000_000
 
 
 class _BriefTimer:
     """Per-block durations of one assembly (#1652).
 
-    Each block name has exactly one accounting zone in ``build_review_brief``;
-    zones never nest, so no interval is counted twice. A block that does not
-    apply to the task is never entered and is therefore absent, not zero.
+    Each block but ``assemble`` has exactly one accounting zone in
+    ``build_review_brief`` (awaited reads and service calls); zones never nest,
+    so no interval is counted twice. A block that does not apply to the task is
+    never entered and is therefore absent, not zero. ``assemble`` is everything
+    outside those zones — the pure transformations and the construction of the
+    models — taken as the remainder, so the blocks add up to ``total_ms`` with
+    no gap and no overlap.
     """
 
     def __init__(self) -> None:
@@ -112,10 +118,10 @@ class _BriefTimer:
             return await awaitable
 
     def finish(self) -> BriefTimings:
-        return BriefTimings(
-            blocks={name: _ns_to_ms(ns) for name, ns in self._ns.items()},
-            total_ms=_ns_to_ms(_now_ns() - self._start),
-        )
+        total_ms = _ns_to_ms(_now_ns() - self._start)
+        blocks = {name: _ns_to_ms(ns) for name, ns in self._ns.items()}
+        blocks["assemble"] = total_ms - sum(blocks.values())
+        return BriefTimings(blocks=blocks, total_ms=total_ms)
 
 
 async def build_call_sites_section(
@@ -425,8 +431,7 @@ async def build_review_brief(
     if not row:
         return None
     task_row = dict(row)
-    with timer.block("assemble"):
-        task_view = services.row_to_task(row)
+    task_view = services.row_to_task(row)
     project_row = await timer.run(
         "db_reads", repo.resolve_project_for_task(db, task_id)
     )
@@ -483,25 +488,22 @@ async def build_review_brief(
     # the poller's steward path, so it must never import the branch's code
     # (conftest.py, plugins, the tests themselves). Only pays the git reads
     # when the brief actually has test-AC to check.
-    with timer.block("assemble"):
-        ac_models = [services.row_to_ac(r) for r in ac_rows]
+    ac_models = [services.row_to_ac(r) for r in ac_rows]
     locator_resolution: list[ACLocatorResolution] = []
     if any(a.verifiable_by.value == "test" for a in ac_models):
         with timer.block("test_locators"):
             ctx = await services.project_git_context(db, task_id)
-            locator_resolution = [
-                ACLocatorResolution(**r)
-                for r in await resolve_locators_at_ref(
-                    plugins.git_ops,
-                    ctx.get("repo"),
-                    ac_models,
-                    submission_sha=task_view.submission_sha or "",
-                    branch=task_view.branch or "",
-                    base=diff_base.get("base")
-                    or ctx.get("base_branch")
-                    or config.PAIR_BASE_BRANCH,
-                )
-            ]
+            resolved = await resolve_locators_at_ref(
+                plugins.git_ops,
+                ctx.get("repo"),
+                ac_models,
+                submission_sha=task_view.submission_sha or "",
+                branch=task_view.branch or "",
+                base=diff_base.get("base")
+                or ctx.get("base_branch")
+                or config.PAIR_BASE_BRANCH,
+            )
+        locator_resolution = [ACLocatorResolution(**r) for r in resolved]
 
     # #572: does the branch still stand where the submission pinned it? Three
     # states, never collapsed — the reviewer must see "could not look" as
@@ -542,13 +544,12 @@ async def build_review_brief(
 
     # #507: recorded pass/fail of each test-AC for the current generation.
     ac_result_rows = await timer.run("db_reads", repo.list_ac_test_results(db, task_id))
-    with timer.block("assemble"):
-        ac_test_results = [
-            ACTestResultView(**r)
-            for r in current_ac_test_results(
-                ac_result_rows, task_view.submission_generation or 0
-            )
-        ]
+    ac_test_results = [
+        ACTestResultView(**r)
+        for r in current_ac_test_results(
+            ac_result_rows, task_view.submission_generation or 0
+        )
+    ]
 
     # #546: is there run evidence for the COMMIT under review? Two states only,
     # and the unknown one always carries its cause — a reviewer must be able to
@@ -606,20 +607,19 @@ async def build_review_brief(
     # words are. Four blocks silent, one reassuring wrongly and one narrow-but-
     # green read as six independent findings across a day of briefs; they were
     # one absence, and only a combined statement says so.
-    with timer.block("assemble"):
-        coverage = review_evidence.evidence_coverage(
-            diff_base=diff_base,
-            branch=task_view.branch or "",
-            call_sites_status=call_sites_section.status,
-            has_test_acs=any(a.verifiable_by.value == "test" for a in ac_models),
-            locator_resolution=locator_resolution,
-            ac_test_results=ac_test_results,
-            ci_state=ci_state,
-            freshness=freshness,
-            sha_check=sha_check,
-            live_check=live_check,
-            base_merge=base_merge_state.model_dump(),
-        )
+    coverage = review_evidence.evidence_coverage(
+        diff_base=diff_base,
+        branch=task_view.branch or "",
+        call_sites_status=call_sites_section.status,
+        has_test_acs=any(a.verifiable_by.value == "test" for a in ac_models),
+        locator_resolution=locator_resolution,
+        ac_test_results=ac_test_results,
+        ci_state=ci_state,
+        freshness=freshness,
+        sha_check=sha_check,
+        live_check=live_check,
+        base_merge=base_merge_state.model_dump(),
+    )
 
     # #808: the block the human reads at the gate, built by the same function
     # that feeds the task card. Two readers, one report.
@@ -647,73 +647,73 @@ async def build_review_brief(
     growth_updates = await timer.run(
         "db_reads", repo.get_task_updates(db, task_row["id"])
     )
-    with timer.block("assemble"):
-        scope_growth = [
-            str(u["content"])
-            for u in reversed(list(growth_updates))
-            if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
-        ]
+    scope_growth = [
+        str(u["content"])
+        for u in reversed(list(growth_updates))
+        if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
+    ]
 
     late = await _late_reads(db, task_row, task_view, mr_row, timer)
 
-    with timer.block("assemble"):
-        brief = ReviewBrief(
-            **late,
-            review_report=brief_review_report,
-            task_id=task_view.id,
-            title=task_view.title,
-            status=task_view.status,
-            description=task_view.description,
-            project=task_view.project,
-            acceptance_criteria=ac_models,
-            locator_resolution=locator_resolution,
-            ac_test_results=ac_test_results,
-            ci_run_report=ci_run_report,
-            prepass=prepass,
-            validation=validation,
-            live_check=LiveCheckState(**live_check),
-            statement_freshness=freshness,
-            scope_in=task_view.scope_in,
-            scope_out=task_view.scope_out,
-            scope_growth=scope_growth,
-            out_of_scope_for_review=task_view.out_of_scope_for_review,
-            review_checklist=task_view.review_checklist,
-            validation_commands=task_view.validation_commands,
-            constraints=task_view.constraints,
-            technical_hints=task_view.technical_hints,
-            outcome_metric=task_view.outcome_metric,
-            outcome_indicator=task_view.outcome_indicator,
-            outcome_deadline=task_view.outcome_deadline,
-            outcome_revisit_condition=task_view.outcome_revisit_condition,
-            redesign_decision=task_view.redesign_decision,
-            redesign_rationale=task_view.redesign_rationale,
-            agent_fit=task_view.agent_fit,
-            branch=task_view.branch,
-            pr_number=task_view.pr_number,
-            diff_command=diff_command,
-            diff_base=DiffBaseState(**diff_base),
-            base_merge=base_merge_state,
-            evidence_coverage=EvidenceCoverage(**coverage),
-            submission_sha=submission_sha,
-            current_branch_tip=current_tip,
-            sha_check=sha_check,
-            sha_check_reason=sha_check_reason,
-            call_sites=call_sites_section,
-            review_cycle=task_view.review_cycle,
-            submission_generation=task_view.submission_generation,
-            latest_submission_summary=latest_submission_summary,
-            latest_review=task_view.latest_review,
-            machine_review=machine_review,
-            self_review_warning=self_review_warning,
-            stacking_warning=stacking_warning,
-        )
-    brief.timings = timer.finish()
-    if brief.timings.total_ms > SLOW_BRIEF_MS:
+    brief = ReviewBrief(
+        **late,
+        review_report=brief_review_report,
+        task_id=task_view.id,
+        title=task_view.title,
+        status=task_view.status,
+        description=task_view.description,
+        project=task_view.project,
+        acceptance_criteria=ac_models,
+        locator_resolution=locator_resolution,
+        ac_test_results=ac_test_results,
+        ci_run_report=ci_run_report,
+        prepass=prepass,
+        validation=validation,
+        live_check=LiveCheckState(**live_check),
+        statement_freshness=freshness,
+        scope_in=task_view.scope_in,
+        scope_out=task_view.scope_out,
+        scope_growth=scope_growth,
+        out_of_scope_for_review=task_view.out_of_scope_for_review,
+        review_checklist=task_view.review_checklist,
+        validation_commands=task_view.validation_commands,
+        constraints=task_view.constraints,
+        technical_hints=task_view.technical_hints,
+        outcome_metric=task_view.outcome_metric,
+        outcome_indicator=task_view.outcome_indicator,
+        outcome_deadline=task_view.outcome_deadline,
+        outcome_revisit_condition=task_view.outcome_revisit_condition,
+        redesign_decision=task_view.redesign_decision,
+        redesign_rationale=task_view.redesign_rationale,
+        agent_fit=task_view.agent_fit,
+        branch=task_view.branch,
+        pr_number=task_view.pr_number,
+        diff_command=diff_command,
+        diff_base=DiffBaseState(**diff_base),
+        base_merge=base_merge_state,
+        evidence_coverage=EvidenceCoverage(**coverage),
+        submission_sha=submission_sha,
+        current_branch_tip=current_tip,
+        sha_check=sha_check,
+        sha_check_reason=sha_check_reason,
+        call_sites=call_sites_section,
+        review_cycle=task_view.review_cycle,
+        submission_generation=task_view.submission_generation,
+        latest_submission_summary=latest_submission_summary,
+        latest_review=task_view.latest_review,
+        machine_review=machine_review,
+        self_review_warning=self_review_warning,
+        stacking_warning=stacking_warning,
+    )
+    # Last act before the log line and the return: total_ms is read here.
+    timings = timer.finish()
+    brief.timings = timings
+    if timings.total_ms > SLOW_BRIEF_MS:
         log.warning(
             "slow-brief task_id=%s total_ms=%s timings=%s",
             task_id,
-            brief.timings.total_ms,
-            brief.timings.model_dump(),
+            timings.total_ms,
+            timings.model_dump(),
         )
     return brief
 
@@ -736,33 +736,33 @@ async def _late_reads(
     sha_key = {"id": task_id, "submission_sha": task_view.submission_sha}
     with timer.block("db_reads"):
         circle = await review_circle(db, task_id)
-        late: dict[str, Any] = {
-            "profile_downgrade": await profile_downgrade_of(
-                db, task_id, generation, mr_row
-            ),
-            # #920: the rules this area already paid for, from category_checks.
-            # An empty list renders no section at all — never a header over
-            # nothing.
-            "catalogue_rules": [
-                CatalogueRuleView(**r)
-                for r in await rules_for_areas(db, list(task_view.affected_areas or []))
-            ],
-            "review_circle": ReviewCircleView(
-                laps=circle.count,
-                threshold=circle.threshold,
-                named=circle.named,
-                breakdown=circle.breakdown(),
-                repeated_categories=list(circle.repeated_categories),
-            ),
-            "outcome_status": await outcome_status_for_task(db, task_row),
-            "ci_evidence": await review_evidence.ci_evidence_state(db, sha_key),
-            # #1589: результат ТЕКУЩЕГО поколения; предыдущие не показываются.
-            "path_notices": await path_notices.view_for_generation(
-                db, task_id, generation
-            ),
-            "review_in_flight": await review_evidence.inflight_view(db, task_row),
-            "current_generation_review": await generation_review(db, task_row),
-        }
+        downgrade = await profile_downgrade_of(db, task_id, generation, mr_row)
+        # #920: the rules this area already paid for, from category_checks.
+        rule_rows = await rules_for_areas(db, list(task_view.affected_areas or []))
+        outcome_status = await outcome_status_for_task(db, task_row)
+        ci_evidence = await review_evidence.ci_evidence_state(db, sha_key)
+        # #1589: результат ТЕКУЩЕГО поколения; предыдущие не показываются.
+        notices = await path_notices.view_for_generation(db, task_id, generation)
+        in_flight = await review_evidence.inflight_view(db, task_row)
+        generation_state = await generation_review(db, task_row)
+    # Models are built outside the read zone: they are assembly, not a read.
+    late: dict[str, Any] = {
+        "profile_downgrade": downgrade,
+        # An empty list renders no section at all — never a header over nothing.
+        "catalogue_rules": [CatalogueRuleView(**r) for r in rule_rows],
+        "review_circle": ReviewCircleView(
+            laps=circle.count,
+            threshold=circle.threshold,
+            named=circle.named,
+            breakdown=circle.breakdown(),
+            repeated_categories=list(circle.repeated_categories),
+        ),
+        "outcome_status": outcome_status,
+        "ci_evidence": ci_evidence,
+        "path_notices": notices,
+        "review_in_flight": in_flight,
+        "current_generation_review": generation_state,
+    }
     late["verdict_route"] = (
         await timer.run("verdict_route", _brief_verdict_route(db, task_view))
         if task_view.status == TaskStatus.review
