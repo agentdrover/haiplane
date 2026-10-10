@@ -441,6 +441,16 @@ async def test_form_body_is_replayed_unchanged_to_the_handler(world, monkeypatch
     assert big.status_code == 403 and "csrf_failed" in big.text
     assert len(seen) < count, "the whole body was read before refusing"
 
+    # A body that cannot carry a form field is not read at all.
+    seen.clear()
+    unread = await client.post(
+        "/__csrf_echo",
+        headers={**base, "content-type": "application/json"},
+        content=_chunks(count, chunk, seen),
+    )
+    assert unread.status_code == 403 and "csrf_failed" in unread.text
+    assert seen == [], "a JSON body was read to look for a form field"
+
     # In warn mode the same request goes through and the handler still gets
     # every byte: what was buffered plus what had not been read yet.
     _set_mode(monkeypatch, "warn")
@@ -480,6 +490,7 @@ async def test_foreign_origin_is_refused_even_with_a_valid_token(world, monkeypa
         "https://evil.example",
         "https://hub.example.test.evil.example",
         "http://hub.example.test",
+        "http://hub.example.test:443",
         "https://hub.example.test:8443",
         "null",
         "not a url",
@@ -610,3 +621,39 @@ async def test_health_warns_when_the_secret_is_not_from_env(client, monkeypatch)
     assert health["csrf_key_source"] == "env"
     assert not health["csrf_warning"]
     csrf.reset_secret_cache()
+
+
+@pytest.mark.asyncio
+async def test_handlers_that_check_the_token_themselves_accept_the_session_token(
+    world, monkeypatch
+):
+    """``_human_door`` and ``_check_web_csrf`` read the transport and the token.
+
+    Mode ``off`` switches the middleware away, so only the handler decides.
+    """
+    _set_mode(monkeypatch, "off")
+    client = world.client
+    token = await _page_token(world, world.session_a)
+    cookie = _cookie(world.session_a)
+
+    start = "/api/auth/chat-pair/start"
+    assert (await client.post(start, headers=cookie)).status_code == 403
+    wrong = await client.post(start, headers={**cookie, "X-CSRF-Token": "nope"})
+    assert wrong.status_code == 403
+    ok = await client.post(start, headers={**cookie, "X-CSRF-Token": token})
+    assert ok.status_code == 200, ok.text
+    both = {
+        "Cookie": f"{config.HUB_COOKIE_NAME}={world.session_a}; {brand.CSRF_COOKIE_NAME}=legacy-value"
+    }
+    legacy = await client.post(start, headers={**both, "X-CSRF-Token": "legacy-value"})
+    assert legacy.status_code == 200, "the double-submit value stays valid until CSRF B"
+
+    form = "/chat-pair/web-start"
+    stale = await client.post(form, headers=cookie, data={"csrf_token": "nope"})
+    assert stale.status_code == 403
+    fresh = await client.post(form, headers=cookie, data={"csrf_token": token})
+    assert fresh.status_code == 200, fresh.text
+
+    # A Bearer caller is never asked.
+    bearer = await client.post(start, headers=world.human_bearer)
+    assert bearer.status_code == 200, bearer.text
