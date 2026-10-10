@@ -442,6 +442,10 @@ def _ci_scoped_forbidden(method: str, path: str) -> Response:
     )
 
 
+# Public paths whose Bearer is a credential of their own, not a session: the
+# bootstrap token is checked by the handler (#1664).
+_BEARER_IS_OWN_CREDENTIAL: Final[frozenset[str]] = frozenset({"/api/admin/bootstrap"})
+
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
 _PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
@@ -685,7 +689,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         try:
             if _looks_public(path):
                 resolved_public = await _resolve_identity(request)
-                if resolved_public is None and _bearer_refused(request):
+                if (
+                    resolved_public is None
+                    and path not in _BEARER_IS_OWN_CREDENTIAL
+                    and _bearer_refused(request)
+                ):
                     # #1664: a Bearer that did not resolve must not become an
                     # anonymous caller on a public path either (/logout acts
                     # on the cookie session behind it).
