@@ -551,7 +551,9 @@ async def project_refs(
     ancestry = await repo.list_task_ancestry(db, task_ids)
     if not ancestry:
         return {}
-    owner_of = project_resolver(await repo.list_projects(db, include_archived=True))
+    owner_of = project_resolver(
+        await repo.list_projects(db, include_archived=True), missing_is_none=True
+    )
     refs: dict[int, TaskProjectRef] = {}
     for task_id in task_ids:
         project = owner_of(ancestry, task_id)

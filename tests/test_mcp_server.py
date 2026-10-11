@@ -5911,3 +5911,48 @@ async def test_mutation_envelope_and_brief_name_the_project(
     out = await hub_get_review_brief(42)
     text = json.loads(_mcp_text(out))["message"]
     assert "Project: P" in text.splitlines()
+
+
+async def test_refusal_of_a_known_task_names_the_project(
+    db, client, monkeypatch
+) -> None:
+    """#1672 P2-2: настоящий отказ MCP-инструмента для прочитанной задачи — с project."""
+    from hub import mcp_server
+    from hub import repository as repo
+    from hub import services
+    from hub.db import seed_default_project
+    from hub.models import TaskCreate
+
+    await seed_default_project(db)
+    pid = await repo.create_project(db, slug="proj-r", name="R")
+    epic = await services.create_task(db, TaskCreate(title="e", task_type="epic"))
+    await repo.update_task(db, epic.id, project_id=pid)
+    task = await services.create_task(
+        db, TaskCreate(title="c", task_type="task", parent_id=epic.id)
+    )
+    await db.commit()
+
+    async def _get(path: str, **_: object) -> object:
+        resp = await client.get(path)
+        if resp.status_code >= 400:
+            raise HubApiError({"reason": "not_found", "message": resp.text})
+        return resp.json()
+
+    async def _post(path: str, body: object = None, **_: object) -> object:
+        resp = await client.post(path, json=body or {})
+        if resp.status_code >= 400:
+            detail = resp.json().get("detail")
+            raise HubApiError(
+                detail if isinstance(detail, dict) else {"message": str(detail)}
+            )
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+
+    refused = json.loads(await hub_report_done(task.id, "готово", agent="a"))
+    assert refused.get("reason"), refused  # это настоящий отказ, не успех
+    assert refused["project"] == "proj-r"
+    # Задача не прочитана (нет такой) — отказ без project.
+    unknown = json.loads(await hub_report_done(987654, "готово", agent="a"))
+    assert "project" not in unknown, unknown

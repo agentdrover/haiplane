@@ -1572,6 +1572,7 @@ async def hub_task_update(
         finding_outcomes: same as hub_report_done (#1155).
     """
     prior_status: str | None = None
+    prior_task: dict[str, Any] | None = None
     try:
         prior_task = await _api_get(f"/api/tasks/{task_id}")
         prior_status = prior_task.get("status")
@@ -1596,7 +1597,7 @@ async def hub_task_update(
         result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     status = task.get("status", "?")
     if kind == "done":
         message = _format_hub_report_done_message(task_id, result["id"], status)
@@ -1649,7 +1650,21 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
     return base
 
 
-def _format_hub_api_error(err: HubApiError) -> str:
+def _with_known_project(
+    payload: dict[str, Any], task: dict[str, Any] | None
+) -> dict[str, Any]:
+    """A refusal about a task the call READ names its project (#1672).
+
+    Without a read task there is nothing to name, and the refusal stays without
+    ``project`` — a guess would be worse than silence.
+    """
+    slug = _project_slug(task) if task else ""
+    if slug and "project" not in payload:
+        return {**payload, "project": slug}
+    return payload
+
+
+def _format_hub_api_error(err: HubApiError, task: dict[str, Any] | None = None) -> str:
     """Отказ для инструментов, чей УСПЕХ тоже строка.
 
     В модуле два семейства инструментов: одни отвечают структурой, другие —
@@ -1657,10 +1672,15 @@ def _format_hub_api_error(err: HubApiError) -> str:
     инструмента, иначе клиент разбирает его ответ двумя способами — ровно то,
     что чинит #895. Для структурных есть _error_result ниже.
     """
-    return json.dumps(enrich_error_payload(err.payload), ensure_ascii=False)
+    return json.dumps(
+        enrich_error_payload(_with_known_project(err.payload, task)),
+        ensure_ascii=False,
+    )
 
 
-def _error_result(err: HubApiError) -> CallToolResult:
+def _error_result(
+    err: HubApiError, task: dict[str, Any] | None = None
+) -> CallToolResult:
     """Отказ для инструментов, чей успех — CallToolResult (#895).
 
     Семнадцать инструментов объявляли CallToolResult, а на пути ошибки отдавали
@@ -1668,7 +1688,9 @@ def _error_result(err: HubApiError) -> CallToolResult:
     нельзя — SDK запрещает CallToolResult в Union. Текст при этом не меняется,
     он остаётся тем же плоским payload.
     """
-    return structured_error_result(enrich_error_payload(err.payload))
+    return structured_error_result(
+        enrich_error_payload(_with_known_project(err.payload, task))
+    )
 
 
 def _format_mutation_success(
@@ -1744,6 +1766,7 @@ async def hub_report_done(
         prevention: needed if found_in=prod (#919): {kind: regression_test|rule|accepted_risk, ref, reason, revisit}.
     """
     prior_status: str | None = None
+    prior_task: dict[str, Any] | None = None
     try:
         prior_task = await _api_get(f"/api/tasks/{task_id}")
         prior_status = prior_task.get("status")
@@ -1762,7 +1785,7 @@ async def hub_report_done(
         result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     status = task.get("status", "?")
     msg = _format_hub_report_done_message(task_id, result["id"], status)
     msg += _format_report_warnings(result)
@@ -2334,7 +2357,7 @@ async def hub_approve_task(
     try:
         result = await _api_post(f"/api/tasks/{task_id}/approve", body)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     status = (task or result).get("status", "?")
     message = f"Task #{task_id} approved (status: {status})."
@@ -2360,7 +2383,7 @@ async def hub_reject_task(task_id: int, comment: str = "") -> str:
     try:
         await _api_post(f"/api/tasks/{task_id}/reject", {"comment": comment})
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     message = f"Task #{task_id} rejected."
     return await _task_mutation_response(
@@ -2385,6 +2408,7 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
         runtime: Override runtime: 'auto' or 'openrouter'. Empty to keep existing.
     """
     prior_status: str | None = None
+    prior_task: dict[str, Any] | None = None
     try:
         prior_task = await _api_get(f"/api/tasks/{task_id}")
         prior_status = prior_task.get("status")
@@ -2399,7 +2423,7 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
         result = await _api_post(f"/api/tasks/{task_id}/start", body)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     status = task.get("status", result.get("status", "?"))
     job_id = task.get("job_id", result.get("job_id", "-"))
     message = f"Task #{task_id} dispatched (status: {status}, job: {job_id})."
@@ -2494,7 +2518,7 @@ async def hub_pair_start(
     try:
         result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     status = (task or result).get("status", "?")
     branch = (task or result).get("branch") or "-"
@@ -2612,7 +2636,7 @@ async def hub_submit_for_review(
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     generation = task.get("submission_generation", 0)
     # #1265 AC-6: a same-sha retry from review opens no new generation — the
     # prior read (BEFORE this call) and the fresh one (AFTER) share the same
@@ -3011,7 +3035,7 @@ async def hub_submit_review(
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     n_findings = len(findings or [])
     findings_note = f", {n_findings} finding(s)" if n_findings else ""
     message = (
@@ -3053,7 +3077,7 @@ async def hub_claim_task(
             {"agent": agent, "session_id": session_id},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     status = (task or result).get("status", "?")
     holder = (task or result).get("claimed_by") or agent
@@ -3141,7 +3165,7 @@ async def hub_release_task(
             {"agent": agent, "session_id": session_id},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     status = (task or result).get("status", "?")
     message = f"Task #{task_id} claim released (status: {status})."
@@ -3183,7 +3207,7 @@ async def hub_force_complete_task(
     try:
         result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     status = (task or result).get("status", "?")
     message = f"Task #{task_id} force-completed (status: {status})."
@@ -3212,7 +3236,7 @@ async def hub_archive_task(task_id: int, cascade: bool = True) -> str:
             {"cascade": cascade},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     st = (task or result).get("status", "?")
     message = f"Task #{task_id} archived (status in response: {st})."
@@ -3239,7 +3263,7 @@ async def hub_withdraw_own_draft(task_id: int) -> str:
     try:
         result = await _api_post(f"/api/tasks/{task_id}/withdraw")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     st = (task or result).get("status", "?")
     archived = (task or result).get("archived", True)
@@ -3269,7 +3293,7 @@ async def hub_unarchive_task(task_id: int, cascade: bool = True) -> str:
             {"cascade": cascade},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     task = await _read_task(task_id)
     st = (task or result).get("status", "?")
     message = f"Task #{task_id} unarchived (status in response: {st})."
@@ -3294,7 +3318,7 @@ async def hub_delete_task(task_id: int) -> str:
     try:
         await _api_delete(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     message = f"Task #{task_id} and its descendants were deleted."
     return await _task_mutation_response(
         task_id,
@@ -3463,7 +3487,7 @@ async def hub_decide_task(
         result = await _api_post(f"/api/tasks/{task_id}/decide", body)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     status = task.get("status", result.get("status", "?"))
     suffix = ""
     if decision_summary:

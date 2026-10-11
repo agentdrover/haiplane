@@ -5220,3 +5220,64 @@ async def test_task_list_names_the_project_of_every_item(db, client, monkeypatch
         text = json.loads(out.content[0].text)["message"].splitlines()
         for line, task in zip(text, structured["tasks"], strict=False):
             assert f"[{expected[task['id']]}]" in line, (mode, line)
+
+
+async def test_list_project_resolution_matches_the_card_resolver(db):
+    """#1672 P2-1: пакетный резолв списка == resolve_project_with_source по задаче."""
+    from hub.db import seed_default_project
+    from hub.services import dashboard
+    from hub.services.orchestrator_queue import project_resolver
+
+    await seed_default_project(db)
+
+    async def _task(parent: int | None = None, kind: str = "task") -> int:
+        return await repo.create_task(
+            db,
+            title="t",
+            description="",
+            runtime="auto",
+            source="human",
+            assigned_agent="",
+            rationale="",
+            status="open",
+            auto_review=True,
+            task_type=kind,
+            parent_id=parent,
+            priority="medium",
+        )
+
+    active = await repo.create_project(db, slug="par-active", name="a")
+    pending = await repo.create_project(
+        db, slug="par-pending", name="p", status="pending"
+    )
+    cases: list[int] = [await _task()]  # орфан без эпика
+    cases.append(await _task(kind="epic"))  # эпик без project_id
+    for pid in (active, pending, 9999):  # активный, pending, отсутствующий
+        epic = await _task(kind="epic")
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await repo.update_task(db, epic, project_id=pid)
+        await db.execute("PRAGMA foreign_keys = ON")
+        cases += [epic, await _task(epic)]
+    chain = await _task(kind="epic")
+    await repo.update_task(db, chain, project_id=active)
+    node = chain
+    for _ in range(22):  # глубже порога 20 у resolve_project_with_source
+        node = await _task(node)
+        cases.append(node)
+    await db.commit()
+
+    refs = await dashboard.project_refs(db, cases)
+    seen: set[str | None] = set()
+    for task_id in cases:
+        row, _ = await repo.resolve_project_with_source(db, task_id)
+        expected = row["slug"] if row is not None else None
+        got = refs.get(task_id)
+        assert (got.slug if got else None) == expected, task_id
+        seen.add(expected)
+    assert {"default", "par-active", None} <= seen, seen  # все ветви достигнуты
+
+    # Очередь оркестратора по-прежнему подменяет отсутствующий проект на default.
+    projects = await repo.list_projects(db, include_archived=True)
+    ancestry = {1: {"id": 1, "parent_id": None, "project_id": 9999}}
+    assert project_resolver(projects)(ancestry, 1)["slug"] == "default"
+    assert project_resolver(projects, missing_is_none=True)(ancestry, 1) is None
