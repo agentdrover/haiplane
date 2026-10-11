@@ -135,8 +135,13 @@ def _sort_key(task: dict[str, Any]) -> tuple[int, int, int]:
     )
 
 
-def project_resolver(projects: list[Any]) -> Any:
-    """``resolve_project_for_task`` (#335) по задачам в памяти, без запросов."""
+def project_resolver(projects: list[Any], *, missing_is_none: bool = False) -> Any:
+    """``resolve_project_for_task`` (#335) по задачам в памяти, без запросов.
+
+    ``missing_is_none`` (#1672) — семантика ``resolve_project_with_source`` для
+    списков: проект, на который ссылается эпик, но которого нет, даёт None, а не
+    'default'. Очередь оркестратора зовёт без флага и не меняется.
+    """
     by_id = {int(p["id"]): p for p in projects}
     default = next((p for p in projects if p["slug"] == "default"), None)
 
@@ -148,6 +153,8 @@ def project_resolver(projects: list[Any]) -> Any:
                 break
             if row["project_id"] is not None:
                 found = by_id.get(int(row["project_id"]))
+                if found is None and missing_is_none:
+                    return None
                 return found if found and found["status"] == "active" else default
             current = row["parent_id"]
         return default
