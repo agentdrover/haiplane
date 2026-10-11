@@ -1165,7 +1165,7 @@ async def test_brief_says_whether_the_current_generation_has_a_review(
 ):
     """AC-3 (#1262): отказ провайдера — «ревью у поколения N нет» с причиной;
     полный отчёт — ревьюер (принципал и модель), sha и полнота."""
-    from tests.test_review_dispatch import (
+    from tests.review_dispatch_support import (
         _LIMIT_REFUSAL,
         _DispatchRecorder,
         _no_local_path,
