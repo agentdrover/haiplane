@@ -2609,6 +2609,7 @@ async def _web_task_detail_page(
     review_error: str = "",
     implementer_code: str = "",
     implementer_error: str = "",
+    archive_refusal: dict[str, Any] | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
     db = _db(request)
@@ -2837,6 +2838,7 @@ async def _web_task_detail_page(
             "csrf_token": csrf_token,
             "implementer_code": implementer_code,
             "implementer_error": implementer_error,
+            "archive_refusal": archive_refusal,
             "implementer_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
         },
         status_code=status_code,
@@ -3596,10 +3598,32 @@ async def web_archive_task(
     task_id: int,
     request: Request,
     cascade: str = Form("true"),
-    _identity=Depends(require_permission("tasks.archive")),
+    reason: str = Form(""),
+    identity=Depends(require_permission("tasks.archive")),
 ):
     cascade_flag = cascade.lower() in ("1", "true", "yes", "on")
-    await services.archive_task(_db(request), task_id, cascade=cascade_flag)
+    try:
+        await services.archive_task(
+            _db(request),
+            task_id,
+            cascade=cascade_flag,
+            reason=reason,
+            actor=identity.username,
+            principal_id=identity.principal_id,
+        )
+    except HTTPException as exc:
+        detail = exc.detail
+        if exc.status_code != 409 or not isinstance(detail, dict):
+            raise
+        if detail.get("reason") != "archive_active_work":
+            raise
+        # #1673: отказ виден на странице, а выбранное не теряется.
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            archive_refusal={**detail, "cascade": cascade_flag, "typed_reason": reason},
+            status_code=409,
+        )
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 

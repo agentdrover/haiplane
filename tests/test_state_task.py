@@ -35,6 +35,7 @@ from tests.state_support import (
     make_project,
     make_state_task,
     pair_start,
+    row as state_row,
     submit,
 )
 
@@ -1451,3 +1452,21 @@ async def test_the_rollback_detail_follows_the_same_strip_as_passed(
         c for c in (await evaluate_dor(db, ok)).checks if c.key == "has_rollback"
     )
     assert item.passed is True and item.detail == "rollback is filled"
+
+
+async def test_archive_of_running_state_task_needs_a_reason(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    task_id = await make_state_task(db, status="running")
+    url = f"/api/tasks/{task_id}/archive"
+
+    refused = await client.post(url, json={})
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert detail["reason"] == "archive_active_work"
+    assert detail["blocking"][0]["task_id"] == task_id
+    assert (await state_row(db, task_id))["archived"] == 0
+
+    done = await client.post(url, json={"reason": "DNS не нужен"})
+    assert done.status_code == 200, done.text
+    assert (await state_row(db, task_id))["archived"] == 1

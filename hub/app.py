@@ -2082,11 +2082,17 @@ async def api_archive_task(
     task_id: int,
     request: Request,
     body: TaskArchive | None = None,
-    _identity=Depends(require_permission("tasks.archive")),
+    identity=Depends(require_permission("tasks.archive")),
 ):
-    cascade = body.cascade if body else True
     try:
-        return await services.archive_task(_db(request), task_id, cascade=cascade)
+        return await services.archive_task(
+            _db(request),
+            task_id,
+            cascade=body.cascade if body else True,
+            reason=body.reason if body else "",
+            actor=identity.username,
+            principal_id=identity.principal_id,
+        )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
 

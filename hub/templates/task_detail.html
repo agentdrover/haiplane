@@ -961,14 +961,35 @@
                     {% endif %}
                 {% else %}
                     {% if can_archive %}
-                    <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                    {% if archive_refusal %}
+                    <div class="task-action-note task-action-note--warning" id="archive-refusal">
+                        <p><strong>Архив отклонён ({{ archive_refusal.reason }}):</strong> в поддереве есть работа в ходу. Укажите причину и повторите.</p>
+                        <ul>
+                        {% for b in archive_refusal.blocking %}
+                            <li><a href="/tasks/{{ b.task_id }}">#{{ b.task_id }}</a> &mdash; {{ b.status }}{% if b.claimed_by %}, держатель {{ b.claimed_by }}{% endif %}{% if b.active_job %}, job {{ b.active_job }}{% endif %}{% if b.open_slot %}, слот {{ b.open_slot }}{% endif %}; записей агентов: {{ b.updates_by_agents }}, ответов: {{ b.answers }}{% if b.branch %}, ветка {{ b.branch }}{% endif %}{% if b.pr_number %}, PR #{{ b.pr_number }}{% endif %}</li>
+                        {% endfor %}
+                        </ul>
+                        <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack"
+                              onsubmit="return confirm('Архив не остановит исполнителя. Архивировать работу в ходу?');">
+                          {{ csrf_field() }}
+                            <input type="hidden" name="cascade" value="{{ 'true' if archive_refusal.cascade else 'false' }}">
+                            <input type="text" name="reason" value="{{ archive_refusal.typed_reason }}" placeholder="Причина архива" required>
+                            <button type="submit" class="btn btn-warning task-action-btn">Archive with reason</button>
+                        </form>
+                    </div>
+                    {% endif %}
+                    <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack"
+                          onsubmit="return confirm('Archive this task and all its descendants?');">
                       {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="true">
+                        <input type="text" name="reason" placeholder="Причина (обязательна, если есть работа в ходу)">
                         <button type="submit" class="btn btn-warning task-action-btn">Archive subtree</button>
                     </form>
-                    <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                    <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack"
+                          onsubmit="return confirm('Archive only this task?');">
                       {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="false">
+                        <input type="text" name="reason" placeholder="Причина (обязательна, если есть работа в ходу)">
                         <button type="submit" class="btn btn-ghost task-action-btn">Archive only this</button>
                     </form>
                     {% endif %}
