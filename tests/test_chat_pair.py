@@ -727,6 +727,10 @@ async def test_chat_pair_errors_are_actionable(hub, monkeypatch):
         detail = resp.json()["detail"]
         assert detail["reason"] == reason, resp.text
         for field in MUTATION_ENVELOPE_FIELDS:
+            if field == "project":
+                # #1672: отказ без известной задачи проекта не называет.
+                assert field not in detail, f"{reason}: выдумал проект"
+                continue
             assert field in detail, f"{reason}: нет поля {field}"
         assert detail["next_action"]
         assert detail["next_action"] != generic, f"{reason}: обвязка по умолчанию"

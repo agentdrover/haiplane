@@ -186,8 +186,14 @@ def _print_task_short(t: dict[str, Any]) -> None:
     )
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
     arch = " [archived]" if t.get("archived") else ""
+    project = t.get("project")
+    slug = (
+        f" [{project['slug']}]"
+        if isinstance(project, dict) and project.get("slug")
+        else ""
+    )
     print(
-        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){arch}{src}{owner}{reviewer}{parent} {t['title']}"
+        f"#{t['id']}{slug} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){arch}{src}{owner}{reviewer}{parent} {t['title']}"
     )
 
 

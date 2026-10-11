@@ -30,6 +30,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "source",
     "runtime",
     "assigned_agent",
+    "project",
     "job_id",
     "exit_code",
     "auto_review",

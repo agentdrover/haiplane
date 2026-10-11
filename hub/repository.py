@@ -1310,6 +1310,35 @@ async def list_task_ids_for_project(
     return {r["id"] for r in rows}
 
 
+async def list_task_ancestry(
+    db: aiosqlite.Connection, task_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    """``id -> {id, parent_id, project_id}`` for the tasks and ALL their ancestors.
+
+    One statement whatever the page size and the depth (#1672): a list names
+    each task's project from this map, so the cost does not grow per task
+    (#485). Ancestors outside the page are included — the project lives on the
+    epic and a page rarely holds it.
+    """
+    if not task_ids:
+        return {}
+    marks = ", ".join("?" for _ in task_ids)
+    rows = await fetchall(
+        db,
+        f"""
+        WITH RECURSIVE chain(id, parent_id, project_id) AS (
+            SELECT id, parent_id, project_id FROM tasks WHERE id IN ({marks})
+            UNION
+            SELECT t.id, t.parent_id, t.project_id
+            FROM tasks t JOIN chain c ON t.id = c.parent_id
+        )
+        SELECT id, parent_id, project_id FROM chain
+        """,  # nosec B608 - placeholders only, values are params
+        tuple(task_ids),
+    )
+    return {int(r["id"]): dict(r) for r in rows}
+
+
 async def resolve_project_with_source(
     db: aiosqlite.Connection, task_id: int
 ) -> tuple[aiosqlite.Row | None, int | None]:

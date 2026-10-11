@@ -379,6 +379,9 @@
             <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
             <span class="badge badge-stale">stale</span>
         </div>
+        {% if stale_meta.get(t.id, {}).get('project') %}
+        <div class="inbox-item-meta">project: {{ stale_meta[t.id]['project'] }}</div>
+        {% endif %}
         {% if t.assigned_agent %}
         <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
         {% endif %}
