@@ -5320,7 +5320,11 @@ async def test_archive_rechecks_work_inside_the_write(
     monkeypatch.setattr(db_module, "write_transaction", real)
     other = await mk(db, "ещё", "running")
 
-    async def broken(*_a, **_kw):
+    real_log = lifecycle.log_activity
+
+    async def broken(*a, **kw):
+        # Настоящая запись (с тем commit, что передал сервис), затем сбой.
+        await real_log(*a, **kw)
         raise RuntimeError("activity недоступна")
 
     monkeypatch.setattr(lifecycle, "log_activity", broken)
