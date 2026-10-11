@@ -164,7 +164,7 @@ URL» (#1119). Локальный запускает агентский CLI на
 
 Эта таблица не пересказ кода, а он сам: формы лежат в `SANDBOX_SHAPES`
 (`hub/integrations/local_reviewer.py`), и тест
-`tests/test_review_dispatch.py::test_the_doc_names_the_closed_set_the_guard_accepts`
+`tests/test_review_dispatch_deploy_doc.py::test_the_doc_names_the_closed_set_the_guard_accepts`
 сверяет с ними МАШИНОЙ и имена форм, и строки целиком, и оба списка флагов, а
 потом прогоняет каждую строку через самого стража. Расхождение документа с
 кодом на этой задаче случалось пять раз и глазами не поймалось ни разу.
@@ -279,7 +279,7 @@ true` → rc 0), а у systemd-run решётки нет вовсе и `--uid=65
 редакция этого документа писала их без префикса, и выкат 08.09.2026 потратил на
 это отдельный заход. Теперь совпадение имён документа с тем, что читает код,
 проверяется тестом
-(`tests/test_review_dispatch.py::test_the_deploy_doc_names_the_settings_the_code_reads`),
+(`tests/test_review_dispatch_pin_and_deploy_doc.py::test_the_deploy_doc_names_the_settings_the_code_reads`),
 а не внимательным чтением.
 
 Четыре обязательные переменные (drop-in `systemd`, `chmod 600`):
@@ -548,7 +548,7 @@ Interactive authentication required`. Выкат по прежнему доку�
    `HAIPLANE_LOCAL_REVIEW_CMD`, — тот же класс отказа, ради которого писан
    весь этот документ: не ломает, а тихо подменяет. Совпадение скелета с тем,
    как хаб склеивает argv, проверяется тестом
-   (`tests/test_review_dispatch.py::test_the_doc_wrapper_carries_the_argv_the_hub_appends`),
+   (`tests/test_review_dispatch_deploy_doc.py::test_the_doc_wrapper_carries_the_argv_the_hub_appends`),
    а не внимательным чтением.
 
    `"$@"` нужен и тогда, когда argv CLI зашит в образ через `ENTRYPOINT`:
@@ -586,7 +586,7 @@ Interactive authentication required`. Выкат по прежнему доку�
    `HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC` втрое, копировал скелет как есть — и
    получал контейнер, переживающий прогон, без единого слова в ленте.
    Совпадение умолчания скелета с хабским держит тест
-   (`tests/test_review_dispatch.py::test_the_doc_wrapper_deadline_follows_the_conf_file`),
+   (`tests/test_review_dispatch_deploy_doc.py::test_the_doc_wrapper_deadline_follows_the_conf_file`),
    а сам файл — вы.
 
    Оговорка, которую флагом не закрыть и о которой поэтому сказано словами:
@@ -1603,7 +1603,7 @@ esac
 их все к молчанию, а молчание читалось как успех.
 
 Что эти три ответа и вправду РАЗЛИЧНЫ — держит тест
-(`tests/test_review_dispatch.py::test_the_doc_limits_probe_tells_failure_from_success`):
+(`tests/test_review_dispatch_deploy_doc.py::test_the_doc_limits_probe_tells_failure_from_success`):
 он исполняет эту самую пробу с подставным движком и сверяет, что отказ движка
 не выглядит так же, как успех.
 
