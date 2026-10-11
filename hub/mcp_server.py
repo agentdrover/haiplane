@@ -824,18 +824,26 @@ def _finding_line(finding: dict[str, Any]) -> str:
     )
 
 
+def _project_slug(item: dict[str, Any]) -> str:
+    """Slug of the project a REST object names ({id, slug}); '' when it names none."""
+    project = item.get("project")
+    return str(project.get("slug") or "") if isinstance(project, dict) else ""
+
+
 def _format_task(t: dict[str, Any]) -> str:
     src = (
         f" [agent:{t.get('assigned_agent', '')}]" if t.get("source") == "agent" else ""
     )
     tt = t.get("task_type", "task")
     tt_tag = f"[{tt}] " if tt != "task" else ""
+    slug = _project_slug(t)
+    project = f" [{slug}]" if slug else ""
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
     owner = f" [owner:{t['human_owner']}]" if t.get("human_owner") else ""
     reviewer = f" [reviewer:{t['human_reviewer']}]" if t.get("human_reviewer") else ""
     arch = " [archived]" if t.get("archived") else ""
     return (
-        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')})"
+        f"#{t['id']}{project} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')})"
         f"{arch}{src}{owner}{reviewer}{parent} {t['title']}"
     )
 
@@ -1344,6 +1352,8 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
         f"Task #{task['id']}: {task['title']}",
         f"Status: {task['status']}",
     ]
+    if _project_slug(task):
+        parts.append(f"Project: {_project_slug(task)}")
     if task.get("outcome_status"):
         parts.append(f"Outcome hypothesis: {task['outcome_status']}")
     parts += [
@@ -2865,6 +2875,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     parts.extend(
         [
             f"Review brief for task #{brief['task_id']}: {brief['title']}",
+            *([f"Project: {_project_slug(brief)}"] if _project_slug(brief) else []),
             f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]

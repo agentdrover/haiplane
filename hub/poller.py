@@ -1053,6 +1053,17 @@ def _age_phrase(minutes: float) -> str:
     return f"{int(minutes)} мин"
 
 
+async def _project_prefix(db, task_id: int) -> str:
+    """«[slug] » for an alert, so the reader sees whose task is silent (#1672).
+
+    Same resolution as the task card (``resolve_project_with_source``). The
+    prefix goes in FRONT: the dedup keys «stale in {status}» and «[рубеж X]»
+    are matched by substring and stay verbatim after it.
+    """
+    project, _ = await repo.resolve_project_with_source(db, task_id)
+    return f"[{project['slug']}] " if project is not None else ""
+
+
 async def _stale_task_tick(
     db, task: dict, status: str, threshold: int, action: str
 ) -> None:
@@ -1080,6 +1091,7 @@ async def _stale_task_tick(
             task_id,
             "hub",
             "alert",
+            f"{await _project_prefix(db, task_id)}"
             f"Ожидание просрочено (stale in {status}) [рубеж {rung}]: ждали "
             f"«{waiting_for}» до {waiting_until}, срок вышел "
             f"{_age_phrase(overdue)} назад. {action}",
@@ -1117,6 +1129,7 @@ async def _stale_task_tick(
         task_id,
         "hub",
         "alert",
+        f"{await _project_prefix(db, task_id)}"
         f"Task stale in {status} [рубеж {rung}]: тишина уже "
         f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'})."
         f"{await _slot_phrase(db, task_id)} {action}",
@@ -1252,6 +1265,7 @@ async def _sweep_unrefined_drafts(db) -> None:
                 task["id"],
                 "hub",
                 "alert",
+                f"{await _project_prefix(db, task['id'])}"
                 f"Task stale in draft: DoR не пройден "
                 f"{config.UNREFINED_DRAFT_MINUTES}+ минут "
                 f"(missing: {missing}). hub_refine_task доведёт "

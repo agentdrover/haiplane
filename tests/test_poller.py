@@ -3915,3 +3915,113 @@ async def test_scheduled_change_equal_to_current_value_leaves_an_event(
         )
     )
     assert before == after
+
+
+# ---- Проект в алерте простоя (#1672) ----
+
+
+async def _project_task(db, slug: str, task_id: int) -> None:
+    """Подвесить задачу под эпик проекта ``slug``: проект наследуется от эпика."""
+    pid = await repo.create_project(db, slug=slug, name=slug.title())
+    epic = await repo.create_task(
+        db,
+        title="epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, epic, project_id=pid)
+    await repo.update_task(db, task_id, parent_id=epic)
+    await db.commit()
+
+
+async def _age_task_feed(db, task_id: int, minutes: int) -> None:
+    await db.execute(
+        "UPDATE task_updates SET created_at = datetime('now', ?) WHERE task_id=? "
+        "AND NOT (kind='alert' AND content LIKE '%stale in %')",
+        (f"-{minutes} minutes", task_id),
+    )
+    await db.execute(
+        "UPDATE tasks SET updated_at = datetime('now', ?) WHERE id=?",
+        (f"-{minutes} minutes", task_id),
+    )
+    await db.commit()
+
+
+async def test_stale_alert_names_the_project_and_keeps_dedup(db):
+    """AC-4 (#1672): алерт простоя начинается с «[slug] », а дедуп и лестница живут."""
+    from hub.poller import _sweep_stale_statuses, _sweep_unrefined_drafts
+
+    # Тишина: лестница по рубежам.
+    silent = await _make_stale_task(db, status="ci_check", minutes=0)
+    await _project_task(db, "pj-silent", silent)
+    await repo.add_task_update(db, silent, "dev", "status", "Plan: ждать")
+    await _age_task_feed(db, silent, 90)
+    await _sweep_stale_statuses(db)
+    first = await _stale_alerts(db, silent)
+    assert len(first) == 1
+    assert first[0].startswith("[pj-silent] "), first[0]
+    assert "stale in ci_check" in first[0] and "[рубеж " in first[0]
+
+    await _sweep_stale_statuses(db)
+    assert len(await _stale_alerts(db, silent)) == 1, "второй тик не добавляет запись"
+
+    await _age_task_feed(db, silent, 25 * 60)
+    await _sweep_stale_statuses(db)
+    second = await _stale_alerts(db, silent)
+    assert len(second) == 2, "следующий рубеж — ровно одна новая запись"
+    assert second[1].startswith("[pj-silent] ") and "[рубеж 24h]" in second[1]
+
+    # Старый алерт без префикса проекта по-прежнему дедуплицирует.
+    legacy = await _make_stale_task(db, status="ci_check", minutes=0)
+    await _project_task(db, "pj-legacy", legacy)
+    await repo.add_task_update(db, legacy, "dev", "status", "Plan: ждать")
+    await _age_task_feed(db, legacy, 90)
+    await _sweep_stale_statuses(db)
+    assert len(await _stale_alerts(db, legacy)) == 1
+    await db.execute(
+        "UPDATE task_updates SET content=replace(content, '[pj-legacy] ', '') "
+        "WHERE task_id=? AND kind='alert'",
+        (legacy,),
+    )
+    await db.commit()
+    assert not (await _stale_alerts(db, legacy))[0].startswith("[")
+    await _sweep_stale_statuses(db)
+    assert len(await _stale_alerts(db, legacy)) == 1
+
+    # Истёкшее ожидание.
+    lapsed = await _make_stale_task(db, status="ci_check", minutes=0)
+    await _project_task(db, "pj-lapsed", lapsed)
+    await db.execute(
+        "UPDATE tasks SET updated_at=datetime('now', '-999 minutes'), "
+        "waiting_for='вердикт', "
+        "waiting_until=datetime('now', '-45 minutes') WHERE id=?",
+        (lapsed,),
+    )
+    await db.commit()
+    await _sweep_stale_statuses(db)
+    alerts = await _stale_alerts(db, lapsed)
+    assert len(alerts) == 1
+    assert alerts[0].startswith("[pj-lapsed] "), alerts[0]
+    assert "stale in ci_check" in alerts[0] and "[рубеж просрочка]" in alerts[0]
+    await _sweep_stale_statuses(db)
+    assert len(await _stale_alerts(db, lapsed)) == 1
+
+    # Draft: без лестницы, has_stale_alert.
+    draft = await _make_draft(db)
+    await _project_task(db, "pj-draft", draft)
+    await _sweep_unrefined_drafts(db)
+    drafts = await _stale_alerts(db, draft)
+    assert len(drafts) == 1
+    assert drafts[0].startswith("[pj-draft] Task stale in draft: DoR не пройден"), (
+        drafts[0]
+    )
+    await _sweep_unrefined_drafts(db)
+    assert len(await _stale_alerts(db, draft)) == 1

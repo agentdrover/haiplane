@@ -280,3 +280,43 @@ async def test_the_inbox_row_names_the_fact_not_the_constant(db):
         "у молчащей — фактический момент последней записи, не «30+ minutes»"
     )
     assert "30+ minutes" not in str(meta), "константа умерла"
+
+
+# ---------------------------------------------------------------------------
+# #1672 AC-5 — строка простоя в инбоксе называет проект
+# ---------------------------------------------------------------------------
+
+
+async def test_the_inbox_stale_row_names_the_project(db, client):
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(db, slug="pj-inbox", name="Inbox")
+    epic = await services.create_task(db, TaskCreate(title="эпик", task_type="epic"))
+    await repo.update_task(db, epic.id, project_id=pid)
+    await db.commit()
+    task_id = await _running_task(db, "Молчит в чужом проекте")
+    await repo.update_task(db, task_id, parent_id=epic.id)
+    loose_id = await _running_task(db, "Молчит без эпика")
+    lapsed_id = await _running_task(db, "Просрочила ожидание")
+    await repo.update_task(db, lapsed_id, parent_id=epic.id)
+    await services.declare_task_wait(
+        db,
+        lapsed_id,
+        TaskDeclareWait(waiting_for="вердикт", waiting_until=_until(5), agent="dev"),
+    )
+    past = (datetime.now(UTC) - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute("UPDATE tasks SET waiting_until=? WHERE id=?", (past, lapsed_id))
+    await db.commit()
+    await _age_feed(db, lapsed_id, minutes=3 * 60)
+    await _age_feed(db, task_id, minutes=3 * 60)
+    await _age_feed(db, loose_id, minutes=3 * 60)
+
+    html = (await client.get("/partials/inbox")).text
+
+    row = html.split(f'id="inbox-task-{task_id}"', 1)[1].split("</article>", 1)[0]
+    assert "project: pj-inbox" in row, "строка простоя называет проект"
+    lapsed = html.split(f'id="inbox-task-{lapsed_id}"', 1)[1].split("</article>", 1)[0]
+    assert "project: pj-inbox" in lapsed, "и просрочившая ожидание"
+    loose = html.split(f'id="inbox-task-{loose_id}"', 1)[1].split("</article>", 1)[0]
+    assert "project: default" in loose, "и задача без эпика — default"

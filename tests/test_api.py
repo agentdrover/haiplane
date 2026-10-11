@@ -1974,6 +1974,7 @@ async def test_summary_mode_returns_compact_fields(client: AsyncClient):
         "priority",
         "readiness_score",
         "dor_passed",
+        "project",  # #1672
     }
 
 
@@ -5129,3 +5130,93 @@ async def test_state_fields_evidence_and_verdict_parity_across_surfaces(
         "/api/tasks", json={"title": "commit"}, headers=headers["human"]
     )
     assert plain.json()["result_kind"] == "commit" and plain.json()["rollback"] == ""
+
+
+async def test_task_list_names_the_project_of_every_item(db, client, monkeypatch):
+    """AC-2 (#1672): у каждого элемента списка точный {id, slug}; без N+1."""
+    import json
+
+    from hub import mcp_server
+    from hub import repository as repo
+    from hub import services
+    from hub.models import TaskCreate
+    from hub.services import dashboard
+
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    expected: dict[int, str] = {}
+    for slug in ("lp-a", "lp-b"):
+        pid = await repo.create_project(db, slug=slug, name=slug)
+        parent = None
+        for depth, kind in enumerate(("epic", "feature", "task", "subtask")):
+            tv = await services.create_task(
+                db, TaskCreate(title=f"{slug}-{kind}", task_type=kind, parent_id=parent)
+            )
+            if depth == 0:
+                await repo.update_task(db, tv.id, project_id=pid)
+            expected[tv.id] = slug
+            parent = tv.id
+    for i in range(6):
+        tv = await services.create_task(db, TaskCreate(title=f"loose-{i}"))
+        expected[tv.id] = "default"
+    await db.commit()
+    ids = sorted(expected, reverse=True)  # листинг — по id убыванию
+    project_ids = {p["slug"]: p["id"] for p in await repo.list_projects(db)}
+
+    def _check(items: list[dict]) -> None:
+        for item in items:
+            slug = expected[item["id"]]
+            assert item["project"] == {"id": project_ids[slug], "slug": slug}, item
+
+    # Счёт запросов на инструментированном соединении: не зависит от страницы.
+    counts: dict[int, int] = {}
+    for limit, after in ((2, 4), (20, 0)):
+        seen: list[str] = []
+        await db.set_trace_callback(seen.append)
+        page = await dashboard.list_tasks(db, after_id=after, limit=limit, mode="full")
+        await db.set_trace_callback(None)
+        assert page["tasks"], limit
+        counts[limit] = len(seen)
+        _check(page["tasks"])
+    assert counts[2] > 0 and counts[2] == counts[20], counts
+
+    # Страница 2 начинается внутри иерархии: родители вне страницы.
+    first = (await client.get("/api/tasks?after_id=4&limit=2")).json()
+    assert [t["id"] for t in first["tasks"]] == [3, 2]
+    _check(first["tasks"])
+
+    # Обход курсором: те же id и курсоры, что и без проекта.
+    walked: list[int] = []
+    cursor: int | None = 0
+    cursors: list[int | None] = []
+    while cursor is not None:
+        for mode in ("full", "summary"):
+            body = (
+                await client.get(f"/api/tasks?after_id={cursor}&limit=5&mode={mode}")
+            ).json()
+            _check(body["tasks"])
+            if mode == "full":
+                full_body = body
+        walked += [t["id"] for t in full_body["tasks"]]
+        cursor = full_body["next_cursor"]
+        cursors.append(cursor)
+    assert walked == ids
+    assert cursors == [ids[4], ids[9], None]
+
+    # Плоский full-список (без курсора) и MCP.
+    flat = (await client.get("/api/tasks?limit=50")).json()
+    assert sorted(t["id"] for t in flat) == sorted(ids)
+    _check(flat)
+
+    async def _get(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    for mode in ("full", "summary"):
+        out = await mcp_server.hub_list_tasks(mode=mode, after_id=0, limit=50)
+        structured = out.structuredContent
+        _check(structured["tasks"])
+        text = json.loads(out.content[0].text)["message"].splitlines()
+        for line, task in zip(text, structured["tasks"], strict=False):
+            assert f"[{expected[task['id']]}]" in line, (mode, line)

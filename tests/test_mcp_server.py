@@ -5824,3 +5824,90 @@ async def test_practice_metrics_text_names_window_beyond_history(
     }
     text = _mcp_text(await hub_practice_metrics(since_days=7))
     assert "длиннее хранения" not in text
+
+
+async def test_task_status_names_the_project_in_both_forms(
+    db, client, monkeypatch
+) -> None:
+    """AC-1 (#1672): карточка и полная форма называют проект: structured и текст."""
+    from hub import mcp_server
+    from hub import repository as repo
+    from hub import services
+    from hub.models import TaskCreate
+
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(db, slug="proj-p", name="P")
+    epic = await services.create_task(db, TaskCreate(title="e", task_type="epic"))
+    await repo.update_task(db, epic.id, project_id=pid)
+    feature = await services.create_task(
+        db, TaskCreate(title="f", task_type="feature", parent_id=epic.id)
+    )
+    child = await services.create_task(
+        db, TaskCreate(title="c", task_type="task", parent_id=feature.id)
+    )
+    loose = await services.create_task(db, TaskCreate(title="loose"))
+    await db.commit()
+
+    async def _get(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    monkeypatch.setattr(mcp_server, "_api_post", AsyncMock(return_value={}))
+
+    for task_id, slug in ((loose.id, "default"), (child.id, "proj-p")):
+        for full in (False, True):
+            out = await hub_task_status(task_id, full=full)
+            structured = _mcp_structured(out)
+            assert structured["task"]["project"]["slug"] == slug, (task_id, full)
+            lines = json.loads(_mcp_text(out))["message"].splitlines()
+            assert f"Project: {slug}" in lines, (task_id, full)
+
+
+async def test_mutation_envelope_and_brief_name_the_project(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-3 (#1672): конверт мутации и бриф называют проект P; отказ без задачи — нет."""
+    from hub.mcp_envelope import (
+        MUTATION_ENVELOPE_FIELDS,
+        build_mutation_envelope,
+        enrich_error_payload,
+    )
+
+    assert "project" in MUTATION_ENVELOPE_FIELDS
+
+    task = {"id": 41, "status": "open", "project": {"id": 7, "slug": "P"}}
+    mock_api_post.return_value = {"status": "claimed"}
+    mock_api_get.side_effect = [task, {**task, "status": "claimed"}]
+    claimed = json.loads(await hub_claim_task(41, "composer", session_id="s"))
+    assert claimed["project"] == "P"
+
+    mock_api_post.return_value = {"status": "open"}
+    mock_api_get.side_effect = [{**task, "status": "claimed"}, task]
+    released = json.loads(await hub_release_task(41, "composer", session_id="s"))
+    assert released["project"] == "P"
+
+    assert "project" not in build_mutation_envelope(None, status="open")
+    assert "project" not in build_mutation_envelope({"status": "open"})
+    refusal = enrich_error_payload(
+        {"reason": "forbidden", "message": "no", "project": "P", "status": "open"}
+    )
+    assert refusal["project"] == "P"
+    assert "project" not in enrich_error_payload(
+        {"reason": "forbidden", "message": "x"}
+    )
+
+    mock_api_get.reset_mock()
+    mock_api_get.side_effect = None
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "project": {"id": 7, "slug": "P"},
+        "submission_generation": 1,
+        "review_cycle": 0,
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert "Project: P" in text.splitlines()
