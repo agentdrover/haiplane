@@ -57,6 +57,7 @@ types:
 
 budget:
 	uv run python scripts/complexity_budget.py
+	uv run python scripts/file_size_budget.py
 	uv run python scripts/mcp_catalog_budget.py
 
 security:
