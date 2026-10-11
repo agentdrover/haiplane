@@ -3187,12 +3187,12 @@ async def hub_force_complete_task(
 
 @mcp.tool()
 async def hub_archive_task(task_id: int, cascade: bool = True, reason: str = "") -> str:
-    """Hide a task from default lists (optional subtree cascade).
+    """Hide a task from default lists.
 
     Args:
         task_id: Task to archive
-        cascade: If True, archive the whole subtree. If False, only this row.
-        reason: Required when the task or a descendant has work in progress.
+        cascade: False archives only this row.
+        reason: Required if work is in progress in it or a descendant.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
