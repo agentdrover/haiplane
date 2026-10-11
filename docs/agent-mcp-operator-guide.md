@@ -71,14 +71,15 @@ Hub также подмешивает недостающие части `Accept`
 | Cursor config | `"command": "uv", "args": ["run", "haiplane-hub-mcp"]` | `"type": "streamable-http", "url": "…/mcp"` |
 | Токен | env `HAIPLANE_HUB_TOKEN` | заголовок `Authorization: Bearer …` |
 | URL Hub | env `HAIPLANE_HUB_URL` (REST backend для subprocess) | URL в `mcp.json` |
-| Сессия MCP | управляет subprocess | `initialize` → заголовок `Mcp-Session-Id` на follow-up |
+| Сессия MCP | управляет subprocess | нет: хаб stateless, `Mcp-Session-Id` не требует |
 
 **stdio** запускает `haiplane-hub-mcp`, который проксирует вызовы инструментов
 в REST API Hub по `HAIPLANE_HUB_URL`. Токен берётся из `HAIPLANE_HUB_TOKEN`.
 
 **streamable HTTP** — клиент (Cursor) говорит напрямую с `/mcp` того же
-uvicorn-процесса, что и Web UI. Auth — Bearer на каждый запрос; после
-`initialize` нужен `Mcp-Session-Id` для `tools/list` и `tools/call`.
+uvicorn-процесса, что и Web UI. Auth — Bearer на каждый запрос. Транспорт
+stateless (`stateless_http=True` в `hub/mcp_server.py`, #1364): хаб не выдаёт и
+не требует `Mcp-Session-Id`, каждый POST самостоятелен.
 
 Пример stdio (локально) — см. [`.cursor/mcp.json.example`](../.cursor/mcp.json.example).
 
@@ -132,14 +133,9 @@ curl -sS -D /tmp/mcp-headers.txt \
 
 - HTTP **200**
 - в теле есть `serverInfo` с именем `haiplane-hub`
-- в заголовках ответа есть **`Mcp-Session-Id`**
 
-Сохраните session id:
-
-```bash
-SESSION=$(grep -i '^mcp-session-id:' /tmp/mcp-headers.txt | cut -d: -f2- | tr -d ' \r\n')
-echo "session=$SESSION"
-```
+Хаб stateless и `Mcp-Session-Id` не требует: заголовка в ответе может не быть,
+это не ошибка. Сохранять и передавать ничего не нужно.
 
 ### 3.4 tools/list
 
@@ -148,7 +144,6 @@ curl -sS \
   -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: $SESSION" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   "$HUB/mcp"
 ```
@@ -157,6 +152,25 @@ curl -sS \
 
 Если шаги 3.3–3.4 проходят — MCP на этом инстансе **рабочий** (AC-1 для staging:
 повторите с URL staging и выданным оператором токеном).
+
+### Стартовый пакет проекта (#1631)
+
+Первое сообщение агенту нового проекта хаб собирает сам, без credentials:
+
+```bash
+oc-hub projects bootstrap <slug>          # текст, как его отдал сервер
+oc-hub projects bootstrap <slug> --json   # типизированная модель + text
+```
+
+REST: `GET /api/projects/{slug}/agent-bootstrap`. В пакете: конфиг MCP с
+плейсхолдером `<ТОКЕН АГЕНТА>`, последовательность первых вызовов (с
+`hub_session_register` до claim), активные навыки, политика проекта, состояние
+`.hub/AGENT_RULES.md` и `.hub/REVIEW_RULES.md` на базовой ветке, порядок сдачи
+(строка «push → зелёный CI на sha → сдача» — при `ci_before_submit` require или
+warn) и human-only действия. Токен подставляет оператор локально. Доступ: обычный
+агент и watcher — 200; chat-pair и steward — 403; без токена в закрытом режиме
+— 401. MCP-инструмента нет.
+
 
 ---
 
@@ -385,10 +399,11 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$HUB/api/whoami" | jq .
 | **401 Unauthorized** | 401 | Нет или неверный `Authorization: Bearer` | Выдайте токен из `HAIPLANE_HUB_TOKENS` / admin API keys; для stdio — `HAIPLANE_HUB_TOKEN`; не используйте пустой Bearer |
 | **421 Misdirected Request** / rebinding | 421 | Неверный `Host` / DNS rebinding protection у клиента | Используйте hostname из `HAIPLANE_HUB_ALLOWED_HOSTS`; для Tailscale — MagicDNS из [`deploy/TAILSCALE.md`](../deploy/TAILSCALE.md); Hub отключает MCP-layer rebinding, но nginx/proxy должен проксировать правильный Host |
 | **406 Not Acceptable** | 406 | В `Accept` нет `application/json` и/или `text/event-stream` | Добавьте `Accept: application/json, text/event-stream` в Cursor headers и curl |
-| **Missing session** / tools fail после initialize | 400/ошибка MCP | Вызов `tools/list` или `tools/call` без `Mcp-Session-Id` | Сначала `initialize`, возьмите `Mcp-Session-Id` из ответа, передайте во все follow-up запросы |
+| **Missing session** / tools fail после initialize | 400/ошибка MCP | Хаб stateless и `Mcp-Session-Id` не требует. Такая ошибка приходит от клиента или прокси, который ждёт сессию, либо от старого stateful-хаба (до #1364) | Не добавляйте `Mcp-Session-Id`. Проверьте `$HUB/mcp` и Bearer (401/406 выше), обновите клиент; если хаб за прокси — убедитесь, что тот не режет запросы без сессии |
+| <a id="deploy-window-mcp-disconnect"></a>**MCP хаба отключён / failed после старта сессии в окно релиза** | — | Деплой после мержа в `main` перезапускает единственный экземпляр хаба; MCP и REST — одно приложение и недоступны до конца старта. Клиент, чей запуск пришёлся на рестарт, может остаться отключённым и не подключиться сам | По порядку: 1) дождитесь `200` на `$HUB/healthz` (он показывает живость процесса, не исправность MCP); 2) для Claude Code попросите пользователя переподключить сервер командой `/mcp`, для Cursor — Reload Window (см. раздел 4); 3) пока MCP недоступен, работайте через REST с уже доступным токеном (имя переменной, например `HAIPLANE_HUB_TOKEN`; сам токен в чат не пишите). Не считайте хаб сломанным, пока `/healthz` отвечает 200. Наблюдение, не гарантия: 04.10 в логах деплоя первый успешный `healthz` пришёл через ~4 с после возврата `restart` |
 | **404 на `/mcp/mcp`** | 404 | Устаревший путь | Используйте **`/mcp`** |
 | Connection refused | — | Hub не слушает / неверный туннель | `curl /healthz` на loopback; для prod — SSH `-L 8080:127.0.0.1:8080` (см. [`docs/agent-onboarding.md`](agent-onboarding.md)) |
-| 403 human_only_gate в MCP | 403 | Agent-токен на human-only tool | Используйте human/admin токен или попросите человека (`hub_force_complete_task`, `hub_decide_task`, …) |
+| human_only_gate в MCP | isError | Agent-токен вызвал скрытый human-only инструмент | Агентскому токену эти инструменты не показаны (#1624): человек выполняет шаг через UI, `oc-hub` или REST (`/api/tasks/{id}/approve`, `/decide`, `/force-complete`, …) |
 
 ### 401 — подробнее
 
@@ -405,13 +420,16 @@ MCP streamable HTTP negotiation требует JSON **и** SSE в Accept. Cursor
 
 ### Missing session — подробнее
 
-Типичная последовательность:
+Хаб stateless (`stateless_http=True`, #1364): `Mcp-Session-Id` он не выдаёт и
+не требует, ответ на `initialize` без этого заголовка — норма. Последовательность
+для проверки:
 
-1. `POST /mcp` + `initialize` → сохранить `Mcp-Session-Id`
-2. `POST /mcp` + `notifications/initialized` (если требует клиент)
-3. `POST /mcp` + `tools/list` / `tools/call` **с тем же** `Mcp-Session-Id`
+1. `POST /mcp` + `initialize` — проверка из раздела 3.3
+2. `POST /mcp` + `tools/list` / `tools/call` с тем же Bearer; заголовок сессии не передаётся
 
-Без шага 1 клиент пишет «Missing session» или аналог.
+Сообщение «Missing session» или аналог значит, что клиент или прокси ждёт
+сессию, которой у stateless-хаба нет. Хаб тут не виноват. Если такой клиент
+прямо в момент релиза не смог подключиться, см. строку про окно релиза выше.
 
 ---
 

@@ -41,6 +41,10 @@ def _clean_prefixed_env(monkeypatch):
         "HUB_CI_PYTEST",
         "HUB_CI_CHECKS",
         "HUB_CI_MUTATIONS",
+        "HUB_CI_BASELINE",
+        "HUB_CI_MUTATIONS_OUTCOME",
+        "HUB_CI_BASELINE_OUTCOME",
+        "HUB_CI_EVENT_ACTION",
     ):
         monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
 
@@ -645,7 +649,11 @@ def test_the_mutation_report_is_sent_under_its_own_key(script, monkeypatch, tmp_
 
     payload = _capture_payload(script, monkeypatch)
 
-    assert payload["mutations"] == report
+    sent = dict(payload["mutations"])
+    assert sent.pop("provenance") is not None, (
+        "#1606: the run is named inside the block"
+    )
+    assert sent == report
     assert "mutation" not in payload["checks"], "a warning is not a check outcome"
 
 
@@ -689,7 +697,7 @@ def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
     mutation = next(s for s in steps if s.get("id") == "mutations")
 
     assert mutation["continue-on-error"] is True
-    assert "pull_request" in mutation["if"]
+    assert "steps.evidence.outputs.run" in mutation["if"], "#1606: decided by event"
     assert "timeout-minutes" in mutation
     assert "scripts/mutation_changed.py" in mutation["run"]
     assert names.index("mutations") > names.index("tests")
@@ -698,3 +706,312 @@ def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
     assert names.index("mutations") < steps.index(reporter)
     json_out = re.search(r"--json-out\s+(\S+)", mutation["run"]).group(1)
     assert reporter["with"]["mutations-file"] == json_out.strip("\"'")
+
+
+# ---- #913: the red-test baseline travels under its own key --------------------
+
+
+def test_a_long_baseline_keeps_the_ac_tests_and_says_so(script):
+    tests = {f"tests/test_big.py::test_{i}": "passed" for i in range(500)}
+    tests["tests/test_big.py::test_ac[1]"] = "failed"
+    tests["tests/test_big.py::test_ac[2]"] = "failed"
+    report = {"state": "ran", "merge_base": "m", "tests": tests}
+
+    trimmed = script.trim_baseline(report, {"tests/test_big.py::test_ac"})
+
+    assert len(json.dumps(trimmed)) < 30_000
+    assert trimmed["tests"]["tests/test_big.py::test_ac[1]"] == "failed"
+    assert trimmed["tests"]["tests/test_big.py::test_ac[2]"] == "failed"
+    assert trimmed["tests_trimmed"] == len(tests) - len(trimmed["tests"])
+    assert trimmed["tests_trimmed"] > 0
+
+
+def test_a_missing_baseline_report_is_not_sent(script, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HAIPLANE_HUB_CI_BASELINE", str(tmp_path / "absent.json"))
+    assert "baseline" not in _capture_payload(script, monkeypatch)
+    assert "absent.json" in capsys.readouterr().out
+
+
+_INNER_TESTS = """
+import pytest
+
+def test_passes():
+    assert True
+
+def test_fails():
+    assert False
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_param(n):
+    assert n != 2
+"""
+
+
+@pytest.fixture
+def inner_suite(script, monkeypatch, tmp_path):
+    """A real pytest run against a throwaway suite, through the real runner."""
+    import shlex
+    import sys
+
+    (tmp_path / "test_inner.py").write_text(_INNER_TESTS)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "HAIPLANE_HUB_CI_PYTEST", f"{shlex.quote(sys.executable)} -m pytest"
+    )
+    return "test_inner.py"
+
+
+def test_a_missing_nodeid_does_not_hide_the_others(script, inner_suite, capsys):
+    """#1581 AC-1: one absent test_ref is not_found alone, never all of them."""
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    missing = f"{inner_suite}::test_typo_in_the_card"
+
+    result = script.run_nodeids([passing, missing, failing])
+
+    assert result == {passing: True, failing: False}, (
+        "the existing ids keep their real outcome; the absent one is not in "
+        "the result, which the caller reports as not_found"
+    )
+    assert "test_typo_in_the_card" in capsys.readouterr().out, (
+        "the reason for not_found is named in the log, with the id"
+    )
+
+
+def test_all_present_nodeids_report_as_before(script, inner_suite):
+    """#1581 AC-2: with nothing missing the outcome is what it was, in one run."""
+    passing = f"{inner_suite}::test_passes"
+    parametrized = f"{inner_suite}::test_param"
+
+    calls: list[list[str]] = []
+    real_run = script.subprocess.run
+
+    def counting_run(cmd, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    script.subprocess.run = counting_run
+    try:
+        result = script.run_nodeids([passing, parametrized])
+    finally:
+        script.subprocess.run = real_run
+
+    assert result == {passing: True, parametrized: False}, (
+        "one failing case fails the parametrized AC"
+    )
+    assert len(calls) == 1, "nothing missing: no extra pytest start"
+
+
+def test_a_missing_file_takes_only_its_own_ids_out(script, inner_suite, capsys):
+    """#1581 round 2: pytest names a missing FILE, not the ids inside it."""
+    passing = f"{inner_suite}::test_passes"
+    gone = ["no_such_dir/test_gone.py::test_x", "no_such_dir/test_gone.py::test_y"]
+
+    result = script.run_nodeids([gone[0], passing, gone[1]])
+
+    assert result == {passing: True}, (
+        "both ids of the absent file are not_found, the existing one is pass"
+    )
+    assert "test_gone.py" in capsys.readouterr().out
+
+
+def test_a_missing_file_and_a_missing_test_each_get_their_own_outcome(
+    script, inner_suite, capsys
+):
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    no_test = f"{inner_suite}::test_typo"
+    no_file = "no_such_dir/test_gone.py::test_x"
+
+    result = script.run_nodeids([no_file, passing, no_test, failing])
+
+    assert result == {passing: True, failing: False}
+    out = capsys.readouterr().out
+    assert "test_typo" in out and "test_gone.py" in out
+
+
+def test_a_pytest_failure_naming_nothing_is_not_retried(script, monkeypatch):
+    """No named missing id: behave as before, one run, no loop."""
+    calls = []
+
+    class Proc:
+        stdout = "collecting ... \nno tests ran\n"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Proc()
+
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    assert script.run_nodeids(["t.py::a", "t.py::b"]) == {}
+    assert len(calls) == 1
+
+
+def test_a_same_named_file_elsewhere_does_not_take_the_id_out(
+    script, inner_suite, tmp_path
+):
+    """#1581 round 3: nested/test_inner.py missing is not test_inner.py."""
+    passing = f"{inner_suite}::test_passes"
+    gone = f"nested/{inner_suite}::test_missing"
+
+    assert script.run_nodeids([gone, passing]) == {passing: True}
+
+
+def test_an_absolute_reported_path_still_matches_a_relative_id(
+    script, inner_suite, tmp_path
+):
+    """pytest prints '<abs>/test_inner.py::t' for a relative argument."""
+    passing = f"{inner_suite}::test_passes"
+    missing = f"{inner_suite}::test_typo"
+    absolute = f"ERROR: not found: {tmp_path / missing}\n(no match in any of [])\n"
+
+    assert script._missing_nodeids(absolute, [passing, missing]) == {
+        missing: f"not found: {tmp_path / missing}"
+    }
+    nested = f"ERROR: file or directory not found: {tmp_path / 'nested' / inner_suite}"
+    assert script._missing_nodeids(nested, [passing]) == {}
+
+
+# ---- #1606: skipped / failed / present are three different payloads ----------
+
+
+def _provenance_env(monkeypatch):
+    monkeypatch.setenv("GITHUB_RUN_ID", "4242")
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.example")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/repo")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_EVENT_ACTION", "opened")
+
+
+def test_evidence_keys_distinguish_skipped_failed_and_present(
+    script, monkeypatch, tmp_path
+):
+    """AC-3: a step that did not run sends no key; one that ran says what happened."""
+    _provenance_env(monkeypatch)
+    valid = tmp_path / "ok.json"
+    valid.write_text(json.dumps({"state": "ran", "survivors": []}))
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    absent = tmp_path / "absent.json"
+
+    def run(kind: str, outcome: str, path) -> dict:
+        monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
+        monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", outcome)
+        return _capture_payload(script, monkeypatch)
+
+    for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
+        # skipped: the key is absent — not {} and not an error.
+        assert key not in run(kind, "skipped", absent)
+        assert key not in run(kind, "skipped", valid), "a skipped step sends nothing"
+
+        # ran, but no file (timeout before the write): an explicit error.
+        timed_out = run(kind, "cancelled", absent)[key]
+        assert timed_out["state"] == "error"
+        assert timed_out["reason"], "the cause must be named"
+        assert "provenance" in timed_out
+
+        # ran, file is broken: an explicit error too.
+        garbage = run(kind, "failure", broken)[key]
+        assert garbage["state"] == "error" and garbage["reason"]
+
+        # ran, file is valid: the data, plus where it came from.
+        good = run(kind, "success", valid)[key]
+        assert good["state"] == "ran"
+        assert good["provenance"]["run_id"] == "4242"
+        assert good["provenance"]["run_url"] == (
+            "https://github.example/org/repo/actions/runs/4242"
+        )
+        assert good["provenance"]["event"] == "pull_request.opened"
+        assert good["provenance"]["at"], "a time must be stated"
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+
+
+def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
+    script, monkeypatch, tmp_path
+):
+    """#1606: `{}` or a foreign object is not a mutation/baseline report."""
+    _provenance_env(monkeypatch)
+    for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
+        for content in ({}, {"unexpected": "x"}, {"state": "banana"}):
+            path = tmp_path / f"{key}.json"
+            path.write_text(json.dumps(content))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", "success")
+            block = _capture_payload(script, monkeypatch)[key]
+            assert block["state"] == "error", (key, content)
+            assert block["reason"] and "unexpected" not in block
+            assert block["provenance"]["run_id"] == "4242"
+        # Without a stated outcome (an old caller) foreign content sends nothing.
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+        assert key not in _capture_payload(script, monkeypatch)
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
+
+
+def test_a_spent_deadline_still_sends_the_report_naming_what_did_not_run(
+    script, monkeypatch
+):
+    """#1666: the step is capped by CI; the reporter must send before that.
+
+    With the clock past the overall deadline no command is launched, the
+    commands left are named as not run (never as pass), and the POST happens.
+    """
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-1666/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(script.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(script, "_STARTED", 1000.0)
+    sent: dict = {}
+
+    def fake_request(url, token, payload=None):
+        if payload is None:
+            return {
+                "acceptance_criteria": [],
+                "validation_commands": ["ruff --version", "ruff check hub"],
+            }
+        sent.update(payload)
+        return {"applied": True, "reason": "ok"}
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("no command may start after the deadline")
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    clock["now"] += script._REPORT_DEADLINE + 1  # 17 minutes spent before validation
+    assert script.main() == 0
+    assert sent, "the report must be sent even when the deadline is spent"
+    assert sent["validation_status"] == "unknown"
+    assert "deadline" in sent["reason"]
+    assert "ruff --version" in sent["reason"]
+    assert "не выполнена" in sent["validation_log"]
+
+
+def test_durations_flags_do_not_change_what_a_pytest_run_selects(script):
+    """#1666: the Test step prints --durations=30; that must not break reuse.
+
+    The step's outcome is handed to the reporter under its exact command line.
+    If the flag made the selection key None, the task's `uv run pytest -q`
+    would no longer be proven and the whole suite would run a second time
+    inside the 20 minute step (#1081).
+    """
+    plain = script._selection_key("uv run pytest -q")
+    assert plain is not None
+    for cmd in (
+        "uv run pytest -q -n auto --durations=30",
+        "uv run pytest -q -n auto --durations 30",
+        "uv run pytest -q --durations=30 --durations-min=1.0",
+        "uv run pytest -q --durations 30 --durations-min 1.0",
+    ):
+        assert script._selection_key(cmd) == plain, cmd
+    ran = {"uv run pytest -q -n auto --durations=30": "pass"}
+    assert script.already_proven("uv run pytest -q", ran) == (
+        "pass",
+        "uv run pytest -q -n auto --durations=30",
+    )
+    # a path after the flag is still a selection, never swallowed as its value
+    assert (
+        script._selection_key("uv run pytest -q --durations tests/test_web.py") != plain
+    )

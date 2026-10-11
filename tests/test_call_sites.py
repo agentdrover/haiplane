@@ -7,7 +7,9 @@ hand would only prove I can match my own format.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -599,3 +601,363 @@ async def test_a_registry_call_is_removable_and_charges_nothing(
         json={"verdict": "approved", "agent": "reviewer"},
     )
     assert verdict.status_code == 200, verdict.text
+
+
+# ---- #1652: the raw index is built once per clean commit ----
+
+
+@pytest.fixture(autouse=True)
+def _isolated_index_cache():
+    call_sites.clear_index_cache()
+    yield
+    call_sites.clear_index_cache()
+
+
+@pytest.fixture
+def committed(repo: Path) -> tuple[Path, str, str]:
+    """HEAD clean; two diffs against the base, as real git emits them."""
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "hub" / "core.py").write_text(
+        "def guard(value):\n"
+        "    return bool(value) and value != 0\n"
+        "\n"
+        "\n"
+        "def unrelated():\n"
+        "    return 1\n"
+    )
+    _git(repo, "commit", "-qam", "core")
+    mid = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "hub" / "writer.py").write_text(
+        "from hub.core import guard\n"
+        "\n"
+        "\n"
+        "def write(value):\n"
+        "    if guard(value):\n"
+        "        return str(value)\n"
+        "    return None\n"
+    )
+    _git(repo, "commit", "-qam", "writer")
+    core_diff = _git(repo, "diff", "-U0", base, mid).stdout
+    writer_diff = _git(repo, "diff", "-U0", mid, "HEAD").stdout
+    assert core_diff and writer_diff
+    return repo, core_diff, writer_diff
+
+
+def _uncached(monkeypatch, root: Path, diff: str):
+    """The report the way it was computed before the cache existed."""
+    with monkeypatch.context() as m:
+        m.setattr(call_sites, "cached_call_index", call_sites.build_call_index)
+        return call_sites.analyse(str(root), diff)
+
+
+class _CountingBuilder:
+    def __init__(self, monkeypatch):
+        self.calls = 0
+        self._real = call_sites.build_call_index
+        monkeypatch.setattr(call_sites, "build_call_index", self)
+
+    def __call__(self, root, subdirs=call_sites.INDEX_SUBDIRS):
+        self.calls += 1
+        return self._real(root, subdirs)
+
+
+def test_call_index_is_reused_for_the_same_clean_head(committed, monkeypatch):
+    root, core_diff, writer_diff = committed
+    expected = [_uncached(monkeypatch, root, d) for d in (core_diff, writer_diff)]
+    builder = _CountingBuilder(monkeypatch)
+
+    got = [call_sites.analyse(str(root), d) for d in (core_diff, writer_diff)]
+
+    assert builder.calls == 1, "two diffs on one clean HEAD share one raw index"
+    assert got == expected
+
+    # What an analyse hands out is a copy: mutating it leaves the cache alone.
+    index, unparsed = call_sites.cached_call_index(str(root))
+    assert builder.calls == 1
+    index["guard"][0].line = 99999
+    index["injected"] = []
+    unparsed.append("injected.py")
+    again_index, again_unparsed = call_sites.cached_call_index(str(root))
+    assert "injected" not in again_index
+    assert again_index["guard"][0].line != 99999
+    assert "injected.py" not in again_unparsed
+    assert builder.calls == 1
+
+
+def _new_commit(root, monkeypatch, tmp_path):
+    (root / "hub" / "extra.py").write_text("def extra():\n    return guard(2)\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "extra")
+    return root, True
+
+
+def _edit_tracked(root, monkeypatch, tmp_path):
+    (root / "hub" / "bulk.py").write_text("def write_many(values):\n    return []\n")
+    return root, False
+
+
+def _add_untracked(root, monkeypatch, tmp_path):
+    (root / "hub" / "fresh.py").write_text("def fresh():\n    return guard(3)\n")
+    return root, False
+
+
+def _add_ignored(root, monkeypatch, tmp_path):
+    with open(root / ".git" / "info" / "exclude", "a") as handle:
+        handle.write("hub/hidden.py\n")
+    (root / "hub" / "hidden.py").write_text("def hidden():\n    return guard(4)\n")
+    return root, False
+
+
+def _renamed_py(root, monkeypatch, tmp_path):
+    _git(root, "mv", "hub/bulk.py", "hub/bulk.txt")  # staged: "R  old -> new"
+    return root, False
+
+
+def _gitlink(root, monkeypatch, tmp_path):
+    head = _git(root, "rev-parse", "HEAD").stdout.strip()
+    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{head},hub/vendor")
+    return root, False
+
+
+def _symlinked_py(root, monkeypatch, tmp_path):
+    (root / "hub" / "linked.py").symlink_to("core.py")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "a tracked symlink")
+    return root, False
+
+
+def _head_moves_between_head_and_status(root, monkeypatch, tmp_path):
+    real = call_sites._indexed_tree_is_clean
+    moved = []
+
+    def status_after_a_checkout(path, subdirs):
+        if not moved:
+            moved.append(True)
+            (root / "hub" / "late.py").write_text("def late():\n    return guard(5)\n")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-qm", "checked out between HEAD and status")
+        return real(path, subdirs)
+
+    monkeypatch.setattr(call_sites, "_indexed_tree_is_clean", status_after_a_checkout)
+    return root, False
+
+
+def _head_moves_during_build(root, monkeypatch, tmp_path):
+    call_sites.clear_index_cache()  # the build below must really happen
+    real = call_sites.build_call_index
+    moved = []
+
+    def build_then_move(path, subdirs=call_sites.INDEX_SUBDIRS):
+        built = real(path, subdirs)
+        if not moved:
+            moved.append(True)
+            _git(root, "commit", "-q", "--allow-empty", "-m", "moved under the build")
+        return built
+
+    monkeypatch.setattr(call_sites, "build_call_index", build_then_move)
+    return root, "moved"
+
+
+def _not_a_repository(root, monkeypatch, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for sub in ("hub", "tests"):
+        (plain / sub).mkdir()
+        for src in (root / sub).glob("*.py"):
+            (plain / sub / src.name).write_text(src.read_text())
+    return plain, False
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(_new_commit, id="new-commit"),
+        pytest.param(_edit_tracked, id="modified-tracked"),
+        pytest.param(_add_untracked, id="untracked"),
+        pytest.param(_add_ignored, id="ignored"),
+        pytest.param(_renamed_py, id="renamed-py"),
+        pytest.param(_gitlink, id="gitlink"),
+        pytest.param(_symlinked_py, id="symlinked-py"),
+        pytest.param(
+            _head_moves_between_head_and_status, id="head-moves-before-status"
+        ),
+        pytest.param(_head_moves_during_build, id="head-moves-during-build"),
+        pytest.param(_not_a_repository, id="not-a-repository"),
+    ],
+)
+def test_call_index_cache_never_serves_a_stale_tree(
+    committed, monkeypatch, tmp_path, scenario
+):
+    root, core_diff, _ = committed
+    call_sites.analyse(str(root), core_diff)  # warms the cache
+    warm = len(call_sites._index_cache)
+    assert warm == 1
+
+    target, grows = scenario(root, monkeypatch, tmp_path)
+
+    builder = _CountingBuilder(monkeypatch)
+    got = call_sites.analyse(str(target), core_diff)
+    assert builder.calls == 1, "the warm entry was not served"
+    assert got == _uncached(monkeypatch, target, core_diff)
+    if scenario is _head_moves_during_build:
+        assert len(call_sites._index_cache) == 0, "a build that straddled a commit"
+    else:
+        assert len(call_sites._index_cache) == (warm + 1 if grows else warm), (
+            "only a new commit on a clean tree adds an entry"
+        )
+
+
+class _SignalEvent(threading.Event):
+    """An Event that says when somebody has started waiting on it."""
+
+    waiting = threading.Event()
+
+    def wait(self, timeout=None):
+        type(self).waiting.set()
+        return super().wait(timeout)
+
+
+def _run_thread(target, results: list, errors: list):
+    def body():
+        try:
+            results.append(target())
+        except BaseException as exc:  # noqa: BLE001 - the test reads it back
+            errors.append(exc)
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.fixture
+def flight_probe(monkeypatch):
+    class Flight(call_sites._Flight):
+        def __init__(self):
+            self.done = _SignalEvent()
+
+    _SignalEvent.waiting = threading.Event()
+    monkeypatch.setattr(call_sites, "_Flight", Flight)
+    return _SignalEvent
+
+
+def test_call_index_cache_single_flight_and_lru(committed, monkeypatch, flight_probe):
+    root, core_diff, _ = committed
+    real = call_sites.build_call_index
+    started, release = threading.Event(), threading.Event()
+    calls: list[int] = []
+
+    def gated(path, subdirs=call_sites.INDEX_SUBDIRS):
+        calls.append(1)
+        started.set()
+        assert release.wait(10)
+        return real(path, subdirs)
+
+    monkeypatch.setattr(call_sites, "build_call_index", gated)
+
+    # Two threads, one key: one build.
+    results: list = []
+    errors: list = []
+    first = _run_thread(
+        lambda: call_sites.analyse(str(root), core_diff), results, errors
+    )
+    assert started.wait(10)
+    second = _run_thread(
+        lambda: call_sites.analyse(str(root), core_diff), results, errors
+    )
+    assert flight_probe.waiting.wait(10), "the second call waits for the first build"
+    release.set()
+    first.join(10)
+    second.join(10)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors and len(results) == 2
+    assert len(calls) == 1
+    assert results[0] == results[1]
+    assert call_sites._index_inflight == {}
+
+    # The owner fails: the waiter does not hang, builds for itself, and the
+    # in-flight mark is gone for whoever comes next.
+    call_sites.clear_index_cache()
+    calls.clear()
+    started.clear()
+    release.clear()
+    flight_probe.waiting.clear()
+    boom = RuntimeError("owner failed")
+
+    def failing_then_real(path, subdirs=call_sites.INDEX_SUBDIRS):
+        calls.append(1)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(10)
+            raise boom
+        return real(path, subdirs)
+
+    monkeypatch.setattr(call_sites, "build_call_index", failing_then_real)
+    results, errors = [], []
+    owner = _run_thread(
+        lambda: call_sites.analyse(str(root), core_diff), results, errors
+    )
+    assert started.wait(10)
+    waiter_results: list = []
+    waiter_errors: list = []
+    waiter = _run_thread(
+        lambda: call_sites.analyse(str(root), core_diff), waiter_results, waiter_errors
+    )
+    assert flight_probe.waiting.wait(10)
+    release.set()
+    owner.join(10)
+    waiter.join(10)
+    assert not owner.is_alive() and not waiter.is_alive(), "nobody hangs"
+    assert errors == [boom]
+    assert not waiter_errors and len(waiter_results) == 1
+    assert len(calls) == 2, "the waiter rebuilt after the owner failed"
+    assert call_sites._index_inflight == {}
+
+    # And a failure with nobody waiting leaves nothing behind either.
+    call_sites.clear_index_cache()
+    calls.clear()
+
+    def fails_once(path, subdirs=call_sites.INDEX_SUBDIRS):
+        calls.append(1)
+        if len(calls) == 1:
+            raise boom
+        return real(path, subdirs)
+
+    monkeypatch.setattr(call_sites, "build_call_index", fails_once)
+    with pytest.raises(RuntimeError):
+        call_sites.analyse(str(root), core_diff)
+    assert call_sites._index_inflight == {} and len(call_sites._index_cache) == 0
+    call_sites.analyse(str(root), core_diff)
+    assert len(calls) == 2, "the next request builds again"
+
+    # LRU of eight: the ninth key evicts the least recently used one.
+    monkeypatch.setattr(call_sites, "build_call_index", real)
+    call_sites.clear_index_cache()
+    _check_lru_keeps_the_eight_most_recent_keys(committed, monkeypatch)
+
+
+def _check_lru_keeps_the_eight_most_recent_keys(committed, monkeypatch):
+    root, _, _ = committed
+    shas = [_git(root, "rev-parse", "HEAD").stdout.strip()]
+    for i in range(8):
+        _git(root, "commit", "-q", "--allow-empty", "-m", f"empty {i}")
+        shas.append(_git(root, "rev-parse", "HEAD").stdout.strip())
+    builder = _CountingBuilder(monkeypatch)
+
+    def at(sha: str):
+        _git(root, "checkout", "-q", sha)
+        call_sites.cached_call_index(str(root))
+
+    def key(sha: str):
+        return (os.path.abspath(str(root)), sha, call_sites.INDEX_SUBDIRS)
+
+    for sha in shas[:8]:
+        at(sha)
+    assert builder.calls == 8 and len(call_sites._index_cache) == 8
+
+    at(shas[0])  # a hit: the first key becomes the most recent
+    assert builder.calls == 8
+    at(shas[8])  # the ninth key evicts the least recent one
+    assert builder.calls == 9
+    assert key(shas[1]) not in call_sites._index_cache, "the second key is evicted"
+    assert key(shas[0]) in call_sites._index_cache, "the first key stayed"
+    assert len(call_sites._index_cache) == 8

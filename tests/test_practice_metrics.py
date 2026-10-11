@@ -17,6 +17,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -672,7 +673,9 @@ async def _bug(
 
 
 async def _escaped(db: aiosqlite.Connection, **kwargs) -> dict:
-    return (await practice_metrics(db, **kwargs))["escaped_defects"]
+    """The completed_at reconstruction (#528), kept since #918 as the second,
+    labelled number — the tests below are about how it is reconstructed."""
+    return (await practice_metrics(db, **kwargs))["escaped_defects"]["reconstructed"]
 
 
 async def test_bug_after_feature_close_is_escaped(db: aiosqlite.Connection):
@@ -836,6 +839,346 @@ async def test_page_says_nothing_measurable_instead_of_zero(
 
     page = (await client.get("/metrics")).text
     assert "нет измеримых утечек в этом окне" in page
+
+
+# --- Change failure rate and measured escapes (#918) ----------------------
+#
+# CFR = share of successful deploys in the window with at least one prod defect
+# bound to them through tasks.release_id (#917); the denominator travels with
+# the share. escaped_defects is measured from found_in='prod' (#909); the
+# completed_at walk stays as a separate, labelled reconstruction over bugs
+# whose found_in was never recorded.
+
+
+async def _deploy(
+    db: aiosqlite.Connection,
+    sha: str,
+    *,
+    project_id: int | None = None,
+    status: str = "success",
+    deployed: str = "-1 days",
+) -> int:
+    release_id = await repo.record_release(
+        db, deployed_sha=sha, project_id=project_id, status=status, source="ci"
+    )
+    await db.execute(
+        "UPDATE releases SET deployed_at=datetime('now', ?) WHERE id=?",
+        (deployed, release_id),
+    )
+    return release_id
+
+
+async def _defect(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    found_in: str = "prod",
+    release_id: int | None = None,
+    parent_id: int | None = None,
+) -> int:
+    task_id = await _bug(db, title=title, parent_id=parent_id)
+    await db.execute(
+        "UPDATE tasks SET found_in=?, release_id=? WHERE id=?",
+        (found_in, release_id, task_id),
+    )
+    return task_id
+
+
+def _cfr_row(cfr: dict, project: str) -> dict:
+    rows = [r for r in cfr["by_project"] if r["project"] == project]
+    assert len(rows) == 1, cfr
+    return rows[0]
+
+
+async def test_change_failure_rate_and_restore_time(db: aiosqlite.Connection):
+    """AC-1: the share comes with its denominator, deploys without a project
+    belong to the default project (#915), and the defect that makes a deploy
+    failed is the same one whose restore clock is measured (#916)."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    default_id = await repo.create_project(db, slug="default", name="Default")
+    releases = [await _deploy(db, f"{i:040x}") for i in range(1, 5)]
+    # Stamped with the default project: the same history as project-less rows.
+    releases.append(await _deploy(db, "d" * 40, project_id=default_id))
+    await _deploy(db, "a" * 40, deployed="-400 days")  # outside the window
+    await _deploy(db, "b" * 40, status="failed")  # never reached prod
+    other = await _deploy(db, "c" * 40, project_id=spike)
+
+    fixed = await _defect(db, title="broke the first", release_id=releases[0])
+    await _defect(db, title="broke it again", release_id=releases[0])
+    await _defect(db, title="broke the second", release_id=releases[1])
+    await _defect(
+        db, title="caught at review", found_in="review", release_id=releases[2]
+    )
+    await _defect(db, title="release unknown")
+    await _defect(db, title="spike broke", release_id=other)
+    await db.execute(
+        "UPDATE tasks SET detected_at=datetime('now', '-3 hours') WHERE id=?",
+        (fixed,),
+    )
+    await db.commit()
+    await repo.update_task(db, fixed, status="completed")
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    cfr = metrics["change_failure_rate"]
+    default = _cfr_row(cfr, "default")
+    assert default["deploys"] == 5, "only successful deploys of the window"
+    assert default["failed_deploys"] == 2, "two defects on one deploy count once"
+    assert default["rate"] == 0.4
+    assert default["small_sample"] is False
+    spike_row = _cfr_row(cfr, "spike")
+    assert (spike_row["deploys"], spike_row["failed_deploys"]) == (1, 1)
+    assert spike_row["small_sample"] is True, "fewer than min_sample deploys"
+    assert cfr["min_sample"] == 5
+    assert cfr["defects_without_release"] == 1, "counted apart, not dropped"
+
+    restore = metrics["prod_defect_clocks"]["time_to_restore"]
+    assert restore["measured"] == 1
+    assert 2.9 <= restore["median_hours"] <= 3.1
+
+
+async def test_escapes_counted_from_found_in(db: aiosqlite.Connection):
+    """AC-2: a prod defect without a feature ancestor is a measured escape,
+    not a bug lost in bugs_without_feature."""
+    await _defect(db, title="prod, under nothing")
+    await _defect(db, title="caught at review", found_in="review")
+    await _bug(db, title="old orphan, stage unknown", parent_id=None)
+    await db.commit()
+
+    escaped = (await practice_metrics(db))["escaped_defects"]
+    assert escaped["escaped"] == 1
+    assert escaped["source"] == "found_in"
+    reconstructed = escaped["reconstructed"]
+    assert reconstructed["bugs_in_window"] == 1, "only bugs without found_in"
+    assert reconstructed["bugs_without_feature"] == 1, "the unknown orphan only"
+
+
+async def test_reconstructed_escapes_labelled(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-3: the reconstructed number carries its label and sits apart from
+    the measured one — on the data, on the page and in the MCP text."""
+    feature_id = await _feature(db, title="closed feature", completed="-10 days")
+    await _bug(db, title="old bug, stage unknown", parent_id=feature_id)
+    await _defect(db, title="prod defect", parent_id=feature_id)
+    await _defect(db, title="prod defect, no feature")
+    await db.commit()
+
+    escaped = (await practice_metrics(db))["escaped_defects"]
+    assert escaped["escaped"] == 2
+    assert escaped["reconstructed"]["escaped"] == 1
+    assert escaped["reconstructed"]["label"] == "реконструкция"
+
+    api = (await client.get("/api/metrics/practices")).json()["escaped_defects"]
+    assert (api["escaped"], api["reconstructed"]["escaped"]) == (2, 1)
+    assert api["reconstructed"]["label"] == "реконструкция"
+
+    econ = (await practice_metrics(db))["review_economy"]["escapes"]
+    assert econ["escaped"] == 2
+    assert econ["reconstructed"]["escaped"] == 1
+
+    page = (await client.get("/metrics")).text
+    assert 'data-metric="escaped_defects.escaped">2<' in page
+    assert 'data-metric="escaped_defects.reconstructed.escaped">1<' in page
+    assert "Утечек в прод, измерено" in page
+    assert "Реконструкция" in page
+
+
+async def test_metrics_page_shows_change_failure_rate(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Under min_sample deploys the page prints the mark, not a share."""
+    release_id = await _deploy(db, "e" * 40)
+    await _defect(db, title="broke it", release_id=release_id)
+    await db.commit()
+
+    page = (await client.get("/metrics")).text
+    assert "Change failure rate" in page
+    assert 'data-metric="change_failure_rate.default.deploys">1<' in page
+    assert "малая выборка" in page
+    # The CFR table only: the shift-left table above it (#914) rightly shows
+    # this one defect as 100% of the window's prod stage.
+    cfr_section = page.split("Change failure rate (#918)", 1)[1].split("<h2>", 1)[0]
+    assert "100.0%" not in cfr_section
+
+
+async def test_mcp_practice_metrics_names_cfr_and_both_escapes():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 90,
+        "change_failure_rate": {
+            "min_sample": 5,
+            "defects_without_release": 1,
+            "by_project": [
+                {
+                    "project": "default",
+                    "deploys": 5,
+                    "failed_deploys": 2,
+                    "rate": 0.4,
+                    "small_sample": False,
+                },
+                {
+                    "project": "spike",
+                    "deploys": 1,
+                    "failed_deploys": 1,
+                    "rate": 1.0,
+                    "small_sample": True,
+                },
+            ],
+        },
+        "escaped_defects": {
+            "escaped": 3,
+            "source": "found_in",
+            "reconstructed": {"label": "реконструкция", "escaped": 7},
+        },
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics()
+    text = result.content[0].text
+    assert (
+        "Change failure rate: default 40.0% (2/5 deploys); "
+        "spike small sample (1/1 deploys); 1 prod defect(s) without release"
+    ) in text
+    assert "Escaped to prod (measured, found_in): 3; reconstructed" in text
+    assert "реконструкция: 7" in text
+
+
+def test_cli_change_failure_rate_prints_the_section(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    cfr = {"min_sample": 5, "by_project": [], "defects_without_release": 0}
+    with (
+        patch.object(
+            sys, "argv", ["oc-hub", "change-failure-rate", "--since-days", "30"]
+        ),
+        patch.object(
+            cli, "_api", return_value={"since_days": 30, "change_failure_rate": cfr}
+        ) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
+    assert json.loads(capsys.readouterr().out) == cfr
+
+
+# --- Shift-left: where defects were caught (#914) ---------------------------
+#
+# A defect is a bug, or any task with a recorded found_in. Every stage gets a
+# row, empty ones too; unknown is not folded into the others and has its own
+# share, because a distribution over "only the rows someone filled in" reads as
+# a finished picture when it is not.
+
+
+async def test_shift_left_distribution(client: AsyncClient, db: aiosqlite.Connection):
+    """#914 AC-2: the distribution by stage, with the unknown share apart —
+    in the data, on the page and in the API."""
+    await _defect(db, title="caught at review", found_in="review")
+    await _defect(db, title="caught at review again", found_in="review")
+    await _defect(db, title="caught by CI", found_in="ci")
+    await _defect(db, title="escaped", found_in="prod")
+    await _bug(db, title="stage never recorded", parent_id=None)
+    await _task(db, title="a feature, stage unknown by default")  # no defect
+    caught = await _task(db, title="a feature whose test run caught a defect")
+    await db.execute("UPDATE tasks SET found_in='test' WHERE id=?", (caught,))
+    old = await _defect(db, title="outside the window", found_in="staging")
+    await db.execute(
+        "UPDATE tasks SET created_at=datetime('now', '-400 days') WHERE id=?", (old,)
+    )
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    sl = metrics["shift_left"]
+    assert sl["defects"] == 6, "bugs, plus any task with a recorded stage"
+    assert [r["stage"] for r in sl["by_stage"]] == [
+        "review",
+        "ci",
+        "test",
+        "staging",
+        "prod",
+        "unknown",
+    ]
+    by = {r["stage"]: r for r in sl["by_stage"]}
+    assert (by["review"]["defects"], by["review"]["share"]) == (2, 0.333)
+    assert (by["ci"]["defects"], by["test"]["defects"]) == (1, 1)
+    assert by["staging"]["defects"] == 0, "the window applies to created_at"
+    assert by["prod"]["defects"] == metrics["escaped_defects"]["escaped"] == 1
+    assert (by["unknown"]["defects"], sl["unknown"]) == (1, 1)
+    assert sl["unknown_share"] == 0.167
+    assert sl["recorded"] == 5
+
+    api = (await client.get("/api/metrics/practices")).json()["shift_left"]
+    assert api["unknown_share"] == 0.167
+
+    page = (await client.get("/metrics")).text
+    assert "Shift-left" in page
+    assert 'data-metric="shift_left.review.defects">2<' in page
+    assert 'data-metric="shift_left.unknown_share">16.7%<' in page
+
+
+async def test_shift_left_empty_window_has_no_shares(db: aiosqlite.Connection):
+    """No defects is not "0% unknown": the share is None, not zero."""
+    sl = (await practice_metrics(db))["shift_left"]
+    assert sl["defects"] == 0
+    assert sl["unknown_share"] is None
+    assert all(r["share"] is None for r in sl["by_stage"])
+
+
+async def test_mcp_practice_metrics_names_shift_left():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 90,
+        "shift_left": {
+            "defects": 5,
+            "recorded": 4,
+            "unknown": 1,
+            "unknown_share": 0.2,
+            "by_stage": [
+                {"stage": "review", "defects": 2, "share": 0.4},
+                {"stage": "ci", "defects": 1, "share": 0.2},
+                {"stage": "test", "defects": 0, "share": 0.0},
+                {"stage": "staging", "defects": 0, "share": 0.0},
+                {"stage": "prod", "defects": 1, "share": 0.2},
+                {"stage": "unknown", "defects": 1, "share": 0.2},
+            ],
+        },
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics()
+    text = result.content[0].text
+    assert (
+        "Shift-left (defects by found_in, 5): review 2, ci 1, test 0, "
+        "staging 0, prod 1; unknown 1 (20.0%)"
+    ) in text
+
+
+def test_cli_shift_left_prints_the_section(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    sl = {"defects": 0, "recorded": 0, "unknown": 0, "unknown_share": None}
+    with (
+        patch.object(sys, "argv", ["oc-hub", "shift-left", "--since-days", "30"]),
+        patch.object(
+            cli, "_api", return_value={"since_days": 30, "shift_left": sl}
+        ) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
+    assert json.loads(capsys.readouterr().out) == sl
 
 
 # --- What the findings turned out to be (#877, on #876's data) ---------------
@@ -1101,6 +1444,183 @@ async def test_debt_blocks_nothing_and_says_so_when_empty(
         await fresh.executescript(_SCHEMA)
         await _migrate(fresh)
         assert (await practice_metrics(fresh))["category_debt"] == []
+
+
+# --- A rule that did not hold (#920) ------------------------------------------
+#
+# A class closed by a named check (#878) should stop coming back. Whether it
+# did is only visible against the date the rule was set up: a finding of the
+# class AFTER that date is a breach, one BEFORE it is the history the rule was
+# written from.
+
+
+async def _finding_at(db, title: str, category: str, when: str) -> int:
+    task_id = await _task(db, title=title)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": title, "severity": "high", "category": category}]
+        ),
+        incomplete=False,
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE task_id=?", (when, task_id)
+    )
+    return task_id
+
+
+async def _rule_set_up(db, category: str, when: str) -> None:
+    await services.record_category_check(
+        db, category=category, check_ref=f"tests/test_x.py::test_{category}"
+    )
+    await db.execute(
+        "UPDATE category_checks SET created_at=?, recorded_at=? WHERE category=?",
+        (when, when, category),
+    )
+    await db.commit()
+
+
+async def test_repeat_after_rule_is_reported(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3: the class came back after its check was named; the report shows the
+    # rule as breached, with the date it was set up.
+    rule_date = _ts(48)
+    await _finding_at(db, "before", "timeouts", _ts(72))
+    await _rule_set_up(db, "timeouts", rule_date)
+    after = await _finding_at(db, "after", "timeouts", _ts(24))
+    await db.commit()
+
+    report = (await practice_metrics(db))["rule_breaches"]
+    assert report["rules_total"] == 1
+    [row] = report["breached"]
+    assert row["category"] == "timeouts"
+    assert row["check_ref"] == "tests/test_x.py::test_timeouts"
+    assert row["rule_created_at"] == rule_date
+    assert row["breaches"] == 1
+    assert row["task_ids"] == [after]
+
+    # Re-recording a better check replaces the check, not the date the rule
+    # was set up: the class was already promised closed from the first one.
+    await services.record_category_check(
+        db, category="timeouts", check_ref="tests/test_y.py::test_better"
+    )
+    [again] = (await practice_metrics(db))["rule_breaches"]["breached"]
+    assert again["rule_created_at"] == rule_date
+    assert again["check_ref"] == "tests/test_y.py::test_better"
+
+    page = (await client.get("/metrics")).text
+    assert "test_better" in page and rule_date[:10] in page
+
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+
+    data = await practice_metrics(db)
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=data)):
+        result = await mcp_server.hub_practice_metrics()
+    text = result.content[0].text
+    assert "timeouts" in text and rule_date[:10] in text
+
+
+async def test_repeat_before_rule_is_not_a_breach(db: aiosqlite.Connection):
+    # AC-4: findings of the class from before the rule are what the rule was
+    # written from — counting them would call every new rule broken on day one.
+    await _finding_at(db, "one", "timeouts", _ts(96))
+    await _finding_at(db, "two", "timeouts", _ts(72))
+    await _rule_set_up(db, "timeouts", _ts(48))
+    # Another class after the date breaches nothing of this rule.
+    await _finding_at(db, "other", "naming", _ts(24))
+    await db.commit()
+
+    report = (await practice_metrics(db))["rule_breaches"]
+    assert report["rules_total"] == 1
+    assert report["breached"] == []
+
+
+async def test_carried_over_copy_is_not_a_second_breach(db: aiosqlite.Connection):
+    # A report re-attached over a base-only merge (#1361) is the same finding,
+    # not another return of the class.
+    await _rule_set_up(db, "timeouts", _ts(48))
+    await _finding_at(db, "after", "timeouts", _ts(24))
+    [original] = await db.execute_fetchall("SELECT id FROM machine_reviews")
+    await repo.insert_machine_review(
+        db,
+        task_id=1,
+        submission_generation=2,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps([{"title": "after", "category": "timeouts"}]),
+        incomplete=False,
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET carried_from_review_id=? WHERE id != ?",
+        (original["id"], original["id"]),
+    )
+    await db.commit()
+
+    [row] = (await practice_metrics(db))["rule_breaches"]["breached"]
+    assert row["breaches"] == 1
+
+
+async def test_rule_date_migration_on_clean_and_populated_base():
+    # #920 schema: a base with rules from before the column gets their set-up
+    # date from the earliest record event, never later than recorded_at; a
+    # second run changes nothing; a clean base just gets the column.
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, "
+            "applied_at TEXT DEFAULT (datetime('now')))"
+        )
+        for name, sql in _MIGRATIONS:
+            if name == "add_category_checks_created_at":
+                break
+            try:
+                await conn.execute(sql)
+            except Exception:  # noqa: BLE001 - column already in _SCHEMA
+                pass
+            await conn.execute("INSERT INTO _migrations (name) VALUES (?)", (name,))
+        await conn.execute(
+            "INSERT INTO category_checks (category, check_ref, recorded_at) "
+            "VALUES ('timeouts', 'a', '2026-08-20 10:00:00'), "
+            "('naming', 'b', '2026-08-21 10:00:00')"
+        )
+        await conn.execute(
+            "INSERT INTO events (kind, payload, created_at) VALUES "
+            "('category_check_recorded', '{\"category\": \"timeouts\"}', "
+            "'2026-08-01 09:00:00'), "
+            "('category_check_recorded', 'not json', '2026-07-01 09:00:00')"
+        )
+        await conn.commit()
+        await _migrate(conn)
+        await _migrate(conn)
+        rows = {
+            r["category"]: r["created_at"]
+            for r in await conn.execute_fetchall(
+                "SELECT category, created_at FROM category_checks"
+            )
+        }
+        assert rows == {
+            "timeouts": "2026-08-01 09:00:00",
+            "naming": "2026-08-21 10:00:00",
+        }
+    finally:
+        await conn.close()
+
+    async with aiosqlite.connect(":memory:") as fresh:
+        fresh.row_factory = aiosqlite.Row
+        await fresh.executescript(_SCHEMA)
+        await _migrate(fresh)
+        await repo.upsert_category_check(fresh, category="x", check_ref="c")
+        [row] = await fresh.execute_fetchall("SELECT * FROM category_checks")
+        assert row["created_at"], "a new rule is dated on its first record"
 
 
 async def test_provider_cost_per_run_split_by_profile(db: aiosqlite.Connection):
@@ -1593,3 +2113,1508 @@ async def test_an_empty_window_prints_zero_not_a_blank(client: AsyncClient):
     start = page.index("Без данных")
     row = page[start : page.index("</tr>", start)]
     assert "0 из 0" in row, f"пустое окно печатает нули, а не пустоту: {row!r}"
+
+
+# --- Сводка ревью для владельца (#1406) -------------------------------------
+#
+# Цена берётся только из счёта провайдера (review_dispatches.provider_tokens):
+# tokens_spent — самоотчёт харнесса, занижен в 12–62 раза и в цену не входит.
+# Прогон без счёта — отдельная строка, а не ноль и не среднее.
+
+_SELF_REPORT_TOKENS = 99_999_999  # tokens_spent, которого не должно быть нигде
+
+
+async def _order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    profile: str = "lite",
+    bill: int | None = None,
+    status: str = "done",
+    channel: str = "cloud",
+    replaces: int | None = None,
+    agent_id: str = "bc-run",
+) -> int:
+    did = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id=agent_id,
+        run_id="run",
+        model="gpt-5.3-codex",
+        profile=profile,
+        channel=channel,
+        replaces_dispatch_id=replaces,
+    )
+    if bill is not None:
+        await repo.set_review_dispatch_provider_tokens(db, did, bill)
+    await repo.set_review_dispatch_status(db, did, status)
+    return did
+
+
+async def test_cascade_counts_failed_attempt(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2 (#1566): успешная и неудавшаяся попытки каскада — attempts=2,
+    failed=1; неудачная не попадает ни в reported, ни в pending, даже когда
+    после неё в той же сдаче лёг чужой отчёт."""
+    from hub.services.review_dispatch import MODEL_CASCADE_EVENT
+
+    ok = await _task(db, title="cascade ok, waiting")
+    ordered = await _order(db, ok, profile="deep")
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=ok,
+        actor="policy",
+        payload={"generation": 1, "dispatch_id": ordered, "attempt": 1},
+    )
+    bad = await _task(db, title="cascade refused")
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=bad,
+        actor="policy",
+        payload={
+            "outcome": "failed",
+            "reason": "провайдер отказал: HTTP 400, invalid_model",
+            "generation": 1,
+            "model": "grok-4.6",
+            "attempt": 1,
+            "dispatch_id": None,
+            "after_review_id": 0,
+        },
+    )
+    await _economy_report(db, bad, confirmed=1)
+    await db.commit()
+
+    cascade = (await practice_metrics(db))["review_model_cascade"]
+
+    assert cascade["attempts"] == 2
+    assert cascade["failed"] == 1
+    assert cascade["reported"] == 0, "чужой отчёт не исход неудавшейся попытки"
+    assert cascade["pending"] == 1, "ждёт отчёта только успешный заказ"
+    assert cascade["complete"] == 0 and cascade["incomplete"] == 0
+
+    page = (await client.get("/metrics")).text
+    assert "заказ не удался: 1" in page
+
+
+async def _economy_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    confirmed: int = 0,
+    unresolved: int = 0,
+    profile: str = "lite",
+    self_reviewed: bool = False,
+    bill: int | None = None,
+) -> int:
+    await db.execute(
+        "UPDATE tasks SET submission_generation=? WHERE id=?", (generation, task_id)
+    )
+    rid = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="multi-agent-review",
+        tokens_spent=_SELF_REPORT_TOKENS,
+        raw_count=confirmed + unresolved,
+        findings_confirmed=json.dumps(
+            [{"title": f"c{i}", "severity": "medium"} for i in range(confirmed)]
+        ),
+        unresolved=json.dumps(
+            [{"title": f"u{i}", "severity": "medium"} for i in range(unresolved)]
+        ),
+        incomplete=False,
+        profile=profile,
+        self_reviewed=self_reviewed,
+    )
+    if bill is not None:
+        await repo.set_machine_review_provider_tokens(
+            db, task_id, generation, bill, review_id=rid
+        )
+    return rid
+
+
+def _row(rows: list[dict], key: str, value: str) -> dict:
+    found = [r for r in rows if r[key] == value]
+    assert found, f"нет строки {key}={value}: {rows}"
+    return found[0]
+
+
+async def test_review_economy_counts_runs_by_profile_from_the_provider_bill(
+    db: aiosqlite.Connection,
+):
+    # AC-1 (#1406): прогоны по профилям и типам заказа — из счёта провайдера.
+    from hub.services.review_dispatch import MODEL_CASCADE_EVENT
+
+    a = await _task(db, title="first + ladder")
+    await _order(db, a, profile="lite", bill=1_000_000)
+    await _order(db, a, profile="deep", bill=3_000_000)
+    await _economy_report(db, a, confirmed=1)
+
+    b = await _task(db, title="unbilled run")
+    await _order(db, b, profile="deep", bill=None)
+    await _economy_report(db, b, confirmed=1)
+
+    c = await _task(db, title="ask again")
+    lost = await _order(db, c, profile="lite", bill=500_000, status="failed")
+    await _order(db, c, profile="lite", bill=700_000, replaces=lost)
+
+    d = await _task(db, title="cascade")
+    await _order(db, d, profile="deep", bill=2_000_000)
+    cascade = await _order(db, d, profile="deep", bill=2_500_000)
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=d,
+        actor="policy",
+        payload={"generation": 1, "dispatch_id": cascade, "attempt": 1},
+    )
+
+    e = await _task(db, title="second door")
+    refused = await _order(db, e, profile="lite", bill=None, status="failed")
+    await _order(db, e, profile="lite", bill=None, channel="local", replaces=refused)
+    # Заглушка отказа (#1242) — не прогон: агента не было, счёта тоже.
+    await _order(db, e, profile="lite", agent_id="", status="failed")
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+    runs = econ["runs"]
+
+    assert runs["total"] == 9
+    assert runs["billed"] == 6
+    assert runs["unbilled"] == 3, "прогон без счёта — своя строка, не ноль"
+    assert runs["provider_tokens_total"] == 9_700_000
+
+    lite = _row(runs["by_profile"], "profile", "lite")
+    assert (lite["runs"], lite["billed_runs"], lite["unbilled_runs"]) == (5, 3, 2)
+    assert lite["provider_tokens_total"] == 2_200_000
+    deep = _row(runs["by_profile"], "profile", "deep")
+    assert (deep["runs"], deep["billed_runs"], deep["unbilled_runs"]) == (4, 3, 1)
+    assert deep["provider_tokens_total"] == 7_500_000
+    assert deep["provider_tokens_per_run"] == 2_500_000
+
+    by_kind = runs["by_kind"]
+    first = _row(by_kind, "kind", "first")
+    assert (first["runs"], first["billed_runs"]) == (5, 3)
+    assert first["provider_tokens_total"] == 3_500_000
+    assert _row(by_kind, "kind", "ladder")["provider_tokens_total"] == 3_000_000
+    assert _row(by_kind, "kind", "ask_again")["provider_tokens_total"] == 700_000
+    assert _row(by_kind, "kind", "cascade")["provider_tokens_total"] == 2_500_000
+    second = _row(by_kind, "kind", "second_door")
+    assert (second["runs"], second["unbilled_runs"]) == (1, 1)
+
+    assert str(_SELF_REPORT_TOKENS) not in json.dumps(econ), (
+        "tokens_spent не входит ни в одно число сводки"
+    )
+
+
+async def test_review_economy_shows_unresolved_apart_from_confirmed(
+    db: aiosqlite.Connection,
+):
+    # AC-2 (#1406): unresolved и confirmed — разные строки; самоотчёт —
+    # не независимое ревью.
+    t1 = await _task(db, title="confirmed only")
+    await _economy_report(db, t1, confirmed=2, profile="lite")
+    t2 = await _task(db, title="unresolved only")
+    await _economy_report(db, t2, unresolved=3, profile="deep")
+    t3 = await _task(db, title="both")
+    await _economy_report(db, t3, confirmed=1, unresolved=1, profile="deep")
+    t4 = await _task(db, title="self review")
+    await _economy_report(db, t4, confirmed=1, unresolved=5, self_reviewed=True)
+    await db.commit()
+
+    f = (await practice_metrics(db))["review_economy"]["findings"]
+
+    assert f["independent_reports"] == 3
+    assert f["reports_with_unresolved"] == 2
+    assert f["unresolved_total"] == 4
+    assert f["reports_with_confirmed"] == 2
+    assert f["confirmed_total"] == 3
+    assert f["reports_with_both"] == 1
+    assert f["unresolved_report_share"] == round(2 / 3, 3)
+    assert f["n"] == 3
+    assert f["undersampled"] is True, "n<20 помечается недобором"
+
+    assert f["self_reviewed"] == {"reports": 1, "confirmed": 1, "unresolved": 5}
+
+    deep = _row(f["by_profile"], "profile", "deep")
+    assert (deep["reports"], deep["confirmed"], deep["unresolved"]) == (2, 1, 4)
+    lite = _row(f["by_profile"], "profile", "lite")
+    assert (lite["reports"], lite["confirmed"], lite["unresolved"]) == (1, 2, 0)
+
+
+async def _pin(db: aiosqlite.Connection, task_id: int, sha: str, ci: str | None):
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=sha, base_branch="develop"
+    )
+    if ci is not None:
+        await repo.upsert_ci_run_report(
+            db,
+            task_id=task_id,
+            head_sha=sha,
+            ac_results="{}",
+            validation_status=ci,
+            validation_log="",
+            reason="",
+            reported_by="ci",
+        )
+
+
+async def test_review_economy_counts_runs_bought_on_red_ci(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#1406): прогоны на сдачах, чей закреплённый sha CI назвал fail.
+    red = await _task(db, title="red")
+    await _pin(db, red, "sha-red", "fail")
+    await _order(db, red, profile="lite", bill=1_000_000)
+    await _order(db, red, profile="deep", bill=3_000_000)
+
+    red_unbilled = await _task(db, title="red without bill")
+    await _pin(db, red_unbilled, "sha-red-2", "fail")
+    await _order(db, red_unbilled, bill=None)
+
+    green = await _task(db, title="green, red on an old sha")
+    await _pin(db, green, "sha-old", "fail")
+    await _pin(db, green, "sha-green", "pass")
+    await _order(db, green, bill=2_000_000)
+
+    silent = await _task(db, title="no CI report")
+    await _pin(db, silent, "sha-silent", None)
+    await _order(db, silent, bill=5_000_000)
+    await db.commit()
+
+    red_ci = (await practice_metrics(db))["review_economy"]["red_ci"]
+
+    assert red_ci["runs"] == 3
+    assert red_ci["billed_runs"] == 2
+    assert red_ci["provider_tokens"] == 4_000_000
+    assert red_ci["runs_without_ci_report"] == 1, (
+        "прогон без отчёта CI в строку «на красном CI» не попадает"
+    )
+    assert red_ci["runs_on_green_ci"] == 1
+
+
+async def test_review_economy_reconciles_reports_with_paid_runs(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#1406): расхождение отчётов и оплаченных прогонов — по корзинам.
+    paid = await _task(db, title="paid run, billed report")
+    await _order(db, paid, bill=1_000_000)
+    await _economy_report(db, paid, confirmed=1, bill=1_000_000)
+
+    own = await _task(db, title="self report")
+    await _economy_report(db, own, confirmed=1, self_reviewed=True)
+
+    outside = await _task(db, title="report without an order")
+    await _economy_report(db, outside, confirmed=1)
+
+    local = await _task(db, title="local door")
+    await _order(db, local, bill=None, channel="local")
+    await _economy_report(db, local, confirmed=1)
+
+    unbilled = await _task(db, title="cloud order without a bill")
+    await _order(db, unbilled, bill=None)
+    await _economy_report(db, unbilled, confirmed=1)
+
+    burnt = await _task(db, title="paid run without a report")
+    await _order(db, burnt, bill=2_000_000, status="failed")
+
+    twice = await _task(db, title="two reports of one paid run")
+    await _order(db, twice, bill=3_000_000)
+    await _economy_report(db, twice, confirmed=1, bill=3_000_000)
+    await _economy_report(db, twice, confirmed=1)
+    await db.commit()
+
+    rec = (await practice_metrics(db))["review_economy"]["reconciliation"]
+
+    assert rec["reports"] == 7
+    assert rec["paid_runs"] == 3
+    assert rec["gap"] == 4
+    buckets = {b["bucket"]: b["count"] for b in rec["buckets"]}
+    assert buckets["self_reviewed"] == 1
+    assert buckets["no_dispatch"] == 1
+    assert buckets["local_door"] == 1
+    assert buckets["dispatch_without_bill"] == 1
+    assert buckets["paid_without_report"] == -1
+    assert buckets["unexplained"] == 1, "необъяснённый остаток — своя корзина"
+    assert sum(buckets.values()) == rec["gap"]
+    assert all(b["label"] for b in rec["buckets"]), "каждая корзина названа"
+
+
+async def test_review_economy_does_not_count_a_carried_report(
+    db: aiosqlite.Connection,
+):
+    # Находка deep-ревью сдачи 3 #1361: перенос отчёта на пересдачу «только
+    # слита база» (#1361) — не прогон и не чтение. Сводка #1406 читала
+    # machine_reviews без фильтра переноса, и одна копия давала два
+    # независимых отчёта, вдвое больше находок и отчёт «без счёта».
+    task_id = await _task(db, title="merge-only resubmission")
+    await _order(db, task_id, bill=1_000_000)
+    rid = await _economy_report(db, task_id, confirmed=2, bill=1_000_000)
+    source = dict(await repo.get_machine_review(db, rid))
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill=source["harness_skill"],
+        raw_count=int(source["raw_count"] or 0),
+        findings_confirmed=source["findings_confirmed"],
+        unresolved=source["unresolved"],
+        incomplete=False,
+        profile=source["profile"],
+        carried_from_review_id=rid,
+    )
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+
+    assert econ["findings"]["independent_reports"] == 1, "перенос — не отчёт"
+    assert econ["findings"]["confirmed_total"] == 2, "находки не удваиваются"
+    rec = econ["reconciliation"]
+    assert rec["reports"] == 1
+    assert rec["gap"] == 0
+    buckets = {b["bucket"]: b["count"] for b in rec["buckets"]}
+    assert all(count == 0 for count in buckets.values()), (
+        "перенос не попадает ни в одну корзину «без счёта»"
+    )
+
+
+async def test_review_economy_is_the_same_on_every_surface(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-5 (#1406): REST, MCP и /metrics отдают одни и те же числа.
+    import re
+
+    from hub import mcp_server
+
+    red = await _task(db, title="red")
+    await _pin(db, red, "sha-red", "fail")
+    await _order(db, red, profile="lite", bill=1_000_000)
+    await _order(db, red, profile="deep", bill=None)
+    await _economy_report(db, red, confirmed=2, unresolved=1, bill=1_000_000)
+    other = await _task(db, title="outside")
+    exported = await _order(db, other, profile="deep", bill=4_000_000)
+    await db.execute(
+        "UPDATE review_dispatches SET billed_tokens = 9000000 WHERE id = ?",
+        (exported,),
+    )
+    await _economy_report(db, other, unresolved=2, profile="deep")
+    await db.commit()
+
+    rest = (await client.get("/api/metrics/practices?since_days=90")).json()
+    econ = rest["review_economy"]
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_practice_metrics(since_days=90)
+    assert out.structuredContent["metrics"]["review_economy"] == econ
+    text = out.content[0].text
+    assert (
+        f"Review economy: {econ['runs']['total']} run(s), "
+        f"{econ['runs']['billed']} billed / {econ['runs']['unbilled']} without a bill, "
+        f"{econ['runs']['provider_tokens_total']} provider tokens"
+    ) in text
+    assert f"Unresolved: {econ['findings']['unresolved_total']} in" in text
+    red_ci = econ["red_ci"]
+    assert (
+        f"CI undetermined {red_ci['runs_ci_undetermined']}, checks skipped "
+        f"{red_ci['runs_ci_skipped']}, no CI report "
+        f"{red_ci['runs_without_ci_report']}"
+    ) in text
+
+    page = (await client.get("/metrics?since_days=90")).text
+    shown = dict(re.findall(r'data-metric="([\w.]+)"[^>]*>\s*(-?\d+)\s*<', page))
+    expected = {
+        "runs.total": econ["runs"]["total"],
+        "runs.billed": econ["runs"]["billed"],
+        "runs.unbilled": econ["runs"]["unbilled"],
+        "runs.provider_tokens_total": econ["runs"]["provider_tokens_total"],
+        "findings.reports_with_unresolved": econ["findings"]["reports_with_unresolved"],
+        "findings.unresolved_total": econ["findings"]["unresolved_total"],
+        "findings.confirmed_total": econ["findings"]["confirmed_total"],
+        "red_ci.runs": econ["red_ci"]["runs"],
+        "red_ci.provider_tokens": econ["red_ci"]["provider_tokens"],
+        "red_ci.runs_on_green_ci": econ["red_ci"]["runs_on_green_ci"],
+        "red_ci.runs_ci_undetermined": econ["red_ci"]["runs_ci_undetermined"],
+        "red_ci.runs_ci_skipped": econ["red_ci"]["runs_ci_skipped"],
+        "red_ci.runs_without_ci_report": econ["red_ci"]["runs_without_ci_report"],
+        "reconciliation.reports": econ["reconciliation"]["reports"],
+        "reconciliation.paid_runs": econ["reconciliation"]["paid_runs"],
+        "reconciliation.gap": econ["reconciliation"]["gap"],
+    }
+    for bucket in econ["reconciliation"]["buckets"]:
+        expected[f"reconciliation.{bucket['bucket']}"] = bucket["count"]
+    # #1413: источник цены и покрытие выгрузкой — те же, что в REST и MCP.
+    expected["runs.export_billed_runs"] = econ["runs"]["export_billed_runs"]
+    expected["runs.api_lower_bound_runs"] = econ["runs"]["api_lower_bound_runs"]
+    assert {k: int(v) for k, v in shown.items() if k in expected} == expected
+    share = re.search(r'data-metric-share="runs.export_coverage_share">([^<]*)<', page)
+    assert share and share.group(1) == str(econ["runs"]["export_coverage_share"])
+    assert econ["runs"]["cost_source_note"] in page
+    assert (
+        f"Cursor export covers {econ['runs']['export_billed_runs']} run(s), "
+        f"{econ['runs']['api_lower_bound_runs']} priced by the API (lower bound)"
+    ) in text
+    assert (
+        econ["runs"]["export_billed_runs"],
+        econ["runs"]["api_lower_bound_runs"],
+    ) == (
+        1,
+        1,
+    )
+    # Числа попарно различны, иначе подмена одного другим прошла бы молча.
+    assert (econ["runs"]["billed"], econ["runs"]["unbilled"]) == (2, 1)
+    assert econ["findings"]["unresolved_total"] == 3
+
+
+async def test_review_economy_red_ci_rows_cover_every_run(
+    db: aiosqlite.Connection,
+):
+    # Находка a5370258c13e33c0 (#1406): unknown и skipped — полноправные
+    # статусы CI. Молчание не успех и не провал: у них своя строка, и строки
+    # вместе дают все прогоны, без безымянного остатка.
+    for title, ci in (
+        ("red", "fail"),
+        ("green", "pass"),
+        ("undetermined", "unknown"),
+        ("skipped", "skipped"),
+        ("no report", None),
+    ):
+        task_id = await _task(db, title=title)
+        await _pin(db, task_id, f"sha-{title}", ci)
+        await _order(db, task_id, bill=1_000_000)
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+    red_ci = econ["red_ci"]
+
+    assert red_ci["runs"] == 1, "unknown и skipped не красные"
+    assert red_ci["runs_on_green_ci"] == 1
+    assert red_ci["runs_ci_undetermined"] == 1
+    assert red_ci["runs_ci_skipped"] == 1
+    assert red_ci["runs_without_ci_report"] == 1
+    assert (
+        red_ci["runs"]
+        + red_ci["runs_on_green_ci"]
+        + red_ci["runs_ci_undetermined"]
+        + red_ci["runs_ci_skipped"]
+        + red_ci["runs_without_ci_report"]
+    ) == econ["runs"]["total"]
+
+
+# --- Slices: project, reviewer model, dates, previous period (#1490) ---------
+#
+# One scope object feeds every section (hub/services/metrics_scope.py). A
+# filter that narrowed only the sections somebody remembered would be the
+# mixed total this task exists to remove, so the tests read several sections
+# under one filter.
+
+LEGACY_KEYS = {
+    "since_days",
+    "machine_reviews",
+    "incomplete_reasons",
+    "review_model_cascade",
+    "review_dispatches",
+    "by_harness",
+    "by_profile",
+    "by_reviewer_model",
+    "recurring_categories",
+    "category_debt",
+    "rule_breaches",
+    "cycle_times",
+    "escaped_defects",
+    "prod_defect_clocks",
+    "change_failure_rate",
+    "shift_left",
+    "model_declarations",
+    "human_gates",
+    "steward_shadow",
+    "human_touches",
+    "review_outcomes",
+    "validation_run_lines",
+    "executor_runs",
+    "review_economy",
+    "events_history",
+}
+
+
+async def _completed(
+    db: aiosqlite.Connection,
+    title: str,
+    *,
+    project_id: int | None = None,
+    hours: float = 5.0,
+    completed_days_ago: float = 3.0,
+) -> int:
+    """A finished feature whose cycle time is exactly ``hours``."""
+    task_id = await _task(db, title=title, status="completed", project_id=project_id)
+    await db.execute(
+        "UPDATE tasks SET work_type='feature', ready_at=?, completed_at=? WHERE id=?",
+        (
+            _ts(completed_days_ago * 24.0 + hours),
+            _ts(completed_days_ago * 24.0),
+            task_id,
+        ),
+    )
+    return task_id
+
+
+async def _report_at(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    model: str = "",
+    days_ago: float = 1.0,
+    confirmed: int = 1,
+) -> None:
+    await _report(db, task_id, confirmed=confirmed)
+    await db.execute(
+        "UPDATE machine_reviews SET model=?, created_at=? WHERE task_id=?",
+        (model, _ts(days_ago * 24.0), task_id),
+    )
+
+
+async def test_metrics_filter_by_project(db: aiosqlite.Connection):
+    """AC-1 (#1490): every section counts only the project's tasks."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d1 = await _task(db, title="default 1")
+    d2 = await _task(db, title="default 2")
+    s1 = await _task(db, title="spike 1", project_id=spike)
+    for tid in (d1, d2):
+        await _report_at(db, tid, confirmed=2)
+    await _report_at(db, s1, confirmed=1)
+    await _completed(db, "default feature", hours=10.0)
+    await _completed(db, "spike feature", project_id=spike, hours=4.0)
+    escaped = await _defect(db, title="spike prod defect", found_in="prod")
+    await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (spike, escaped))
+    await _verdict(db, d1, "approved")
+    await _verdict(db, s1, "changes_requested")
+    await _deploy(db, "aaa111")
+    await _deploy(db, "bbb222", project_id=spike)
+    await db.commit()
+
+    everything = await practice_metrics(db)
+    only_spike = await practice_metrics(db, project="spike")
+    only_default = await practice_metrics(db, project="default")
+
+    assert everything["machine_reviews"]["confirmed_total"] == 5
+    assert only_spike["machine_reviews"]["confirmed_total"] == 1
+    assert only_default["machine_reviews"]["confirmed_total"] == 4
+    assert only_spike["review_economy"]["reconciliation"]["reports"] == 1
+    assert only_spike["review_economy"]["findings"]["confirmed_total"] == 1
+    features = {
+        name: {r["work_type"]: r for r in m["cycle_times"]}["feature"]
+        for name, m in (("all", everything), ("spike", only_spike))
+    }
+    assert features["all"]["tasks"] == 2
+    assert features["spike"]["tasks"] == 1
+    assert features["spike"]["median_hours"] == 4.0
+    assert only_spike["shift_left"]["defects"] == 1
+    assert only_default["shift_left"]["defects"] == 0
+    assert only_spike["escaped_defects"]["escaped"] == 1
+    assert only_spike["review_outcomes"]["verdicts"] == 1
+    assert only_spike["review_outcomes"]["changes_requested"] == 1
+    assert only_default["review_outcomes"]["approved"] == 1
+    assert everything["review_outcomes"]["verdicts"] == 2
+    assert {g["project"] for g in only_spike["human_gates"]} <= {"spike"}
+    cfr = {
+        name: {r["project"] for r in m["change_failure_rate"]["by_project"]}
+        for name, m in (("all", everything), ("spike", only_spike))
+    }
+    assert cfr == {"all": {"default", "spike"}, "spike": {"spike"}}
+    assert only_spike["scope"]["project"] == "spike"
+
+
+async def test_metrics_unknown_project_is_refused(db: aiosqlite.Connection):
+    with pytest.raises(ValueError, match="unknown project"):
+        await practice_metrics(db, project="no-such-project")
+
+
+async def _verdict_pack(
+    db: aiosqlite.Connection, *, approved: int, changed: int, days_ago: float
+) -> None:
+    for i in range(approved):
+        tid = await _task(db, title=f"ok {days_ago} {i}")
+        await _verdict(db, tid, "approved", days_ago=days_ago)
+    for i in range(changed):
+        tid = await _task(db, title=f"rework {days_ago} {i}")
+        await _verdict(db, tid, "changes_requested", days_ago=days_ago)
+
+
+def _indicator_row(comparison: dict, key: str) -> dict:
+    return {r["key"]: r for r in comparison["indicators"]}[key]
+
+
+async def test_metrics_period_comparison_delta(db: aiosqlite.Connection):
+    """AC-2 (#1490): current, previous and delta; no delta below the floor."""
+    # Window: the last 30 days; the previous one is days 30..60 back.
+    await _verdict_pack(db, approved=10, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=5, changed=5, days_ago=40)
+    await db.commit()
+
+    cmp = (await practice_metrics(db, since_days=30, compare=True))["comparison"]
+    row = _indicator_row(cmp, "first_pass")
+    assert (row["current"], row["current_n"]) == (1.0, 10)
+    assert (row["previous"], row["previous_n"]) == (0.5, 10)
+    assert row["delta"] == 0.5
+    assert row["delta_rel"] == 1.0
+    assert (row["status"], row["direction"]) == ("compared", "better")
+    assert cmp["min_compare_n"] == 10
+    # Not a single number is invented for a key indicator without data.
+    cfr = _indicator_row(cmp, "change_failure_rate")
+    assert (cfr["current"], cfr["previous"], cfr["delta"]) == (None, None, None)
+    assert cfr["status"] == "insufficient_data"
+
+    # No previous data at all: the delta is not made up.
+    lonely = (await practice_metrics(db, since_days=8, compare=True))["comparison"]
+    lonely_row = _indicator_row(lonely, "first_pass")
+    assert lonely_row["previous"] is None
+    assert lonely_row["delta"] is None
+    assert lonely_row["reason"] == "no_previous_data"
+
+    # Nine in one window is below MIN_COMPARE_N: both values show, no delta.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=9, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=10, changed=0, days_ago=40)
+    await db.commit()
+    thin = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert (thin["current"], thin["previous"]) == (1.0, 1.0)
+    assert thin["delta"] is None and thin["direction"] is None
+    assert thin["reason"] == "below_min_n"
+
+    # The floor holds for the previous window alone as well.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=10, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=9, changed=0, days_ago=40)
+    await db.commit()
+    thin_prev = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert thin_prev["delta"] is None
+    assert thin_prev["reason"] == "below_min_n"
+
+    # Under 5% relative change is "no change", not a move: 1.0 against 0.975.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=20, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=39, changed=1, days_ago=40)
+    await db.commit()
+    flat = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert (flat["status"], flat["direction"]) == ("compared", "flat")
+    assert flat["delta_rel"] == 0.026
+
+
+async def test_metrics_period_comparison_uses_same_window_length(
+    db: aiosqlite.Connection,
+):
+    await _verdict_pack(db, approved=1, changed=0, days_ago=5)
+    result = await practice_metrics(
+        db, date_from="2026-01-11", date_to="2026-01-20", compare=True
+    )
+    previous = result["comparison"]["previous_window"]
+    assert previous["from"] == "2026-01-01 00:00:00"
+    assert previous["to"] == "2026-01-11 00:00:00"
+    assert previous["days"] == result["scope"]["days"] == 10
+
+
+async def test_metrics_filter_by_model_keeps_unknown_group(
+    db: aiosqlite.Connection,
+):
+    """AC-3 (#1490): the reviewer model filter keeps the «не заявлена» group
+    and leaves the model-blind blocks exactly as they were."""
+    t1 = await _task(db, title="grok")
+    t2 = await _task(db, title="kimi")
+    t3 = await _task(db, title="no model recorded")
+    await _judged(db, t1, ["fixed", "fixed"], model="grok-4.6")
+    await _judged(db, t2, ["fixed"], model="kimi-k3")
+    await _judged(db, t3, ["false_positive"], model="")
+    await _completed(db, "feature", hours=6.0)
+    await _defect(db, title="prod defect", found_in="prod")
+    await db.commit()
+
+    plain = await practice_metrics(db)
+    assert {m["model"] for m in plain["by_reviewer_model"]} == {
+        "grok-4.6",
+        "kimi-k3",
+        "не заявлена",
+    }
+    assert "scope" not in plain
+
+    unknown = await practice_metrics(db, model="не заявлена")
+    assert [m["model"] for m in unknown["by_reviewer_model"]] == ["не заявлена"]
+    assert unknown["machine_reviews"]["reviews"] == 1
+    assert unknown["machine_reviews"]["dispositions"]["false_positive"] == 1
+    assert unknown["review_economy"]["findings"]["confirmed_total"] == 1
+
+    grok = await practice_metrics(db, model="grok-4.6")
+    assert grok["machine_reviews"]["reviews"] == 1
+    assert grok["machine_reviews"]["confirmed_total"] == 2
+
+    for section in ("cycle_times", "change_failure_rate", "shift_left"):
+        assert grok[section] == plain[section], section
+        assert section in grok["scope"]["model_independent"]
+    assert grok["scope"]["model"] == "grok-4.6"
+    assert plain["machine_reviews"]["reviews"] == 3
+
+
+async def test_metrics_since_days_backward_compatible(db: aiosqlite.Connection):
+    """AC-4 (#1490): since_days alone answers as before — the same keys and
+    no slice, comparison, series or ranking added."""
+    t1 = await _task(db, title="reviewed")
+    await _judged(db, t1, ["fixed", "false_positive"])
+    await _completed(db, "feature")
+    await db.commit()
+
+    plain = await practice_metrics(db, since_days=30)
+    assert set(plain) == LEGACY_KEYS
+    assert plain["since_days"] == 30
+    assert plain["machine_reviews"]["reviews"] == 1
+    assert plain["machine_reviews"]["dispositions"]["judged"] == 2
+    again = await practice_metrics(db, since_days=30, project=None)
+    # history_from moves with the clock: compare the rest, then the shape.
+    assert (
+        plain.pop("events_history")["windows_beyond_history"]
+        == (again.pop("events_history")["windows_beyond_history"])
+    )
+    assert plain == again
+    # The default stays the one named constant.
+    assert (await practice_metrics(db))["since_days"] == 90
+
+
+async def test_metrics_series_empty_bucket_is_missing_not_zero(
+    db: aiosqlite.Connection,
+):
+    """AC-5 (#1490): a bucket without observations has no value, not 0; a
+    bucket with data equals the same window asked for directly."""
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=27)
+    await _verdict_pack(db, approved=2, changed=0, days_ago=26)  # bucket 1
+    await _verdict_pack(db, approved=1, changed=1, days_ago=1)  # bucket 4
+    await db.commit()
+
+    result = await practice_metrics(
+        db,
+        date_from=start.isoformat(),
+        date_to=today.isoformat(),
+        series=True,
+        series_days=7,
+    )
+    series = {i["key"]: i for i in result["series"]["indicators"]}["first_pass"]
+    points = series["points"]
+    assert len(points) == 4
+    assert [p["n"] for p in points] == [2, 0, 0, 2]
+    assert points[1]["value"] is None and points[2]["value"] is None
+    assert points[0]["value"] == 1.0 and points[3]["value"] == 0.5
+    # Every key indicator answers the same way for a bucket with no data.
+    for indicator in result["series"]["indicators"]:
+        assert all(p["value"] is None for p in indicator["points"][1:3])
+
+    # The same code: bucket 4 is the window of its own dates.
+    last = points[3]
+    direct = await practice_metrics(
+        db,
+        date_from=last["from"][:10],
+        date_to=(datetime.strptime(last["to"], "%Y-%m-%d %H:%M:%S") - timedelta(days=1))
+        .date()
+        .isoformat(),
+    )
+    assert direct["review_outcomes"]["first_pass_acceptance_rate"] == last["value"]
+    assert direct["review_outcomes"]["tasks"] == last["n"]
+
+
+async def test_metrics_problem_spots_ranked_worse_first(db: aiosqlite.Connection):
+    """AC-6 (#1490): the ranking follows the spec — unchecked debt first, then
+    the worsened indicator; an improved one is not listed at all; the order is
+    stable; with no previous window nothing is claimed to have worsened."""
+    # first-pass worsens 1.0 -> 0.5 (n=10 each): a problem.
+    await _verdict_pack(db, approved=10, changed=0, days_ago=40)
+    await _verdict_pack(db, approved=5, changed=5, days_ago=5)
+    # precision improves 0.5 -> 1.0 (n=10 each): not a problem, not listed.
+    old = await _task(db, title="old judged")
+    await _judged(db, old, ["fixed"] * 5 + ["false_positive"] * 5)
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE task_id=?", (_ts(40 * 24), old)
+    )
+    new = await _task(db, title="new judged")
+    await _judged(db, new, ["fixed"] * 10)
+    # A category seen in three tasks with no check: debt.
+    for i in range(3):
+        await _categorised(db, f"debt {i}", ["flaky-shape"])
+    await db.commit()
+
+    result = await practice_metrics(db, since_days=30, compare=True)
+    spots = result["problem_spots"]
+    kinds = [s["kind"] for s in spots]
+    assert kinds[0] == "debt_unchecked"
+    assert spots[0]["title"] == "flaky-shape"
+    assert "worsened" in kinds
+    assert kinds.index("debt_unchecked") < kinds.index("worsened")
+    titles = [s["title"] for s in spots]
+    assert "Precision ревью" not in titles
+    worse = [s for s in spots if s["kind"] == "worsened"]
+    assert [s["key"] for s in worse] == ["first_pass"]
+    assert [s["rank"] for s in spots] == list(range(1, len(spots) + 1))
+    assert result["problem_spots_more"] == 0
+
+    again = await practice_metrics(db, since_days=30, compare=True)
+    assert again["problem_spots"] == spots, "the order is deterministic"
+
+    # No previous window behind the current one: no worsening is claimed.
+    blank = await practice_metrics(db, since_days=1, compare=True)
+    assert "worsened" not in [s["kind"] for s in blank["problem_spots"]]
+    assert "debt_unchecked" in [s["kind"] for s in blank["problem_spots"]]
+
+
+def test_problem_spots_group_order_and_cap():
+    from hub.services.metrics_compare import MAX_SPOTS, rank_problem_spots
+
+    metrics = {
+        "category_debt": [
+            {"category": "b", "tasks": 3, "findings": 4, "covered": False},
+            {"category": "a", "tasks": 3, "findings": 4, "covered": False},
+            {"category": "done", "tasks": 9, "findings": 9, "covered": True},
+            {"category": "big", "tasks": 5, "findings": 1, "covered": False},
+        ],
+        "rule_breaches": {
+            "breached": [
+                {"category": "r1", "breaches": 1},
+                {"category": "r2", "breaches": 4},
+            ]
+        },
+        "review_economy": {"reconciliation": {"gap": 3}, "runs": {"unbilled": 7}},
+        "machine_reviews": {"dispositions": {"confirmed_unjudged": 0}},
+        "shift_left": {"unknown_share": 0.3, "unknown": 3, "defects": 10},
+    }
+    comparison = {
+        "indicators": [
+            {
+                "key": "touches_per_delivered",
+                "label": "t",
+                "status": "compared",
+                "direction": "worse",
+                "delta_rel": 0.2,
+                "source_field": "x",
+                "previous": 1,
+                "previous_n": 10,
+                "current": 1.2,
+                "current_n": 10,
+            },
+            {
+                "key": "first_pass",
+                "label": "f",
+                "status": "compared",
+                "direction": "worse",
+                "delta_rel": 0.09,  # under 10%: not a problem
+                "source_field": "x",
+                "previous": 1,
+                "previous_n": 10,
+                "current": 0.9,
+                "current_n": 10,
+            },
+        ]
+    }
+    spots, more = rank_problem_spots(metrics, comparison)
+    assert [(s["kind"], s["title"]) for s in spots[:3]] == [
+        ("debt_unchecked", "big"),
+        ("debt_unchecked", "a"),
+        ("debt_unchecked", "b"),
+    ]
+    assert [s["title"] for s in spots if s["kind"] == "rule_breached"] == ["r2", "r1"]
+    assert [s["title"] for s in spots if s["kind"] == "worsened"] == ["t"]
+    assert len(spots) == MAX_SPOTS
+    # 3 debt + 2 rules + 1 worsened + 3 gaps = 9 candidates; 7 are shown.
+    assert more == 2
+
+
+async def test_rest_practice_metrics_takes_the_slice(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1490: REST carries project, model, dates, compare and series."""
+    await repo.create_project(db, slug="spike", name="Spike")
+    tid = await _task(db, title="reviewed")
+    await _judged(db, tid, ["fixed"], model="grok-4.6")
+    await db.commit()
+
+    body = (
+        await client.get(
+            "/api/metrics/practices",
+            params={
+                "project": "default",
+                "model": "grok-4.6",
+                "since_days": 30,
+                "compare": "true",
+                "series": "true",
+                "series_days": 10,
+            },
+        )
+    ).json()
+    assert body["scope"]["project"] == "default"
+    assert body["scope"]["model"] == "grok-4.6"
+    assert body["machine_reviews"]["reviews"] == 1
+    assert "problem_spots" in body and "comparison" in body
+    assert body["series"]["bucket_days"] == 10
+
+    other = (
+        await client.get("/api/metrics/practices", params={"project": "spike"})
+    ).json()
+    assert other["machine_reviews"]["reviews"] == 0
+
+    dated = (
+        await client.get(
+            "/api/metrics/practices",
+            params={"date_from": "2020-01-01", "date_to": "2020-01-31"},
+        )
+    ).json()
+    assert dated["since_days"] == 31
+    assert dated["machine_reviews"]["reviews"] == 0
+
+    plain = (await client.get("/api/metrics/practices")).json()
+    assert set(plain) == LEGACY_KEYS
+
+
+async def test_rest_practice_metrics_refuses_bad_slice(client: AsyncClient):
+    missing = await client.get("/api/metrics/practices?project=nope")
+    assert missing.status_code == 400
+    assert "unknown project" in missing.json()["detail"]
+    bad_date = await client.get("/api/metrics/practices?date_from=01.02.2026")
+    assert bad_date.status_code == 400
+    backwards = await client.get(
+        "/api/metrics/practices?date_from=2026-02-02&date_to=2026-02-01"
+    )
+    assert backwards.status_code == 400
+
+
+def test_cli_practice_metrics_passes_the_slice(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    argv = [
+        "oc-hub",
+        "practice-metrics",
+        "--since-days",
+        "30",
+        "--project",
+        "spike",
+        "--model",
+        "не заявлена",
+        "--date-from",
+        "2026-01-01",
+        "--compare",
+        "--series",
+        "--series-days",
+        "14",
+    ]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(cli, "_api", return_value={"since_days": 30}) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    method, url = api.call_args.args[:2]
+    assert method == "GET"
+    assert url.startswith("/api/metrics/practices?since_days=30")
+    for part in (
+        "project=spike",
+        "model=%D0%BD%D0%B5+%D0%B7%D0%B0%D1%8F%D0%B2%D0%BB%D0%B5%D0%BD%D0%B0",
+        "date_from=2026-01-01",
+        "compare=true",
+        "series=true",
+        "series_days=14",
+    ):
+        assert part in url, url
+    assert "date_to" not in url
+    assert json.loads(capsys.readouterr().out) == {"since_days": 30}
+
+    with (
+        patch.object(sys, "argv", ["oc-hub", "practice-metrics"]),
+        patch.object(cli, "_api", return_value={}) as plain,
+    ):
+        cli.main()
+    assert (
+        plain.call_args.args[1] == "/api/metrics/practices?since_days=90&series_days=7"
+    )
+
+
+async def test_mcp_practice_metrics_passes_the_slice_and_names_the_ranking():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 30,
+        "scope": {
+            "project": "spike",
+            "model": "grok-4.6",
+            "from": "2026-01-01 00:00:00",
+            "to": None,
+            "days": 30,
+            "model_independent": ["cycle_times", "shift_left"],
+        },
+        "comparison": {
+            "indicators": [
+                {
+                    "label": "С первого раза (first-pass)",
+                    "current": 0.5,
+                    "current_n": 10,
+                    "previous": 1.0,
+                    "previous_n": 10,
+                    "delta": -0.5,
+                    "direction": "worse",
+                    "reason": "",
+                },
+                {
+                    "label": "Change failure rate",
+                    "current": None,
+                    "current_n": 0,
+                    "previous": None,
+                    "previous_n": 0,
+                    "delta": None,
+                    "direction": None,
+                    "reason": "no_current_data",
+                },
+            ]
+        },
+        "problem_spots": [
+            {
+                "rank": 1,
+                "kind": "worsened",
+                "title": "С первого раза (first-pass)",
+                "reason": "было 1.0 (n=10), стало 0.5 (n=10)",
+            }
+        ],
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics(
+            project="spike", model="grok-4.6", compare=True, date_from="2026-01-01"
+        )
+    url = get.call_args.args[0]
+    for part in (
+        "project=spike",
+        "model=grok-4.6",
+        "date_from=2026-01-01",
+        "compare=true",
+    ):
+        assert part in url, url
+    assert "series" not in url
+    text = result.content[0].text
+    assert "Slice: project=spike, reviewer model=grok-4.6" in text
+    assert "Model filter does not apply to: cycle_times, shift_left" in text
+    assert "insufficient data (no_current_data)" in text
+    assert "Problem #1 [worsened]" in text
+
+
+async def test_metrics_slice_reaches_dispatches_executor_and_refusals(
+    db: aiosqlite.Connection,
+):
+    """#1490: the sections that live outside orchestration.py read the slice
+    too — review dispatches, the review-economy runs, executor runs and the
+    incomplete-report counters — and the reviewer model narrows only the
+    review ones."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d = await _task(db, title="default")
+    s = await _task(db, title="spike", project_id=spike)
+    await _failed_dispatch(db, d, provider_tokens=100)
+    await _failed_dispatch(db, s, provider_tokens=40)
+    await db.execute(
+        "UPDATE review_dispatches SET model='kimi-k3' WHERE task_id=?", (s,)
+    )
+    for task_id in (d, s):
+        await repo.create_executor_run(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            agent_id="bc-x",
+            run_id="r",
+            model="composer",
+        )
+    await db.commit()
+
+    everything = await practice_metrics(db)
+    only_spike = await practice_metrics(db, project="spike")
+    assert everything["review_dispatches"]["wasted_provider_tokens_total"] == 140
+    assert only_spike["review_dispatches"]["wasted_provider_tokens_total"] == 40
+    assert only_spike["review_economy"]["runs"]["total"] == 1
+    assert everything["review_economy"]["runs"]["total"] == 2
+    assert everything["executor_runs"]["runs"] == 2
+    assert only_spike["executor_runs"]["runs"] == 1
+
+    kimi = await practice_metrics(db, model="kimi-k3")
+    assert kimi["review_dispatches"]["wasted_provider_tokens_total"] == 40
+    assert kimi["review_economy"]["runs"]["total"] == 1
+    assert kimi["executor_runs"] == everything["executor_runs"], "no reviewer model"
+
+    # Incomplete reports are counted per slice as well.
+    for task_id, model in ((d, "grok-4.6"), (s, "kimi-k3")):
+        await _report_at(db, task_id, model=model)
+    await db.execute("UPDATE machine_reviews SET incomplete=1")
+    await db.commit()
+    assert (await practice_metrics(db))["incomplete_reasons"]["incomplete_total"] == 2
+    by_project = await practice_metrics(db, project="spike")
+    assert by_project["incomplete_reasons"]["incomplete_total"] == 1
+    by_model = await practice_metrics(db, model="grok-4.6")
+    assert by_model["incomplete_reasons"]["incomplete_total"] == 1
+
+
+async def test_metrics_unjudged_queue_and_rules_follow_the_slice(
+    db: aiosqlite.Connection,
+):
+    """The unjudged-findings stock and the rule breaches carry no window, but
+    they still belong to a project and a reviewer model (#1490)."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d = await _task(db, title="default")
+    s = await _task(db, title="spike", project_id=spike)
+    await _report_at(db, d, model="grok-4.6", confirmed=2)
+    await _report_at(db, s, model="kimi-k3", confirmed=1)
+    await db.commit()
+
+    def unjudged(m: dict) -> int:
+        return m["machine_reviews"]["dispositions"]["confirmed_unjudged"]
+
+    assert unjudged(await practice_metrics(db)) == 3
+    assert unjudged(await practice_metrics(db, project="spike")) == 1
+    assert unjudged(await practice_metrics(db, model="grok-4.6")) == 2
+    assert unjudged(await practice_metrics(db, project="spike", model="grok-4.6")) == 0
+
+    rule_date = _ts(72)
+    await _rule_set_up(db, "timeouts", rule_date)
+    for project_id, title, model in (
+        (None, "breach default", "grok-4.6"),
+        (spike, "breach spike", "kimi-k3"),
+    ):
+        task_id = await _finding_at(db, title, "timeouts", _ts(24))
+        if project_id is not None:
+            await db.execute(
+                "UPDATE tasks SET project_id=? WHERE id=?", (project_id, task_id)
+            )
+        await db.execute(
+            "UPDATE machine_reviews SET model=? WHERE task_id=?", (model, task_id)
+        )
+    await db.commit()
+
+    def breaches(m: dict) -> int:
+        return sum(r["breaches"] for r in m["rule_breaches"]["breached"])
+
+    assert breaches(await practice_metrics(db)) == 2
+    assert breaches(await practice_metrics(db, project="spike")) == 1
+    assert breaches(await practice_metrics(db, model="grok-4.6")) == 1
+
+
+async def test_metrics_series_names_the_buckets_it_dropped(db: aiosqlite.Connection):
+    """A window wider than the bucket limit is cut loudly, never silently
+    (#1490): the answer says how many old buckets went and where it starts."""
+    await _verdict_pack(db, approved=1, changed=0, days_ago=2)
+    await db.commit()
+
+    wide = (
+        await practice_metrics(db, date_from="2015-01-01", series=True, series_days=7)
+    )["series"]
+    points = wide["indicators"][0]["points"]
+    assert wide["truncated"] is True
+    assert len(points) == wide["max_buckets"] == 104
+    assert wide["dropped_buckets"] > 0
+    assert wide["starts_at"] == points[0]["from"]
+    # The newest bucket is kept: the recent verdict is still there.
+    assert sum(p["n"] for p in points) == 1
+
+    narrow = (await practice_metrics(db, since_days=28, series=True))["series"]
+    assert narrow["truncated"] is False
+    assert narrow["dropped_buckets"] == 0
+    assert len(narrow["indicators"][0]["points"]) == 4
+    assert narrow["starts_at"] == narrow["indicators"][0]["points"][0]["from"]
+
+
+async def test_mcp_practice_metrics_passes_series_days():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = {"since_days": 90}
+        await hub_practice_metrics(series=True, series_days=14)
+        assert "series=true" in get.call_args.args[0]
+        assert "series_days=14" in get.call_args.args[0]
+        await hub_practice_metrics()
+        assert "series_days" not in get.call_args.args[0]
+
+
+# --- validation_run_lines counts every submission of the window (#1567) ----
+
+_SHA_ONE = "1f047c" + "b7a91f" + "1" * 28
+_SHA_TWO = "bf3de1" + "a0c2d4" + "2" * 28
+_SHA_THREE = "c0ffee" + "123456" + "3" * 28
+_RUN_CLAIM = " ruff check: rc=0; pytest: rc=0."
+
+
+async def _submission_row(
+    db: aiosqlite.Connection,
+    task_id: int,
+    number: int,
+    sha: str | None,
+    *,
+    hours_ago: float = 1,
+) -> None:
+    tip = f" Branch tip at submission: {sha[:12]}." if sha else ""
+    content = f"{repo.SUBMISSION_UPDATE_PREFIX}{number}).{tip}{_RUN_CLAIM}"
+    await db.execute(
+        "INSERT INTO task_updates (task_id, agent, kind, content, created_at) "
+        "VALUES (?, 'dev', 'status', ?, ?)",
+        (task_id, content, _ts(hours_ago)),
+    )
+
+
+async def _ci_report(
+    db: aiosqlite.Connection, task_id: int, sha: str, **checks
+) -> None:
+    from hub.services.ci_report import accept_ci_run_report
+
+    await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha=sha,
+        ac_results={},
+        checks=checks,
+        reported_by="github-actions",
+    )
+
+
+async def _run_lines(db: aiosqlite.Connection, **scope) -> dict:
+    return (await practice_metrics(db, **scope))["validation_run_lines"]
+
+
+async def test_validation_run_lines_counts_every_submission(db: aiosqlite.Connection):
+    # #1168: submission 1 failed the prepass, submission 4 passed. The task
+    # pins only the last sha, yet the failed one is a submission of the window.
+    task_id = await _task(db, title="four submissions", status="review")
+    await _submission_row(db, task_id, 1, _SHA_ONE, hours_ago=5)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=1)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await _ci_report(db, task_id, _SHA_ONE, lint="pass", tests="fail")
+    await _ci_report(db, task_id, _SHA_TWO, lint="pass", tests="pass")
+    await db.commit()
+
+    runs = await _run_lines(db)
+
+    assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (1, 2, 0)
+
+
+async def test_validation_run_lines_late_report_counts(db: aiosqlite.Connection):
+    # The CI report arrives after the submission row (623 of 872 in prod): it
+    # is still the verdict of that submission, not a "not_run".
+    task_id = await _task(db, title="late report", status="review")
+    await _submission_row(db, task_id, 1, _SHA_ONE, hours_ago=3)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=2)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await db.commit()
+    before = await _run_lines(db)
+    assert (before["sample"], before["not_run"]) == (0, 2)
+
+    await _ci_report(db, task_id, _SHA_ONE, tests="fail")
+    await db.commit()
+
+    after = await _run_lines(db)
+    assert (after["failed_with_run_lines"], after["sample"], after["not_run"]) == (
+        1,
+        1,
+        1,
+    )
+
+
+async def test_validation_run_lines_window_and_project_slice(
+    db: aiosqlite.Connection,
+):
+    spike = await repo.create_project(db, slug="spike-runs", name="Spike Runs")
+    inside = await _task(db, title="in spike", status="review", project_id=spike)
+    outside = await _task(db, title="in default", status="review")
+    await _submission_row(db, inside, 1, _SHA_ONE, hours_ago=2)
+    await _submission_row(db, inside, 2, _SHA_TWO, hours_ago=24 * 200)
+    await _submission_row(db, outside, 1, _SHA_THREE, hours_ago=2)
+    await repo.update_task(db, inside, submission_sha=_SHA_ONE)
+    await repo.update_task(db, outside, submission_sha=_SHA_THREE)
+    await _ci_report(db, inside, _SHA_ONE, tests="fail")
+    await _ci_report(db, inside, _SHA_TWO, tests="fail")
+    await _ci_report(db, outside, _SHA_THREE, tests="pass")
+    await db.commit()
+
+    window = await _run_lines(db)
+    assert (window["failed_with_run_lines"], window["sample"]) == (1, 2)
+    wide = await _run_lines(db, since_days=400)
+    assert (wide["failed_with_run_lines"], wide["sample"]) == (2, 3)
+    only_spike = await _run_lines(db, project="spike-runs")
+    assert (only_spike["failed_with_run_lines"], only_spike["sample"]) == (1, 1)
+    only_default = await _run_lines(db, project="default")
+    assert (only_default["failed_with_run_lines"], only_default["sample"]) == (0, 1)
+
+
+async def test_validation_run_lines_unpinned_submission_is_not_run(
+    db: aiosqlite.Connection,
+):
+    # A row without a branch tip has no commit to read a report for, and the
+    # task's current pin is another submission's commit: it never stands in.
+    task_id = await _task(db, title="unpinned first", status="review")
+    await _submission_row(db, task_id, 1, None, hours_ago=3)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=1)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await _ci_report(db, task_id, _SHA_TWO, tests="fail")
+    await db.commit()
+
+    runs = await _run_lines(db)
+
+    assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (1, 1, 1)
+
+
+# --- events_history: окно длиннее хранения events (#1621) --------------------
+#
+# events чистится на EVENTS_RETENTION_DAYS. Покрытие определяется этим
+# известным пределом, а не MIN(created_at): пустые первые часы окна не должны
+# менять ответ.
+
+_EVENTS_NOTE = (
+    "окно по events длиннее хранения: по политике хранения (14 дн.) данные раньше "
+)
+_EVENTS_TAIL = " не гарантированы; более старые события могут оставаться до очистки"
+
+
+def _eh(body: dict) -> dict:
+    assert "events_history" in body, sorted(body)
+    return body["events_history"]
+
+
+def _today_offset(days: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+async def test_events_history_marks_window_beyond_retention(db: aiosqlite.Connection):
+    """AC-1 (#1621): since_days=30 называет current, history_from = now − 14 дней."""
+    before = datetime.now(UTC)
+    out = await practice_metrics(db, since_days=30)
+    history = _eh(out)
+    assert history["retention_days"] == repo.EVENTS_RETENTION_DAYS == 14
+    assert history["windows_beyond_history"] == ["current"]
+    moment = datetime.fromisoformat(history["history_from"])
+    assert moment.utcoffset() == timedelta(0)
+    assert abs((before - timedelta(days=14)) - moment) < timedelta(minutes=2)
+    assert history["note"].startswith(_EVENTS_NOTE)
+    names = {s["name"]: s["own_window"] for s in history["events_sections"]}
+    assert {
+        "human_gates",
+        "review_outcomes",
+        "review_model_cascade",
+        "review_economy.deep_cap",
+        "review_economy.small_delta",
+        "review_economy.runs.by_kind",
+        "steward_shadow.human_table",
+        "steward_shadow.false_approve",
+        "steward_shadow.false_approve_tasks",
+        "steward_shadow.act_refusals",
+        "steward_shadow.act_ready",
+    } <= set(names)
+    assert names["human_touches"] is True
+    assert names["steward_shadow.actual_verdicts"] is True
+    # The shadow phase is read whole: the request window does not narrow it.
+    assert names["steward_shadow.human_table"] is True
+    window = {s["name"]: s["window"] for s in history["events_sections"]}
+    assert window["steward_shadow.human_table"] == "окно — вся фаза тени"
+    assert names["human_gates"] is False
+    assert "task_updates" not in names and "machine_reviews" not in names
+
+
+async def test_events_history_window_inside_retention_is_clean(
+    db: aiosqlite.Connection,
+):
+    """AC-2 (#1621): окно 7 дней без событий в начале — не урезано."""
+    t1 = await _task(db, title="recent")
+    await db.execute(
+        "INSERT INTO events (kind, task_id, created_at) VALUES ('x', ?, ?)",
+        (t1, _ts(1)),
+    )
+    await db.commit()
+    for days in (7, 14):
+        history = _eh(await practice_metrics(db, since_days=days))
+        assert history["windows_beyond_history"] == [], days
+        assert history["note"] == ""
+
+
+async def test_events_history_compare_and_absolute_dates(db: aiosqlite.Connection):
+    """AC-3 (#1621): previous и абсолютные даты попадают в список, current — нет."""
+    out = await practice_metrics(db, since_days=10, compare=True)
+    assert _eh(out)["windows_beyond_history"] == ["previous"]
+
+    inside = await practice_metrics(
+        db, date_from=_today_offset(3), date_to=_today_offset(1)
+    )
+    assert _eh(inside)["windows_beyond_history"] == []
+
+    old = await practice_metrics(db, date_from="2020-01-01", date_to="2020-01-31")
+    assert _eh(old)["windows_beyond_history"] == ["2020-01-01..2020-01-31"]
+
+    straddle = await practice_metrics(db, date_from=_today_offset(20))
+    assert len(_eh(straddle)["windows_beyond_history"]) == 1
+
+    serie = await practice_metrics(db, since_days=20, series=True, series_days=5)
+    beyond = _eh(serie)["windows_beyond_history"]
+    assert "current" in beyond
+    assert any(label.startswith("series:") for label in beyond)
+
+
+async def test_events_history_empty_window_uses_retention_only(
+    db: aiosqlite.Connection,
+):
+    """AC-4 (#1621): без единого события дата — из хранения, не из данных."""
+    count = await db.execute_fetchall("SELECT COUNT(*) FROM events")
+    assert count[0][0] == 0
+    history = _eh(await practice_metrics(db, since_days=30))
+    expected = datetime.now(UTC) - timedelta(days=repo.EVENTS_RETENTION_DAYS)
+    got = datetime.fromisoformat(history["history_from"])
+    assert abs(expected - got) < timedelta(minutes=2)
+    assert history["note"] == _EVENTS_NOTE + history["history_from"] + _EVENTS_TAIL
+    assert history["windows_beyond_history"] == ["current"]
+
+
+async def test_events_history_is_rendered_on_the_metrics_page(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-5 (#1621): на /metrics стоит строка о хранении; REST отдаёт поле."""
+    body = (await client.get("/api/metrics/practices?since_days=30")).json()
+    from_ = _eh(body)["history_from"]
+    page = await client.get("/metrics?since_days=30")
+    assert page.status_code == 200
+    assert _EVENTS_NOTE in page.text
+    assert _EVENTS_TAIL in page.text
+    assert from_[:10] in page.text
+    clean = await client.get("/metrics?since_days=7")
+    assert _EVENTS_NOTE not in clean.text
+
+
+async def test_events_history_boundary_is_exact_and_shadow_ignores_window(
+    db: aiosqlite.Connection,
+):
+    """#1621: 14 дней — внутри хранения, 15 — снаружи, без допуска; секция
+    steward_shadow.human_table от since_days не зависит."""
+    assert (
+        _eh(await practice_metrics(db, since_days=14))["windows_beyond_history"] == []
+    )
+    assert _eh(await practice_metrics(db, since_days=15))["windows_beyond_history"] == [
+        "current"
+    ]
+    short = await practice_metrics(db, since_days=7)
+    long_ = await practice_metrics(db, since_days=90)
+    assert (
+        short["steward_shadow"]["human_table"] == long_["steward_shadow"]["human_table"]
+    )

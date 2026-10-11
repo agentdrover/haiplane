@@ -30,14 +30,22 @@ def bearer_context_get() -> str | None:
 # a core surface — and a tool function has no request to read that from. The
 # identity is a snapshot of what AuthMiddleware already resolved: the token
 # itself stays in the bearer var above and is never copied here.
-_identity: contextvars.ContextVar[tuple[int | None, str] | None] = (
+_identity: contextvars.ContextVar[tuple[int | None, str, bool] | None] = (
     contextvars.ContextVar("hub_mcp_identity", default=None)
 )
 
 
-def identity_context_set(principal_id: int | None, role: str) -> Any:
-    """Stash caller (principal_id, role); returns handle for the reset."""
-    return _identity.set((principal_id, role or ""))
+def identity_context_set(
+    principal_id: int | None, role: str, is_human: bool = False
+) -> Any:
+    """Stash caller (principal_id, role, is_human); returns handle for the reset.
+
+    ``is_human`` is ``TokenIdentity.is_human`` as resolved after the role gate
+    (#1624): a watcher or steward is never human, a custom role holding
+    ``tasks.human_gate`` is. The bare role cannot say that, so the flag rides
+    along. Everything that does not set it is the agent view.
+    """
+    return _identity.set((principal_id, role or "", bool(is_human)))
 
 
 def identity_context_reset(handle: Any) -> None:
@@ -46,4 +54,15 @@ def identity_context_reset(handle: Any) -> None:
 
 def identity_context_get() -> tuple[int | None, str]:
     """Caller identity for the current MCP call, or (None, "") outside one."""
-    return _identity.get() or (None, "")
+    ident = _identity.get()
+    return (ident[0], ident[1]) if ident else (None, "")
+
+
+def identity_is_human() -> bool:
+    """True only for a call whose protected identity is human (#1624).
+
+    No context (stdio, open mode, a direct call from code) is False: the
+    agent view is the default and the human view has to be earned.
+    """
+    ident = _identity.get()
+    return bool(ident and ident[2])

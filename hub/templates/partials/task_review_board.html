@@ -27,6 +27,7 @@
    block, it only says it shorter. A block without a signal shows as a
    warning tile, never as a blank — silence here reads as "checked, clean"
    (#725). #}
+{% set sr = evidence.state_review if evidence else None %}
 {% set ev_acs = evidence.acceptance_criteria if evidence else [] %}
 {% set ev_test_acs = [] %}
 {% set ev_pass = [] %}
@@ -40,6 +41,25 @@
         <div class="task-review-tile-label">Свидетельства</div>
         <div class="task-review-tile-value">не собраны</div>
         <div class="task-review-tile-sub">бриф по этой сдаче не построен — проверять не по чему</div>
+    </div>
+    {% elif sr %}
+    {# #1648: задача-состояние. Плитки считаются из доказательств поколения; про
+       тесты, CI, предпас и машинное ревью — не «0 из 0» и не «нет отчёта»,
+       а «не применимо»: сверять там нечего. #}
+    <div class="task-review-tile {{ 'task-review-tile--ok' if sr.evidence_complete else 'task-review-tile--bad' }}">
+        <div class="task-review-tile-label">Доказательства</div>
+        <div class="task-review-tile-value">{{ sr.evidence|length }} из {{ sr.acceptance_criteria|length }}</div>
+        <div class="task-review-tile-sub">{% if sr.evidence_complete %}по каждому AC есть запись поколения {{ sr.generation }}{% elif sr.missing_ac %}нет записей: {{ sr.missing_ac|join(', ') }}{% else %}снимок AC сдачи не записан{% endif %}</div>
+    </div>
+    <div class="task-review-tile {{ 'task-review-tile--ok' if sr.rollback else 'task-review-tile--bad' }}">
+        <div class="task-review-tile-label">Откат</div>
+        <div class="task-review-tile-value">{{ 'назван' if sr.rollback else 'не назван' }}</div>
+        <div class="task-review-tile-sub" title="{{ sr.rollback }}">{{ sr.rollback|truncate(110) if sr.rollback else 'в снимке сдачи rollback пуст' }}</div>
+    </div>
+    <div class="task-review-tile">
+        <div class="task-review-tile-label">Проверки кода</div>
+        <div class="task-review-tile-value">не применимо</div>
+        <div class="task-review-tile-sub">ветки, CI, тестов AC и машинного ревью у задачи-состояния нет</div>
     </div>
     {% else %}
     <div class="task-review-tile {{ 'task-review-tile--ok' if ev_test_acs and ev_pass|length == ev_test_acs|length else 'task-review-tile--warn' }}">
@@ -152,7 +172,59 @@
        здесь читается как «проверено, чисто».
        #1207: свой контейнер вместо заметки с потолком 180px —
        свидетельства читаются целиком, а не первой строкой. #}
-    {% if evidence %}
+    {% if sr %}
+    {# #1648: человек принимает СОСТОЯНИЕ мира. Метка вида, откат, снимок AC и
+       таблица наблюдений поколения {{ sr.generation }} — вместо блоков про код.
+       Всё экранируется шаблоном: наблюдения пишет исполнитель, это данные. #}
+    <div class="task-evidence" id="state-evidence">
+        <span class="badge badge--xs badge-pending">{{ sr.label }}</span>
+        <strong>Принимается поколение {{ sr.generation }}</strong>
+        <div class="muted">{{ sr.headline }}</div>
+        <div class="task-evidence-row">
+            <span class="u-text-muted">Откат (rollback):</span>
+            <span class="u-pre-wrap">{{ sr.rollback or 'не назван' }}</span>
+        </div>
+        <table class="task-ac-evidence">
+            <thead>
+                <tr>
+                    <th>AC</th>
+                    <th>Ожидание (снимок сдачи)</th>
+                    <th>Что выполнено</th>
+                    <th>Что увидели</th>
+                    <th>Над чем</th>
+                    <th>Когда</th>
+                    <th>Автор</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for ac in sr.acceptance_criteria %}
+            {% set ev = (sr.evidence | selectattr('ac_id', 'equalto', ac.id) | first) %}
+            <tr>
+                <td class="task-ac-evidence-id">{{ ac.id }}</td>
+                <td class="task-ac-evidence-then">{{ ac.then }}</td>
+                {% if ev %}
+                <td>{{ ev.action }}</td>
+                <td>{{ ev.observed }}</td>
+                <td>{{ ev.target }}</td>
+                <td>{{ ev.observed_at }}</td>
+                <td>{{ ev.author }}</td>
+                {% else %}
+                <td colspan="5"><span class="badge badge-failed">записи этого поколения нет</span></td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <details>
+            <summary class="project-edit-summary">не применимо к задаче-состоянию: {{ sr.not_applicable | length }}</summary>
+            <ul class="task-review-findings">
+                {% for c in sr.not_applicable %}
+                <li>{{ c.check }} — {{ c.reason }}</li>
+                {% endfor %}
+            </ul>
+        </details>
+    </div>
+    {% elif evidence %}
     <div class="task-evidence"><strong>Проверено по этой сдаче:</strong>
         {% if evidence.review_in_flight %}
         <div class="task-action-note--warning">{{ evidence.review_in_flight.headline }}</div>
@@ -240,6 +312,17 @@
             {% if evidence.base_merge.files %}
             <span class="badge badge-failed">конфликтуют: {{ evidence.base_merge.files|join(', ') }}</span>
             {% endif %}
+        </div>
+        {% endif %}
+
+        {# #1589: предупреждения по путям диффа — ручные шаги вне CI. Текст
+           приходит из политики проекта и выводится ЭКРАНИРОВАННЫМ (данные, не
+           разметка); блок есть только при совпадении или непрочитанном диффе. #}
+        {% if evidence.path_notices and evidence.path_notices.state != 'none' %}
+        <div class="task-evidence-row" id="path-notices">
+            <span class="u-text-muted">Пути диффа требуют ручных шагов:</span>
+            <span class="badge badge--xs badge-{{ 'pending' if evidence.path_notices.state == 'unknown' else 'failed' }}">{{ evidence.path_notices.state }}</span>
+            <div class="u-pre-wrap">{{ evidence.path_notices.text }}</div>
         </div>
         {% endif %}
 
@@ -364,6 +447,7 @@
     {% endif %}
 </section>
 
+{% if not sr %}
 <section class="task-content-card task-review-board task-review-board--review">
     <div class="task-card-header">
         <h2>Ревью</h2>
@@ -384,6 +468,7 @@
     <div class="task-action-note task-action-note--warning">
         {{ machine_review_gap }}
         <form method="post" action="/tasks/{{ task.id }}/web-request-machine-review" class="project-inline-form">
+          {{ csrf_field() }}
             <button class="btn btn-ghost" type="submit">Request machine review</button>
         </form>
     </div>
@@ -519,11 +604,18 @@
         {% for c in machine_review.observation_closures %}
         {% if observed.update({c.finding_uid: c}) %}{% endif %}
         {% endfor %}
+        {# #1448: повтор находки, отложенной до недоставленной задачи. Гейты
+           его не считают блокером, но и прятать его нельзя. #}
+        {% set deferred = {} %}
+        {% for r in machine_review.deferred_repeats %}
+        {% if deferred.update({r.finding_uid: r}) %}{% endif %}
+        {% endfor %}
         <details>
             <summary class="project-edit-summary">confirmed findings — {#
                 #}размечено {{ machine_review.dispositions|length }}{% if observed %}, закрыто наблюдением {{ observed|length }}{% endif %} из {{ machine_review.findings_confirmed|length }}</summary>
             <form method="post"
                   action="/tasks/{{ task.id }}/web-finding-dispositions">
+              {{ csrf_field() }}
                 <p class="u-text-muted">
                     Ложняк — описанного дефекта в коде НЕТ.
                     Неважно — дефект есть, править не будем.
@@ -560,6 +652,10 @@
                             value="wont_fix"
                             {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'wont_fix' %}checked{% endif %}>
                             неважно</label>
+                        {% set repeat = deferred.get(f.finding_uid) %}
+                        {% if repeat %}
+                        <span class="badge badge--xs">отложена до <a href="/tasks/{{ repeat.linked_task_id }}">#{{ repeat.linked_task_id }}</a>, повтор не блокирует</span>
+                        {% endif %}
                         {% set closure = observed.get(f.finding_uid) %}
                         {% if closure %}
                         <span class="badge badge--xs">закрыта наблюдением: живая проверка #{{ closure.live_check_id }}</span>
@@ -620,12 +716,18 @@
     {% endif %}
 </section>
 
+{% endif %}
+
 <section class="task-content-card task-review-board task-review-board--verdict">
     <div class="task-card-header">
         <h2>Вердикт</h2>
         <span class="task-card-header-meta">одобрение уходит в гейт доставки, возврат — исполнителю</span>
     </div>
     <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack" id="review-verdict-form">
+      {{ csrf_field() }}
+        {# #1647: вердикт по задаче-состоянию привязан к поколению сдачи, которое
+           показано на этой странице; расхождение — 409 без записей. #}
+        {% if task.result_kind == 'state' %}<input type="hidden" name="expected_generation" value="{{ task.submission_generation }}">{% endif %}
         <label class="task-action-label" for="review-comments">Review comments</label>
         <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
         <label class="task-action-label" for="review-findings">Findings</label>

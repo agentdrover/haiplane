@@ -29,6 +29,7 @@ import logging
 from typing import Any
 
 from hub import repository as repo
+from hub.services import red_test_gate
 from hub.services.ac_tests import (
     FAIL as AC_FAIL,
     NOT_FOUND as AC_NOT_FOUND,
@@ -72,13 +73,16 @@ CHECK_OUTCOMES = frozenset({CHECK_PASS, CHECK_FAIL, CHECK_SKIPPED})
 # The mutation report (#1270) is stored verbatim; the reporter trims the survivor
 # list well below this, so hitting it means a reporter that forgot to.
 MUTATIONS_MAX_CHARS = 32_000
+# The red-test baseline (#913): the reporter keeps the AC tests and trims the
+# rest well below this, so hitting it means a reporter that forgot to.
+BASELINE_MAX_CHARS = 32_000
 
 
 def _pinned_sha(task: dict) -> str:
     return (task.get("submission_sha") or "").strip()
 
 
-async def accept_ci_run_report(
+async def _store_ci_run_report(
     db: Any,
     task_id: int,
     *,
@@ -90,6 +94,7 @@ async def accept_ci_run_report(
     reported_by: str = "",
     checks: dict[str, str] | None = None,
     mutations: dict[str, Any] | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -126,12 +131,19 @@ async def accept_ci_run_report(
 
     # #1270: stored as evidence under its own key, never interpreted into a
     # gate. Bounded, because it is free text from CI landing in a table row.
-    mutations_json = json.dumps(mutations or {}, ensure_ascii=False, sort_keys=True)
-    if len(mutations_json) > MUTATIONS_MAX_CHARS:
-        raise ValueError(
-            f"mutations report is {len(mutations_json)} chars, the limit is "
-            f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
-        )
+    # #1606: ``None`` is "the report carried no such key" — the step did not
+    # run — and is NOT stored as {}: the repository keeps what is already
+    # there. A dict, even an empty one or a state=error, replaces.
+    mutations_json = None
+    if mutations is not None:
+        mutations_json = json.dumps(mutations, ensure_ascii=False, sort_keys=True)
+        if len(mutations_json) > MUTATIONS_MAX_CHARS:
+            raise ValueError(
+                f"mutations report is {len(mutations_json)} chars, the limit is "
+                f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
+            )
+
+    baseline_json = None if baseline is None else _checked_baseline(baseline)
 
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
@@ -185,6 +197,7 @@ async def accept_ci_run_report(
             sort_keys=True,
         ),
         mutations=mutations_json,
+        baseline=baseline_json,
     )
 
     recorded: list[dict] = []
@@ -197,8 +210,9 @@ async def accept_ci_run_report(
             validation_status=validation_status,
             validation_log=validation_log or "",
         )
-    await db.commit()
-
+    # What the commit now holds, not what this report carried: a report without
+    # the keys leaves the stored blocks, and the answer must say so.
+    stored = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
     return {
         "applied": applied,
         "reason": applied_reason,
@@ -207,8 +221,52 @@ async def accept_ci_run_report(
         "ac_recorded": recorded,
         "ac_ignored": ignored,
         "validation_status": validation_status,
-        "mutations_state": str((mutations or {}).get("state") or "not_reported"),
+        "mutations_state": _stored_state(stored.get("mutations")),
+        "baseline_state": _stored_state(stored.get("baseline")),
     }
+
+
+async def accept_ci_run_report(
+    db: Any, task_id: int, *, commit: bool = True, **report: Any
+) -> dict:
+    """Store a CI run report (see ``_store_ci_run_report``) and, by default, commit.
+
+    The request handler passes ``commit=False``: it owns the write transaction
+    until the result is read back (#1644), so a failure after the write rolls
+    the report back instead of leaving it behind a 500.
+    """
+    result = await _store_ci_run_report(db, task_id, **report)
+    if commit:
+        await db.commit()
+    return result
+
+
+def _stored_state(raw: str | None) -> str:
+    """``state`` of a stored evidence block, ``not_reported`` when it holds none."""
+    try:
+        block = json.loads(raw or "{}")
+    except ValueError:
+        return "not_reported"
+    if not isinstance(block, dict):
+        return "not_reported"
+    return str(block.get("state") or "not_reported")
+
+
+def _checked_baseline(baseline: dict[str, Any] | None) -> str:
+    """The baseline (#913) as stored text, or ValueError for one we cannot read.
+
+    Stored verbatim next to ``mutations``; interpreted only by the red-test
+    gate at submission. Statuses are enumerated like AC statuses: a test the
+    hub cannot classify is refused, never guessed into "failed".
+    """
+    red_test_gate.validate_baseline(baseline or {})
+    text = json.dumps(baseline or {}, ensure_ascii=False, sort_keys=True)
+    if len(text) > BASELINE_MAX_CHARS:
+        raise ValueError(
+            f"baseline report is {len(text)} chars, the limit is "
+            f"{BASELINE_MAX_CHARS}: trim the non-AC tests before sending"
+        )
+    return text
 
 
 async def _stamp(

@@ -18,13 +18,13 @@
 | Инструмент | Пересекается с | Классификация | Решение |
 |---|---|---|---|
 | `hub_task_update kind=done` | `hub_report_done` | **deprecated alias** (задокументирован) | вывести по этапам |
-| `hub_approve_proposal` | `hub_approve_task` | **deprecated alias** | вывести по этапам |
-| `hub_reject_proposal` | `hub_reject_task` | **deprecated alias** | вывести по этапам |
+| `hub_approve_proposal` | `hub_approve_task` | **deprecated alias** | **удалён (#1624)**; REST `/api/proposals` остаётся |
+| `hub_reject_proposal` | `hub_reject_task` | **deprecated alias** | **удалён (#1624)**; REST `/api/proposals` остаётся |
 | `hub_task_update kind=review` | `hub_submit_review` | **legacy-канал вердикта** (поллер сканирует текст) | мигрировать headless-ревьюера на `hub_submit_review`, скан оставить fallback-ом для dispatch-логов |
 | `hub_refine_task`, `hub_add/upsert/replace/delete_acceptance_criterion`, `hub_add_risk` | `hub_prepare_developer_task` | **granular vs macro** — НЕ дубликаты | оставить оба слоя: granular = API-паритет, prepare = аналитический макрос; в описаниях указать «prepare предпочтителен для полного hand-off» |
 | `hub_list_proposals` | `hub_list_tasks(status=draft)` | **filter view** с добавленной ценностью (ранжирование #253, ready_to_approve) | оставить; описание уточнить как «ranked draft queue» |
-| `hub_start_task` vs `hub_pair_start` | — | разные операции (headless dispatch vs pair) | оставить |
-| `hub_force_complete_task` vs `hub_decide_task` | — | разные human-гейты | оставить |
+| `hub_start_task` vs `hub_pair_start` | — | разные операции (headless dispatch vs pair) | оставить; `hub_start_task` скрыт от агентских токенов (#1624) |
+| `hub_force_complete_task` vs `hub_decide_task` | — | разные human-гейты | оставить; скрыты от агентских токенов (#1624) |
 
 Итог: настоящих кандидатов на удаление три — алиасы `task_update kind=done`,
 `approve_proposal`, `reject_proposal`; плюс одна миграция канала вердикта.

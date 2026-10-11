@@ -26,3 +26,7 @@ htmlcov/
 # рабочие копии других задач, а не исходник этой. Пока они висели untracked,
 # pre-push видел грязное дерево и блокировал КАЖДЫЙ push из основного клона.
 .claude/worktrees/
+
+# #1620: CI exports these from uv.lock into the deploy tree; never committed.
+requirements.runtime.txt
+requirements.build.txt

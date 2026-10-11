@@ -109,7 +109,9 @@ async def test_precondition_failure_escalates(
     # Ни одного факта: нет CI, нет отчёта, нет клона.
     bare = await _task(db, project_id)
     refusals = await apply_refusals(db, bare)
-    assert _codes(refusals) == {REFUSED_PRECONDITION}
+    # Отказ «советник не согласен» (#1601) приходит рядом: у голой задачи нет и
+    # судьи. Предусловия — всё остальное, и оно обязано быть одним кодом.
+    assert _codes(refusals) - {"advisor_not_concurred"} == {REFUSED_PRECONDITION}
     sources = " ".join(detail for _, detail in refusals)
     for fact in PRECONDITION_FACTS:
         assert fact in sources, (
@@ -1593,16 +1595,11 @@ async def test_a_judgement_is_never_applied_where_the_verdict_is_not_delegated(
     не отказывается — иначе проверка была бы выключателем, а не правилом.
     """
     from hub.services.steward_apply import REFUSED_NOT_DELEGATED
-    from tests.test_steward_shadow import _pair
+    from tests.test_steward_shadow import _v2_sample
 
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
     measured = await _project(db, "apply-measured")
-    for _ in range(10):
-        await _pair(
-            db, measured, steward="changes_requested", human="changes_requested"
-        )
-    for _ in range(2):
-        await _pair(db, measured, steward="escalate", human="approved")
+    await _v2_sample(db, measured, concur=18, objects=2, changes=10, substantive=5)
     from hub.services.steward_shadow import effective_mode
 
     assert await effective_mode(db) == "act", "предусловие: автономия выдана"

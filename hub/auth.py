@@ -34,9 +34,11 @@ from hub.actionable_errors import (
     human_only_gate_detail,
     permission_denied_detail,
     steward_gate_forbidden_detail,
+    watcher_gate_forbidden_detail,
     withdraw_agent_only_detail,
 )
 from hub.config import TokenIdentity
+from hub.csrf import MUTATING_METHODS, request_session_token_ok
 from hub.mcp_internal_auth import (
     bearer_context_reset,
     bearer_context_set,
@@ -112,6 +114,28 @@ def verify_csrf(request_token: str | None, cookie_token: str | None) -> bool:
         hashlib.sha256(request_token.encode()).hexdigest()
         == hashlib.sha256(cookie_token.encode()).hexdigest()
     )
+
+
+def cookie_csrf_ok(request: Request, presented: str | None) -> bool:
+    """Token check for a handler that verifies it itself (#1664).
+
+    Accepts the session-bound token, and — while the pages that still hand out
+    the old double-submit value exist (CSRF B) — that value too.
+    """
+    return request_session_token_ok(request, presented) or verify_csrf(
+        presented, request.cookies.get(CSRF_COOKIE_NAME, "")
+    )
+
+
+def csrf_exempt_transport(request: Request) -> bool:
+    """A Bearer caller is not asked for a token (#1664).
+
+    Open mode is NOT exempt here: before this task the handlers asked it for a
+    token too, and the global middleware is what skips open mode, not the
+    per-handler checks.
+    """
+    identity = getattr(request.state, "identity", None)
+    return getattr(identity, "transport", "") == "bearer"
 
 
 _PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
@@ -270,6 +294,8 @@ _ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
     # descriptions of one boundary drift, and the one that drifts wider wins
     # silently.
     "steward": _STEWARD_ALLOWED,
+    # #1601: советник-критик — те же две операции, другой вид сессии.
+    "steward_advisor": _STEWARD_ALLOWED,
 }
 
 
@@ -321,6 +347,105 @@ def steward_route_allowed(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Watcher route allowlist (#1556)
+# ---------------------------------------------------------------------------
+#
+# A watcher reads. The list is positive — method AND path shape — so a write
+# route added tomorrow is closed for it today, and routes that do not exist,
+# /admin*, web forms and every POST/PUT/PATCH/DELETE on /api are refused
+# before routing. /mcp is open as a transport only (JSON-RPC rides on POST):
+# what a tool may do is decided by the REST call it makes with the CALLER's
+# bearer, which lands back in this same check and is refused there.
+#
+# Shapes, not prefixes-by-accident: "/api/" needs the slash, so /apix is out.
+WATCHER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/*"),
+    ("HEAD", "/api/*"),
+    ("GET", "/mcp"),
+    ("POST", "/mcp"),
+    ("DELETE", "/mcp"),
+    ("GET", "/mcp/*"),
+    ("POST", "/mcp/*"),
+    ("DELETE", "/mcp/*"),
+)
+
+
+def _watcher_shape_matches(shape: str, path: str) -> bool:
+    if shape.endswith("/*"):
+        return path.startswith(shape[:-1]) and len(path) > len(shape) - 1
+    return path == shape
+
+
+def watcher_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a watcher principal may reach ``(method, path)`` (#1556)."""
+    if identity is not None and not identity.is_watcher:
+        return False
+    return any(
+        method == allowed_method and _watcher_shape_matches(shape, path)
+        for allowed_method, shape in WATCHER_ALLOWLIST
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project-bound CI key allowlist (#1644)
+# ---------------------------------------------------------------------------
+#
+# A ci_runner key bound to projects may do exactly what the CI reporter does:
+# read the task it reports on, report, and record a deploy. Everything else —
+# refine (which can move an epic to another project and then report "inside"
+# the scope), run-validation / run-ac-tests (host commands), MCP, drafts — is
+# refused before routing, including routes that do not exist yet.
+CI_SCOPED_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/tasks/{task_id}"),
+    ("POST", "/api/tasks/{task_id}/ci-run-report"),
+    ("POST", "/api/deploys"),
+    ("GET", "/api/whoami"),
+)
+_CI_SCOPED_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in CI_SCOPED_ALLOWLIST
+)
+
+
+def ci_scoped_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a project-bound CI key may reach ``(method, path)`` (#1644)."""
+    if identity is not None and not identity.is_scoped_ci:
+        return False
+    probe = "GET" if method == "HEAD" else method
+    return any(
+        probe == allowed_method and pattern.match(path)
+        for allowed_method, pattern in _CI_SCOPED_ALLOWED
+    )
+
+
+def _ci_scoped_forbidden(method: str, path: str) -> Response:
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {
+                "detail": {
+                    "reason": "ci_scoped_route_forbidden",
+                    "actor_hint": "human",
+                    "message": (
+                        f"{method} {path}: ключ CI, привязанный к проекту, "
+                        "может только читать задачу, слать отчёт CI и deploy."
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
+# Public paths whose Bearer is a credential of their own, not a session: the
+# bootstrap token is checked by the handler (#1664).
+_BEARER_IS_OWN_CREDENTIAL: Final[frozenset[str]] = frozenset({"/api/admin/bootstrap"})
+
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
 _PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
@@ -330,7 +455,7 @@ ANONYMOUS_IDENTITY: Final[TokenIdentity] = TokenIdentity(
     "anonymous", "human", auth_source="anonymous"
 )
 OPEN_MODE_IDENTITY: Final[TokenIdentity] = TokenIdentity(
-    "anonymous", "human", auth_source="open_mode"
+    "anonymous", "human", auth_source="open_mode", transport="open"
 )
 
 
@@ -350,6 +475,8 @@ def _with_auth_source(
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
         chat_pair_generation=identity.chat_pair_generation,
+        scopes=identity.scopes,
+        scopes_damaged=identity.scopes_damaged,
     )
 
 
@@ -452,6 +579,67 @@ async def _resolve_chat_pair(request: Request, token: str) -> TokenIdentity | No
         return None
 
 
+def _stamped(identity: TokenIdentity, transport: str) -> TokenIdentity:
+    """A copy that records how the caller proved who it is (#1664).
+
+    A copy, never the shared object: env identities live in ``config.HUB_TOKENS``
+    and serve Bearer and cookie callers alike.
+    """
+    return TokenIdentity(
+        identity.username,
+        identity.role,
+        identity.principal_id,
+        identity.permissions,
+        auth_source=identity.auth_source,
+        api_key_id=identity.api_key_id,
+        chat_pair_kind=identity.chat_pair_kind,
+        chat_pair_task_id=identity.chat_pair_task_id,
+        chat_pair_generation=identity.chat_pair_generation,
+        scopes=identity.scopes,
+        scopes_damaged=identity.scopes_damaged,
+        transport=transport,
+    )
+
+
+def _bearer_presented(request: Request) -> bool:
+    """Whether the request tried to authenticate with Bearer, valid or not.
+
+    ``_extract_bearer`` returns nothing for an empty token, which is exactly
+    the case that must not be mistaken for "no Bearer at all" (#1664).
+    """
+    header = request.headers.get("authorization") or ""
+    parts = header.split(None, 1)
+    return bool(parts) and parts[0].lower() == "bearer"
+
+
+def _bearer_refused(request: Request) -> bool:
+    """A mutating request that presented a Bearer which did not resolve."""
+    return request.method in MUTATING_METHODS and _bearer_presented(request)
+
+
+async def _resolve_bearer(request: Request, bearer: str) -> TokenIdentity | None:
+    identity = await _resolve_chat_pair(request, bearer)
+    if identity:
+        return identity
+    identity = await _resolve_db_bearer(request, bearer)
+    if identity:
+        return identity
+    identity = _resolve_env_token(bearer)
+    if identity:
+        return _with_auth_source(identity, "env")
+    return None
+
+
+async def _resolve_cookie(request: Request, cookie: str) -> TokenIdentity | None:
+    identity = await _resolve_db_session(request, cookie)
+    if identity:
+        return identity
+    identity = _resolve_env_token(cookie)
+    if identity:
+        return _with_auth_source(identity, "env")
+    return None
+
+
 async def _resolve_identity(request: Request) -> TokenIdentity | None:
     """Resolve identity from bearer header or session cookie.
 
@@ -459,27 +647,25 @@ async def _resolve_identity(request: Request) -> TokenIdentity | None:
     cookie DB session > cookie env token. Chat-pair goes first because its
     tokens carry their own prefix — the lookup is one indexed hash, and the
     session must never be mistaken for the API key of the same principal.
+
+    A Bearer that was presented but did not resolve ends the search for a
+    mutating method (#1664): falling through to the cookie would let a stale or
+    empty ``Authorization`` header turn a Bearer client's request into a cookie
+    request, which is the one kind a foreign page can forge.
     """
     bearer = _extract_bearer(request)
     if bearer:
-        identity = await _resolve_chat_pair(request, bearer)
+        identity = await _resolve_bearer(request, bearer)
         if identity:
-            return identity
-        identity = await _resolve_db_bearer(request, bearer)
-        if identity:
-            return identity
-        identity = _resolve_env_token(bearer)
-        if identity:
-            return _with_auth_source(identity, "env")
+            return _stamped(identity, "bearer")
+    if _bearer_refused(request):
+        return None
 
     cookie = _extract_cookie(request)
     if cookie:
-        identity = await _resolve_db_session(request, cookie)
+        identity = await _resolve_cookie(request, cookie)
         if identity:
-            return identity
-        identity = _resolve_env_token(cookie)
-        if identity:
-            return _with_auth_source(identity, "env")
+            return _stamped(identity, "cookie")
 
     return None
 
@@ -502,12 +688,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         try:
             if _looks_public(path):
-                identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+                resolved_public = await _resolve_identity(request)
+                if (
+                    resolved_public is None
+                    and path not in _BEARER_IS_OWN_CREDENTIAL
+                    and _bearer_refused(request)
+                ):
+                    # #1664: a Bearer that did not resolve must not become an
+                    # anonymous caller on a public path either (/logout acts
+                    # on the cookie session behind it).
+                    return _unauthorized(request)
+                identity = resolved_public or ANONYMOUS_IDENTITY
                 if _chat_pair_refused(identity, request.method, path):
                     return _chat_pair_forbidden(request.method, path)
-                if _steward_refused(identity, request.method, path):
-                    await _record_steward_refusal(request, request.method, path)
-                    return _steward_forbidden(request.method, path)
+                if (blocked := await _role_gate(request, identity, path)) is not None:
+                    return blocked
                 request.state.user = identity.username
                 request.state.identity = identity
                 return await call_next(request)
@@ -535,9 +730,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # chat-pair session in the first place (#961).
             if _chat_pair_refused(identity, request.method, path):
                 return _chat_pair_forbidden(request.method, path)
-            if _steward_refused(identity, request.method, path):
-                await _record_steward_refusal(request, request.method, path)
-                return _steward_forbidden(request.method, path)
+            if (blocked := await _role_gate(request, identity, path)) is not None:
+                return blocked
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):
@@ -546,7 +740,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # resolved, rather than re-resolved inside the MCP layer —
                 # two places deciding who the caller is eventually disagree.
                 identity_ctx = identity_context_set(
-                    identity.principal_id, identity.role
+                    identity.principal_id, identity.role, identity.is_human
                 )
             return await call_next(request)
         finally:
@@ -592,6 +786,32 @@ def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     return identity.is_steward and not steward_route_allowed(method, path, identity)
 
 
+async def _role_gate(
+    request: Request, identity: TokenIdentity, path: str
+) -> Response | None:
+    """Closed-list roles (steward #1021, watcher #1556): refuse before routing.
+
+    One place for both, so the two branches of ``dispatch`` cannot drift apart:
+    a role added to one branch and not the other is the failure that does not
+    announce itself.
+    """
+    if _steward_refused(identity, request.method, path):
+        await _record_steward_refusal(request, request.method, path)
+        return _steward_forbidden(request.method, path)
+    if _watcher_refused(identity, request.method, path):
+        await _record_watcher_refusal(request, identity, path)
+        return _watcher_forbidden(request.method, path)
+    if identity.is_scoped_ci and not ci_scoped_route_allowed(
+        request.method, path, identity
+    ):
+        return _ci_scoped_forbidden(request.method, path)
+    return None
+
+
+def _watcher_refused(identity: TokenIdentity, method: str, path: str) -> bool:
+    return identity.is_watcher and not watcher_route_allowed(method, path, identity)
+
+
 def _chat_pair_forbidden(method: str, path: str) -> Response:
     """403 with the same actionable payload the REST handlers raise (#961)."""
     return Response(
@@ -630,6 +850,45 @@ async def _record_steward_refusal(request: Request, method: str, path: str) -> N
         await db.commit()
     except Exception:  # noqa: BLE001 — the refusal stands regardless
         log.warning("steward refusal not recorded: %s %s", method, path)
+
+
+async def _record_watcher_refusal(
+    request: Request, identity: TokenIdentity, path: str
+) -> None:
+    """A refused write attempt by a read-only principal is an audit event (#1556).
+
+    Best effort, like the steward's: failing to record never turns the 403
+    into a 500. The identity is passed in because ``request.state.identity``
+    is not set yet at this point of the middleware.
+    """
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        from hub import repository as repo
+        from hub.services.gate_events import WATCHER_ROUTE_REFUSED
+
+        await repo.insert_event(
+            db,
+            kind=WATCHER_ROUTE_REFUSED,
+            actor=identity.username or "watcher",
+            payload={"method": request.method, "path": path},
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — the refusal stands regardless
+        log.warning("watcher refusal not recorded: %s %s", request.method, path)
+
+
+def _watcher_forbidden(method: str, path: str) -> Response:
+    """403 with the actionable payload: method and path named (#1556)."""
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {"detail": watcher_gate_forbidden_detail(method, path)},
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
 
 
 def _steward_forbidden(method: str, path: str) -> Response:

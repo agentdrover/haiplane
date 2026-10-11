@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,25 +74,112 @@ UNATTENDED_BLOCKERS: tuple[str, ...] = ("confirmed", "unresolved", "incomplete")
 ACCOUNTABLE_SECTIONS: tuple[str, ...] = ("confirmed", "unresolved")
 
 
+def unexcused_confirmed(
+    confirmed: list[dict[str, Any]],
+    repeats: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Confirmed-находки, за которые ещё нужно отчитаться (#1448).
+
+    Повтор отложенной (:func:`deferred_repeats`) не входит: по нему отчёт уже
+    дан, исходом ``deferred`` со ссылкой на задачу. Единственное место, где
+    находка опознаётся по uid, — чтобы автопилот, стюард и карточка не
+    разошлись в том, что считать повтором.
+    """
+    if not repeats:
+        return list(confirmed)
+    from hub.services.finding_identity import finding_uids
+
+    return [
+        finding
+        for uid, finding in zip(finding_uids(confirmed), confirmed, strict=True)
+        if uid not in repeats
+    ]
+
+
 def unattended_blockers(
     confirmed: list[dict[str, Any]],
     unresolved: list[dict[str, Any]],
     incomplete: bool,
+    repeats: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
     """Какие разделы отчёта требуют отчёта — ВСЕ, а не первый попавшийся.
 
     Возвращает имена, а не булево: вызывающему нужно не только «нельзя», но и
     за что именно. Автовердикт отказывает при любом непустом ответе, стюард
     требует по каждому названной и проверяемой хабом судьбы.
+
+    ``repeats`` (#1448) — uid повторов отложенных находок: confirmed, в
+    котором остались только они, блокером не считается. Без них правило то
+    же, что было.
     """
     named = {
-        "confirmed": bool(confirmed),
+        "confirmed": bool(unexcused_confirmed(confirmed, repeats)),
         "unresolved": bool(unresolved),
         "incomplete": bool(incomplete),
     }
     # Порядок — из описи, а не из порядка проверок: две функции, называющие
     # одни и те же разделы в разном порядке, читаются как разные ответы.
     return tuple(name for name in UNATTENDED_BLOCKERS if named[name])
+
+
+async def deferred_repeats(
+    db: aiosqlite.Connection, task_id: int, confirmed: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Повторы находок, осознанно отложенных до НЕдоставленной задачи (#1448).
+
+    ОДИН предикат на автопилот, стюарда, карточку и заказ ревьюеру: второй
+    список рядом с первым разъезжается, и разъезжается тот, который мягче.
+
+    Находка — повтор, когда выполнено ВСЁ:
+
+    * её ``finding_uid`` (содержательный, #1007) назван исходом ``deferred``
+      по этой задаче, и последний исход — именно он;
+    * у исхода есть ``linked_task_id``, и такая задача существует;
+    * доставку связанной задачи читает тот же читатель, что у зависимостей
+      (``with_cached_delivery`` поверх строки блокера ``task_as_blocker``), и его ответ — ровно «не доставлена»:
+      доставлена (отсрочка оказалась ложной) и «узнать не удалось» (незнание
+      не оправдание) блокируют как раньше;
+    * находка не security — отсрочка не может увести её от человека.
+
+    Возвращает ``{finding_uid: {"linked_task_id", "title"}}`` — и для
+    блокеров, и для показа «отложена до #N».
+    """
+    if not confirmed:
+        return {}
+    from hub import repository as repo
+    from hub.models import FindingOutcome
+    from hub.services.delivery_state import with_cached_delivery
+    from hub.services.finding_identity import finding_uids
+    from hub.services.finding_outcome import KIND_CONFIRMED
+
+    found: dict[str, dict[str, Any]] = {}
+    for uid, finding in zip(finding_uids(confirmed), confirmed, strict=True):
+        if mentions_security([finding]):
+            continue
+        row = await repo.finding_outcome_for_uid(
+            db, task_id, uid, finding_kind=KIND_CONFIRMED
+        )
+        outcome = dict(row) if row is not None else {}
+        linked = outcome.get("linked_task_id")
+        if outcome.get("outcome") != FindingOutcome.deferred.value or not linked:
+            continue
+        linked = int(linked)
+        if linked == task_id:
+            continue
+        # Та же строка блокера, что у зависимостей (#484/#485): с merges по
+        # pipeline_merges и pr_number. Голый {"task_id"} терял мерж гейта, и
+        # доставленная squash-ем задача читалась «не доставлена».
+        row_blocker = await repo.task_as_blocker(db, linked)
+        if row_blocker is None:
+            continue
+        (answer,) = await with_cached_delivery(db, [row_blocker])
+        if answer.get("delivered") is not False:
+            continue
+        found[uid] = {
+            "linked_task_id": linked,
+            "title": str(finding.get("title") or ""),
+        }
+    return found
 
 
 def _finding_blob(finding: dict[str, Any]) -> str:
@@ -324,7 +412,10 @@ def _report_stage(
         )
 
     blockers = unattended_blockers(
-        confirmed, unresolved, bool(report.value.get("incomplete"))
+        confirmed,
+        unresolved,
+        bool(report.value.get("incomplete")),
+        report.value.get("deferred_repeats"),
     )
     if "confirmed" in blockers or "unresolved" in blockers:
         return PolicyDecision(

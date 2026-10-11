@@ -181,3 +181,55 @@ async def test_foreign_branch_does_not_block(git_ops: GitOpsIntegration) -> None
     assert branch == "task-953/readme"
     assert not _pushes(calls)
     assert not [c for c in calls if c[0] in ("reset", "clean") or "--force" in c]
+
+
+async def test_rules_file_is_read_outside_the_write_transaction(
+    client, db, tmp_path, monkeypatch
+):
+    """AC-6 (#1630): git читает файл правил ДО capture_areas и вне транзакции
+    (#1456): в момент git-вызова db.in_transaction=False."""
+    from hub.integrations.registry import plugins
+    from hub.services import lifecycle, working_rules
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: "правила\n"})
+    events: list[tuple[str, bool]] = []
+    holder: dict = {}
+
+    class _Instrumented(ReadingGitOps):
+        async def read_file_at_ref(self, repo, ref, path, **kw):
+            events.append(("git_read", holder["db"].in_transaction))
+            return await super().read_file_at_ref(repo, ref, path, **kw)
+
+    real_reader = working_rules.read_base_branch_file
+
+    async def _spy_reader(db_, task_id, path, **kw):
+        holder["db"] = db_
+        return await real_reader(db_, task_id, path, **kw)
+
+    real_capture = lifecycle.capture_areas
+
+    def _spy_capture(db_, *a, **kw):
+        events.append(("capture_areas", db_.in_transaction))
+        return real_capture(db_, *a, **kw)
+
+    monkeypatch.setattr(working_rules, "read_base_branch_file", _spy_reader)
+    monkeypatch.setattr(lifecycle, "capture_areas", _spy_capture)
+    plugins.git_ops = _Instrumented()
+    task_id = await task_in_project(client, db, ws, slug="wr-txn")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert events[0] == ("git_read", False), events
+    names = [name for name, _ in events]
+    assert names.index("git_read") < names.index("capture_areas"), events
+    assert resp.json()["working_rules"]["repository_rules"]["state"] == "present"

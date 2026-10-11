@@ -100,43 +100,11 @@
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
-      "path": "hub/mcp_server.py",
-      "function": "hub_task_status",
-      "rule": "C901",
-      "measured": 19,
-      "max": 22,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
       "path": "hub/mcp_structured.py",
       "function": "fit_echo_result",
       "rule": "C901",
       "measured": 21,
       "max": 25,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/auto_verdict.py",
-      "function": "maybe_auto_verdict",
-      "rule": "C901",
-      "measured": 29,
-      "max": 34,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/auto_verdict.py",
-      "function": "maybe_auto_verdict",
-      "rule": "PLR0915",
-      "measured": 79,
-      "max": 91,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/delivery_state.py",
-      "function": "delivery_state",
-      "rule": "C901",
-      "measured": 19,
-      "max": 22,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
@@ -173,34 +141,10 @@
     },
     {
       "path": "hub/services/lifecycle.py",
-      "function": "approve_task",
-      "rule": "C901",
-      "measured": 16,
-      "max": 19,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
       "function": "create_task",
       "rule": "C901",
       "measured": 18,
       "max": 21,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "pair_start_task",
-      "rule": "C901",
-      "measured": 21,
-      "max": 25,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "pair_start_task",
-      "rule": "PLR0915",
-      "measured": 65,
-      "max": 75,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {

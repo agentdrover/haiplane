@@ -86,6 +86,29 @@ def parse_porcelain_paths(porcelain: str) -> list[str]:
     return paths
 
 
+def parse_name_status_paths(raw: str) -> list[str]:
+    """Paths from ``git diff --name-status -z`` — both ends of a rename (#1589).
+
+    Records are NUL-separated: ``<status>\0<path>`` and, for ``R``/``C``,
+    ``<status>\0<old>\0<new>``. Every named path is returned once, in order
+    of appearance; deletions are paths like any other.
+    """
+    fields = raw.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        status = fields[i].strip()
+        i += 1
+        if not status:
+            continue
+        count = 2 if status[0] in ("R", "C") else 1
+        for name in fields[i : i + count]:
+            if name.strip() and name not in paths:
+                paths.append(name)
+        i += count
+    return paths
+
+
 def _normalize(area: str) -> str:
     return area.strip().strip("/").replace("\\", "/")
 

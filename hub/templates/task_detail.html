@@ -101,6 +101,12 @@
                     <div class="u-pre-wrap">{{ task.rationale }}</div>
                 </div>
                 {% endif %}
+                {% if task.freeze_rationale %}
+                <div class="task-rationale">
+                    <span>Freeze rationale</span>
+                    <div class="u-pre-wrap">{{ task.freeze_rationale }}</div>
+                </div>
+                {% endif %}
             {% endcall %}
 
             {% if not review_board %}
@@ -136,7 +142,7 @@
             {% endif %}
 
             {% set is_defect = task.work_type and task.work_type.value in ('bug', 'incident') %}
-            {% set has_passport = task.caused_by_task_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
+            {% set has_passport = task.caused_by_task_id or task.release_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
             {# In review an unfilled passport is one line below the statement card
                (#1207); a filled one stays a block, because it carries facts. #}
             {% if (is_defect or has_passport) and not (review_board and not has_passport) %}
@@ -161,6 +167,20 @@
                         <span class="u-text-muted">не установлено</span>
                         {% endif %}
                     </dd>
+                    {% if task.release_id %}
+                    {% set cs = task.cause_suggestion %}
+                    <dt>Релиз</dt>
+                    <dd data-defect-release="{{ task.release_id }}">#{{ task.release_id }}{% if cs and cs.release_sha %} <code>{{ cs.release_sha[:12] }}</code>{% endif %}</dd>
+                    <dt>Гипотеза о виновнике <span class="u-text-muted">(не подтверждено)</span></dt>
+                    <dd data-cause-suggestion>
+                        {% for c in (cs.candidates if cs else []) %}
+                        <div><a href="/tasks/{{ c.task_id }}">#{{ c.task_id }}</a> {{ c.title }}{% if c.confirmed %} — подтверждён{% endif %}: <span class="u-text-muted">{{ c.overlap | join('; ') }}</span></div>
+                        {% else %}
+                        <span class="u-text-muted">кандидатов нет: {{ cs.reason if cs else 'не посчитано' }}</span>
+                        {% endfor %}
+                        {% if cs and cs.unmatched_rows %}<div class="u-text-muted">вне состава: {{ cs.unmatched_rows }} несопоставимых мержей</div>{% endif %}
+                    </dd>
+                    {% endif %}
                     {% if task.detected_at %}
                     <dt>Обнаружен</dt>
                     <dd>{{ task.detected_at }}</dd>
@@ -194,8 +214,9 @@
                     {% set outcome_status_value = task.outcome_status.value %}
                     {% set outcome_status_labels = {
                         'no_hypothesis': 'Нет гипотезы',
-                        'not_due': 'Срок не наступил',
+                        'not_due': 'Окно наблюдения не вышло',
                         'unanswered': 'Срок наступил, ответа нет',
+                        'unknown': 'Релиз фикса неизвестен',
                         'confirmed': 'Подтверждена',
                         'refuted': 'Опровергнута',
                         'unmeasurable': 'Неизмерима',
@@ -465,6 +486,7 @@
                 <span class="task-line-label">Сообщения сессий</span>
                 <span>По этой задаче сессии ещё не переписывались</span>
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-line-form">
+                  {{ csrf_field() }}
                     <input type="text" name="body" placeholder="Написать в канал задачи" required class="task-action-control">
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
@@ -503,6 +525,7 @@
                 </div>
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-action-stack">
+                  {{ csrf_field() }}
                     <textarea name="body" rows="2" placeholder="Написать в канал задачи" required></textarea>
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
@@ -570,6 +593,13 @@
 
                 {% if task.status.value == 'draft' %}
                 <div class="task-action-state">Approval Required</div>
+                {% if approve_error == 'freeze_refused' %}
+                <div class="task-action-note task-action-note--warning">
+                    <strong>Заморозка проекта не допускает эту работу.</strong>
+                    {% if approve_message %}<div>{{ approve_message }}</div>{% endif %}
+                    <div>Исправьте тип работы или заполните freeze_rationale и повторите одобрение.</div>
+                </div>
+                {% endif %}
                 {% if approve_error == 'dor_failed' %}
                 <div class="task-action-note task-action-note--warning">
                     <strong>Задача не готова к одобрению (DoR не пройден).</strong>
@@ -580,6 +610,7 @@
                 </div>
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-approve" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-approve">Runtime</label>
                     <select id="task-runtime-approve" name="runtime" class="task-action-control">
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
@@ -591,6 +622,7 @@
                     <button class="btn btn-primary task-action-btn" type="submit">Approve to Backlog</button>
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
+                  {{ csrf_field() }}
                     <input type="text" name="comment" placeholder="Reason (optional)" class="task-action-control">
                     <button class="btn btn-danger task-action-btn" type="submit">Reject</button>
                 </form>
@@ -598,6 +630,7 @@
                 {% elif task.status.value == 'open' %}
                 <div class="task-action-state">Ready to Run</div>
                 <form method="post" action="/tasks/{{ task.id }}/web-start" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-start">Runtime</label>
                     <select id="task-runtime-start" name="runtime" class="task-action-control">
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
@@ -611,7 +644,7 @@
                     {% endif %}
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-implementer-start" class="task-action-stack task-action-stack--separated">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
 
@@ -625,6 +658,7 @@
                 {% endfor %}
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-answer" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-answer">Your Answer</label>
                     <textarea id="task-answer" name="answer" class="task-action-control task-action-textarea" required placeholder="Type your answer..."></textarea>
                     <button class="btn btn-success task-action-btn" type="submit" name="resume" value="true">Answer &amp; Resume</button>
@@ -641,6 +675,7 @@
                 {% endfor %}
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-decide" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-decision-summary">Decision reason / summary</label>
                     <textarea id="task-decision-summary" name="decision_summary" class="task-action-control task-action-textarea" placeholder="Why you are accepting or sending back for rework..."></textarea>
                     <label class="task-action-checkbox">
@@ -755,6 +790,12 @@
                     <dt>Review</dt>
                     <dd>cycle {{ task.review_cycle }}/3 {% if task.review_job_id %}<code class="code-sm">{{ task.review_job_id[:16] }}...</code>{% endif %}</dd>
                     {% endif %}
+                    {# #1440: кто вынесет вердикт — строка маршрута, посчитанная
+                       хабом (services/verdict_route), без пересчёта в шаблоне. #}
+                    {% if task.verdict_route and task.verdict_route.line %}
+                    <dt>Вердикт</dt>
+                    <dd data-verdict-route="{{ task.verdict_route.decider }}">{{ task.verdict_route.line }}</dd>
+                    {% endif %}
                     {# #1235: заходы «закрыли находки — пришли новые». Стоят
                        ОТДЕЛЬНОЙ строкой от cycle: то другой счёт (возвраты
                        работы автору) и другой потолок, который задачу
@@ -784,6 +825,76 @@
                     {% endif %}
                 </dl>
             </section>
+
+            {# #1410: прогоны облачного исполнителя — центы по счёту провайдера
+               (chargedCents) и исход. Непрочитанная цена — «неизвестно», не ноль. #}
+            {% if executor_runs %}
+            <section class="task-sidebar-card">
+                <div class="task-sidebar-title">Прогоны исполнителя</div>
+                {# #1455: человек останавливает идущий прогон — та же отмена с повторами. #}
+                {% if executor_runs.stoppable %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-stop" class="project-inline-form">
+                  {{ csrf_field() }}
+                    <button class="btn btn-danger" type="submit"
+                            onclick="return confirm('Остановить идущий прогон исполнителя задачи #{{ task.id }}? Хаб отменит его у провайдера с повторами.')">Остановить прогон</button>
+                </form>
+                {% endif %}
+                {# #1444: круг починки — повторный прогон по находкам ревью. #}
+                {% if repair_offered %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">
+                  {{ csrf_field() }}
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Вернуть задачу #{{ task.id }} в работу и заказать повторный прогон исполнителя по находкам ревью? Это платный прогон.')">Повторный прогон исполнителя</button>
+                </form>
+                {% endif %}
+                {# #1445: доставка встала на конфликте с базой — прогон слияния. #}
+                {% if merge_offered %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-merge" class="project-inline-form">
+                  {{ csrf_field() }}
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Заказать исполнителя, который сольёт базу в ветку задачи #{{ task.id }} и пересдаст её? Это платный прогон.')">Слить базу и пересдать</button>
+                </form>
+                {% endif %}
+                {# #1443: бюджет задачи — сумма всех прогонов против потолка. #}
+                {% set budget = executor_runs.budget %}
+                <div class="task-action-note">
+                    {% if budget.unknown %}
+                    Бюджет задачи: не меньше {{ budget.cents_spent }} ¢ из {{ budget.cents_ceiling }} ¢
+                    и {{ budget.tokens_spent }} из {{ budget.token_ceiling }} токенов &mdash;
+                    цена {{ budget.unpriced }} прогон(ов) не прочитана, остаток неизвестен
+                    {% else %}
+                    Бюджет задачи: {{ budget.cents_spent }} ¢ из {{ budget.cents_ceiling }} ¢,
+                    осталось {{ budget.cents_left }} ¢;
+                    токенов {{ budget.tokens_spent }} из {{ budget.token_ceiling }},
+                    осталось {{ budget.tokens_left }}
+                    {% endif %}
+                    {% if budget.exhausted %}<span class="badge badge-self-approved">исчерпан</span>{% endif %}
+                </div>
+                <div class="task-action-note">
+                    Прогонов: {{ executor_runs.count }}
+                    {% if executor_runs.cents_total is not none %}
+                    &mdash; {{ executor_runs.cents_total }} ¢ по счёту провайдера
+                    {% if executor_runs.billed < executor_runs.count %}
+                    <span class="badge badge-self-approved">счёт есть у {{ executor_runs.billed }} из {{ executor_runs.count }}</span>
+                    {% endif %}
+                    {% else %}
+                    <span class="badge badge-self-approved">счёт провайдера неизвестен</span>
+                    {% endif %}
+                    <ul class="tight-list">
+                        {% for run in executor_runs.runs %}
+                        <li>
+                            сдача #{{ run.generation }}{% if run.model %}, {{ run.model }}{% endif %} &mdash;
+                            исход {{ run.outcome }},
+                            {% if run.cents is not none %}{{ run.cents }} ¢{% else %}<span class="muted">центы неизвестны</span>{% endif %},
+                            {% if run.tokens is not none %}{{ '{:,}'.format(run.tokens).replace(',', ' ') }} токенов{% else %}<span class="muted">токены неизвестны</span>{% endif %}
+                            {% if run.duration_ms is not none %}, {{ (run.duration_ms // 1000) }} с{% endif %}
+                            {% if run.reason %}<div class="muted">{{ run.reason }}</div>{% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </section>
+            {% endif %}
 
             {# #893: цена задачи считается в ПРОГОНАХ. Порог входа одного
                прогона — 777k токенов по счёту провайдера, и размер диффа
@@ -821,6 +932,12 @@
                             {% endfor %}
                         </ul>
                     </details>
+                    {# #1361: перенос — не прогон: денег не стоил, кода не читал. #}
+                    {% for carry in review_carries or [] %}
+                    <div class="muted">
+                        сдача #{{ carry.generation }}: отчёт перенесён с поколения {{ carry.from_generation if carry.from_generation is not none else '?' }}, счёта нет &mdash; прогона не было
+                    </div>
+                    {% endfor %}
                 </div>
             </section>
             {% endif %}
@@ -832,10 +949,12 @@
                 {% if task.archived %}
                     {% if can_archive %}
                     <form method="post" action="/tasks/{{ task.id }}/web-unarchive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="true">
                         <button type="submit" class="btn btn-primary task-action-btn">Unarchive subtree</button>
                     </form>
                     <form method="post" action="/tasks/{{ task.id }}/web-unarchive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="false">
                         <button type="submit" class="btn btn-ghost task-action-btn">Unarchive only this</button>
                     </form>
@@ -843,10 +962,12 @@
                 {% else %}
                     {% if can_archive %}
                     <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="true">
                         <button type="submit" class="btn btn-warning task-action-btn">Archive subtree</button>
                     </form>
                     <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="false">
                         <button type="submit" class="btn btn-ghost task-action-btn">Archive only this</button>
                     </form>
@@ -856,6 +977,7 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-delete"
                       onsubmit="return confirm('Permanently delete this task and all descendants? This cannot be undone.');"
                       class="task-action-stack task-action-stack--separated">
+                  {{ csrf_field() }}
                     <button type="submit" class="btn btn-danger task-action-btn">Delete subtree permanently</button>
                 </form>
                 {% endif %}

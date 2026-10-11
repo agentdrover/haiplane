@@ -7,6 +7,7 @@ from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.services.risk_class import derive_risk_class
 from hub.models import (
+    DoRCheckItem,
     ACVerifiableBy,
     AcceptanceCriterion,
     ClassOfService,
@@ -455,3 +456,729 @@ def test_every_code_work_type_requires_areas(work_type: str, wip_tag: str):
     )
 
     assert "has_affected_areas" in result.missing_required
+
+
+# --- #1456: пути постановки должны существовать или создаваться задачей ---
+
+_BASE_TREE = {
+    "hub/services/dor.py",
+    "tests/test_dor.py",
+    "tests/fixtures/home_basic/config",
+}
+_LIVE_1392 = "tool --ssh-dir tests/fixtures/home_basic/.ssh"
+
+
+def _paths_check(**overrides):
+    from hub.services.dor import check_statement_paths
+
+    kwargs = dict(
+        validation_commands=[],
+        test_refs=[],
+        affected_areas=["hub/services/dor.py"],
+        tree=set(_BASE_TREE),
+        mode="warn",
+    )
+    kwargs.update(overrides)
+    return check_statement_paths(**kwargs)
+
+
+def _paths_item(result):
+    evaluation = evaluate_from_data(
+        **_empty_kwargs(
+            work_type=WorkType.chore.value,
+            scope_in_count=1,
+            validation_count=1,
+            size="S",
+            statement_paths=result,
+        )
+    )
+    item = next(c for c in evaluation.checks if c.key == "statement_paths_resolve")
+    return evaluation, item
+
+
+async def _task_in_project(
+    db: aiosqlite.Connection, mode: str | None, *, workspace: str = "/tmp/ws"
+) -> int:
+    import json
+
+    pid = await repo.create_project(
+        db, slug="p1456", name="P1456", workspace_path=workspace
+    )
+    if mode is not None:
+        await repo.update_project(
+            db, pid, gate_policy=json.dumps({"statement_paths": mode})
+        )
+    task_id = await _make_task(
+        db,
+        work_type=WorkType.chore,
+        validation_commands=[_LIVE_1392],
+        affected_areas=["hub/services/dor.py"],
+        scope_in=["a"],
+        size=TaskSize.S,
+    )
+    await repo.update_task(db, task_id, project_id=pid)
+    await db.commit()
+    return task_id
+
+
+def _serve_tree(monkeypatch, tree, *, by_ref=None):
+    """git хаба отвечает деревом; ``by_ref`` различает origin/<base> и <base>."""
+    from hub.integrations.registry import plugins
+
+    async def files_at_ref(repo_path, ref):
+        if by_ref is not None:
+            found = by_ref.get(ref)
+            return None if found is None else set(found)
+        return None if tree is None else set(tree)
+
+    monkeypatch.setattr(plugins.git_ops, "files_at_ref", files_at_ref)
+
+
+async def test_statement_path_missing_from_base_and_areas_is_flagged(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1: #1392 — каталога нет на базе и он не покрыт областями.
+    result = _paths_check(validation_commands=[_LIVE_1392], mode="require")
+    assert result.checked is True
+    [violation] = result.violations
+    assert violation.path == "tests/fixtures/home_basic/.ssh"
+    assert _LIVE_1392 in violation.source
+
+    evaluation, item = _paths_item(result)
+    assert item.passed is False
+    assert "tests/fixtures/home_basic/.ssh" in item.detail
+    assert "statement_paths_resolve" in evaluation.missing_required
+
+    # warn: нарушение названо, но одобрению не мешает.
+    warn_eval, warn_item = _paths_item(
+        _paths_check(validation_commands=[_LIVE_1392], mode="warn")
+    )
+    assert warn_item.passed is False
+    assert "tests/fixtures/home_basic/.ssh" in warn_item.detail
+    assert "statement_paths_resolve" not in warn_eval.missing_required
+    assert warn_eval.passed is True
+
+    # Тот же случай через БД: режим берётся из политики проекта.
+    _serve_tree(monkeypatch, _BASE_TREE)
+    required = await evaluate_dor(db, await _task_in_project(db, "require"))
+    assert "statement_paths_resolve" in required.missing_required
+
+
+async def test_statement_path_violation_is_recorded_on_approve_in_warn(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from hub.models import TaskApprove
+    from hub.services.lifecycle import approve_task
+
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "warn")
+    await approve_task(db, task_id, TaskApprove())
+    updates = await repo.get_task_updates(db, task_id)
+    alerts = [
+        u["content"]
+        for u in updates
+        if "tests/fixtures/home_basic/.ssh" in u["content"]
+    ]
+    assert alerts, "warn must leave a record naming the path"
+
+
+async def test_statement_path_violation_refuses_approve_in_require(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub.models import TaskApprove
+    from hub.services.lifecycle import approve_task
+
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require")
+    with pytest.raises(HTTPException) as refused:
+        await approve_task(db, task_id, TaskApprove())
+    assert refused.value.status_code == 422
+    detail = refused.value.detail
+    assert "statement_paths_resolve" in detail["missing_required"]
+    assert "tests/fixtures/home_basic/.ssh" in str(detail["recommendations"])
+
+
+async def test_paths_to_be_created_or_existing_are_not_flagged(
+    db: aiosqlite.Connection,
+):
+    # AC-2: test_ref в affected_areas; флаги, URL и абсолютный путь — не пути репо.
+    result = _paths_check(
+        validation_commands=[
+            "uv run pytest -q tests/test_dor.py --maxfail=1 -k explain",
+            "curl -fsS https://example.com/api/health.json",
+            "uv run python /opt/tool/run.py --out /tmp/report.json",
+            "uv run pytest tests/fixtures/home_basic",
+            "python -m hub.cli --ssh-dir=tests/fixtures/home_basic",
+        ],
+        test_refs=[("AC-2", "tests/test_explain.py::x")],
+        affected_areas=["hub/services/dor.py", "tests/test_explain.py"],
+        mode="require",
+    )
+    assert result.checked is True
+    assert result.violations == ()
+    evaluation, item = _paths_item(result)
+    assert item.passed is True
+    assert "statement_paths_resolve" not in evaluation.missing_required
+
+
+async def test_unreadable_base_is_not_checked_not_clean(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3: база не читается — «не проверено» с причиной, а не «пройдено».
+    result = _paths_check(validation_commands=[_LIVE_1392], tree=None, mode="require")
+    assert result.checked is False
+    assert result.reason
+    evaluation, item = _paths_item(result)
+    assert item.passed is False
+    assert "не проверено" in item.detail
+    assert result.reason in item.detail
+    # Неизвестность не блокирует одобрение: отказывает только найденное нарушение.
+    assert "statement_paths_resolve" not in evaluation.missing_required
+
+    # Через БД: git ответил None, и проект без клона.
+    _serve_tree(monkeypatch, None)
+    unread = await evaluate_dor(db, await _task_in_project(db, "require"))
+    check = next(c for c in unread.checks if c.key == "statement_paths_resolve")
+    assert check.passed is False and "не проверено" in check.detail
+    assert "statement_paths_resolve" not in unread.missing_required
+
+
+def test_statement_paths_off_and_no_paths_are_quiet():
+    _, off_item = _paths_item(
+        _paths_check(validation_commands=[_LIVE_1392], mode="off")
+    )
+    assert off_item.passed is True
+    _, none_item = _paths_item(_paths_check(validation_commands=["uv run ruff check"]))
+    assert none_item.passed is True
+
+
+def test_statement_paths_mode_reader_follows_the_policy_rule():
+    from hub.services.project_policy import statement_paths_of
+
+    assert statement_paths_of({}) == "warn"
+    assert statement_paths_of({"statement_paths": "off"}) == "off"
+    assert statement_paths_of({"statement_paths": "require"}) == "require"
+    assert statement_paths_of({"statement_paths": "typo"}) == "warn"
+
+
+def test_unchecked_paths_ask_nothing_but_violations_name_the_path():
+    from hub.services.recommendations import build_recommendations
+
+    unread, _ = _paths_item(_paths_check(validation_commands=[_LIVE_1392], tree=None))
+    assert [
+        r for r in build_recommendations(unread) if r.field == "validation_commands"
+    ] == []
+
+    flagged, _ = _paths_item(_paths_check(validation_commands=[_LIVE_1392]))
+    [rec] = [
+        r for r in build_recommendations(flagged) if r.field == "validation_commands"
+    ]
+    assert "tests/fixtures/home_basic/.ssh" in rec.message
+    assert rec.expected_score_delta == 0
+
+
+def test_statement_paths_extraction_skips_redirect_targets_and_dedups():
+    from hub.services.dor import statement_paths_in
+
+    assert statement_paths_in("make report > build/out.txt && cat tests/a.py") == [
+        "tests/a.py"
+    ]
+    assert statement_paths_in("pytest tests/a.py::t1 tests/a.py::t2 ./tests/a.py") == [
+        "tests/a.py"
+    ]
+
+
+async def test_test_ref_of_a_stored_ac_is_checked_and_named_by_ac_id(
+    db: aiosqlite.Connection, monkeypatch
+):
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require")
+    await repo.update_task(db, task_id, validation_commands="[]")
+    ac = _ac(1).model_copy(update={"test_ref": "tests/test_gone.py::test_x"})
+    await repo.add_acceptance_criterion(db, task_id, ac)
+    await db.commit()
+    result = await evaluate_dor(db, task_id)
+    item = next(c for c in result.checks if c.key == "statement_paths_resolve")
+    assert "tests/test_gone.py" in item.detail and "test_ref AC-1" in item.detail
+    assert "statement_paths_resolve" in result.missing_required
+
+
+def test_statement_paths_policy_write_refuses_a_typo_and_flag_is_not_a_path():
+    from hub.models import validated_gate_policy
+    from hub.services.dor import statement_paths_in
+    from hub.services.project_policy import statement_paths_of
+
+    assert validated_gate_policy({"statement_paths": "require"}) == {
+        "statement_paths": "require"
+    }
+    with pytest.raises(ValueError, match="statement_paths"):
+        validated_gate_policy({"statement_paths": "strict"})
+    assert statement_paths_of(None) == "warn"  # type: ignore[arg-type]
+    assert statement_paths_in("tool -tests/a.py --out/b.json") == []
+
+
+_NOW_ABSENT = "tests/fixtures/home_basic/.ssh"
+
+
+def test_parametrized_locator_keeps_its_equals_sign_out_of_the_path():
+    # 7531fad453d1f46c: «=» внутри [..] не режет путь, файла нет — нарушение.
+    from hub.services.dor import statement_paths_in
+
+    assert statement_paths_in("tests/test_gone.py::test_x[mode=require]") == [
+        "tests/test_gone.py"
+    ]
+    assert statement_paths_in("pytest tests/test_gone.py::test_x[a=1]") == [
+        "tests/test_gone.py"
+    ]
+    assert statement_paths_in("tool --cfg=conf/a.toml FOO=conf/b.toml") == [
+        "conf/a.toml",
+        "conf/b.toml",
+    ]
+    flagged = _paths_check(
+        test_refs=[("AC-1", "tests/test_gone.py::test_x[mode=require]")]
+    )
+    assert [v.path for v in flagged.violations] == ["tests/test_gone.py"]
+
+
+def test_quoted_paths_are_unquoted_and_globs_and_vars_are_not_checked():
+    # 4bd475224fea928f
+    from hub.services.dor import statement_paths_in
+
+    assert statement_paths_in("tool --dir 'tests/with space/x.py'") == [
+        "tests/with space/x.py"
+    ]
+    assert statement_paths_in('tool "tests/q.py::t"') == ["tests/q.py"]
+    assert statement_paths_in("pytest tests/*.py $OUT/x.json tests/[ab].py") == []
+    clean = _paths_check(
+        validation_commands=["pytest tests/gone_*.py ${HOME}/x.py tests/[ab].py"]
+    )
+    assert clean.violations == ()
+
+
+def test_every_missing_path_is_named_not_only_the_first():
+    # 4af1b107574d2a05
+    result = _paths_check(
+        validation_commands=["tool --a tests/one/missing.py --b tests/two/missing.py"],
+        test_refs=[("AC-3", "tests/three/test_missing.py::t")],
+    )
+    assert [v.path for v in result.violations] == [
+        "tests/one/missing.py",
+        "tests/two/missing.py",
+        "tests/three/test_missing.py",
+    ]
+    _, item = _paths_item(result)
+    for path in (v.path for v in result.violations):
+        assert path in item.detail
+
+
+def test_areas_cover_paths_in_both_directions_like_the_queue_overlap():
+    # c208ec275249a129: каталог в областях покрывает файл, файл в областях —
+    # каталог, который он создаёт; соседний путь не покрыт.
+    def flagged(path, areas):
+        result = _paths_check(
+            validation_commands=[f"pytest {path}"], affected_areas=areas
+        )
+        return [v.path for v in result.violations]
+
+    assert flagged("tests/new_dir/test_a.py", ["tests/new_dir"]) == []
+    assert flagged("tests/new_dir/test_a.py", ["tests/new_dir/"]) == []
+    assert flagged("tests/newer/test_a.py", ["tests/newer/*"]) == []
+    assert flagged("tests/new_dir", ["tests/new_dir/test_a.py"]) == []
+    assert flagged("tests/other_dir/test_a.py", ["tests/new_dir"]) == [
+        "tests/other_dir/test_a.py"
+    ]
+    assert flagged("tests/new_dir_2/test_a.py", ["tests/new_dir"]) == [
+        "tests/new_dir_2/test_a.py"
+    ]
+
+
+async def test_path_present_on_base_is_clean_through_evaluate_dor(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # d58160b0aee5af86: путь ЕСТЬ в дереве — пункт чистый, в require не блокирует.
+    import json
+
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require")
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(
+            [
+                "uv run pytest -q tests/test_dor.py",
+                "tool --dir tests/fixtures/home_basic",
+            ]
+        ),
+    )
+    await db.commit()
+    result = await evaluate_dor(db, task_id)
+    item = next(c for c in result.checks if c.key == "statement_paths_resolve")
+    assert item.passed is True, item.detail
+    assert result.missing_required == frozenset()
+
+
+async def test_file_only_in_origin_base_or_only_in_local_base_is_clean(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # a184406610432a1d: моку видно, какой ref спрошен. origin/<base> — первый,
+    # локальное имя — запасной.
+    import json
+
+    from hub import config
+
+    base = config.PAIR_BASE_BRANCH
+    task_id = await _task_in_project(db, "require")
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(["pytest tests/only_upstream.py"]),
+    )
+    await db.commit()
+
+    async def verdict():
+        result = await evaluate_dor(db, task_id)
+        return next(c for c in result.checks if c.key == "statement_paths_resolve")
+
+    _serve_tree(
+        monkeypatch,
+        None,
+        by_ref={f"origin/{base}": {"tests/only_upstream.py"}, base: set()},
+    )
+    assert (await verdict()).passed is True
+
+    _serve_tree(
+        monkeypatch,
+        None,
+        by_ref={f"origin/{base}": None, base: {"tests/only_upstream.py"}},
+    )
+    assert (await verdict()).passed is True
+
+    _serve_tree(monkeypatch, None, by_ref={f"origin/{base}": set(), base: set()})
+    assert (await verdict()).passed is False
+
+
+async def test_project_without_clone_is_not_checked_and_does_not_block(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # ff69022154985965: пустой workspace_path — «не проверено: … клона нет».
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require", workspace="")
+    result = await evaluate_dor(db, task_id)
+    item = next(c for c in result.checks if c.key == "statement_paths_resolve")
+    assert item.passed is False
+    assert "не проверено" in item.detail and "клон" in item.detail
+    assert "statement_paths_resolve" not in result.missing_required
+
+
+# --- workspace_missing: проект без workspace_path (#1604) ---
+
+_WS_CONSEQUENCES = (
+    "sha сдачи не закрепляется",
+    "автозаказ машинного ревью не идёт",
+    "проверки предмета и путей постановки не применяются",
+)
+
+
+async def _ws_project(db: aiosqlite.Connection, slug: str, workspace: str) -> int:
+    pid = await repo.create_project(
+        db, slug=slug, name=slug.title(), workspace_path=workspace
+    )
+    await db.commit()
+    return pid
+
+
+async def _ws_task(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int | None = None,
+    parent_id: int | None = None,
+    task_type: str = "task",
+) -> int:
+    task_id = await _make_task(
+        db,
+        work_type=WorkType.chore,
+        validation_commands=["uv run pytest -q"],
+        affected_areas=["docs/notes.md"],
+        scope_in=["a"],
+        size=TaskSize.S,
+    )
+    fields: dict = {}
+    if project_id is not None:
+        fields["project_id"] = project_id
+    if parent_id is not None:
+        fields["parent_id"] = parent_id
+    if fields:
+        await repo.update_task(db, task_id, **fields)
+        await db.commit()
+    return task_id
+
+
+async def _ws_epic(db: aiosqlite.Connection, project_id: int) -> int:
+    epic = await repo.create_task(
+        db,
+        title="epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, epic, project_id=project_id)
+    await db.commit()
+    return epic
+
+
+async def _ws_default(db: aiosqlite.Connection, workspace: str) -> None:
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    default = await repo.get_project_by_slug(db, "default")
+    await repo.update_project(db, default["id"], workspace_path=workspace)
+    await db.commit()
+
+
+async def _ws_check(db: aiosqlite.Connection, task_id: int):
+    result = await evaluate_dor(db, task_id)
+    by_key = {c.key: c for c in result.checks}
+    return result, by_key.get("workspace_missing")
+
+
+async def test_workspace_missing_is_advisory_and_names_consequences(
+    db: aiosqlite.Connection,
+):
+    from hub.services.readiness import calculate_readiness
+
+    bare = await _ws_task(db, project_id=await _ws_project(db, "bare", ""))
+    cloned = await _ws_task(db, project_id=await _ws_project(db, "cloned", "/tmp/ws"))
+
+    result, item = await _ws_check(db, bare)
+    assert item is not None, "проект без workspace_path должен быть назван в DoR"
+    assert item.passed is False
+    assert "workspace_missing" in result.advisory
+    assert "workspace_missing" not in result.missing_required
+    assert result.passed is True
+    assert "bare" in item.detail and "свой" in item.detail
+    for consequence in _WS_CONSEQUENCES:
+        assert consequence in item.detail
+
+    bare_report = await calculate_readiness(db, bare)
+    cloned_report = await calculate_readiness(db, cloned)
+    assert bare_report.score == cloned_report.score
+    assert bare_report.dor_passed is True
+
+
+async def test_workspace_missing_names_project_source(db: aiosqlite.Connection):
+    epic = await _ws_epic(db, await _ws_project(db, "inherited", ""))
+    child = await _ws_task(db, parent_id=epic)
+    _, item = await _ws_check(db, child)
+    assert item is not None
+    assert "inherited" in item.detail
+    assert f"унаследован от эпика #{epic}" in item.detail
+
+    await _ws_default(db, "")
+    orphan = await _ws_task(db)
+    _, fallback = await _ws_check(db, orphan)
+    assert fallback is not None
+    assert "default" in fallback.detail
+    assert "резервный проект default" in fallback.detail
+
+
+async def test_workspace_present_gives_no_workspace_advice(db: aiosqlite.Connection):
+    from hub.models import TaskApprove
+    from hub.services.lifecycle import approve_task
+
+    own = await _ws_task(db, project_id=await _ws_project(db, "own-ws", "/tmp/ws"))
+    await _ws_default(db, "/tmp/default-ws")
+    fallback = await _ws_task(db)
+
+    for task_id in (own, fallback):
+        _, item = await _ws_check(db, task_id)
+        assert item is None
+        await approve_task(db, task_id, TaskApprove())
+        feed = [u["content"] for u in await repo.get_task_updates(db, task_id)]
+        assert not [c for c in feed if "workspace_missing" in c]
+
+
+def _workspace_alerts(updates) -> list[str]:
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert" and "workspace_missing" in u["content"]
+    ]
+
+
+async def test_approve_records_workspace_missing_alert_once(
+    db: aiosqlite.Connection, monkeypatch
+):
+    import json
+
+    from hub import config
+    from hub.models import TaskApprove
+    from hub.services import recommendations
+    from hub.services.auto_approve import maybe_auto_approve
+    from hub.services.dor import STATEMENT_PATHS_MARK
+    from hub.services.lifecycle import approve_task
+    from hub.services.readiness import calculate_readiness
+
+    def paths_check(path: str) -> DoRCheckItem:
+        return DoRCheckItem(
+            key="statement_paths_resolve",
+            passed=False,
+            detail=f"{STATEMENT_PATHS_MARK}: {path} (AC-1)",
+        )
+
+    def approve_lines(updates, path: str) -> tuple[list[str], list[str]]:
+        approve = [
+            u["content"] for u in updates if u["content"].startswith("Approve: ")
+        ]
+        return (
+            [c for c in approve if path in c],
+            [c for c in approve if "workspace_missing" in c],
+        )
+
+    # Ручное одобрение: отчёт DoR несёт и нарушение путей.
+    real = recommendations.calculate_readiness_with_recommendations
+
+    async def with_paths_violation(db_, task_id_, *args, **kwargs):
+        report = await real(db_, task_id_, *args, **kwargs)
+        report.dor_checks.append(paths_check("tests/manual.py"))
+        return report
+
+    monkeypatch.setattr(
+        recommendations,
+        "calculate_readiness_with_recommendations",
+        with_paths_violation,
+    )
+    manual = await _ws_task(db, project_id=await _ws_project(db, "bare-m", ""))
+    before = (await calculate_readiness(db, manual)).score
+    await approve_task(db, manual, TaskApprove())
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, manual), "tests/manual.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0], "две отдельные строки, не одна общая"
+    assert (await repo.get_task(db, manual))["status"] == "open"
+    assert (await calculate_readiness(db, manual)).score == before
+    monkeypatch.setattr(
+        recommendations, "calculate_readiness_with_recommendations", real
+    )
+
+    # Автоодобрение: проект с dor=auto, класс R0 под потолком; отчёт передан.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _ws_project(db, "bare-a", "")
+    await repo.update_project(db, pid, gate_policy=json.dumps({"dor": "auto"}))
+    auto = await _ws_task(db, project_id=pid)
+    await repo.update_task(db, auto, dor_passed=1, risk_class="R0")
+    await db.commit()
+    assert await maybe_auto_approve(db, auto, dor_checks=[paths_check("tests/auto.py")])
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, auto), "tests/auto.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0]
+
+    # Автоодобрение без отчёта (путь стюарда): строка workspace всё равно одна.
+    steward = await _ws_task(db, project_id=pid)
+    await repo.update_task(db, steward, dor_passed=1, risk_class="R0")
+    await db.commit()
+    assert await maybe_auto_approve(db, steward)
+    _, workspace = approve_lines(
+        await repo.get_task_updates(db, steward), "tests/none.py"
+    )
+    assert len(workspace) == 1, workspace
+
+
+async def test_record_workspace_missing_does_not_commit_callers_transaction(
+    db: aiosqlite.Connection,
+):
+    # Помощник пишет внутри транзакции вызывающего и не коммитит её сам.
+    from hub.services.dor import record_workspace_missing
+
+    task_id = await _ws_task(db, project_id=await _ws_project(db, "bare-tx", ""))
+    await db.execute("BEGIN IMMEDIATE")
+    await record_workspace_missing(db, task_id)
+    assert db.in_transaction is True
+    assert _workspace_alerts(await repo.get_task_updates(db, task_id))
+    await db.rollback()
+    assert not _workspace_alerts(await repo.get_task_updates(db, task_id))
+
+
+# --- #1647 AC-1: профиль DoR задачи-состояния ---
+
+
+async def test_state_task_dor_profile_drops_code_checks_and_requires_rollback(
+    client, db: aiosqlite.Connection
+):
+    """AC-1: state = профиль work_type минус две кодовые проверки плюс две свои.
+
+    Первая задача проходит без affected_areas/validation_commands, без штрафа и
+    без кодовых рекомендаций. Без rollback и с test-AC она не проходит, причина
+    названа. Commit-близнец даёт прежний результат. Feature/epic с
+    result_kind=state отклоняются 422 на создании и на refine.
+    """
+    from hub.services.recommendations import calculate_readiness_with_recommendations
+    from tests.state_support import make_state_task
+
+    ok = await make_state_task(db)
+    result = await evaluate_dor(db, ok)
+    assert result.passed is True, (
+        "state с полной базовой постановкой, rollback и manual/log_check AC обязана "
+        f"проходить без кодовых проверок; не хватает {sorted(result.missing_required)}"
+    )
+    assert not {"has_affected_areas", "has_validation_commands"} & result.required
+    report = await calculate_readiness_with_recommendations(db, ok)
+    assert report.score == 100, f"неприменимые проверки не штрафуют: {report.score}"
+    code_recs = [
+        r.field
+        for r in report.recommendations
+        if r.field in ("affected_areas", "validation_commands")
+    ]
+    assert code_recs == [], f"кодовые рекомендации у state: {code_recs}"
+
+    no_rollback = await make_state_task(db, rollback=None)
+    missing = (await evaluate_dor(db, no_rollback)).missing_required
+    assert "has_rollback" in missing, sorted(missing)
+
+    only_test_ac = await make_state_task(db, kinds=("test",))
+    bad = await evaluate_dor(db, only_test_ac)
+    assert "has_state_ac" in bad.missing_required, sorted(bad.missing_required)
+    detail = next(c.detail for c in bad.checks if c.key == "has_state_ac")
+    assert "manual" in detail and "log_check" in detail and "ui_check" in detail
+
+    commit_twin = await make_state_task(db, result_kind="commit")
+    twin = await evaluate_dor(db, commit_twin)
+    assert {"has_affected_areas", "has_validation_commands"} <= twin.missing_required
+    assert "has_rollback" not in {c.key for c in twin.checks}, (
+        "у commit-задачи пунктов state нет вовсе: прежний результат"
+    )
+
+    for task_type in ("feature", "epic"):
+        created = await client.post(
+            "/api/tasks",
+            json={"title": "агрегат", "task_type": task_type, "result_kind": "state"},
+        )
+        assert created.status_code == 422, (task_type, created.text)
+    epic = await client.post("/api/tasks", json={"title": "эпик", "task_type": "epic"})
+    aggregate = await client.post(
+        "/api/tasks",
+        json={
+            "title": "фича",
+            "task_type": "feature",
+            "parent_id": epic.json()["id"],
+            "source": "agent",
+        },
+    )
+    assert aggregate.json()["status"] == "draft", aggregate.text
+    refined = await client.post(
+        f"/api/tasks/{aggregate.json()['id']}/refine", json={"result_kind": "state"}
+    )
+    assert refined.status_code == 422, refined.text

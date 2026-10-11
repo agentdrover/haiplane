@@ -192,6 +192,48 @@ async def test_failed_callback_is_stored_but_not_prod_state(client, db, monkeypa
     assert latest is not None and latest["deployed_sha"] == "shipped-four"
 
 
+async def test_deploy_record_carries_backup_outcome(client, db, monkeypatch):
+    # AC-3 (#1590): итог бэкапа хранится у записи деплоя и виден; без поля —
+    # «неизвестно»; известный итог повтором без поля не стирается; повтор того
+    # же sha/status с итогом его обновляет; старый клиент (без поля) работает.
+    auth = _deploy_tokens(monkeypatch)
+    old_client = {"sha": "backed-up-one", "ref": "main", "status": "success"}
+
+    first = await client.post("/api/deploys", json=old_client, headers=auth["ci"])
+    assert first.status_code == 200, first.text
+    assert first.json()["backup"] == "неизвестно"
+
+    line = 'failed (cannot open "hub.db": it\'s locked)'
+    second = await client.post(
+        "/api/deploys", json={**old_client, "backup": line}, headers=auth["ci"]
+    )
+    assert second.json()["id"] == first.json()["id"], "повтор — та же запись"
+    assert second.json()["backup"] == line
+
+    again = await client.post("/api/deploys", json=old_client, headers=auth["ci"])
+    assert again.json()["backup"] == line, "отчёт без поля стёр известный итог"
+
+    newer = "ok /var/backups/predeploy-1.db.gz size=10 integrity=ok seconds=2"
+    updated = await client.post(
+        "/api/deploys", json={**old_client, "backup": newer}, headers=auth["ci"]
+    )
+    assert updated.json()["backup"] == newer, "повтор не обновил итог"
+    rows = await _release_rows(db)
+    assert len(rows) == 1 and rows[0]["backup"] == newer
+
+    fresh = await client.post(
+        "/api/deploys",
+        json={
+            "sha": "backed-up-two",
+            "ref": "main",
+            "status": "failed",
+            "backup": line,
+        },
+        headers=auth["ci"],
+    )
+    assert fresh.json()["backup"] == line and len(await _release_rows(db)) == 2
+
+
 # ---- #968: a squash release leaves commits behind, and they are not work ----
 #
 # Observed on prod 26.08.2026, minutes after #931 shipped. The poller opened and
@@ -479,3 +521,31 @@ async def test_narrowing_to_empty_never_silently_drops_a_release(
     title = opened.await_args.args[2]
     assert "6 задач(и)" in title, title
     assert 880 in task_ids and 728 in task_ids
+
+
+async def test_scoped_ci_key_records_deploys_only_for_its_project(
+    ci_runner_hub, scoped_ci_key
+):
+    """AC-2 (#1644): a key bound to audit-in records only audit-in deploys."""
+    hub = ci_runner_hub
+    for slug in ("audit-in", "default"):
+        if await repo.get_project_by_slug(hub.db, slug) is None:
+            await repo.create_project(
+                hub.db, slug=slug, name=slug, workspace_path="/tmp/ws"
+            )
+    await hub.db.commit()
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    base = {"sha": "scoped-deploy", "ref": "main", "status": "success"}
+
+    for extra in ({"project": "default"}, {}):
+        resp = await hub.client.post(
+            "/api/deploys", json={**base, **extra}, headers=scoped
+        )
+        assert resp.status_code == 403, (extra, resp.text)
+    assert await _release_rows(hub.db) == [], "a refused call must write nothing"
+
+    ok = await hub.client.post(
+        "/api/deploys", json={**base, "project": "audit-in"}, headers=scoped
+    )
+    assert ok.status_code == 200, ok.text
+    assert len(await _release_rows(hub.db)) == 1

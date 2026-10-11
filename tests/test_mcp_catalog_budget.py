@@ -417,6 +417,10 @@ PRE_TRIM_CEILINGS = {
 # list, the published file) and still fails: the new entry would sit above its
 # predecessor. Lowering after a trim takes the same three and passes.
 WORKING_FREEZE_HISTORY = [
+    # #1624: lowered on purpose after the catalog stopped carrying the human-only
+    # gates and the dead tools to every agent (65 tools, descriptions 32054 in
+    # the agent view). Room left under it stays 3546 — a decision, not --update.
+    ("2026-10-06", "#1624", {"description_chars": 35600, "max_tool_chars": 6404}),
     ("2026-08-28", "#1031", {"description_chars": 36383, "max_tool_chars": 6404}),
     ("2026-08-21", "#988", {"description_chars": 36495, "max_tool_chars": 6472}),
 ]
@@ -468,14 +472,14 @@ def test_no_ceiling_rises() -> None:
 # against, so a re-freeze has to state in the diff how much room it created.
 # The prose used to claim 1000 while the truth was 324, and nothing noticed
 # (#1071).
-DECLARED_WORKING_HEADROOM = {"description_chars": 324, "max_tool_chars": 82}
+DECLARED_WORKING_HEADROOM = {"description_chars": 3546, "max_tool_chars": 82}
 
 
 def test_the_declared_working_headroom_is_true() -> None:
     """AC-1: the promise is arithmetic over recorded facts, not prose.
 
     An earlier version of this test asserted only that the headroom was
-    positive — true before the change too (36383 > 36059), true if the freeze
+    positive — true before the change too (36383 > 36059 then), true if the freeze
     were raised to 40000, and true if it were dropped to measured + 1, which
     would remove the working headroom the freeze exists to provide. It watched
     nothing move.
@@ -775,3 +779,70 @@ def test_agent_docs_point_to_the_refill_policy_not_to_update(doc: str) -> None:
                     f"{doc}: --update is offered as a way to move the budget, "
                     f"which working_headroom_note forbids: {clause!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# #1624: the budget measures what an AGENT pays for
+# ---------------------------------------------------------------------------
+
+_HIDDEN_FROM_AGENTS = (
+    "hub_approve_task",
+    "hub_reject_task",
+    "hub_decide_task",
+    "hub_force_complete_task",
+    "hub_answer_question",
+    "hub_start_task",
+)
+
+
+async def test_the_budget_measures_the_agent_view(client, db, monkeypatch):
+    """AC-3 (#1624): CI/budget = agent view; usage sees the full catalog."""
+    import importlib.util
+    from pathlib import Path
+
+    agent = await catalog_snapshot("agent")
+    full = await catalog_snapshot("full")
+    agent_names = {e["name"] for e in agent["tools_list"]}
+    full_names = {e["name"] for e in full["tools_list"]}
+    assert not (agent_names & set(_HIDDEN_FROM_AGENTS))
+    assert set(_HIDDEN_FROM_AGENTS) <= full_names
+    assert full_names - agent_names == set(_HIDDEN_FROM_AGENTS)
+    assert agent["description_chars"] <= 32200
+    assert agent["model_visible_chars"] < full["model_visible_chars"]
+    # the default is the agent view: nothing measures the human view by accident
+    assert (await catalog_snapshot())["tools"] == agent["tools"]
+
+    # the freeze came down with the catalog, and the history says so
+    assert WORKING_FREEZE["description_chars"] < 36383
+    assert WORKING_FREEZE_HISTORY[0][1] == "#1624"
+    assert room_left(agent)["description_chars"] >= 3500
+
+    # the CI script asks for the agent view
+    seen: list[str] = []
+    real = catalog_snapshot
+
+    async def _spy(view: str = "agent"):
+        seen.append(view)
+        return await real(view)  # type: ignore[arg-type]
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "mcp_catalog_budget.py"
+    spec = importlib.util.spec_from_file_location("mcp_catalog_budget_script", path)
+    assert spec and spec.loader
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    monkeypatch.setattr(script, "catalog_snapshot", _spy)
+    monkeypatch.setattr("sys.argv", ["mcp_catalog_budget.py"])
+    assert await script.main() == 0
+    assert seen == ["agent"]
+
+    # served: the budget check is the agent view, both views are shown
+    served = (await client.get("/api/metrics/mcp-catalog")).json()
+    assert served["view"] == "agent" and served["ok"] is True
+    assert served["snapshot"]["tools"] == len(served["tools_list"]) == agent["tools"]
+    assert served["views"]["agent"]["tools"] == agent["tools"]
+    assert served["views"]["full"]["tools"] == full["tools"]
+    assert not ({e["name"] for e in served["tools_list"]} & set(_HIDDEN_FROM_AGENTS))
+
+    # usage: unused_tools sees the hidden tools too (nobody called them here)
+    usage = (await client.get("/api/metrics/mcp-usage")).json()
+    assert set(_HIDDEN_FROM_AGENTS) <= set(usage["unused_tools"])

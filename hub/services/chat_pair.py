@@ -127,11 +127,16 @@ async def issue_code(
     kind: str = "intake",
     bound_task_id: int | None = None,
     bound_generation: int | None = None,
+    channel: str = "",
+    slot: str = "",
 ) -> tuple[str, int]:
     """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
 
     Intake and implementer do not kill each other: burn is scoped to the
     same kind (and, for implementer, the same bound task).
+
+    ``channel``/``slot`` (#1434) ride along with the code into its session and
+    land on the task card at capture; empty keeps today's behaviour.
     """
     kind = (kind or "intake").strip().lower() or "intake"
     if kind in config.CHAT_PAIR_TASK_BOUND_KINDS:
@@ -167,8 +172,8 @@ async def issue_code(
     await db.execute(
         "INSERT INTO chat_pair_codes "
         "(principal_id, kind, bound_task_id, bound_generation, code_hash, "
-        " expires_at) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        " expires_at, channel, slot) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
         (
             principal_id,
             kind,
@@ -176,6 +181,8 @@ async def issue_code(
             bound_generation,
             hash_pair_code(code),
             f"+{int(ttl)} seconds",
+            channel if kind == "implementer" else "",
+            slot if kind == "implementer" else "",
         ),
     )
     await db.commit()
@@ -187,12 +194,88 @@ async def issue_code(
 # ---------------------------------------------------------------------------
 
 
+async def issue_run_code(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    issued_by_principal_id: int | None,
+) -> tuple[str, int]:
+    """Код implementer, который выписывает сам хаб на прогон исполнителя (#1439).
+
+    Выписывается от имени агента chat-pair — того принципала, которым сессия
+    implementer и так действует, — и привязан к задаче и к поколению сдачи,
+    которую делает прогон. Отдельной двери сюда нет: зовёт только запуск
+    исполнителя, поэтому «выписывает только код диспетчера» держится по
+    построению (F4 #1368). В аудит — кто нажал запуск, задача и поколение;
+    сам код не пишется никуда.
+
+    Нет агента chat-pair — ``LookupError``: вызывающий называет причину
+    отказа, а не выписывает код от чужого имени.
+    """
+    from hub.services import admin as admin_svc
+
+    acting = await get_acting_agent(db)
+    if acting is None:
+        raise LookupError("нет активного агента chat-pair (CHAT_PAIR_AGENT)")
+    code, ttl = await issue_code(
+        db,
+        int(acting["id"]),
+        kind="implementer",
+        bound_task_id=int(task_id),
+        bound_generation=int(generation),
+        # #1434: диспетчер хаба запускает облачного исполнителя — канал
+        # известен по построению и ложится в карточку при захвате.
+        channel="cloud",
+    )
+    await admin_svc.write_audit(
+        db,
+        actor_id=issued_by_principal_id,
+        action="implementer_code_dispatched",
+        target_type="task",
+        target_id=str(int(task_id)),
+        summary=(
+            f"implementer code issued by the hub dispatcher for task #{task_id}, "
+            f"generation {generation}, valid {ttl}s"
+        ),
+    )
+    return code, ttl
+
+
+#: Куда возвращают работу исполнителю (#1439): находки ревью, решение
+#: человека по конфликту с базой (#1362), живой pair-прогон. Не review (там
+#: отчёт ревьюера, а не работа), не claimed (чужая бронь), не финальные.
+IMPLEMENTER_RETURN_STATUSES = frozenset({"running", "fix_requested", "needs_decision"})
+
+
+def _implementer_may_redeem(task: dict[str, Any], pinned: Any) -> bool:
+    """Можно ли обменять код implementer на эту задачу сейчас (#980, #1439).
+
+    open — как раньше; если код выписал хаб (есть поколение), оно обязано
+    быть следующим: код «через одно» — не для этой сдачи. Не-open — только
+    код хаба на СЛЕДУЮЩЕЕ поколение возвращённой задачи: без поколения код
+    ручной выдачи нельзя потратить на задачу, ушедшую из open.
+    """
+    status = str(task.get("status") or "")
+    next_generation = int(task.get("submission_generation") or 0) + 1
+    if status == "open":
+        return pinned is None or int(pinned) == next_generation
+    if status not in IMPLEMENTER_RETURN_STATUSES or pinned is None:
+        return False
+    return int(pinned) == next_generation
+
+
 async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any] | None:
     """Exchange a code for a session. ``None`` for every way that can fail.
 
     Unknown, already spent and expired are ONE answer on purpose: three
     distinguishable refusals would tell a caller enumerating codes which
     guesses were close.
+
+    The one exception is the capture check of #1433: a VALID implementer code
+    on an open task whose areas overlap started work under
+    ``claim_area_check=require`` raises the structured 409 naming the
+    neighbour, and the code stays unspent.
     """
     normalized = normalize_pair_code(raw_code)
     if len(normalized) != CODE_LENGTH:
@@ -201,7 +284,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, p.username, p.status "
+        "c.bound_generation, c.channel, c.slot, p.username, p.status "
         "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
         "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
         "AND c.expires_at > datetime('now')",
@@ -221,10 +304,23 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
         if bound_task_id is None:
             return None
         task_rows = await fetchall(
-            db, "SELECT status FROM tasks WHERE id = ?", (int(bound_task_id),)
+            db,
+            "SELECT status, submission_generation FROM tasks WHERE id = ?",
+            (int(bound_task_id),),
         )
-        if not task_rows or dict(task_rows[0]).get("status") != "open":
+        if not task_rows or not _implementer_may_redeem(
+            dict(task_rows[0]), row.get("bound_generation")
+        ):
             return None
+        if dict(task_rows[0]).get("status") == "open":
+            # #1433: код на open-задачу — вход в её захват, третий рядом с
+            # claim и pair_start; сверка та же и до траты кода. Отказ — не
+            # None: он возможен только с действительным кодом и называет
+            # соседа, а не угадывание кода.
+            from hub.services.lifecycle import capture_areas
+
+            async with capture_areas(db, int(bound_task_id), "open"):
+                pass
         acting = await get_acting_agent(db)
         if acting is None:
             return None
@@ -272,8 +368,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
-        " bound_generation, token_hash, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?))",
+        " bound_generation, token_hash, expires_at, channel, slot) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
         (
             row["principal_id"],
             acting_id,
@@ -282,6 +378,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             row.get("bound_generation"),
             hash_pair_code(token),
             f"+{int(ttl)} seconds",
+            row.get("channel") or "",
+            row.get("slot") or "",
         ),
     )
     await db.commit()
@@ -384,7 +482,9 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
                 else None
             ),
         )
-    if kind == "steward":
+    if kind in config.STEWARD_PAIR_KINDS:
+        # #1601: тот же допуск стюарда, но вид сессии сохраняется — по нему
+        # суждение судьи и суждение советника разведены.
         # #1120: the steward run authenticates the same way the reviewer does
         # since #1084 — Cursor drops mcpServers, so the header never arrives
         # and a one-time code in the prompt is the only channel that does.
@@ -398,7 +498,7 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
             principal_id=row["principal_id"],
             permissions=config.STEWARD_PERMS,
             auth_source="chat_pair",
-            chat_pair_kind="steward",
+            chat_pair_kind=kind,
             chat_pair_task_id=bound_id,
             chat_pair_generation=(
                 int(row["bound_generation"])

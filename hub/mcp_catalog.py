@@ -55,7 +55,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 HERE = Path(__file__).resolve().parent
 BUDGET_PATH = HERE.parent / "docs" / "agent-context" / "mcp-catalog-budget.json"
@@ -80,7 +80,7 @@ BUDGET_PATH = HERE.parent / "docs" / "agent-context" / "mcp-catalog-budget.json"
 # not exist, which is the same defect this task is about: a promise in prose
 # with nothing behind it.
 WORKING_FREEZE = {
-    "description_chars": 36383,
+    "description_chars": 35600,
     "max_tool_chars": 6404,
 }
 
@@ -223,12 +223,36 @@ def snapshot_from_tools(tools: list[Any], *, instructions: str = "") -> dict[str
     }
 
 
-async def catalog_snapshot() -> dict[str, Any]:
-    """Measure the live MCP catalog exactly as a client would receive it."""
+CatalogView = Literal["agent", "full"]
+
+
+async def catalog_snapshot(view: CatalogView = "agent") -> dict[str, Any]:
+    """Measure the live MCP catalog exactly as a client would receive it.
+
+    ``agent`` is what an agent token (and open mode, and stdio) receives: the
+    human-only gates are not in it, and it is what the budget measures — the
+    cost every agent turn pays (#1624). ``full`` is everything registered, for
+    "which tools nobody called" (usage) and for seeing the human view.
+    """
     from hub.mcp_server import mcp
 
-    tools = await mcp.list_tools()
+    tools = await mcp.list_tools_for(view)
     return snapshot_from_tools(list(tools), instructions=mcp.instructions or "")
+
+
+def view_summary(snapshot: Mapping[str, Any]) -> dict[str, int]:
+    """The few numbers that tell two views apart."""
+    return {
+        key: int(snapshot[key])
+        for key in (
+            "tools",
+            "description_chars",
+            "schema_chars",
+            "instruction_chars",
+            "model_visible_chars",
+            "max_tool_chars",
+        )
+    }
 
 
 def load_budget(path: Path | None = None) -> dict[str, Any]:

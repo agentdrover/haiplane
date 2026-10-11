@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
 import aiosqlite
@@ -17,6 +17,7 @@ import aiosqlite
 from hub import config
 from hub.db import (
     inserted_id,
+    write_transaction,
     STRUCTURED_TASK_FIELDS,
     ac_to_row_kwargs,
     fetchall,
@@ -868,6 +869,106 @@ async def release_fact_for_task(
     return dict(rows[0]) if rows else None
 
 
+class FixDeploy(NamedTuple):
+    """When a fix reached production and whether that moment is a guess (#1572)."""
+
+    at: str | None
+    assumed: bool = False
+
+
+_FIX_TREE_SQL = (
+    "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL "
+    "SELECT t.id FROM tasks t JOIN tree ON t.parent_id = tree.id) "
+    "SELECT id FROM tree"
+)
+
+
+async def _merge_is_delivery_fix(
+    db: aiosqlite.Connection, task_id: int, projects: frozenset[int]
+) -> FixDeploy:
+    """The fix moment of a task whose project declared merge = delivery (#1572).
+
+    Only a task with NO stamped merge comes here (the release-PR path owns the
+    rest). The project is the one of the task's LAST merge
+    (``pipeline_merges.project_id``), never ``tasks.project_id``. A project
+    with successful ``releases`` rows is dated by its first deploy at or after
+    the merge, and has no date until there is one; a project without any is
+    dated by the merge itself, marked assumed.
+    """
+    merges = await fetchall(
+        db,
+        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha "
+        "FROM pipeline_merges WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    )
+    if not merges or any(row["sha"] for row in merges):
+        return FixDeploy(None)
+    last = merges[0]
+    project_id = last["project_id"]
+    if project_id is None or int(project_id) not in projects:
+        return FixDeploy(None)
+    deploys = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n, MIN(CASE WHEN datetime(deployed_at) >= datetime(?) "
+        "THEN deployed_at END) AS first_after FROM releases "
+        "WHERE status = 'success' AND project_id = ?",
+        (last["merged_at"], int(project_id)),
+    )
+    if not deploys[0]["n"]:
+        return FixDeploy(str(last["merged_at"]) if last["merged_at"] else None, True)
+    after = deploys[0]["first_after"]
+    return FixDeploy(str(after) if after else None)
+
+
+async def first_fix_deploy_at(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    with_descendants: bool = False,
+    delivery_projects: frozenset[int] | set[int] = frozenset(),
+) -> FixDeploy:
+    """When the fix of this task first reached production, or None (#1568).
+
+    The fix is the release stamped on the task's LAST merge
+    (``pipeline_merges.released_sha``); its deploy is the earliest successful
+    ``releases`` row of that sha — a re-run of the deploy never moves it. The
+    sha is matched trimmed and lower-cased with no project_id: releases
+    reported before 28.09 carry ``project_id=NULL`` (the rule of
+    ``defect_release``). With ``with_descendants`` the latest such moment among
+    the task and everything below it is returned: an epic or feature is out
+    when its last child is. ``at`` None means no recorded fix release — unknown.
+
+    ``delivery_projects`` are the projects whose owner declared merge = delivery
+    (``merge_is_delivery``, #1572): for a task of theirs without a stamped
+    merge the moment comes from ``_merge_is_delivery_fix`` and is ``assumed``
+    when it is the merge itself; one assumed task makes a rolled-up date
+    assumed. Empty (the default) is exactly the behaviour before the key.
+    """
+    tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
+    rows = await fetchall(
+        db,
+        f"SELECT MAX(d) AS at FROM (SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
+        "WHERE r.status = 'success' "
+        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d "
+        f"FROM ({tree}) AS tr "
+        "JOIN pipeline_merges pm ON pm.id = (SELECT MAX(p2.id) FROM pipeline_merges p2 "
+        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != ''))",
+        (task_id,),
+    )
+    strict = str(rows[0]["at"]) if rows and rows[0]["at"] else None
+    if not delivery_projects:
+        return FixDeploy(strict)
+    projects = frozenset(delivery_projects)
+    ids = await fetchall(db, tree if with_descendants else "SELECT ?", (task_id,))
+    moments = [FixDeploy(strict)]
+    for row in ids:
+        moments.append(await _merge_is_delivery_fix(db, int(row[0]), projects))
+    dated = [m for m in moments if m.at]
+    if not dated:
+        return FixDeploy(None)
+    return FixDeploy(max(m.at for m in dated if m.at), any(m.assumed for m in dated))
+
+
 async def pipeline_merge_recorded(
     db: aiosqlite.Connection, task_id: int, pr_number: int
 ) -> bool:
@@ -1026,9 +1127,38 @@ async def list_projects(
     )
 
 
+class GateLockViolation(ValueError):
+    """Запись политики, которую замок #743 не пропускает (#1602)."""
+
+    def __init__(self, slug: str, violations: list[str]) -> None:
+        super().__init__(
+            f"замок #743: политика проекта {slug} не может содержать "
+            f"{', '.join(violations)}"
+        )
+        self.violations = violations
+
+
 async def update_project(
     db: aiosqlite.Connection, project_id: int, **fields: Any
 ) -> None:
+    # #1602: замок #743 стоит и на самой записи, а не только в слиянии
+    # PATCH: прямой вызов с gate_policy не должен класть на default политику,
+    # которую API отказал бы принять. Нечитаемое значение пропускается как
+    # раньше — проверку формата делает слой модели.
+    if fields.get("gate_policy") is not None:
+        from hub.services import project_policy
+
+        row = await get_project(db, project_id)
+        raw = fields["gate_policy"]
+        if row is not None and project_policy.gate_lock_applies(row["slug"]):
+            try:
+                policy = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                policy = None
+            if isinstance(policy, dict):
+                violations = project_policy.gate_lock_violations(row["slug"], policy)
+                if violations:
+                    raise GateLockViolation(row["slug"], violations)
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
     values = [*fields.values(), project_id]
@@ -1036,6 +1166,129 @@ async def update_project(
         f"UPDATE projects SET {', '.join(sets)} WHERE id=?",  # nosec B608
         tuple(values),
     )
+
+
+# ---------------------------------------------------------------------------
+# Отложенные правки политики проекта (#1593)
+# ---------------------------------------------------------------------------
+
+
+async def insert_scheduled_policy_change(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int,
+    at: str,
+    patch: dict[str, Any],
+    note: str,
+    created_by: str,
+) -> int:
+    """Новая запись всегда pending; id выдаёт база. Коммит — на вызывающем."""
+    cur = await db.execute(
+        "INSERT INTO scheduled_policy_changes "
+        "(project_id, at, patch, note, created_by) VALUES (?, ?, ?, ?, ?)",
+        (project_id, at, json.dumps(patch, ensure_ascii=False), note, created_by),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def get_scheduled_policy_change(
+    db: aiosqlite.Connection, change_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db, "SELECT * FROM scheduled_policy_changes WHERE id=?", (change_id,)
+    )
+    return rows[0] if rows else None
+
+
+async def list_scheduled_policy_changes(
+    db: aiosqlite.Connection, project_id: int, *, state: str | None = None
+) -> list[aiosqlite.Row]:
+    """Записи проекта в порядке исполнения (at, id)."""
+    if state is None:
+        return await fetchall(
+            db,
+            "SELECT * FROM scheduled_policy_changes WHERE project_id=? ORDER BY at, id",
+            (project_id,),
+        )
+    return await fetchall(
+        db,
+        "SELECT * FROM scheduled_policy_changes WHERE project_id=? AND state=? "
+        "ORDER BY at, id",
+        (project_id, state),
+    )
+
+
+async def count_pending_scheduled_policy_changes(
+    db: aiosqlite.Connection, project_id: int
+) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM scheduled_policy_changes "
+        "WHERE project_id=? AND state='pending'",
+        (project_id,),
+    )
+    return int(rows[0]["n"])
+
+
+async def has_due_scheduled_policy_change(db: aiosqlite.Connection, now: str) -> bool:
+    """Дешёвая проверка БЕЗ write-лока: «есть ли что исполнять».
+
+    Только подсказка, чтобы пустой проход не брал write-лок на каждом тике.
+    Саму запись исполнитель читает заново, внутри транзакции.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM scheduled_policy_changes "
+        "WHERE state='pending' AND at<=? LIMIT 1",
+        (now,),
+    )
+    return bool(rows)
+
+
+async def next_due_scheduled_policy_change(
+    db: aiosqlite.Connection, now: str
+) -> aiosqlite.Row | None:
+    """Первая просроченная pending-запись в порядке (at, id).
+
+    Вызывать ТОЛЬКО внутри write_transaction: прочитанная раньше запись к
+    моменту записи может быть уже исполнена другим соединением.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM scheduled_policy_changes "
+        "WHERE state='pending' AND at<=? ORDER BY at, id LIMIT 1",
+        (now,),
+    )
+    return rows[0] if rows else None
+
+
+async def settle_scheduled_policy_change(
+    db: aiosqlite.Connection,
+    change_id: int,
+    *,
+    state: str,
+    executed_at: str,
+    result: dict[str, Any],
+) -> bool:
+    """pending → applied|refused. False, если запись уже не pending."""
+    cur = await db.execute(
+        "UPDATE scheduled_policy_changes SET state=?, executed_at=?, result=? "
+        "WHERE id=? AND state='pending'",
+        (state, executed_at, json.dumps(result, ensure_ascii=False), change_id),
+    )
+    return bool(cur.rowcount)
+
+
+async def cancel_scheduled_policy_change(
+    db: aiosqlite.Connection, change_id: int, *, result: dict[str, Any]
+) -> bool:
+    """pending → cancelled (человек). False, если запись уже не pending."""
+    cur = await db.execute(
+        "UPDATE scheduled_policy_changes SET state='cancelled', result=? "
+        "WHERE id=? AND state='pending'",
+        (json.dumps(result, ensure_ascii=False), change_id),
+    )
+    return bool(cur.rowcount)
 
 
 async def list_task_ids_for_project(
@@ -1057,14 +1310,16 @@ async def list_task_ids_for_project(
     return {r["id"] for r in rows}
 
 
-async def resolve_project_for_task(
+async def resolve_project_with_source(
     db: aiosqlite.Connection, task_id: int
-) -> aiosqlite.Row | None:
-    """Resolve a task's project by walking up to its root epic (#335).
+) -> tuple[aiosqlite.Row | None, int | None]:
+    """The task's project and the node that supplied it (#335, #1604).
 
-    Projects live on epics only; descendants inherit. Tasks outside any
-    epic (or epics without an assignment) fall back to the seeded
-    'default' project so legacy behavior never breaks.
+    Projects live on epics only; descendants inherit. The second value is the
+    id of the task row that carries the assignment (the task itself, or an
+    ancestor), or ``None`` when the 'default' project is the fallback: the
+    task sits outside any epic, the epic has no assignment, or the assigned
+    project is still a pending proposal (#345) and must not affect routing.
     """
     current_id: int | None = task_id
     for _ in range(20):  # hierarchy depth guard
@@ -1080,12 +1335,50 @@ async def resolve_project_for_task(
         row = rows[0]
         if row["project_id"] is not None:
             project = await get_project(db, row["project_id"])
-            # A pending proposal (#345) must not affect routing yet.
             if project is not None and project["status"] != "active":
-                return await get_project_by_slug(db, "default")
-            return project
+                return await get_project_by_slug(db, "default"), None
+            return project, int(row["id"])
         current_id = row["parent_id"]
-    return await get_project_by_slug(db, "default")
+    return await get_project_by_slug(db, "default"), None
+
+
+async def resolve_bound_project(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """The project actually bound to the task or its nearest bound ancestor.
+
+    Unlike ``resolve_project_with_source`` this never substitutes 'default' for
+    an inactive project: it is for AUTHORIZATION, where "routed to default"
+    must not be read as "belongs to default" (#1644). ``None`` = no binding at
+    all (the orphan case), the only one where the caller may assume default.
+    """
+    current_id: int | None = task_id
+    for _ in range(20):  # hierarchy depth guard
+        if current_id is None:
+            return None
+        rows = await fetchall(
+            db,
+            "SELECT parent_id, project_id FROM tasks WHERE id=?",
+            (current_id,),
+        )
+        if not rows:
+            return None
+        if rows[0]["project_id"] is not None:
+            return await get_project(db, rows[0]["project_id"])
+        current_id = rows[0]["parent_id"]
+    return None
+
+
+async def resolve_project_for_task(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """Resolve a task's project by walking up to its root epic (#335).
+
+    Projects live on epics only; descendants inherit. Tasks outside any
+    epic (or epics without an assignment) fall back to the seeded
+    'default' project so legacy behavior never breaks.
+    """
+    return (await resolve_project_with_source(db, task_id))[0]
 
 
 # --- skills library (#380) --------------------------------------------------
@@ -1289,14 +1582,16 @@ async def insert_machine_review(
     profile: str = "",
     self_reviewed: bool = False,
     principal_id: int | None = None,
+    carried_from_review_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, incomplete_reason, "
-        "unresolved, lost_dimensions, profile, self_reviewed, principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "unresolved, lost_dimensions, profile, self_reviewed, principal_id, "
+        "carried_from_review_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1318,6 +1613,7 @@ async def insert_machine_review(
             profile,
             int(self_reviewed),
             principal_id,
+            carried_from_review_id,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1342,15 +1638,22 @@ async def insert_steward_judgement(
     submitted_by: str = "",
     principal_id: int | None = None,
     tokens_unknown_reason: str = "",
+    judged_id: int | None = None,
+    packet_hash: str = "",
+    contour: int = 2,
 ) -> int | None:
-    """Insert one judgement. None when the (task, generation, kind) slot is taken."""
+    """Insert one judgement. None when the (task, generation, kind) slot is taken.
+
+    ``contour`` 2 — суждение нового контура (#1601); строки до выката остались
+    с 1 по умолчанию колонки и в выборку критерия выхода не входят.
+    """
     try:
         cur = await db.execute(
             "INSERT INTO steward_judgements (task_id, generation, kind, "
             "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
             "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
-            "principal_id, tokens_unknown_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "principal_id, tokens_unknown_reason, judged_id, packet_hash, contour) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 generation,
@@ -1368,6 +1671,9 @@ async def insert_steward_judgement(
                 submitted_by,
                 principal_id,
                 tokens_unknown_reason,
+                judged_id,
+                packet_hash,
+                contour,
             ),
         )
     except aiosqlite.IntegrityError:
@@ -1516,7 +1822,10 @@ async def list_machine_reviews(
         await fetchall(
             db,
             "SELECT id, submission_generation, profile, model, agent_count, "
-            "tokens_spent, provider_tokens, incomplete, created_at "
+            "tokens_spent, provider_tokens, incomplete, created_at, "
+            # #1361: a carried report is a row but NOT a run; the reader
+            # needs the mark to tell the two apart.
+            "carried_from_review_id "
             "FROM machine_reviews WHERE task_id=? ORDER BY id",
             (task_id,),
         )
@@ -1623,13 +1932,18 @@ async def list_judged_findings(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
 #: The disposition is matched per FINDING, not per report. Subtracting one
 #: total from another (what ``confirmed_unjudged`` did before) treats a
 #: judgement on a stale report as an answer about a live one.
+#:
+#: #1361: a CARRIED report is the same reading on the same author edit, so a
+#: judgement made on its source still answers it. Without this every carry
+#: would put already-judged findings back in front of a person.
 _UNJUDGED_FINDINGS_FROM = (
     "FROM machine_reviews mr "
     "JOIN tasks t ON t.id = mr.task_id "
     "AND t.submission_generation = mr.submission_generation "
     "JOIN json_each(mr.findings_confirmed) f "
     "LEFT JOIN finding_dispositions d "
-    "ON d.review_id = mr.id AND d.finding_index = f.key "
+    "ON d.review_id IN (mr.id, mr.carried_from_review_id) "
+    "AND d.finding_index = f.key "
     "WHERE d.id IS NULL"
 )
 
@@ -1649,11 +1963,21 @@ UNJUDGED_CATEGORY_SQL = (
 
 
 def _unjudged_where(
-    since: str | None, project_id: int | None, category: str | None = None
+    since: str | None,
+    project_id: int | None,
+    category: str | None = None,
+    extra: tuple[str, Sequence[Any]] | None = None,
 ) -> tuple[str, list[Any]]:
-    """The one place the queue's WHERE is assembled, for list and count alike."""
+    """The one place the queue's WHERE is assembled, for list and count alike.
+
+    ``extra`` is a condition already assembled by the metrics scope (#1490):
+    the project and reviewer model of a metrics slice, in terms of ``mr``.
+    """
     where = _UNJUDGED_FINDINGS_FROM
     params: list[Any] = []
+    if extra is not None and extra[0]:
+        where += f" AND {extra[0]}"
+        params.extend(extra[1])
     if since is not None:
         where += " AND mr.created_at >= datetime('now', ?)"
         params.append(since)
@@ -1743,6 +2067,7 @@ async def count_unjudged_findings(
     *,
     since: str | None = None,
     project_id: int | None = None,
+    extra: tuple[str, Sequence[Any]] | None = None,
 ) -> dict[str, int]:
     """How many findings wait, and across how many reports.
 
@@ -1751,7 +2076,7 @@ async def count_unjudged_findings(
     it are the same question, and answering it twice is how the two start
     disagreeing.
     """
-    where, params = _unjudged_where(since, project_id)
+    where, params = _unjudged_where(since, project_id, extra=extra)
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS findings, "  # nosec B608 - constant fragment
@@ -1873,10 +2198,15 @@ async def upsert_category_check(
 ) -> None:
     """Record the deterministic check that covers a finding category."""
     await db.execute(
-        "INSERT INTO category_checks (category, check_ref, note, recorded_by) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(category) DO UPDATE SET "
+        # ``created_at`` is the rule's birth (#920): set on the first record
+        # only. A re-record replaces the check and its stamp, not the date the
+        # class was promised closed from.
+        "INSERT INTO category_checks "
+        "(category, check_ref, note, recorded_by, created_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(category) DO UPDATE SET "
         "check_ref=excluded.check_ref, note=excluded.note, "
-        "recorded_by=excluded.recorded_by, recorded_at=datetime('now')",
+        "recorded_by=excluded.recorded_by, recorded_at=datetime('now'), "
+        "created_at=COALESCE(category_checks.created_at, category_checks.recorded_at)",
         (category, check_ref, note, recorded_by),
     )
 
@@ -1931,25 +2261,37 @@ async def upsert_ci_run_report(
     reason: str,
     reported_by: str,
     checks: str = "{}",
-    mutations: str = "{}",
+    mutations: str | None = None,
+    baseline: str | None = None,
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
 
     Re-running CI on the same commit updates the row rather than adding a
     second opinion — the same rule the merge ledger follows (#605).
+
+    ``mutations`` / ``baseline`` of ``None`` mean "the report carried no such
+    key" (#1606): the step did not run, so a block stored earlier for this
+    commit stays. The decision is made inside ON CONFLICT, in the same
+    statement that writes — a read before the write would let two reports for
+    one commit pass each other and erase the evidence they meant to keep. Text
+    (including ``"{}"``) replaces: a step that ran and found nothing, or ended
+    in error, is a fact, not an absence.
     """
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
         "validation_status, validation_log, reason, reported_by, checks, "
-        "mutations, reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "mutations, baseline, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
         "ac_results=excluded.ac_results, "
         "validation_status=excluded.validation_status, "
         "validation_log=excluded.validation_log, "
         "reason=excluded.reason, reported_by=excluded.reported_by, "
         "checks=excluded.checks, "
-        "mutations=excluded.mutations, "
+        "mutations=CASE WHEN ? THEN ci_run_reports.mutations "
+        "ELSE excluded.mutations END, "
+        "baseline=CASE WHEN ? THEN ci_run_reports.baseline "
+        "ELSE excluded.baseline END, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -1960,7 +2302,10 @@ async def upsert_ci_run_report(
             reason,
             reported_by,
             checks,
-            mutations,
+            "{}" if mutations is None else mutations,
+            "{}" if baseline is None else baseline,
+            1 if mutations is None else 0,
+            1 if baseline is None else 0,
         ),
     )
 
@@ -2064,11 +2409,54 @@ async def list_events(
     )
 
 
-async def prune_events(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
-    """Delete events older than ``keep_days``. Returns rows removed."""
+async def last_project_event(
+    db: aiosqlite.Connection, project_id: int, kind: str
+) -> aiosqlite.Row | None:
+    """The newest event of ``kind`` on a project, or ``None``."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM events WHERE project_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+        (project_id, kind),
+    )
+    return rows[0] if rows else None
+
+
+async def list_project_events(
+    db: aiosqlite.Connection, project_id: int, kind: str, limit: int = 50
+) -> list[aiosqlite.Row]:
+    """The newest events of ``kind`` on a project, newest first."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM events WHERE project_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT ?",
+            (project_id, kind, limit),
+        )
+    )
+
+
+#: Сколько дней живёт лента событий (#349). Читатели, которым нужно окно
+#: длиннее, считают по ленте неправду, поэтому окно счётчиков по событиям
+#: берётся отсюда, а не придумывается рядом.
+EVENTS_RETENTION_DAYS = 14
+
+# #1645: the egress alert's open state IS its newest event. Retention must not
+# delete it, or an outage older than the window would vanish from every reader.
+EGRESS_KINDS = ("egress_down", "egress_restored")
+
+
+async def prune_events(
+    db: aiosqlite.Connection, *, keep_days: int = EVENTS_RETENTION_DAYS
+) -> int:
+    """Delete events older than ``keep_days``. Returns rows removed.
+
+    The newest event of the egress pair stays whatever its age (#1645).
+    """
     cur = await db.execute(
-        "DELETE FROM events WHERE created_at < datetime('now', ?)",
-        (f"-{keep_days} days",),
+        "DELETE FROM events WHERE created_at < datetime('now', ?) "
+        "AND NOT (kind IN (?, ?) AND id = "
+        "(SELECT MAX(id) FROM events WHERE kind IN (?, ?)))",
+        (f"-{keep_days} days", *EGRESS_KINDS, *EGRESS_KINDS),
     )
     return cur.rowcount or 0
 
@@ -2424,6 +2812,21 @@ async def create_task(
     return cur.lastrowid  # type: ignore[return-value]
 
 
+# #916: a production defect stops hurting when it is closed, so ``resolved_at``
+# is stamped on the way into ``completed`` — in the same primitives and by the
+# same rule as ``completed_at`` (#517), because several paths complete a task
+# and a stamp placed in one of them is a stamp the others forget. Only
+# ``found_in='prod'`` rows carry the clock (time-to-restore is downtime, which
+# a defect caught at review never caused), and a stamp already recorded is
+# kept: a reopened and re-closed defect keeps its first recovery. Two
+# placeholders, both bound to the new status.
+RESOLVED_AT_ON_COMPLETION_SQL = (
+    "resolved_at = CASE WHEN ? = 'completed' AND status != ? "
+    "AND found_in = 'prod' AND resolved_at IS NULL "
+    "THEN datetime('now') ELSE resolved_at END"
+)
+
+
 async def update_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2458,6 +2861,9 @@ async def update_task(
             "THEN datetime('now') ELSE completed_at END"
         )
         values.extend([fields["status"], fields["status"]])
+        if "resolved_at" not in fields:
+            sets.append(RESOLVED_AT_ON_COMPLETION_SQL)
+            values.extend([fields["status"], fields["status"]])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -2494,8 +2900,14 @@ async def record_review_verdict(
     verdict: str,
     findings_json: str = "[]",
     self_approved: bool = False,
-) -> None:
+    expected_generation: int | None = None,
+    claim: tuple[int, str] | None = None,
+) -> bool:
     """Persist a review verdict bound to the CURRENT submission generation.
+
+    ``expected_generation`` (#1601): запись условна В SQL — только если живое
+    поколение равно названному И на него ещё нет вердикта. Возвращает, была
+    ли запись; без ожидания поведение прежнее (всегда True).
 
     The binding is done in SQL (``review_verdict_generation = submission_generation``)
     so the verdict can never be attached to a generation the caller read
@@ -2509,15 +2921,33 @@ async def record_review_verdict(
     (#1286): a window closed by a human decision belonged to the PREVIOUS
     verdict, and a new verdict opens its own.
     """
-    await db.execute(
-        "UPDATE tasks SET review_verdict=?, "
+    guard = ""
+    params: list[Any] = [verdict, findings_json, 1 if self_approved else 0, task_id]
+    if expected_generation is not None:
+        guard = (
+            " AND submission_generation=? AND NOT (COALESCE(review_verdict,'')!='' "
+            "AND review_verdict_generation=submission_generation)"
+        )
+        params.append(expected_generation)
+    if claim is not None:
+        # #1601: применение стюарда пишет вердикт, только пока ЕГО метка цела —
+        # суждение всё ещё applying с тем же временем занятия. Переведённое в
+        # escalated (прерванное) применение вердикта не пишет.
+        guard += (
+            " AND EXISTS (SELECT 1 FROM steward_judgements sj WHERE sj.id=? "
+            "AND sj.advisor_outcome='applying' AND sj.advisor_claimed_at=?)"
+        )
+        params.extend([claim[0], claim[1]])
+    cursor = await db.execute(
+        "UPDATE tasks SET review_verdict=?, "  # nosec B608 - guard is a constant
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
         "review_self_approved=?, "
         "review_verdict_closed_generation=NULL, "
-        "updated_at=datetime('now') WHERE id=?",
-        (verdict, findings_json, 1 if self_approved else 0, task_id),
+        "updated_at=datetime('now') WHERE id=?" + guard,
+        tuple(params),
     )
+    return (cursor.rowcount or 0) > 0
 
 
 async def close_review_verdict_window(
@@ -2590,14 +3020,24 @@ async def transition_status_if(
     409 Conflict instead of double-processing the task. Review I5.
     """
     cur = await db.execute(
-        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "
+        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "  # nosec B608 - module constant, values stay params
         "updated_at=datetime('now'), "
         # Same rule as update_task (#517): stamp the completion moment on the
         # way into `completed` and never on any other transition.
         "completed_at = CASE WHEN ? = 'completed' AND status != ? "
-        "THEN datetime('now') ELSE completed_at END "
+        "THEN datetime('now') ELSE completed_at END, "
+        # #916: and a prod defect's recovery moment, by the same rule.
+        f"{RESOLVED_AT_ON_COMPLETION_SQL} "
         "WHERE id=? AND status=?",
-        (new_status, new_status, new_status, task_id, expected_from),
+        (
+            new_status,
+            new_status,
+            new_status,
+            new_status,
+            new_status,
+            task_id,
+            expected_from,
+        ),
     )
     return (cur.rowcount or 0) > 0
 
@@ -2734,6 +3174,7 @@ async def create_review_dispatch(
     run_id: str,
     model: str,
     profile: str = "",
+    profile_assignment: str = "rule",
     reviewer_principal_id: int | None = None,
     channel: str = "cloud",
     replaces_dispatch_id: int | None = None,
@@ -2744,6 +3185,9 @@ async def create_review_dispatch(
 
     ``only_tests`` (#1254) — the symbols this order named to the reviewer;
     None when the call-site walk did not run for it.
+
+    ``profile_assignment`` (#1403) — who chose the profile: ``rule`` or the
+    ``random`` lot over rule-assigned lite.
 
     ``replaces_dispatch_id`` is set ONLY when this row is the second door's
     local replacement of an earlier failed order of the SAME rung — it marks
@@ -2756,9 +3200,9 @@ async def create_review_dispatch(
     cur = await db.execute(
         "INSERT INTO review_dispatches "
         "(task_id, submission_generation, agent_id, run_id, model, profile, "
-        "reviewer_principal_id, channel, replaces_dispatch_id, "
-        "second_door_reason, only_tests) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "profile_assignment, reviewer_principal_id, channel, "
+        "replaces_dispatch_id, second_door_reason, only_tests) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -2766,6 +3210,7 @@ async def create_review_dispatch(
             run_id,
             model,
             profile,
+            profile_assignment,
             reviewer_principal_id,
             channel,
             replaces_dispatch_id,
@@ -2846,6 +3291,48 @@ async def get_review_dispatch_for_generation(
     return rows[0] if rows else None
 
 
+async def reopen_refused_order_for_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, principal_id: int
+) -> aiosqlite.Row | None:
+    """Заказ, записанный отказом, к которому пришёл отчёт его ревьюера (#1408).
+
+    Прод 25.09: create ответил 404, заказ 429 лёг заглушкой (``failed``,
+    пустой ``agent_id``), а агент был создан и сдал отчёт 582. Такой отчёт —
+    доказательство, что заказ состоялся: заглушка ПОСЛЕДНЯЯ в поколении
+    (ни переспрос, ни вторая дверь её не заменили), облачная и того же
+    принципала снова становится ``active``, и свип находит агента по метке
+    и снимает счёт. Возвращает строку заказа или None.
+    """
+    rows = list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches WHERE task_id=? "
+            "AND submission_generation=? AND status='failed' AND agent_id='' "
+            "AND channel='cloud' AND reviewer_principal_id=? "
+            "AND id = (SELECT MAX(id) FROM review_dispatches "
+            "WHERE task_id=? AND submission_generation=?)",
+            (task_id, generation, principal_id, task_id, generation),
+        )
+    )
+    if not rows:
+        return None
+    await db.execute(
+        "UPDATE review_dispatches SET status='active' WHERE id=?",
+        (int(rows[0]["id"]),),
+    )
+    return rows[0]
+
+
+async def set_review_dispatch_agent(
+    db: aiosqlite.Connection, dispatch_id: int, agent_id: str, run_id: str
+) -> None:
+    """Записать агента, найденного за заказом по метке после отчёта (#1408)."""
+    await db.execute(
+        "UPDATE review_dispatches SET agent_id=?, run_id=? WHERE id=?",
+        (agent_id, run_id, dispatch_id),
+    )
+
+
 async def record_submission(
     db: aiosqlite.Connection,
     *,
@@ -2853,15 +3340,123 @@ async def record_submission(
     generation: int,
     sha: str,
     base_branch: str,
+    state_snapshot: str = "",
 ) -> None:
-    """Remember which commit a submission pinned (#880)."""
+    """Remember which commit a submission pinned (#880).
+
+    ``state_snapshot`` (#1647) — JSON-снимок AC, rollback и result_kind сдачи
+    state-задачи; у сдачи commit-задачи пуст.
+    """
     await db.execute(
-        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(task_id, generation) DO UPDATE SET "
+        "INSERT INTO submissions (task_id, generation, sha, base_branch, "
+        "state_snapshot) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(task_id, generation) DO UPDATE SET "
         "sha=excluded.sha, base_branch=excluded.base_branch, "
+        "state_snapshot=excluded.state_snapshot, "
         "submitted_at=datetime('now')",
-        (task_id, generation, sha, base_branch),
+        (task_id, generation, sha, base_branch, state_snapshot),
     )
+
+
+async def insert_task_evidence(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    items: list[dict[str, str]],
+    principal_id: int | None,
+    agent: str,
+) -> int:
+    """Записать комплект доказательств поколения (#1647). Только вставка.
+
+    Зовётся внутри транзакции сдачи: комплект и поколение появляются вместе или
+    не появляются. UNIQUE (task_id, generation, ac_id) в схеме — вторая запись
+    на тот же AC того же поколения падает IntegrityError, а не переписывает.
+    """
+    for item in items:
+        await db.execute(
+            "INSERT INTO task_evidence (task_id, generation, ac_id, action, "
+            "observed, target, observed_at, principal_id, agent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                generation,
+                item["ac_id"],
+                item["action"],
+                item["observed"],
+                item["target"],
+                item["observed_at"],
+                principal_id,
+                agent,
+            ),
+        )
+    return len(items)
+
+
+async def list_task_evidence(
+    db: aiosqlite.Connection, task_id: int, generation: int | None = None
+) -> list[aiosqlite.Row]:
+    """Доказательства задачи, по поколениям и AC; одно поколение или все."""
+    sql = (
+        "SELECT generation, ac_id, action, observed, target, observed_at, "
+        "principal_id, agent, created_at FROM task_evidence WHERE task_id=?"
+    )
+    params: list[Any] = [task_id]
+    if generation is not None:
+        sql += " AND generation=?"
+        params.append(generation)
+    return await fetchall(db, sql + " ORDER BY generation, ac_id", tuple(params))
+
+
+async def record_state_decision(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    verdict: str,
+    generation: int,
+    findings_json: str,
+    new_status: str,
+) -> bool:
+    """Вердикт state-задачи и переход статуса — ОДНА условная запись (#1647).
+
+    Условие целиком в SQL: задача — state, в review, живое поколение равно
+    названному, и вердикта на него ещё нет. Любое расхождение даёт 0 строк и
+    False — вызывающий откатывает транзакцию (409 без записей). Так запись
+    вердикта, переход и завершение не расходятся между собой: нет момента, где
+    вердикт записан, а статус нет.
+
+    ``new_status='completed'`` ставит ещё и метку завершения, снимает бронь и
+    прод-дефекту проставляет время восстановления — тем же правилом, что
+    ``update_task`` (#517, #916), только условным.
+    """
+    sets = [
+        "review_verdict=?",
+        "review_verdict_generation=submission_generation",
+        "review_findings=?",
+        "review_self_approved=0",
+        "review_verdict_closed_generation=NULL",
+        "status=?",
+        "status_entered_at=datetime('now')",
+        "updated_at=datetime('now')",
+    ]
+    params: list[Any] = [verdict, findings_json, new_status]
+    if new_status == "completed":
+        sets += [
+            "completed_at=datetime('now')",
+            "claimed_by=NULL",
+            "claim_session_id=NULL",
+            "claimed_at=NULL",
+            "resolved_at=CASE WHEN found_in='prod' AND resolved_at IS NULL "
+            "THEN datetime('now') ELSE resolved_at END",
+        ]
+    cursor = await db.execute(
+        "UPDATE tasks SET " + ", ".join(sets) + " WHERE id=? "  # nosec B608 - constants
+        "AND status='review' AND result_kind='state' AND submission_generation=? "
+        "AND NOT (COALESCE(review_verdict,'')!='' "
+        "AND review_verdict_generation=submission_generation)",
+        (*params, task_id, generation),
+    )
+    return (cursor.rowcount or 0) > 0
 
 
 async def get_submission(
@@ -2871,6 +3466,42 @@ async def get_submission(
     rows = await fetchall(
         db,
         "SELECT * FROM submissions WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
+async def insert_path_notice_result(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    sha: str,
+    state: str,
+    reason: str,
+    notices: str,
+) -> bool:
+    """Record the path-notice result of one generation once (#1589).
+
+    Returns True when a row was written. A second write for the same
+    generation changes nothing: the result is fixed at submission.
+    """
+    cur = await db.execute(
+        "INSERT INTO path_notice_results "
+        "(task_id, generation, sha, state, reason, notices) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, generation) DO NOTHING",
+        (task_id, generation, sha, state, reason, notices),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+async def get_path_notice_result(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The stored path-notice result of this generation, or None (#1589)."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM path_notice_results WHERE task_id=? AND generation=?",
         (task_id, generation),
     )
     return rows[0] if rows else None
@@ -2950,11 +3581,209 @@ async def count_review_dispatches(
     return int(dict(rows[0])["n"]) if rows else 0
 
 
+#: Сколько живёт бронь заказа ревью (#1399). Бронь снимается в той же
+#: транзакции, что пишет строку заказа, или сразу после отказа провайдера;
+#: пережить её может только падение процесса посреди вызова. Тогда через
+#: этот срок сдачу снова можно заказать — вместо вечной блокировки.
+REVIEW_ORDER_CLAIM_TTL_MINUTES = 10
+
+
+async def claim_review_order(
+    db: aiosqlite.Connection, task_id: int, generation: int, profile: str
+) -> bool:
+    """Забронировать облачный заказ профиля на сдачу — атомарно (#1399).
+
+    Проверка «заказ уже есть» и бронь идут ОДНОЙ транзакцией BEGIN IMMEDIATE:
+    второй триггер, пришедший в окно между созданием агента и записью строки
+    (у #1378 это пять секунд), ждёт на write-локе и видит бронь первого, а не
+    пустоту. Проверка по одним строкам review_dispatches этого окна не
+    закрывает: строка пишется ПОСЛЕ оплаченного вызова провайдера.
+
+    Заказом считается любая неотказавшая строка того же профиля на ту же
+    сдачу — active, done или долг второй двери. Отказ (failed) сдачу не
+    держит: по нему свип переспрашивает (#1242), а новый триггер вправе
+    позвать ревьюера снова. Возвращает False, если заказ уже есть или
+    забронирован другим.
+
+    Пустой ``profile`` — бронь ПЕРВИЧНОГО заказа, профиль которого ещё не
+    выбран: бронь берётся до подготовки заказа, у которой есть побочные
+    эффекты (выпуск кода доступа гасит код уже запущенного ревьюера). Такой
+    заказ отказывает при любой неотказавшей строке этой сдачи: первичный
+    триггер профиль сам не выбирает, и второй прогон на сдаче — дело
+    лестницы (#879) или второй оси (#1243), а не повтора сдачи.
+    """
+    # Чужие незакоммиченные записи этого соединения фиксируются до брони:
+    # BEGIN IMMEDIATE нужен свой, иначе бронь уехала бы в чужую транзакцию.
+    await db.commit()
+    async with write_transaction(db):
+        rows = await fetchall(
+            db,
+            "SELECT id FROM review_dispatches WHERE task_id=? "
+            "AND submission_generation=? AND (? = '' OR profile=?) "
+            "AND status <> 'failed' LIMIT 1",
+            (task_id, generation, profile, profile),
+        )
+        if rows:
+            return False
+        await db.execute(
+            "DELETE FROM review_order_claims WHERE task_id=? "
+            "AND submission_generation=? AND profile=? "
+            "AND claimed_at < datetime('now', ?)",
+            (
+                task_id,
+                generation,
+                profile,
+                f"-{REVIEW_ORDER_CLAIM_TTL_MINUTES} minutes",
+            ),
+        )
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO review_order_claims "
+            "(task_id, submission_generation, profile) VALUES (?, ?, ?)",
+            (task_id, generation, profile),
+        )
+        return cur.rowcount == 1
+
+
+async def release_review_order(
+    db: aiosqlite.Connection, task_id: int, generation: int, profile: str
+) -> None:
+    """Снять бронь заказа (#1399). Коммит — за вызывающим: на успехе бронь
+    уходит в ОДНОЙ транзакции со строкой заказа, чтобы между ними не было
+    момента, когда нет ни брони, ни строки."""
+    await db.execute(
+        "DELETE FROM review_order_claims WHERE task_id=? "
+        "AND submission_generation=? AND profile=?",
+        (task_id, generation, profile),
+    )
+
+
+#: Бронь места под суточным потолком deep (#1414) — в той же таблице броней,
+#: что и #1399, под своим «профилем»: с бронью заказа она не сталкивается.
+DEEP_SEAT_CLAIM = "deep_cap_seat"
+
+# Оплаченный deep сегодня: строка с агентом (заглушка отказа #1242 ничего не
+# запускала), не отказ и не переданная второй двери (её место займёт строка
+# двери). Локальный канал квоту провайдера не тратит и в счёт не идёт. Считается СДАЧА, а не строка: переспрос, вторая ось и вторая дверь
+# той же сдачи второго места не занимают. Проект задачи — по её эпику
+# (resolve_project_for_task), поэтому фильтр по проекту делается в Python:
+# за сутки таких строк десятки.
+_DEEP_SEATS_SQL = (
+    "SELECT task_id, submission_generation FROM review_dispatches "
+    "WHERE profile = 'deep' AND agent_id != '' AND channel != 'local' "
+    "AND status NOT IN ('failed', 'second_door') "
+    "AND created_at >= date('now') "
+    "UNION "
+    "SELECT task_id, submission_generation FROM review_order_claims "
+    "WHERE profile = ? "
+    "AND claimed_at >= date('now') AND claimed_at >= datetime('now', ?)"
+)
+
+
+async def _deep_seats_of_project(
+    db: aiosqlite.Connection, project_id: int, ttl: str
+) -> set[tuple[int, int]]:
+    rows = await fetchall(db, _DEEP_SEATS_SQL, (DEEP_SEAT_CLAIM, ttl))
+    project_of: dict[int, int | None] = {}
+    seats: set[tuple[int, int]] = set()
+    for row in rows:
+        tid = int(row[0])
+        if tid not in project_of:
+            project = await resolve_project_for_task(db, tid)
+            project_of[tid] = int(project["id"]) if project is not None else None
+        if project_of[tid] == project_id:
+            seats.add((tid, int(row[1])))
+    return seats
+
+
+async def claim_deep_seat(
+    db: aiosqlite.Connection,
+    project_id: int,
+    task_id: int,
+    generation: int,
+    cap: int,
+) -> bool:
+    """Место под суточным потолком deep проекта — атомарно (#1414).
+
+    Счёт и бронь одной транзакцией BEGIN IMMEDIATE, как у брони заказа
+    (#1399): строка заказа пишется ПОСЛЕ оплаченного вызова провайдера, и
+    два параллельных заказа, считающие только строки, оба увидели бы
+    свободное место. Бронь живёт срок брони заказа и в счёте склеивается со
+    строкой своей сдачи; снимать её не нужно.
+
+    Сдача, уже занявшая место сегодня, получает его снова: переспрос и
+    повторный триггер той же сдачи — не новый deep.
+    """
+    await db.commit()
+    ttl = f"-{REVIEW_ORDER_CLAIM_TTL_MINUTES} minutes"
+    async with write_transaction(db):
+        seats = await _deep_seats_of_project(db, project_id, ttl)
+        if (task_id, generation) not in seats and len(seats) >= cap:
+            return False
+        await db.execute(
+            "DELETE FROM review_order_claims WHERE task_id=? "
+            "AND submission_generation=? AND profile=?",
+            (task_id, generation, DEEP_SEAT_CLAIM),
+        )
+        await db.execute(
+            "INSERT INTO review_order_claims "
+            "(task_id, submission_generation, profile) VALUES (?, ?, ?)",
+            (task_id, generation, DEEP_SEAT_CLAIM),
+        )
+        return True
+
+
 async def set_review_dispatch_status(
     db: aiosqlite.Connection, dispatch_id: int, status: str
 ) -> None:
     await db.execute(
         "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+#: Причина закрытия долга второй двери по политике проекта (#1653). Живёт в
+#: ``review_dispatches.second_door_reason`` облачной строки: это и ключ дедупа
+#: сообщения (событие чистится через 14 дней, строка — нет), и метка, по
+#: которой поздний собственный отчёт облака возвращает строку в ``done``.
+LOCAL_FALLBACK_OFF_REASON = "local_fallback_off_by_policy"
+
+
+async def close_dispatch_by_policy(
+    db: aiosqlite.Connection, dispatch_id: int, status: str
+) -> bool:
+    """Закрыть долг второй двери по политике: True ровно один раз на строку (#1653).
+
+    Условие в самом UPDATE делает закрытие атомарным без отдельного чтения:
+    параллельное второе закрытие и повтор после чистки событий видят метку и
+    получают False. Коммит — за вызывающим: причина, событие и алерт идут в
+    одной транзакции.
+    """
+    cur = await db.execute(
+        "UPDATE review_dispatches SET status=?, second_door_reason=? "
+        "WHERE id=? AND status IN ('active', 'second_door') "
+        "AND coalesce(second_door_reason, '') != ?",
+        (status, LOCAL_FALLBACK_OFF_REASON, dispatch_id, LOCAL_FALLBACK_OFF_REASON),
+    )
+    return cur.rowcount == 1
+
+
+async def settle_policy_closed_dispatch(
+    db: aiosqlite.Connection, dispatch_id: int, principal_id: int | None
+) -> None:
+    """Поздний собственный отчёт облака возвращает закрытое по политике в done (#1653).
+
+    Свипы берут только active и second_door, поэтому строка, закрытая как
+    failed с меткой политики, сама в done не вернётся. Трогается ТОЛЬКО строка,
+    которой отчёт принадлежит (её определяет вызывающий общим правилом
+    ``dispatch_for_report``), и только при совпавшем принципале: строка без
+    принципала не совпадает ни с кем, чужой принципал строку не трогает.
+    """
+    if principal_id is None:
+        return
+    await db.execute(
+        "UPDATE review_dispatches SET status='done' "
+        "WHERE id=? AND channel='cloud' AND status='failed' "
+        "AND second_door_reason=? AND reviewer_principal_id=?",
+        (dispatch_id, LOCAL_FALLBACK_OFF_REASON, principal_id),
     )
 
 
@@ -3002,6 +3831,56 @@ async def set_review_dispatch_provider_tokens(
     await db.execute(
         "UPDATE review_dispatches SET provider_tokens = ? WHERE id = ?",
         (tokens, dispatch_id),
+    )
+
+
+async def mark_review_dispatch_usage(
+    db: aiosqlite.Connection, dispatch_id: int, scope: str
+) -> None:
+    """Чем снят счёт заказа и когда провайдера спросили последний раз (#1413)."""
+    await db.execute(
+        "UPDATE review_dispatches SET usage_scope = ?, "
+        "usage_checked_at = datetime('now') WHERE id = ?",
+        (scope, dispatch_id),
+    )
+
+
+async def list_review_dispatches_usage_expired(
+    db: aiosqlite.Connection, ceiling_hours: int
+) -> list[aiosqlite.Row]:
+    """Открытые счета (#1413), чьё окно переснятия вышло без итога."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches WHERE usage_scope = 'agent_open' "
+            "AND status NOT IN ('active', 'second_door') "
+            "AND created_at < datetime('now', ?) ORDER BY id ASC",
+            (f"-{int(ceiling_hours)} hours",),
+        )
+    )
+
+
+async def list_review_dispatches_owing_usage(
+    db: aiosqlite.Connection, every_minutes: int, ceiling_hours: int
+) -> list[aiosqlite.Row]:
+    """Закрытые заказы, чей счёт агента снят до его конца (#1413).
+
+    Только ``agent_open``: история (``''``) переснимается одной командой
+    владельца, не поллером. Не чаще раза в ``every_minutes`` на строку и не
+    дольше ``ceiling_hours`` от заказа — агент, висящий сутками, не должен
+    опрашиваться вечно.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches "
+            "WHERE usage_scope = 'agent_open' AND agent_id <> '' "
+            "AND status NOT IN ('active', 'second_door') "
+            "AND (usage_checked_at IS NULL "
+            "     OR usage_checked_at <= datetime('now', ?)) "
+            "AND created_at >= datetime('now', ?) ORDER BY id ASC",
+            (f"-{int(every_minutes)} minutes", f"-{int(ceiling_hours)} hours"),
+        )
     )
 
 
@@ -3118,6 +3997,41 @@ def _blocker_entry(row: dict[str, Any]) -> dict[str, Any]:
     if not delivered:
         reason = f"PR #{pr_number} не смержен гейтом" if pr_number else "PR не заявлен"
     return {**row, "delivered": delivered, "reason": reason}
+
+
+async def task_as_blocker(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, Any] | None:
+    """Одна задача в форме строки блокера (#1448): та же, что даёт
+    ``list_task_dependencies`` (#485), с ``merges`` по pipeline_merges.
+
+    Читатели доставки (``blocker_delivery``) ждут именно эту строку, а не
+    голый id: без ``merges`` и ``pr_number`` мерж гейта не виден, и
+    доставленная задача читалась бы недоставленной. None — задачи нет.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
+        "FROM tasks t WHERE t.id = ?",
+        (task_id,),
+    )
+    return _blocker_entry(dict(rows[0])) if rows else None
+
+
+async def children_as_blockers(
+    db: aiosqlite.Connection, parent_id: int
+) -> list[dict[str, Any]]:
+    """Дети контейнера в форме строки блокера (#1442): та же доставка по
+    pipeline_merges, что у ``_blocker_entry`` — второго правила нет."""
+    rows = await fetchall(
+        db,
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
+        "FROM tasks t WHERE t.parent_id = ? AND t.archived = 0 ORDER BY t.id",
+        (parent_id,),
+    )
+    return [_blocker_entry(dict(r)) for r in rows]
 
 
 async def undelivered_blockers(
@@ -3462,6 +4376,88 @@ class DefectPassportError(ValueError):
     """
 
 
+# #914 / #1565: work types that cannot carry ``found_in='prod'``. A feature is
+# not a defect: filed as one it lands in ``escaped``, the prod defect clocks and
+# the shift-left prod bucket, which then count work nobody broke. chore, spike,
+# refactor and the rest stay allowed — a CVE bump, a spike on a prod error and a
+# lock fix are real prod-found work.
+PROD_DEFECT_FORBIDDEN_WORK_TYPES = frozenset({"feature"})
+
+
+async def defect_stage_problem(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    work_type: str | None = None,
+    found_in: str | None = None,
+) -> str:
+    """Why the task cannot end up as ``found_in='prod'`` + a forbidden type, or "".
+
+    The ONE rule behind every entrance (refine, refine-bulk, MCP and CLI go
+    through REST refine; ``set_defect_passport`` is the direct writer). The
+    arguments are what the caller is about to write, ``None`` = not sent; the
+    stored value fills the gap, so a partial PATCH is judged on the FINAL pair.
+    A row that already breaks the rule is not refused for an unrelated edit —
+    only a call that sets one of the two fields is judged (#1565 leaves the
+    existing rows to a manual clean-up).
+    """
+    if work_type is None and found_in is None:
+        return ""
+    rows = await fetchall(
+        db, "SELECT work_type, found_in FROM tasks WHERE id = ?", (task_id,)
+    )
+    stored = dict(rows[0]) if rows else {}
+    final_type = work_type if work_type is not None else stored.get("work_type")
+    final_stage = found_in if found_in is not None else stored.get("found_in")
+    if final_stage != "prod" or final_type not in PROD_DEFECT_FORBIDDEN_WORK_TYPES:
+        return ""
+    from hub.models import WorkType
+
+    allowed = ", ".join(
+        t.value for t in WorkType if t.value not in PROD_DEFECT_FORBIDDEN_WORK_TYPES
+    )
+    if work_type is not None and found_in is None:
+        what = f"work_type={final_type} нельзя поставить задаче с found_in='prod'"
+    else:
+        what = f"found_in='prod' запрещён при work_type={final_type}"
+    return (
+        f"{what} (инвариант #914: фича не прод-дефект и портит escaped, "
+        f"prod_defect_clocks и shift_left). Допустимые work_type: {allowed}. "
+        "Если это дефект, поставь work_type=bug в том же вызове."
+    )
+
+
+async def _release_link_problem(
+    db: aiosqlite.Connection, task_id: int, release_id: int
+) -> str:
+    """Why this release cannot be the one a defect showed up in, or "" (#917).
+
+    Three refusals, each a different lie the link would otherwise tell: a
+    release that is not recorded, a deploy that failed (it never ran in
+    production, so nothing could break there), and another project's release
+    (its membership is another project's work).
+    """
+    rows = await fetchall(
+        db, "SELECT project_id, status FROM releases WHERE id = ?", (release_id,)
+    )
+    if not rows:
+        return f"release #{release_id} not found"
+    release = dict(rows[0])
+    if release["status"] != RELEASE_SUCCESS:
+        return (
+            f"release #{release_id} has status {release['status']!r}: "
+            "only a successful deploy runs in production"
+        )
+    if release["project_id"] is not None:
+        project = await resolve_project_for_task(db, task_id)
+        if project is not None and int(project["id"]) != int(release["project_id"]):
+            return (
+                f"release #{release_id} belongs to project "
+                f"#{release['project_id']}, the task to project #{project['id']}"
+            )
+    return ""
+
+
 async def set_defect_passport(
     db: aiosqlite.Connection,
     task_id: int,
@@ -3471,6 +4467,7 @@ async def set_defect_passport(
     detected_at: str | None = None,
     resolved_at: str | None = None,
     clear_caused_by: bool = False,
+    release_id: int | None = None,
 ) -> dict[str, Any]:
     """Write the defect passport for one task and return the applied columns.
 
@@ -3496,6 +4493,11 @@ async def set_defect_passport(
             raise DefectPassportError(
                 f"unknown found_in {found_in!r}; allowed: {allowed}"
             ) from exc
+        stage_problem = await defect_stage_problem(
+            db, task_id, found_in=updates["found_in"]
+        )
+        if stage_problem:
+            raise DefectPassportError(stage_problem)
 
     if clear_caused_by:
         updates["caused_by_task_id"] = None
@@ -3504,6 +4506,12 @@ async def set_defect_passport(
         if problem:
             raise DefectPassportError(problem)
         updates["caused_by_task_id"] = caused_by_task_id
+
+    if release_id is not None:
+        problem = await _release_link_problem(db, task_id, release_id)
+        if problem:
+            raise DefectPassportError(problem)
+        updates["release_id"] = release_id
 
     if detected_at is not None:
         updates["detected_at"] = detected_at
@@ -5297,6 +6305,7 @@ async def record_release(
     ref: str = "",
     status: str = RELEASE_SUCCESS,
     source: str = "",
+    backup: str = "",
 ) -> int:
     """Record one deploy attempt and return its id.
 
@@ -5304,8 +6313,13 @@ async def record_release(
     about the pipeline, and dropping it would make the failure look like it
     never happened. Readers ask for the last SUCCESSFUL release, so a failure
     never becomes the state of production.
+
+    ``backup`` (#1590) is the pre-deploy backup verdict. A repeat report of the
+    same (project, sha, status) updates it; a report WITHOUT it never erases
+    one that is already known.
     """
     sha, status = deployed_sha.strip(), status.strip()
+    backup = backup.strip()
     # #495: CI runs get re-run, and a re-run redelivers the same callback. A
     # second row for the same (project, sha, status) would say the commit was
     # deployed twice, turning the release history into noise — so the existing
@@ -5321,12 +6335,18 @@ async def record_release(
         )
     )
     if existing:
-        return int(dict(existing[0])["id"])
+        release_id = int(dict(existing[0])["id"])
+        if backup:
+            await db.execute(
+                "UPDATE releases SET backup = ? WHERE id = ?", (backup, release_id)
+            )
+            await db.commit()
+        return release_id
 
     cursor = await db.execute(
-        "INSERT INTO releases (project_id, deployed_sha, ref, status, source) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (project_id, sha, ref.strip(), status, source.strip()),
+        "INSERT INTO releases (project_id, deployed_sha, ref, status, source, backup) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (project_id, sha, ref.strip(), status, source.strip(), backup),
     )
     await db.commit()
     return int(cursor.lastrowid or 0)
@@ -5362,3 +6382,205 @@ async def release_by_id(
         await fetchall(db, "SELECT * FROM releases WHERE id = ?", (release_id,))
     )
     return dict(rows[0]) if rows else None
+
+
+# ---- #1410 (F2.2): строка прогона облачного исполнителя ----
+
+
+async def create_executor_run(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    submission_generation: int,
+    agent_id: str,
+    run_id: str,
+    model: str,
+    token_ceiling: int | None = None,
+    cents_ceiling: float | None = None,
+) -> int:
+    """Записать прогон исполнителя при заказе (#1410). Коммит — за вызывающим.
+
+    Токены и центы не пишутся: их называет только провайдер при опросе, а
+    ноль на месте неизвестного выдал бы непрочитанный счёт за бесплатный.
+
+    ``submission_generation`` — поколение сдачи, которую этот прогон
+    делает: когда у задачи ляжет сдача этого поколения, хаб прогон снимает
+    (#1411). Потолки (#1411) фиксируются в строке при заказе; не названные —
+    берутся из конфигурации на момент заказа, чтобы правка настройки не
+    двигала потолок уже идущего прогона.
+    """
+    cur = await db.execute(
+        "INSERT INTO executor_runs "
+        "(task_id, submission_generation, agent_id, run_id, model, "
+        "token_ceiling, cents_ceiling) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            agent_id,
+            run_id,
+            model,
+            config.EXECUTOR_TOKEN_CEILING if token_ceiling is None else token_ceiling,
+            config.EXECUTOR_CENTS_CEILING if cents_ceiling is None else cents_ceiling,
+        ),
+    )
+    return inserted_id(cur)
+
+
+async def record_executor_cancel_attempt(
+    db: aiosqlite.Connection, row_id: int, intent: str
+) -> int:
+    """Отметить попытку отмены ДО вызова провайдера (#1411) и закоммитить.
+
+    Запись до вызова — по образцу переспроса ревью (#1242): попытка видна в
+    счёте, даже если вызов не вернулся. Возвращает номер этой попытки.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET cancel_intent=?, "
+        "cancel_attempts=cancel_attempts + 1, cancel_last_at=datetime('now') "
+        "WHERE id=?",
+        (intent, row_id),
+    )
+    await db.commit()
+    rows = await fetchall(
+        db, "SELECT cancel_attempts FROM executor_runs WHERE id=?", (row_id,)
+    )
+    return int(dict(rows[0])["cancel_attempts"]) if rows else 0
+
+
+async def executor_cancel_paused(
+    db: aiosqlite.Connection, row_id: int, pause_s: int
+) -> bool:
+    """True — с последней попытки отмены пауза ещё не вышла (#1411)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE id=? AND cancel_last_at IS NOT NULL "
+        "AND cancel_last_at > datetime('now', ?)",
+        (row_id, f"-{int(pause_s)} seconds"),
+    )
+    return bool(rows)
+
+
+async def get_executor_run(
+    db: aiosqlite.Connection, row_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(db, "SELECT * FROM executor_runs WHERE id=?", (row_id,))
+    return rows[0] if rows else None
+
+
+async def list_executor_runs(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM executor_runs WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+
+
+async def list_executor_runs_in_outcome(
+    db: aiosqlite.Connection, outcome: str
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM executor_runs WHERE outcome=? ORDER BY id",
+        (outcome,),
+    )
+
+
+async def stopped_executor_runs_of_running_tasks(
+    db: aiosqlite.Connection, outcomes: tuple[str, ...]
+) -> list[aiosqlite.Row]:
+    """Последний прогон задачи в running, закрытый одним из ``outcomes`` (#1455).
+
+    Только прогон, закончившийся ПОСЛЕ входа задачи в running, и только без
+    сдачи его поколения: задачу, которую после остановки взяли снова или
+    уже сдали, старый прогон не трогает.
+    """
+    marks = ", ".join("?" for _ in outcomes)
+    return await fetchall(
+        db,
+        "SELECT r.* FROM executor_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE t.status = 'running' AND t.archived = 0 "
+        "AND r.id = (SELECT MAX(x.id) FROM executor_runs x WHERE x.task_id = t.id) "
+        f"AND r.outcome IN ({marks}) AND r.finished_at IS NOT NULL "  # nosec B608 - placeholders only, values are params
+        "AND r.finished_at >= COALESCE(t.status_entered_at, '') "
+        "AND COALESCE(t.submission_generation, 0) < r.submission_generation "
+        "ORDER BY r.id",
+        tuple(outcomes),
+    )
+
+
+async def update_executor_run(
+    db: aiosqlite.Connection,
+    row_id: int,
+    *,
+    tokens: int | None = None,
+    cents: float | None = None,
+    outcome: str | None = None,
+    reason: str = "",
+    finish: bool = False,
+) -> None:
+    """Обновить строку по опросу (#1410). Коммит — за вызывающим.
+
+    ``None`` в ``tokens``/``cents``/``outcome`` — «провайдер этого не назвал»:
+    прежнее значение остаётся, а не обнуляется. ``reason`` пишется всегда —
+    пустая строка снимает прежнюю причину. ``finish`` ставит ``finished_at``
+    и длительность от ``started_at``.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET "
+        "tokens=COALESCE(?, tokens), cents=COALESCE(?, cents), "
+        "outcome=COALESCE(?, outcome), reason=?, polled_at=datetime('now'), "
+        "finished_at=CASE WHEN ? THEN datetime('now') ELSE finished_at END, "
+        "duration_ms=CASE WHEN ? THEN CAST(ROUND("
+        "(julianday('now') - julianday(started_at)) * 86400000) AS INTEGER) "
+        "ELSE duration_ms END "
+        "WHERE id=?",
+        (tokens, cents, outcome, reason, finish, finish, row_id),
+    )
+
+
+async def set_executor_run_agent(
+    db: aiosqlite.Connection, row_id: int, *, agent_id: str, run_id: str
+) -> None:
+    """Дописать агента и прогон в бронь запуска (#1412). Коммит — за вызывающим."""
+    await db.execute(
+        "UPDATE executor_runs SET agent_id=?, run_id=? WHERE id=?",
+        (agent_id, run_id, row_id),
+    )
+
+
+async def set_executor_run_starting_ref(
+    db: aiosqlite.Connection, row_id: int, starting_ref: str
+) -> None:
+    """Записать ссылку, от которой заказан прогон (#1563). Коммит — за вызывающим.
+
+    Пишется ДО заказа провайдеру: слепой исход (ответ не пришёл) всё равно
+    оставляет в строке то, что хаб отправил.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET starting_ref=? WHERE id=?", (starting_ref, row_id)
+    )
+
+
+async def wait_for_executor_cost(
+    db: aiosqlite.Connection, row_id: int, minutes: int
+) -> bool:
+    """Отметить ожидание цены (#1410); True — срок ожидания исчерпан.
+
+    Отметка ставится один раз — при первом конце прогона без цены — и дальше
+    не сдвигается, иначе ожидание не кончилось бы никогда.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=COALESCE(cost_wait_since, "
+        "datetime('now')) WHERE id=?",
+        (row_id,),
+    )
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE id=? "
+        "AND cost_wait_since <= datetime('now', ?)",
+        (row_id, f"-{minutes} minutes"),
+    )
+    return bool(rows)

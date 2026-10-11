@@ -8,11 +8,19 @@ last successful release (#839), never from parsing free-text outcome_deadline.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
+import json
+
 import aiosqlite
 from httpx import AsyncClient
 
 from hub import repository as repo
-from hub.services.outcomes import derive_outcome_status, outcome_debt
+from hub.services.outcomes import (
+    derive_outcome_status,
+    outcome_debt,
+    resolve_outcome_status,
+)
 
 
 async def _project(db: aiosqlite.Connection, slug: str = "ship") -> int:
@@ -50,12 +58,40 @@ async def _completed_task(
     return task_id
 
 
-async def _release_after_completion(
-    db: aiosqlite.Connection, project_id: int, sha: str = "a" * 40
+_PR = iter(range(9000, 99999))
+
+
+async def _fix_release(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    days_ago: float,
+    sha: str,
+    release_project_id: int | None = None,
 ) -> None:
-    await repo.record_release(
-        db, deployed_sha=sha, project_id=project_id, ref="main", source="ci"
+    """The task's merge, stamped with a release first deployed ``days_ago`` ago."""
+    await repo.record_pipeline_merge(
+        db, pr_number=next(_PR), merge_sha=f"m{sha}", task_id=task_id
     )
+    await db.execute(
+        "UPDATE pipeline_merges SET released_pr=1, released_sha=? WHERE id = "
+        "(SELECT MAX(id) FROM pipeline_merges WHERE task_id=?)",
+        (f"  {sha.upper()} ", task_id),
+    )
+    await repo.record_release(
+        db, deployed_sha=sha, project_id=release_project_id, ref="main", source="ci"
+    )
+    await db.execute(
+        "UPDATE releases SET deployed_at=datetime('now', ?) WHERE deployed_sha=?",
+        (f"-{days_ago} days", sha),
+    )
+    await db.commit()
+
+
+async def _release_after_completion(
+    db: aiosqlite.Connection, task_id: int, sha: str = "a" * 40
+) -> None:
+    await _fix_release(db, task_id, days_ago=20, sha=sha)
 
 
 async def test_not_due_and_unanswered_are_distinct(
@@ -80,15 +116,10 @@ async def test_not_due_and_unanswered_are_distinct(
         ("Within the first 30 captures", waiting, due),
     )
     await db.commit()
-    await _release_after_completion(db, project_id)
-
-    # Same free-text deadline, different machine states: waiting finished
-    # after the release, due finished before it.
-    await db.execute(
-        "UPDATE tasks SET completed_at=datetime('now', '+1 days') WHERE id=?",
-        (waiting,),
-    )
-    await db.commit()
+    # Same free-text deadline, different machine states: the fix of `waiting`
+    # went out 3 days ago (window open), the fix of `due` 20 days ago.
+    await _fix_release(db, waiting, days_ago=3, sha="a" * 40)
+    await _fix_release(db, due, days_ago=20, sha="f" * 40)
     waiting_body = (await client.get(f"/api/tasks/{waiting}")).json()
     due_body = (await client.get(f"/api/tasks/{due}")).json()
 
@@ -106,7 +137,7 @@ async def test_no_hypothesis_is_never_overdue(
     task_id = await _completed_task(
         db, title="Typical technical backlog", metric="", project_id=project_id
     )
-    await _release_after_completion(db, project_id, sha="b" * 40)
+    await _release_after_completion(db, task_id, sha="b" * 40)
 
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     debt = await outcome_debt(db)
@@ -124,7 +155,7 @@ async def test_status_is_derived_from_answers_not_a_stored_column(
     task_id = await _completed_task(
         db, title="Answered hypothesis", metric="X: 0 -> 5", project_id=project_id
     )
-    await _release_after_completion(db, project_id, sha="c" * 40)
+    await _release_after_completion(db, task_id, sha="c" * 40)
     resp = await client.post(
         f"/api/tasks/{task_id}/outcome-answers",
         json={"verdict": "moved", "measured_value": "0 → 5 on prod"},
@@ -193,7 +224,7 @@ async def test_review_brief_and_card_expose_status(
     task_id = await _completed_task(
         db, title="Visible status", metric="a number", project_id=project_id
     )
-    await _release_after_completion(db, project_id, sha="d" * 40)
+    await _release_after_completion(db, task_id, sha="d" * 40)
 
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     card = await client.get(f"/tasks/{task_id}")
@@ -205,28 +236,145 @@ async def test_review_brief_and_card_expose_status(
 
 
 async def test_overdue_sample_uses_machine_deadline(db: aiosqlite.Connection):
+    """AC-6. A release with no merge of the task is not its fix: unknown."""
     project_id = await _project(db, slug="overdue")
-    waiting = await _completed_task(
-        db, title="Not yet shipped", metric="a number", project_id=project_id
+    without_merge = await _completed_task(
+        db, title="Release but no merge", metric="a number", project_id=project_id
     )
     due = await _completed_task(
         db, title="Shipped, no answer", metric="a number", project_id=project_id
     )
-    await _release_after_completion(db, project_id, sha="e" * 40)
-    await db.execute(
-        "UPDATE tasks SET completed_at=datetime('now', '+1 days') WHERE id=?",
-        (waiting,),
+    await repo.record_release(
+        db, deployed_sha="e" * 40, project_id=project_id, ref="main", source="ci"
     )
+    await db.execute("UPDATE releases SET deployed_at=datetime('now', '-30 days')")
     await db.commit()
+    await _fix_release(db, due, days_ago=20, sha="9" * 40)
 
     debt = await outcome_debt(db)
     overdue_ids = [item["task_id"] for item in debt["overdue"]]
     by_id = {item["task_id"]: item["outcome_status"] for item in debt["items"]}
 
-    assert by_id[waiting] == "not_due"
+    assert by_id[without_merge] == "unknown"
     assert by_id[due] == "unanswered"
     assert due in overdue_ids
-    assert waiting not in overdue_ids
+    assert without_merge not in overdue_ids
+
+
+async def test_window_not_reached_is_observing(db: aiosqlite.Connection):
+    """AC-1. Fix deployed 3 days ago: observing, due_on = deploy + 14 days."""
+    task_id = await _completed_task(db, title="Fresh fix", metric="a number")
+    await _fix_release(db, task_id, days_ago=3, sha="1" * 40)
+
+    debt = await outcome_debt(db)
+    item = next(i for i in debt["items"] if i["task_id"] == task_id)
+    expected = (datetime.now(UTC) + timedelta(days=11)).date().isoformat()
+
+    assert item["outcome_status"] == "not_due"
+    assert item["due_on"] == expected
+    assert task_id in [i["task_id"] for i in debt["observing"]]
+    assert task_id not in [i["task_id"] for i in debt["overdue"]]
+    assert debt["observing_total"] == 1 and debt["overdue_total"] == 0
+
+
+async def test_window_reached_is_overdue(db: aiosqlite.Connection):
+    """AC-2. Fix first deployed 20 days ago: overdue. A later re-deploy of the
+    same sha does not move the anchor; sha match is trim+lower, no project_id."""
+    task_id = await _completed_task(db, title="Old fix", metric="a number")
+    await _fix_release(db, task_id, days_ago=20, sha="2" * 40, release_project_id=None)
+    await repo.record_release(
+        db, deployed_sha="2" * 40, project_id=7, ref="main", source="ci"
+    )
+
+    debt = await outcome_debt(db)
+
+    assert [i["task_id"] for i in debt["overdue"]] == [task_id]
+    assert debt["overdue_total"] == 1
+    assert debt["observing_total"] == 0 and debt["unknown_total"] == 0
+
+
+async def test_no_fix_release_is_unknown(db: aiosqlite.Connection):
+    """AC-3. No release of the fix: unknown, counted, never overdue."""
+    merged_unreleased = await _completed_task(db, title="Merged", metric="a number")
+    await repo.record_pipeline_merge(
+        db, pr_number=next(_PR), merge_sha="abc", task_id=merged_unreleased
+    )
+    sha_without_row = await _completed_task(db, title="No row", metric="a number")
+    await repo.record_pipeline_merge(
+        db, pr_number=next(_PR), merge_sha="def", task_id=sha_without_row
+    )
+    await db.execute(
+        "UPDATE pipeline_merges SET released_sha='dead' WHERE task_id=?",
+        (sha_without_row,),
+    )
+    await db.commit()
+    no_merge = await _completed_task(db, title="Nothing", metric="a number")
+
+    debt = await outcome_debt(db)
+    by_id = {i["task_id"]: i for i in debt["items"]}
+
+    for tid in (merged_unreleased, sha_without_row, no_merge):
+        assert by_id[tid]["outcome_status"] == "unknown"
+        assert by_id[tid]["due_on"] is None
+    assert debt["unknown_total"] == 3
+    assert [i["task_id"] for i in debt["unknown"]] == [
+        merged_unreleased,
+        sha_without_row,
+        no_merge,
+    ]
+    assert debt["overdue_total"] == 0
+
+
+async def test_epic_due_from_children_fix_release(db: aiosqlite.Connection):
+    """AC-4. Epic and feature without a merge of their own: the latest fix
+    release among descendants sets the deadline."""
+    epic = await _completed_task(db, title="Epic", metric="a number")
+    feature = await _completed_task(db, title="Feature", metric="a number")
+    old_child = await _completed_task(db, title="Old child", metric="")
+    new_child = await _completed_task(db, title="New child", metric="")
+    grandchild = await _completed_task(db, title="Grandchild", metric="")
+    await db.execute("UPDATE tasks SET task_type='epic' WHERE id=?", (epic,))
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (epic, feature))
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (epic, old_child))
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (feature, new_child))
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (new_child, grandchild))
+    await db.commit()
+    await _fix_release(db, old_child, days_ago=40, sha="3" * 40)
+    await _fix_release(db, grandchild, days_ago=20, sha="4" * 40)
+
+    debt = await outcome_debt(db)
+    overdue = [i["task_id"] for i in debt["overdue"]]
+    assert epic in overdue and feature in overdue
+
+    # The latest child release still inside the window keeps the epic observing.
+    fresh = await _completed_task(db, title="Fresh child", metric="")
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (epic, fresh))
+    await db.commit()
+    await _fix_release(db, fresh, days_ago=2, sha="5" * 40)
+    debt = await outcome_debt(db)
+    by_id = {i["task_id"]: i["outcome_status"] for i in debt["items"]}
+    assert by_id[epic] == "not_due"
+    assert by_id[feature] == "unanswered"
+
+
+async def test_card_and_debt_agree(db: aiosqlite.Connection, client: AsyncClient):
+    """AC-5. Card, brief and debt read one function."""
+    fresh = await _completed_task(db, title="Fresh", metric="a number")
+    old = await _completed_task(db, title="Old", metric="a number")
+    none = await _completed_task(db, title="None", metric="a number")
+    await _fix_release(db, fresh, days_ago=1, sha="6" * 40)
+    await _fix_release(db, old, days_ago=30, sha="7" * 40)
+
+    debt = await outcome_debt(db)
+    by_id = {i["task_id"]: i["outcome_status"] for i in debt["items"]}
+    assert set(by_id.values()) == {"not_due", "unanswered", "unknown"}
+    for tid in (fresh, old, none):
+        card = (await client.get(f"/api/tasks/{tid}")).json()
+        brief = (await client.get(f"/api/tasks/{tid}/review-brief")).json()
+        assert card["outcome_status"] == by_id[tid] == brief["outcome_status"]
+    page = await client.get(f"/tasks/{none}")
+    assert 'data-outcome-status="unknown"' in page.text
+    assert "Релиз фикса неизвестен" in page.text
 
 
 async def test_derive_maps_verdicts_and_ignores_deadline_text():
@@ -236,8 +384,7 @@ async def test_derive_maps_verdicts_and_ignores_deadline_text():
         derive_outcome_status(
             outcome_metric="metric",
             answers=answers,
-            completed_at="2026-01-01T00:00:00+00:00",
-            latest_release={"deployed_at": "2026-02-01T00:00:00+00:00"},
+            fix_released_at="2026-02-01T00:00:00+00:00",
         )
         == "refuted"
     )
@@ -245,8 +392,7 @@ async def test_derive_maps_verdicts_and_ignores_deadline_text():
         derive_outcome_status(
             outcome_metric="",
             answers=[],
-            completed_at="2026-01-01T00:00:00+00:00",
-            latest_release={"deployed_at": "2026-02-01T00:00:00+00:00"},
+            fix_released_at="2026-02-01T00:00:00+00:00",
         )
         == "no_hypothesis"
     )
@@ -254,8 +400,259 @@ async def test_derive_maps_verdicts_and_ignores_deadline_text():
         derive_outcome_status(
             outcome_metric="metric",
             answers=[],
-            completed_at="2026-01-01T00:00:00+00:00",
-            latest_release=None,
+            fix_released_at=None,
         )
-        == "not_due"
+        == "unknown"
     )
+
+
+async def test_mcp_and_cli_show_the_three_buckets(db: aiosqlite.Connection):
+    """MCP text names overdue/observing/unknown counts and the due date; the CLI
+    prints the REST payload as is, so the new fields reach it unchanged."""
+    import argparse
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from hub import cli, mcp_server
+
+    fresh = await _completed_task(db, title="Fresh", metric="a number")
+    await _fix_release(db, fresh, days_ago=1, sha="8" * 40)
+    await _completed_task(db, title="No fix", metric="a number")
+    payload = await outcome_debt(db)
+    page = await outcome_debt(db, status="observing")
+
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=page)):
+        tool = mcp_server.hub_outcome_debt
+        result = await (tool.fn() if hasattr(tool, "fn") else tool())
+    text = "\n".join(b.text for b in result.content if hasattr(b, "text"))
+    with patch.object(cli, "_api", MagicMock(return_value=payload)):
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.cmd_outcome_debt(argparse.Namespace())
+
+    assert "0 overdue, 1 observing, 1 unknown" in text
+    assert f"due {payload['observing'][0]['due_on']}" in text
+    assert '"unknown_total": 1' in buf.getvalue()
+
+
+async def test_anchor_is_the_last_merge_of_the_task(db: aiosqlite.Connection):
+    """AC-1/AC-2. A re-opened task is anchored on its LAST merge's release."""
+    task_id = await _completed_task(db, title="Merged twice", metric="a number")
+    await _fix_release(db, task_id, days_ago=40, sha="a1" * 20)
+    await _fix_release(db, task_id, days_ago=2, sha="b2" * 20)
+
+    debt = await outcome_debt(db)
+
+    assert [i["task_id"] for i in debt["observing"]] == [task_id]
+    assert debt["overdue_total"] == 0
+
+
+async def _delivery_project(
+    db: aiosqlite.Connection, slug: str, policy: dict | None
+) -> int:
+    pid = await _project(db, slug)
+    if policy is not None:
+        await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+        await db.commit()
+    return pid
+
+
+async def _merge(
+    db: aiosqlite.Connection, task_id: int, project_id: int, *, days_ago: int
+) -> None:
+    """A merge of the task in the project, unstamped: no release PR exists."""
+    await repo.record_pipeline_merge(
+        db,
+        pr_number=next(_PR),
+        merge_sha=f"s{next(_PR)}",
+        project_id=project_id,
+        task_id=task_id,
+        merged_at=(datetime.now(UTC) - timedelta(days=days_ago)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    )
+
+
+async def _resolve(db: aiosqlite.Connection, task_id: int):
+    task = dict(await repo.get_task(db, task_id))
+    return await resolve_outcome_status(db, task, [])
+
+
+async def test_merge_is_delivery_due_from_merge_assumed(db: aiosqlite.Connection):
+    """AC-1. The key makes the merge the delivery: due = merge + 14 days, assumed."""
+    pid = await _delivery_project(db, "local-app", {"merge_is_delivery": True})
+    # tasks.project_id stays empty on purpose: the project is the merge's.
+    task_id = await _completed_task(db, title="Local fix", metric="a number")
+    await _merge(db, task_id, pid, days_ago=3)
+
+    status, due_on, assumed = await _resolve(db, task_id)
+
+    assert status.value == "not_due"
+    assert due_on == (datetime.now(UTC) + timedelta(days=11)).date().isoformat()
+    assert assumed is True
+
+
+async def test_without_merge_is_delivery_stays_unknown(db: aiosqlite.Connection):
+    """AC-2. No key (also false and a non-bool): unknown, no date, not assumed."""
+    # A project WITH the key exists, so a gate by project (not by "any key") shows.
+    await _delivery_project(db, "declared", {"merge_is_delivery": True})
+    for slug, policy in (
+        ("plain", None),
+        ("spike-bo", {"release": "manual"}),
+        ("off", {"merge_is_delivery": False}),
+        ("typo", {"merge_is_delivery": "true"}),
+    ):
+        pid = await _delivery_project(db, slug, policy)
+        task_id = await _completed_task(db, title=f"Fix {slug}", metric="a number")
+        await _merge(db, task_id, pid, days_ago=30)
+
+        status, due_on, assumed = await _resolve(db, task_id)
+
+        assert (status.value, due_on, assumed) == ("unknown", None, False), slug
+
+
+async def test_merge_is_delivery_due_from_first_deploy_after_merge(
+    db: aiosqlite.Connection,
+):
+    """AC-3. A project with successful releases: the first deploy at or after the
+    merge, not assumed; a deploy before the merge and a failed one do not count."""
+    pid = await _delivery_project(db, "app", {"merge_is_delivery": True})
+    task_id = await _completed_task(db, title="Shipped fix", metric="a number")
+    await _merge(db, task_id, pid, days_ago=10)
+    for sha, days, status in (
+        ("a" * 40, 20, "success"),  # before the merge
+        ("b" * 40, 8, "failed"),  # failed
+        ("c" * 40, 6, "success"),  # the one
+        ("d" * 40, 2, "success"),  # a later one
+    ):
+        await repo.record_release(
+            db, deployed_sha=sha, project_id=pid, ref="main", status=status
+        )
+        await db.execute(
+            "UPDATE releases SET deployed_at=datetime('now', ?) WHERE deployed_sha=?",
+            (f"-{days} days", sha),
+        )
+    await db.commit()
+
+    fix = await repo.first_fix_deploy_at(db, task_id, delivery_projects={pid})
+    expected = await db.execute_fetchall(
+        "SELECT deployed_at FROM releases WHERE deployed_sha=?", ("c" * 40,)
+    )
+    assert fix.at == expected[0][0]
+    assert fix.assumed is False
+
+    _, due_on, assumed = await _resolve(db, task_id)
+    assert due_on == (datetime.now(UTC) + timedelta(days=8)).date().isoformat()
+    assert assumed is False
+
+
+async def test_merge_is_delivery_without_deploy_after_merge_stays_unknown(
+    db: aiosqlite.Connection,
+):
+    """Releases exist but none after the merge: the fix has not shipped yet."""
+    pid = await _delivery_project(db, "app2", {"merge_is_delivery": True})
+    task_id = await _completed_task(db, title="Waiting fix", metric="a number")
+    await _merge(db, task_id, pid, days_ago=1)
+    await repo.record_release(db, deployed_sha="e" * 40, project_id=pid, ref="main")
+    await db.execute("UPDATE releases SET deployed_at=datetime('now', '-9 days')")
+    await db.commit()
+
+    status, due_on, assumed = await _resolve(db, task_id)
+
+    assert (status.value, due_on, assumed) == ("unknown", None, False)
+
+
+async def test_stamped_merge_keeps_the_release_path_under_the_key(
+    db: aiosqlite.Connection,
+):
+    """A merge with released_sha is dated by its release, key or not."""
+    pid = await _delivery_project(db, "both", {"merge_is_delivery": True})
+    task_id = await _completed_task(db, title="Released", metric="a number")
+    await _fix_release(db, task_id, days_ago=3, sha="f" * 40)
+    await db.execute("UPDATE pipeline_merges SET project_id=?", (pid,))
+    await db.commit()
+
+    _, due_on, assumed = await _resolve(db, task_id)
+
+    assert due_on == (datetime.now(UTC) + timedelta(days=11)).date().isoformat()
+    assert assumed is False
+
+
+async def test_epic_is_assumed_when_any_descendant_is(db: aiosqlite.Connection):
+    """with_descendants: the rolled-up date is assumed if any child's is."""
+    pid = await _delivery_project(db, "tree", {"merge_is_delivery": True})
+    epic = await _completed_task(db, title="Epic", metric="a number")
+    await db.execute("UPDATE tasks SET task_type='epic' WHERE id=?", (epic,))
+    child = await _completed_task(db, title="Child", metric="")
+    await db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (epic, child))
+    await db.commit()
+    await _merge(db, child, pid, days_ago=5)
+
+    _, due_on, assumed = await _resolve(db, epic)
+
+    assert due_on == (datetime.now(UTC) + timedelta(days=9)).date().isoformat()
+    assert assumed is True
+
+
+async def test_mcp_outcome_debt_says_when_the_date_is_assumed(
+    db: aiosqlite.Connection,
+):
+    """#1572: the MCP text marks a due date counted from the merge."""
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+
+    pid = await _delivery_project(db, "mcp-app", {"merge_is_delivery": True})
+    assumed = await _completed_task(db, title="Assumed", metric="a number")
+    await _merge(db, assumed, pid, days_ago=2)
+    payload = await outcome_debt(db, status="observing")
+
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=payload)):
+        tool = mcp_server.hub_outcome_debt
+        result = await (tool.fn() if hasattr(tool, "fn") else tool())
+    text = "\n".join(b.text for b in result.content if hasattr(b, "text"))
+
+    assert "(assumed: from merge)" in text
+
+
+async def test_the_last_merge_decides_the_project(db: aiosqlite.Connection):
+    """A task merged in two projects is dated by the project of its LAST merge."""
+    declared = await _delivery_project(db, "yes", {"merge_is_delivery": True})
+    plain = await _delivery_project(db, "no", None)
+    ends_in_declared = await _completed_task(db, title="A", metric="a number")
+    await _merge(db, ends_in_declared, plain, days_ago=9)
+    await _merge(db, ends_in_declared, declared, days_ago=3)
+    ends_in_plain = await _completed_task(db, title="B", metric="a number")
+    await _merge(db, ends_in_plain, declared, days_ago=9)
+    await _merge(db, ends_in_plain, plain, days_ago=3)
+
+    first = await _resolve(db, ends_in_declared)
+    second = await _resolve(db, ends_in_plain)
+
+    assert first[2] is True and first[1] is not None
+    assert (second[1], second[2]) == (None, False)
+
+
+async def test_epic_with_a_released_and_an_assumed_child_is_assumed(
+    db: aiosqlite.Connection,
+):
+    """The rolled-up date is assumed when ANY dated descendant is, even if the
+    latest date belongs to a recorded release."""
+    pid = await _delivery_project(db, "mixed", {"merge_is_delivery": True})
+    epic = await _completed_task(db, title="Epic", metric="a number")
+    await db.execute("UPDATE tasks SET task_type='epic' WHERE id=?", (epic,))
+    released = await _completed_task(db, title="Released child", metric="")
+    assumed = await _completed_task(db, title="Merged child", metric="")
+    await db.execute(
+        "UPDATE tasks SET parent_id=? WHERE id IN (?, ?)", (epic, released, assumed)
+    )
+    await db.commit()
+    await _fix_release(db, released, days_ago=1, sha="7" * 40)
+    await _merge(db, assumed, pid, days_ago=6)
+
+    _, due_on, is_assumed = await _resolve(db, epic)
+
+    assert due_on == (datetime.now(UTC) + timedelta(days=13)).date().isoformat()
+    assert is_assumed is True

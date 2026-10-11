@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Варианты шапки страницы проекта — макет (#1471)</title>
+<style>
+:root{
+  --bg:#0c0e14;--surface:#171a24;--surface-hover:#1e2130;--surface-active:#252838;
+  --border:#252838;--border-subtle:#1e2130;
+  --text:#e4e7f0;--text-secondary:#a0a5b8;--text-muted:#6b7084;
+  /* Два цвета сигнала, больше цветов в статусах нет (спека §7):
+     акцент = «требует вас / ваш шаг» (существующий токен --orange), сигнал = «ошибка, авария» (новый --signal). */
+  --orange:#f39c12;            /* 7,92:1 на --surface, существующий токен хаба */
+  --signal:#ff6b5b;            /* 6,21:1 на --surface; НОВЫЙ токен вместо --red #e74c3c (4,54:1) */
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;
+  --radius:8px;--radius-sm:6px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--mono:"SF Mono","JetBrains Mono",monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 var(--font)}
+/* Ссылки нейтральные: цвет текста и тонкое подчёркивание, а не ещё один цвет */
+a{color:var(--text);text-decoration:underline;text-decoration-color:var(--text-muted);text-underline-offset:3px}
+a:hover{text-decoration-color:var(--text)}
+a.chip,a.btn,.tabs a,.project-seg a,.epic-title{text-decoration:none}
+a:focus-visible,summary:focus-visible,select:focus-visible,input:focus-visible,button:focus-visible,label:focus-visible,textarea:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-hover);padding:0 4px;border-radius:4px;overflow-wrap:anywhere}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 4px}h3{font-size:12px;margin:0}h4{font-size:13px;margin:0 0 4px}
+.u-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.muted{color:var(--text-secondary)}
+.small{font-size:12px}
+p{margin:0 0 6px}
+b{font-weight:600}
+
+/* ---------- обвязка макета (не часть страницы) ---------- */
+.mock-bar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.mock-bar a{margin-right:4px}
+#w375{position:absolute;opacity:0}
+.mock-bar label.tog{cursor:pointer;border:1px solid var(--text-muted);border-radius:100px;padding:2px 12px;min-height:28px}
+#w375:checked ~ .mock-bar label[for=w375]{background:var(--text);color:var(--bg)}
+#w375:focus-visible ~ .mock-bar label[for=w375]{outline:2px solid var(--text);outline-offset:2px}
+.banner{margin:12px 16px;padding:8px 12px;border:1px dashed var(--text-muted);border-radius:var(--radius);color:var(--text-secondary)}
+.stage{padding:0 16px 48px;display:flex;justify-content:center}
+.frame{container-type:inline-size;container-name:pg;width:100%;max-width:1100px}
+#w375:checked ~ .stage .frame{max-width:375px;border:1px solid var(--border);border-radius:16px;padding:0 0 8px}
+.page-tag{font:12px var(--mono);color:var(--text-secondary);margin:28px 0 8px;overflow-wrap:anywhere}
+/* пометки «какая задача наполняет блок»: обвязка макета, в готовой странице их нет */
+.ann{font:12px var(--mono);color:var(--text-secondary);border:1px dashed var(--text-muted);border-radius:4px;padding:0 6px;white-space:normal;text-transform:none;letter-spacing:0;font-weight:400}
+.src{color:var(--text-secondary);font:12px var(--mono);overflow-wrap:anywhere;min-width:0}
+
+/* ---------- СУЩЕСТВУЮЩИЕ классы (имена как в hub/static/style.css), значения ИЗМЕНЕНЫ по спеке §7 ---------- */
+.page-header{margin:8px 0 12px}
+.page-title{display:flex;align-items:center;gap:8px}
+/* бейдж: без заливки, 1 px рамка; цвет только у двух смыслов */
+.badge{display:inline-flex;align-items:center;padding:1px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;line-height:1.5;white-space:nowrap;background:transparent;color:var(--text-secondary)}
+.badge--xs{font-size:9px;padding:1px 5px;letter-spacing:.2px}
+.badge-draft,.badge-needs_decision-you{border-color:var(--orange);color:var(--orange)}   /* требует вас */
+.badge-failed,.badge-needs_decision{border-color:var(--signal);color:var(--signal)}      /* ошибка, авария */
+.badge-completed,.badge-running,.badge-review,.badge-muted{border-color:var(--border);color:var(--text-secondary)}  /* нейтральные */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:8px 20px;border-radius:var(--radius);font:600 13px/1.5 var(--font);border:1px solid var(--text-muted);cursor:pointer;white-space:nowrap;min-height:36px;background:transparent;color:var(--text)}
+.btn-primary{background:var(--surface-active);border-color:var(--border);color:var(--text)}   /* нейтральная */
+.btn-success{border-color:var(--orange);color:var(--orange)}                                 /* действие владельца: «Одобрить», «Активировать» */
+.btn-ghost{border-color:var(--border);color:var(--text-secondary)}
+.btn-ghost:hover,.btn-primary:hover{background:var(--surface-hover);color:var(--text)}
+.btn-sm{padding:4px 12px;font-size:12px}
+.btn-xs{padding:3px 12px;font-size:11px;border-radius:var(--radius-sm);min-height:32px}
+.btn[disabled]{cursor:not-allowed;color:var(--text-secondary);border:1px dashed var(--border);background:transparent}
+.topbar-stats{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.topbar-stat{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:var(--radius);background:transparent;border:1px solid var(--border);white-space:nowrap;min-height:32px;color:var(--text)}
+.topbar-stat-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--text-secondary)}
+.topbar-stat-value{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;min-width:14px;text-align:center}
+.project-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-bottom:20px}
+.project-cards>*{min-width:0}
+.project-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--sp-4)}
+.project-card--archived{background:transparent}
+.epic-header{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;min-width:0}
+.epic-title{font-size:14px;font-weight:600}
+.epic-children{display:flex;flex-direction:column;gap:4px;min-width:0}
+.epic-child-link{font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;padding:4px 0;min-width:0;text-decoration:none}
+.epic-child-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epic-empty{font-size:12px;color:var(--text-secondary);padding:4px 0}
+.project-admin-facts{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:8px 0;font-size:13px}
+.project-admin-facts dt{color:var(--text-secondary)}
+.project-admin-facts dd{margin:0;overflow-wrap:anywhere}
+.project-admin-note{display:block;color:var(--text-secondary);font-size:12px}
+.project-admin-actions{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.project-archive-summary{cursor:pointer;display:flex;align-items:center;min-height:44px;font-size:14px;color:var(--text-secondary)}
+.task-action-label{display:block;font-size:12px;color:var(--text-secondary);margin:8px 0 2px}
+.task-action-control{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit}
+
+/* ---------- НОВОЕ (префикс project-) ---------- */
+.project-card-meta{margin:0 0 8px;font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}
+.project-row{display:grid;grid-template-columns:132px minmax(0,1fr);gap:4px 12px;padding:8px 0;border-top:1px solid var(--border-subtle)}
+.project-row>h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);padding-top:6px}
+.project-row>div{min-width:0}
+.project-chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+/* чип: нейтральный, 1 px. Цвет: chip--you (акцент, только если N > 0) и chip--bad (сигнал, только ошибка) */
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:2px 10px;border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text);background:transparent;white-space:nowrap;max-width:100%}
+a.chip:hover{border-color:var(--text-muted);background:var(--surface-hover)}
+.chip b{font-variant-numeric:tabular-nums}
+.chip--long,.chip--bad,.chip--warn,.chip--ok{white-space:normal;flex-wrap:wrap;text-align:left}
+.chip--you{border-color:var(--orange);color:var(--orange)}.chip--you b{color:var(--orange)}
+.chip--bad,.chip--warn{border-color:var(--signal)}.chip--bad .w,.chip--warn .w{color:var(--signal);font-weight:700}
+.chip--ok .w,.chip--lock .w{color:var(--text-secondary);font-weight:400}
+.chip--zero{border-style:dashed}.chip--zero b{color:var(--text-secondary)}
+.chip--link{margin-right:2px}
+.project-mini{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:4px;font-size:13px}
+.project-mini li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;align-items:baseline}
+.project-mini .t{min-width:0;overflow-wrap:anywhere}
+.project-mini .r{font-size:12px;color:var(--text-secondary)}
+.project-mini .r b{color:var(--text);font-weight:600}
+.project-more{font-size:12px;margin:4px 0 0}
+/* оговорка: тихая, без заливки; полоска 2 px только у ошибки */
+.project-note{border-left:1px solid var(--text-muted);padding:0 0 0 8px;font-size:12px;margin:6px 0;color:var(--text-secondary)}
+.project-note--bad{border-left:2px solid var(--signal);color:var(--text)}
+.project-note--info{border-left-color:var(--text-muted)}
+.project-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.project-seg a{padding:6px 10px;min-height:36px;display:inline-flex;align-items:center;color:var(--text-secondary);border-right:1px solid var(--border)}
+.project-seg a:last-child{border-right:0}
+.project-seg a[aria-current=true]{background:var(--surface-active);color:var(--text);font-weight:600}
+.project-toolbar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 6px}
+.project-empty{border:1px dashed var(--border);border-radius:var(--radius);padding:10px;color:var(--text-secondary);font-size:13px}
+.project-empty b{color:var(--text)}
+.project-delta{font-size:12px;color:var(--text-secondary)}
+.project-search{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin:0 0 6px}
+.project-search input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit;flex:1 1 140px;min-width:0}
+
+@container pg (max-width:760px){
+  .project-cards{grid-template-columns:minmax(0,1fr)}
+}
+@container pg (max-width:480px){
+  .project-row{grid-template-columns:1fr}
+  .project-row>h3{padding-top:0}
+  .project-mini li{grid-template-columns:1fr}
+  .chip,.topbar-stat{min-height:44px}
+  .btn,.btn-xs,.btn-sm{min-height:44px}
+  .project-seg{width:100%}.project-seg a{flex:1;justify-content:center;min-height:44px}
+  .project-search input{min-height:44px}
+  .project-admin-actions .btn{flex:1 1 100%}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+/* ---- страница проекта: тихая иерархия (спека §7) ---- */
+.crumbs{color:var(--text-secondary);font-size:13px;margin:8px 0 0}
+.tabradio{position:absolute;opacity:0;width:1px;height:1px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin:12px 0 16px;overflow-x:auto}
+.tabs label,.tabs a{padding:8px 12px;font-size:14px;color:var(--text-secondary);white-space:nowrap;cursor:pointer;min-height:36px;display:inline-flex;align-items:center;border-bottom:1px solid transparent}
+.panel{display:none}
+#tab-path:checked ~ .panels #p-path,#tab-work:checked ~ .panels #p-work,#tab-policy:checked ~ .panels #p-policy,#tab-models:checked ~ .panels #p-models,#tab-set:checked ~ .panels #p-set{display:block}
+#tab-path:checked ~ .tabs label[for=tab-path],#tab-work:checked ~ .tabs label[for=tab-work],#tab-policy:checked ~ .tabs label[for=tab-policy],#tab-models:checked ~ .tabs label[for=tab-models],#tab-set:checked ~ .tabs label[for=tab-set]{color:var(--text);border-bottom-color:var(--text);font-weight:600}
+.tabradio:focus-visible ~ .tabs label{outline:1px dotted var(--text)}
+/* секция без рамки: отделяется отступом и тонкой линией сверху */
+section.blk{padding:14px 0 4px;margin-bottom:12px;border-top:1px solid var(--border)}
+section.blk:first-child{border-top:0}
+.summary{font-size:18px;line-height:1.4;color:var(--text);margin:0 0 4px;padding:4px 0 12px}
+.summary .k{color:var(--text-secondary)}
+.attn{border-left:2px solid var(--orange);padding:2px 0 2px 12px;margin:0 0 12px}
+.attn--ok{border-left:1px solid var(--border)}
+.attn--bad{border-left-color:var(--signal)}
+.attn--info{border-left-color:var(--orange)}
+.attn h2,.attn h3,.attn h4{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);margin:0 0 4px;font-weight:600}
+.epic{border-top:1px solid var(--border-subtle);padding:12px 0}
+.epic:first-of-type{border-top:0;padding-top:4px}
+.epic-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;margin-bottom:8px}
+.epic-head h3{font-size:14px;text-transform:none;letter-spacing:0;font-weight:600}
+.epic-meta{color:var(--text-secondary);font-size:13px}
+ol.path{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px 22px;counter-reset:st}
+/* ячейка пути: имя и статус текстом, 1 px, без заливки; выделен только шаг владельца полоской 2 px и словом */
+.step{position:relative;border:1px solid var(--border-subtle);border-radius:6px;padding:6px 8px 6px 30px;min-width:150px;max-width:210px;flex:0 1 190px;font-size:13px}
+.step::before{counter-increment:st;content:counter(st);position:absolute;left:8px;top:6px;font:12px var(--mono);color:var(--text-secondary)}
+.step:not(:last-child)::after{content:"→";position:absolute;right:-18px;top:50%;transform:translateY(-50%);color:var(--text-muted)}
+.step b{display:block;font-size:12px;font-weight:600;overflow-wrap:anywhere}
+.step .st{font-size:12px;display:block;color:var(--text-secondary)}
+.step .sz{font:11px var(--mono);color:var(--text-secondary)}
+.step .tag{display:block;font-size:12px;color:var(--text)}
+.step .tag::before{content:"⚑ "}
+.s-you{border-left:2px solid var(--orange)}.s-you .st{color:var(--orange);font-weight:600}
+.s-ext{border-style:dashed}
+.pnote{margin-top:8px;font-size:13px;color:var(--text-secondary)}
+.pnote .you{color:var(--orange);font-weight:600}
+.pnote .bn{color:var(--text);font-weight:600}
+.legend{margin:10px 0 0;font-size:12px;color:var(--text-secondary)}
+.group h3{font-size:14px;text-transform:none;letter-spacing:0;margin:14px 0 4px;display:flex;gap:8px;align-items:baseline;font-weight:600;color:var(--text)}
+.group h3.g-you{color:var(--orange)}
+.count{font-size:12px;color:var(--text-secondary);font-weight:400}
+.qrow{display:grid;grid-template-columns:64px minmax(0,1fr) minmax(0,300px);gap:4px 10px;padding:6px 0;border-top:1px solid var(--border-subtle);font-size:13px}
+.qrow .id{color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.qrow .why{font-size:13px;color:var(--text-secondary)}
+.qrow .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.qrow.is-next .ttl{font-weight:700}
+.qrow.is-next .why::before{content:"▸ "}
+.qrow.is-next .why{color:var(--text);font-weight:600}
+details.more summary{cursor:pointer;color:var(--text-secondary);font-size:13px;min-height:36px;display:flex;align-items:center}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border-subtle);vertical-align:top}
+th{color:var(--text-secondary);font-weight:600}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.src-pill{display:inline-block;border:1px solid var(--border);border-radius:100px;padding:0 8px;font-size:12px;color:var(--text-secondary)}
+.src-pill.proj{color:var(--text);border-color:var(--text-muted)}
+.diff-old{color:var(--text-secondary);text-decoration:line-through}.diff-new{color:var(--text);font-weight:700}
+.hist{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.hist li{border-top:1px solid var(--border-subtle);padding-top:4px}
+.gal .project-card{margin-bottom:12px}
+.dl-in{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:13px;margin:6px 0}
+.dl-in dt{color:var(--text-secondary)}.dl-in dd{margin:0}
+@container pg (max-width:760px){
+  .qrow{grid-template-columns:52px minmax(0,1fr)}
+  .qrow .why{grid-column:2}
+}
+@container pg (max-width:480px){
+  .tabs label,.tabs a{min-height:44px}
+  .summary{font-size:16px}
+  ol.path{flex-direction:column;gap:6px}
+  .step{max-width:none;flex:1 1 auto;min-width:0}
+  .step:not(:last-child)::after{content:"↓";right:auto;left:10px;top:auto;bottom:-16px;transform:none}
+  .step:not(:last-child){margin-bottom:10px}
+  table.stack-sm thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  table.stack-sm tr{display:block;border-bottom:1px solid var(--border-subtle);padding:6px 0}
+  table.stack-sm td{display:flex;justify-content:space-between;gap:12px;border:0;padding:2px 4px;text-align:right}
+  table.stack-sm td::before{content:attr(data-label);color:var(--text-secondary);text-align:left;flex:0 0 40%}
+  details.more summary{min-height:44px}
+  .attn .btn{width:100%}
+}
+
+</style>
+</head>
+<body>
+<input type="checkbox" id="w375" aria-label="Показать в рамке 375 px">
+<div class="mock-bar">
+  <strong>Служебный файл #1471</strong>
+  <span><a href="project-page.html">← Страница проекта</a> <a href="project-card.html">Дашборд проектов</a></span>
+  <label class="tog" for="w375">Вариант 375 px (вкл/выкл)</label>
+</div>
+<div class="stage"><div class="frame">
+<h1>Варианты шапки страницы проекта — для вёрстки, на странице не показываются</h1>
+<p class="muted">Это не страница и не список проектов. Шесть состояний шапки <b>одного и того же проекта</b> (в макете он называется default), которые вёрстка страницы <code>/projects/{slug}</code> должна уметь показать. Во всех шести есть «Требует вас», «Ждёт вас: N» и все вкладки. Числа выдуманы. Спека: §4.1 и §4.8 в <code>docs/specs/project-card-ux.md</code>.</p>
+<section class="project-cards gal" aria-label="Шесть состояний шапки страницы">
+<article class="project-card" aria-label="Шапка страницы в состоянии 1">
+<p class="src" style="margin:0 0 6px">состояние 1 · норма</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 1, проект default</h2></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Решений не требуется.</p></section>
+<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 2 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>2</b></a><a class="chip " href="#" aria-label="На ревью: 1 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>1</b></a><a class="chip " href="#" aria-label="5 ключей политики проекта отличаются от умолчаний" data-target="/projects/default?tab=policy"><span></span><b>5 ключей политики отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 2">
+<p class="src" style="margin:0 0 6px">состояние 2 · ждёт вас</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 2, проект default</h2><span class="badge badge-draft">ждёт вас: 7</span></div>
+<section class="attn " aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0 0 4px"><a class="chip chip--you chip--link" href="project-page.html" aria-label="Ждёт вас 7 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>7</b></a> Верхние 3, полный список на вкладке «Путь и очередь»:</p><ol class="project-mini"><li><span class="t"><a href="#">#1375</a> SID: отчёты и команды CLI</span><span class="r"><b>needs_decision</b></span></li><li><span class="t"><a href="#">#1471</a> Дизайн карточки</span><span class="r"><b>приёмка макета</b></span></li><li><span class="t"><a href="#">#1466</a> Политика моделей</span><span class="r"><b>вердикт</b></span></li></ol></section>
+<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 1 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>1</b></a><a class="chip " href="#" aria-label="На ревью: 2 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>2</b></a><a class="chip " href="#" aria-label="7 ключей политики проекта отличаются от умолчаний" data-target="/projects/default?tab=policy"><span></span><b>7 ключей политики отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 3">
+<p class="src" style="margin:0 0 6px">состояние 3 · ошибка workspace</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 3, проект default</h2><span class="badge badge-failed">workspace: ошибка</span></div>
+<section class="attn attn--bad" aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0 0 4px"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> по задачам. <span class="badge badge-failed">ошибка</span> Workspace не собран:</p><p class="project-note project-note--bad">git clone: Permission denied (publickey) для agentdrover/haiplane</p><a class="btn btn-primary btn-sm" href="#">Проверить workspace</a></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="3 ключа политики проекта отличаются от умолчаний" data-target="/projects/default?tab=policy"><span></span><b>3 ключа политики отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 4">
+<p class="src" style="margin:0 0 6px">состояние 4 · ждёт активации</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 4, проект default</h2><span class="badge badge-draft">ждёт активации</span></div>
+<section class="attn attn--info" aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0 0 4px"><a class="chip chip--you chip--link" href="project-page.html" aria-label="Ждёт вас 1 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>1</b></a> <span class="badge badge-draft">ждёт активации</span> Проект не активирован и не попал в git-маршрутизацию.</p><button class="btn btn-success btn-sm" type="button">Активировать</button></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Политика всё по умолчанию — проект default" data-target="/projects/default?tab=policy"><span>Политика</span><b>всё по умолчанию</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 5">
+<p class="src" style="margin:0 0 6px">состояние 5 · архив: «Требует вас» и вкладка «Политика» на месте</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 5, проект default</h2><span class="badge badge-muted">в архиве</span></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Проект в архиве: решений и действий нет. Вернуть его можно на вкладке «Настройки».</p></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="2 ключа политики проекта отличаются от умолчаний" data-target="/projects/default?tab=policy"><span></span><b>2 ключа политики отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 6">
+<p class="src" style="margin:0 0 6px">состояние 6 · пусто</p>
+<div class="epic-header"><h2 style="margin:0;font-size:14px">Состояние 6, проект default</h2></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h3>Требует вас</h3><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Решений не требуется. Живой работы нет — все эпики проекта доделаны или их ещё не завели.</p></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Политика всё по умолчанию — проект default" data-target="/projects/default?tab=policy"><span>Политика</span><b>всё по умолчанию</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article>
+</section>
+</div></div>
+</body>
+</html>

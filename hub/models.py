@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, date, datetime, time
 from enum import Enum
 from typing import Any, Literal
 
@@ -133,6 +134,19 @@ class WorkType(str, Enum):
     docs = "docs"
     spike = "spike"
     incident = "incident"
+
+
+class ResultKind(str, Enum):
+    """Что является результатом работы (#1647).
+
+    ``commit`` — коммит в репозитории (все существующие задачи). ``state`` —
+    состояние мира (сервер настроен, ключ сменён, DNS переключён): у такой
+    задачи нет ветки, PR и CI, сдача — доказательства по каждому AC, а
+    вердикт выносит только человек на конкретное поколение.
+    """
+
+    commit = "commit"
+    state = "state"
 
 
 class DefectFoundIn(str, Enum):
@@ -323,11 +337,311 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # project_policy.review_limit_of / review_limit_mode_of.
     "review_limit",
     "review_limit_mode",
+    # #1274: очередь исполнения в тени и WIP-лимит проекта. Не гейт и ничего
+    # не делегирует: тень только пишет событие. Читатели:
+    # project_policy.queue_mode_of / wip_limit_of.
+    "orchestrator_queue",
+    "wip_limit",
+    # #1414: суточный потолок deep-ревью проекта. Не гейт и ничего не
+    # делегирует — замок #743 его не трогает. Читатель:
+    # review_dispatch.deep_daily_cap_of.
+    "deep_daily_cap",
+    # #1416: порог маленькой пересдачи в строках авторской дельты. Не гейт и
+    # ничего не делегирует. Читатель: review_dispatch.small_delta_lines_of.
+    "small_delta_lines",
+    # #1412 (F2.4): запуск облачного исполнителя. Не гейт и ничего не
+    # делегирует: запуск нажимает человек. Читатели:
+    # executor_launch.launch_mode_of и _observation_missing.
+    "executor_launch",
+    "executor_push_rights_task",
+    # #1443 (F5.1): суммарный потолок исполнителя на задачу. Читатель:
+    # executor_dispatch.task_budget.
+    "executor_task_cents_ceiling",
+    "executor_task_token_ceiling",
+    # #1432: число заходов круга, с которого deep приостановлен до решения
+    # человека. Не гейт. Читатель: review_dispatch.circle_deep_stop_of.
+    "circle_deep_stop",
+    # #1436: контракт сдачи — model, summary и мутация на каждый AC с тестом.
+    # Не гейт и ничего не делегирует. Читатель:
+    # project_policy.submission_contract_of.
+    "submission_contract",
+    # #1433: сверка областей при захвате задачи. Не гейт и ничего не
+    # делегирует. Читатель: project_policy.claim_area_check_of.
+    "claim_area_check",
+    # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
+    # project_policy.bug_red_test_of.
+    "bug_red_test",
+    # #1629: гейт «CI до сдачи» (off|warn|require). Не делегирует. Читатель:
+    # project_policy.ci_before_submit_of.
+    "ci_before_submit",
+    # #1456: проверка путей постановки (validation_commands, test_ref) на
+    # существование. Не гейт, не делегирует. Читатель:
+    # project_policy.statement_paths_of.
+    "statement_paths",
+    # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
+    # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
+    "slot_dead_minutes",
+    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
+    # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
+    "deep_reviewer",
+    # #1653: согласие проекта на локального ревьюера ВМЕСТО отказавшего облака
+    # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
+    # Читатель: project_policy.local_review_fallback_of.
+    "local_review_fallback",
+    # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
+    # отдельного выката): срок исхода считается от даты мержа. Не гейт и
+    # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
+    "merge_is_delivery",
+    # #1589: предупреждения по путям диффа сдачи — список {pattern, text}. Не
+    # гейт, ничего не блокирует и не делегирует. Читатель:
+    # project_policy.path_notices_of.
+    "path_notices",
+    # #1591: пары «файл репо на голове релиза → серверная копия» — релиз не
+    # сливается, пока копия расходится. Не гейт ревью и ничего не делегирует.
+    # Читатель: project_policy.release_artifacts_of.
+    "release_artifacts",
+    # #1594: заморозка проекта — допуск новой работы только для разрешённых
+    # типов и с обоснованием. Не гейт и ничего не делегирует: человека не
+    # заменяет, а ограничивает и его, и автоодобрение. Читатель:
+    # project_policy.freeze_of; единственная проверка: freeze_admission.
+    "freeze",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
+
+
+def _validate_merge_is_delivery(policy: dict[str, Any]) -> None:
+    """``merge_is_delivery`` — только true или false (#1572).
+
+    Читатель понимает один ``True``; строка «true» выглядела бы включённой, ничего
+    не включая, поэтому запись отказывает громко.
+    """
+    if "merge_is_delivery" in policy and not isinstance(
+        policy["merge_is_delivery"], bool
+    ):
+        raise ValueError(
+            "gate_policy merge_is_delivery must be true or false, "
+            f"got: {policy['merge_is_delivery']!r}"
+        )
+
+
+PATH_NOTICES_MAX_RULES = 50
+PATH_NOTICES_MAX_PATTERN = 200
+PATH_NOTICES_MAX_TEXT = 500
+
+
+def _validate_path_notices(policy: dict[str, Any]) -> None:
+    """``path_notices`` — список {pattern, text} в заданных пределах (#1589).
+
+    Пустой список допустим и значит «правил нет». Отказ громкий: правило,
+    выброшенное молча, читалось бы как «путь описан», когда не описан ничего.
+    Значения нормализуются (пробелы по краям срезаются) на месте.
+    """
+    if "path_notices" not in policy:
+        return
+    rules = policy["path_notices"]
+    if not isinstance(rules, list):
+        raise ValueError(
+            "gate_policy path_notices must be a list of {pattern, text}, "
+            f"got: {type(rules).__name__}"
+        )
+    if len(rules) > PATH_NOTICES_MAX_RULES:
+        raise ValueError(
+            f"gate_policy path_notices holds at most {PATH_NOTICES_MAX_RULES} "
+            f"rules, got {len(rules)}"
+        )
+    cleaned: list[dict[str, str]] = []
+    for index, rule in enumerate(rules):
+        where = f"gate_policy path_notices[{index}]"
+        if not isinstance(rule, dict) or set(rule) != {"pattern", "text"}:
+            raise ValueError(f"{where} must be an object with pattern and text")
+        pattern, text = rule["pattern"], rule["text"]
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(f"{where}.pattern must be a non-empty string")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{where}.text must be a non-empty string")
+        if len(pattern.strip()) > PATH_NOTICES_MAX_PATTERN:
+            raise ValueError(
+                f"{where}.pattern is longer than {PATH_NOTICES_MAX_PATTERN} chars"
+            )
+        if len(text.strip()) > PATH_NOTICES_MAX_TEXT:
+            raise ValueError(
+                f"{where}.text is longer than {PATH_NOTICES_MAX_TEXT} chars"
+            )
+        cleaned.append({"pattern": pattern.strip(), "text": text.strip()})
+    policy["path_notices"] = cleaned
+
+
+FREEZE_NOTE_MAX = 500
+FREEZE_FIELDS = ("until", "allow_work_types", "note")
+
+
+def parse_freeze_until(raw: Any) -> datetime | None:
+    """``freeze.until`` -> момент в UTC; ``None`` - «до снятия» (#1594).
+
+    Принимается timestamp ISO 8601 С ЧАСОВЫМ ПОЯСОМ либо дата без времени
+    (00:00 UTC этого дня). Время без пояса отказывается: «до 18:00» без пояса
+    читается по-разному у владельца и у сервера, а заморозка - не то место, где
+    это можно угадывать.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "gate_policy freeze.until must be an ISO 8601 timestamp with a "
+            f"time zone, a date, or null, got: {raw!r}"
+        )
+    text = raw.strip()
+    try:
+        if len(text) == 10:
+            return datetime.combine(date.fromisoformat(text), time(), tzinfo=UTC)
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            "gate_policy freeze.until must be an ISO 8601 timestamp with a "
+            f"time zone (e.g. 2026-10-26T00:00:00+00:00) or a date, got: {raw!r}"
+        ) from None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(
+            "gate_policy freeze.until has no time zone; write "
+            f"2026-10-26T00:00:00+00:00 or a bare date, got: {raw!r}"
+        )
+    return moment.astimezone(UTC)
+
+
+def validated_freeze(raw: Any) -> dict[str, Any]:
+    """Привести ``gate_policy.freeze`` к каноническому виду или отказать (#1594).
+
+    Канон: ``{until: UTC-ISO | None, allow_work_types: [str], note: str}``.
+    Прошедший ``until`` допустим - он значит «не действует»; неизвестный тип
+    работы и лишний ключ отказываются: тип, выброшенный молча, читался бы как
+    «разрешён всем», а ключ-опечатка - как «заморозки с ограничением нет».
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "gate_policy freeze must be an object {until, allow_work_types, note}, "
+            f"got: {type(raw).__name__}"
+        )
+    extra = set(raw) - set(FREEZE_FIELDS)
+    if extra:
+        raise ValueError(
+            f"gate_policy freeze has unknown keys: {sorted(extra)}; "
+            f"allowed: {', '.join(FREEZE_FIELDS)}"
+        )
+    types = raw.get("allow_work_types")
+    if not isinstance(types, list):
+        raise ValueError(
+            "gate_policy freeze.allow_work_types must be a list of work types "
+            f"({', '.join(w.value for w in WorkType)}); an empty list admits nothing"
+        )
+    known = {w.value for w in WorkType}
+    allowed: list[str] = []
+    for item in types:
+        if not isinstance(item, str):
+            raise ValueError(
+                "gate_policy freeze.allow_work_types must hold work type names "
+                f"(strings), got: {item!r}"
+            )
+        name = item.strip()
+        if name not in known:
+            raise ValueError(
+                f"gate_policy freeze.allow_work_types has unknown work type "
+                f"{item!r}; allowed: {', '.join(sorted(known))}"
+            )
+        if name not in allowed:
+            allowed.append(name)
+    note = raw.get("note", "")
+    if not isinstance(note, str):
+        raise ValueError("gate_policy freeze.note must be a string")
+    note = note.strip()
+    if len(note) > FREEZE_NOTE_MAX:
+        raise ValueError(
+            f"gate_policy freeze.note is longer than {FREEZE_NOTE_MAX} chars"
+        )
+    until = parse_freeze_until(raw.get("until"))
+    return {
+        "until": until.isoformat() if until is not None else None,
+        "allow_work_types": allowed,
+        "note": note,
+    }
+
+
+def _validate_freeze(policy: dict[str, Any]) -> None:
+    if "freeze" in policy:
+        policy["freeze"] = validated_freeze(policy["freeze"])
+
+
+RELEASE_ARTIFACTS_MAX = 20
+RELEASE_ARTIFACT_HINT_MAX = 500
+
+
+def _validate_release_artifacts(policy: dict[str, Any]) -> None:
+    """``release_artifacts`` — список {repo_path, server_path, update_hint} (#1591).
+
+    Только «точные копии». ``server_path`` проверяется по ТЕКУЩЕМУ списку
+    каталогов хоста (``HAIPLANE_RELEASE_ARTIFACT_DIRS``); при чтении проверка
+    повторяется — запись могла лечь до смены списка. Пустой список допустим.
+    """
+    if "release_artifacts" not in policy:
+        return
+    from hub import config
+    from hub.release_artifact_paths import repo_path_problem, server_path_problem
+
+    pairs = policy["release_artifacts"]
+    if not isinstance(pairs, list):
+        raise ValueError(
+            "gate_policy release_artifacts must be a list of "
+            f"{{repo_path, server_path, update_hint}}, got: {type(pairs).__name__}"
+        )
+    if len(pairs) > RELEASE_ARTIFACTS_MAX:
+        raise ValueError(
+            f"gate_policy release_artifacts holds at most {RELEASE_ARTIFACTS_MAX} "
+            f"pairs, got {len(pairs)}"
+        )
+    cleaned: list[dict[str, str]] = []
+    for index, pair in enumerate(pairs):
+        where = f"gate_policy release_artifacts[{index}]"
+        keys = {"repo_path", "server_path", "update_hint"}
+        if not isinstance(pair, dict) or set(pair) != keys:
+            raise ValueError(
+                f"{where} must be an object with repo_path, server_path, update_hint"
+            )
+        problem = repo_path_problem(pair["repo_path"]) or server_path_problem(
+            pair["server_path"], tuple(config.RELEASE_ARTIFACT_DIRS)
+        )
+        if problem:
+            raise ValueError(f"{where}: {problem}")
+        hint = pair["update_hint"]
+        if not isinstance(hint, str) or not hint.strip():
+            raise ValueError(f"{where}.update_hint must be a non-empty string")
+        if len(hint.strip()) > RELEASE_ARTIFACT_HINT_MAX:
+            raise ValueError(
+                f"{where}.update_hint is longer than {RELEASE_ARTIFACT_HINT_MAX} chars"
+            )
+        cleaned.append(
+            {
+                "repo_path": pair["repo_path"],
+                "server_path": pair["server_path"],
+                "update_hint": hint.strip(),
+            }
+        )
+    policy["release_artifacts"] = cleaned
+
+
+def _validate_count(policy: dict[str, Any], key: str) -> None:
+    """Счётный ключ — целое ≥ 0 или ничего (#1414 deep_daily_cap, #1416
+    small_delta_lines).
+
+    ``True`` — тоже int в Python, и «потолок true» читался бы как 1; строка
+    «2» выглядела бы числом, не будучи им для читателя. Обе — отказ.
+    """
+    if key not in policy:
+        return
+    value = policy[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"gate_policy {key} must be an integer >= 0, got: {value!r}")
 
 
 def _validate_review_limit(policy: dict[str, Any]) -> None:
@@ -351,6 +665,176 @@ def _validate_review_limit(policy: dict[str, Any]) -> None:
             raise ValueError(
                 "gate_policy review_limit_mode must be one of "
                 f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
+
+
+def _validate_executor_task_ceilings(policy: dict[str, Any]) -> None:
+    """Refuse a task ceiling the budget reader would silently ignore (#1443)."""
+    cents = policy.get("executor_task_cents_ceiling")
+    if "executor_task_cents_ceiling" in policy and (
+        isinstance(cents, bool) or not isinstance(cents, int | float) or cents <= 0
+    ):
+        raise ValueError(
+            "gate_policy executor_task_cents_ceiling must be a positive number "
+            f"of cents, got: {cents!r}"
+        )
+    tokens = policy.get("executor_task_token_ceiling")
+    if "executor_task_token_ceiling" in policy and (
+        isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1
+    ):
+        raise ValueError(
+            "gate_policy executor_task_token_ceiling must be an integer >= 1, "
+            f"got: {tokens!r}"
+        )
+
+
+def _validate_executor_launch(policy: dict[str, Any]) -> None:
+    """Refuse a launch mode the reader would silently read as off (#1412).
+
+    ``auto`` is refused with its reason: without the dispatcher issuing the
+    implementer code (F4 #1368) there is nobody to launch on its own.
+    """
+    from hub.services.executor_launch import LAUNCH_MODES
+
+    if "executor_launch" in policy and policy["executor_launch"] not in LAUNCH_MODES:
+        raise ValueError(
+            "gate_policy executor_launch must be one of "
+            f"{', '.join(LAUNCH_MODES)}, got: {policy['executor_launch']!r}; "
+            "auto waits for the dispatcher-issued implementer code (F4 #1368)"
+        )
+    if "executor_push_rights_task" in policy:
+        witness = policy["executor_push_rights_task"]
+        if isinstance(witness, bool) or not isinstance(witness, int) or witness < 1:
+            raise ValueError(
+                "gate_policy executor_push_rights_task must be a task id, "
+                f"got: {witness!r}"
+            )
+
+
+def _validate_submission_contract(policy: dict[str, Any]) -> None:
+    """Refuse a contract mode the reader would read as warn by accident (#1436)."""
+    from hub.services.project_policy import SUBMISSION_CONTRACT_MODES
+
+    if (
+        "submission_contract" in policy
+        and policy["submission_contract"] not in SUBMISSION_CONTRACT_MODES
+    ):
+        raise ValueError(
+            "gate_policy submission_contract must be one of "
+            f"{', '.join(SUBMISSION_CONTRACT_MODES)}, "
+            f"got: {policy['submission_contract']!r}"
+        )
+
+
+def _validate_bug_red_test(policy: dict[str, Any]) -> None:
+    """Refuse a red-test gate mode the reader would read as warn by accident (#913)."""
+    from hub.services.project_policy import BUG_RED_TEST_MODES
+
+    if "bug_red_test" in policy and policy["bug_red_test"] not in BUG_RED_TEST_MODES:
+        raise ValueError(
+            "gate_policy bug_red_test must be one of "
+            f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
+        )
+
+
+def _validate_ci_before_submit(policy: dict[str, Any]) -> None:
+    """Refuse a CI-before-submit mode the reader would read as warn by accident (#1629)."""
+    from hub.services.project_policy import CI_BEFORE_SUBMIT_MODES
+
+    if (
+        "ci_before_submit" in policy
+        and policy["ci_before_submit"] not in CI_BEFORE_SUBMIT_MODES
+    ):
+        raise ValueError(
+            "gate_policy ci_before_submit must be one of "
+            f"{', '.join(CI_BEFORE_SUBMIT_MODES)}, got: {policy['ci_before_submit']!r}"
+        )
+
+
+def _validate_deep_reviewer(policy: dict[str, Any]) -> None:
+    """Refuse a deep-reviewer value the reader would read as cloud by accident (#1561)."""
+    from hub.services.project_policy import DEEP_REVIEWERS
+
+    if "deep_reviewer" in policy and policy["deep_reviewer"] not in DEEP_REVIEWERS:
+        raise ValueError(
+            "gate_policy deep_reviewer must be one of "
+            f"{', '.join(DEEP_REVIEWERS)}, got: {policy['deep_reviewer']!r}"
+        )
+
+
+def _validate_local_review_fallback(policy: dict[str, Any]) -> None:
+    """Refuse a fallback value the reader would read as off by accident (#1653)."""
+    from hub.services.project_policy import LOCAL_REVIEW_FALLBACKS
+
+    if (
+        "local_review_fallback" in policy
+        and policy["local_review_fallback"] not in LOCAL_REVIEW_FALLBACKS
+    ):
+        raise ValueError(
+            "gate_policy local_review_fallback must be one of "
+            f"{', '.join(LOCAL_REVIEW_FALLBACKS)}, "
+            f"got: {policy['local_review_fallback']!r}"
+        )
+
+
+def _validate_statement_paths(policy: dict[str, Any]) -> None:
+    """Refuse a path-check mode the reader would read as warn by accident (#1456)."""
+    from hub.services.project_policy import STATEMENT_PATHS_MODES
+
+    if (
+        "statement_paths" in policy
+        and policy["statement_paths"] not in STATEMENT_PATHS_MODES
+    ):
+        raise ValueError(
+            "gate_policy statement_paths must be one of "
+            f"{', '.join(STATEMENT_PATHS_MODES)}, "
+            f"got: {policy['statement_paths']!r}"
+        )
+
+
+def _validate_claim_area_check(policy: dict[str, Any]) -> None:
+    """Refuse a capture-check mode the reader would read as warn by accident (#1433)."""
+    from hub.services.project_policy import CLAIM_AREA_CHECK_MODES
+
+    if (
+        "claim_area_check" in policy
+        and policy["claim_area_check"] not in CLAIM_AREA_CHECK_MODES
+    ):
+        raise ValueError(
+            "gate_policy claim_area_check must be one of "
+            f"{', '.join(CLAIM_AREA_CHECK_MODES)}, "
+            f"got: {policy['claim_area_check']!r}"
+        )
+
+
+def _validate_slot_dead_minutes(policy: dict[str, Any]) -> None:
+    """Порог смерти слота — целое >= 1 минуты или ничего (#1434)."""
+    if "slot_dead_minutes" not in policy:
+        return
+    value = policy["slot_dead_minutes"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"gate_policy slot_dead_minutes must be an integer >= 1, got: {value!r}"
+        )
+
+
+def _validate_orchestrator_queue(policy: dict[str, Any]) -> None:
+    """Refuse a queue mode or WIP limit the reader would silently ignore (#1274)."""
+    from hub.services.project_policy import QUEUE_MODES
+
+    if (
+        "orchestrator_queue" in policy
+        and policy["orchestrator_queue"] not in QUEUE_MODES
+    ):
+        raise ValueError(
+            "gate_policy orchestrator_queue must be one of "
+            f"{', '.join(QUEUE_MODES)}, got: {policy['orchestrator_queue']!r}"
+        )
+    if "wip_limit" in policy:
+        limit = policy["wip_limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"gate_policy wip_limit must be an integer >= 1, got: {limit!r}"
             )
 
 
@@ -492,6 +976,9 @@ class TaskCreate(BaseModel):
     source: TaskSource = TaskSource.human
     agent: str = Field("", max_length=100)
     rationale: str = Field("", max_length=5000)
+    # #1594: почему эта работа допустима при заморозке проекта. Не то же, что
+    # rationale (общая необходимость): пустое после strip = обоснования нет.
+    freeze_rationale: str = Field("", max_length=1000)
     human_owner: str = Field("", max_length=100)
     human_reviewer: str = Field("", max_length=100)
     run_immediately: bool = False
@@ -524,11 +1011,29 @@ class TaskCreate(BaseModel):
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
+    # #1647: результат — коммит или состояние мира. Только у листовых
+    # task/subtask; feature/epic остаются агрегатами. Меняется потом только в
+    # draft (refine). rollback — как вернуть состояние назад; обязателен для
+    # DoR state-задачи, у commit-задачи не читается.
+    result_kind: ResultKind = ResultKind.commit
+    rollback: str = Field("", max_length=2000)
     client_request_id: str | None = Field(
         default=None,
         max_length=128,
         description="Optional idempotency key; duplicates return the original task",
     )
+
+    @model_validator(mode="after")
+    def _state_only_for_leaves(self) -> "TaskCreate":
+        if self.result_kind == ResultKind.state and self.task_type in (
+            TaskType.epic,
+            TaskType.feature,
+        ):
+            raise ValueError(
+                "result_kind=state is allowed for task and subtask only: "
+                "feature and epic stay aggregates"
+            )
+        return self
 
 
 MAX_BULK_CHILD_TASKS = 20
@@ -542,7 +1047,16 @@ class BulkChildTaskItem(BaseModel):
     # DoR without a follow-up refine round-trip. Forward refs are resolved by
     # ``BulkChildTaskItem.model_rebuild()`` after AcceptanceCriterion/TaskRisk.
     acceptance_criteria: list["AcceptanceCriterion"] | None = None
-    risks: list["TaskRisk"] | None = None
+    # #1592: the same cap TaskRefine applies; a longer list used to pass here and
+    # fail with a bare ValidationError after the first rows were written.
+    risks: list["TaskRisk"] | None = Field(default=None, max_length=MAX_RISKS)
+    # #1594: тип работы и обоснование допуска ребёнка. Раньше тип терялся и
+    # ребёнок становился feature; при заморозке проекта этого мало.
+    work_type: WorkType = WorkType.feature
+    freeze_rationale: str = Field("", max_length=1000)
+    # #1647: те же два поля, что у TaskCreate; тип родителя — task/subtask.
+    result_kind: ResultKind = ResultKind.commit
+    rollback: str = Field("", max_length=2000)
 
 
 class BulkChildTasksCreate(BaseModel):
@@ -592,6 +1106,9 @@ class BatchApprove(BaseModel):
 class BatchApproveSkipped(BaseModel):
     task_id: int
     reason: str
+    # #1594: текст причины отказа (заморозка со сроком и note), когда у кода
+    # причины он есть; пусто - код говорит сам за себя.
+    detail: str = ""
 
 
 class BatchApproveResult(BaseModel):
@@ -649,6 +1166,40 @@ class TaskPairStart(BaseModel):
     git_mode: PairGitMode = PairGitMode.hub
 
 
+class SubmissionMutation(BaseModel):
+    """Одна заявленная мутация сдачи (#1436): что сломали и какой тест упал.
+
+    Заявление, а не наблюдение: хаб мутаций не исполняет (это #1278). Поле
+    делает заявление проверяемым по форме — ``failed_test`` сверяется с
+    ``test_ref`` именно этого AC — и видимым судье. Пустые строки не режутся
+    здесь: при ``require`` отказ перечисляет ВСЕ нарушения разом, а ошибка
+    валидации тела назвала бы только первое.
+    """
+
+    ac: str = Field("", max_length=20)
+    mutation: str = Field("", max_length=500)
+    failed_test: str = Field("", max_length=500)
+
+
+#: The three prevention outputs a closed prod defect may leave (#919).
+PreventionKind = Literal["regression_test", "rule", "accepted_risk"]
+
+
+class DefectPrevention(BaseModel):
+    """What a production defect leaves behind when it closes (#919).
+
+    Shape only. Which fields each kind needs — a test locator, a catalogued
+    category, a reason AND a revisit condition — is checked by
+    ``hub.services.prevention_gate``, so the refusal can name all three
+    options in one answer instead of a pydantic path.
+    """
+
+    kind: PreventionKind
+    ref: str = Field("", max_length=500)
+    reason: str = Field("", max_length=2000)
+    revisit: str = Field("", max_length=500)
+
+
 class TaskSubmitReview(BaseModel):
     """Submit the current work of a pair task for review (#305)."""
 
@@ -676,6 +1227,20 @@ class TaskSubmitReview(BaseModel):
     # found in the old". A separate endpoint would let the submission land
     # without the account, which is the silence being removed.
     finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+    # #1436: мутация на каждый AC с verifiable_by=test — {ac, mutation,
+    # failed_test}. Обязательность — по политике проекта submission_contract;
+    # при off поле просто пишется в карточку, если прислано.
+    mutations: list[SubmissionMutation] = Field(default_factory=list, max_length=50)
+    # #919: the prevention output of a production defect. The pair author's
+    # last word before the poller delivers, so it rides the submission.
+    prevention: DefectPrevention | None = None
+    # #1647: доказательства задачи-состояния — список записей {ac_id, action,
+    # observed, target, observed_at}, ровно по одной на каждый AC. Тип нарочно
+    # свободный: разбор и ошибки делает hub.services.state_task, а не pydantic —
+    # его 422 возвращает входное значение, а ошибка контракта доказательств не
+    # имеет права его вернуть (в observed может лежать секрет). У commit-задачи
+    # поле не читается.
+    evidence: Any = None
 
 
 class ReviewFinding(BaseModel):
@@ -724,6 +1289,11 @@ class TaskReviewVerdict(BaseModel):
     # the defect was not fixed; pasting the old text over a complaint the
     # author already closed is not, and only the reviewer can tell them apart.
     acknowledge_repeat: bool = False
+    # #1647: поколение сдачи, о котором судят. У задачи-состояния обязателен:
+    # запись вердикта и завершение условны по нему, расхождение — 409 без
+    # записей. У commit-задачи не читается (там вердикт и так пишется на
+    # текущее поколение, а стюард передаёт своё отдельным аргументом #1601).
+    expected_generation: int | None = None
 
 
 class LatestReview(BaseModel):
@@ -908,6 +1478,31 @@ class CIRunReportState(BaseModel):
     state: str = "unknown"
     reason: str = "отчёт CI о прогоне не запрашивался"
     head_sha: str = ""
+
+
+class CIEvidenceBlock(BaseModel):
+    """One piece of CI evidence about the commit under review (#1606).
+
+    ``state`` is ``received`` or ``not_received`` — never a pass. A commit whose
+    CI run skipped the step (a branch update) has nothing here, and the reader
+    must see "not received", not an empty field that looks like a clean result.
+    ``result`` is the step's own state (ran, error, ...), ``run`` names the run
+    and event it came from, or says the run is unknown for a block stored
+    before provenance existed.
+    """
+
+    state: str = "not_received"
+    result: str = ""
+    run: str = ""
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    reason: str = "не получено: отчёт CI о закреплённом коммите не прислан"
+
+
+class CIEvidenceState(BaseModel):
+    """Mutation and red-test baseline evidence, each with its own provenance."""
+
+    mutations: CIEvidenceBlock = Field(default_factory=lambda: CIEvidenceBlock())
+    baseline: CIEvidenceBlock = Field(default_factory=lambda: CIEvidenceBlock())
 
 
 class PrepassState(BaseModel):
@@ -1114,6 +1709,12 @@ class ReviewQueueRow(BaseModel):
     waiting_minutes: int | None = None
     # ready | ready_sha_unverified | findings | awaiting_report | blocked.
     readiness: str = "awaiting_report"
+    # #1648: commit | state. Для state: sha_check и report_status равны
+    # ``not_applicable`` (ветки и машинного отчёта нет), а готовность к вердикту
+    # определяют доказательства текущего поколения. None — не про эту задачу.
+    result_kind: str = "commit"
+    evidence_count: int | None = None
+    evidence_complete: bool | None = None
 
 
 class ReviewQueueView(BaseModel):
@@ -1146,6 +1747,111 @@ class ReviewCircleView(BaseModel):
     repeated_categories: list[str] = Field(default_factory=list)
 
 
+class RuleSourceDefect(BaseModel):
+    """The prod defect that named a catalogue rule on close (#919, #920)."""
+
+    task_id: int
+    title: str = ""
+
+
+class CatalogueRuleView(BaseModel):
+    """A category_checks rule whose area touches the task under review (#920).
+
+    The area is derived, not declared: where the class was met in confirmed
+    findings and in the defects that named the rule (see
+    ``hub.services.rule_catalogue``). ``source_defects`` is empty for a rule
+    recorded straight from the recurrence debt (#878) — no defect bought it.
+    """
+
+    category: str
+    check_ref: str
+    note: str = ""
+    #: When the rule was set up — not when its current check was recorded.
+    created_at: str = ""
+    #: The task's own areas that the rule's area touches.
+    matched_areas: list[str] = Field(default_factory=list)
+    source_defects: list[RuleSourceDefect] = Field(default_factory=list)
+    #: Tasks whose confirmed findings carried the class.
+    seen_in_tasks: list[int] = Field(default_factory=list)
+
+
+class ReviewerHarnessSkill(BaseModel):
+    """Active ``multi-agent-review`` text for a chat-pair reviewer session (#1586).
+
+    Not a field of ``ReviewBrief``: the key exists in the JSON ONLY for a
+    reviewer session (the route adds it), so the human card, an implementer,
+    MCP and CLI never carry ~12k characters they did not ask for. Empty
+    ``text`` with a ``reason`` means no ACTIVE version — a draft or the seed
+    is never substituted.
+    """
+
+    name: str
+    version: int | None = None
+    text: str = ""
+    reason: str = ""
+
+
+class ProfileDowngradeView(BaseModel):
+    """Требовался deep, а заказан lite — и почему (#1587).
+
+    Источник — событие ``review_dispatched`` ИМЕННО этого заказа (профиль и
+    причины), а не лента и не пересчёт правила: лента показывает то же, но
+    бриф читает человек на гейте, и «lite» без причины читается как «дёшево
+    потому что просто». ``state`` — «заказан», пока отчёта этого заказа нет, и
+    «отчёт получен», когда он есть: заказанное не равно выполненному.
+    """
+
+    required_profile: str = "deep"
+    ordered_profile: str = "lite"
+    reasons: list[str] = Field(default_factory=list)
+    state: str = "заказан"
+    channel: str = ""
+    dispatch_id: int | None = None
+    headline: str = ""
+
+
+class PathNoticeItem(BaseModel):
+    """One matched warning: the text, the rule patterns and the paths it hit (#1589)."""
+
+    text: str
+    patterns: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list)
+    #: Paths beyond the stored cap, so a long list stays readable.
+    more_paths: int = 0
+
+
+class PathNoticesView(BaseModel):
+    """The path-notice result recorded for ONE submission generation (#1589).
+
+    ``state``: ``matched`` (notices non-empty), ``none`` (diff read, no rule
+    hit) or ``unknown`` (diff not read; ``reason`` says why). ``sha`` is the
+    commit the paths were read for. Present only when the project had a
+    non-empty rule list at submission.
+    """
+
+    generation: int
+    sha: str = ""
+    state: str
+    reason: str = ""
+    notices: list[PathNoticeItem] = Field(default_factory=list)
+    #: Plain-text rendering shared by the feed, the MCP text and the brief.
+    text: str = ""
+
+
+class BriefTimings(BaseModel):
+    """How long each block of one brief assembly took (#1652), in milliseconds.
+
+    ``blocks`` holds only the blocks that applied to the task: an absent name
+    means "not asked", never "took 0 ms". ``total_ms`` runs from the entry of
+    the builder to the return of the object, on a monotonic clock; it is read
+    before the slow-brief log line is written (total_ms — до записи slow-brief
+    лога). The blocks add up to ``total_ms`` exactly.
+    """
+
+    blocks: dict[str, int] = Field(default_factory=dict)
+    total_ms: int = 0
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -1170,6 +1876,9 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    # #1606: mutation and baseline evidence for this commit, each block with the
+    # run it came from; "не получено" when the CI run for it skipped the step.
+    ci_evidence: CIEvidenceState = Field(default_factory=lambda: CIEvidenceState())
     # #875: which deterministic checks already passed on this very commit. The
     # reviewer reads it to stop paying model prices for what a linter proved
     # minutes earlier; the human reads it beside the report.
@@ -1224,6 +1933,16 @@ class ReviewBrief(BaseModel):
     # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
     # как первый.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #1587: требуемый и заказанный профиль, когда потолок или круг понизил
+    # deep до lite. None — понижения нет (блока нет вовсе).
+    profile_downgrade: ProfileDowngradeView | None = None
+    # #1440: who will write the verdict for this submission and under what
+    # condition — the answer of services.verdict_route, not a copy of its rules.
+    # None means "not computed on this path" or "task not in review".
+    verdict_route: dict[str, Any] | None = None
+    # #920: rules from category_checks whose area touches this task. Empty
+    # when none does — and then the rendered brief has no section for it.
+    catalogue_rules: list[CatalogueRuleView] = Field(default_factory=list)
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
     # whether they agree. sha_check is "match" | "diverged" | "unknown" —
@@ -1252,6 +1971,14 @@ class ReviewBrief(BaseModel):
     # #438: advisory — non-empty when the branch carries commits of another
     # unmerged task branch (stacked branches). Never blocks the review.
     stacking_warning: str = ""
+    # #1589: manual server steps named by the project for the paths this
+    # generation touched. None = no rules configured at submission.
+    path_notices: PathNoticesView | None = None
+    # #1648: вид результата и, для задачи-состояния, блок «что принимается».
+    result_kind: str = "commit"
+    state_review: "StateReviewView | None" = None
+    # #1652: where the assembly spent its time. None = this path did not time it.
+    timings: BriefTimings | None = None
 
 
 class TaskClaim(BaseModel):
@@ -1487,6 +2214,18 @@ class TaskUpdateCreate(BaseModel):
     # Optional by construction: a done report without outcomes behaves exactly
     # as it did before, and the done report is the most-called tool there is.
     finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+    # #919: the prevention output of a production defect. Optional on the
+    # wire; required by the gate only when the task is found_in='prod'.
+    prevention: DefectPrevention | None = None
+
+    @model_validator(mode="after")
+    def _only_a_done_report_carries_prevention(self) -> "TaskUpdateCreate":
+        if self.prevention is not None and self.kind != "done":
+            raise ValueError(
+                f"prevention is accepted only with kind='done', not "
+                f"'{self.kind}': it is the output of closing a defect"
+            )
+        return self
 
     @model_validator(mode="after")
     def _only_a_done_report_answers_findings(self) -> "TaskUpdateCreate":
@@ -1591,6 +2330,8 @@ class TaskRefine(BaseModel):
     # string is a legal value, so min_length is deliberately absent.
     description: str | None = Field(default=None, max_length=10000)
     work_type: WorkType | None = None
+    # #1594: обоснование допуска при заморозке проекта; пустая строка очищает.
+    freeze_rationale: str | None = Field(default=None, max_length=1000)
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
     wip_tag: WipTag | None = None
@@ -1617,6 +2358,9 @@ class TaskRefine(BaseModel):
     caused_by_task_id: int | None = Field(default=None, ge=1)
     detected_at: str | None = Field(default=None, max_length=32)
     clear_caused_by: bool = False
+    # #917: the release row the defect showed up in; resolved by
+    # ``repo.set_defect_passport`` (exists, succeeded, same project).
+    release_id: int | None = None
     scope_in: list[str] | None = Field(default=None, max_length=20)
     scope_out: list[str] | None = Field(default=None, max_length=20)
     affected_areas: list[str] | None = Field(default=None, max_length=20)
@@ -1632,6 +2376,11 @@ class TaskRefine(BaseModel):
     # ложится текст из карточки, а исполняет его служба с ключами, — это не
     # поле, а канал исполнения. "" очищает объявление.
     live_probe: str | None = Field(default=None, max_length=64)
+    # #1647: результат работы и способ отката. result_kind меняется только в
+    # draft; после сдачи state-задачи rollback и AC заморожены до возврата в
+    # работу (refinement._guard_state_statement).
+    result_kind: ResultKind | None = None
+    rollback: str | None = Field(default=None, max_length=2000)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
@@ -1855,6 +2604,11 @@ class ProdStateView(BaseModel):
     failure #824 refused to ship.
     """
 
+    # #1420: open release alerts (project, reason, since, minutes) — empty
+    # while every release moves.
+    release_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    # #1645: can the server reach GitHub — typed fields, see EgressStatus.
+    egress: dict[str, Any] = Field(default_factory=dict)
     deployed: dict[str, str] = Field(default_factory=dict)
     in_prod: list[ProdStateEntry] = Field(default_factory=list)
     not_in_prod: list[ProdStateEntry] = Field(default_factory=list)
@@ -1862,6 +2616,16 @@ class ProdStateView(BaseModel):
     examined: int = 0
     window: int = 0
     note: str = ""
+
+
+class ReleaseBlocksView(BaseModel):
+    """Open release alerts only (#1420) — the cheap read of hub_my_context.
+
+    The same rows as ``ProdStateView.release_blocks``, without the delivery
+    walk over completed tasks that the full snapshot costs.
+    """
+
+    release_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskUpdateView(BaseModel):
@@ -2038,6 +2802,10 @@ class DeployCallback(BaseModel):
     ref: str = Field("", max_length=200)
     status: str = Field("success", pattern="^(success|failed)$")
     project: str = Field("", max_length=100)
+    # #1590: the one-line verdict of the pre-deploy database backup
+    # (``ok <file> ...`` / ``failed (<why>)`` / ``skipped (<why>)``). Empty is
+    # "the client did not say" - an old client - and never erases a known one.
+    backup: str = Field("", max_length=500)
 
 
 class DeployView(BaseModel):
@@ -2050,6 +2818,217 @@ class DeployView(BaseModel):
     status: str = "success"
     source: str = ""
     deployed_at: str = ""
+    # #1590: «неизвестно» — отчёт пришёл без итога бэкапа (старый клиент).
+    backup: str = "неизвестно"
+
+
+class ProdDefectCreate(BaseModel):
+    """A production defect filed in one call (#915): the minimum DoR.
+
+    What broke, how to check the fix and where — nothing the hub can fill
+    itself (stage, detection time, release, class of service) is asked for.
+    """
+
+    title: str = Field(..., min_length=1, max_length=500)
+    broken: str = Field(..., min_length=1, max_length=2000)
+    verify: str = Field(..., min_length=1, max_length=500)
+    affected_areas: list[str] = Field(..., min_length=1, max_length=20)
+    parent_id: int | None = None
+    agent: str = Field("", max_length=100)
+
+    @field_validator("affected_areas")
+    @classmethod
+    def _areas_are_named(cls, value: list[str]) -> list[str]:
+        areas = [a.strip() for a in value if a and a.strip()]
+        if not areas:
+            raise ValueError("affected_areas: name at least one path or module")
+        return areas
+
+
+class ProdDefectFiled(BaseModel):
+    """The filed draft, and the release it was bound to or why it was not."""
+
+    task: "TaskView"
+    release_id: int | None = None
+    release_reason: str = ""
+
+
+class DefectCauseCandidate(BaseModel):
+    """One task the release carried whose area overlaps the defect's (#917)."""
+
+    task_id: int
+    title: str = ""
+    # "defect_area ↔ candidate_area" pairs: the reason is the overlap itself,
+    # so a reader can check it instead of trusting a score.
+    overlap: list[str] = Field(default_factory=list)
+    # True when caused_by_task_id already names this task — the explicit
+    # confirmation, never set by the suggestion itself.
+    confirmed: bool = False
+
+
+class DefectCauseSuggestion(BaseModel):
+    """Culprit hypothesis for a defect linked to a release (#917).
+
+    ``reason`` is empty only when candidates exist: an empty list with no
+    reason would read as "nobody broke it", which the hub cannot know.
+    ``unmatched_rows`` counts project merges whose released_sha matches no
+    recorded deploy — left out of the membership, and named so.
+    """
+
+    release_id: int | None = None
+    release_sha: str = ""
+    candidates: list[DefectCauseCandidate] = Field(default_factory=list)
+    reason: str = ""
+    unmatched_rows: int = 0
+
+
+class WorkingRulesSkill(BaseModel):
+    """Слой 1 «Правил работы» (#1630): навык хаба. Доверенный текст."""
+
+    name: str
+    state: str = "inactive"  # active | inactive | unreadable
+    version: int | None = None
+    content: str = ""
+    chars: int = 0
+    reason: str = ""  # при unreadable: тип ошибки чтения, без секретов
+
+
+class WorkingRulesPolicy(BaseModel):
+    """Слой 2: политика проекта, как её даёт format_policy_brief. Доверенный."""
+
+    state: str = "unavailable"  # available | unavailable
+    text: str = ""
+    chars: int = 0
+
+
+class WorkingRulesRepository(BaseModel):
+    """Слой 3: .hub/AGENT_RULES.md базовой ветки. ДАННЫЕ, не указания хаба."""
+
+    trust: str = "repository_data"
+    state: str = "unreadable"  # present | missing | unreadable
+    path: str = ""
+    ref: str = ""
+    sha: str = ""
+    content: str = ""
+    truncated: bool = False
+    size: int = 0
+    chars: int = 0
+    reason: str = ""
+
+
+class WorkingRules(BaseModel):
+    """Блок «Правила работы» исполнителю (#1630).
+
+    Три слоя лежат отдельными объектами и в один текст не склеиваются:
+    два доверенных (навык, политика) и слой репозитория с trust=repository_data.
+    ``preamble`` — фиксированный доверенный текст границы доверия.
+    ``mode=summary`` — тексты слоёв опущены, остаются состояния и размеры.
+    """
+
+    mode: str = "full"  # full | summary
+    preamble: str
+    hub_skill: WorkingRulesSkill
+    project_policy: WorkingRulesPolicy
+    repository_rules: WorkingRulesRepository
+
+
+class BootstrapMcpConfig(BaseModel):
+    """Раздел 1 стартового пакета: подключение MCP. Токен — только плейсхолдер."""
+
+    server_name: str
+    transport: str
+    url: str
+    url_note: str = ""
+    authorization: str
+
+
+class BootstrapSkill(BaseModel):
+    name: str
+    version: int
+
+
+class BootstrapRulesFile(BaseModel):
+    """Файл правил базовой ветки: только состояние. Причина чтения не отдаётся."""
+
+    path: str
+    state: str  # present | missing | unreadable
+
+
+class AgentBootstrap(BaseModel):
+    """Стартовый пакет проекта (#1631): первое сообщение агенту без credentials.
+
+    Строится только из разрешённых полей; ``text`` — единый серверный рендер
+    тех же данных, CLI печатает его как есть. workspace_path не входит.
+    """
+
+    project_slug: str
+    project_name: str
+    repo: str = ""
+    base_branch: str = ""
+    mcp: BootstrapMcpConfig
+    first_calls: list[str]
+    skills: list[BootstrapSkill]
+    policy_brief: list[str]
+    rules_files: list[BootstrapRulesFile]
+    ci_before_submit: str
+    submit_order: list[str]
+    human_only: list[str]
+    text: str
+
+
+class TaskEvidenceView(BaseModel):
+    """Одна запись доказательства сдачи state-задачи (#1647).
+
+    ``principal_id`` — автор из идентичности вызывающего; ``agent`` — подпись,
+    которую назвал клиент, и доказательством авторства она не является.
+    """
+
+    generation: int
+    ac_id: str
+    action: str
+    observed: str
+    target: str
+    observed_at: str
+    principal_id: int | None = None
+    agent: str = ""
+    created_at: str = ""
+
+
+class StateEvidenceItem(TaskEvidenceView):
+    """Доказательство в брифе и на карточке: плюс читаемый автор (#1648).
+
+    ``author`` — подпись сдачи, а при пустой подписи номер принципала из
+    идентичности вызывающего; подпись клиента доказательством авторства не
+    является, поэтому принципал остаётся рядом в ``principal_id``.
+    """
+
+    author: str = ""
+
+
+class StateReviewView(BaseModel):
+    """Что человек принимает по задаче-состоянию, одним блоком (#1648).
+
+    Один читатель на очередь, входящие, бриф (REST и MCP) и карточку:
+    ``hub.services.state_review``. ``acceptance_criteria`` — СНИМОК AC сдачи
+    (его видел автор), а не живая постановка; ``evidence`` — только
+    поколения ``generation``. ``expected_generation`` — число, которое форма
+    вердикта обязана назвать (устаревшее получает 409). ``not_applicable`` —
+    проверки кода, которых у такой задачи нет: они названы, а не пропущены
+    молча и не выданы за ``unknown``/``match``.
+    """
+
+    result_kind: str = "state"
+    label: str = "результат: состояние"
+    generation: int = 0
+    expected_generation: int = 0
+    rollback: str = ""
+    acceptance_criteria: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: list[StateEvidenceItem] = Field(default_factory=list)
+    evidence_complete: bool = False
+    missing_ac: list[str] = Field(default_factory=list)
+    not_applicable: list[dict[str, str]] = Field(default_factory=list)
+    decider: str = "human"
+    headline: str = ""
 
 
 class TaskView(BaseModel):
@@ -2065,6 +3044,7 @@ class TaskView(BaseModel):
     source: TaskSource = TaskSource.human
     assigned_agent: str = ""
     rationale: str = ""
+    freeze_rationale: str = ""
     human_owner: str = ""
     human_reviewer: str = ""
     job_id: str | None = None
@@ -2081,6 +3061,10 @@ class TaskView(BaseModel):
     # прячущий заодно и число, отнял бы единственный способ увидеть, что
     # выключили не то.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #1440: who will write the verdict for this submission and under what
+    # condition — the answer of services.verdict_route, not a copy of its rules.
+    # None means "not computed on this path" or "task not in review".
+    verdict_route: dict[str, Any] | None = None
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None
@@ -2164,6 +3148,14 @@ class TaskView(BaseModel):
     caused_by_task_id: int | None = None
     detected_at: str | None = None
     resolved_at: str | None = None
+    # #917: the release the defect showed up in (None = not stated), and the
+    # culprit HYPOTHESIS computed from it. Kept apart from caused_by_task_id
+    # on purpose: a suggestion is never written into the fact column.
+    release_id: int | None = None
+    cause_suggestion: "DefectCauseSuggestion | None" = None
+    # #919: what the closed prod defect left behind (kind, ref / reason +
+    # revisit, recorded_by, recorded_at); None = nothing recorded.
+    defect_prevention: dict[str, str] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)
@@ -2175,6 +3167,11 @@ class TaskView(BaseModel):
     review_checklist: list[str] = Field(default_factory=list)
     # #1236: имя объявленного живого зонда; "" — не объявлен.
     live_probe: str = ""
+    # #1647: результат работы и способ отката; evidence — доказательства всех
+    # поколений сдачи state-задачи (у commit-задачи None).
+    result_kind: str = "commit"
+    rollback: str = ""
+    evidence: list["TaskEvidenceView"] | None = None
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None
@@ -2201,6 +3198,20 @@ class TaskView(BaseModel):
     # would be one more thing to go stale — which is the very defect this
     # addresses. Absent means "not computed on this path", not "fresh".
     statement_freshness: dict[str, Any] | None = None
+    # #1433: the area overlap this claim/pair-start went through in warn mode
+    # (path, with_task_id, with_path, detail). None means none was found or
+    # the check is off; in require the overlap is a refusal, not this field.
+    area_check: dict[str, Any] | None = None
+    # #1589: the path-notice result of THIS submission, set on submit responses
+    # only. None = no rules were configured, nothing to say.
+    path_notices: PathNoticesView | None = None
+    # #1515: where this task's worktree goes, as a template relative to the
+    # caller's clone. Set on claim and pair-start only; the hub cannot know the
+    # clone's folder name, so the exact path comes from `hp-hub worktree`.
+    worktree_hint: str = ""
+    # #1630: «Правила работы» исполнителю — навык хаба, политика проекта и
+    # правила репозитория тремя отдельными слоями. Set on pair-start only.
+    working_rules: WorkingRules | None = None
     # #485: who blocks this task and whom it unblocks. None means no edges at
     # all, which is not the same as "edges, but empty".
     dependencies: "TaskDependencies | None" = None
@@ -2261,6 +3272,19 @@ class ContextParentGoal(BaseModel):
     business_value: str = ""
 
 
+class PathBrief(BaseModel):
+    """#1643: блок «что дальше» в контексте задачи, посчитанный на сервере.
+
+    Сессия исполнителя не читает ``/api/projects/{slug}/path``, поэтому блок
+    приходит вместе с контекстом. ``status``: ``ok``; ``no_project`` — у задачи
+    нет проекта; ``unavailable`` — расчёт не удался (это «неизвестно», не «нет»).
+    """
+
+    status: str
+    project: str = ""
+    lines: list[str] = Field(default_factory=list)
+
+
 class TaskContextView(BaseModel):
     """Response for GET /api/tasks/{task_id}/context.
 
@@ -2284,6 +3308,11 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+    # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
+    working_rules: WorkingRules | None = None
+    # #1643: следующая задача и критический путь проекта задачи. None — сервер
+    # блока не считает (старый хаб): клиент идёт в /path сам.
+    path_brief: PathBrief | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -2308,6 +3337,101 @@ class ProjectCreate(BaseModel):
         return _validated_forge(v)
 
 
+def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
+    """Проверить политику гейтов проекта целиком (#743, #760, #1427).
+
+    Один читатель на присланный кусок и на итоговую политику после слияния:
+    правило, добавленное сюда, действует на обоих путях сразу. Бросает
+    ``ValueError`` с человеческой причиной.
+    """
+    unknown = set(v) - set(GATE_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown gate_policy keys: {sorted(unknown)}; "
+            f"allowed: {', '.join(GATE_POLICY_KEYS)}"
+        )
+    # #1151: словарь значений гейта. До этой задачи он был {'human',
+    # 'auto'} буквально, и «verdict=steward» не принимался API вовсе —
+    # то есть рычаг, которым владелец должен переводить пилотный проект
+    # на стюарда, не существовал: политику можно было положить только
+    # прямо в базу, мимо всех проверок. Значения перечислены здесь и
+    # только здесь; делегирующие из них живут в project_policy, и оба
+    # перечня сверяются тестом.
+    from hub.services.project_policy import GATE_VALUES
+
+    bad = {
+        k: val
+        for k, val in v.items()
+        if k in ("dor", "verdict") and val not in GATE_VALUES
+    }
+    if bad:
+        raise ValueError(
+            f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
+        )
+    if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
+        # Читатель понимает только true (#835); запись отказывает громко,
+        # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
+        raise ValueError(
+            "gate_policy steward_shadow must be true or false, "
+            f"got: {v['steward_shadow']!r}"
+        )
+    if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
+        raise ValueError(
+            "gate_policy review must be one of "
+            f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
+        )
+    if "dor_max_class" in v:
+        ceiling = v["dor_max_class"]
+        if ceiling not in AUTO_APPROVE_CLASSES:
+            raise ValueError(
+                "gate_policy dor_max_class must be one of "
+                f"{', '.join(AUTO_APPROVE_CLASSES)}, got: {ceiling!r}; "
+                "R2 is not delegable until #585 opens it, R3+ never"
+            )
+    if "risk_map" in v:
+        v["risk_map"] = _validated_risk_map(v["risk_map"])
+    _validate_review_limit(v)
+    _validate_orchestrator_queue(v)
+    _validate_submission_contract(v)
+    _validate_bug_red_test(v)
+    _validate_ci_before_submit(v)
+    _validate_claim_area_check(v)
+    _validate_statement_paths(v)
+    _validate_deep_reviewer(v)
+    _validate_local_review_fallback(v)
+    _validate_slot_dead_minutes(v)
+    _validate_executor_launch(v)
+    _validate_executor_task_ceilings(v)
+    _validate_count(v, "deep_daily_cap")
+    _validate_count(v, "small_delta_lines")
+    _validate_count(v, "circle_deep_stop")
+    _validate_merge_is_delivery(v)
+    _validate_path_notices(v)
+    _validate_release_artifacts(v)
+    _validate_freeze(v)
+    return v
+
+
+def validated_gate_policy_patch(v: dict[str, Any]) -> dict[str, Any]:
+    """Проверить присланный КУСОК gate_policy (#1427, #1593).
+
+    PATCH сливает gate_policy с сохранённой по ключам, и ``null`` у ключа
+    значит «удалить его». Поэтому здесь null проходит проверку формы как
+    удаление, а остальные значения проверяются тем же читателем, что и
+    итоговая политика, — ранний отказ называет ошибку в присланном ключе.
+    Итоговая политика после слияния проверяется целиком
+    (``validated_gate_policy``): кусок может быть чистым, а результат нет.
+    """
+    unknown = set(v) - set(GATE_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown gate_policy keys: {sorted(unknown)}; "
+            f"allowed: {', '.join(GATE_POLICY_KEYS)}"
+        )
+    sent = validated_gate_policy({k: val for k, val in v.items() if val is not None})
+    return {k: (None if v[k] is None else sent[k]) for k in v}
+
+
 class ProjectPatch(BaseModel):
     """PATCH semantics: omitted fields stay unchanged (#338).
 
@@ -2329,6 +3453,11 @@ class ProjectPatch(BaseModel):
     gate_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
+    # Версия политики, с которой правка была составлена (#1593). Не поле
+    # проекта: сверяется внутри write-транзакции и в базу не пишется. Не
+    # прислали — проверки нет (API-клиент, меняющий один ключ, слияние и так
+    # не затирает); веб-форма шлёт её всегда, потому что несёт политику целиком.
+    policy_version: str | None = Field(default=None, max_length=64)
 
     @field_validator("default_branch_policy")
     @classmethod
@@ -2343,56 +3472,13 @@ class ProjectPatch(BaseModel):
     @field_validator("gate_policy")
     @classmethod
     def _gate_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
-        if v is None:
-            return v
-        unknown = set(v) - set(GATE_POLICY_KEYS)
-        if unknown:
-            raise ValueError(
-                f"unknown gate_policy keys: {sorted(unknown)}; "
-                f"allowed: {', '.join(GATE_POLICY_KEYS)}"
-            )
-        # #1151: словарь значений гейта. До этой задачи он был {'human',
-        # 'auto'} буквально, и «verdict=steward» не принимался API вовсе —
-        # то есть рычаг, которым владелец должен переводить пилотный проект
-        # на стюарда, не существовал: политику можно было положить только
-        # прямо в базу, мимо всех проверок. Значения перечислены здесь и
-        # только здесь; делегирующие из них живут в project_policy, и оба
-        # перечня сверяются тестом.
-        from hub.services.project_policy import GATE_VALUES
+        """Проверить присланный КУСОК политики (#1427).
 
-        bad = {
-            k: val
-            for k, val in v.items()
-            if k in ("dor", "verdict") and val not in GATE_VALUES
-        }
-        if bad:
-            raise ValueError(
-                f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
-            )
-        if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
-            # Читатель понимает только true (#835); запись отказывает громко,
-            # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
-            raise ValueError(
-                "gate_policy steward_shadow must be true or false, "
-                f"got: {v['steward_shadow']!r}"
-            )
-        if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
-            raise ValueError(
-                "gate_policy review must be one of "
-                f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
-            )
-        if "dor_max_class" in v:
-            ceiling = v["dor_max_class"]
-            if ceiling not in AUTO_APPROVE_CLASSES:
-                raise ValueError(
-                    "gate_policy dor_max_class must be one of "
-                    f"{', '.join(AUTO_APPROVE_CLASSES)}, got: {ceiling!r}; "
-                    "R2 is not delegable until #585 opens it, R3+ never"
-                )
-        if "risk_map" in v:
-            v["risk_map"] = _validated_risk_map(v["risk_map"])
-        _validate_review_limit(v)
-        return v
+        Тот же читатель проверяет кусок отложенной правки (#1593):
+        ``validated_gate_policy_patch``. Итоговая политика после слияния
+        проверяется целиком в hub/services/policy_change.py.
+        """
+        return None if v is None else validated_gate_policy_patch(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -2582,8 +3668,14 @@ class CIRunReportSubmit(BaseModel):
     # The mutation run over changed functions (#1270), kept under its own key:
     # a warning with named survivors, not a check outcome — putting it into
     # ``checks`` would tell the reviewer the code is "known-broken" whenever a
-    # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
+    # weak test exists. Omitted ⇒ the step did not run: what is stored for this
+    # commit is kept (#1606), and a commit with nothing stored reads as
+    # not_reported. Sent (even as {} or state=error) ⇒ replaces the stored block.
     mutations: dict[str, Any] = Field(default_factory=dict)
+    # The branch's changed tests run over the merge-base code (#913): state,
+    # merge_base and {nodeid: failed|passed|error|skipped}. Evidence for the
+    # red-test gate on bugs. Omitted ⇒ kept as stored (#1606); sent ⇒ replaces.
+    baseline: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
@@ -2601,6 +3693,7 @@ class CIRunReportResult(BaseModel):
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
     mutations_state: str = "not_reported"
+    baseline_state: str = "not_reported"
 
 
 class OutcomeVerdict(str, Enum):
@@ -2628,6 +3721,8 @@ class OutcomeHypothesisStatus(str, Enum):
     no_hypothesis = "no_hypothesis"
     not_due = "not_due"
     unanswered = "unanswered"
+    # #1568: no recorded release of the task's fix, so no window to count from.
+    unknown = "unknown"
     confirmed = "confirmed"
     refuted = "refuted"
     unmeasurable = "unmeasurable"
@@ -2719,6 +3814,37 @@ def normalise_incomplete_reason(value: Any) -> str:
         text[:40],
     )
     return INCOMPLETE_REASON_UNSTATED
+
+
+# Where a stored report came from (#1036, #1180, #1587). The two text origins
+# are the hub transcribing what a run wrote about itself; they are written into
+# the ``orchestrator`` column as a prefix, so the prefix IS the fact. The
+# contract path must never be able to claim one of them.
+ORIGIN_RUN_TEXT = "cursor-cloud-result"
+ORIGIN_LOCAL_TEXT = "local-reviewer-result"
+TEXT_ORIGINS = (ORIGIN_RUN_TEXT, ORIGIN_LOCAL_TEXT)
+
+
+def text_origin_of(orchestrator: str | None) -> str:
+    """The text origin a stored ``orchestrator`` carries, or "" for a contract report.
+
+    Exact prefixes: the hub writes ``<origin>:<claimed>`` and nothing else.
+    """
+    value = orchestrator or ""
+    for origin in TEXT_ORIGINS:
+        if value.startswith(origin + ":"):
+            return origin
+    return ""
+
+
+def claims_text_origin(orchestrator: str | None) -> bool:
+    """Whether a CALLER-supplied orchestrator tries to look like a text origin.
+
+    Looser than ``text_origin_of`` on purpose (case, leading blanks): it guards
+    the door, and a near miss at the door is still an attempt.
+    """
+    value = (orchestrator or "").strip().lower()
+    return any(value.startswith(origin + ":") for origin in TEXT_ORIGINS)
 
 
 class MachineReviewSubmit(BaseModel):
@@ -2986,6 +4112,19 @@ class FindingObservationClosure(BaseModel):
     hand: str = ""
 
 
+class DeferredRepeatView(BaseModel):
+    """A confirmed finding that repeats one deferred to a named task (#1448).
+
+    NOT a disposition and not a closure: the finding stays in the report and
+    the approval rules only stop counting it against the submission. Shown, so
+    that "does not block" is never the same as "hidden".
+    """
+
+    finding_uid: str
+    linked_task_id: int
+    title: str = ""
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -3039,6 +4178,10 @@ class MachineReviewView(BaseModel):
     # a hand other than the author's (#1244). Computed when the report is read,
     # never stored on it: the report stays what it was.
     observation_closures: list[FindingObservationClosure] = Field(default_factory=list)
+    # Confirmed findings that repeat one the author deferred to a task that is
+    # not delivered yet (#1448). Computed on read by the same predicate the
+    # autopilot and the steward use; never stored on the report.
+    deferred_repeats: list[DeferredRepeatView] = Field(default_factory=list)
     # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
     # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
     # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где
@@ -3202,6 +4345,36 @@ class CloneBranchState(BaseModel):
     # branch that is gone.
 
 
+class PolicyScheduleCreate(BaseModel):
+    """Отложенная правка политики проекта (#1593): когда и какой кусок."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: datetime
+    patch: dict[str, Any] = Field(min_length=1)
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("patch")
+    @classmethod
+    def _patch_shape(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validated_gate_policy_patch(v)
+
+
+class PolicyScheduleView(BaseModel):
+    """Запись расписания как её видит человек и агент (только чтение)."""
+
+    id: int
+    project_id: int
+    at: str
+    patch: dict[str, Any] = Field(default_factory=dict)
+    note: str = ""
+    created_by: str = ""
+    created_at: str = ""
+    state: str
+    executed_at: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProjectView(BaseModel):
     id: int
     slug: str
@@ -3354,6 +4527,9 @@ class RoleView(BaseModel):
 class ApiKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     expires_days: int | None = Field(default=None, ge=1, le=3650)
+    # #1644: slugs of the projects the key may speak for (CI report, deploy).
+    # Empty = no restriction (legacy).
+    projects: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ApiKeyView(BaseModel):
@@ -3366,6 +4542,9 @@ class ApiKeyView(BaseModel):
     revoked_at: str | None = None
     created_at: str = ""
     created_by: int | None = None
+    # #1644: ``["project:<slug>"]``; empty = not bound to a project (legacy).
+    scopes: list[str] = Field(default_factory=list)
+    scopes_damaged: bool = False
 
     @field_validator(
         "expires_at", "last_used_at", "revoked_at", "created_at", mode="before"
@@ -3385,6 +4564,14 @@ class MergeLedgerBackfillRequest(BaseModel):
     """Body of the merge-ledger backfill (#1367): dry run unless ``apply``."""
 
     project: str = Field("default", min_length=1, max_length=100)
+    apply: bool = False
+
+
+class CursorUsageImportRequest(BaseModel):
+    """Body of the Cursor usage export import (#1413): dry run unless ``apply``."""
+
+    # Потолок = MAX_CSV_CHARS сервиса: выгрузка за день около 200 КБ.
+    csv: str = Field(..., min_length=1, max_length=5_000_000)
     apply: bool = False
 
 
@@ -3456,6 +4643,12 @@ class WhoamiView(BaseModel):
     app_version: str
 
 
+#: #1434: каналы исполнения. Правило «какую задачу в какой канал» здесь не
+#: кодируется — канал называет тот, кто выдаёт код.
+EXECUTOR_CHANNELS: tuple[str, ...] = ("cloud", "slot")
+_SLOT_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+
+
 class ChatPairStartRequest(BaseModel):
     """Optional body on POST /api/auth/chat-pair/start (#980).
 
@@ -3465,6 +4658,11 @@ class ChatPairStartRequest(BaseModel):
 
     kind: str = "intake"
     task_id: int | None = None
+    #: #1434: канал исполнения — ``cloud`` или ``slot``; пусто — не назван, и
+    #: код работает как до задачи. Только для implementer.
+    channel: str = ""
+    #: Имя слота (``slot-2``) — только при ``channel=slot`` и обязательно там.
+    slot: str = ""
 
     @field_validator("kind")
     @classmethod
@@ -3473,6 +4671,28 @@ class ChatPairStartRequest(BaseModel):
         if kind not in {"intake", "implementer"}:
             raise ValueError("kind must be intake or implementer")
         return kind
+
+    @model_validator(mode="after")
+    def _channel(self) -> ChatPairStartRequest:
+        self.channel = (self.channel or "").strip().lower()
+        self.slot = (self.slot or "").strip().lower()
+        if not self.channel and not self.slot:
+            return self
+        if self.kind != "implementer":
+            raise ValueError("channel and slot are for kind=implementer only")
+        if self.channel not in EXECUTOR_CHANNELS:
+            raise ValueError(
+                f"channel must be one of {', '.join(EXECUTOR_CHANNELS)}, "
+                f"got: {self.channel!r}"
+            )
+        if self.channel == "slot" and not _SLOT_NAME.fullmatch(self.slot):
+            raise ValueError(
+                "channel=slot needs slot: lowercase letters, digits and dashes, "
+                f"up to 32 chars, got: {self.slot!r}"
+            )
+        if self.channel == "cloud" and self.slot:
+            raise ValueError("channel=cloud takes no slot name")
+        return self
 
 
 class ChatPairStartView(BaseModel):
@@ -3510,6 +4730,22 @@ class ChatPairRevoked(BaseModel):
     revoked: int
 
 
+class EgressStatus(BaseModel):
+    """Can the server reach GitHub (#1645): typed fields only, never text.
+
+    ``unknown`` = the watcher has not probed within three intervals.
+    ``reason_code`` is one of a fixed list; exception text and URLs never
+    reach this public model.
+    """
+
+    state: Literal["up", "down", "unknown"] = "unknown"
+    since: str | None = None
+    checked_at: str | None = None
+    reason_code: (
+        Literal["dns", "connect", "tls", "timeout", "proxy", "other"] | None
+    ) = None
+
+
 class HealthView(BaseModel):
     status: str = "ok"
     app_version: str
@@ -3525,6 +4761,14 @@ class HealthView(BaseModel):
     # Имена env-переменных с устаревшим префиксом (#964) — политики, которые
     # оператор считает включёнными, а код не читает. Имена, не значения.
     stale_env: list[str] = Field(default_factory=list)
+    egress: EgressStatus = Field(default_factory=EgressStatus)
+    # CSRF for cookie sessions (#1664): the mode, how many requests warn mode
+    # let through that require would refuse, and where the key comes from.
+    csrf_mode: str = "warn"
+    # None = the count could not be read (not "zero").
+    csrf_would_reject_24h: int | None = 0
+    csrf_key_source: str = ""
+    csrf_warning: str = ""
 
 
 class EffectivePolicies(BaseModel):
@@ -3574,8 +4818,18 @@ class IdentityDiagnosticsView(BaseModel):
 
 # Closed vocabularies for steward judgements (#1022). `unknown` is absent on
 # purpose: a catch-all would reopen the dictionary (#549 on a different axis).
-STEWARD_JUDGEMENT_KINDS: tuple[str, ...] = ("verdict", "dor", "disposition")
+STEWARD_JUDGEMENT_KINDS: tuple[str, ...] = (
+    "verdict",
+    "dor",
+    "disposition",
+    # #1601: суждение советника-критика о approve судьи. Своя строка в той же
+    # таблице: тройка (задача, поколение, kind) уже даёт at-most-once.
+    "advisor",
+)
 STEWARD_VERDICTS: tuple[str, ...] = ("approve", "changes_requested", "escalate")
+#: Ответы советника (#1601). Отдельный словарь, а не расширение STEWARD_VERDICTS:
+#: «concur» судьи не бывает, а «approve» советника не отличить от одобрения.
+STEWARD_ADVISOR_VERDICTS: tuple[str, ...] = ("concur", "object")
 STEWARD_CONFIDENCE: tuple[str, ...] = ("high", "medium", "low")
 STEWARD_GROUND_SOURCES: tuple[str, ...] = (
     "ci_pinned_sha",
@@ -3669,6 +4923,14 @@ class StewardJudgementSubmit(BaseModel):
     duration_ms: int | None = Field(default=None, ge=0)
 
 
+class StewardFalseApproveClear(BaseModel):
+    """Явное решение человека: снять ошибочное одобрение пары с задачи (#1601)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = Field("", max_length=1000)
+
+
 class StewardJudgementView(BaseModel):
     """Stored judgement as the writer reads it back. Not an applied transition."""
 
@@ -3684,6 +4946,12 @@ class StewardJudgementView(BaseModel):
     findings: list[dict[str, Any]] = Field(default_factory=list)
     closures: list[StewardClosure] = Field(default_factory=list)
     model: str = ""
+    #: Для kind=advisor (#1601): id суждения судьи, на которое он отвечает, и
+    #: хеш пакета, по которому ответил (ставит хаб, а не советник).
+    judged_id: int | None = None
+    packet_hash: str = ""
+    #: Контур выборки: 2 — после выката #1601, 1 — прежние одиночные суждения.
+    contour: int = 1
     tokens_spent: int | None = None
     # Почему tokens_spent пуст (#1328): pending | provider_no_answer | no_run;
     # '' — число есть. Ноль и «неизвестно» не смешиваются.
@@ -3719,4 +4987,6 @@ ProposalView = TaskView
 # which is declared after ReviewBrief (#381).
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
+StateReviewView.model_rebuild()
 TaskView.model_rebuild()
+ProdDefectFiled.model_rebuild()

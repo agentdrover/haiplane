@@ -410,6 +410,24 @@ async def test_unproven_empty_review_stays_human(
     assert body["review_verdict"] is None
 
 
+async def test_empty_review_without_tokens_spent_is_not_proven(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#1435): the #769 setup that DOES approve, minus tokens_spent.
+    # Settled dispatch, billed usage over the floor, class under the ceiling —
+    # but a report with no number of its own cannot agree with the bill, so
+    # nothing is proven and the verdict stays with the human.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-no-tokens", {"verdict": "auto"})
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(client, task_id, raw_count=0, findings_rejected=[])
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+
+
 async def test_proven_empty_above_class_ceiling_stays_human(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ) -> None:
@@ -651,3 +669,159 @@ async def test_an_unresolved_finding_leaves_the_verdict_to_the_human(
     assert not await _events(db, "verdict_escalated", unresolved), (
         "unresolved is a silent refusal, not an escalation trigger"
     )
+
+
+_DEFERRED_FINDING = {
+    "locator": "none",
+    "title": "оркестратор не вызывается из CLI",
+    "severity": "low",
+    "category": "correctness",
+}
+
+
+async def _second_generation_with_deferral(
+    db: aiosqlite.Connection, task_id: int, finding: dict
+) -> int:
+    """Сдача на втором поколении; на первом та же находка отложена до задачи.
+
+    Возвращает задачу, куда отложено. Исход пишется так, как его пишет гейт
+    пересдачи: по задаче и finding_uid первого отчёта.
+    """
+    from hub.services.finding_identity import finding_uids
+
+    linked = await _node(db, title="сюда отложено", task_type="task", parent_id=None)
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        raw_count=2,
+        findings_confirmed=json.dumps([finding]),
+        incomplete=False,
+    )
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=finding_uids([finding])[0],
+        finding_index=0,
+        finding_title=finding["title"],
+        outcome="deferred",
+        note="делается отдельной задачей",
+        linked_task_id=linked,
+        reported_by="pda_claude",
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return linked
+
+
+async def test_repeat_of_deferred_finding_does_not_block_autopilot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1448 AC-1: повтор отложенной находки не запирает чистую сдачу.
+
+    Живой случай: da70b3f7dfab0996 отложена до #1392, ревьюер подтверждал её
+    на каждом поколении, и владелец трижды одобрял руками. Пара: рядом та же
+    сдача, где отсрочки нет — она по-прежнему остаётся человеку, иначе
+    тест не отличал бы правило от выключателя.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+
+    deferred = await _submitted_task(client, db, "spike-deferred", {"verdict": "auto"})
+    linked = await _second_generation_with_deferral(db, deferred, _DEFERRED_FINDING)
+    await _post_review(client, deferred, findings_confirmed=[_DEFERRED_FINDING])
+
+    body = (await client.get(f"/api/tasks/{deferred}")).json()
+    assert body["review_verdict"] == "approved", "повтор отложенной — не блокер"
+    verdicts = await _events(db, "review_verdict_recorded", deferred)
+    assert verdicts and verdicts[-1]["actor"] == "policy"
+    feed = [u["content"] for u in body["updates"] or []]
+    shown = [c for c in feed if "Автовердикт APPROVED" in c]
+    assert shown and f"отложена до #{linked}" in shown[0], (
+        f"повтор должен быть виден в карточке, а не скрыт: {shown}"
+    )
+    assert "повтор не блокирует" in shown[0]
+
+    fresh = await _submitted_task(client, db, "spike-not-deferred", {"verdict": "auto"})
+    await _post_review(client, fresh, findings_confirmed=[_DEFERRED_FINDING])
+    other = (await client.get(f"/api/tasks/{fresh}")).json()
+    assert other["status"] == "review"
+    assert other["review_verdict"] != "approved", "без отсрочки находка блокирует"
+
+
+# --- #1587: a report the hub transcribed from a run's text is not a verdict ---
+#
+# Origin is a fact the hub writes into ``orchestrator`` (#1036, #1180). The
+# report is accepted and shown — only the unattended approval and the hand-over
+# to the steward are refused, with the reason named.
+
+
+async def _record_with_origin(
+    db: aiosqlite.Connection, task_id: int, origin: str
+) -> None:
+    from hub.models import MachineReviewSubmit
+    from hub.services import machine_review_intake
+
+    await machine_review_intake.record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**_CLEAN_REVIEW),
+        principal_id=None,
+        username="hub",
+        origin=origin,
+    )
+
+
+async def test_text_recovered_report_never_auto_approves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub.services.machine_review_intake import (
+        ORIGIN_LOCAL_TEXT,
+        ORIGIN_MCP,
+        ORIGIN_RUN_TEXT,
+    )
+    from hub.services.verdict_route import verdict_route
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    for policy in ("auto", "steward"):
+        for origin in (ORIGIN_RUN_TEXT, ORIGIN_LOCAL_TEXT):
+            slug = f"spike-text-{policy}-{origin[:5]}"
+            task_id = await _submitted_task(client, db, slug, {"verdict": policy})
+            await _record_with_origin(db, task_id, origin)
+
+            body = (await client.get(f"/api/tasks/{task_id}")).json()
+            assert body["review_verdict"] is None, (
+                f"{policy}/{origin}: a text-recovered report must not approve"
+            )
+            assert body["status"] == "review", "the verdict stays with the human"
+            feed = " ".join(u["content"] for u in body["updates"] or [])
+            assert "Автовердикт НЕ вынесен" in feed and origin in feed, (
+                "the refusal names its reason in the feed"
+            )
+            row = await repo.get_latest_machine_review(db, task_id)
+            assert row is not None and row["orchestrator"].startswith(origin + ":"), (
+                "the report is accepted and visible, with its origin"
+            )
+            from hub.services import steward_apply
+
+            gate = await steward_apply.text_origin_refusals(db, task_id, None)
+            assert gate and origin in gate[0][1], (
+                "the steward's apply gate refuses a text-recovered approve"
+            )
+            route = await verdict_route(db, task_id, observe=True)
+            assert route.decider == "human", f"{policy}/{origin}: {route}"
+            assert route.code == "text_recovered_report", route
+            assert origin in route.reason
+
+    # Control (regression guard): the same clean report through the contract
+    # keeps today's behaviour in both policies.
+    for policy in ("auto", "steward"):
+        task_id = await _submitted_task(
+            client, db, f"spike-contract-{policy}", {"verdict": policy}
+        )
+        await _record_with_origin(db, task_id, ORIGIN_MCP)
+        body = (await client.get(f"/api/tasks/{task_id}")).json()
+        assert body["review_verdict"] == "approved", policy

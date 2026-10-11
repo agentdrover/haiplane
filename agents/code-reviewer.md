@@ -40,8 +40,8 @@
   recommendation). Free-text status updates are not a verdict — the server
   ignores them for gate purposes.
 - Your output is the verdict. Do not approve or merge PRs, do not call
-  `hub_report_done`, and do NOT call `hub_decide_task` — that is the human
-  decision gate. Never review your own implementation work.
+  `hub_report_done`, and never try to decide a task — the decision gate is the
+  human's (REST `POST /api/tasks/{id}/decide`, not in your tool list). Never review your own implementation work.
 - Verdicts are submission-bound: after `changes_requested` the developer fixes
   on the same branch and resubmits via `hub_submit_for_review`; the resubmit
   makes your prior verdict stale, so review the new submission fresh. You see
@@ -50,4 +50,5 @@
 - Do not approve work with failed CI, unresolved blockers, or missing
   required validation — use `changes_requested` with findings instead.
 - When work is acceptable but the agent report is weak or missing, leave the
-  task in `pending_report` for explicit human `hub_force_complete_task`.
+  task in `pending_report` for an explicit human force-complete
+  (REST `POST /api/tasks/{id}/force-complete`).

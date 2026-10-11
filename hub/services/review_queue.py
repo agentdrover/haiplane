@@ -33,7 +33,8 @@ from typing import Any
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import ReviewQueueRow, ReviewQueueView
-from hub.services import review_evidence
+from hub.services import review_evidence, state_review
+from hub.services.result_kind import NOT_APPLICABLE, automation_not_applicable
 from hub.services.lifecycle import (
     latest_review_projection,
     observed_branch_tip,
@@ -145,7 +146,53 @@ def readiness(row: ReviewQueueRow) -> str:
     return READY if row.sha_check == "match" else READY_SHA_UNVERIFIED
 
 
+async def state_queue_row(db, task_row: dict[str, Any]) -> ReviewQueueRow:
+    """Строка очереди для задачи-состояния (#1648): без ветки, отчёта и сети.
+
+    Готовность к вердикту — полный комплект доказательств ТЕКУЩЕГО поколения
+    (``state_review.current_submission``), а не машинный отчёт, которого у такой
+    задачи не будет. Вердикт, ожидание и стойло читаются теми же функциями, что
+    у commit-строки.
+    """
+    task_id = int(task_row["id"])
+    sub = await state_review.current_submission(db, task_row)
+    latest = latest_review_projection(task_row)
+    since = str(task_row.get("status_entered_at") or "")
+    stall, stall_at = await last_stall(db, task_id, since)
+    entered = _parse_at(since)
+    complete = bool(sub and sub.complete)
+    row = ReviewQueueRow(
+        task_id=task_id,
+        title=str(task_row.get("title") or ""),
+        status=str(task_row.get("status") or ""),
+        submission_generation=int(task_row.get("submission_generation") or 0),
+        sha_check=NOT_APPLICABLE,
+        sha_check_reason=dict(state_review.NOT_APPLICABLE_CHECKS)["sha_check"],
+        report_status=NOT_APPLICABLE,
+        generation_has_review=False,
+        generation_review_reason=state_review.STATE_REASON,
+        verdict=latest.verdict.value if latest else None,
+        verdict_generation=latest.submission_generation if latest else None,
+        verdict_is_current=latest.is_current if latest else False,
+        stall_reason=stall,
+        stall_at=stall_at,
+        waiting_since=since,
+        waiting_minutes=(
+            max(0, int((datetime.now(UTC) - entered).total_seconds() // 60))
+            if entered
+            else None
+        ),
+        result_kind="state",
+        evidence_count=len(sub.evidence) if sub else 0,
+        evidence_complete=complete,
+    )
+    row.readiness = READY if (row.status == "review" and complete) else "blocked"
+    return row
+
+
 async def queue_row(db, task_row: dict[str, Any]) -> ReviewQueueRow:
+    if automation_not_applicable(task_row):
+        return await state_queue_row(db, task_row)
     task_id = int(task_row["id"])
     branch = str(task_row.get("branch") or "")
     tip, tip_reason = observed_branch_tip(task_id, branch)

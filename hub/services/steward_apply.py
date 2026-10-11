@@ -28,7 +28,9 @@ ladder
 вопрос, и расходиться они начнут молча.
 
 Новых кодов эскалации не заводится: словарь #1022 закрыт, и всё, что здесь
-нужно, в нём уже есть.
+нужно, в нём уже есть. Исключение одно и не про суждение судьи: отказ
+применения без согласия советника (#1601, ``advisor_not_concurred``) — код
+привратника, а не причина эскалации судьи.
 """
 
 from __future__ import annotations
@@ -290,7 +292,14 @@ async def closure_refusals(
         name: [f for f in (value.get(name) or []) if isinstance(f, dict)]
         for name in grounds.ACCOUNTABLE_SECTIONS
     }
-    owed = _findings_owing_an_account(sections)
+    # Повтор находки, отложенной до недоставленной задачи, отчёта не требует
+    # (#1448): предикат тот же, что у автовердикта, и посчитан в пакете.
+    repeats = value.get("deferred_repeats") or {}
+    owed = [
+        entry
+        for entry in _findings_owing_an_account(sections)
+        if not (entry[0] == "confirmed" and entry[1] in repeats)
+    ]
     if not owed:
         return []
     confirmed = sections.get("confirmed") or []
@@ -688,6 +697,28 @@ async def policy_refusal(
     )
 
 
+async def text_origin_refusals(
+    db: aiosqlite.Connection, task_id: int, generation: int | None
+) -> list[tuple[str, str]]:
+    """Отчёт, переписанный хабом из текста прогона, самостоятельного approve не даёт (#1587).
+
+    Тот же признак, что у автопилота и маршрута вердикта: если стюард всё же
+    начал суждение раньше, чем отчёт стал известен как текстовый, применять
+    его approve нельзя.
+    """
+    from hub import repository as repo
+    from hub.services.auto_verdict import text_origin_refusal
+
+    review = await repo.get_latest_machine_review(db, task_id)
+    if review is None:
+        return []
+    row = dict(review)
+    if generation is not None and (row.get("submission_generation") or 0) != generation:
+        return []
+    refusal = text_origin_refusal(row)
+    return [(REFUSED_PRECONDITION, refusal[1])] if refusal else []
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -712,6 +743,7 @@ async def apply_refusals(
     task = dict(row) if row is not None else {"id": task_id}
 
     out = [not_delegated] if not_delegated else []
+    out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(precondition_refusals(packet))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
@@ -721,4 +753,11 @@ async def apply_refusals(
     ladder = ladder_refusal(packet)
     if ladder:
         out.append(ladder)
+    # #1601: approve судьи применяется только при согласии советника на ТОМ
+    # ЖЕ пакете. Спрашивается готовым пакетом — второй сборки рядом нет.
+    from hub.services.steward_advisor import advisor_refusal
+
+    advisor = await advisor_refusal(db, task_id, packet.generation, packet)
+    if advisor:
+        out.append(advisor)
     return out

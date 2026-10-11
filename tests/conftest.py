@@ -9,6 +9,7 @@ import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from hub import config
 from hub.db import (
     _SCHEMA,
     _migrate,
@@ -17,6 +18,7 @@ from hub.db import (
     _table_exists,
 )
 from hub.integrations import git_ops as git_ops_mod
+from tests.branch_code_support import spawn_spy  # noqa: F401 - shared fixture
 from hub.integrations.noop import (
     NoopDispatch,
     NoopGitHub,
@@ -26,6 +28,11 @@ from hub.integrations.noop import (
     NoopVast,
 )
 from hub.integrations.registry import plugins
+from tests.local_advisor_support import (  # noqa: F401 - фикстуры задачи #1649
+    local_identity,
+    local_service,
+    local_spool,
+)
 
 
 class MockDispatch(NoopDispatch):
@@ -73,6 +80,34 @@ class MockGitOps(NoopGitOps):
 
     async def checkout(self, branch, repo=None):
         return True
+
+
+@pytest.fixture(autouse=True)
+def _fresh_mcp_session_manager():
+    """Менеджер сессий MCP глобального app запускается тестами по разу на тест.
+
+    ``StreamableHTTPSessionManager.run()`` по контракту SDK вызывается один раз
+    на экземпляр; несколько тестов (test_csrf, test_mcp_transport) входят в его
+    lifespan на реальном приложении, и на одном воркере xdist второй из них
+    падал «can only be called once» в зависимости от раскладки (#1667). Перед
+    каждым тестом флаг запуска сбрасывается; менеджер после выхода из
+    ``run()`` чист (task group закрыта, реестры очищены).
+    """
+    from hub import mcp_server
+
+    manager = getattr(mcp_server.mcp, "_session_manager", None)
+    if manager is not None:
+        manager._has_started = False
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_random_deep_lot(monkeypatch):
+    """Жребий deep (#1403) выключен: тесты профилей не должны зависеть от хеша.
+
+    Сам жребий проверяют тесты, которые ставят долю явно.
+    """
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "0", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -135,8 +170,26 @@ def _forget_gate_merges():
     from hub.services import orchestration
 
     orchestration._gate_merges.clear()
+    orchestration._unrecorded_gate_merges.clear()
+    orchestration._gate_branch_updates.clear()
     yield
     orchestration._gate_merges.clear()
+    orchestration._unrecorded_gate_merges.clear()
+    orchestration._gate_branch_updates.clear()
+
+
+@pytest.fixture(autouse=True)
+def _forget_models_catalog():
+    """Empty the Cursor models-catalog cache around every test (#1423).
+
+    The cache is process-wide for an hour; one test's catalog would otherwise
+    choose the reviewer's model params for the next.
+    """
+    from hub.integrations import cursor_cloud
+
+    cursor_cloud.forget_models_catalog()
+    yield
+    cursor_cloud.forget_models_catalog()
 
 
 @pytest.fixture(autouse=True)
@@ -349,3 +402,95 @@ def squash_release(tmp_path: Path) -> dict[str, str]:
         "released": released,
         "after_release": after_release,
     }
+
+
+@pytest.fixture(autouse=True)
+def _clean_in_prod_cache():
+    """#1603: the process-wide IN_PROD cache must not leak between tests."""
+    from hub.services import delivery_state as ds
+
+    cache = getattr(ds, "_in_prod_cache", None)
+    if cache is not None:
+        cache.clear()
+    yield
+    cache = getattr(ds, "_in_prod_cache", None)
+    if cache is not None:
+        cache.clear()
+
+
+@pytest.fixture
+async def ci_runner_hub(client, db, monkeypatch):
+    """Closed auth mode with REAL DB principals (#1639).
+
+    ``ci``: kind=service, one role ``ci_runner``, a DB API key. ``human``: an
+    operator with a key. Open mode and substituted identities replace the
+    caller, which is exactly what hid this defect: the identity must come out
+    of ``admin.get_effective_role`` through the DB resolver.
+    """
+    from types import SimpleNamespace
+
+    from hub.services import admin as admin_svc
+
+    # Auth is on only when some token exists: an empty map means open mode.
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"unused-env-token": config.TokenIdentity("env-x", "agent")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-1639", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    ci = await admin_svc.create_principal(
+        db, kind="service", username="ci-1639", role_slug="ci_runner"
+    )
+    ci_key = await admin_svc.create_api_key(db, ci["id"], name="ci")
+    ci_session = await admin_svc.create_browser_session(db, ci["id"])
+    await db.commit()
+    return SimpleNamespace(
+        client=client,
+        db=db,
+        # A real browser session of the CI principal: the cookie door resolves
+        # through resolve_browser_session, a second DB resolver that Bearer
+        # tests never touch.
+        ci_cookie={"Cookie": f"{config.HUB_COOKIE_NAME}={ci_session}"},
+        human_principal=human,
+        ci_principal=ci,
+        human={"Authorization": f"Bearer {human_key['plaintext_key']}"},
+        ci={"Authorization": f"Bearer {ci_key['plaintext_key']}"},
+        ci_token=ci_key["plaintext_key"],
+        human_token=human_key["plaintext_key"],
+    )
+
+
+@pytest.fixture
+def scoped_ci_key(ci_runner_hub):
+    """Factory of REAL ci_runner DB keys with a given ``api_keys.scopes`` (#1644).
+
+    The scope is written straight into the column: the tests of the checks must
+    not depend on the issuing path, which has its own tests.
+    """
+    from hub.services import admin as admin_svc
+
+    async def make(scopes_raw: str, name: str = "scoped") -> dict:
+        hub = ci_runner_hub
+        key = await admin_svc.create_api_key(hub.db, hub.ci_principal["id"], name=name)
+        await hub.db.execute(
+            "UPDATE api_keys SET scopes = ? WHERE id = ?", (scopes_raw, key["id"])
+        )
+        await hub.db.commit()
+        return {"Authorization": f"Bearer {key['plaintext_key']}"}
+
+    return make
+
+
+@pytest.fixture(autouse=True)
+def _forget_locator_answers():
+    """A sha names the same content in real life, but test fakes reuse one."""
+    from hub.services.test_existence import clear_locator_cache
+
+    clear_locator_cache()
+    yield
+    clear_locator_cache()

@@ -13,7 +13,12 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from hub.models import FindingLocator, MachineFinding, MachineReviewView
+from hub.models import (
+    FindingLocator,
+    MachineFinding,
+    MachineReviewSubmit,
+    MachineReviewView,
+)
 from hub.services.finding_identity import finding_uid, finding_uids
 
 
@@ -415,3 +420,237 @@ def test_uid_survives_reordering():
 
 def test_locator_enum_names_all_three_answers():
     assert {m.value for m in FindingLocator} == {"lines", "file", "none"}
+
+
+# --- #1584: алерт «харнесс не запускался» отзывается честным отчётом ---
+
+_RETRACTED = "алерт по пустому"
+
+
+def _submit_body(raw_count: int) -> MachineReviewSubmit:
+    return MachineReviewSubmit(
+        raw_count=raw_count,
+        incomplete=False,
+        harness_skill="lite-diff-review",
+        agent="reviewer",
+    )
+
+
+async def _accept(db, task_id: int, raw_count: int, principal_id: int) -> None:
+    from hub.services.machine_review_intake import record_machine_review
+
+    await record_machine_review(
+        db,
+        task_id,
+        _submit_body(raw_count),
+        principal_id=principal_id,
+        username="reviewer",
+    )
+
+
+async def _feed(db, task_id: int) -> list[tuple[str, str]]:
+    rows = await db.execute_fetchall(
+        "SELECT kind, content FROM task_updates WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    return [(dict(r)["kind"], dict(r)["content"]) for r in rows]
+
+
+async def _review_ids(db, task_id: int) -> list[int]:
+    rows = await db.execute_fetchall(
+        "SELECT id FROM machine_reviews WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [dict(r)["id"] for r in rows]
+
+
+def _retractions(feed: list[tuple[str, str]]) -> list[str]:
+    return [c for _, c in feed if _RETRACTED in c]
+
+
+async def test_no_candidates_alert_is_retracted_when_real_report_follows(
+    client: AsyncClient, db
+):
+    task_id = await _reviewable_task(client, db)
+    await _accept(db, task_id, 0, principal_id=11)
+    feed = await _feed(db, task_id)
+    assert any("харнесс не запускался" in c for k, c in feed if k == "alert")
+    assert _retractions(feed) == []
+
+    await _accept(db, task_id, 2, principal_id=11)
+    r_id, n_id = (await _review_ids(db, task_id))[:2]
+    lines = _retractions(await _feed(db, task_id))
+    assert len(lines) == 1
+    assert f"#{r_id}" in lines[0] and f"#{n_id}" in lines[0]
+    assert "пришёл отчёт с данными" in lines[0]
+
+    # Второй отчёт с данными от того же принципала отзыва не даёт.
+    await _accept(db, task_id, 3, principal_id=11)
+    assert len(_retractions(await _feed(db, task_id))) == 1
+    # Ничего не переписано: алерт на месте, строки приняты.
+    feed = await _feed(db, task_id)
+    assert any("харнесс не запускался" in c for k, c in feed if k == "alert")
+    assert len(await _review_ids(db, task_id)) == 3
+
+
+async def test_no_retraction_for_another_principal_or_without_alert(
+    client: AsyncClient, db
+):
+    from hub import repository as repo_module
+
+    # (а) нулевая от P, нулевая от Q, отчёт Q с данными.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 0, principal_id=11)
+    await _accept(db, t, 0, principal_id=12)
+    await _accept(db, t, 2, principal_id=12)
+    assert _retractions(await _feed(db, t)) == []
+    assert len(await _review_ids(db, t)) == 3
+
+    # (б) поколение без нулевых строк.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (в) перенесённая строка P с данными, затем отчёт P с данными.
+    t = await _reviewable_task(client, db)
+    gen = (dict(await repo_module.get_task(db, t)))["submission_generation"]
+    await repo_module.insert_machine_review(
+        db,
+        task_id=t,
+        submission_generation=gen,
+        raw_count=2,
+        principal_id=11,
+        carried_from_review_id=1,
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (г) перенесённая нулевая R, затем отчёт P с данными.
+    t = await _reviewable_task(client, db)
+    gen = (dict(await repo_module.get_task(db, t)))["submission_generation"]
+    await repo_module.insert_machine_review(
+        db,
+        task_id=t,
+        submission_generation=gen,
+        raw_count=0,
+        principal_id=11,
+        carried_from_review_id=1,
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (д) нулевая P по прежнему поколению, отчёт P с данными по новому.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 0, principal_id=11)
+    await db.execute(
+        "UPDATE tasks SET submission_generation=submission_generation+1 WHERE id=?",
+        (t,),
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+    assert len(await _review_ids(db, t)) == 2
+
+
+# --- #1587: the contract cannot claim a text origin ------------------------
+
+
+async def test_contract_report_cannot_claim_a_text_origin(client: AsyncClient, db):
+    """Префиксы cursor-cloud-result: и local-reviewer-result: — метка хаба.
+
+    Контрактный приём отказывает (422) и не пишет строку: иначе сданный
+    ревьюером отчёт выдавал бы себя за переписанный хабом, и по префиксу
+    нельзя было бы отличить факт от заявления. Честное имя проходит и
+    остаётся контрактным (без префикса).
+    """
+    from hub import repository as repo_module
+
+    task_id = await _reviewable_task(client, db)
+    for claimed in (
+        "cursor-cloud-result:grok",
+        "local-reviewer-result:x",
+        "  Cursor-Cloud-Result:grok",
+    ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/machine-review",
+            json={**_report([]), "orchestrator": claimed},
+        )
+        assert resp.status_code == 422, claimed
+        assert "зарезервированы" in resp.json()["detail"], claimed
+    assert await repo_module.get_latest_machine_review(db, task_id) is None, (
+        "a refused report leaves no row"
+    )
+
+    ok = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={**_report([]), "orchestrator": "claude-code-workflow"},
+    )
+    assert ok.status_code == 200, ok.text
+    row = await repo_module.get_latest_machine_review(db, task_id)
+    assert row["orchestrator"] == "claude-code-workflow", "origin stays contractual"
+
+
+# --- #1598: правило отказа среды #1238 не знает канала ---------------------
+
+
+async def test_local_environment_refusal_handling_is_unchanged(client: AsyncClient, db):
+    """AC-4 (#1598): регрессионная защита, зелёная и до, и после задачи.
+
+    Локальный отчёт с заявленным ``incomplete_reason=environment`` (бриф
+    недоступен) получает прежнее: алерт на карточке, примечание лестницы и
+    место в счётчике. Локальный отчёт, что просто не запускал тесты и
+    environment не заявил, отказом среды хабом не считается.
+    """
+    from hub import repository as repo_module
+    from hub.services.review_dispatch import (
+        ENVIRONMENT_REFUSAL_NOTE,
+        _ladder_cause_note,
+        count_environment_refusals,
+        is_environment_refusal,
+    )
+
+    refused_id = await _reviewable_task(client, db)
+    refusal = {
+        "raw_count": 0,
+        "incomplete": True,
+        "incomplete_reason": "environment",
+        "harness_skill": "multi-agent-review",
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "unresolved": [],
+        "lost_dimensions": ["бриф ревью по HTTP недоступен: код доступа не принят"],
+        "agent": "local-reviewer",
+        "model": "qwen3.8-max",
+    }
+    resp = await client.post(f"/api/tasks/{refused_id}/machine-review", json=refusal)
+    assert resp.status_code == 200, resp.text
+    stored = dict(await repo_module.get_latest_machine_review(db, refused_id))
+    assert is_environment_refusal(stored) is True
+    assert ENVIRONMENT_REFUSAL_NOTE in _ladder_cause_note(stored)
+    updates = [dict(u) for u in await repo_module.get_task_updates(db, refused_id)]
+    alerts = [u["content"] for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert len(alerts) == 1, alerts
+    assert "бриф ревью по HTTP недоступен" in alerts[0]
+    assert "второй прогон" in alerts[0], "запрет бесполезного повтора назван"
+
+    silent_id = await _reviewable_task(client, db)
+    silent = dict(refusal)
+    silent.pop("incomplete_reason")
+    silent["lost_dimensions"] = [
+        "тесты не запускались: у локального ревьюера нет pytest"
+    ]
+    resp = await client.post(f"/api/tasks/{silent_id}/machine-review", json=silent)
+    assert resp.status_code == 200, resp.text
+    silent_stored = dict(await repo_module.get_latest_machine_review(db, silent_id))
+    assert silent_stored["incomplete_reason"] == ""
+    assert is_environment_refusal(silent_stored) is False
+    assert _ladder_cause_note(silent_stored) == ""
+    silent_updates = [
+        dict(u) for u in await repo_module.get_task_updates(db, silent_id)
+    ]
+    assert not [u for u in silent_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+    stats = await count_environment_refusals(db, since_days=30)
+    assert stats["environment_refusals"] == 1
+    assert stats["reason_unstated"] == 1

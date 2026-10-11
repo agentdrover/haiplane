@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from hub.services.test_existence import (
-    BY_COLLECTION,
     BY_SOURCE,
     MISSING,
+    PARAM_NOT_CHECKED,
     RESOLVABLE,
     UNKNOWN,
     UNPARSEABLE,
-    collect_test_nodeids,
-    needs_source_reading,
     resolve_ac_locators,
     resolve_locator_in_source,
 )
@@ -23,47 +21,46 @@ class _AC:
         self.test_ref = test_ref
 
 
+_PRESENT = "def test_ok():\n    assert True\n"
+
+
 def test_resolve_marks_present_missing_and_skips_non_test():
-    collected = {"tests/test_a.py::test_ok"}
     acs = [
         _AC("AC-1", "test", "tests/test_a.py::test_ok"),  # resolvable
         _AC("AC-2", "test", "tests/test_a.py::test_gone"),  # valid locator, absent
         _AC("AC-3", "test", "free-text ref"),  # no valid locator
         _AC("AC-4", "manual", None),  # non-test → skipped
     ]
-    by = {r["ac_id"]: r["status"] for r in resolve_ac_locators(acs, collected)}
+    by = {
+        r["ac_id"]: r["status"]
+        for r in resolve_ac_locators(acs, {"tests/test_a.py": _PRESENT})
+    }
     assert by == {"AC-1": RESOLVABLE, "AC-2": MISSING, "AC-3": MISSING}
     assert "AC-4" not in by
 
 
-def test_resolve_unknown_when_collection_unavailable():
-    # collected=None (collection could not run) → unknown, never false missing.
+def test_resolve_unknown_when_nothing_was_read():
+    # No text at all (no ref, no workspace) → unknown, never a false missing.
     acs = [_AC("AC-1", "test", "tests/test_a.py::test_ok")]
-    res = resolve_ac_locators(acs, None)
-    assert res[0]["status"] == UNKNOWN
+    assert resolve_ac_locators(acs, None)[0]["status"] == UNKNOWN
 
 
-async def test_collect_returns_none_without_repo_path():
-    assert await collect_test_nodeids(None) is None
-    assert await collect_test_nodeids("") is None
+def test_resolve_names_the_ref_it_read():
+    acs = [_AC("AC-1", "test", "tests/test_a.py::test_ok")]
+    res = resolve_ac_locators(
+        acs, {"tests/test_a.py": _PRESENT}, ref_label="submission_sha 1234567890"
+    )[0]
+    assert res["reason"].endswith("[ref: submission_sha 1234567890]")
 
 
 def test_resolve_matches_parametrized_test_by_bare_locator():
-    # #506 fix: pytest emits only the parametrized ids; a bare function locator
-    # (the documented common form) still runs every case and must resolve.
-    collected = {"tests/test_a.py::test_p[case1]", "tests/test_a.py::test_p[case2]"}
+    # A bare function locator (the documented common form) runs every case.
+    src = "import pytest\n\n\n@pytest.mark.parametrize('c', [1])\ndef test_p(c):\n    pass\n"
     acs = [_AC("AC-1", "test", "tests/test_a.py::test_p")]
-    assert resolve_ac_locators(acs, collected)[0]["status"] == RESOLVABLE
+    assert resolve_ac_locators(acs, {"tests/test_a.py": src})[0]["status"] == RESOLVABLE
 
 
-def test_resolve_still_missing_for_unknown_base():
-    # The base-nodeid relaxation must not turn a genuinely absent test green.
-    collected = {"tests/test_a.py::test_p[case1]"}
-    acs = [_AC("AC-1", "test", "tests/test_a.py::test_other")]
-    assert resolve_ac_locators(acs, collected)[0]["status"] == MISSING
-
-
-# --- #764: reading the file when collection cannot run ----------------------
+# --- #764: reading the file instead of collecting ----------------------
 #
 # At review time no working tree holds the submitted branch — submit removes
 # the task's worktree — so collection is not merely unavailable, it is the
@@ -93,7 +90,7 @@ class TestGroup:
 def test_static_resolution_reports_missing_with_what_it_looked_for():
     """#764 AC-2: an absent test is named as absent, not shrugged at."""
     acs = [_AC("AC-1", "test", "tests/test_a.py::test_never_written")]
-    res = resolve_ac_locators(acs, None, {"tests/test_a.py": _SOURCE})[0]
+    res = resolve_ac_locators(acs, {"tests/test_a.py": _SOURCE})[0]
     assert res["status"] == MISSING
     assert "test_never_written" in res["reason"]
     assert "tests/test_a.py" in res["reason"]
@@ -108,7 +105,7 @@ def test_static_resolution_handles_method_parametrised_and_unparseable():
         _AC("AC-4", "test", "tests/broken.py::test_anything"),
     ]
     sources = {"tests/test_a.py": _SOURCE, "tests/broken.py": "def (:"}
-    by = {r["ac_id"]: r for r in resolve_ac_locators(acs, None, sources)}
+    by = {r["ac_id"]: r for r in resolve_ac_locators(acs, sources)}
     assert by["AC-1"]["status"] == RESOLVABLE
     assert by["AC-2"]["status"] == RESOLVABLE
     assert by["AC-3"]["status"] == RESOLVABLE
@@ -117,19 +114,12 @@ def test_static_resolution_handles_method_parametrised_and_unparseable():
 
 
 def test_resolution_names_how_it_was_resolved():
-    """#764 AC-5: collection and reading the file are not equal evidence.
-
-    One says pytest would collect the test; the other says a function by that
-    name is written in the file. A brief that reported both as a bare
-    "resolvable" would let the weaker of the two pass for the stronger.
-    """
+    """#764 AC-5: a resolution says it was READ, not run, and where."""
     acs = [_AC("AC-1", "test", "tests/test_a.py::test_module_level")]
 
-    by_collection = resolve_ac_locators(acs, {"tests/test_a.py::test_module_level"})[0]
-    by_source = resolve_ac_locators(acs, None, {"tests/test_a.py": _SOURCE})[0]
+    by_source = resolve_ac_locators(acs, {"tests/test_a.py": _SOURCE})[0]
 
-    assert by_collection["status"] == by_source["status"] == RESOLVABLE
-    assert by_collection["reason"] == BY_COLLECTION
+    assert by_source["status"] == RESOLVABLE
     assert BY_SOURCE in by_source["reason"]
     assert "tests/test_a.py:5" in by_source["reason"]  # file and line
 
@@ -137,7 +127,7 @@ def test_resolution_names_how_it_was_resolved():
 def test_unreadable_file_stays_unknown():
     """#764 AC-4 at unit level: "could not read" never becomes "not there"."""
     acs = [_AC("AC-1", "test", "tests/test_a.py::test_module_level")]
-    res = resolve_ac_locators(acs, None, {"tests/test_a.py": None})[0]
+    res = resolve_ac_locators(acs, {"tests/test_a.py": None})[0]
     assert res["status"] == UNKNOWN
     assert res["status"] != MISSING
 
@@ -156,36 +146,24 @@ describe("признак раскрытия подсписка", () => {
 
 
 def test_foreign_runner_locator_is_never_missing():
-    # AC-1. The measured defect: `collected` comes from pytest and speaks only
-    # for pytest, but every locator was judged against it. On #1202 that
-    # answered `missing`, "locator does not match any collected test", about a
-    # test written three lines into the file — the false missing this module's
-    # own docstring promises never to produce.
-    pytest_collected = {"tests/test_poller.py::test_a"}
+    # AC-1. A locator of another runner is judged by its own reader, never by
+    # what pytest would list: on #1202 that answered `missing` about a test
+    # written three lines into the file.
     ac = [_AC("AC-1", "test", _VITEST_LOCATOR)]
 
-    # Path 1: pytest collection ran and (of course) does not list this test.
-    with_source = resolve_ac_locators(
-        ac, pytest_collected, {_VITEST_FILE: _VITEST_SOURCE}
-    )[0]
-    assert with_source["status"] == RESOLVABLE
-    assert BY_SOURCE in with_source["reason"]
+    found = resolve_ac_locators(ac, {_VITEST_FILE: _VITEST_SOURCE})[0]
+    assert found["status"] == RESOLVABLE
+    assert BY_SOURCE in found["reason"]
 
-    # Path 2: collection ran, but the file itself could not be read. Unknown
-    # with a stated reason — "could not look" is not "the answer is no" (#725).
-    unread = resolve_ac_locators(ac, pytest_collected, {_VITEST_FILE: None})[0]
+    # The file could not be read: unknown with a stated reason (#725).
+    unread = resolve_ac_locators(ac, {_VITEST_FILE: None})[0]
     assert unread["status"] == UNKNOWN
     assert _VITEST_FILE in unread["reason"]
-
-    # Path 3: no collection at all — the pre-existing fallback route.
-    no_collection = resolve_ac_locators(ac, None, {_VITEST_FILE: _VITEST_SOURCE})[0]
-    assert no_collection["status"] == RESOLVABLE
 
     # And the guard is not blanket silence: when the file is readable and the
     # test really is absent, `missing` is still the honest answer.
     absent = resolve_ac_locators(
         [_AC("AC-1", "test", f"{_VITEST_FILE}::a test nobody wrote")],
-        pytest_collected,
         {_VITEST_FILE: _VITEST_SOURCE},
     )[0]
     assert absent["status"] == MISSING
@@ -238,10 +216,6 @@ def test_unreadable_declaration_form_is_unknown_not_missing():
     # первой сдаче — до правки каждый отвечал `missing` про существующий тест.
     forms = [
         ('it.each`\n  $a | $b\n`("adds $a and $b", () => {});', "adds $a and $b"),
-        (
-            'it.each(items.map(x => foo(x)))("maps then names", () => {});',
-            "maps then names",
-        ),
         ('const n = "still toggles";\nit(n, () => {});', "still toggles"),
     ]
     for src, name in forms:
@@ -250,6 +224,14 @@ def test_unreadable_declaration_form_is_unknown_not_missing():
         # И причина обязана назвать, ЧТО именно помешало: "не смог прочитать
         # эту форму" — ответ, а "теста нет" на том же месте было обвинением.
         assert "cannot follow" in reason, (name, reason)
+
+
+def test_a_nested_each_table_is_followed_by_the_scanner():
+    # The old regular expression gave up on a call inside the table and said
+    # unknown; the scanner balances the parentheses and finds the name.
+    src = 'it.each(items.map(x => foo(x)))("maps then names", () => {});'
+    status, _ = resolve_locator_in_source(src, "a/b.test.ts::maps then names")
+    assert status == RESOLVABLE
 
 
 def test_missing_survives_where_it_is_honest():
@@ -262,19 +244,107 @@ def test_missing_survives_where_it_is_honest():
     assert resolve_locator_in_source(plain, "a/b.test.ts::b")[0] == RESOLVABLE
 
 
-def test_source_reading_is_needed_when_collection_speaks_for_another_runner():
-    # #1203: правило "когда нужен текст файла" жило в двух местах и копии
-    # разошлись — brief читал файлы только при провале сборки. Теперь правило
-    # одно и стоит рядом с резолвером, который им пользуется.
-    collected = {"tests/test_poller.py::test_a"}
-    vitest = [_AC("AC-1", "test", "a/b.test.ts::still toggles")]
-    pytest_only = [_AC("AC-1", "test", "tests/test_a.py::test_ok")]
+# ---- #1650: the full definition path ------------------------------------------
 
-    assert needs_source_reading(vitest, collected) is True
-    assert needs_source_reading(pytest_only, collected) is False
-    # Провал сборки по-прежнему требует чтения — прежнее поведение цело.
-    assert needs_source_reading(pytest_only, None) is True
-    # Негодный локатор ничего не требует: его судьба решается формой.
-    assert needs_source_reading([_AC("AC-1", "test", "free text")], collected) is False
-    # Не-test критерий тоже: ему тест не нужен вовсе.
-    assert needs_source_reading([_AC("AC-1", "manual", None)], collected) is False
+_PATH_SOURCE = """
+from base_module import ImportedBase
+
+
+def test_only_here():
+    pass
+
+
+class TestOwn:
+    def test_method(self):
+        pass
+
+
+class LocalBase:
+    def test_from_base(self):
+        pass
+
+
+class TestChild(LocalBase):
+    pass
+
+
+class TestForeign(ImportedBase):
+    pass
+
+
+class TestParam:
+    @staticmethod
+    def test_p(x):
+        pass
+"""
+
+
+def _one(locator: str, source: str = _PATH_SOURCE) -> dict:
+    return resolve_ac_locators(
+        [_AC("AC-1", "test", locator)], {"tests/test_p.py": source}
+    )[0]
+
+
+def test_static_resolver_matches_the_full_definition_path():
+    """#1650 AC-2: Class::method is a path, not the last name found anywhere."""
+    found = _one("tests/test_p.py::TestOwn::test_method")
+    assert found["status"] == RESOLVABLE
+    assert "tests/test_p.py:10" in found["reason"]
+
+    # The function exists, but not in this class: it must not satisfy the path.
+    wrong_class = _one("tests/test_p.py::MissingClass::test_only_here")
+    assert wrong_class["status"] == MISSING
+    assert "MissingClass" in wrong_class["reason"]
+    gone = _one("tests/test_p.py::MissingClass::test_x")
+    assert gone["status"] == MISSING
+    # ...nor does a method of another class stand in for this one.
+    assert _one("tests/test_p.py::TestOwn::test_from_base")["status"] == MISSING
+    # A module-level function is not reachable through a class either.
+    assert _one("tests/test_p.py::TestOwn::test_only_here")["status"] == MISSING
+
+    # Unambiguous local inheritance, in the same file.
+    local = _one("tests/test_p.py::TestChild::test_from_base")
+    assert local["status"] == RESOLVABLE
+    assert _one("tests/test_p.py::TestChild::test_nothing")["status"] == MISSING
+
+    # Inheritance from elsewhere cannot be followed without importing: unknown,
+    # and the reason names the base — never "missing".
+    imported = _one("tests/test_p.py::TestForeign::test_x")
+    assert imported["status"] == UNKNOWN
+    assert "ImportedBase" in imported["reason"]
+
+    # [param-id]: the base definition is found and the parameter is not judged.
+    param = _one("tests/test_p.py::TestParam::test_p[a-b]")
+    assert param["status"] == RESOLVABLE
+    assert PARAM_NOT_CHECKED in param["reason"]
+    assert _one("tests/test_p.py::TestParam::test_q[a]")["status"] == MISSING
+
+
+def test_what_a_static_reader_cannot_follow_is_unknown_not_missing():
+    star = "from helpers import *\n\n\ndef test_a():\n    pass\n"
+    assert _one("tests/test_p.py::test_b", star)["status"] == UNKNOWN
+
+    assigned = "test_b = make_test()\n"
+    assert _one("tests/test_p.py::test_b", assigned)["status"] == UNKNOWN
+
+    hidden = "class TestX:\n    __test__ = False\n"
+    assert _one("tests/test_p.py::TestX::test_a", hidden)["status"] == UNKNOWN
+
+    decorated = "@wrap\nclass TestX:\n    pass\n"
+    assert _one("tests/test_p.py::TestX::test_a", decorated)["status"] == UNKNOWN
+
+    marked = "import pytest\n\n\n@pytest.mark.slow\nclass TestX:\n    pass\n"
+    assert _one("tests/test_p.py::TestX::test_a", marked)["status"] == MISSING
+
+    guarded = "if True:\n    def test_a():\n        pass\n"
+    assert _one("tests/test_p.py::test_a", guarded)["status"] == UNKNOWN
+
+
+def test_a_config_issue_makes_a_found_pytest_test_unknown():
+    res = resolve_ac_locators(
+        [_AC("AC-1", "test", "tests/test_p.py::test_only_here")],
+        {"tests/test_p.py": _PATH_SOURCE},
+        pytest_config_issue="pyproject.toml sets python_functions",
+    )[0]
+    assert res["status"] == UNKNOWN
+    assert "python_functions" in res["reason"]

@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
+from collections.abc import AsyncIterator
 from typing import Any
 
 import contextlib
@@ -18,6 +19,10 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    claim_area_conflict_detail,
+    submission_contract_violated_detail,
+    bug_red_test_unproven_detail,
+    ci_before_submit_unproven_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
     verdict_repeats_previous_detail,
@@ -30,7 +35,9 @@ from hub.actionable_errors import (
     withdraw_own_draft_error_detail,
 )
 from hub import repository as repo
+from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.sessions import note_session_task
+from hub.services.result_kind import is_state
 from hub.hub_instance import mutation_activity_detail
 from hub.db import (
     deserialize_str_list,
@@ -41,10 +48,21 @@ from hub.db import (
 )
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
-from hub.services import verdict_text
-from hub.services.project_policy import risk_map_for_task
+from hub.services import (
+    prevention_gate,
+    project_policy,
+    ci_green_proof,
+    red_test_gate,
+    submission_contract,
+    verdict_text,
+)
+from hub.services.project_policy import (
+    FREEZE_REFUSED,
+    freeze_admission,
+    risk_map_for_task,
+)
 from hub.services.risk_class import derive_risk_class
-from hub.models import RiskClass, TaskDeclareWait
+from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
@@ -105,6 +123,7 @@ from hub.models import (
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
     apply_live_worktree,
+    defer_completions,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -115,6 +134,7 @@ from hub.services.orchestration import (
     restore_pair_workspace_base,
     review_approved_for_current_submission,
     review_verdict_covers_current_submission,
+    run_deferred_completions,
     switch_pair_workspace_to_task,
     transition_after_agent_done,
 )
@@ -207,8 +227,8 @@ async def _try_restore_pair_workspace(
 ) -> None:
     """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
-        return
+    if _git_mode_is_remote(row) or is_state(row):
+        return  # #1647: у задачи-состояния рабочей копии нет ни в каком режиме
     try:
         await restore_pair_workspace_base(db, task_id)
     except Exception as exc:
@@ -242,7 +262,7 @@ async def _try_switch_pair_workspace_to_task(
 ) -> None:
     """Best-effort workspace switch to the task branch for rework (#457)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
+    if _git_mode_is_remote(row) or is_state(row):
         return
     try:
         await switch_pair_workspace_to_task(db, task_id)
@@ -321,18 +341,27 @@ def _parent_has_own_work(parent: dict[str, Any]) -> bool:
 async def _note_rollup_awaits_own_report(
     db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
 ) -> None:
-    """Write the skip to the task tape so the parent is not silently stuck."""
+    """Write the skip to the task tape so the parent is not silently stuck.
+
+    Said once per reason (#1562): the sweep passes over the same parent every
+    tick, and the same sentence on each pass would bury the tape. The text
+    carries branch and holder, so a changed reason is a new sentence.
+    """
     branch = (parent.get("branch") or "").strip() or "—"
     claimed = (parent.get("claimed_by") or "").strip() or "—"
-    await repo.add_task_update(
-        db,
-        parent_id,
-        "hub",
-        "status",
+    content = (
         "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
         f"задачу, потому что у неё есть собственная работа "
-        f"(branch={branch}, claimed_by={claimed}).",
+        f"(branch={branch}, claimed_by={claimed})."
     )
+    already = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND agent='hub' AND content=?",
+        (parent_id, content),
+    )
+    if already:
+        return
+    await repo.add_task_update(db, parent_id, "hub", "status", content)
     await log_activity(
         db,
         "task_updated",
@@ -341,8 +370,94 @@ async def _note_rollup_awaits_own_report(
     )
 
 
-async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
-    """Auto-complete feature/epic when every direct child is terminal (#742)."""
+async def mis_issued_container_run(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Последний прогон, если выдача контейнера им — ошибочная и осталась (#1562).
+
+    Единый предикат для возврата в open и для свипа свёртки: контейнер
+    (feature/epic с детьми, как для #1043), PR нет, последний прогон
+    исполнителя остановлен без сдачи своего поколения, в карточке ещё лежит
+    выдача (захват: claimed_by или сессия; одной ветки мало). Обычная задача
+    под него не подпадает: её ветка — настоящая работа, даже если прогон
+    остановили.
+    """
+    if task.get("task_type") not in _ROLLUP_PARENT_TYPES or task.get("pr_number"):
+        return None
+    # Признак ошибочной выдачи — висящий захват, а не ветка: release_task и
+    # return_to_work снимают захват и ветку оставляют намеренно (#1356).
+    if not (
+        (task.get("claimed_by") or "").strip()
+        or (task.get("claim_session_id") or "").strip()
+    ):
+        return None
+    if not await db_module.get_children(db, task["id"]):
+        return None
+    from hub.services.executor_dispatch import STOPPED_OUTCOMES
+
+    runs = await repo.list_executor_runs(db, task["id"])
+    if not runs:
+        return None
+    last = dict(runs[-1])
+    if last["outcome"] not in STOPPED_OUTCOMES or int(
+        last["submission_generation"] or 0
+    ) <= int(task.get("submission_generation") or 0):
+        return None
+    return last
+
+
+async def reset_mis_issued_assignment(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> bool:
+    """Снять остаток ошибочной выдачи с контейнера, не дав ей держать свёртку (#1562).
+
+    Контейнер выдали исполнителю по ошибке (#1455), прогон кончился без
+    сдачи, а claimed_by, сессия, ветка и режим git остались бы «собственной
+    работой» для правила #1043 и держали бы свёртку навсегда (#1375). Решает
+    :func:`mis_issued_container_run`. Только поля карточки: ветка в git и
+    каталог на диске не трогаются, прежние значения уходят в ленту. Рабочего
+    каталога в карточке нет — он выводится из id задачи. Коммит — за
+    вызывающим.
+    """
+    last = await mis_issued_container_run(db, {**task, "id": task_id})
+    if last is None:
+        return False
+    holder = (task.get("claimed_by") or "").strip()
+    session = (task.get("claim_session_id") or "").strip()
+    branch = (task.get("branch") or "").strip()
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+        branch=None,
+        git_mode="hub",
+    )
+    await note_session_task(db, session, None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Выдача снята: прогон исполнителя закончился без сдачи "
+        f"({last['outcome']}), PR нет. Прежняя выдача: держатель "
+        f"{holder or '—'}, сессия {session or '—'}, ветка {branch or '—'}. "
+        "Ветка в git и каталог на диске не тронуты; без остатка выдачи "
+        "свёртка родителя может закрыть задачу, если все дети завершены.",
+    )
+    return True
+
+
+async def maybe_rollup_parent(
+    db: aiosqlite.Connection, child_id: int, *, commit: bool = True
+) -> None:
+    """Auto-complete feature/epic when every direct child is terminal (#742).
+
+    ``commit=False`` (#1647) — внутри транзакции вызывающего: свёртка не
+    фиксирует её раньше времени, владелец коммитит или откатывает всё сам.
+    """
     row = await repo.get_task(db, child_id)
     if not row:
         return
@@ -365,6 +480,12 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     if _parent_has_own_work(parent):
         await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
+    if prevention_gate.prevention_gap(parent):
+        # #919: a rollup cannot answer for a prod defect's output; the parent
+        # waits for its own report, like one with its own work above — and,
+        # like it, says so instead of standing silently.
+        await prevention_gate.note_rollup_held(db, parent_id)
+        return
 
     if not await repo.transition_status_if(
         db,
@@ -374,15 +495,16 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     ):
         refreshed = await repo.get_task(db, parent_id)
         if refreshed and dict(refreshed)["status"] == "completed":
-            await maybe_rollup_parent(db, parent_id)
+            await maybe_rollup_parent(db, parent_id, commit=commit)
         return
 
     await log_activity(
         db,
         "task_completed",
         f"Task #{parent_id} auto-completed: all children done",
+        commit=commit,
     )
-    await maybe_rollup_parent(db, parent_id)
+    await maybe_rollup_parent(db, parent_id, commit=commit)
 
 
 async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
@@ -394,6 +516,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC",
     )
     repaired = 0
+    noted = False
     for row in rows:
         parent_id = row["id"]
         parent_row = await repo.get_task(db, parent_id)
@@ -403,11 +526,25 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         children = await db_module.get_children(db, parent_id)
         if not _children_allow_rollup(children):
             continue
+        if _parent_has_own_work(parent) and parent["status"] == "open":
+            # #1562: an open container still holding a stopped run's
+            # assignment (#1375) is released here, by the same predicate as the
+            # return to open, and rolled up in this very pass.
+            if await reset_mis_issued_assignment(db, parent_id, parent):
+                parent = dict(await repo.get_task(db, parent_id))  # type: ignore[arg-type]
         if _parent_has_own_work(parent):
+            # #1562: the sweep says why it passes, once per reason — it used
+            # to skip in silence, and #1375 stood open for days.
+            await _note_rollup_awaits_own_report(db, parent_id, parent)
+            noted = True
+            continue
+        if prevention_gate.prevention_gap(parent):
+            await prevention_gate.note_rollup_held(db, parent_id)
+            noted = True
             continue
         await repo.update_task(db, parent_id, status="completed")
         repaired += 1
-    if repaired:
+    if repaired or noted:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
     return repaired
@@ -461,7 +598,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             detail=_done_report_error(
                 task,
                 reason="awaiting_ci_conveyor",
-                hint="Task is in ci_check; wait for poller or use hub_decide_task / human gate.",
+                hint="Task is in ci_check; wait for poller or use REST POST /api/tasks/<id>/decide / human gate.",
                 required_status="ci_check",
             ),
         )
@@ -471,7 +608,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             detail=_done_report_error(
                 task,
                 reason="human_decision_required",
-                hint="Task awaits hub_decide_task or human Decision Gate.",
+                hint="Task awaits REST POST /api/tasks/<id>/decide or human Decision Gate.",
                 required_status="needs_decision",
             ),
         )
@@ -480,7 +617,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
         detail=_done_report_error(
             task,
             reason="invalid_status_for_done",
-            hint="Start work via hub_pair_start or hub_start_task before reporting done.",
+            hint="Start work via hub_pair_start (claim first) before reporting done.",
             required_status="running",
         ),
     )
@@ -700,6 +837,9 @@ def row_to_task(
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         archived=bool(d.get("archived", 0)),
+        defect_prevention=json.loads(d["defect_prevention"])
+        if d.get("defect_prevention")
+        else None,
         **structured_clean,
     )
 
@@ -754,8 +894,19 @@ async def enrich_task_view(
     row = await repo.get_task(db, task_view.id)
     if row:
         task_dict = dict(row)
+        if is_state(task_dict):
+            # #1647: доказательства всех поколений — на единичном чтении карточки.
+            from hub.services.state_task import evidence_views
+
+            task_view.evidence = await evidence_views(db, task_view.id)
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
+        # #917: single-task read only, and only for a defect with a release —
+        # lists must not pay for a join most tasks do not need (#485).
+        if task_dict.get("release_id") is not None:
+            from hub.services.defect_release import suggest_causes
+
+            task_view.cause_suggestion = await suggest_causes(db, task_view.id)
 
     # #1235: круг ревью читается ТОЙ ЖЕ функцией, которой его считают бриф и
     # сигнал. Второе выражение того же счёта здесь означало бы, что карточка
@@ -780,7 +931,23 @@ async def enrich_task_view(
             id=project_row["id"], slug=project_row["slug"]
         )
 
+    task_view.verdict_route = await _verdict_route_of(db, task_view)
     return await apply_live_worktree(db, task_view)
+
+
+async def _verdict_route_of(
+    db: aiosqlite.Connection, task_view: TaskView
+) -> dict[str, Any] | None:
+    """#1440: who will write the verdict, for a task in review only.
+
+    Answered by ``verdict_route`` — the same stance the deciders read — and
+    without the network: a card and a status call must not fetch the branch.
+    """
+    if task_view.status != TaskStatus.review:
+        return None
+    from hub.services.verdict_route import verdict_route
+
+    return (await verdict_route(db, task_view.id)).as_dict()
 
 
 @dataclass(frozen=True)
@@ -803,13 +970,96 @@ async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+def _require_freeze_admission(
+    project: Any, work_type: Any, rationale: str, *, where: str = ""
+) -> None:
+    """Отказ 422, если заморозка проекта не пускает эту работу (#1594).
+
+    Тонкая обёртка над ``project_policy.freeze_admission``: проверка одна, а
+    здесь она лишь превращается в структурированный отказ. ``where`` называет
+    элемент пачки, чтобы смешанная пачка отказывала поимённо.
+    """
+    refusal = freeze_admission(project, work_type, rationale)
+    if refusal is None:
+        return
+    detail = refusal.detail()
+    if where:
+        detail["message"] = f"{where}: {refusal.text}"
+    raise HTTPException(422, detail=detail)
+
+
+async def _project_of_new_task(
+    db: aiosqlite.Connection, parent_id: int | None, bound: Any = None
+) -> Any:
+    """Проект, в который войдёт ещё не созданная задача (#1594).
+
+    Тем же наследованием, что и у существующей: эпик с ``project`` - в него,
+    иначе по родителю, иначе проект default (запасной путь
+    ``resolve_project_for_task``).
+    """
+    if bound is not None:
+        # Строка, прочитанная до write-лока, могла устареть: перечитывается.
+        return await repo.get_project(db, int(bound["id"]))
+    if parent_id is not None:
+        return await repo.resolve_project_for_task(db, parent_id)
+    return await repo.get_project_by_slug(db, "default")
+
+
+async def _epic_project_at_creation(db: aiosqlite.Connection, body: TaskCreate) -> Any:
+    """Строка проекта, к которому привязывается создаваемый эпик (#346); иначе None."""
+    if not body.project:
+        return None
+    if body.task_type != TaskType.epic:
+        raise HTTPException(
+            422, "project can only be set on epics; children inherit it"
+        )
+    project_row = await repo.get_project_by_slug(db, body.project)
+    if project_row is None:
+        raise HTTPException(422, f"unknown project slug: {body.project!r}")
+    if project_row["archived"] or project_row["status"] != "active":
+        raise HTTPException(
+            422,
+            f"project {body.project!r} is not active "
+            "(pending proposals and archived projects cannot take epics)",
+        )
+    return project_row
+
+
+async def _replay_after_conflict(
+    db: aiosqlite.Connection, idem_key: str | None, request_hash: str | None
+) -> CreateTaskOutcome:
+    """Гонка за ключ идемпотентности: вернуть победителя или 409 (прежняя логика).
+
+    Без ключа или без записи по нему исходная IntegrityError пробрасывается.
+    """
+    if not idem_key:
+        raise
+    existing = await repo.get_task_idempotency_key(db, idem_key)
+    if not existing:
+        raise
+    if existing["request_hash"] != request_hash:
+        record = IdempotencyRecord(
+            client_request_id=idem_key,
+            task_id=int(existing["task_id"]),
+            request_hash=existing["request_hash"],
+        )
+        raise HTTPException(409, idempotency_conflict_detail(record)) from None
+    task = await _load_task_view(db, int(existing["task_id"]))
+    return CreateTaskOutcome(task=task, is_new=False)
+
+
 async def create_task(
     db: aiosqlite.Connection,
     body: TaskCreate,
     *,
     client_request_id: str | None = None,
+    force_draft: bool = False,
 ) -> CreateTaskOutcome:
-    """Create a new task, optionally dispatching it immediately."""
+    """Create a new task, optionally dispatching it immediately.
+
+    ``force_draft`` keeps the task a draft whoever files it (#915): a human
+    reporting a production defect is not a human approving its fix.
+    """
     idem_key = resolve_client_request_id(
         None, client_request_id or body.client_request_id
     )
@@ -824,33 +1074,38 @@ async def create_task(
                 parent_id=body.parent_id,
             ),
         )
+    if is_state(body) and body.run_immediately:
+        # #1647: до вставки строки — отказ не оставляет задачи, брони и job.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("run_immediately")
+    await _refuse_state_parent(db, body.parent_id)
 
     # Bind an epic to a project at creation (#346). Only epics carry
     # project_id — children resolve it by walking up to the root epic.
-    project_id: int | None = None
-    if body.project:
-        if body.task_type != TaskType.epic:
-            raise HTTPException(
-                422, "project can only be set on epics; children inherit it"
-            )
-        project_row = await repo.get_project_by_slug(db, body.project)
-        if project_row is None:
-            raise HTTPException(422, f"unknown project slug: {body.project!r}")
-        if project_row["archived"] or project_row["status"] != "active":
-            raise HTTPException(
-                422,
-                f"project {body.project!r} is not active "
-                "(pending proposals and archived projects cannot take epics)",
-            )
-        project_id = project_row["id"]
+    bound_project = await _epic_project_at_creation(db, body)
+    project_id: int | None = bound_project["id"] if bound_project else None
 
     initial_status, normalized = normalize_task_create(body)
+    if force_draft:
+        initial_status = "draft"
     request_hash = hash_task_create_payload(normalized) if idem_key else None
     run_check, run_held = await _plan_created_run(db, normalized)
     if run_held:
         initial_status = "open"
 
+    owns_tx = not db.in_transaction
     try:
+        # #1594: write-лок берётся ДО чтения политики проекта. Допуск заморозки
+        # и вставка - одна транзакция: правка политики между ними иначе
+        # пропускала бы работу, запрещённую уже действующей заморозкой.
+        if owns_tx:
+            await db.execute("BEGIN IMMEDIATE")
+        # #1647: тот же вопрос ещё раз — под замком, которым защищена вставка:
+        # конкурентный refine мог перевести листовой draft в state после первой
+        # проверки. Refine читает детей под своей транзакцией, значит из двух
+        # операций выигрывает одна.
+        await _refuse_state_parent(db, body.parent_id)
         if idem_key:
             existing = await repo.get_task_idempotency_key(db, idem_key)
             if existing:
@@ -867,6 +1122,18 @@ async def create_task(
                 await db.commit()
                 task = await _load_task_view(db, int(existing["task_id"]))
                 return CreateTaskOutcome(task=task, is_new=False)
+
+        # #1594: уже одобренная работа входит в проект только через допуск
+        # заморозки. После поиска по ключу: повтор успешного создания вернул
+        # бы существующую задачу выше, и заморозка к нему не применяется;
+        # проверяется только новая вставка. Черновик (в т.ч. от агента) не
+        # ограничивается.
+        if initial_status != "draft":
+            _require_freeze_admission(
+                await _project_of_new_task(db, normalized.parent_id, bound_project),
+                normalized.work_type,
+                normalized.freeze_rationale,
+            )
 
         # Structured-aware insert so all fields from TaskCreate (work_type,
         # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
@@ -899,27 +1166,18 @@ async def create_task(
 
         await db.commit()
     except HTTPException:
-        await db.rollback()
+        if owns_tx:
+            await db.rollback()
         raise
     except aiosqlite.IntegrityError:
         await db.rollback()
-        if not idem_key:
-            raise
-        existing = await repo.get_task_idempotency_key(db, idem_key)
-        if not existing:
-            raise
-        if existing["request_hash"] != request_hash:
-            record = IdempotencyRecord(
-                client_request_id=idem_key,
-                task_id=int(existing["task_id"]),
-                request_hash=existing["request_hash"],
-            )
-            raise HTTPException(
-                409,
-                idempotency_conflict_detail(record),
-            ) from None
-        task = await _load_task_view(db, int(existing["task_id"]))
-        return CreateTaskOutcome(task=task, is_new=False)
+        return await _replay_after_conflict(db, idem_key, request_hash)
+    except BaseException:
+        # Любое иное исключение (ValueError, OperationalError, отмена) не должно
+        # оставлять BEGIN IMMEDIATE открытым и write-лок занятым (#1594).
+        if owns_tx and db.in_transaction:
+            await db.rollback()
+        raise
 
     result: dict[str, Any] = {}
     if _wants_run(normalized):
@@ -971,6 +1229,37 @@ async def _run_created_task(
     return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
+async def _require_bulk_admission(
+    db: aiosqlite.Connection, parent_id: int, items: list[Any]
+) -> None:
+    """Допуск пачки открытой работы поштучно, под write-локом (#1594).
+
+    Политика читается уже под локом; одна непрошедшая позиция отказывает всей
+    пачке, и ничего не создано.
+    """
+    project = await _project_of_new_task(db, parent_id)
+    for index, item in enumerate(items):
+        _require_freeze_admission(
+            project,
+            item.work_type,
+            item.freeze_rationale,
+            where=f"items[{index}] {item.title!r}",
+        )
+
+
+async def _refuse_state_parent(db: aiosqlite.Connection, parent_id: int | None) -> None:
+    """Задача-состояние — лист: детей у неё не бывает (#1647)."""
+    if parent_id is None:
+        return
+    parent = await repo.get_task(db, parent_id)
+    if parent is not None and is_state(parent):
+        raise HTTPException(
+            422,
+            f"task #{parent_id} is a state task (result_kind=state): it is a "
+            "leaf and cannot have child tasks",
+        )
+
+
 async def create_subtasks_bulk(
     db: aiosqlite.Connection,
     parent_id: int,
@@ -996,6 +1285,7 @@ async def create_subtasks_bulk(
 
     if await repo.get_task(db, parent_id) is None:
         raise HTTPException(404, "parent task not found")
+    await _refuse_state_parent(db, parent_id)
 
     if body.source == TaskSource.agent:
         initial_status = "draft"
@@ -1020,6 +1310,9 @@ async def create_subtasks_bulk(
 
     created_ids: list[int] = []
     async with write_transaction(db):
+        await _refuse_state_parent(db, parent_id)  # #1647: под замком вставки
+        if initial_status != "draft":
+            await _require_bulk_admission(db, parent_id, body.items)
         await db.execute("SAVEPOINT bulk_child_tasks")
         try:
             for idx, item in enumerate(body.items):
@@ -1033,6 +1326,10 @@ async def create_subtasks_bulk(
                     agent=body.agent,
                     auto_review=auto_review,
                     run_immediately=False,
+                    work_type=item.work_type,
+                    freeze_rationale=item.freeze_rationale,
+                    result_kind=item.result_kind,
+                    rollback=item.rollback,
                 )
                 task_id = await repo.create_task_full(
                     db,
@@ -1071,6 +1368,213 @@ async def create_subtasks_bulk(
     return views
 
 
+@contextlib.asynccontextmanager
+async def _local_rollback(db: aiosqlite.Connection) -> AsyncIterator[None]:
+    """Откат только своей работы внутри чужой транзакции (SAVEPOINT).
+
+    Владелец транзакции - вызывающий: мы её не коммитим и не откатываем целиком,
+    а при отказе возвращаем лишь то, что записали сами (#1594).
+    """
+    await db.execute("SAVEPOINT approve_local")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO SAVEPOINT approve_local")
+        await db.execute("RELEASE SAVEPOINT approve_local")
+        raise
+    else:
+        await db.execute("RELEASE SAVEPOINT approve_local")
+
+
+#: Всего попыток одобрения при меняющейся постановке (#1610): первая и два повтора.
+APPROVAL_SNAPSHOT_ATTEMPTS = 3
+#: Код отказа, когда постановка менялась во время одобрения (#1610).
+STATEMENT_CHANGED = "statement_changed_during_approval"
+
+
+class _StatementMoved(Exception):
+    """Снимок входов DoR под локом не совпал с тем, по которому считали DoR."""
+
+
+def _statement_changed_error(task_id: int, attempts: int) -> HTTPException:
+    tries = "без повтора" if attempts == 1 else f"за {attempts} попытки"
+    return HTTPException(
+        409,
+        detail={
+            "error": STATEMENT_CHANGED,
+            "task_id": task_id,
+            "message": (
+                f"постановка менялась во время одобрения ({tries}): DoR устарел; "
+                "повторите одобрение"
+            ),
+        },
+    )
+
+
+async def _open_draft_under_lock(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskApprove,
+    readiness: Any,
+    snapshot: DorSnapshot,
+    caller_owns_tx: bool = False,
+) -> str | None:
+    """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
+
+    ``BEGIN IMMEDIATE`` берётся ДО чтения: проект, политика, work_type и
+    обоснование перечитываются под write-локом, и решение заморозки принимается
+    по ним, а не по тому, что было прочитано до расчёта DoR (#1594). Конкурентный
+    refine или правка политики между проверкой и переходом иначе открыли бы
+    запрещённую работу. Отказ откатывает всё, включая запись override.
+
+    Тем же способом сверяется DoR (#1610): снимок входов перечитывается под
+    локом (только БД: git под write-локом запрещён, #1456) и сравнивается по
+    отпечатку со снимком, из которого посчитан ``readiness``. Расхождение -
+    ``_StatementMoved`` до любой записи.
+    Возвращает сводку DoR-override (или None).
+    """
+    scope = _local_rollback(db) if caller_owns_tx else write_transaction(db)
+    async with scope:
+        fresh = await repo.get_task(db, task_id)
+        if fresh is None or fresh["status"] != "draft":
+            raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+        if (
+            await load_dor_snapshot(db, task_id)
+        ).fingerprint() != snapshot.fingerprint():
+            raise _StatementMoved
+        task.update(dict(fresh))
+        _require_freeze_admission(
+            await repo.resolve_project_for_task(db, task_id),
+            fresh["work_type"],
+            fresh["freeze_rationale"] or "",
+        )
+        dor_override_summary: str | None = None
+        if not readiness.dor_passed:
+            # Use the report's required-only list. Filtering dor_checks ourselves
+            # would mistakenly include checks that failed but aren't required
+            # for this work_type (review I1).
+            missing = readiness.missing_required
+            if not body.force:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "dor_failed",
+                        "task_id": task_id,
+                        "score": readiness.score,
+                        "missing_required": missing,
+                        # Dump the whole Recommendation instead of re-typing a
+                        # subset of its fields (#1172). The hand-built dict here
+                        # silently dropped ``defect_code``, so the one refusal a
+                        # caller actually receives carried human prose and no
+                        # vocabulary code — exactly the thing the closed
+                        # vocabulary exists to prevent. model_dump also means the
+                        # next field added to Recommendation reaches this payload
+                        # without anyone remembering to widen it.
+                        "recommendations": [
+                            r.model_dump() for r in readiness.recommendations
+                        ],
+                        "hint": "pass force=true to override the DoR gate",
+                    },
+                )
+            dor_override_summary = ", ".join(missing) or "<unknown>"
+            log.warning(
+                "DoR override on approve for task #%s (missing: %s)",
+                task_id,
+                dor_override_summary,
+            )
+            override_message = (
+                f"Approve override: DoR failed (missing: {dor_override_summary}); "
+                f"approved with force=true"
+            )
+            if body.comment:
+                override_message += f". Comment: {body.comment}"
+            await repo.add_task_update(db, task_id, "", "alert", override_message)
+        elif body.force:
+            # DoR passed but the caller still set force=true. Record the
+            # explicit human override so post-mortems can spot "we forced
+            # this even though we didn't strictly need to" — review I7.
+            force_message = (
+                "Approve override: force=true requested (DoR was already passing)"
+            )
+            if body.comment:
+                force_message += f". Comment: {body.comment}"
+            await repo.add_task_update(db, task_id, "", "alert", force_message)
+
+        from hub.services.dor import record_statement_paths, record_workspace_missing
+
+        await record_statement_paths(db, task_id, readiness.dor_checks)
+        await record_workspace_missing(db, task_id)
+
+        if body.comment and dor_override_summary is None and not body.force:
+            await repo.add_task_update(
+                db, task_id, "", "status", f"Approved: {body.comment}"
+            )
+
+        if body.runtime:
+            await repo.update_task(db, task_id, runtime=body.runtime.value)
+            task["runtime"] = body.runtime.value
+
+        # Atomic conditional transition: a concurrent second approve will see
+        # ``rowcount == 0`` and get a 409 instead of being silently double-
+        # processed. Even though aiosqlite serializes a shared connection
+        # today, this guards us when someone moves to a per-request connection
+        # or a pool. Review I5.
+        transitioned = await repo.transition_status_if(
+            db, task_id, expected_from="draft", new_status="open"
+        )
+        if transitioned:
+            await repo.insert_event(
+                db,
+                kind="task_approved",
+                task_id=task_id,
+                actor="human",
+                payload={"run": bool(body.run), "force": bool(body.force)},
+            )
+        if not transitioned:
+            raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+    return dor_override_summary
+
+
+async def _approve_on_current_dor(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskApprove,
+    caller_owns_tx: bool,
+) -> str | None:
+    """DoR и отпечаток из одного снимка; под локом снимок сверяется (#1610).
+
+    Расчёт (включая git) идёт ВНЕ write-лока. Не совпал снимок под локом -
+    лок отпущен, снимок и DoR пересчитываются заново; всего
+    ``APPROVAL_SNAPSHOT_ATTEMPTS`` попыток, затем 409. Внутри транзакции
+    вызывающего (``caller_owns_tx``) расчёт уже идёт под его локом, повторять
+    нечем: сразу 409, откат только своей работы.
+    """
+    # Import locally to avoid a circular dependency (services.recommendations
+    # imports from .readiness which imports from .dor; lifecycle is called
+    # from many modules and should stay lightweight at import time).
+    from hub.services.recommendations import (
+        calculate_readiness_with_recommendations,
+    )
+
+    attempts = 1 if caller_owns_tx else APPROVAL_SNAPSHOT_ATTEMPTS
+    for _ in range(attempts):
+        snapshot = await load_dor_snapshot(db, task_id)
+        readiness = await calculate_readiness_with_recommendations(
+            db, task_id, snapshot=snapshot
+        )
+        if db.in_transaction and not caller_owns_tx:
+            await db.commit()
+        try:
+            return await _open_draft_under_lock(
+                db, task_id, task, body, readiness, snapshot, caller_owns_tx
+            )
+        except _StatementMoved:
+            continue
+    raise _statement_changed_error(task_id, attempts)
+
+
 async def approve_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1085,6 +1589,8 @@ async def approve_task(
     ``alert`` updates and tagged in the activity log so the audit trail
     stays intact.
     """
+    # Транзакцию, уже открытую вызывающим, не коммитим и не начинаем заново.
+    caller_owns_tx = db.in_transaction
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -1096,96 +1602,34 @@ async def approve_task(
         )
 
     body = body or TaskApprove()
+    if body.run and is_state(task):
+        # #1647: запуск headless для state отказывает до одобрения, чтобы
+        # отказ не оставил задачу одобренной, но не запущенной.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("approve_run")
+    if caller_owns_tx and body.run:
+        # Запуск (review_limit, dispatch_task) коммитит сам; внутри чужой
+        # транзакции это закоммитило бы её. Ошибка вызывающего, до любой записи.
+        raise ValueError(
+            "approve_task(run=True) нельзя внутри транзакции вызывающего: "
+            "запуск коммитит; одобрите без run и запустите после своего commit"
+        )
+
+    # --- Freeze admission (#1594) ------------------------------------------
+    # До DoR и до любой записи: отказ не оставляет следов, а force (который
+    # обходит только DoR) заморозку не обходит. Сюда сходятся REST, batch,
+    # web, CLI, MCP и compatibility-маршруты.
+    _require_freeze_admission(
+        await repo.resolve_project_for_task(db, task_id),
+        task.get("work_type"),
+        task.get("freeze_rationale") or "",
+    )
 
     # --- DoR gate -----------------------------------------------------------
-    # Import locally to avoid a circular dependency (services.recommendations
-    # imports from .readiness which imports from .dor; lifecycle is called
-    # from many modules and should stay lightweight at import time).
-    from hub.services.recommendations import (
-        calculate_readiness_with_recommendations,
+    dor_override_summary = await _approve_on_current_dor(
+        db, task_id, task, body, caller_owns_tx
     )
-
-    readiness = await calculate_readiness_with_recommendations(db, task_id)
-    dor_override_summary: str | None = None
-    if not readiness.dor_passed:
-        # Use the report's required-only list. Filtering dor_checks ourselves
-        # would mistakenly include checks that failed but aren't required
-        # for this work_type (review I1).
-        missing = readiness.missing_required
-        if not body.force:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "dor_failed",
-                    "task_id": task_id,
-                    "score": readiness.score,
-                    "missing_required": missing,
-                    # Dump the whole Recommendation instead of re-typing a
-                    # subset of its fields (#1172). The hand-built dict here
-                    # silently dropped ``defect_code``, so the one refusal a
-                    # caller actually receives carried human prose and no
-                    # vocabulary code — exactly the thing the closed
-                    # vocabulary exists to prevent. model_dump also means the
-                    # next field added to Recommendation reaches this payload
-                    # without anyone remembering to widen it.
-                    "recommendations": [
-                        r.model_dump() for r in readiness.recommendations
-                    ],
-                    "hint": "pass force=true to override the DoR gate",
-                },
-            )
-        dor_override_summary = ", ".join(missing) or "<unknown>"
-        log.warning(
-            "DoR override on approve for task #%s (missing: %s)",
-            task_id,
-            dor_override_summary,
-        )
-        override_message = (
-            f"Approve override: DoR failed (missing: {dor_override_summary}); "
-            f"approved with force=true"
-        )
-        if body.comment:
-            override_message += f". Comment: {body.comment}"
-        await repo.add_task_update(db, task_id, "", "alert", override_message)
-    elif body.force:
-        # DoR passed but the caller still set force=true. Record the
-        # explicit human override so post-mortems can spot "we forced
-        # this even though we didn't strictly need to" — review I7.
-        force_message = (
-            "Approve override: force=true requested (DoR was already passing)"
-        )
-        if body.comment:
-            force_message += f". Comment: {body.comment}"
-        await repo.add_task_update(db, task_id, "", "alert", force_message)
-
-    if body.comment and dor_override_summary is None and not body.force:
-        await repo.add_task_update(
-            db, task_id, "", "status", f"Approved: {body.comment}"
-        )
-
-    if body.runtime:
-        await repo.update_task(db, task_id, runtime=body.runtime.value)
-        task["runtime"] = body.runtime.value
-
-    # Atomic conditional transition: a concurrent second approve will see
-    # ``rowcount == 0`` and get a 409 instead of being silently double-
-    # processed. Even though aiosqlite serializes a shared connection
-    # today, this guards us when someone moves to a per-request connection
-    # or a pool. Review I5.
-    transitioned = await repo.transition_status_if(
-        db, task_id, expected_from="draft", new_status="open"
-    )
-    if transitioned:
-        await repo.insert_event(
-            db,
-            kind="task_approved",
-            task_id=task_id,
-            actor="human",
-            payload={"run": bool(body.run), "force": bool(body.force)},
-        )
-    await db.commit()
-    if not transitioned:
-        raise HTTPException(409, "task is no longer draft (concurrent approve?)")
 
     # #1264: the approval stands; only the run waits for the review queue.
     run_held = bool(body.run) and not await run_allowed_by_review_limit(
@@ -1209,9 +1653,12 @@ async def approve_task(
         "task_approved",
         f"Task #{task_id} approved{activity_suffix}",
         detail=mutation_activity_detail(),
+        commit=not caller_owns_tx,
     )
 
-    await _warn_on_dead_locators(db, task_id, task.get("task_type"))
+    await _warn_on_dead_locators(
+        db, task_id, task.get("task_type"), commit=not caller_owns_tx
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1228,7 +1675,11 @@ _LOCATOR_WARNED_TYPES = frozenset({"epic", "feature"})
 
 
 async def _warn_on_dead_locators(
-    db: aiosqlite.Connection, task_id: int, task_type: str | None
+    db: aiosqlite.Connection,
+    task_id: int,
+    task_type: str | None,
+    *,
+    commit: bool = True,
 ) -> None:
     """Name AC whose test does not exist, once, at approval (#1032).
 
@@ -1260,12 +1711,15 @@ async def _warn_on_dead_locators(
         task_id,
         "hub",
         "alert",
-        "Критерии приёмки ссылаются на несуществующие тесты: "
+        "Критерии приёмки ссылаются на несуществующие тесты "
+        "(файлы прочитаны через git, pytest не запускался; названы только те, "
+        "отсутствие которых доказано): "
         f"{named}. Апрув не заблокирован — на верхнем уровне теста может ещё "
         "не быть. Но пока локатор не разрешается, критерий проверить нечем, и "
         "узнать об этом иначе можно только вручную (#1032).",
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def batch_approve_tasks(
@@ -1330,10 +1784,14 @@ async def batch_approve_tasks(
         except HTTPException as exc:
             reason = "approve_failed"
             detail = exc.detail
+            text = ""
             if isinstance(detail, dict):
                 reason = detail.get("reason") or detail.get("error") or reason
+                # #1594: у отказа заморозки есть текст со сроком и note.
+                if reason in (FREEZE_REFUSED, STATEMENT_CHANGED):
+                    text = str(detail.get("message") or "")
             result.skipped.append(
-                BatchApproveSkipped(task_id=task_id, reason=f"{reason}")
+                BatchApproveSkipped(task_id=task_id, reason=f"{reason}", detail=text)
             )
             continue
         result.approved.append(task_id)
@@ -1489,6 +1947,47 @@ async def refuse_opening_without_subject(
     )
 
 
+@contextlib.asynccontextmanager
+async def capture_areas(
+    db: aiosqlite.Connection, task_id: int, current_status: str
+) -> AsyncIterator[dict[str, Any] | None]:
+    """Сверка областей при захвате задачи — одна на четыре входа (#1433).
+
+    Через неё идут claim_task, pair_start_task, start_task и вход по
+    одноразовому коду implementer (chat_pair.redeem_code). Правило —
+    orchestrator_queue, второй копии нет. Переход статуса пишется ВНУТРИ
+    блока: бронь (``capture_hold``) держится до его записи, иначе два
+    одновременных захвата прошли бы оба (находка ревью c2af5487). Режим —
+    политика проекта ``claim_area_check``:
+
+    * off — ничего не читается и не пишется, захват как до #1433;
+    * warn — захват проходит, в карточке ОДНА запись с задачей-соседом и
+      путём (повторная встреча того же пересечения — claim, затем
+      pair_start — вторую не пишет); вызывающий получает пересечение;
+    * require — отказ структурной ошибкой до перехода статуса.
+    """
+    from hub.services.orchestrator_queue import capture_hold
+    from hub.services.project_policy import CLAIM_AREA_MARK, CLAIM_AREA_REQUIRE
+
+    async with capture_hold(db, task_id) as (mode, conflict):
+        if conflict is None:
+            yield None
+            return
+        if mode == CLAIM_AREA_REQUIRE:
+            raise HTTPException(
+                409,
+                detail=claim_area_conflict_detail(
+                    task_id=task_id, current_status=current_status, conflict=conflict
+                ),
+            )
+        text = f"{CLAIM_AREA_MARK} (claim_area_check={mode}): {conflict['detail']}."
+        updates = await repo.get_task_updates(db, task_id)
+        if not any(str(u["content"]) == text for u in updates):
+            await repo.add_task_update(db, task_id, "hub", "alert", text)
+            await db.commit()
+        yield {"mode": mode, **conflict}
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1504,6 +2003,11 @@ async def start_task(
             400,
             f"can only start open tasks, current status: {task['status']}",
         )
+    if is_state(task):
+        # #1647: headless для state — до плана, брони и смены статуса.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("start")
     # #1232: before anything is written — the plan update below is a write, and
     # a task refused after it would carry a plan for work it never began.
     await refuse_opening_without_subject(db, task_id, task)
@@ -1513,28 +2017,31 @@ async def start_task(
 
     body = body or TaskStart()
 
-    if body.plan:
-        await repo.add_task_update(
-            db,
-            task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
-        )
+    # #1433 (находка ревью 13906dae): the fourth entrance into work — the
+    # same area check, held until dispatch has written the transition.
+    async with capture_areas(db, task_id, task["status"]):
+        if body.plan:
+            await repo.add_task_update(
+                db,
+                task_id,
+                task.get("assigned_agent", ""),
+                "status",
+                f"Plan: {body.plan}",
+            )
 
-    if not await repo.has_plan_updates(db, task_id):
-        raise HTTPException(
-            400,
-            "Plan required before starting a task. "
-            "Either pass 'plan' field in start request or create an update "
-            "with kind='status' and content starting with 'Plan:'.",
-        )
+        if not await repo.has_plan_updates(db, task_id):
+            raise HTTPException(
+                400,
+                "Plan required before starting a task. "
+                "Either pass 'plan' field in start request or create an update "
+                "with kind='status' and content starting with 'Plan:'.",
+            )
 
-    if body.runtime:
-        await repo.update_task(db, task_id, runtime=body.runtime.value)
-        task["runtime"] = body.runtime.value
+        if body.runtime:
+            await repo.update_task(db, task_id, runtime=body.runtime.value)
+            task["runtime"] = body.runtime.value
 
-    await dispatch_task(db, task_id, task)
+        await dispatch_task(db, task_id, task)
     await log_activity(
         db,
         "task_started",
@@ -1548,6 +2055,117 @@ async def start_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def _pair_start_write(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskPairStart | None,
+    *,
+    caller: str,
+    implementer_principal_id: int | None,
+    declared_session: str,
+    starting_status: str,
+) -> PairGitMode:
+    """Plan, branch and the transition to running, up to the commit (#1433).
+
+    Runs inside ``capture_areas``: the area hold lasts until this commit, so a
+    concurrent overlapping capture cannot slip through the seconds that branch
+    preparation takes (#365 K4).
+    """
+    body = body or TaskPairStart()
+
+    if body.plan:
+        await repo.add_task_update(
+            db,
+            task_id,
+            task.get("assigned_agent", ""),
+            "status",
+            f"Plan: {body.plan}",
+        )
+
+    if not await repo.has_plan_updates(db, task_id):
+        raise HTTPException(
+            400,
+            "Plan required before pair-start. "
+            "Either pass 'plan' field in pair-start request or create an update "
+            "with kind='status' and content starting with 'Plan:'.",
+        )
+
+    git_mode = body.git_mode
+    slug = (body.branch_slug or "").strip()
+    if is_state(task):
+        # #1647: у задачи-состояния нет ни ветки, ни worktree; git не зовётся ни
+        # в одном режиме. Записанный remote держит и последующие места (сдача,
+        # возврат в работу) подальше от git хоста хаба.
+        git_mode = PairGitMode.remote
+        branch = ""
+    elif git_mode == PairGitMode.remote:
+        # Record the canonical name only. The caller creates this branch in
+        # its own clone; the hub host must not checkout, clean, or worktree.
+        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
+    else:
+        try:
+            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
+        except PairBranchConflictError as exc:
+            raise HTTPException(422, detail=exc.to_detail()) from exc
+    if branch:
+        task["branch"] = branch
+
+    assigned_agent = (body.assigned_agent or "").strip()
+    if not assigned_agent:
+        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
+
+    update_fields: dict[str, Any] = {
+        "job_id": None,
+        "assigned_agent": assigned_agent,
+        "git_mode": git_mode.value,
+    }
+    if implementer_principal_id is not None:
+        update_fields["implementer_principal_id"] = implementer_principal_id
+    if branch:
+        update_fields["branch"] = branch
+    # #852: pair-start from `open` skips the claim entirely, which is how a
+    # task reached running with no session at all. Whoever starts it owns it,
+    # so the address is written here too — not only on the claim path.
+    if declared_session:
+        update_fields["claim_session_id"] = declared_session
+
+    # #365 K4: the status was written unconditionally, and everything between
+    # the check above and this line is a window — branch preparation talks to
+    # git and can take seconds. Another claim, a human decision or the poller
+    # could move the task meanwhile, and the last writer simply won. Transition
+    # from the status we actually read, so a lost race is reported instead of
+    # overwriting somebody else's move. expected_from is that status and not a
+    # literal: pair-start legitimately begins from `open` or from `claimed`.
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=starting_status, new_status="running"
+    ):
+        raise HTTPException(
+            409,
+            f"Task #{task_id} left {starting_status!r} during pair-start; "
+            "retry from its current status",
+        )
+    await repo.update_task(db, task_id, **update_fields)
+    # The registry follows the task the same way it follows a claim (#771
+    # AC-3): silent when the session is unregistered.
+    if declared_session:
+        await note_session_task(db, declared_session, task_id)
+    await db.commit()
+    return git_mode
+
+
+def _worktree_hint_for(task: dict[str, Any], task_id: int) -> str:
+    """Подсказка worktree; у задачи-состояния её нет (#1647)."""
+    return "" if is_state(task) else _worktree_hint(task_id)
+
+
+def _worktree_hint(task_id: int) -> str:
+    """Worktree path template for the claim/pair-start response (#1515)."""
+    from hub.integrations.git_ops import worktree_hint
+
+    return worktree_hint(task_id)
 
 
 async def pair_start_task(
@@ -1636,82 +2254,33 @@ async def pair_start_task(
     # #1232: here, for the same reason the session check above is here — what
     # follows writes the plan and prepares a branch, and a task refused after
     # that would leave both behind.
-    await refuse_opening_without_subject(db, task_id, task)
+    state_task = is_state(task)
+    if not state_task:
+        # #1647: предмет в базовой ветке — проверка по коду; у state кода нет.
+        await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
+    # #1433: the same place for the same reason — refused before the plan and
+    # the branch are written; the hold lasts until the transition is committed.
+    # #1630: файл правил репозитория читается ЗДЕСЬ — после проверок допуска и
+    # до capture_areas: git не зовётся под write-локом и в транзакции (#1456).
+    # Ошибка чтения — данные (unreadable), а не отказ pair_start.
+    from hub.services import working_rules
 
-    body = body or TaskPairStart()
-
-    if body.plan:
-        await repo.add_task_update(
+    # #1647: правила репозитория читает git; у задачи-состояния git не зовётся.
+    agent_rules = (
+        None if state_task else await working_rules.read_agent_rules(db, task_id)
+    )
+    async with capture_areas(db, task_id, starting_status) as area_check:
+        git_mode = await _pair_start_write(
             db,
             task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
+            task,
+            body,
+            caller=caller,
+            implementer_principal_id=implementer_principal_id,
+            declared_session=declared_session,
+            starting_status=starting_status,
         )
-
-    if not await repo.has_plan_updates(db, task_id):
-        raise HTTPException(
-            400,
-            "Plan required before pair-start. "
-            "Either pass 'plan' field in pair-start request or create an update "
-            "with kind='status' and content starting with 'Plan:'.",
-        )
-
-    git_mode = body.git_mode
-    slug = (body.branch_slug or "").strip()
-    if git_mode == PairGitMode.remote:
-        # Record the canonical name only. The caller creates this branch in
-        # its own clone; the hub host must not checkout, clean, or worktree.
-        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
-    else:
-        try:
-            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
-        except PairBranchConflictError as exc:
-            raise HTTPException(422, detail=exc.to_detail()) from exc
-    if branch:
-        task["branch"] = branch
-
-    assigned_agent = (body.assigned_agent or "").strip()
-    if not assigned_agent:
-        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
-
-    update_fields: dict[str, Any] = {
-        "job_id": None,
-        "assigned_agent": assigned_agent,
-        "git_mode": git_mode.value,
-    }
-    if implementer_principal_id is not None:
-        update_fields["implementer_principal_id"] = implementer_principal_id
-    if branch:
-        update_fields["branch"] = branch
-    # #852: pair-start from `open` skips the claim entirely, which is how a
-    # task reached running with no session at all. Whoever starts it owns it,
-    # so the address is written here too — not only on the claim path.
-    if declared_session:
-        update_fields["claim_session_id"] = declared_session
-
-    # #365 K4: the status was written unconditionally, and everything between
-    # the check above and this line is a window — branch preparation talks to
-    # git and can take seconds. Another claim, a human decision or the poller
-    # could move the task meanwhile, and the last writer simply won. Transition
-    # from the status we actually read, so a lost race is reported instead of
-    # overwriting somebody else's move. expected_from is that status and not a
-    # literal: pair-start legitimately begins from `open` or from `claimed`.
-    if not await repo.transition_status_if(
-        db, task_id, expected_from=starting_status, new_status="running"
-    ):
-        raise HTTPException(
-            409,
-            f"Task #{task_id} left {starting_status!r} during pair-start; "
-            "retry from its current status",
-        )
-    await repo.update_task(db, task_id, **update_fields)
-    # The registry follows the task the same way it follows a claim (#771
-    # AC-3): silent when the session is unregistered.
-    if declared_session:
-        await note_session_task(db, declared_session, task_id)
-    await db.commit()
     await log_activity(
         db,
         "task_pair_started",
@@ -1730,12 +2299,19 @@ async def pair_start_task(
     # Remote pair-start has no hub-host worktree (#975).
     if git_mode != PairGitMode.remote:
         tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
+    tv.area_check = area_check
+    if state_task:
+        # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
+        # что уехало в базу: постановка state-задачи не о коде.
+        return tv
     # #615: the statement may be older than the work that invalidated it. Told
     # HERE, on the server, so CLI and REST callers see it too — computing it in
     # the MCP tool would leave every other client blind.
     from hub.services.statement_freshness import statement_freshness
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
+    tv.worktree_hint = _worktree_hint(task_id)
+    tv.working_rules = await working_rules.build_working_rules(db, task_id, agent_rules)
     return tv
 
 
@@ -1997,10 +2573,16 @@ class SubmitContext:
     #: #1362: сдача пришла из needs_decision после конфликта с базой.
     resubmitted_after_base_conflict: bool = False
     replaced_sha: str = ""
+    #: #919: вывод прод-дефекта, проверенный шагом и записываемый переходом.
+    prevention_record: dict[str, str] | None = None
     canonical: str = ""
     reported: str = ""
     diff_paths: list[str] | None = None
     diff_reason: str = ""
+    #: #1589: исход шага path_notices; None — правил у проекта нет.
+    path_notices: Any = None
+    #: #1589: то, что записано на поколение, — для ответа на сдачу.
+    path_notices_view: Any = None
     risk_fields: dict[str, Any] = dc_field(default_factory=dict)
     risk_alert: str = ""
     risk_note: str = ""
@@ -2032,6 +2614,15 @@ class SubmitContext:
     #: #1265 — та же вершина ветки пришла повторно из review: сдача не
     #: открывает новое поколение, и вызывающий получает ответ без перехода.
     same_sha_noop: bool = False
+    #: #1436: запись «Контракт сдачи нарушен» при warn; пусто — нарушений нет
+    #: или контракт выключен.
+    contract_alert: str = ""
+    #: #913: запись гейта красного теста — доказательство или (при warn)
+    #: недоказанное; пусто — гейт к сдаче не относится.
+    red_test_record: str = ""
+    red_test_kind: str = ""
+    #: #1629: запись «CI до сдачи не доказан» при warn; пусто — доказан или off.
+    ci_before_alert: str = ""
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -2050,6 +2641,11 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
             f"can only submit running or under-review pair tasks for review, "
             f"current status: {state.task['status']}",
         )
+    # #919: the last word the agent has before the poller delivers — the
+    # output rides the submission itself and is written with the transition.
+    state.prevention_record = await prevention_gate.check_submission(
+        state.db, state.task, state.body.prevention
+    )
     # #1054: what this submission replaces, read before anything is written.
     state.resubmitted_from_review = state.task["status"] == "review"
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
@@ -2082,7 +2678,7 @@ async def _require_base_conflict_entry(state: SubmitContext) -> None:
         f"current status: needs_decision ({cause}{': ' + detail if detail else ''}). "
         "From needs_decision the author resubmits only after merge_failed on a "
         "conflict with the base branch; this cause is a human decision "
-        "(hub_decide_task).",
+        "(REST POST /api/tasks/<id>/decide).",
     )
 
 
@@ -2144,6 +2740,25 @@ async def _step_resolve_diff(state: SubmitContext) -> None:
         state.diff_paths,
         state.diff_reason,
         await risk_map_for_task(state.db, state.task_id),
+    )
+
+
+async def _step_path_notices(state: SubmitContext) -> None:
+    """Пути диффа против правил проекта path_notices (#1589).
+
+    Не отказывает и ничего не исполняет: исход кладётся в контекст, а запись
+    поколения и строку ленты делает общая запись заметок сдачи. Пути читаются
+    для ТОГО ЖЕ коммита, что закреплён сдачей. Без правил в политике шаг
+    ничего не читает.
+    """
+    from hub.services import path_notices
+
+    state.path_notices = await path_notices.compute(
+        state.db,
+        state.task,
+        submission_sha=state.submission_sha,
+        diff_paths=state.diff_paths,
+        diff_reason=state.diff_reason,
     )
 
 
@@ -2425,6 +3040,124 @@ async def _step_submit_rules(state: SubmitContext) -> None:
                 )
 
 
+async def _step_submission_contract(state: SubmitContext) -> None:
+    """Контракт сдачи проекта: model, summary, мутация на каждый AC (#1436).
+
+    Режим — из политики проекта, а не из config: включается на одном проекте
+    (раскатка через warn), остальные живут как жили. Стоит ДО сетевых шагов и
+    до перехода: отказ при require не создаёт поколения и не заказывает ревью.
+    """
+    from hub.services.project_policy import (
+        CONTRACT_OFF,
+        CONTRACT_REQUIRE,
+        gate_policy_for_task,
+        submission_contract_of,
+    )
+
+    mode = submission_contract_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == CONTRACT_OFF:
+        return
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    found = submission_contract.violations(state.body, ac_rows)
+    if not found:
+        return
+    if mode == CONTRACT_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=submission_contract_violated_detail(
+                found, mutations_format=submission_contract.MUTATIONS_FORMAT
+            ),
+        )
+    state.contract_alert = submission_contract.warning_text(found)
+
+
+async def _step_bug_red_test(state: SubmitContext) -> None:
+    """Баг сдаётся с тестом, упавшим на коде базы по прогону CI (#913).
+
+    Режим — из политики проекта ``bug_red_test``. Доказательство — поле
+    ``baseline`` отчёта CI о коммите, который закрепил ``pin_submission_sha``;
+    мутации и summary сдачи сюда не передаются вовсе. Стоит до перехода: отказ
+    при require не создаёт поколения и не заказывает ревью (как #1436).
+    """
+    if (state.task.get("work_type") or "") != "bug":
+        return
+    from hub.services.project_policy import (
+        RED_TEST_OFF,
+        RED_TEST_REQUIRE,
+        bug_red_test_of,
+        gate_policy_for_task,
+    )
+
+    mode = bug_red_test_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == RED_TEST_OFF:
+        return
+    sha = state.submission_sha
+    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    baseline = (
+        red_test_gate.parse_baseline(dict(report).get("baseline"))
+        if report is not None
+        else None
+    )
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    proofs, found = red_test_gate.evaluate(ac_rows, baseline, head_sha=sha)
+    if not found:
+        state.red_test_kind = "status"
+        state.red_test_record = red_test_gate.evidence_text(
+            proofs, baseline or {}, head_sha=sha
+        )
+        return
+    if mode == RED_TEST_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=bug_red_test_unproven_detail(
+                found, head_sha=sha, not_evidence=red_test_gate.NOT_EVIDENCE
+            ),
+        )
+    state.red_test_kind = "alert"
+    state.red_test_record = red_test_gate.warning_text(found, proofs, baseline)
+
+
+async def _step_ci_before_submit(state: SubmitContext) -> None:
+    """Явная сдача требует доказанного зелёного CI о закреплённом sha (#1629).
+
+    Режим — из политики проекта ``ci_before_submit``. Предикат —
+    ``ci_green_proof.proof_gap`` над отчётом о коммите, который закрепил
+    ``pin_submission_sha``; ``failed_checks`` (#1405) не трогается. Стоит до
+    перехода: отказ при require не создаёт поколения, записи и заказа ревью.
+    Только pair-путь: на headless отказ запрещён решением #1122.
+    """
+    from hub.services.project_policy import (
+        RED_TEST_OFF,
+        RED_TEST_REQUIRE,
+        ci_before_submit_of,
+        gate_policy_for_task,
+    )
+
+    mode = ci_before_submit_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == RED_TEST_OFF:
+        return
+    sha = state.submission_sha
+    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    gap = ci_green_proof.proof_gap(dict(report) if report else None, ac_rows, sha)
+    if gap is None:
+        return
+    if mode == RED_TEST_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=ci_before_submit_unproven_detail(
+                gap.violations, head_sha=sha, cause=gap.cause
+            ),
+        )
+    state.ci_before_alert = ci_green_proof.warning_text(sha, gap)
+
+
 async def _step_pin_submission_sha(state: SubmitContext) -> None:
     """Код, который будет судить ревьюер (#572)."""
     # #572: pin the code the reviewer will actually be judging. Resolved by
@@ -2565,10 +3298,19 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
 )
 
 SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
+    # #1436: режим читается из политики ПРОЕКТА внутри шага — общий policy()
+    # смотрит в config. Первым во второй половине: дешёвые чтения базы, отказ
+    # до сетевого диффа и тем более до перехода.
+    Step("submission_contract", _step_submission_contract),
+    # #913: тоже политика проекта и тоже дешёвое чтение базы — отказ до диффа.
+    Step("bug_red_test", _step_bug_red_test),
+    # #1629: тоже политика проекта и чтение базы — отказ до диффа и записей.
+    Step("ci_before_submit", _step_ci_before_submit),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
     Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
+    Step("path_notices", _step_path_notices, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
 
@@ -2604,6 +3346,32 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
             "хуже отсутствующей — она выглядит гарантией"
         ),
     ),
+    Step(
+        "submission_contract",
+        _step_submission_contract,
+        inactive_reason=(
+            "headless сдаёт done-отчётом, у которого нет полей model и "
+            "mutations: контракт требовал бы того, что этот путь передать не "
+            "может, и отказ оставил бы задачу стоять без человека (#1436)"
+        ),
+    ),
+    Step(
+        "bug_red_test",
+        _step_bug_red_test,
+        inactive_reason=(
+            "headless закрепляет коммит последним шагом, после гейтов: отчёта "
+            "CI о нём ещё не с чем сверить, и гейт отвечал бы «нет baseline» "
+            "на каждый баг. Включение на этом пути — решение владельца (#913)"
+        ),
+    ),
+    Step(
+        "ci_before_submit",
+        _step_ci_before_submit,
+        inactive_reason=(
+            "done/headless: отказ запрещён решением #1122, а коммит "
+            "закрепляется последним шагом — отчёта CI о нём ещё нет (#1629)"
+        ),
+    ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=capped_at_warn("SDD_SURFACES")),
     # #1155: поле у done-отчёта появилось, отвечать теперь есть чем — шаг
@@ -2618,6 +3386,9 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    # #1589: после закрепления коммита — пути читаются для него, а не для
+    # вершины, которая успела уйти вперёд.
+    Step("path_notices", _step_path_notices, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
 
@@ -2644,6 +3415,8 @@ async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskSubmitReview | None = None,
+    *,
+    principal_id: int | None = None,
 ) -> TaskView:
     """Submit the current work of a pair task for client-driven review (#305).
 
@@ -2674,6 +3447,13 @@ async def submit_for_review(
         raise HTTPException(404, "task not found")
     task = dict(row)
     body = body or TaskSubmitReview()
+    if is_state(task):
+        # #1647: задача-состояние сдаётся доказательствами, без ветки, CI и
+        # ревью; commit-конвейер ниже её не видит. ``principal_id`` — автор
+        # доказательств из идентичности вызывающего.
+        from hub.services.state_task import submit_state
+
+        return await submit_state(db, task_id, task, body, principal_id=principal_id)
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
     await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
@@ -2745,6 +3525,8 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
+        await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
         # того, как решение о ревью уходит за пределы транзакции ниже.
         # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
@@ -2827,6 +3609,11 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         "открыто, ревью и вердикт остаются текущими как были (#1265)."
     )
     view.wait_baseline = wait_baseline_for(dict(row))
+    # #1589: повтор того же коммита возвращает СОХРАНЁННЫЙ результат поколения
+    # и не пишет второй строки ленты.
+    from hub.services import path_notices
+
+    view.path_notices = await path_notices.view_for_generation(db, task_id, generation)
     return view
 
 
@@ -2904,6 +3691,7 @@ def _submission_update_text(
         content += f" Модель исполнителя (декларация): {declared_model}."
     if summary:
         content += f" {summary}"
+    content += submission_contract.mutations_text(list(state.body.mutations))
     return agent, content
 
 
@@ -2955,7 +3743,15 @@ async def _record_accepted_scope(
         return
     declared = deserialize_str_list(task.get("affected_areas"))
     merged = list(declared) + [p for p in accepted_paths if p not in declared]
-    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=merged))
+    # #1592: NOT TaskRefine(affected_areas=...). Its max_length=20 is the limit
+    # on what an AGENT may send through refine; the accepted scope is a fact
+    # about the diff, and on a wide task declared+accepted passes 20 (28 on
+    # #1589 on 05.10 -> ValidationError -> bare 500). The hub's own write
+    # bypasses the input model; every reader takes the column as is. We are in
+    # the caller's transaction, so a failure here leaves the submission whole.
+    await repo.update_task(
+        db, task_id, affected_areas=db_module.serialize_str_list(merged)
+    )
     shown = ", ".join(accepted_paths[:10])
     more = f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
     # A separate, visible event on purpose. Without it affected_areas would
@@ -2991,6 +3787,14 @@ async def _write_submission_notices(
     попасть в базу вместе, иначе лента расскажет о переходе, которого не
     было, или умолчит о состоявшемся.
     """
+    if state.path_notices is not None:
+        # #1589: ОДНА запись на поколение, в транзакции вызывающего — вместе с
+        # самой сдачей. Исход None (правил нет) не пишет ничего.
+        from hub.services import path_notices
+
+        state.path_notices_view = await path_notices.record(
+            state.db, state.task_id, state.path_notices
+        )
     report_lines = [
         ln for ln in ([state.surface_note, state.outcome_note] + state.rule_lines) if ln
     ]
@@ -3024,6 +3828,28 @@ async def _write_submission_notices(
         await repo.add_task_update(
             state.db, state.task_id, "hub", "alert", state.risk_alert
         )
+    if state.contract_alert:
+        # #1436: ОДНА запись с перечнем, отдельно от отчёта проверок — её ищут
+        # по заголовку, и строка внутри чужого отчёта терялась бы.
+        await repo.add_task_update(
+            state.db, state.task_id, "hub", "alert", state.contract_alert
+        )
+    if state.ci_before_alert:
+        # #1629: ОДНА запись на принятое поколение; повтор того же sha из
+        # review уходит в no-op до шага и второй не пишет.
+        await repo.add_task_update(
+            state.db, state.task_id, "hub", "alert", state.ci_before_alert
+        )
+    if state.red_test_record:
+        # #913: доказательство (или недоказанное при warn) — одной записью в
+        # карточке, со своим заголовком.
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            state.red_test_kind or "alert",
+            state.red_test_record,
+        )
 
 
 async def _dispatch_cross_model_review(db: aiosqlite.Connection, task_id: int) -> None:
@@ -3055,6 +3881,18 @@ async def _warn_on_branch_stacking(
         await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
         await db.commit()
     return stacking
+
+
+async def _store_submitted_prevention(state: SubmitContext) -> None:
+    """#919: the prevention output checked by the pipeline, written in-tx."""
+    if state.prevention_record is None:
+        return
+    await prevention_gate.store_prevention(
+        state.db,
+        state.task_id,
+        state.prevention_record,
+        actor=(state.body.agent or state.task.get("assigned_agent") or "agent"),
+    )
 
 
 async def _apply_submission(state: SubmitContext) -> TaskView:
@@ -3112,6 +3950,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             state,
             reported_by=(body.agent or task.get("assigned_agent") or ""),
         )
+        await _store_submitted_prevention(state)
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -3214,6 +4053,8 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     # A snapshot of the current values, never of the desired ones: a baseline
     # describing the future would be the same guess it replaces.
     view.wait_baseline = wait_baseline_for(dict(row))
+    # #1589: результат, записанный этой сдачей; None — правил у проекта нет.
+    view.path_notices = state.path_notices_view
 
     await _try_restore_pair_workspace(db, task_id)
     return view
@@ -3319,6 +4160,10 @@ async def _previous_verdict_update(db: Any, task_id: int) -> dict | None:
     return verdicts[-1] if verdicts else None
 
 
+#: Метка события вердикта, записанного применением стюарда (#1602).
+STEWARD_APPLIED_SOURCE = "steward_applied"
+
+
 @dataclass
 class VerdictContext:
     """Что шаги вердикта читают и производят до его записи (#1067).
@@ -3335,6 +4180,18 @@ class VerdictContext:
     # Флаги вызова, а не производное шагов: приходят из ручки и нужны записи.
     self_approved: bool = False
     principal_id: int | None = None
+    # #1601: поколение, о котором судили. Если задано, запись вердикта
+    # условна В SQL: поколение живо и вердикта на него нет.
+    expected_generation: int | None = None
+    # #1601: метка применения стюарда (id суждения, время занятия): запись
+    # вердикта условна по ней в той же транзакции.
+    claim: tuple[int, str] | None = None
+    # #1602: вызов пришёл от агентского токена (REST/CLI/MCP). Внутренние
+    # записи — стюард, автопилот — этот флаг не ставят.
+    agent_caller: bool = False
+    # #1602: вердикт записан применением стюарда. Метка ставится САМИМ
+    # применением, а не телом запроса, поэтому подделать её именем агента нельзя.
+    applied_by_steward: bool = False
 
     body_text: str = ""
     pinned_sha: str = ""
@@ -3351,6 +4208,38 @@ async def _vstep_has_a_submission(state: VerdictContext) -> None:
         raise HTTPException(
             400,
             "no submission to review yet: the task has never been submitted for review",
+        )
+
+
+async def _vstep_default_approval_is_the_stewards(state: VerdictContext) -> None:
+    """На default при verdict=steward approved агента не пишется (#1602).
+
+    Замок #743 снят для пары (verdict, steward): вердикт на хабе ставит
+    стюард после согласия советника или человек. Независимый агент, зовущий
+    review-verdict (REST, CLI, MCP hub_submit_review), обходил бы и судью, и
+    советника. changes_requested остаётся доступным: он возвращает работу, а
+    не открывает доставку. При verdict=human правило не действует — там
+    approved независимого ревьюера и есть штатный путь.
+    """
+    if not state.agent_caller or state.body.verdict.value != "approved":
+        return
+    from hub.services import project_policy, steward_dispatch
+
+    project = await repo.resolve_project_for_task(state.db, state.task_id)
+    if project is None or not project_policy.gate_lock_applies(project["slug"]):
+        return
+    if steward_dispatch._policy_wants_steward(project, "verdict", shadow=False):
+        raise HTTPException(
+            409,
+            detail={
+                "error": "default_verdict_reserved_for_steward",
+                "hint": (
+                    "замок #743: на проекте default при verdict=steward "
+                    "approved пишет только стюард (судья и согласие советника) "
+                    "или человек; агентский approved отклонён. "
+                    "changes_requested доступен."
+                ),
+            },
         )
 
 
@@ -3558,6 +4447,7 @@ async def _vstep_auto_draft_out_of_scope(state: VerdictContext) -> None:
 # который уже случился, значит платить за него временем.
 VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
     Step("has_a_submission", _vstep_has_a_submission),
+    Step("default_approval_is_the_stewards", _vstep_default_approval_is_the_stewards),
     Step("changes_requested_has_content", _vstep_changes_requested_has_content),
     Step("verdict_matches_its_text", _vstep_verdict_matches_its_text),
     Step("verdict_is_not_a_repeat", _vstep_verdict_is_not_a_repeat),
@@ -3584,6 +4474,11 @@ async def record_review_verdict(
     *,
     self_approved: bool = False,
     principal_id: int | None = None,
+    expected_generation: int | None = None,
+    claim: tuple[int, str] | None = None,
+    agent_caller: bool = False,
+    applied_by_steward: bool = False,
+    human_caller: bool = False,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -3591,7 +4486,9 @@ async def record_review_verdict(
     later resubmission automatically invalidates an APPROVED verdict. For
     client-driven review (status=review, no review_job_id) the task returns
     to ``running`` so the developer can fix findings or report done (#307);
-    headless transitions remain with the poller. Never a completion path.
+    headless transitions remain with the poller. Not a completion path for a
+    commit task; a state task (#1647) is routed to
+    ``state_task.record_state_verdict``, where a human APPROVED completes it.
 
     Content (#1010): ``changes_requested`` is refused without a reason —
     either one finding or a non-empty ``comments``. The refusal happens
@@ -3621,6 +4518,21 @@ async def record_review_verdict(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    if is_state(task):
+        # #1647: вердикт по задаче-состоянию — только с поколением, APPROVED
+        # только от человека (``human_caller`` ставят REST и веб по личности
+        # вызывающего; стюард и автопилот его не ставят и отказываются здесь,
+        # даже если дверь выше них забыли закрыть).
+        from hub.services.state_task import record_state_verdict
+
+        return await record_state_verdict(
+            db,
+            task_id,
+            task,
+            body,
+            principal_id=principal_id,
+            human_caller=human_caller,
+        )
 
     state = VerdictContext(
         db=db,
@@ -3629,6 +4541,10 @@ async def record_review_verdict(
         body=body,
         self_approved=self_approved,
         principal_id=principal_id,
+        expected_generation=expected_generation,
+        claim=claim,
+        agent_caller=agent_caller,
+        applied_by_steward=applied_by_steward,
     )
     await run_steps(state, VERDICT_STEPS)
 
@@ -3711,6 +4627,17 @@ def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
     return agent, content
 
 
+def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
+    payload: dict[str, Any] = {
+        "verdict": state.body.verdict.value,
+        "submission_generation": state.task.get("submission_generation") or 0,
+        "self_approved": self_approved,
+    }
+    if state.applied_by_steward:
+        payload["source"] = STEWARD_APPLIED_SOURCE
+    return payload
+
+
 async def _apply_verdict(state: VerdictContext) -> TaskView:
     """Запись вердикта и всё, что за ней (#1067).
 
@@ -3726,6 +4653,8 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     body = state.body
     self_approved = state.self_approved
     principal_id = state.principal_id
+    expected_generation = state.expected_generation
+    claim = state.claim
 
     # Контракт между конвейером и записью вердикта.
     pinned_sha = state.pinned_sha
@@ -3739,13 +4668,24 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             [f.model_dump(exclude_none=True) for f in body.findings],
             ensure_ascii=False,
         )
-        await repo.record_review_verdict(
+        written = await repo.record_review_verdict(
             db,
             task_id,
             body.verdict.value,
             findings_json=findings_json,
             self_approved=self_approved,
+            expected_generation=expected_generation,
+            claim=claim,
         )
+        if not written:
+            # #1601: пока считали (пакет, согласие), сдачу пересдали или вердикт
+            # на неё уже поставил человек. Запись не состоялась ни на какое
+            # поколение; транзакция откатывается целиком.
+            raise HTTPException(
+                409,
+                f"вердикт о сдаче {expected_generation} не записан: поколение "
+                "уже другое или вердикт на него уже стоит",
+            )
         agent, content = _verdict_update_text(state)
         # The verdict is authored by a principal — the endpoint already
         # resolved one to check reviewer independence. Without this it would
@@ -3793,11 +4733,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             kind="review_verdict_recorded",
             task_id=task_id,
             actor=agent,
-            payload={
-                "verdict": body.verdict.value,
-                "submission_generation": task.get("submission_generation") or 0,
-                "self_approved": self_approved,
-            },
+            payload=_verdict_event_payload(state, self_approved),
         )
         await db.commit()
         await log_activity(
@@ -3835,6 +4771,56 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             else inflight_note
         )
     return view
+
+
+async def _claim_write(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskClaim,
+    implementer_principal_id: int | None,
+) -> TaskView | None:
+    """The claim's transition and fields, up to the commit (#1433).
+
+    Runs inside ``capture_areas``: the area hold lasts until this commit.
+    Returns the view when a concurrent claim of the same holder won the race.
+    """
+    if not await repo.transition_status_if(
+        db, task_id, expected_from="open", new_status="claimed"
+    ):
+        row = _existing_task(await repo.get_task(db, task_id), task_id)
+        task = dict(row)
+        if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
+            updates = await repo.get_task_updates(db, task_id)
+            return row_to_task(row, updates=updates)
+        raise HTTPException(409, f"Task #{task_id} claim conflict")
+
+    session_note = f" session={body.session_id}" if body.session_id else ""
+    claim_fields: dict[str, Any] = {
+        "claimed_by": body.agent,
+        "claim_session_id": body.session_id or None,
+        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "assigned_agent": body.agent,
+    }
+    if is_state(await repo.get_task(db, task_id)):
+        # #1647: git_mode=remote уже на claim — release/cleanup до pair-start не
+        # идут в git хоста хаба.
+        claim_fields["git_mode"] = PairGitMode.remote.value
+    if implementer_principal_id is not None:
+        claim_fields["implementer_principal_id"] = implementer_principal_id
+    await repo.update_task(db, task_id, **claim_fields)
+    # The registry follows the claim inside the same transaction (#771 AC-3):
+    # two places may not disagree about which task a session holds. Silent when
+    # the session is unregistered — the registry is optional.
+    await note_session_task(db, body.session_id, task_id)
+    await repo.add_task_update(
+        db,
+        task_id,
+        body.agent,
+        "status",
+        f"Claimed by {body.agent}{session_note}",
+    )
+    await db.commit()
+    return None
 
 
 async def claim_task(
@@ -3876,7 +4862,9 @@ async def claim_task(
         ):
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            tv.worktree_hint = _worktree_hint_for(task, task_id)
+            return tv
         holder = task.get("claimed_by") or "unknown"
         raise HTTPException(
             409,
@@ -3889,38 +4877,15 @@ async def claim_task(
             f"can only claim open tasks, current status: {task['status']}",
         )
 
-    if not await repo.transition_status_if(
-        db, task_id, expected_from="open", new_status="claimed"
-    ):
-        row = _existing_task(await repo.get_task(db, task_id), task_id)
-        task = dict(row)
-        if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
-            updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)
-        raise HTTPException(409, f"Task #{task_id} claim conflict")
-
-    session_note = f" session={body.session_id}" if body.session_id else ""
-    claim_fields: dict[str, Any] = {
-        "claimed_by": body.agent,
-        "claim_session_id": body.session_id or None,
-        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "assigned_agent": body.agent,
-    }
-    if implementer_principal_id is not None:
-        claim_fields["implementer_principal_id"] = implementer_principal_id
-    await repo.update_task(db, task_id, **claim_fields)
-    # The registry follows the claim inside the same transaction (#771 AC-3):
-    # two places may not disagree about which task a session holds. Silent when
-    # the session is unregistered — the registry is optional.
-    await note_session_task(db, body.session_id, task_id)
-    await repo.add_task_update(
-        db,
-        task_id,
-        body.agent,
-        "status",
-        f"Claimed by {body.agent}{session_note}",
-    )
-    await db.commit()
+    # #1433: before the transition, and the hold lasts until its commit — a
+    # refusal leaves the task open, a concurrent overlapping claim sees ours.
+    async with capture_areas(db, task_id, task["status"]) as area_check:
+        won_by_same_holder = await _claim_write(
+            db, task_id, body, implementer_principal_id
+        )
+    if won_by_same_holder is not None:
+        won_by_same_holder.worktree_hint = _worktree_hint_for(task, task_id)
+        return won_by_same_holder
     await log_activity(
         db,
         "task_claimed",
@@ -3930,7 +4895,10 @@ async def claim_task(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv.area_check = area_check
+    tv.worktree_hint = _worktree_hint_for(task, task_id)
+    return tv
 
 
 async def release_task(
@@ -4037,6 +5005,11 @@ async def ask_question(
     await repo.add_task_update(db, task_id, body.agent, "question", body.question)
     await repo.update_task(db, task_id, status="needs_info")
     await db.commit()
+    # #1458: идущий прогон облачного исполнителя вопрос останавливает —
+    # иначе он пишет код против догадки, пока ответа нет.
+    from hub.services.executor_dispatch import pause_run_on_question
+
+    await pause_run_on_question(db, task_id)
     await log_activity(
         db,
         "task_question",
@@ -4086,6 +5059,21 @@ async def answer_question(
         payload={"resume": bool(body.resume)},
     )
     await db.commit()
+
+    from hub.services.executor_dispatch import answer_for_executor
+
+    if await answer_for_executor(db, task, resume=bool(body.resume)):
+        # #1458: вопрос облачного исполнителя — продолжение (или решение
+        # человеку) ведёт хаб; статус running без прогона здесь не ставится.
+        await log_activity(
+            db,
+            "task_answered",
+            f"Task #{task_id}: answered, executor continuation handled by the hub",
+            detail=mutation_activity_detail(),
+        )
+        row = await repo.get_task(db, task_id)
+        updates = await repo.get_task_updates(db, task_id)
+        return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
     if body.resume:
         if _is_pair_task(task):
@@ -4343,7 +5331,18 @@ async def return_to_work(
         raise HTTPException(404, "task not found")
     task = dict(row)
     from_status = task["status"]
-    if from_status not in RETURN_TO_WORK_STATUSES:
+    state_task = is_state(task)
+    # #1647: задачу-состояние возвращают и из running после отказного вердикта,
+    # и из needs_info, и из open (ушла по реестру сессий): без этой двери
+    # замороженную постановку нельзя было бы править.
+    # #1648: и из completed. Завершённую без действующего одобрения (force-
+    # complete, decide accept) state-задачу иначе нельзя ни сдать, ни одобрить:
+    # зависимые ждут принятия, а пути к нему нет. Вызывающий — человек (REST и
+    # веб-форма проверяют роль); commit-задача из completed по-прежнему 400.
+    allowed = RETURN_TO_WORK_STATUSES | (
+        {"running", "needs_info", "open", "completed"} if state_task else frozenset()
+    )
+    if from_status not in allowed:
         raise HTTPException(
             400,
             "can only return review or fix_requested tasks to work, "
@@ -4374,6 +5373,17 @@ async def return_to_work(
         # open task would keep it out of the pair delivery sweep later.
         job_id=None,
         review_job_id=None,
+        # #1647: явный возврат размораживает постановку на этом поколении.
+        # #1648: из completed ещё и снимается метка завершения — задача снова
+        # не завершена, и новая сдача завершит её заново.
+        **(
+            {
+                "unfrozen_generation": int(task.get("submission_generation") or 0),
+                **({"completed_at": None} if from_status == "completed" else {}),
+            }
+            if state_task
+            else {}
+        ),
     )
     await note_session_task(db, task.get("claim_session_id") or "", None)
     await repo.add_task_update(
@@ -4421,6 +5431,31 @@ async def return_to_work(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def _dispatch_rework(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any], instructions: str
+) -> None:
+    """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
+    message = plugins.dispatch.build_fix_message(
+        task_id=task_id,
+        title=task["title"],
+        description=task.get("description", ""),
+        review_comments=instructions,
+        review_cycle=0,
+        max_cycles=config.MAX_REVIEW_CYCLES,
+    )
+    runtime = task.get("runtime", "auto")
+    result = await plugins.dispatch.submit_task(
+        message, runtime=runtime, task_id=task_id
+    )
+    job_id = result.get("job_id")
+    if job_id:
+        await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+    else:
+        await repo.update_task(db, task_id, status="open")
+        await reset_mis_issued_assignment(db, task_id, task)
+    await db.commit()
+
+
 async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4453,6 +5488,9 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="decide_accept", actor="human"
+        )
         await repo.update_task(db, task_id, status="completed")
         await repo.insert_event(
             db,
@@ -4523,24 +5561,16 @@ async def decide_task(
         )
         await db.commit()
 
-        message = plugins.dispatch.build_fix_message(
-            task_id=task_id,
-            title=task["title"],
-            description=task.get("description", ""),
-            review_comments=instructions,
-            review_cycle=0,
-            max_cycles=config.MAX_REVIEW_CYCLES,
-        )
-        runtime = task.get("runtime", "auto")
-        result = await plugins.dispatch.submit_task(
-            message, runtime=runtime, task_id=task_id
-        )
-        job_id = result.get("job_id")
-        if job_id:
-            await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+        if is_state(task):
+            # #1647: rework задачи-состояния не заказывает headless-задание —
+            # её руками делает человек или агент в pair. Задача возвращается в
+            # open (как при return-to-work): постановку можно править, затем
+            # новая сдача.
+            from hub.services.state_task import rework_without_dispatch
+
+            await rework_without_dispatch(db, task_id)
         else:
-            await repo.update_task(db, task_id, status="open")
-        await db.commit()
+            await _dispatch_rework(db, task_id, task, instructions)
         await log_activity(
             db,
             "task_decided",
@@ -4586,6 +5616,74 @@ async def _release_done_flow(
         await db.execute("RELEASE SAVEPOINT done_flow")
 
 
+async def _finish_deferred_done(
+    db: aiosqlite.Connection, task_id: int, deferred: list[dict[str, Any]]
+) -> None:
+    """Завершить отложенное done-flow после его коммита (#1430).
+
+    Завершение pair-задачи — поиск PR, CI, мерж — идёт без write-лока на
+    время сети. Откат #364 охраняет путь сдачи внутри транзакции и не
+    меняется: сюда доходит только уже законно записанный done-отчёт.
+    """
+    if not deferred:
+        return
+    await run_deferred_completions(db, deferred)
+    row = await repo.get_task(db, task_id)
+    if row is not None and dict(row)["status"] == "completed":
+        await maybe_rollup_parent(db, task_id)
+        await db.commit()
+
+
+async def _done_report_warnings(
+    db: aiosqlite.Connection, before: dict[str, Any], kind: str, undelivered: str
+) -> list[str]:
+    """Заметки к ответу на отчёт: недоставленное (#498) и пути диффа (#1589)."""
+    notes = [undelivered] if undelivered else []
+    if kind == "done":
+        notes.append(await _path_notice_warning(db, before))
+    return [note for note in notes if note]
+
+
+async def _path_notice_warning(db: aiosqlite.Connection, before: dict[str, Any]) -> str:
+    """Текст path_notices, если ЭТОТ done-отчёт открыл новое поколение (#1589)."""
+    from hub.services import path_notices
+
+    row = await repo.get_task(db, int(before["id"]))
+    if row is None:
+        return ""
+    generation = int(dict(row).get("submission_generation") or 0)
+    if generation <= int(before.get("submission_generation") or 0):
+        return ""
+    return path_notices.shown_text(
+        await path_notices.view_for_generation(db, int(before["id"]), generation)
+    )
+
+
+async def _record_path_notices_for_done(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> None:
+    """path_notices для done-маршрута, где конвейер гейтов не работает (#1589).
+
+    Дешёвое чтение политики первым: без правил git не трогается. Не коммитит.
+    """
+    from hub.services import path_notices
+
+    rules = project_policy.path_notices_of(
+        await project_policy.gate_policy_for_task(db, int(task["id"]))
+    )
+    if not rules:
+        return
+    paths, reason = await _resolve_branch_diff(db, task)
+    sha, _sha_reason = await resolve_branch_tip(
+        db, int(task["id"]), task.get("branch") or ""
+    )
+    outcome = await path_notices.compute(
+        db, task, submission_sha=sha, diff_paths=paths, diff_reason=reason
+    )
+    if outcome is not None:
+        await path_notices.record(db, int(task["id"]), outcome)
+
+
 async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4619,6 +5717,11 @@ async def add_update(
         ) == "completed" and await repo.completed_by_poller_delivery(db, task_id):
             body = body.model_copy(update={"kind": "status"})
         else:
+            # #1647: done-отчёт state-задачи — не сдача и не завершение.
+            # До вставки строки: отказ не оставляет ни done-строки, ни bump.
+            from hub.services.state_task import refuse_done_report
+
+            refuse_done_report(task)
             _validate_done_report(task)
 
     # #498: work that never started its way out, named while the report is
@@ -4638,7 +5741,7 @@ async def add_update(
     # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
     # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
     # which is why it must run under the same lock.
-    async with write_transaction(db):
+    async with defer_completions() as deferred_done, write_transaction(db):
         # #364: the done row and the generation bump are written before the
         # git tail runs, and a git adapter that raises used to leave both
         # behind — reproduced: one done row and generation 1 after the
@@ -4662,6 +5765,15 @@ async def add_update(
                 # identity, while the hub writing its own alerts has none by
                 # nature. Telling them apart is the point of the field.
                 author_kind="principal" if principal_id is not None else "anonymous",
+            )
+            # #919: inside the savepoint, before any route — a refused close
+            # of a prod defect takes its done row back with it.
+            await prevention_gate.record_done_prevention(
+                db,
+                task,
+                kind=body.kind,
+                prevention=body.prevention,
+                actor=body.agent or task.get("assigned_agent") or "agent",
             )
 
             if body.finding_outcomes:
@@ -4730,6 +5842,9 @@ async def add_update(
                         # path may not complete unreviewed work — the done
                         # report becomes a submission for client-driven review.
                         generation = await repo.bump_submission_generation(db, task_id)
+                        # #1589: и этот вход — сдача; без гейтов конвейера он
+                        # иначе остался бы без предупреждений по путям.
+                        await _record_path_notices_for_done(db, task)
                         await repo.update_task(
                             db, task_id, status="review", review_job_id=None
                         )
@@ -4787,7 +5902,7 @@ async def add_update(
                             # through the decision, not around it.
                             f"Отчёт о готовности не пошёл в доставку: после "
                             f"последней сдачи записан блокер — {note}. Решение "
-                            "за человеком (hub_decide_task): rework вернёт "
+                            "за человеком (REST POST /api/tasks/<id>/decide): rework вернёт "
                             "задачу в running — снимите препятствие и "
                             "пересдайте done; accept завершит без доставки.",
                         )
@@ -4828,6 +5943,8 @@ async def add_update(
             if not released:
                 await _release_done_flow(db)
 
+    await _finish_deferred_done(db, task_id, deferred_done)
+
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
         # #897, the third door: a ``pending_report`` task with auto_review off
@@ -4861,8 +5978,7 @@ async def add_update(
 
     update_row = await repo.get_task_update_by_id(db, update_id)
     view = TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
-    if undelivered:
-        view.warnings = [undelivered]
+    view.warnings = await _done_report_warnings(db, task, body.kind, undelivered)
     return view
 
 
@@ -5080,6 +6196,9 @@ async def force_complete_task(
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with write_transaction(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="force_complete", actor="human"
+        )
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
@@ -5110,6 +6229,31 @@ async def force_complete_task(
 
 
 DELIVER_DISPOSITION = "deliver"
+
+
+async def _name_the_owed_record(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> bool:
+    """Доставка по решению человека, где PR влит, а строка реестра — нет (#1428).
+
+    Сказать правду: код в базовой ветке, строки pipeline_merges нет. Задача
+    уже завершена (decide/force-complete закоммитили это до вызова), и
+    поллер её не допишет. Запись одна и без повтора: база, не отпустившая
+    лок всё ожидание гейта, может не отпустить его и здесь — тогда запрос
+    человека упадёт на «locked» ПОСЛЕ мержа, без ложной фразы в ленте.
+    Корень — сеть под write-транзакцией done-flow — вынесен отдельной
+    задачей (#1428).
+    """
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Доставка по решению человека выполнена, реестр — нет: {reason}. "
+        "Задача завершена, свип доставки к ней не вернётся; до досыпки "
+        "реестра (#1367) drift-guard увидит этот мерж как ручной.",
+    )
+    return True
 
 
 async def deliver_on_disposition(
@@ -5160,6 +6304,7 @@ async def deliver_on_disposition(
         return False, "no_pr", False
 
     from hub.services.orchestration import (
+        GATE_RECORD_PENDING_PREFIX,
         merge_before_completion,
         resolve_delivery_pr,
         review_approved_for_current_submission,
@@ -5198,6 +6343,10 @@ async def deliver_on_disposition(
         ok, reason = False, delivery_pr.reason
     else:
         ok, reason = await merge_before_completion(db, task)
+        # #1428: PR влит, не легла только строка реестра — это доставка, а не
+        # «PR остался открытым». Задача уже завершена, свип её не вернёт.
+        if not ok and reason.startswith(GATE_RECORD_PENDING_PREFIX):
+            ok = await _name_the_owed_record(db, task_id, reason)
     if ok:
         await repo.add_task_update(
             db,

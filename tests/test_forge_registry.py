@@ -99,7 +99,6 @@ async def test_hub_starts_with_noop_forge():
     assert await forge.close_pr(1) is False
     assert await forge.branch_contains("develop", "abc") is None
     assert await forge.compare_subjects("develop", "main") == []
-    assert (await forge.merge_branches("develop", "main", "msg"))[0] == "unavailable"
 
 
 def test_every_forge_declares_whether_it_can_merge():

@@ -127,3 +127,138 @@ def test_steward_spec_links_resolve():
     assert targets, "spec cites no repository files at all"
     for rel in targets:
         assert (spec.parent / rel).resolve().is_file(), f"broken link: {rel}"
+
+
+GUIDE_PATH = REPO_ROOT / "docs" / "agent-mcp-operator-guide.md"
+DEPLOY_WINDOW_ANCHOR = "deploy-window-mcp-disconnect"
+
+
+def _anchor_exists(doc: Path, anchor: str) -> bool:
+    """True when ``doc`` has an explicit HTML anchor or a heading with that slug."""
+    text = doc.read_text(encoding="utf-8")
+    if re.search(rf'<a\s+(?:id|name)="{re.escape(anchor)}"\s*>', text):
+        return True
+    for heading in re.findall(r"^#{1,6}\s+(.+?)\s*$", text, flags=re.MULTILINE):
+        slug = re.sub(r"[^\w\s-]", "", heading.lower()).strip().replace(" ", "-")
+        if slug == anchor:
+            return True
+    return False
+
+
+def test_operator_guide_names_the_deploy_window_mcp_failure():
+    # #1585 AC-1: a session that started in the release window can keep the hub
+    # MCP disconnected. The guide names the symptom, the cause and the way out.
+    text = GUIDE_PATH.read_text(encoding="utf-8")
+    assert _anchor_exists(GUIDE_PATH, DEPLOY_WINDOW_ANCHOR)
+    troubleshooting = text[text.index("## 7. Troubleshooting") :]
+    troubleshooting = troubleshooting[: troubleshooting.index("\n---")]
+    rows = [
+        line
+        for line in troubleshooting.splitlines()
+        if line.startswith("|") and f'id="{DEPLOY_WINDOW_ANCHOR}"' in line
+    ]
+    assert len(rows) == 1, "one Troubleshooting row must carry the anchor"
+    row = rows[0]
+    for needle in (
+        "/healthz",
+        "200",
+        "Claude Code",
+        "/mcp",
+        "REST",
+        "HAIPLANE_HUB_TOKEN",
+    ):
+        assert needle in row, f"deploy-window row lacks {needle!r}"
+    assert "деплой" in row.lower()
+    # the way out goes in order: healthz, then /mcp; REST only while MCP is down
+    assert row.index("/healthz") < row.index("/mcp")
+    assert "пока MCP недоступен" in row
+    # /mcp is a Claude Code command, not a universal one
+    assert "Claude Code" in row[: row.index("/mcp")]
+    # no promise that the client recovers by itself, no window as a guarantee
+    lowered = row.lower()
+    for forbidden in ("переподключится сам", "гарантир", "всегда переподключ"):
+        assert forbidden not in lowered
+    assert "может остаться" in lowered
+    # a variable name only, never a secret value
+    assert not re.search(r"Bearer\s+[A-Za-z0-9_\-]{16,}", row)
+
+
+def test_session_restart_spec_links_the_deploy_window_row():
+    # #1585 AC-2: the spec points at the guide row. Both the path and the anchor
+    # must exist: a fragment is not checked by the generic link test.
+    spec = REPO_ROOT / "docs" / "specs" / "mcp-session-restart.md"
+    text = spec.read_text(encoding="utf-8")
+    links = re.findall(r"\]\(([^)\s#]*agent-mcp-operator-guide\.md)#([^)\s]+)\)", text)
+    matching = [(path, frag) for path, frag in links if frag == DEPLOY_WINDOW_ANCHOR]
+    assert matching, "spec does not link the deploy-window row by anchor"
+    for path, frag in matching:
+        target = (spec.parent / path).resolve()
+        assert target.is_file(), f"broken link: {path}"
+        assert _anchor_exists(target, frag), f"missing anchor {frag} in {path}"
+    assert "stateful" in text, "spec must say its 404 scenario is the old transport"
+
+
+def test_operator_guide_matches_stateless_mcp():
+    # #1585 AC-3: hub/mcp_server.py runs stateless_http=True, so the guide must
+    # not ask for Mcp-Session-Id or call its absence an error (#1364).
+    server = (REPO_ROOT / "hub" / "mcp_server.py").read_text(encoding="utf-8")
+    assert "stateless_http=True" in server
+    text = GUIDE_PATH.read_text(encoding="utf-8")
+    assert "stateless" in text
+    assert "не требует" in text
+    for stale in (
+        '-H "Mcp-Session-Id',
+        "SESSION=",
+        "нужен `Mcp-Session-Id`",
+        "есть **`Mcp-Session-Id`**",
+        "передайте во все follow-up",
+        "**с тем же** `Mcp-Session-Id`",
+        "без `Mcp-Session-Id`",
+        "Передайте `Mcp-Session-Id`",
+        "Добавьте `Mcp-Session-Id`",
+    ):
+        assert stale not in text, f"guide still requires a session id: {stale}"
+    onboarding = (REPO_ROOT / "docs" / "agent-onboarding.md").read_text(
+        encoding="utf-8"
+    )
+    assert "возвращает `Mcp-Session-Id`" not in onboarding
+    for doc in (text, onboarding):
+        for line in doc.splitlines():
+            if "Mcp-Session-Id" in line:
+                assert re.search(r"не (требу|нужен|передаёт|выда)", line), line
+
+
+def test_deep_lifecycle_contract_lists_the_scenarios():
+    """#1587: the deep-review behaviour contract exists and every row is marked."""
+    doc = REPO_ROOT / "docs" / "review-deep-lifecycle.md"
+    assert doc.is_file()
+    text = doc.read_text(encoding="utf-8")
+    marks = (
+        "реализовано этой задачей",
+        "существующее поведение сохранено",
+        "целевое, отдельная задача",
+    )
+    rows = {}
+    for line in text.splitlines():
+        m = re.match(r"^\|\s*(\d+[a-d]?)\s*\|", line)
+        if m:
+            rows[m.group(1)] = line
+    expected = [
+        "1", "1b", "1c", "1d", "2", "3", "4", "5", "6", "6b", "7",
+        "8a", "8b", "8c", "8d", "9", "10", "11", "12", "13",
+    ]  # fmt: skip
+    assert sorted(rows) == sorted(expected), "every scenario of the card has a row"
+    for number, line in rows.items():
+        assert sum(mark in line for mark in marks) == 1, f"row {number}: one mark"
+    for number in ("6", "7", "8d"):
+        assert "реализовано этой задачей" in rows[number], number
+    assert "бронь блокирует первичный двойной заказ" in rows["11"]
+    assert "гонок нет" not in text.replace("без утверждения «гонок нет»", "")
+
+    local = (REPO_ROOT / "deploy" / "LOCAL-REVIEW.md").read_text(encoding="utf-8")
+    assert (
+        "docs/review-deep-lifecycle.md" in local or "review-deep-lifecycle.md" in local
+    )
+    link = re.search(r"\]\(([^)]*review-deep-lifecycle\.md)\)", local)
+    assert link, "LOCAL-REVIEW.md links the document"
+    assert (REPO_ROOT / "deploy" / link.group(1)).resolve() == doc.resolve()

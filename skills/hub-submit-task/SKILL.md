@@ -1,0 +1,154 @@
+---
+name: hub-submit-task
+description: Use before hub_submit_for_review on a Haiplane Hub pair task - payload shape (prevention.ref, mutations, finding_outcomes), what a resubmission does to the generation and the verdict, what to check after a transport error, and what must be pushed and green before the submission.
+---
+
+# Hub Submit Task
+
+Каждая сдача с новым sha открывает новое поколение и покупает ревью. Этот skill
+перечисляет шесть правил, которые держат число сдач и отказов по форме
+минимальными. Парный skill для чтения отчёта после сдачи:
+`skills/hub-review-report-reading/`. Общий цикл pair-задачи и дисциплина
+исполнителя — skill `executor-pair-discipline` в библиотеке хаба; здесь он не
+копируется.
+
+Ссылки на код даны по имени сущности на базе `1b60f5453fccfe9e59a1745666b084ca13c36a67`
+(origin/develop). Номеров строк нет: ищите сущность по имени.
+
+## 1. Вывод по прод-дефекту идёт в `prevention.ref`, не в `test_ref`
+
+- Поля `DefectPrevention` (`hub/models.py`): `kind`, `ref`, `reason`, `revisit`.
+  Поля `test_ref` там нет: `test_ref` принадлежит критерию приёмки (AC), не выводу.
+- `DefectPrevention` не запрещает лишние поля (в отличие от `FindingOutcomeItem`,
+  где `extra="forbid"`). Присланный `test_ref` отбрасывается молча, `ref`
+  остаётся пустым, и `prevention_gate.validate_prevention` отвечает 422
+  `regression_test без ref`. Проверено запуском модели на этой базе.
+- Три вида вывода (`PreventionKind`, `prevention_gate.PREVENTION_OPTIONS`):
+  - `regression_test`: `ref` = локатор теста `tests/x.py::test_y`;
+  - `rule`: `ref` = категория, которая уже есть в `category_checks`; иначе 422
+    `prevention_invalid` (запись категории - `POST /api/metrics/category-checks`);
+  - `accepted_risk`: `reason` и `revisit` оба обязательны, `ref` не нужен.
+- Когда обязателен: у задачи `found_in='prod'` сдача получает 422
+  `prevention_required`, только если вывода нет ни в payload, ни в уже
+  сохранённом `defect_prevention` задачи (`prevention_gate.prevention_gap`,
+  `check_submission`, `refuse_without_prevention`). Если `prevention` прислан, он
+  проверяется всегда.
+- Оговорка: тексты отказов в `prevention_gate` до сих пор называют CLI `oc-hub`.
+  Имя команды - `hp-hub` (правило 6).
+- Инцидент не привязан: 422 по `ref`/`test_ref` в ленте #1600 не найден (запись
+  10676). Правило держится на коде.
+
+## 2. Комментарий, повтор того же sha и новый sha - три разные вещи
+
+Источник: `lifecycle.submit_for_review` и `_same_sha_noop_response`.
+
+| Что вы сделали | Что происходит |
+| --- | --- |
+| Запись в ленту (`hub_task_update`, kind `status`) | Поколение, sha и вердикт не меняются. Это комментарий, не сдача. |
+| `hub_submit_for_review` из `review`, ветка на том же sha | Не новое поколение (#1265). Статус, поколение, `submission_sha` и текущесть вердикта остаются прежними. Данные сдачи (`finding_outcomes`, `accept_areas`) применяются к текущему поколению; решение о заказе ревью принимается заново, и если полного отчёта нет, прогон может быть заказан на том же поколении. Ветку этот путь не пушит и PR не открывает. |
+| `hub_submit_for_review` из `review`, ветка на новом sha | Новое поколение (#1054). `repository.bump_submission_generation` повышает счётчик, прежний вердикт перестаёт быть текущим (вердикт привязан к поколению), задача остаётся в `review`. В ленту пишется «Пересдача из review: сдача X заменена на Y». |
+| `hub_submit_for_review` из `running` | Обычная сдача, новое поколение. |
+
+Следствия:
+
+- Правка после сдачи требует нового sha и новой сдачи; поправить сданный код
+  записью в ленту нельзя. Старая фраза «правки в review - апдейтом» неверна после
+  #1054 и не используется.
+- sha закрепляет хаб, не клиент: `lifecycle.resolve_branch_tip` читает
+  `origin/<branch>` на момент сдачи. Пуш после сдачи ничего не меняет, пока нет
+  пересдачи.
+- Каждая пересдача с новым sha покупает ревью: собирайте правки в один коммит.
+- Журнал #1600 (запись 10676): три сдачи, три разных sha (97788de, f0d96ad,
+  03999db), все три - новые поколения; повторов того же sha не было.
+
+## 3. Ошибка транспорта не значит, что сдача не записана
+
+- Сначала `hub_task_status(task_id)`: поля `status`, `submission_generation`,
+  `submission_sha`, `latest_review`. Рост поколения - признак новой сдачи:
+  успешный повтор того же sha поколение не растит (правило 2). Сдача записана,
+  если статус `review` и поколение выросло против того, что было до вызова.
+- Клиентский `hub_submit_for_review` сам читает задачу до вызова
+  (`prior_status`, `prior_generation`) и по совпадению поколения узнаёт повтор
+  того же sha (`was_unchanged_retry`); других ключей идемпотентности у сдачи нет.
+- Слепой повтор после «упавшего» вызова даёт один из трёх исходов, и читается он
+  по `hub_task_status`, не по тексту ошибки:
+  1. первый вызов не дошёл: повтор станет первой сдачей;
+  2. первый записался, `submission_sha` не пуст: повтор того же sha из `review`
+     будет no-op (правило 2);
+  3. первый записался с пустым `submission_sha`: хаб не получил вершину ветки
+     (`resolve_branch_tip` вернул пустой sha и причину). No-op требует непустого
+     совпадающего sha (`_step_same_sha_from_review_is_current`), поэтому повтор
+     при том же коде откроет НОВОЕ поколение и купит ещё одно ревью. Если поле
+     `submission_sha` пусто, не повторяйте вслепую: сначала выясните, почему
+     вершина не получена (ветка не запушена, нет сети у хаба), и скажите об этом.
+- Источник правила - практика сессий; кодом подтверждены только поля сверки и
+  поведение повтора выше.
+
+## 4. `mutations` - список `{ac, mutation, failed_test}`
+
+- Формат: `[{"ac": "AC-1", "mutation": "что сломано в коде", "failed_test": "<test_ref этого AC>"}]`
+  (`models.SubmissionMutation`, `submission_contract.MUTATIONS_FORMAT`).
+- По записи на каждый AC с `verifiable_by=test`. `failed_test` обязан совпасть с
+  `test_ref` именно этого AC; AC без `test_ref` требует непустого `failed_test`
+  (`submission_contract`, проверки мутаций). Неизвестный `ac` и пустое
+  `mutation` - нарушения.
+- Обязательность задаёт политика проекта `submission_contract`: `warn` пишет
+  нарушение в карточку, `require` отказывает 422 (#1436). Прислать поле стоит и
+  при `off`.
+- Это заявление, не наблюдение: хаб мутаций не исполняет. Мутацию нужно
+  действительно сделать и увидеть красный тест, иначе запись ложная.
+- Для `bug_red_test` мутации не доказательство: красный базовый прогон CI
+  проверяется отдельно (#913, `red_test_gate`).
+
+## 5. До сдачи: пуш, CI нужного sha, критик на ядре
+
+1. Коммит сделан, дерево чистое. Хук `.githooks/pre-push` отказывает в пуше с
+   грязным деревом и из ветки с именем вне `task-*/*`, `fix/*`, `chore/*`,
+   `docs/*`, `ci/*`, `dependabot/*`.
+2. Пуш полным refspec из ветки с каноническим именем:
+   `git push origin "refs/heads/${B}:refs/heads/${B}"`, где `B` - имя ветки
+   задачи. Форма `HEAD:refs/heads/...` хук отвергает: он читает локальную ссылку
+   `HEAD`, а не имя ветки.
+   Затем `git ls-remote origin <ветка>` и сверка sha с `git rev-parse HEAD`. Хаб
+   читает `origin/<ветка>`, и сдача закрепляет именно то, что там лежит
+   (`resolve_branch_tip`).
+3. CI на этом sha до сдачи. Хаб не ждёт CI (#1405, `review_ci_gate`,
+   `docs/agent-context/invariants.md`): ревью заказывается сразу при сдаче по
+   отчёту CI о закреплённом sha, который есть в этот момент. Нет отчёта: заказ
+   идёт без него, в ленте событие `review_ordered_without_ci`, а поздний отчёт
+   ревью не перезаказывает. Красный отчёт: ревью не покупается, событие
+   `review_withheld_red_ci`. Поэтому:
+   - привяжите всё к sha, который будет закреплён: `SHA=$(git rev-parse HEAD)`;
+   - запустите CI на ветке: `gh workflow run ci.yml --ref <ветка>`. Триггер
+     `workflow_dispatch`; пуш ветки без PR прогона не создаёт (`ci.yml` слушает
+     `pull_request`, push в `main`/`develop` и `workflow_dispatch`);
+   - найдите id прогона именно на этот sha, повторяя каждые ~10 с, пока вывод
+     пуст: `gh run list --workflow ci.yml --branch <ветка> --commit "$SHA" --event workflow_dispatch --limit 1 --json databaseId,headSha,status -q '.[0]'`.
+     Без `--commit` и `--workflow` первой строкой может оказаться чужой прогон
+     (например, push в `develop`), а `headSha` в таблице по умолчанию нет, он
+     есть только в `--json`;
+   - дождитесь конца: `gh run watch <databaseId> --exit-status`. Без id в
+     неинтерактивной сессии команда сразу выходит с кодом 1 («run ID required
+     when not running interactively»); код 0 значит success;
+   - код не 0 (красный прогон): не сдавайте. Чините, коммитьте, пушьте и снова
+     делайте dispatch на НОВЫЙ sha: пуш прогона не создаёт. Сдавать можно только
+     после кода 0 на sha, который будет закреплён;
+   - потом `hub_submit_for_review`. Сдача подхватит сохранённый отчёт для
+     закреплённого коммита (`lifecycle`, `ci_report.adopt_ci_run_report`), в
+     ленте будет «CI run report adopted for this commit»;
+   - до закрепления sha бриф показывает `ci_run_report` = `unknown`: это
+     нормально, итог прогона смотрите командами выше.
+   Источник: событие `review_ordered_without_ci` и случай #1602 06.10 (по
+   ленте #1602: ревью заказано в 14:48, отчёт CI в 14:58).
+4. На ядре хаба (lifecycle, схема, DoR, интеграции) сначала критик Codex, правка
+   P1/P2 одним кругом, затем одна сдача. Источник: правило владельца от 06.10
+   (постановка #1612); это правило процесса, кодом хаба оно не проверяется. Запуск:
+   `codex exec` в режиме read-only со stdin, закрытым `< /dev/null`.
+5. Локальные проверки до сдачи: `make lint types budget security` и `uv run pytest -q`
+   смотрите по коду возврата, не по хвосту вывода.
+
+## 6. CLI называется `hp-hub`
+
+- `pyproject.toml`, `[project.scripts]`: `hp-hub = "hub.cli:main"`. Скрипта
+  `oc-hub` в этой базе нет. Сдача из командной строки: `hp-hub submit-review <id>`
+  с `--prevention '<json>'` (`hub.cli.cmd_submit_review`).

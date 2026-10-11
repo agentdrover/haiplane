@@ -11,11 +11,13 @@ the library walked into it.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import aiosqlite
 
 from hub.db import (
     _SCHEMA,
+    EXECUTOR_PAIR_DISCIPLINE_SKILL,
     MACHINE_REVIEW_CYCLE_SKILL,
     _migrate,
     fetchall,
@@ -25,6 +27,14 @@ import hub.db as db_module
 from hub.repository import activate_skill_version, get_active_skill
 
 OLD_TEXT = "старый текст без locator"
+
+#: The rule itself, not a pointer to it: a text that keeps "see hub-submit-task"
+#: and drops these has stopped teaching anything (Codex on 97c8e2a).
+RESUBMISSION_CLAIMS = (
+    "новая сдача (новое поколение, прежний вердикт не текущий, #1054)",
+    "повтор из review с тем же sha сохраняет поколение, статус и текущесть вердикта",
+    "finding_outcomes, accept_areas и решение о заказе ревью могут обновиться (#1265)",
+)
 
 
 async def _versions(db: aiosqlite.Connection, name: str) -> list[dict]:
@@ -370,3 +380,68 @@ async def test_seeding_is_safe_on_a_parallel_start(tmp_path):
     finally:
         for conn in connections:
             await conn.close()
+
+
+async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
+    db: aiosqlite.Connection,
+):
+    """The seeded discipline matches lifecycle.submit_for_review (#1054, #1265).
+
+    A fix to submitted code is a new commit, a push and a NEW submission; a
+    feed entry does not move the pinned sha. And the text lands beside, never
+    over, an active version that a person stands behind: both a version a
+    stranger wrote and a seeded draft a person activated.
+    """
+    text = EXECUTOR_PAIR_DISCIPLINE_SKILL
+    flat = " ".join(text.split())  # a phrase wrapped over two lines is still the phrase
+    assert "апдейтом, а не пересдачей" not in flat
+    assert "правки в review — апдейтом" not in flat.lower()
+    assert "ровно одна сдача" not in flat.lower(), (
+        "an unconditional single-submission rule contradicts the resubmission rule"
+    )
+    assert "hub-submit-task" in text
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim in flat.lower(), f"seed lost the rule itself: {claim}"
+    assert "только сдай" in flat, "the hub's submit-only order stays an exception"
+    # The draft must be the whole active text with the fix on top, not a
+    # shorter version a person would lose sections by activating.
+    assert "## Вопрос — это стоп" in text
+    assert "## Правила пилота" in text
+    assert "#1054" in text and "#1265" in text
+
+    # The spec teaches the same rules to people who write the order; it is the
+    # second place the same two phrases lived.
+    spec = " ".join(
+        (
+            Path(__file__).resolve().parents[1]
+            / "docs/specs/orchestrator-executor-environment.md"
+        )
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+    assert "апдейтом, а не пересдачей" not in spec
+    assert "ровно одна сдача" not in spec
+    assert "hub-submit-task" in spec and "#1054" in spec
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim.lower() in spec, f"spec lost the rule itself: {claim}"
+
+    name = "executor-pair-discipline"
+    populations = {
+        "foreign author": (1, OLD_TEXT, "active", "denis", "denis"),
+        "seeded, activated by a person": (1, OLD_TEXT, "active", "seed", "denis"),
+    }
+    for label, active_row in populations.items():
+        await _install(db, name, [active_row])
+        await seed_default_skills(db)
+        await seed_default_skills(db)
+
+        assert await _served(db, name) == OLD_TEXT, label
+        versions = await _versions(db, name)
+        active = [v for v in versions if v["status"] == "active"]
+        assert [(v["version"], v["activated_by"]) for v in active] == [
+            (1, active_row[4])
+        ], label
+        drafts = [v for v in versions if v["status"] == "draft"]
+        assert [d["content"] for d in drafts] == [text], (
+            f"{label}: the new text waits as exactly one draft"
+        )

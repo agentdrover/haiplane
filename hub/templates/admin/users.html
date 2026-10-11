@@ -9,6 +9,7 @@
     <form class="admin-form"
           hx-post="/admin/users/create"
           hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">
+      {{ csrf_field() }}
         <div>
             <label for="cu-username">Username</label>
             <input id="cu-username" name="username" type="text" required placeholder="jdoe">
@@ -80,6 +81,7 @@
                 <form class="admin-roles-inline"
                       hx-post="/admin/users/{{ p.id }}/edit-roles"
                       hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">
+                  {{ csrf_field() }}
                     {% for r in roles %}
                     <label class="admin-checkbox">
                         <input type="checkbox" name="roles" value="{{ r.slug }}"

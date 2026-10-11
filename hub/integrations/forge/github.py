@@ -21,10 +21,14 @@ from hub import brand
 from hub.config import GH_BIN, REPO_NAME
 from hub.integrations import proc
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -125,6 +129,54 @@ class GitHubForge:
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
         return None
+
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """The open PR ``head`` → ``base`` from THIS repository (#1426).
+
+        ``(number, "")`` — found; ``(None, "")`` — there is none;
+        ``(None, reason)`` — the list could not be read, or only PRs from
+        other repositories matched. The last two are named, never collapsed
+        into "none" (#516): the caller would otherwise create a second PR
+        blindly, or stay silent while a stranger's PR sits there.
+
+        ``--head`` filters by branch NAME only: a fork's ``attacker:main``
+        passes it. Pull-request CI runs for forks too, so a green fork PR
+        would have been merged into develop as "the return". Only a PR whose
+        head lives in this repository — not cross-repository, and owned by
+        this repository's owner — is accepted.
+        """
+        slug = gh_repo or REPO_NAME
+        rc, out, err = await _gh(
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--base",
+            base,
+            "--head",
+            head,
+            "--state",
+            "open",
+            "--json",
+            "number,isCrossRepository,headRepositoryOwner",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            said = (err or out or "").strip() or f"gh rc={rc}"
+            return (None, f"список PR {head} → {base} не прочитан: {said[:150]}")
+        try:
+            prs = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            return (None, f"список PR {head} → {base} не разобран")
+        return _own_repo_pr(prs, slug, head)
 
     async def open_or_update_pr(
         self,
@@ -412,6 +464,105 @@ class GitHubForge:
             )
         return (MergeabilityOutcome.unavailable, f"нераспознанный ответ {mergeable}")
 
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness:
+        """Отстала ли голова PR от базы — ``compare base...head``, behind_by (#1419).
+
+        Форма ответа снята живым запросом 26.09.2026 (agentdrover/haiplane):
+        ``compare/develop...task-1404/review-economy-spec`` отдал
+        ``{"status": "diverged", "ahead_by": 1, "behind_by": 62}``, своя ветка
+        на develop — ``identical``, 0 и 0. behind_by — коммиты базы, которых
+        нет в голове: ровно то, что CI головы не видел.
+
+        Голова спрашивается по sha, а не по имени ветки: ответ обязан быть о
+        той голове, которой потом арендуется обновление. Любой сбой — unknown:
+        «спросить не удалось» не читается как «не отстала» (#725).
+        """
+        slug = gh_repo or REPO_NAME
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            slug,
+            "--json",
+            "baseRefName,headRefOid",
+            repo=repo,
+            check=False,
+        )
+        try:
+            data = json.loads(out) if rc == 0 else {}
+        except json.JSONDecodeError:
+            data = {}
+        base = str((data or {}).get("baseRefName") or "").strip()
+        head = str((data or {}).get("headRefOid") or "").strip()
+        if not base or not head:
+            why = (err or "").strip()[:200] or "ответ gh не разобран"
+            return BaseFreshness(
+                BaseFreshnessState.unknown, reason=f"PR #{pr_number} не прочитан: {why}"
+            )
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{slug}/compare/{base}...{head}",
+            "--jq",
+            "{status: .status, behind_by: .behind_by}",
+            repo=repo,
+            check=False,
+        )
+        try:
+            behind = json.loads(out).get("behind_by") if rc == 0 else None
+        except (json.JSONDecodeError, AttributeError):
+            behind = None
+        if not isinstance(behind, int) or isinstance(behind, bool) or behind < 0:
+            why = (err or "").strip()[:200] or "behind_by нет в ответе"
+            return BaseFreshness(
+                BaseFreshnessState.unknown,
+                head_sha=head,
+                reason=f"compare {base}...{head[:12]} не ответил: {why}",
+            )
+        state = BaseFreshnessState.behind if behind else BaseFreshnessState.current
+        return BaseFreshness(
+            state, head_sha=head, behind_by=behind, reason=f"база {base}"
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """Слить базу в ветку PR: ``PUT /pulls/{n}/update-branch`` (#1419).
+
+        Аренда головы — ``expected_head_sha``: если ветка уехала, GitHub
+        отвечает 422 и не сливает поверх чужого пуша. По документации вызова
+        коды — 202 (принято, слияние идёт асинхронно), 403 (нет права) и 422
+        (неверные параметры: голова не совпала, конфликт, лимит). 404 в
+        документации этого вызова нет, но так GitHub отвечает на PR, которого
+        нет или который токену не виден, — это тоже отказ, а не сбой сети.
+
+        Ответ 202 не называет новую голову: она появится, когда GitHub
+        закончит слияние. Поэтому гейт ждёт следующего цикла, а не читает её.
+        """
+        if not expected_head_sha:
+            return (BranchUpdateOutcome.unavailable, "голова PR не известна")
+        rc, out, err = await _gh(
+            "api",
+            "-X",
+            "PUT",
+            f"repos/{gh_repo or REPO_NAME}/pulls/{pr_number}/update-branch",
+            "-f",
+            f"expected_head_sha={expected_head_sha}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc == 0:
+            return (BranchUpdateOutcome.updated, "GitHub принял слияние базы в ветку")
+        return _update_branch_refusal(out, err)
+
     async def merge_commit_sha(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> str:
@@ -486,6 +637,8 @@ class GitHubForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
 
@@ -496,18 +649,33 @@ class GitHubForge:
         delete_branch_on_merge=false proves it was us, not GitHub. The default
         stays True so the task path is untouched; the release path passes
         False, because a release must not remove the branch work lands on.
+
+        ``expected_head_sha`` (#1591): ``--match-head-commit`` — GitHub отказывает,
+        если голова PR уже не этот коммит. Релиз проверяет серверные копии на
+        закреплённой голове и сливает ровно её; новый push между проверкой и
+        merge не сливается непроверенным.
+
+        ``method`` is the merge strategy (#1426). Squash stays the default —
+        linear main was a deliberate choice (#946). The release RETURN is the
+        one PR merged with a merge commit: squashing main into develop would
+        write yet another new commit and leave the release commit outside
+        develop's history, which is exactly the drift #969 closes.
         """
+        if method not in ("squash", "merge"):
+            raise ValueError(f"unknown merge method: {method!r}")
         args = [
             "pr",
             "merge",
             str(pr_number),
             "--repo",
             gh_repo or REPO_NAME,
-            "--squash",
+            f"--{method}",
             "--admin",
         ]
         if delete_branch:
             args.append("--delete-branch")
+        if expected_head_sha:
+            args += ["--match-head-commit", expected_head_sha]
         args += ["--subject", subject]
         rc, _, err = await _gh(
             *args,
@@ -516,7 +684,7 @@ class GitHubForge:
             timeout=30,
         )
         if rc == 0:
-            log.info("Merged PR #%d (squash, admin)", pr_number)
+            log.info("Merged PR #%d (%s, admin)", pr_number, method)
             return True
         log.error("Failed to merge PR #%d: %s", pr_number, err)
         return False
@@ -1089,64 +1257,42 @@ class GitHubForge:
             return []
         return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
 
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Merge ``from_branch`` into ``into_branch`` server-side (#969).
 
-        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
-        names rather than three, because a conflict and a git that could not
-        be asked need different hands: one is a merge somebody has to resolve,
-        the other is a question to ask again next cycle. Collapsing them is
-        how #725 gets repeated with new words.
+def _update_branch_refusal(out: str, err: str) -> tuple[BranchUpdateOutcome, str]:
+    """Отказ update-branch — по коду HTTP и сообщению GitHub (#1419)."""
+    text = f"{err or ''} {out or ''}".strip()
+    code = re.search(r"HTTP (\d{3})", text)
+    detail = text[:200] or "gh молчит"
+    if code is None:
+        # Ответа HTTP нет вовсе — вызов не долетел.
+        return (BranchUpdateOutcome.unavailable, detail)
+    status = int(code.group(1))
+    low = text.lower()
+    if status == 422 and "expected head sha" in low:
+        return (BranchUpdateOutcome.head_moved, detail)
+    if status == 422 and "conflict" in low:
+        return (BranchUpdateOutcome.conflict, detail)
+    if status in (403, 404, 422):
+        return (BranchUpdateOutcome.refused, f"HTTP {status}: {detail}")
+    return (BranchUpdateOutcome.unavailable, f"HTTP {status}: {detail}")
 
-        Asks GitHub to do the merge rather than driving the workspace clone.
-        The clone is shared, may sit on someone else's branch with a dirty
-        tree, and carries an armed pre-push hook — three ways for a
-        bookkeeping merge to damage work in progress (#949 was one of them).
-        The merges endpoint has no such surface: it answers 201 with the new
-        commit, 204 when there is nothing to merge, 409 on a conflict.
 
-        The conflict detail names no files — those come from the clone, and
-        the clone is git_ops' side of the fence (#1113).
-        """
-        if not gh_repo and not REPO_NAME:
-            return ("unavailable", "не названо, в каком репозитории возвращать")
-        rc, out, err = await _gh(
-            "api",
-            "--method",
-            "POST",
-            f"repos/{gh_repo or REPO_NAME}/merges",
-            "-f",
-            f"base={into_branch}",
-            "-f",
-            f"head={from_branch}",
-            "-f",
-            f"commit_message={message}",
-            repo=repo,
-            check=False,
+def _own_repo_pr(prs: object, slug: str, head: str) -> tuple[int | None, str]:
+    """The first listed PR whose head is in ``slug`` itself (#1426)."""
+    if not isinstance(prs, list):
+        return (None, f"список PR с головой {head} не разобран")
+    owner = slug.split("/", 1)[0].lower()
+    foreign: list[str] = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+            continue
+        login = str((pr.get("headRepositoryOwner") or {}).get("login") or "")
+        if pr.get("isCrossRepository") is False and login.lower() == owner:
+            return (int(pr["number"]), "")
+        foreign.append(f"#{pr['number']} ({login or '?'}:{head})")
+    if foreign:
+        return (
+            None,
+            f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
         )
-        if rc == 0:
-            # 204 — «уже содержит», и gh печатает пустоту. Это ответ, а не
-            # промах: возвращать нечего.
-            body = (out or "").strip()
-            if not body:
-                return ("nothing", f"{into_branch} уже содержит {from_branch}")
-            try:
-                sha = str(json.loads(body).get("sha") or "").strip()
-            except json.JSONDecodeError:
-                return ("unavailable", f"ответ GitHub не разобран: {body[:150]}")
-            if not sha:
-                return ("unavailable", "GitHub не назвал коммит возврата")
-            return ("returned", sha)
-
-        detail = (err or "").strip() or "gh молчит"
-        if "409" in detail or "conflict" in detail.lower():
-            return ("conflict", "")
-        return ("unavailable", detail[:200])
+    return (None, "")

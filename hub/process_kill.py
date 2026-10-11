@@ -17,6 +17,7 @@ subprocess timeout (#363), and importing it from there would be a cycle.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -26,23 +27,36 @@ from typing import Any
 log = logging.getLogger("hub")
 
 
-async def kill_process_group(proc: Any) -> None:
+async def kill_process_group(proc: Any, *, pgid: int | None = None) -> None:
     """SIGKILL the child's process group and reap it. Never raises.
 
     Falls back to a single-pid kill when the group cannot be signalled, so the
     outcome is never worse than plain ``proc.kill()``.
+
+    ``pgid`` is the group id the caller saved at spawn time (with
+    ``start_new_session`` it equals the child's pid). Without it the group is
+    looked up through the live leader — and a launcher that has already exited
+    leaves its children running in a group nobody can find any more (#1650).
+    With it, the group is signalled whatever state the leader is in.
+
+    Residual window: a group id is the pid of its leader, and the number can be
+    handed to an unrelated process once the group is EMPTY. While any member
+    lives the number is reserved; if the leader was already reaped and every
+    member died before this call, ``killpg`` could in theory hit a new group
+    that got the same number. Callers therefore use ``pgid`` only on the
+    timeout and cancel paths, promptly, and never after a normal exit.
     """
-    if proc is None or proc.returncode is not None:
+    if proc is None or (proc.returncode is not None and pgid is None):
         return
 
-    pgid = None
-    with contextlib.suppress(ProcessLookupError, OSError):
-        pgid = os.getpgid(proc.pid)
+    if pgid is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            pgid = os.getpgid(proc.pid)
 
     # Never signal our own group. Without start_new_session the child shares the
     # hub's process group, and killpg would SIGKILL the hub itself — a far worse
     # outcome than the leak this function exists to prevent.
-    if pgid is not None and pgid != os.getpgid(0):
+    if pgid is not None and pgid > 1 and pgid != os.getpgid(0):
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signal.SIGKILL)
     else:
@@ -55,5 +69,13 @@ async def kill_process_group(proc: Any) -> None:
     # and signalling an already-dead process is a no-op.
     with contextlib.suppress(ProcessLookupError, OSError):
         proc.kill()
-    with contextlib.suppress(ProcessLookupError, OSError):
-        await proc.wait()
+    # Python 3.11 wakes ``wait()`` only once the pipes are closed, and a pipe
+    # whose reader stopped early (output over a cap) never reaches EOF: closing
+    # the transport first is what lets the reap finish. The wait is bounded too,
+    # so a stuck reap cannot hold a caller's own deadline hostage.
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        with contextlib.suppress(Exception):
+            transport.close()
+    with contextlib.suppress(ProcessLookupError, OSError, TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=5)

@@ -4,11 +4,50 @@ import asyncio
 import html
 import re
 
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.auth import CSRF_COOKIE_NAME
 from hub.services import project_policy
+
+
+@pytest.fixture(autouse=True)
+def _form_carries_policy_version(request):
+    """Настоящая страница всегда несёт скрытое policy_version (#1593).
+
+    Тесты формы политики шлют то, что отправил бы браузер: текущую версию.
+    Явно переданное (в том числе пустое) значение не трогается — отказ без
+    версии проверяет test_web_form_without_policy_version_is_refused.
+    """
+    if "client" not in request.fixturenames or "db" not in request.fixturenames:
+        yield
+        return
+    client = request.getfixturevalue("client")
+    db = request.getfixturevalue("db")
+    original = client.post
+
+    async def post(url, *args, **kwargs):
+        data = kwargs.get("data")
+        if (
+            isinstance(data, dict)
+            and str(url).endswith("/web-edit")
+            and "policy_version" not in data
+            and any(str(k).startswith("gate_policy_") for k in data)
+        ):
+            from hub.services import policy_change
+
+            await db.commit()
+            row = await repo.get_project(db, int(str(url).split("/")[2]))
+            kwargs["data"] = {
+                **data,
+                "policy_version": policy_change.policy_version(row),
+            }
+        return await original(url, *args, **kwargs)
+
+    client.post = post
+    yield
+    client.post = original
 
 
 async def test_dashboard_page(client: AsyncClient):
@@ -4565,6 +4604,62 @@ async def test_project_form_default_locked(client: AsyncClient):
     assert row["gate_policy"] == {}, "the forged submit must change nothing"
 
 
+async def test_project_form_on_default_keeps_the_allowed_steward_verdict(
+    client: AsyncClient,
+):
+    # #1602: у default форма не показывает селекты dor/verdict, и сохранение
+    # формы не имеет права сбросить разрешённое verdict=steward в human.
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}
+    )
+    pid = resp.json()["id"]
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
+    )
+    assert resp.status_code == 200, resp.text
+    version = (await client.get("/api/projects/default/effective-policy")).json()[
+        "policy_version"
+    ]
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review": "off", "policy_version": version},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"].get("verdict") == "steward", row["gate_policy"]
+    assert row["gate_policy"].get("dor") == "human"
+    page = (await client.get("/projects")).text
+    assert "кроме verdict=steward" in page
+
+
+async def test_project_form_exception_is_confined_to_default(client: AsyncClient):
+    # #1602 P3: у другого проекта отсутствующее поле формы по-прежнему human.
+    resp = await client.post(
+        "/api/projects", json={"slug": "spike-other", "name": "Other"}
+    )
+    pid = resp.json()["id"]
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
+    )
+    assert resp.status_code == 200, resp.text
+    version = (await client.get("/api/projects/spike-other/effective-policy")).json()[
+        "policy_version"
+    ]
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review": "off", "policy_version": version},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"].get("verdict") == "human", row["gate_policy"]
+
+
 async def test_project_form_reverts_policy_to_human(client: AsyncClient):
     # AC-3 (#753): rolling the autopilot back is the same single click.
     resp = await client.post(
@@ -5604,6 +5699,55 @@ async def test_card_agrees_on_a_finding_an_observation_closed(client: AsyncClien
     assert page.count("судьба не названа") == 1
 
 
+async def test_card_names_a_repeat_of_a_deferred_finding(client: AsyncClient, db):
+    # #1448: «не блокирует» не значит «спрятано». Повтор находки, отложенной
+    # до недоставленной задачи, назван на строке самой находки; соседняя
+    # находка метки не получает.
+    from hub import repository as repo_module
+    from hub.services.finding_identity import finding_uids
+
+    task_id = await _web_task_in_review(client)
+    follow_up = await repo_module.create_task(
+        db,
+        title="сюда отложено",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    prior = await repo_module.insert_machine_review(
+        db, task_id=task_id, submission_generation=0, incomplete=False
+    )
+    await repo_module.upsert_finding_outcome(
+        db,
+        review_id=prior,
+        task_id=task_id,
+        submission_generation=0,
+        finding_uid=finding_uids(_TWO_FINDINGS)[0],
+        finding_index=0,
+        finding_title=_TWO_FINDINGS[0]["title"],
+        outcome="deferred",
+        note="",
+        linked_task_id=follow_up,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    assert "отложена до" in page and f"#{follow_up}</a>, повтор не блокирует" in page
+    assert page.count("повтор не блокирует") == 1
+
+
 async def test_disposition_is_corrected_not_duplicated(client: AsyncClient, db):
     # A gate that changes its mind corrects the row instead of leaving two
     # contradictory ones for the metrics to average.
@@ -5673,6 +5817,39 @@ async def test_task_card_shows_review_runs_and_their_provider_cost(
     assert "Прогонов ревью: 1" in page.text
     assert "777 389" in page.text, "the bill is shown, not the self-report alone"
     assert "25 000" in page.text, "and the self-report stays visible beside it"
+
+
+async def test_a_carried_report_is_not_a_review_run_on_the_card(
+    client: AsyncClient, db
+):
+    # Находка deep-ревью #1361: после пересдачи «только слита база» в новом
+    # поколении лежит перенесённый отчёт, и карточка считала его прогоном с
+    # неизвестным счётом — «Прогонов ревью: 2», «счёт есть у 1 из 2». Прогона
+    # не было, и денег он не стоил: перенос показывается своей строкой.
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id, tokens_spent=25_000)
+    await repo_module.set_machine_review_provider_tokens(db, task_id, 1, 777_389)
+    source = dict(await repo_module.get_latest_machine_review(db, task_id))
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill=source["harness_skill"],
+        model=source["model"],
+        raw_count=int(source["raw_count"] or 0),
+        carried_from_review_id=int(source["id"]),
+    )
+    await db.commit()
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert "Прогонов ревью: 1" in page.text, "перенос — не прогон"
+    assert "счёт есть у 1 из 2" not in page.text
+    assert "перенесён с поколения 1" in page.text, (
+        "перенос виден отдельной строкой и называет источник"
+    )
 
 
 async def test_unbilled_review_run_reads_as_unknown_not_free(client: AsyncClient, db):
@@ -6550,14 +6727,42 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
     import json
 
     from hub.models import GATE_POLICY_KEYS
-    from hub.web import _FORM_GATE_POLICY_KEYS
+    from hub.web import _FORM_GATE_POLICY_KEYS, _REVIEW_COST_KEYS
 
     samples = {
         "ci_runner": "make test",
         "review_limit": 3,
         "review_limit_mode": "warn",
+        "orchestrator_queue": "shadow",
+        "wip_limit": 2,
+        "executor_launch": "manual",
+        "executor_push_rights_task": 1409,
+        "executor_task_cents_ceiling": 10500,
+        "executor_task_token_ceiling": 24000000,
+        "submission_contract": "warn",
+        "claim_area_check": "warn",
+        "bug_red_test": "warn",
+        "ci_before_submit": "warn",
+        "statement_paths": "require",
+        "slot_dead_minutes": 90,
+        "merge_is_delivery": True,
+        "path_notices": [{"pattern": "deploy/**", "text": "ручной шаг"}],
+        "freeze": {
+            "until": None,
+            "allow_work_types": ["bug", "chore"],
+            "note": "до MS-A2",
+        },
+        "release_artifacts": [
+            {
+                "repo_path": "deploy/x.sh",
+                "server_path": "/usr/local/sbin/x.sh",
+                "update_hint": "обновить копию",
+            }
+        ],
     }
-    not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
+    # #1638: четыре настройки стоимости ревью форма теперь показывает; их
+    # сохранность проверяют явные test_project_form_*review_cost* ниже.
+    not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS - set(_REVIEW_COST_KEYS)
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"
     missing = not_shown - set(samples)
     assert not missing, f"дайте образец значения для {sorted(missing)}"
@@ -6650,6 +6855,234 @@ async def test_the_project_form_edits_the_review_limit(client: AsyncClient):
     assert "project_error" not in resp.headers.get("location", ""), resp.headers
     policy = await _policy_of(client, pid)
     assert "review_limit" not in policy and "review_limit_mode" not in policy, policy
+
+
+_COST_KEYS_STORED = {
+    "deep_reviewer": "local",
+    "deep_daily_cap": 0,
+    "small_delta_lines": 120,
+    "circle_deep_stop": 3,
+}
+
+
+def _cost_form_block(page: str, pid: int) -> str:
+    """Кусок страницы от формы правки проекта pid до следующей формы правки."""
+    marker = f"/projects/{pid}/web-edit"
+    start = page.index(marker)
+    nxt = page.find("/web-edit", start + len(marker))
+    return page[start : nxt if nxt != -1 else len(page)]
+
+
+def _now_text(block: str, key: str) -> str:
+    found = re.search(rf'data-key="{key}">([^<]*)<', block)
+    assert found, f"нет «действует» для {key}"
+    return found.group(1)
+
+
+async def test_project_form_shows_review_cost_settings_with_effective_values(
+    client: AsyncClient, monkeypatch
+):
+    """AC-1: четыре контрола, действующее значение и источник, подписи нуля."""
+    from hub import config
+
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "80")
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "")
+    empty = await _project_with_policy(client, "cost-empty", {})
+    full = await _project_with_policy(client, "cost-full", dict(_COST_KEYS_STORED))
+    page = (await client.get("/projects")).text
+
+    for pid in (empty, full):
+        block = _cost_form_block(page, pid)
+        for name in (
+            "gate_policy_deep_reviewer",
+            "gate_policy_deep_daily_cap",
+            "gate_policy_small_delta_lines",
+            "gate_policy_circle_deep_stop",
+        ):
+            assert f'name="{name}"' in block, (pid, name)
+        assert "0 — обычный deep уходит в lite" in block
+        assert block.count("0 — правило удешевления выключено") == 2
+
+    block = _cost_form_block(page, empty)
+    assert "действует: 80 (server)" in _now_text(block, "small_delta_lines")
+    assert "cloud (default)" in _now_text(block, "deep_reviewer")
+    assert "без потолка (default)" in _now_text(block, "deep_daily_cap")
+    assert "правило выключено (default)" in _now_text(block, "circle_deep_stop")
+    assert "наследовать: cloud" in block
+
+    block = _cost_form_block(page, full)
+    assert "local (project)" in _now_text(block, "deep_reviewer")
+    assert "действует: 0 (project)" in _now_text(block, "deep_daily_cap")
+    assert "120 (project)" in _now_text(block, "small_delta_lines")
+    assert "3 (project)" in _now_text(block, "circle_deep_stop")
+    assert (
+        'name="gate_policy_deep_daily_cap" class="task-action-control" value="0"'
+        in block
+    )
+    assert re.search(r'<option value="local"\s+selected', block)
+
+
+async def test_projects_page_isolates_review_cost_failure_and_skips_full_summary(
+    client: AsyncClient, monkeypatch
+):
+    """P2 Codex: сбой одного проекта не роняет /projects; сводка целиком не считается."""
+    from hub.services import effective_policy
+
+    await _project_with_policy(client, "cost-ok-a", dict(_COST_KEYS_STORED))
+    boom = await _project_with_policy(client, "cost-boom", {})
+    ok_b = await _project_with_policy(client, "cost-ok-b", {})
+
+    calls = {"full": 0}
+    real = effective_policy.key_rows
+
+    def flaky(project):
+        if project["slug"] == "cost-boom":
+            raise RuntimeError("boom")
+        return real(project)
+
+    async def no_full(*args, **kwargs):
+        calls["full"] += 1
+        raise AssertionError("форма не должна считать сводку целиком")
+
+    monkeypatch.setattr(effective_policy, "key_rows", flaky)
+    monkeypatch.setattr(effective_policy, "effective_policy", no_full)
+    resp = await client.get("/projects")
+    assert resp.status_code == 200
+    assert calls["full"] == 0
+    page = resp.text
+    assert "действующее значение не рассчитано" in _cost_form_block(page, boom)
+    assert "(default)" in _now_text(_cost_form_block(page, ok_b), "deep_reviewer")
+
+
+async def test_project_form_saves_review_cost_settings(client: AsyncClient):
+    """AC-2: четыре значения с правильным типом, 0 не удалён, чужие ключи целы."""
+    other = {"ci_runner": "make test", "wip_limit": 2, "executor_launch": "manual"}
+    pid = await _project_with_policy(client, "cost-save", dict(other))
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_deep_reviewer": "local",
+            "gate_policy_deep_daily_cap": "0",
+            "gate_policy_small_delta_lines": "120",
+            "gate_policy_circle_deep_stop": "3",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    for key, value in _COST_KEYS_STORED.items():
+        assert policy[key] == value, (key, policy)
+        assert type(policy[key]) is type(value), (key, policy)
+    assert {k: policy[k] for k in other} == other
+
+
+async def test_project_form_review_cost_fields_absent_keeps_and_empty_clears(
+    client: AsyncClient,
+):
+    """AC-3: пустые поля снимают ключи; запрос без полей их не трогает."""
+    pid = await _project_with_policy(client, "cost-keep", dict(_COST_KEYS_STORED))
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review": "off", "gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert {k: policy.get(k) for k in _COST_KEYS_STORED} == _COST_KEYS_STORED
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_deep_reviewer": "",
+            "gate_policy_deep_daily_cap": "",
+            "gate_policy_small_delta_lines": "",
+            "gate_policy_circle_deep_stop": "",
+        },
+        follow_redirects=False,
+    )
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert not set(_COST_KEYS_STORED) & set(policy), policy
+    rows = {
+        row["key"]: row
+        for row in (
+            await client.get("/api/projects/cost-keep/effective-policy")
+        ).json()["keys"]
+    }
+    for key in _COST_KEYS_STORED:
+        assert rows[key]["source"] in ("server", "default"), rows[key]
+
+
+async def test_project_form_rejects_bad_review_cost_values(client: AsyncClient):
+    """AC-4: -1, 1.5, abc и deep_reviewer=mars — отказ текстом общего валидатора."""
+    from urllib.parse import unquote_plus
+
+    import pytest
+
+    from hub.models import _validate_count, _validate_deep_reviewer
+
+    pid = await _project_with_policy(client, "cost-bad", dict(_COST_KEYS_STORED))
+    before = await _policy_of(client, pid)
+
+    for key in ("deep_daily_cap", "small_delta_lines", "circle_deep_stop"):
+        for raw in ("-1", "1.5", "abc"):
+            resp = await client.post(
+                f"/projects/{pid}/web-edit",
+                data={f"gate_policy_{key}": raw},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 303
+            location = unquote_plus(resp.headers.get("location", ""))
+            assert "project_error" in location, (key, raw, location)
+            with pytest.raises(ValueError) as refused:
+                _validate_count({key: int(raw) if raw == "-1" else raw}, key)
+            assert str(refused.value) in location, (key, raw, location)
+            assert await _policy_of(client, pid) == before
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_deep_reviewer": "mars", "gate_policy_deep_daily_cap": "5"},
+        follow_redirects=False,
+    )
+    location = unquote_plus(resp.headers.get("location", ""))
+    assert "project_error" in location, location
+    with pytest.raises(ValueError) as refused:
+        _validate_deep_reviewer({"deep_reviewer": "mars"})
+    assert str(refused.value) in location, location
+    assert await _policy_of(client, pid) == before, "отказ атомарный"
+
+
+async def test_project_form_review_cost_fields_keep_default_lock_and_version(
+    client: AsyncClient,
+):
+    """AC-5: на default новые ключи сохранены, verdict=steward цел; старая форма отклонена."""
+    from urllib.parse import unquote
+
+    pid = await _project_with_policy(client, "default", {"verdict": "steward"})
+    old = (await client.get("/api/projects/default/effective-policy")).json()[
+        "policy_version"
+    ]
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_deep_daily_cap": "7", "gate_policy_deep_reviewer": "local"},
+        follow_redirects=False,
+    )
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy.get("deep_daily_cap") == 7 and policy.get("deep_reviewer") == "local"
+    assert policy.get("verdict") == "steward", policy
+
+    # Форма, открытая до сохранения выше, несёт прежнюю версию политики.
+    stale = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"policy_version": old, "gate_policy_small_delta_lines": "55"},
+        follow_redirects=False,
+    )
+    assert "политика проекта изменилась" in unquote(stale.headers["location"])
+    assert await _policy_of(client, pid) == policy, "ничего не сохранено"
 
 
 async def test_emptied_project_form_fields_still_clear_their_keys(
@@ -7074,3 +7507,306 @@ async def test_web_return_to_work_rejects_agent_token(
     )
     assert resp.status_code == 403
     assert (await repo.get_task(db, task_id))["status"] == "review"
+
+
+async def test_inbox_partial_renders_action_and_grounds(client: AsyncClient, db):
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    draft = await client.post(
+        "/api/tasks",
+        json={"title": "Inbox approve row", "source": "agent", "agent": "bot"},
+    )
+    draft_id = draft.json()["id"]
+    question = await repo.create_task(
+        db,
+        title="Inbox answer row",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.add_task_update(db, question, "dev", "question", "Which branch?")
+    await db.commit()
+    verdict = await _submitted_task(client, db, "inbox-web-human", {"verdict": "human"})
+    await _post_review(client, verdict)
+
+    page = (await client.get("/partials/inbox")).text
+
+    def block(task_id: int) -> str:
+        start = page.index(f'id="inbox-task-{task_id}"')
+        return page[start : page.index("</article>", start)]
+
+    approve = block(draft_id)
+    assert 'data-decision-action="approve"' in approve
+    assert "inbox-decision-grounds" in approve and "readiness" in approve
+    assert f"/tasks/{draft_id}/web-approve" in approve
+
+    answer = block(question)
+    assert 'data-decision-action="answer"' in answer
+    assert "Which branch?" in answer
+    assert f"/tasks/{question}/web-answer" in answer
+
+    assert "All clear" not in page
+    ruling = block(verdict)
+    assert 'data-decision-action="verdict"' in ruling
+    assert "0/0/1" in ruling and "CI зелёный" in ruling
+    assert f'href="/tasks/{verdict}#review-verdict-form"' in ruling
+
+
+async def test_dashboard_inbox_total_counts_a_verdict_waiting_for_the_human(
+    client: AsyncClient, db
+):
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    def total(page: str) -> int:
+        m = re.search(
+            r'topbar-stat-value">\s*(\d+)\s*<', page[page.index("topbar-stat--inbox") :]
+        )
+        assert m, "плашка Inbox не найдена"
+        return int(m.group(1))
+
+    before = total((await client.get("/")).text)
+    task_id = await _submitted_task(
+        client, db, "inbox-total-human", {"verdict": "human"}
+    )
+    await _post_review(client, task_id)
+    page = (await client.get("/")).text
+    assert total(page) == before + 1
+    assert "is-zero" not in page[page.index("topbar-stat--inbox") :][:120]
+
+
+async def test_web_create_takes_work_type_and_freeze_rationale(client: AsyncClient):
+    # #1594: форма даёт тип и обоснование; не-task больше не становится feature.
+    page = await client.get("/")
+    assert 'name="freeze_rationale"' in page.text
+    assert 'name="work_type"' in page.text
+    resp = await client.post(
+        "/tasks/create",
+        data={
+            "title": "Typed epic",
+            "task_type": "epic",
+            "work_type": "chore",
+            "freeze_rationale": "чистка долга",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    tasks = (await client.get("/api/tasks")).json()
+    epic = next(t for t in tasks if t["title"] == "Typed epic")
+    assert epic["work_type"] == "chore"
+    assert epic["freeze_rationale"] == "чистка долга"
+
+
+async def test_web_key_form_can_scope_the_key_to_a_project(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1644: the key form carries a project; an unknown one is refused."""
+    from hub import repository as repo
+    from hub.services import admin as admin_svc
+
+    admin = _admin_headers(monkeypatch)
+    await repo.create_project(
+        db, slug="audit-in", name="audit-in", workspace_path="/tmp/ws"
+    )
+    principal = await admin_svc.create_principal(
+        db, kind="service", username="ci-web-1644", role_slug="ci_runner"
+    )
+    await db.commit()
+
+    ok = await client.post(
+        "/admin/keys/create",
+        data={"principal_id": principal["id"], "name": "scoped", "project": "audit-in"},
+        headers=admin,
+    )
+    assert ok.status_code == 200, ok.text
+    keys = await admin_svc.list_api_keys(db, principal_id=principal["id"])
+    assert [k["name"] for k in keys] == ["scoped"]
+    assert keys[0]["scopes"] == ["project:audit-in"]
+
+    bad = await client.post(
+        "/admin/keys/create",
+        data={"principal_id": principal["id"], "name": "bad", "project": "nope"},
+        headers=admin,
+    )
+    assert "bad" not in [
+        k["name"]
+        for k in await admin_svc.list_api_keys(db, principal_id=principal["id"])
+    ]
+    assert bad.status_code == 422, "same status as the API"
+    assert "nope" in str(dict(bad.headers)), "the refusal names the project"
+
+
+async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3 (#1648): карточка state-задачи в review — метка «результат:
+    состояние», rollback и таблица доказательств поколения; нет «тесты 0 из 0»
+    и строк про отсутствующий CI; форма несёт expected_generation, форма с
+    устаревшим поколением получает 409 и ничего не записывает."""
+    from tests.state_support import (
+        ROLLBACK,
+        GitSpy,
+        drive_to_second_generation,
+        make_state_task,
+    )
+    from hub.integrations.registry import plugins
+
+    task_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, task_id)
+    # Карточка state не вычисляет блоки кода: ни отчёт, ни дифф, ни доставку,
+    # ни суждение стюарда — любое такое чтение здесь падает.
+    from hub import web
+    from hub.services import delivery_state, review_evidence, task_diff
+
+    def _refuse(name):
+        async def refuse(*_args, **_kwargs):
+            raise AssertionError(f"карточка state вычислила блок кода: {name}")
+
+        return refuse
+
+    monkeypatch.setattr(review_evidence, "review_report", _refuse("review_report"))
+    monkeypatch.setattr(task_diff, "submission_files", _refuse("submission_files"))
+    monkeypatch.setattr(delivery_state, "delivery_state", _refuse("delivery_state"))
+    monkeypatch.setattr(
+        web, "_steward_recommendation", _refuse("_steward_recommendation")
+    )
+    original_git = plugins.git_ops
+    spy = GitSpy()
+    plugins.git_ops = spy
+    try:
+        page = (await client.get(f"/tasks/{task_id}")).text
+    finally:
+        plugins.git_ops = original_git
+
+    text = html.unescape(page)
+    assert "результат: состояние" in text
+    block = text.split('id="state-evidence"', 1)[1]
+    assert ROLLBACK in block.split("<table", 1)[0], "rollback в блоке принятия"
+    assert "task-review-board--review" not in text, "секции машинного ревью нет"
+    assert "повторное наблюдение, поколение 2" in text, "доказательство поколения 2"
+    assert "отвечает 203.0.113.7" not in text, "поколение 1 на карточке не показано"
+    assert "2026-10-09T12:00:00Z" in text
+    for absent in (
+        "Ревью за эту сдачу не проводилось",
+        "Машинное ревью",
+        "Request machine review",
+        "0 из 0",
+        "CI по коммиту",
+        "CI по закреплённому коммиту",
+        "нет отчёта",
+    ):
+        assert absent not in text, absent
+    assert 'name="expected_generation" value="2"' in page
+    assert spy.calls == [], f"карточка state ходила в git: {spy.calls}"
+
+    # устаревшая форма: плоский POST — 303 с причиной на карточке, htmx — 409
+    stale = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        follow_redirects=False,
+    )
+    assert stale.status_code == 303 and "review_error=" in stale.headers["location"]
+    stale_htmx = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        headers={"HX-Request": "true"},
+    )
+    assert stale_htmx.status_code == 409, stale_htmx.text
+    assert "поколен" in stale_htmx.text
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    ok = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "2"},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303 and "review_error" not in ok.headers["location"]
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_project_form_saves_local_review_fallback(client: AsyncClient):
+    """AC-8 (#1653): on/off сохранены, нет поля — ключ цел, пусто — снят, мусор — отказ."""
+    from urllib.parse import unquote_plus
+
+    other = {"ci_runner": "make test", "wip_limit": 2, "deep_reviewer": "local"}
+    pid = await _project_with_policy(client, "lrf-form", dict(other))
+    page = (await client.get("/projects")).text
+    block = _cost_form_block(page, pid)
+    assert 'name="gate_policy_local_review_fallback"' in block
+    assert "off" in _now_text(block, "local_review_fallback")
+
+    async def _post(data):
+        return await client.post(
+            f"/projects/{pid}/web-edit", data=data, follow_redirects=False
+        )
+
+    resp = await _post(
+        {"gate_policy_local_review_fallback": "on", "gate_policy_deep_daily_cap": "3"}
+    )
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy["local_review_fallback"] == "on" and policy["deep_daily_cap"] == 3
+    assert {k: policy[k] for k in other} == other, "соседние настройки не потеряны"
+    page = (await client.get("/projects")).text
+    assert "on (project)" in _now_text(
+        _cost_form_block(page, pid), "local_review_fallback"
+    )
+    assert re.search(r'<option value="on"\s+selected', _cost_form_block(page, pid)), (
+        "выбор отражает сохранённое"
+    )
+
+    resp = await _post({"gate_policy_local_review_fallback": "off"})
+    assert (await _policy_of(client, pid))["local_review_fallback"] == "off"
+
+    await _post({"gate_policy_local_review_fallback": "on"})
+    resp = await _post({"gate_policy_review": "off"})  # форма без поля
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert (await _policy_of(client, pid))["local_review_fallback"] == "on"
+
+    before = await _policy_of(client, pid)
+    resp = await _post({"gate_policy_local_review_fallback": "maybe"})
+    assert "project_error" in unquote_plus(resp.headers.get("location", ""))
+    assert await _policy_of(client, pid) == before, "отказ не меняет политику"
+
+    resp = await _post({"gate_policy_local_review_fallback": ""})  # пустой выбор
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert "local_review_fallback" not in policy
+    assert {k: policy[k] for k in other} == other
+
+
+async def test_project_form_local_review_fallback_keeps_the_full_form_neighbours(
+    client: AsyncClient,
+):
+    """#1653 P3: полная форма — review, verdict, release и соседние ключи не теряются."""
+    other = {"ci_runner": "make test", "deep_reviewer": "local", "wip_limit": 2}
+    pid = await _project_with_policy(client, "lrf-full", dict(other))
+    full = {
+        "gate_policy_dor": "human",
+        "gate_policy_verdict": "human",
+        "gate_policy_review": "dispatch",
+        "gate_policy_release": "auto",
+        "gate_policy_deep_reviewer": "local",
+    }
+    for value in ("on", "off", ""):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={**full, "gate_policy_local_review_fallback": value},
+            follow_redirects=False,
+        )
+        assert "project_error" not in resp.headers.get("location", ""), resp.headers
+        policy = await _policy_of(client, pid)
+        assert policy.get("local_review_fallback") == (value or None), policy
+        assert policy["review"] == "dispatch" and policy["release"] == "auto"
+        assert policy["verdict"] == "human" and policy["dor"] == "human"
+        assert policy["deep_reviewer"] == "local"
+        assert {k: policy[k] for k in ("ci_runner", "wip_limit")} == {
+            "ci_runner": "make test",
+            "wip_limit": 2,
+        }

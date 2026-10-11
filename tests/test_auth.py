@@ -17,6 +17,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hub import brand, config
@@ -865,3 +867,596 @@ def test_the_classification_names_the_permissions_from_the_incident():
     assert "tasks.human_gate" in ENFORCED_PERMISSIONS, (
         "it gates through is_human, one hop away — decorative would be wrong"
     )
+
+
+# ---------------------------------------------------------------------------
+# watcher: read-only role (#1556)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def watcher_hub(client, db, monkeypatch):
+    """Auth on; a human who makes a task and a DB principal with role watcher."""
+    from types import SimpleNamespace
+
+    from hub.services import admin as admin_svc
+
+    # Auth is on only when some token exists: an empty map means open mode.
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"unused-env-token": TokenIdentity("env-x", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-w", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    watcher = await admin_svc.create_principal(
+        db, kind="agent", username="grok-w", role_slug="watcher"
+    )
+    watcher_key = await admin_svc.create_api_key(db, watcher["id"], name="w")
+    return SimpleNamespace(
+        client=client,
+        db=db,
+        human={"Authorization": f"Bearer {human_key['plaintext_key']}"},
+        watcher={"Authorization": f"Bearer {watcher_key['plaintext_key']}"},
+        watcher_key=watcher_key["plaintext_key"],
+    )
+
+
+async def _task_state(hub, task_id: int) -> tuple:
+    rows = await hub.db.execute_fetchall(
+        "SELECT title, status, assigned_agent, claimed_by FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    n = await hub.db.execute_fetchall(
+        "SELECT COUNT(*) FROM task_updates WHERE task_id = ?", (task_id,)
+    )
+    return (tuple(rows[0]), n[0][0])
+
+
+@pytest.mark.asyncio
+async def test_watcher_reads_api_and_every_write_is_refused(watcher_hub):
+    """AC-1 (#1556): GET /api/* works; everything else, even unknown, is 403."""
+    hub = watcher_hub
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "для сторожа"}, headers=hub.human
+    )
+    assert created.status_code in (200, 201), created.text
+    tid = created.json()["id"]
+    before = await _task_state(hub, tid)
+
+    for path in (f"/api/tasks/{tid}", "/api/metrics/practices"):
+        ok = await hub.client.get(path, headers=hub.watcher)
+        assert ok.status_code == 200, (path, ok.status_code, ok.text)
+    head = await hub.client.head(f"/api/tasks/{tid}", headers=hub.watcher)
+    assert head.status_code != 403
+
+    refused = [
+        ("POST", f"/api/tasks/{tid}/claim", {}),
+        ("PATCH", f"/api/tasks/{tid}", {"title": "взломано"}),
+        ("POST", f"/api/tasks/{tid}/updates", {"content": "x", "agent": "w"}),
+        ("POST", "/api/tasks", {"title": "новая"}),
+        ("DELETE", f"/api/tasks/{tid}", None),
+        ("PUT", f"/api/tasks/{tid}", {}),
+        ("GET", "/admin", None),
+        ("GET", "/admin/anything", None),
+        ("GET", "/api/no-such-route-write", None),
+        ("POST", "/api/no-such-route-write", {}),
+        ("POST", "/login", {}),
+    ]
+    for method, path, body in refused:
+        kwargs = {"headers": hub.watcher}
+        if body is not None:
+            kwargs["json"] = body
+        resp = await hub.client.request(method, path, **kwargs)
+        expect = 403
+        # An unknown GET under /api is allowed by the list and then 404s in routing;
+        # the list is by method+path shape, never by "does the route exist".
+        if (method, path) == ("GET", "/api/no-such-route-write"):
+            expect = 404
+        assert resp.status_code == expect, (method, path, resp.status_code, resp.text)
+        if expect == 403:
+            detail = resp.json()["detail"]
+            assert detail["reason"] == "watcher_gate_forbidden", detail
+            assert method in detail["message"] and path in detail["message"]
+
+    assert await _task_state(hub, tid) == before
+    events = await hub.db.execute_fetchall(
+        "SELECT actor, payload FROM events WHERE kind='watcher_route_refused'"
+    )
+    paths = {json.loads(r["payload"])["path"] for r in events}
+    assert f"/api/tasks/{tid}/claim" in paths and "/admin" in paths
+    assert {r["actor"] for r in events} == {"grok-w"}
+
+
+@pytest.mark.asyncio
+async def test_watcher_refused_on_public_looking_paths_too(watcher_hub):
+    """AC-1 (#1556): the _looks_public branch of the middleware refuses as well."""
+    hub = watcher_hub
+    for method, path in (("POST", "/login"), ("POST", "/api/admin/bootstrap")):
+        resp = await hub.client.request(method, path, headers=hub.watcher, json={})
+        assert resp.status_code == 403, (method, path, resp.status_code)
+
+
+def test_watcher_is_neither_agent_nor_human():
+    """AC-2 (#1556): is_watcher only; no 'not an agent = human' branch fires."""
+    ident = TokenIdentity("w", "watcher", principal_id=7)
+    assert ident.is_watcher is True
+    assert ident.is_agent is False
+    assert ident.is_human is False
+    assert ident.is_admin is False
+    assert ident.is_steward is False
+    for perm in (
+        "tasks.create",
+        "tasks.refine",
+        "tasks.update",
+        "tasks.agent_report",
+        "tasks.human_gate",
+        "tasks.decision",
+        "tasks.archive",
+        "tasks.delete",
+        "admin.read",
+        "admin.users.write",
+    ):
+        assert ident.has_permission(perm) is False, perm
+    # even when the DB role hands it a permission set
+    seeded = TokenIdentity(
+        "w", "watcher", principal_id=7, permissions=frozenset({"tasks.read"})
+    )
+    assert seeded.has_permission("tasks.read") is True
+    assert seeded.has_permission("tasks.update") is False
+    # a stored permission set that names a human gate does not make it a human
+    loaded = TokenIdentity(
+        "w",
+        "watcher",
+        principal_id=7,
+        permissions=frozenset({"tasks.read", "tasks.human_gate", "tasks.update"}),
+    )
+    assert (loaded.is_human, loaded.is_agent) == (False, False)
+    assert loaded.has_permission("tasks.human_gate") is False
+    assert loaded.has_permission("tasks.update") is False
+    # a plain agent / human are untouched
+    assert TokenIdentity("a", "agent", principal_id=1).is_watcher is False
+
+
+@pytest.mark.asyncio
+async def test_db_watcher_principal_does_not_resolve_as_human(watcher_hub):
+    """AC-2 (#1556): without the role in the priority list it fell through to human."""
+    from hub.services import admin as admin_svc
+
+    ident = await admin_svc.resolve_api_key(watcher_hub.db, watcher_hub.watcher_key)
+    assert ident is not None
+    assert ident.role == "watcher"
+    assert (ident.is_watcher, ident.is_human, ident.is_agent) == (True, False, False)
+
+
+# ---------------------------------------------------------------------------
+# ci_runner is a machine, not a human (#1639)
+# ---------------------------------------------------------------------------
+
+
+def _human_gate_routes() -> list[tuple[str, str]]:
+    """Every (method, path) guarded by ``require_human_or_admin``, from the app.
+
+    Two shapes carry the guard: ``Depends(require_human_or_admin)`` (found by
+    walking each route's dependant tree) and a direct call inside the handler
+    (found in the handler source). Derived, not listed by hand: a gate added
+    next month is covered without anyone remembering to extend a list.
+    """
+    import inspect
+
+    from fastapi.routing import APIRoute
+
+    from hub.app import app
+    from hub.auth import require_human_or_admin
+
+    def _depends_on_gate(dependant) -> bool:
+        return any(
+            sub.call is require_human_or_admin or _depends_on_gate(sub)
+            for sub in dependant.dependencies
+        )
+
+    found: set[tuple[str, str]] = set()
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        guarded = _depends_on_gate(route.dependant)
+        if not guarded:
+            try:
+                guarded = "require_human_or_admin(" in inspect.getsource(route.endpoint)
+            except (OSError, TypeError):
+                guarded = False
+        if guarded:
+            for method in route.methods - {"HEAD", "OPTIONS"}:
+                found.add((method, route.path))
+    return sorted(found)
+
+
+def _fill_path(path: str) -> str:
+    import re
+
+    return re.sub(r"\{[^}:]+(:path)?\}", "1", path)
+
+
+# Every table a human-gate operation could write to: tasks and their feed,
+# criteria, dependencies, projects and the scheduled policy, skills, delivery
+# and dispositions, executor state, pairing, messages. No table is skipped when
+# it is missing: a renamed table must fail this test, not drop out of it.
+_GATE_TABLES = (
+    "tasks",
+    "task_updates",
+    "acceptance_criteria",
+    "task_dependencies",
+    "projects",
+    "scheduled_policy_changes",
+    "skills",
+    "releases",
+    "ci_run_reports",
+    "finding_dispositions",
+    "outcome_answers",
+    "live_checks",
+    "steward_false_approvals",
+    "executor_runs",
+    "executor_slots",
+    "chat_pair_codes",
+    "chat_pair_sessions",
+    "agent_messages",
+)
+
+
+async def _business_state(db) -> str:
+    out = {}
+    for table in _GATE_TABLES:
+        rows = await db.execute_fetchall(f"SELECT * FROM {table} ORDER BY 1")
+        out[table] = [tuple(r) for r in rows]
+    return json.dumps(out, default=str, sort_keys=True)
+
+
+def test_the_human_gate_route_list_is_derived_and_not_trivial():
+    routes = _human_gate_routes()
+    paths = {p for _m, p in routes}
+    assert len(routes) >= 25, routes
+    for needle in ("/approve", "/reject", "/decide", "/force-complete", "/start"):
+        assert any(p.endswith(needle) for p in paths), needle
+
+
+async def test_ci_runner_key_is_refused_by_every_human_route(ci_runner_hub):
+    """AC-1 (#1639): a REAL ci_runner DB key, closed mode, every human gate."""
+    hub = ci_runner_hub
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "gate probe"}, headers=hub.human
+    )
+    assert created.status_code in (200, 201), created.text
+    # Slug "1" and id 1 are what the path filler puts into every route, so the
+    # routes act on real rows and a leaked call WOULD change something.
+    proj = await hub.client.post(
+        "/api/projects", json={"slug": "1", "name": "One"}, headers=hub.human
+    )
+    assert proj.status_code == 200, proj.text
+    before = await _business_state(hub.db)
+    routes = _human_gate_routes()
+    assert routes
+    leaked: list[tuple[str, str, int, str]] = []
+    for method, path in routes:
+        resp = await hub.client.request(
+            method,
+            _fill_path(path),
+            headers=hub.ci,
+            json={},
+            follow_redirects=False,
+        )
+        refused = resp.status_code == 403 and "human_only_gate" in resp.text
+        if not refused:
+            leaked.append((method, path, resp.status_code, resp.text[:120]))
+        # After EVERY request, not once at the end: a leak that a later route
+        # undoes (or that a later failure hides) must still be seen.
+        if await _business_state(hub.db) != before:
+            leaked.append((method, path, resp.status_code, "state changed"))
+            before = await _business_state(hub.db)
+    assert not leaked, leaked
+    who = await hub.client.get("/api/whoami", headers=hub.ci)
+    assert who.status_code == 200, who.text
+    assert who.json()["role"] == "agent", who.json()
+
+
+async def test_ci_runner_browser_session_is_not_human(ci_runner_hub):
+    """#1639 -> #1644: the cookie door gives a CI (service) principal nothing."""
+    hub = ci_runner_hub
+    task = await hub.client.post(
+        "/api/tasks", json={"title": "cookie probe"}, headers=hub.human
+    )
+    tid = task.json()["id"]
+    who = await hub.client.get("/api/whoami", headers=hub.ci_cookie)
+    assert who.status_code == 401, who.text
+
+    from hub.services import admin as admin_svc
+
+    token = hub.ci_cookie["Cookie"].split("=", 1)[1]
+    assert await admin_svc.resolve_browser_session(hub.db, token) is None
+
+    before = await _business_state(hub.db)
+    rest = await hub.client.post(
+        f"/api/tasks/{tid}/approve", json={}, headers=hub.ci_cookie
+    )
+    assert rest.status_code in (401, 403), rest.text
+    web = await hub.client.get(
+        "/chat-pair", headers=hub.ci_cookie, follow_redirects=False
+    )
+    assert web.status_code in (303, 401, 403), web.status_code
+    assert await _business_state(hub.db) == before
+
+
+async def test_ci_runner_may_withdraw_its_own_draft(ci_runner_hub):
+    """Accepted consequence (#1639): ci_runner is an agent, so /withdraw is open."""
+    hub = ci_runner_hub
+    made = await hub.client.post(
+        "/api/tasks",
+        json={"title": "ci draft", "source": "agent", "agent": "ci-1639"},
+        headers=hub.ci,
+    )
+    assert made.status_code in (200, 201), made.text
+    tid = made.json()["id"]
+    resp = await hub.client.post(f"/api/tasks/{tid}/withdraw", headers=hub.ci)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["archived"] is True
+
+
+# ---------------------------------------------------------------------------
+# agent-bootstrap: матрица ролей (#1631)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_bootstrap_role_matrix(client, db, monkeypatch):
+    """AC-4: anonymous 401, агент и watcher 200, implementer и steward 403, нет slug 404."""
+    from hub import repository as repo
+    from hub.services import admin as admin_svc
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-env": TokenIdentity("bot", "agent"),
+            "steward-env": TokenIdentity("stew", "steward"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await repo.create_project(db, slug="matrix", name="Matrix")
+    await db.commit()
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-m", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    watcher = await admin_svc.create_principal(
+        db, kind="agent", username="grok-m", role_slug="watcher"
+    )
+    watcher_key = await admin_svc.create_api_key(db, watcher["id"], name="w")
+    human_auth = {"Authorization": f"Bearer {human_key['plaintext_key']}"}
+    ip = {"x-forwarded-for": "203.0.113.9"}
+    task = await client.post(
+        "/api/tasks", json={"title": "для сессии"}, headers=human_auth
+    )
+    assert task.status_code in (200, 201), task.text
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task.json()["id"]},
+        headers={**human_auth, **ip},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await client.post(
+        "/api/auth/chat-pair/redeem", json={"code": issued.json()["code"]}, headers=ip
+    )
+    assert redeemed.status_code == 200, redeemed.text
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    url = "/api/projects/matrix/agent-bootstrap"
+    got = {
+        "anonymous": (await client.get(url, headers={"Accept": "application/json"})),
+        "agent": await client.get(url, headers=bearer("agent-env")),
+        "watcher": await client.get(url, headers=bearer(watcher_key["plaintext_key"])),
+        "implementer": await client.get(url, headers=bearer(redeemed.json()["token"])),
+        "steward": await client.get(url, headers=bearer("steward-env")),
+        "unknown": await client.get(
+            "/api/projects/no-such/agent-bootstrap", headers=bearer("agent-env")
+        ),
+    }
+    assert {k: v.status_code for k, v in got.items()} == {
+        "anonymous": 401,
+        "agent": 200,
+        "watcher": 200,
+        "implementer": 403,
+        "steward": 403,
+        "unknown": 404,
+    }
+
+
+# ---------------------------------------------------------------------------
+# run-validation / run-ac-tests: исполнение на хосте только для людей (#1646)
+# ---------------------------------------------------------------------------
+
+_RUN_ROUTES = ("run-validation", "run-ac-tests")
+
+
+@pytest.fixture
+async def run_routes_hub(client, db, monkeypatch):
+    """Closed mode, REAL DB keys of every kind, a task with prior results.
+
+    Both default runners are replaced by recorders: the test never executes a
+    command or a test, and ``calls`` shows whether a route reached the runner.
+    """
+    from types import SimpleNamespace
+
+    from hub import repository as repo
+    from hub.models import AcceptanceCriterion
+    from hub.services import ac_tests, validation_run
+    from hub.services import admin as admin_svc
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"steward-env": TokenIdentity("stew", "steward")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+    calls: list[str] = []
+
+    async def fake_tests(nodeids, repo_path):
+        calls.append("ac-tests")
+        return {n: True for n in nodeids}
+
+    async def fake_validation(commands, repo_path):
+        calls.append("validation")
+        return (0, "ran")
+
+    monkeypatch.setattr(ac_tests, "default_test_runner", fake_tests)
+    monkeypatch.setattr(validation_run, "default_validation_runner", fake_validation)
+
+    keys: dict[str, dict[str, str]] = {}
+    for label, kind, role in (
+        ("human", "human", "operator"),
+        ("agent", "agent", "agent"),
+        ("ci_runner", "service", "ci_runner"),
+        ("watcher", "agent", "watcher"),
+    ):
+        principal = await admin_svc.create_principal(
+            db, kind=kind, username=f"{label}-1646", role_slug=role
+        )
+        key = await admin_svc.create_api_key(db, principal["id"], name=label)
+        keys[label] = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    keys["steward"] = {"Authorization": "Bearer steward-env"}
+
+    task_id = await repo.create_task(
+        db,
+        title="прежние результаты",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
+            )
+        ],
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(["echo old"]),
+        validation_generation=1,
+        validation_status="fail",
+        validation_log="old log",
+    )
+    await repo.upsert_ac_test_result(db, task_id, "AC-1", 1, "fail")
+    await db.commit()
+
+    ip = {"x-forwarded-for": "203.0.113.46"}
+    # Pairing is issued only for an open task, so it gets its own.
+    open_task = await client.post(
+        "/api/tasks", json={"title": "для сессии"}, headers=keys["human"]
+    )
+    assert open_task.status_code in (200, 201), open_task.text
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": open_task.json()["id"]},
+        headers={**keys["human"], **ip},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await client.post(
+        "/api/auth/chat-pair/redeem", json={"code": issued.json()["code"]}, headers=ip
+    )
+    assert redeemed.status_code == 200, redeemed.text
+    keys["chat_pair"] = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    return SimpleNamespace(
+        client=client, db=db, task_id=task_id, keys=keys, calls=calls
+    )
+
+
+async def _run_routes_state(hub) -> str:
+    rows = await hub.db.execute_fetchall(
+        "SELECT validation_commands, validation_generation, validation_status, "
+        "validation_log FROM tasks WHERE id = ?",
+        (hub.task_id,),
+    )
+    results = await hub.db.execute_fetchall(
+        "SELECT ac_id, submission_generation, status, created_at "
+        "FROM ac_test_results WHERE task_id = ? ORDER BY ac_id",
+        (hub.task_id,),
+    )
+    return json.dumps([[tuple(r) for r in rows], [tuple(r) for r in results]])
+
+
+async def test_run_validation_and_ac_tests_refuse_machine_keys(run_routes_hub):
+    """AC-1 (#1646): agent и ci_runner с настоящими ключами получают 403."""
+    hub = run_routes_hub
+    before = await _run_routes_state(hub)
+    for who in ("agent", "ci_runner"):
+        for route in _RUN_ROUTES:
+            resp = await hub.client.post(
+                f"/api/tasks/{hub.task_id}/{route}", headers=hub.keys[who]
+            )
+            assert resp.status_code == 403, (who, route, resp.text)
+            assert "human_only_gate" in resp.text, (who, route, resp.text)
+            # Отказ раньше поиска задачи: чужой/несуществующий id тоже 403, не 404.
+            ghost = await hub.client.post(
+                f"/api/tasks/999999/{route}", headers=hub.keys[who]
+            )
+            assert ghost.status_code == 403, (who, route, ghost.text)
+    assert hub.calls == []
+    assert await _run_routes_state(hub) == before
+
+
+async def test_run_validation_and_ac_tests_keep_middleware_refusals(run_routes_hub):
+    """AC-2 (#1646): steward, watcher, chat-pair режутся своими кодами middleware."""
+    hub = run_routes_hub
+    before = await _run_routes_state(hub)
+    expected = {
+        "steward": "steward_gate_forbidden",
+        "watcher": "watcher_gate_forbidden",
+        "chat_pair": "chat_pair_gate_forbidden",
+    }
+    for who, reason in expected.items():
+        for route in _RUN_ROUTES:
+            resp = await hub.client.post(
+                f"/api/tasks/{hub.task_id}/{route}", headers=hub.keys[who]
+            )
+            assert resp.status_code == 403, (who, route, resp.text)
+            assert resp.json()["detail"]["reason"] == reason, (who, route, resp.text)
+    assert hub.calls == []
+    assert await _run_routes_state(hub) == before
+
+
+async def test_run_validation_and_ac_tests_still_work_for_humans(run_routes_hub):
+    """AC-3 (#1646): человеческий ключ — маршруты работают, runner вызван, результат записан."""
+    hub = run_routes_hub
+    tests = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-ac-tests", headers=hub.keys["human"]
+    )
+    assert tests.status_code == 200, tests.text
+    assert [r["status"] for r in tests.json()["results"]] == ["pass"]
+    validation = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-validation", headers=hub.keys["human"]
+    )
+    assert validation.status_code == 200, validation.text
+    assert validation.json()["status"] == "pass"
+    assert hub.calls == ["ac-tests", "validation"]
+    state = json.loads(await _run_routes_state(hub))
+    assert tuple(state[0][0][1:]) == (1, "pass", "ran")
+    assert state[1][0][2] == "pass"

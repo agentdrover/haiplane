@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
-from hub.models import DEFAULT_FORGE, FORGES
+from hub.models import (
+    DEFAULT_FORGE,
+    FORGES,
+    STEWARD_ADVISOR_VERDICTS,
+    STEWARD_JUDGEMENT_KINDS,
+    STEWARD_VERDICTS,
+)
 
 HUB_URL = config.env_get("HUB_URL", "http://127.0.0.1:8080") or "http://127.0.0.1:8080"
 HUB_TOKEN = config.env_get("HUB_TOKEN", "") or ""
@@ -107,8 +113,40 @@ def _print_http_error(code: int, body_text: str) -> None:
         if detail.get("hint"):
             print(f"  Hint: {detail['hint']}", file=sys.stderr)
         return
+    if isinstance(detail, dict) and detail.get("error") == "freeze_refused":
+        print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+        return
+    if isinstance(detail, dict) and detail.get("reason") == "bug_red_test_unproven":
+        _print_red_test_refusal(code, detail)
+        return
+    if isinstance(detail, dict) and detail.get("reason") == "ci_before_submit_unproven":
+        _print_ci_before_submit_refusal(code, detail)
+        return
 
     print(f"HTTP {code}: {body_text}", file=sys.stderr)
+
+
+def _print_red_test_refusal(code: int, detail: dict[str, Any]) -> None:
+    """Отказ гейта красного теста (#913): причина по каждому AC строкой."""
+    print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+    for line in detail.get("violations") or []:
+        print(f"  - {line}", file=sys.stderr)
+    if detail.get("hint"):
+        print(f"  Hint: {detail['hint']}", file=sys.stderr)
+
+
+def _print_ci_before_submit_refusal(code: int, detail: dict[str, Any]) -> None:
+    """Отказ гейта «CI до сдачи» (#1629): причина, перечень и что делать."""
+    print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+    print(
+        f"  reason: {detail.get('reason')} (cause: {detail.get('cause')}, "
+        f"sha: {detail.get('sha')})",
+        file=sys.stderr,
+    )
+    for line in detail.get("violations") or []:
+        print(f"  - {line}", file=sys.stderr)
+    if detail.get("hint"):
+        print(f"  Hint: {detail['hint']}", file=sys.stderr)
 
 
 def _load_payload_file(path: str) -> dict[str, Any] | list[Any]:
@@ -158,6 +196,61 @@ def _print_task_short(t: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_WORK_TYPES = ("feature", "bug", "refactor", "chore", "docs", "spike", "incident")
+
+
+def _put_freeze_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
+    """Тип работы и обоснование допуска при заморозке (#1594); не заданные не шлются."""
+    if getattr(args, "work_type", None):
+        body["work_type"] = args.work_type
+    if getattr(args, "freeze_rationale", None):
+        body["freeze_rationale"] = args.freeze_rationale
+
+
+def _add_freeze_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--work-type",
+        dest="work_type",
+        choices=_WORK_TYPES,
+        default=None,
+        help="Work type (default feature); a frozen project admits by type",
+    )
+    parser.add_argument(
+        "--freeze-rationale",
+        dest="freeze_rationale",
+        default="",
+        help="Why the work may enter a frozen project (required there)",
+    )
+
+
+def _put_state_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
+    """result_kind и rollback задачи-состояния (#1647); не заданные не шлются."""
+    if getattr(args, "result_kind", None):
+        body["result_kind"] = args.result_kind
+    if getattr(args, "rollback", None):
+        body["rollback"] = args.rollback
+
+
+def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--result-kind",
+        dest="result_kind",
+        choices=("commit", "state"),
+        default=None,
+        help=(
+            "commit (default) or state (#1647): the result is a state of the "
+            "world, submitted with evidence and accepted by a human; leaf "
+            "task/subtask only, changes only in draft"
+        ),
+    )
+    parser.add_argument(
+        "--rollback",
+        dest="rollback",
+        default=None,
+        help="How to undo a state result (required by DoR for state tasks)",
+    )
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "title": args.title,
@@ -169,6 +262,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         "task_type": getattr(args, "task_type", "task"),
         "priority": getattr(args, "priority", "medium"),
     }
+    _put_freeze_fields(body, args)
+    _put_state_fields(body, args)
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     if getattr(args, "owner", None):
@@ -196,6 +291,8 @@ def _cmd_create_typed(task_type: str) -> Any:
             "priority": getattr(args, "priority", "medium"),
             "source": "human",
         }
+        _put_freeze_fields(body, args)
+        _put_state_fields(body, args)
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
         if getattr(args, "owner", None):
@@ -297,7 +394,20 @@ def cmd_context(args: argparse.Namespace) -> int:
         params["mode"] = args.mode
     query = f"?{urllib.parse.urlencode(params)}" if params else ""
     result = _api("GET", f"/api/tasks/{args.task_id}/context{query}")
-    print(result.get("context_text", ""))
+    text = result.get("context_text", "")
+    # #1643: блок «что дальше» приходит из /context, как в hub_my_context: в
+    # summary он в начале (потолок режет хвост), в full — в конце. Лимит
+    # --max-chars действует на итоговый текст, а не только на context_text.
+    brief = result.get("path_brief") or {}
+    block = "\n".join(brief.get("lines") or [])
+    if block:
+        summary = getattr(args, "mode", "full") == "summary"
+        text = f"{block}\n\n{text}" if summary else f"{text}\n\n{block}"
+    if getattr(args, "max_chars", None) is not None:
+        from hub.services.tree_output import truncate_text
+
+        text, _ = truncate_text(text, args.max_chars)
+    print(text)
     return 0
 
 
@@ -309,6 +419,19 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "agent": args.agent or "",
         "rationale": args.rationale or "",
     }
+    if getattr(args, "defect_verify", None):
+        # #915: the same draft, filed as a prod defect with its passport.
+        body = {
+            "title": args.title,
+            "broken": args.description or "",
+            "verify": args.defect_verify,
+            "affected_areas": list(args.area or []),
+            "agent": args.agent or "",
+        }
+        if getattr(args, "parent", None) is not None:
+            body["parent_id"] = args.parent
+        _print_json(_api("POST", "/api/prod-defects", body))
+        return 0
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     result = _api("POST", "/api/tasks", body)
@@ -347,6 +470,21 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_area_check(result: Any) -> None:
+    """Warn-mode area overlap of a claim/pair-start, on stderr (#1433).
+
+    The JSON on stdout carries it as ``area_check``; the line is for the human
+    reading the terminal, who would not look for it inside the task view.
+    """
+    found = result.get("area_check") if isinstance(result, dict) else None
+    if isinstance(found, dict) and found.get("detail"):
+        print(
+            f"area overlap (claim_area_check={found.get('mode', 'warn')}): "
+            f"{found['detail']}",
+            file=sys.stderr,
+        )
+
+
 def cmd_pair_start(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.plan:
@@ -361,6 +499,7 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["git_mode"] = args.git_mode
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
+    _warn_area_check(result)
     return 0
 
 
@@ -373,9 +512,163 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
 
 def cmd_outcome_debt(args: argparse.Namespace) -> int:
     """Outcome promises and the answers to them (#766, #819)."""
-    result = _api("GET", "/api/metrics/outcome-debt")
+    params: dict[str, Any] = {}
+    if getattr(args, "status", None):
+        params["status"] = args.status
+    for name in ("limit", "offset"):
+        if getattr(args, name, None) is not None:
+            params[name] = getattr(args, name)
+    if getattr(args, "only_counts", False):
+        params["only_counts"] = "true"
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/metrics/outcome-debt{query}")
     _print_json(result)
     return 0
+
+
+def _practice_query(args: argparse.Namespace) -> str:
+    """Query string of ``/api/metrics/practices`` from the slice flags (#1490)."""
+    params: dict[str, Any] = {"since_days": args.since_days}
+    for name in ("project", "model", "date_from", "date_to"):
+        value = getattr(args, name, None)
+        if value:
+            params[name] = value
+    for name in ("compare", "series"):
+        if getattr(args, name, False):
+            params[name] = "true"
+    if getattr(args, "series_days", None):
+        params["series_days"] = args.series_days
+    return urllib.parse.urlencode(params)
+
+
+def cmd_practice_metrics(args: argparse.Namespace) -> int:
+    """Practice metrics of a slice (#1490): project, reviewer model, dates,
+    previous-period comparison, series and ranked problem spots."""
+    _print_json(_api("GET", f"/api/metrics/practices?{_practice_query(args)}"))
+    return 0
+
+
+def _add_practice_metrics_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p = sub.add_parser(
+        "practice-metrics",
+        help="Practice metrics of a slice: project, reviewer model, date range, "
+        "previous-period comparison, series and problem spots (#1490)",
+    )
+    p.add_argument("--since-days", type=int, default=90)
+    p.add_argument("--project", default="", help="project slug")
+    p.add_argument(
+        "--model",
+        default="",
+        help="REVIEWER model; 'не заявлена' selects reports with none recorded",
+    )
+    p.add_argument("--date-from", default="", help="YYYY-MM-DD, replaces --since-days")
+    p.add_argument("--date-to", default="", help="YYYY-MM-DD, last day included")
+    p.add_argument(
+        "--compare",
+        action="store_true",
+        help="previous window of the same length, deltas and problem spots",
+    )
+    p.add_argument("--series", action="store_true", help="indicators per bucket")
+    p.add_argument("--series-days", type=int, default=7, help="bucket length")
+    p.set_defaults(func=cmd_practice_metrics)
+
+
+def cmd_review_economy(args: argparse.Namespace) -> int:
+    """Owner's review summary (#1406): the review_economy section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("review_economy", {}))
+    return 0
+
+
+def cmd_defect_clocks(args: argparse.Namespace) -> int:
+    """Prod defect clocks (#916): the prod_defect_clocks section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("prod_defect_clocks", {}))
+    return 0
+
+
+def cmd_change_failure_rate(args: argparse.Namespace) -> int:
+    """Change failure rate (#918): the change_failure_rate section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("change_failure_rate", {}))
+    return 0
+
+
+def _add_change_failure_rate_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p_cfr = sub.add_parser(
+        "change-failure-rate",
+        help="Share of successful deploys with a prod defect bound to them, "
+        "per project, with the deploy count (#918)",
+    )
+    p_cfr.add_argument("--since-days", type=int, default=90)
+    p_cfr.set_defaults(func=cmd_change_failure_rate)
+
+
+def cmd_shift_left(args: argparse.Namespace) -> int:
+    """Shift-left (#914): the shift_left section — defects by found_in."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("shift_left", {}))
+    return 0
+
+
+def _add_shift_left_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p_sl = sub.add_parser(
+        "shift-left",
+        help="Defects of the window by the stage that caught them (found_in), "
+        "with the unknown share apart (#914)",
+    )
+    p_sl.add_argument("--since-days", type=int, default=90)
+    p_sl.set_defaults(func=cmd_shift_left)
+
+
+def _add_effective_policy_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1457)."""
+    p_policy = sub.add_parser(
+        "effective-policy",
+        help="Effective policy of a project: keys, sources, steward, locks (#1457)",
+    )
+    p_policy.add_argument("slug", help="Project slug")
+    p_policy.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_policy.set_defaults(func=cmd_effective_policy)
+
+
+def _add_policy_schedule_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1593)."""
+    p_sched = sub.add_parser(
+        "policy-schedule",
+        help="Scheduled policy changes of a project (read-only; humans plan) (#1593)",
+    )
+    p_sched.add_argument("slug", help="Project slug")
+    p_sched.add_argument(
+        "--state", choices=("pending", "applied", "refused", "cancelled")
+    )
+    p_sched.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_sched.set_defaults(func=cmd_policy_schedule)
+
+
+def _add_path_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1527)."""
+    p_path = sub.add_parser(
+        "path",
+        help="Critical path per epic and the queue with reasons (#1527)",
+    )
+    p_path.add_argument("slug", help="Project slug")
+    p_path.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_path.set_defaults(func=cmd_path)
+
+
+def _add_defect_metric_parsers(sub: Any) -> None:
+    """Defect metric sections (#918, #914) and the policy view (#1457): one call
+    from build_parser, which sits at its complexity ceiling."""
+    _add_effective_policy_parser(sub)
+    _add_policy_schedule_parser(sub)
+    _add_path_parser(sub)
+    _add_change_failure_rate_parser(sub)
+    _add_shift_left_parser(sub)
+    _add_practice_metrics_parser(sub)
 
 
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
@@ -425,6 +718,19 @@ def cmd_approve_batch(args: argparse.Namespace) -> int:
 FINDING_OUTCOMES_JSON_ERROR = "--finding-outcomes is not valid JSON"
 
 
+def _put_prevention(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """#919: the prod-defect output, refused before the request when unparsable."""
+    raw = (getattr(args, "prevention", "") or "").strip()
+    if not raw:
+        return True
+    try:
+        body["prevention"] = json.loads(raw)
+    except ValueError as exc:
+        print(f"--prevention is not valid JSON: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> bool:
     """Положить исходы находок в тело запроса; False — отказ уже напечатан.
 
@@ -446,6 +752,22 @@ def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> boo
     return True
 
 
+def _done_report_options(parser: argparse.ArgumentParser) -> None:
+    """Keys a done report carries: finding outcomes (#1155), prevention (#919)."""
+    _finding_outcomes_option(parser)
+    parser.add_argument(
+        "--prevention",
+        default="",
+        help=(
+            "JSON prevention output of a prod defect (#919): "
+            '{"kind": "regression_test|rule|accepted_risk", "ref": "...", '
+            '"reason": "...", "revisit": "..."}. regression_test/rule need ref '
+            "(rule = category from category_checks); accepted_risk needs reason "
+            "and revisit."
+        ),
+    )
+
+
 def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
     """Один и тот же ключ у сдачи и у отчёта о готовности (#911, #1155)."""
     parser.add_argument(
@@ -461,13 +783,99 @@ def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+#: Что гейт красного теста ждёт от сдачи бага (#913). У CLI нет флага, которым
+#: доказательство можно заявить: его приносит отчёт CI, а не автор.
+SUBMIT_REVIEW_EPILOG = (
+    "work_type=bug under project policy bug_red_test=warn|require (#913): every "
+    "AC test_ref must be 'failed' in the CI baseline of the pinned commit (the "
+    "branch's changed tests run over the merge-base code). --mutations and "
+    "--summary are not evidence."
+)
+
+#: Отказ CLI на битом --mutations (#1436): до сети, как у --finding-outcomes.
+MUTATIONS_JSON_ERROR = "--mutations is not a JSON list"
+
+
+def _put_mutations(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить мутации сдачи в тело; False — отказ уже напечатан (#1436).
+
+    Отказ, а не тихая сдача без них: при require хаб всё равно откажет, но
+    уже с «мутаций нет», и автор будет искать не ту ошибку.
+    """
+    raw = getattr(args, "mutations", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        print(f"{MUTATIONS_JSON_ERROR}: {exc}", file=sys.stderr)
+        return False
+    if not isinstance(parsed, list):
+        print(f"{MUTATIONS_JSON_ERROR}: got {type(parsed).__name__}", file=sys.stderr)
+        return False
+    body["mutations"] = parsed
+    return True
+
+
+#: Отказ CLI на битом --evidence (#1647): до сети. Входное значение не печатается.
+EVIDENCE_JSON_ERROR = "--evidence is not a JSON list"
+
+
+def _put_evidence(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить доказательства задачи-состояния в тело; False — отказ напечатан.
+
+    Текст разбора не печатается: в нём могло быть значение из доказательства.
+    """
+    raw = getattr(args, "evidence", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        print(EVIDENCE_JSON_ERROR, file=sys.stderr)
+        return False
+    if not isinstance(parsed, list):
+        print(f"{EVIDENCE_JSON_ERROR}: got {type(parsed).__name__}", file=sys.stderr)
+        return False
+    body["evidence"] = parsed
+    return True
+
+
+def _add_state_submit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--evidence",
+        default="",
+        help=(
+            "State task (#1647): JSON list, one record per AC: "
+            '[{"ac_id": "AC-1", "action": "...", "observed": "...", '
+            '"target": "...", "observed_at": "2026-10-09T12:00:00Z"}]. '
+            "Observations are depersonalised; secrets are refused."
+        ),
+    )
+
+
+def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--expected-generation",
+        dest="expected_generation",
+        type=int,
+        default=None,
+        help="State task (#1647): the submission generation you judge (required)",
+    )
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
         body["agent"] = args.agent
     if args.summary:
         body["summary"] = args.summary
-    if not _put_finding_outcomes(body, args):
+    model = getattr(args, "model", "") or ""
+    if model:
+        body["model"] = model
+    if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
+        return 2
+    if not _put_mutations(body, args) or not _put_evidence(body, args):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
@@ -476,6 +884,7 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
 
 def cmd_review_brief(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
+    _print_verdict_route(result)
     _print_json(result)
     return 0
 
@@ -495,6 +904,8 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
         body["findings"] = findings
     if getattr(args, "create_tasks_for_out_of_scope", False):
         body["create_tasks_for_out_of_scope"] = True
+    if getattr(args, "expected_generation", None) is not None:
+        body["expected_generation"] = args.expected_generation
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0
@@ -529,10 +940,35 @@ def cmd_steward_judgement(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_steward_false_approve_clear(args: argparse.Namespace) -> int:
+    """Human-only: lift a sticky false approve of the steward pair (#1601)."""
+    body = {"note": args.note}
+    result = _api(
+        "POST", f"/api/tasks/{args.task_id}/steward-false-approve/clear", body
+    )
+    _print_json(result)
+    return 0
+
+
+def _add_false_approve_parser(sub: Any) -> None:
+    """Подкоманда снятия ошибочного одобрения — вынесена: build_parser на пределе."""
+    p = sub.add_parser(
+        "steward-false-approve-clear",
+        help=(
+            "Human-only: lift the sticky false approve of the steward pair from a "
+            "task (the only way it is lifted, #1601)"
+        ),
+    )
+    p.add_argument("task_id", type=int)
+    p.add_argument("--note", default="", help="Why the case is closed")
+    p.set_defaults(func=cmd_steward_false_approve_clear)
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
     body = {"agent": args.agent, "session_id": args.session_id or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
     _print_json(result)
+    _warn_area_check(result)
     return 0
 
 
@@ -563,9 +999,17 @@ def cmd_answer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_verdict_route(result: Any) -> None:
+    """#1440: the verdict route as one stderr line; the JSON on stdout carries it whole."""
+    route = result.get("verdict_route") if isinstance(result, dict) else None
+    if isinstance(route, dict) and route.get("line"):
+        print(route["line"], file=sys.stderr)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}")
     _print_json(result)
+    _print_verdict_route(result)
     return 0
 
 
@@ -602,7 +1046,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     # #1155: отказ ДО запроса. Отправить отчёт без исходов и вернуть 0 значило
     # бы записать в ленту готовность, потеряв ответ про находки, — и автор
     # узнал бы об этом только от гейта на следующей сдаче.
-    if not _put_finding_outcomes(body, args):
+    if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/updates", body)
     _print_json(result)
@@ -707,6 +1151,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("title", "title"),
     ("work_type", "work_type"),
+    ("freeze_rationale", "freeze_rationale"),
+    ("result_kind", "result_kind"),
+    ("rollback", "rollback"),
     ("class_of_service", "class_of_service"),
     ("size", "size"),
     ("wip_tag", "wip_tag"),
@@ -721,6 +1168,7 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("found_in", "found_in"),
     ("caused_by", "caused_by_task_id"),
     ("detected_at", "detected_at"),
+    ("release_id", "release_id"),
 )
 _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("scope_in", "scope_in"),
@@ -1051,6 +1499,19 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_blocks(args: argparse.Namespace) -> int:
+    """Open release alerts only (#1420) — the cheap read, no delivery walk."""
+    from hub.services.release_alert import release_block_lines
+
+    result = _api("GET", "/api/release-blocks")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    lines = release_block_lines(list(result.get("release_blocks") or []))
+    print("\n".join(lines) if lines else "Открытых аварий релиза нет")
+    return 0
+
+
 def cmd_prod_state(args: argparse.Namespace) -> int:
     """What production runs and which completed tasks are where (#499)."""
     from hub.services.prod_state import format_prod_state
@@ -1143,6 +1604,30 @@ def cmd_merge_ledger_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cursor_usage_import(args: argparse.Namespace) -> int:
+    """Разнести выгрузку usage Cursor по заказам ревью (#1413).
+
+    По умолчанию сухой прогон: план по заказам и чужие строки числом. Пишет
+    только с ``--apply``. Только админский токен.
+    """
+    from hub.services.cursor_usage_import import MAX_CSV_CHARS, render_import
+
+    path = Path(args.file).expanduser()
+    if path.stat().st_size > MAX_CSV_CHARS * 4:
+        print(f"Файл больше потолка {MAX_CSV_CHARS} символов.", file=sys.stderr)
+        return 1
+    result = _api(
+        "POST",
+        "/api/admin/cursor-usage/import",
+        {"csv": path.read_text(encoding="utf-8"), "apply": bool(args.apply)},
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(render_import(result))
+    return 0
+
+
 def _review_queue_line(row: dict) -> str:
     findings = (
         "нет текущего отчёта"
@@ -1155,6 +1640,17 @@ def _review_queue_line(row: dict) -> str:
     readiness = row.get("readiness")
     if readiness == "ready_sha_unverified":
         readiness = "ready, sha не проверен"
+    if row.get("result_kind") == "state":
+        # #1648: у задачи-состояния нет ни sha, ни машинного отчёта — строка
+        # называет то, по чему человек судит: доказательства поколения.
+        kit = "полный" if row.get("evidence_complete") else "НЕПОЛНЫЙ"
+        return (
+            f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
+            f"{row.get('status')}, сдача {row.get('submission_generation')}, "
+            f"задача-состояние: комплект доказательств {kit} "
+            f"({row.get('evidence_count') or 0} AC), {verdict}, "
+            f"ждёт {row.get('waiting_minutes', '?')} мин"
+        )
     sha = f"sha {row.get('sha_check')}"
     # Not a match: the reason says why, and when the tip is fresh it already
     # opens with the observation age — so it replaces the minutes, not joins them.
@@ -1193,6 +1689,118 @@ def cmd_review_queue(args: argparse.Namespace) -> int:
             print(f"    стойло: {row['stall_reason']}")
     if result.get("note"):
         print(result["note"])
+    return 0
+
+
+def cmd_next_task(args: argparse.Namespace) -> int:
+    """Какую задачу хаб взял бы следующей и почему ждут остальные (#1274)."""
+    path = "/api/orchestrator/next"
+    if args.project:
+        path += "?" + urllib.parse.urlencode({"project": args.project})
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    answers = result.get("projects") or []
+    if not answers:
+        print("No project runs the orchestrator queue (orchestrator_queue=shadow).")
+    for answer in answers:
+        print(
+            f"[{answer.get('project')} · {answer.get('mode')}] {answer.get('summary')}"
+        )
+    return 0
+
+
+def cmd_executor_stop(args: argparse.Namespace) -> int:
+    """Остановить идущий прогон исполнителя задачи — человеку (#1455)."""
+    result = _api("POST", f"/api/tasks/{args.task_id}/executor-stop")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if result.get("confirmed"):
+        print(f"#{args.task_id}: прогон остановлен, исход {result.get('outcome')}.")
+    else:
+        print(
+            f"#{args.task_id}: отмена начата ({result.get('cancel_intent')}); "
+            f"повторы держит хаб. {result.get('reason') or ''}".rstrip()
+        )
+    return 0
+
+
+def _add_executor_stop_parser(sub: Any) -> None:
+    """``oc-hub executor-stop`` (#1455); отдельно — build_parser на потолке."""
+    p_stop = sub.add_parser(
+        "executor-stop", help="Stop the task's running cloud executor run (human)"
+    )
+    p_stop.add_argument("task_id", type=int)
+    p_stop.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_stop.set_defaults(func=cmd_executor_stop)
+
+
+def cmd_slots(args: argparse.Namespace) -> int:
+    """Занятость слотов и каналов исполнения (#1434)."""
+    from hub.services.executor_slots import format_occupancy
+
+    result = _api("GET", "/api/executor-slots")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_occupancy(result)))
+    return 0
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    """Критический путь и очередь с причинами проекта (#1527)."""
+    from hub.services.project_path import format_path
+
+    result = _api("GET", f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/path")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_path(result)))
+    return 0
+
+
+def cmd_effective_policy(args: argparse.Namespace) -> int:
+    """Действующая политика проекта: ключи, источники, стюард, замки (#1457)."""
+    from hub.services.effective_policy import format_effective_policy
+
+    result = _api(
+        "GET",
+        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/effective-policy",
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_effective_policy(result)))
+    return 0
+
+
+def cmd_projects_bootstrap(args: argparse.Namespace) -> int:
+    """Стартовый пакет проекта: печатает серверный text, не пересобирает (#1631)."""
+    result = _api(
+        "GET",
+        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/agent-bootstrap",
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(result["text"])
+    return 0
+
+
+def cmd_policy_schedule(args: argparse.Namespace) -> int:
+    """Расписание правок политики проекта — только чтение (#1593)."""
+    from hub.services.policy_change import format_schedule
+
+    path = f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/policy-schedule"
+    if args.state:
+        path += f"?state={args.state}"
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_schedule(args.slug, result)))
     return 0
 
 
@@ -1293,7 +1901,19 @@ def cmd_health(args: argparse.Namespace) -> int:
     print(f"Auth disabled: {result['auth_disabled']}")
     print(f"Env tokens configured: {result['env_tokens_configured']}")
     print(f"Vast enabled: {result['vast_enabled']}")
+    _print_egress(result.get("egress"))
     return 0
+
+
+def _print_egress(egress: object) -> None:
+    """Egress state of the server (#1645): fixed wording, typed fields only."""
+    from hub.services.egress_watch import egress_lines
+
+    if not isinstance(egress, dict):
+        return
+    print(f"Egress: {egress.get('state', 'unknown')}")
+    for line in egress_lines(egress):
+        print(line)
 
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +1986,7 @@ def cmd_admin_agents_create(args: argparse.Namespace) -> int:
         "kind": "agent",
         "username": args.name,
         "display_name": getattr(args, "display_name", "") or args.name,
-        "role": "agent",
+        "role": getattr(args, "role", "") or "agent",
     }
     result = _api("POST", "/api/admin/principals", body)
     print(f"Agent '{args.name}' created (id={result.get('id')}).")
@@ -1386,6 +2006,8 @@ def cmd_admin_keys_create(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {"name": args.name}
     if getattr(args, "expires_days", None):
         body["expires_days"] = args.expires_days
+    if getattr(args, "project", None):
+        body["projects"] = list(args.project)
     result = _api("POST", f"/api/admin/principals/{target['id']}/api-keys", body)
     print(
         f"API key created (id={result.get('id')}, prefix={result.get('key_prefix')}…)"
@@ -1486,6 +2108,101 @@ def cmd_readiness_tree(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _add_agents_create_parser(agents_sub: Any) -> None:
+    """``admin agents create``; kept out of build_parser, which is over budget."""
+    p = agents_sub.add_parser("create", help="Create an AI agent identity")
+    p.add_argument("--name", required=True, help="Agent slug/username")
+    p.add_argument("--display-name", dest="display_name", default="")
+    p.add_argument(
+        "--role",
+        choices=["agent", "watcher"],
+        default="agent",
+        help="agent (default) or watcher: read-only, every write refused by the hub",
+    )
+    p.set_defaults(func=cmd_admin_agents_create)
+
+
+def _add_subtasks_bulk_parser(sub: Any) -> None:
+    p_subtasks_bulk = sub.add_parser(
+        "subtasks-bulk",
+        help="Create multiple child tasks under a parent atomically",
+    )
+    p_subtasks_bulk.add_argument("parent_id", type=int)
+    p_subtasks_bulk.add_argument(
+        "--from-file",
+        required=True,
+        help="JSON/YAML with items: [{title, description?, priority?, "
+        "work_type?, freeze_rationale?}, ...]",
+    )
+    p_subtasks_bulk.add_argument(
+        "--task-type",
+        dest="task_type",
+        choices=["task", "subtask"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument(
+        "--source",
+        choices=["agent", "human"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument("--agent", default="")
+    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
+
+
+def _add_outcome_debt_parser(sub: Any) -> None:
+    """``outcome-debt`` and its page flags (#1605)."""
+    p_outcomes = sub.add_parser(
+        "outcome-debt",
+        help="Outcome promises and the answers to them (#766, #819)",
+    )
+    p_outcomes.add_argument(
+        "--status",
+        choices=["overdue", "observing", "unknown", "answered"],
+        default=None,
+        help="One status page instead of the full payload (#1605)",
+    )
+    p_outcomes.add_argument("--limit", type=int, default=None, help="Page size 1-200")
+    p_outcomes.add_argument("--offset", type=int, default=None, help="Page start")
+    p_outcomes.add_argument(
+        "--only-counts",
+        dest="only_counts",
+        action="store_true",
+        help="Counters only, no rows",
+    )
+    p_outcomes.set_defaults(func=cmd_outcome_debt)
+
+
+def _add_projects_parser(sub: Any) -> None:
+    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
+    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
+    pp_list = projects_sub.add_parser("list", help="List projects")
+    pp_list.add_argument(
+        "--include-archived", dest="include_archived", action="store_true"
+    )
+    pp_list.set_defaults(func=cmd_projects_list)
+    pp_bootstrap = projects_sub.add_parser(
+        "bootstrap", help="First message for an agent of a new project (#1631)"
+    )
+    pp_bootstrap.add_argument("slug")
+    pp_bootstrap.add_argument("--json", action="store_true")
+    pp_bootstrap.set_defaults(func=cmd_projects_bootstrap)
+    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
+    pp_create.add_argument("slug")
+    pp_create.add_argument("--name", required=True)
+    pp_create.add_argument("--repo", default="")
+    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
+    pp_create.add_argument(
+        "--default-branch",
+        dest="default_branch",
+        default=config.PAIR_BASE_BRANCH,
+    )
+    # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность, где
+    # форж задать нельзя, означает, что GitVerse-проект отсюда не завести —
+    # и молча, потому что умолчание примут за выбор.
+    pp_create.add_argument("--forge", choices=list(FORGES), default=DEFAULT_FORGE)
+    pp_create.set_defaults(func=cmd_projects_create)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1517,6 +2234,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Idempotency key for safe retries (maps to X-Client-Request-Id)",
     )
+    _add_freeze_args(p_task)
+    _add_result_kind_args(p_task)
     p_task.set_defaults(func=cmd_task, task_type="task")
 
     # epic — create an epic
@@ -1531,6 +2250,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_epic.add_argument(
         "--project", default=None, help="Project slug to attach the epic to"
     )
+    _add_freeze_args(p_epic)
     p_epic.set_defaults(func=_cmd_create_typed("epic"))
 
     # feature — create a feature under an epic
@@ -1543,6 +2263,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_feature.add_argument("--owner", default="", help="Human owner")
     p_feature.add_argument("--reviewer", default="", help="Human reviewer")
+    _add_freeze_args(p_feature)
     p_feature.set_defaults(func=_cmd_create_typed("feature"))
 
     # subtask — create a subtask under a task
@@ -1555,31 +2276,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_subtask.add_argument("--owner", default="", help="Human owner")
     p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
+    _add_freeze_args(p_subtask)
+    _add_result_kind_args(p_subtask)
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
 
-    p_subtasks_bulk = sub.add_parser(
-        "subtasks-bulk",
-        help="Create multiple child tasks under a parent atomically",
-    )
-    p_subtasks_bulk.add_argument("parent_id", type=int)
-    p_subtasks_bulk.add_argument(
-        "--from-file",
-        required=True,
-        help="JSON/YAML with items: [{title, description?, priority?}, ...]",
-    )
-    p_subtasks_bulk.add_argument(
-        "--task-type",
-        dest="task_type",
-        choices=["task", "subtask"],
-        default=None,
-    )
-    p_subtasks_bulk.add_argument(
-        "--source",
-        choices=["agent", "human"],
-        default=None,
-    )
-    p_subtasks_bulk.add_argument("--agent", default="")
-    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
+    _add_subtasks_bulk_parser(sub)
 
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
@@ -1637,6 +2338,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_propose.add_argument("--agent", default="")
     p_propose.add_argument("--rationale", default="")
     p_propose.add_argument("--parent", type=int, default=None, help="Parent task ID")
+    p_propose.add_argument(
+        "--defect-verify", default=None, help="Prod defect: how to check the fix"
+    )
+    p_propose.add_argument("--area", action="append", help="Prod defect: where")
     p_propose.set_defaults(func=cmd_propose)
 
     # approve — approve a draft task
@@ -1701,11 +2406,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
 
-    p_outcomes = sub.add_parser(
-        "outcome-debt",
-        help="Outcome promises and the answers to them (#766, #819)",
+    _add_outcome_debt_parser(sub)
+
+    p_economy = sub.add_parser(
+        "review-economy",
+        help="Review runs by profile with the provider bill, unresolved, "
+        "red-CI runs and reports-vs-bill reconciliation (#1406)",
     )
-    p_outcomes.set_defaults(func=cmd_outcome_debt)
+    p_economy.add_argument("--since-days", type=int, default=90)
+    p_economy.set_defaults(func=cmd_review_economy)
+
+    p_clocks = sub.add_parser(
+        "defect-clocks",
+        help="Prod defect time-to-detect and time-to-restore medians, with "
+        "unmeasurable rows by reason (#916)",
+    )
+    p_clocks.add_argument("--since-days", type=int, default=90)
+    p_clocks.set_defaults(func=cmd_defect_clocks)
+    _add_defect_metric_parsers(sub)
+    _add_worktree_parser(sub)
 
     p_answer = sub.add_parser(
         "answer-outcome",
@@ -1727,28 +2446,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_answer.add_argument("--note", default="", help="Context or what to do next")
     p_answer.set_defaults(func=cmd_answer_outcome)
 
-    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
-    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
-    pp_list = projects_sub.add_parser("list", help="List projects")
-    pp_list.add_argument(
-        "--include-archived", dest="include_archived", action="store_true"
-    )
-    pp_list.set_defaults(func=cmd_projects_list)
-    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
-    pp_create.add_argument("slug")
-    pp_create.add_argument("--name", required=True)
-    pp_create.add_argument("--repo", default="")
-    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
-    pp_create.add_argument(
-        "--default-branch",
-        dest="default_branch",
-        default=config.PAIR_BASE_BRANCH,
-    )
-    # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность, где
-    # форж задать нельзя, означает, что GitVerse-проект отсюда не завести —
-    # и молча, потому что умолчание примут за выбор.
-    pp_create.add_argument("--forge", choices=list(FORGES), default=DEFAULT_FORGE)
-    pp_create.set_defaults(func=cmd_projects_create)
+    _add_projects_parser(sub)
 
     p_approve_batch = sub.add_parser(
         "approve-batch",
@@ -1770,13 +2468,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review = sub.add_parser(
         "submit-review",
         help="Submit a running pair task for client-driven review (status=review)",
+        epilog=SUBMIT_REVIEW_EPILOG,
     )
     p_submit_review.add_argument("task_id", type=int)
     p_submit_review.add_argument("--agent", default="", help="Submitting agent name")
     p_submit_review.add_argument(
         "--summary", default="", help="Short note on what is being submitted"
     )
-    _finding_outcomes_option(p_submit_review)
+    p_submit_review.add_argument(
+        "--model",
+        default="",
+        help="Model that wrote this submission (#758); required by submission_contract",
+    )
+    p_submit_review.add_argument(
+        "--mutations",
+        default="",
+        help=(
+            "JSON list, one per AC with verifiable_by=test (#1436): "
+            '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
+        ),
+    )
+    _done_report_options(p_submit_review)
+    _add_state_submit_args(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
 
     p_review_brief = sub.add_parser(
@@ -1816,6 +2529,7 @@ def build_parser() -> argparse.ArgumentParser:
             "without linked_task_id (#436); drafts still need human approval"
         ),
     )
+    _add_state_verdict_args(p_review_verdict)
     p_review_verdict.set_defaults(func=cmd_review_verdict)
 
     p_steward_judgement = sub.add_parser(
@@ -1825,12 +2539,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_steward_judgement.add_argument("task_id", type=int)
     p_steward_judgement.add_argument("--generation", type=int, required=True)
     p_steward_judgement.add_argument(
-        "--kind", required=True, choices=["verdict", "dor", "disposition"]
+        "--kind", required=True, choices=list(STEWARD_JUDGEMENT_KINDS)
     )
     p_steward_judgement.add_argument(
         "--verdict",
         required=True,
-        choices=["approve", "changes_requested", "escalate"],
+        choices=[*STEWARD_VERDICTS, *STEWARD_ADVISOR_VERDICTS],
     )
     p_steward_judgement.add_argument(
         "--confidence", default="", choices=["", "high", "medium", "low"]
@@ -1848,6 +2562,7 @@ def build_parser() -> argparse.ArgumentParser:
         help='JSON list of closures: [{"finding_uid":"...","type":"fixed"}]',
     )
     p_steward_judgement.set_defaults(func=cmd_steward_judgement)
+    _add_false_approve_parser(sub)
 
     p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
     p_claim.add_argument("task_id", type=int)
@@ -1943,7 +2658,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "report", "blocker", "done", "review", "arbitration"],
         help="Update type",
     )
-    _finding_outcomes_option(p_update)
+    _done_report_options(p_update)
     p_update.set_defaults(func=cmd_update)
 
     # updates — list updates
@@ -2097,6 +2812,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     p_refine.add_argument(
+        "--freeze-rationale",
+        dest="freeze_rationale",
+        default=None,
+        help="Why the work may enter a frozen project (#1594); '' clears",
+    )
+    p_refine.add_argument(
         "--cos",
         dest="class_of_service",
         choices=["standard", "expedite", "fixed_date", "intangible"],
@@ -2125,6 +2846,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Defect passport: when the defect was noticed",
     )
     p_refine.add_argument(
+        "--release-id",
+        dest="release_id",
+        type=int,
+        default=None,
+        help="Defect passport: release the defect showed up in (#917)",
+    )
+    p_refine.add_argument(
         "--clear-caused-by",
         dest="clear_caused_by",
         action="store_true",
@@ -2145,6 +2873,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="As a <role> I want <X> so that <Y>",
     )
+    _add_result_kind_args(p_refine)
     p_refine.add_argument("--problem", dest="problem", default=None)
     p_refine.add_argument("--value", dest="value", default=None, help="Business value")
     p_refine.add_argument(
@@ -2375,6 +3104,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_prod.add_argument("--json", action="store_true", help="Print raw JSON")
     p_prod.set_defaults(func=cmd_prod_state)
 
+    p_blocks = sub.add_parser(
+        "release-blocks", help="Open release alerts (red CI, conflict, refusal)"
+    )
+    p_blocks.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_blocks.set_defaults(func=cmd_release_blocks)
+
+    p_next = sub.add_parser(
+        "next-task", help="Which task the hub would start next, and why others wait"
+    )
+    p_next.add_argument(
+        "--project", default="", help="Project slug (default: shadow ones)"
+    )
+    p_next.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_next.set_defaults(func=cmd_next_task)
+
+    _add_executor_stop_parser(sub)
+
+    p_slots = sub.add_parser(
+        "slots", help="Executor channels and slots: which task, since when (#1434)"
+    )
+    p_slots.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_slots.set_defaults(func=cmd_slots)
+
     p_undelivered = sub.add_parser(
         "undelivered", help="Completed tasks whose PR is still open"
     )
@@ -2394,6 +3146,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ledger.add_argument("--json", action="store_true", help="Print raw JSON")
     p_ledger.set_defaults(func=cmd_merge_ledger_backfill)
+
+    p_usage = sub.add_parser(
+        "cursor-usage-import",
+        help="Выгрузка usage Cursor на заказы ревью (сухой прогон без --apply)",
+    )
+    p_usage.add_argument("file", help="CSV usage-events из кабинета Cursor")
+    p_usage.add_argument("--apply", action="store_true", help="Записать")
+    p_usage.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_usage.set_defaults(func=cmd_cursor_usage_import)
 
     p_review_queue = sub.add_parser(
         "review-queue",
@@ -2496,12 +3257,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_admin_agents = admin_sub.add_parser("agents", help="Manage AI agents")
     agents_sub = p_admin_agents.add_subparsers(dest="agents_command", required=True)
 
-    p_agents_create = agents_sub.add_parser(
-        "create", help="Create an AI agent identity"
-    )
-    p_agents_create.add_argument("--name", required=True, help="Agent slug/username")
-    p_agents_create.add_argument("--display-name", dest="display_name", default="")
-    p_agents_create.set_defaults(func=cmd_admin_agents_create)
+    _add_agents_create_parser(agents_sub)
 
     # admin keys
     p_admin_keys = admin_sub.add_parser("keys", help="Manage API keys")
@@ -2512,6 +3268,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_keys_create.add_argument("--name", required=True, help="Key name/description")
     p_keys_create.add_argument(
         "--expires-days", dest="expires_days", type=int, default=None
+    )
+    p_keys_create.add_argument(
+        "--project",
+        action="append",
+        default=None,
+        help="Bind the key to a project slug (repeatable); CI keys should be bound",
     )
     p_keys_create.set_defaults(func=cmd_admin_keys_create)
 
@@ -2558,6 +3320,93 @@ def build_parser() -> argparse.ArgumentParser:
     p_tpl.set_defaults(func=cmd_template)
 
     return parser
+
+
+def _worktree_refusal(task: dict[str, Any], project: dict[str, Any], clone: str) -> str:
+    """Why ``clone`` is not the project's clone; ``""`` when it is (#1515)."""
+    import asyncio
+
+    if str(task.get("result_kind") or "") == "state":
+        # #1647: у задачи-состояния нет ветки и worktree; рабочая копия не
+        # создаётся ни при каком клоне.
+        return (
+            f"задача #{task.get('id')} — состояние (result_kind=state): у неё нет "
+            "ветки и worktree, работа идёт в мире, а не в репозитории"
+        )
+
+    from hub.integrations.git_ops import origin_url, repo_slug
+
+    want = repo_slug(str(project.get("repo") or ""))
+    if not want:
+        return (
+            f"у проекта задачи #{task.get('id')} не задан repo: сверить клон не с чем"
+        )
+    origin = asyncio.run(origin_url(clone))
+    if not origin:
+        return f"у клона {clone} нет remote origin: сверить с repo проекта нечем"
+    if repo_slug(origin) != want:
+        return (
+            f"origin клона {clone} — {repo_slug(origin)}, а repo проекта задачи "
+            f"#{task.get('id')} — {want}; это не тот клон"
+        )
+    return ""
+
+
+def cmd_worktree(args: argparse.Namespace) -> int:
+    """Create or reuse the task's worktree at the #459 path and print it (#1515)."""
+    import asyncio
+
+    from hub.integrations.git_ops import (
+        WorktreeRefused,
+        canonical_task_branch,
+        clone_root,
+        ensure_task_worktree,
+    )
+
+    clone = asyncio.run(clone_root(args.repo or "."))
+    if not clone:
+        print(f"{args.repo or '.'} не git-клон: нечего сверять", file=sys.stderr)
+        return 1
+    task = _api("GET", f"/api/tasks/{args.task_id}")
+    pid = (task.get("project") or {}).get("id")
+    projects = _api("GET", "/api/projects?include_archived=true") or []
+    project: dict[str, Any] = next((p for p in projects if p.get("id") == pid), {})
+    reason = _worktree_refusal(task, project, clone)
+    if reason:
+        print(f"отказ: {reason}", file=sys.stderr)
+        return 1
+    branch = task.get("branch") or canonical_task_branch(
+        args.task_id, "", task.get("title") or ""
+    )
+    notes: list[str] = []
+    try:
+        path = asyncio.run(
+            ensure_task_worktree(
+                args.task_id,
+                branch,
+                clone,
+                project.get("default_branch") or "develop",
+                notes,
+            )
+        )
+    except WorktreeRefused as exc:
+        print(f"отказ: {exc}", file=sys.stderr)
+        return 1
+    for note in notes:
+        print(f"предупреждение: {note}", file=sys.stderr)
+    print(path)
+    return 0
+
+
+def _add_worktree_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1515)."""
+    p = sub.add_parser(
+        "worktree",
+        help="Create/reuse the task worktree at the hub's rule path and print it",
+    )
+    p.add_argument("task_id", type=int)
+    p.add_argument("--repo", default="", help="Clone path (default: current git clone)")
+    p.set_defaults(func=cmd_worktree)
 
 
 def main() -> int:

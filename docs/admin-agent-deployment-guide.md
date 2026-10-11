@@ -372,6 +372,14 @@ sudo chmod 0755 /etc/cron.daily/haiplane-hub-backup
 Один раз вручную проверить корректность бэкапа и восстановления на тестовом
 пути.
 
+Перед каждым рестартом при выкате через `deploy/remote-deploy.sh` снимок делает
+сам скрипт (#1590): рецепт тот же (backup API от пользователя хаба, база только
+на чтение `mode=ro`), плюс `PRAGMA integrity_check` копии, `gzip`, каталог
+`0700`, файлы `0600`, имя `predeploy-<UTC>-<sha7>.db.gz`, последние 10. Код —
+`deploy/predeploy-backup.py`, описание — `deploy/CD.md`. Каталог бэкапов
+должен принадлежать пользователю хаба и иметь режим `0700` (скрипт выставит
+его сам, если каталог ему принадлежит).
+
 ---
 
 ## 11. Smoke-тесты
@@ -408,7 +416,8 @@ sudo -u haiplane git fetch --tags
 NEW_TAG=<запросить у оператора>
 sudo -u haiplane git checkout "$NEW_TAG"
 sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e .
-# Бэкап перед рестартом
+# Бэкап перед рестартом (при выкате скриптом deploy/remote-deploy.sh он
+# делается сам и проверяется, #1590; здесь — ручной путь)
 sudo /etc/cron.daily/haiplane-hub-backup
 sudo systemctl restart haiplane-hub
 sudo journalctl -u haiplane-hub -f --since '1 min ago'

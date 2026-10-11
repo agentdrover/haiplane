@@ -150,7 +150,7 @@ async def main() -> int:
     args = parser.parse_args()
 
     path = Path(args.budget_file)
-    snapshot = await catalog_snapshot()
+    snapshot = await catalog_snapshot("agent")
 
     if args.update:
         existing_stamp, existing_headroom = "", 10.0

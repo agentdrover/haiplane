@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 import time
 import urllib.parse
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator
@@ -18,7 +21,7 @@ from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
-from hub.mcp_internal_auth import identity_context_get
+from hub.mcp_internal_auth import identity_context_get, identity_is_human
 from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -41,9 +44,15 @@ from hub.models import (
     latest_review_freshness,
 )
 from hub.mcp_signature import Hidden, with_model_signature
-from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
+from hub.workflow_reference import (
+    AGENT_HIDDEN_TOOLS,
+    HUMAN_ROUTES,
+    build_mcp_instructions,
+    lifecycle_map_lines,
+)
 from mcp.types import CallToolResult
 
+from hub.mcp_task_card import bounds_lines, build_compact_view
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -112,6 +121,23 @@ class InstrumentedFastMCP(FastMCP):
                 names.add(field_info.alias)
         return names
 
+    async def list_tools_for(self, view: Literal["agent", "full"]) -> list[Any]:
+        """``tools/list`` as one view sees it (#1624).
+
+        ``agent`` drops the human-only lifecycle gates; ``full`` is everything
+        registered. Built from a fresh list: the tool manager is shared by all
+        callers and its tools are never touched here.
+        """
+        tools = await super().list_tools()
+        if view == "full":
+            return list(tools)
+        return [tool for tool in tools if tool.name not in AGENT_HIDDEN_TOOLS]
+
+    async def list_tools(self) -> list[Any]:
+        # Decided on EVERY call from the protected identity of this request.
+        # The SDK's own cache holds schemas only, never who may see them.
+        return await self.list_tools_for("full" if identity_is_human() else "agent")
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         principal_id, role = identity_context_get()
         started = time.perf_counter()
@@ -122,6 +148,11 @@ class InstrumentedFastMCP(FastMCP):
             else []
         )
         try:
+            # Hidden is also refused. Inside the try so the refusal is measured
+            # like any other failed call (one record), and before the tool
+            # runs so no REST request or mutation happens (#1624).
+            if name in AGENT_HIDDEN_TOOLS and not identity_is_human():
+                raise ToolError(_human_only_refusal(name, arguments))
             result = await super().call_tool(name, arguments)
         except Exception as exc:
             await record_call(
@@ -175,14 +206,19 @@ def _hub_url() -> str:
 def _hub_token() -> str:
     from hub.config import env_get
 
-    env_tok = (env_get("HUB_TOKEN", "") or "").strip()
-    if env_tok:
-        return env_tok
-    # Streamable MCP mounted in the same process: reuse caller's Bearer (set by
-    # AuthMiddleware via hub.mcp_internal_auth) so tools work without HAIPLANE_HUB_TOKEN.
     from hub.mcp_internal_auth import bearer_context_get
 
-    return (bearer_context_get() or "").strip()
+    # Streamable MCP mounted in the same process: the REST call a tool makes
+    # carries the CALLER's Bearer (set by AuthMiddleware via
+    # hub.mcp_internal_auth). It goes first, never the service's env token
+    # (#1556): an env token ahead of it would let a read-only caller write
+    # under someone else's rights.
+    caller = (bearer_context_get() or "").strip()
+    if caller:
+        return caller
+    # Local stdio MCP has no inbound request, so no caller bearer: the env
+    # token is its only credential.
+    return (env_get("HUB_TOKEN", "") or "").strip()
 
 
 def _auth_headers() -> dict[str, str]:
@@ -190,6 +226,27 @@ def _auth_headers() -> dict[str, str]:
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
+
+
+def _human_only_refusal(name: str, arguments: dict[str, Any]) -> str:
+    """JSON envelope for an agent that calls a human gate it was never shown."""
+    task_id = arguments.get("task_id") if isinstance(arguments, dict) else None
+    route = HUMAN_ROUTES[name].replace(
+        "{id}", str(task_id) if isinstance(task_id, int) else "{id}"
+    )
+    payload = enrich_error_payload(
+        {
+            "reason": "human_only_gate",
+            "message": "This tool is a human gate and is not available to this token.",
+            "hint": "A person acts on this: hub UI task card, oc-hub, or REST.",
+            "actor_hint": "human",
+            "next_action": (
+                f"Ask the human owner to run {route} with a human token; "
+                "do not retry this call."
+            ),
+        }
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class HubApiError(Exception):
@@ -313,7 +370,9 @@ _TRANSPORT_WRITE_CHECKS: tuple[tuple[re.Pattern[str], str | None, str], ...] = (
     (
         re.compile(r"^/api/tasks/(?P<task_id>\d+)(?:/|$)"),
         "hub_task_status",
-        "Читать состояние здесь: hub_task_status(task_id={task_id}).",
+        "Читать состояние здесь: hub_task_status(task_id={task_id}, updates=-1): "
+        "лента по умолчанию усечена, и записи, которой нет в окне, это "
+        "не доказывает — перед повтором прочитай updates=-1.",
     ),
     (
         re.compile(r"^/api/tasks(?:/|$)"),
@@ -847,10 +906,46 @@ async def hub_project_status() -> CallToolResult:
             title = d.get("title", "Decision")
             parts.append(f"- {title}")
 
+    queue, queue_error = await _orchestrator_queue()
+    parts.extend(_queue_lines(queue))
+    if queue_error:
+        parts.append(f"\n## Next Task: не удалось прочитать очередь — {queue_error}")
+
     return structured_echo_result(
         "\n".join(parts) if parts else "No activity found.",
         dashboard=data,
+        orchestrator_queue=queue,
+        orchestrator_queue_error=queue_error,
     )
+
+
+async def _orchestrator_queue() -> tuple[list[dict[str, Any]], str]:
+    """Ответы очереди исполнения проектов в тени (#1274) и причина сбоя.
+
+    Отдельного инструмента нет намеренно: каталог MCP упёрся в рабочую
+    заморозку описаний (#1241), а обзор проекта — то место, куда агент и
+    так смотрит за «что дальше». Сбой этого чтения не роняет обзор, но и не
+    молчит: пустой список без причины читался бы как «очереди нет».
+    """
+    try:
+        body = await _api_get("/api/orchestrator/next")
+    except Exception as exc:  # noqa: BLE001 - the overview must survive, named
+        return [], f"{type(exc).__name__}: {exc}"
+    projects = body.get("projects") if isinstance(body, dict) else None
+    return [p for p in projects or [] if isinstance(p, dict)], ""
+
+
+def _queue_lines(queue: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for answer in queue:
+        lines.append(
+            f"\n## Next Task (orchestrator queue, {answer.get('mode', 'shadow')}) "
+            f"— {answer.get('project', '?')}"
+        )
+        lines.append(str(answer.get("summary") or ""))
+        for skip in answer.get("skipped") or []:
+            lines.append(f"- #{skip.get('task_id')} {skip.get('detail', '')}")
+    return lines
 
 
 def _tree_query_string(
@@ -891,13 +986,15 @@ async def hub_create_task(
     human_owner: str = "",
     human_reviewer: str = "",
     client_request_id: str = "",
+    work_type: str = "feature",
+    freeze_rationale: str = "",
+    result_kind: str = "commit",
+    rollback: str = "",
 ) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
-    Creates work that is already approved, so an agent token gets 403
-    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which drafts
-    for human approval. Enforced by the API, not here, so it also holds for a
-    token calling POST /api/tasks directly.
+    Already-approved work: an agent token gets 403 ``agent_create_forbidden``
+    (API-enforced); agents use ``hub_propose_task`` (a draft).
 
     Args:
         title: Short title (required)
@@ -907,9 +1004,13 @@ async def hub_create_task(
         priority: 'critical', 'high', 'medium', or 'low'
         runtime: 'auto' or 'openrouter'
         run_immediately: Dispatch at once (not for epic/feature)
-        human_owner: Who is accountable for this task
-        human_reviewer: Who accepts the result
-        client_request_id: Optional idempotency key; safe to retry on timeout
+        human_owner: Accountable person
+        human_reviewer: Accepting person
+        client_request_id: Idempotency key (retry-safe)
+        work_type: feature, bug, refactor, chore, docs, spike, incident
+        freeze_rationale: Why it may enter a frozen project
+        result_kind: commit | state (world state, human-accepted; leaf only)
+        rollback: Undo text; DoR requires it for state
     """
     body: dict[str, Any] = {
         "title": title,
@@ -921,7 +1022,13 @@ async def hub_create_task(
         "run_immediately": run_immediately,
         "human_owner": human_owner,
         "human_reviewer": human_reviewer,
+        "work_type": work_type,
+        "freeze_rationale": freeze_rationale,
     }
+    if result_kind != "commit":
+        body["result_kind"] = result_kind
+    if rollback:
+        body["rollback"] = rollback
     if parent_id is not None:
         body["parent_id"] = parent_id
     extra_headers: dict[str, str] = {}
@@ -951,12 +1058,12 @@ async def hub_create_subtasks(
 
     Args:
         parent_id: Parent task ID (must match hierarchy rules for task_type).
-        items: List of dicts with title, optional description, priority, and
-            optional acceptance_criteria (list of Given/When/Then dicts) and
+        items: List of dicts with title, optional description, priority,
+            work_type, freeze_rationale, result_kind (commit|state), rollback,
+            and optional acceptance_criteria (list of Given/When/Then dicts) and
             risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
-        source: agent (draft) or human (open). ``human`` is human-only (#360):
-            an agent token asking for it gets 403 agent_create_forbidden.
+        source: agent (draft) or human (open; human-only, #360).
         agent: Assigned agent name when source is agent.
     """
     if not items:
@@ -1207,15 +1314,32 @@ async def hub_list_dependencies(task_id: int) -> CallToolResult:
     return structured_echo_result(_format_dependency_edges(edges), dependencies=edges)
 
 
-@mcp.tool()
-async def hub_task_status(task_id: int) -> HubTaskStatusResult:
-    """Get detailed status of a specific task including updates and log tail.
+def _verdict_route_line(task: dict[str, Any]) -> str:
+    """#1440: who will write the verdict — the line the hub computed, verbatim."""
+    route = task.get("verdict_route")
+    return str(route.get("line") or "") if isinstance(route, dict) else ""
 
-    Args:
-        task_id: The task ID number
-    """
-    await _api_post(f"/api/tasks/{task_id}/refresh")
-    task = await _api_get(f"/api/tasks/{task_id}")
+
+def _cause_suggestion_line(task: dict[str, Any]) -> str:
+    """The defect's release and culprit HYPOTHESIS, never read as caused_by (#917)."""
+    suggestion = task.get("cause_suggestion")
+    if task.get("release_id") is None or not suggestion:
+        return ""
+    head = f"Release: #{task['release_id']}; гипотеза о виновнике"
+    unmatched = int(suggestion.get("unmatched_rows") or 0)
+    tail = f"; вне состава {unmatched} несопоставимых мержей" if unmatched else ""
+    candidates = suggestion.get("candidates") or []
+    if not candidates:
+        return f"{head}: нет — {suggestion.get('reason', '')}{tail}"
+    names = ", ".join(
+        f"#{c['task_id']}{' (подтверждён)' if c.get('confirmed') else ''}"
+        f" [{'; '.join(c.get('overlap') or [])}]"
+        for c in candidates
+    )
+    return f"{head}: {names}{tail}"
+
+
+def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts = [
         f"Task #{task['id']}: {task['title']}",
         f"Status: {task['status']}",
@@ -1234,10 +1358,37 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     if task.get("worktree_path"):
         parts.append(f"Worktree: {task['worktree_path']}")
     parts.extend(_dependency_lines(task))
-    if task.get("description"):
-        parts.append(f"\nDescription:\n{task['description']}")
-    if task.get("technical_hints"):
-        parts.append(f"\nTechnical hints:\n{task['technical_hints']}")
+    parts.extend(filter(None, [_cause_suggestion_line(task)]))
+    parts.extend(filter(None, [_verdict_route_line(task)]))
+    return parts
+
+
+def _status_review_lines(task: dict[str, Any]) -> list[str]:
+    latest_review = task.get("latest_review")
+    if not latest_review:
+        return []
+    freshness = latest_review_freshness(
+        bool(latest_review.get("is_current")),
+        bool(latest_review.get("closed_by_decision")),
+    )
+    solo = (
+        " [SELF-APPROVED: solo mode, not independent]"
+        if latest_review.get("self_approved")
+        else ""
+    )
+    lines = [
+        f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
+        f"for submission #{latest_review.get('submission_generation', 0)} "
+        f"({freshness}){solo}"
+    ]
+    lines.extend(
+        _finding_line(finding) for finding in (latest_review.get("findings") or [])[:10]
+    )
+    return lines
+
+
+def _status_scope_lines(task: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
     scope_in = task.get("scope_in") or []
     scope_out = task.get("scope_out") or []
     if scope_in or scope_out:
@@ -1249,50 +1400,147 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     validation = task.get("validation_commands") or []
     if validation:
         parts.append("\nValidation commands:")
-        for cmd in validation:
-            parts.append(f"  - {cmd}")
-    if task.get("lifecycle_hint"):
-        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
-    latest_review = task.get("latest_review")
-    if latest_review:
-        freshness = latest_review_freshness(
-            bool(latest_review.get("is_current")),
-            bool(latest_review.get("closed_by_decision")),
-        )
-        solo = (
-            " [SELF-APPROVED: solo mode, not independent]"
-            if latest_review.get("self_approved")
-            else ""
-        )
-        parts.append(
-            f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
-            f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness}){solo}"
-        )
-        for finding in (latest_review.get("findings") or [])[:10]:
-            parts.append(_finding_line(finding))
+        parts.extend(f"  - {cmd}" for cmd in validation)
+    return parts
+
+
+def _status_ac_lines(task: dict[str, Any]) -> list[str]:
     acs = task.get("acceptance_criteria") or []
-    if acs:
-        parts.append("\nAcceptance criteria:")
-        for ac in acs:
-            parts.append(
-                f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]\n"
-                f"    Given: {ac.get('given', '')}\n"
-                f"    When: {ac.get('when', '')}\n"
-                f"    Then: {ac.get('then', '')}"
-            )
-    if task.get("updates"):
+    if not acs:
+        return []
+    parts = ["\nAcceptance criteria:"]
+    for ac in acs:
+        parts.append(
+            f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]\n"
+            f"    Given: {ac.get('given', '')}\n"
+            f"    When: {ac.get('when', '')}\n"
+            f"    Then: {ac.get('then', '')}"
+        )
+    return parts
+
+
+def _update_line(u: dict[str, Any]) -> str:
+    mark = f"#{u['id']} " if u.get("id") is not None else ""
+    return (
+        f"  {mark}[{u.get('created_at', '')}] ({u.get('kind', '')}) "
+        f"{u.get('agent', '')}: {u.get('content', '')}"
+    )
+
+
+def _full_update_line(u: dict[str, Any]) -> str:
+    """The feed line exactly as it was before #1613: no id."""
+    return f"  [{u['created_at']}] ({u['kind']}) {u.get('agent', '')}: {u['content']}"
+
+
+def _status_tail_lines(
+    updates: list[dict[str, Any]], line: Callable[[dict[str, Any]], str]
+) -> list[str]:
+    parts: list[str] = []
+    if updates:
         parts.append("\nUpdates:")
-        for u in task["updates"]:
-            parts.append(
-                f"  [{u['created_at']}] ({u['kind']}) {u.get('agent', '')}: {u['content']}"
-            )
-    if task.get("result_text"):
-        parts.append(f"\nResult:\n{task['result_text']}")
+        parts.extend(line(u) for u in updates)
+    return parts
+
+
+def _status_log_lines(task: dict[str, Any], result_text: str) -> list[str]:
+    parts: list[str] = []
+    if result_text:
+        parts.append(f"\nResult:\n{result_text}")
     if task.get("log_tail"):
         parts.append("\nLog tail:\n" + "\n".join(task["log_tail"][-20:]))
-    summary = "\n".join(parts)
-    return structured_tool_result(summary, HubTaskStatusStructured(task=task))
+    return parts
+
+
+def _full_status_text(task: dict[str, Any]) -> str:
+    parts = _status_header_lines(task)
+    if task.get("description"):
+        parts.append(f"\nDescription:\n{task['description']}")
+    if task.get("technical_hints"):
+        parts.append(f"\nTechnical hints:\n{task['technical_hints']}")
+    parts.extend(_status_scope_lines(task))
+    if task.get("lifecycle_hint"):
+        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    parts.extend(_status_review_lines(task))
+    parts.extend(_status_ac_lines(task))
+    parts.extend(_status_tail_lines(task.get("updates") or [], _full_update_line))
+    parts.extend(_status_log_lines(task, task.get("result_text") or ""))
+    return "\n".join(parts)
+
+
+def _compact_counts_lines(task: dict[str, Any]) -> list[str]:
+    """Scope, validation and criteria as counts; ids of the criteria only."""
+    counts = [
+        f"{name}: {len(task.get(name) or [])}"
+        for name in ("scope_in", "scope_out", "validation_commands")
+        if task.get(name)
+    ]
+    acs = task.get("acceptance_criteria") or []
+    parts = ["\nStatement: " + "; ".join(counts)] if counts else []
+    if acs:
+        ids = ", ".join(
+            f"{ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]" for ac in acs
+        )
+        parts.append(f"Acceptance criteria ({len(acs)}): {ids}")
+    return parts
+
+
+def _compact_status_text(task: dict[str, Any], view: dict[str, Any]) -> str:
+    texts = view["texts"]
+    parts = _status_header_lines(task)
+    if task.get("work_type") or task.get("size"):
+        parts.append(
+            f"Work type: {task.get('work_type', '-')}, size: {task.get('size') or '-'}"
+        )
+    if "description" in texts:
+        parts.append(f"\nDescription:\n{texts['description']}")
+    if "technical_hints" in texts:
+        parts.append(f"\nTechnical hints:\n{texts['technical_hints']}")
+    parts.extend(_compact_counts_lines(task))
+    if task.get("lifecycle_hint"):
+        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    parts.extend(_status_review_lines(task))
+    parts.extend(_status_tail_lines(view["updates"], _update_line))
+    parts.extend(_status_log_lines(task, texts.get("result_text", "")))
+    parts.extend(["", *bounds_lines(view["bounds"])] if view["bounds"] else [])
+    return "\n".join(parts)
+
+
+@mcp.tool()
+async def hub_task_status(
+    task_id: int, updates: int = 10, full: bool = False
+) -> HubTaskStatusResult:
+    """Task status: compact card, newest updates, log tail.
+
+    Args:
+        task_id: The task ID number
+        updates: newest entries shown; -1 all, 0 none
+        full: whole task and feed
+    """
+    if updates < -1 and not full:
+        raise HubApiError(
+            {
+                "reason": "invalid_updates",
+                "message": f"updates={updates} is not valid: use -1 (whole feed), 0 (none) or a count.",
+                "hint": "hub_task_status(task_id, updates=-1) reads the whole feed; full=true the whole task.",
+            }
+        )
+    # refresh syncs the task with its dispatch job — a state transition, not a
+    # read. A read-only caller (watcher, #1556) gets the stored state instead;
+    # opening that POST to it would be a hole in the role, not a convenience.
+    if identity_context_get()[1] != "watcher":
+        await _api_post(f"/api/tasks/{task_id}/refresh")
+    task = await _api_get(f"/api/tasks/{task_id}")
+    if full:
+        return structured_tool_result(
+            _full_status_text(task), HubTaskStatusStructured(task=task)
+        )
+    view = build_compact_view(task, updates)
+    return structured_tool_result(
+        _compact_status_text(task, view), HubTaskStatusStructured(task=view["card"])
+    )
+
+
+_drop_generated_titles("hub_task_status", ("task_id", "updates", "full"))
 
 
 @mcp.tool()
@@ -1454,6 +1702,13 @@ async def _task_mutation_response(
     fallback_status: str | None = None,
 ) -> str:
     body = task or {"id": task_id, "status": fallback_status or "?"}
+    if body.get("status") == "review" and "verdict_route" not in body:
+        # #1440: a mutation answer is not the enriched view, and the verdict
+        # route lives only there — read it, so the envelope of a task waiting
+        # in review names who acts instead of guessing from the status.
+        fresh = await _read_task(task_id) or {}
+        if fresh.get("status") == "review":
+            body = {**body, "verdict_route": fresh.get("verdict_route")}
     return _format_mutation_success(message, body, transition_from=prior_status)
 
 
@@ -1463,20 +1718,20 @@ async def hub_report_done(
     summary: str,
     agent: str = "",
     finding_outcomes: list[dict[str, Any]] | None = None,
+    prevention: dict[str, Any] | None = None,
 ) -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
-    AUTHOR step. Universal Review Gate (#306): this completes the task only
-    when the current submission already carries an APPROVED review by another
-    actor (or auto_review=false opted out). Otherwise it IS a submission — the
-    task routes to ``review`` or ``ci_check`` and the response names the next
-    action.
+    AUTHOR step (#306): completes only with a current APPROVED review by
+    another actor (or auto_review=false). Else it IS a submission: the
+    task goes to review or ci_check; the response says what is next.
 
     Args:
         task_id: The task ID to report on
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
         finding_outcomes: same as hub_submit_for_review (#1155).
+        prevention: needed if found_in=prod (#919): {kind: regression_test|rule|accepted_risk, ref, reason, revisit}.
     """
     prior_status: str | None = None
     try:
@@ -1492,6 +1747,8 @@ async def hub_report_done(
         }
         if finding_outcomes:
             payload["finding_outcomes"] = finding_outcomes
+        if prevention:
+            payload["prevention"] = prevention
         result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
@@ -1731,7 +1988,53 @@ async def _attach_live_worktree_paths(rows: list[dict[str, Any]]) -> None:
             row["worktree_path"] = path
 
 
-async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
+async def _release_block_lines() -> list[str]:
+    """«Релиз заблокирован с …» per open alert, from /api/release-blocks.
+
+    A failed read is named, never skipped: an empty section reads as «аварий
+    нет», which is the very silence #1420 exists to end (#516; review
+    326e28d01b4c8d1b).
+    """
+    from hub.services.release_alert import release_block_lines
+
+    unknown = "статус аварий релиза не получен: "
+    try:
+        data = await _api_get("/api/release-blocks")
+    except HubApiError as exc:
+        return [unknown + str(exc.payload.get("message") or exc)]
+    except Exception as exc:  # noqa: BLE001 - context must render without it
+        return [
+            unknown
+            + (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+        ]
+    blocks = data.get("release_blocks") if isinstance(data, dict) else None
+    if not isinstance(blocks, list):
+        return [unknown + "ответ без списка release_blocks"]
+    return release_block_lines(blocks)
+
+
+_EGRESS_READ_SECONDS = 2.0
+
+
+async def _egress_lines() -> list[str]:
+    """«GitHub недоступен с сервера N мин…» from the public /health, or none."""
+    from hub.services.egress_watch import egress_lines
+
+    unread = ["Состояние связи сервера с GitHub не прочитано"]
+    try:
+        # Short wait: a hub that cannot answer /health in 2 s must not hold
+        # the whole context for the client's full timeout.
+        data = await asyncio.wait_for(_api_get("/health"), timeout=_EGRESS_READ_SECONDS)
+    except Exception:  # noqa: BLE001 - context must render without it
+        return unread
+    egress = data.get("egress") if isinstance(data, dict) else None
+    # A hub that predates the field has nothing to say; that is not a failure.
+    return egress_lines(egress) if isinstance(egress, dict) else []
+
+
+async def _general_hub_context(
+    *, max_chars: int | None, mode: str, project: str = ""
+) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
     Combines the connected instance, the caller's identity, their active
@@ -1770,6 +2073,16 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
+    # #1645: the server cannot reach GitHub — the first thing after the
+    # instance, whoever the caller is: /health is public, so no identity is
+    # needed, and a failed read just leaves no line (never a false "fine").
+    lines.extend(await _egress_lines())
+    # #1420: an open release alert comes before identity and tasks — a red
+    # develop holds back everything merged, and this is what a session reads
+    # first. Best effort: an old hub without the route just has no line, and
+    # a caller the hub does not know cannot read it anyway.
+    if identity:
+        lines.extend(await _release_block_lines())
     if identity:
         lines.append(
             f"Identity: {username or 'anonymous'} "
@@ -1809,6 +2122,12 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             "Note: could not tell headless review from a client-driven one "
             "(the review lookup failed) — rows in review are listed as Waiting."
         )
+    # #1594: политика проекта видна ДО создания задачи - заморозка решает, какую
+    # работу и с каким обоснованием в проект пустят. Без project - default.
+    if identity:
+        policy_text = await _policy_brief_for_slug(project.strip() or "default")
+        if policy_text:
+            lines.append(policy_text.strip())
     lines.append("")
     lines.extend(lifecycle_map_lines())
 
@@ -1822,6 +2141,10 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         "\n".join(lines),
         budget,
         shrink="my_tasks",
+        # #1645: under a tight cap the prose must keep its head (title,
+        # instance, the egress alert), so the structured identity — which the
+        # prose already restates in the Identity line — goes before the text is cut.
+        drop_order=("identity",),
         identity=identity,
         my_tasks=my_tasks,
     )
@@ -1832,41 +2155,148 @@ async def hub_my_context(
     task_id: int | None = None,
     max_chars: int | None = None,
     mode: str = "full",
+    project: str = "",
 ) -> CallToolResult:
-    """Get work context for an agent: hierarchy breadcrumb, siblings, progress, children.
+    """Work context for a task: breadcrumb, siblings, progress, children, project policy.
 
-    Call it before starting work on a task to understand its place in the project.
-    Omit ``task_id`` (or pass null) to get the general Hub context instead — the
-    Workflow reference plus your own active tasks and the connected instance — which
-    is what to read when you have no active task yet.
+    Read it before starting a task. Omit ``task_id`` for the general Hub context
+    (Workflow reference, your active tasks, the instance) when you have no task yet.
 
-    ``mode=summary`` or ``max_chars`` caps the WHOLE response — text and
-    structuredContent together — at 4000 chars by default, and names what did
-    not fit in ``bounds``. Without either, the full context is returned.
+    ``mode=summary`` or ``max_chars`` caps the WHOLE response (text and
+    structuredContent) at 4000 chars by default; ``bounds`` names what did not
+    fit. Without either, the full context is returned.
 
     Args:
         task_id: The task ID to get context for. Omit for general Hub context.
         max_chars: Cap on the whole response, in characters
         mode: ``full`` (default) or ``summary``; ``brief`` is an alias of
             ``summary``, anything else is rejected with the allowed set.
+        project: Project slug for the policy shown without task_id.
     """
     try:
         mode = _normalize_context_mode(mode)
     except ValueError as exc:
         return structured_echo_result(str(exc), error="invalid_mode")
 
+    if task_id is not None and project.strip():
+        return structured_echo_result(
+            "task_id and project are mutually exclusive: a task's project is "
+            "inherited from its epic; pass one of them.",
+            error="invalid_arguments",
+        )
     if task_id is None:
-        return await _general_hub_context(max_chars=max_chars, mode=mode)
+        return await _general_hub_context(
+            max_chars=max_chars, mode=mode, project=project
+        )
 
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
+    text += await _policy_brief_text(ctx)
+    path_block = await _path_brief_text(ctx)
+    if mode == "summary":
+        # #1643: потолок режет хвост, поэтому короткий блок стоит в начале —
+        # как сводка правил; в full он остаётся в конце.
+        text = path_block.lstrip("\n") + "\n\n" + text if path_block else text
+    else:
+        text += path_block
+    # Блок уже в тексте: во втором представлении он не нужен.
+    ctx = {k: v for k, v in ctx.items() if k != "path_brief"}
+    extra: dict[str, Any] = {}
+    rules = ctx.get("working_rules")
+    if rules and rules.get("mode") == "summary":
+        # #1630: сводка правил живёт отдельным полем вне "context": его нет
+        # в _CONTEXT_DROP_ORDER, она мала и остаётся в обоих представлениях.
+        from hub.models import WorkingRules
+        from hub.services import working_rules as wr_service
+
+        try:
+            extra["working_rules_summary"] = wr_service.compact_summary(
+                WorkingRules.model_validate(rules)
+            )
+            ctx = {k: v for k, v in ctx.items() if k != "working_rules"}
+        except ValueError:
+            pass
     return fit_echo_result(
         text,
         _context_char_budget(max_chars, mode),
         drop_order=_CONTEXT_DROP_ORDER,
         context=ctx,
+        **extra,
     )
+
+
+async def _policy_brief_text(ctx: dict[str, Any]) -> str:
+    """Блок «политика проекта» для контекста задачи (#1457); best effort."""
+    layer = (ctx.get("working_rules") or {}).get("project_policy")
+    if layer is not None:
+        # #1630: политика уже пришла в блоке — второй запрос не нужен, а
+        # сессии implementer маршрут /effective-policy закрыт.
+        # В mode=full она уже есть в разделе context_text.
+        text = layer.get("text") or ""
+        in_summary = (ctx.get("working_rules") or {}).get("mode") == "summary"
+        return f"\n\n{text}" if text and in_summary else ""
+    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
+    return await _policy_brief_for_slug(slug)
+
+
+async def _policy_brief_for_slug(slug: str) -> str:
+    """Тот же блок по слагу проекта: для задачи и для контекста без задачи."""
+    from hub.services.effective_policy import format_policy_brief
+
+    if not slug:
+        return ""
+    try:
+        data = await _api_get(
+            f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
+        )
+    except HubApiError as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not read: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return f"\n\nполитика проекта не прочитана: {exc}"
+    try:
+        return "\n\n" + "\n".join(format_policy_brief(data))
+    except (KeyError, TypeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not parsed: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return "\n\nполитика проекта не прочитана: ответ хаба не разобран"
+
+
+async def _path_brief_text(ctx: dict[str, Any]) -> str:
+    """Блок «что дальше» для контекста задачи (#1527); best effort.
+
+    Тот же расчёт, что у REST и CLI: следующая задача проекта и путь эпиков.
+    Сервер кладёт готовый блок в /context (#1643): сессии исполнителя /path
+    закрыт. В /path идём только за ответом без блока (хаб старее).
+    """
+    from hub.services.project_path import format_path_brief
+
+    brief = ctx.get("path_brief")
+    if isinstance(brief, dict):
+        # Блок есть — в /path не идём, даже если строк нет: implementer он
+        # закрыт, а «нет строк» не значит «хаб старее».
+        lines = [str(line) for line in brief.get("lines") or []]
+        if lines:
+            return "\n\n" + "\n".join(lines)
+        if brief.get("status") == "no_project":
+            return "\n\nПуть проекта: у задачи нет проекта — блока «что дальше» нет"
+        return "\n\nПуть проекта: сервер блок не передал (неизвестно)"
+    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
+    if not slug:
+        return ""
+    try:
+        data = await _api_get(f"/api/projects/{urllib.parse.quote(slug, safe='')}/path")
+    except HubApiError as exc:
+        return f"\n\nпуть проекта не прочитан: {exc}"
+    return "\n\n" + "\n".join(format_path_brief(data))
 
 
 @mcp.tool()
@@ -1966,6 +2396,48 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
     return _format_mutation_success(message, task, transition_from=prior_status)
 
 
+def _area_check_note(result: dict[str, Any] | None) -> str:
+    """Warn-mode area overlap of a claim/pair-start, as one line (#1433)."""
+    found = (result or {}).get("area_check")
+    if not isinstance(found, dict) or not found.get("detail"):
+        return ""
+    return (
+        f"\nArea overlap (claim_area_check={found.get('mode', 'warn')}): "
+        f"{found['detail']}. Recorded in the card; coordinate before editing."
+    )
+
+
+def _worktree_hint_note(result: dict[str, Any] | None) -> str:
+    """Where the task worktree goes, from claim/pair-start (#1515)."""
+    hint = (result or {}).get("worktree_hint")
+    return f"\nWorktree: {hint}" if hint else ""
+
+
+def _working_rules_note(task_id: int, result: dict[str, Any] | None) -> str:
+    """«Правила работы» из ответа pair-start, в пределах потолков (#1630).
+
+    Навык — до 6000 знаков, файл репозитория — до 4000 с пометкой усечения и
+    указателем на hub_my_context(mode="full"). Слой репозитория остаётся
+    данными: маркеры и экранирование — в render_working_rules.
+    """
+    raw = (result or {}).get("working_rules")
+    if not raw:
+        return ""
+    from hub.models import WorkingRules
+    from hub.services import working_rules as wr_service
+
+    try:
+        block = WorkingRules.model_validate(raw)
+    except ValueError:
+        return ""
+    return "\n\n" + wr_service.render_working_rules(
+        block,
+        skill_cap=wr_service.MCP_SKILL_CAP,
+        repo_cap=wr_service.MCP_REPO_CAP,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
+    )
+
+
 @mcp.tool()
 async def hub_pair_start(
     task_id: int,
@@ -1977,8 +2449,8 @@ async def hub_pair_start(
 ) -> str:
     """Start pair mode: move an open task to running without headless dispatch.
 
-    Use this when a human works with a local agent, instead of hub_start_task
-    (which dispatches). In worktree mode the response names your task's
+    The agent's way to begin work: claim, then pair-start (no headless dispatch).
+    In worktree mode the response names your task's
     isolated worktree — work THERE, not in the shared clone.
 
     Args:
@@ -2023,6 +2495,8 @@ async def hub_pair_start(
         f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
         f"agent: {agent_name}, {job_note})."
     )
+    message += _area_check_note(result)
+    message += _worktree_hint_note(result)
     # Worktree isolation (#530): the mode/path live on the pair-start response
     # (not the DB re-read), so read them from `result` and tell the agent where
     # its isolated tree is — otherwise it would keep working in the shared clone.
@@ -2053,6 +2527,7 @@ async def hub_pair_start(
             "name locally — submit_for_review compares what you report against "
             "it and refuses a mismatch."
         )
+    message += _working_rules_note(task_id, result)
     return await _task_mutation_response(
         task_id,
         message,
@@ -2071,24 +2546,24 @@ async def hub_submit_for_review(
     model: str = "",
     accept_areas: bool = False,
     finding_outcomes: list[dict[str, Any]] | None = None,
+    mutations: list[dict[str, Any]] | None = None,
+    prevention: dict[str, Any] | None = None,
+    evidence: Any = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    This does NOT complete the task, and the verdict is not yours: the
-    reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Bumps the generation, invalidating any earlier APPROVED; resubmitting
-    the same commit from review keeps it (#1265).
+    It does NOT complete the task: a different actor writes the verdict
+    (hub_submit_review). Bumps the generation, voiding any APPROVED; the
+    same commit resubmitted from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
         agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: The branch you actually worked in, checked against the
-            canonical name pair-start gave you; a mismatch is refused naming
-            both. Omitting it skips the check — reported, not observed (#533).
-        model: The model that wrote this submission (#758) — declared, not
-            proven. The diversity rule needs it: empty keeps the verdict with
-            the human.
+        branch: Your working branch; one unlike the canonical is refused.
+            Omitted skips the check (#533).
+        model: Model that wrote this submission (#758), declared; empty
+            keeps the verdict with the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
             affected_areas (#890), visibly.
         finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
@@ -2096,6 +2571,11 @@ async def hub_submit_for_review(
             fixed|false_positive|wont_fix|deferred. Unresolved (author judges):
             real_fixed|real_deferred|not_a_defect|not_judged. All but a fix
             owe a note; one leaving the defect leaves a draft.
+        mutations: [{ac, mutation, failed_test}] per test AC (#1436); not
+            evidence for bug_red_test: CI baseline must fail it (#913).
+        prevention: see hub_report_done (#919).
+        evidence: State task, required: [{ac_id, action, observed, target,
+            observed_at}] per AC; no secrets.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2113,6 +2593,12 @@ async def hub_submit_for_review(
         body["accept_areas"] = True
     if finding_outcomes:
         body["finding_outcomes"] = finding_outcomes
+    if mutations:
+        body["mutations"] = mutations
+    if prevention:
+        body["prevention"] = prevention
+    if evidence is not None:
+        body["evidence"] = evidence
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
@@ -2153,12 +2639,20 @@ async def hub_submit_for_review(
         )
     if task.get("lifecycle_hint"):
         message += f"\nLifecycle: {task['lifecycle_hint']}"
+    message += _path_notices_text(task.get("path_notices"))
     return await _task_mutation_response(
         task_id,
         message,
         prior_status=prior_status,
         task=task,
     )
+
+
+def _path_notices_text(block: dict[str, Any] | None) -> str:
+    """Предупреждения по путям диффа (#1589): только matched и unknown."""
+    if not block or block.get("state") == "none" or not block.get("text"):
+        return ""
+    return "\n" + str(block["text"])
 
 
 def _generation_review_line(brief: dict[str, Any]) -> str:
@@ -2192,6 +2686,28 @@ def _review_circle_line(brief: dict[str, Any]) -> str:
     return line
 
 
+# #1652: the assembly time is named in the text only when it was slow. The
+# threshold is the hub's own (the log record uses the same one).
+def _brief_timings_line(brief: dict[str, Any]) -> str:
+    """Slow-assembly line of the text brief; empty when the assembly was fast."""
+    from hub.services.review_brief import SLOW_BRIEF_MS
+
+    timings = brief.get("timings") or {}
+    total = int(timings.get("total_ms") or 0)
+    if total <= SLOW_BRIEF_MS:
+        return ""
+    blocks = timings.get("blocks") or {}
+    slowest = sorted(blocks.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:3]
+    named = ", ".join(f"{name} {int(ms)} мс" for name, ms in slowest)
+    return f"сборка {total} мс; самые долгие: {named}"
+
+
+def _profile_downgrade_line(brief: dict[str, Any]) -> str:
+    """Строка о том, что deep понижен до lite потолком или кругом (#1587)."""
+    block = brief.get("profile_downgrade") or {}
+    return str(block.get("headline") or "")
+
+
 def _brief_statement_lines(brief: dict[str, Any]) -> list[str]:
     """Scope, checklist, validation commands, constraints and hints.
 
@@ -2222,6 +2738,35 @@ def _brief_statement_lines(brief: dict[str, Any]) -> list[str]:
     return parts
 
 
+def _brief_rules_lines(brief: dict[str, Any]) -> list[str]:
+    """Catalogue rules of the task's area (#920); nothing at all when none.
+
+    No header over an empty list: "rules: none" would read as "the area was
+    checked and is clean", when it only means no rule was ever set up here.
+    """
+    rules = brief.get("catalogue_rules") or []
+    if not rules:
+        return []
+    parts = [
+        "\nRules from the catalogue (category_checks) for this area — "
+        "classes already paid for; check they did not come back:"
+    ]
+    for rule in rules:
+        defects = rule.get("source_defects") or []
+        source = (
+            ", ".join(f"#{d['task_id']} {d.get('title', '')}".rstrip() for d in defects)
+            if defects
+            else "no defect recorded (rule from the recurrence debt, #878)"
+        )
+        parts.append(
+            f"  - {rule['category']} → check: {rule['check_ref']} "
+            f"| since {str(rule.get('created_at') or '?')[:10]} "
+            f"| defect: {source} "
+            f"| area: {', '.join(rule.get('matched_areas') or [])}"
+        )
+    return parts
+
+
 def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
     """Base-merge divergence (#1233) and the coverage verdict over the blocks.
 
@@ -2229,6 +2774,9 @@ def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
     they move together, and the base-merge block stays immediately above the
     coverage line that counts it.
     """
+    if brief.get("state_review"):
+        # #1648: у задачи-состояния вместо веток и CI — блок «что принимается».
+        return _state_review_lines(brief["state_review"])
     parts: list[str] = []
     # #1233: расхождение с базой — ДО вердикта. Раньше человек узнавал о нём
     # из отказа доставки, то есть после того, как одобрение уже потрачено.
@@ -2249,6 +2797,40 @@ def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
             for miss in coverage.get("checks_missing") or []
         )
     return parts
+
+
+def _state_review_lines(state: dict[str, Any]) -> list[str]:
+    """Блок «что принимается» для задачи-состояния (#1648).
+
+    Вместо веток и CI — вид результата, rollback, доказательства ТЕКУЩЕГО
+    поколения и число, которое вердикт обязан назвать. Проверки кода названы
+    «не применимо» одной строкой, а не пропущены молча.
+    """
+    generation = state.get("generation", 0)
+    parts = [
+        f"\n{state.get('label', 'результат: состояние')} — поколение {generation}",
+        str(state.get("headline") or ""),
+        f"Rollback: {state.get('rollback') or 'не назван'}",
+        "Evidence of the current generation (the author's word, not run by the hub):",
+    ]
+    for ev in state.get("evidence") or []:
+        parts.append(
+            f"  {ev.get('ac_id', '?')} | действие: {ev.get('action', '')} | "
+            f"наблюдение: {ev.get('observed', '')} | над чем: {ev.get('target', '')} "
+            f"| когда: {ev.get('observed_at', '')} | автор: {ev.get('author', '')}"
+        )
+    for ac_id in state.get("missing_ac") or []:
+        parts.append(f"  {ac_id} | записи этого поколения нет")
+    na = state.get("not_applicable") or []
+    if na:
+        parts.append(
+            "Проверки кода — не применимо: "
+            + "; ".join(f"{c.get('check', '?')} ({c.get('reason', '')})" for c in na)
+        )
+    parts.append(
+        f"Verdict: only a human, with expected_generation={state.get('expected_generation', generation)}."
+    )
+    return [line for line in parts if line]
 
 
 @mcp.tool()
@@ -2289,7 +2871,12 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     )
     parts.extend(
         line
-        for line in (_generation_review_line(brief), _review_circle_line(brief))
+        for line in (
+            _generation_review_line(brief),
+            _review_circle_line(brief),
+            _profile_downgrade_line(brief),
+            _brief_timings_line(brief),
+        )
         if line
     )
     if brief.get("description"):
@@ -2304,6 +2891,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
                 f"| Then: {ac.get('then', '')}"
             )
     parts.extend(_brief_statement_lines(brief))
+    parts.extend(_brief_rules_lines(brief))
     if brief.get("branch"):
         pr = f" | PR #{brief['pr_number']}" if brief.get("pr_number") else ""
         parts.append(f"\nBranch: {brief['branch']}{pr}")
@@ -2321,6 +2909,9 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     parts.extend(_brief_evidence_lines(brief))
     if brief.get("stacking_warning"):
         parts.append(f"\n{brief['stacking_warning']}")
+    notices_text = _path_notices_text(brief.get("path_notices"))
+    if notices_text:
+        parts.append(notices_text)
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")
@@ -2358,13 +2949,14 @@ async def hub_submit_review(
     findings: list[dict[str, Any]] | None = None,
     create_tasks_for_out_of_scope: bool = False,
     acknowledge_repeat: bool = False,
+    expected_generation: int | None = None,
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
     Not for the task's own implementer — such a verdict is refused. Binds to
-    the current submission generation and does NOT complete the task: it
-    returns to running, where APPROVED lets the author take the done path and
-    CHANGES_REQUESTED sends them back to hub_submit_for_review.
+    the current submission generation. Commit task: does NOT complete it, it
+    returns to running (APPROVED: author takes the done path; CHANGES_REQUESTED:
+    back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
     in_scope one — all-out-of-scope means approve and keep them as linked
@@ -2387,6 +2979,8 @@ async def hub_submit_review(
             unlinked out_of_scope findings (default false).
         acknowledge_repeat: A verdict repeating the previous one word for
             word is refused without it (#1057).
+        expected_generation: State task: generation judged (required); only a
+            human approves.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2401,6 +2995,8 @@ async def hub_submit_review(
         body["create_tasks_for_out_of_scope"] = True
     if acknowledge_repeat:
         body["acknowledge_repeat"] = True
+    if expected_generation is not None:
+        body["expected_generation"] = expected_generation
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:
@@ -2427,17 +3023,16 @@ async def hub_claim_task(
 ) -> str:
     """Claim an open task for one Cursor agent/session (409 if already claimed).
 
-    Remember the ``agent`` name you pass here: a later hub_pair_start must use
-    the same value as its ``assigned_agent`` (the name is how the holder is
-    matched), unless you pair-start under the same authenticated principal.
+    Reuse ``agent`` as hub_pair_start's ``assigned_agent`` (the holder is
+    matched by name) unless you pair-start as the same principal. Policy
+    claim_area_check (#1433) notes or refuses areas overlapping a started task.
 
     Args:
         task_id: The open task ID
-        agent: Agent name taking the claim; reuse it as assigned_agent in hub_pair_start
-        session_id: YOUR session id — REQUIRED for agents (#852), because the
-            agent name does not identify which session works the task. Register
-            it with hub_session_register and reuse it in hub_pair_start and
-            hub_release_task
+        agent: Agent name taking the claim
+        session_id: YOUR session id, REQUIRED for agents (#852): the agent
+            name does not identify the session. Register it with
+            hub_session_register; reuse it in hub_pair_start and hub_release_task
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2452,6 +3047,8 @@ async def hub_claim_task(
     status = (task or result).get("status", "?")
     holder = (task or result).get("claimed_by") or agent
     message = f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
+    message += _area_check_note(result)
+    message += _worktree_hint_note(result)
     return await _task_mutation_response(
         task_id,
         message,
@@ -2771,6 +3368,44 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
 # ---------------------------------------------------------------------------
 
 
+#: Начало alert-а, который пишет delivery_state._acceptance_note (#897).
+_ACCEPTANCE_NOTE_HEAD = "Задача принята вручную"
+
+
+def _new_acceptance_alert(prior: dict[str, Any] | None, task: dict[str, Any]) -> str:
+    """The #897 alert this very call left on the task, or ``""``."""
+    prior_updates = (prior or {}).get("updates") or []
+    seen = max((int(u.get("id") or 0) for u in prior_updates), default=0)
+    for upd in task.get("updates") or []:
+        content = str(upd.get("content") or "")
+        if (
+            int(upd.get("id") or 0) > seen
+            and upd.get("kind") == "alert"
+            and content.startswith(_ACCEPTANCE_NOTE_HEAD)
+        ):
+            return content
+    return ""
+
+
+def _undelivered_pr_note(prior: dict[str, Any] | None, task: dict[str, Any]) -> str:
+    """#930: name the PR a completion left undelivered, in the reply itself.
+
+    Not a second computation: it repeats the alert note_completion_without_
+    delivery wrote during this call. A delivered task gets no alert, so the
+    reply stays as it was.
+    """
+    pr = task.get("pr_number")
+    alert = _new_acceptance_alert(prior, task) if pr else ""
+    if not alert:
+        return ""
+    head = (
+        "доставка кода НЕ подтверждена"
+        if "подтвердить не удалось" in alert
+        else "код НЕ доставлен"
+    )
+    return f" PR #{pr}: {head}. {alert}"
+
+
 @mcp.tool()
 async def hub_decide_task(
     task_id: int,
@@ -2807,6 +3442,7 @@ async def hub_decide_task(
         "pr_disposition": pr_disposition,
     }
     prior_status: str | None = None
+    prior_task: dict[str, Any] | None = None
     try:
         prior_task = await _api_get(f"/api/tasks/{task_id}")
         prior_status = prior_task.get("status")
@@ -2823,6 +3459,7 @@ async def hub_decide_task(
         suffix = " (decision recorded)"
     message = (
         f"Task #{task_id}: decision '{action}' applied (status: {status}).{suffix}"
+        f"{_undelivered_pr_note(prior_task, task)}"
     )
     return _format_mutation_success(message, task, transition_from=prior_status)
 
@@ -2830,6 +3467,36 @@ async def hub_decide_task(
 # ---------------------------------------------------------------------------
 # Proposals (backward compat)
 # ---------------------------------------------------------------------------
+
+
+async def _propose_prod_defect(
+    title: str,
+    broken: str,
+    verify: str,
+    areas: list[str] | None,
+    agent: str,
+    parent_id: int | None,
+) -> str:
+    """The prod-defect branch of hub_propose_task: POST /api/prod-defects."""
+    body: dict[str, Any] = {
+        "title": title,
+        "broken": broken,
+        "verify": verify,
+        "affected_areas": list(areas or []),
+        "agent": agent,
+    }
+    if parent_id is not None:
+        body["parent_id"] = parent_id
+    filed = await _api_post("/api/prod-defects", body)
+    release = (
+        f"release #{filed['release_id']}"
+        if filed.get("release_id") is not None
+        else filed.get("release_reason", "")
+    )
+    return format_echo_response(
+        f"Prod defect draft #{filed['task']['id']} (expedite, found_in=prod); "
+        f"{release}. Awaiting human approval."
+    )
 
 
 @mcp.tool()
@@ -2843,6 +3510,10 @@ async def hub_propose_task(
     human_reviewer: str = "",
     task_type: str = "task",
     project: str = "",
+    defect_verify: str = "",
+    affected_areas: list[str] | None = None,
+    result_kind: str = "commit",
+    rollback: str = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -2860,7 +3531,15 @@ async def hub_propose_task(
         human_reviewer: Person who will review and accept the result
         task_type: task (default), subtask, feature, or epic
         project: Project slug — only when proposing an epic (#346)
+        defect_verify: Prod defect (#915): how to check the fix; needs areas
+        affected_areas: Where it broke (prod defect)
+        result_kind: commit | state (leaf only)
+        rollback: Undo text for state
     """
+    if defect_verify:
+        return await _propose_prod_defect(
+            title, description, defect_verify, affected_areas, agent, parent_id
+        )
     if task_type not in ("task", "subtask", "feature", "epic"):
         return format_echo_response(
             f"Invalid task_type {task_type!r}: use task, subtask, feature, or epic."
@@ -2877,6 +3556,10 @@ async def hub_propose_task(
     }
     if project:
         body["project"] = project
+    if result_kind != "commit":
+        body["result_kind"] = result_kind
+    if rollback:
+        body["rollback"] = rollback
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
@@ -3048,74 +3731,42 @@ async def hub_submit_machine_review(
 
 
 @mcp.tool()
-async def hub_submit_steward_judgement(
-    task_id: int,
-    generation: int,
-    kind: str,
-    verdict: str,
-    grounds: list[dict[str, Any]] | None = None,
-    findings: list[dict[str, Any]] | None = None,
-    closures: list[dict[str, Any]] | None = None,
-    escalate_reason: str = "",
-    confidence: str = "",
-    model: str = "",
-    tokens_spent: int | None = None,
-    duration_ms: int | None = None,
-) -> CallToolResult:
-    """Record a steward judgement. Does not transition the task (#1022).
+async def hub_executor_slots() -> CallToolResult:
+    """Slots and channels: task, since, last sign of life (#1434)."""
+    from hub.services.executor_slots import format_occupancy
 
-    ``verdict`` has no default (422, never a silent approve). ``kind`` is
-    verdict|dor|disposition. ``ground.source`` and ``escalate_reason`` are
-    closed sets with no ``unknown``. ``confidence=low`` stores as
-    escalate/low_confidence. At-most-once on (task_id, generation, kind).
-    Closures address findings by finding_uid.
-
-    Args:
-        task_id: Task being judged.
-        generation: Submission generation being judged.
-        kind: verdict, dor, or disposition.
-        verdict: approve, changes_requested, or escalate.
-        grounds: [{source, detail?}].
-        findings: Same shape as a human review verdict.
-        closures: [{finding_uid, type}].
-        escalate_reason: Required when verdict is escalate.
-        confidence: high, medium, or low.
-        model: Model that produced the judgement.
-        tokens_spent: Tokens spent producing it.
-        duration_ms: Duration.
-    """
-    body: dict[str, Any] = {
-        "generation": generation,
-        "kind": kind,
-        "verdict": verdict,
-        "grounds": grounds or [],
-        "findings": findings or [],
-        "closures": closures or [],
-        "model": model,
-    }
-    if escalate_reason:
-        body["escalate_reason"] = escalate_reason
-    if confidence:
-        body["confidence"] = confidence
-    if tokens_spent is not None:
-        body["tokens_spent"] = tokens_spent
-    if duration_ms is not None:
-        body["duration_ms"] = duration_ms
     try:
-        result = await _api_post(f"/api/tasks/{task_id}/steward-judgement", body)
+        data = await _api_get("/api/executor-slots")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result("\n".join(format_occupancy(data)), **data)
+
+
+@mcp.tool()
+async def hub_effective_policy(project: str) -> CallToolResult:
+    """Effective policy of a project: gate keys, values, sources."""
+    from hub.services.effective_policy import format_effective_policy
+
+    slug = urllib.parse.quote(project, safe="")
+    try:
+        data = await _api_get(f"/api/projects/{slug}/effective-policy")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result("\n".join(format_effective_policy(data)), **data)
+
+
+@mcp.tool()
+async def hub_policy_schedule(project: str) -> CallToolResult:
+    """Scheduled policy changes of a project (read)."""
+    from hub.services.policy_change import format_schedule
+
+    slug = urllib.parse.quote(project, safe="")
+    try:
+        data = await _api_get(f"/api/projects/{slug}/policy-schedule")
     except HubApiError as exc:
         return _error_result(exc)
     return structured_echo_result(
-        f"Steward judgement for task #{task_id} recorded "
-        f"(generation {result.get('generation')}, kind {result.get('kind')}): "
-        f"{result.get('verdict')}"
-        + (
-            f" ({result.get('escalate_reason')})"
-            if result.get("escalate_reason")
-            else ""
-        )
-        + ". Not applied — recording only.",
-        steward_judgement=result,
+        "\n".join(format_schedule(project, data)), entries=data
     )
 
 
@@ -3217,61 +3868,112 @@ async def hub_undelivered_completed() -> CallToolResult:
     return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 
-@mcp.tool()
-async def hub_outcome_debt() -> CallToolResult:
-    """Outcome promises and the answers to them (#766, #819).
+def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
+    """One row of the outcome-debt page: an open promise or an answered one."""
+    if "latest_answer" in item:
+        latest = item.get("latest_answer") or {}
+        return [
+            f"#{item['task_id']} {item['title']} — {latest.get('verdict', '?')}"
+            f" ({item.get('answers', 0)} check(s), last by "
+            f"{latest.get('answered_by') or 'unknown'})",
+            f"    measured: {latest.get('measured_value') or '—'}",
+        ]
+    waited = item.get("days_unanswered")
+    waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
+    due_on = item.get("due_on")
+    due_text = f", due {due_on}" if due_on else ""
+    if due_on and item.get("due_assumed"):
+        due_text += " (assumed: from merge)"
+    lines = [
+        f"#{item['task_id']} {item['title']} — {waited_text}",
+        f"    {item.get('outcome_status', '')}{due_text}",
+        f"    metric: {item.get('outcome_metric') or '—'}",
+    ]
+    if item.get("outcome_deadline"):
+        lines.append(f"    said by: {item['outcome_deadline']}")
+    if item.get("outcome_revisit_condition"):
+        lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
+    return lines
 
-    DoR refuses a task without an outcome_metric, and for a long time nothing
-    ever read one back: a task counted as successful when its gates passed, not
-    when the number moved. This read makes both sides visible - the tasks
-    nobody has come back to, and the ones somebody has, with the last verdict
-    and what was measured. Record an answer with hub_answer_outcome.
 
-    outcome_deadline is shown verbatim and never used for filtering - it is free
-    text holding event descriptions rather than dates, so nothing is hidden
-    behind a value that cannot be parsed.
-    """
-    try:
-        data = await _api_get("/api/metrics/outcome-debt")
-    except HubApiError as exc:
-        return _error_result(exc)
-    items = data.get("items", [])
+_OUTCOME_DEBT_HINT = (
+    "Остальное: выберите status=overdue|observing|unknown|answered и листайте "
+    "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
+    "или CLI hp-hub outcome-debt без флагов."
+)
+
+
+def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
+    """Text of one outcome-debt page (#1605). "No debt" only when ``total`` is 0:
+    an empty page says nothing about the other statuses."""
     answered = data.get("answered_total", 0)
-    # Both numbers in the header: the unanswered count alone can only grow, so
-    # on its own it says more about the age of the backlog than about whether
-    # anyone checks (#819). The answered rows are printed in both branches —
-    # hiding them exactly when the debt is clean would make the evidence of
-    # checking disappear at the moment it is most worth seeing.
-    if not items:
+    if not data.get("total", 0):
         lines = [
             "No outcome debt: every completed task with a stated metric has "
             f"an answer ({answered} answered).",
-            "",
         ]
     else:
         lines = [
             f"{data.get('total', 0)} completed tasks stated an outcome nobody "
-            f"answered; {answered} have been answered:",
-            "",
+            f"answered ({data.get('overdue_total', 0)} overdue, "
+            f"{data.get('observing_total', 0)} observing, "
+            f"{data.get('unknown_total', 0)} unknown); {answered} answered.",
         ]
-    for item in items:
-        waited = item.get("days_unanswered")
-        waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
-        lines.append(f"#{item['task_id']} {item['title']} — {waited_text}")
-        lines.append(f"    metric: {item.get('outcome_metric') or '—'}")
-        if item.get("outcome_deadline"):
-            lines.append(f"    said by: {item['outcome_deadline']}")
-        if item.get("outcome_revisit_condition"):
-            lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
-    for item in data.get("answered", []):
-        latest = item.get("latest_answer") or {}
-        lines.append(
-            f"#{item['task_id']} {item['title']} — {latest.get('verdict', '?')}"
-            f" ({item.get('answers', 0)} check(s), last by "
-            f"{latest.get('answered_by') or 'unknown'})"
+    rows = data.get("rows")
+    if rows is not None:
+        shown = (
+            f"показано {len(rows)} из {data.get('total_in_status', 0)} "
+            f"({data.get('status')})"
         )
-        lines.append(f"    measured: {latest.get('measured_value') or '—'}")
-    return structured_echo_result("\n".join(lines), outcome_debt=data)
+        next_offset = data.get("next_offset")
+        if next_offset is not None:
+            lines.append(f"{shown}; следующая страница offset={next_offset}.")
+        elif not rows and data.get("total_in_status", 0):
+            lines.append(
+                f"{shown}: offset={data.get('offset')} за концом списка, "
+                "начните с offset=0."
+            )
+        else:
+            lines.append(f"{shown}; это последняя страница.")
+    else:
+        lines.append("Только счётчики, строк нет.")
+    if data.get("total", 0):
+        lines.append(_OUTCOME_DEBT_HINT)
+    lines.append("")
+    for item in rows or []:
+        lines.extend(_outcome_debt_row_lines(item))
+    return lines
+
+
+@mcp.tool()
+async def hub_outcome_debt(
+    status: Literal["overdue", "observing", "unknown", "answered"] = "overdue",
+    limit: int = 20,
+    offset: int = 0,
+    only_counts: bool = False,
+) -> CallToolResult:
+    """Outcome promises and the answers to them (#766, #819).
+
+    Completed tasks whose stated outcome nobody answered, plus answered ones
+    with the last verdict. Record an answer with hub_answer_outcome. Due =
+    first deploy of the fix + 14 days (#1568); due_assumed = counted from the
+    merge (#1572); outcome_deadline stays free text.
+
+    Returns counters plus ONE page (#1605): status overdue by default, limit
+    1-200, offset to page on; only_counts drops the rows. Not the full list.
+    """
+    params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
+    if only_counts:
+        params["only_counts"] = "true"
+    try:
+        data = await _api_get(
+            f"/api/metrics/outcome-debt?{urllib.parse.urlencode(params)}"
+        )
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(
+        "\n".join(_outcome_debt_lines(data)), outcome_debt=data
+    )
 
 
 @mcp.tool()
@@ -3311,16 +4013,197 @@ async def hub_answer_outcome(
     )
 
 
+def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
+    """Owner's review summary (#1406): provider bill only, never tokens_spent."""
+    if not econ:
+        return []
+    runs = econ.get("runs") or {}
+    findings = econ.get("findings") or {}
+    red = econ.get("red_ci") or {}
+    rec = econ.get("reconciliation") or {}
+    by_profile = ", ".join(
+        f"{r.get('profile')} {r.get('runs', 0)} ({r.get('provider_tokens_total', 0)})"
+        for r in runs.get("by_profile") or []
+    )
+    buckets = ", ".join(
+        f"{b.get('bucket')} {b.get('count', 0)}" for b in rec.get("buckets") or []
+    )
+    return [
+        f"Review economy: {runs.get('total', 0)} run(s), "
+        f"{runs.get('billed', 0)} billed / {runs.get('unbilled', 0)} without a bill, "
+        f"{runs.get('provider_tokens_total', 0)} provider tokens"
+        + (f"; by profile: {by_profile}" if by_profile else "")
+        + f"; Cursor export covers {runs.get('export_billed_runs', 0)} run(s), "
+        f"{runs.get('api_lower_bound_runs', 0)} priced by the API (lower bound)",
+        f"Unresolved: {findings.get('unresolved_total', 0)} in "
+        f"{findings.get('reports_with_unresolved', 0)}/"
+        f"{findings.get('independent_reports', 0)} independent report(s)"
+        + (" (undersampled)" if findings.get("undersampled") else "")
+        + f"; confirmed: {findings.get('confirmed_total', 0)}",
+        f"Runs on red CI: {red.get('runs', 0)} "
+        f"({red.get('provider_tokens', 0)} provider tokens); green "
+        f"{red.get('runs_on_green_ci', 0)}, CI undetermined "
+        f"{red.get('runs_ci_undetermined', 0)}, checks skipped "
+        f"{red.get('runs_ci_skipped', 0)}, no CI report "
+        f"{red.get('runs_without_ci_report', 0)}",
+        f"Reports vs paid runs: {rec.get('reports', 0)} vs "
+        f"{rec.get('paid_runs', 0)}, gap {rec.get('gap', 0)} = {buckets}",
+    ]
+
+
+def _defect_clock_part(name: str, clock: dict) -> str:
+    median = clock.get("median_hours")
+    reasons = ", ".join(
+        f"{k} {v}" for k, v in (clock.get("unmeasurable") or {}).items()
+    )
+    return (
+        f"{name} median "
+        + (f"{median}h" if median is not None else "—")
+        + f" over {clock.get('measured', 0)}, unmeasurable "
+        + f"{clock.get('unmeasurable_total', 0)}"
+        + (f" ({reasons})" if reasons else "")
+    )
+
+
+def _defect_clocks_line(clocks: dict) -> str:
+    """#916: both prod-defect clocks with the rows left out of each median."""
+    return (
+        f"Prod defects ({clocks.get('defects', 0)}): "
+        + _defect_clock_part("time-to-detect", clocks.get("time_to_detect") or {})
+        + "; "
+        + _defect_clock_part("time-to-restore", clocks.get("time_to_restore") or {})
+    )
+
+
+def _cfr_part(row: dict) -> str:
+    counts = f"({row.get('failed_deploys', 0)}/{row.get('deploys', 0)} deploys)"
+    if row.get("small_sample"):
+        return f"{row.get('project')} small sample {counts}"
+    return f"{row.get('project')} {round((row.get('rate') or 0) * 100, 1)}% {counts}"
+
+
+def _change_failure_lines(data: dict) -> list[str]:
+    """#918: CFR with its denominator; measured and reconstructed escapes apart."""
+    cfr = data.get("change_failure_rate") or {}
+    parts = [_cfr_part(row) for row in cfr.get("by_project") or []]
+    esc = data.get("escaped_defects") or {}
+    rec = esc.get("reconstructed") or {}
+    return [
+        "Change failure rate: "
+        + ("; ".join(parts) if parts else "— (no successful deploys in window)")
+        + f"; {cfr.get('defects_without_release', 0)} prod defect(s) without release",
+        f"Escaped to prod (measured, found_in): {esc.get('escaped', 0)}; "
+        f"reconstructed by completed_at, {rec.get('label', '')}: "
+        f"{rec.get('escaped', 0)}",
+    ]
+
+
+def _shift_left_lines(sl: dict[str, Any]) -> list[str]:
+    """#914: defects by found_in; unknown named apart with its share."""
+    if not sl:
+        return []
+    stages = [r for r in sl.get("by_stage") or [] if r.get("stage") != "unknown"]
+    share = sl.get("unknown_share")
+    return [
+        f"Shift-left (defects by found_in, {sl.get('defects', 0)}): "
+        + ", ".join(f"{r.get('stage')} {r.get('defects', 0)}" for r in stages)
+        + f"; unknown {sl.get('unknown', 0)} "
+        + (f"({round(share * 100, 1)}%)" if share is not None else "(no defects)")
+    ]
+
+
+def _rule_breach_lines(report: dict[str, Any]) -> list[str]:
+    """Catalogue rules whose class came back after they were set up (#920)."""
+    total = int(report.get("rules_total") or 0)
+    breached = report.get("breached") or []
+    if not total:
+        return []
+    if not breached:
+        return [f"Catalogue rules: {total}, none breached since set up"]
+    return [
+        f"Catalogue rules breached: {len(breached)} of {total} — "
+        + "; ".join(
+            f"{r['category']} (set up {str(r.get('rule_created_at') or '?')[:10]}, "
+            f"{r['breaches']} finding(s) after, check {r['check_ref']})"
+            for r in breached[:5]
+        )
+    ]
+
+
+def _practice_slice_lines(data: dict[str, Any]) -> list[str]:
+    """Slice, comparison and problem spots of a filtered call (#1490)."""
+    scope = data.get("scope")
+    if not scope:
+        return []
+    lines = [
+        f"Slice: project={scope.get('project') or 'all'}, "
+        f"reviewer model={scope.get('model') or 'all'}, "
+        f"{scope.get('from')} .. {scope.get('to') or 'now'}"
+    ]
+    if scope.get("model_independent"):
+        lines.append(
+            "Model filter does not apply to: " + ", ".join(scope["model_independent"])
+        )
+    for row in (data.get("comparison") or {}).get("indicators", []):
+        delta = row.get("delta")
+        lines.append(
+            f"{row['label']}: {row['current']} (n={row['current_n']}) vs "
+            f"{row['previous']} (n={row['previous_n']}) — "
+            + (
+                f"{row['direction']}, delta {delta}"
+                if delta is not None
+                else f"insufficient data ({row['reason']})"
+            )
+        )
+    lines.extend(
+        f"Problem #{spot['rank']} [{spot['kind']}] {spot['title']}: {spot['reason']}"
+        for spot in data.get("problem_spots") or []
+    )
+    return lines
+
+
+def _events_history_lines(history: dict[str, Any]) -> list[str]:
+    """Window beyond the events retention (#1621): the figure covers less."""
+    beyond = history.get("windows_beyond_history") or []
+    if not beyond:
+        return []
+    note = history.get("note") or ""
+    return [f"{note} (окна: {', '.join(str(w) for w in beyond)})"]
+
+
 @mcp.tool()
-async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
-    """Practice metrics (#384): machine-review economics, harness-version
-    comparison, recurring finding categories, task cycle times.
+async def hub_practice_metrics(
+    since_days: int = 90,
+    project: str = "",
+    model: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    compare: bool = False,
+    series: bool = False,
+    series_days: int = 7,
+) -> CallToolResult:
+    """Practice metrics (#384): review economics, cycle times, problem spots.
 
     Args:
-        since_days: Aggregation window in days (default 90).
+        model: Reviewer model ("не заявлена": none recorded).
+        compare: Add previous window, deltas, problem spots.
     """
+    query: dict[str, Any] = {"since_days": since_days}
+    for name, value in (
+        ("project", project),
+        ("model", model),
+        ("date_from", date_from),
+        ("date_to", date_to),
+    ):
+        if value:
+            query[name] = value
+    for name, flag in (("compare", compare), ("series", series)):
+        if flag:
+            query[name] = "true"
+    if series:
+        query["series_days"] = series_days
     try:
-        data = await _api_get(f"/api/metrics/practices?since_days={since_days}")
+        data = await _api_get(f"/api/metrics/practices?{urllib.parse.urlencode(query)}")
     except HubApiError as exc:
         return _error_result(exc)
     mr = data.get("machine_reviews", {})
@@ -3332,6 +4215,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    lines.extend(_review_economy_lines(data.get("review_economy") or {}))
     rd = data.get("review_dispatches") or {}
     lines.append(
         "Wasted dispatch spend (no report): "
@@ -3402,6 +4286,12 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
             else "—"
         )
     )
+    lines.append(_defect_clocks_line(data.get("prod_defect_clocks") or {}))
+    lines.extend(_change_failure_lines(data))
+    lines.extend(_shift_left_lines(data.get("shift_left") or {}))
+    lines.extend(_rule_breach_lines(data.get("rule_breaches") or {}))
+    lines.extend(_practice_slice_lines(data))
+    lines.extend(_events_history_lines(data.get("events_history") or {}))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(
@@ -3952,7 +4842,7 @@ async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     return structured_echo_result("\n".join(lines), proposals=agent_tasks)
 
 
-# Deprecated aliases (ADR-0002 Stage 1: warning + telemetry, #325)
+# Deprecated alias hub_task_update kind=done (ADR-0002 Stage 1: warning + telemetry, #325)
 async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
     """Count the alias call and stamp the response with a migration hint."""
     try:
@@ -3969,20 +4859,6 @@ async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
     payload["deprecated"] = True
     payload["next_action"] = f"Deprecated alias: use {replacement} instead."
     return json.dumps(payload, ensure_ascii=False)
-
-
-@mcp.tool()
-async def hub_approve_proposal(proposal_id: int, comment: str = "") -> str:
-    """Deprecated: use hub_approve_task instead. Approves and dispatches."""
-    result = await hub_approve_task(proposal_id, comment=comment, run=True)
-    return await _mark_deprecated("hub_approve_proposal", "hub_approve_task", result)
-
-
-@mcp.tool()
-async def hub_reject_proposal(proposal_id: int, comment: str = "") -> str:
-    """Deprecated: use hub_reject_task instead."""
-    result = await hub_reject_task(proposal_id, comment=comment)
-    return await _mark_deprecated("hub_reject_proposal", "hub_reject_task", result)
 
 
 # ---------------------------------------------------------------------------
@@ -4237,9 +5113,34 @@ def _prepare_quality_warnings(
     return warnings
 
 
+# #914: the order of work a bug brief hands over, and the AC shape that makes
+# that order checkable. The gate it names is #913 (hub/services/red_test_gate.py):
+# a test only counts as a reproduction when CI saw it FAIL on the merge-base code.
+# Saying so in the brief is the point — the gate refusing after the fact is the
+# expensive way to learn the rule. Other work types get no such lines.
+BUG_REPRODUCE_FIRST_LINES = (
+    "Порядок работы (дефект, #914):",
+    "1. Сначала воспроизведи: напиши падающий тест, который воспроизводит "
+    "дефект на текущем коде, и закоммить его до фикса.",
+    "2. Потом чини: меняй код, пока этот тест не станет зелёным; тест остаётся "
+    "регрессионным.",
+    "Гейт красного теста (#913): CI прогоняет изменённые в ветке тестовые файлы "
+    "поверх кода merge-base (baseline). Воспроизведением засчитывается только "
+    "failed (упал на assert); error — не доказано: тест упал по неверной "
+    "причине (импорт, фикстура, сборка); skipped и passed тоже не доказывают. "
+    "Слова и мутации в сдаче доказательством не считаются.",
+    "Тест должен стоять в test_ref AC, который он доказывает: гейт читает "
+    "test_ref, тест вне его ничего не доказывает.",
+    "Шаблон AC дефекта: Given состояние, в котором дефект проявляется; "
+    "When действие, на котором он проявляется; Then ожидаемое поведение; "
+    "verifiable_by=test; test_ref=tests/<file>.py::<test_name>.",
+)
+
+
 def _developer_handoff_text(
     task_id: int,
     *,
+    work_type: str | None = None,
     problem_statement: str | None,
     business_value: str | None,
     scope_in: list[str] | None,
@@ -4255,6 +5156,8 @@ def _developer_handoff_text(
         lines.append(f"Problem: {problem_statement}")
     if business_value:
         lines.append(f"Value: {business_value}")
+    if work_type == "bug":
+        lines.extend(BUG_REPRODUCE_FIRST_LINES)
     if scope_in:
         lines.append("Scope in:")
         lines.extend(f"- {item}" for item in scope_in)
@@ -4318,7 +5221,10 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("release_id", "паспорт дефекта (#917): релиз, а не поле доводки"),
     Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    Hidden("result_kind", "вид результата (#1647) задают при создании и в draft"),
+    Hidden("rollback", "откат результата-состояния (#1647) правят через refine"),
     # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
     # стояла в пяти символах от потолка, а потолок двигается только вниз.
     # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
@@ -4433,6 +5339,7 @@ async def hub_prepare_developer_task(
 
     handoff_text = _developer_handoff_text(
         task_id,
+        work_type=effective_work_type,
         problem_statement=problem_statement,
         business_value=business_value,
         scope_in=scope_in,
@@ -4601,45 +5508,47 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
 async def hub_refine_task(
     task_id: int, include_task: bool = False, **fields: Any
 ) -> HubRefineTaskResult:
-    """PATCH a task's structured fields (Definition of Ready inputs).
+    """PATCH a task's DoR fields.
 
     Only fields you pass are written; every list REPLACES the stored one.
-    Mirrors POST /api/tasks/{id}/refine.
 
     Args:
         task_id: Task to refine.
-        title: New title (1–500 chars).
-        description: New statement text (≤10000); "" clears it.
-        work_type: feature | bug | refactor | chore | docs | spike | incident
-        class_of_service: standard | expedite | fixed_date | intangible
-        size: XS | S | M | L | XL
-        wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date, for fixed_date COS.
-        user_story: "As a <role>, I want <X> so that <Y>".
-        problem_statement: What's broken and why.
-        outcome_metric: Which number moves, from what to what (3d -> 1d).
-        outcome_indicator: Leading signal, before the metric moves.
-        outcome_deadline: When the outcome is checked.
-        outcome_revisit_condition: What reopens this decision.
+        title: New title.
+        description: Statement text; "" clears it.
+        work_type: Kind of work (a frozen project admits by type).
+        class_of_service: Class of service.
+        size: T-shirt size.
+        wip_tag: WIP bucket.
+        due_date: ISO date (fixed_date).
+        user_story: As a / I want / so that.
+        problem_statement: What is broken.
+        outcome_metric: Which number moves.
+        outcome_indicator: Leading signal.
+        outcome_deadline: When checked.
+        outcome_revisit_condition: What reopens it.
         redesign_decision: adapt | redesign.
-        redesign_rationale: Why that choice.
-        agent_fit: deterministic | assistant | sdd_native | agentic.
-        found_in: Defect stage: unknown | review | ci | test | staging | prod.
-        caused_by_task_id: Task that introduced the defect.
-        technical_hints: Hints, references, approach.
+        redesign_rationale: Why.
+        agent_fit: Agent fit.
+        found_in: Defect stage (prod: not feature).
+        caused_by_task_id: Causing task.
+        technical_hints: Hints, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        affected_areas: Modules/paths impacted.
-        validation_commands: Commands proving it works.
-        live_probe: Read-only probe the hub runs after delivery; a registry name.
-        out_of_scope_for_review: What the reviewer ignores.
-        review_checklist: What the reviewer verifies.
+        affected_areas: Paths impacted.
+        validation_commands: Proof commands.
+        live_probe: Post-delivery probe (registry name).
+        result_kind: commit|state; draft only.
+        rollback: Undo of a state result.
+        out_of_scope_for_review: Reviewer ignores.
+        review_checklist: Reviewer verifies.
         human_owner: Who is accountable.
-        human_reviewer: Who accepts the result.
-        acceptance_criteria: Full AC replacement (REST refine shape).
-        risks: Full replacement (TaskRisk shape).
-        include_task: Echo the whole task back too; off by default.
+        human_reviewer: Who accepts.
+        freeze_rationale: Why it may enter a freeze.
+        acceptance_criteria: Full AC replacement.
+        risks: Full replacement.
+        include_task: Echo the task.
     """
     # Один источник вместо двух списков. До #1068 поля были выписаны и в
     # сигнатуре, и здесь, а комментарий рядом называл цену расхождения:
@@ -4981,6 +5890,14 @@ def _format_whoami(data: dict[str, Any]) -> str:
 
 
 def _format_health(data: dict[str, Any]) -> str:
+    from hub.services.egress_watch import egress_lines
+
+    egress = data.get("egress")
+    egress_part = (
+        [f"Egress: {egress.get('state', 'unknown')}", *egress_lines(egress)]
+        if isinstance(egress, dict)
+        else []
+    )
     return "\n".join(
         [
             f"Status: {data['status']}",
@@ -4990,6 +5907,7 @@ def _format_health(data: dict[str, Any]) -> str:
             f"Auth disabled: {data['auth_disabled']}",
             f"Env tokens configured: {data['env_tokens_configured']}",
             f"Vast enabled: {data['vast_enabled']}",
+            *egress_part,
         ]
     )
 

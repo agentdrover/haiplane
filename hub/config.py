@@ -36,6 +36,18 @@ N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
 
+# #1591: каталоги сервера, внутри которых хаб вправе сверять хэш файла из
+# gate_policy.release_artifacts. Серверная настройка, не политика проекта:
+# политику пишет PATCH, а список того, что хаб вообще может открыть, держит
+# владелец хоста. Через запятую; пустое значение — значение по умолчанию.
+RELEASE_ARTIFACT_DIRS: tuple[str, ...] = tuple(
+    part.strip()
+    for part in env_get(
+        "RELEASE_ARTIFACT_DIRS", "/usr/local/sbin,/usr/local/lib,/usr/local/bin"
+    ).split(",")
+    if part.strip()
+)
+
 # GitVerse как второй форж (#1115, эпик #1112). Токен обязателен даже для
 # ПУБЛИЧНЫХ репозиториев — анонимного режима у API нет, проверено живым
 # запросом: без заголовка авторизации он отвечает 401.
@@ -83,6 +95,12 @@ MAX_REVIEW_CYCLES = int(env_get("MAX_REVIEW_CYCLES", "3"))
 # потому что порог назначен по трём наблюдениям одного дня, и первым
 # вопросом к нему будет «как это выключить», а не «на сколько подвинуть».
 REVIEW_CIRCLE_THRESHOLD = int(env_get("REVIEW_CIRCLE_THRESHOLD", "3"))
+# #1432: с этого числа заходов круга пересдача, которой правило дало бы deep,
+# получает lite, а лестница добора и вторая ось deep не докупают — до решения
+# человека (ручной запрос ревью). Ключ circle_deep_stop в gate_policy проекта
+# главнее; 0 выключает; нечитаемое значение — тоже выключает: ошибка в
+# настройке не должна удешевлять ревью молча.
+REVIEW_CIRCLE_DEEP_STOP = env_get("REVIEW_CIRCLE_DEEP_STOP", "2")
 # Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
 # from the agent principal that implemented the task (assigned_agent or
 # claimed_by); 'allow' is the explicit solo-mode opt-out.
@@ -176,12 +194,76 @@ STEWARD_DAILY_CAP = int(env_get("STEWARD_DAILY_CAP", "20"))
 # human-owned slot with no deadline of its own, so a hung cloud agent would
 # otherwise never escalate — it would just sit there looking ordered.
 STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
+# #1410: сколько ждать цену прогона исполнителя после его конца. Cost у
+# Cursor «eventually consistent» и сразу после конца прогона может не прийти;
+# закрыть прогон без неё — выдать непрочитанную цену за окончательную. По
+# истечении срока строка закрывается с названной причиной, центы — NULL.
+EXECUTOR_COST_WAIT_MIN = int(env_get("EXECUTOR_COST_WAIT_MIN", "30"))
+# #1411 (F2.3): потолки прогона исполнителя по умолчанию — ставятся в строку
+# при заказе, если заказ не назвал свои. Цифры — смета F0: 8M токенов и около
+# $35; в F0 первый превысили, и остановить прогон было некому.
+EXECUTOR_TOKEN_CEILING = int(env_get("EXECUTOR_TOKEN_CEILING", "8000000"))
+EXECUTOR_CENTS_CEILING = float(env_get("EXECUTOR_CENTS_CEILING", "3500"))
+# #1411: запас до потолка в процентах. Отмена стартует, когда usage съел
+# (100 - запас)% любого потолка: в F0 отмена пять раз подряд получила 429, и
+# отмена ровно на пределе остановила бы прогон уже за ним.
+EXECUTOR_CEILING_MARGIN_PCT = float(env_get("EXECUTOR_CEILING_MARGIN_PCT", "15"))
+# #1411: отмена прогона — не одна попытка. Сколько раз хаб зовёт cancel, пока
+# прогон не читается CANCELLED, и пауза между попытками в секундах (опрос
+# идёт раз в 30 с). В F0 взяла шестая попытка после паузы.
+EXECUTOR_CANCEL_MAX_ATTEMPTS = int(env_get("EXECUTOR_CANCEL_MAX_ATTEMPTS", "10"))
+EXECUTOR_CANCEL_PAUSE_S = int(env_get("EXECUTOR_CANCEL_PAUSE_S", "60"))
+# #1412 (F2.4): модель облачного исполнителя. Пусто — запуск отказывает с
+# причиной: семейство обязано отличаться от ревьюера и стюарда (#758, #1008),
+# и угадывать его хаб не берётся.
+EXECUTOR_MODEL = env_get("EXECUTOR_MODEL", "")
+# #1434 (F7): сколько минут слот может молчать — ни записи исполнителя в
+# карточке, ни heartbeat сессии на задаче, — прежде чем поллер освободит его с
+# названной причиной. Ключ политики проекта ``slot_dead_minutes`` сильнее: агент
+# слота может долго гонять тесты молча, и порог — решение проекта.
+EXECUTOR_SLOT_DEAD_MINUTES = int(env_get("EXECUTOR_SLOT_DEAD_MINUTES", "60"))
+# Повтор создания агента при 429 и usage_limit_exceeded (F0, 22–24.09): сколько
+# попыток и пауза между ними. Запуск ручной — пауза держит HTTP-запрос
+# человека, поэтому короткая.
+EXECUTOR_LAUNCH_MAX_ATTEMPTS = int(env_get("EXECUTOR_LAUNCH_MAX_ATTEMPTS", "3"))
+EXECUTOR_LAUNCH_PAUSE_S = int(env_get("EXECUTOR_LAUNCH_PAUSE_S", "10"))
+# #1443 (F5.1): суммарный потолок исполнителя на задачу — сумма всех её
+# прогонов (круг починки даёт несколько). По умолчанию — три прогона по
+# потолку одного (EXECUTOR_CENTS_CEILING / EXECUTOR_TOKEN_CEILING). Политика
+# проекта (executor_task_cents_ceiling / executor_task_token_ceiling) важнее.
+EXECUTOR_TASK_CENTS_CEILING = float(env_get("EXECUTOR_TASK_CENTS_CEILING", "10500"))
+EXECUTOR_TASK_TOKEN_CEILING = int(env_get("EXECUTOR_TASK_TOKEN_CEILING", "24000000"))
+# #1446: потолок повторного прогона «только сдай» — он не пишет код, а только
+# сдаёт запушенную работу, поэтому потолок заметно ниже обычного: прогон, что
+# начал переписывать код, упрётся в него, а не в бюджет задачи. Повтор
+# заказывается, только если на задаче остался запас не меньше этого потолка.
+EXECUTOR_SUBMIT_ONLY_CENTS_CEILING = float(
+    env_get("EXECUTOR_SUBMIT_ONLY_CENTS_CEILING", "300")
+)
+EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING = int(
+    env_get("EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING", "1500000")
+)
+# #1446: сколько минут после конца тихого прогона ждать зелёного CI на
+# вершине его ветки. «Не прочитан», «нет прогона» и «идёт» — не зелёный:
+# платный заказ «только сдай» на них не делается; по истечении — к человеку.
+EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN = int(
+    env_get("EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN", "30")
+)
 #: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
 #: суждения (#1181). Одно число на два вопроса делало ответ на второй
 #: зависимым от того, как долго не отвечали на первый: на первом прогоне
 #: стюарда семнадцать минут ушли на повторные попытки, и судье досталось
 #: двенадцать минут из тридцати.
 STEWARD_START_DEADLINE_MIN = int(env_get("STEWARD_START_DEADLINE_MIN", "30"))
+#: Сколько минут от сдачи судья стюарда ждёт отчёт ревью, которое положено и
+#: ещё может прийти (#1600). Потом прогон покупается с причиной «ждали отчёт
+#: N мин»: вечной отсрочки нет, а эскалация по no_current_report после такого
+#: ожидания уже законна — ревью действительно не пришло.
+STEWARD_REVIEW_WAIT_MAX = int(env_get("STEWARD_REVIEW_WAIT_MAX", "120"))
+#: Сколько минут от заказа советник-критик (#1601) может отвечать, прежде чем
+#: ответ считается не пришедшим (timeout) и approve судьи уходит к человеку.
+#: Срок один на старт и работу: окно не продлевается запуском.
+STEWARD_ADVISOR_WAIT_MAX = int(env_get("STEWARD_ADVISOR_WAIT_MAX", "60"))
 #: Имена, ЗАПУСК которых наблюдён у провайдера попыткой создания (#1237).
 #: Список сегодня не сужает ничего — в нём все проверенные имена, — и стоит
 #: он не ради сужения, а ради связи выбора судьи со СПОСОБОМ проверки: имя
@@ -259,6 +341,25 @@ STEWARD_MODEL_FALLBACKS = tuple(
     )
     if m.strip()
 )
+# Кандидаты в советники-критики (#1601), порядок — предпочтение. Берётся
+# первый, что наблюдался запускающимся (SUBSCRIPTION_LAUNCHABLE_MODELS) и
+# отличается СЕМЕЙСТВОМ от исполнителя, ревьюера и фактической модели судьи.
+# Имя вне наблюдённых запусков пропускается, а не покупается (#1237).
+STEWARD_ADVISOR_MODELS = tuple(
+    m.strip()
+    for m in env_get(
+        "STEWARD_ADVISOR_MODELS",
+        "gpt-5.3-codex,gemini-3.1-pro,claude-sonnet-5,grok-4.6,composer-2.5",
+    ).split(",")
+    if m.strip()
+)
+# Локальный советник (#1649): ОДНА закреплённая модель, которую служба ревью
+# держит в доверенной конфигурации профиля advisor (файл advisor-model рядом с
+# враппером). Пусто — локального советника нет. Модель запускаема локально,
+# только если служба в heartbeat объявила профиль advisor с ТОЙ ЖЕ моделью и
+# STEWARD_HUB_TOKEN разрешается в принципала; автоподмены модели нет, а
+# самодекларация модели в суждении доказательством не считается.
+STEWARD_ADVISOR_LOCAL_MODEL = env_get("STEWARD_ADVISOR_LOCAL_MODEL", "").strip()
 # The hub token the steward run authenticates with (#1105). Same shape as
 # CURSOR_REVIEWER_HUB_TOKEN: the run reaches the hub's own MCP as the steward
 # principal, whose allowlist is two operations (#1021). Unset means no run —
@@ -278,6 +379,16 @@ CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
 # without touching the implementers' tokens.
 CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
 CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
+# Параметры модели в заказе облачного ревьюера (#1417, #1423). Без них
+# Cursor подставляет вариант Fast — та же модель вдвое дороже (Grok 4.6:
+# 4/1/12 против 2/0,5/6 $ за 1 млн токенов ввода/кэша/вывода).
+# "auto" (умолчание) — под модель заказа: вариант isDefault из GET /v1/models,
+# в нём fast=false, и только если такая пара есть в variants. Cursor
+# принимает ЛИШЬ полные пары: "fast=false" для grok-4.6 давал 400
+# invalid_model (25.09.2026, #1423). Явная строка "effort=high,fast=false" —
+# как есть, в обход каталога; пустая — заказ без params, как до #1417.
+# Семейство модели (#758) они не меняют.
+CURSOR_REVIEW_MODEL_PARAMS = os.environ.get("CURSOR_REVIEW_MODEL_PARAMS", "auto")
 CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
 # Локальный ревьюер (#1180): ВТОРОЙ СПОСОБ ДОБЫТЬ тот же отчёт, а не второй
 # механизм ревью. Облачный агент Cursor принимает только GitHub (измерено
@@ -314,6 +425,66 @@ LOCAL_REVIEW_TIMEOUT_SEC = int(env_get("LOCAL_REVIEW_TIMEOUT_SEC", "1800"))
 # сумме уже потраченного на ЭТУ задачу: без него автозапуск обошёл бы механизм
 # экономии #1152 с другой стороны.
 LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"))
+# Потолок диффа, который хаб кладёт в промт ЛОКАЛЬНОГО ревьюера (#1582), в
+# символах. Клона у ревьюера нет (#1180), и читать ему больше нечего: дифф
+# едет в промте, в STDIN, где лимита argv нет. 150000 символов — порядка
+# 40–70 тыс. токенов: помещается в окно модели с запасом под бриф и ответ. Сверх
+# потолка файлы режутся ЦЕЛИКОМ, невошедшие названы в промте поимённо.
+# Строки контекста вокруг правки в диффе для локального ревьюера (#1582).
+# Без клона окружающий код ему взять негде; -U0 показывал только изменённые
+# строки. 20 строк — на дифф этой же задачи 22,9 тыс. символов (-U0) → 69,9 тыс.
+# (-U20), то есть втрое; --function-context дал 75,9 тыс. и без верхней границы
+# на длинной функции. Расчёт профиля остаётся на -U0.
+LOCAL_REVIEW_DIFF_CONTEXT_LINES = int(env_get("LOCAL_REVIEW_DIFF_CONTEXT_LINES", "20"))
+LOCAL_REVIEW_DIFF_CHAR_CEILING = int(
+    env_get("LOCAL_REVIEW_DIFF_CHAR_CEILING", "150000")
+)
+# Потолок для deep, заказанного ПО ПОЛИТИКЕ проекта (deep_reviewer=local,
+# #1561). Прежний потолок выше считает сумму уже потраченного на задачу ДО
+# запуска и не прерывает идущий прогон; но один deep весит больше него
+# (у grok в среднем 3,2 млн токенов по API), и после первого же прогона
+# следующий заказ отказал бы. Эта сумма — тоже предзапусковая и тоже называется
+# в карточке при отказе; идущий прогон она не обрезает.
+LOCAL_REVIEW_DEEP_TOKEN_CEILING = int(
+    env_get("LOCAL_REVIEW_DEEP_TOKEN_CEILING", "10000000")
+)
+# Модель локального CLI, как её записывать в заказ и отчёт (#1561). Пусто —
+# разбирается --model из LOCAL_REVIEW_CMD. Значение попадает в
+# review_dispatches.model и в правило разных семейств, поэтому оно обязано
+# называть ту модель, которая на самом деле читает код, а не облачный выбор.
+LOCAL_REVIEW_MODEL = env_get("LOCAL_REVIEW_MODEL", "")
+# Транспорт запуска локального ревьюера (#1571). ``direct`` (умолчание) — хаб
+# сам запускает песочницу, как с #1180: годится хосту без изоляции службы.
+# ``runner`` — хаб ничего не запускает: кладёт задание в spool-каталог, а
+# запуск делает отдельная служба вне изоляции хаба (deploy/review-runner/).
+# Нужен там, где юнит хаба идёт с ProtectSystem=strict и NoNewPrivileges=yes:
+# sudo и запись вне ReadWritePaths ему запрещены, и ослаблять это нельзя.
+LOCAL_REVIEW_TRANSPORT = env_get("LOCAL_REVIEW_TRANSPORT", "direct")
+# Каталог очереди службы-исполнителя: обязан лежать в ReadWritePaths хаба и
+# быть доступен службе (2770, общая группа). Нужен только при ``runner``.
+LOCAL_REVIEW_SPOOL_DIR = env_get("LOCAL_REVIEW_SPOOL_DIR", "")
+# Снимок исходников для локального ревьюера (#1599). ВЫКЛЮЧЕН по умолчанию и
+# включается ТОЛЬКО после установки защищённого распаковщика, новой службы и
+# новой обёртки (порядок — deploy/LOCAL-REVIEW.md): задание со снимком идёт
+# форматом version=2, который старая служба отклоняет, а хаб не может знать,
+# что на хосте уже стоит. Выключено — хаб шлёт version=1 без снимка, как до
+# задачи, и ревьюер судит по диффу.
+LOCAL_REVIEW_SNAPSHOT = env_get("LOCAL_REVIEW_SNAPSHOT", "0") == "1"
+# Потолок размера архива git archive на закреплённом sha: чтение останавливается
+# на нём и процесс убивается. Служба держит свой потолок
+# (HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES), не меньший этого.
+LOCAL_REVIEW_SNAPSHOT_MAX_BYTES = int(
+    env_get("LOCAL_REVIEW_SNAPSHOT_MAX_BYTES", str(64 * 1024 * 1024))
+)
+# Только для транспорта direct: путь к защищённому snapshot_unpack.py (файл и
+# каталоги над ним — root, на запись никому). Хаб грузит распаковщик ТОЛЬКО
+# отсюда, после проверки; из клона и spool — никогда. Пусто — снимка при direct
+# нет, причина названа. При runner не читается: распаковывает служба.
+LOCAL_REVIEW_SNAPSHOT_UNPACKER = env_get("LOCAL_REVIEW_SNAPSHOT_UNPACKER", "")
+# Только для direct: путь снимка ГЛАЗАМИ ревьюера. Пусто — <workdir>/src
+# (ревьюер на файловой системе хоста). Контейнерная обёртка монтирует снимок
+# в /work/src: тогда здесь /work/src, иначе промт обещал бы недоступный путь.
+LOCAL_REVIEW_SNAPSHOT_PATH = env_get("LOCAL_REVIEW_SNAPSHOT_PATH", "")
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #
@@ -325,6 +496,25 @@ LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"
 # size. The unit that tracks cost is the RUN: none billed under 777k, lite
 # averages 1.38M, deep 3.85M.
 REVIEW_LITE_TOKEN_BUDGET = int(env_get("REVIEW_LITE_TOKEN_BUDGET", "40000"))
+# #1414: сколько deep-ревью проект покупает за сутки UTC, когда в его
+# gate_policy нет своего deep_daily_cap. Пусто — потолка нет (как до задачи);
+# нечитаемое значение — тоже нет: опечатка в окружении не должна молча
+# перевести все проекты на lite. Считается по числу, не по токенам: счёт
+# провайдера deep занижен до #1413.
+REVIEW_DEEP_DAILY_CAP = env_get("REVIEW_DEEP_DAILY_CAP", "")
+# #1403: доля сдач, которым правило риска дало lite, а они получают deep по
+# жребию (детерминированному от задачи и поколения) — случайная когорта, на
+# которой deep и lite сравнимы. Умолчание 0 — решение владельца 01.10: до
+# сброса квоты (13.10) жребий выкатывается выключенным, включают его через
+# env. 0 выключает; нечитаемое значение — тоже.
+# Круг (#1432) и суточный потолок (#1414) жребий режут, малая дельта (#1416)
+# в него не попадает.
+REVIEW_RANDOM_DEEP_SHARE = env_get("REVIEW_RANDOM_DEEP_SHARE", "0.0")
+# #1416: пересдача, чья АВТОРСКАЯ дельта (#1249) не длиннее стольких
+# изменённых строк (добавлено + удалено, без сгенерированных файлов), получает
+# lite вместо deep. Ключ small_delta_lines в gate_policy проекта главнее;
+# 0 выключает правило; нечитаемое значение — тоже выключает (дорогая сторона).
+REVIEW_SMALL_DELTA_LINES = env_get("REVIEW_SMALL_DELTA_LINES", "80")
 MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
 # Seconds after CI start / first missing-run probe before "no run for this
 # SHA" is a named fact rather than a wait. Same window the poller already
@@ -498,6 +688,19 @@ HUB_COOKIE_MAX_AGE = int(env_get("HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
 HUB_COOKIE_SECURE = env_get("HUB_COOKIE_SECURE", "0") == "1"
 
 
+# CSRF for cookie-session mutations (#1664): off | warn | require. An unknown
+# value falls back to warn, never to off — a typo must not switch protection off.
+CSRF_MODES = ("off", "warn", "require")
+_csrf_mode_raw = (env_get("CSRF_MODE", "warn") or "warn").strip().lower()
+CSRF_MODE = _csrf_mode_raw if _csrf_mode_raw in CSRF_MODES else "warn"
+# Key of the session-bound token. Empty: a 0600 file next to the database.
+CSRF_SECRET = env_get("HUB_CSRF_SECRET", "")
+# A form body is buffered up to this size to find the csrf_token field.
+CSRF_BODY_LIMIT = 1024 * 1024
+# ... and read for at most this many seconds (a slow body holds a worker).
+CSRF_BODY_DEADLINE = 10.0
+
+
 HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")
 
 # ---------------------------------------------------------------------------
@@ -564,8 +767,12 @@ CHAT_PAIR_REVIEWER_PERMS: frozenset[str] = frozenset({"tasks.read"})
 # is not the bound one — a judge let loose on a neighbouring task would be
 # judging evidence nobody ordered for it.
 CHAT_PAIR_TASK_BOUND_KINDS: frozenset[str] = frozenset(
-    {"implementer", "reviewer", "steward"}
+    {"implementer", "reviewer", "steward", "steward_advisor"}
 )
+#: Виды сессии, чья личность — принципал стюарда (#1021). Советник-критик
+#: (#1601) ходит той же дорогой и по тем же двум операциям, но судья не может
+#: сдать суждение советника, а советник — суждение судьи: вид сессии решает.
+STEWARD_PAIR_KINDS: frozenset[str] = frozenset({"steward", "steward_advisor"})
 
 # Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
 # Those four include create/refine/update and would let the steward write the
@@ -577,6 +784,10 @@ STEWARD_PERMS: frozenset[str] = frozenset(
         "steward.judgement.write",
     }
 )
+
+# Watcher (#1556): read-only. One verb, and the real gate is the positive
+# method+path list in hub/auth.py, not this set.
+WATCHER_PERMS: frozenset[str] = frozenset({"tasks.read"})
 
 
 class TokenIdentity:
@@ -598,6 +809,9 @@ class TokenIdentity:
         "chat_pair_kind",
         "chat_pair_task_id",
         "chat_pair_generation",
+        "scopes",
+        "scopes_damaged",
+        "transport",
     )
 
     def __init__(
@@ -611,6 +825,9 @@ class TokenIdentity:
         chat_pair_kind: str | None = None,
         chat_pair_task_id: int | None = None,
         chat_pair_generation: int | None = None,
+        scopes: tuple[str, ...] | None = None,
+        scopes_damaged: bool = False,
+        transport: str = "",
     ) -> None:
         self.username = username
         self.role = role
@@ -621,6 +838,16 @@ class TokenIdentity:
         self.chat_pair_kind = chat_pair_kind
         self.chat_pair_task_id = chat_pair_task_id
         self.chat_pair_generation = chat_pair_generation
+        # #1644: project slugs an API key is bound to. ``None`` = the key
+        # carries no scope (legacy, unrestricted); a damaged ``api_keys.scopes``
+        # sets ``scopes_damaged`` so the CI entrances can refuse (fail closed).
+        self.scopes = scopes
+        self.scopes_damaged = scopes_damaged
+        # #1664: how the caller proved who it is — "bearer" (Authorization
+        # header), "cookie" (browser session), "open" (open mode) or ""
+        # (anonymous / not resolved by the request resolver). Only "cookie"
+        # makes a request forgeable from another site, so CSRF reads this.
+        self.transport = transport
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"
@@ -636,8 +863,26 @@ class TokenIdentity:
         return self.role == "steward"
 
     @property
+    def is_watcher(self) -> bool:
+        return self.role == "watcher"
+
+    @property
+    def is_scoped_ci(self) -> bool:
+        """A CI key bound to projects (#1644): confined to the CI routes.
+
+        Damaged scopes count as bound: a key whose binding cannot be read is
+        refused, never widened. Keys without any scope (legacy) are not
+        confined here; they are flagged by the CI entrances instead.
+        """
+        bound = bool(self.scopes) or self.scopes_damaged
+        return bound and (
+            "tasks.ci_report" in self.permissions
+            or "deploys.record" in self.permissions
+        )
+
+    @property
     def is_human(self) -> bool:
-        if self.is_steward:
+        if self.is_steward or self.is_watcher:
             return False
         if self.role in ("human", "admin", "super_admin"):
             return True
@@ -645,7 +890,7 @@ class TokenIdentity:
 
     @property
     def is_agent(self) -> bool:
-        if self.is_steward:
+        if self.is_steward or self.is_watcher:
             return False
         if self.role == "agent":
             return True
@@ -657,6 +902,12 @@ class TokenIdentity:
         if self.is_steward:
             held = self.permissions if self.permissions else STEWARD_PERMS
             return perm in held
+        if self.is_watcher:
+            # Never widened by a stored permission set: whatever a role row
+            # carries, a watcher holds no verb outside WATCHER_PERMS.
+            return perm in WATCHER_PERMS and (
+                not self.permissions or perm in self.permissions
+            )
         if self.permissions:
             return perm in self.permissions
         if self.role == "admin":
@@ -777,3 +1028,20 @@ def validate_network_auth() -> None:
         f"Either set HAIPLANE_HUB_TOKENS, bind to 127.0.0.1, or set "
         f"HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 to override."
     )
+
+
+# Egress watch (#1645): the hub's own look at the way out of the server.
+def _int_env(suffix: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(env_get(suffix, str(default)))
+    except ValueError:
+        return default
+    return value if low <= value <= high else default
+
+
+EGRESS_PROBE_URL = env_get("EGRESS_PROBE_URL", "https://api.github.com/")
+EGRESS_PROBE_SECONDS = _int_env("EGRESS_PROBE_SECONDS", 120, 30, 900)
+EGRESS_DOWN_AFTER = _int_env("EGRESS_DOWN_AFTER", 3, 1, 100)
+# One shared limit for stopping every background task (#1667): after it the
+# stop names what did not finish and goes on, instead of waiting for ever.
+STOP_TIMEOUT_SECONDS = _int_env("STOP_TIMEOUT_SECONDS", 10, 1, 120)

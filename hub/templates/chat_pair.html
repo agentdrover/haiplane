@@ -24,14 +24,14 @@
 {% endif %}
 
 <form method="post" action="/chat-pair/web-start" class="task-action-stack">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {{ csrf_field() }}
     <button class="btn btn-primary task-action-btn" type="submit">
         {% if code %}Выдать новый код{% else %}Получить код{% endif %}
     </button>
 </form>
 
 <form method="post" action="/chat-pair/web-revoke" class="task-action-stack">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {{ csrf_field() }}
     <button class="btn task-action-btn" type="submit">Отозвать чат-сессии</button>
 </form>
 

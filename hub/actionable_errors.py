@@ -34,14 +34,17 @@ _PERMISSION_HINTS: dict[str, dict[str, str | None]] = {
     },
     "tasks.decision": {
         "required_role": "human",
-        "suggested_tool": "hub_decide_task",
-        "hint": "Decision Gate requires hub_decide_task with a human or admin token.",
+        "suggested_tool": None,
+        "hint": (
+            "Decision Gate is a human step: POST /api/tasks/<id>/decide with a "
+            "human or admin token (hub UI or oc-hub)."
+        ),
     },
 }
 
 _DONE_SUGGESTED_TOOLS: dict[str, str | None] = {
     "pair_start_required": "hub_pair_start",
-    "human_decision_required": "hub_decide_task",
+    "human_decision_required": None,
     "awaiting_ci_conveyor": "hub_task_status",
     "task_already_terminal": "hub_task_status",
     "invalid_status_for_done": "hub_pair_start",
@@ -175,7 +178,7 @@ def steward_verdict_required_detail() -> dict[str, Any]:
                 "Send verdict as approve, changes_requested or escalate. "
                 "Omitting it must not become an approve."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -197,7 +200,7 @@ def steward_closed_vocabulary_detail(
                 f"{field} must be one of: {', '.join(allowed_list)}. "
                 "There is no unknown bucket — a new code is a spec change."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -214,7 +217,7 @@ def steward_escalate_reason_required_detail(
             "allowed": allowed_list,
             "message": "escalate_reason is required when verdict is escalate",
             "hint": f"Send escalate_reason as one of: {', '.join(allowed_list)}.",
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -230,7 +233,7 @@ def steward_unknown_finding_uid_detail(uid: str) -> dict[str, Any]:
                 "Closures address confirmed findings of this submission by "
                 "finding_uid. A uid the hub cannot see cannot close a finding."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -251,7 +254,52 @@ def steward_judgement_exists_detail(
                 "A second judgement of the same triple is refused, not stacked. "
                 "A new submission generation opens a new slot."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
+        }
+    )
+
+
+def steward_advisor_channel_detail(kind: str, session_kind: str) -> dict[str, Any]:
+    """403: a judgement of this kind came through the other steward channel (#1601).
+
+    The judge and the advisor walk the same two routes with different session
+    kinds; each may only write its own judgement, so the judge cannot answer
+    for its own critic (and the critic cannot judge for the judge).
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_advisor_channel",
+            "actor_hint": "none",
+            "message": (
+                f"a {kind!r} judgement is not accepted from a "
+                f"{session_kind or 'plain'} steward session"
+            ),
+            "hint": (
+                "kind=advisor is written only by the advisor session the hub "
+                "ordered for the judge's approve; every other kind only by the "
+                "judge session. The channel is the session kind, not a field."
+            ),
+            "suggested_tool": None,
+        }
+    )
+
+
+def steward_advisor_not_ordered_detail(task_id: int, generation: int) -> dict[str, Any]:
+    """409: no open, started advisor order backs this advisor judgement (#1601)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_advisor_not_ordered",
+            "actor_hint": "none",
+            "message": (
+                f"no open advisor order for task #{task_id} generation "
+                f"{generation}, or the judge's approve it answers is missing"
+            ),
+            "hint": (
+                "The advisor answers one approve of the judge, under the order "
+                "the hub placed for it. A late answer after the order closed "
+                "(timeout, new submission) is refused, not stored."
+            ),
+            "suggested_tool": None,
         }
     )
 
@@ -269,6 +317,24 @@ def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
                 "routes that do not exist yet."
             ),
             "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )
+
+
+def watcher_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
+    """A watcher token reached a route outside its read-only list (#1556)."""
+    return enrich_error_payload(
+        {
+            "reason": "watcher_gate_forbidden",
+            "actor_hint": "none",
+            "message": f"watcher principals may not call {method} {path}",
+            "hint": (
+                "The watcher role is read-only: GET and HEAD on /api/* and the "
+                "MCP transport at /mcp. Everything else is refused by default, "
+                "including routes that do not exist yet."
+            ),
+            "required_role": "watcher",
             "suggested_tool": None,
         }
     )
@@ -795,6 +861,144 @@ def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str
     )
 
 
+def submission_contract_violated_detail(
+    violations: list[str], *, mutations_format: str
+) -> dict[str, Any]:
+    """Сдача, нарушившая контракт проекта в режиме require (#1436).
+
+    Все нарушения разом, а не первое: исполнитель, получивший одно, чинит его
+    и приходит за следующим — ровно так три поля превращаются в три отказа.
+    Формат ``mutations`` назван в подсказке: облачный исполнитель ходит по REST
+    без MCP (#1384), и эта ошибка — всё, что он прочитает.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "submission_contract_violated",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "message": (
+                "submission contract (require) refused this submission: "
+                + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                "status did not change. Resubmit with a non-empty model and "
+                f"summary and {mutations_format}."
+            ),
+            "mutations_format": mutations_format,
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
+def bug_red_test_unproven_detail(
+    violations: list[str], *, head_sha: str, not_evidence: str
+) -> dict[str, Any]:
+    """Сдача бага без доказанного красного теста в режиме require (#913).
+
+    Причина по каждому AC разом: нет baseline, зелёный до фикса, упал по
+    неверной причине. Подсказка говорит, откуда берётся доказательство —
+    исполнитель без MCP читает только эту ошибку.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "bug_red_test_unproven",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "message": (
+                f"bug_red_test (require) refused this bug submission at "
+                f"{(head_sha or '')[:12] or '—'}: " + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                "status did not change. " + not_evidence + " Push the branch, "
+                "wait for CI to report the pinned commit, then resubmit."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
+def ci_before_submit_unproven_detail(
+    violations: list[str], *, head_sha: str, cause: str
+) -> dict[str, Any]:
+    """Явная сдача без доказанного зелёного CI в режиме require (#1629).
+
+    Причина в ``cause``: no_report | red | validation_not_pass | malformed.
+    Подсказка не обещает, что push сам запускает CI: у проекта может не быть
+    ни отчётчика CI, ни validation_commands — тогда доказательство недоступно,
+    и это решение владельца, а не повод повторять сдачу.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "ci_before_submit_unproven",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "sha": head_sha,
+            "cause": cause,
+            "message": (
+                f"ci_before_submit (require) refused this submission at "
+                f"{(head_sha or '')[:12] or '—'} ({cause}): " + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                f"status did not change. Дождитесь отчёта CI о {head_sha or 'закреплённом коммите'} "
+                "со статусом validation pass и без красных проверок, затем "
+                "повторите сдачу. Если у проекта нет отчётчика CI или "
+                "validation_commands, доказательство недоступно: решает "
+                "владелец (ci_before_submit=warn или off)."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
+def claim_area_conflict_detail(
+    *, task_id: int, current_status: str, conflict: dict[str, Any]
+) -> dict[str, Any]:
+    """Захват, отказанный сверкой областей в режиме require (#1433).
+
+    Причин две, и они названы разными ``reason``: пересечение с начатой
+    задачей (``claim_area_overlap`` — сосед и оба пути) и незнание
+    (``claim_area_undeclared`` — области не объявлены у захватываемой задачи
+    или у начатой). ``area_rule`` — причина из правила очереди как есть.
+    Статус задачи не менялся: отказ стоит до перехода.
+    """
+    from hub.services.orchestrator_queue import SKIP_OVERLAP
+
+    undeclared = conflict.get("reason") != SKIP_OVERLAP
+    detail = str(conflict.get("detail") or "")
+    fields: dict[str, Any] = {
+        k: conflict[k]
+        for k in ("path", "with_task_id", "with_path", "with_task_ids")
+        if k in conflict
+    }
+    return enrich_error_payload(
+        {
+            "reason": "claim_area_undeclared" if undeclared else "claim_area_overlap",
+            "actor_hint": "agent",
+            "retry_by_same_caller": False,
+            "current_status": current_status,
+            "task_id": task_id,
+            "area_rule": conflict.get("reason", ""),
+            "message": (
+                f"Task #{task_id} is not captured: claim_area_check=require "
+                f"refused it: {detail}"
+            ),
+            "hint": (
+                f"{detail}. The task stays {current_status}. Take another task, "
+                "wait until the named one leaves work, or declare "
+                "affected_areas precisely."
+            ),
+            **fields,
+            "suggested_tool": "hub_task_status",
+        }
+    )
+
+
 def changes_requested_requires_content_detail() -> dict[str, Any]:
     """A verdict that sends work back has to say what to redo (#1010).
 
@@ -908,6 +1112,25 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
             )
         ):
             return hierarchy_error_detail(detail)
+
+    # #1602: структурированный отказ с кодом ``error`` (замок #743:
+    # default_project_gate_locked, violations, allowed) не теряет свои поля.
+    # Раньше он превращался в безымянный validation_error со строкой-словарём.
+    if isinstance(detail, dict) and detail.get("error"):
+        reason, actor = _reason_for_status(status_code)
+        hint = str(detail.get("hint") or detail["error"])
+        payload = {
+            "reason": reason,
+            "message": hint,
+            "hint": hint,
+            "actor_hint": actor,
+            "suggested_tool": None,
+            "status_code": status_code,
+        }
+        for key in ("error", "violations", "allowed"):
+            if key in detail:
+                payload[key] = detail[key]
+        return enrich_error_payload(payload)
 
     msg = str(detail)
     if status_code == 403:

@@ -15,8 +15,10 @@ behavior, the same shadow-step pattern as #581 and #743.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import httpx
 
@@ -29,6 +31,52 @@ _TIMEOUT = 30.0
 #: при общем терпении в 30, и клиент бросал вызов, который на деле удался
 #: (#1199). Остальные вызовы модуля — короткие GET, им общий срок годится.
 _CREATE_TIMEOUT = 120.0
+#: Публично для брони запуска исполнителя (#1412): сколько длится один заказ.
+CREATE_TIMEOUT_S = _CREATE_TIMEOUT
+
+
+#: Эвристика по env: короче этого значение не считается секретом, иначе
+#: вычистятся обычные слова. Явно объявленные секреты порогу не подчиняются.
+_MIN_SECRET_LEN = 6
+_SECRET_NAME_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+
+
+def _explicit_secrets() -> set[str]:
+    """Секреты, объявленные настройкой: вычищаются при любой длине (#1222).
+
+    В составной настройке (``name:token[:role]``) секрет — только поле токена,
+    имя пользователя и роль остаются в диагностике.
+    """
+    found: set[str] = {
+        (config.CURSOR_API_KEY or "").strip(),
+        (config.STEWARD_HUB_TOKEN or "").strip(),
+    }
+    found.update(config.HUB_TOKENS)
+    found.update(config.parse_tokens(config.HUB_TOKENS_RAW))
+    found.update(
+        config.parse_tokens(os.environ.get(brand.ENV_PREFIX + "HUB_TOKENS", ""))
+    )
+    found.discard("")
+    return found
+
+
+def known_secrets() -> list[str]:
+    """Известные секреты процесса, длинные первыми; значения — только для замены."""
+    found = _explicit_secrets()
+    for name, value in os.environ.items():
+        value = value.strip()
+        if len(value) >= _MIN_SECRET_LEN and name.upper().endswith(
+            _SECRET_NAME_SUFFIXES
+        ):
+            found.add(value)
+    return sorted(found, key=len, reverse=True)
+
+
+def scrub_secrets(text: str) -> str:
+    """Текст без известных секретов: эхо ключа в теле ошибки не попадает в журнал."""
+    for secret in known_secrets():
+        text = text.replace(secret, "[redacted]")
+    return text
 
 
 def is_configured() -> bool:
@@ -64,6 +112,30 @@ class Refusal:
         """Сеть, таймаут, нечитаемый ответ — то, что стоит повторить как есть."""
         return self.status == 0 or self.status // 100 == 5
 
+    @property
+    def leaves_create_unknown(self) -> bool:
+        """Ответ на СОЗДАНИЕ, который не доказывает, что агента нет (#1408).
+
+        Не то же, что ``is_transport``: ответ дошёл, но отрицательным он
+        только выглядит. Повторять create на нём нельзя — агент может уже
+        работать и выставлять счёт; можно только спросить провайдера по метке.
+        """
+        return self.status in CREATE_OUTCOME_UNKNOWN_STATUSES
+
+
+#: HTTP-коды ответа на POST /v1/agents, после которых агент МОЖЕТ существовать
+#: (#1408). Основание — прод, не догадка: 25.09.2026 два заказа (#1399 gen2,
+#: #1402 gen1) получили HTTP 404 ``agent_not_found``, а выгрузка usage Cursor
+#: показала по каждому созданного и оплаченного агента (bc-1ddea9c5,
+#: bc-14da80ef), первый ещё и сдал отчёт. 404 на ресурс, который этот же
+#: запрос создаёт, отрицательного факта не несёт — код ``error.code`` тут не
+#: разбирается намеренно: чужой 404, окажись он настоящим отказом, стоит
+#: одной сверки по метке, а принятый за отказ живой агент — второго прогона.
+#: Обрыв связи и 5xx сюда не входят: их уже ведёт ``is_transport`` (#1199).
+#: Отказы, доказывающие отсутствие агента (400 ``usage_limit_exceeded``,
+#: 429 ``rate_limited`` и прочие 4xx), остаются отказами.
+CREATE_OUTCOME_UNKNOWN_STATUSES: frozenset[int] = frozenset({404})
+
 
 async def _attempt(
     method: str,
@@ -89,12 +161,12 @@ async def _attempt(
                 method,
                 path,
                 resp.status_code,
-                resp.text[:300],
+                scrub_secrets(resp.text)[:300],
             )
             return None, Refusal(
                 status=resp.status_code,
                 code=_error_code(resp),
-                detail=resp.text[:300],
+                detail=scrub_secrets(resp.text)[:300],
             )
         body = resp.json()
         if not isinstance(body, dict):
@@ -106,7 +178,9 @@ async def _attempt(
         # ``str(exc)`` ПУСТ — в журнале оставалось «failed:» и ничего, и
         # причину пришлось восстанавливать по арифметике времени. Класс
         # называет её сразу: ReadTimeout и ConnectError — разные разговоры.
-        detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        detail = scrub_secrets(
+            f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        )
         log.warning("cursor cloud %s %s failed: %s", method, path, detail)
         return None, Refusal(detail=detail[:300])
 
@@ -304,34 +378,153 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
     return Reconciliation("", "", True)
 
 
-async def create_review_agent(
-    *,
-    repo_url: str,
-    starting_ref: str,
-    model_id: str,
-    prompt_text: str,
-    hub_mcp_url: str,
-    reviewer_token: str,
-    name: str = "",
-) -> dict[str, Any] | None:
-    """Queue a cloud agent that reviews ``starting_ref`` of ``repo_url``.
+#: Параметр модели в заказе: ``{"id": "fast", "value": "false"}`` (#1417).
+ModelParam = dict[str, str]
 
-    The agent gets the hub's own MCP inline, authenticated as the REVIEWER
-    principal — the report comes back through our contract
-    (hub_get_review_brief / hub_submit_machine_review), not through git:
-    ``autoCreatePR=false`` and ``workOnCurrentBranch=false`` keep any
-    accidental commits on a throwaway cursor/ branch.
+#: Значение CURSOR_REVIEW_MODEL_PARAMS «подобрать по каталогу» (#1423).
+REVIEW_PARAMS_FROM_CATALOG = "auto"
+
+#: Сколько живёт прочитанный каталог моделей (#1423). Час: варианты у
+#: Cursor меняются с выпуском моделей, а не между заказами, а заказов ревью —
+#: единицы в час, так что чтение на каждый заказ удваивало бы запросы ради
+#: свежести, которой никто не ждёт. Устаревание дороже одного лишнего
+#: запроса не выходит: вариант, который провайдер перестал принимать, ловит
+#: запасной путь (любой 400 → один заказ без params), а через час каталог
+#: перечитывается сам. Неудачное чтение не кэшируется — следующий заказ
+#: спросит снова.
+MODELS_CATALOG_TTL_SECONDS = 3600.0
+
+_models_catalog: dict[str, Any] = {}
+
+
+def forget_models_catalog() -> None:
+    """Забыть прочитанный каталог — для тестов и ручного сброса."""
+    _models_catalog.clear()
+
+
+def parse_model_params(raw: str) -> list[ModelParam]:
+    """``"effort=high,fast=false"`` → ``[{id, value}, ...]``.
+
+    Запись без ``=`` или с пустым именем пропускается с предупреждением —
+    послать провайдеру параметр, которого владелец не называл, хуже, чем не
+    послать никакого.
     """
-    created, _ = await create_agent_attempt(
-        repo_url=repo_url,
-        starting_ref=starting_ref,
-        model_id=model_id,
-        prompt_text=prompt_text,
-        hub_mcp_url=hub_mcp_url,
-        reviewer_token=reviewer_token,
-        name=name,
+    params: list[ModelParam] = []
+    for chunk in (raw or "").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            log.warning("CURSOR_REVIEW_MODEL_PARAMS: skipped malformed %r", item)
+            continue
+        params.append({"id": key.strip(), "value": value.strip()})
+    return params
+
+
+def _as_params(raw: Any) -> list[ModelParam] | None:
+    """``variants[].params`` в виде ``[{id, value}]`` или None, если форма чужая."""
+    if not isinstance(raw, list):
+        return None
+    params: list[ModelParam] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        key, value = item.get("id"), item.get("value")
+        if not isinstance(key, str) or not isinstance(value, str):
+            return None
+        params.append({"id": key, "value": value})
+    return params
+
+
+def _catalog_item(catalog: dict[str, Any], model_id: str) -> dict[str, Any] | None:
+    items = catalog.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        aliases = item.get("aliases")
+        names = [item.get("id")] + (aliases if isinstance(aliases, list) else [])
+        if model_id in names:
+            return item
+    return None
+
+
+def slow_default_variant(catalog: dict[str, Any], model_id: str) -> list[ModelParam]:
+    """Вариант isDefault модели с fast=false — только если он есть в variants.
+
+    Cursor принимает в ``model.params`` лишь полные пары из ``variants``
+    (25.09.2026: ``[{fast:false}]`` для grok-4.6 → 400 invalid_model, #1423),
+    поэтому пара не собирается, а находится: берётся вариант по умолчанию,
+    в нём меняется только fast, и получившийся набор обязан стоять в
+    variants. Нет модели, нет isDefault, нет fast или нет такой пары —
+    пустой список, заказ без params: вариант по умолчанию дороже, но он
+    заведомо допустим.
+    """
+    item = _catalog_item(catalog, model_id)
+    variants = item.get("variants") if item else None
+    if not isinstance(variants, list):
+        return []
+    offered = [
+        p
+        for p in (_as_params(v.get("params")) for v in variants if isinstance(v, dict))
+        if p is not None
+    ]
+    default = next(
+        (
+            _as_params(v.get("params"))
+            for v in variants
+            if isinstance(v, dict) and v.get("isDefault") is True
+        ),
+        None,
     )
-    return created
+    if not default or not any(p["id"] == "fast" for p in default):
+        return []
+    wanted = {p["id"]: ("false" if p["id"] == "fast" else p["value"]) for p in default}
+    for params in offered:
+        if {p["id"]: p["value"] for p in params} == wanted and len(params) == len(
+            wanted
+        ):
+            return params
+    return []
+
+
+async def _read_models_catalog() -> dict[str, Any] | None:
+    """Каталог моделей из кэша или свежим чтением; None — прочитать не вышло."""
+    now = time.monotonic()
+    cached = _models_catalog.get("body")
+    if cached is not None and now - _models_catalog.get("at", 0.0) < (
+        MODELS_CATALOG_TTL_SECONDS
+    ):
+        return cast(dict[str, Any], cached)
+    body = await list_models()
+    if body is None or not isinstance(body.get("items"), list):
+        return None
+    _models_catalog.update(body=body, at=now)
+    return body
+
+
+async def review_params_for(model_id: str) -> list[ModelParam]:
+    """Параметры заказа ревьюера под КОНКРЕТНУЮ модель (#1423).
+
+    Порядок: пустая настройка — без params (быстрая мера владельца, как до
+    #1417); явные пары — как есть, их выбрал человек, и если провайдер их
+    отвергнет, запасной путь закажет без них; ``auto`` (умолчание) — вариант
+    по умолчанию этой модели с fast=false из GET /v1/models. Каталог не
+    прочитан — без params: ревью дороже, но оно есть.
+    """
+    raw = (config.CURSOR_REVIEW_MODEL_PARAMS or "").strip()
+    if raw.lower() != REVIEW_PARAMS_FROM_CATALOG:
+        return parse_model_params(raw)
+    catalog = await _read_models_catalog()
+    return slow_default_variant(catalog, model_id) if catalog is not None else []
+
+
+def model_variant(model_id: str, params: list[ModelParam] | None) -> str:
+    """Модель с параметрами одной строкой: ``grok-4.6 fast=false`` (#1417)."""
+    tail = ",".join(f"{p['id']}={p['value']}" for p in params or [])
+    return f"{model_id} {tail}" if tail else model_id
 
 
 async def create_agent_attempt(
@@ -340,33 +533,50 @@ async def create_agent_attempt(
     starting_ref: str,
     model_id: str,
     prompt_text: str,
-    hub_mcp_url: str,
-    reviewer_token: str,
+    hub_mcp_url: str = "",
+    reviewer_token: str = "",
     name: str = "",
+    model_params: list[ModelParam] | None = None,
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
-    """То же, что :func:`create_review_agent`, но с причиной отказа (#1182).
+    """Заказать облачного агента на ``starting_ref`` из ``repo_url``.
 
-    Нужна одному потребителю — выбору судьи, который обязан отличить
-    «эта модель недоступна» от «связь оборвалась». Тело запроса собирается
-    здесь, а ``create_review_agent`` остаётся видом на неё: два способа
-    собрать один и тот же запрос разошлись бы, и разошёлся бы тот, который
-    реже читают.
+    Возвращает созданного агента или причину отказа (#1182): выбор судьи
+    обязан отличить «эта модель недоступна» от «связь оборвалась». Это
+    единственный шов заказа — им пользуются и диспетч ревью, и судья
+    стюарда.
+
+    Агент получает MCP самого хаба, авторизованный как РЕВЬЮЕР: отчёт
+    возвращается через наш контракт (hub_get_review_brief /
+    hub_submit_machine_review), а не через git. ``autoCreatePR=false`` и
+    ``workOnCurrentBranch=false`` уводят случайные коммиты в одноразовую
+    ветку cursor/.
+
+    ``model_params`` (#1417) уходят в ``model.params`` как есть; пусто или
+    ``None`` — голый ``model.id``, как до задачи. Умолчания тут нет
+    намеренно: судья стюарда зовёт этот же шов, и параметры ревьюера ему
+    не принадлежат.
     """
+    model: dict[str, Any] = {"id": model_id}
+    if model_params:
+        model["params"] = [dict(p) for p in model_params]
     body: dict[str, Any] = {
         "prompt": {"text": prompt_text},
-        "model": {"id": model_id},
+        "model": model,
         "repos": [{"url": repo_url, "startingRef": starting_ref}],
         "autoCreatePR": False,
         "workOnCurrentBranch": False,
-        "mcpServers": [
+    }
+    if hub_mcp_url:
+        # Исполнитель F2.4 (#1412) идёт в хаб по HTTP через код implementer,
+        # а не через MCP ревьюера: без адреса блок не кладётся вовсе.
+        body["mcpServers"] = [
             {
                 "name": brand.MCP_SERVER_NAME,
                 "type": "http",
                 "url": hub_mcp_url,
                 "headers": {"Authorization": f"Bearer {reviewer_token}"},
             }
-        ],
-    }
+        ]
     if name:
         # Метка кладётся ТОЛЬКО когда её попросили: пустое имя означает, что
         # вызывающий подбирать не собирается, и придумывать за него метку —
@@ -381,11 +591,90 @@ async def get_run(agent_id: str, run_id: str) -> dict[str, Any] | None:
     return await _request("GET", f"/v1/agents/{agent_id}/runs/{run_id}")
 
 
+async def list_runs(agent_id: str, pages: int = 3) -> list[dict[str, Any]] | None:
+    """Все прогоны агента; ``None`` — список не прочитан (#1413).
+
+    Форма ответа ЖИВЬЁМ НЕ ПРОВЕРЕНА: разбирается та же, что наблюдалась у
+    списка агентов (``items`` + ``nextCursor``, 06.09.2026). Тело другой формы
+    — это «прочитать не смог», а не «прогонов нет»: пустой список здесь
+    обнулил бы счёт агента.
+    """
+    runs: list[dict[str, Any]] = []
+    cursor = ""
+    for _ in range(max(1, pages)):
+        path = f"/v1/agents/{agent_id}/runs?limit=50"
+        if cursor:
+            path += f"&cursor={cursor}"
+        page = await _request("GET", path)
+        items = (page or {}).get("items")
+        if not isinstance(items, list):
+            return None
+        runs.extend(item for item in items if isinstance(item, dict))
+        cursor = str((page or {}).get("nextCursor") or "")
+        if not cursor:
+            return runs
+    return None  # страниц больше потолка — список неполный, это не ответ
+
+
 async def get_usage(agent_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+    """Ответ ``/usage``: с ``run_id`` — одного прогона, без — агента (#1413).
+
+    Счёт одного прогона сверен с выгрузкой Cursor до токена (lite, 25.09).
+    Что отдаёт путь без ``runId`` — агрегат по агенту или отказ — живьём не
+    проверено; вызывающий обязан пережить оба исхода.
+    """
     path = f"/v1/agents/{agent_id}/usage"
     if run_id:
         path += f"?runId={run_id}"
     return await _request("GET", path)
+
+
+async def cancel_run(
+    agent_id: str, run_id: str
+) -> tuple[dict[str, Any] | None, Refusal | None]:
+    """Одна попытка отмены прогона (#1411): ``(тело, отказ)``.
+
+    Это только просьба. В F0 отмена пять раз подряд получила 429
+    ``rate_limit_exceeded``; и 2xx не значит, что прогон встал. Исход
+    подтверждает перечтённый прогон (:func:`get_run`), а повторы и паузу
+    держит вызывающий.
+    """
+    return await _attempt("POST", f"/v1/agents/{agent_id}/runs/{run_id}/cancel")
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _first_present(key: str, *places: dict[str, Any]) -> Any:
+    """Значение ``key`` из первого места, где оно есть и не ``None``."""
+    for place in places:
+        if place.get(key) is not None:
+            return place[key]
+    return None
+
+
+def usage_totals(usage: dict[str, Any] | None) -> tuple[int | None, float | None]:
+    """``(токены, центы)`` из ответа ``/usage``; ``None`` — провайдер не назвал.
+
+    Токены — ``totalUsage.totalTokens`` (как у ревью). Центы — ``chargedCents``
+    (наблюдено в F0, docs/specs/orchestrator-executor-environment.md). По
+    типам Cloud Agents API/SDK деньги лежат в соседнем объекте ``cost``
+    (``V1AgentUsageResponse.cost``: ``rawCostCents``, ``chargedCents``) —
+    оттуда и читаются. ``totalUsage`` и верхний уровень остались запасными
+    местами (#1410). Нечисловое значение — не ноль, а ``None``.
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    total = _as_dict(usage.get("totalUsage"))
+    tokens = total.get("totalTokens")
+    cents = _first_present("chargedCents", _as_dict(usage.get("cost")), total, usage)
+    return (
+        tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None,
+        float(cents)
+        if isinstance(cents, int | float) and not isinstance(cents, bool)
+        else None,
+    )
 
 
 async def list_models() -> dict[str, Any] | None:

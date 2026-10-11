@@ -35,6 +35,10 @@ jobs:
   test:
     name: Ruff and pytest
     runs-on: ubuntu-latest
+    # #1666: 90 min = 70 min of explicit step ceilings (Test 25 + mutations 15 +
+    # baseline 10 + report 20) plus headroom for the steps that have no ceiling
+    # of their own (install, lint, type check, scans).
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -44,9 +48,14 @@ jobs:
           # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
 
+      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
+      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
+      # lock revision, so a floating version would rewrite uv.lock under us. The
+      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: "0.12.18"
           enable-cache: true
 
       - name: Set up Python
@@ -55,7 +64,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: uv sync --dev
+        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
+        run: uv sync --locked --dev
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -143,7 +153,10 @@ jobs:
       - name: Test
         id: tests
         if: ${{ steps.treedup.outputs.skip != 'true' }}
-        run: uv run pytest -q -n auto
+        # #1666: a hung test must not hold the run for the 360 min default;
+        # pytest-timeout (300 s per test) names the test well before this.
+        timeout-minutes: 25
+        run: uv run pytest -q -n auto --durations=30
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
       # grew to its current size because nothing was watching. The check
@@ -173,6 +186,44 @@ jobs:
           uv run python scripts/surface_parity.py \
             --base "origin/${{ github.base_ref }}"
 
+      # #1606: мутации (~9,5 мин) и baseline (~2-3 мин) считаются там, где их
+      # результат будет прочитан, а не на каждом обновлении ветки. Решение
+      # принимается по СОБЫТИЮ GitHub, которое CI знает сам, без доверия к
+      # хабу: ручной прогон исполнителя ДО сдачи (workflow_dispatch) и первый
+      # прогон PR (opened/reopened) task-ветки. Обновление ветки (synchronize —
+      # гейт подтянул базу или автор дописал коммит) и не-task PR (релизный
+      # develop→main, возврат main→develop, dependabot/*) их не считают;
+      # Test, AC и validation идут как раньше. Ветка и база — через env, а не
+      # подстановкой в тело: имя ветки приходит снаружи.
+      - name: Decide whether mutations and baseline are worth their minutes
+        id: evidence
+        # !cancelled(): a red Test or an earlier check must not skip this step
+        # and with it the baseline, whose own condition already says !cancelled().
+        if: ${{ !cancelled() }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          case "$EVENT_NAME:$EVENT_ACTION:$HEAD_REF" in
+            workflow_dispatch:*:task-* | pull_request:opened:task-* | pull_request:reopened:task-*)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: running ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF)"
+              ;;
+            push:*)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped (push: the branch is the base, the diff is empty)"
+              ;;
+            pull_request:synchronize:task-*)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped (synchronize: a branch update; they come from the manual run before submission or from opened)"
+              ;;
+            *)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF: not a task branch run they are for)"
+              ;;
+          esac
+
       # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
       # test does not fail on broken behaviour", and the reviewer named the
       # surviving mutation himself in 33. The script mutates ONLY the Python
@@ -182,17 +233,40 @@ jobs:
       # survivors". Warning only, like Surface parity: the script exits 0,
       # continue-on-error keeps a crash out of the delivery gate, and the
       # timeout caps the cost (outcome revisit condition: 10 minutes).
-      # Pull requests only: on a push the branch IS the base, the diff is empty.
+      # #1606: runs only where the "evidence" step above says so; the base is the
+      # PR base, develop for a manual run (as for the baseline below).
       - name: Mutations of changed functions (warning only)
         id: mutations
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ steps.evidence.outputs.run == 'true' }}
         continue-on-error: true
         timeout-minutes: 15
         run: |
           uv run python scripts/mutation_changed.py \
-            --base "origin/${{ github.base_ref }}" \
+            --base "origin/${{ github.base_ref || 'develop' }}" \
             --budget-seconds 540 \
             --json-out mutation-report.json
+
+      # #913: the red-test gate for bugs needs proof that the AC test failed
+      # BEFORE the fix, and the hub accepts CI reports only about the pinned
+      # commit. So the proof travels in that same report: the branch's changed
+      # tests/** are laid over the merge-base code in a separate worktree and
+      # run with junitxml — failed (assert) / passed / error (collection,
+      # ImportError, fixture). A test failing on the base is DATA, not an
+      # error: the script always exits 0 and continue-on-error keeps a crash
+      # out of the delivery gate. task-* branches only (PR and manual runs);
+      # the base is the PR base, develop for a manual run.
+      - name: Red-test baseline on merge-base (data only)
+        id: baseline
+        # !cancelled(): the proof is about the base, not about this commit's
+        # own Test step — a red suite must not also erase the baseline.
+        # #1606: the same decision as for the mutations (task-* is part of it).
+        if: ${{ !cancelled() && steps.evidence.outputs.run == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          uv run python scripts/red_test_baseline.py \
+            --base "origin/${{ github.base_ref || 'develop' }}" \
+            --json-out red-test-baseline.json
 
       # #546: the hub has no test runner by design, so the evidence for its two
       # SDD gates is produced here and reported back. Placed AFTER the main test
@@ -210,6 +284,11 @@ jobs:
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
+        # #1666: the reporter has its own overall deadline (17 min, see
+        # _REPORT_DEADLINE in scripts/ci_report_to_hub.py): past it no command
+        # is launched, the rest is reported as not run, and the report is sent
+        # before this 20 min ceiling can cut the step.
+        timeout-minutes: 20
         uses: ./.github/actions/hub-ci-report
         with:
           hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
@@ -218,6 +297,13 @@ jobs:
           ac-runner: uv run pytest
           # #1270: its own key in the hub's report, not a `checks` entry.
           mutations-file: mutation-report.json
+          # #913: its own key too — evidence for the red-test gate on bugs.
+          baseline-file: red-test-baseline.json
+          # #1606: what each step DID, so the reporter can tell "did not run"
+          # (no key sent) from "ran and left no file" (an explicit error).
+          mutations-outcome: ${{ steps.mutations.outcome }}
+          baseline-outcome: ${{ steps.baseline.outcome }}
+          event-action: ${{ github.event.action }}
           # A step that never ran reports its outcome as '' and is dropped by
           # the reporter — silence, not a pass (#875).
           checks: >-
@@ -235,7 +321,7 @@ jobs:
             ${{ steps.lint.outcome }} uv run ruff check hub tests
             ${{ steps.format.outcome }} uv run ruff format --check hub tests
             ${{ steps.types.outcome }} uv run mypy hub
-            ${{ steps.tests.outcome }} uv run pytest -q -n auto
+            ${{ steps.tests.outcome }} uv run pytest -q -n auto --durations=30
 
       # #611: the audit no longer decides whether anything ships. The delivery
       # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery
@@ -316,6 +402,10 @@ jobs:
     # Only deploy real merges into main, never on pull_request runs.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
+    # #1588: деплой ждёт идущие локальные deep-ревью до 1800 с (deploy/review-drain.sh),
+    # потом rsync, pip, restart и health. Без своего предела job жил бы до 6 часов
+    # GitHub по умолчанию; 45 мин = срок ожидания + запас на выкладку.
+    timeout-minutes: 45
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -323,6 +413,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # #1620: prod installs exactly what uv.lock pins. The sets are exported
+      # here, from the commit being deployed, into the tree that the next step
+      # rsyncs to staging; remote-deploy.sh checks both files before it changes
+      # anything and installs them wheels-only with --require-hashes. uv is the
+      # same pinned version as in the test job and the Dockerfile; Python 3.11 is
+      # the version of prod. --no-emit-project: the app is installed by the
+      # server itself, with --no-deps. Without --no-dev the dev group would ship.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Export hashed dependency sets from uv.lock
+        run: |
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --no-header -o requirements.runtime.txt
+          uv export --frozen --only-group build --no-emit-project --format requirements-txt --no-header -o requirements.build.txt
+          echo "runtime: $(grep -cE '^[A-Za-z0-9][A-Za-z0-9._-]*==' requirements.runtime.txt) packages, build: $(grep -cE '^[A-Za-z0-9][A-Za-z0-9._-]*==' requirements.build.txt) packages"
 
       - name: Configure SSH
         env:
@@ -339,7 +453,12 @@ jobs:
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOYED_SHA: ${{ github.sha }}
         run: |
+          # #1590: the commit goes into the file name of the pre-deploy backup.
+          # .git is not in staging and the CI key's forced command takes no
+          # arguments or environment, so the sha travels as a file of the tree.
+          printf '%s\n' "$DEPLOYED_SHA" > .deploy-sha
           rsync -az --delete \
             -e "ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes" \
             --exclude '.venv' \
@@ -356,8 +475,25 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          # Keepalive: на время ожидания (до 1800 с) в канале бывает тихо, и
+          # промежуточный узел не должен счесть соединение мёртвым (#1588).
+          # #1590: the output is captured locally AND shown, the ssh exit code
+          # is kept, and the `backup:` line goes to the step output EVEN when
+          # the code is non-zero - a deploy that refused to restart because the
+          # backup failed is exactly the one whose verdict the hub must get.
+          # The original code is returned at the end.
+          log="${RUNNER_TEMP:-/tmp}/rollout.log"
+          set +e
           ssh -i "$HOME/.ssh/id_deploy" -o BatchMode=yes \
-            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          line="$(grep '^backup: ' "$log" | tail -n 1 | tr -d '\r' || true)"
+          if [ -n "$line" ]; then
+            printf 'backup=%s\n' "${line#backup: }" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
 
       # #496: tell the Hub what is now running. Until this step existed the
       # Hub knew only when it MERGED something and read that as delivery — on
@@ -380,6 +516,10 @@ jobs:
           ROLLOUT_OUTCOME: ${{ steps.rollout.outcome }}
           DEPLOYED_SHA: ${{ github.sha }}
           DEPLOYED_REF: ${{ github.ref_name }}
+          # Project slug for the release row (#1453); unset or empty -> default.
+          DEPLOYED_PROJECT: ${{ vars.HAIPLANE_HUB_PROJECT || 'default' }}
+          # #1590: verdict of the pre-deploy backup; empty = the log had none.
+          BACKUP_LINE: ${{ steps.rollout.outputs.backup }}
         run: |
           if [ -z "$HAIPLANE_HUB_URL" ] || [ -z "$HAIPLANE_HUB_CI_TOKEN" ]; then
             echo "::notice::Hub secrets absent — deploy not reported (fork or clone)"
@@ -390,11 +530,26 @@ jobs:
           else
             STATUS=failed
           fi
+          # The body is built by a serializer, not by string interpolation: the
+          # backup reason may carry quotes, and a broken body would lose the report.
+          body_file="$(mktemp)"
+          STATUS="$STATUS" python3 -c '
+          import json, os
+          body = {
+              "sha": os.environ["DEPLOYED_SHA"],
+              "ref": os.environ["DEPLOYED_REF"],
+              "status": os.environ["STATUS"],
+              "project": os.environ["DEPLOYED_PROJECT"],
+          }
+          if os.environ.get("BACKUP_LINE"):
+              body["backup"] = os.environ["BACKUP_LINE"][:500]
+          print(json.dumps(body))
+          ' > "$body_file"
           code=$(curl -sS -o /tmp/deploy-callback.out -w '%{http_code}' \
             -X POST "$HAIPLANE_HUB_URL/api/deploys" \
             -H "Authorization: Bearer $HAIPLANE_HUB_CI_TOKEN" \
             -H 'Content-Type: application/json' \
-            -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\"}" \
+            --data-binary @"$body_file" \
           ) || code=000
           if [ "$code" != "200" ]; then
             echo "::warning::Hub did not record the deploy (HTTP $code): $(cat /tmp/deploy-callback.out)"

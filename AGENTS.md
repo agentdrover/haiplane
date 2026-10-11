@@ -69,3 +69,5 @@
 - `skills/hub-development/`
 - `skills/hub-testing/`
 - `skills/hub-task-prep/`
+- `skills/hub-submit-task/`: правила сдачи задачи на ревью
+- `skills/hub-review-report-reading/`: правила чтения отчёта ревью

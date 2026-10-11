@@ -30,8 +30,13 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
-from hub.models import RiskClass
-from hub.services.project_policy import gate_policy_of
+from hub.models import DoRCheckItem, RiskClass
+from hub.services.result_kind import automation_not_applicable
+from hub.services.project_policy import (
+    freeze_admission,
+    gate_policy_of,
+    gate_value_of,
+)
 
 log = logging.getLogger(__name__)
 
@@ -71,12 +76,40 @@ LADDER_SURFACES: tuple[str, ...] = (
     "hub/services/project_policy.py",
 )
 
+# #1559, решение владельца 03.10 (вариант Б): выбор профиля ревью читает НЕ весь
+# контур, а его подмножество — решатели одобрения и доступа, код, который
+# одобряет или пускает без человека. lifecycle.py, config.py, project_policy.py,
+# docs/agent-context/, docs/repository-rules.md и .github/ остаются в
+# LADDER_SURFACES для автоодобрения, но deep не покупают: замер исполнителя —
+# 32 новых deep за 2 недели, в основном из-за них. Каждая запись обязана быть
+# буквально элементом LADDER_SURFACES (тест подмножества), список истины один.
+APPROVAL_DECIDERS: tuple[str, ...] = (
+    "hub/services/auto_verdict.py",
+    "hub/services/auto_approve.py",
+    "hub/services/steward_apply.py",
+    "hub/services/steward_applied.py",
+    "hub/services/steward_dispatch.py",
+    "hub/services/steward_evidence.py",
+    "hub/services/steward_judgement.py",
+    "hub/services/steward_shadow.py",
+    "hub/services/gate_grounds.py",
+    "hub/services/risk_class.py",
+    "hub/auth.py",
+    "hub/mcp_internal_auth.py",
+)
+
 # The classes the switch can name. R2 stays OUT: opening it is #585, and that
 # task is conditioned on a measured agreement between the agent reviewer and
 # the owner (#522/#527) — a condition set on 31.07.2026 and not yet met. The
 # per-project ceiling below can therefore only tighten this band, never widen
 # it, which is the only safe direction while the number is missing.
 _AUTO_BAND: dict[str, RiskClass] = {"r0": RiskClass.r0, "r1": RiskClass.r1}
+
+
+def project_ceiling_of(policy: dict) -> RiskClass | None:
+    """Потолок класса риска из ``dor_max_class`` проекта; ``None`` — не задан."""
+    raw = policy.get("dor_max_class") if isinstance(policy, dict) else None
+    return _AUTO_BAND.get(str(raw or "").lower())
 
 
 def ladder_hits(paths: list[str]) -> list[str]:
@@ -88,16 +121,53 @@ def ladder_hits(paths: list[str]) -> list[str]:
     вердикта дифф есть, и верить декларации там значит пропускать задачу,
     объявившую «hub/services/» и поменявшую hub/auth.py (#1147).
     """
-    return sorted(
-        p for p in paths if any(p == s or p.startswith(s) for s in LADDER_SURFACES)
-    )
+    return surface_hits(paths, LADDER_SURFACES)
+
+
+def surface_hits(paths: list[str], surfaces: tuple[str, ...]) -> list[str]:
+    """Пути, совпавшие с поверхностью из списка: точный путь или префикс.
+
+    Единственное место правила совпадения; ``ladder_hits`` и
+    ``decider_hits`` отличаются только списком.
+    """
+    return sorted(p for p in paths if any(p == s or p.startswith(s) for s in surfaces))
+
+
+def decider_hits(paths: list[str]) -> list[str]:
+    """Какие из путей — решатели одобрения (``APPROVAL_DECIDERS``, #1559)."""
+    return surface_hits(paths, APPROVAL_DECIDERS)
 
 
 def _touches_ladder(areas: list[str]) -> list[str]:
     return ladder_hits(areas)
 
 
-async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
+_FREEZE_NOTE_PREFIX = "Автоодобрение отклонено заморозкой проекта (dor=auto): "
+
+
+async def _note_freeze_refusal(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> None:
+    """Строка ленты об отказе заморозки; не повторяется, пока причина та же.
+
+    Функция зовётся при каждой записи готовности, и тот же отказ на каждый
+    вызов засорил бы карточку одинаковыми строками.
+    """
+    content = _FREEZE_NOTE_PREFIX + reason
+    for update in reversed(await repo.get_task_updates(db, task_id)):
+        if str(update["content"]).startswith(_FREEZE_NOTE_PREFIX):
+            if update["content"] == content:
+                return
+            break
+    await repo.add_task_update(db, task_id, "hub", "status", content, author_kind="hub")
+
+
+async def maybe_auto_approve(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    dor_checks: list[DoRCheckItem] | None = None,
+) -> bool:
     """Approve a DoR-passed low-class draft when the switch allows (#584).
 
     CALLERS, ENUMERATED RATHER THAN CLAIMED (#1164). Two, and the list is
@@ -122,9 +192,18 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     review #313 pointed out that moving the call one floor down left the
     whole suite green, and the measurement agreed (3475 passed).
 
+    ``dor_checks`` are the checks the caller ALREADY computed and gated on
+    (#1456). The statement-path record is written from them: this runs under
+    the caller's write lock, and a second ``evaluate_dor`` would read the git
+    tree there. A caller with no computed checks (the steward poller) passes
+    none, and the record is skipped rather than recomputed.
+
     Runs inside the caller's transaction; returns True when the draft was
     transitioned. Every refusal is silent by design: a draft that does not
-    qualify simply keeps waiting for the human, exactly as today.
+    qualify simply keeps waiting for the human, exactly as today. The one
+    refusal that is NOT silent is the project freeze (#1594): a draft that
+    qualified in every other way and was stopped by the freeze gets a feed
+    line with the reason.
     """
     mode = (config.AUTO_APPROVE_MAX_CLASS or "off").strip().lower()
     global_ceiling = _AUTO_BAND.get(mode)
@@ -135,6 +214,11 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
 
     row = await repo.get_task(db, task_id)
     if row is None or row["status"] != "draft" or not row["dor_passed"]:
+        return False
+    if automation_not_applicable(row):
+        # #1647: явный запрет по result_kind, независимо от risk_class и
+        # политики. До него state не одобрялась «случайно» — у неё нет
+        # областей, а значит нет класса; теперь это правило, а не следствие.
         return False
 
     raw_class = row["risk_class"]
@@ -166,7 +250,7 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     if project is None:
         return False
     policy = gate_policy_of(project)
-    if policy.get("dor") != "auto":
+    if gate_value_of(policy, "dor") != "auto":
         return False
     project_slug = project["slug"]
 
@@ -175,7 +259,7 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     # for more than the env allows simply gets the env's answer, and the feed
     # line below says so, because "why did this not auto-approve" must be
     # answerable without reading two configs and a deployment.
-    project_ceiling = _AUTO_BAND.get(str(policy.get("dor_max_class") or "").lower())
+    project_ceiling = project_ceiling_of(policy)
     ceiling = global_ceiling
     if project_ceiling is not None and order.index(project_ceiling) < order.index(
         ceiling
@@ -184,11 +268,25 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     if order.index(risk) > order.index(ceiling):
         return False
 
+    # #1594: заморозка проекта - тот же допуск, что у ручного одобрения, и
+    # автоодобрение ему подчиняется. Молча остаться черновиком было бы
+    # ошибкой наблюдаемости: «почему не автоодобрено» отвечает строка ленты.
+    refusal = freeze_admission(project, row["work_type"], row["freeze_rationale"] or "")
+    if refusal is not None:
+        await _note_freeze_refusal(db, task_id, refusal.text)
+        return False
+
     transitioned = await repo.transition_status_if(
         db, task_id, expected_from="draft", new_status="open"
     )
     if not transitioned:
         return False
+
+    from hub.services.dor import record_statement_paths, record_workspace_missing
+
+    if dor_checks:
+        await record_statement_paths(db, task_id, dor_checks)
+    await record_workspace_missing(db, task_id)
 
     reasons = deserialize_str_list(row["risk_class_reasons"])
     await repo.add_task_update(

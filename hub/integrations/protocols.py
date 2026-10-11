@@ -15,6 +15,12 @@ from typing import Any, Protocol, runtime_checkable
 import aiosqlite
 
 
+# Причина ``pr_between``, когда под базу+голову попали только PR из чужих
+# репозиториев (#1426). Это не сбой чтения: свой PR возврата создавать можно,
+# иначе любой форк с веткой ``main`` останавливает возврат.
+FOREIGN_PR_ONLY = "PR из чужого репозитория не принят за возврат"
+
+
 class CIProbeOutcome(str, Enum):
     """Every observable result of probing a PR's CI checks (#419).
 
@@ -57,6 +63,33 @@ class MergeabilityOutcome(str, Enum):
 
 
 @dataclass(frozen=True)
+class SnapshotArchive:
+    """Снимок исходников на закреплённом sha для локального ревьюера (#1599).
+
+    Три состояния, и ни одно не молчит. ``ok`` — ``data`` это несжатый tar с
+    обычными файлами и каталогами; ``empty`` — дерево на sha пусто, читать
+    нечего, и это НЕ сбой монтирования; ``absent`` — снимка нет, ``reason``
+    называет почему (нет sha, потолок, git не ответил). ``note`` — что git
+    archive и хаб исключили из ok-снимка (ссылки, слишком длинные пути).
+    """
+
+    sha: str
+    data: bytes | None
+    reason: str = ""
+    note: str = ""
+    empty: bool = False
+    #: Маркер пути в промте, вставленный заказом (у каждого заказа свой): по нему
+    #: транспорт подставляет фактический путь, не трогая чужие вхождения (#1599).
+    placeholder: str = ""
+
+    @property
+    def state(self) -> str:
+        if self.data is not None:
+            return "ok"
+        return "empty" if self.empty else "absent"
+
+
+@dataclass(frozen=True)
 class CIProbeResult:
     """A CI probe outcome plus a stable, machine-usable reason (#419)."""
 
@@ -92,6 +125,56 @@ class CIRunRequestResult:
     outcome: CIRunRequestOutcome
     reason: str
     details: str | None = None
+
+
+class BaseFreshnessState(str, Enum):
+    """Стоит ли голова PR на актуальной базе (#1419).
+
+    25.09.2026 гейт влил #1361 и через 57 с #1400: каждая зелёная на своей
+    базе, вместе — красный develop на 1 ч 43 мин. CI головы PR ничего не
+    говорит о базе, которая ушла вперёд после прогона, поэтому гейт спрашивает
+    об этом отдельно.
+
+    ``unknown`` — спросили, ответа нет: ждать, не мержить и не звать человека
+    (#951). ``unsupported`` — плагин не умеет спрашивать вовсе (заглушка без
+    форжа): это факт о плагине, а не о ветке, и гейт идёт как до #1419.
+    """
+
+    current = "current"  # база целиком в голове PR
+    behind = "behind"  # в базе есть коммиты, которых нет в голове
+    unknown = "unknown"  # спросить не удалось — ждать
+    unsupported = "unsupported"  # этот плагин не спрашивает вовсе
+
+
+@dataclass(frozen=True)
+class BaseFreshness:
+    """Ответ форжа об отставании головы PR от базы (#1419).
+
+    ``head_sha`` — голова, о которой ответ: ею же гейт арендует обновление
+    (expected_head_sha), чтобы не слить базу поверх чужого пуша.
+    """
+
+    state: BaseFreshnessState
+    head_sha: str = ""
+    behind_by: int | None = None
+    reason: str = ""
+
+
+class BranchUpdateOutcome(str, Enum):
+    """Чем кончилась просьба слить базу в ветку PR (#1419).
+
+    Разные исходы — разные руки. ``conflict`` и ``refused`` зовут человека с
+    причиной; ``head_moved`` и ``unavailable`` — повтор следующим циклом;
+    ``unsupported`` — у форжа нет такого вызова, и ветку обновляет git_ops
+    локальным мержем с пушем.
+    """
+
+    updated = "updated"
+    conflict = "conflict"  # база не сливается в ветку без человека
+    refused = "refused"  # форж отказал осмысленно: права, защита, валидация
+    head_moved = "head_moved"  # голова уже не та, что в аренде
+    unavailable = "unavailable"  # вызов не долетел — спросить снова
+    unsupported = "unsupported"  # у форжа нет такого вызова
 
 
 class StackProbeOutcome(str, Enum):
@@ -338,6 +421,13 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> list[str] | None: ...
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None: ...
     async def commit_exists(self, repo: str, sha: str) -> bool | None: ...
     async def commit_diff(
         self, repo: str, base: str, sha: str, *, context: int = 3
@@ -358,7 +448,10 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool | None: ...
-    async def return_release_into_base(
+    # #1426: возврат релиза идёт PR-ом. Открытый PR ``head`` → ``base`` из
+    # этого же репозитория — ``(номер | None, причина)``; его открытие по паре
+    # база+голова; его мерж мерж-коммитом с сохранением головы.
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -366,7 +459,27 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]: ...
+    ) -> tuple[int | None, str]: ...
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]: ...
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]: ...
     async def check_pr_mergeable(
         self,
         pr_number: int,
@@ -375,6 +488,25 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
+    # #1419: отстала ли голова PR от базы, и слить базу в ветку, если да.
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness: ...
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]: ...
     async def base_merge_conflicts(
         self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]: ...
@@ -395,6 +527,9 @@ class GitOpsPlugin(Protocol):
     async def fetch_commit(
         self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
     ) -> tuple[bool, str]: ...
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive: ...
     async def auto_commit(
         self,
         task_id: int,
@@ -484,11 +619,16 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> tuple[str, str]: ...
-    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None: ...
+    async def branch_diff(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None: ...
     async def delta_without_base(
         self, repo: str, base: str, prev: str, current: str
     ) -> str | None: ...
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None: ...
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict[str, Any]: ...
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None: ...
     async def files_naming_at_ref(
         self, repo: str, ref: str, word: str, pathspec: str = "*.py"
@@ -573,6 +713,7 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool: ...
     # То же, но с ПРИЧИНОЙ отказа (#1116, по ревью). Булевого ответа не
     # хватает: «слить не смогли» и «слили, но подтвердить не удалось» ведут к
@@ -588,7 +729,16 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]: ...
+    # #1591: голова PR на форже, чтобы закрепить проверку релиза и merge.
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str: ...
     async def delete_branch(
         self,
         branch: str,
@@ -684,6 +834,17 @@ class ForgePlugin(Protocol):
     async def pr_for_branch(
         self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> int | None: ...
+    # #1426: открытый PR ``head`` → ``base`` только из ЭТОГО репозитория.
+    # ``(номер, "")`` | ``(None, "")`` | ``(None, причина)`` — сбой чтения и
+    # PR из форка называются, а не читаются как «PR нет» (#516).
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]: ...
     async def open_or_update_pr(
         self,
         base: str,
@@ -715,6 +876,20 @@ class ForgePlugin(Protocol):
     async def pr_mergeability(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> tuple[MergeabilityOutcome, str]: ...
+    # #1419: отстала ли голова PR от базы. Только чтение.
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness: ...
+    # #1419: слить базу в ветку PR с арендой головы (expected_head_sha).
+    # Пишущий вызов; форж без такого вызова отвечает ``unsupported``.
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]: ...
     async def merge_commit_sha(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...
@@ -723,6 +898,7 @@ class ForgePlugin(Protocol):
     async def pr_for_merge_commit(
         self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> dict[str, Any] | None: ...
+    # ``method``: "squash" для задач и релиза, "merge" для возврата (#1426).
     async def merge_pr(
         self,
         pr_number: int,
@@ -731,6 +907,8 @@ class ForgePlugin(Protocol):
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool: ...
     # Закрыть PR, ничего не вливая (#1116). Нужен там, где мерж сделан не
     # форжем: GitVerse не замечает мержа пушем и оставляет PR открытым
@@ -789,17 +967,6 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[str]: ...
-    # Слить ``from_branch`` в ``into_branch`` силами форжа.
-    # ``(returned <sha> | nothing | conflict | unavailable, detail)``.
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]: ...
 
 
 @runtime_checkable

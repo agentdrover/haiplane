@@ -347,7 +347,7 @@ async def test_stale_claimed_and_needs_info_alerted(mock_sleep, db):
     info_alerts = await _stale_alerts(db, info_id)
     assert len(info_alerts) == 1
     assert "needs_info" in info_alerts[0]
-    assert "hub_answer_question" in info_alerts[0]
+    assert "/answer" in info_alerts[0]
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
@@ -385,7 +385,7 @@ async def test_stale_machine_dead_ends_alerted(db):
         alerts = await _stale_alerts(db, tid)
         assert len(alerts) == 1, status
         assert f"stale in {status}" in alerts[0]
-        assert "hub_force_complete_task" in alerts[0]
+        assert "/force-complete" in alerts[0]
         assert dict(await repo.get_task(db, tid))["status"] == status
 
     await _run_poll_once(db)
@@ -2030,6 +2030,7 @@ from hub.poller import (  # noqa: E402 - тесты дописаны после 
     _sweep_messages_retention,
     _sweep_review,
     _sweep_review_dispatches,
+    _sweep_parent_rollup,
     _sweep_sessions_retention,
 )
 
@@ -2560,7 +2561,7 @@ async def test_human_owned_reminder_ladder(db):
     events = await _events_for(db, task_id, "human_queue_reminder")
     assert len(events) == 1
     payload = str(events[0]["payload"])
-    assert "hub_decide_task" in payload  # the action, not just the age
+    assert "/decide" in payload  # the action, not just the age
     row = dict(await repo.get_task(db, task_id))
     assert row["status"] == "needs_decision"  # volume only: nothing moved
 
@@ -2682,9 +2683,16 @@ async def test_the_sweep_order_is_pinned(db):
     from hub.poller import SWEEPS
 
     assert [sweep.name for sweep in SWEEPS] == [
+        # #1593: отложенные правки политики первыми — правка, назначенная на
+        # этот момент, действует уже для решений этого же прохода.
+        "policy_schedule",
         "running_dispatch",
         "review",
         "pair_delivery",
+        # #1437: свёртка родителей сразу за доставкой — фича, последнюю
+        # подзадачу которой этот проход доставил, закрывается в том же проходе,
+        # и очередь F1 (orchestrator_queue ниже) уже видит её зависимых.
+        "parent_rollup",
         "ci_check",
         "stale_running",
         "stale_statuses",
@@ -2704,6 +2712,10 @@ async def test_the_sweep_order_is_pinned(db):
         # ревью-диспатчей — обе работы про жизненный цикл прогонов, и обе
         # обязаны отработать до того, как истекут клеймы и вердикты.
         "steward_runs",
+        # #1410: опрос прогонов исполнителя — рядом со слотами стюарда, та же
+        # работа про жизненный цикл облачных прогонов.
+        "executor_runs",
+        "executor_slots",
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",
@@ -2711,6 +2723,9 @@ async def test_the_sweep_order_is_pinned(db):
         "stale_worktrees",
         "sessions_retention",
         "release_policy",
+        # #1274: очередь исполнения в тени — после релиза, чтобы доставка
+        # этого прохода уже снимала зависимости; только пишет событие.
+        "orchestrator_queue",
         "messages_retention",
         "mcp_retention",
     ]
@@ -3555,3 +3570,348 @@ async def test_concurrent_poller_and_report_done_deliver_once_without_alert(
     assert not any(
         e["kind"] == "needs_decision" and e["task_id"] == tv.id for e in events
     ), "ни одного перехода в needs_decision"
+
+
+async def test_rollup_skip_note_once_per_sweep(db):
+    """AC-2 (#1562): свип называет причину отказа по #1043 — один раз, не на каждом проходе."""
+    feature_id = await repo.create_task(
+        db,
+        title="Feature with its own work",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="feature",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Done child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await repo.update_task(
+        db, feature_id, branch="task-1/own-work", claimed_by="pda_claude"
+    )
+    await repo.update_task(db, feature_id, pr_number=5)
+    await db.commit()
+
+    def _notes() -> list[str]:
+        return [c for c in feed if "ждёт своего отчёта" in c]
+
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 1, "первый проход пишет причину отказа"
+    assert "branch=task-1/own-work" in _notes()[0] and "pda_claude" in _notes()[0]
+
+    await _sweep_parent_rollup(db)
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 1, "следующие проходы не повторяют ту же причину"
+
+    await repo.update_task(db, feature_id, claimed_by="someone_else")
+    await db.commit()
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 2, "изменившаяся причина пишется заново"
+    assert dict(await repo.get_task(db, feature_id))["status"] == "open"
+
+
+# ---------------------------------------------------------------------------
+# #1593: отложенные правки политики проекта исполняет поллер
+# ---------------------------------------------------------------------------
+
+
+def _policy_clock(monkeypatch, start):
+    """Тестовые часы расписания: время двигает тест, а не sleep."""
+    from hub.services import policy_change
+
+    clock = {"now": start}
+    monkeypatch.setattr(policy_change, "utcnow", lambda: clock["now"])
+    return clock
+
+
+async def _scheduled_project(db, slug: str, policy: dict) -> int:
+    import json
+
+    pid = await repo.create_project(
+        db, slug=slug, name=slug, repo_name="o/r", workspace_path="/tmp/ws"
+    )
+    await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+    await db.commit()
+    return pid
+
+
+async def test_scheduled_policy_patch_applies_once(client, db, db_dsn, monkeypatch):
+    """AC-1 (#1593): два соединения, порядок (at, id), по событию на запись.
+
+    Запись 1 создана первой, но назначена ПОЗЖЕ (T1); запись 2 создана позже и
+    назначена раньше (T0 < T1). Порядок — (at, id), а не создания: итог 4.
+    Два независимых соединения к файловой БД заходят в проход одновременно;
+    запись обязана исполниться ровно один раз.
+    """
+    import contextlib
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from hub.db import connect
+    from hub.services import policy_change
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = _policy_clock(monkeypatch, base)
+    await _scheduled_project(db, "sched-once", {"deep_daily_cap": 2})
+    t1, t0 = base + timedelta(hours=2), base + timedelta(hours=1)
+    for at, value in ((t1, 4), (t0, 3)):
+        resp = await client.post(
+            "/api/projects/sched-once/policy-schedule",
+            json={"at": at.isoformat(), "patch": {"deep_daily_cap": value}},
+        )
+        assert resp.status_code == 201, resp.text
+    ids = {
+        r["at"]: r["id"]
+        for r in (await client.get("/api/projects/sched-once/policy-schedule")).json()
+    }
+    assert ids[policy_change.stamp(t1)] == 1 and ids[policy_change.stamp(t0)] == 2
+
+    clock["now"] = base + timedelta(hours=3)
+
+    # Оба соединения доходят до чтения записи одновременно: если чтение стоит
+    # ДО write-транзакции, обе прочтут одну и ту же запись и применят её дважды.
+    real = repo.next_due_scheduled_policy_change
+    arrived = {"n": 0}
+    both_here = asyncio.Event()
+
+    async def meeting(conn, now):
+        arrived["n"] += 1
+        if arrived["n"] >= 2:
+            both_here.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(both_here.wait(), 0.6)
+        return await real(conn, now)
+
+    monkeypatch.setattr(repo, "next_due_scheduled_policy_change", meeting)
+    first, second = await connect(db_dsn), await connect(db_dsn)
+    try:
+        await asyncio.gather(
+            policy_change.run_due(first), policy_change.run_due(second)
+        )
+        again = await policy_change.run_due(first)
+    finally:
+        await first.close()
+        await second.close()
+    assert again == [], "повторный проход ничего не повторяет"
+
+    project = await repo.get_project_by_slug(db, "sched-once")
+    assert json.loads(project["gate_policy"])["deep_daily_cap"] == 4
+    events = await fetchall(
+        db,
+        "SELECT * FROM events WHERE kind='project_gate_policy_changed' "
+        "AND project_id=? ORDER BY id",
+        (project["id"],),
+    )
+    assert len(events) == 2, "по одному событию на запись, не больше"
+    payloads = [json.loads(e["payload"]) for e in events]
+    assert [e["actor"] for e in events] == ["schedule", "schedule"]
+    assert [p["schedule_id"] for p in payloads] == [2, 1]
+    assert payloads[0]["changes"] == {"deep_daily_cap": {"was": 2, "now": 3}}
+    assert payloads[1]["changes"] == {"deep_daily_cap": {"was": 3, "now": 4}}
+    rows = await repo.list_scheduled_policy_changes(db, project["id"])
+    assert [r["state"] for r in rows] == ["applied", "applied"]
+    assert all(r["executed_at"] for r in rows)
+
+
+async def test_schedule_refusal_cancel_and_late_execution(client, db, monkeypatch):
+    """AC-2 (#1593): отказ, отмена, опоздание, сбой фиксации итога."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change, review_dispatch
+    from hub.services.review_dispatch import ReviewReach
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = _policy_clock(monkeypatch, base)
+    reach = {"runnable": True}
+
+    async def fake_reach(_db, _forge):
+        if reach["runnable"]:
+            return ReviewReach(("local",), "", ())
+        return ReviewReach((), "локальная конфигурация снята", ("нет принципала",))
+
+    monkeypatch.setattr(review_dispatch, "review_reach", fake_reach)
+    pid = await _scheduled_project(db, "sched-edge", {"deep_daily_cap": 2})
+    url = "/api/projects/sched-edge/policy-schedule"
+    at = base + timedelta(hours=1)
+
+    async def plan(patch, when=at):
+        resp = await client.post(url, json={"at": when.isoformat(), "patch": patch})
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    refused_id = await plan({"review": "dispatch"})
+    cancelled_id = await plan({"deep_daily_cap": 9})
+    late_id = await plan({"deep_daily_cap": 7}, base + timedelta(hours=1, seconds=1))
+    cancelled = await client.post(f"{url}/{cancelled_id}/cancel")
+    assert cancelled.status_code == 200 and cancelled.json()["state"] == "cancelled"
+    assert (await client.post(f"{url}/{cancelled_id}/cancel")).status_code == 409
+
+    # До срока локальная конфигурация снята; хаб «лежал» два часа.
+    reach["runnable"] = False
+    clock["now"] = base + timedelta(hours=3)
+    outcomes = await policy_change.run_due(db)
+    by_id = {o["id"]: o for o in outcomes}
+    assert set(by_id) == {refused_id, late_id}, "отменённая не исполняется"
+    assert by_id[refused_id]["outcome"] == "refused"
+    assert "локальная конфигурация снята" in by_id[refused_id]["reason"]
+    assert by_id[late_id]["outcome"] == "applied" and by_id[late_id]["late"] is True
+
+    policy = json.loads((await repo.get_project(db, pid))["gate_policy"])
+    assert policy == {"deep_daily_cap": 7}, "политика отказанной записи не тронута"
+    alert = await fetchall(
+        db, "SELECT * FROM events WHERE kind='scheduled_policy_change_refused'"
+    )
+    assert len(alert) == 1 and alert[0]["project_id"] == pid
+    assert "локальная конфигурация снята" in json.loads(alert[0]["payload"])["reason"]
+    changed = await fetchall(
+        db, "SELECT payload FROM events WHERE kind='project_gate_policy_changed'"
+    )
+    assert json.loads(changed[0]["payload"])["late"] is True
+
+    # Сбой между записью политики/события и фиксацией итога: всё откатывается.
+    broken_id = await plan({"deep_daily_cap": 8}, base + timedelta(hours=4))
+    clock["now"] = base + timedelta(hours=5)
+    real_settle = repo.settle_scheduled_policy_change
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("сбой фиксации итога")
+
+    monkeypatch.setattr(repo, "settle_scheduled_policy_change", failing)
+    assert await policy_change.run_due(db) == []
+    row = await repo.get_scheduled_policy_change(db, broken_id)
+    assert row["state"] == "pending" and row["executed_at"] is None
+    assert json.loads((await repo.get_project(db, pid))["gate_policy"]) == {
+        "deep_daily_cap": 7
+    }, "политика откачена вместе с итогом"
+    events_after_failure = await fetchall(
+        db, "SELECT id FROM events WHERE kind='project_gate_policy_changed'"
+    )
+    assert len(events_after_failure) == 1, "событие откачено вместе с политикой"
+
+    monkeypatch.setattr(repo, "settle_scheduled_policy_change", real_settle)
+    retried = await policy_change.run_due(db)
+    assert [o["id"] for o in retried] == [broken_id]
+    assert json.loads((await repo.get_project(db, pid))["gate_policy"]) == {
+        "deep_daily_cap": 8
+    }
+
+
+async def test_poll_tick_executes_due_scheduled_change_in_at_id_order(
+    client, db, monkeypatch
+):
+    """#1593: правку исполняет настоящий тик поллера; при равном at — порядок по id."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from hub.poller import _poll_once
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = _policy_clock(monkeypatch, base)
+    pid = await _scheduled_project(db, "sched-tick", {})
+    at = (base + timedelta(hours=1)).isoformat()
+    for value in (5, 6):
+        resp = await client.post(
+            "/api/projects/sched-tick/policy-schedule",
+            json={"at": at, "patch": {"wip_limit": value}},
+        )
+        assert resp.status_code == 201, resp.text
+    # Будущая запись тика не касается.
+    later = await client.post(
+        "/api/projects/sched-tick/policy-schedule",
+        json={"at": (base + timedelta(days=3)).isoformat(), "patch": {"wip_limit": 9}},
+    )
+    assert later.status_code == 201
+
+    clock["now"] = base + timedelta(hours=1, seconds=5)
+    await _poll_once(db)
+
+    assert json.loads((await repo.get_project(db, pid))["gate_policy"]) == {
+        "wip_limit": 6
+    }
+    events = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='project_gate_policy_changed' ORDER BY id",
+    )
+    assert [json.loads(e["payload"])["schedule_id"] for e in events] == [1, 2]
+    states = [r["state"] for r in await repo.list_scheduled_policy_changes(db, pid)]
+    assert states == ["applied", "applied", "pending"]
+
+
+async def test_scheduled_change_equal_to_current_value_leaves_an_event(
+    client, db, monkeypatch
+):
+    """#1593: запланировано 4, человек поставил 4 раньше — исполнение видно в событиях."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = _policy_clock(monkeypatch, base)
+    pid = await _scheduled_project(db, "sched-same", {"deep_daily_cap": 2})
+    resp = await client.post(
+        "/api/projects/sched-same/policy-schedule",
+        json={
+            "at": (base + timedelta(hours=1)).isoformat(),
+            "patch": {"deep_daily_cap": 4},
+        },
+    )
+    assert resp.status_code == 201
+    manual = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 4}}
+    )
+    assert manual.status_code == 200
+    clock["now"] = base + timedelta(hours=2)
+    outcomes = await policy_change.run_due(db)
+    assert [o["outcome"] for o in outcomes] == ["applied"]
+    last = (
+        await fetchall(
+            db,
+            "SELECT * FROM events WHERE kind='project_gate_policy_changed' "
+            "ORDER BY id DESC LIMIT 1",
+        )
+    )[0]
+    payload = json.loads(last["payload"])
+    assert last["actor"] == "schedule" and payload["schedule_id"] == 1
+    assert payload["changes"] == {} and payload["unchanged"] is True
+    # Ручной PATCH без изменений событий по-прежнему не пишет.
+    before = len(
+        await fetchall(
+            db, "SELECT id FROM events WHERE kind='project_gate_policy_changed'"
+        )
+    )
+    await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 4}}
+    )
+    after = len(
+        await fetchall(
+            db, "SELECT id FROM events WHERE kind='project_gate_policy_changed'"
+        )
+    )
+    assert before == after

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -407,6 +408,265 @@ async def test_repair_sweep_skips_parent_with_its_own_branch(db: aiosqlite.Conne
     parent = dict(await repo.get_task(db, feature_id))
     assert parent["status"] == "running"
     assert repaired == 0
+
+
+def _dispatch_returns_no_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Контейнер-фича не уходит в прогон: rework приводит её в open, не в fix_requested."""
+    from hub.integrations.registry import plugins
+
+    async def _no_job(*_a, **_k):
+        return {"error": "no executor"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", _no_job)
+
+
+async def _mis_issued_feature(
+    db: aiosqlite.Connection,
+    *,
+    pr_number: int | None = None,
+    run_outcome: str = "cancelled",
+    task_type: str = "feature",
+    with_child: bool = True,
+    status: str = "needs_decision",
+    claimed: bool = True,
+) -> int:
+    """#1562: контейнер-фича, выданная облачному исполнителю по ошибке (#1375).
+
+    Все дети завершены; у фичи остались claimed_by, сессия и ветка от прогона,
+    который закончился без сдачи; человек должен решить, что с ней делать.
+    """
+    feature_id, _child_id = await _feature_with_completed_child(
+        db,
+        branch="task-1375/sid-d-otchety",
+        claimed_by="cloud",
+        parent_status=status,
+    )
+    if task_type != "feature":
+        await db.execute(
+            "UPDATE tasks SET task_type=? WHERE id=?", (task_type, feature_id)
+        )
+    if not with_child:
+        await db.execute(
+            "UPDATE tasks SET parent_id=NULL WHERE parent_id=?", (feature_id,)
+        )
+    await db.execute(
+        "UPDATE tasks SET claim_session_id=?, claimed_at=datetime('now'), "
+        "pr_number=?, git_mode='remote', implementer_principal_id=1 WHERE id=?",
+        ("bc-session", pr_number, feature_id),
+    )
+    if not claimed:
+        await db.execute(
+            "UPDATE tasks SET claimed_by='', claim_session_id=NULL WHERE id=?",
+            (feature_id,),
+        )
+    run_id = await repo.create_executor_run(
+        db,
+        task_id=feature_id,
+        submission_generation=1,
+        agent_id="bc-agent",
+        run_id="run-1",
+        model="m",
+    )
+    await repo.update_executor_run(db, run_id, outcome=run_outcome, finish=True)
+    await db.commit()
+    return feature_id
+
+
+async def test_rollup_closes_feature_after_assignment_reset(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562): возврат в open снимает остаток выдачи — и фича сворачивается."""
+    feature_id = await _mis_issued_feature(db)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Выдана по ошибке."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "open"
+    assert not (parent["claimed_by"] or "").strip()
+    assert not (parent["claim_session_id"] or "").strip()
+    assert not parent["claimed_at"]
+    assert not (parent["branch"] or "").strip()
+    assert parent["git_mode"] == "hub"
+    assert parent["implementer_principal_id"] is None
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "task-1375/sid-d-otchety" in feed and "cloud" in feed, (
+        "прежняя выдача названа в ленте: ветка и держатель не пропадают молча"
+    )
+
+    assert await repair_stale_parent_completions(db) == 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+
+
+async def test_rework_keeps_the_assignment_of_real_work(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: ветка с PR — настоящая работа, выдача остаётся."""
+    feature_id = await _mis_issued_feature(db, pr_number=77)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+    assert await repair_stale_parent_completions(db) == 0
+
+
+async def test_rework_keeps_the_assignment_when_the_run_was_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: прогон, кончившийся иначе, выдачу не сбрасывает."""
+    feature_id = await _mis_issued_feature(db, run_outcome="finished")
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_when_the_run_submitted(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """AC-1 (#1562), граница: у прогона есть сдача его поколения — это не «без сдачи»."""
+    _dispatch_returns_no_job(monkeypatch)
+    feature_id = await _mis_issued_feature(db)
+    await db.execute(
+        "UPDATE tasks SET submission_generation=1 WHERE id=?", (feature_id,)
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_of_a_plain_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """#1562, находка af2f98b0: у обычной задачи ветка — настоящая работа."""
+    _dispatch_returns_no_job(monkeypatch)
+    task_id = await _mis_issued_feature(db, task_type="task")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["claimed_by"] == "cloud"
+    assert task["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_of_a_container_without_children(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """#1562: фича без детей — не контейнер для свёртки, её выдача остаётся."""
+    _dispatch_returns_no_job(monkeypatch)
+    task_id = await _mis_issued_feature(db, with_child=False)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+    assert dict(await repo.get_task(db, task_id))["claimed_by"] == "cloud"
+
+
+async def test_sweep_releases_and_rolls_up_an_open_feature_with_stale_assignment(
+    db: aiosqlite.Connection,
+):
+    """AC-1 (#1562), состояние #1375: фича уже open, выдача от остановленного прогона."""
+    feature_id = await _mis_issued_feature(db, status="open")
+
+    assert await repair_stale_parent_completions(db) == 1
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "completed"
+    assert not (parent["claimed_by"] or "").strip()
+    assert not (parent["claim_session_id"] or "").strip()
+    assert not (parent["branch"] or "").strip()
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "Выдача снята" in feed and "task-1375/sid-d-otchety" in feed
+
+
+async def test_sweep_keeps_stale_assignment_when_the_predicate_does_not_hold(
+    db: aiosqlite.Connection,
+):
+    """#1562: свип сбрасывает по тому же предикату, что и rework, не шире."""
+    for label, kwargs in {
+        "pr": {"pr_number": 77},
+        "run_not_stopped": {"run_outcome": "finished"},
+        "needs_decision": {"status": "needs_decision"},
+    }.items():
+        feature_id = await _mis_issued_feature(db, **{"status": "open", **kwargs})
+
+        assert await repair_stale_parent_completions(db) == 0, label
+
+        parent = dict(await repo.get_task(db, feature_id))
+        assert parent["claimed_by"] == "cloud", label
+        assert parent["branch"] == "task-1375/sid-d-otchety", label
+        await repo.update_task(db, feature_id, status="rejected")
+        await db.commit()
+
+
+async def test_sweep_keeps_the_branch_of_a_container_released_on_purpose(
+    db: aiosqlite.Connection,
+):
+    """#1562, находка 06e7105b: release_task и return_to_work оставляют ветку намеренно.
+
+    Захвата нет, ветка есть, последний прогон остановлен: это не висящая
+    ошибочная выдача, свип ветку не стирает и контейнер остаётся «со своей
+    работой» (причина — в ленте).
+    """
+    feature_id = await _mis_issued_feature(db, status="open", claimed=False)
+
+    assert await repair_stale_parent_completions(db) == 0
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+    assert parent["status"] == "open"
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "Выдача снята" not in feed
+
+
+async def test_sweep_resets_a_dangling_session_without_claimed_by(
+    db: aiosqlite.Connection,
+):
+    """#1562: висящий захват — это и claimed_by, и сессия; хватает одной сессии."""
+    feature_id = await _mis_issued_feature(db, status="open")
+    await db.execute("UPDATE tasks SET claimed_by='' WHERE id=?", (feature_id,))
+    await db.commit()
+
+    assert await repair_stale_parent_completions(db) == 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
 
 
 async def test_verdict_notes_review_in_flight(
@@ -1213,7 +1473,7 @@ async def test_other_needs_decision_causes_still_need_a_human(
             assert exc.status_code == 400, label
             text = str(exc.detail)
             assert "can only submit running or under-review" in text, label
-            assert "hub_decide_task" in text, f"{label}: отказ называет решение"
+            assert "/decide" in text, f"{label}: отказ называет решение"
             if payloads:
                 assert payloads[-1]["reason"] in text, f"{label}: причина названа"
         else:
@@ -1242,3 +1502,694 @@ async def test_other_needs_decision_causes_still_need_a_human(
         assert exc.status_code == 400
     else:
         raise AssertionError("событие прошлого захода открыло пересдачу")
+
+
+# --- #1589: предупреждения по путям диффа (path_notices) --------------------
+
+PATH_RULES = [
+    {
+        "pattern": "deploy/remote-deploy.sh",
+        "text": "обновить закреплённую копию на сервере (sha256)",
+    },
+    {"pattern": "deploy/review-runner/**", "text": "применить службу ревьюера"},
+    {"pattern": "deploy/**/*.service", "text": "подтвердить unit на сервере"},
+]
+
+
+def _real(repo_dir, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def make_path_notices_workspace(tmp_path):
+    """Настоящий репозиторий: база main с файлами из правил и вне них."""
+    root = tmp_path / "pn-repo"
+    root.mkdir()
+    _real(root, "init", "-q", "-b", "main")
+    _real(root, "config", "user.email", "t@example.com")
+    _real(root, "config", "user.name", "t")
+    files = {
+        "deploy/remote-deploy.sh": "echo deploy\n" * 30,
+        "deploy/review-runner/run.py": "print('run')\n" * 30,
+        "deploy/x.service": "[Unit]\nDescription=x\n" * 10,
+        "docs/other.md": "# other\n" * 30,
+        "app.py": "x = 1\n",
+    }
+    for name, body in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+    _real(root, "add", "-A")
+    _real(root, "commit", "-q", "-m", "base")
+    return root
+
+
+def make_path_notices_git(workspace):
+    """git_ops с НАСТОЯЩИМ чтением путей; остальное — инертный Noop."""
+    from hub.integrations.git_ops import GitOpsIntegration
+    from tests.conftest import MockGitOps
+
+    real = GitOpsIntegration()
+
+    class _PathGit(MockGitOps):
+        async def fetch_base(self, repo, base):
+            return (True, "")
+
+        async def head_sha(self, repo, base):
+            return _real(repo, "rev-parse", f"{base}^{{commit}}")
+
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return await real.branch_diff_paths(branch, base_branch, repo)
+
+        async def branch_touched_paths(
+            self, branch, base_branch=None, repo=None, head_sha=""
+        ):
+            return await real.branch_touched_paths(branch, base_branch, repo, head_sha)
+
+    return _PathGit()
+
+
+async def path_notices_project(db, client, workspace, rules, *, slug="pn"):
+    """Задача pair в проекте с workspace и правилами; ветка id задачи."""
+    import json as _json
+
+    from hub import repository as _repo
+
+    project_id = await _repo.create_project(
+        db,
+        slug=slug,
+        name=slug,
+        repo_name="",
+        workspace_path=str(workspace),
+        default_branch="main",
+    )
+    if rules is not None:
+        await _repo.update_project(
+            db, project_id, gate_policy=_json.dumps({"path_notices": rules})
+        )
+    epic = (
+        await client.post("/api/tasks", json={"title": "Epic", "task_type": "epic"})
+    ).json()["id"]
+    await _repo.update_task(db, epic, project_id=project_id)
+    await db.commit()
+    return project_id, epic
+
+
+async def pair_task_with_branch(db, client, epic, workspace, title, change):
+    """Задача pair-running; на её ветке настоящий коммит ``change(root)``."""
+    task_id = (
+        await client.post(
+            "/api/tasks",
+            json={"title": title, "task_type": "task", "parent_id": epic},
+        )
+    ).json()["id"]
+    for url, payload in (
+        (f"/api/tasks/{task_id}/claim", {"agent": "dev"}),
+        (
+            f"/api/tasks/{task_id}/updates",
+            {"agent": "dev", "kind": "status", "content": "Plan: go"},
+        ),
+        (f"/api/tasks/{task_id}/pair-start", {"assigned_agent": "dev"}),
+    ):
+        resp = await client.post(url, json=payload)
+        assert resp.status_code == 200, resp.text
+    branch = f"task-{task_id}/work"
+    _real(workspace, "checkout", "-q", "-B", branch, "main")
+    change(workspace)
+    _real(workspace, "add", "-A")
+    _real(workspace, "commit", "-q", "--allow-empty", "-m", title)
+    _real(workspace, "checkout", "-q", "main")
+    await repo.update_task(db, task_id, branch=branch)
+    await db.commit()
+    return task_id
+
+
+def _notice_lines(updates) -> list[str]:
+    from hub.services.path_notices import PATH_NOTICES_MARK
+
+    return [
+        dict(u)["content"] for u in updates if PATH_NOTICES_MARK in dict(u)["content"]
+    ]
+
+
+def _edit(root, name, text="changed\n"):
+    (root / name).write_text((root / name).read_text() + text)
+
+
+def _rename(old, new):
+    def change(root):
+        (root / new).parent.mkdir(parents=True, exist_ok=True)
+        _real(root, "mv", old, new)
+
+    return change
+
+
+def _delete(name):
+    def change(root):
+        _real(root, "rm", "-q", name)
+
+    return change
+
+
+PATH_CASES = [
+    # (заголовок, правка, путь, который обязан быть назван, текст правила)
+    (
+        "modify script",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+        "deploy/remote-deploy.sh",
+        "закреплённую копию",
+    ),
+    (
+        "rename out of a watched path",
+        _rename("deploy/remote-deploy.sh", "docs/moved.sh"),
+        "deploy/remote-deploy.sh",
+        "закреплённую копию",
+    ),
+    (
+        "rename into a watched path",
+        _rename("docs/other.md", "deploy/review-runner/other.md"),
+        "deploy/review-runner/other.md",
+        "службу ревьюера",
+    ),
+    (
+        "delete from runner",
+        _delete("deploy/review-runner/run.py"),
+        "deploy/review-runner/run.py",
+        "службу ревьюера",
+    ),
+    (
+        "modify service",
+        lambda r: _edit(r, "deploy/x.service", "# edit\n"),
+        "deploy/x.service",
+        "unit на сервере",
+    ),
+]
+
+
+async def test_submission_names_path_notices_for_touched_paths(
+    db: aiosqlite.Connection, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589 AC-1: настоящий git; submit и done называют пути и тексты, строка одна.
+
+    Пять правок: изменение, rename из подходящего пути и в него, удаление,
+    unit. Повтор того же коммита второй строки ленты не пишет и отдаёт
+    сохранённый результат.
+    """
+    from hub.integrations.registry import plugins
+
+    workspace = make_path_notices_workspace(tmp_path)
+    monkeypatch.setattr(plugins, "git_ops", make_path_notices_git(workspace))
+    _, epic = await path_notices_project(db, client, workspace, PATH_RULES)
+
+    for index, (title, change, named, text) in enumerate(PATH_CASES):
+        task_id = await pair_task_with_branch(
+            db, client, epic, workspace, f"{title} {index}", change
+        )
+        resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert resp.status_code == 200, resp.text
+        block = resp.json()["path_notices"]
+        assert block["state"] == "matched", (title, block)
+        assert named in block["text"] and text in block["text"], (title, block)
+        assert block["sha"] == _real(workspace, "rev-parse", f"task-{task_id}/work")
+        lines = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(lines) == 1, (title, lines)
+        assert named in lines[0] and text in lines[0]
+
+        again = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert again.status_code == 200, again.text
+        assert again.json()["path_notices"]["text"] == block["text"], title
+        after = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(after) == 1, f"{title}: повтор того же SHA написал строку: {after}"
+
+    # Тот же набор через переход done: общий путь поллера и pair.
+    for index, (title, change, named, text) in enumerate(PATH_CASES[:2]):
+        task_id = await pair_task_with_branch(
+            db, client, epic, workspace, f"done {title} {index}", change
+        )
+        resp = await client.post(
+            f"/api/tasks/{task_id}/updates",
+            json={"agent": "dev", "kind": "done", "content": "готово"},
+        )
+        assert resp.status_code == 200, resp.text
+        warnings = resp.json()["warnings"]
+        assert any(named in w and text in w for w in warnings), (title, warnings)
+        lines = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(lines) == 1, (title, lines)
+        assert named in lines[0] and text in lines[0]
+
+
+async def test_done_from_pending_report_also_names_path_notices(
+    db: aiosqlite.Connection, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589: маршрут pending_report → review тоже сдача и не остаётся без пути."""
+    from hub.integrations.registry import plugins
+
+    workspace = make_path_notices_workspace(tmp_path)
+    monkeypatch.setattr(plugins, "git_ops", make_path_notices_git(workspace))
+    _, epic = await path_notices_project(db, client, workspace, PATH_RULES)
+    task_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "pending report",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert any("закреплённую копию" in w for w in resp.json()["warnings"])
+    lines = _notice_lines(await repo.get_task_updates(db, task_id))
+    assert len(lines) == 1 and "deploy/remote-deploy.sh" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# #1592: accept_areas на широкой задаче не роняет сдачу 500
+# ---------------------------------------------------------------------------
+
+
+async def test_accept_areas_beyond_twenty_paths_does_not_500(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1592 AC-1: 20 заявленных путей + 8 незаявленных — через настоящий вход.
+
+    Прод 05.10 (#1589): слияние давало 28 записей при лимите 20 у ввода refine,
+    pydantic ValidationError не ловился, и сдача отвечала голым 500.
+    """
+    from hub import config
+    from hub.commit_scope import SCOPE_GROWTH_MARKER
+    from hub.db import deserialize_str_list
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    declared = [f"hub/declared_{i}.py" for i in range(20)]
+    extra = [f"hub/extra_{i}.py" for i in range(8)]
+
+    class _Diff(NoopGitOps):
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return declared + extra
+
+    monkeypatch.setattr(plugins, "git_ops", _Diff())
+    task_id = (await client.post("/api/tasks", json={"title": "Wide"})).json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"affected_areas": declared}
+    )
+    assert resp.status_code == 200, resp.text
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: wide work"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={"accept_areas": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "review"
+    stored = deserialize_str_list(
+        dict(await repo.get_task(db, task_id))["affected_areas"]
+    )
+    assert stored == declared + extra, "принятый объём сохранён целиком"
+    updates = await repo.get_task_updates(db, task_id)
+    growth = [u["content"] for u in updates if SCOPE_GROWTH_MARKER in u["content"]]
+    assert len(growth) == 1 and "+8" in growth[0], growth
+
+    # Следующая сдача с теми же путями о них не предупреждает: объём принят.
+    before = len(updates)
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    later = [u["content"] for u in (await repo.get_task_updates(db, task_id))[before:]]
+    assert not any("Вне объявленной области" in c for c in later), later
+    assert not any(SCOPE_GROWTH_MARKER in c for c in later), later
+
+    # Лимит 20 остаётся для refine от агента: хаб обошёл его только для
+    # собственной записи принятого объёма.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"affected_areas": [f"x{i}.py" for i in range(21)]},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_bulk_children_with_too_many_risks_refuse_before_writes(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1592 scope_in п.2: lifecycle ~1199 строит TaskRefine(risks=...) из ввода.
+
+    Больше MAX_RISKS рисков в элементе пачки давало ValidationError уже после
+    записи первых строк; теперь отказ 422 на входе, до записей.
+    """
+    parent = (await client.post("/api/tasks", json={"title": "Epic parent"})).json()
+    risk = {
+        "kind": "large_scope",
+        "severity": "low",
+        "description": "r",
+        "mitigation": "m",
+    }
+    resp = await client.post(
+        f"/api/tasks/{parent['id']}/subtasks",
+        json={"items": [{"title": "child", "risks": [risk] * 51}]},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+# ---- #1647: задача-состояние (result_kind=state) ----
+
+
+async def test_state_pair_start_has_no_git_and_submit_takes_evidence_without_ci(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2: ни ветки, ни worktree, ни git-вызова; сдача идёт без CI и ревью.
+
+    Три варианта: git_mode hub и remote под шпионом (любое обращение к git
+    записывается) и noop-адаптер. Проект держит ci_before_submit=require и
+    submission_contract=require: на коде до задачи сдача получила бы 422 по CI
+    (пустой sha → NO_REPORT).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from tests.state_support import (
+        GitSpy,
+        evidence_for,
+        evidence_rows,
+        events,
+        feed,
+        make_project,
+        make_state_task,
+        pair_start,
+        submit,
+    )
+
+    pid = await make_project(
+        db,
+        "state-ci",
+        {"ci_before_submit": "require", "submission_contract": "require"},
+    )
+    variants = (("hub", GitSpy()), ("remote", GitSpy()), ("hub", NoopGitOps()))
+    for mode, git in variants:
+        task_id = await make_state_task(db, project_id=pid)
+        plugins.git_ops = git
+
+        started = await pair_start(client, task_id, git_mode=mode)
+        assert started.status_code == 200, started.text
+        view = started.json()
+        assert not view["branch"], f"у state-задачи нет ветки: {view['branch']!r}"
+        assert not view.get("worktree_path") and not view.get("worktree_hint"), view
+        assert view["status"] == "running"
+        stored = dict(await repo.get_task(db, task_id))
+        assert not stored["branch"], stored["branch"]
+        assert stored["git_mode"] == "remote", (
+            "state записывается как remote в любом режиме: хост хаба в git не ходит"
+        )
+        if isinstance(git, GitSpy):
+            assert git.calls == [], f"git-вызовы на pair-start: {git.calls}"
+
+        with patch(
+            "hub.services.review_dispatch.maybe_dispatch_review", new=AsyncMock()
+        ) as dispatch:
+            sent = await submit(client, task_id, evidence_for())
+        assert sent.status_code == 200, sent.text
+        done = sent.json()
+        assert done["status"] == "review"
+        assert done["submission_generation"] == 1
+        assert done["submission_sha"] == ""
+        dispatch.assert_not_awaited()
+        if isinstance(git, GitSpy):
+            assert git.calls == [], f"git-вызовы на сдаче: {git.calls}"
+
+        text = " ".join(u["content"] for u in await feed(db, task_id))
+        assert "НЕ закреплена" not in text, (
+            "алерта «вершина не закреплена» быть не должно"
+        )
+        kinds = {e["kind"] for e in await events(db, task_id)}
+        assert "review_ordered_without_ci" not in kinds
+        assert not await db.execute_fetchall(
+            "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+        assert len(await evidence_rows(db, task_id)) == 2
+
+        submission = await repo.get_submission(db, task_id, 1)
+        assert submission is not None
+        snapshot = json.loads(dict(submission).get("state_snapshot") or "{}")
+        assert snapshot.get("result_kind") == "state", snapshot
+        assert snapshot.get("rollback"), snapshot
+        assert [a["id"] for a in snapshot.get("acceptance_criteria", [])] == [
+            "AC-1",
+            "AC-2",
+        ]
+
+
+async def test_state_submit_refuses_bad_evidence_without_side_effects(
+    client: AsyncClient, db: aiosqlite.Connection, caplog
+):
+    """AC-3: каждая ошибка контракта доказательств — 422 без входных значений.
+
+    Названы AC или вид ошибки; ни ответ, ни лог не содержат присланных
+    значений; поколение, статус, сдачи, task_evidence и лента не изменились.
+    """
+    import logging
+
+    from tests.state_support import (
+        MARKER,
+        evidence_for,
+        fingerprint,
+        make_state_task,
+        pair_start,
+        submit,
+    )
+
+    secret = "ghp_" + "aB3dE5gH7jK9" * 3  # pragma: allowlist secret
+    assert len(secret) == 40
+    task_id = await make_state_task(db)
+    assert (await pair_start(client, task_id)).status_code == 200
+
+    def good(**over):
+        return evidence_for(("AC-1", "AC-2"), observed=f"{MARKER} ok", **over)
+
+    cases = [
+        ("missing_ac", good()[:1], "AC-2"),
+        ("duplicate_ac", good() + good()[:1], "AC-1"),
+        ("unknown_ac", good() + [dict(good()[0], ac_id="AC-9")], "AC-9"),
+        ("empty_value", [dict(good()[0], observed=""), good()[1]], "AC-1"),
+        ("empty_value", [dict(good()[0], observed="  \n\t "), good()[1]], "AC-1"),
+        ("empty_set", [], ""),
+        (
+            "too_long",
+            [dict(good()[0], observed=MARKER + "x" * 6000), good()[1]],
+            "AC-1",
+        ),
+        (
+            "secret",
+            [dict(good()[0], observed=f"ответ {secret} получен"), good()[1]],
+            "AC-1",
+        ),
+        (
+            "secret",
+            [dict(good()[0], action=f"curl -H 'X: {secret}'"), good()[1]],
+            "AC-1",
+        ),
+        ("type", [dict(good()[0], observed=12345), good()[1]], "AC-1"),
+    ]
+    caplog.set_level(logging.DEBUG)
+    for kind, payload, ac_name in cases:
+        before = await fingerprint(db, task_id)
+        resp = await submit(client, task_id, payload)
+        label = f"{kind}/{ac_name}"
+        assert resp.status_code == 422, (label, resp.status_code, resp.text)
+        body = resp.text
+        detail = resp.json()["detail"]
+        assert isinstance(detail, dict), (label, detail)
+        assert detail.get("reason") == "state_evidence_invalid", (label, detail)
+        assert detail.get("kind") == kind, (label, detail)
+        if ac_name:
+            assert ac_name in body, (label, "AC не назван", body)
+        for leaked in (MARKER, secret, "12345", "x" * 50):
+            assert leaked not in body, (label, "ответ вернул вход", leaked)
+            assert leaked not in caplog.text, (label, "лог хранит вход", leaked)
+        assert await fingerprint(db, task_id) == before, label
+
+    # Не список и неизвестное поле записи — тоже отказ без входа.
+    for payload in ("текст вместо списка " + MARKER, [dict(good()[0], extra=MARKER)]):
+        before = await fingerprint(db, task_id)
+        resp = await submit(client, task_id, payload)
+        assert resp.status_code == 422, resp.text
+        assert MARKER not in resp.text and MARKER not in caplog.text
+        assert await fingerprint(db, task_id) == before
+
+
+async def test_state_done_report_does_not_complete_without_accepted_evidence(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-5: done-отчёт по state без принятой сдачи — отказ без побочных эффектов.
+
+    При auto_review true и false: ни done-строки, ни bump поколения, ни
+    перехода. /force-complete и /decide accept остаются аудируемыми исключениями.
+    """
+    from tests.state_support import fingerprint, make_state_task, pair_start
+
+    for auto_review in (True, False):
+        task_id = await make_state_task(db)
+        await repo.update_task(db, task_id, auto_review=int(auto_review))
+        await db.commit()
+        assert (await pair_start(client, task_id)).status_code == 200
+        before = await fingerprint(db, task_id)
+
+        resp = await client.post(
+            f"/api/tasks/{task_id}/updates",
+            json={"agent": "dev", "kind": "done", "content": "DNS переключён"},
+        )
+
+        assert resp.status_code in (400, 409, 422), (auto_review, resp.text)
+        after = await fingerprint(db, task_id)
+        assert after == before, (auto_review, before, after)
+        assert after["status"] == "running" and after["generation"] == 0
+        kinds = [u["kind"] for u in await repo.get_task_updates(db, task_id)]
+        assert "done" not in kinds, "отказанный отчёт не оставляет done-строки"
+
+    # Аудируемые исключения остаются.
+    forced_id = await make_state_task(db)
+    assert (await pair_start(client, forced_id)).status_code == 200
+    forced = await client.post(
+        f"/api/tasks/{forced_id}/force-complete",
+        json={"comment": "владелец закрыл вручную: проверено на месте"},
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["status"] == "completed"
+
+    decided_id = await make_state_task(db)
+    assert (await pair_start(client, decided_id)).status_code == 200
+    await repo.update_task(db, decided_id, status="needs_decision")
+    await db.commit()
+    accepted = await client.post(
+        f"/api/tasks/{decided_id}/decide",
+        json={"action": "accept", "decision_summary": "принято владельцем"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "completed"
+
+
+async def test_state_statement_is_frozen_between_submission_and_rework(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-6: AC, rollback и result_kind замёрзли после сдачи до возврата в работу.
+
+    В review и в running после сдачи отказывают refine, bulk-refine, весь AC
+    CRUD и смена result_kind; отказ называет путь «возврат в работу и новая
+    сдача». В draft result_kind и AC меняются, после return-to-work — тоже.
+    """
+    from tests.state_support import drive_to_review, fingerprint, make_state_task
+
+    new_ac = {
+        "id": "AC-3",
+        "given": "g",
+        "when": "w",
+        "then": "t",
+        "verifiable_by": "manual",
+    }
+    changed = dict(new_ac, id="AC-1")
+
+    def attempts(tid: int):
+        base = f"/api/tasks/{tid}"
+        return {
+            "refine rollback": lambda: client.post(
+                f"{base}/refine", json={"rollback": "иной откат"}
+            ),
+            "refine ac": lambda: client.post(
+                f"{base}/refine", json={"acceptance_criteria": [new_ac]}
+            ),
+            "refine kind": lambda: client.post(
+                f"{base}/refine", json={"result_kind": "commit"}
+            ),
+            "bulk refine": lambda: client.post(
+                "/api/tasks/refine-bulk",
+                json={"items": [{"task_id": tid, "rollback": "иной откат"}]},
+            ),
+            "ac add": lambda: client.post(f"{base}/acceptance_criteria", json=new_ac),
+            "ac upsert": lambda: client.put(
+                f"{base}/acceptance_criteria/AC-1", json=changed
+            ),
+            "ac replace": lambda: client.put(
+                f"{base}/acceptance_criteria", json=[changed]
+            ),
+            "ac delete": lambda: client.delete(f"{base}/acceptance_criteria/AC-2"),
+        }
+
+    async def assert_all_refused(tid: int, phase: str) -> None:
+        acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+        before = await fingerprint(db, tid)
+        for name, call in attempts(tid).items():
+            resp = await call()
+            assert resp.status_code in (409, 422), (phase, name, resp.text)
+            assert "возврат в работу" in resp.text, (phase, name, resp.text)
+        assert await fingerprint(db, tid) == before, phase
+        assert (
+            await client.get(f"/api/tasks/{tid}/acceptance_criteria")
+        ).json() == acs, phase
+        stored = dict(await repo.get_task(db, tid))
+        assert (
+            stored.get("rollback") == "Вернуть запись DNS на прежний адрес из карточки"
+        )
+
+    in_review = await make_state_task(db)
+    await drive_to_review(client, db, in_review)
+    await assert_all_refused(in_review, "review")
+
+    sent_back = await client.post(
+        f"/api/tasks/{in_review}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "rev",
+            "comments": "AC-2 снят без оговорки",
+            "expected_generation": 1,
+        },
+    )
+    assert sent_back.status_code == 200, sent_back.text
+    assert sent_back.json()["status"] == "running"
+    await assert_all_refused(in_review, "running после сдачи")
+
+    # Явный возврат в работу размораживает постановку.
+    second = await make_state_task(db, title="вторая")
+    await drive_to_review(client, db, second)
+    returned = await client.post(
+        f"/api/tasks/{second}/return-to-work", json={"reason": "поменялась цель"}
+    )
+    assert returned.status_code == 200, returned.text
+    refined = await client.post(
+        f"/api/tasks/{second}/refine", json={"rollback": "новый откат"}
+    )
+    assert refined.status_code == 200, refined.text
+    added = await client.post(f"/api/tasks/{second}/acceptance_criteria", json=new_ac)
+    assert added.status_code == 201, added.text
+
+    # draft: result_kind и AC меняются; в open result_kind уже не меняется.
+    draft = await make_state_task(db, title="черновик", status="draft")
+    for kind in ("commit", "state"):
+        resp = await client.post(
+            f"/api/tasks/{draft}/refine", json={"result_kind": kind}
+        )
+        assert resp.status_code == 200, (kind, resp.text)
+        assert resp.json()["result_kind"] == kind
+    assert (
+        await client.post(f"/api/tasks/{draft}/acceptance_criteria", json=new_ac)
+    ).status_code == 201
+    opened = await make_state_task(db, title="открытая")
+    resp = await client.post(
+        f"/api/tasks/{opened}/refine", json={"result_kind": "commit"}
+    )
+    assert resp.status_code == 422, resp.text
+    assert "draft" in resp.text
+    assert dict(await repo.get_task(db, opened)).get("result_kind") == "state"

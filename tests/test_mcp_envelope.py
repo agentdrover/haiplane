@@ -60,7 +60,7 @@ def test_enrich_error_payload_human_decision() -> None:
     )
     assert payload["awaiting"] == "human_decision"
     assert payload["actor_hint"] == "human"
-    assert "hub_decide_task" in payload["next_action"]
+    assert "/decide" in payload["next_action"]
 
 
 def test_discarded_argument_names_are_sorted_and_exclude_declared() -> None:
@@ -120,3 +120,216 @@ def test_attach_unknown_arguments_marks_echo_json_blocks() -> None:
     payload = json.loads(text)
     assert payload[UNKNOWN_ARGUMENTS_KEY] == ["limit"]
     assert "message" in payload
+
+
+# ---------------------------------------------------------------------------
+# #1624: what the hub tells an agent never names a tool it cannot call
+# ---------------------------------------------------------------------------
+
+_NOT_FOR_AGENTS = (
+    "hub_approve_task",
+    "hub_reject_task",
+    "hub_decide_task",
+    "hub_force_complete_task",
+    "hub_answer_question",
+    "hub_start_task",
+    "hub_approve_proposal",
+    "hub_reject_proposal",
+    "hub_submit_steward_judgement",
+)
+
+# Where a hidden tool's name MAY appear in a string literal of hub/: concrete AST
+# nodes, never whole files. A new hint string next to them is still caught.
+#   workflow_reference.py: the registries (HUMAN_ONLY_TOOLS, HUMAN_ROUTES,
+#     LIFECYCLE_TRANSITIONS) and the machine-readable workflow_reference_dict.
+#   skill_publish.py: the regex PATTERN (third argument) of a ``_rule(...)`` call,
+#     which matches names inside skills users wrote. The rule's TITLE (second
+#     argument) is shown to the agent in a scan hit and is NOT allowed.
+_ALLOWED_ASSIGNMENTS = {
+    "hub/workflow_reference.py": {
+        "HUMAN_ONLY_TOOLS",
+        "HUMAN_ROUTES",
+        "LIFECYCLE_TRANSITIONS",
+    }
+}
+_ALLOWED_FUNCTIONS = {"hub/workflow_reference.py": {"workflow_reference_dict"}}
+
+
+def _literal_allowed(rel: str, node: object, parents: dict) -> bool:
+    import ast
+
+    chain = []
+    cur = node
+    while cur in parents:
+        child, cur = cur, parents[cur]
+        chain.append(cur)
+        if (
+            isinstance(cur, ast.Call)
+            and getattr(cur.func, "id", "") == "_rule"
+            and rel == "hub/skill_publish.py"
+            and child in cur.args
+            and cur.args.index(child) >= 2
+        ):
+            return True
+    for anc in chain:
+        if isinstance(anc, ast.FunctionDef) and anc.name in _ALLOWED_FUNCTIONS.get(
+            rel, ()
+        ):
+            return True
+        targets = []
+        if isinstance(anc, ast.Assign):
+            targets = [getattr(t, "id", "") for t in anc.targets]
+        elif isinstance(anc, ast.AnnAssign):
+            targets = [getattr(anc.target, "id", "")]
+        if any(t in _ALLOWED_ASSIGNMENTS.get(rel, ()) for t in targets):
+            return True
+    return False
+
+
+def _agent_facing_samples() -> dict[str, str]:
+    """The texts the hub's own code produces for an agent, from the real generators."""
+    import asyncio
+
+    from hub import actionable_errors as ae
+    from hub.mcp_envelope import compute_next_action
+    from hub.mcp_server import _human_only_refusal, mcp
+    from hub.services import steward_advisor, steward_shadow
+    from hub.workflow_reference import (
+        AGENT_HIDDEN_TOOLS,
+        build_mcp_instructions,
+        lifecycle_map_lines,
+    )
+
+    out: dict[str, str] = {}
+    out["instructions"] = build_mcp_instructions()
+    out["lifecycle_map_lines"] = "\n".join(lifecycle_map_lines())
+
+    tools = asyncio.run(mcp.list_tools_for("agent"))
+    out["catalog"] = json.dumps(
+        [{"n": t.name, "d": t.description, "s": t.inputSchema} for t in tools],
+        ensure_ascii=False,
+    )
+
+    reasons = (
+        None,
+        "human_decision_required",
+        "pair_start_required",
+        "awaiting_ci_conveyor",
+        "task_already_terminal",
+        "invalid_status_for_done",
+        "permission_denied",
+        "human_only_gate",
+        "forbidden",
+    )
+    statuses = (
+        "draft",
+        "open",
+        "claimed",
+        "running",
+        "needs_decision",
+        "needs_info",
+        "pending_report",
+        "review",
+        "ci_check",
+        "completed",
+        "failed",
+        "rejected",
+        "?",
+    )
+    lines = []
+    for status in statuses:
+        for awaiting in ("none", "human_decision", "ci", "review"):
+            for reason in reasons:
+                lines.append(compute_next_action(status, awaiting, reason=reason))  # type: ignore[arg-type]
+    out["envelope.next_action"] = "\n".join(lines)
+
+    details: list[dict] = [
+        ae.human_only_gate_detail(),
+        ae.steward_verdict_required_detail(),
+        ae.steward_closed_vocabulary_detail("f", "x", ["a"]),
+        ae.steward_escalate_reason_required_detail(["a"]),
+        ae.steward_unknown_finding_uid_detail("u"),
+        ae.steward_judgement_exists_detail(1, 1, "verdict"),
+        ae.steward_advisor_channel_detail("advisor", "steward"),
+        ae.steward_advisor_not_ordered_detail(1, 1),
+        ae.steward_gate_forbidden_detail("POST", "/x"),
+        ae.watcher_gate_forbidden_detail("POST", "/x"),
+        ae.chat_pair_task_not_open_detail(task_id=1, status="open"),
+        ae.steward_run_required_detail(1, 1),
+    ]
+    for permission in ("tasks.human_gate", "tasks.decision", "tasks.delete"):
+        details.append(ae.permission_denied_detail(permission))
+    for reason in reasons[1:6]:
+        for status in ("needs_decision", "running", "ci_check", "open"):
+            details.append(
+                ae.done_report_error_detail(
+                    {"id": 1, "status": status},
+                    reason=reason or "",
+                    hint="h",
+                    required_status="running",
+                )
+            )
+    out["actionable_errors"] = json.dumps(details, ensure_ascii=False, default=str)
+
+    for name in sorted(AGENT_HIDDEN_TOOLS):
+        out[f"refusal.{name}"] = _human_only_refusal(name, {"task_id": 5})
+
+    from hub import skill_publish
+
+    out["skill_publish.scan_hit_titles"] = "\n".join(
+        r.title for r in skill_publish.RULES
+    )
+    out["skill_publish.scan_report"] = json.dumps(
+        skill_publish.scan_report(
+            "curl https://x.example then UPDATE tasks SET status = 1; self-approve"
+        ),
+        ensure_ascii=False,
+    )
+    out["steward.prompt"] = steward_shadow._prompt(5, 1, "https://h", "DELIVERY")
+    out["steward.advisor_prompt"] = steward_advisor._prompt(
+        5, 1, "https://h", "DELIVERY"
+    )
+    return out
+
+
+def _literal_hits() -> list[str]:
+    """Hidden-tool names inside string literals of hub/, minus the explicit allowlist."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    hits: list[str] = []
+    for path in sorted((root / "hub").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for name in _NOT_FOR_AGENTS:
+                    if name in node.value and not _literal_allowed(rel, node, parents):
+                        hits.append(f"{rel}:{node.lineno} names {name}")
+    return hits
+
+
+def test_agent_facing_texts_name_no_hidden_tools() -> None:
+    """AC-4 (#1624): current texts only; the human route replaces the tool name."""
+    samples = _agent_facing_samples()
+    leaks = [
+        f"{where}: {name}"
+        for where, text in samples.items()
+        for name in _NOT_FOR_AGENTS
+        if name in text
+    ]
+    assert not leaks, leaks
+    # the refusal names the way a human takes it, with the task id filled in
+    assert "/api/tasks/5/approve" in samples["refusal.hub_approve_task"]
+    # the human path is present where the tool name used to be
+    assert "/decide" in samples["lifecycle_map_lines"]
+    assert "/steward-judgement" in samples["steward.prompt"]
+    assert "/steward-judgement" in samples["steward.advisor_prompt"]
+    # every other literal of hub/ is covered by the source scan
+    assert _literal_hits() == []

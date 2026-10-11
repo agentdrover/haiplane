@@ -10,10 +10,13 @@ one in.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import os
 import re
 import socket
+import tarfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -27,10 +30,14 @@ from hub.integrations import forge as forge_registry
 from hub.integrations import proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BranchUpdateOutcome,
     CIProbeResult,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     ForgePlugin,
     MergeabilityOutcome,
+    SnapshotArchive,
     StackProbeOutcome,
     StackProbeResult,
 )
@@ -38,7 +45,7 @@ from hub.mcp_envelope import enrich_error_payload
 from hub.models import DEFAULT_FORGE
 
 from hub import git_policy
-from hub.commit_scope import parse_porcelain_paths
+from hub.commit_scope import parse_name_status_paths, parse_porcelain_paths
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +56,46 @@ log = logging.getLogger(__name__)
 NOOP_FORGE = "noop"
 
 _TIMEOUT_RC = proc.TIMEOUT_RC
+
+
+#: Прочитанные present-файлы по (клон, sha коммита, путь, потолок): sha
+#: неизменяем, поэтому запись не стареет; missing/unreadable не кэшируются.
+_BASE_FILE_CACHE: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+
+
+def _unreadable_file(ref: str, path: str, reason: str) -> dict[str, Any]:
+    return {
+        "state": "unreadable",
+        "path": path,
+        "ref": ref,
+        "sha": "",
+        "content": "",
+        "truncated": False,
+        "size": 0,
+        "chars": 0,
+        "reason": reason,
+    }
+
+
+async def _blob_prefix(repo: str, obj: str, nbytes: int) -> tuple[int, bytes, str]:
+    """Первые ``nbytes`` байт blob; остальное git не отдаёт (#1630).
+
+    ``head -c`` закрывает канал, git получает SIGPIPE: память ограничена
+    префиксом при файле любого размера. Недобор против известного размера
+    вызывающий читает как ошибку чтения.
+    """
+    return await proc.run_bytes(
+        "sh",
+        "-c",
+        'git -C "$1" cat-file blob "$2" | head -c "$3"',
+        "sh",
+        repo,
+        obj,
+        str(nbytes),
+        cwd=repo,
+        timeout=30,
+        max_bytes=nbytes + 1,
+    )
 
 
 #: Причина, когда git отказал, но словами, которых мы не знаем (#1118, AC-3).
@@ -419,6 +466,167 @@ async def _worktree_registered(path: str, repo: str) -> bool:
     return False
 
 
+def worktree_hint(task_id: int) -> str:
+    """Where a task's worktree goes, as a template the caller can read (#1515).
+
+    The hub does not know the folder name of the caller's clone (the project
+    repo agentdrover/Spike_bo may live in a clone called spike_bo), so it can
+    name only the shape. The shape is cut from ``_worktree_path`` itself with a
+    placeholder clone name: there is no second formula to drift from it.
+    """
+    template = _worktree_path(task_id, "/<имя вашего клона>")
+    return (
+        f"..{template} — шаблон относительно основного клона; "
+        f"точный путь строит и создаёт `hp-hub worktree {task_id}`"
+    )
+
+
+def repo_slug(remote: str) -> str:
+    """``owner/name`` of a remote URL or a bare ``owner/name``, lower-cased (#1515).
+
+    Compares an origin (https, ssh or scp form) with the repo a project names.
+    Case is ignored: forges treat owner and name case-insensitively.
+    """
+    text = (remote or "").strip().rstrip("/")
+    text = text.removesuffix(".git")
+    text = text.replace(":", "/") if "://" not in text else text.split("://", 1)[1]
+    parts = [p for p in text.split("/") if p]
+    return "/".join(parts[-2:]).lower()
+
+
+async def clone_root(start: str) -> str:
+    """Main clone of the git checkout at ``start``; ``""`` when there is none.
+
+    Asked from inside a task worktree it still answers with the MAIN clone: the
+    #459 path is a sibling of the clone, never of another worktree (#1515).
+    """
+    if not os.path.isdir(start):
+        return ""
+    rc, out, _ = await _git(
+        "rev-parse", "--path-format=absolute", "--git-common-dir",
+        repo=start, check=False,
+    )  # fmt: skip
+    common = out.strip()
+    if rc != 0 or os.path.basename(common) != ".git":
+        return ""
+    return os.path.dirname(common)
+
+
+async def origin_url(clone: str) -> str:
+    """The clone's ``origin`` URL; ``""`` when it has none (#1515)."""
+    rc, out, _ = await _git("remote", "get-url", "origin", repo=clone, check=False)
+    return out.strip() if rc == 0 else ""
+
+
+class WorktreeRefused(Exception):
+    """A task worktree was not created or reused; nothing was touched (#1515)."""
+
+
+async def _fetch_for_worktree(
+    repo: str, branch: str, base: str, notes: list[str]
+) -> None:
+    """Best-effort fetch of the task branch and base before a new copy (#1515).
+
+    A failure is not a refusal, but it is named in ``notes``: the copy is then
+    cut from what the clone already has, which may be stale. Whether the task
+    branch exists on origin is asked with ``ls-remote --heads`` (rc 0 and empty
+    output: absent, as in ``_refresh_remote_ref``), never read from git's
+    stderr, which follows the user's locale. An absent branch is the normal
+    state of a task not yet pushed: no fetch and no note. The base is fetched
+    always, so a missing base is a real warning.
+    """
+    for name in (branch, base):
+        if name == branch:
+            rc, out, err = await _git(
+                "ls-remote", "--heads", "origin", f"refs/heads/{name}",
+                repo=repo, check=False, timeout=30,
+            )  # fmt: skip
+            if rc == 0 and not out.strip():
+                continue
+            if rc != 0:
+                notes.append(
+                    f"fetch origin {name} не удался (ls-remote: "
+                    f"{(err or '').strip()[:200] or rc}): "
+                    f"копия строится по тому, что уже есть в клоне"
+                )
+                continue
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0:
+            notes.append(
+                f"fetch origin {name} не удался ({(err or '').strip()[:200] or rc}): "
+                f"копия строится по тому, что уже есть в клоне"
+            )
+
+
+async def ensure_task_worktree(
+    task_id: int,
+    branch: str,
+    repo: str,
+    base: str,
+    notes: list[str] | None = None,
+) -> str:
+    """Create or reuse the task's worktree at the #459 path; return the path.
+
+    A new copy takes the task branch from, in order: the local branch, the
+    branch on origin (tracking it, so work already pushed is not lost), the
+    base. Fetch failures are appended to ``notes``.
+
+    Reuses a registered worktree of ``repo`` that is already on ``branch``.
+    Refuses — changing nothing — when the path holds anything else: another
+    branch (its dirty files are named), or a directory git does not know.
+    Never deletes and never switches a branch.
+    """
+    wt_path = _worktree_path(task_id, repo)
+    await _git("worktree", "prune", repo=repo, check=False)
+    if os.path.lexists(wt_path):
+        if not (await _worktree_registered(wt_path, repo) and os.path.isdir(wt_path)):
+            raise WorktreeRefused(
+                f"{wt_path} существует, но не копия клона {repo}; ничего не изменено"
+            )
+        _, cur, _ = await _git("branch", "--show-current", repo=wt_path, check=False)
+        cur = (cur or "").strip()
+        if cur == branch:
+            return wt_path
+        dirty, files = await _dirty_state(wt_path)
+        state = (
+            f"с незакоммиченными правками ({_name_dirty_files(files)})"
+            if dirty.strip()
+            else "без правок"
+        )
+        raise WorktreeRefused(
+            f"копия {wt_path} стоит на ветке {cur or '(detached)'!r} {state}, "
+            f"а ветка задачи — {branch!r}; ничего не изменено"
+        )
+    os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+    await _fetch_for_worktree(repo, branch, base, notes if notes is not None else [])
+    args: tuple[str, ...]
+    rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+    if rc == 0:
+        args = ("worktree", "add", wt_path, branch)
+    else:
+        remote = f"refs/remotes/origin/{branch}"
+        rc, _, _ = await _git("rev-parse", "--verify", remote, repo=repo, check=False)
+        if rc == 0:
+            args = ("worktree", "add", "-b", branch, wt_path, remote)
+        else:
+            rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
+            start = base if rc == 0 else f"origin/{base}"
+            args = ("worktree", "add", "-b", branch, wt_path, start)
+    rc, _, err = await _git(*args, repo=repo, check=False)
+    if rc != 0:
+        raise WorktreeRefused(
+            f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
+        )
+    return wt_path
+
+
 async def _default_workspace_error() -> str | None:
     """Readable reason when the default-project workspace is unusable (#378).
 
@@ -551,6 +759,58 @@ def _conv_commit_type(title: str) -> str:
     if any(k in t for k in ("ci", "cd", "pipeline", "deploy")):
         return "ci"
     return "feat"
+
+
+#: Тип записи tar, которую снимок несёт: обычные файлы и каталоги (#1599).
+_SNAPSHOT_KEPT = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+
+
+def _snapshot_is_empty(raw: bytes) -> bool:
+    """``git archive`` пустого дерева — один pax_global_header без записей."""
+    return raw.startswith(b"pax_global_header") and not raw[1024:].strip(b"\x00")
+
+
+def _snapshot_repack(raw: bytes) -> tuple[bytes, str, int]:
+    """Перепаковать ``git archive`` в канонический tar снимка: ``(tar, note, n)``.
+
+    Политика, названная явно (#1599). Защищённый распаковщик принимает только
+    обычные файлы и каталоги в ustar без PAX-переопределений, поэтому хаб
+    сам убирает то, что распаковщик отверг бы целиком: символьные ссылки
+    (их цель вне снимка, ревьюеру они не нужны — отброшены и посчитаны) и
+    записи, чьё имя не умещается в ustar. Submodule git archive отдаёт
+    пустым каталогом, он не раскрывается. ``export-ignore`` и
+    ``export-subst`` — как у ``git archive``: действует то, что записано в
+    дереве на sha. Режимы, uid/gid, время не переносятся — это не данные.
+    """
+    if _snapshot_is_empty(raw):
+        return b"", "", 0
+    out = io.BytesIO()
+    dropped: dict[str, int] = {}
+    count = 0
+    with (
+        tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source,
+        tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as target,
+    ):
+        for member in source:
+            if member.type not in _SNAPSHOT_KEPT:
+                kind = "ссылок" if member.issym() or member.islnk() else "прочих"
+                dropped[kind] = dropped.get(kind, 0) + 1
+                continue
+            entry = tarfile.TarInfo(member.name)
+            entry.type = tarfile.DIRTYPE if member.isdir() else tarfile.REGTYPE
+            entry.mode = 0o755 if member.isdir() else 0o644
+            entry.size = 0 if member.isdir() else member.size
+            try:
+                if member.isdir():
+                    target.addfile(entry)
+                else:
+                    target.addfile(entry, source.extractfile(member))
+            except ValueError:
+                dropped["длинных путей"] = dropped.get("длинных путей", 0) + 1
+                continue
+            count += 1
+    note = ", ".join(f"исключено {n} {kind}" for kind, n in sorted(dropped.items()))
+    return out.getvalue(), note, count
 
 
 async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
@@ -846,6 +1106,60 @@ def _stack_probe_cache_put(
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
+
+
+async def _push_tree_head(
+    repo: str, path: str, temp: str, target: str, lease: str | None = None
+) -> tuple[int, str]:
+    """Запушить HEAD одноразового дерева в ``target`` через временную ветку.
+
+    pre-push хук (.githooks/pre-push) читает ЛОКАЛЬНЫЙ ref строки пуша, и ни
+    «HEAD», ни голый sha в его списке нет, — а хаб вооружает хуком каждый клон
+    воркспейса сам (#532). Так резались восстановление релизной ветки (#949),
+    обновление ветки PR (#1419), автомерж базы (#1233) и мерж пушем (#1116):
+    27.09 на проде «Blocked push from branch 'HEAD'» (#1438).
+
+    Поэтому коммит кладётся во временную локальную ветку с именем по шаблону
+    хука (``temp``) и пушится полным refspec — хук видит обычную ветку, обхода
+    нет. Настоящую локальную ветку ``target`` не трогаем: её может держать
+    живое дерево исполнителя, и ``checkout -B`` переставил бы ref под ним
+    (e74f63e646dd4078). ``lease`` — ожидаемая вершина ``target`` на origin:
+    пуш пройдёт, только если ветка всё ещё там (``None`` — без аренды; пустая
+    строка — аренда «ветки нет», как у git). Временная ветка удаляется при
+    любом исходе.
+    """
+    rc, _, err = await _git("branch", "-f", temp, "HEAD", repo=path, check=False)
+    if rc != 0:
+        return rc, f"временная ветка {temp} не создана: {err}"
+    args = ["push"]
+    if lease is not None:
+        args.append(f"--force-with-lease=refs/heads/{target}:{lease.strip()}")
+    args += ["origin", f"refs/heads/{temp}:refs/heads/{target}"]
+    try:
+        rc, _, err = await _git(*args, repo=path, check=False, timeout=60)
+    finally:
+        await _git("branch", "-D", temp, repo=repo, check=False)
+    return rc, err
+
+
+def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
+    """Отказ пуша обновлённой ветки — чьи руки его лечат (#1419).
+
+    Как у пути API: аренда (голова уехала) — head_moved, повтор; таймаут и
+    сеть — unavailable, повтор; к человеку (refused) — только отказ прав или
+    защиты ветки на стороне сервера.
+    """
+    low = (err or "").lower()
+    if rc == _TIMEOUT_RC:
+        return BranchUpdateOutcome.unavailable
+    if any(w in low for w in ("permission", "denied", "protected", "declined", "403")):
+        return BranchUpdateOutcome.refused
+    if any(
+        w in low
+        for w in ("stale info", "[rejected]", "non-fast-forward", "fetch first")
+    ):
+        return BranchUpdateOutcome.head_moved
+    return BranchUpdateOutcome.unavailable
 
 
 class GitOpsIntegration:
@@ -1749,8 +2063,13 @@ class GitOpsIntegration:
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
         return out.strip() if rc == 0 else ""
 
-    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
-        """``git diff -U0 base...branch``, or None when it cannot be read (#601).
+    async def branch_diff(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
+        """``git diff -U<context> base...branch``, or None when unreadable (#601).
+
+        ``context`` (#1582) is the unchanged lines around each change: 0 for
+        the hub's own measurements, more for a reviewer that has no clone.
 
         None rather than "" on failure: an empty diff and an unreadable one are
         different answers, and the section must be able to say which.
@@ -1790,7 +2109,7 @@ class GitOpsIntegration:
             return None
         rc, out, _ = await _git(
             "diff",
-            "-U0",
+            f"-U{max(0, int(context))}",
             f"{base_sha}...{branch_sha}",
             repo=repo,
             check=False,
@@ -1868,6 +2187,95 @@ class GitOpsIntegration:
         """
         rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
         return out if rc == 0 else None
+
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict[str, Any]:
+        """Общий дедлайн на чтение (45 с); просрочка — unreadable, а не зависание."""
+        try:
+            return await asyncio.wait_for(
+                self._read_file_at_ref(repo, ref, path, limit_chars), timeout=45
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return _unreadable_file(ref, path, "чтение не уложилось в 45 с")
+
+    async def _read_file_at_ref(
+        self, repo: str, ref: str, path: str, limit_chars: int
+    ) -> dict[str, Any]:
+        """Файл на ``ref`` с честным состоянием: present | missing | unreadable (#1630).
+
+        ``file_at_ref`` схлопывает «файла нет» и «не смогли прочитать» в None —
+        для правил рецензента это нарочно. Здесь различие и есть ответ: пустой
+        файл это present с пустым content, отсутствие — missing, ошибка ref или
+        клона — unreadable с причиной. Читается blob по объекту, не ``strip()``.
+        """
+        out: dict[str, Any] = {
+            "state": "unreadable",
+            "path": path,
+            "ref": ref,
+            "sha": "",
+            "content": "",
+            "truncated": False,
+            "size": 0,
+            "chars": 0,
+            "reason": "",
+        }
+        rc, sha, err = await _git(
+            "rev-parse",
+            "--verify",
+            f"{ref}^{{commit}}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0:
+            out["reason"] = f"ref {ref!r} не прочитан: {err[:120] or f'rc={rc}'}"
+            return out
+        out["sha"] = sha.strip()
+        key = (repo, out["sha"], path, limit_chars)
+        if key in _BASE_FILE_CACHE:
+            return dict(_BASE_FILE_CACHE[key])
+        rc, tree, err = await _git(
+            "ls-tree", "-z", out["sha"], "--", path, repo=repo, check=False, timeout=30
+        )
+        if rc != 0:
+            out["reason"] = f"дерево {ref!r} не прочитано: {err[:120] or f'rc={rc}'}"
+            return out
+        entry = tree.split("\0", 1)[0]
+        meta, _, name = entry.partition("\t")
+        fields = meta.split()
+        if not entry or name != path or len(fields) != 3:
+            out["state"] = "missing"
+            return out
+        mode, kind, obj = fields
+        if kind != "blob" or mode not in ("100644", "100755"):
+            out["reason"] = f"{path} не обычный файл (mode {mode})"
+            return out
+        rc, size_text, err = await _git(
+            "cat-file", "-s", obj, repo=repo, check=False, timeout=30
+        )
+        if rc != 0 or not size_text.strip().isdigit():
+            out["reason"] = f"размер {path} не прочитан: {err[:120] or f'rc={rc}'}"
+            return out
+        size = int(size_text.strip())
+        out["size"] = size
+        # Префикс blob, а не весь: память ограничена потолком, файл любого
+        # размера даёт present + truncated + size (AC-2).
+        want = min(size, limit_chars * 4 + 8)
+        rc, body, err = await _blob_prefix(repo, obj, want) if want else (0, b"", "")
+        if rc != 0 or len(body) < want:
+            out["reason"] = f"содержимое {path} не прочитано: {err[:120] or f'rc={rc}'}"
+            return out
+        text = body.decode("utf-8", errors="replace")
+        whole = len(body) >= size
+        out["state"] = "present"
+        out["chars"] = len(text) if whole else 0
+        out["truncated"] = (not whole) or len(text) > limit_chars
+        out["content"] = text[:limit_chars]
+        if len(_BASE_FILE_CACHE) >= 64:
+            _BASE_FILE_CACHE.pop(next(iter(_BASE_FILE_CACHE)))
+        _BASE_FILE_CACHE[key] = dict(out)
+        return out
 
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
         """Every path in the tree of ``ref``; ``None`` when it could not be read.
@@ -2148,6 +2556,105 @@ class GitOpsIntegration:
                 return (True, "")
             return (False, (err_ref or err or "").strip())
         return (False, (err or "").strip())
+
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive:
+        """Снимок дерева на закреплённом ``sha`` для ревьюера без клона (#1599).
+
+        ``git archive --format=tar <sha>``, прочитанный ПОТОКОМ с потолком
+        (``proc.run_capped``): превышение останавливает и убивает процесс, а не
+        копит вывод. Вывод — сырые байты, без decode и strip. Объект ``sha``
+        при необходимости доставляется (``commit_exists`` → ``fetch_commit``).
+        Ни одна ветка не бросает: отсутствие снимка — это ``SnapshotArchive``
+        с названной причиной, и вызывающий не принимает его за «чисто».
+        Политика содержимого — в ``_snapshot_repack``.
+        """
+        if not sha or not repo:
+            return SnapshotArchive(sha=sha, data=None, reason="нет sha или клона")
+        exists = await self.commit_exists(repo, sha)
+        if exists is None:
+            return SnapshotArchive(sha=sha, data=None, reason="клон не читается")
+        if not exists:
+            fetched, why = await self.fetch_commit(repo, sha, ref)
+            if not fetched:
+                return SnapshotArchive(
+                    sha=sha,
+                    data=None,
+                    reason=f"коммит {sha[:12]} не найден в клоне хаба и не "
+                    f"доставлен: {why or 'причина не названа'}"[:300],
+                )
+        rc, raw, err = await proc.run_capped(
+            "git",
+            "-C",
+            repo,
+            "archive",
+            "--format=tar",
+            sha,
+            cwd=repo,
+            timeout=120,
+            max_bytes=max_bytes,
+        )
+        if rc != 0:
+            reason = (
+                f"архив больше потолка {max_bytes} байт"
+                if rc == -2
+                else f"git archive не удался (rc={rc}): {err}"
+            )
+            return SnapshotArchive(sha=sha, data=None, reason=reason[:300])
+        try:
+            data, note, count = await asyncio.to_thread(_snapshot_repack, raw)
+        except (tarfile.TarError, OSError, ValueError) as exc:
+            return SnapshotArchive(
+                sha=sha, data=None, reason=f"архив не разобран: {exc}"[:300]
+            )
+        if count == 0:
+            return await self._nothing_to_snapshot(repo, sha, note)
+        return SnapshotArchive(sha=sha, data=data, note=note)
+
+    async def _nothing_to_snapshot(
+        self, repo: str, sha: str, note: str
+    ) -> SnapshotArchive:
+        """В снимке нет ни одного файла: ПУСТОЕ ДЕРЕВО или «всё исключено».
+
+        Это разные факты, и ревьюеру нельзя говорить первое, когда верно второе
+        (находка Codex): коммит из одной символьной ссылки или дерево целиком
+        под ``export-ignore`` не пусты, а отфильтрованы.
+        """
+        if note:
+            return SnapshotArchive(
+                sha=sha,
+                data=None,
+                note=note,
+                reason=f"в снимке не осталось файлов: {note}",
+            )
+        rc, listed, _ = await proc.run_capped(
+            "git",
+            "-C",
+            repo,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            sha,
+            cwd=repo,
+            timeout=30,
+            max_bytes=1 << 20,
+        )
+        if rc == 0 and listed:
+            return SnapshotArchive(
+                sha=sha,
+                data=None,
+                reason="в дереве коммита есть файлы, но git archive исключил их "
+                "все (export-ignore): снимок пуст не потому, что пусто дерево",
+            )
+        if rc != 0:
+            return SnapshotArchive(
+                sha=sha, data=None, reason="дерево коммита не прочитано (ls-tree)"
+            )
+        return SnapshotArchive(
+            sha=sha, data=None, empty=True, reason="дерево на закреплённом sha пусто"
+        )
 
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         """Commits on the base's own line, newest first, or None on failure.
@@ -2452,6 +2959,57 @@ class GitOpsIntegration:
             )
             return None
         return [p for p in (out or "").split("\0") if p.strip()]
+
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None:
+        """Every path the branch touches, BOTH ends of a rename (#1589).
+
+        A separate call from ``branch_diff_paths`` on purpose: that one feeds
+        the surface check and the risk recompute, which compare the NEW name
+        only, and must not change behaviour. This one answers a different
+        question — "which watched path did the change touch" — and a file
+        moved out of a watched directory touches it, as does a deletion.
+
+        Returns ``(paths, sha_read)`` or None when unknowable. ``sha_read`` is
+        the commit the paths were actually read for: ``head_sha`` when the
+        submission pinned one, else the branch tip resolved origin-first. No
+        fetch here: the caller has just run ``branch_diff_paths``, which does.
+        ``-M`` is explicit so the answer does not hang on ``diff.renames``;
+        ``-z`` for the same reason as everywhere else (#555).
+        """
+        repo = repo or _repo_root()
+        base = _resolve_base(base_branch)
+        if not (branch or "").strip():
+            return None
+        base_sha = await _resolve_ref_remote_first(base, repo)
+        if base_sha is None:
+            return None
+        head = (head_sha or "").strip() or await _resolve_ref_remote_first(branch, repo)
+        if not head:
+            return None
+        rc, out, err = await _git(
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            f"{base_sha}...{head}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.warning(
+                "branch_touched_paths: diff failed for %s...%s: %s",
+                base_sha,
+                head,
+                (err or "").strip(),
+            )
+            return None
+        return parse_name_status_paths(out or ""), head
 
     async def auto_commit(
         self,
@@ -2961,7 +3519,7 @@ class GitOpsIntegration:
             return []
         return await self._conflicting_files(head, base, repo=repo)
 
-    async def return_release_into_base(
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -2969,41 +3527,101 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]:
-        """Merge the release branch back into the integration branch (#969).
+    ) -> tuple[int | None, str]:
+        """The open PR ``head`` → ``base`` from this repository (#1426).
 
-        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
-        names rather than three, because a conflict and a git that could not
-        be asked need different hands: one is a merge somebody has to resolve,
-        the other is a question to ask again next cycle. Collapsing them is
-        how #725 gets repeated with new words.
-
-        Called the moment the release merge lands, and the moment matters. A
-        squash release writes a NEW commit on the release branch instead of
-        carrying the originals, so the branch it came from does not contain
-        it, and the two diverge by one commit per release. Right here that
-        commit holds EXACTLY the tree the integration branch already has and
-        the merge base is fresh, so the merge is trivial by construction.
-        Left to age it stops being trivial: on 26.08.2026 five releases'
-        worth of them collided in ``hub/db.py`` and release PR #83 stood
-        conflicted with 13 tasks undelivered.
-
-        The merge itself is the forge's job — the clone is shared, may sit on
-        someone else's branch with a dirty tree, and carries an armed pre-push
-        hook (#949). Naming the conflicting files is git's job, and stays here.
+        ``(number, "")``, ``(None, "")`` when there is none, ``(None, reason)``
+        when the list could not be read or only a stranger's PR matched. The
+        forge filters by base AND head, and accepts only a head that lives in
+        this repository: a fork's ``main`` is not the release branch, and a PR
+        from main into anything but ``base`` is not the return.
         """
-        state, detail = await self._forge_for(forge).merge_branches(
-            head,
-            base,
-            f"chore: return {base} into {head} after the release",
+        return await self._forge_for(forge).pr_between(
+            base, head, repo=repo, gh_repo=gh_repo
+        )
+
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]:
+        """Find the return PR ``head`` → ``base``, or create exactly that one (#1426).
+
+        Not ``open_release_pr``: that one finds a PR by head alone and edits
+        it, so an open PR main → staging would have been renamed into "the
+        return" while main → develop was never created. Here nobody else's PR
+        is touched. A lookup that failed stops the call — creating blindly on
+        "could not read" is how a second PR appears (#516).
+
+        The number ``create_pr`` answers is not trusted either: on "already
+        exists" it falls back to a head-only lookup. The PR is looked up again
+        by base and head instead, and that answer is the result.
+        """
+        adapter = self._forge_for(forge)
+        found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)
+        # Чужой PR с той же парой — не сбой чтения: свой всё равно создаётся,
+        # иначе любой форк с веткой main останавливает возврат.
+        if found or (why and not why.startswith(FOREIGN_PR_ONLY)):
+            return (found, why)
+        await adapter.create_pr(title, body, head, base, repo=repo, gh_repo=gh_repo)
+        found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)
+        if found or why:
+            return (found, why)
+        return (None, "форж не создал PR")
+
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]:
+        """Merge the release-return PR: ``(True, merge sha)`` or ``(False, why)``.
+
+        Replaces the direct branch merge of #969 (#1426). That merge went
+        through ``POST /merges`` with no PR, and the ruleset's pull_request
+        rule let it through only because the Write role could bypass it — a
+        bypass every writer had, not only the hub. As a PR merged at green
+        CI the return needs no bypass at all.
+
+        Two things differ from a task merge, and both are load-bearing:
+
+        * a MERGE COMMIT, not a squash. The point of the return is to make
+          the release commit an ancestor of the integration branch; a squash
+          would write one more new commit and leave the drift in place;
+        * the head is never deleted. The head of this PR is the release
+          branch — main.
+
+        A forge that cannot merge through its API merges by push, which is a
+        ``--no-ff`` merge already and never deletes a branch (#1116).
+        The merge sha may come back empty when the forge would not name it;
+        the merge still happened, and the caller records it keyed by the PR.
+        """
+        adapter = self._forge_for(forge)
+        if not adapter.can_merge_via_api:
+            return await self.merge_pr_by_push(
+                pr_number, subject, repo=repo, gh_repo=gh_repo, forge=forge
+            )
+        merged = await adapter.merge_pr(
+            pr_number,
+            subject,
+            delete_branch=False,
             repo=repo,
             gh_repo=gh_repo,
+            method="merge",
         )
-        if state != "conflict":
-            return (state, detail)
-        files = await self._conflicting_files(base, head, repo=repo)
-        named = f": {', '.join(files)}" if files else ""
-        return ("conflict", f"{base} не сливается с {head} без конфликта{named}")
+        if not merged:
+            return (False, "")
+        sha = await adapter.merge_commit_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        return (True, sha)
 
     async def _conflicting_files(
         self, base: str, head: str, repo: str | None = None
@@ -3159,6 +3777,96 @@ class GitOpsIntegration:
                 return None, f"конфликтующий файл {rel} не прочитан: {exc}"
         return files, ""
 
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness:
+        """Отстала ли голова PR от базы — вопрос форжу, роутинг как у всех (#1419)."""
+        return await self._forge_for(forge).pr_base_freshness(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """Слить базу в ветку PR с арендой головы (#1419).
+
+        Форж с вызовом (GitHub update-branch) делает это сам. Форж без него
+        отвечает ``unsupported``, и тогда база сливается здесь локальным git в
+        одноразовом дереве на ``expected_head_sha`` и пушится с арендой на неё
+        же — та же механика, что у автомержа #1233, без разрешения конфликтов:
+        конфликт здесь не разрешается, а называется.
+        """
+        adapter = self._forge_for(forge)
+        outcome, detail = await adapter.update_pr_branch(
+            pr_number, expected_head_sha, repo=repo, gh_repo=gh_repo
+        )
+        if outcome is BranchUpdateOutcome.conflict:
+            # Форж конфликт не расписывает по файлам — их называет клон (#970).
+            files = await self._conflicting_files_of_pr(
+                pr_number, repo=repo, gh_repo=gh_repo, forge=forge
+            )
+            return (outcome, ", ".join(files) if files else detail)
+        if outcome is not BranchUpdateOutcome.unsupported or not repo:
+            return (outcome, detail)
+        base, head = await adapter.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        if not base or not head:
+            return (
+                BranchUpdateOutcome.unavailable,
+                f"ветки PR #{pr_number} не прочитаны",
+            )
+        return await self._update_branch_by_push(
+            repo, base, head, task_id, expected_head_sha
+        )
+
+    async def _update_branch_by_push(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """Слить ``origin/<base>`` в ветку на ``tip`` и запушить с арендой (#1419)."""
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
+        if not path:
+            return (BranchUpdateOutcome.unavailable, why)
+        try:
+            files, why = await self._conflicting_texts(path)
+            if files is None:
+                return (BranchUpdateOutcome.unavailable, why)
+            if files:
+                return (BranchUpdateOutcome.conflict, ", ".join(sorted(files)))
+            rc, _, err = await _git(
+                "commit",
+                "-m",
+                f"chore(task-{task_id}): merge {base} into {branch}",
+                "--no-verify",
+                repo=path,
+                check=False,
+            )
+            if rc != 0:
+                return (BranchUpdateOutcome.unavailable, f"коммит мержа: {err[:150]}")
+            # #949/#1438: пуш через временную ветку по шаблону хука, аренда на
+            # закреплённую голову; временная убирается всегда.
+            _, merged, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            temp = f"task-{task_id}/gate-update-{(merged or '').strip()[:8]}"
+            rc, err = await _push_tree_head(repo, path, temp, branch, lease=tip)
+            if rc != 0:
+                return (_push_refusal(rc, err), f"пуш ветки: {(err or '')[:150]}")
+            return (BranchUpdateOutcome.updated, f"база {base} слита в {branch}")
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+
     async def base_merge_conflicts(
         self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]:
@@ -3295,14 +4003,9 @@ class GitOpsIntegration:
             # нём, так что это обычный fast-forward; аренда закрывает окно между
             # пробой и пушем, где чужой коммит успел бы лечь под наш вердикт.
             # Пустой ``tip`` сюда не доходит: дерево на нём и строится.
-            rc, _, err = await _git(
-                "push",
-                f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
-                "origin",
-                f"HEAD:refs/heads/{branch}",
-                repo=path,
-                check=False,
-                timeout=60,
+            # #1438: не ``HEAD:refs/heads/…`` — его режет вооружённый хук.
+            rc, err = await _push_tree_head(
+                repo, path, f"task-{task_id}/gate-merge-{sha[:8]}", branch, lease=tip
             )
             if rc != 0:
                 return False, f"пуш слитой ветки не прошёл: {err[:150]}"
@@ -3486,6 +4189,18 @@ class GitOpsIntegration:
             sha, repo=repo, gh_repo=gh_repo
         )
 
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str:
+        """Голова PR на форже; пусто, когда спросить не удалось (#1591)."""
+        return await self._forge_for(forge).pr_head_sha(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Останется ли сдаточный коммит предком базовой ветки после доставки.
 
@@ -3510,8 +4225,12 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
+
+        ``expected_head_sha`` (#1591) делает merge УСЛОВНЫМ: форж сливает только
+        если голова PR всё ещё этот коммит. Пусто — как раньше.
 
         Ветвится по ОБЪЯВЛЕННОЙ способности форжа, а не по попытке (#1116).
         GitHub сливает сам одним вызовом. У GitVerse такого вызова нет вовсе,
@@ -3532,6 +4251,7 @@ class GitOpsIntegration:
             gh_repo=gh_repo,
             forge=forge,
             delete_branch=delete_branch,
+            expected_head_sha=expected_head_sha,
         )
         return ok
 
@@ -3544,6 +4264,7 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Слить PR и НАЗВАТЬ причину, если не вышло (#1116, по ревью).
 
@@ -3562,10 +4283,16 @@ class GitOpsIntegration:
                 delete_branch=delete_branch,
                 repo=repo,
                 gh_repo=gh_repo,
+                expected_head_sha=expected_head_sha,
             )
             return (ok, "")
         ok, detail = await self.merge_pr_by_push(
-            pr_number, subject, repo=repo, gh_repo=gh_repo, forge=forge
+            pr_number,
+            subject,
+            repo=repo,
+            gh_repo=gh_repo,
+            forge=forge,
+            expected_head_sha=expected_head_sha,
         )
         if not ok:
             log.error("merge by push failed for PR #%d: %s", pr_number, detail)
@@ -3579,6 +4306,7 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Слить PR локальным git и ДОКАЗАТЬ доставку базовой веткой (#1116).
 
@@ -3621,6 +4349,16 @@ class GitOpsIntegration:
         )
         if rc != 0:
             return (False, f"не удалось получить ветки из origin: {err[:150]}")
+        if expected_head_sha:
+            _, fetched, _ = await _git(
+                "rev-parse", f"refs/remotes/origin/{head}", repo=workspace, check=False
+            )
+            if (fetched or "").strip() != expected_head_sha:
+                return (
+                    False,
+                    f"голова {head} ушла с {expected_head_sha[:12]} (#1591): "
+                    "мерж отменён, сверка повторится",
+                )
 
         # Имя включает клон, а не только номер PR: два проекта на одном
         # форже легко имеют PR №1 каждый, и общий путь свёл бы их мержи в
@@ -3691,8 +4429,12 @@ class GitOpsIntegration:
             if rc != 0 or not merged_sha:
                 return (False, "git не назвал коммит мержа")
 
-            rc, _, err = await _git(
-                "push", "origin", f"HEAD:refs/heads/{base}", repo=path, check=False
+            # #1438: не ``HEAD:refs/heads/<база>`` — его режет вооружённый хук.
+            rc, err = await _push_tree_head(
+                workspace,
+                path,
+                f"chore/gate-merge-pr{pr_number}-{merged_sha[:8]}",
+                base,
             )
             if rc != 0:
                 detail = (err or "").strip()

@@ -14,11 +14,15 @@ from typing import Any
 import aiosqlite
 
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
     MergeabilityOutcome,
+    SnapshotArchive,
     StackProbeResult,
     stacking_probe_batch_from_probe,
     stacking_probe_from_predicate,
@@ -237,7 +241,9 @@ class NoopGitOps:
         """No git here: "could not ask" is a reason, never "no such PR"."""
         raise RuntimeError("git не настроен — провайдера спросить нельзя")
 
-    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
+    async def branch_diff(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
@@ -250,6 +256,22 @@ class NoopGitOps:
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
         """No git here — there is no rules file to read (#873)."""
         return None
+
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict[str, Any]:
+        """No git here — "could not look", never "the file is absent" (#1630)."""
+        return {
+            "state": "unreadable",
+            "path": path,
+            "ref": ref,
+            "sha": "",
+            "content": "",
+            "truncated": False,
+            "size": 0,
+            "chars": 0,
+            "reason": "git не настроен",
+        }
 
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
@@ -349,7 +371,7 @@ class NoopGitOps:
         """
         return (MergeabilityOutcome.unavailable, "git integration is not configured")
 
-    async def return_release_into_base(
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -357,15 +379,33 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]:
-        """No git here — "could not ask", never "nothing to return" (#969).
+    ) -> tuple[int | None, str]:
+        return (None, "")
 
-        The distinction is load-bearing the same way it is in
-        content_differs: "nothing" would let the divergence pile up in
-        silence, and a silent pipeline failure is found later than a noisy
-        one.
-        """
-        return ("unavailable", "git integration is not configured")
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]:
+        return (None, "git integration is not configured")
+
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]:
+        """No git here — "could not merge", with the reason (#1426, #725)."""
+        return (False, "git integration is not configured")
 
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
@@ -383,6 +423,14 @@ class NoopGitOps:
     ) -> tuple[bool, str]:
         """No git here — nothing is fetched, and the caller must say so (#883)."""
         return (False, "git integration is not configured")
+
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive:
+        """No git here — there is no snapshot, and the reason says so (#1599)."""
+        return SnapshotArchive(
+            sha=sha, data=None, reason="git integration is not configured"
+        )
 
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
@@ -560,6 +608,15 @@ class NoopGitOps:
     ) -> list[str] | None:
         return None
 
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None:
+        return None
+
     async def auto_commit(
         self,
         task_id: int,
@@ -646,6 +703,44 @@ class NoopGitOps:
         # runs" is a different answer that would read as a green base (#929).
         return None
 
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness:
+        """Заглушка не спрашивает форж вовсе (#1419): unsupported, не unknown.
+
+        unknown остановил бы гейт ожиданием, которое никогда не кончится, —
+        у заглушки нет форжа, который однажды ответит.
+        """
+        return BaseFreshness(
+            BaseFreshnessState.unsupported, reason="git integration is not configured"
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]:
+        return (BranchUpdateOutcome.unsupported, "git integration is not configured")
+
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str:
+        return ""
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Заглушка не мержит — значит и родословную ничем не рвёт (#1214).
 
@@ -667,6 +762,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool:
         return False
 
@@ -679,6 +775,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Согласован с ``merge_pr``, а не отвечает отдельно (#1116).
 
@@ -761,6 +858,16 @@ class NoopForge:
     ) -> int | None:
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        return (None, "форж не настроен")
+
     async def open_or_update_pr(
         self,
         base: str,
@@ -798,6 +905,22 @@ class NoopForge:
     ) -> tuple[str, str]:
         return ("", "")
 
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness:
+        # Не unknown: форжа нет, спрашивать некого — это факт о плагине (#1419).
+        return BaseFreshness(BaseFreshnessState.unsupported, reason="форж не настроен")
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]:
+        return (BranchUpdateOutcome.unsupported, "форж не настроен")
+
     async def pr_mergeability(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> tuple[MergeabilityOutcome, str]:
@@ -821,6 +944,8 @@ class NoopForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         return False
 
@@ -892,17 +1017,6 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> list[str]:
         return []
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        return ("unavailable", "форж не настроен")
 
 
 class NoopGitHub:

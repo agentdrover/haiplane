@@ -30,10 +30,14 @@ import httpx
 
 from hub import config
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -316,6 +320,50 @@ class GitVerseForge:
                 return int(pr["number"])
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """Открытый PR ``head`` → ``base`` из ЭТОГО репозитория (#1426).
+
+        Контракт тот же, что у GitHub: сбой чтения и PR из чужого репозитория
+        называются причиной, а не сводятся к «PR нет» (#516).
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return (None, "репозиторий не назван")
+        resp = await self._request(
+            "GET", f"/repos/{slug}/pulls", params={"state": "open"}
+        )
+        if not resp.ok or not isinstance(resp.data, list):
+            return (None, f"список PR {head} → {base} не прочитан")
+        foreign: list[str] = []
+        for pr in resp.data:
+            if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+                continue
+            pr_base, pr_head = pr.get("base"), pr.get("head")
+            if not isinstance(pr_base, dict) or not isinstance(pr_head, dict):
+                continue
+            if (pr_base.get("ref"), pr_head.get("ref")) != (base, head):
+                continue
+            head_repo = pr_head.get("repo")
+            name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+            # Без head.repo голова не доказана своей — fail-closed, как у GitHub.
+            if not name or str(name).lower() != slug.lower():
+                foreign.append(f"#{pr['number']} ({name or '?'}:{head})")
+                continue
+            return (int(pr["number"]), "")
+        if foreign:
+            return (
+                None,
+                f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
+            )
+        return (None, "")
+
     async def open_or_update_pr(
         self,
         base: str,
@@ -525,6 +573,79 @@ class GitVerseForge:
         """
         return (MergeabilityOutcome.unavailable, _MERGE_PENDING)
 
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness:
+        """Отстала ли голова PR от базы — по status compare, как branch_contains (#1419).
+
+        ``behind`` и ``diverged`` у ``compare/{base}...{head}`` значат, что в
+        базе есть коммиты, которых нет в голове; ``ahead`` и ``identical`` —
+        что база целиком в голове. Незнакомое слово и сбой — unknown, не «не
+        отстала»: молчание форжа не повод мержить (#725).
+        """
+        slug = self._repo(gh_repo)
+        resp = await self._pr(pr_number, gh_repo)
+        data: dict[str, Any] = (
+            resp.data if resp.ok and isinstance(resp.data, dict) else {}
+        )
+        base = data.get("base")
+        head = data.get("head")
+        base_ref = str(base.get("ref") or "").strip() if isinstance(base, dict) else ""
+        head_sha = str(head.get("sha") or "").strip() if isinstance(head, dict) else ""
+        if not slug or not base_ref or not head_sha:
+            return BaseFreshness(
+                BaseFreshnessState.unknown,
+                reason=f"PR #{pr_number} не прочитан: {resp.reason or resp.status}",
+            )
+        cmp = await self._request(
+            "GET", f"/repos/{slug}/compare/{base_ref}...{head_sha}"
+        )
+        status = ""
+        if cmp.ok and isinstance(cmp.data, dict):
+            status = str(cmp.data.get("status") or "").strip().lower()
+            behind = cmp.data.get("behind_by")
+        else:
+            behind = None
+        count = (
+            behind if isinstance(behind, int) and not isinstance(behind, bool) else None
+        )
+        if status in ("ahead", "identical"):
+            return BaseFreshness(
+                BaseFreshnessState.current, head_sha=head_sha, behind_by=count or 0
+            )
+        if status in ("behind", "diverged"):
+            return BaseFreshness(
+                BaseFreshnessState.behind,
+                head_sha=head_sha,
+                behind_by=count,
+                reason=f"compare: {status}",
+            )
+        return BaseFreshness(
+            BaseFreshnessState.unknown,
+            head_sha=head_sha,
+            reason=f"compare {base_ref}...{head_sha[:12]} не ответил "
+            f"({status or cmp.reason or cmp.status})",
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """У GitVerse нет вызова «обновить ветку PR» (#1419).
+
+        Как с мержем (#1116): способность объявляется ответом, а не пробой.
+        git_ops, получив ``unsupported``, сливает базу в ветку локальным git и
+        пушит с арендой головы.
+        """
+        return (
+            BranchUpdateOutcome.unsupported,
+            "GitVerse не обновляет ветку PR по API — база сливается локальным git",
+        )
+
     async def merge_pr(
         self,
         pr_number: int,
@@ -533,6 +654,8 @@ class GitVerseForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         """Форж слить не может — и говорит это, а не молчит (#1116).
 
@@ -1033,15 +1156,3 @@ class GitVerseForge:
                 subjects.append(subject)
         subjects.reverse()
         return subjects
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Сводится в #1116: серверного мержа веток у GitVerse тоже нет."""
-        return ("unavailable", _MERGE_PENDING)

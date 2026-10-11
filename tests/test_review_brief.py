@@ -572,6 +572,21 @@ class _RealFiles(NoopGitOps):
 
         return await GitOpsIntegration().files_at_ref(repo, ref)
 
+    async def read_file_at_ref(self, repo: str, ref: str, path: str, **kw):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().read_file_at_ref(repo, ref, path, **kw)
+
+    async def head_sha(self, repo: str, base: str) -> str:
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().head_sha(repo, base)
+
+    async def resolve_ref(self, name: str, repo: str):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().resolve_ref(name, repo)
+
 
 async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -> int:
     task_id = await _project_with(db, client, workspace, "main")
@@ -593,40 +608,29 @@ async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -
     return task_id
 
 
-async def test_locator_resolves_in_the_tasks_own_worktree(
-    db, client: AsyncClient, workspace, monkeypatch
+async def test_locator_resolves_at_the_ref_not_in_a_working_tree(
+    db, client: AsyncClient, workspace
 ):
-    """#764 AC-1: collection is attempted where the task's branch lives.
+    """#764 AC-1 / #1650: the file is read at the task's ref, wherever HEAD is.
 
-    The shared clone sits on the base branch — that is the normal state under
-    worktree-per-task, not an accident — so a check that only ever looked
-    there could not have resolved anything.
+    The shared clone sits on the base branch for every task under
+    worktree-per-task, so a check that depended on what is checked out could
+    not have resolved anything; reading the ref does not care.
     """
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_a.py").write_text("def test_ok():\n    pass\n")
+    _git(workspace, "add", ".")
+    _git(workspace, "commit", "-m", "the test the submission adds")
+    _git(workspace, "checkout", "main")  # HEAD is NOT the task's branch
     task_id = await _task_with_test_ac(
         db, client, workspace, "tests/test_a.py::test_ok"
     )
-    looked_in: list[str] = []
-
-    async def _fake_collect(path):
-        looked_in.append(path)
-        return {"tests/test_a.py::test_ok"}
-
-    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _fake_collect)
-    monkeypatch.setattr(
-        "hub.services.orchestration.live_pair_worktree_info",
-        lambda _db, _tid: _awaitable(("worktree", "/tmp/wt/task-42")),
-    )
-
-    class _OnBranch(_RealFiles):
-        async def current_branch(self, repo: str | None = None) -> str:
-            return "task-42/work" if repo == "/tmp/wt/task-42" else "main"
-
-    plugins.git_ops = _OnBranch()
+    plugins.git_ops = _RealFiles()
 
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
 
-    assert looked_in == ["/tmp/wt/task-42"], "collection must run where the code is"
     assert brief["locator_resolution"][0]["status"] == "resolvable"
+    assert "[ref: task branch task-42/work" in brief["locator_resolution"][0]["reason"]
 
 
 async def test_no_readable_tree_reports_unknown_not_missing(
@@ -743,18 +747,14 @@ class _OnTaskBranch(_RealFiles):
         return "task-42/work"
 
 
-async def test_foreign_locator_is_read_even_when_collection_succeeded(
-    db, client: AsyncClient, workspace, monkeypatch
+async def test_foreign_locator_is_read_from_its_file(
+    db, client: AsyncClient, workspace
 ):
-    """#1203: a successful pytest collection does not excuse reading the file.
+    """#1203: a locator of another runner is judged by its own reader.
 
-    The resolver is right to refuse to judge a vitest locator by a pytest
-    collection. But the brief fetched file text ONLY when collection had
-    failed, so on the path that actually runs in production the resolver was
-    handed nothing and answered "could not read at the submitted commit" —
-    about a file no one had opened. The resolver's own unit test passed a
-    collection AND the sources together, which is exactly why it could not
-    see this: the defect lived between the two, not inside either.
+    Nothing pytest could list speaks for a vitest test, and the file text must
+    actually be fetched — a resolver handed nothing answered "could not read"
+    about a file no one had opened.
     """
     (workspace / "frontend").mkdir()
     (workspace / "frontend" / "recent.test.ts").write_text(
@@ -765,13 +765,6 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
 
     task_id = await _task_with_test_ac(
         db, client, workspace, "frontend/recent.test.ts::still toggles"
-    )
-
-    async def _collection_succeeds(path):
-        return {"tests/test_a.py::test_ok"}
-
-    monkeypatch.setattr(
-        "hub.services.review_brief.collect_test_nodeids", _collection_succeeds
     )
     plugins.git_ops = _OnTaskBranch()
 
@@ -1252,3 +1245,770 @@ async def test_an_incomplete_or_evidence_free_report_is_no_review(
         answer = brief["current_generation_review"]
         assert answer["has_review"] is False
         assert answer["reason"] == reason
+
+
+# --- #1587: the brief names the profile the cap or the circle took away ----
+
+
+async def _brief_task_with_orders(db, orders: list[tuple]) -> int:
+    """Задача на ревью с заказами ``(channel, profile, reasons)`` в одном поколении."""
+    from hub import services
+    from hub.models import TaskCreate
+
+    tv = await services.create_task(db, TaskCreate(title="downgrade brief"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await services.submit_for_review(db, tv.id)
+    generation = dict(await repo.get_task(db, tv.id))["submission_generation"]
+    for i, (channel, profile, reasons) in enumerate(orders):
+        agent = f"local:r{i}" if channel == "local" else f"bc-{tv.id}-{i}"
+        await repo.create_review_dispatch(
+            db,
+            task_id=tv.id,
+            submission_generation=generation,
+            agent_id=agent,
+            run_id=f"r{i}",
+            model="grok-4.6",
+            profile=profile,
+            channel=channel,
+        )
+        await repo.insert_event(
+            db,
+            kind="review_dispatched",
+            task_id=tv.id,
+            actor="policy",
+            payload={
+                "agent_id": agent,
+                "generation": generation,
+                "profile": profile,
+                "profile_reasons": reasons,
+            },
+        )
+    await db.commit()
+    return tv.id
+
+
+_CAP = ["deep по правилу (риск), но суточный потолок 2 исчерпан — lite"]
+_CIRCLE = ["круг: 3 захода, deep приостановлен до решения человека"]
+
+
+async def test_brief_names_required_and_actual_review_profile(client: AsyncClient, db):
+    from hub.services.review_brief import build_review_brief
+
+    # Потолок #1414: требовался deep, заказан lite — до результата «заказан».
+    capped = await _brief_task_with_orders(db, [("cloud", "lite", _CAP)])
+    block = (await build_review_brief(db, capped)).profile_downgrade
+    assert block is not None
+    assert (block.required_profile, block.ordered_profile) == ("deep", "lite")
+    assert block.state == "заказан", "before a result the order is not 'done'"
+    assert block.reasons == _CAP and "потолок" in block.headline
+
+    # Круг и запасной облачный заказ после local-first: причина того заказа.
+    fallback = await _brief_task_with_orders(
+        db, [("local", "deep", ["правило"]), ("cloud", "lite", _CIRCLE)]
+    )
+    block = (await build_review_brief(db, fallback)).profile_downgrade
+    assert block is not None and block.channel == "cloud"
+    assert block.reasons == _CIRCLE, "the reasons are the LATEST order's own"
+
+    # Несколько заказов: бриф говорит о заказе, породившем ТЕКУЩИЙ отчёт.
+    multi = await _brief_task_with_orders(
+        db, [("cloud", "lite", _CAP), ("cloud", "deep", ["ревью запрошено"])]
+    )
+    assert (await build_review_brief(db, multi)).profile_downgrade is None, (
+        "the latest order is a plain deep: no downgrade block"
+    )
+    resp = await client.post(
+        f"/api/tasks/{multi}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "raw_count": 1,
+            "incomplete": False,
+            "agent": "reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    done = (await build_review_brief(db, multi)).profile_downgrade
+    assert done is not None and done.reasons == _CAP, (
+        "the order that produced the report is the one the brief speaks of"
+    )
+    assert done.state == "отчёт получен"
+
+    # Случай без понижения: lite по правилу, причина — не потолок и не круг.
+    plain = await _brief_task_with_orders(
+        db, [("cloud", "lite", ["класс риска r1, процессных поверхностей нет"])]
+    )
+    assert (await build_review_brief(db, plain)).profile_downgrade is None
+    deep_only = await _brief_task_with_orders(db, [("cloud", "deep", ["security"])])
+    assert (await build_review_brief(db, deep_only)).profile_downgrade is None
+
+    # После рестарта хаба: блок читается из событий и строки заказа, не из памяти.
+    again = await client.get(f"/api/tasks/{capped}/review-brief")
+    assert again.status_code == 200
+    assert again.json()["profile_downgrade"]["state"] == "заказан"
+    from hub.mcp_server import _profile_downgrade_line
+
+    assert "Требовался deep" in _profile_downgrade_line(again.json())
+
+
+# --- #1589: path_notices в ответе на сдачу, брифе и карточке вердикта --------
+
+
+def _commit_on(root, branch, name, text):
+    from tests.test_lifecycle import _real
+
+    _real(root, "checkout", "-q", branch)
+    (root / name).write_text((root / name).read_text() + text)
+    _real(root, "add", "-A")
+    _real(root, "commit", "-q", "-m", f"edit {name}")
+    _real(root, "checkout", "-q", "main")
+
+
+async def test_brief_and_verdict_card_show_path_notices(
+    db, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589 AC-2: без ключа и с пустым списком — ничего; с правилами — ТЕКУЩЕЕ поколение."""
+    import json
+
+    from hub import mcp_server
+    from tests.test_lifecycle import (
+        _edit,
+        _notice_lines,
+        make_path_notices_git,
+        make_path_notices_workspace,
+        pair_task_with_branch,
+        path_notices_project,
+    )
+
+    workspace = make_path_notices_workspace(tmp_path)
+    git = make_path_notices_git(workspace)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    evil = "<script>alert(1)</script> обновить копию"
+    rules = [{"pattern": "deploy/remote-deploy.sh", "text": evil}]
+
+    # Без ключа и с пустым списком: ни поля, ни строки, ни текста.
+    for slug, configured in (("pn-nokey", None), ("pn-empty", [])):
+        _, epic = await path_notices_project(
+            db, client, workspace, configured, slug=slug
+        )
+        task_id = await pair_task_with_branch(
+            db,
+            client,
+            epic,
+            workspace,
+            f"quiet {slug}",
+            lambda r: _edit(r, "deploy/remote-deploy.sh"),
+        )
+        resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["path_notices"] is None, slug
+        assert not _notice_lines(await repo.get_task_updates(db, task_id)), slug
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        assert brief["path_notices"] is None, slug
+        assert mcp_server._path_notices_text(brief["path_notices"]) == ""
+        page = (await client.get(f"/tasks/{task_id}")).text
+        assert "Пути диффа требуют ручных шагов" not in page, slug
+
+    # С правилами: пути задеты.
+    _, epic = await path_notices_project(db, client, workspace, rules, slug="pn-rules")
+    task_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "with rules",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["path_notices"]["state"] == "matched"
+    assert evil in brief["path_notices"]["text"]
+    assert evil in mcp_server._path_notices_text(brief["path_notices"])
+
+    async def fake_get(path):
+        return brief
+
+    monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    mcp_result = await mcp_server.hub_get_review_brief(task_id)
+    assert evil in mcp_result.content[0].text, "MCP-бриф называет предупреждение"
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert "Пути диффа требуют ручных шагов" in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page, "текст экранирован"
+    assert "<script>alert(1)</script>" not in page
+
+    # Правка политики ПОСЛЕ сдачи результат поколения не меняет.
+    project = await repo.resolve_project_for_task(db, task_id)
+    await repo.update_project(
+        db,
+        project["id"],
+        gate_policy=json.dumps(
+            {"path_notices": [{"pattern": "deploy/remote-deploy.sh", "text": "новый"}]}
+        ),
+    )
+    await db.commit()
+    brief2 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief2["path_notices"]["text"] == brief["path_notices"]["text"]
+    # Даже полное снятие правил: результат поколения зафиксирован сдачей.
+    await repo.update_project(db, project["id"], gate_policy=json.dumps({}))
+    await db.commit()
+    brief2 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief2["path_notices"]["text"] == brief["path_notices"]["text"]
+    await repo.update_project(
+        db, project["id"], gate_policy=json.dumps({"path_notices": rules})
+    )
+    await db.commit()
+
+    # Пересдача без совпадения: правку скрипта откатили, старое предупреждение
+    # прошлого поколения не показано ни в брифе, ни в карточке.
+    from tests.test_lifecycle import _real
+
+    branch = f"task-{task_id}/work"
+    _real(workspace, "checkout", "-q", branch)
+    _real(workspace, "checkout", "main", "--", "deploy/remote-deploy.sh")
+    _real(workspace, "commit", "-q", "-m", "revert script edit")
+    _real(workspace, "checkout", "-q", "main")
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path_notices"]["state"] == "none"
+    assert len(_notice_lines(await repo.get_task_updates(db, task_id))) == 1, (
+        "новой строки нет: совпадений в этом поколении нет"
+    )
+    brief3 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert (
+        brief3["path_notices"]["generation"] == brief["path_notices"]["generation"] + 1
+    )
+    assert mcp_server._path_notices_text(brief3["path_notices"]) == ""
+    old_page = (await client.get(f"/tasks/{task_id}")).text
+    assert "Пути диффа требуют ручных шагов" not in old_page
+    assert 'id="path-notices"' not in old_page, (
+        "блок карточки только у текущего поколения"
+    )
+
+    # Чистая ветка с пустым диффом: состояние none, ничего не показывается.
+    clean_id = await pair_task_with_branch(
+        db, client, epic, workspace, "empty diff", lambda r: None
+    )
+    await repo.update_project(
+        db,
+        project["id"],
+        gate_policy=json.dumps({"path_notices": rules}),
+    )
+    await db.commit()
+    resp = await client.post(f"/api/tasks/{clean_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path_notices"]["state"] == "none"
+    assert not _notice_lines(await repo.get_task_updates(db, clean_id))
+    clean_brief = (await client.get(f"/api/tasks/{clean_id}/review-brief")).json()
+    assert mcp_server._path_notices_text(clean_brief["path_notices"]) == ""
+    assert (
+        "Пути диффа требуют ручных шагов"
+        not in (await client.get(f"/tasks/{clean_id}")).text
+    )
+
+    # Непрочитанный дифф: явное «проверка путей не выполнена», не тишина.
+    class _Blind(type(git)):
+        async def branch_touched_paths(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(plugins, "git_ops", _Blind())
+    blind_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "blind",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{blind_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["path_notices"]
+    assert block["state"] == "unknown" and block["reason"]
+    assert "проверка путей не выполнена" in block["text"]
+    lines = _notice_lines(await repo.get_task_updates(db, blind_id))
+    assert len(lines) == 1 and "проверка путей не выполнена" in lines[0]
+    blind_page = (await client.get(f"/tasks/{blind_id}")).text
+    assert "проверка путей не выполнена" in blind_page
+
+    # Дифф сдачи не прочитан вовсе (branch_diff_paths вернул None): то же явное
+    # «не выполнена» с причиной диффа, а не тишина.
+    class _NoDiff(type(git)):
+        async def branch_diff_paths(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(plugins, "git_ops", _NoDiff())
+    nodiff_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "no diff",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{nodiff_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["path_notices"]
+    assert block["state"] == "unknown"
+    assert "не удалось прочитать дифф ветки" in block["reason"]
+    assert len(_notice_lines(await repo.get_task_updates(db, nodiff_id))) == 1
+
+
+# ---- #1606: mutation / baseline evidence in the brief ------------------------
+
+
+async def _store_report(db, task_id: int, *, mutations: dict, baseline: dict):
+    import json
+
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha="a" * 40,
+        ac_results="{}",
+        validation_status="pass",
+        validation_log="",
+        reason="",
+        reported_by="ci",
+        checks="{}",
+        mutations=json.dumps(mutations),
+        baseline=json.dumps(baseline),
+    )
+    await db.commit()
+
+
+async def test_missing_mutation_evidence_reads_as_not_received(
+    db, client: AsyncClient, workspace
+):
+    """AC-4: absence is "не получено", a block names its run, an old one says unknown."""
+    task_id = await _project_with(db, client, workspace, "main")
+    plugins.git_ops = _RealRefs()
+    await repo.update_task(db, task_id, submission_sha="a" * 40)
+    await db.commit()
+
+    async def evidence() -> dict:
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        return brief["ci_evidence"]
+
+    # No report for the pinned commit: neither block is a pass.
+    both = await evidence()
+    for key in ("mutations", "baseline"):
+        assert both[key]["state"] == "not_received", both
+        assert "не получено" in both[key]["reason"]
+
+    # A report that carries no evidence keys (a synchronize run) is the same.
+    await _store_report(db, task_id, mutations={}, baseline={})
+    both = await evidence()
+    assert both["mutations"]["state"] == "not_received"
+    assert both["baseline"]["state"] == "not_received"
+
+    # A block with provenance names the run and the event.
+    provenance = {
+        "run_id": "777",
+        "run_url": "https://github.example/runs/777",
+        "event": "pull_request.opened",
+        "at": "2026-10-06T10:00:00Z",
+    }
+    await _store_report(
+        db,
+        task_id,
+        mutations={"state": "ran", "survivors": [], "provenance": provenance},
+        baseline={"state": "ran", "tests": {}},
+    )
+    both = await evidence()
+    assert both["mutations"]["state"] == "received"
+    assert both["mutations"]["result"] == "ran"
+    assert "777" in both["mutations"]["run"]
+    assert "pull_request.opened" in both["mutations"]["run"]
+    # An old block, stored before provenance existed, does not invent one.
+    assert both["baseline"]["state"] == "received"
+    assert "прогон неизвестен" in both["baseline"]["run"]
+
+
+async def test_brief_rejects_foreign_evidence_and_keeps_error_reasons(
+    db, client: AsyncClient, workspace
+):
+    """#1606: provenance alone is not evidence; an error block shows its cause."""
+    task_id = await _project_with(db, client, workspace, "main")
+    plugins.git_ops = _RealRefs()
+    await repo.update_task(db, task_id, submission_sha="a" * 40)
+    await db.commit()
+    prov = {"run_id": "9", "event": "workflow_dispatch", "at": "t", "run_url": ""}
+
+    async def evidence() -> dict:
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        return brief["ci_evidence"]
+
+    for foreign in ({"provenance": prov}, {"unexpected": "x", "provenance": prov}):
+        await _store_report(db, task_id, mutations=foreign, baseline=foreign)
+        both = await evidence()
+        for key in ("mutations", "baseline"):
+            assert both[key]["state"] == "not_received", (key, foreign)
+            assert both[key]["result"] == ""
+            assert both[key]["reason"]
+
+    error = {"state": "error", "reason": "timeout после 540 с", "provenance": prov}
+    await _store_report(db, task_id, mutations=error, baseline=error)
+    both = await evidence()
+    for key in ("mutations", "baseline"):
+        assert both[key]["state"] == "received"
+        assert both[key]["result"] == "error"
+        assert "timeout после 540 с" in both[key]["reason"]
+        assert "9" in both[key]["run"]
+
+    # An old valid block without provenance stays acceptable.
+    old = {"state": "ran", "survivors": []}
+    await _store_report(db, task_id, mutations=old, baseline={"state": "ran"})
+    both = await evidence()
+    assert both["mutations"]["state"] == "received"
+    assert "прогон неизвестен" in both["mutations"]["run"]
+
+
+# ---- #1650: the hub never runs the task branch's code to list its tests ----
+
+
+async def test_brief_never_imports_task_branch_code(
+    db, client: AsyncClient, tmp_path: Path, spawn_spy
+):
+    """#1650 AC-1: the brief and the steward packet read the branch, not run it.
+
+    The branch carries a conftest.py that writes a marker outside the tree of
+    the pytest running this test. HEAD of the clone stands on the task branch,
+    which is exactly the condition under which the old collector ran
+    ``uv run pytest --collect-only`` with the hub's whole environment.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services.steward_evidence import build_evidence_packet
+    from tests.branch_code_support import TEST_FILE, make_clone
+
+    marker = tmp_path / "outside" / "marker"
+    marker.parent.mkdir()
+    workspace, tip = make_clone(tmp_path, marker)
+    plugins.git_ops = GitOpsIntegration()
+    task_id = await _task_with_test_ac(db, client, workspace, f"{TEST_FILE}::test_ok")
+    await repo.update_task(db, task_id, submission_sha=tip)
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    packet = await build_evidence_packet(db, task_id)
+
+    assert not marker.exists(), "the branch's conftest.py ran on the hub host"
+    assert spawn_spy.pytest_runs() == [], "the hub started pytest"
+    assert packet is not None and packet.brief is not None
+    for resolution in (
+        brief["locator_resolution"][0],
+        packet.brief.locator_resolution[0].model_dump(),
+    ):
+        assert resolution["status"] == "resolvable", resolution
+        assert "without running" in resolution["reason"], resolution
+
+
+# --- #1648: бриф задачи-состояния --------------------------------------------
+
+
+async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_applicable(
+    client: AsyncClient, db, monkeypatch, capsys
+):
+    """AC-2 (#1648): бриф state-задачи (REST и MCP) показывает снимок AC,
+    rollback, доказательства поколения 2 с автором и observed_at, номер
+    поколения и expected_generation; проверки кода — «не применимо», а не
+    unknown и не match; git при сборке не трогается."""
+    from hub import mcp_server
+    from tests.state_support import (
+        ROLLBACK,
+        GitSpy,
+        drive_to_second_generation,
+        make_state_task,
+    )
+
+    task_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, task_id)
+    spy = GitSpy()
+    monkeypatch.setattr(plugins, "git_ops", spy)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert resp.status_code == 200, resp.text
+    brief = resp.json()
+
+    assert brief["sha_check"] == "not_applicable", brief["sha_check"]
+    assert brief["ci_run_report"]["state"] == "not_applicable"
+    assert brief["base_merge"]["state"] == "not_applicable"
+    assert brief["call_sites"]["status"] == "not_applicable"
+    assert brief["ac_test_results"] == [] and brief["locator_resolution"] == []
+    assert brief["path_notices"] is None
+    # #725: дефолт DiffBaseState — unverified без причины; для state он ложен.
+    assert brief["diff_base"]["state"] == "not_applicable", brief["diff_base"]
+    assert brief["diff_base"]["reason"] and not brief["diff_command"]
+    for block in ("mutations", "baseline"):
+        ci = brief["ci_evidence"][block]
+        assert ci["state"] == "not_applicable", (block, ci)
+        assert "не получено" not in ci["reason"] and "не прислан" not in ci["reason"]
+    assert brief["evidence_coverage"]["state"] == "complete"
+    missing = {c["check"] for c in brief["evidence_coverage"]["checks_missing"]}
+    assert not missing, "ничего из кода не «отсутствует»: оно не применимо"
+    na = {c["check"] for c in brief["evidence_coverage"]["checks_not_applicable"]}
+    assert {"sha_check", "ci_run_report", "ac_tests", "base_merge", "diff_base"} <= na
+
+    # Ни одно поле брифа не остаётся с ложным дефолтом «не смогли узнать»:
+    # проверенные поля (state-блоки, у которых дефолт unverified/unknown/
+    # not_received) либо not_applicable, либо названы в not_applicable выше.
+    for path in (
+        ("sha_check",),
+        ("ci_run_report", "state"),
+        ("ci_evidence", "mutations", "state"),
+        ("ci_evidence", "baseline", "state"),
+        ("prepass", "state"),
+        ("validation", "state"),
+        ("live_check", "state"),
+        ("diff_base", "state"),
+        ("base_merge", "state"),
+        ("call_sites", "status"),
+    ):
+        value = brief
+        for key in path:
+            value = value[key]
+        assert value == "not_applicable", (path, value)
+
+    state = brief["state_review"]
+    assert state["generation"] == 2 and state["expected_generation"] == 2
+    assert state["label"] == "результат: состояние"
+    assert state["rollback"] == ROLLBACK
+    assert [a["id"] for a in state["acceptance_criteria"]] == ["AC-1", "AC-2"]
+    assert state["evidence_complete"] is True
+    assert {e["generation"] for e in state["evidence"]} == {2}, "поколение 1 не в брифе"
+    first = state["evidence"][0]
+    assert first["observed"] == "повторное наблюдение, поколение 2"
+    assert first["observed_at"] == "2026-10-09T12:00:00Z"
+    assert first["action"] and first["target"] and first["author"]
+    assert brief["verdict_route"]["final"] == "human"
+    assert brief["verdict_route"]["code"] == "state_task_no_automation"
+    assert spy.calls == [], f"бриф state ходил в git: {spy.calls}"
+
+    async def fake_get(path):
+        return brief
+
+    # CLI печатает тот же JSON брифа: diff_base не теряется и там (#725).
+    import argparse
+    import json as _json
+
+    from hub import cli
+
+    monkeypatch.setattr(cli, "_api", lambda *_a, **_k: brief)
+    cli.cmd_review_brief(argparse.Namespace(task_id=task_id))
+    printed = capsys.readouterr().out
+    cli_brief = _json.loads(printed[printed.index("{") :])
+    assert cli_brief["diff_base"]["state"] == "not_applicable"
+    assert cli_brief["diff_base"]["reason"]
+
+    monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    text = (await mcp_server.hub_get_review_brief(task_id)).content[0].text
+    for needle in (
+        "результат: состояние",
+        ROLLBACK,
+        "поколение 2",
+        "expected_generation=2",
+        "повторное наблюдение, поколение 2",
+        "2026-10-09T12:00:00Z",
+        "не применимо",
+    ):
+        assert needle in text, needle
+    assert "sha_check: unknown" not in text and "Branch:" not in text
+
+
+# ---- #1652: the brief says where its assembly spent the time ----
+
+
+class _FakeClock:
+    """The monotonic clock of the brief, advanced only where a test says so."""
+
+    def __init__(self) -> None:
+        self.ns = 1_000_000_000
+
+    def __call__(self) -> int:
+        return self.ns
+
+    def advance_ms(self, ms: int) -> None:
+        self.ns += ms * 1_000_000
+
+
+def _spend(clock: _FakeClock, ms: int, target):
+    """``target`` wrapped so that calling it costs ``ms`` of fake time."""
+    import inspect
+
+    if inspect.iscoroutinefunction(target):
+
+        async def timed_async(*args, **kwargs):
+            clock.advance_ms(ms)
+            return await target(*args, **kwargs)
+
+        return timed_async
+
+    def timed(*args, **kwargs):
+        clock.advance_ms(ms)
+        return target(*args, **kwargs)
+
+    return timed
+
+
+def _slow_blocks(monkeypatch, clock: _FakeClock) -> None:
+    """Every accounting zone of the brief costs a known, distinct time."""
+    from hub import services
+    from hub.services import review_brief as rb
+
+    monkeypatch.setattr(rb, "_now_ns", clock)
+    costs = [
+        (review_evidence, "resolve_diff_base", 10),
+        (services, "detect_branch_stacking", 20),
+        (rb, "resolve_locators_at_ref", 30),
+        (services, "resolve_branch_tip", 40),
+        (rb, "base_merge_section", 50),
+        (rb, "build_call_sites_section", 60),
+        (rb, "_brief_verdict_route", 70),
+        (repo, "list_ac_test_results", 5),
+        (repo, "get_latest_machine_review", 3),
+        (review_evidence, "evidence_coverage", 7),
+        (services, "row_to_ac", 1),
+        # outside every zone: only the total sees it
+        (review_evidence, "sha_check_of", 4),
+    ]
+    for owner, name, ms in costs:
+        monkeypatch.setattr(owner, name, _spend(clock, ms, getattr(owner, name)))
+
+
+async def test_brief_reports_block_timings(
+    db, client: AsyncClient, workspace, monkeypatch
+):
+    import json
+    from io import StringIO
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from hub import cli
+    from hub.mcp_server import hub_get_review_brief
+    from hub.services import review_brief as rb
+
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    await repo.update_task(
+        db, task_id, status="review", pr_number=7, submission_sha="a" * 40
+    )
+    plain = (await client.post("/api/tasks", json={"title": "No branch"})).json()["id"]
+    await db.commit()
+
+    clock = _FakeClock()
+    _slow_blocks(monkeypatch, clock)
+
+    brief = await rb.build_review_brief(db, task_id)
+    assert brief is not None and brief.timings is not None
+    assert brief.timings.blocks == {
+        "diff_base": 10,
+        "stacking": 20,
+        "test_locators": 30,
+        "branch_tip": 40,
+        "base_merge": 50,
+        "call_sites": 60,
+        "verdict_route": 70,
+        "db_reads": 5 + 3,
+        # 4 ms of sha_check_of, a pure transformation, sit in assemble too.
+        "assemble": 7 + 1 + 4,
+    }
+    assert brief.timings.total_ms == 10 + 20 + 30 + 40 + 50 + 60 + 70 + 8 + 12
+    assert sum(brief.timings.blocks.values()) == brief.timings.total_ms, "no gap"
+
+    clock.advance_ms(0)
+    second = await rb.build_review_brief(db, plain)
+    assert second is not None and second.timings is not None
+    assert set(second.timings.blocks) == {
+        "diff_base",
+        "call_sites",
+        "db_reads",
+        "assemble",
+    }, "a block that did not apply is absent, not zero"
+    assert "test_locators" not in second.timings.blocks
+    assert sum(second.timings.blocks.values()) == second.timings.total_ms
+    assert "base_merge" not in second.timings.blocks
+
+    # The three readers: REST, MCP structuredContent, CLI.
+    monkeypatch.undo()
+    rest = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert set(rest["timings"]) == {"blocks", "total_ms"}
+    assert isinstance(rest["timings"]["total_ms"], int)
+    assert "diff_base" in rest["timings"]["blocks"]
+
+    with patch("hub.mcp_server._api_get", AsyncMock(return_value=rest)):
+        out = await hub_get_review_brief(task_id)
+    assert out.structuredContent["brief"]["timings"] == rest["timings"]
+
+    stdout = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=rest)),
+        patch("sys.stdout", new=stdout),
+    ):
+        cli.cmd_review_brief(MagicMock(task_id=task_id))
+    assert json.loads(stdout.getvalue())["timings"] == rest["timings"]
+
+
+async def _mcp_brief_text(brief: dict) -> str:
+    import json
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_get_review_brief
+
+    with patch("hub.mcp_server._api_get", AsyncMock(return_value=brief)):
+        out = await hub_get_review_brief(brief["task_id"])
+    return json.loads(out.content[0].text)["message"]
+
+
+async def test_slow_brief_logs_once_above_threshold(
+    db, client: AsyncClient, workspace, monkeypatch, caplog
+):
+    import logging
+
+    from hub.services import review_brief as rb
+    from hub.services.steward_evidence import EvidencePacket, packet_hash
+
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(rb, "_now_ns", clock)
+    real_base = review_evidence.resolve_diff_base
+
+    def costing(ms: int) -> None:
+        monkeypatch.setattr(
+            review_evidence, "resolve_diff_base", _spend(clock, ms, real_base)
+        )
+
+    def slow_records():
+        return [r for r in caplog.records if "slow-brief" in r.getMessage()]
+
+    caplog.set_level(logging.WARNING, logger="hub")
+
+    costing(rb.SLOW_BRIEF_MS)
+    at_threshold = await rb.build_review_brief(db, task_id)
+    assert at_threshold.timings.total_ms == rb.SLOW_BRIEF_MS
+    assert slow_records() == [], "equal to the threshold is not slow"
+    assert "сборка" not in await _mcp_brief_text(at_threshold.model_dump(mode="json"))
+
+    costing(rb.SLOW_BRIEF_MS + 1)
+    slow = await rb.build_review_brief(db, task_id)
+    assert slow.timings.total_ms == rb.SLOW_BRIEF_MS + 1
+    records = slow_records()
+    assert len(records) == 1, "one record per slow assembly"
+    message = records[0].getMessage()
+    assert f"task_id={task_id}" in message
+    assert "diff_base" in message
+    assert records[0].levelno == logging.WARNING
+
+    text = await _mcp_brief_text(slow.model_dump(mode="json"))
+    assert f"сборка {rb.SLOW_BRIEF_MS + 1} мс; самые долгие: diff_base" in text
+
+    # The steward packet hash does not depend on timings.
+    def packet(brief):
+        return EvidencePacket(
+            task_id=task_id, generation=1, brief=brief, facts={}, quotes=()
+        )
+
+    other = slow.model_copy(deep=True)
+    other.timings = at_threshold.timings
+    assert packet_hash(packet(slow)) == packet_hash(packet(other))

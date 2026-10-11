@@ -26,7 +26,18 @@ HAIPLANE_HUB_CI_RAN (#1081: the commands this job already executed, one
 time; absent ⇒ nothing is reused and every command runs as before),
 HAIPLANE_HUB_CI_MUTATIONS (#1270: path to the JSON written by
 scripts/mutation_changed.py — sent under its own ``mutations`` key; absent or
-unreadable ⇒ the key is not sent, and the log says why).
+unreadable ⇒ the key is not sent, and the log says why),
+HAIPLANE_HUB_CI_BASELINE (#913: path to the JSON written by
+scripts/red_test_baseline.py — the branch's changed tests run over the
+merge-base code, sent under its own ``baseline`` key; absent or unreadable ⇒
+the key is not sent, and the log says why),
+HAIPLANE_HUB_CI_MUTATIONS_OUTCOME / HAIPLANE_HUB_CI_BASELINE_OUTCOME (#1606: how
+the step that wrote the file ended. ``skipped`` ⇒ the step did not run and the
+key is NOT sent, so the hub keeps what it stored for this commit; any other
+value ⇒ it ran, and a missing or broken file is sent as an explicit
+``state=error`` with its cause; empty ⇒ not stated, the file alone decides),
+HAIPLANE_HUB_CI_EVENT_ACTION (#1606: the event's activity type, part of the
+provenance — run id, URL, event, time — written inside each evidence block).
 """
 
 from __future__ import annotations
@@ -38,8 +49,10 @@ import shlex
 import shutil
 import subprocess  # nosec B404 - runs the task's own declared commands, in CI
 import sys
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # A validation entry we are willing to hand to a shell. Task text mixes real
@@ -49,11 +62,24 @@ TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # unknown with its text, never as a failure.
 COMMAND_TOKEN = re.compile(r"^[A-Za-z0-9._/-]+$")
 _RUN_TIMEOUT = 900
+# #1666: the CI step that runs this script is capped at 20 minutes, while the
+# budgets above are per call (AC run 900 s, then 900 s for EACH validation
+# command). Without one overall deadline GitHub could kill the step before the
+# POST and the evidence would vanish silently. Past 17 minutes from start no
+# further command is launched, what was left is named as not run, and the
+# report is still sent.
+_REPORT_DEADLINE = 17 * 60
+_STARTED = time.monotonic()
 _LOG_TAIL = 4000
 # The default is this repository's own runner. A satellite repository sets
 # HAIPLANE_HUB_CI_PYTEST to whatever runs ITS tests; an unparsable or missing
 # runner reports not_found with a reason, never a failure about the work.
 _DEFAULT_AC_RUNNER = "uv run pytest"
+
+
+def _remaining() -> float:
+    """Seconds left before the reporter must stop launching work and send."""
+    return _REPORT_DEADLINE - (time.monotonic() - _STARTED)
 
 
 def env_get(suffix: str) -> str:
@@ -154,31 +180,47 @@ def ac_runner() -> list[str]:
     return argv
 
 
-def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
-    """Run the AC tests for ``nodeids`` and return {nodeid: passed} for what ran."""
-    if not nodeids:
-        return {}
-    runner = ac_runner()
-    if not runner:
-        return {}
-    cmd = [
-        *runner,
-        *nodeids,
-        "-v",
-        "--no-header",
-        "-p",
-        "no:cacheprovider",
-    ]
-    try:
-        proc = subprocess.run(  # nosec B603 - fixed argv, nodeids come from the hub
-            cmd, capture_output=True, text=True, timeout=_RUN_TIMEOUT, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"pytest could not run ({exc}) — every AC stays not_found")
-        return {}
+# pytest names an id it cannot resolve on its own line and then stops
+# collecting: "no tests ran", with the rest of the ids unrun.
+_NOT_FOUND_LINE = re.compile(
+    r"^ERROR: (file or directory not found|not found): (\S+)", re.MULTILINE
+)
+
+
+def _split_id(ident: str) -> tuple[str, str]:
+    """(absolute normalized file path, ``::`` tail) of a test id or path.
+
+    pytest may print an absolute path for a relative argument; both are brought
+    to one form, relative to the directory the tests are run from, and compared
+    for equality, never by suffix: ``nested/t.py`` is not ``t.py``.
+    """
+    path, sep, tail = ident.partition("::")
+    return os.path.abspath(path), sep + tail
+
+
+def _missing_nodeids(output: str, nodeids: list[str]) -> dict[str, str]:
+    """{nodeid: reason} for the ids pytest said it could not find.
+
+    "not found: <id>" names one test id. "file or directory not found: <path>"
+    names a whole file (with or without a ``::test`` tail), so every id living
+    in that file is missing with it.
+    """
+    missing: dict[str, str] = {}
+    split = {nodeid: _split_id(nodeid) for nodeid in nodeids}
+    for match in _NOT_FOUND_LINE.finditer(output):
+        kind, reported = match.groups()
+        reason = match.group(0).removeprefix("ERROR: ")
+        r_file, r_tail = _split_id(reported)
+        for nodeid, (n_file, n_tail) in split.items():
+            if r_file == n_file and (kind != "not found" or r_tail == n_tail):
+                missing[nodeid] = reason
+    return missing
+
+
+def _parse_outcomes(stdout: str, nodeids: list[str]) -> dict[str, bool]:
     out: dict[str, bool] = {}
     wanted = set(nodeids)
-    for raw in proc.stdout.splitlines():
+    for raw in stdout.splitlines():
         parts = raw.strip().split(None, 1)
         if len(parts) != 2:
             continue
@@ -195,6 +237,50 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
         # Any failing parametrized case fails the AC.
         out[key] = out.get(key, True) and passed
     return out
+
+
+def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
+    """Run the AC tests for ``nodeids`` and return {nodeid: passed} for what ran.
+
+    One pytest start for the ids. If pytest reports some of them as not found it
+    has stopped collecting, so those are set aside with the reason it gave (they
+    stay not_found) and only the rest are run again: a typo in one test_ref must
+    not hide the real outcome of the others (#1581). Nothing missing costs
+    nothing extra; each distinct missing batch costs one more start, all inside
+    one ``_RUN_TIMEOUT`` budget.
+    """
+    if not nodeids:
+        return {}
+    runner = ac_runner()
+    if not runner:
+        return {}
+    deadline = time.monotonic() + min(_RUN_TIMEOUT, max(1.0, _remaining()))
+    pending = list(nodeids)
+    while pending:
+        if _remaining() <= 0:
+            log(
+                "report deadline reached — the AC tests were not run, they stay not_found"
+            )
+            return {}
+        cmd = [*runner, *pending, "-v", "--no-header", "-p", "no:cacheprovider"]
+        try:
+            proc = subprocess.run(  # nosec B603 - fixed argv, nodeids come from the hub
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, deadline - time.monotonic()),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"pytest could not run ({exc}) — every AC stays not_found")
+            return {}
+        missing = _missing_nodeids(proc.stdout + "\n" + proc.stderr, pending)
+        if not missing:
+            return _parse_outcomes(proc.stdout, pending)
+        for nodeid, reason in sorted(missing.items()):
+            log(f"{nodeid} stays not_found: pytest says {reason}")
+        pending = [n for n in pending if n not in missing]
+    return {}
 
 
 # GitHub spells a step's result its own way; the hub's contract has three
@@ -258,6 +344,9 @@ _NON_SELECTING_FLAGS = {
     "-n",
     "--numprocesses",
     "--dist",
+    # #1666: only prints the slowest tests, selects nothing.
+    "--durations",
+    "--durations-min",
 }
 
 
@@ -265,7 +354,16 @@ _NON_SELECTING_FLAGS = {
 # an "=". Kept separate from the whitelist itself: membership here decides
 # whether a token is EATEN, and eating one too many is how a narrowed run gets
 # mistaken for the whole suite.
-_VALUE_TAKING_FLAGS = {"-n", "--numprocesses", "--dist", "--tb", "--color", "-r"}
+_VALUE_TAKING_FLAGS = {
+    "-n",
+    "--numprocesses",
+    "--dist",
+    "--tb",
+    "--color",
+    "-r",
+    "--durations",
+    "--durations-min",
+}
 
 
 def _looks_like_a_test_path(token: str) -> bool:
@@ -412,13 +510,27 @@ def run_validation(
             if outcome == "fail":
                 return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
             continue
+        if _remaining() <= 0:
+            # #1666: the deadline is spent: do not launch this one or the rest.
+            idx = commands.index(cmd)
+            skipped = [c for c in commands[idx:] if is_command(c)]
+            for c in skipped:
+                logs.append(f"$ {c}\n[не выполнена: deadline отчёта исчерпан]")
+            log(f"report deadline reached — {len(skipped)} command(s) not run")
+            return (
+                "unknown",
+                "\n".join(logs)[-_LOG_TAIL:],
+                f"deadline отчёта исчерпан; исполнено {executed} из "
+                f"{len(commands)}, не выполнены по deadline ({len(skipped)}): "
+                + ", ".join(repr(c[:80]) for c in skipped[:3]),
+            )
         try:
             proc = subprocess.run(  # nosec B602 - the task's own declared commands, run in a disposable CI runner
                 cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=_RUN_TIMEOUT,
+                timeout=min(_RUN_TIMEOUT, max(1.0, _remaining())),
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -469,20 +581,153 @@ def trim_mutations(report: dict) -> dict:
     return trimmed
 
 
-def read_mutations(path: str) -> dict | None:
-    """The mutation step's JSON, or None with the reason logged."""
-    if not path:
-        return None
+def _read_report(path: str) -> tuple[dict | None, str]:
+    """A step's JSON file as (report, ""), or (None, the reason it is unusable)."""
     try:
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
     except (OSError, ValueError) as exc:
-        log(f"mutation report {path} not sent: {exc}")
-        return None
+        return None, str(exc)
     if not isinstance(report, dict):
-        log(f"mutation report {path} not sent: expected an object")
+        return None, "expected an object"
+    return report, ""
+
+
+# The states each step's own script can write (scripts/mutation_changed.py,
+# scripts/red_test_baseline.py). A JSON object without one of them is not that
+# step's report, and provenance on it would make it look like evidence.
+_MUTATION_STATES = frozenset(
+    {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+)
+_BASELINE_STATES = frozenset({"ran", "no_tests", "error"})
+
+
+def provenance() -> dict:
+    """Which run produced an evidence block (#1606): kept INSIDE the block.
+
+    The hub shows it next to the evidence, and "run unknown" for a block that
+    predates it. No new column: the block is already free-form JSON.
+    """
+    server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
+    repository = os.environ.get("GITHUB_REPOSITORY") or ""
+    run_id = os.environ.get("GITHUB_RUN_ID") or ""
+    event = os.environ.get("GITHUB_EVENT_NAME") or ""
+    action = env_get("HUB_CI_EVENT_ACTION")
+    return {
+        "run_id": run_id,
+        "run_url": (
+            f"{server}/{repository}/actions/runs/{run_id}"
+            if run_id and repository
+            else ""
+        ),
+        "event": f"{event}.{action}" if event and action else event,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def evidence_block(
+    label: str,
+    path: str,
+    outcome: str,
+    trim: Callable[[dict], dict],
+    states: frozenset[str],
+) -> dict | None:
+    """The block to send under an evidence key, or None for "send no key" (#1606).
+
+    Three cases, never collapsed: a step that did not run (``skipped``) sends
+    no key, because the hub reads an absent key as "keep what you stored"; a
+    step that ran but left no usable file sends ``state=error`` with the cause,
+    because a timeout is a fact the reader must see; a valid file is sent as
+    it is. An outcome the caller does not state falls back to the file alone,
+    which is how reporters written before this contract behave.
+    """
+    outcome = (outcome or "").strip().lower()
+    if not path:
         return None
-    return trim_mutations(report)
+    if outcome == "skipped":
+        log(f"{label} step did not run — no key sent; the hub keeps what it stored")
+        return None
+    report, why = _read_report(path)
+    if report is not None and report.get("state") not in states:
+        report, why = (
+            None,
+            f"state {report.get('state')!r} is not one of {sorted(states)}",
+        )
+    if report is None:
+        log(f"{label} report {path} not usable: {why}")
+        if not outcome:
+            return None
+        report = {
+            "state": "error",
+            "reason": (
+                f"the {label} step ended {outcome} without a readable report ({why})"
+            ),
+        }
+    else:
+        report = trim(report)
+    return {**report, "provenance": provenance()}
+
+
+# The hub refuses a baseline above 32 000 chars (#913). A changed test module
+# can hold hundreds of tests; the AC tests are always kept, the rest trimmed,
+# and the trimmed count is sent — a cut list must not read as "all of them".
+_BASELINE_TESTS_MAX = 200
+_BASELINE_ERRORS_MAX = 30
+
+
+def trim_baseline(report: dict, keep: set[str]) -> dict:
+    """Bound the per-test map; AC nodeids (and their variants) are never cut."""
+    tests = report.get("tests")
+    if not isinstance(tests, dict):
+        return report
+
+    def wanted(nodeid: str) -> bool:
+        return nodeid in keep or nodeid.split("[", 1)[0] in keep
+
+    kept = {k: v for k, v in tests.items() if wanted(k)}
+    for nodeid, status in tests.items():
+        if len(kept) >= _BASELINE_TESTS_MAX:
+            break
+        kept.setdefault(nodeid, status)
+    trimmed = dict(report, tests=kept)
+    if len(tests) > len(kept):
+        trimmed["tests_trimmed"] = len(tests) - len(kept)
+    errors = report.get("collection_errors")
+    if isinstance(errors, dict) and len(errors) > _BASELINE_ERRORS_MAX:
+        trimmed["collection_errors"] = dict(list(errors.items())[:_BASELINE_ERRORS_MAX])
+    return trimmed
+
+
+def attach_evidence(payload: dict, keep: set[str]) -> None:
+    """Add the mutations / baseline keys the run actually has to report."""
+    mutations = evidence_block(
+        "mutation",
+        env_get("HUB_CI_MUTATIONS"),
+        env_get("HUB_CI_MUTATIONS_OUTCOME"),
+        trim_mutations,
+        _MUTATION_STATES,
+    )
+    if mutations is not None:
+        payload["mutations"] = mutations
+        log(f"mutation run reported: state={mutations.get('state')!r}")
+    baseline = evidence_block(
+        "baseline",
+        env_get("HUB_CI_BASELINE"),
+        env_get("HUB_CI_BASELINE_OUTCOME"),
+        lambda report: trim_baseline(report, keep),
+        _BASELINE_STATES,
+    )
+    if baseline is not None:
+        payload["baseline"] = baseline
+        log(
+            f"red-test baseline reported: state={baseline.get('state')!r}, "
+            f"merge_base={str(baseline.get('merge_base'))[:12]}, "
+            f"tests={len(baseline.get('tests') or {})}"
+        )
+        for nodeid in sorted(keep):
+            log(
+                f"  baseline {nodeid}: {(baseline.get('tests') or {}).get(nodeid, '—')}"
+            )
 
 
 def main() -> int:
@@ -545,10 +790,7 @@ def main() -> int:
         "reported_by": "github-actions",
         "checks": checks,
     }
-    mutations = read_mutations(env_get("HUB_CI_MUTATIONS"))
-    if mutations is not None:
-        payload["mutations"] = mutations
-        log(f"mutation run reported: state={mutations.get('state')!r}")
+    attach_evidence(payload, set(nodeid_by_ac.values()))
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")
@@ -556,7 +798,8 @@ def main() -> int:
     log(
         f"reported {len(ac_results)} AC result(s), validation={v_status}; "
         f"applied={result.get('applied')} ({result.get('reason')}); "
-        f"mutations={result.get('mutations_state', 'not accepted by this hub')}"
+        f"mutations={result.get('mutations_state', 'not accepted by this hub')}; "
+        f"baseline={result.get('baseline_state', 'not accepted by this hub')}"
     )
     return 0
 

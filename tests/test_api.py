@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import subprocess
 import pytest
 from httpx import AsyncClient
 
@@ -4230,3 +4231,901 @@ async def test_refusal_names_the_version_mismatch(client: AsyncClient, monkeypat
     assert detail["hint"].index("Pass your session id") < detail["hint"].index(
         "IF YOUR TOOL SCHEMA"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1602: замок #743 на default снимается ровно для пары (verdict, steward)
+# ---------------------------------------------------------------------------
+
+
+def _lock_tokens(monkeypatch) -> tuple[dict, dict]:
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return (
+        {"headers": {"Authorization": "Bearer human-token"}},
+        {"headers": {"Authorization": "Bearer agent-token"}},
+    )
+
+
+async def _stored_policy(client: AsyncClient, human: dict, pid: int) -> dict:
+    listed = (await client.get("/api/projects", **human)).json()
+    return next(p for p in listed if p["id"] == pid)["gate_policy"]
+
+
+async def test_default_project_lock_allows_only_verdict_steward_pair(
+    client: AsyncClient, monkeypatch
+):
+    """#1602 AC-1: на default разрешена ровно пара verdict=steward."""
+    human, agent = _lock_tokens(monkeypatch)
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}, **human
+    )
+    assert resp.status_code == 200, resp.text
+    pid = resp.json()["id"]
+    url = f"/api/projects/{pid}"
+
+    # Агентский токен политику не меняет — как и раньше, даже разрешённую пару.
+    denied = await client.patch(
+        url, json={"gate_policy": {"verdict": "steward"}}, **agent
+    )
+    assert denied.status_code == 403, denied.text
+    assert await _stored_policy(client, human, pid) == {}
+
+    # Разрешённая пара принята человеком.
+    ok = await client.patch(url, json={"gate_policy": {"verdict": "steward"}}, **human)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["gate_policy"]["verdict"] == "steward"
+
+    def refused(resp, pairs: list[str]) -> None:
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "default_project_gate_locked"
+        assert detail["violations"] == pairs
+        assert "#743" in detail["hint"]
+        for pair in pairs:
+            assert pair in detail["hint"]
+
+    refused(
+        await client.patch(url, json={"gate_policy": {"verdict": "auto"}}, **human),
+        ["verdict=auto"],
+    )
+    refused(
+        await client.patch(url, json={"gate_policy": {"dor": "steward"}}, **human),
+        ["dor=steward"],
+    )
+    refused(
+        await client.patch(url, json={"gate_policy": {"dor": "auto"}}, **human),
+        ["dor=auto"],
+    )
+    refused(
+        await client.patch(
+            url, json={"gate_policy": {"dor": "auto", "verdict": "auto"}}, **human
+        ),
+        ["dor=auto", "verdict=auto"],
+    )
+
+    # Смешанный PATCH: разрешённая половина тоже не записана (атомарность).
+    reset = await client.patch(url, json={"gate_policy": {"verdict": "human"}}, **human)
+    assert reset.status_code == 200, reset.text
+    mixed = await client.patch(
+        url,
+        json={"gate_policy": {"verdict": "steward", "dor": "steward"}},
+        **human,
+    )
+    refused(mixed, ["dor=steward"])
+    stored = await _stored_policy(client, human, pid)
+    assert stored.get("verdict") == "human" and "dor" not in stored, stored
+
+
+async def test_scheduled_change_obeys_the_same_pair_lock(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1602: отложенная правка (#1593) идёт через то же слияние и тот же замок."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    human, _ = _lock_tokens(monkeypatch)
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(policy_change, "utcnow", lambda: base)
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}, **human
+    )
+    pid = resp.json()["id"]
+    at = (base + timedelta(days=1)).isoformat()
+    url = "/api/projects/default/policy-schedule"
+
+    allowed = await client.post(
+        url, json={"at": at, "patch": {"verdict": "steward"}}, **human
+    )
+    assert allowed.status_code == 201, allowed.text
+    for patch in ({"verdict": "auto"}, {"dor": "steward"}):
+        locked = await client.post(url, json={"at": at, "patch": patch}, **human)
+        assert locked.status_code == 422, locked.text
+        assert locked.json()["detail"]["error"] == "default_project_gate_locked"
+
+    # Исполнение: запись, положенная мимо API, исполнением отказана, а не применена.
+    for patch in ({"dor": "steward"}, {"verdict": "auto"}):
+        await repo.insert_scheduled_policy_change(
+            db,
+            project_id=pid,
+            at=policy_change.stamp(base + timedelta(hours=1)),
+            patch=patch,
+            note="",
+            created_by="test",
+        )
+    await db.commit()
+    out = await policy_change.run_due(db, now=base + timedelta(days=2))
+    refused = [o for o in out if o["outcome"] == "refused"]
+    assert len(refused) == 2, out
+    assert all(o["error"] == "default_project_gate_locked" for o in refused)
+    stored = await _stored_policy(client, human, pid)
+    assert stored.get("verdict") == "steward" and "dor" not in stored, stored
+
+
+async def test_autopilot_never_applies_verdict_on_default_with_steward(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1602 AC-2: steward входит в DELEGATED_VERDICTS, но на default автопилот молчит."""
+    from hub import config
+    from hub.services import auto_verdict
+    from hub.services.verdict_route import verdict_route
+    from tests.test_auto_verdict import _events, _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    locked = await _submitted_task(client, db, "default", {"verdict": "steward"})
+    other = await _submitted_task(client, db, "spike-other", {"verdict": "steward"})
+
+    stance = await auto_verdict.autopilot_stance(db, locked)
+    assert stance.outcome == auto_verdict.OUTCOME_REFUSE
+    assert stance.code == "default_project_autopilot_locked"
+    assert "#743" in stance.reason
+
+    # Приход чистого отчёта (путь приёма), прямой вызов и повторный проход.
+    await _post_review(client, locked)
+    assert await auto_verdict.maybe_auto_verdict(db, locked) is False
+    assert await auto_verdict.maybe_auto_verdict(db, locked) is False
+    body = (await client.get(f"/api/tasks/{locked}")).json()
+    assert body["review_verdict"] is None and body["status"] == "review"
+    assert await _events(db, "review_verdict_recorded", locked) == []
+    # Маршрут вердикта не называет автопилота решателем.
+    route = await verdict_route(db, locked, observe=True)
+    assert route.decider != "policy"
+
+    # Другой проект с verdict=steward — автопилот как раньше.
+    await _post_review(client, other)
+    body = (await client.get(f"/api/tasks/{other}")).json()
+    assert body["review_verdict"] == "approved"
+    verdicts = await _events(db, "review_verdict_recorded", other)
+    assert verdicts and verdicts[-1]["actor"] == "policy"
+
+
+# ---------------------------------------------------------------------------
+# #1602 (Codex P1): approved агента через review-verdict на default при steward
+# ---------------------------------------------------------------------------
+
+
+async def _default_review_task(client, db, monkeypatch, policy: dict) -> int:
+    from tests.test_auto_verdict import _submitted_task
+
+    task_id = await _submitted_task(client, db, "default", policy)
+    return task_id
+
+
+async def test_agent_cannot_approve_on_default_while_the_steward_holds_the_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """REST review-verdict (его же зовут CLI и MCP) не обходит стюарда на default."""
+    task_id = await _default_review_task(
+        client, db, monkeypatch, {"verdict": "steward"}
+    )
+    human, agent = _lock_tokens(monkeypatch)
+    url = f"/api/tasks/{task_id}/review-verdict"
+
+    refused = await client.post(
+        url, json={"verdict": "approved", "agent": "reviewer"}, **agent
+    )
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert detail["error"] == "default_verdict_reserved_for_steward"
+    assert "#743" in detail["hint"]
+    body = (await client.get(f"/api/tasks/{task_id}", **human)).json()
+    assert body["review_verdict"] is None and body["status"] == "review"
+
+    # changes_requested от агента разрешён: он возвращает работу, а не открывает доставку.
+    back = await client.post(
+        url,
+        json={"verdict": "changes_requested", "comments": "поправить", "agent": "r"},
+        **agent,
+    )
+    assert back.status_code == 200, back.text
+
+
+async def test_human_may_approve_on_default_with_the_steward_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """Человек старше стюарда: его approved на default проходит."""
+    task_id = await _default_review_task(
+        client, db, monkeypatch, {"verdict": "steward"}
+    )
+    human, _ = _lock_tokens(monkeypatch)
+    ok = await client.post(
+        f"/api/tasks/{task_id}/review-verdict", json={"verdict": "approved"}, **human
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["review_verdict"] == "approved"
+
+
+async def test_agent_approval_is_unchanged_where_the_steward_does_not_hold_the_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """Граница правила: default при human и другой проект при steward — как раньше."""
+    human_task = await _default_review_task(
+        client, db, monkeypatch, {"verdict": "human"}
+    )
+    from tests.test_auto_verdict import _submitted_task
+
+    other_task = await _submitted_task(
+        client, db, "spike-steward-rest", {"verdict": "steward"}
+    )
+    _, agent = _lock_tokens(monkeypatch)
+    for task_id in (human_task, other_task):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/review-verdict",
+            json={"verdict": "approved", "agent": "reviewer"},
+            **agent,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["review_verdict"] == "approved"
+
+
+async def test_cli_and_mcp_review_verdict_hit_the_guarded_route(
+    client: AsyncClient, db, monkeypatch
+):
+    """CLI и MCP — только обёртки над REST-путём; отказ доходит до MCP со структурой."""
+    import argparse
+    import json as _json
+    from unittest.mock import patch
+
+    from hub import cli, mcp_server
+
+    task_id = await _default_review_task(
+        client, db, monkeypatch, {"verdict": "steward"}
+    )
+    _, agent = _lock_tokens(monkeypatch)
+
+    calls: list[tuple] = []
+    with patch.object(cli, "_api", side_effect=lambda *a, **k: calls.append(a) or {}):
+        cli.cmd_review_verdict(
+            argparse.Namespace(
+                task_id=task_id,
+                verdict="approved",
+                comments="",
+                agent="r",
+                findings_json="",
+                create_tasks_for_out_of_scope=False,
+            )
+        )
+    assert calls[0][:2] == ("POST", f"/api/tasks/{task_id}/review-verdict")
+
+    async def _post(path: str, body: dict | None = None, **_):
+        resp = await client.post(path, json=body or {}, **agent)
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError(
+                mcp_server._parse_api_error(resp, resp.status_code)
+            )
+        return resp.json()
+
+    async def _get(path: str, **_):
+        return (await client.get(path, **agent)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    out = await mcp_server.hub_submit_review(task_id, "approved", agent="reviewer")
+    blob = out if isinstance(out, str) else _json.dumps(out, default=str)
+    assert "default_verdict_reserved_for_steward" in blob, blob
+    body = (await client.get(f"/api/tasks/{task_id}", **agent)).json()
+    assert body["review_verdict"] is None
+
+
+def test_mcp_keeps_the_structure_of_a_coded_422():
+    """P3: error/violations/allowed не теряются в нормализации отказа."""
+    from hub.actionable_errors import normalize_api_error_detail
+
+    detail = {
+        "error": "default_project_gate_locked",
+        "violations": ["dor=steward"],
+        "allowed": ["verdict=steward"],
+        "hint": "замок #743: проект default",
+    }
+    payload = normalize_api_error_detail(detail, status_code=422)
+    assert payload["error"] == "default_project_gate_locked"
+    assert payload["violations"] == ["dor=steward"]
+    assert payload["allowed"] == ["verdict=steward"]
+    assert "#743" in payload["message"]
+
+
+async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """P2: счётчик верит метке применения, а не имени из тела запроса."""
+    from hub.models import ReviewVerdict
+    from hub.services import steward_applied, steward_exit
+    from tests.test_auto_verdict import _submitted_task
+
+    spoofed = await _submitted_task(client, db, "spike-spoof", {"verdict": "human"})
+    real = await _submitted_task(client, db, "spike-real", {"verdict": "human"})
+
+    resp = await client.post(
+        f"/api/tasks/{spoofed}/review-verdict",
+        json={"verdict": "approved", "agent": "steward"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert await steward_exit.actual_steward_verdicts(db) == {}
+
+    await steward_applied._record(db, real, ReviewVerdict.approved, 1)
+    assert await steward_exit.actual_steward_verdicts(db) == {"spike-real": 1}
+
+
+async def test_web_review_form_with_an_agent_identity_is_guarded_too(
+    client: AsyncClient, db, monkeypatch
+):
+    """Форма карточки — вторая точка записи вердикта: агентский approved там тоже отклонён."""
+    task_id = await _default_review_task(
+        client, db, monkeypatch, {"verdict": "steward"}
+    )
+    human, agent = _lock_tokens(monkeypatch)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved"},
+        follow_redirects=False,
+        **agent,
+    )
+    assert resp.status_code == 409, resp.text
+    body = (await client.get(f"/api/tasks/{task_id}", **human)).json()
+    assert body["review_verdict"] is None
+    ok = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved"},
+        follow_redirects=False,
+        **human,
+    )
+    assert ok.status_code in (200, 303), ok.text
+    body = (await client.get(f"/api/tasks/{task_id}", **human)).json()
+    assert body["review_verdict"] == "approved"
+
+
+async def test_outcome_debt_endpoint_pages_one_status(client: AsyncClient, db):
+    """AC-2 (REST). A page of one status, full counters, 422 outside 1..200."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=45, observing=2, unknown=1, answered=1)
+    full = (await client.get("/api/metrics/outcome-debt")).json()
+
+    resp = await client.get(
+        "/api/metrics/outcome-debt?status=overdue&limit=20&offset=20"
+    )
+    body = resp.json()
+    last = (
+        await client.get("/api/metrics/outcome-debt?status=overdue&limit=20&offset=40")
+    ).json()
+
+    assert resp.status_code == 200
+    assert body["rows"] == full["overdue"][20:40]
+    assert (body["total_in_status"], body["next_offset"]) == (45, 40)
+    assert body["overdue_total"] == 45 and body["answered_total"] == 1
+    for key in ("items", "overdue", "observing", "unknown", "answered"):
+        assert key not in body
+    assert last["next_offset"] is None
+    for query in ("limit=0", "limit=201", "offset=-1", "status=nope"):
+        assert (
+            await client.get(f"/api/metrics/outcome-debt?{query}")
+        ).status_code == 422
+    counts = (await client.get("/api/metrics/outcome-debt?only_counts=true")).json()
+    assert "rows" not in counts and counts["total"] == 48
+
+
+# --- #1630: блок «Правила работы» в ответе pair-start ---
+
+
+async def test_pair_start_returns_working_rules_layers(client, db, tmp_path):
+    """AC-1: три слоя отдельными объектами и фиксированная preamble."""
+    from hub import repository as repo_mod
+    from hub.integrations.registry import plugins
+    from hub.services import working_rules as wr
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    rules_text = "Правило 1: пиши тесты первыми.\n"
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: rules_text})
+    plugins.git_ops = ReadingGitOps()
+    _, version = await repo_mod.create_skill_version(
+        db, name=wr.DISCIPLINE_SKILL, content="ДИСЦИПЛИНА ИСПОЛНИТЕЛЯ v-test"
+    )
+    await repo_mod.activate_skill_version(
+        db, wr.DISCIPLINE_SKILL, version, activated_by="test"
+    )
+    await db.commit()
+    task_id = await task_in_project(client, db, ws, slug="wr-layers")
+    expected_sha = subprocess.run(
+        ["git", "-C", ws, "rev-parse", "develop"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["working_rules"]
+    assert block["preamble"] == wr.PREAMBLE
+    skill = block["hub_skill"]
+    assert skill["name"] == wr.DISCIPLINE_SKILL and skill["state"] == "active"
+    assert skill["version"] == version
+    assert skill["content"] == "ДИСЦИПЛИНА ИСПОЛНИТЕЛЯ v-test"
+    policy = block["project_policy"]
+    assert policy["state"] == "available"
+    assert "Policy of project wr-layers" in policy["text"]
+    repo_layer = block["repository_rules"]
+    assert repo_layer["state"] == "present"
+    assert repo_layer["path"] == RULES_PATH
+    assert repo_layer["sha"] == expected_sha
+    assert repo_layer["trust"] == "repository_data"
+    assert repo_layer["content"] == rules_text
+    # Слои не склеены: текст репозитория не попал в доверенные объекты.
+    assert "Правило 1" not in skill["content"] + policy["text"] + block["preamble"]
+
+
+# --- #1631: стартовый пакет проекта GET /api/projects/{slug}/agent-bootstrap ---
+
+
+async def _bootstrap_project(
+    db, slug: str, workspace: str = "", *, policy: dict | None = None
+) -> None:
+    import json as _json
+
+    pid = await repo.create_project(db, slug=slug, name=f"Проект {slug}")
+    fields: dict = {"workspace_path": workspace, "default_branch": "develop"}
+    if policy is not None:
+        fields["gate_policy"] = _json.dumps(policy)
+    await repo.update_project(db, pid, **fields)
+    await db.commit()
+
+
+def _parse_call(line: str) -> tuple[str, list[str]]:
+    import re
+
+    match = re.match(r"(hub_\w+)(?:\((.*?)\))?( — .*)?$", line)
+    assert match, line
+    return match.group(1), re.findall(r"(\w+)=", match.group(2) or "")
+
+
+async def _skill(db, name: str, *, active: bool) -> None:
+    _, version = await repo.create_skill_version(db, name=name, content=f"body {name}")
+    if active:
+        await repo.activate_skill_version(db, name, version, activated_by="test")
+    await db.commit()
+
+
+async def test_agent_bootstrap_has_all_sections(client, db, tmp_path):
+    """AC-1: шесть разделов, URL, только active-навыки, порядок вызовов, без пути."""
+    from hub.hub_instance import hub_base_url
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import RULES_PATH, ReadingGitOps, make_rules_repo
+
+    ws = make_rules_repo(tmp_path / "secret-ws-dir", {RULES_PATH: "правила\n"})
+    plugins.git_ops = ReadingGitOps()
+    await _bootstrap_project(db, "boot-all", ws, policy={"ci_before_submit": "require"})
+    await _skill(db, "boot-skill-a", active=True)
+    await _skill(db, "boot-skill-b", active=True)
+    await _skill(db, "boot-skill-draft", active=False)
+
+    resp = await client.get("/api/projects/boot-all/agent-bootstrap")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    text = data["text"]
+    for n in range(1, 7):
+        assert f"## {n}. " in text
+    assert data["mcp"]["url"] == f"{hub_base_url()}/mcp"
+    assert data["mcp"]["transport"] == "streamable-http"
+    assert "Bearer <ТОКЕН АГЕНТА>" in text
+    names = {s["name"] for s in data["skills"]}
+    assert {"boot-skill-a", "boot-skill-b"} <= names
+    assert "boot-skill-draft" not in names
+    assert "boot-skill-draft" not in text and "boot-skill-a v1" in text
+    calls = data["first_calls"]
+    parsed = [_parse_call(c) for c in calls]
+    assert [n for n, _ in parsed] == [
+        "hub_whoami",
+        "hub_my_context",
+        "hub_session_register",
+        "hub_list_tasks",
+        "hub_my_context",
+        "hub_claim_task",
+        "hub_pair_start",
+    ]
+    assert "project" in parsed[1][1] and "mode" in parsed[1][1]
+    assert "task_id" in parsed[4][1] and "project" not in parsed[4][1]
+    assert "project" in parsed[3][1]
+    for key in ("task_id", "agent", "session_id"):
+        assert key in parsed[5][1]
+    for key in ("task_id", "assigned_agent", "session_id", "git_mode"):
+        assert key in parsed[6][1]
+    # Аргументы шагов сверены с реальными сигнатурами MCP-инструментов.
+    from hub import mcp_server
+
+    schemas = {t.name: t.inputSchema for t in await mcp_server.mcp.list_tools()}
+    for name, args in parsed:
+        schema = schemas[name]
+        assert set(schema.get("required", [])) <= set(args), (name, args)
+        assert set(args) <= set(schema["properties"]), (name, args)
+    submit = " ".join(data["submit_order"])
+    assert "hub_task_status" in submit
+    from tests.test_skill_seeding import RESUBMISSION_CLAIMS
+
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim in submit, f"bootstrap lost the rule itself: {claim}"
+    assert "Policy of project boot-all" in text
+    assert RULES_PATH in text and ".hub/REVIEW_RULES.md" in text
+    assert "workspace" not in resp.text and "secret-ws-dir" not in resp.text
+
+
+async def test_agent_bootstrap_never_contains_credentials(
+    client, db, monkeypatch, capsys
+):
+    """AC-2: canary принципала, env-токена и сессии не видны ни в JSON, ни в text."""
+    import json as _json
+    import sys
+
+    from hub import brand, cli, config
+    from hub.config import TokenIdentity
+    from hub.services import admin as admin_svc
+
+    env_canary = "canary-env-token-0001"  # pragma: allowlist secret
+    cookie_canary = "canary-session-cookie-0003"  # pragma: allowlist secret
+    principal = await admin_svc.create_principal(
+        db, kind="agent", username="canary-bot", role_slug="agent"
+    )
+    key = await admin_svc.create_api_key(db, principal["id"], name="canary")
+    principal_canary = key["plaintext_key"]
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {env_canary: TokenIdentity("env-bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await _bootstrap_project(db, "boot-canary")
+    canaries = (env_canary, principal_canary, cookie_canary)
+
+    bodies = []
+    for headers in (
+        {"Authorization": f"Bearer {principal_canary}"},
+        {
+            "Authorization": f"Bearer {env_canary}",
+            "Cookie": f"hub_session={cookie_canary}",
+        },
+    ):
+        resp = await client.get(
+            "/api/projects/boot-canary/agent-bootstrap", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        bodies.append(resp.text)
+    for body in bodies:
+        for canary in canaries:
+            assert canary not in body
+    data = _json.loads(bodies[0])
+    assert "Bearer <ТОКЕН АГЕНТА>" in data["text"]
+    assert set(data) == {
+        "project_slug", "project_name", "repo", "base_branch", "mcp", "first_calls",
+        "skills", "policy_brief", "rules_files", "ci_before_submit", "submit_order",
+        "human_only", "text",
+    }  # fmt: skip
+
+    agent_auth = {"Authorization": f"Bearer {env_canary}"}
+    # Credential в URL хаба не публикуется: userinfo, query и fragment.
+    url_canary = "canary-url-secret-0004"  # pragma: allowlist secret
+    for bad in (
+        f"https://user:{url_canary}@hub.example",
+        f"https://hub.example/?token={url_canary}",
+        f"https://hub.example/#{url_canary}",
+    ):
+        monkeypatch.setenv(brand.ENV_PREFIX + "HUB_URL", bad)
+        resp = await client.get(
+            "/api/projects/boot-canary/agent-bootstrap", headers=agent_auth
+        )
+        assert resp.status_code == 200, resp.text
+        assert url_canary not in resp.text and "hub.example" not in resp.text
+        assert resp.json()["mcp"]["url"] == ""
+        assert "URL хаба не опубликован" in resp.json()["text"]
+    monkeypatch.delenv(brand.ENV_PREFIX + "HUB_URL")
+
+    # Свободный текст политики (команда ci_runner, путь) не публикуется.
+    await _bootstrap_project(
+        db,
+        "boot-policy-path",
+        policy={
+            "ci_runner": "uv run /opt/hub-private/check.py",
+            "freeze": {"note": "/opt/hub-private/freeze-note"},
+        },
+    )
+    resp = await client.get(
+        "/api/projects/boot-policy-path/agent-bootstrap", headers=agent_auth
+    )
+    assert resp.status_code == 200, resp.text
+    assert "/opt/hub-private" not in resp.text and "check.py" not in resp.text
+    assert "ci_runner = настроен" in resp.json()["text"]
+
+    monkeypatch.setattr(cli, "HUB_TOKEN", env_canary)
+    monkeypatch.setattr(cli, "_api", lambda *a, **k: data)
+    monkeypatch.setattr(
+        sys, "argv", ["oc-hub", "projects", "bootstrap", "boot-canary", "--json"]
+    )
+    rc = cli.main()
+    printed = capsys.readouterr().out
+    assert rc == 0 and _json.loads(printed) == data
+    assert not any(c in printed for c in canaries)
+
+
+async def test_agent_bootstrap_follows_project_policy(client, db, tmp_path):
+    """AC-3: политика и state файлов у каждого проекта свои; строка CI — только у require."""
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import RULES_PATH, ReadingGitOps, make_rules_repo
+
+    plugins.git_ops = ReadingGitOps()
+    with_rules = make_rules_repo(tmp_path / "a", {RULES_PATH: "x\n"})
+    without = make_rules_repo(tmp_path / "b", {})
+    await _bootstrap_project(
+        db, "boot-req", with_rules, policy={"ci_before_submit": "require"}
+    )
+    await _bootstrap_project(
+        db, "boot-off", without, policy={"ci_before_submit": "off"}
+    )
+    ci_line = "push → зелёный CI на sha → сдача"
+
+    req = (await client.get("/api/projects/boot-req/agent-bootstrap")).json()
+    off = (await client.get("/api/projects/boot-off/agent-bootstrap")).json()
+
+    assert ci_line in req["text"] and ci_line not in off["text"]
+    assert req["ci_before_submit"] == "require" and off["ci_before_submit"] == "off"
+    assert "ci_before_submit = require" in req["text"]
+    assert "ci_before_submit = require" not in off["text"]
+    states = {f["path"]: f["state"] for f in req["rules_files"]}
+    assert states == {RULES_PATH: "present", ".hub/REVIEW_RULES.md": "missing"}
+    states_off = {f["path"]: f["state"] for f in off["rules_files"]}
+    assert states_off[RULES_PATH] == "missing"
+
+
+# ---- #1647: задача-состояние одинакова на REST, в CLI и в MCP ----
+
+
+async def test_state_fields_evidence_and_verdict_parity_across_surfaces(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-10: result_kind/rollback, доказательства и вердикт с поколением.
+
+    CLI проверяется по телу запроса, которое он строит, и это тело
+    проигрывается через REST под теми же токенами; MCP ходит в тот же REST.
+    Авторство доказательств берётся из токена: поле agent — только подпись.
+    """
+    import argparse
+    import json
+    from unittest.mock import patch
+
+    from hub import cli, mcp_server
+    from tests.state_support import (
+        auth,
+        evidence_for,
+        evidence_rows,
+        pair_start,
+    )
+
+    headers = auth(monkeypatch)
+
+    def bridge(who: str):
+        async def _post(path: str, body: dict | None = None, **_):
+            resp = await client.post(path, json=body or {}, headers=headers[who])
+            if resp.status_code >= 400:
+                raise mcp_server.HubApiError(
+                    mcp_server._parse_api_error(resp, resp.status_code)
+                )
+            return resp.json()
+
+        async def _get(path: str, **_):
+            return (await client.get(path, headers=headers[who])).json()
+
+        return _post, _get
+
+    def cli_body(call, **namespace) -> tuple[str, str, dict]:
+        sent: list[tuple] = []
+        with patch.object(
+            cli,
+            "_api",
+            side_effect=lambda m, p, b=None, **k: sent.append((m, p, b)) or {},
+        ):
+            call(argparse.Namespace(**namespace))
+        method, path, body = sent[-1]
+        return method, path, body
+
+    full_form = {
+        "user_story": "Как владелец хочу сменить ключ",
+        "problem_statement": "Ключ скомпрометирован",
+        "business_value": "Закрыт риск",
+    }
+
+    # --- создание: REST, CLI (проигрыш тела), MCP ---
+    rest = await client.post(
+        "/api/tasks",
+        json={
+            "title": "rest",
+            "result_kind": "state",
+            "rollback": "откат REST",
+            **full_form,
+        },
+        headers=headers["human"],
+    )
+    assert rest.status_code in (200, 201), rest.text
+    assert (
+        rest.json()["result_kind"] == "state"
+        and rest.json()["rollback"] == "откат REST"
+    )
+    rest_id = rest.json()["id"]
+
+    _m, path, body = cli_body(
+        cli.cmd_task,
+        title="cli", description="", runtime="auto", run=False, no_review=False,
+        task_type="task", priority="medium", work_type=None, freeze_rationale="",
+        parent=None, owner=None, reviewer=None, request_id="",
+        result_kind="state", rollback="откат CLI",
+    )  # fmt: skip
+    assert body["result_kind"] == "state" and body["rollback"] == "откат CLI"
+    replay = await client.post(path, json=body, headers=headers["human"])
+    assert replay.json()["result_kind"] == "state", replay.text
+    cli_id = replay.json()["id"]
+
+    post, get = bridge("human")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    created = await mcp_server.hub_create_task(
+        "mcp", result_kind="state", rollback="откат MCP"
+    )
+    mcp_id = created.structuredContent["task"]["id"]
+    stored = (await client.get(f"/api/tasks/{mcp_id}", headers=headers["human"])).json()
+    assert (stored["result_kind"], stored["rollback"]) == ("state", "откат MCP")
+
+    # --- уточнение: CLI-тело и MCP-инструмент ---
+    refine_payload = cli._build_refine_payload(
+        argparse.Namespace(rollback="откат CLI 2", result_kind=None)
+    )
+    assert refine_payload == {"rollback": "откат CLI 2"}
+    refined = await client.post(
+        f"/api/tasks/{cli_id}/refine", json=refine_payload, headers=headers["human"]
+    )
+    assert refined.json()["rollback"] == "откат CLI 2", refined.text
+    await mcp_server.hub_refine_task(mcp_id, rollback="откат MCP 2")
+    assert (await client.get(f"/api/tasks/{mcp_id}", headers=headers["human"])).json()[
+        "rollback"
+    ] == "откат MCP 2"
+
+    # --- сдача с доказательствами: REST, CLI-тело, MCP; автор — из токена ---
+    ids = {}
+    for label, task_id in (("rest", rest_id), ("cli", cli_id), ("mcp", mcp_id)):
+        for n, kind in enumerate(("manual", "log_check"), start=1):
+            added = await client.post(
+                f"/api/tasks/{task_id}/acceptance_criteria",
+                json={"id": f"AC-{n}", "given": "g", "when": "w", "then": "t",
+                      "verifiable_by": kind},
+                headers=headers["human"],
+            )  # fmt: skip
+            assert added.status_code == 201, added.text
+        started = await pair_start(client, task_id, headers=headers["impl"])
+        assert started.status_code == 200, started.text
+        ids[label] = task_id
+
+    sent_rest = await client.post(
+        f"/api/tasks/{ids['rest']}/submit-review",
+        json={"agent": "подпись-REST", "summary": "s", "model": "m",
+              "evidence": evidence_for()},
+        headers=headers["impl"],
+    )  # fmt: skip
+    assert sent_rest.status_code == 200, sent_rest.text
+
+    _m, path, body = cli_body(
+        cli.cmd_submit_review,
+        task_id=ids["cli"], agent="подпись-CLI", summary="s", model="m",
+        evidence=json.dumps(evidence_for()),
+    )  # fmt: skip
+    assert body["evidence"] == evidence_for()
+    sent_cli = await client.post(path, json=body, headers=headers["impl"])
+    assert sent_cli.status_code == 200, sent_cli.text
+
+    post, get = bridge("impl")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    await mcp_server.hub_submit_for_review(
+        ids["mcp"], agent="подпись-MCP", summary="s", model="m", evidence=evidence_for()
+    )
+
+    for label, signature in (("rest", "подпись-REST"), ("cli", "подпись-CLI"),
+                             ("mcp", "подпись-MCP")):  # fmt: skip
+        task = (
+            await client.get(f"/api/tasks/{ids[label]}", headers=headers["human"])
+        ).json()
+        assert task["status"] == "review", (label, task["status"])
+        rows = await evidence_rows(db, ids[label])
+        assert len(rows) == 2, (label, rows)
+        assert {r["principal_id"] for r in rows} == {7}, (label, "автор из токена")
+        assert {r["agent"] for r in rows} == {signature}, (label, "agent — подпись")
+
+    # --- вердикт с поколением: REST, CLI-тело, MCP ---
+    no_gen = await client.post(
+        f"/api/tasks/{ids['rest']}/review-verdict",
+        json={"verdict": "changes_requested", "comments": "нужно ещё наблюдение"},
+        headers=headers["human"],
+    )
+    assert no_gen.status_code == 409, "вердикт по state без поколения не принимается"
+    verdict_rest = await client.post(
+        f"/api/tasks/{ids['rest']}/review-verdict",
+        json={"verdict": "changes_requested", "comments": "нужно ещё наблюдение",
+              "expected_generation": 1},
+        headers=headers["human"],
+    )  # fmt: skip
+    assert verdict_rest.status_code == 200, verdict_rest.text
+
+    _m, path, body = cli_body(
+        cli.cmd_review_verdict,
+        task_id=ids["cli"], verdict="changes_requested", comments="нужно ещё",
+        agent="r", findings_json="", create_tasks_for_out_of_scope=False,
+        expected_generation=1,
+    )  # fmt: skip
+    assert body["expected_generation"] == 1
+    verdict_cli = await client.post(path, json=body, headers=headers["human"])
+    assert verdict_cli.status_code == 200, verdict_cli.text
+
+    post, get = bridge("human")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    await mcp_server.hub_submit_review(
+        ids["mcp"], "changes_requested", comments="нужно ещё", expected_generation=1
+    )
+    for label in ("rest", "cli", "mcp"):
+        task = (
+            await client.get(f"/api/tasks/{ids[label]}", headers=headers["human"])
+        ).json()
+        assert task["status"] == "running", (label, task["status"])
+
+    # --- чтение истории: комплект поколения 1 виден на карточке и в MCP ---
+    history = (
+        await client.get(f"/api/tasks/{ids['rest']}/evidence", headers=headers["human"])
+    ).json()
+    assert [(h["generation"], h["ac_id"]) for h in history] == [
+        (1, "AC-1"),
+        (1, "AC-2"),
+    ]
+    card = (
+        await client.get(f"/api/tasks/{ids['rest']}", headers=headers["human"])
+    ).json()
+    assert [e["ac_id"] for e in card["evidence"]] == ["AC-1", "AC-2"]
+    status = await mcp_server.hub_task_status(ids["rest"], full=True)
+    assert "AC-1" in json.dumps(status.structuredContent["task"]["evidence"])
+
+    # Существующие commit-сценарии не ослаблены: commit-задача прежней формы.
+    plain = await client.post(
+        "/api/tasks", json={"title": "commit"}, headers=headers["human"]
+    )
+    assert plain.json()["result_kind"] == "commit" and plain.json()["rollback"] == ""

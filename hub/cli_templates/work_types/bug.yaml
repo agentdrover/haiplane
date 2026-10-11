@@ -35,13 +35,16 @@ assumptions:
 technical_hints: |
   Likely root cause hypothesis or location.
 
+# Defect AC template (#914): reproduce first, fix second. The test named in
+# test_ref must FAIL on the merge-base code in CI — only `failed` counts as a
+# reproduction, `error` proves nothing (red-test gate, #913).
 acceptance_criteria:
   - id: AC-1
-    given: <preconditions that previously triggered the bug>
+    given: <state in which the defect shows>
     when:  <user action / API call>
-    then:  <correct, fixed behavior>
+    then:  <expected behavior>
     verifiable_by: test
-    test_ref: ""
+    test_ref: "tests/<file>.py::<test_name>"
   - id: AC-2
     given: regression-test
     when:  the test suite runs

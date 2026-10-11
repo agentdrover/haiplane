@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from hub import config
+from hub import repository as repo
 from hub.auth import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, login_limiter
 from hub.config import TokenIdentity
 from hub.services import admin as admin_svc
@@ -1271,6 +1272,9 @@ async def test_reviewer_session_reaches_two_routes_and_nothing_else(hub):
         ("GET", f"/api/tasks/{bound}"),
         ("GET", "/api/whoami"),
         ("POST", "/api/tasks"),
+        # #1586: харнесс ревьюер получает из брифа, а не третьим маршрутом.
+        ("GET", "/api/skills/multi-agent-review"),
+        ("GET", "/api/skills"),
     ):
         resp = await hub.client.request(method, path, json={}, headers=session)
         assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
@@ -1375,3 +1379,380 @@ async def test_reviewer_session_cannot_file_against_a_newer_submission(hub):
         headers=session,
     )
     assert filed.status_code == 403, filed.text
+
+
+# ---------------------------------------------------------------------------
+# #1439 (F4): код implementer выписывает хаб — на задачу и поколение прогона
+# ---------------------------------------------------------------------------
+
+
+async def _returned_task(
+    hub, generation: int = 1, status: str = "fix_requested"
+) -> int:
+    """Задача, которую вернули исполнителю: не open, прошлая сдача generation."""
+    from hub import repository as repo
+
+    task_id = await _make_task(hub, "возвращённая")
+    await repo.update_task(
+        hub.db, task_id, status=status, submission_generation=generation
+    )
+    await hub.db.commit()
+    return task_id
+
+
+@pytest.mark.asyncio
+async def test_a_returned_task_gets_a_code_for_the_next_generation(hub):
+    """AC-2: не-open задача, код на следующее поколение — обмен проходит,
+    сессия привязана к задаче и этому поколению."""
+    task_id = await _returned_task(hub, generation=1)
+    code, _ttl = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+
+    token = await _redeem(hub, code)
+
+    session = (
+        await _rows(
+            hub.db,
+            "SELECT kind, bound_task_id, bound_generation FROM chat_pair_sessions "
+            "WHERE token_hash = ?",
+            (cp.hash_pair_code(token),),
+        )
+    )[0]
+    assert (session["kind"], session["bound_task_id"], session["bound_generation"]) == (
+        "implementer",
+        task_id,
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_implementer_code_is_bound_to_its_task_generation_and_single_use(hub):
+    """AC-3: повтор, сменившееся поколение, не-open без поколения, агентская
+    выдача — всё отказано."""
+    from hub import repository as repo
+
+    # Повторный обмен одного кода.
+    task_id = await _returned_task(hub, generation=1)
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    await _redeem(hub, code)
+    again = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert again.status_code == 401, again.text
+
+    # Поколение задачи ушло дальше, чем то, на которое выписан код.
+    moved = await _returned_task(hub, generation=1)
+    stale, _ = await cp.issue_run_code(
+        hub.db, moved, 2, issued_by_principal_id=hub.human_id
+    )
+    await repo.update_task(hub.db, moved, submission_generation=2)
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": stale}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+    # Не-open задача и код без привязки к поколению (ручная выдача старого вида).
+    unpinned_task = await _returned_task(hub, generation=1)
+    acting = await cp.get_acting_agent(hub.db)
+    unpinned, _ = await cp.issue_code(
+        hub.db, int(acting["id"]), kind="implementer", bound_task_id=unpinned_task
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": unpinned}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+    # Агентский токен не выписывает код implementer.
+    open_task = await _make_task(hub, "open")
+    by_agent = await hub.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": open_task},
+        headers={**hub.agent_auth, **_ip()},
+    )
+    assert by_agent.status_code == 403, by_agent.text
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_code_on_an_open_task_must_name_the_next_generation(hub):
+    """Код хаба на open-задачу тоже сверяется с поколением: на «через одно»
+    поколение он не обменивается."""
+    task_id = await _make_task(hub, "open")
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 5, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_task_in_review_does_not_take_an_implementer_code(hub):
+    """Задача в review — там идёт отчёт ревьюера, не работа исполнителя:
+    код хаба даже на следующее поколение не обменивается (#1439)."""
+    task_id = await _returned_task(hub, generation=1, status="review")
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+
+# ---------------------------------------------------------------------------
+# #1586: харнесс multi-agent-review в брифе reviewer-сессии
+# ---------------------------------------------------------------------------
+
+
+async def _set_skill(hub, *, status: str, content: str) -> int:
+    _id, version = await repo.create_skill_version(
+        hub.db,
+        name="multi-agent-review",
+        content=content,
+        status=status,
+        created_by="test",
+    )
+    await hub.db.commit()
+    return version
+
+
+async def _wipe_skill(hub) -> None:
+    await hub.db.execute("DELETE FROM skills WHERE name='multi-agent-review'")
+    await hub.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_reviewer_brief_carries_active_harness_skill(hub):
+    """AC-1 (#1586): у reviewer-сессии в брифе активный харнесс; у прочих ключа нет."""
+    task_id = await _in_review(hub, "харнесс в брифе")
+    await _wipe_skill(hub)
+    v1 = await _set_skill(hub, status="active", content="HARNESS-TEXT-V1")
+    session = await _reviewer_session(hub, task_id)
+
+    brief = await hub.client.get(f"/api/tasks/{task_id}/review-brief", headers=session)
+    assert brief.status_code == 200, brief.text
+    harness = brief.json()["harness_skill"]
+    assert harness["name"] == "multi-agent-review"
+    assert harness["version"] == v1
+    assert harness["text"] == "HARNESS-TEXT-V1"
+
+    # Активация новой версии: следующее чтение отдаёт новую.
+    await repo.activate_skill_version(
+        hub.db,
+        "multi-agent-review",
+        await _set_skill(hub, status="draft", content="HARNESS-TEXT-V2"),
+        activated_by="test",
+    )
+    await hub.db.commit()
+    again = await hub.client.get(f"/api/tasks/{task_id}/review-brief", headers=session)
+    assert again.json()["harness_skill"]["text"] == "HARNESS-TEXT-V2"
+
+    # Человек и implementer: КЛЮЧА нет вовсе (не null).
+    human = await hub.client.get(
+        f"/api/tasks/{task_id}/review-brief", headers=hub.human_auth
+    )
+    assert human.status_code == 200, human.text
+    assert "harness_skill" not in human.json()
+
+    open_task = await _make_task(hub, "для implementer")
+    implementer = await _implementer_session(hub, open_task)
+    own = await hub.client.get(
+        f"/api/tasks/{open_task}/review-brief", headers=implementer
+    )
+    assert own.status_code == 200, own.text
+    assert "harness_skill" not in own.json()
+    assert "HARNESS-TEXT" not in own.text and "HARNESS-TEXT" not in human.text
+
+
+@pytest.mark.asyncio
+async def test_reviewer_brief_without_active_harness_names_the_gap(hub):
+    """AC-4 (#1586): нет активной версии (и есть только draft) — 200, пусто, причина."""
+    task_id = await _in_review(hub, "без харнесса")
+    session = await _reviewer_session(hub, task_id)
+
+    for setup in ("none", "draft_only"):
+        await _wipe_skill(hub)
+        if setup == "draft_only":
+            await _set_skill(hub, status="draft", content="DRAFT-TEXT")
+        brief = await hub.client.get(
+            f"/api/tasks/{task_id}/review-brief", headers=session
+        )
+        assert brief.status_code == 200, brief.text
+        harness = brief.json()["harness_skill"]
+        assert harness["text"] == "", setup
+        assert harness["version"] is None, setup
+        assert harness["reason"], setup
+        assert "DRAFT-TEXT" not in brief.text, "draft не подставляется"
+
+
+# ---------------------------------------------------------------------------
+# #1643 hub_my_context у implementer: блок «что дальше» приходит из /context
+# ---------------------------------------------------------------------------
+
+
+def _session_api_get(hub, session: dict[str, str], calls: list[str]):
+    """_api_get как у облачного исполнителя: реальные запросы с его токеном."""
+    from hub.mcp_server import HubApiError
+
+    async def _get(path: str, **_: object):
+        calls.append(path)
+        resp = await hub.client.get(path, headers=session)
+        if resp.status_code >= 400:
+            raise HubApiError({"message": f"HTTP {resp.status_code}", **resp.json()})
+        return resp.json()
+
+    return _get
+
+
+async def _epic_with_queue(hub) -> tuple[int, int, int, int]:
+    """Эпик проекта: цепочка first → second и своя задача сессии (mine).
+
+    mine ниже по priority, поэтому «следующая» — first. Читать контекст mine
+    нельзя заменять чтением first: get_readiness пересчитывает DoR прочитанной
+    задачи, а у задач-заглушек он проставлен руками.
+    """
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp1643")
+    epic = await _epic(hub.db, pid)
+    first = await _task(hub.db, pid, "first", parent=epic, size="M")
+    second = await _task(hub.db, pid, "second", parent=epic, size="S")
+    await _dep(hub.db, second, first)
+    mine = await _task(hub.db, pid, "mine", parent=epic, size="XS", priority="low")
+    return epic, first, second, mine
+
+
+@pytest.mark.asyncio
+async def test_implementer_context_has_the_path_block_without_calling_path(
+    hub, monkeypatch
+):
+    """AC-1 (#1643): implementer получает следующую задачу и критический путь
+    в hub_my_context(mode=full); к закрытому /path запросов нет, строки
+    «не прочитан» нет."""
+    from hub import mcp_server
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, calls))
+
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+
+    assert f"Next task: #{first}" in text
+    assert f"#{first} → #{second}" in text
+    assert "не прочитан" not in text
+    assert not [c for c in calls if "/path" in c], calls
+
+
+@pytest.mark.asyncio
+async def test_implementer_still_cannot_read_path_or_foreign_context(hub):
+    """AC-2 (#1643): allowlist не расширен — прямой /path и /context чужой
+    задачи по-прежнему 403."""
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+
+    path = await hub.client.get("/api/projects/cp1643/path", headers=session)
+    assert path.status_code == 403, path.text
+    foreign = await hub.client.get(f"/api/tasks/{second}/context", headers=session)
+    assert foreign.status_code == 403, foreign.text
+    own = await hub.client.get(f"/api/tasks/{mine}/context", headers=session)
+    assert own.status_code == 200, own.text
+
+
+@pytest.mark.asyncio
+async def test_implementer_path_block_names_nothing_outside_the_session(
+    hub, monkeypatch
+):
+    """#1643 P1: блок implementer не называет чужие задачи, эпики и проекты:
+    ни названий, ни номеров, ни slug; вместо них обезличенная пометка."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    pid = await _project(hub.db, "cp1643")
+    other_pid = await _project(hub.db, "tajnyj-proekt")
+    # Следующая задача проекта — из другого эпика, который сессии не виден.
+    foreign_epic = await _epic(hub.db, pid, "tajnyj-epik")
+    foreign_next = await _task(
+        hub.db, pid, "tajnoe-imya", parent=foreign_epic, size="S", priority="critical"
+    )
+    # Цепочка собственного эпика идёт через зависимость из чужого проекта.
+    other_epic = await _epic(hub.db, other_pid, "epik-chuzhogo")
+    foreign_dep = await _task(
+        hub.db, other_pid, "chuzhaya-zavisimost", parent=other_epic
+    )
+    await _dep(hub.db, first, foreign_dep)
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "вне вашей сессии" in text
+    for secret in (
+        "tajnoe-imya",
+        "tajnyj-epik",
+        "chuzhaya-zavisimost",
+        "epik-chuzhogo",
+    ):
+        assert secret not in text and secret not in structured, secret
+    assert "tajnyj-proekt" not in text and "tajnyj-proekt" not in structured
+    for hidden_id in (foreign_next, foreign_epic, foreign_dep, other_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+
+
+@pytest.mark.asyncio
+async def test_implementer_block_without_ready_task_carries_no_skip_reasons(
+    hub, monkeypatch
+):
+    """#1643 (ревью): очередь без готовой задачи, пропущены чужие кандидаты.
+    Свободный reason очереди перечисляет их номера и причины; implementer
+    получает только обезличенную пометку, ни в тексте, ни в structuredContent."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp-noready")
+    mine_epic = await _epic(hub.db, pid)
+    mine = await _task(hub.db, pid, "mine", parent=mine_epic, size="XS")
+    foreign_epic = await _epic(hub.db, pid, "chuzhoj-epik")
+    blocker = await _task(
+        hub.db, pid, "blokirujushhaja", parent=foreign_epic, size="S", dor=False
+    )
+    skipped = await _task(hub.db, pid, "propushhennaja", parent=foreign_epic, size="S")
+    await _dep(hub.db, skipped, blocker)
+    await _dep(hub.db, mine, blocker)
+
+    # Без фильтра reason называет чужие номера — иначе тест ничего не доказывает.
+    plain = await hub.client.get(
+        "/api/projects/cp-noready/path", headers=hub.human_auth
+    )
+    assert plain.json()["next"]["task_id"] is None
+    assert f"#{skipped}" in plain.json()["next"]["reason"]
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "Next task: нет готовой или вне вашей сессии" in text
+    for hidden_id in (skipped, blocker, foreign_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+        assert not re.search(rf"#{hidden_id}\b", structured), hidden_id
+    assert "propushhennaja" not in text + structured

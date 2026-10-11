@@ -13,8 +13,10 @@ from urllib.parse import quote
 
 import aiosqlite
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from jinja2 import pass_context
+from markupsafe import Markup
 from pydantic import ValidationError
 
 from hub import brand
@@ -30,6 +32,8 @@ from hub.actionable_errors import (
 from hub.auth import (
     CSRF_COOKIE_NAME,
     client_ip,
+    cookie_csrf_ok,
+    csrf_exempt_transport,
     current_user,
     current_identity,
     require_human_or_admin,
@@ -38,10 +42,13 @@ from hub.auth import (
     require_permission,
     verify_csrf,
 )
+from hub.csrf import CSRF_FIELD_NAME
+from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
-from hub.services import project_policy
+from hub.services import effective_policy, policy_change, project_policy
+from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
@@ -80,16 +87,51 @@ HERE = Path(__file__).parent
 
 def _user_context(request: Request) -> dict[str, Any]:
     """Inject ``current_user`` into every Jinja template automatically."""
-    return {"current_user": getattr(request.state, "user", "anonymous")}
+    context: dict[str, Any] = {
+        "current_user": getattr(request.state, "user", "anonymous")
+    }
+    # #1664: the session-bound token reaches every page (meta tag and hx-headers
+    # in base.html). Starlette lets a processor override the view's own context,
+    # so the legacy double-submit value of the pages that still mint one is
+    # replaced by this one — which their handlers accept too.
+    # /login keeps its pre-session token: its handler verifies that one.
+    if request.url.path != "/login" and (token := csrf_token_for_request(request)):
+        context["csrf_token"] = token
+    return context
 
 
 TEMPLATES = Jinja2Templates(
     directory=str(HERE / "templates"),
     context_processors=[_user_context],
 )
+
+
+@pass_context
+def _csrf_field(context: Any) -> Markup:
+    """Hidden session-bound token field for a POST form (#1665).
+
+    Empty when the page has no token (a Bearer caller or a login page), so a
+    form never carries a stale value. Every POST form calls this and the
+    static check in tests/test_csrf_templates.py fails one that does not.
+    """
+    token = context.get("csrf_token")
+    if not token:
+        return Markup("")
+    return Markup('<input type="hidden" name="{}" value="{}">').format(
+        CSRF_FIELD_NAME, token
+    )
+
+
+TEMPLATES.env.globals["csrf_field"] = _csrf_field
 TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
 TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
 TEMPLATES.env.globals["app_version"] = get_app_version()
+
+
+def _release_ci_text(ci: Any) -> str:
+    from hub.services.release_alert import ci_evidence_text
+
+    return ci_evidence_text(ci)
 
 
 def default_pr_disposition(task: Any) -> str:
@@ -114,6 +156,20 @@ def default_pr_disposition(task: Any) -> str:
 
 
 TEMPLATES.env.globals["default_pr_disposition"] = default_pr_disposition
+
+# #1420: the CI run and failed checks of a release alert, worded once for the
+# dashboard card, prod_state and hub_my_context.
+TEMPLATES.env.globals["release_ci_text"] = _release_ci_text
+
+
+def _egress_text(egress: Any) -> str:
+    from hub.services.egress_watch import egress_lines
+
+    return next(iter(egress_lines(egress)), "")
+
+
+# #1645: the egress alert line, worded once for every surface.
+TEMPLATES.env.globals["egress_text"] = _egress_text
 
 router = APIRouter()
 
@@ -405,7 +461,8 @@ async def _chat_pair_page(
 
 
 def _check_web_csrf(request: Request, csrf_token: str) -> bool:
-    return verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, ""))
+    """A Bearer caller is not asked for a token (#1664)."""
+    return csrf_exempt_transport(request) or cookie_csrf_ok(request, csrf_token)
 
 
 @router.get("/chat-pair", response_class=HTMLResponse)
@@ -707,6 +764,41 @@ def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLRespo
     return HTMLResponse(fragment, status_code=200)
 
 
+async def _freeze_message(request: Request, task_id: int, approve_error: str) -> str:
+    """Текст отказа заморозки для карточки; считается заново, а не берётся из URL."""
+    if approve_error != FREEZE_REFUSED:
+        return ""
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return ""
+    refusal = project_policy.freeze_admission(
+        await repo.resolve_project_for_task(db, task_id),
+        row["work_type"],
+        row["freeze_rationale"] or "",
+    )
+    return refusal.text if refusal is not None else ""
+
+
+def _freeze_refused_response(
+    request: Request, task_id: int, detail: dict[str, Any]
+) -> Response:
+    """Отказ допуска заморозки (#1594): причина текстом, состояние не менялось."""
+    message = str(detail.get("message") or "Заморозка проекта не допускает работу.")
+    if _is_htmx(request):
+        fragment = (
+            f'<div class="dor-gate-warning" id="freeze-warn-{task_id}">'
+            f'<span class="badge badge-failed">Заморозка проекта</span>'
+            f"<p>{html.escape(message)}</p>"
+            f'<a class="btn btn-secondary btn-xs" href="/tasks/{task_id}">'
+            f"Открыть задачу</a></div>"
+        )
+        return HTMLResponse(fragment, status_code=200)
+    return RedirectResponse(
+        f"/tasks/{task_id}?approve_error=freeze_refused", status_code=303
+    )
+
+
 # ---------------------------------------------------------------------------
 # Partials (HTMX fragments)
 # ---------------------------------------------------------------------------
@@ -945,33 +1037,9 @@ async def web_dashboard(
             if (e.get("id") if isinstance(e, dict) else getattr(e, "id", None))
             in allowed
         ]
-    inbox_total = (
-        len(inbox["drafts"])
-        + len(inbox["questions"])
-        + len(inbox["decisions"])
-        + len(inbox["pending_reports"])
-        + len(inbox["ci_check_tasks"])
-        + len(inbox["fix_requested_tasks"])
-        + len(inbox["stale_tasks"])
-        # #1038: находки живут не в статусном списке, а в своём счёте, и без
-        # этой строки верхняя плашка показывала бы «Inbox 0» при непустой
-        # секции ниже — ровно та невидимость, которую задача и убирает.
-        + (1 if inbox.get("unjudged_findings", {}).get("findings") else 0)
-        # #897: a completed task with an open PR belongs in the count the owner
-        # glances at. Left out of it, the section would be a thing you only see
-        # if you already scrolled to where you were not looking.
-        #
-        # #1198: acknowledged rows are excluded. They stay in the section — the
-        # record is never erased — but a discrepancy the owner has already
-        # judged legitimate must not keep pushing the badge up: a counter that
-        # never returns to zero is a counter nobody reads, which is the exact
-        # death this task exists to prevent.
-        # #294: «признано» спрашивается ОДНИМ определением из репозитория
-        # (acknowledged_now), а не своим здесь. Своё уже разъехалось с голосом:
-        # строка, признанная для другого факта, будила агентов и одновременно
-        # считалась нулём.
-        + len([d for d in inbox["undelivered"] if not d.get("acknowledged_now")])
-    )
+    # Один счёт на плашку, секцию и шаблон входящих — из данных get_inbox_data
+    # (services.dashboard.inbox_attention_total), не второй перечень здесь.
+    inbox_total = inbox["inbox_attention_total"]
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session
     # belongs to an agent, not to a project, and a thread the owner cannot see
@@ -1054,11 +1122,36 @@ async def web_projects(
     # epics and three numbers, computed server-side.
     cards = await services.get_project_cards(_db(request))
     reach = await _review_reach_by_project(_db(request), rows)
-    return TEMPLATES.TemplateResponse(
+    # #1638: действующее значение и источник четырёх настроек стоимости ревью —
+    # из того же расчёта строк ключей, что и /api/projects/{slug}/effective-policy
+    # (effective_policy.key_rows), без сводки целиком и без обращений к базе.
+    # Отказ расчёта одного проекта не роняет страницу: None — «не рассчитано».
+    review_cost: dict[int, dict[str, Any] | None] = {}
+    for r in rows:
+        try:
+            review_cost[int(r["id"])] = {
+                row["key"]: row
+                for row in effective_policy.key_rows(r)
+                if row["key"] in _REVIEW_COST_KEYS
+            }
+        except Exception:
+            log.exception("review cost settings failed for project %s", r["id"])
+            review_cost[int(r["id"])] = None
+    # #1412: кнопка запуска исполнителя выписывает код implementer от имени
+    # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
+    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
         request,
         "projects.html",
         {
+            "csrf_token": csrf_token,
+            "executor_launch_mode": _executor_launch_mode,
             "projects": [dict(r) for r in rows],
+            # #1593: версия политики, с которой составлена форма правки; её
+            # сверяет PATCH внутри write-транзакции.
+            "policy_versions": {
+                int(r["id"]): policy_change.policy_version(r) for r in rows
+            },
             "cards": cards,
             "project_error": project_error,
             "project_error_id": project_error_id,
@@ -1081,11 +1174,175 @@ async def web_projects(
             # оси. Причина едет рядом, потому что молча убранный пункт
             # ничем не лучше пункта, который отказывает.
             "review_reach": reach,
+            "review_cost": review_cost,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
         },
     )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
+def _executor_launch_mode(project: Any) -> str:
+    """Режим запуска исполнителя проекта для шаблона (#1412)."""
+    from hub.services.executor_launch import launch_mode_of
+
+    # Карточка несёт политику уже разобранной; строка из базы — через
+    # общего читателя.
+    raw = project.get("gate_policy") if isinstance(project, dict) else None
+    if isinstance(raw, dict):
+        return launch_mode_of(raw)
+    return launch_mode_of(project_policy.gate_policy_of(project))
+
+
+@router.post("/tasks/{task_id}/web-executor-merge")
+async def web_executor_merge(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «слить базу и пересдать» (#1445): тот же сервис, что у REST."""
+    from hub.services.executor_launch import merge_executor
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=(
+                "Код исполнителю выписывается от имени принципала хаба; вход по "
+                "env-токену для этого не подходит."
+            ),
+        )
+    result = await merge_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(identity.principal_id),
+        issuer=identity.username,
+    )
+    if not result.launched:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=f"Прогон слияния не заказан: {result.reason}",
+            status_code=409,
+        )
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-executor-stop")
+async def web_executor_stop(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «остановить прогон» (#1455): тот же сервис, что у REST."""
+    from hub.services.executor_dispatch import stop_executor_run
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    result = await stop_executor_run(
+        _db(request), task_id, actor=current_identity(request).username
+    )
+    if not result.accepted:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=f"Прогон не остановлен: {result.reason}",
+            status_code=409,
+        )
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-executor-repair")
+async def web_executor_repair(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «повторный прогон исполнителя» (#1444): тот же сервис, что у REST."""
+    from hub.services.executor_launch import repair_executor
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=(
+                "Код исполнителю выписывается от имени принципала хаба; вход по "
+                "env-токену для этого не подходит."
+            ),
+        )
+    result = await repair_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(identity.principal_id),
+        issuer=identity.username,
+    )
+    if not result.launched:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=f"Повторный прогон не заказан: {result.reason}",
+            status_code=409,
+        )
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/projects/{slug}/web-executor-launch")
+async def web_executor_launch(
+    slug: str, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «запустить исполнителя» (#1412): тот же сервис, что у REST."""
+    from hub.services.executor_launch import launch_executor
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return _projects_error_redirect(
+            "Форма устарела. Обновите страницу и попробуйте снова."
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return _projects_error_redirect(
+            "Код исполнителю выписывается от имени принципала хаба; "
+            "вход по env-токену для этого не подходит."
+        )
+    db = _db(request)
+    project = await repo.get_project_by_slug(db, slug)
+    if project is None:
+        return _projects_error_redirect("project not found")
+    result = await launch_executor(
+        db, project, issuer_principal_id=int(identity.principal_id)
+    )
+    if not result.launched:
+        return _projects_error_redirect(
+            f"Исполнитель не запущен: {result.reason}", int(project["id"])
+        )
+    return RedirectResponse(f"/tasks/{result.task_id}", status_code=303)
 
 
 def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -1135,6 +1392,14 @@ _SHADOW_FIELD = f"gate_policy_{steward_dispatch.STEWARD_SHADOW_KEY}"
 #: переключатель) о лимите не знает и снять его не может.
 _REVIEW_LIMIT_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_KEY}"
 _REVIEW_LIMIT_MODE_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_MODE_KEY}"
+
+#: Четыре настройки стоимости ревью в форме проекта (#1638): ключ политики →
+#: «число или строка». Как и лимит очереди, они принадлежат форме, только когда
+#: поле пришло в запросе; в _FORM_GATE_POLICY_KEYS их нет намеренно.
+_REVIEW_COST_COUNT_KEYS = ("deep_daily_cap", "small_delta_lines", "circle_deep_stop")
+#: local_review_fallback (#1653) живёт рядом с deep_reviewer: оба решают, куда
+#: уходит платное ревью, и оба — строка «выбор или пусто».
+_REVIEW_COST_KEYS = ("deep_reviewer", "local_review_fallback", *_REVIEW_COST_COUNT_KEYS)
 
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
@@ -1238,7 +1503,32 @@ _GATE_POLICY_FORM_FIELDS = (
     "gate_policy_risk_map",
     _SHADOW_FIELD,
     _REVIEW_LIMIT_FIELD,
+    *(f"gate_policy_{key}" for key in _REVIEW_COST_KEYS),
 )
+
+
+def _review_cost_from_form(form: Any, policy: dict[str, Any]) -> None:
+    """deep_reviewer, deep_daily_cap, small_delta_lines, circle_deep_stop (#1638).
+
+    По образцу лимита очереди: нет поля — сохранённое остаётся; поле пусто —
+    ключ снимается (наследование серверной настройки); число, включая 0, —
+    числом. Всё прочее кладётся как пришло: отказывает общий валидатор.
+    """
+    for key in _REVIEW_COST_KEYS:
+        field = f"gate_policy_{key}"
+        if field not in form:
+            continue
+        policy.pop(key, None)
+        raw = str(form.get(field) or "").strip()
+        if not raw:
+            continue
+        if key in _REVIEW_COST_COUNT_KEYS:
+            try:
+                policy[key] = int(raw)
+                continue
+            except ValueError:
+                pass
+        policy[key] = raw
 
 
 def _review_limit_from_form(form: Any, policy: dict[str, Any]) -> None:
@@ -1272,9 +1562,10 @@ async def _gate_policy_from_form(
     """(gate_policy | None если запрос не про политику, ошибка | None).
 
     #1335: сборка начинается с СОХРАНЁННОЙ политики, а форма перезаписывает
-    только свои ручки. PATCH заменяет политику целиком, поэтому ключ, которого
-    форма не показывает (#886: ci_runner; #1264: лимит очереди review, когда
-    его поля нет в запросе), держится ровно на этом старте.
+    только свои ручки: ключ, которого форма не показывает (#886: ci_runner;
+    #1264: лимит очереди review, когда его поля нет в запросе), держится на
+    этом старте. С #1427 PATCH сливает политику по ключам, и снятая ручка
+    уходит в запрос явным null — иначе слияние её бы оставило.
 
     Ручки формы (_FORM_GATE_POLICY_KEYS) сначала снимаются: форма несёт их
     целиком, и пустое поле значит «убрать ручку» (#760), а не «оставить».
@@ -1287,10 +1578,19 @@ async def _gate_policy_from_form(
     gate_policy: dict[str, Any] = {
         key: value for key, value in kept.items() if key not in _FORM_GATE_POLICY_KEYS
     }
-    gate_policy["dor"] = str(form.get("gate_policy_dor") or "").strip() or "human"
-    gate_policy["verdict"] = (
-        str(form.get("gate_policy_verdict") or "").strip() or "human"
+    # #1602: у default форма этих двух полей не показывает (стоит значок замка),
+    # и «поля нет» там значит «не трогать», а не «human»: иначе любое сохранение
+    # формы сбрасывало бы разрешённое verdict=steward. Где поле есть, пустое
+    # по-прежнему human.
+    default_project = bool(
+        stored is not None and project_policy.gate_lock_applies(stored["slug"])
     )
+    for gate in project_policy.GATE_LOCK_GATES:
+        field = f"gate_policy_{gate}"
+        if default_project and field not in form and gate in kept:
+            gate_policy[gate] = kept[gate]
+        else:
+            gate_policy[gate] = str(form.get(field) or "").strip() or "human"
     # #805: the review key is offered to EVERY project, including default
     # — dispatching a reviewer takes no human out of any gate, so the
     # #743 lock (which is about 'auto' on dor/verdict) does not apply.
@@ -1331,6 +1631,12 @@ async def _gate_policy_from_form(
     if risk_map is not None:
         gate_policy["risk_map"] = risk_map
     _review_limit_from_form(form, gate_policy)
+    _review_cost_from_form(form, gate_policy)
+    # #1427: PATCH сливает политику по ключам, и снятая формой ручка ушла бы
+    # из запроса, но осталась бы в базе. Форма собирает ИТОГОВУЮ политику,
+    # поэтому всё, что было сохранено и в неё не попало, снимается явно — null.
+    for key in kept:
+        gate_policy.setdefault(key, None)
     return gate_policy, None
 
 
@@ -1355,6 +1661,21 @@ async def web_edit_project(project_id: int, request: Request):
         return _projects_error_redirect(err, project_id)
     if gate_policy is not None:
         fields["gate_policy"] = gate_policy
+        # #1593: форма несёт политику ЦЕЛИКОМ — открытая до исполнения
+        # отложенной правки и отправленная после, она вернула бы старые
+        # значения. Версия, с которой форма составлена, едет в PATCH и
+        # сверяется под write-локом; без неё форма отказывает.
+        sent_version = str(form.get("policy_version") or "").strip()
+        if not sent_version:
+            # Старая страница (открыта до выката проверки) или самодельный
+            # запрос: без версии не узнать, не затрёт ли форма исполненную
+            # правку. Отказ, а не молчаливое «проверки нет».
+            return _projects_error_redirect(
+                "Форма политики без версии: обновите страницу и повторите правку. "
+                "НИЧЕГО не сохранено.",
+                project_id,
+            )
+        fields["policy_version"] = sent_version
     if not fields:
         return RedirectResponse("/projects", status_code=303)
     try:
@@ -1836,8 +2157,13 @@ async def web_agent_api_metrics(
     )
     from hub.services.mcp_telemetry import usage_report
 
-    snapshot = await catalog_snapshot()
-    data = await usage_report(_db(request), window_days=window_days, catalog=snapshot)
+    # Usage reads the FULL catalog (unused_tools sees hidden tools too); the
+    # budget below measures the AGENT view (#1624).
+    full_snapshot = await catalog_snapshot("full")
+    snapshot = await catalog_snapshot("agent")
+    data = await usage_report(
+        _db(request), window_days=window_days, catalog=full_snapshot
+    )
     # The same check CI runs, rendered where a human actually looks (#832).
     # Headroom bought the mergeability of the budget file; it stays honest
     # only while somebody can watch it shrink.
@@ -2255,6 +2581,26 @@ async def _steward_recommendation(
     return out
 
 
+async def _card_machine_report(
+    db: aiosqlite.Connection, task_id: int, row: dict[str, Any]
+) -> tuple[bool, Any, Any]:
+    """``(state_card, review_report, machine_review)`` для карточки (#381, #808).
+
+    #1648: задача-состояние — без ветки, диффа и машинного отчёта. Карточка
+    читает те же блоки, что бриф, и НЕ ходит за кодом: отчёт, git, дифф, карта
+    изменений, доставка и суждение стюарда для неё не вычисляются.
+    """
+    from hub.services.result_kind import automation_not_applicable
+    from hub.services.review_evidence import review_report
+
+    if automation_not_applicable(row):
+        return True, None, None
+    report = await review_report(
+        db, row, await repo.get_latest_machine_review(db, task_id)
+    )
+    return False, report, report.machine_review
+
+
 async def _web_task_detail_page(
     request: Request,
     task_id: int,
@@ -2280,11 +2626,9 @@ async def _web_task_detail_page(
     # Machine review (#381): summary next to the verdict buttons, assembled
     # by the same builder the review brief uses (#808) — the human at the
     # gate and the reviewing agent must not read two different reports.
-    from hub.services.review_evidence import review_report as _review_report
-
-    mr_row = await repo.get_latest_machine_review(db, task_id)
-    review_report = await _review_report(db, dict(row), mr_row)
-    machine_review = review_report.machine_review
+    state_card, review_report, machine_review = await _card_machine_report(
+        db, task_id, dict(row)
+    )
     # #1012: how much of that report nobody answered — computed by the same
     # helper the verdict itself uses, so the sentence beside the button and
     # the sentence written into the record cannot disagree.
@@ -2302,7 +2646,21 @@ async def _web_task_detail_page(
     evidence = await gate_evidence(db, dict(row))
     review_in_flight = await inflight_view(db, dict(row))
 
-    steward_judgement = await _steward_recommendation(db, task_id, dict(row))
+    steward_judgement = (
+        None if state_card else await _steward_recommendation(db, task_id, dict(row))
+    )
+    # #1410: прогоны облачного исполнителя — центы и исход по каждому.
+    from hub.services.executor_dispatch import executor_runs_view
+
+    executor_runs = await executor_runs_view(db, task_id)
+    # #1444: кнопка повторного прогона — только когда он вообще возможен.
+    from hub.services.executor_launch import repair_offered as _repair_offered
+
+    repair_offered = bool(executor_runs) and await _repair_offered(db, dict(row))
+    # #1445: кнопка прогона слияния — только на конфликте с базой.
+    from hub.services.executor_launch import merge_offered as _merge_offered
+
+    merge_offered = bool(executor_runs) and await _merge_offered(db, dict(row))
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -2317,7 +2675,11 @@ async def _web_task_detail_page(
     # merge (#534) and the deploy CI reported (#839, #496) — and this compares
     # them. Computed, never stored: the answer changes with every release.
     delivery = None
-    if task.status.value in ("completed", "review", "fix_requested"):
+    if not state_card and task.status.value in (
+        "completed",
+        "review",
+        "fix_requested",
+    ):
         from hub.services.delivery_state import delivery_state
 
         try:
@@ -2330,7 +2692,7 @@ async def _web_task_detail_page(
     # the numstat of the pinned submission — paths, not hunks: the hunks load
     # on demand (#824), and this map only needs to know which files moved.
     change_map = None
-    if evidence is not None:
+    if evidence is not None and not state_card:
         from hub.services import change_map as change_map_service
         from hub.services.task_diff import READ, submission_files
 
@@ -2357,6 +2719,14 @@ async def _web_task_detail_page(
     # five resubmissions cost five entry prices. A sum alone would hide that;
     # the count is the point. Runs whose bill never arrived say "неизвестно",
     # never nothing, because a missing bill is not a free run (#725).
+    #
+    # #1361: a report CARRIED over a base-only merge is a row, not a run — it
+    # cost nothing and read nothing. Counting it made the card say "2 runs,
+    # bill known for 1 of 2" about a single paid run. Carries are listed apart.
+    report_rows = [dict(r) for r in await repo.list_machine_reviews(db, task_id)]
+    generation_of = {
+        int(r["id"]): int(r["submission_generation"] or 0) for r in report_rows
+    }
     review_runs = [
         {
             "generation": int(r["submission_generation"] or 0),
@@ -2365,7 +2735,16 @@ async def _web_task_detail_page(
             "tokens_spent": r["tokens_spent"],
             "created_at": r["created_at"],
         }
-        for r in map(dict, await repo.list_machine_reviews(db, task_id))
+        for r in report_rows
+        if r.get("carried_from_review_id") is None
+    ]
+    review_carries = [
+        {
+            "generation": int(r["submission_generation"] or 0),
+            "from_generation": generation_of.get(int(r["carried_from_review_id"])),
+        }
+        for r in report_rows
+        if r.get("carried_from_review_id") is not None
     ]
     review_runs_billed = [
         r["provider_tokens"] for r in review_runs if r["provider_tokens"] is not None
@@ -2378,7 +2757,7 @@ async def _web_task_detail_page(
 
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
-    if task.status.value == "review" and not task.review_job_id:
+    if not state_card and task.status.value == "review" and not task.review_job_id:
         from hub.services.orchestration import machine_review_gap
 
         machine_review_gap_text = await machine_review_gap(db, dict(row))
@@ -2435,11 +2814,15 @@ async def _web_task_detail_page(
             "change_map": change_map,
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
+            "executor_runs": executor_runs,
+            "repair_offered": repair_offered,
+            "merge_offered": merge_offered,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,
             "review_runs": review_runs,
             "review_runs_cost": review_runs_cost,
+            "review_carries": review_carries,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
@@ -2449,6 +2832,7 @@ async def _web_task_detail_page(
             "dispatch_available": _dispatch_available(),
             "dispatch_configured": _dispatch_configured(),
             "approve_error": approve_error,
+            "approve_message": await _freeze_message(request, task_id, approve_error),
             "review_error": review_error,
             "csrf_token": csrf_token,
             "implementer_code": implementer_code,
@@ -2608,6 +2992,7 @@ async def web_create_task(
     parent_id: int | None = Form(None),
     priority: str = Form("medium"),
     work_type: str = Form("feature"),
+    freeze_rationale: str = Form(""),
     user_story: str = Form(""),
     problem_statement: str = Form(""),
     scope_in: str = Form(""),
@@ -2641,11 +3026,11 @@ async def web_create_task(
         run_immediately=run_immediately,
         task_type=_enum_from_form(TaskType, task_type, "task_type"),
         parent_id=parent_id,
-        work_type=(
-            _enum_from_form(WorkType, work_type, "work_type")
-            if task_type == "task"
-            else WorkType.feature
-        ),
+        # #1594: тип берётся из формы для любого вида работы. Раньше не-task
+        # принудительно становился feature, и при заморозке проекта нельзя было
+        # завести ни эпик ошибки, ни фичу-качество с честным типом.
+        work_type=_enum_from_form(WorkType, work_type, "work_type"),
+        freeze_rationale=freeze_rationale,
         priority=priority,
         user_story=user_story,
         problem_statement=problem_statement,
@@ -2689,6 +3074,14 @@ async def web_approve_task(
         # Проверка и её следствие должны стоять рядом: isinstance, спрятанный
         # в булев флаг, не сужает тип на строках ниже — и dict там держался на
         # честном слове автора.
+        if (
+            exc.status_code == 422
+            and isinstance(detail, dict)
+            and detail.get("error") == FREEZE_REFUSED
+        ):
+            # #1594: заморозка проекта объясняется человеку на месте, а не
+            # голым JSON-ответом 422.
+            return _freeze_refused_response(request, task_id, detail)
         if (
             exc.status_code != 422
             or not isinstance(detail, dict)
@@ -3016,7 +3409,7 @@ def _verdict_refusal_text(detail: Any) -> str:
 
 
 def _review_form_error(
-    request: Request, task_id: int, message: str
+    request: Request, task_id: int, message: str, status_code: int = 422
 ) -> HTMLResponse | RedirectResponse:
     """Show a review-form refusal where the reviewer was typing (#1010).
 
@@ -3027,10 +3420,20 @@ def _review_form_error(
     if _is_htmx(request):
         return HTMLResponse(
             f'<div class="task-action-note">{html.escape(message)}</div>',
-            status_code=422,
+            status_code=status_code,
         )
     return RedirectResponse(
         f"/tasks/{task_id}?review_error={quote(message)}", status_code=303
+    )
+
+
+def _is_state_verdict_refusal(exc: HTTPException) -> bool:
+    """403/409 вердикта по задаче-состоянию (#1647) показываются в форме."""
+    detail = exc.detail
+    return (
+        isinstance(detail, dict)
+        and str(detail.get("reason") or "").startswith("state_")
+        and exc.status_code in (403, 409)
     )
 
 
@@ -3042,6 +3445,7 @@ async def web_review_verdict(
     comments: str = Form(""),
     findings_text: str = Form(""),
     acknowledge_repeat: str = Form(""),
+    expected_generation: str = Form(""),
 ):
     """Submit a review verdict from the task card panel (#321).
 
@@ -3084,6 +3488,12 @@ async def web_review_verdict(
             # confirmation has to exist here too — a refusal a human cannot
             # answer where he typed is a wall, not a check.
             acknowledge_repeat=bool(acknowledge_repeat),
+            # #1647: скрытое поле формы state-задачи; у commit-задачи пусто.
+            expected_generation=(
+                int(expected_generation)
+                if expected_generation.strip().isdigit()
+                else None
+            ),
         )
     except ValidationError as exc:
         errors = exc.errors()
@@ -3098,11 +3508,20 @@ async def web_review_verdict(
             body,
             self_approved=self_approved,
             principal_id=identity.principal_id,
+            agent_caller=identity.is_agent,
+            human_caller=identity.is_human,
         )
     except HTTPException as exc:
-        if exc.status_code != 422:
+        if exc.status_code != 422 and not _is_state_verdict_refusal(exc):
             raise
-        return _review_form_error(request, task_id, _verdict_refusal_text(exc.detail))
+        # #1648: отказ по поколению (409) htmx-форма получает со своим кодом, а
+        # не 422: устаревшая форма — конфликт состояния, не ошибка ввода.
+        return _review_form_error(
+            request,
+            task_id,
+            _verdict_refusal_text(exc.detail),
+            status_code=exc.status_code if exc.status_code in (403, 409) else 422,
+        )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
@@ -3642,7 +4061,12 @@ async def web_admin_reset_password(principal_id: int, request: Request):
         return await _render_users_page(
             request, flash_msg="User not found", flash_level="error"
         )
-    await admin_svc.set_password(db, principal_id, new_password)
+    try:
+        await admin_svc.set_password(db, principal_id, new_password)
+    except admin_svc.ServicePasswordError as exc:
+        return await _render_users_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
     await admin_svc.write_audit(
         db,
         actor_id=actor_id,
@@ -3899,6 +4323,7 @@ async def web_admin_create_key(
     principal_id: int = Form(...),
     name: str = Form(...),
     expires_days: int = Form(0),
+    project: str = Form(""),
 ):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
@@ -3910,13 +4335,21 @@ async def web_admin_create_key(
         return await _render_keys_page(
             request, flash_msg="Principal not found", flash_level="error"
         )
-    key_info = await admin_svc.create_api_key(
-        db,
-        principal_id,
-        name=name.strip(),
-        expires_days=expires_days if expires_days > 0 else None,
-        created_by=actor_id,
-    )
+    try:
+        key_info = await admin_svc.create_api_key(
+            db,
+            principal_id,
+            name=name.strip(),
+            expires_days=expires_days if expires_days > 0 else None,
+            created_by=actor_id,
+            projects=[project] if project.strip() else None,
+        )
+    except admin_svc.ApiKeyScopeError as exc:
+        refused = await _render_keys_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
+        refused.status_code = 422
+        return refused
     await admin_svc.write_audit(
         db,
         actor_id=actor_id,

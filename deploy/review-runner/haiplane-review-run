@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+RUID=$(id -u)
+export XDG_RUNTIME_DIR="/run/user/$RUID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$RUID/bus"
+export HOME=/var/lib/haiplane-review
+# Каталог настроек враппера. На хосте хаба это /etc/haiplane-review;
+# переменная нужна затем, чтобы скелет можно было ПРОГНАТЬ на проверке, а
+# не только прочитать глазами.
+CONF=${HAIPLANE_REVIEW_CONF:-/etc/haiplane-review}
+# Образ и срок читаются из файлов, чтобы менять их не правя root-овый
+# скрипт, и ведут себя без файла ПО-РАЗНОМУ — намеренно:
+#   образ: нет файла — ОТКАЗ, подстановка падает и её обрывает set -e;
+#   срок:  нет файла — умолчание, потому что молчаливого запуска БЕЗ срока
+#          жизни отсюда выйти не должно.
+IMAGE=$(cat "$CONF/image")
+# СРОК ЖИЗНИ КОНТЕЙНЕРА — ТО ЖЕ ЧИСЛО, ЧТО HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC.
+# Ставите там не 1800 — впишите то же число в "$CONF/timeout" (шаг 3a):
+# 1800 ниже это умолчание ХАБА, а не «просто число», и разойтись им нельзя.
+TIMEOUT=$(cat "$CONF/timeout" 2>/dev/null || echo 1800)
+# Снимок исходников (#1599). Служба кладёт его в $PWD/src (cwd враппера —
+# каталог прогона), а контейнер видит его в /work/src ТОЛЬКО ДЛЯ ЧТЕНИЯ.
+# Нет каталога src — прежний запуск без монтирования, ни одного лишнего флага.
+# Группа haiplane-review нужна контейнеру, чтобы ПРОЧЕСТЬ файлы 0440: rootless
+# Podman по умолчанию группы пользователя отбрасывает, keep-groups их
+# сохраняет. Метка SELinux — по факту хоста: файл $CONF/src-mount (по
+# умолчанию ro; на хосте с SELinux enforcing — ro,z), см. «Проба снимка».
+SRC_FLAGS=""
+if [ -d "$PWD/src" ]; then
+    case $PWD in *[[:space:]]*) echo "в пути каталога прогона пробел" >&2; exit 64 ;; esac
+    SRC_OPTS=$(cat "$CONF/src-mount" 2>/dev/null || echo ro)
+    SRC_FLAGS="--group-add keep-groups -v $PWD/src:/work/src:$SRC_OPTS --workdir /work"
+fi
+# Хвост ПРОШЛОГО прогона — и только свой. Здесь стояло `podman rm -af`, и
+# это сносило ВСЕ контейнеры пользователя-ревьюера, включая живой прогон
+# соседнего ревью (находка 10.09.2026). Имя адресует уборку одному
+# контейнеру; одновременных прогонов не бывает — их выстраивает в очередь
+# сам хаб (`local_reviewer._HOST_BUDGET`), поэтому контейнер с этим именем
+# на старте может быть только хвостом.
+exec /usr/bin/podman run --rm -i \
+     --replace --name haiplane-review \
+     --cgroup-manager=systemd \
+     --timeout="$TIMEOUT" \
+     --memory=1500m --cpus=1.5 --pids-limit=512 \
+     --env-file="$CONF/model.env" \
+     $SRC_FLAGS \
+     "$IMAGE" "$@"

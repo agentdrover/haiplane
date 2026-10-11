@@ -25,8 +25,8 @@
 
 Agent не делает commit, push, rebase, force-push, merge или branch delete в branch чужой задачи.
 
-- Если для прогресса по задаче `#A` нужен код, который живёт в branch задачи `#B`, корректный путь — дождаться merge `#B` в базовый branch или оформить явное решение человеком через `hub_decide_task` / `needs_decision`.
-- Исключение — явная human decision, зафиксированная через `hub_decide_task`, с указанием reason в audit trail.
+- Если для прогресса по задаче `#A` нужен код, который живёт в branch задачи `#B`, корректный путь — дождаться merge `#B` в базовый branch или оформить явное решение человеком через решение в `needs_decision` (человек: `POST /api/tasks/{id}/decide`).
+- Исключение — явная human decision, зафиксированная через `POST /api/tasks/{id}/decide`, с указанием reason в audit trail.
 
 ### 3. Out-of-scope работа — только draft proposal
 
@@ -54,9 +54,9 @@ Agent не делает commit, push, rebase, force-push, merge или branch de
 
 - **Developer agent**: работает только в branch своей задачи, не трогает чужие branches, предлагает out-of-scope работу через `hub_propose_task`.
 - **Testing agent**: валидация и дополнительные тесты — в том же branch задачи; failed validation → `hub_task_update(..., kind="blocker")`.
-- **Code Reviewer agent**: при неразрешимой неоднозначности оставляет задачу в `needs_decision`, не вызывает `hub_decide_task` сам.
+- **Code Reviewer agent**: при неразрешимой неоднозначности оставляет задачу в `needs_decision`, не принимает решение сам (инструмента решения у него нет).
 - **Architect Analyst agent**: при обнаружении scope creep оформляет новый draft через `hub_propose_task`, не расширяет текущую задачу.
-- **Человек**: единственный, кто может (a) авторизовать касание чужого branch через `hub_decide_task`, (b) принять решение в `needs_decision`, (c) выполнить `hub_approve_task(..., force=true)` или `hub_force_complete_task`.
+- **Человек**: единственный, кто может (a) авторизовать касание чужого branch через `POST /api/tasks/{id}/decide`, (b) принять решение в `needs_decision`, (c) выполнить force approve (`POST /api/tasks/{id}/approve`, `force=true`) или `POST /api/tasks/{id}/force-complete`.
 
 ## Pair mode (path B) — дополнительные правила git
 
@@ -173,5 +173,5 @@ Worktree-изоляция выше её не закрывает: она прим
 ## Аудит
 
 Любое нарушение политики должно быть видимым постфактум:
-- human override — через `hub_decide_task` или force-gate (оставляет audit-update и запись в activity log);
+- human override — через `POST /api/tasks/{id}/decide` или force-gate (оставляет audit-update и запись в activity log);
 - touching foreign branch без override — эскалация human-owner-ом, факт фиксируется в notes.

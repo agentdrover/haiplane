@@ -24,7 +24,14 @@ from hub import db as db_module
 from hub import repository as repo
 from hub import services
 from hub.db import fetchall
-from hub.models import MachineReviewSubmit, MachineReviewView
+from hub.models import (
+    ORIGIN_LOCAL_TEXT,  # noqa: F401 - re-exported
+    ORIGIN_RUN_TEXT,  # noqa: F401 - re-exported
+    MachineReviewSubmit,
+    MachineReviewView,
+    claims_text_origin,
+)
+from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
 log = logging.getLogger("hub")
@@ -33,11 +40,11 @@ log = logging.getLogger("hub")
 # hub_submit_machine_review itself, authenticated as itself. Anything else is
 # the hub transcribing what a run left behind, and says so in the stored row.
 ORIGIN_MCP = "mcp"
-ORIGIN_RUN_TEXT = "cursor-cloud-result"
-# #1180: тот же вид факта — отчёт, переписанный хабом из текста прогона, — но
-# с локального ревьюера. Отдельная метка, а не общая с облачной: канал добычи
-# должен быть виден в данных, иначе метрики сложат два разных источника в один.
-ORIGIN_LOCAL_TEXT = "local-reviewer-result"
+# ORIGIN_RUN_TEXT and ORIGIN_LOCAL_TEXT live in hub.models (#1587): the verdict
+# side must read the same prefixes without importing this module.
+# #1180: ORIGIN_LOCAL_TEXT — тот же вид факта, но с локального ревьюера.
+# Отдельная метка, а не общая с облачной: канал добычи должен быть виден в
+# данных, иначе метрики сложат два разных источника в один.
 
 
 async def _alert_no_candidates(
@@ -91,6 +98,62 @@ async def _alert_no_candidates(
     )
 
 
+async def _retract_no_candidates_alert(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    new_id: int,
+    raw_count: int,
+    principal_id: int | None,
+) -> None:
+    """Снять алерт «харнесс не запускался», когда тот же ревьюер сдал данные (#1584).
+
+    R — первая нулевая строка поколения, та самая, на которую
+    _alert_no_candidates писал алерт. Отзыв — только новая строка ленты: алерт
+    и строки machine_reviews не переписываются. Пишется, когда новая строка N
+    (её id — из текущего INSERT) несёт данные, R не перенесена и принадлежит
+    тому же принципалу, а между R и N у него нет другого неперенесённого
+    отчёта с данными: это и даёт однократность. Приём и отзыв идут в одной
+    write-транзакции (commit — позже в record_machine_review), поэтому
+    однократность держится и для конкурентных приёмов.
+    """
+    if raw_count <= 0 or principal_id is None:
+        return
+    zero = await fetchall(
+        db,
+        "SELECT id, principal_id, carried_from_review_id FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND raw_count=0 "
+        "ORDER BY id LIMIT 1",
+        (task_id, generation),
+    )
+    if not zero:
+        return
+    first = zero[0]
+    if first["carried_from_review_id"] is not None:
+        return
+    if first["principal_id"] != principal_id or int(first["id"]) >= new_id:
+        return
+    between = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND principal_id=? "
+        "AND raw_count>0 AND carried_from_review_id IS NULL "
+        "AND id>? AND id<?",
+        (task_id, generation, principal_id, first["id"], new_id),
+    )
+    if int(between[0]["n"]) != 0:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"По поколению пришёл отчёт с данными #{new_id} от того же ревьюера; "
+        f"алерт по пустому #{first['id']} снят (#1584). Второй отчёт не "
+        "заменяет первый: обе строки приняты.",
+    )
+
+
 async def _alert_environment_refusal(
     db: aiosqlite.Connection, task_id: int, body: MachineReviewSubmit
 ) -> None:
@@ -130,6 +193,23 @@ async def _alert_environment_refusal(
             "не «чисто» (#1238)."
         ),
     )
+
+
+def _refuse_claimed_text_origin(origin: str, body: MachineReviewSubmit) -> None:
+    """#1587: происхождение — факт хаба, а не слова отчёта.
+
+    Контрактный отчёт, чей orchestrator начинается с зарезервированного
+    префикса, выдавал бы себя за переписанный хабом (или сливался бы с ним в
+    метриках и автовердикте) — отказ, а не тихая очистка: автор должен увидеть
+    причину.
+    """
+    if origin == ORIGIN_MCP and claims_text_origin(body.orchestrator):
+        raise HTTPException(
+            422,
+            "orchestrator: префиксы cursor-cloud-result: и "
+            "local-reviewer-result: зарезервированы за хабом — они помечают "
+            "отчёт, переписанный из текста прогона; назовите оркестратор иначе",
+        )
 
 
 async def record_machine_review(
@@ -185,6 +265,7 @@ async def record_machine_review(
     # Where each confirmed finding sits, before anything is stored (#1007):
     # a report that never placed its findings cannot be matched against a diff
     # later, and the gap is invisible once the report is in the ground.
+    _refuse_claimed_text_origin(origin, body)
     services.require_locator_decision(body.findings_confirmed)
     services.refuse_supplied_uid(body.findings_confirmed)
     # #1085: unresolved records carry the same derived id, so they are refused
@@ -207,6 +288,11 @@ async def record_machine_review(
     # #750 showed to be worthless. No dispatch behind the report leaves the
     # profile empty, which reads as "unknown", not as "cheap".
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if dispatch is None and principal_id is not None:
+        # #1408: заказ записан отказом, а его ревьюер отчитался — заказ был.
+        dispatch = await repo.reopen_refused_order_for_report(
+            db, task_id, generation, int(principal_id)
+        )
     profile = (dispatch["profile"] if dispatch is not None else "") or ""
     # #807 forced incomplete=true on a lite run whose SELF-REPORTED spend
     # reached the ceiling. Removed in #893: it never once fired, and could
@@ -243,7 +329,7 @@ async def record_machine_review(
         principal_id=principal_id,
         username=username,
     )
-    await repo.insert_machine_review(
+    new_review_id = await repo.insert_machine_review(
         db,
         task_id=task_id,
         submission_generation=generation,
@@ -293,6 +379,15 @@ async def record_machine_review(
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
     )
+    # #1653: отчёт возвращает в done только ту закрытую по политике строку
+    # (local_review_fallback=off), которой он принадлежит по общему правилу
+    # dispatch_for_report; свипы такую строку уже не видят.
+    from hub.services.review_dispatch import dispatch_for_report
+
+    mine = {"id": new_review_id}
+    owner = await dispatch_for_report(db, task_id, generation, mine)
+    if owner is not None:
+        await repo.settle_policy_closed_dispatch(db, int(owner["id"]), principal_id)
     # #1234: лента приёма — тоже читатель ступени. С одними raw/confirmed/
     # rejected отчёт с нулём подтверждённых и непустым unresolved выглядел в
     # ней ровно как чистый. Ступень — из той же функции, что и на карточке.
@@ -317,6 +412,9 @@ async def record_machine_review(
         },
     )
     await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _retract_no_candidates_alert(
+        db, task_id, generation, new_review_id, raw_count, principal_id
+    )
     await _alert_environment_refusal(db, task_id, body)
 
     # #1012/#1025: the hub may already have called a reviewer for this very
@@ -379,6 +477,24 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
+    await _run_report_automation(db, task_id, task)
+
+    return view
+
+
+async def _run_report_automation(
+    db: aiosqlite.Connection, task_id: int, task: dict
+) -> None:
+    """Всё, что вешается на пришедший отчёт: круг ревью, автовердикт, добор.
+
+    Вынесено из ``record_machine_review`` (стоит на потолке по операторам). Для
+    задачи-состояния (#1647) отчёт записан и виден, а автоматику за ним не
+    запускает ничто: ни автовердикта, ни добора лестницы — ручной отчёт
+    человека остаётся справкой, не триггером.
+    """
+    if automation_not_applicable(task):
+        return
+
     # #1235: круг ревью — сколько поколений подряд автор закрывал находки и
     # получал новые. Считается ЗДЕСЬ, потому что заход виден ровно в момент,
     # когда приходит очередной отчёт с новыми находками: раньше его нет, а
@@ -414,5 +530,3 @@ async def record_machine_review(
         await maybe_top_up_incomplete(db, task_id)
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("review top-up failed for task #%s", task_id)
-
-    return view

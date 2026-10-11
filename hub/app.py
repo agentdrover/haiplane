@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, Literal
 
 import aiosqlite
 import uvicorn
@@ -21,7 +24,10 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import PlainTextResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -33,12 +39,14 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    AgentBootstrap,
     latest_review_freshness,
     DeliveryAcknowledgement,
     DeliveryObservation,
     DeployCallback,
     DeployView,
     ProdStateView,
+    ReleaseBlocksView,
     ChatPairRedeem,
     ChatPairRedeemed,
     ChatPairRevoked,
@@ -80,8 +88,10 @@ from hub.models import (
     TaskCreate,
     TaskProjectRef,
     MachineReviewSubmit,
+    CursorUsageImportRequest,
     MergeLedgerBackfillRequest,
     MachineReviewView,
+    StewardFalseApproveClear,
     StewardJudgementSubmit,
     StewardJudgementView,
     CategoryCheckSubmit,
@@ -89,6 +99,7 @@ from hub.models import (
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
+    PolicyScheduleCreate,
     ProjectPatch,
     ProjectView,
     SkillCreate,
@@ -126,23 +137,25 @@ from hub.actionable_errors import (
 )
 from hub.auth import (
     AuthMiddleware,
-    CSRF_COOKIE_NAME,
     CSRF_FIELD_NAME,
     CSRF_HEADER_NAME,
     _extract_bearer,
     client_ip,
+    cookie_csrf_ok,
+    csrf_exempt_transport,
     current_identity,
     require_admin,
     require_agent_caller,
     require_human_or_admin,
     require_permission,
-    verify_csrf,
 )
+from hub.csrf import CsrfMiddleware, would_reject_count_24h
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_catalog import (
     catalog_snapshot,
+    view_summary,
     check_budget,
     load_baseline,
     load_budget,
@@ -151,7 +164,12 @@ from hub.mcp_catalog import (
 from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
-from hub.services import project_policy
+from hub.services import policy_change, project_policy
+from hub.services.steward_evidence import (
+    KIND_ADVISOR,
+    KIND_VERDICT,
+    stamp_served_packet,
+)
 from hub.services.review_dispatch import cancel_local_runs
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -170,7 +188,7 @@ from hub.services.ac_tests import run_ac_tests
 from hub.services.ci_report import accept_ci_run_report
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
-from hub.services.review_brief import build_review_brief
+from hub.services.review_brief import build_review_brief, reviewer_harness_skill
 from hub.services.tree_output import (
     TreeOutputOptions,
     apply_tree_limits,
@@ -242,6 +260,173 @@ def _register_plugins() -> None:
 _mcp_streamable_app = mcp_server.streamable_http_app()
 
 
+async def _report_stale_env(db: aiosqlite.Connection) -> None:
+    # Мёртвые env-переменные (#964): устаревший префикс — это политика, которую
+    # оператор включил, а код никогда не увидит. Одна запись в ленту на старт,
+    # только имена, и best effort — сигнал не имеет права уронить подъём.
+    stale = config.stale_env_names()
+    if stale:
+        log.warning(
+            "Stale env prefix detected, hub will NOT read: %s", ", ".join(stale)
+        )
+        try:
+            await log_activity(
+                db,
+                "stale_env_detected",
+                "Мёртвые env-переменные: хаб не читает "
+                + ", ".join(stale)
+                + " — политики стоят на дефолтах, мигрируйте префикс",
+            )
+        except Exception:
+            log.exception("stale env activity write failed")
+
+
+async def _recover_after_crash(db: aiosqlite.Connection) -> None:
+    """Захваты и локальные прогоны, оставленные мёртвым процессом (#1195, #1649)."""
+    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
+    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
+    # снятая после него, стоила бы поколению ещё одного круга ожидания.
+    #
+    # Признак точный, а не «наверное»: процесс, который только что поднялся,
+    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
+    # метка захвата в базе оставлена тем, кого больше нет.
+    #
+    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
+    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
+    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
+    # смогло.
+    try:
+        from hub.services.steward_shadow import recover_dead_process_claims
+
+        await recover_dead_process_claims(db)
+    except Exception:
+        log.exception("steward claim recovery failed at startup")
+    # #1649: локальные прогоны советника, оставленные умершим хабом: задание
+    # отозвать, строку закрыть с причиной, повторный запуск не покупать.
+    try:
+        from hub.services.steward_advisor_local import recover_local_advisor_runs
+
+        await recover_local_advisor_runs(db)
+    except Exception:
+        log.exception("local advisor recovery failed at startup")
+
+
+async def _startup_checks(db: aiosqlite.Connection) -> None:
+    """Сообщения и проверки подъёма внутри жизни MCP-менеджера."""
+    if config.HUB_TOKENS:
+        log.info(
+            "Hub auth ENABLED (%d token(s) configured)",
+            len(config.HUB_TOKENS),
+        )
+    else:
+        log.info("Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS to enable)")
+
+    # Workspace git health-check (#455): opt-in network probe so a
+    # broken deploy key on the default workspace is loud, not silent.
+    # Off by default to keep startup (and tests) free of network I/O.
+    if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
+        from hub.services.diagnostics import check_default_workspace_origin
+
+        try:
+            await check_default_workspace_origin()
+        except Exception:
+            log.warning("workspace origin health-check failed", exc_info=True)
+
+    # Bootstrap token guard
+    if config.HUB_BOOTSTRAP_TOKEN:
+        from hub.db import has_active_admin
+
+        if await has_active_admin(db):
+            log.warning(
+                "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                "but an admin already exists. Remove it from the environment "
+                "to prevent unauthorized bootstrap attempts."
+            )
+
+
+def _log_late_step(name: str, step: "asyncio.Future[Any]") -> None:
+    """Результат шага остановки: ошибка названа, а не «never retrieved»."""
+    if step.cancelled():
+        return
+    exc = step.exception()
+    if exc is not None:
+        log.error("shutdown step %s ended with an error", name, exc_info=exc)
+
+
+async def _stop_background(
+    app: FastAPI,
+    poll_task: "asyncio.Task[None]",
+    deadline: float | None = None,
+    steps: "dict[str, Awaitable[Any]] | None" = None,
+) -> None:
+    """Остановка фоновой работы: всё стартует разом и ждётся под ОДНИМ пределом.
+
+    Раньше поллер отменялся без ожидания, задачи reaper/drift/red-base не имели
+    handles, а ожидание наблюдателя egress не имело предела (#1667): одна
+    зависшая задача держала выход процесса часами. Теперь предел общий
+    (``config.STOP_TIMEOUT_SECONDS``), не на задачу; не успевшая названа в логе,
+    остановка идёт дальше.
+
+    ``steps`` — работа остановки, которой нельзя дать урезанный бюджет: снятие
+    локальных прогонов и советников. Она стартует ВМЕСТЕ с отменой задач, а не
+    после неё, и по истечении предела не отменяется (повторная отмена прервала
+    бы отзыв опубликованного задания у службы). Ошибка шага читается и
+    пишется в лог с его именем.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + config.STOP_TIMEOUT_SECONDS
+    step_futures = {n: asyncio.ensure_future(c) for n, c in (steps or {}).items()}
+    handles = dict(getattr(app.state, "background_tasks", None) or {})
+    egress_task = getattr(app.state, "egress_task", None)
+    for name, task in (("hub-poller", poll_task), ("hub-egress-watch", egress_task)):
+        if task is not None and task not in handles.values():
+            handles[name] = task
+    loop = asyncio.get_running_loop()
+    # Only live tasks of THIS loop: the state of a long-lived app object can
+    # still hold handles of an earlier run whose loop is gone.
+    tasks = {
+        n: t
+        for n, t in handles.items()
+        if isinstance(t, asyncio.Future) and t.get_loop() is loop
+    }
+    if not isinstance(poll_task, asyncio.Future):
+        poll_task.cancel()  # a stand-in for the poller, not a task
+    cancelled = {t for t in tasks.values() if not t.done()}
+    for task in cancelled:
+        task.cancel()
+    app.state.background_tasks = {}
+    app.state.egress_task = None
+    waiting = cancelled | set(step_futures.values())
+    pending: set[asyncio.Future[Any]] = set()
+    if waiting:
+        _done, pending = await asyncio.wait(
+            waiting, timeout=max(0.0, deadline - time.monotonic())
+        )
+    by_name = {**tasks, **step_futures}
+    for name, fut in by_name.items():
+        if fut in pending:
+            log.warning(
+                "background task %s did not stop within %ds",
+                name,
+                config.STOP_TIMEOUT_SECONDS,
+            )
+            if fut in step_futures.values():
+                fut.add_done_callback(functools.partial(_log_late_step, name))
+        elif fut.done() and not fut.cancelled():
+            _log_late_step(name, fut)
+
+
+async def _cancel_local_advisors() -> None:
+    # #1649: то же для локальных советников стюарда — задание отзывается,
+    # строка закрывается с причиной, подтверждения хаб не ждёт.
+    try:
+        from hub.services.steward_advisor_local import cancel_local_advisors
+
+        await cancel_local_advisors()
+    except Exception:
+        log.exception("local advisors not cancelled on stop")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.validate_network_auth()
@@ -259,43 +444,8 @@ async def lifespan(app: FastAPI):
     # not a failure.
     set_telemetry_sink(app.state.db)
 
-    # Мёртвые env-переменные (#964): устаревший префикс — это политика, которую
-    # оператор включил, а код никогда не увидит. Одна запись в ленту на старт,
-    # только имена, и best effort — сигнал не имеет права уронить подъём.
-    stale = config.stale_env_names()
-    if stale:
-        log.warning(
-            "Stale env prefix detected, hub will NOT read: %s", ", ".join(stale)
-        )
-        try:
-            await log_activity(
-                app.state.db,
-                "stale_env_detected",
-                "Мёртвые env-переменные: хаб не читает "
-                + ", ".join(stale)
-                + " — политики стоят на дефолтах, мигрируйте префикс",
-            )
-        except Exception:
-            log.exception("stale env activity write failed")
-
-    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
-    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
-    # снятая после него, стоила бы поколению ещё одного круга ожидания.
-    #
-    # Признак точный, а не «наверное»: процесс, который только что поднялся,
-    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
-    # метка захвата в базе оставлена тем, кого больше нет.
-    #
-    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
-    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
-    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
-    # смогло.
-    try:
-        from hub.services.steward_shadow import recover_dead_process_claims
-
-        await recover_dead_process_claims(app.state.db)
-    except Exception:
-        log.exception("steward claim recovery failed at startup")
+    await _report_stale_env(app.state.db)
+    await _recover_after_crash(app.state.db)
 
     poll_task = start_poller(app)
 
@@ -304,45 +454,22 @@ async def lifespan(app: FastAPI):
     mcp_lifespan = _mcp_streamable_app.router.lifespan_context(_mcp_streamable_app)
     try:
         async with mcp_lifespan:
-            if config.HUB_TOKENS:
-                log.info(
-                    "Hub auth ENABLED (%d token(s) configured)",
-                    len(config.HUB_TOKENS),
-                )
-            else:
-                log.info(
-                    "Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS to enable)"
-                )
-
-            # Workspace git health-check (#455): opt-in network probe so a
-            # broken deploy key on the default workspace is loud, not silent.
-            # Off by default to keep startup (and tests) free of network I/O.
-            if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
-                from hub.services.diagnostics import check_default_workspace_origin
-
-                try:
-                    await check_default_workspace_origin()
-                except Exception:
-                    log.warning("workspace origin health-check failed", exc_info=True)
-
-            # Bootstrap token guard
-            if config.HUB_BOOTSTRAP_TOKEN:
-                from hub.db import has_active_admin
-
-                if await has_active_admin(app.state.db):
-                    log.warning(
-                        "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
-                        "but an admin already exists. Remove it from the environment "
-                        "to prevent unauthorized bootstrap attempts."
-                    )
+            await _startup_checks(app.state.db)
             yield
     finally:
-        poll_task.cancel()
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
-        # некому смотреть, и всё это время будет жечь процессор.
-        await cancel_local_runs()
+        # некому смотреть, и всё это время будет жечь процессор. Снятие идёт
+        # ВМЕСТЕ с отменой поллера (#1667): после неё бюджета могло не остаться.
+        await _stop_background(
+            app,
+            poll_task,
+            steps={
+                "local review runs": cancel_local_runs(),
+                "local advisors": _cancel_local_advisors(),
+            },
+        )
         set_telemetry_sink(None)
         await app.state.db.close()
 
@@ -404,6 +531,9 @@ app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lif
 # соединение открывается только для запроса, который дошёл до обработчика, а
 # не для каждого отбитого на пороге (#1065).
 app.add_middleware(RequestConnectionMiddleware)
+# #1664: after authentication (it reads the resolved identity), before the
+# handler and its connection: a refused request never touches the database.
+app.add_middleware(CsrfMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
@@ -465,9 +595,24 @@ async def healthz() -> str:
 
 
 @app.get("/health", response_model=HealthView)
-async def health() -> HealthView:
-    """Public service health snapshot without secrets or subprocess checks."""
-    return build_health()
+async def health(request: Request) -> HealthView:
+    """Public service health snapshot without secrets or subprocess checks.
+
+    ``egress`` is read from the stored state — no network at request time.
+    """
+    from hub.services.egress_watch import egress_status
+
+    view = build_health(await egress_status(_db(request)))
+    count = await would_reject_count_24h(_db(request))
+    view.csrf_would_reject_24h = count
+    if count is None:
+        unknown = (
+            "csrf_would_reject count is unknown: the events table could not be read"
+        )
+        view.csrf_warning = (
+            f"{view.csrf_warning}; {unknown}" if view.csrf_warning else unknown
+        )
+    return view
 
 
 @app.get("/api/whoami", response_model=WhoamiView)
@@ -487,6 +632,31 @@ def _guard_chat_pair_enabled() -> None:
         raise HTTPException(503, detail=chat_pair_auth_required_detail())
 
 
+async def _human_door(request: Request, what: str) -> config.TokenIdentity:
+    """Человек по Bearer или cookie-сессия с верным CSRF — иначе 403 (#961).
+
+    Общая дверь выдачи кода и остановки прогона (#1455): без CSRF любая
+    страница в интернете могла бы нажать за оператора.
+    """
+    identity = current_identity(request)
+    if not identity.is_human:
+        raise HTTPException(403, detail=human_only_gate_detail())
+    if not csrf_exempt_transport(request):
+        presented = request.headers.get(CSRF_HEADER_NAME)
+        if presented is None and "form" in (request.headers.get("content-type") or ""):
+            form = await request.form()
+            value = form.get(CSRF_FIELD_NAME)
+            presented = value if isinstance(value, str) else None
+        if not cookie_csrf_ok(request, presented):
+            raise HTTPException(
+                403,
+                detail=human_only_gate_detail(
+                    f"cookie-authenticated {what} requires a valid CSRF token"
+                ),
+            )
+    return identity
+
+
 async def _chat_pair_issuer(request: Request) -> int:
     """The principal allowed to issue or revoke pairing codes.
 
@@ -494,24 +664,7 @@ async def _chat_pair_issuer(request: Request) -> int:
     valid CSRF token. Without the CSRF check any page on the internet could
     make the operator's browser burn their live code.
     """
-    identity = current_identity(request)
-    if not identity.is_human:
-        raise HTTPException(403, detail=human_only_gate_detail())
-
-    if _extract_bearer(request) is None:
-        presented = request.headers.get(CSRF_HEADER_NAME)
-        if presented is None and "form" in (request.headers.get("content-type") or ""):
-            form = await request.form()
-            value = form.get(CSRF_FIELD_NAME)
-            presented = value if isinstance(value, str) else None
-        if not verify_csrf(presented, request.cookies.get(CSRF_COOKIE_NAME, "")):
-            raise HTTPException(
-                403,
-                detail=human_only_gate_detail(
-                    "cookie-authenticated pairing requires a valid CSRF token"
-                ),
-            )
-
+    identity = await _human_door(request, "pairing")
     if identity.principal_id is None:
         # An env-token identity has no principal to attribute the session to,
         # and a session without an owner could not be revoked by anyone.
@@ -583,6 +736,8 @@ async def api_chat_pair_start(request: Request) -> ChatPairStartView:
         principal_id,
         kind=payload.kind,
         bound_task_id=bound_task_id,
+        channel=payload.channel,
+        slot=payload.slot,
     )
     await admin_svc.write_audit(
         _db(request),
@@ -741,6 +896,21 @@ async def api_create_task(body: TaskCreate, request: Request, response: Response
     return outcome.task
 
 
+@app.post("/api/prod-defects", response_model=models.ProdDefectFiled)
+async def api_file_prod_defect(body: models.ProdDefectCreate, request: Request):
+    """File a production defect in one call (#915): a draft that passes DoR.
+
+    The author kind comes from the token, never from the body (#360). The
+    draft waits for approval whoever files it — see ``services.prod_defect``.
+    """
+    from hub.services.prod_defect import file_prod_defect
+
+    source = (
+        TaskSource.human if current_identity(request).is_human else TaskSource.agent
+    )
+    return await file_prod_defect(_db(request), body, source=source)
+
+
 @app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
 async def api_create_subtasks_bulk(
     parent_id: int,
@@ -856,66 +1026,6 @@ async def api_list_projects(
     return [await _project_view(r) for r in rows]
 
 
-async def _refuse_unrunnable_review(db, before, fields: dict) -> None:
-    """Не хранить как исполнимую политику, исполнить которую нельзя (#1119).
-
-    ``review=dispatch`` там, где ревью НЕЧЕМ добыть, — не «попробуем», а
-    гарантированный отказ на КАЖДОЙ сдаче. Отказать на записи дешевле: тут
-    есть кому прочитать причину.
-
-    #1188: «нечем» перестало означать «не тот форж». До #1180 других способов
-    не было, и проверка форжа была этим вопросом целиком; после — локальный
-    ревьюер работает на любом форже, и инвариант, оставшийся на старом
-    признаке, отказывал В ЗАПИСИ политике, которую хаб уже умел ИСПОЛНЯТЬ.
-    Включить ревью на GitVerse-проекте было нельзя ни через UI, ни через API.
-    Поэтому вопрос задаётся общему читателю (review_dispatch.review_reach) —
-    тому же, которого спрашивают диспетчер и форма проекта.
-
-    Инвариант, а не проверка поля, — и в этом была ошибка первой редакции
-    (найдено ревью, отчёт #201). Она стояла внутри ветки ``gate_policy`` и
-    поэтому смотрела только на патч политики. PATCH, который менял ОДИН
-    ``forge``, проходил мимо: проект с ``review=dispatch`` на GitHub
-    переключался на GitVerse и сохранял политику, которую больше нельзя
-    исполнить. Запрещённое состояние достижимо двумя дорогами, и закрывать
-    надо обе — поэтому оба значения берутся ПОСЛЕ патча, каждое из патча,
-    если оно там есть, иначе из строки.
-    """
-    import json as _json
-
-    from hub.services.review_dispatch import review_reach
-
-    if "forge" not in fields and "gate_policy" not in fields:
-        return
-    if "gate_policy" in fields and fields["gate_policy"] is not None:
-        review_after = str(
-            _json.loads(fields["gate_policy"]).get("review") or ""
-        ).strip()
-    else:
-        review_after = str(
-            project_policy.gate_policy_of(before).get("review") or ""
-        ).strip()
-    forge_after = str(fields.get("forge") or project_policy.forge_of(before)).strip()
-    if review_after != "dispatch":
-        return
-    reach = await review_reach(db, forge_after)
-    if reach.runnable:
-        return
-    raise HTTPException(
-        422,
-        {
-            # Имя кода сменилось вместе со смыслом (#1188): «форж не тот» было
-            # ЕДИНСТВЕННОЙ причиной, пока способ добычи был один. Оставить
-            # старое имя значило бы назвать отказ по недостающей конфигурации
-            # проблемой форжа — то есть отправить человека чинить не то.
-            "error": "review_unrunnable_here",
-            "hint": (
-                reach.reason + ". Пока способа нет, поле review принимает только off; "
-                "вердикт в любом случае остаётся за человеком"
-            ),
-        },
-    )
-
-
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
 async def api_patch_project(
     project_id: int,
@@ -924,9 +1034,6 @@ async def api_patch_project(
     _identity=Depends(require_human_or_admin),
 ):
     db = _db(request)
-    before = await repo.get_project(db, project_id)
-    if before is None:
-        raise HTTPException(404, "project not found")
     fields = body.model_dump(exclude_unset=True)
     if (
         "default_branch_policy" in fields
@@ -935,54 +1042,36 @@ async def api_patch_project(
         import json as _json
 
         fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
-    if "gate_policy" in fields and fields["gate_policy"] is not None:
-        import json as _json
-
-        # #743: the hub never weakens oversight over itself — the default
-        # project (the hub's own repo) refuses any DELEGATING value at the
-        # gate keys, from any token. The rule lives here rather than in the
-        # model because it needs to know WHICH project is being patched.
-        # #760 keeps the check on the two GATE keys by name: the policy now
-        # also carries a path map and a ceiling, and "any value equals auto"
-        # would quietly start meaning something else as keys are added.
-        #
-        # #1151: сравнение шло ровно со строкой "auto", и появление второго
-        # делегирующего значения сделало бы замок обходимым одним словом —
-        # verdict=steward на default включил бы на репозитории самого хаба
-        # ту автоматику, которую этот замок и запрещает. Теперь читается тот
-        # же перечень, что и у потребителей политики: новый делегат
-        # закрывается здесь в тот же момент, когда открывается там.
-        if before["slug"] == "default" and any(
-            fields["gate_policy"].get(gate) in project_policy.DELEGATED_VERDICTS
-            for gate in ("dor", "verdict")
-        ):
-            raise HTTPException(
-                422,
-                {
-                    "error": "default_project_gate_locked",
-                    "hint": (
-                        "проект default (сам хаб) не принимает делегирование "
-                        "ни на одном гейте — ни автопилоту, ни стюарду; "
-                        "политика default всегда human"
-                    ),
-                },
-            )
-        fields["gate_policy"] = _json.dumps(fields["gate_policy"])
-    await _refuse_unrunnable_review(db, before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
-    if fields:
-        await repo.update_project(db, project_id, **fields)
-        if fields.get("status") == "active" and before["status"] != "active":
-            # Events feed (#349): a pending proposal became a real project.
-            await repo.insert_event(
+    # #1593: политика читается и пишется в ОДНОЙ write-транзакции — ту же,
+    # в которой поллер исполняет отложенную правку, поэтому ни одна из двух
+    # не затирает другую. Слияние, замок #743 и проверка исполнимости review —
+    # общий путь hub/services/policy_change.py, а не копия для расписания.
+    try:
+        async with write_transaction(db):
+            before = await repo.get_project(db, project_id)
+            if before is None:
+                raise HTTPException(404, "project not found")
+            await policy_change.apply_project_fields(
                 db,
-                kind="project_activated",
-                project_id=project_id,
+                before,
+                fields,
                 actor="human",
-                payload={"slug": before["slug"]},
+                by=getattr(_identity, "username", "") or "",
             )
-        await db.commit()
+            if fields.get("status") == "active" and before["status"] != "active":
+                # Events feed (#349): a pending proposal became a real project.
+                await repo.insert_event(
+                    db,
+                    kind="project_activated",
+                    project_id=project_id,
+                    actor="human",
+                    payload={"slug": before["slug"]},
+                )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    fields.pop("policy_version", None)
     row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     # #887: the branch keys reach the clone in the same operation that changed
     # them. Before this, the hook kept protecting the previous branch until the
@@ -1012,6 +1101,259 @@ async def api_list_digests(
             d["payload"] = {}
         out.append(d)
     return out
+
+
+@app.post("/api/tasks/{task_id}/executor-merge")
+async def api_executor_merge(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Прогон «слей базу и пересдай» (#1445, F5.3).
+
+    Те же двери, что у запуска #1412 и повторного прогона #1444: только
+    человек или админ, CSRF для cookie, принципал. Отказ — 409 с причиной.
+    """
+    from hub.services.executor_launch import merge_executor
+
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    result = await merge_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(issuer),
+        issuer=current_identity(request).username,
+    )
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
+
+
+@app.post("/api/tasks/{task_id}/executor-stop")
+async def api_executor_stop(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Остановить идущий прогон исполнителя задачи (#1455).
+
+    Только человек или админ, CSRF для cookie — те же двери, что у запуска.
+    Отмена — существующая, с повторами (#1411); ответ говорит, подтверждена
+    ли она уже (``confirmed``) или её держит поллер. Нет прогона — 409.
+    """
+    from hub.services.executor_dispatch import stop_executor_run
+
+    identity = await _human_door(request, "executor stop")
+    result = await stop_executor_run(_db(request), task_id, actor=identity.username)
+    if not result.accepted:
+        raise HTTPException(409, detail={"reason": result.reason, "task_id": task_id})
+    return {
+        "task_id": task_id,
+        "row_id": result.row_id,
+        "outcome": result.outcome,
+        "cancel_intent": result.cancel_intent,
+        "confirmed": result.confirmed,
+        "reason": result.reason,
+    }
+
+
+@app.post("/api/tasks/{task_id}/executor-repair")
+async def api_executor_repair(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Повторный прогон исполнителя по находкам ревью (#1444, F5.2).
+
+    Те же двери, что у запуска #1412: только человек или админ, CSRF для
+    cookie, принципал. Отказ — 409 с причиной, задача не тронута.
+    """
+    from hub.services.executor_launch import repair_executor
+
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    result = await repair_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(issuer),
+        issuer=current_identity(request).username,
+    )
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
+
+
+@app.get("/api/projects/{slug}/effective-policy")
+async def api_effective_policy(slug: str, request: Request) -> dict:
+    """Действующая политика проекта одной сводкой (#1457).
+
+    Каждый ключ gate_policy со значением, источником (project, default или
+    server) и умолчанием; запрошенный и эффективный режим стюарда с причинами
+    отказа act; настройки сервера без секретов; замки; последняя правка.
+    Читает тех же читателей, что решатели, и ничего не пишет.
+    """
+    from hub.services import effective_policy
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await effective_policy.effective_policy(db, project)
+
+
+@app.get("/api/projects/{slug}/agent-bootstrap", response_model=AgentBootstrap)
+async def api_agent_bootstrap(slug: str, request: Request) -> AgentBootstrap:
+    """Стартовый пакет проекта: первое сообщение агенту без credentials (#1631).
+
+    Запрос здесь не читается — ни bearer, ни cookie: пакет строится из
+    проекта, навыков и политики. Доступ — по существующим гейтам ролей.
+    """
+    from hub.services import agent_bootstrap
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await agent_bootstrap.build_agent_bootstrap(db, project)
+
+
+async def _project_by_slug_or_404(request: Request, slug: str):
+    return _row_or_404(
+        await repo.get_project_by_slug(_db(request), slug), "project not found"
+    )
+
+
+@app.post("/api/projects/{slug}/policy-schedule", status_code=201)
+async def api_create_policy_schedule(
+    slug: str,
+    body: PolicyScheduleCreate,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+) -> dict:
+    """Запланировать правку политики проекта на момент ``at`` (#1593).
+
+    Только человек — тот же уровень прав, что у PATCH проекта. Кусок
+    проверяется сейчас на слиянии с ТЕКУЩЕЙ политикой (замок #743,
+    исполнимость review); в срок хаб исполнит его тем же общим путём, что и
+    PATCH, и запишет «было → стало». Агенты расписание не создают.
+    """
+    project = await _project_by_slug_or_404(request, slug)
+    db = _db(request)
+    try:
+        change_id = await policy_change.create_scheduled_change(
+            db,
+            project,
+            at=body.at,
+            patch=body.patch,
+            note=body.note,
+            created_by=getattr(_identity, "username", "") or "",
+        )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    row = await repo.get_scheduled_policy_change(db, change_id)
+    return policy_change.view_row(row)
+
+
+@app.get("/api/projects/{slug}/policy-schedule")
+async def api_list_policy_schedule(
+    slug: str,
+    request: Request,
+    state: str | None = Query(
+        default=None, pattern="^(pending|applied|refused|cancelled)$"
+    ),
+) -> list[dict]:
+    """Записи расписания проекта в порядке исполнения; только чтение (#1593)."""
+    project = await _project_by_slug_or_404(request, slug)
+    rows = await repo.list_scheduled_policy_changes(
+        _db(request), int(project["id"]), state=state
+    )
+    return [policy_change.view_row(r) for r in rows]
+
+
+@app.post("/api/projects/{slug}/policy-schedule/{change_id}/cancel")
+async def api_cancel_policy_schedule(
+    slug: str,
+    change_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+) -> dict:
+    """Отменить ожидающую запись расписания; исполненную — нельзя (#1593)."""
+    project = await _project_by_slug_or_404(request, slug)
+    db = _db(request)
+    try:
+        await policy_change.cancel_scheduled_change(
+            db,
+            project,
+            change_id,
+            by=getattr(_identity, "username", "") or "",
+        )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    row = await repo.get_scheduled_policy_change(db, change_id)
+    return policy_change.view_row(row)
+
+
+@app.get("/api/projects/{slug}/path")
+async def api_project_path(slug: str, request: Request, days: int = 30) -> dict:
+    """Критический путь по эпикам и очередь с причинами (#1527).
+
+    Один расчёт на страницу проекта, входящие и hub_my_context: путь по
+    depends_on с весом в шагах (не днях), узкое место, шаги человека, очередь
+    по группам и следующая задача по правилу очереди оркестратора. Ничего не
+    пишет.
+    """
+    from hub.services import project_path
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await project_path.compute(db, project, days=max(1, min(days, 365)))
+
+
+@app.post("/api/projects/{slug}/executor-launch")
+async def api_executor_launch(
+    slug: str,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Запустить облачного исполнителя на задачу из очереди F1 (#1412, F2.4).
+
+    Только человек или админ: в режиме manual кнопку жмёт человек, и код
+    implementer выписывается от ЕГО имени — агентского пути «запусти себе
+    исполнителя» нет (F4 #1368). Отказ — 409 с названной причиной, провайдер
+    при этом не зван.
+    """
+    from hub.services.executor_launch import launch_executor
+
+    # Те же двери, что у выдачи кода руками (#961): запуск выписывает код
+    # implementer от имени человека, и cookie-сессия без CSRF дала бы любой
+    # странице в интернете заказать исполнителя за счёт владельца.
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    db = _db(request)
+    project = await repo.get_project_by_slug(db, slug)
+    if project is None:
+        raise HTTPException(404, detail=f"project {slug!r} not found")
+    result = await launch_executor(db, project, issuer_principal_id=int(issuer))
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
 
 
 @app.post("/api/digests/{digest_id}/audit")
@@ -1307,10 +1649,41 @@ async def api_provision_project(
 async def api_practice_metrics(
     request: Request,
     since_days: int = Query(default=90, ge=1, le=3650),
+    project: str | None = Query(default=None, max_length=100),
+    model: str | None = Query(default=None, max_length=200),
+    date_from: str | None = Query(default=None, max_length=10),
+    date_to: str | None = Query(default=None, max_length=10),
+    compare: bool = False,
+    series: bool = False,
+    series_days: int = Query(default=7, ge=1, le=365),
 ):
     """Practice metrics (#384): review economics, harness versions,
-    recurring finding categories, cycle times."""
-    return await services.practice_metrics(_db(request), since_days=since_days)
+    recurring finding categories, cycle times.
+
+    ``project`` (slug), ``model`` (the REVIEWER model; ``не заявлена`` is the
+    group with none recorded), ``date_from``/``date_to`` (YYYY-MM-DD, the last
+    day included, replacing ``since_days``), ``compare`` (previous window of
+    the same length, deltas, ranked problem spots) and ``series`` (indicators
+    per ``series_days`` bucket) are optional (#1490); without them the answer
+    is unchanged. The answer always carries ``events_history`` (#1621):
+    ``retention_days``, ``history_from`` (now − retention, UTC), the windows
+    that start before it (``windows_beyond_history``) and the sections that
+    read ``events`` (``events_sections``, with ``own_window``).
+    """
+    try:
+        return await services.practice_metrics(
+            _db(request),
+            since_days=since_days,
+            project=project,
+            model=model,
+            date_from=date_from,
+            date_to=date_to,
+            compare=compare,
+            series=series,
+            series_days=series_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/metrics/mcp-usage")
@@ -1330,7 +1703,9 @@ async def api_mcp_usage(
     answers a 365-day question from a 120-day table would look complete and be
     wrong.
     """
-    catalog = await catalog_snapshot() if include_catalog else None
+    # Usage looks at the FULL catalog: a hidden tool nobody called is still a
+    # tool, and unused_tools must see it (#1624).
+    catalog = await catalog_snapshot("full") if include_catalog else None
     return await usage_report(_db(request), window_days=window_days, catalog=catalog)
 
 
@@ -1341,13 +1716,24 @@ async def api_mcp_catalog(request: Request):
     The same check CI runs, served live so the cost of the surface is visible
     without reading a workflow log.
     """
-    snapshot = await catalog_snapshot()
+    snapshot = await catalog_snapshot("agent")
     # measured is what makes the answer say how much of the declared headroom
     # is gone, not merely how much room is left (#832). Without it the API
     # reported nulls while CI printed real percentages — the same check
     # answering differently depending on where you looked at it.
     result = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
-    return {**result, "tools_list": snapshot["tools_list"]}
+    # The budget and the top-level numbers are the AGENT view (what every agent
+    # turn pays). The human view is beside it, not mixed in (#1624).
+    full = await catalog_snapshot("full")
+    return {
+        **result,
+        "tools_list": snapshot["tools_list"],
+        "view": "agent",
+        "views": {
+            "agent": view_summary(snapshot),
+            "full": view_summary(full),
+        },
+    }
 
 
 @app.post("/api/metrics/category-checks")
@@ -1377,15 +1763,33 @@ async def api_record_category_check(
 
 
 @app.get("/api/metrics/outcome-debt")
-async def api_outcome_debt(request: Request):
+async def api_outcome_debt(
+    request: Request,
+    status: Literal["overdue", "observing", "unknown", "answered"] | None = Query(
+        default=None
+    ),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    offset: int | None = Query(default=None, ge=0),
+    only_counts: bool = Query(default=False),
+):
     """Outcome promises and the answers to them (#766, #819).
 
     ``items`` are the tasks nobody has come back to; ``answered`` are the ones
     somebody has, with the last verdict and what was measured. Both counts are
     reported: a list that could only grow measured the age of the backlog, not
     the habit of checking.
+
+    Without parameters the full payload (#1605); with ``status``/``limit``/
+    ``offset`` one page of one status plus the counters, with ``only_counts``
+    the counters alone.
     """
-    return await services.outcome_debt(_db(request))
+    return await services.outcome_debt(
+        _db(request),
+        status=status,
+        limit=limit,
+        offset=offset,
+        only_counts=only_counts,
+    )
 
 
 @app.post("/api/tasks/{task_id}/finding-dispositions")
@@ -1529,6 +1933,41 @@ async def api_get_task(task_id: int, request: Request):
     return await services.enrich_task_view(db, task_view)
 
 
+@app.get("/api/tasks/{task_id}/evidence", response_model=list[models.TaskEvidenceView])
+async def api_task_evidence(
+    task_id: int, request: Request, generation: int | None = None
+):
+    """Доказательства сдач задачи-состояния по поколениям (#1647).
+
+    Пусто у commit-задачи и у state-задачи, которую ещё не сдавали. Строки
+    только читаются: таблица insert-only, ни правки, ни удаления через API нет.
+    """
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return [
+        models.TaskEvidenceView(**dict(row))
+        for row in await repo.list_task_evidence(db, task_id, generation)
+    ]
+
+
+@app.get("/api/tasks/{task_id}/verdict-route")
+async def api_get_verdict_route(task_id: int, request: Request, observe: bool = False):
+    """Who will write the verdict for the current submission (#1440).
+
+    The same answer the task card, the review brief and ``hub_task_status``
+    carry. ``observe=true`` asks the deciders' own questions in full, including
+    the branch tip and diff over the network; the default does not touch it and
+    says so in ``condition``.
+    """
+    from hub.services.verdict_route import verdict_route
+
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return (await verdict_route(db, task_id, observe=observe)).as_dict()
+
+
 # --- Task dependencies (#486, epic #478) ------------------------------------
 #
 # The graph existed since #482 but only code inside the hub could write to it,
@@ -1620,6 +2059,24 @@ async def api_list_task_dependencies(task_id: int, request: Request):
     )
 
 
+@app.get("/api/orchestrator/next")
+async def api_orchestrator_next(
+    request: Request, project: str = Query(default="")
+) -> dict:
+    """Какую задачу хаб взял бы следующей и почему ждут остальные (#1274).
+
+    С ``project`` — ответ этого проекта в любом режиме; без него — ответы
+    всех проектов с ``orchestrator_queue=shadow``. Только чтение: событие
+    кандидата пишет поллер, а не этот вызов.
+    """
+    from hub.services.orchestrator_queue import next_tasks
+
+    answers = await next_tasks(_db(request), project.strip() or None)
+    if answers is None:
+        raise HTTPException(404, detail=f"project {project!r} not found")
+    return {"projects": answers}
+
+
 @app.post("/api/tasks/{task_id}/archive", response_model=TaskView)
 async def api_archive_task(
     task_id: int,
@@ -1709,6 +2166,38 @@ async def api_task_tree(
     if truncated:
         response.headers["X-Hub-Truncated"] = "true"
     return limited
+
+
+async def _context_path_brief(
+    request: Request,
+    db: aiosqlite.Connection,
+    project_row: Any,
+    breadcrumb: list[dict[str, Any]],
+    siblings: list[dict[str, Any]],
+    children: list[dict[str, Any]],
+    mode: str,
+) -> dict[str, Any]:
+    """Блок «что дальше» для /context (#1643) в границах видимости вызывающего.
+
+    Сессия implementer читает только свою задачу, поэтому ей видно то, что
+    /context и так показывает: задача, предки, соседи, дети. Остальные
+    вызывающие получают блок целиком.
+    """
+    from hub.services import project_path as project_path_service
+
+    identity = getattr(request.state, "identity", None)
+    visible: set[int] | None = None
+    if (
+        identity is not None
+        and identity.auth_source == "chat_pair"
+        and identity.chat_pair_kind == "implementer"
+    ):
+        visible = {
+            int(n["id"]) for n in [*breadcrumb, *siblings, *children] if "id" in n
+        }
+    return await project_path_service.task_path_brief(
+        db, project_row, breadcrumb, summary=mode == "summary", visible=visible
+    )
 
 
 @app.get("/api/tasks/{task_id}/context", response_model=TaskContextView)
@@ -1895,6 +2384,27 @@ async def api_task_context(
     )
     if missing_required:
         lines.append(f"  Missing required: {', '.join(missing_required)}")
+    # #1630: «Правила работы» — тот же блок, что в pair-start. Чтение файла
+    # правил ничего не пишет; в summary тексты слоёв опущены.
+    from hub.services import working_rules as working_rules_service
+
+    working_rules = await working_rules_service.build_working_rules(
+        db, task_id, summary=mode == "summary"
+    )
+    rules_text = working_rules_service.render_working_rules(
+        working_rules,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
+    )
+    path_brief = await _context_path_brief(
+        request, db, project_row, breadcrumb, siblings, children, mode
+    )
+    if mode == "summary":
+        # Сводка стоит в начале: потолок режет хвост, и место под правила
+        # занято до сокращения остального контекста.
+        lines.insert(2, rules_text)
+    else:
+        lines.append("")
+        lines.append(rules_text)
     if mode == "full":
         lines.append("")
         lines.extend(lifecycle_map_lines())
@@ -1917,7 +2427,30 @@ async def api_task_context(
         "task": task_view,
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
+        "working_rules": working_rules,
+        "path_brief": path_brief,
     }
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """422 тела запроса. Для сдачи значения запроса в ответ не попадают (#1647).
+
+    Внешнее тело сдачи state-задачи несёт evidence, а в observed может лежать
+    секрет: стандартный ответ pydantic возвращает ``input`` целиком. Для этого
+    маршрута остаются место и вид ошибки; остальные маршруты — как были.
+    """
+    if request.url.path.endswith("/submit-review"):
+        errors = [
+            {
+                "loc": list(e.get("loc", ())),
+                "type": e.get("type", ""),
+                "msg": e.get("msg", ""),
+            }
+            for e in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)
@@ -1925,14 +2458,21 @@ async def api_submit_for_review(
     task_id: int,
     request: Request,
     body: TaskSubmitReview | None = None,
+    identity=Depends(current_identity),
 ):
     """Submit the current work of a pair task for client-driven review (#307).
 
     Canonical REST operation behind hub_submit_for_review and the
     ``oc-hub submit-review`` CLI: running pair task → status=review with a
     bumped submission generation.
+
+    State tasks (#1647) are submitted with ``evidence`` — one record per AC —
+    and their author is the authenticated principal: ``agent`` in the body is
+    only a signature.
     """
-    return await services.submit_for_review(_db(request), task_id, body)
+    return await services.submit_for_review(
+        _db(request), task_id, body, principal_id=identity.principal_id
+    )
 
 
 @app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)
@@ -1991,7 +2531,9 @@ async def api_review_verdict(
 
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
-    ``running``; this endpoint never completes a task.
+    ``running``; for a commit task this endpoint never completes it. A state
+    task (result_kind=state, #1647) is completed by a human APPROVED with the
+    right ``expected_generation`` (event via=state_approved).
 
     Finding scope (#435): each finding carries ``scope``
     (in_scope|out_of_scope, default in_scope) and an optional
@@ -2020,15 +2562,25 @@ async def api_review_verdict(
         body,
         self_approved=self_approved,
         principal_id=identity.principal_id,
+        agent_caller=identity.is_agent,
+        # #1647: APPROVED по задаче-состоянию — только от человека; признак
+        # берётся из аутентифицированной личности, а не из тела запроса.
+        human_caller=identity.is_human,
     )
 
 
 @app.post("/api/tasks/{task_id}/run-ac-tests")
-async def api_run_ac_tests(task_id: int, request: Request):
+async def api_run_ac_tests(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
     """Run the tests bound to a task's verifiable_by=test AC and record them (#507).
 
     Best-effort: an unavailable workspace records ``not_found`` rather than a
     false ``fail``. Results are stamped with the current submission_generation.
+    Human-only (#1646): it executes test code on the hub host, and the refusal
+    comes before the task lookup, the runner and any write.
     """
     db = _db(request)
     if not await repo.get_task(db, task_id):
@@ -2037,12 +2589,27 @@ async def api_run_ac_tests(task_id: int, request: Request):
 
 
 @app.post("/api/tasks/{task_id}/run-validation")
-async def api_run_validation(task_id: int, request: Request):
-    """Run a task's declared validation_commands and record the result (#509)."""
+async def api_run_validation(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Run a task's declared validation_commands and record the result (#509).
+
+    Human-only (#1646): the commands run as a shell on the hub host.
+    """
     db = _db(request)
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return await run_validation_commands(db, task_id)
+
+
+@app.get("/api/release-blocks", response_model=ReleaseBlocksView)
+async def api_release_blocks(request: Request):
+    """Open release alerts (#1420): one indexed query, no delivery walk."""
+    from hub.services.release_alert import active_release_blocks
+
+    return ReleaseBlocksView(release_blocks=await active_release_blocks(_db(request)))
 
 
 @app.get("/api/prod-state", response_model=ProdStateView)
@@ -2236,6 +2803,23 @@ async def api_deliver_delivery_discrepancy(
         ) from exc
 
 
+async def _enforce_ci_scope(db, identity, project_slug, *, entrance: str) -> None:
+    """403 when the key may not speak for this project (#1644)."""
+    from hub.services import ci_scope
+
+    try:
+        await ci_scope.enforce_ci_project_scope(
+            db, identity, project_slug, entrance=entrance
+        )
+    except ci_scope.CIScopeRefused as exc:
+        raise HTTPException(
+            403,
+            detail=enrich_error_payload(
+                {"reason": exc.reason, "actor_hint": "human", "message": exc.message}
+            ),
+        ) from None
+
+
 @app.post("/api/deploys", response_model=DeployView)
 async def api_record_deploy(
     body: DeployCallback,
@@ -2254,8 +2838,11 @@ async def api_record_deploy(
     redelivers the same callback. Two rows would claim two deploys.
     """
     db = _db(request)
-    project_id = None
     slug = (body.project or "").strip()
+    # #1644: before any lookup or write — a key bound to a project records
+    # deploys of that project only, and must name it.
+    await _enforce_ci_scope(db, identity, slug or None, entrance="deploy")
+    project_id = None
     if slug:
         project = await repo.get_project_by_slug(db, slug)
         if not project:
@@ -2269,6 +2856,7 @@ async def api_record_deploy(
         ref=body.ref,
         status=body.status,
         source=identity.username or "ci",
+        backup=body.backup,
     )
     # #883: bring the deployed commit into the workspace now, once per deploy,
     # instead of on every card render. Best-effort by contract: the rollout has
@@ -2285,7 +2873,64 @@ async def api_record_deploy(
     row = await repo.release_by_id(db, release_id)
     if row is None:  # pragma: no cover - the row was just written
         raise HTTPException(500, "release was written but could not be read back")
+    row["backup"] = row.get("backup") or "неизвестно"
     return DeployView(**row)
+
+
+async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
+    """Guard and store one CI report; the caller holds the write transaction."""
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise HTTPException(404, "task not found")
+    # #1644: the project check comes before the stale check and before every
+    # write — a report from a key of another project changes nothing.
+    # Authorization reads the REAL binding: routing would send an inactive
+    # project to default, and a "default" key must not inherit that.
+    project_row = await repo.resolve_bound_project(db, task_id)
+    bound = dict(project_row) if project_row is not None else None
+    await _enforce_ci_scope(
+        db,
+        identity,
+        str(bound["slug"]) if bound else "default",
+        entrance="ci_report",
+    )
+    current_generation = dict(row).get("submission_generation") or 0
+    if (
+        body.submission_generation is not None
+        and body.submission_generation != current_generation
+    ):
+        raise HTTPException(
+            409,
+            f"stale report: sent for submission #{body.submission_generation}, "
+            f"current is #{current_generation}",
+        )
+    sent = body.model_fields_set
+    try:
+        result = await accept_ci_run_report(
+            db,
+            task_id,
+            head_sha=body.head_sha,
+            ac_results=body.ac_results,
+            validation_status=body.validation_status,
+            validation_log=body.validation_log,
+            reason=body.reason,
+            # #1644: the name is the key's principal; ``body.reported_by`` is the
+            # client's claim and decides nothing.
+            reported_by=identity.username,
+            checks=body.checks,
+            # #1606: a key the reporter did not send is NOT an empty object —
+            # the step behind it did not run, and what the hub already stored
+            # for this commit must survive. The model's defaults hide the
+            # difference; model_fields_set keeps it.
+            mutations=body.mutations if "mutations" in sent else None,
+            baseline=body.baseline if "baseline" in sent else None,
+            commit=False,
+        )
+    except LookupError:
+        raise HTTPException(404, "task not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return result
 
 
 @app.post("/api/tasks/{task_id}/ci-run-report", response_model=CIRunReportResult)
@@ -2308,36 +2953,11 @@ async def api_ci_run_report(
     a task or write a verdict.
     """
     db = _db(request)
-    row = await repo.get_task(db, task_id)
-    if row is None:
-        raise HTTPException(404, "task not found")
-    current_generation = dict(row).get("submission_generation") or 0
-    if (
-        body.submission_generation is not None
-        and body.submission_generation != current_generation
-    ):
-        raise HTTPException(
-            409,
-            f"stale report: sent for submission #{body.submission_generation}, "
-            f"current is #{current_generation}",
-        )
-    try:
-        result = await accept_ci_run_report(
-            db,
-            task_id,
-            head_sha=body.head_sha,
-            ac_results=body.ac_results,
-            validation_status=body.validation_status,
-            validation_log=body.validation_log,
-            reason=body.reason,
-            reported_by=body.reported_by or identity.username,
-            checks=body.checks,
-            mutations=body.mutations,
-        )
-    except LookupError:
-        raise HTTPException(404, "task not found") from None
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+    # #1644: the project of the task, the key's scope, the generation and the
+    # UPSERT are read and written under ONE write transaction. Without it the
+    # epic's project could change between the guard and the write.
+    async with write_transaction(db):
+        result = await _accept_ci_report_checked(db, identity, task_id, body)
     return CIRunReportResult(**result)
 
 
@@ -2368,8 +2988,15 @@ async def api_steward_evidence(
     asked = services.steward_pinned_generation(
         identity, dict(row) if row is not None else {"id": task_id}, generation
     )
+    # #1601: дверь открывает заказ ТОГО вида, которому принадлежит сессия:
+    # судья читает под заказом вердикта, советник — под заказом советника.
+    run_kind = (
+        KIND_ADVISOR
+        if getattr(identity, "chat_pair_kind", None) == "steward_advisor"
+        else KIND_VERDICT
+    )
     if identity.is_steward and not await services.steward_open_run_exists(
-        db, task_id, asked
+        db, task_id, asked, run_kind
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -2380,6 +3007,8 @@ async def api_steward_evidence(
     packet = await services.build_evidence_packet(db, task_id, asked)
     if packet is None:
         raise HTTPException(404, "task not found")
+    if identity.is_steward:
+        await stamp_served_packet(db, task_id, asked, run_kind, packet)
     return services.steward_packet_payload(packet)
 
 
@@ -2406,10 +3035,37 @@ async def api_steward_judgement(
         identity,
         expected_generation=(
             identity.chat_pair_generation
-            if getattr(identity, "chat_pair_kind", None) == "steward"
+            if getattr(identity, "chat_pair_kind", None) in config.STEWARD_PAIR_KINDS
             else None
         ),
     )
+
+
+@app.post("/api/tasks/{task_id}/steward-false-approve/clear")
+async def api_steward_false_approve_clear(
+    task_id: int,
+    request: Request,
+    body: StewardFalseApproveClear | None = None,
+    identity=Depends(require_human_or_admin),
+):
+    """Human decision: lift a sticky false approve of the steward pair (#1601).
+
+    The mark that sent the steward back to the shadow stays until a human
+    removes it HERE — no data change lifts it, and no agent may. Human or
+    admin only; the steward allowlist (#1021) does not reach this route. No
+    MCP tool on purpose: the catalog is at its budget and the decision belongs
+    to a human (same as return-to-work, #1356).
+    """
+    from hub.services.steward_exit import clear_false_approval
+
+    if await repo.get_task(_db(request), task_id) is None:
+        raise HTTPException(404, "task not found")
+    cleared = await clear_false_approval(
+        _db(request), task_id, identity.username, (body.note if body else "")
+    )
+    if not cleared:
+        raise HTTPException(404, "no active false approve on this task")
+    return {"task_id": task_id, "cleared": cleared, "by": identity.username}
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
@@ -2454,6 +3110,15 @@ async def api_review_brief(
     )
     if brief is None:
         raise HTTPException(404, "task not found")
+    # #1586: the harness text rides ONLY to a chat-pair reviewer session — the
+    # one reader with no MCP and no route to the skill library. Same two
+    # signs the allowlist reads; role, name or principal_id prove nothing.
+    # A Response is returned as-is, so the key is absent (not null) for
+    # everyone else and response_model never sees it.
+    if identity.auth_source == "chat_pair" and identity.chat_pair_kind == "reviewer":
+        payload = jsonable_encoder(brief)
+        payload["harness_skill"] = (await reviewer_harness_skill(db)).model_dump()
+        return JSONResponse(payload)
     return brief
 
 
@@ -2517,7 +3182,7 @@ async def api_pair_start_task(
     identity=Depends(current_identity),
 ):
     """Start pair mode: running without headless dispatch (human or agent)."""
-    return await services.pair_start_task(
+    view = await services.pair_start_task(
         _db(request),
         task_id,
         body,
@@ -2525,6 +3190,8 @@ async def api_pair_start_task(
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
     )
+    await _record_slot_capture(request, identity, task_id)
+    return view
 
 
 @app.post("/api/tasks/{task_id}/claim", response_model=TaskView)
@@ -2537,13 +3204,42 @@ async def api_claim_task(
     """Claim an open task for one Cursor agent/session."""
     if not body.agent.strip():
         body = TaskClaim(agent=identity.username, session_id=body.session_id)
-    return await services.claim_task(
+    view = await services.claim_task(
         _db(request),
         task_id,
         body,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
     )
+    await _record_slot_capture(request, identity, task_id)
+    return view
+
+
+async def _record_slot_capture(request: Request, identity, task_id: int) -> None:
+    """Захват сессией implementer пишет её канал и слот в карточку (#1434).
+
+    Только сессия кода implementer: у остальных входов канала нет, и их захват
+    идёт как до задачи. Код без канала — тоже как до задачи.
+    """
+    if identity.auth_source != "chat_pair" or identity.chat_pair_kind != "implementer":
+        return
+    # Канал — только вызывающей сессии, по хэшу её токена: соседняя живая
+    # сессия на той же задаче чужой канал не даёт (находка 1c10075c).
+    token = _extract_bearer(request) or ""
+    from hub.services import executor_slots
+
+    await executor_slots.record_capture(
+        _db(request), task_id, chat_pair.hash_pair_code(token)
+    )
+
+
+@app.get("/api/executor-slots")
+async def api_executor_slots(request: Request) -> dict:
+    """Занятость каналов исполнения (#1434): слот, задача, с какого времени,
+    последний признак жизни; задачи в работе без канала — «не назван»."""
+    from hub.services import executor_slots
+
+    return await executor_slots.occupancy(_db(request))
 
 
 @app.post("/api/tasks/{task_id}/declare-wait", response_model=TaskView)
@@ -3408,14 +4104,23 @@ async def api_admin_create_key(
     from hub.services import admin as admin_svc
 
     identity = _identity
-    body = ApiKeyCreate(**(await request.json()))
-    key_data = await admin_svc.create_api_key(
-        _db(request),
-        principal_id,
-        name=body.name,
-        expires_days=body.expires_days,
-        created_by=identity.principal_id,
-    )
+    try:
+        body = ApiKeyCreate(**(await request.json()))
+    except ValidationError as exc:
+        import json as _json
+
+        raise HTTPException(422, detail=_json.loads(exc.json())) from None
+    try:
+        key_data = await admin_svc.create_api_key(
+            _db(request),
+            principal_id,
+            name=body.name,
+            expires_days=body.expires_days,
+            created_by=identity.principal_id,
+            projects=body.projects,
+        )
+    except admin_svc.ApiKeyScopeError as exc:
+        raise HTTPException(422, str(exc)) from None
     await admin_svc.write_audit(
         _db(request),
         actor_id=identity.principal_id,
@@ -3461,7 +4166,10 @@ async def api_admin_set_password(
 
     identity = _identity
     body = PasswordSetPayload(**(await request.json()))
-    await admin_svc.set_password(_db(request), principal_id, body.password)
+    try:
+        await admin_svc.set_password(_db(request), principal_id, body.password)
+    except admin_svc.ServicePasswordError as exc:
+        raise HTTPException(422, str(exc)) from None
     await admin_svc.write_audit(
         _db(request),
         actor_id=identity.principal_id,
@@ -3509,6 +4217,30 @@ async def api_admin_merge_ledger_backfill(
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/admin/cursor-usage/import")
+async def api_admin_cursor_usage_import(
+    body: CursorUsageImportRequest,
+    request: Request,
+    _identity=Depends(require_admin),
+):
+    """Import the owner's Cursor usage export onto review orders (#1413).
+
+    Dry run unless ``apply`` is true. Admin only; no MCP tool — the export
+    exists only on the owner's machine and the import is the owner's action.
+    A malformed file is refused with 422 and a structured detail naming the
+    missing columns or bad lines; nothing is written.
+    """
+    from hub.services.cursor_usage_import import (
+        UsageImportRefused,
+        import_cursor_usage,
+    )
+
+    try:
+        return await import_cursor_usage(_db(request), body.csv, apply=body.apply)
+    except UsageImportRefused as exc:
+        raise HTTPException(422, exc.as_dict()) from exc
 
 
 @app.post("/api/admin/bootstrap")

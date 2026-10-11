@@ -53,6 +53,7 @@
            выключатель, а не решение. #}
         <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
               class="inbox-item-actions inbox-ack-form">
+          {{ csrf_field() }}
             {# Фильтр проекта переживает нажатие — так же, как его переживает
                batch-approve выше и ссылка «Разобрать» ниже. Без этого поля
                человек, разбирающий расхождения по одному проекту, после
@@ -71,6 +72,7 @@
            Ручного мержа мимо гейта больше не нужно; агенту действие закрыто. #}
         <form method="post" action="/tasks/{{ d.task_id }}/web-deliver-undelivered"
               class="inbox-item-actions inbox-deliver-form">
+          {{ csrf_field() }}
             <input type="hidden" name="return_project" value="{{ filter_project or '' }}">
             <button type="submit" class="btn btn-success btn-xs"
                     title="Влить PR #{{ d.pr_number }} под условиями гейта: одобрение, неизменный код, зелёный CI">Доставить PR #{{ d.pr_number }}</button>

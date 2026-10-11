@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import enum
 import functools
 import json
 import logging
 import re
 import os
+import sqlite3
 from collections.abc import AsyncIterator, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -18,13 +22,25 @@ import aiosqlite
 from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
+from hub.services.prevention_gate import hold_completion
+from hub.services.result_kind import automation_not_applicable
+from hub.services.defect_clocks import (
+    change_failure_rate,
+    shift_left,
+    measured_escapes,
+    prod_defect_clocks,
+)
 from hub.integrations import git_ops as git_ops_mod
+from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
     MERGE_UNCONFIRMED,
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -36,6 +52,7 @@ from hub.integrations.protocols import (
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, workflow_seed
+from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
     NON_HUMAN_GATE_ACTORS,
@@ -45,6 +62,7 @@ from hub.services.gate_events import (
     sql_in,
 )
 from hub.integrations import forge as forge_urls
+from hub.services.review_economy import review_economy
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
@@ -210,14 +228,26 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
 # The condition is written ONCE. Both the gate below and the two metric
 # aggregates use this fragment; a copy would drift, and the whole point is
 # that the gate and the number agree on what a review is.
+#
+# #1361: a CARRIED report (``carried_from_review_id``) is evidence by
+# construction — it is only ever made from a report that passed this very
+# check — while its own tokens are deliberately empty: the carry cost nothing.
 REPORT_HAS_EVIDENCE_SQL = (
     "(raw_count > 0 "
     "OR json_array_length(findings_confirmed) > 0 "
     "OR json_array_length(findings_rejected) > 0 "
     "OR COALESCE(tokens_spent, 0) > 0 "
     "OR COALESCE(provider_tokens, 0) > 0 "
-    "OR COALESCE(agent_count, 0) > 1)"
+    "OR COALESCE(agent_count, 0) > 1 "
+    "OR carried_from_review_id IS NOT NULL)"
 )
+
+#: #1361: a report READ for this submission, not carried over from an earlier
+#: one. Every metric that counts reads, findings or reviewer models filters on
+#: it: a carry is the absence of a read, and counting it would make the saving
+#: look like one more run. Unqualified on purpose — no other table joined to
+#: machine_reviews has this column.
+ORIGINAL_READ_SQL = "carried_from_review_id IS NULL"
 
 
 def report_has_evidence(review: Any) -> bool:
@@ -256,6 +286,7 @@ def report_has_evidence(review: Any) -> bool:
         or (col("tokens_spent") or 0) > 0
         or (col("provider_tokens") or 0) > 0
         or (col("agent_count") or 0) > 1
+        or col("carried_from_review_id") is not None
     )
 
 
@@ -314,7 +345,9 @@ async def machine_review_gap(
 _REAL = ("fixed", "wont_fix")
 
 
-async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _disposition_metrics(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Precision and resolution, overall and split by profile and model.
 
     The window is the REPORT's ``created_at``, never the disposition's: a
@@ -340,6 +373,9 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
             ),
         }
 
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT CASE WHEN mr.profile = '' THEN 'не заявлен' ELSE mr.profile END "
@@ -348,9 +384,9 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "d.disposition AS disposition, COUNT(*) AS n "
         "FROM finding_dispositions d "
         "JOIN machine_reviews mr ON mr.id = d.review_id "
-        "WHERE mr.created_at >= datetime('now', ?) "
+        f"WHERE {where} "
         "GROUP BY profile, model, d.disposition",
-        (since,),
+        tuple(params),
     )
     overall: dict[str, int] = {}
     by_profile: dict[str, dict[str, int]] = {}
@@ -402,9 +438,10 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "AND t.submission_generation = mr.submission_generation "
         "LEFT JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
-        f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL} "
+        f"WHERE {where} AND {REPORT_HAS_EVIDENCE_SQL} "
+        f"AND {ORIGINAL_READ_SQL} "
         "AND json_array_length(mr.findings_confirmed) > 0",
-        (since,),
+        tuple(params),
     )
     cov = dict(coverage_rows[0]) if coverage_rows else {}
     reports_counted = int(cov.get("reports_counted") or 0)
@@ -432,7 +469,10 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # oldest items, and it would also split this number from the queue page it
     # links to, which shows everything. The page says "за всё время" next to it
     # so the reader is not told a windowed number by the header.
-    unjudged = await repo.count_unjudged_findings(db)
+    unjudged = await repo.count_unjudged_findings(
+        db,
+        extra=scope.stock_where(task_column="mr.task_id", model_column="mr.model"),
+    )
     result["confirmed_unjudged"] = unjudged["findings"]
     result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
@@ -446,8 +486,15 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
 
 
 async def _tokens_per_fixed(
-    db: aiosqlite.Connection, since: str, column: str
+    db: aiosqlite.Connection, scope: Scope, column: str
 ) -> int | None:
+    """Tokens per FIXED finding over the slice, or None (see the stats twin)."""
+    return (await _tokens_per_fixed_stats(db, scope, column))[0]
+
+
+async def _tokens_per_fixed_stats(
+    db: aiosqlite.Connection, scope: Scope, column: str
+) -> tuple[int | None, int]:
     """Tokens per FIXED finding, or None when nothing supports the division.
 
     Numerator and denominator come from the same rows — the #516 rule that
@@ -457,19 +504,24 @@ async def _tokens_per_fixed(
     """
     if column not in ("tokens_spent", "provider_tokens"):  # pragma: no cover
         raise ValueError(f"unsupported token column: {column}")
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         f"SELECT COALESCE(SUM(mr.{column}), 0) AS tokens, "  # nosec B608 - column is checked above against a literal allow-list
-        "COALESCE(SUM(fixed.n), 0) AS fixed FROM machine_reviews mr "
+        "COALESCE(SUM(fixed.n), 0) AS fixed, COUNT(*) AS reports "
+        "FROM machine_reviews mr "
         "JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "WHERE disposition = 'fixed' GROUP BY review_id) AS fixed "
         "ON fixed.review_id = mr.id "
-        f"WHERE mr.created_at >= datetime('now', ?) AND mr.{column} IS NOT NULL",
-        (since,),
+        f"WHERE {where} AND mr.{column} IS NOT NULL",
+        tuple(params),
     )
     row = dict(rows[0]) if rows else {}
     fixed = int(row.get("fixed") or 0)
-    return round(int(row.get("tokens") or 0) / fixed) if fixed else None
+    value = round(int(row.get("tokens") or 0) / fixed) if fixed else None
+    return value, int(row.get("reports") or 0)
 
 
 # How many DISTINCT tasks a finding category must appear in before it stops
@@ -480,7 +532,7 @@ RECURRENCE_DEBT_THRESHOLD = 3
 
 
 async def recurring_categories(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, since: str | Scope
 ) -> list[dict[str, Any]]:
     """Confirmed-finding categories in the window, with how far they spread.
 
@@ -489,15 +541,20 @@ async def recurring_categories(
     sprawling task say something about that task, three hits across three
     tasks say something about the repository.
     """
+    # A bare modifier ('-90 days') is still accepted: the digest passes one.
+    scope = Scope.from_modifier(since) if isinstance(since, str) else since
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
-        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
-        "WHERE mr.created_at >= datetime('now', ?) "
+        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "  # nosec B608 - constant fragment
+        f"WHERE {where} AND {ORIGINAL_READ_SQL} "
         "GROUP BY category HAVING category != '' "
         "ORDER BY findings DESC LIMIT 50",
-        (since,),
+        tuple(params),
     )
     return [dict(r) | {"recurring": r["tasks"] > 1} for r in rows]
 
@@ -531,6 +588,15 @@ async def build_category_debt(
             }
         )
     return debt
+
+
+async def _rule_breaches(
+    db: aiosqlite.Connection, scope: Scope | None = None
+) -> dict[str, Any]:
+    """The repeat report of catalogue rules (#920); see ``rule_catalogue``."""
+    from hub.services.rule_catalogue import rule_breaches
+
+    return await rule_breaches(db, scope)
 
 
 async def record_category_check(
@@ -575,32 +641,55 @@ async def record_category_check(
 
 
 async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
-    """The 2x2 table and the act thresholds, for the practice metrics (#1107).
+    """Критерий выхода из тени v2 и таблица тени, для метрик практики (#1107, #1601).
 
     Read-only and total rather than windowed: the exit criteria are about the
     whole shadow phase, and a 90-day window would quietly reset the sample
     the decision rests on.
+
+    Верхний уровень — НОВЫЙ контур «судья + советник»: пары, согласие,
+    возражения, таймауты, ошибочные одобрения с номерами задач, процедурные
+    эскалации отдельно, доля по существу и ``act_refusals`` v2. Таблица 2x2
+    «стюард против человека» — другая метрика (справочная, она больше не
+    решает о выходе) и лежит под ключом ``human_table`` со своими счётчиками.
     """
+    from hub.services.steward_exit import (
+        STEWARD_VERDICT_WINDOW_DAYS,
+        actual_steward_verdicts,
+        contour_report,
+    )
     from hub.services.steward_shadow import act_refusals, shadow_table
 
     table = await shadow_table(db)
     refusals = await act_refusals(db)
+    by_project = await actual_steward_verdicts(db)
     return {
-        "both_approve": table.both_approve,
-        "steward_approve_human_changes": table.steward_approve_human_changes,
-        "steward_changes_human_approve": table.steward_changes_human_approve,
-        "both_changes": table.both_changes,
-        "escalated": table.escalated,
-        "unpaired": table.unpaired,
-        "false_approve": table.false_approve,
-        "human_changes": table.human_changes,
-        # None means "not measured", never 0.0 — the same distinction the
-        # packet draws between absent and negative (#762).
-        "escalation_share": table.escalation_share,
+        **await contour_report(db),
+        # #1602: ФАКТИЧЕСКИЕ вердикты стюарда (review_verdict_recorded,
+        # actor=steward), а не суждения: тень и DoR сюда не входят. Окно —
+        # срок жизни ленты событий, а не окно практики.
+        "actual_verdicts": {
+            "window_days": STEWARD_VERDICT_WINDOW_DAYS,
+            "total": sum(by_project.values()),
+            "by_project": dict(sorted(by_project.items())),
+        },
         "act_refusals": [
             {"reason": code, "detail": detail} for code, detail in refusals
         ],
         "act_ready": not refusals,
+        "human_table": {
+            "both_approve": table.both_approve,
+            "steward_approve_human_changes": table.steward_approve_human_changes,
+            "steward_changes_human_approve": table.steward_changes_human_approve,
+            "both_changes": table.both_changes,
+            "escalated": table.escalated,
+            "unpaired": table.unpaired,
+            "false_approve": table.false_approve,
+            "human_changes": table.human_changes,
+            # None means "not measured", never 0.0 — the same distinction the
+            # packet draws between absent and negative (#762).
+            "escalation_share": table.escalation_share,
+        },
     }
 
 
@@ -614,9 +703,123 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
 PRACTICE_METRICS_DEFAULT_DAYS = 90
 
 
-async def practice_metrics(
-    db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
-) -> dict[str, Any]:
+async def _carried_over_count(db: aiosqlite.Connection, scope: Scope) -> int:
+    """Reports carried over a base-only merge in the window (#1361).
+
+    Counted BESIDE the reads, never inside them: the saving stays visible
+    without passing for a run.
+    """
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
+        f"WHERE {where} AND NOT ({ORIGINAL_READ_SQL})",
+        tuple(params),
+    )
+    return int(dict(rows[0])["n"] or 0) if rows else 0
+
+
+async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str, Any]]:
+    """Cycle time by work type over the slice (#517, #518, #810).
+
+    Moved out of ``practice_metrics`` unchanged so that the comparison and the
+    series (#1490) read the same computation as the aggregate.
+    """
+    import statistics
+
+    # `completed_at` is the only completion clock (#517). Until #810 a row
+    # without it was filled in from `updated_at`, and that fallback was
+    # defended as a small bias — 0–13.3h against durations of 280–340h. The
+    # comparison used the fallback rows as their own yardstick. Split by
+    # source on production data (21.08.2026, 518 completed tasks), the two are
+    # not the same quantity: measured rows have a median of 0.83h for bug and
+    # 1.70h for feature, while the rows filled in from `updated_at` sit at
+    # 254h and 550h. So the blended median tracked the share of filled-in rows
+    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
+    # bugs take eight times longer than features when measured bugs are in
+    # fact the fastest rows in the table.
+    #
+    # The other half of that argument — dropping them costs three quarters of
+    # the sample — expired as the window rolled forward: 46 measured bugs and
+    # 119 measured features now stand on their own.
+    #
+    # Rows without the stamp are counted, never estimated. Their membership in
+    # the window is decided by `updated_at` only because nothing else about
+    # them is dated: that is a "recent enough to mention" test, never a
+    # duration. Every row that HAS a completion is filtered and measured by
+    # the same `completed_at` — #518 fixed a version where numerator and
+    # window used different clocks, and that fix stays.
+    in_completed, p_completed = scope.where("completed_at", task_column="id")
+    in_updated, p_updated = scope.where("updated_at", task_column="id")
+    cycle_rows = await fetchall(
+        db,
+        "SELECT work_type, completed_at IS NULL AS no_completion, "
+        "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
+        "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
+        f"AND ({in_completed} "  # nosec B608 - constant fragment
+        f"OR (completed_at IS NULL AND {in_updated}))",
+        (*p_completed, *p_updated),
+    )
+    by_type: dict[str, list[float]] = {}
+    no_completion_by_type: dict[str, int] = {}
+    unmeasurable_by_type: dict[str, int] = {}
+    for r in cycle_rows:
+        wt = r["work_type"] or "feature"
+        if r["no_completion"]:
+            # Checked before the start test below, so a row missing BOTH stamps
+            # is counted once, here. The two exclusions overlap almost entirely
+            # in today's data: on production every row with a bulk-stamped
+            # ready_at also predates completed_at, so unmeasurable_tasks now
+            # reads 0 across the board and no_completion_tasks absorbs those
+            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
+            # of label, not of exclusion — the #518 test below still guards the
+            # case it was written for: a future row that has a completion but a
+            # start stamped after it.
+            no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
+            continue
+        if r["hours"] is None:
+            continue
+        if r["hours"] <= 0:
+            # A non-positive duration is not a fast task, it is a task whose
+            # start is unknown (#518). On production every such row carries the
+            # same ready_at — a bulk stamp applied to tasks that were already
+            # finished — so ready_at records when someone backfilled the
+            # column, not when the work became ready. Counting these as zero
+            # dragged the feature median from 70h down to 4h.
+            #
+            # Only equality occurs in the data; negatives were checked for and
+            # there are none. The condition stays <= so a clock skew that does
+            # produce one is excluded rather than averaged in.
+            unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
+            continue
+        by_type.setdefault(wt, []).append(r["hours"])
+    # Both exclusions are reported per row rather than folded into the median:
+    # a number that silently mixes measured with inferred values reads as fact.
+    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
+    # say what is not known instead of estimating it.
+    # A work type all of whose rows are excluded still gets a line: saying
+    # "5 tasks, no completion stamp, no median" is information, while omitting
+    # the row entirely reads as "no work of this type happened" (#518).
+    cycle_times = [
+        {
+            "work_type": wt,
+            "tasks": len(by_type.get(wt, [])),
+            "no_completion_tasks": no_completion_by_type.get(wt, 0),
+            "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
+            "median_hours": (
+                round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
+            ),
+        }
+        for wt in sorted(
+            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
+        )
+    ]
+    return cycle_times
+
+
+async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Practice economics (#384): machine-review costs, filtration rate,
     harness-version comparison, recurring finding categories, cycle times,
     escaped defects.
@@ -639,10 +842,14 @@ async def practice_metrics(
     ``review_dispatches`` is a sibling (#1026): the provider bill of runs
     that closed without a report. It is never folded into
     ``tokens_per_confirmed`` / ``provider_tokens_per_confirmed``.
-    """
-    import statistics
 
-    since = f"-{since_days} days"
+    Every section reads the same ``scope`` (#1490): the window, the project and
+    the reviewer model. The public entry point is :func:`practice_metrics`.
+    """
+    since_days = scope.days
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
 
     totals_rows = await fetchall(
         db,
@@ -685,10 +892,12 @@ async def practice_metrics(
         "COALESCE(SUM(CASE WHEN provider_tokens IS NOT NULL "
         "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
         "AS confirmed_with_provider "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
-        (since,),
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
+        f"AND {ORIGINAL_READ_SQL}",
+        tuple(params),
     )
     totals = dict(totals_rows[0])
+    totals["carried_over"] = await _carried_over_count(db, scope)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
     # Cost per finding has to take its numerator and denominator from the same
@@ -755,9 +964,10 @@ async def practice_metrics(
         "SUM(CASE WHEN provider_tokens IS NOT NULL THEN 1 ELSE 0 END) "
         "AS billed_runs, "
         "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY profile ORDER BY reviews DESC",
-        (since,),
+        tuple(params),
     )
 
     harness_rows = await fetchall(
@@ -769,113 +979,30 @@ async def practice_metrics(
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY harness_skill, harness_version "
         "ORDER BY harness_skill, harness_version",
-        (since,),
+        tuple(params),
     )
 
-    recurring = await recurring_categories(db, since)
+    recurring = await recurring_categories(db, scope)
     # #878: the flywheel. A category the reviewer has found in enough DISTINCT
     # tasks is no longer a finding, it is a property of the codebase, and
     # paying a model to rediscover it every submission is the one cost here
     # that never has to be paid again.
     debt = await build_category_debt(db, recurring)
 
-    # `completed_at` is the only completion clock (#517). Until #810 a row
-    # without it was filled in from `updated_at`, and that fallback was
-    # defended as a small bias — 0–13.3h against durations of 280–340h. The
-    # comparison used the fallback rows as their own yardstick. Split by
-    # source on production data (21.08.2026, 518 completed tasks), the two are
-    # not the same quantity: measured rows have a median of 0.83h for bug and
-    # 1.70h for feature, while the rows filled in from `updated_at` sit at
-    # 254h and 550h. So the blended median tracked the share of filled-in rows
-    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
-    # bugs take eight times longer than features when measured bugs are in
-    # fact the fastest rows in the table.
-    #
-    # The other half of that argument — dropping them costs three quarters of
-    # the sample — expired as the window rolled forward: 46 measured bugs and
-    # 119 measured features now stand on their own.
-    #
-    # Rows without the stamp are counted, never estimated. Their membership in
-    # the window is decided by `updated_at` only because nothing else about
-    # them is dated: that is a "recent enough to mention" test, never a
-    # duration. Every row that HAS a completion is filtered and measured by
-    # the same `completed_at` — #518 fixed a version where numerator and
-    # window used different clocks, and that fix stays.
-    cycle_rows = await fetchall(
-        db,
-        "SELECT work_type, completed_at IS NULL AS no_completion, "
-        "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
-        "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
-        "AND (completed_at >= datetime('now', ?) "
-        "OR (completed_at IS NULL AND updated_at >= datetime('now', ?)))",
-        (since, since),
-    )
-    by_type: dict[str, list[float]] = {}
-    no_completion_by_type: dict[str, int] = {}
-    unmeasurable_by_type: dict[str, int] = {}
-    for r in cycle_rows:
-        wt = r["work_type"] or "feature"
-        if r["no_completion"]:
-            # Checked before the start test below, so a row missing BOTH stamps
-            # is counted once, here. The two exclusions overlap almost entirely
-            # in today's data: on production every row with a bulk-stamped
-            # ready_at also predates completed_at, so unmeasurable_tasks now
-            # reads 0 across the board and no_completion_tasks absorbs those
-            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
-            # of label, not of exclusion — the #518 test below still guards the
-            # case it was written for: a future row that has a completion but a
-            # start stamped after it.
-            no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
-            continue
-        if r["hours"] is None:
-            continue
-        if r["hours"] <= 0:
-            # A non-positive duration is not a fast task, it is a task whose
-            # start is unknown (#518). On production every such row carries the
-            # same ready_at — a bulk stamp applied to tasks that were already
-            # finished — so ready_at records when someone backfilled the
-            # column, not when the work became ready. Counting these as zero
-            # dragged the feature median from 70h down to 4h.
-            #
-            # Only equality occurs in the data; negatives were checked for and
-            # there are none. The condition stays <= so a clock skew that does
-            # produce one is excluded rather than averaged in.
-            unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
-            continue
-        by_type.setdefault(wt, []).append(r["hours"])
-    # Both exclusions are reported per row rather than folded into the median:
-    # a number that silently mixes measured with inferred values reads as fact.
-    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
-    # say what is not known instead of estimating it.
-    # A work type all of whose rows are excluded still gets a line: saying
-    # "5 tasks, no completion stamp, no median" is information, while omitting
-    # the row entirely reads as "no work of this type happened" (#518).
-    cycle_times = [
-        {
-            "work_type": wt,
-            "tasks": len(by_type.get(wt, [])),
-            "no_completion_tasks": no_completion_by_type.get(wt, 0),
-            "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
-            "median_hours": (
-                round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
-            ),
-        }
-        for wt in sorted(
-            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
-        )
-    ]
+    cycle_times = await _cycle_times(db, scope)
 
     # #877: what the findings turned out to be. Attached to the profile rows
     # as well, because "lite found three things" and "lite found three things
     # and two of them were real" are different facts about the same run.
-    dispositions = await _disposition_metrics(db, since)
+    dispositions = await _disposition_metrics(db, scope)
     totals["dispositions"] = dispositions
-    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, since, "tokens_spent")
+    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, scope, "tokens_spent")
     totals["provider_tokens_per_fixed"] = await _tokens_per_fixed(
-        db, since, "provider_tokens"
+        db, scope, "provider_tokens"
     )
     by_profile_rates = {row["profile"]: row for row in dispositions["by_profile"]}
     profile_dicts = []
@@ -898,15 +1025,26 @@ async def practice_metrics(
         )
         profile_dicts.append(entry)
 
-    escaped = await _escaped_defect_metrics(db, since)
+    escaped = {
+        # #918: the headline is the recorded fact — found_in='prod' filed in
+        # the window. The completed_at walk (#528) stays beside it, restricted
+        # to bugs whose stage was never recorded and labelled as what it is,
+        # so the two numbers cannot be read as one.
+        "escaped": await measured_escapes(db, scope),
+        "source": "found_in",
+        "reconstructed": {
+            "label": RECONSTRUCTED_ESCAPES_LABEL,
+            **await _escaped_defect_metrics(db, scope),
+        },
+    }
 
-    model_declarations = await _model_declaration_metrics(db, since)
-    human_gates = await _human_gate_metrics(db, since)
+    model_declarations = await _model_declaration_metrics(db, scope)
+    human_gates = await _human_gate_metrics(db, scope)
     steward_shadow_metrics = await _steward_shadow_metrics(db)
-    human_touches = await _human_touch_metrics(db, since)
-    review_outcomes = await _review_outcome_metrics(db, since)
-    review_dispatches = await _review_dispatch_spend_metrics(db, since)
-    validation_run_lines = await _validation_run_line_metrics(db, since)
+    human_touches = await _human_touch_metrics(db, scope)
+    review_outcomes = await _review_outcome_metrics(db, scope)
+    review_dispatches = await _review_dispatch_spend_metrics(db, scope)
+    validation_run_lines = await _validation_run_line_metrics(db, scope)
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
@@ -916,11 +1054,10 @@ async def practice_metrics(
         count_model_cascade_outcomes,
     )
 
-    incomplete_reasons = await count_environment_refusals(db, since_days=since_days)
+    incomplete_reasons = await count_environment_refusals(db, scope=scope)
     # #1243: исход второй оси каскада — без него выкат был бы добавкой к
     # счёту, измеренной без пользы. Тот же приём и то же окно.
-    model_cascade = await count_model_cascade_outcomes(db, since_days=since_days)
-
+    model_cascade = await count_model_cascade_outcomes(db, scope=scope)
     return {
         "since_days": since_days,
         "machine_reviews": totals,
@@ -932,8 +1069,20 @@ async def practice_metrics(
         "by_reviewer_model": dispositions["by_model"],
         "recurring_categories": recurring,
         "category_debt": debt,
+        # #920: rules from category_checks whose class came back AFTER the
+        # rule was set up. Not windowed — a rule is judged over its life.
+        "rule_breaches": await _rule_breaches(db, scope),
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
+        # #916: time-to-detect and time-to-restore of prod defects, from
+        # recorded facts only; rows missing one are counted by reason.
+        "prod_defect_clocks": await prod_defect_clocks(db, scope),
+        # #918: share of successful deploys a prod defect points at, per
+        # project, with the deploy count beside the share.
+        "change_failure_rate": await change_failure_rate(db, scope),
+        # #914: defects of the window by the stage that caught them, with
+        # the unknown share apart; the prod bucket is the measured escapes.
+        "shift_left": await shift_left(db, scope),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
         # #1107: the shadow table lives BESIDE the other practice numbers,
@@ -947,11 +1096,133 @@ async def practice_metrics(
         # #1246: submissions whose prepass failed while the author wrote about
         # runs — a count for a human to compare, not a claim about meaning.
         "validation_run_lines": validation_run_lines,
+        # #1410: стоимость облачного исполнителя за окно — центы по счёту
+        # провайдера (chargedCents) и число прогонов рядом с суммой.
+        "executor_runs": await executor_run_metrics(db, scope),
+        # #1406: сводка ревью для владельца — один агрегат на все поверхности.
+        "review_economy": await review_economy(
+            db, since_days=since_days, escaped=escaped, scope=scope
+        ),
     }
 
 
+async def _indicator_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
+    """The sections the key indicators (#1490) read, for one window.
+
+    Each one is the function ``practice_metrics`` calls for the aggregate, so a
+    bucket of a series or the previous window is computed by the same code as
+    the window itself — never by a parallel re-implementation.
+    """
+    return {
+        "review_outcomes": await _review_outcome_metrics(db, scope),
+        "dispositions": await _disposition_metrics(db, scope),
+        "provider_tokens_per_fixed": await _tokens_per_fixed_stats(
+            db, scope, "provider_tokens"
+        ),
+        "human_touches": await _human_touch_metrics(db, scope),
+        "change_failure_rate": await change_failure_rate(db, scope),
+        "cycle_times": await _cycle_times(db, scope),
+    }
+
+
+async def _window_extras(
+    db: aiosqlite.Connection,
+    scope: Scope,
+    result: dict[str, Any],
+    *,
+    compare: bool,
+    series: bool,
+    series_days: int,
+) -> None:
+    """Add ``comparison``, ``series`` and ``problem_spots`` to ``result`` (#1490)."""
+    from hub.services import metrics_compare as mc
+
+    comparison = None
+    if compare:
+        previous = scope.previous()
+        comparison = mc.build_comparison(
+            await _indicator_sections(db, scope),
+            await _indicator_sections(db, previous),
+            previous.describe(),
+        )
+        result["comparison"] = comparison
+        result["problem_spots"], result["problem_spots_more"] = mc.rank_problem_spots(
+            result, comparison
+        )
+    if series:
+        pieces, dropped = scope.bucket_plan(series_days)
+        buckets = [
+            (piece.describe(), await _indicator_sections(db, piece)) for piece in pieces
+        ]
+        result["series"] = mc.build_series(buckets, series_days, dropped)
+
+
+async def practice_metrics(
+    db: aiosqlite.Connection,
+    *,
+    since_days: int = PRACTICE_METRICS_DEFAULT_DAYS,
+    project: str | None = None,
+    model: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    compare: bool = False,
+    series: bool = False,
+    series_days: int = 7,
+) -> dict[str, Any]:
+    """Practice metrics of a slice: window, project and reviewer model (#1490).
+
+    Without the new parameters the answer is what it was: the last
+    ``since_days`` over every project, and no extra keys but ``events_history``
+    (#1621: which windows start before the ``events`` retention, so a figure
+    over events is not read as covering the whole window). ``date_from`` and
+    ``date_to`` (``YYYY-MM-DD``, the last day included) replace ``since_days``.
+    ``project`` is a slug, resolved the way the gates attribute work (#747).
+    ``model`` is the REVIEWER model, ``machine_reviews.model`` — the group with
+    none recorded is named ``не заявлена`` and is selected by that name; it
+    narrows only the review blocks, and ``scope.model_independent`` lists the
+    blocks it leaves alone (cycle time, CFR, shift-left and the rest).
+
+    ``compare`` adds the previous window of the same length, the delta per key
+    indicator and the ranked problem spots; ``series`` adds the indicators per
+    ``series_days`` bucket. An empty bucket is a missing value, never zero.
+
+    Raises ``ValueError`` for an unknown project or a malformed date.
+    """
+    from hub.services.metrics_scope import (
+        MODEL_INDEPENDENT,
+        UNFILTERED,
+        build_scope,
+        events_history,
+    )
+
+    scope = await build_scope(
+        db,
+        since_days=since_days,
+        project=project,
+        model=model,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    result = await _practice_sections(db, scope)
+    # #1621: always present — a 30-day number read as 14 days of events is the
+    # silent case, and it has no flag that would announce it.
+    result["events_history"] = events_history(
+        scope, compare=compare, series=series, series_days=series_days
+    )
+    if not (project or model or date_from or date_to or compare or series):
+        return result
+    description = scope.describe()
+    description["model_independent"] = list(MODEL_INDEPENDENT) if scope.model else []
+    description["unfiltered"] = list(UNFILTERED)
+    result["scope"] = description
+    await _window_extras(
+        db, scope, result, compare=compare, series=series, series_days=series_days
+    )
+    return result
+
+
 async def _validation_run_line_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """Failed prepass with author's lines about runs, per submission (#1246).
 
@@ -962,24 +1233,39 @@ async def _validation_run_line_metrics(
     """
     from hub.services import review_evidence
 
+    where, params = scope.where("u.created_at", task_column="u.task_id")
+    # Every submission row of the window counts, not the task's latest: the
+    # failed prepass of an early submission stays visible when a later one
+    # passed (#1567). The latest row of a task may fall back to its pinned sha.
     rows = await fetchall(
         db,
-        "SELECT id, submission_sha FROM tasks "
-        "WHERE COALESCE(submission_sha, '') != '' "
-        "AND updated_at >= datetime('now', ?)",
-        (since,),
+        "SELECT u.task_id, u.content, "
+        "u.id = (SELECT MAX(l.id) FROM task_updates l WHERE l.task_id = u.task_id "
+        "AND l.kind = 'status' AND l.content LIKE ?) AS is_latest, "
+        "COALESCE(t.submission_sha, '') AS pinned "
+        "FROM task_updates u JOIN tasks t ON t.id = u.task_id "
+        f"WHERE u.kind = 'status' AND u.content LIKE ? AND {where} "  # nosec B608
+        "ORDER BY u.id",
+        (
+            f"{repo.SUBMISSION_UPDATE_PREFIX}%",
+            f"{repo.SUBMISSION_UPDATE_PREFIX}%",
+            *params,
+        ),
     )
-    standings = []
-    for row in rows:
-        task = {"id": row["id"], "submission_sha": row["submission_sha"]}
-        prepass = await review_evidence.prepass_state(db, task)
-        text = await review_evidence.latest_submission_text(db, int(row["id"]))
-        standings.append(review_evidence.validation_standing(prepass, text))
+    standings = [
+        await review_evidence.submission_standing(
+            db,
+            int(row["task_id"]),
+            str(row["content"]),
+            row["pinned"] if row["is_latest"] else "",
+        )
+        for row in rows
+    ]
     return review_evidence.run_lines_tally(standings)
 
 
 async def _review_dispatch_spend_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """What dispatched runs billed, including those that never reported (#1026).
 
@@ -990,26 +1276,30 @@ async def _review_dispatch_spend_metrics(
     the same rows). NULL is "never asked or the API did not answer"; 0 is a
     billed zero. Unknown rows are counted, never collapsed into the sum.
     """
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     rows = await fetchall(
         db,
         "SELECT "
+        # #1413: счёт — выгрузка Cursor, где она импортирована, иначе API.
         "COALESCE(SUM(CASE WHEN status = 'failed' "
-        "AND provider_tokens IS NOT NULL THEN provider_tokens ELSE 0 END), 0) "
+        "THEN COALESCE(billed_tokens, provider_tokens, 0) ELSE 0 END), 0) "
         "AS wasted_provider_tokens_total, "
         "COALESCE(SUM(CASE WHEN status = 'failed' "
-        "AND provider_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) "
-        "AS wasted_dispatches, "
+        "AND COALESCE(billed_tokens, provider_tokens) IS NOT NULL "
+        "THEN 1 ELSE 0 END), 0) AS wasted_dispatches, "
         "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
-        "AND provider_tokens IS NULL THEN 1 ELSE 0 END), 0) "
-        "AS unknown_usage, "
+        "AND COALESCE(billed_tokens, provider_tokens) IS NULL "
+        "THEN 1 ELSE 0 END), 0) AS unknown_usage, "
         "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
         "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
         # #1242: a sync-refusal stub now outlives its call as the ask-again
         # trace. It never ran and nothing was billed — it is not a closed
         # dispatch with unknown usage.
-        "FROM review_dispatches WHERE created_at >= datetime('now', ?) "
+        f"FROM review_dispatches WHERE {where} "  # nosec B608 - constant fragment
         "AND agent_id != ''",
-        (since,),
+        tuple(params),
     )
     if not rows:
         return {
@@ -1021,10 +1311,21 @@ async def _review_dispatch_spend_metrics(
     return dict(rows[0])
 
 
+# #918: the reconstruction reads only bugs whose stage was never recorded.
+_STAGE_UNRECORDED_SQL = "COALESCE(found_in, 'unknown') = 'unknown'"
+RECONSTRUCTED_ESCAPES_LABEL = "реконструкция"
+
+
 async def _escaped_defect_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """Bugs filed after their feature was closed — what review let through (#528).
+
+    Since #918 this is the RECONSTRUCTION, not the measurement: it only looks
+    at bugs whose ``found_in`` was never recorded (``unknown``). A bug with a
+    recorded stage is answered by that stage — ``prod`` is a measured escape,
+    anything else is not an escape — and walking its ancestry as well would
+    count one bug twice or contradict the record.
 
     Recurring categories count what the gate STOPPED. This counts what it
     missed, which is the only side of the ledger that can contradict a
@@ -1057,15 +1358,19 @@ async def _escaped_defect_metrics(
     never to the feature's closure. #518 was a bug about a numerator and a
     window keeping different clocks; this one states its clock.
     """
+    # The project narrows the BUG (the thing the window dates), never the
+    # feature it is attributed to up the chain.
+    where, params = scope.where("created_at", task_column="id")
     rows = await fetchall(
         db,
         # The ancestry walk stops at the first feature, so each bug contributes
         # its NEAREST feature and no other: a bug hanging under a task under a
         # feature is attributed to that feature, not to the epic above it.
-        "WITH RECURSIVE ancestry(bug_id, bug_created, node_id, depth) AS ("
+        "WITH RECURSIVE ancestry(bug_id, bug_created, node_id, depth) AS ("  # nosec B608 - constant SQL
         "  SELECT id, created_at, parent_id, 1 FROM tasks"
         "   WHERE work_type = 'bug' AND parent_id IS NOT NULL"
-        "     AND created_at >= datetime('now', ?)"
+        f"     AND {_STAGE_UNRECORDED_SQL}"
+        f"     AND {where}"
         "  UNION ALL"
         "  SELECT a.bug_id, a.bug_created, t.parent_id, a.depth + 1"
         "    FROM ancestry a JOIN tasks t ON t.id = a.node_id"
@@ -1076,13 +1381,14 @@ async def _escaped_defect_metrics(
         "f.status AS feature_status, f.completed_at AS feature_completed "
         "FROM ancestry a "
         "JOIN tasks f ON f.id = a.node_id AND f.task_type = 'feature'",
-        (since,),
+        tuple(params),
     )
     total_rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS bugs FROM tasks "
-        "WHERE work_type = 'bug' AND created_at >= datetime('now', ?)",
-        (since,),
+        "SELECT COUNT(*) AS bugs FROM tasks "  # nosec B608 - constant SQL
+        f"WHERE work_type = 'bug' AND {_STAGE_UNRECORDED_SQL} "
+        f"AND {where}",
+        tuple(params),
     )
     bugs_in_window = total_rows[0]["bugs"] or 0
 
@@ -1121,7 +1427,7 @@ async def _escaped_defect_metrics(
 
 
 async def _review_outcome_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """First-pass acceptance and changes-requested rate (#522).
 
@@ -1155,12 +1461,12 @@ async def _review_outcome_metrics(
     """
     import json as _json
 
+    where, params = scope.where("created_at", task_column="task_id")
     rows = await fetchall(
         db,
         "SELECT task_id, payload FROM events "
-        "WHERE kind = 'review_verdict_recorded' "
-        "AND created_at >= datetime('now', ?)",
-        (since,),
+        f"WHERE kind = 'review_verdict_recorded' AND {where}",  # nosec B608
+        tuple(params),
     )
 
     approved = 0
@@ -1246,7 +1552,7 @@ def _parse_hub_ts(raw: str | None) -> Any:
 
 
 async def _model_declaration_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """How often the diversity rule has anything to work with (#1008).
 
@@ -1266,12 +1572,15 @@ async def _model_declaration_metrics(
     """
     from hub.services.model_family import UNKNOWN, family
 
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
-        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "
-        "WHERE mr.created_at >= datetime('now', ?)",
-        (since,),
+        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "  # nosec B608 - constant fragment
+        f"WHERE {where} AND mr.{ORIGINAL_READ_SQL}",
+        tuple(params),
     )
 
     def _tally(values: list[Any]) -> dict[str, int]:
@@ -1303,7 +1612,9 @@ async def _model_declaration_metrics(
     }
 
 
-async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _human_touch_metrics(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Touches per delivered task (#1009, spec §13).
 
     Denominator is tasks the hub merged in the window (``pipeline_merges``).
@@ -1314,12 +1625,13 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     """
     kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
     actor_ph, actors = sql_in(NON_HUMAN_GATE_ACTORS)
+    where, params = scope.where("merged_at", task_column="task_id")
     rows = await fetchall(
         db,
         "WITH delivered AS ("
         " SELECT DISTINCT task_id FROM pipeline_merges"
         " WHERE task_id IS NOT NULL"
-        " AND merged_at >= datetime('now', ?)"
+        f" AND {where}"
         ") SELECT"
         " (SELECT COUNT(*) FROM delivered) AS delivered_tasks,"
         " (SELECT COUNT(*) FROM events e"
@@ -1327,7 +1639,7 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         f" AND e.kind IN ({kind_ph})"
         f" AND e.actor NOT IN ({actor_ph})"
         ") AS touches",  # nosec B608 - placeholders from module constants
-        (since, *kinds, *actors),
+        (*params, *kinds, *actors),
     )
     delivered = int(rows[0]["delivered_tasks"] or 0)
     touches = int(rows[0]["touches"] or 0)
@@ -1339,7 +1651,7 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
 
 
 async def _human_gate_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> list[dict[str, Any]]:
     """Override-rate and queue wait per HUMAN gate and project (#737).
 
@@ -1354,14 +1666,15 @@ async def _human_gate_metrics(
     import statistics
 
     kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
+    window, window_params = scope.window_sql("e.created_at")
     event_rows = await fetchall(
         db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
-        "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
-        f"({kind_ph}) ORDER BY e.created_at ASC",  # nosec B608 - closed vocabulary
-        (since, *kinds),
+        f"WHERE {window} AND e.kind IN "  # nosec B608 - closed vocabulary
+        f"({kind_ph}) ORDER BY e.created_at ASC",
+        (*window_params, *kinds),
     )
 
     # Project attribution (#747): project_id lives on epics only — children
@@ -1420,6 +1733,8 @@ async def _human_gate_metrics(
     for row in event_rows:
         actor = (row["actor"] or "").strip()
         project_slug = await project_slug_for(row["task_id"])
+        if not scope.project_admits(project_slug):
+            continue
         decided_at = _parse_hub_ts(row["created_at"])
         kind = row["kind"]
         if kind in {"task_approved", "task_rejected", "task_decided", "audit_result"}:
@@ -1679,6 +1994,12 @@ async def dispatch_task(
     task: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
+    if automation_not_applicable(task):
+        # #1647: общий затвор headless-запуска (start, approve(run), создание с
+        # run_immediately, решение владельца о rework). До git, брони и job.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("dispatch")
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     branch = task.get("branch") or ""
@@ -1728,7 +2049,7 @@ async def dispatch_task(
             "blocker",
             f"{error} Обычная причина — незакоммиченные изменения в общем "
             f"рабочем каталоге. Закоммитьте или спрячьте их и решите через "
-            f"hub_decide_task.",
+            f"REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -1947,6 +2268,8 @@ async def restore_pair_workspace_base(
     row = await repo.get_task(db, task_id)
     if row and (dict(row).get("git_mode") or "hub") == "remote":
         return
+    if row and automation_not_applicable(row):
+        return  # #1647: у задачи-состояния нет worktree и рабочей копии
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
@@ -1972,8 +2295,8 @@ async def switch_pair_workspace_to_task(
     """
     row = await repo.get_task(db, task_id)
     task = dict(row) if row else {}
-    if (task.get("git_mode") or "hub") == "remote":
-        return
+    if (task.get("git_mode") or "hub") == "remote" or automation_not_applicable(task):
+        return  # #1647: state не переключает рабочую копию
     branch = (task.get("branch") or "").strip()
     if not branch:
         return
@@ -3004,9 +3327,13 @@ async def _approved_code_check(
     if current_tip != pinned:
         # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
         # авторская работа та же, и второй человеческий вердикт за неё — плата
-        # за механику, а не за содержание. Признак механический: дифф ветки к
-        # базе до и после мержа. Проверка стоит два чтения диффа и делается
-        # только здесь, на уже разошедшейся вершине.
+        # за механику, а не за содержание. Признак механический: авторская
+        # правка в диффе ветки к базе до и после мержа (#1361 — по смыслу, не
+        # побайтно). Проверка стоит два чтения диффа и делается только здесь,
+        # на уже разошедшейся вершине.
+        waiting = await _gate_update_base(db, task)
+        if waiting:
+            return waiting, ""
         kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
         if kept:
             return "", (
@@ -3023,6 +3350,35 @@ async def _approved_code_check(
     return "", ""
 
 
+async def _gate_update_base(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """База в клоне — не старее той, что гейт слил в ветку (#1419); "" — да.
+
+    Вершина ушла с закреплённой после слияния базы гейтом. Сверка #1361
+    считает дифф ветки к базе клона, и старая база там читала бы коммиты,
+    приехавшие слиянием, как правку автора — второй вердикт за механику.
+    Базу не получили — временное ожидание с причиной, не мерж и не stale.
+    """
+    if not await gate_branch_update_from(db, task):
+        return ""
+    ctx = await project_git_context(db, task["id"])
+    workspace = ctx.get("repo")
+    base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+    if not workspace:
+        return ""
+    try:
+        ok, err = await plugins.git_ops.fetch_base(workspace, base)
+    except Exception as exc:  # noqa: BLE001 - «не получили» — повод ждать
+        ok, err = False, str(exc)
+    if ok:
+        return ""
+    return (
+        f"{BASE_FETCH_PENDING_PREFIX}: гейт слил {base} в ветку, а свежую {base} "
+        f"в клон получить не удалось ({(err or 'fetch не прошёл').strip()[:150]}) — "
+        "без неё сверка с одобрением приняла бы базу за правку автора; "
+        "повтор следующим циклом, мержа нет"
+    )
+
+
 async def base_merge_kept_the_verdict(
     db: aiosqlite.Connection, task: dict[str, Any], pinned: str, current_tip: str
 ) -> tuple[bool, str]:
@@ -3032,16 +3388,15 @@ async def base_merge_kept_the_verdict(
     сохранение вердикта без сказанного вслух основания ничем не отличается от
     доверия.
 
-    Сравниваются два диффа ветки к базе: одобренной вершины и текущей. Совпали
-    байт в байт — привезена только база. Это НАБЛЮДЕНИЕ, а не разбор сообщения
-    коммита: «merge develop» в заголовке пишется рукой и ничего не доказывает.
+    Сравниваются два диффа ветки к базе: одобренной вершины и текущей, одним
+    правилом ``base_merge.author_edit_same`` — упорядоченные строки +/- по
+    файлам, без ``index``, заголовков ханков и контекста (#1361). Это
+    НАБЛЮДЕНИЕ, а не разбор сообщения коммита: «merge develop» в заголовке
+    пишется рукой и ничего не доказывает.
 
-    Известная узость, и она в безопасную сторону: если база тронула тот же файл,
-    что и автор, дифф перестаёт совпадать (другой блоб базы — другая строка
-    ``index``, вставка базы — другие смещения ханков), и вердикт слетает, то
-    есть ровно сегодняшнее поведение. Наблюдено на настоящем git в
-    tests/test_delivery_gate.py. Обратной ошибки — сохранить вердикт там, где
-    автор правил, — такое сравнение не допускает, и это здесь важнее полноты.
+    Тем же чтением пользуется заказ ревью на пересдаче (review_dispatch,
+    #1361): «правка та же» у гейта и у ревью — один ответ, а не два.
+    ``pinned`` и ``current_tip`` — любые две вершины одной ветки.
     """
     branch = (task.get("branch") or "").strip()
     if not branch:
@@ -3057,7 +3412,7 @@ async def base_merge_kept_the_verdict(
     except Exception as exc:  # noqa: BLE001 - деградация, а не отказ гейта
         log.warning("base-merge check failed for #%s: %s", task["id"], exc)
         return False, f"сверка диффа к базе не состоялась: {exc}"
-    return base_merge.author_diff_unchanged(before, after)
+    return base_merge.author_edit_same(before, after)
 
 
 def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
@@ -3069,6 +3424,22 @@ def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
     except ValueError:
         return None
     return (datetime.now(UTC) - started).total_seconds()
+
+
+async def _gate_made_head(
+    db: aiosqlite.Connection, task: dict[str, Any], observed: str
+) -> bool:
+    """Сделал ли эту голову гейт слиянием базы в ЭТОМ поколении (#1419).
+
+    Два факта, и оба наблюдаемы: событие gate_branch_update этого поколения
+    с головы, закреплённой сдачей, и авторская правка головы та же, что у
+    закреплённой (#1361). Чужой пуш поверх слияния второе не пройдёт.
+    """
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned or await gate_branch_update_from(db, task) != pinned:
+        return False
+    kept, _why = await base_merge_kept_the_verdict(db, task, pinned, observed)
+    return kept
 
 
 async def request_missing_ci_run(
@@ -3113,11 +3484,14 @@ async def request_missing_ci_run(
         )
     if not observed:
         return False, "вершина ветки не прочитана — просить прогон вслепую нельзя"
-    if pinned != observed:
+    if pinned != observed and not await _gate_made_head(db, task, observed):
         return False, (
             f"ветка на {observed[:12]}, а закреплён {pinned[:12]} — прогон по "
             f"чужому коммиту ничего не даст, запроса нет"
         )
+    # #1419: голова, которую сделал гейт слиянием базы, — законный предмет
+    # прогона: ею будет судиться доставка. Попытка по-прежнему одна на коммит.
+    pinned = observed
 
     # The attempt is RESERVED before the paid call, never checked against a
     # snapshot and then spent after an await. Two callers share this population
@@ -3484,6 +3858,45 @@ MERGE_REFUSAL_UNVERIFIED_PREFIX = "merge_refusal_unverified"
 # задачи нет. Терминальный: доставку сделал не гейт, и молча записать её как
 # свою значило бы ослепить drift-guard (#534).
 MERGED_OUTSIDE_GATE_PREFIX = "merged_outside_gate"
+# #1407: соседний путь гейта ещё ждёт ответа форжа по этому PR дольше
+# GATE_MERGE_WAIT_SECONDS. Истёкшее ожидание — не «мержа нет»: второй вызов
+# форжа, пока первый жив, — та же гонка #1376/#1398. Ждём следующего цикла.
+GATE_MERGE_IN_FLIGHT_PREFIX = "gate_merge_in_flight"
+# #1407: PR MERGED, строки pipeline_merges нет, а merge-коммит прочитать не
+# вышло (исключение чтения, пустой sha). Это «проверить не удалось», а не
+# «гейт не вливал» (#516/#549): терминальный MERGED_OUTSIDE_GATE здесь был бы
+# выводом из отсутствия данных. Следующий цикл перечитает.
+MERGE_COMMIT_UNVERIFIED_PREFIX = "merge_commit_unverified"
+# #1428: форж влил PR, а строку pipeline_merges записать не дали — база занята
+# чужой write-транзакцией дольше всего ожидания. Это не недоставка: код уже в
+# базовой ветке. Ждём следующего цикла — он допишет строку без второго мержа.
+GATE_RECORD_PENDING_PREFIX = "gate_record_pending"
+# Сколько ждать занятую базу после влитого PR и с какой паузой повторять.
+# Каждая попытка сама ждёт busy_timeout; ожидание целиком перекрывает мерж
+# соседнего done-flow, который держит лок на время сети.
+GATE_RECORD_WAIT_SECONDS = 60.0
+GATE_RECORD_RETRY_PAUSE_SECONDS = 1.0
+# #1419: гейт мержит только голову, стоящую на актуальной базе. 25.09.2026
+# #1361 и #1400 влиты за 57 с, каждая зелёная на своей базе, — и develop
+# покраснел на 1 ч 43 мин: CI #1400 шёл на базе без #1361.
+# Временные: отставание не прочитано; база слита гейтом и ждёт CI на новой
+# голове; обновление уже запрошено с этой головы; обновление не долетело.
+BASE_FRESHNESS_UNKNOWN_PREFIX = "base_freshness_unknown"
+BASE_UPDATED_PREFIX = "base_updated"
+BASE_UPDATE_PENDING_PREFIX = "base_update_pending"
+BASE_UPDATE_RETRY_PREFIX = "base_update_retry"
+BASE_FETCH_PENDING_PREFIX = "base_fetch_pending"
+# Терминальные — к человеку с причиной: конфликт при слиянии базы, отказ
+# форжа (права, защита ветки), красный CI на свежей базе. Последний нарочно
+# НЕ начинается с "ci_fail": это не красный CI автора, который он чинит на
+# конвейере (#1030), а семантический конфликт с чужой доставкой.
+BASE_UPDATE_CONFLICT_PREFIX = "base_update_conflict"
+BASE_UPDATE_REFUSED_PREFIX = "base_update_refused"
+FRESH_BASE_CI_FAILED_PREFIX = "fresh_base_ci_failed"
+# Событие «гейт слил базу в ветку с головы X в поколении сдачи N». По нему
+# следующий цикл узнаёт и красный CI на свежей базе, и уже потраченное
+# обновление (не больше одного без нового прогона CI).
+GATE_BRANCH_UPDATE_EVENT = "gate_branch_update"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -3501,6 +3914,16 @@ TRANSIENT_GATE_PREFIXES = (
     # нечего. Лечится следующим циклом, а не решением.
     MERGE_UNCONFIRMED,
     MERGE_REFUSAL_UNVERIFIED_PREFIX,
+    GATE_MERGE_IN_FLIGHT_PREFIX,
+    MERGE_COMMIT_UNVERIFIED_PREFIX,
+    GATE_RECORD_PENDING_PREFIX,
+    # #1419: отставание от базы — ждать ответа форжа, CI на новой голове или
+    # следующей попытки обновления, но не мержить и не звать человека.
+    BASE_FRESHNESS_UNKNOWN_PREFIX,
+    BASE_UPDATED_PREFIX,
+    BASE_UPDATE_PENDING_PREFIX,
+    BASE_UPDATE_RETRY_PREFIX,
+    BASE_FETCH_PENDING_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -3525,6 +3948,21 @@ MERGE_REFUSAL_UNVERIFIED_WAIT_HINT = (
     "мерже, а прочитать PR после отказа не удалось — возможно, его уже влил "
     "соседний путь гейта. Хаб перечитает PR следующим циклом. Пересдавать НЕ "
     "нужно — новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+# #1407: мерж гейта по этому PR уже идёт в этом процессе — форж отвечает
+# медленно. Второго вызова не будет; следующий цикл увидит его исход.
+GATE_MERGE_IN_FLIGHT_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: соседний путь "
+    "гейта уже вливает этот PR, а форж ещё не ответил. Второй мерж не "
+    "запускается — хаб увидит исход следующим циклом. Пересдавать НЕ нужно — "
+    "новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+# #1407: PR влит, но чей это мерж — проверить не удалось.
+MERGE_COMMIT_UNVERIFIED_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: PR уже влит, но "
+    "прочитать его merge-коммит и сверить с реестром гейта не удалось. Хаб "
+    "проверит следующим циклом, гейт ли это влил. Пересдавать НЕ нужно — "
+    "новых коммитов нет, пересдача сбросит вердикт (#612)."
 )
 BASE_AUTOMERGE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: гейт сам слил "
@@ -3852,20 +4290,35 @@ _gate_merges: dict[tuple[int, int], asyncio.Future[bool]] = {}
 GATE_MERGE_WAIT_SECONDS = 60.0
 
 
-async def _gate_merge_outcome(key: tuple[int, int]) -> bool:
+class GateMergeSeen(enum.Enum):
+    """Что память ``_gate_merges`` знает о мерже гейта (#1398, #1407).
+
+    Три состояния, а не bool: истёкшее ожидание идущего мержа — не «мержа
+    нет». Прочитай его как «нет», и вызывающий зовёт форж второй раз, пока
+    первый вызов ещё жив (#1407).
+    """
+
+    MERGED = "merged"
+    ABSENT = "absent"
+    IN_FLIGHT = "in_flight"
+
+
+async def _gate_merge_outcome(key: tuple[int, int]) -> GateMergeSeen:
     """Влил ли гейт этот PR в этом процессе — дождавшись идущего мержа (#1398).
 
-    False — «гейт в этом процессе его не вливал» (или не дождались): решает
-    вызывающий, как решал бы без этой памяти.
+    ABSENT — «гейт в этом процессе его не вливал»: решает вызывающий, как
+    решал бы без этой памяти. IN_FLIGHT — мерж идёт дольше
+    GATE_MERGE_WAIT_SECONDS; второй вызов форжа сейчас запрещён (#1407).
     """
     fut = _gate_merges.get(key)
     if fut is None:
-        return False
+        return GateMergeSeen.ABSENT
     try:
-        return await asyncio.wait_for(asyncio.shield(fut), GATE_MERGE_WAIT_SECONDS)
+        merged = await asyncio.wait_for(asyncio.shield(fut), GATE_MERGE_WAIT_SECONDS)
     except TimeoutError:
         log.warning("gate merge of %s did not answer in time", key)
-        return False
+        return GateMergeSeen.IN_FLIGHT
+    return GateMergeSeen.MERGED if merged else GateMergeSeen.ABSENT
 
 
 async def _registered_gate_merge(
@@ -3909,8 +4362,18 @@ async def _gate_merge_step(
     у зелёной доставки нет причины за них платить.
     """
     key = (int(task["id"]), int(task["pr_number"]))
-    if await _gate_merge_outcome(key):
+    seen = await _gate_merge_outcome(key)
+    if seen is GateMergeSeen.MERGED:
         return (True, "already delivered"), ""
+    if seen is GateMergeSeen.IN_FLIGHT:
+        # #1407: ожидание истекло, а первый вызов форжа жив. Второй вызов
+        # перезаписал бы его Future и получил бы отказ по уже влитому PR.
+        return (
+            False,
+            f"{GATE_MERGE_IN_FLIGHT_PREFIX}: мерж гейта ещё идёт — PR "
+            f"#{key[1]} вливает соседний путь гейта, форж не ответил за "
+            f"{GATE_MERGE_WAIT_SECONDS:g} с; второй мерж не запускается",
+        ), ""
     merged, merge_detail = await _registered_gate_merge(key, task, ctx)
     if not merged:
         return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
@@ -3934,6 +4397,8 @@ async def _refused_merge_outcome(
       записанных гейтом) — доставка, без второй строки реестра;
     * MERGED без следа гейта — терминально, с названной причиной: ручной мерж
       в то же окно не должен тихо стать мержем гейта (drift-guard, #534);
+    * MERGED, а след проверить не удалось (merge-коммит не прочитан, мерж
+      соседнего пути ещё идёт) — временное ожидание, не ручной мерж (#1407);
     * PR не прочитан — после молчаливого отказа это временное ожидание, а
       не решение; при названной форжем причине — прежний путь с ней;
     * иначе (open/closed/absent) — прежний путь отказа.
@@ -3943,8 +4408,15 @@ async def _refused_merge_outcome(
     pr_num = int(task["pr_number"])
     state, why = await _recorded_pr_state(db, task, pr_num)
     if state == "merged":
-        if await _merged_by_gate(db, task, ctx, pr_num):
+        trace = await _merged_by_gate(db, task, ctx, pr_num)
+        if trace is GateTrace.GATE:
             return True, "already delivered"
+        if trace is GateTrace.UNVERIFIED:
+            return False, (
+                f"{MERGE_COMMIT_UNVERIFIED_PREFIX}: PR #{pr_num} уже MERGED, но "
+                "проверить, гейт ли его влил, не удалось — merge-коммит не "
+                "прочитан или мерж соседнего пути ещё идёт. Это не ручной мерж, а непроверенный"
+            )
         return False, (
             f"{MERGED_OUTSIDE_GATE_PREFIX}: PR влит не гейтом — PR #{pr_num} уже "
             "MERGED, но мержа гейта по нему нет (ни строки pipeline_merges этой "
@@ -3959,15 +4431,30 @@ async def _refused_merge_outcome(
     return False, await refusal_after_automerge(db, task, ctx, merge_detail)
 
 
+class GateTrace(enum.Enum):
+    """Нашёлся ли у MERGED-PR след гейта (#1398, #1407).
+
+    UNVERIFIED — «проверить не удалось», и это не NOT_GATE: отсутствие данных
+    не вывод (#516/#549), а NOT_GATE терминален и зовёт человека.
+    """
+
+    GATE = "gate"
+    NOT_GATE = "not_gate"
+    UNVERIFIED = "unverified"
+
+
 async def _merged_by_gate(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any], pr_num: int
-) -> bool:
+) -> GateTrace:
     """Влит ли MERGED-PR гейтом — по его собственным следам (#1398)."""
     task_id = task["id"]
     if await repo.pipeline_merge_recorded(db, task_id, pr_num):
-        return True
-    if await _gate_merge_outcome((task_id, pr_num)):
-        return True
+        return GateTrace.GATE
+    seen = await _gate_merge_outcome((task_id, pr_num))
+    if seen is GateMergeSeen.MERGED:
+        return GateTrace.GATE
+    if seen is GateMergeSeen.IN_FLIGHT:
+        return GateTrace.UNVERIFIED
     try:
         sha = await plugins.git_ops.merge_commit_sha(
             pr_num,
@@ -3976,12 +4463,302 @@ async def _merged_by_gate(
             forge=ctx.get("forge", ""),
         )
         proj = await repo.resolve_project_for_task(db, task_id)
-    except Exception:  # noqa: BLE001 - «не узнали» не делает мерж гейтовым
+    except Exception:  # noqa: BLE001 - «не узнали» — не «не гейт» (#1407)
         log.exception("merge commit of PR #%s unreadable (#%s)", pr_num, task_id)
-        return False
-    if not sha or not proj:
-        return False
-    return sha in await repo.known_pipeline_shas(db, dict(proj)["id"])
+        return GateTrace.UNVERIFIED
+    if not sha:
+        # Форж не назвал merge-коммит влитого PR — сверять нечего (#1407).
+        return GateTrace.UNVERIFIED
+    # Нет проекта — это ответ, а не сбой чтения: реестр гейта без проекта
+    # пуст по определению (known_pipeline_shas намеренно не берёт строки с
+    # NULL project_id, #534). Мерж самой задачи уже поймал
+    # pipeline_merge_recorded выше.
+    if proj and sha in await repo.known_pipeline_shas(db, dict(proj)["id"]):
+        return GateTrace.GATE
+    return GateTrace.NOT_GATE
+
+
+_ALREADY_DELIVERED = (True, "already delivered")
+# #1428: мержи гейта, чью строку реестра записать не дали (занятая база).
+# Только по ним «уже доставлено» дописывает строку: проигравший гонки #1398
+# строку победителя ещё не видит, и без этой памяти писал бы вторую — у
+# задачи без проекта уникальный индекс её не отсечёт (NULL ≠ NULL).
+#
+# Память процесса, и это граница, а не недосмотр: прочного следа здесь нет.
+# «Запись не легла» случается ровно тогда, когда чужая транзакция держит лок
+# всё ожидание, — и любой след в SQLite (запись в ленте) упирается в тот же
+# лок. След в ленте к тому же подделываем: текст сдачи ложится записью хаба.
+# Перезапуск в этом окне читает влитый PR как merged_outside_gate — к
+# человеку, как до #1428. Корень — сеть под write-транзакцией done-flow;
+# он вынесен отдельной задачей.
+_unrecorded_gate_merges: set[tuple[int, int]] = set()
+
+
+async def _gate_merge_commit(
+    task_id: int, pr_num: int, ctx: dict[str, Any], merge_detail: str
+) -> str:
+    """The commit THIS pull request produced — never the branch tip (#534)."""
+    try:
+        merge_sha = await plugins.git_ops.merge_commit_sha(
+            pr_num,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+        return _merge_sha_or_detail(merge_sha, merge_detail)
+    except Exception:  # noqa: BLE001 - the drift guard flags it once
+        log.exception(
+            "could not read the merge commit for task #%s; "
+            "the drift guard will flag it once",
+            task_id,
+        )
+        return ""
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+
+
+async def _record_gate_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any], merge_sha: str, *, sha_note: str
+) -> str:
+    """Записать влитый PR в реестр; "" — записано, иначе причина ожидания (#1428).
+
+    Форж уже влил PR, поэтому сбой записи здесь — не недоставка. Занятая база
+    (чужая write-транзакция держит лок дольше busy_timeout) — повод повторить,
+    а не звать человека: 26.09.2026 ровно это увело влитую #1411 в
+    needs_decision без строки pipeline_merges. Не легло за всё ожидание —
+    причина с GATE_RECORD_PENDING_PREFIX: задача ждёт, следующий цикл
+    допишет строку без второго мержа (память _gate_merges, #1398).
+
+    Повтор — только когда соединение не в транзакции: в своей транзакции оно
+    уже держит лок, и «locked» тогда не про очередь, а сломанное состояние.
+    """
+    task_id = int(task["id"])
+    pr_num = int(task["pr_number"])
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + GATE_RECORD_WAIT_SECONDS
+    while True:
+        try:
+            if sha_note:
+                # Delivered WITHOUT the comparison — the reader must be able
+                # to tell that apart from "compared and matched" (#605 AC-5).
+                await repo.add_task_update(db, task_id, "hub", "alert", sha_note)
+            proj = await repo.resolve_project_for_task(db, task_id)
+            await repo.record_pipeline_merge(
+                db,
+                pr_number=pr_num,
+                merge_sha=merge_sha,
+                project_id=(dict(proj)["id"] if proj else None),
+                task_id=task_id,
+            )
+            return ""
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc) or db.in_transaction:
+                raise
+            if loop.time() >= deadline:
+                log.warning("gate record of PR #%s (#%s) did not land", pr_num, task_id)
+                return (
+                    f"{GATE_RECORD_PENDING_PREFIX}: PR #{pr_num} влит, но строку "
+                    "реестра доставок записать не дали — база занята чужой "
+                    f"записью дольше {GATE_RECORD_WAIT_SECONDS:g} с ({exc}). "
+                    "Следующий цикл допишет её без второго мержа"
+                )
+            await asyncio.sleep(GATE_RECORD_RETRY_PAUSE_SECONDS)
+
+
+# #1419: головы, с которых гейт В ЭТОМ процессе уже просил слить базу, по
+# (задача, PR). Ставится до вызова форжа без единого await между проверкой и
+# записью: второй путь гейта (поллер или report_done) не просит второго
+# обновления той же головы, пока событие первого не закоммичено.
+# Значение — (поколение сдачи, голова): пересдача начинает счёт заново.
+_gate_branch_updates: dict[tuple[int, int], tuple[int, str]] = {}
+
+
+async def gate_branch_update_from(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str:
+    """С какой головы гейт сливал базу в ветку в ЭТОМ поколении сдачи, или "" (#1419)."""
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind=? ORDER BY id DESC",
+        (task["id"], GATE_BRANCH_UPDATE_EVENT),
+    )
+    generation = int(task.get("submission_generation") or 0)
+    pr_num = int(task.get("pr_number") or 0)
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("generation") == generation
+            and payload.get("pr") == pr_num
+        ):
+            return str(payload.get("from_sha") or "")
+    return ""
+
+
+async def _ci_gate_refusal(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    ci: CIProbeResult,
+) -> str:
+    """Отказ гейта по исходу CI, или "" при зелёном (вынесено по бюджету, #1419)."""
+    if ci.outcome == CIProbeOutcome.missing_run:
+        return await _missing_run_gate_step(db, task, ctx, ci)
+    if ci.outcome == CIProbeOutcome.failed:
+        return await _red_ci_detail(db, task, ci)
+    if ci.outcome != CIProbeOutcome.passed:
+        return f"ci_{ci.outcome.value}: {ci.reason}"
+    return ""
+
+
+async def _red_ci_detail(
+    db: aiosqlite.Connection, task: dict[str, Any], ci: CIProbeResult
+) -> str:
+    """Красный CI: авторский (чинит исполнитель) или на свежей базе (человек, #1419).
+
+    Гейт слил базу в ветку этого поколения, а CI после этого красный — это
+    конфликт с чужой доставкой, а не недоделка автора: авторская правка та же
+    (иначе сверка #612/#1361 выше уже отказала бы). Решать человеку.
+    """
+    if await gate_branch_update_from(db, task):
+        run = f" ({ci.details})" if ci.details else ""
+        return (
+            f"{FRESH_BASE_CI_FAILED_PREFIX}: CI красный на свежей базе — гейт "
+            f"слил базу в ветку PR #{task['pr_number']}, и прогон на новой "
+            f"голове упал: {ci.reason}{run}. Авторская правка не менялась; "
+            "это конфликт с уже доставленной работой, мержа нет"
+        )
+    return f"ci_{ci.outcome.value}: {ci.reason}"
+
+
+async def base_freshness_step(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> str:
+    """Стоит ли голова PR на актуальной базе; если нет — обновить ветку (#1419).
+
+    "" — стоит (или плагин не умеет спрашивать): мержить. Иначе причина:
+    временная (не прочитано, обновлено и ждём CI, обновление уже запрошено
+    с этой головы) или терминальная (конфликт, отказ форжа).
+
+    Не больше одного обновления на голову: следующая голова появляется
+    только после обновления, и до мержа на ней обязан пройти CI (проба выше
+    по гейту). Значит, второе обновление без нового прогона CI невозможно.
+    """
+    key = (int(task["id"]), int(task["pr_number"]))
+    if key in _gate_merges:
+        # #1398: мерж гейта по этому PR идёт или прошёл в этом процессе —
+        # ветку под ним не трогать; исход разберёт _gate_merge_step.
+        return ""
+    forge = ctx.get("forge", "")
+    fresh = await plugins.git_ops.pr_base_freshness(
+        key[1], repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo"), forge=forge
+    )
+    if fresh.state in (BaseFreshnessState.current, BaseFreshnessState.unsupported):
+        return ""
+    if fresh.state is not BaseFreshnessState.behind or not fresh.head_sha:
+        return (
+            f"{BASE_FRESHNESS_UNKNOWN_PREFIX}: не удалось узнать, отстала ли "
+            f"ветка PR #{key[1]} от базы ({fresh.reason or 'форж не ответил'}) — "
+            "мерж отложен до ответа"
+        )
+    spent = (int(task.get("submission_generation") or 0), fresh.head_sha)
+    pending = (
+        f"{BASE_UPDATE_PENDING_PREFIX}: гейт уже слил базу в ветку PR "
+        f"#{key[1]} с головы {fresh.head_sha[:12]}, новой головы ещё нет — "
+        "второго обновления без нового прогона CI не будет"
+    )
+    if _gate_branch_updates.get(key) == spent:
+        return pending
+    # Бронь — в том же синхронном участке, что и проверка, до первого await
+    # (#421, #1398): иначе второй путь гейта проходит проверку, пока первый
+    # ждёт базу или форж, и зовёт update второй раз.
+    _gate_branch_updates[key] = spent
+    try:
+        if await gate_branch_update_from(db, task) == fresh.head_sha:
+            return pending
+        outcome, detail = await plugins.git_ops.update_pr_branch(
+            key[1],
+            fresh.head_sha,
+            task_id=key[0],
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=forge,
+        )
+    except BaseException:
+        _release_branch_update(key, spent)
+        raise
+    if outcome is not BranchUpdateOutcome.updated:
+        _release_branch_update(key, spent)
+        return _branch_update_refusal(key[1], fresh, outcome, detail)
+    await _record_branch_update(db, task, ctx, fresh)
+    behind = f" на {fresh.behind_by} комм." if fresh.behind_by else ""
+    return (
+        f"{BASE_UPDATED_PREFIX}: ветка PR #{key[1]} отстала от базы{behind} — "
+        f"гейт слил базу в ветку (голова была {fresh.head_sha[:12]}: {detail}). "
+        "Мерж — после зелёного CI на новой голове, следующим циклом"
+    )
+
+
+def _release_branch_update(key: tuple[int, int], spent: tuple[int, str]) -> None:
+    """Снять СВОЮ бронь обновления: обновления не было (#1419)."""
+    if _gate_branch_updates.get(key) == spent:
+        _gate_branch_updates.pop(key, None)
+
+
+def _branch_update_refusal(
+    pr_num: int, fresh: BaseFreshness, outcome: BranchUpdateOutcome, detail: str
+) -> str:
+    """Причина несостоявшегося обновления ветки — временная или к человеку (#1419)."""
+    if outcome is BranchUpdateOutcome.conflict:
+        return (
+            f"{BASE_UPDATE_CONFLICT_PREFIX}: ветка PR #{pr_num} отстала от базы: "
+            f"конфликт в {detail or 'файлах, которые не удалось назвать'} — "
+            "слить базу без человека нельзя, мержа нет"
+        )
+    if outcome in (BranchUpdateOutcome.refused, BranchUpdateOutcome.unsupported):
+        return (
+            f"{BASE_UPDATE_REFUSED_PREFIX}: ветка PR #{pr_num} отстала от базы, "
+            f"а обновить её гейту не дали ({detail}) — нет права обновить ветку "
+            "или форж не умеет; мержа отставшей ветки нет"
+        )
+    return (
+        f"{BASE_UPDATE_RETRY_PREFIX}: ветка PR #{pr_num} отстала от базы, "
+        f"обновление с головы {fresh.head_sha[:12]} не состоялось "
+        f"({outcome.value}: {detail}) — повтор следующим циклом, мержа нет"
+    )
+
+
+async def _record_branch_update(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    fresh: BaseFreshness,
+) -> None:
+    """След обновления гейтом: событие и окно CI заново (#1419).
+
+    Окно ожидания прогона (#1041) перезапускается: новой голове нужен свой
+    прогон, а старая отметка превратила бы его отсутствие в ci_untested
+    сразу. Базу в клоне обновляет сверка на новой голове (_gate_update_base),
+    а не этот шаг: там её отказ останавливает мерж. Запись — после сети (#1428).
+    """
+    await repo.mark_ci_check_started(db, task["id"])
+    await repo.insert_event(
+        db,
+        kind=GATE_BRANCH_UPDATE_EVENT,
+        task_id=task["id"],
+        actor="hub",
+        payload={
+            "pr": int(task["pr_number"]),
+            "from_sha": fresh.head_sha,
+            "behind_by": fresh.behind_by,
+            "generation": int(task.get("submission_generation") or 0),
+        },
+    )
 
 
 async def merge_before_completion(
@@ -4028,12 +4805,10 @@ async def merge_before_completion(
         diverged, sha_note = await _approved_code_check(db, task, pr_num)
         if diverged:
             return False, diverged
-        if sha_note:
-            # Delivered WITHOUT the comparison — the reader must be able to
-            # tell that apart from "compared and matched". Written here rather
-            # than returned: the gate's (ok, reason) contract feeds a refusal
-            # message, and a success has no channel of its own (#605 AC-5).
-            await repo.add_task_update(db, task_id, "hub", "alert", sha_note)
+        # sha_note — «доставлено без сверки» — пишется ПОСЛЕ мержа, в
+        # _record_gate_delivery (#1428): запись здесь, до сети, держала
+        # write-лок соединения на всё время вызова форжа, и соседний путь
+        # гейта падал на «database is locked» по влитому PR.
 
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
@@ -4042,10 +4817,9 @@ async def merge_before_completion(
         ci = await plugins.git_ops.check_pr_ci(
             pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
         )
-        if ci.outcome == CIProbeOutcome.missing_run:
-            return False, await _missing_run_gate_step(db, task, ctx, ci)
-        if ci.outcome != CIProbeOutcome.passed:
-            return False, f"ci_{ci.outcome.value}: {ci.reason}"
+        ci_refusal = await _ci_gate_refusal(db, task, ctx, ci)
+        if ci_refusal:
+            return False, ci_refusal
 
         # #1186: mergeable is not deliverable. A green, conflict-free PR whose
         # branch stands on ANOTHER task's unmerged branch carries that task's
@@ -4056,6 +4830,13 @@ async def merge_before_completion(
         stacked = await stacking_gate_step(db, task)
         if stacked:
             return False, stacked
+
+        # #1419: зелёный CI головы — не зелёный CI на базе, в которую она
+        # ляжет. Отставшую ветку гейт обновляет и ждёт CI на новой голове.
+        # После стопки: ветку на чужом основании обновлять не за чем.
+        stale_base = await base_freshness_step(db, task, ctx)
+        if stale_base:
+            return False, stale_base
 
         # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
         # here is the ready signal. Asking merge_pr first collapses a draft
@@ -4076,34 +4857,21 @@ async def merge_before_completion(
                 )
 
         decided, merge_detail = await _gate_merge_step(db, task, ctx)
-        if decided is not None:
+        key = (int(task_id), int(pr_num))
+        if decided is not None and not (
+            decided == _ALREADY_DELIVERED and key in _unrecorded_gate_merges
+        ):
             return decided
-
-        # The commit THIS pull request produced — never the branch tip,
-        # which is whatever landed last (#534, review round 3).
-        merge_sha = ""
-        try:
-            merge_sha = await plugins.git_ops.merge_commit_sha(
-                pr_num,
-                repo=workspace,
-                gh_repo=gh_repo,
-                forge=ctx.get("forge", ""),
-            )
-            merge_sha = _merge_sha_or_detail(merge_sha, merge_detail)
-        except Exception:  # noqa: BLE001 - the drift guard flags it once
-            log.exception(
-                "could not read the merge commit for task #%s; "
-                "the drift guard will flag it once",
-                task_id,
-            )
-        proj = await repo.resolve_project_for_task(db, task_id)
-        await repo.record_pipeline_merge(
-            db,
-            pr_number=pr_num,
-            merge_sha=merge_sha,
-            project_id=(dict(proj)["id"] if proj else None),
-            task_id=task_id,
-        )
+        # #1428: «уже доставлено» по мержу, чью строку прошлый проход не смог
+        # записать на занятой базе, — дописать её, а не считать записанной.
+        merge_sha = await _gate_merge_commit(task_id, pr_num, ctx, merge_detail)
+        # sha_note и при дописывании: прошлый проход не записал ни строку,
+        # ни заметку «без сверки» — пропасть вместе со строкой она не должна.
+        pending = await _record_gate_delivery(db, task, merge_sha, sha_note=sha_note)
+        if pending:
+            _unrecorded_gate_merges.add(key)
+            return False, pending
+        _unrecorded_gate_merges.discard(key)
 
         # Post-merge tidying, not delivery (#552): the work is merged, so a
         # workspace that cannot be returned to base is logged, never fatal.
@@ -4419,6 +5187,75 @@ async def resolve_delivery_pr(
     return task, delivery_pr
 
 
+# Подсказка ожидания по префиксу транзитного отказа (#1271): у каждого
+# не-CI префикса своя фраза. Фраза про CI советует пересдачу, а пересдача
+# сбрасывает вердикт (#612) — префикс, не названный здесь, наследует её.
+# Комментарии к каждому входу — у констант подсказок выше.
+# * PR_DRAFT (#1053): CI уже зелёный, пересдача сбросит вердикт.
+# * BASE_AUTOMERGE (#1271 в мерже с #1233): «отчитайтесь снова» — ровно та
+#   пересдача, ради избежания которой автомерж и написан.
+# * STACKED_BASE/STACK_UNKNOWN (#1186, машинное ревью): ждут другой задачи,
+#   CI уже зелёный.
+# * MERGE_UNCONFIRMED (#1276): мерж прошёл, CI был зелёным до него.
+# * GATE_MERGE_IN_FLIGHT/MERGE_COMMIT_UNVERIFIED (#1407): ждут исхода мержа
+#   соседнего пути или повторного чтения, а не CI.
+# #1428: PR влит, не записана только строка реестра — база была занята.
+GATE_RECORD_PENDING_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: PR уже влит, "
+    "хаб допишет строку реестра доставок следующим циклом, без второго "
+    "мержа. Пересдавать и отчитываться снова не нужно."
+)
+# #1419: ветка отстала от базы, гейт её обновляет сам.
+BASE_FRESHNESS_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: гейт мержит "
+    "только ветку на актуальной базе и доставит задачу следующим циклом после "
+    "зелёного CI на новой голове. Пересдавать НЕ нужно: слияние базы гейтом — "
+    "не авторская правка, вердикт сохраняется (#1361)."
+)
+_TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
+    (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
+    (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
+    ((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX), STACKED_BASE_WAIT_HINT),
+    (MERGE_REFUSAL_UNVERIFIED_PREFIX, MERGE_REFUSAL_UNVERIFIED_WAIT_HINT),
+    (MERGE_UNCONFIRMED, MERGE_UNCONFIRMED_WAIT_HINT),
+    (GATE_MERGE_IN_FLIGHT_PREFIX, GATE_MERGE_IN_FLIGHT_WAIT_HINT),
+    (MERGE_COMMIT_UNVERIFIED_PREFIX, MERGE_COMMIT_UNVERIFIED_WAIT_HINT),
+    (GATE_RECORD_PENDING_PREFIX, GATE_RECORD_PENDING_WAIT_HINT),
+    (
+        (
+            BASE_FRESHNESS_UNKNOWN_PREFIX,
+            BASE_UPDATED_PREFIX,
+            BASE_UPDATE_PENDING_PREFIX,
+            BASE_UPDATE_RETRY_PREFIX,
+            BASE_FETCH_PENDING_PREFIX,
+        ),
+        BASE_FRESHNESS_WAIT_HINT,
+    ),
+)
+
+
+def _transient_wait_cause(detail: str, delivery_pr: DeliveryPR) -> str:
+    """Чего ждёт транзитный отказ гейта — фраза для ленты задачи (#959, #1271).
+
+    Вынесено из _deliver_completed_pair_task по бюджету сложности (#1407):
+    каждая новая причина ожидания добавляла ветку в лесенку диспетчера.
+    """
+    for prefixes, hint in _TRANSIENT_WAIT_HINTS:
+        if detail.startswith(prefixes):
+            return hint
+    if delivery_pr.established:
+        return (
+            "Это временное состояние, решение человека не требуется: "
+            "отчитайтесь о готовности снова, когда CI станет зелёным."
+        )
+    return (
+        "Состояние самого PR прочитать не удалось, поэтому "
+        "про CI тут сказать нечего: отчитайтесь о готовности "
+        "снова, когда PR станет доступен. Если он недоступен "
+        "не временно — это вопрос к человеку."
+    )
+
+
 async def _deliver_completed_pair_task(
     db: aiosqlite.Connection, task: dict[str, Any], delivery_pr: DeliveryPR
 ) -> str | None:
@@ -4459,46 +5296,7 @@ async def _deliver_completed_pair_task(
             # #952 removed from the terminal branch, here in the
             # patient one. A draft is a third cause (#1053): CI is
             # already green, and resubmitting would stale the verdict.
-            if detail.startswith(PR_DRAFT_PREFIX):
-                cause = PR_DRAFT_WAIT_HINT
-            elif detail.startswith(BASE_AUTOMERGE_PREFIX):
-                # #1271 в мерже с #1233: попасть в TRANSIENT_GATE_PREFIXES —
-                # только половина вступления в этот набор. Не названный здесь
-                # префикс наследует фразу про CI, а «отчитайтесь о готовности
-                # снова» — это ровно та
-                # пересдача, которая сбросит вердикт, ради сохранения которого
-                # автомерж и написан.
-                cause = BASE_AUTOMERGE_WAIT_HINT
-            elif detail.startswith((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX)):
-                # #1186, found by the machine review of the change that added
-                # these two: putting a prefix in TRANSIENT_GATE_PREFIXES is
-                # only half of joining that set. This ladder words the wait per
-                # cause, and an unlisted member inherits the CI sentence — here
-                # a false one, because the CI is already green and the wait is
-                # for another task. Worse than false: it tells the executor to
-                # report done again, which is the one action that would stale
-                # the verdict (#612) — the very trap PR_DRAFT_WAIT_HINT exists
-                # to avoid, re-opened for the neighbour added beside it.
-                cause = STACKED_BASE_WAIT_HINT
-            elif detail.startswith(MERGE_REFUSAL_UNVERIFIED_PREFIX):
-                cause = MERGE_REFUSAL_UNVERIFIED_WAIT_HINT
-            elif detail.startswith(MERGE_UNCONFIRMED):
-                # #1276, found by the #1271 invariant: the same inheritance as
-                # #1186 — the merge happened, and the CI sentence below would
-                # send the executor to wait for a check that was green already.
-                cause = MERGE_UNCONFIRMED_WAIT_HINT
-            elif delivery_pr.established:
-                cause = (
-                    "Это временное состояние, решение человека не требуется: "
-                    "отчитайтесь о готовности снова, когда CI станет зелёным."
-                )
-            else:
-                cause = (
-                    "Состояние самого PR прочитать не удалось, поэтому "
-                    "про CI тут сказать нечего: отчитайтесь о готовности "
-                    "снова, когда PR станет доступен. Если он недоступен "
-                    "не временно — это вопрос к человеку."
-                )
+            cause = _transient_wait_cause(detail, delivery_pr)
             await repo.add_task_update(
                 db,
                 task_id,
@@ -4569,7 +5367,7 @@ async def _deliver_completed_pair_task(
                 else ""
             )
             + " Решение за человеком "
-            "(hub_decide_task): rework вернёт задачу в running — "
+            "(REST POST /api/tasks/<id>/decide): rework вернёт задачу в running — "
             "устраните причину и пересдайте done; accept завершит "
             "задачу БЕЗ доставки PR."
             + base_conflict_resubmit_hint(
@@ -4673,7 +5471,7 @@ async def _complete_without_review(
                     # #952: names only actions needs_decision accepts.
                     f"Done report NOT completed: ветка {branch} меняет "
                     f"{len(diff or [])} файл(ов), а {create_reason}. "
-                    "Решение за человеком (hub_decide_task): rework "
+                    "Решение за человеком (REST POST /api/tasks/<id>/decide): rework "
                     "вернёт задачу в running — откройте PR руками или "
                     "почините доступ к GitHub и пересдайте done; accept "
                     "завершит задачу БЕЗ доставки ветки.",
@@ -4701,7 +5499,21 @@ async def _complete_without_review(
         # but the reader is told which check did not run — an absent line
         # here would read as "there was nothing to deliver" (AC-4).
         await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
+    # #919: before the merge, not after it — a prod defect without its
+    # prevention output is held, never delivered and completed silently.
+    if await hold_completion(
+        db,
+        task_id,
+        via="report_done",
+        actor=task.get("assigned_agent") or "agent",
+    ):
+        return "needs_decision"
     if task.get("pr_number") and not task.get("job_id"):
+        if _running_deferred.get():
+            # #1430: заметки выше (pr_note, «PR открыт хабом») не должны
+            # держать лок на время мержа. Здесь чужой транзакции нет по
+            # построению — отложенный шаг идёт после коммита done-flow.
+            await db.commit()
         delivered = await _deliver_completed_pair_task(db, task, delivery_pr)
         if delivered is not None:
             return delivered
@@ -4725,6 +5537,13 @@ async def _complete_without_review(
         actor=task.get("assigned_agent") or "agent",
         payload={"via": "report_done"},
     )
+    # #1437: сюда сходятся все пути transition_after_agent_done — headless
+    # поллер, одобрение ревью поллером, ручное обновление задания. Не все
+    # сворачивали родителя; повтор за done-flow безвреден (закрытый родитель
+    # пропускается).
+    from hub.services.lifecycle import maybe_rollup_parent
+
+    await maybe_rollup_parent(db, task_id)
     log.info("Task #%d → completed after done report", task_id)
     return "completed"
 
@@ -4829,7 +5648,7 @@ async def _route_after_done(
             f"Не удалось перейти на ветку {branch!r} в {git_repo} — "
             "git-хвост done-конвейера (commit, squash, push, PR) не "
             "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
-            "рабочего каталога и решите через hub_decide_task.",
+            "рабочего каталога и решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -4893,7 +5712,7 @@ async def _route_after_done(
                     "hub",
                     "blocker",
                     f"{error} Объявленная область: {', '.join(areas)}. "
-                    "Решите через hub_decide_task: расширить область, "
+                    "Решите через REST POST /api/tasks/<id>/decide: расширить область, "
                     "убрать чужие правки или закоммитить как есть.",
                 )
                 await repo.insert_event(
@@ -4949,7 +5768,7 @@ async def _route_after_done(
             "hub",
             "blocker",
             f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
-            f"переписать историю чужой ветки. Решите через hub_decide_task.",
+            f"переписать историю чужой ветки. Решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -5099,6 +5918,58 @@ async def _run_headless_submit_gates(
     await write_submission_notices(gates)
 
 
+# #1430: done-отчёт pair-задачи без ревью завершается ПОСЛЕ коммита своей
+# транзакции. Список, выставленный в контексте, — знак «идёт done-flow под
+# write_transaction»: поллер и headless-пути его не ставят и завершают как
+# раньше, сразу.
+DEFERRED_COMPLETION = "deferred"
+_deferred_completions: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "_deferred_completions", default=None
+)
+# Истина, пока run_deferred_completions завершает отложенное: соединение не
+# в чужой транзакции, и записи можно коммитить до сети.
+_running_deferred: ContextVar[bool] = ContextVar("_running_deferred", default=False)
+
+
+@contextlib.asynccontextmanager
+async def defer_completions() -> AsyncIterator[list[dict[str, Any]]]:
+    """Собрать завершения, которые done-flow отложил до своего коммита."""
+    pending: list[dict[str, Any]] = []
+    token = _deferred_completions.set(pending)
+    try:
+        yield pending
+    finally:
+        _deferred_completions.reset(token)
+
+
+async def run_deferred_completions(
+    db: aiosqlite.Connection, pending: list[dict[str, Any]]
+) -> None:
+    """Завершить отложенное вне транзакции: сеть — без лока базы (#1430).
+
+    Задача перечитывается: между коммитом done-flow и этим шагом её мог
+    доставить поллер (память _gate_merges, #1398), и тогда она уже не в
+    running — делать нечего. Каждая запись коммитится сразу, чтобы соединение
+    не держало лок и здесь.
+    """
+    token = _running_deferred.set(True)
+    try:
+        for item in pending:
+            row = await repo.get_task(db, item["task_id"])
+            if row is None or dict(row)["status"] not in ("running", "claimed"):
+                continue
+            await _complete_without_review(
+                db,
+                dict(row),
+                has_done=True,
+                exit_code=item["exit_code"],
+                result_text=item["result_text"],
+            )
+            await db.commit()
+    finally:
+        _running_deferred.reset(token)
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -5110,6 +5981,14 @@ async def transition_after_agent_done(
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
     branch = task.get("branch")
+    if has_done and automation_not_applicable(task):
+        # #1647: страховка. done-отчёт state-задачи отказан раньше, до вставки
+        # строки (state_task.refuse_done_report); сюда он дойти не должен, и
+        # если дошёл, то завершить задачу без вердикта человека — худший исход.
+        log.error(
+            "done report reached the post-done transition of state task #%s", task_id
+        )
+        return str(task.get("status") or "")
 
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
@@ -5145,6 +6024,16 @@ async def transition_after_agent_done(
         still_open_note = await unanswered_findings_note(db, task)
         if still_open_note:
             await repo.add_task_update(db, task_id, "hub", "alert", still_open_note)
+        deferred = _deferred_completions.get()
+        if deferred is not None and not task.get("job_id"):
+            # #1430: done-flow держит write-транзакцию. Всё ниже ходит в
+            # сеть (поиск и открытие PR, CI, мерж), и под транзакцией это
+            # держало лок базы на время вызова форжа. Завершение идёт после
+            # коммита — run_deferred_completions.
+            deferred.append(
+                {"task_id": task_id, "exit_code": exit_code, "result_text": result_text}
+            )
+            return DEFERRED_COMPLETION
         return await _complete_without_review(
             db,
             task,
@@ -5203,7 +6092,7 @@ async def transition_after_agent_done(
             "alert",
             f"Review cycle limit reached ({task.get('review_cycle', 0)}/"
             f"{config.MAX_REVIEW_CYCLES}) without APPROVED review. "
-            "Human decision required (hub_decide_task).",
+            "Human decision required (REST POST /api/tasks/<id>/decide).",
         )
         await repo.insert_event(
             db,
@@ -5276,11 +6165,25 @@ def review_budget_exhausted(review_cycle: int, max_cycles: int | None = None) ->
     return review_cycle >= max_cycles
 
 
+def _state_task_refused(task: dict[str, Any], what: str) -> bool:
+    """Headless-диспетчеру задача-состояние не отдаётся (#1647): True — отказ.
+
+    Страховка: в эти функции state-задача не попадает по построению (у неё нет
+    job, ветки и ci_check), и если попала, платить заданием нельзя.
+    """
+    if not automation_not_applicable(task):
+        return False
+    log.error("%s refused for state task #%s", what, task.get("id"))
+    return True
+
+
 async def dispatch_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],
 ) -> None:
     """Dispatch a code-review job for a completed task."""
+    if _state_task_refused(task, "dispatch_review"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0)
     breadcrumb = await get_breadcrumb_str(db, task_id)
@@ -5350,7 +6253,7 @@ async def dispatch_review(
             "hub",
             "alert",
             f"Reviewer dispatch failed: {result.get('error', 'no job_id')}. "
-            "Universal Review Gate: manual decision required (hub_decide_task).",
+            "Universal Review Gate: manual decision required (REST POST /api/tasks/<id>/decide).",
         )
     await db.commit()
 
@@ -5361,6 +6264,8 @@ async def dispatch_fix(
     review_comments: str,
 ) -> None:
     """Dispatch a fix job back to the developer agent."""
+    if _state_task_refused(task, "dispatch_fix"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0) + 1
     message = plugins.dispatch.build_fix_message(
@@ -5437,6 +6342,8 @@ async def dispatch_arbiter(
     ``running`` with the job id on success; a crash between submit and job id
     leaves ``dispatching`` for the poller's ambiguity watchdog to resolve.
     """
+    if _state_task_refused(task, "dispatch_arbiter"):
+        return
     task_id = task["id"]
     generation = task.get("submission_generation") or 0
 
@@ -5524,6 +6431,8 @@ async def dispatch_ci_fix(
     ci_failures: dict[str, Any],
 ) -> None:
     """Dispatch developer to fix CI failures."""
+    if _state_task_refused(task, "dispatch_ci_fix"):
+        return
     task_id = task["id"]
     ci_fix_cycle = task.get("ci_fix_cycle", 0)
     message = plugins.dispatch.build_ci_fix_message(

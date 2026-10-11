@@ -23,6 +23,7 @@ from hub import repository as repo
 from hub.auth import chat_pair_route_allowed
 from hub.services import chat_pair
 from hub.services import steward_shadow as sh
+from hub.db import fetchall
 from hub.services import admin as admin_svc
 
 STEWARD_OPS = (
@@ -696,3 +697,340 @@ async def test_a_repeated_redeem_does_not_destroy_a_live_credential(
     # И проверка, и следующий запрос по-прежнему работают.
     _run_each_in_its_own_shell([check, evidence], tmp_path, env)
     assert seen.read_text().splitlines()[-1] == "Authorization: Bearer tok-SECRET-42"
+
+
+# ---------------------------------------------------------------------------
+# #1601 — сессия советника-критика: тот же допуск, другой вид сессии
+# ---------------------------------------------------------------------------
+
+
+async def _advisor_session(db, task_id: int, generation: int = 1) -> str:
+    """Настоящий путь для советника: минт → обмен → токен вида steward_advisor."""
+    block = await sh.identity_delivery(
+        db, task_id, generation, "https://hub.example", kind="steward_advisor"
+    )
+    assert block, "канал обязан выдать код"
+    code = re.search(r'"code":"([^"]+)"', block).group(1)
+    session = await chat_pair.redeem_code(db, code)
+    assert session is not None
+    assert session["kind"] == "steward_advisor"
+    return session["token"]
+
+
+async def test_the_advisor_session_walks_the_same_two_operations_of_its_own_kind(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Сессия советника — принципал стюарда, те же две операции, свой вид.
+
+    Вид нужен, чтобы судья не ответил за своего критика; права при этом не
+    шире и не уже судейских: два описания одной границы разъезжаются.
+    """
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db)
+    token = await _advisor_session(db, task_id)
+    identity = await chat_pair.resolve_session(db, token)
+
+    assert identity.chat_pair_kind == "steward_advisor"
+    assert identity.is_steward and not identity.is_human and not identity.is_agent
+    assert identity.permissions == config.STEWARD_PERMS
+    assert identity.chat_pair_generation == 1
+    for method, template in STEWARD_OPS:
+        path = template.replace("{task_id}", str(task_id))
+        assert chat_pair_route_allowed(method, path, identity), f"{method} {path}"
+        alien = template.replace("{task_id}", str(task_id + 777))
+        assert not chat_pair_route_allowed(method, alien, identity), alien
+
+    from hub.app import app
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for verb in sorted((route.methods or set()) - {"HEAD", "OPTIONS"}):
+            if (verb, route.path) in STEWARD_OPS:
+                continue
+            assert not chat_pair_route_allowed(
+                verb, _FILL.sub(str(task_id), route.path), identity
+            ), f"{verb} {route.path} не должен быть открыт советнику"
+
+
+async def test_the_advisor_pin_is_read_on_both_entrances(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Пин поколения у советника читается так же, как у судьи (один guard на все входы)."""
+    from hub.services.steward_dispatch import KIND_ADVISOR, order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1, KIND_ADVISOR, model="gpt-5.3-codex")
+    token = await _advisor_session(db, task_id)
+    auth = {"Authorization": f"Bearer {token}"}
+    assert (
+        await client.get(f"/api/tasks/{task_id}/steward-evidence", headers=auth)
+    ).status_code == 200
+
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    stale = await client.get(f"/api/tasks/{task_id}/steward-evidence", headers=auth)
+    assert stale.status_code == 403
+    assert stale.json()["detail"]["reason"] == "steward_pin_stale"
+    filed = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers=auth,
+        json={
+            "generation": 1,
+            "kind": "advisor",
+            "verdict": "concur",
+            "confidence": "high",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        },
+    )
+    assert filed.status_code == 403, filed.text
+    assert filed.json()["detail"]["reason"] == "steward_pin_stale"
+
+
+async def test_the_door_is_opened_by_the_order_of_the_sessions_own_kind(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Судья читает под заказом вердикта, советник — под заказом советника, и не наоборот.
+
+    Заказ чужого вида расширил бы вход ровно на этот путь: судья, которому
+    открыли дверь заказом советника, читал бы пакет, не будучи заказан.
+    """
+    from hub.services.steward_dispatch import KIND_ADVISOR, order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    only_judge = await _task(db)
+    await order_run(db, only_judge, 1)
+    only_advisor = await _task(db)
+    await order_run(db, only_advisor, 1, KIND_ADVISOR, model="gpt-5.3-codex")
+
+    async def _read(task_id: int, token: str) -> int:
+        return (
+            await client.get(
+                f"/api/tasks/{task_id}/steward-evidence",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).status_code
+
+    judge_on_judge = await _live_session(db, monkeypatch, only_judge, 1)
+    advisor_on_judge = await _advisor_session(db, only_judge)
+    judge_on_advisor = await _live_session(db, monkeypatch, only_advisor, 1)
+    advisor_on_advisor = await _advisor_session(db, only_advisor)
+
+    assert await _read(only_judge, judge_on_judge) == 200
+    assert await _read(only_judge, advisor_on_judge) == 403, "под заказом судьи"
+    assert await _read(only_advisor, advisor_on_advisor) == 200
+    assert await _read(only_advisor, judge_on_advisor) == 403, "под заказом советника"
+
+
+async def test_the_door_stamps_the_served_packet_on_the_order_of_that_kind(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Хеш выданного пакета хаб пишет на заказ ТОГО вида, которому пакет выдан."""
+    from hub.services.steward_dispatch import KIND_ADVISOR, order_run
+    from hub.services.steward_evidence import build_evidence_packet, packet_hash
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db)
+    await order_run(db, task_id, 1)
+    await order_run(db, task_id, 1, KIND_ADVISOR, model="gpt-5.3-codex")
+    judge_token = await _live_session(db, monkeypatch, task_id, 1)
+    advisor_token = await _advisor_session(db, task_id)
+
+    async def _hashes() -> dict[str, str]:
+        rows = await db.execute_fetchall(
+            "SELECT kind, packet_hash FROM steward_runs WHERE task_id=?", (task_id,)
+        )
+        return {r["kind"]: r["packet_hash"] for r in rows}
+
+    assert await _hashes() == {"verdict": "", "advisor": ""}
+    await client.get(
+        f"/api/tasks/{task_id}/steward-evidence",
+        headers={"Authorization": f"Bearer {advisor_token}"},
+    )
+    expected = packet_hash(await build_evidence_packet(db, task_id, 1))
+    assert await _hashes() == {"verdict": "", "advisor": expected}
+    await client.get(
+        f"/api/tasks/{task_id}/steward-evidence",
+        headers={"Authorization": f"Bearer {judge_token}"},
+    )
+    assert await _hashes() == {"verdict": expected, "advisor": expected}
+
+
+async def test_a_judge_session_over_http_cannot_file_the_advisor_judgement(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """По HTTP: судейская сессия — 403 на kind=advisor, советника — на kind=verdict."""
+    from hub.services.steward_dispatch import KIND_ADVISOR, order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db)
+    await order_run(db, task_id, 1)
+    await order_run(db, task_id, 1, KIND_ADVISOR, model="gpt-5.3-codex")
+    judge_token = await _live_session(db, monkeypatch, task_id, 1)
+    advisor_token = await _advisor_session(db, task_id)
+    body = {
+        "generation": 1,
+        "confidence": "high",
+        "grounds": [{"source": "ci_pinned_sha"}],
+    }
+
+    as_judge = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers={"Authorization": f"Bearer {judge_token}"},
+        json={**body, "kind": "advisor", "verdict": "concur"},
+    )
+    as_advisor = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers={"Authorization": f"Bearer {advisor_token}"},
+        json={**body, "kind": "verdict", "verdict": "approve"},
+    )
+
+    assert as_judge.status_code == 403, as_judge.text
+    assert as_judge.json()["detail"]["reason"] == "steward_advisor_channel"
+    assert as_advisor.status_code == 403, as_advisor.text
+    assert as_advisor.json()["detail"]["reason"] == "steward_advisor_channel"
+
+
+async def test_the_judgement_response_carries_the_contour(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Ответ API о суждении называет контур выборки (2 — после выката #1601)."""
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+
+    filed = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "generation": 1,
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        },
+    )
+
+    assert filed.status_code == 200, filed.text
+    assert filed.json()["contour"] == 2
+
+
+async def test_the_local_advisor_exchange_works_over_real_codes_and_http(
+    db: aiosqlite.Connection, client, monkeypatch, local_spool, local_service
+):
+    """#1649 (Codex): без подмены issue_code — настоящий код, обмен и запись по HTTP.
+
+    «CLI» локального советника делает ровно то, что велит промт: обменивает код
+    (POST redeem), читает пакет, сдаёт суждение. Проверяется погашение (второй
+    обмен того же кода отказан), привязка сессии к задаче и поколению (чужая
+    задача и чужое поколение — отказ) и запись суждения через /steward-judgement
+    под принципалом стюарда, вид сессии — steward_advisor.
+    """
+    import asyncio
+
+    from hub.services.steward_advisor import advisor_state, order_due_advisors
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+    from tests.test_steward_shadow import _judge, _judge_run, _project
+    from tests.test_steward_shadow import _task as shadow_task
+
+    principal_id = await _steward_principal(db, monkeypatch)
+    project_id = await _project(db, "real-exchange")
+    task_id = await shadow_task(db, project_id)
+    other_id = await shadow_task(db, project_id)
+    await _judge_run(db, task_id, model="composer-2.5")
+    await _judge(db, task_id)
+    assert await order_due_advisors(db) == 1
+    order = [
+        r
+        for r in await fetchall(
+            db,
+            "SELECT * FROM steward_runs WHERE task_id=? AND kind='advisor'",
+            (task_id,),
+        )
+    ][0]
+    seen: dict = {}
+    svc = local_service()
+
+    async def _cli() -> None:
+        code = re.search(r'"code":"([^"]+)"', svc.prompts[-1]).group(1)
+        redeem = await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+        seen["redeem"] = redeem.status_code
+        token = redeem.json()["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+        pinned = await chat_pair.resolve_session(db, token)
+        seen["pin"] = (
+            pinned.chat_pair_kind,
+            pinned.chat_pair_task_id,
+            pinned.chat_pair_generation,
+        )
+        seen["again"] = (
+            await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+        ).status_code
+        seen["evidence"] = (
+            await client.get(f"/api/tasks/{task_id}/steward-evidence", headers=auth)
+        ).status_code
+        seen["other_task"] = (
+            await client.get(f"/api/tasks/{other_id}/steward-evidence", headers=auth)
+        ).status_code
+        body = {
+            "kind": "advisor",
+            "verdict": "concur",
+            "confidence": "high",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        }
+        seen["wrong_generation"] = (
+            await client.post(
+                f"/api/tasks/{task_id}/steward-judgement",
+                headers=auth,
+                json={**body, "generation": 2},
+            )
+        ).status_code
+        seen["other_task_write"] = (
+            await client.post(
+                f"/api/tasks/{other_id}/steward-judgement",
+                headers=auth,
+                json={**body, "generation": 1},
+            )
+        ).status_code
+        filed = await client.post(
+            f"/api/tasks/{task_id}/steward-judgement",
+            headers=auth,
+            json={**body, "generation": 1},
+        )
+        seen["filed"] = filed.status_code
+
+    svc.judge = _cli
+    assert await start_advisor_run(db, dict(order)) is True
+    await asyncio.wait_for(wait_for_local_advisors(), 20)
+
+    assert seen["redeem"] == 200, seen
+    assert seen["pin"] == ("steward_advisor", task_id, 1), (
+        "сессия привязана к задаче и поколению"
+    )
+    assert seen["again"] in (401, 403, 404), "код погашается один раз"
+    assert seen["evidence"] == 200
+    assert seen["other_task"] == 403 and seen["other_task_write"] == 403
+    assert seen["wrong_generation"] in (403, 409, 422)
+    assert seen["filed"] == 200, seen
+    answer = await repo.get_steward_judgement(db, task_id, 1, "advisor")
+    assert answer is not None
+    answer = dict(answer)
+    assert answer["verdict"] == "concur" and answer["model"] == "glm-5.3"
+    assert answer["principal_id"] == principal_id
+    assert answer["tokens_unknown_reason"] == "local_no_provider_usage"
+    assert (await advisor_state(db, task_id, 1)).state == "received"
+    rows = await fetchall(
+        db, "SELECT redeemed_at FROM chat_pair_codes WHERE kind='steward_advisor'"
+    )
+    assert rows and all(dict(r)["redeemed_at"] for r in rows)

@@ -6,9 +6,135 @@
     <h1 class="page-title">Practice Metrics <span class="badge badge-review">last {{ m.since_days }}d</span></h1>
 </header>
 
+{% if m.events_history and m.events_history.note %}
+<p class="muted" data-events-history>{{ m.events_history.note }}
+(окна: {{ m.events_history.windows_beyond_history | join(", ") }}).</p>
+{% endif %}
+
 <p class="muted">Стоимость самого Agent API — популярность инструментов, ошибки,
 latency и размер ответов — на отдельной странице:
 <a href="/metrics/agent-api">Agent API usage</a>.</p>
+
+{% set e = m.review_economy %}
+<h2 id="review-economy">Сводка ревью: что куплено и что дало</h2>
+<p class="muted">Цена — только счёт провайдера: {{ e.runs.cost_source_note }}.
+Покрыто выгрузкой Cursor: <span data-metric="runs.export_billed_runs">{{ e.runs.export_billed_runs }}</span>
+прогонов, доля <span data-metric-share="runs.export_coverage_share">{{ e.runs.export_coverage_share if e.runs.export_coverage_share is not none else "нет прогонов" }}</span>;
+по API (нижняя граница): <span data-metric="runs.api_lower_bound_runs">{{ e.runs.api_lower_bound_runs }}</span>.
+Самоотчёт харнесса
+(<code>tokens_spent</code>) занижен в 12–62 раза и сюда не входит ни в одно
+число. Прогон без счёта — отдельная строка: он не бесплатный, и его цена
+неизвестна (#1406).</p>
+<table class="task-table">
+    <thead><tr><th>Прогоны</th><th>Всего</th><th>Со счётом</th><th>Без счёта</th>
+        <th>Provider-токены</th><th>На прогон со счётом</th>
+        <th>По выгрузке</th><th>API — нижняя граница</th></tr></thead>
+    <tbody>
+        <tr><td><strong>Итого</strong></td>
+            <td data-metric="runs.total">{{ e.runs.total }}</td>
+            <td data-metric="runs.billed">{{ e.runs.billed }}</td>
+            <td data-metric="runs.unbilled">{{ e.runs.unbilled }}</td>
+            <td data-metric="runs.provider_tokens_total">{{ e.runs.provider_tokens_total }}</td>
+            <td>{{ e.runs.provider_tokens_per_billed_run if e.runs.provider_tokens_per_billed_run is not none else "нет счёта" }}</td>
+            <td>{{ e.runs.export_billed_runs }}</td><td>{{ e.runs.api_lower_bound_runs }}</td></tr>
+        {% for row in e.runs.by_profile %}
+        <tr><td>профиль {{ row.profile }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
+            <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td>
+            <td>{{ row.export_billed_runs }}</td><td>{{ row.api_lower_bound_runs }}</td></tr>
+        {% endfor %}
+        {% for row in e.runs.by_kind %}
+        <tr><td>{{ row.label }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
+            <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td>
+            <td>{{ row.export_billed_runs }}</td><td>{{ row.api_lower_bound_runs }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h3>Находки: unresolved отдельно от confirmed</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Независимых отчётов с данными</td><td>{{ e.findings.independent_reports }}
+            {% if e.findings.undersampled %}<span class="muted">(недобор: n={{ e.findings.n }} &lt; {{ e.min_sample }})</span>{% endif %}</td></tr>
+        <tr><td>Отчётов с unresolved</td>
+            <td data-metric="findings.reports_with_unresolved">{{ e.findings.reports_with_unresolved }}</td></tr>
+        <tr><td>Доля отчётов с unresolved</td>
+            <td>{{ e.findings.unresolved_report_share if e.findings.unresolved_report_share is not none else "нет данных" }}</td></tr>
+        <tr><td>unresolved всего</td>
+            <td data-metric="findings.unresolved_total">{{ e.findings.unresolved_total }}</td></tr>
+        <tr><td>Отчётов с confirmed</td><td>{{ e.findings.reports_with_confirmed }}</td></tr>
+        <tr><td>confirmed всего</td>
+            <td data-metric="findings.confirmed_total">{{ e.findings.confirmed_total }}</td></tr>
+        <tr><td>Самоотчёты <span class="muted">(не независимое ревью, рядом, не внутри)</span></td>
+            <td>{{ e.findings.self_reviewed.reports }} отчётов: confirmed {{ e.findings.self_reviewed.confirmed }}, unresolved {{ e.findings.self_reviewed.unresolved }}</td></tr>
+        {% for row in e.findings.by_profile %}
+        <tr><td>профиль {{ row.profile }}</td>
+            <td>{{ row.reports }} отчётов: confirmed {{ row.confirmed }}, unresolved {{ row.unresolved }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h3>Прогоны, купленные на красном CI</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>На красном CI закреплённого sha</td>
+            <td data-metric="red_ci.runs">{{ e.red_ci.runs }}</td></tr>
+        <tr><td>Provider-токены на красном CI <span class="muted">(без счёта: {{ e.red_ci.unbilled_runs }})</span></td>
+            <td data-metric="red_ci.provider_tokens">{{ e.red_ci.provider_tokens }}</td></tr>
+        <tr><td>На зелёном CI</td><td data-metric="red_ci.runs_on_green_ci">{{ e.red_ci.runs_on_green_ci }}</td></tr>
+        <tr><td>CI не определился <span class="muted">(unknown — не успех и не провал)</span></td>
+            <td data-metric="red_ci.runs_ci_undetermined">{{ e.red_ci.runs_ci_undetermined }}</td></tr>
+        <tr><td>Проверки пропущены <span class="muted">(skipped)</span></td>
+            <td data-metric="red_ci.runs_ci_skipped">{{ e.red_ci.runs_ci_skipped }}</td></tr>
+        <tr><td>Без отчёта CI <span class="muted">(в «красные» не входят)</span></td>
+            <td data-metric="red_ci.runs_without_ci_report">{{ e.red_ci.runs_without_ci_report }}</td></tr>
+    </tbody>
+</table>
+
+<h3>Когорта назначения профиля (#1403)</h3>
+{% if e.profile_assignment.available %}
+<table class="task-table">
+    <tbody>
+        {% for row in e.profile_assignment.cohorts %}
+        <tr><td>{{ row.cohort }}</td><td>{{ row.runs }} прогонов, {{ row.provider_tokens_total }} provider-токенов</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="muted">прогонов в окне нет</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="muted">{{ e.profile_assignment.note }}</p>
+{% endif %}
+
+<h3>Сверка отчётов со счётом провайдера</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Отчётов machine_reviews</td>
+            <td data-metric="reconciliation.reports">{{ e.reconciliation.reports }}</td></tr>
+        <tr><td>Оплаченных прогонов</td>
+            <td data-metric="reconciliation.paid_runs">{{ e.reconciliation.paid_runs }}</td></tr>
+        <tr><td>Расхождение</td>
+            <td data-metric="reconciliation.gap">{{ e.reconciliation.gap }}</td></tr>
+        {% for b in e.reconciliation.buckets %}
+        <tr><td>{{ b.label }}</td>
+            <td data-metric="reconciliation.{{ b.bucket }}">{{ b.count }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% if e.reconciliation.main_cause %}
+<p class="muted">Главная названная причина: {{ e.reconciliation.main_cause }}.</p>
+{% endif %}
+
+<h3>Эскейпы и непосчитанное (#528, #918)</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Утечек в прод, измерено (found_in=prod)</td><td>{{ e.escapes.escaped }}</td></tr>
+        <tr><td>Реконструкция: багов без found_in на закрытые фичи</td><td>{{ e.escapes.reconstructed.escaped }} из {{ e.escapes.reconstructed.bugs_in_window }}</td></tr>
+        <tr><td>Реконструкция, непосчитано: багов без фичи-предка</td><td>{{ e.escapes.reconstructed.uncounted.bugs_without_feature }}</td></tr>
+        <tr><td>Реконструкция, непосчитано: закрытых фич без отметки завершения</td><td>{{ e.escapes.reconstructed.uncounted.features_without_completion }}</td></tr>
+    </tbody>
+</table>
 
 <h2>Machine reviews</h2>
 <table class="task-table">
@@ -257,7 +383,8 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
 с отчётом: {{ m.review_model_cascade.reported }} ·
 полных: {{ m.review_model_cascade.complete }} ·
 неполных: {{ m.review_model_cascade.incomplete }} ·
-ждут отчёта: {{ m.review_model_cascade.pending }} за
+ждут отчёта: {{ m.review_model_cascade.pending }} ·
+заказ не удался: {{ m.review_model_cascade.failed }} за
 {{ m.review_model_cascade.since_days }} дн.</p>
 {% endif %}
 
@@ -342,7 +469,31 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
     </tbody>
 </table>
 
-<h2>Escaped defects: баги на уже закрытые фичи</h2>
+{% if m.rule_breaches and m.rule_breaches.rules_total %}
+<h2>Пробитые правила каталога</h2>
+<p class="muted">Правило из category_checks, чей класс вернулся ПОСЛЕ даты
+заведения правила. Находки того же класса до этой даты — история, из которой
+правило выведено, и пробитием не считаются. Считается за всю жизнь правила, а
+не за окно: окно простило бы пробитие, дав ему устареть (#920).</p>
+<table class="task-table">
+    <thead><tr><th>Категория</th><th>Проверка</th><th>Заведено</th><th>Находок после</th><th>Задачи</th><th>Породивший дефект</th></tr></thead>
+    <tbody>
+        {% for r in m.rule_breaches.breached %}
+        <tr>
+            <td>{{ r.category }}</td><td><span class="badge">{{ r.check_ref }}</span></td>
+            <td>{{ r.rule_created_at }}</td><td>{{ r.breaches }}</td>
+            <td>{% for t in r.task_ids %}<a href="/tasks/{{ t }}">#{{ t }}</a> {% endfor %}</td>
+            <td>{% for d in r.source_defects %}<a href="/tasks/{{ d.task_id }}">#{{ d.task_id }}</a> {% else %}<span class="muted">не записан</span>{% endfor %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">Правил в каталоге: {{ m.rule_breaches.rules_total }};
+            ни одно не пробито после заведения.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<h2>Escaped defects: утечки в прод</h2>
 <p class="muted">Recurring-категории показывают пойманное — находки, остановленные
 на гейте. Здесь обратная сторона: баг, заведённый уже после закрытия своей фичи,
 то есть дефект, который ревью пропустило. Признак считается только там, где обе
@@ -356,27 +507,104 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
 ровно та подмена, которую убрали из cycle time (#810). Пока непосчитанного
 больше, чем посчитанного, итоговое число говорит не о качестве ревью, а о том,
 насколько заполнены поля.</p>
+<p class="muted">С #918 два числа, и они не складываются. «Измерено» — задачи
+с записанным found_in=prod, заведённые в окне: фича-предок и дата её закрытия для
+них не нужны. «Реконструкция» — прежний вывод по completed_at фичи-предка, и
+только для багов, у которых found_in не записан: баг с записанной стадией
+отвечает своей стадией, а не датами. Бэкфилла стадии для старых багов нет, так
+что реконструкция убывает сама, по мере того как окно уходит вперёд.</p>
+{% set ed = m.escaped_defects %}
+{% set rd = ed.reconstructed %}
 <table class="task-table">
     <thead><tr><th>Показатель</th><th>Значение</th></tr></thead>
     <tbody>
-        <tr><td>Утечек посчитано</td>
-            <td>{{ m.escaped_defects.escaped }}</td></tr>
-        <tr><td>Багов в окне</td>
-            <td>{{ m.escaped_defects.bugs_in_window }}</td></tr>
-        <tr><td>Багов без фичи-предка</td>
-            <td>{% if m.escaped_defects.bugs_without_feature %}{{ m.escaped_defects.bugs_without_feature }}{% else %}—{% endif %}</td></tr>
-        <tr><td>Закрытых фич без отметки завершения</td>
-            <td>{% if m.escaped_defects.features_without_completion %}{{ m.escaped_defects.features_without_completion }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Утечек в прод, измерено <span class="muted">(found_in=prod)</span></td>
+            <td data-metric="escaped_defects.escaped">{{ ed.escaped }}</td></tr>
+        <tr><td>Реконструкция: утечек по completed_at
+            <span class="muted">({{ rd.label }}, баги без found_in)</span></td>
+            <td data-metric="escaped_defects.reconstructed.escaped">{{ rd.escaped }}</td></tr>
+        <tr><td>Реконструкция: багов без found_in в окне</td>
+            <td>{{ rd.bugs_in_window }}</td></tr>
+        <tr><td>Реконструкция: багов без фичи-предка</td>
+            <td>{% if rd.bugs_without_feature %}{{ rd.bugs_without_feature }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Реконструкция: закрытых фич без отметки завершения</td>
+            <td>{% if rd.features_without_completion %}{{ rd.features_without_completion }}{% else %}—{% endif %}</td></tr>
     </tbody>
 </table>
 <table class="task-table">
-    <thead><tr><th>Фича-источник</th><th>Утечек</th></tr></thead>
+    <thead><tr><th>Фича-источник <span class="muted">(реконструкция)</span></th><th>Утечек</th></tr></thead>
     <tbody>
-        {% for f in m.escaped_defects.features %}
+        {% for f in rd.features %}
         <tr><td><a href="/tasks/{{ f.feature_id }}">#{{ f.feature_id }} {{ f.title }}</a></td>
             <td>{{ f.bugs }}</td></tr>
         {% else %}
         <tr><td colspan="2"><span class="muted">нет измеримых утечек в этом окне</span></td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Shift-left: где пойман дефект (#914)</h2>
+{% set sl = m.shift_left %}
+<p class="muted">Дефекты окна по стадии обнаружения (found_in, #909): баги и
+любые задачи с записанной стадией, по дате заведения. Стадии идут по цене
+промаха — чем правее, тем дороже. Строка prod совпадает с «Утечек в прод,
+измерено». unknown — стадия не записана; её доля показана отдельно, потому что
+распределение по одним заполненным строкам выглядит законченным, когда им не
+является. Всего дефектов в окне: {{ sl.defects }}, стадия записана у
+{{ sl.recorded }}.</p>
+<table class="task-table">
+    <thead><tr><th>Стадия</th><th>Дефектов</th><th>Доля</th></tr></thead>
+    <tbody>
+        {% for r in sl.by_stage %}
+        <tr><td>{{ r.stage }}</td>
+            <td data-metric="shift_left.{{ r.stage }}.defects">{{ r.defects }}</td>
+            <td>{% if r.share is not none %}{{ (r.share * 100) | round(1) }}%{% else %}—{% endif %}</td></tr>
+        {% endfor %}
+        <tr><td><strong>Доля unknown</strong> <span class="muted">(стадия не записана)</span></td>
+            <td>{{ sl.unknown }}</td>
+            <td data-metric="shift_left.unknown_share">{% if sl.unknown_share is not none %}{{ (sl.unknown_share * 100) | round(1) }}%{% else %}<span class="muted">дефектов в окне нет</span>{% endif %}</td></tr>
+    </tbody>
+</table>
+
+<h2>Часы прод-дефекта (#916)</h2>
+{% set dc = m.prod_defect_clocks %}
+<p class="muted">time-to-detect — от выката релиза, привязанного к дефекту
+(deployed_at), до detected_at; time-to-restore — от detected_at до resolved_at,
+который ставится при закрытии дефекта. Только записанные факты: строка без
+факта в медиану не входит и считается в своей причине, из updated_at часы не
+достраиваются. Прод-дефектов в окне: {{ dc.defects }}.</p>
+<table class="task-table">
+    <thead><tr><th>Часы</th><th>В медиане</th><th>Неизмеримые</th>
+        <th>Median, hours</th></tr></thead>
+    <tbody>
+        {% for label, c in [("time-to-detect", dc.time_to_detect), ("time-to-restore", dc.time_to_restore)] %}
+        <tr><td>{{ label }}</td><td>{{ c.measured }}</td>
+            <td>{% if c.unmeasurable_total %}{{ c.unmeasurable_total }}:
+                {% for reason, n in c.unmeasurable.items() %}{{ reason }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
+            <td>{% if c.median_hours is not none %}{{ c.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Change failure rate (#918)</h2>
+{% set cfr = m.change_failure_rate %}
+<p class="muted">Доля успешных выкатов окна, к которым привязан хотя бы один
+прод-дефект (found_in=prod с release_id на этот релиз). Знаменатель — число
+выкатов, он стоит рядом с долей. Выкаты без проекта относятся к проекту default
+(#915). Меньше {{ cfr.min_sample }} выкатов — малая выборка, доля не
+показывается. Прод-дефектов окна без привязки к релизу:
+{{ cfr.defects_without_release }} — они ни на один выкат не указывают и в долю не
+входят.</p>
+<table class="task-table">
+    <thead><tr><th>Проект</th><th>Выкатов</th><th>С прод-дефектом</th><th>CFR</th></tr></thead>
+    <tbody>
+        {% for r in cfr.by_project %}
+        <tr><td>{{ r.project }}</td>
+            <td data-metric="change_failure_rate.{{ r.project }}.deploys">{{ r.deploys }}</td>
+            <td>{{ r.failed_deploys }}</td>
+            <td>{% if r.small_sample %}<span class="muted">малая выборка</span>{% else %}{{ (r.rate * 100) | round(1) }}%{% endif %}</td></tr>
+        {% else %}
+        <tr><td colspan="4"><span class="muted">успешных выкатов в окне нет</span></td></tr>
         {% endfor %}
     </tbody>
 </table>

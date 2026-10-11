@@ -26,7 +26,7 @@
 ## Hub Lifecycle Duties
 
 - Call `hub_my_context(task_id)` before implementation.
-- Record a plan before work starts with `hub_start_task(..., plan="...")` or
+- Record a plan before work starts with `hub_pair_start(..., plan="...")` or
   `hub_task_update(..., kind="status", content="Plan: ...")`.
 - Use `hub_ask_question` for missing requirements and
   `hub_task_update(..., kind="blocker")` for blocked execution.

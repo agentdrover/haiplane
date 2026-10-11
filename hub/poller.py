@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
@@ -33,11 +34,22 @@ _release_notices: dict[str, str] = {}
 # and whether it already reached the activity feed (#962). In memory like
 # _release_notices — a restart re-counting the threshold costs ~3 cycles,
 # while the silent alternative cost a day of reading server logs on 26.08.
-_release_stalls: dict[str, tuple[str, int, bool]] = {}
+# #1420 adds when the reason was first seen, on _release_clock: routine waits
+# are judged by time, not by cycles.
+_release_stalls: dict[str, tuple[str, int, bool, float]] = {}
 
-# One refused cycle is a flicker (a network hiccup, a race with CI); the same
-# refusal this many cycles in a row is a stall a human has to resolve.
+# A probe that could not look (the forge answered nothing usable) this many
+# cycles in a row is a release nobody can see — an alert. One such cycle is a
+# network hiccup. A definite red does not wait at all (#1420).
 RELEASE_STALL_CYCLES = 3
+
+# CI that is still running is routine (#1420): on 25.09.2026 five ordinary
+# releases were written up as «релиз стоит» after three cycles and buried the
+# one red CI among them. A running CI reaches the feed only after this long.
+RELEASE_ROUTINE_STALL_MINUTES = 30
+
+# Monotonic clock of the release sweep; a name of its own so tests can move it.
+_release_clock = time.monotonic
 
 # Per task: the delivery-gate refusal already reported while waiting (#971).
 # In memory for the same reason as _release_notices — it exists to stop the
@@ -103,11 +115,47 @@ async def _own_connection(app: FastAPI):
     if not dsn:
         yield app.state.db
         return
-    conn = await db_connect(dsn)
+    conn = await _open_connection(dsn)
     try:
         yield conn
     finally:
         await conn.close()
+
+
+_LATE_CLOSES: set["asyncio.Task[None]"] = set()
+
+
+def _close_when_opened(opening: "asyncio.Future[Any]") -> None:
+    """Done-callback: the open outlived its owner, so close what it produced."""
+    if opening.cancelled() or opening.exception() is not None:
+        return
+    closing = asyncio.ensure_future(opening.result().close())
+    _LATE_CLOSES.add(closing)
+    closing.add_done_callback(_LATE_CLOSES.discard)
+
+
+async def _open_connection(dsn: str):
+    """Open a connection so that a cancel in the middle of the open leaks nothing.
+
+    The worker thread of an aiosqlite connection is not a daemon: a connection
+    nobody closes keeps the interpreter from exiting (#1667). A plain
+    ``await db_connect(dsn)`` that is cancelled half way leaves exactly that —
+    the owner never receives the connection, so its ``finally`` has nothing to
+    close. The open therefore runs as its own task behind a shield: on cancel
+    the owner waits for the open to end and closes the result itself, and if
+    it is cancelled again the done-callback does the closing.
+    """
+    opening = asyncio.ensure_future(db_connect(dsn))
+    try:
+        return await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        try:
+            late = await asyncio.shield(opening)
+        except BaseException:  # noqa: BLE001 - cancelled again, or the open failed
+            opening.add_done_callback(_close_when_opened)
+        else:
+            await late.close()
+        raise
 
 
 async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
@@ -311,7 +359,8 @@ async def _finish_arbiter(db, task: dict, job: dict, job_status: str) -> None:
         "hub",
         "alert",
         "Arbiter phase finished — human decision required "
-        "(hub_decide_task)." + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
+        "(REST POST /api/tasks/<id>/decide)."
+        + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
     )
     await db.commit()
     log.info(
@@ -341,7 +390,7 @@ async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
         "alert",
         f"Review job failed (exit={job.get('exit_code')}) "
         "without a verdict. Universal Review Gate: manual "
-        "decision required (hub_decide_task).",
+        "decision required (REST POST /api/tasks/<id>/decide).",
     )
     await db.commit()
     log.info(
@@ -425,7 +474,7 @@ async def _defer_scanned_approval(db, task: dict, scanned) -> None:
         f"Источник: {scanned.source}.\n"
         f"Строка, принятая за вердикт: «{quoted}»\n"
         "Если это действительно вердикт — вынесите его через ревью "
-        "(hub_submit_review) или примите решение вручную (hub_decide_task).",
+        "(hub_submit_review) или примите решение вручную (REST POST /api/tasks/<id>/decide).",
     )
     await repo.update_task(db, task["id"], status="needs_decision")
     await repo.insert_event(
@@ -557,7 +606,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
                     "blocker",
                     f"Доставка остановлена: PR #{pr_num} — {stacked}. "
                     "Ожидание здесь ничего не решит, поэтому задача передана "
-                    "человеку (hub_decide_task).",
+                    "человеку (REST POST /api/tasks/<id>/decide).",
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
                 await repo.insert_event(
@@ -639,7 +688,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
             f"Ревью одобрено, но PR #{pr_num} не влит "
             f"({reason}). Задача не может считаться "
             "выполненной, пока работа не в базовой ветке. "
-            "Решите через hub_decide_task.",
+            "Решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.update_task(db, task["id"], status="needs_decision")
         await repo.insert_event(
@@ -1069,8 +1118,8 @@ async def _stale_task_tick(
         "hub",
         "alert",
         f"Task stale in {status} [рубеж {rung}]: тишина уже "
-        f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'}). "
-        f"{action}",
+        f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'})."
+        f"{await _slot_phrase(db, task_id)} {action}",
     )
     await db.commit()
     await log_activity(
@@ -1085,6 +1134,14 @@ async def _stale_task_tick(
         _age_phrase(silence),
         rung,
     )
+
+
+async def _slot_phrase(db, task_id: int) -> str:
+    """Stale-алерт называет слот, который держит задачу (#1434); не дублирует."""
+    from hub.services.executor_slots import active_slot_of
+
+    slot = await active_slot_of(db, task_id)
+    return f" Задачу держит слот {slot}." if slot else ""
 
 
 async def _sweep_stale_running(db) -> None:
@@ -1128,27 +1185,27 @@ async def _sweep_stale_statuses(db) -> None:
             "needs_info",
             config.STALE_NEEDS_INFO_MINUTES,
             False,
-            "Question awaits a human hub_answer_question.",
+            "Question awaits a human answer (REST POST /api/tasks/<id>/answer).",
         ),
         (
             "ci_check",
             config.STALE_CI_CHECK_MINUTES,
             False,
             "CI conveyor stalled: inspect the PR/CI or recover with "
-            "hub_force_complete_task.",
+            "REST POST /api/tasks/<id>/force-complete.",
         ),
         (
             "fix_requested",
             config.STALE_FIX_REQUESTED_MINUTES,
             False,
             "Fix dispatch stalled: inspect the job or recover with "
-            "hub_force_complete_task.",
+            "REST POST /api/tasks/<id>/force-complete.",
         ),
         (
             "pending_report",
             config.STALE_PENDING_REPORT_MINUTES,
             False,
-            "Awaiting agent hub_report_done, or recover with hub_force_complete_task.",
+            "Awaiting agent hub_report_done, or recover with REST POST /api/tasks/<id>/force-complete.",
         ),
     )
     for status_name, threshold, null_review_job, action in stale_specs:
@@ -1378,9 +1435,9 @@ async def _clear_reviewer_unavailable(db, observed) -> bool:
 # not tell a person what to do with the task — and "someone should look at
 # this" is what the single lifetime alert already said, to no effect.
 _HUMAN_QUEUE_ACTIONS: dict[str, str] = {
-    "draft": "черновик ждёт одобрения или отклонения (hub_approve_task / hub_reject_task)",
-    "needs_info": "агент ждёт ответа на вопрос (hub_answer_question)",
-    "needs_decision": "задача ждёт решения человека (hub_decide_task)",
+    "draft": "черновик ждёт одобрения или отклонения (REST POST /api/tasks/<id>/approve или /reject)",
+    "needs_info": "агент ждёт ответа на вопрос (REST POST /api/tasks/<id>/answer)",
+    "needs_decision": "задача ждёт решения человека (REST POST /api/tasks/<id>/decide)",
     "review:client": "сдача ждёт вердикта ревьюера (hub_submit_review)",
 }
 
@@ -1542,6 +1599,30 @@ async def _sweep_steward_runs(db) -> None:
         log.exception("steward run sweep failed")
 
 
+async def _sweep_executor_runs(db) -> None:
+    # #1410 (F2.2): опрос прогонов облачного исполнителя — токены, центы и
+    # исход каждой строки в running. Только чтение у провайдера; молчание
+    # остаётся названной причиной в строке, а не нулём.
+    try:
+        from hub.services.executor_dispatch import sweep_executor_runs
+
+        await sweep_executor_runs(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("executor run sweep failed")
+
+
+async def _sweep_executor_slots(db) -> None:
+    # #1434 (F7): слот без сдачи и без признаков жизни дольше порога
+    # освобождается один раз с названной причиной; ушедшая из работы задача
+    # закрывает строку слота молча.
+    try:
+        from hub.services.executor_slots import sweep_executor_slots
+
+        await sweep_executor_slots(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("executor slot sweep failed")
+
+
 async def _sweep_expired_claims(db) -> None:
     # Claim lease expiry (#417): a claim held past the lease without a
     # pair start is auto-released back to open so the task returns to
@@ -1686,7 +1767,7 @@ async def _sweep_events_retention(db) -> None:
     # прогоне этой чистки. Теперь они лежат в ``skills.publication_record``, а
     # событие осталось тем, чем лента и объявлена, — уведомлением. Кладёшь
     # сюда что-то, что нужно будет прочитать через месяц, — не клади.
-    pruned = await repo.prune_events(db, keep_days=14)
+    pruned = await repo.prune_events(db, keep_days=repo.EVENTS_RETENTION_DAYS)
     # Коммит БЕЗУСЛОВНЫЙ. isolation_level="IMMEDIATE" (#1065) открывает
     # транзакцию перед любым DML — и перед DELETE, которому нечего удалять.
     # Коммит за условием оставлял её открытой, и поллер засыпал, держа
@@ -1747,6 +1828,22 @@ async def _sweep_stale_worktrees(db) -> None:
                 )
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("worktree retention sweep failed")
+
+
+async def _sweep_parent_rollup(db) -> None:
+    """Закрыть фичи и эпики, все дети которых завершены (#1437).
+
+    Та же починка, что на подъёме приложения (repair_stale_parent_completions),
+    но каждым циклом. Путей к «ребёнок completed» много, и свёртку на каждом
+    может сорвать ошибка, которую изоляция задач поллера глотает без отката.
+    Раньше такой родитель ждал перезапуска хаба, а его зависимые — вместе с
+    ним. Правило #1043 (у родителя своя работа) починка соблюдает сама.
+    """
+    from hub.services.lifecycle import repair_stale_parent_completions
+
+    repaired = await repair_stale_parent_completions(db)
+    if repaired:
+        log.info("Poll: %d parent task(s) rolled up by the sweep", repaired)
 
 
 async def _sweep_sessions_retention(db) -> None:
@@ -1827,6 +1924,12 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # sweep's candidate list the moment either one fires — and the transient
     # branch folds it into _note_pair_delivery_wait's own dedupe-and-commit
     # cycle instead of a second one.
+    # #919: a prod defect without its prevention output is held before the
+    # merge — the sweep would otherwise be the one door that never asks.
+    if await hold_completion(db, task_id, via="poller_delivery", actor="hub"):
+        _pair_delivery_waits.pop(task_id, None)
+        await db.commit()
+        return
     task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
     if delivery_pr.unusable and delivery_pr.search_unanswered:
@@ -1924,7 +2027,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
             "alert",
             f"Ревью одобрено, но PR #{pr_num} не доставлен — {detail}. "
             "Задача не может считаться выполненной, пока работа не в базовой "
-            "ветке. Решение за человеком (hub_decide_task)."
+            "ветке. Решение за человеком (REST POST /api/tasks/<id>/decide)."
             + services.base_conflict_resubmit_hint(reason, detail),
         )
         await repo.insert_event(
@@ -1978,6 +2081,21 @@ async def _deliver_pair_task(db, task: dict) -> None:
         payload={"via": "poller_delivery"},
     )
     await db.commit()
+    # #1437: свёртка родителя, как на done-пути. Без неё фича, последнюю
+    # подзадачу которой доставил поллер, ждала перезапуска хаба
+    # (repair_stale_parent_completions), а её зависимые — вместе с ней.
+    # Отдельно от доставки и с откатом: изоляция задач поллера глотает
+    # исключение без отката, и чужой коммит зафиксировал бы полсвёртки
+    # (ревью #1428-го класса, находка сдачи 1). Не свернулось — свип
+    # parent_rollup закроет родителя следующим циклом.
+    from hub.services.lifecycle import maybe_rollup_parent
+
+    try:
+        await maybe_rollup_parent(db, task_id)
+        await db.commit()
+    except Exception:  # noqa: BLE001 - the parent_rollup sweep closes it
+        await db.rollback()
+        log.exception("Poll: parent rollup after #%d failed — sweep retries", task_id)
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
 
@@ -2038,49 +2156,156 @@ async def _sweep_release_policy(db) -> None:
         for project_row in await repo.list_projects(db):
             merged, reason = await merge_ready_release(db, project_row)
             slug = dict(project_row).get("slug") or "?"
+            project_id = int(dict(project_row).get("id") or 0)
             if merged:
                 log.info("Poll: %s — %s", slug, reason)
                 _release_notices.pop(slug, None)
                 _release_stalls.pop(slug, None)
+                await _clear_release_block(db, project_id, slug, reason)
                 continue
             if not reason:
                 _release_stalls.pop(slug, None)
+                await _clear_release_block(db, project_id, slug, "")
                 continue
             if _release_notices.get(slug) != reason:
                 _release_notices[slug] = reason
                 log.warning("Poll: %s — %s", slug, reason)
-            await _note_release_stall(db, slug, reason)
+            await _note_release_stall(db, slug, reason, project_row)
     except Exception:
         log.exception("Poll: release policy sweep failed")
 
 
-async def _note_release_stall(db, slug: str, reason: str) -> None:
-    """Raise a persistent release refusal into the activity feed (#962).
+async def _note_release_stall(db, slug: str, reason: str, project_row) -> None:
+    """Sort a release refusal into routine and alert, and write each once.
 
-    On 26.08.2026 GitHub refused the release merge three cycles in a row —
-    develop and main had diverged after a squash release — and the only trace
-    was the deduplicated warning above: the stalled policy was discovered by
-    a human reading server logs, and resolved by a manual sync. The feed gets
-    one entry per stall; a failed write is retried next cycle instead of
-    breaking the sweep for the remaining projects.
+    #962 put a persistent refusal into the activity feed — on 26.08.2026 a
+    diverged develop/main stood three cycles with no trace but a server log.
+    #1420 splits what #962 wrote with one phrase: a running CI is routine and
+    reaches the feed only after RELEASE_ROUTINE_STALL_MINUTES; a red CI, a
+    conflict, a refused merge or a reason nobody recognises is an alert from
+    the first cycle (a probe that could not look — after RELEASE_STALL_CYCLES).
+    A failed write is retried next cycle instead of breaking the sweep.
     """
-    prev_reason, streak, noted = _release_stalls.get(slug, ("", 0, False))
+    from hub.services.release_alert import ALERT, PROBE, classify_release_reason
+
+    project_id = int(dict(project_row).get("id") or 0)
+    prev_reason, streak, noted, first_seen = _release_stalls.get(
+        slug, ("", 0, False, 0.0)
+    )
     if prev_reason != reason:
-        streak, noted = 0, False
+        streak, noted, first_seen = 0, False, _release_clock()
     streak += 1
-    if streak >= RELEASE_STALL_CYCLES and not noted:
-        try:
-            await log_activity(
-                db,
-                "release",
-                f"{slug}: релиз стоит — {reason}",
-                f"{streak} цикл(ов) поллера подряд; политика ретраит сама, "
-                "но расшивка причины — за человеком",
-            )
-            noted = True
-        except Exception:
-            log.exception("Poll: release stall of %s not written to activity", slug)
-    _release_stalls[slug] = (reason, streak, noted)
+    _release_stalls[slug] = (reason, streak, noted, first_seen)
+    severity = classify_release_reason(reason)
+    if severity == ALERT or (severity == PROBE and streak >= RELEASE_STALL_CYCLES):
+        await _open_release_block(db, project_row, slug, reason)
+        return
+    if severity == PROBE:
+        return
+    # Routine: the release moves again — a block still open ends here (#9114:
+    # after the fix, CI simply started running again).
+    await _clear_release_block(db, project_id, slug, reason)
+    waited = _release_clock() - first_seen
+    if not noted and waited >= RELEASE_ROUTINE_STALL_MINUTES * 60:
+        noted = await _write_release_note(
+            db,
+            "release",
+            f"{slug}: релиз ждёт дольше {RELEASE_ROUTINE_STALL_MINUTES} мин — {reason}",
+            "CI идёт — это не авария; запись одна на ожидание",
+        )
+        _release_stalls[slug] = (reason, streak, noted, first_seen)
+
+
+async def _write_release_note(
+    db, kind: str, summary: str, detail: str, event: dict | None = None
+) -> bool:
+    """Event (when given) and feed entry in one commit; False if it failed."""
+    try:
+        if event is not None:
+            await repo.insert_event(db, kind=kind, actor="hub", **event)
+        await log_activity(db, kind, summary, detail)
+        return True
+    except Exception:
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        log.exception("Poll: release note not written: %s", summary)
+        return False
+
+
+async def _open_release_block(db, project_row, slug: str, reason: str) -> None:
+    """Write the alert once per reason (#534); the open state lives in events.
+
+    A red CI carries its run and failed checks, asked of the forge once here
+    rather than every cycle (#1420 review, 7c1d20f701b32445).
+    """
+    from hub.services import release_alert as ra
+
+    project_id = int(dict(project_row).get("id") or 0)
+    active = await ra.active_release_block(db, project_id)
+    if active is not None and active["reason"] == reason:
+        return
+    since = active["since"] if active else ra.utc_stamp()
+    ci = await ra.release_ci_evidence(project_row, reason)
+    evidence = ra.ci_evidence_text(ci)
+    payload: dict[str, Any] = {"project": slug, "reason": reason, "since": since}
+    if ci is not None:
+        payload["ci"] = ci
+    await _write_release_note(
+        db,
+        ra.KIND_BLOCKED,
+        f"{slug}: авария — релиз стоит: {reason}",
+        f"Релиз заблокирован с {since} UTC."
+        + (f" {evidence}." if evidence else "")
+        + " Политика повторяет сама, снять причину — за человеком; снятие "
+        "будет записано отдельно.",
+        {"project_id": project_id, "payload": payload},
+    )
+
+
+async def _clear_release_block(db, project_id: int, slug: str, now: str) -> None:
+    """Close an open alert with how long it held; nothing open — nothing written."""
+    from hub.services import release_alert as ra
+
+    active = await ra.active_release_block(db, project_id)
+    if active is None:
+        return
+    minutes = active["minutes"]
+    held = "длительность не прочитана" if minutes is None else f"длилась {minutes} мин"
+    await _write_release_note(
+        db,
+        ra.KIND_UNBLOCKED,
+        f"{slug}: релиз снова идёт — блокировка снята, {held}",
+        f"была: {active['reason']}; сейчас: {now or 'причины нет'}",
+        {
+            "project_id": project_id,
+            "payload": {
+                "project": slug,
+                "reason": active["reason"],
+                "since": active["since"],
+                "minutes": minutes,
+                "now": now,
+            },
+        },
+    )
+
+
+async def _sweep_policy_schedule(db) -> None:
+    """Исполнить просроченные отложенные правки политики проекта (#1593).
+
+    Первым в тике: правка, назначенная на этот момент, должна действовать уже
+    для решений этого же прохода. Вся работа — в policy_change.run_due: запись
+    читается под write-локом, применяется общим с PATCH путём, итог
+    фиксируется в той же транзакции.
+    """
+    from hub.services import policy_change
+
+    for outcome in await policy_change.run_due(db):
+        log.info(
+            "Poll: scheduled policy change #%s — %s%s",
+            outcome["id"],
+            outcome["outcome"],
+            " (late)" if outcome.get("late") else "",
+        )
 
 
 async def _sweep_messages_retention(db) -> None:
@@ -2117,6 +2342,15 @@ async def _sweep_mcp_retention(db) -> None:
         )
 
 
+async def _sweep_orchestrator_queue(db) -> None:
+    # Очередь исполнения в тени (#1274): для каждого проекта с
+    # orchestrator_queue=shadow — событие «следующей взял бы #N» с причинами
+    # пропуска, только при смене ответа. Ни статуса, ни claim, ни воркспейса.
+    from hub.services.orchestrator_queue import shadow_pass
+
+    await shadow_pass(db)
+
+
 @dataclass(frozen=True)
 class Sweep:
     """One sweep in the tick: a name for the log and the coroutine to run."""
@@ -2132,9 +2366,11 @@ class Sweep:
 # place by nobody moving a line; here it is declared, and pinned by
 # test_the_sweep_order_is_pinned.
 SWEEPS: tuple[Sweep, ...] = (
+    Sweep("policy_schedule", _sweep_policy_schedule),
     Sweep("running_dispatch", _sweep_running_dispatch),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),
+    Sweep("parent_rollup", _sweep_parent_rollup),
     Sweep("ci_check", _sweep_ci_check),
     Sweep("stale_running", _sweep_stale_running),
     Sweep("stale_statuses", _sweep_stale_statuses),
@@ -2146,6 +2382,8 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
     Sweep("review_dispatches", _sweep_review_dispatches),
     Sweep("steward_runs", _sweep_steward_runs),
+    Sweep("executor_runs", _sweep_executor_runs),
+    Sweep("executor_slots", _sweep_executor_slots),
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),
@@ -2153,6 +2391,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
+    Sweep("orchestrator_queue", _sweep_orchestrator_queue),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),
 )
@@ -2423,13 +2662,48 @@ async def _red_base_watch(app: FastAPI) -> None:
                 log.exception("Red base watch error")
 
 
+async def _egress_watch(app: FastAPI) -> None:
+    """Probe the way out of the server and keep the egress alert (#1645).
+
+    A task of its own, not a sweep: a probe can wait for its whole deadline,
+    and the main cycle must not wait with it. Own connection, and the network
+    is touched before any write (see ``egress_watch.EgressWatch.step``).
+    """
+    from hub.services import egress_watch
+
+    await egress_watch.run_loop(lambda: _own_connection(app))
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
-    """Create and return the background poller task."""
-    task = asyncio.create_task(_poll_running_tasks(app))
-    asyncio.create_task(_session_reaper(app))
-    asyncio.create_task(_drift_watch(app))
-    asyncio.create_task(_red_base_watch(app))
-    asyncio.create_task(arm_workspace_hooks(app.state.db))
+    """Create and return the background poller task.
+
+    Every task is kept in ``app.state.background_tasks`` (name -> task); the
+    egress watcher also in ``app.state.egress_task`` (``None`` when switched off
+    with ``HAIPLANE_EGRESS_WATCH=off``). The caller stops them all under one
+    limit on shutdown (``hub.app.lifespan``).
+    """
+    from hub.services import egress_watch
+
+    # A handle for EVERY task (#1667): the stop cancels and awaits them under
+    # one limit and names the one that stays. A task with no handle cannot be
+    # awaited, and its connection stays open when the shared one is closed.
+    handles: dict[str, asyncio.Task[Any]] = {}
+
+    def spawn(name: str, coro: Any) -> asyncio.Task[Any]:
+        handles[name] = asyncio.create_task(coro, name=name)
+        return handles[name]
+
+    task = spawn("hub-poller", _poll_running_tasks(app))
+    app.state.egress_task = (
+        spawn("hub-egress-watch", _egress_watch(app))
+        if egress_watch.watch_enabled()
+        else None
+    )
+    spawn("hub-session-reaper", _session_reaper(app))
+    spawn("hub-drift-watch", _drift_watch(app))
+    spawn("hub-red-base-watch", _red_base_watch(app))
+    spawn("hub-arm-workspace-hooks", arm_workspace_hooks(app.state.db))
+    app.state.background_tasks = handles
     log.info(
         "Background poller started (every %ds; drift check every %ds; "
         "red-base check every %ds)",

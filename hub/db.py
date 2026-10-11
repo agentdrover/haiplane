@@ -2191,6 +2191,566 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS ix_pipeline_merges_project_pr "
         "ON pipeline_merges (project_id, pr_number)",
     ),
+    (
+        # #1399: бронь облачного заказа ревью на (сдача, профиль). Ключ —
+        # первичный, и INSERT OR IGNORE по нему решает, кто из параллельных
+        # триггеров покупает ревьюера. Отдельной таблицей, а не уникальным
+        # индексом на review_dispatches: строка заказа пишется ПОСЛЕ
+        # оплаченного вызова провайдера, и индекс остановил бы второго уже
+        # купившим агента. Заодно миграции не нужно переживать дубли, уже
+        # лежащие в review_dispatches (412/413, 347/348): их она не трогает.
+        "create_review_order_claims",
+        """CREATE TABLE IF NOT EXISTS review_order_claims (
+            task_id               INTEGER NOT NULL
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+            submission_generation INTEGER NOT NULL,
+            profile               TEXT    NOT NULL,
+            claimed_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (task_id, submission_generation, profile)
+        )""",
+    ),
+    (
+        # #1361: отчёт, ПЕРЕНЕСЁННЫЙ на пересдачу «только слита база», а не
+        # прочитанный заново. Непустое значение — id исходного отчёта: по нему
+        # перенос помечен в карточке и исключён из метрик чтения. NULL — всё,
+        # что было до этого, и каждое настоящее чтение после.
+        "add_machine_reviews_carried_from_review_id",
+        "ALTER TABLE machine_reviews ADD COLUMN carried_from_review_id INTEGER",
+    ),
+    (
+        # #1410 (F2.2): строка прогона облачного исполнителя. В F0 прогон
+        # висел 12 часов, а цену узнали вручную — хаб её не писал. tokens и
+        # cents (chargedCents провайдера) NULL, пока провайдер их не назвал:
+        # неизвестно — не ноль. outcome: running | finished | cancelled |
+        # failed | over_ceiling | taken_down; reason — почему строка стоит
+        # как стоит (например, провайдер не ответил на опрос).
+        "create_executor_runs",
+        """CREATE TABLE IF NOT EXISTS executor_runs (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id               INTEGER NOT NULL
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+            submission_generation INTEGER NOT NULL DEFAULT 0,
+            agent_id              TEXT    NOT NULL DEFAULT '',
+            run_id                TEXT    NOT NULL DEFAULT '',
+            model                 TEXT    NOT NULL DEFAULT '',
+            tokens                INTEGER,
+            cents                 REAL,
+            started_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+            finished_at           TEXT,
+            duration_ms           INTEGER,
+            outcome               TEXT    NOT NULL DEFAULT 'running',
+            reason                TEXT    NOT NULL DEFAULT '',
+            polled_at             TEXT
+        )""",
+    ),
+    (
+        "idx_executor_runs_outcome",
+        "CREATE INDEX IF NOT EXISTS idx_executor_runs_outcome "
+        "ON executor_runs(outcome, task_id)",
+    ),
+    (
+        # #1410: когда опрос впервые увидел конец прогона без цены. От этой
+        # отметки считается EXECUTOR_COST_WAIT_MIN; NULL — цены не ждём.
+        "add_executor_runs_cost_wait_since",
+        "ALTER TABLE executor_runs ADD COLUMN cost_wait_since TEXT",
+    ),
+    (
+        # #1411 (F2.3): потолки прогона, заданные при заказе, — хаб держит их
+        # сам, не промпт исполнителя. NULL у строк до миграции читается как
+        # умолчание из конфигурации.
+        "add_executor_runs_token_ceiling",
+        "ALTER TABLE executor_runs ADD COLUMN token_ceiling INTEGER",
+    ),
+    (
+        "add_executor_runs_cents_ceiling",
+        "ALTER TABLE executor_runs ADD COLUMN cents_ceiling REAL",
+    ),
+    (
+        # #1411: зачем хаб отменяет прогон (taken_down | over_ceiling) — этим
+        # исходом строка закроется, когда прогон прочитается CANCELLED.
+        # Пусто — хаб отмену не начинал.
+        "add_executor_runs_cancel_intent",
+        "ALTER TABLE executor_runs ADD COLUMN cancel_intent TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1411: попытки отмены и время последней — счёт до потолка попыток и
+        # пауза между ними переживают проход поллера и перезапуск.
+        "add_executor_runs_cancel_attempts",
+        "ALTER TABLE executor_runs "
+        "ADD COLUMN cancel_attempts INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "add_executor_runs_cancel_last_at",
+        "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
+    ),
+    (
+        # #1563: ссылка, от которой хаб заказал прогон (startingRef провайдера).
+        # NULL — у строк до миграции и у заказа, не дошедшего до записи: «не
+        # записано», а не «база».
+        "add_executor_runs_starting_ref",
+        "ALTER TABLE executor_runs ADD COLUMN starting_ref TEXT",
+    ),
+    (
+        # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
+        # последнее событие release_blocked/unblocked по проекту без скана ленты.
+        "idx_events_kind_project",
+        "CREATE INDEX IF NOT EXISTS idx_events_kind_project "
+        "ON events(kind, project_id, id)",
+    ),
+    (
+        # #1645: heartbeat of the egress watcher — ONE row, written in the same
+        # transaction as an episode transition. checked_at lives here, not in
+        # memory: a restart keeps it, every process sees the same one, and a
+        # failed write leaves it stale (-> unknown) instead of a false "up".
+        "create_egress_state_table",
+        "CREATE TABLE IF NOT EXISTS egress_state ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "checked_at TEXT NOT NULL, "
+        "interval_seconds INTEGER NOT NULL, "
+        "ok INTEGER NOT NULL, "
+        "reason_code TEXT NOT NULL DEFAULT '', "
+        "streak INTEGER NOT NULL DEFAULT 0, "
+        "first_fail_at TEXT NOT NULL DEFAULT '')",
+    ),
+    (
+        # #1413: чем снят provider_tokens. '' — история до задачи (счёт
+        # ОДНОГО прогона, переснимается только командой владельца);
+        # agent_open — счёт агента, снятый до его конца, свип переснимет;
+        # agent — итог по агенту; recounted — пересчитан командой владельца.
+        "add_review_dispatches_usage_scope",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_scope TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1413: когда провайдера спрашивали о счёте этого заказа последний
+        # раз — переснятие ходит не чаще раза в USAGE_RESTAMP_EVERY_MINUTES.
+        "add_review_dispatches_usage_checked_at",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_checked_at TEXT",
+    ),
+    (
+        # #1403: кто назначил профиль заказа — правило (rule) или жребий над
+        # lite правила риска (random). Старые строки — rule.
+        "add_review_dispatches_profile_assignment",
+        "ALTER TABLE review_dispatches "
+        "ADD COLUMN profile_assignment TEXT NOT NULL DEFAULT 'rule'",
+    ),
+    (
+        # #1413: полная цена заказа по выгрузке Cursor, которую приносит
+        # владелец. Рядом с provider_tokens (API агента — нижняя граница),
+        # не вместо него. NULL — выгрузка по агенту не импортировалась.
+        "add_review_dispatches_billed_tokens",
+        "ALTER TABLE review_dispatches ADD COLUMN billed_tokens INTEGER",
+    ),
+    (
+        "add_review_dispatches_billed_events",
+        "ALTER TABLE review_dispatches ADD COLUMN billed_events INTEGER",
+    ),
+    (
+        # #1413: события выгрузки Cursor, по одному на ключ (агент, время,
+        # токены, модель) — повторный и перекрывающийся импорт не удваивает.
+        # Хранятся только события заказов ревью хаба.
+        "create_cursor_usage_events",
+        """CREATE TABLE IF NOT EXISTS cursor_usage_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id     TEXT    NOT NULL,
+            event_date   TEXT    NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            model        TEXT    NOT NULL DEFAULT '',
+            dispatch_id  INTEGER,
+            imported_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (agent_id, event_date, total_tokens, model)
+        )""",
+    ),
+    # Строки #1413 стоят до блока #1434 намеренно: его тест требует свои
+    # миграции последними, а применение идёт по имени — порядок не важен.
+    # #917 стоит здесь по той же причине.
+    (
+        # #1590: итог проверенного бэкапа базы перед рестартом (строка из
+        # remote-deploy.sh). Пусто — «неизвестно»: отчёт старого клиента.
+        "add_releases_backup",
+        "ALTER TABLE releases ADD COLUMN backup TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #917 (F5): релиз, в котором проявился дефект. Ссылка на строку
+        # releases, а не sha: «что работало в проде» уже записано там (#495),
+        # и второй копии факта расходиться не с чем. NULL — «не указан», а не
+        # «ни в каком»; #915 заполняет её при заведении прод-дефекта.
+        "add_tasks_release_id",
+        "ALTER TABLE tasks ADD COLUMN release_id INTEGER REFERENCES releases(id)",
+    ),
+    (
+        "idx_tasks_release_id",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)",
+    ),
+    (
+        # #917: предложенный машиной виновник — ГИПОТЕЗА, отдельно от
+        # tasks.caused_by_task_id, который ставит только явное подтверждение.
+        # Строка пишется один раз на тройку (дефект, кандидат, релиз) и не
+        # удаляется: доля подтверждённых предложений (outcome #917) считается
+        # по тому, что было предложено, а не по тому, что предлагается сейчас.
+        "create_defect_cause_suggestions",
+        """CREATE TABLE IF NOT EXISTS defect_cause_suggestions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            defect_task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            candidate_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            release_id        INTEGER NOT NULL REFERENCES releases(id),
+            overlap           TEXT    NOT NULL DEFAULT '[]',
+            suggested_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (defect_task_id, candidate_task_id, release_id)
+        )""",
+    ),
+    (
+        # #1434 (F7): канал (cloud | slot) и имя слота — атрибуты выдачи кода
+        # implementer. Пусто — канал не назван: код без канала работает как
+        # до задачи (облачный исполнитель, пилот SID).
+        "add_chat_pair_codes_channel",
+        "ALTER TABLE chat_pair_codes ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_codes_slot",
+        "ALTER TABLE chat_pair_codes ADD COLUMN slot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_sessions_channel",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_sessions_slot",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN slot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1434: захват задачи в названном канале. Строка живёт от захвата до
+        # released_at: outcome occupied -> freed (задача ушла из работы: сдача,
+        # возврат, отказ) или released_dead (поллер освободил слот без
+        # признаков жизни, reason называет, сколько минут тишины).
+        "create_executor_slots",
+        """CREATE TABLE IF NOT EXISTS executor_slots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            channel      TEXT    NOT NULL,
+            slot         TEXT    NOT NULL DEFAULT '',
+            captured_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            released_at  TEXT,
+            outcome      TEXT    NOT NULL DEFAULT 'occupied',
+            reason       TEXT    NOT NULL DEFAULT ''
+        )""",
+    ),
+    (
+        # Одна живая строка на задачу: повторный захват (claim, затем
+        # pair-start той же сессией) — INSERT OR IGNORE, а не вторая строка.
+        "idx_executor_slots_active",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_slots_active "
+        "ON executor_slots(task_id) WHERE released_at IS NULL",
+    ),
+    (
+        # #919: what a closed production defect left behind — a regression
+        # test, a rule from category_checks (#878), or an accepted risk with a
+        # reason and a revisit condition. One JSON column next to the passport
+        # (#909) rather than a table: there is one answer per defect, and it
+        # travels with the task it answers. NULL = no answer recorded; old rows
+        # stay NULL — back-filling "accepted" would invent the very output the
+        # gate exists to require.
+        "add_defect_prevention_column",
+        "ALTER TABLE tasks ADD COLUMN defect_prevention TEXT",
+    ),
+    (
+        # #920: when a rule was SET UP, apart from when its current check was
+        # recorded. ``recorded_at`` moves on every re-record — a better check
+        # replaces the claim (#878) — so a repeat report reading it would
+        # forgive every finding between the first check and the better one,
+        # and a rule could be made to look unbroken by re-recording it. The
+        # breach is counted from this date; the upsert never touches it.
+        "add_category_checks_created_at",
+        "ALTER TABLE category_checks ADD COLUMN created_at TEXT",
+    ),
+    (
+        # Old rows: the earliest ``category_check_recorded`` event for the
+        # category (#878 writes one on every record), else ``recorded_at``.
+        # Never later than ``recorded_at``: a rule cannot be younger than its
+        # current check. Only NULLs are filled, so a re-run changes nothing.
+        "backfill_category_checks_created_at",
+        "UPDATE category_checks SET created_at = MIN(recorded_at, COALESCE(("
+        "SELECT MIN(e.created_at) FROM events e "
+        "WHERE e.kind = 'category_check_recorded' AND CASE WHEN "
+        "json_valid(e.payload) THEN json_extract(e.payload, '$.category') END "
+        "= category_checks.category), recorded_at)) WHERE created_at IS NULL",
+    ),
+    (
+        # Red-test baseline (#913): the branch's changed test files run over
+        # the merge-base code, a status per nodeid. Its own column next to
+        # ``mutations``: the red-test gate reads it at submission, and '{}' for
+        # every older report means "no baseline was reported" — the gate says
+        # "not proven", never "proven".
+        "add_ci_run_reports_baseline",
+        "ALTER TABLE ci_run_reports ADD COLUMN baseline TEXT NOT NULL DEFAULT '{}'",
+    ),
+    (
+        # #1589: what the project's path_notices rules said about the paths of
+        # ONE submission generation. A table, not an event: events are pruned
+        # after 14 days and a verdict can wait longer, and ``submissions`` is
+        # written only by the pair path. UNIQUE(task_id, generation): the
+        # result is fixed at submission and never rewritten, so a policy edit
+        # afterwards cannot change what the reviewer is shown.
+        "create_path_notice_results",
+        """CREATE TABLE IF NOT EXISTS path_notice_results (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL,
+            sha        TEXT    NOT NULL DEFAULT '',
+            state      TEXT    NOT NULL,
+            reason     TEXT    NOT NULL DEFAULT '',
+            notices    TEXT    NOT NULL DEFAULT '[]',
+            created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation)
+        )""",
+    ),
+    # --- #1601: советник-критик стюарда и критерий выхода из тени v2. -------
+    (
+        # Для kind=advisor: id суждения судьи, на которое отвечает советник.
+        # Привязку ставит хаб по заказу, а не советник словами.
+        "add_steward_judgements_judged_id",
+        "ALTER TABLE steward_judgements ADD COLUMN judged_id INTEGER",
+    ),
+    (
+        # Хеш пакета фактов (steward_evidence.packet_hash), который прочёл
+        # прогон: хаб снимает его при выдаче пакета и переносит в суждение.
+        # Пусто — пакета под этот прогон не отдавали, и согласие не засчитывается.
+        "add_steward_judgements_packet_hash",
+        "ALTER TABLE steward_judgements ADD COLUMN packet_hash TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # Контур выборки: 1 — суждения до выката #1601 (одиночные, без
+        # советника), 2 — новый контур. Старые строки остаются 1 по умолчанию
+        # колонки; критерий выхода v2 их не зачитывает.
+        "add_steward_judgements_contour",
+        "ALTER TABLE steward_judgements ADD COLUMN contour INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        # Исход применения approve судьи (поллер): '' — ещё не применялся;
+        # approved | escalated | moot. Ставится условным UPDATE: так применение
+        # случается ровно один раз и переживает перезапуск хаба.
+        "add_steward_judgements_advisor_outcome",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_outcome TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # Когда применение заняло метку (advisor_outcome='applying'): по ней
+        # прервавшееся применение отличают от идущего (#1601).
+        "add_steward_judgements_advisor_claimed_at",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_claimed_at TEXT",
+    ),
+    (
+        "add_steward_runs_packet_hash",
+        "ALTER TABLE steward_runs ADD COLUMN packet_hash TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Липкое ошибочное одобрение пары (#1601). Таблица, а не событие:
+        # события чистятся через 14 дней, а окно проверки — 30 дней после
+        # доставки. Строка живёт, пока человек явно не снимет её (cleared_*).
+        # Ключ — КОНКРЕТНЫЙ случай (задача, источник, ref): снятие закрывает
+        # случай, а не задачу, новый случай — новая строка.
+        "create_steward_false_approvals",
+        """CREATE TABLE IF NOT EXISTS steward_false_approvals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     INTEGER NOT NULL,
+            source      TEXT    NOT NULL,
+            generation  INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT    NOT NULL DEFAULT '',
+            ref         TEXT    NOT NULL DEFAULT '',
+            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            cleared_by  TEXT,
+            cleared_at  TEXT,
+            clear_note  TEXT    NOT NULL DEFAULT '',
+            UNIQUE (task_id, source, ref)
+        )""",
+    ),
+    # --- #1601: факт ошибочного одобрения пишется В МОМЕНТ события, в той же
+    # транзакции, что и оно. Триггеры БД, а не вызовы в путях: путей записи
+    # вердикта и выхода из completed много, триггер ловит и забытые.
+    (
+        # Сколько раз задача выходила из completed (#1601): порядковый номер
+        # случая «переоткрытие», не зависящий от часов.
+        "add_tasks_completed_exit_seq",
+        "ALTER TABLE tasks ADD COLUMN completed_exit_seq INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        # Человеческий возврат. Список акторов автоматики — как
+        # gate_events.NON_HUMAN_GATE_ACTORS; расхождение ловит тест (новый
+        # актор = новая миграция, пересоздающая триггер).
+        "create_trigger_false_approve_human_return",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_human_return
+        AFTER INSERT ON events
+        WHEN NEW.kind = 'review_verdict_recorded' AND NEW.task_id IS NOT NULL
+          AND NEW.actor NOT IN ('hub', 'policy', 'steward')
+          AND json_extract(NEW.payload, '$.verdict') = 'changes_requested'
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'human_changes_requested', j.generation, 'человек вернул поколение ' || COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0) || ' (пара одобрила поколение ' || j.generation || '), событие #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.task_id AND j.generation <= COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0);
+        END""",
+    ),
+    (
+        # Выход из completed любым путём (transition_status_if, update_task,
+        # прямой UPDATE). Ref — порядковый номер выхода из completed у этой
+        # задачи (счётчик completed_exit_seq, растёт в самом триггере), а не
+        # время: два выхода в одну миллисекунду с одинаковым completed_at —
+        # два разных случая. Последующие переходы нового случая не создают.
+        "create_trigger_false_approve_reopened",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_reopened
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status = 'completed' AND NEW.status != 'completed'
+        BEGIN
+            UPDATE tasks SET completed_exit_seq = completed_exit_seq + 1
+            WHERE id = NEW.id;
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || (SELECT completed_exit_seq FROM tasks WHERE id = NEW.id)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_insert",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_insert
+        AFTER INSERT ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_update",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_update
+        AFTER UPDATE OF found_in, caused_by_task_id ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+          AND (OLD.found_in IS NOT 'prod'
+               OR OLD.caused_by_task_id IS NOT NEW.caused_by_task_id)
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
+    (
+        # #1593: отложенные правки политики проекта. Своя таблица, не ключ
+        # gate_policy: политика остаётся тем, что хаб ЧИТАЕТ, а расписание —
+        # тем, что хаб ИСПОЛНЯЕТ; ключ расписания внутри политики прошёл бы
+        # валидатор и замок как «политика», а исполнитель должен читать его
+        # другим кодом. ``at`` — UTC в одном формате (``%Y-%m-%dT%H:%M:%SZ``),
+        # поэтому порядок (at, id) — порядок строк. State меняет хаб
+        # (pending → applied|refused) или человек (pending → cancelled);
+        # исполненная запись больше не редактируется.
+        "create_scheduled_policy_changes",
+        """CREATE TABLE IF NOT EXISTS scheduled_policy_changes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id),
+            at          TEXT    NOT NULL,
+            patch       TEXT    NOT NULL,
+            note        TEXT    NOT NULL DEFAULT '',
+            created_by  TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            state       TEXT    NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'applied', 'refused', 'cancelled')),
+            executed_at TEXT,
+            result      TEXT    NOT NULL DEFAULT '{}'
+        )""",
+    ),
+    (
+        "idx_scheduled_policy_changes_due",
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_policy_changes_due "
+        "ON scheduled_policy_changes(state, at, id)",
+    ),
+    (
+        # #1594: обоснование допуска работы при заморозке проекта. Отдельно от
+        # ``rationale`` (общая необходимость задачи): пустое после strip значит
+        # «обоснования нет», и заморозка такую работу не пускает.
+        "add_tasks_freeze_rationale",
+        "ALTER TABLE tasks ADD COLUMN freeze_rationale TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1647: что является результатом работы. ``commit`` — у всех
+        # существующих задач (DEFAULT), ``state`` — состояние мира без ветки,
+        # PR и CI. Меняется только в draft: проверка в refinement под
+        # write-транзакцией, не в схеме.
+        "add_tasks_result_kind",
+        "ALTER TABLE tasks ADD COLUMN result_kind TEXT NOT NULL DEFAULT 'commit'",
+    ),
+    (
+        # #1647: способ отката результата-состояния. Пусто у commit-задач.
+        "add_tasks_rollback",
+        "ALTER TABLE tasks ADD COLUMN rollback TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1647: поколение, на котором человек явно вернул state-задачу в работу
+        # (return-to-work, rework). Постановка state-задачи заморожена, пока
+        # поколение сдачи не равно этому числу; новая сдача поднимает поколение
+        # и замораживает её снова. Признак возврата, а не статуса: вопрос
+        # агента (needs_info) заморозку не снимает.
+        "add_tasks_unfrozen_generation",
+        "ALTER TABLE tasks ADD COLUMN unfrozen_generation INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        # #1647: снимок AC, rollback и result_kind на момент сдачи state-задачи
+        # (JSON). Доказательства относятся к снимку, а не к тому, что AC
+        # скажут потом. Пусто у сдач commit-задач.
+        "add_submissions_state_snapshot",
+        "ALTER TABLE submissions ADD COLUMN state_snapshot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1647: доказательства сдачи state-задачи. Одна строка на (задача,
+        # поколение, AC). Только вставка: UPDATE запрещён триггером ниже, а
+        # кода, который правит или удаляет строки, нет. principal_id — автор из
+        # идентичности вызывающего; agent — подпись, которую назвал клиент.
+        # Каскад по задаче оставлен: удаление самой задачи уносит и её след.
+        "create_task_evidence",
+        """CREATE TABLE IF NOT EXISTS task_evidence (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation   INTEGER NOT NULL,
+            ac_id        TEXT    NOT NULL,
+            action       TEXT    NOT NULL,
+            observed     TEXT    NOT NULL,
+            target       TEXT    NOT NULL,
+            observed_at  TEXT    NOT NULL,
+            principal_id INTEGER,
+            agent        TEXT    NOT NULL DEFAULT '',
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation, ac_id)
+        )""",
+    ),
+    (
+        "idx_task_evidence_task",
+        "CREATE INDEX IF NOT EXISTS idx_task_evidence_task "
+        "ON task_evidence(task_id, generation)",
+    ),
+    (
+        "task_evidence_no_update",
+        """CREATE TRIGGER IF NOT EXISTS task_evidence_no_update
+        BEFORE UPDATE ON task_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'task_evidence is insert-only');
+        END""",
+    ),
 ]
 
 
@@ -2249,7 +2809,7 @@ def deserialize_risks(raw: str | None) -> list[dict[str, Any]]:
 # plain columns (#910). They travel through ``repo.set_defect_passport`` so the
 # causal link is resolved first; ``clear_caused_by`` is a verb, not a column.
 PASSPORT_REFINE_FIELDS = frozenset(
-    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by", "release_id"}
 )
 
 # All list[str] columns serialized as JSON in TEXT.
@@ -2290,6 +2850,11 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # #1236: имя объявленного живого зонда. Часть постановки: она говорит, что
     # именно наблюдать после доставки.
     "live_probe",
+    # #1647: результат работы (commit|state) и способ отката state-результата.
+    "result_kind",
+    "rollback",
+    # #1594: обоснование допуска при заморозке проекта; чтение и запись.
+    "freeze_rationale",
     "risks",
     "prepared_by",
     "prepared_at",
@@ -2322,6 +2887,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "caused_by_task_id",
     "detected_at",
     "resolved_at",
+    # #917: the release the defect showed up in — resolved against releases
+    # by ``repo.set_defect_passport`` before it lands, like caused_by above.
+    "release_id",
 )
 
 
@@ -2831,13 +3399,21 @@ async def build_tree(
 
 
 async def log_activity(
-    db: aiosqlite.Connection, kind: str, summary: str, detail: str | None = None
+    db: aiosqlite.Connection,
+    kind: str,
+    summary: str,
+    detail: str | None = None,
+    *,
+    commit: bool = True,
 ) -> None:
+    """Запись в activity_log. ``commit=False`` - внутри чужой транзакции (#1610):
+    владелец транзакции коммитит или откатывает запись сам."""
     await db.execute(
         "INSERT INTO activity_log (kind, summary, detail) VALUES (?, ?, ?)",
         (kind, summary, detail),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -3043,6 +3619,14 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Read the evidence pack and write a judgement; cannot change task state",
         ("steward.evidence.read", "steward.judgement.write"),
     ),
+    (
+        # #1556: read-only. One verb; the route allowlist in hub/auth.py is
+        # the real gate (GET/HEAD on /api/* and /mcp), not this permission.
+        "watcher",
+        "Watcher",
+        "Только чтение: задачи, ревью, метрики, прод-состояние; не меняет ничего",
+        ("tasks.read",),
+    ),
 )
 
 
@@ -3217,6 +3801,110 @@ category питает метрики повторяемости — исполь
 """
 
 
+EXECUTOR_PAIR_DISCIPLINE_SKILL = """\
+# executor-pair-discipline — дисциплина облачного исполнителя (#1366, #1441)
+
+Ты работаешь без сессии-стюарда. Держать дисциплину некому, кроме тебя и
+проверок хаба (предпас, CI, ревью) — они остаются и ничего из этого не
+заменяют. Каждое правило родилось из инцидента.
+
+## Порядок
+
+1. Обмен одноразового кода implementer — первым шагом, до клона, установки и
+   тестов. Код живёт около 5 минут: в F0 обмен после 9-минутного pytest
+   получил 401. Сессию храни для всех запросов к хабу по HTTP.
+2. claim и pair-start задачи; ветка — ровно каноническое имя из ответа
+   pair-start.
+3. Работа по правилам ниже. Прогон кончается одним из двух способов: сдача
+   submit-review ИЛИ вопрос (раздел «Вопрос» ниже). Третьего нет, кроме явного
+   заказа хаба «только сдай» (#1446): он велит закончить прогон без сдачи, если
+   сдать нельзя, и такой заказ исполняй как написан. Правило о повторной
+   сдаче — в разделе «Правила».
+4. После сдачи заверши прогон сразу — не жди ревью и ничего не опрашивай.
+   Хаб снимет висящий прогон сам, но это страховка, а не план.
+
+## Вопрос — это стоп
+
+Вопрос задаётся только через `POST /api/tasks/{id}/question`. После вопроса:
+
+- НЕ коммить и НЕ пушить ничего, даже «пока жду» и даже по своему лучшему
+  пониманию. Незакоммиченную работу оставь как есть.
+- НЕ жди ответа и не опрашивай хаб: ответ придёт в новый прогон.
+- Заверши прогон сразу. Итоговое сообщение прогона — текст вопроса и одна
+  строка о том, что сделано до него.
+
+SID-20 (#1450, 28.09): агент задал вопрос об исключениях, через 4 минуты,
+не дождавшись ответа, запушил код по своей версии и закончил прогон без
+сдачи. Ответ владельца пришёл через 3 минуты после пуша и с кодом разошёлся.
+Доводил локальный исполнитель.
+
+Вопрос текстом в итоговом сообщении, в PR или в ленте — не вопрос: его никто
+не прочтёт как вопрос.
+
+## Правила
+
+- RED до кода: тест падает на коде до правки, и код возврата этого падения
+  записан в ленту задачи.
+- Мутации на каждый AC и каждое место применения — места перечисляются по
+  смыслу, а не по одному имени. Каждая мутация: применилась (проверить),
+  прогон с PYTHONDONTWRITEBYTECODE=1 и чистым __pycache__, смотреть базовый
+  прогон и имя упавшего теста; после отката — cmp с исходником, git status
+  чист.
+- Проверки по коду возврата, а не по хвосту вывода: `cmd; echo EXIT:$?`, без
+  `| tail` на проверке. «Зелено» — только наблюдённый rc 0.
+- pytest кусками короче 5 минут: сначала прицельные файлы, потом полный набор
+  частями, потом make check. Обрыв по таймауту иначе выглядит как зависание.
+- Пуш полным refspec из ветки с каноническим именем:
+  `git push origin "refs/heads/${B}:refs/heads/${B}"`. `HEAD:` режет pre-push
+  хук.
+- CI: смотреть прогон нужного sha и его conclusion, а не «последний».
+  Отсутствующий прогон лечится пушем с реальными изменениями.
+- Не создавай повторную сдачу из-за неопределённого ответа транспорта —
+  сначала проверь статус задачи. Изменение сданного кода — новый коммит, пуш и
+  новая сдача (новое поколение, прежний вердикт не текущий, #1054). Повтор из
+  review с тем же sha сохраняет поколение, статус и текущесть вердикта;
+  finding_outcomes, accept_areas и решение о заказе ревью могут обновиться
+  (#1265). Запись в ленту сданный код не обновляет. Подробно — skill
+  hub-submit-task.
+- После rework — pair-start и submit подряд, без ожидания между ними.
+- Находки прошлой сдачи: исходы находок передаются в сдаче по их uid.
+- Если в заказе есть блок «вопрос и ответ» — ответ владельца обязателен к
+  исполнению; коммиты, сделанные до ответа, сверь с ним и переделай, если
+  расходятся, и скажи об этом в summary.
+- Без субагентов: вся работа в этом прогоне.
+- Свой каталог для временных файлов, не /tmp и не дерево репозитория.
+- Секреты не читать и не выводить.
+
+## Правила пилота ssh-identity-doctor (27–28.09)
+
+- Постановка может ошибаться. Если validation-команда, AC или фикстура из
+  постановки противоречат реальному репозиторию (несуществующий путь, файл,
+  поле), НЕ меняй продуктовый код, чтобы проверка прошла. Задай вопрос (раздел
+  «Вопрос — это стоп») и назови расхождение. SID-17: агент добавил в cli.py
+  молчаливую подмену несуществующего `--ssh-dir …/.ssh` родителем, чтобы
+  прошла ошибочная validation-команда, — это нарушило контракт CLI и стало
+  high-находкой ревью.
+- Запуск продукта руками — только с изолированным окружением (временный
+  HOME, фикстура), никогда на настоящих данных пользователя (~/.ssh и т.п.).
+- Сдача по контракту (submission_contract=require):
+  - `model` — точный id твоей модели, `summary` — по каждому AC тест и что он
+    доказывает;
+  - поле `mutations`: список `{"ac": "AC-N", "mutation": "что испортил",
+    "failed_test": "<ровно test_ref этого AC>"}` на каждый AC с
+    verifiable_by=test. Ключ строго `ac`. Список изменённых файлов — не
+    мутации;
+  - ДО сдачи: пуш выполнен и `git ls-remote origin <ветка>` показывает твой
+    коммит; CI этого sha зелёный.
+- Сдача — только вызов submit-review. Сообщение «work done», статус в ленте
+  или открытый PR сдачей не являются. PR сам не открывай — его откроет хаб.
+  SID-12 и SID-15: агент открыл PR или написал «work done» и завершил прогон
+  без сдачи — задача час висела.
+- Отсутствие данных — не данные: если источник не ответил (timeout,
+  unavailable, файл не найден), продукт и отчёт говорят «неизвестно», а не
+  «нет». Проверяй это тестом.
+"""
+
+
 async def seed_default_skills(db: aiosqlite.Connection) -> None:
     """Seed built-in skills, and keep the ACTIVE one current (#380, #383, #1028).
 
@@ -3269,6 +3957,12 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             "skill",
             MACHINE_REVIEW_CYCLE_SKILL,
             '["review", "workflow", "contract"]',
+        ),
+        (
+            "executor-pair-discipline",
+            "skill",
+            EXECUTOR_PAIR_DISCIPLINE_SKILL,
+            '["executor", "workflow", "discipline"]',
         ),
     )
     for name, kind, content, tags in seeds:

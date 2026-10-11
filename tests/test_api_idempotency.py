@@ -87,3 +87,37 @@ async def test_create_task_idempotency_conflict_on_payload_change(
 async def test_create_task_without_key_keeps_legacy_status(client: AsyncClient):
     resp = await client.post("/api/tasks", json={"title": "no key"})
     assert resp.status_code == 200
+
+
+async def test_replay_of_a_request_created_before_freeze_rationale_is_not_a_conflict(
+    client, db
+):
+    # #1594: хеш, посчитанный кодом до появления freeze_rationale, остаётся
+    # хешем того же запроса; пустое умолчание нового поля его не меняет.
+    import hashlib
+    import json
+
+    from hub.models import TaskCreate
+
+    body = {"title": "legacy replay", "client_request_id": "legacy-1594"}
+    first = await client.post("/api/tasks", json=body)
+    assert first.status_code == 201, first.text
+    payload = TaskCreate(**body).model_dump(
+        mode="json", exclude={"client_request_id", "freeze_rationale"}
+    )
+    legacy = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    await db.execute(
+        "UPDATE task_idempotency_keys SET request_hash=? WHERE client_request_id=?",
+        (legacy, "legacy-1594"),
+    )
+    await db.commit()
+
+    replay = await client.post("/api/tasks", json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    changed = await client.post(
+        "/api/tasks", json=dict(body, freeze_rationale="новое обоснование")
+    )
+    assert changed.status_code == 409, "непустое обоснование - другой запрос"

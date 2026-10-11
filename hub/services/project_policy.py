@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import NamedTuple
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, NamedTuple
 
 import aiosqlite
 
 from hub import config, git_policy
 from hub import repository as repo
-from hub.models import DEFAULT_FORGE, FORGES
+from hub.models import DEFAULT_FORGE, FORGES, parse_freeze_until, validated_freeze
 
 log = logging.getLogger(__name__)
 
@@ -353,6 +355,24 @@ def gate_form_value(policy: dict, key: str) -> str:
     return GATE_HUMAN
 
 
+def gate_value_of(policy: dict, gate: str) -> str:
+    """Значение гейта, по которому РЕШАЮТ: сохранённое, если запись его приняла.
+
+    Единственный читатель ключей ``dor`` и ``verdict`` для решателей и для
+    сводки действующей политики (#1558). Принимается всё из ``GATE_VALUES``,
+    остальное — отсутствие ключа, мусор, не-строка — читается как ``human``
+    (#835). От ``gate_form_value`` он отличается одним: тот отвечает на вопрос
+    «что может выбрать форма» (``IMPLEMENTED_GATE_VALUES``) и потому не знает
+    ``dor=steward``, который запись принимает, а диспетчер DoR-стюарда
+    исполняет. Сводка, читавшая форменного читателя, показывала бы human там,
+    где решатель действует.
+    """
+    stored = _stored_gate_values(policy).get(gate) if isinstance(policy, dict) else None
+    if isinstance(stored, str) and stored in GATE_VALUES:
+        return stored
+    return GATE_HUMAN
+
+
 def gate_delegate_badge(policy: dict, key: str) -> GateChoice | None:
     """Делегирующее значение гейта для витрины — или None, если решает человек.
 
@@ -373,10 +393,7 @@ def verdict_is_delegated(policy: dict) -> bool:
     Нераспознанное значение сюда не попадает и попадать не должно: слово,
     которого никто не узнал, значит «человек», а не «кто-нибудь» (#835).
     """
-    if not isinstance(policy, dict):
-        return False
-    value = policy.get("verdict")
-    return isinstance(value, str) and value in DELEGATED_VERDICTS
+    return gate_value_of(policy, "verdict") in DELEGATED_VERDICTS
 
 
 def review_dispatch_enabled(policy: dict) -> bool:
@@ -406,6 +423,67 @@ def review_dispatch_enabled(policy: dict) -> bool:
     if verdict_is_delegated(policy):
         return True
     return policy.get("review") == REVIEW_DISPATCH
+
+
+# Замок #743: проект default (сам хаб) не принимает делегирование ни на
+# одном из этих гейтов. Запись политики (hub/app.py) и сводка действующей
+# политики (#1457) читают ЭТИ два имени, а не каждый своё.
+GATE_LOCK_SLUG = "default"
+GATE_LOCK_GATES: tuple[str, ...] = ("dor", "verdict")
+
+
+#: Пары (гейт, значение), которые замок #743 на default пропускает. Явный
+#: список, а не «все делегаты, кроме auto»: слово, появившееся в
+#: DELEGATED_VERDICTS, на default закрыто по умолчанию (#1151) и открывается
+#: только строкой здесь. Решение владельца от 06.10.2026 (#1602): вердикт на
+#: default может держать стюард. Автопилот при этом на default не работает
+#: никогда — см. auto_verdict._scope_stage.
+GATE_LOCK_ALLOWED_PAIRS: frozenset[tuple[str, str]] = frozenset(
+    {("verdict", "steward")}
+)
+GATE_LOCK_OWNER_DECISION = "решение владельца от 06.10.2026"
+
+
+def gate_lock_applies(slug: str) -> bool:
+    """Действует ли замок #743 на проект с этим slug."""
+    return slug == GATE_LOCK_SLUG
+
+
+def gate_pair_name(gate: str, value: str) -> str:
+    """Пара в виде, в котором её видит человек: ``verdict=auto``."""
+    return f"{gate}={value}"
+
+
+def gate_lock_violations(slug: str, policy: dict) -> list[str]:
+    """Пары ``gate=value`` итоговой политики, которые замок #743 не пропускает.
+
+    Пусто — замок не действует на проект или все гейты либо у человека, либо
+    в разрешённых парах. Читается итоговая политика целиком (после слияния).
+    """
+    if not gate_lock_applies(slug):
+        return []
+    found = []
+    for gate in GATE_LOCK_GATES:
+        value = gate_value_of(policy, gate)
+        if value == GATE_HUMAN:
+            continue
+        if (gate, value) not in GATE_LOCK_ALLOWED_PAIRS:
+            found.append(gate_pair_name(gate, value))
+    return found
+
+
+def gate_lock_refused_pairs() -> list[str]:
+    """Все пары, которые замок сегодня запрещает: делегаты на замкнутых гейтах."""
+    return sorted(
+        gate_pair_name(gate, value)
+        for gate in GATE_LOCK_GATES
+        for value in DELEGATED_VERDICTS
+        if (gate, value) not in GATE_LOCK_ALLOWED_PAIRS
+    )
+
+
+def gate_lock_allowed_pairs() -> list[str]:
+    return sorted(gate_pair_name(g, v) for g, v in GATE_LOCK_ALLOWED_PAIRS)
 
 
 # Recognised values of the `release` key (#812). Default is manual, and it is
@@ -480,10 +558,16 @@ def review_limit_mode_of(policy: dict) -> str:
 CI_RUNNER_KEY = "ci_runner"
 
 
+def ci_runner_from(policy: dict) -> str:
+    """The CI test command out of an already-read policy; ``""`` when unsaid."""
+    if not isinstance(policy, dict):
+        return ""
+    return str(policy.get(CI_RUNNER_KEY) or "").strip()
+
+
 def ci_runner_of(project) -> str:
     """How this project's acceptance tests are run in CI; ``""`` when unsaid."""
-    policy = gate_policy_of(project)
-    return str(policy.get(CI_RUNNER_KEY) or "").strip()
+    return ci_runner_from(gate_policy_of(project))
 
 
 async def risk_map_for_task(
@@ -494,8 +578,470 @@ async def risk_map_for_task(
     None and ``{}`` mean the same thing to the derivation, but None is the
     honest word for "this project never described its paths".
     """
-    policy = await gate_policy_for_task(db, task_id)
-    raw = policy.get("risk_map")
+    return risk_map_of(await gate_policy_for_task(db, task_id))
+
+
+def risk_map_of(policy: dict) -> dict[str, str] | None:
+    """The path map of an already-read policy; ``None`` when it has none."""
+    raw = policy.get("risk_map") if isinstance(policy, dict) else None
     if not isinstance(raw, dict) or not raw:
         return None
     return {str(k): str(v) for k, v in raw.items()}
+
+
+# Очередь исполнения проекта (#1274). Режим ``shadow`` — хаб пишет в ленту,
+# какую задачу взял бы следующей и почему пропустил остальные, но сам ничего
+# не стартует; запуск исполнителя — F2. Нет ключа, опечатка, значение из
+# будущей версии — всё это ``off`` (#835): нечитаемая политика не включает
+# даже тень. ``wip_limit`` — сколько задач проекта может стоять в running и
+# review разом; нет ключа — лимита нет.
+QUEUE_MODE_KEY = "orchestrator_queue"
+WIP_LIMIT_KEY = "wip_limit"
+QUEUE_OFF = "off"
+QUEUE_SHADOW = "shadow"
+QUEUE_MODES: tuple[str, ...] = (QUEUE_OFF, QUEUE_SHADOW)
+
+
+def queue_mode_of(policy: dict) -> str:
+    """``shadow`` только когда так и записано; всё остальное — ``off``."""
+    if isinstance(policy, dict) and policy.get(QUEUE_MODE_KEY) == QUEUE_SHADOW:
+        return QUEUE_SHADOW
+    return QUEUE_OFF
+
+
+def wip_limit_of(policy: dict) -> int | None:
+    """WIP-лимит проекта; ``None`` — лимита нет (как и нечитаемое значение)."""
+    if not isinstance(policy, dict):
+        return None
+    limit = policy.get(WIP_LIMIT_KEY)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return None
+    return limit
+
+
+# Контракт сдачи (#1436). SID-8 (#1383) и SID-9 (#1384) сданы облачным
+# исполнителем без модели, SID-9 ещё и без описания и без мутаций — промпт этого
+# не удержал. ``warn`` — сдача принята, нарушения названы в карточке одной
+# записью; ``require`` — отказ до записи поколения. Нет ключа — ``off``: проект,
+# который контракт не включал, живёт как жил. Ключ есть, но значение нечитаемое
+# (опечатка, значение из будущей версии) — ``warn``: контракт явно хотели, а
+# отказывать по опечатке в политике нельзя. Запись такое не пропускает
+# (models.validated_gate_policy); правило чтения — для положенного мимо API.
+SUBMISSION_CONTRACT_KEY = "submission_contract"
+CONTRACT_OFF = "off"
+CONTRACT_WARN = "warn"
+CONTRACT_REQUIRE = "require"
+SUBMISSION_CONTRACT_MODES: tuple[str, ...] = (
+    CONTRACT_OFF,
+    CONTRACT_WARN,
+    CONTRACT_REQUIRE,
+)
+
+
+def submission_contract_of(policy: dict) -> str:
+    """Режим контракта сдачи: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or SUBMISSION_CONTRACT_KEY not in policy:
+        return CONTRACT_OFF
+    value = policy.get(SUBMISSION_CONTRACT_KEY)
+    if isinstance(value, str) and value in SUBMISSION_CONTRACT_MODES:
+        return value
+    return CONTRACT_WARN
+
+
+# Сверка областей при захвате задачи (#1433). Очередь #1274 пропускает
+# кандидата, чьи области пересекаются с начатой задачей, но она только
+# советует: claim, pair_start и вход по одноразовому коду брали задачу, не
+# сверяясь. ``warn`` — захват проходит, пересечение названо в карточке одной
+# записью; ``require`` — отказ с задачей-соседом и путём. Нет ключа — ``off``:
+# проект, который сверку не включал, захватывает как захватывал. Ключ есть, но
+# значение нечитаемое — ``warn``, по тому же правилу, что submission_contract:
+# сверку явно хотели, а отказывать по опечатке нельзя.
+CLAIM_AREA_CHECK_KEY = "claim_area_check"
+CLAIM_AREA_OFF = "off"
+CLAIM_AREA_WARN = "warn"
+CLAIM_AREA_REQUIRE = "require"
+CLAIM_AREA_CHECK_MODES: tuple[str, ...] = (
+    CLAIM_AREA_OFF,
+    CLAIM_AREA_WARN,
+    CLAIM_AREA_REQUIRE,
+)
+#: Начало записи в карточке при warn — по нему запись находят и не пишут дважды.
+CLAIM_AREA_MARK = "Пересечение областей при захвате"
+
+
+def claim_area_check_of(policy: dict) -> str:
+    """Режим сверки областей при захвате: нет ключа — off, нечитаемое — warn."""
+    if not isinstance(policy, dict) or CLAIM_AREA_CHECK_KEY not in policy:
+        return CLAIM_AREA_OFF
+    value = policy.get(CLAIM_AREA_CHECK_KEY)
+    if isinstance(value, str) and value in CLAIM_AREA_CHECK_MODES:
+        return value
+    return CLAIM_AREA_WARN
+
+
+# Гейт красного теста для багов (#913). Багфикс сдавался без доказательства,
+# что тест из AC падал до фикса: единственным следом были мутации сдачи
+# (#1436) — слова автора. Доказательство даёт только прогон CI поверх кода
+# merge-base (поле ``baseline`` отчёта о закреплённом коммите). ``warn`` —
+# сдача принята, недоказанное названо одной записью в карточке; ``require`` —
+# отказ до записи поколения. Нет ключа — ``off``. Нечитаемое значение —
+# ``warn``, по тому же правилу, что submission_contract.
+BUG_RED_TEST_KEY = "bug_red_test"
+RED_TEST_OFF = "off"
+RED_TEST_WARN = "warn"
+RED_TEST_REQUIRE = "require"
+BUG_RED_TEST_MODES: tuple[str, ...] = (RED_TEST_OFF, RED_TEST_WARN, RED_TEST_REQUIRE)
+
+
+def bug_red_test_of(policy: dict) -> str:
+    """Режим гейта красного теста: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or BUG_RED_TEST_KEY not in policy:
+        return RED_TEST_OFF
+    value = policy.get(BUG_RED_TEST_KEY)
+    if isinstance(value, str) and value in BUG_RED_TEST_MODES:
+        return value
+    return RED_TEST_WARN
+
+
+# Гейт «CI до сдачи» (#1629): явная сдача без доказанного зелёного отчёта CI о
+# закреплённом коммите. ``warn`` — сдача принята, недоказанное названо одной
+# записью; ``require`` — отказ до записи поколения. Нет ключа — ``off``.
+# Нечитаемое значение — ``warn``, по тому же правилу, что bug_red_test.
+CI_BEFORE_SUBMIT_KEY = "ci_before_submit"
+CI_BEFORE_SUBMIT_MODES: tuple[str, ...] = (
+    RED_TEST_OFF,
+    RED_TEST_WARN,
+    RED_TEST_REQUIRE,
+)
+
+
+def ci_before_submit_of(policy: dict) -> str:
+    """Режим гейта CI до сдачи: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or CI_BEFORE_SUBMIT_KEY not in policy:
+        return RED_TEST_OFF
+    value = policy.get(CI_BEFORE_SUBMIT_KEY)
+    if isinstance(value, str) and value in CI_BEFORE_SUBMIT_MODES:
+        return value
+    return RED_TEST_WARN
+
+
+# Кто читает deep первым (#1561). ``cloud`` — как всегда: облако первым,
+# локальный путь только второй дверью после наблюдённого отказа (#1252) и
+# только если проект это разрешил: local_review_fallback=on (#1653).
+# ``local`` — deep сначала в локальный путь, облако только после его отказа.
+# Нет ключа и нечитаемое значение — ``cloud``: опечатка не должна молча
+# уводить платное ревью с облака на хост хаба.
+DEEP_REVIEWER_KEY = "deep_reviewer"
+DEEP_REVIEWER_CLOUD = "cloud"
+DEEP_REVIEWER_LOCAL = "local"
+DEEP_REVIEWERS: tuple[str, ...] = (DEEP_REVIEWER_CLOUD, DEEP_REVIEWER_LOCAL)
+
+
+def deep_reviewer_of(policy: dict) -> str:
+    """Кто читает deep первым: нет ключа или нечитаемое значение — cloud."""
+    if isinstance(policy, dict) and policy.get(DEEP_REVIEWER_KEY) in DEEP_REVIEWERS:
+        return str(policy[DEEP_REVIEWER_KEY])
+    return DEEP_REVIEWER_CLOUD
+
+
+# Запасной локальный ревьюер (#1653). Согласие проекта на то, чтобы локальный
+# путь заменил отказавшее облако (вторая дверь, #1252): платный прогон решает
+# политика проекта, а не env хоста. Нет ключа и нечитаемое значение — ``off``:
+# опечатка не должна молча включать расход. Прямой локальный путь форжа без
+# облака и ``deep_reviewer=local`` этим ключом не управляются.
+LOCAL_REVIEW_FALLBACK_KEY = "local_review_fallback"
+LOCAL_REVIEW_FALLBACK_OFF = "off"
+LOCAL_REVIEW_FALLBACK_ON = "on"
+LOCAL_REVIEW_FALLBACKS: tuple[str, ...] = (
+    LOCAL_REVIEW_FALLBACK_OFF,
+    LOCAL_REVIEW_FALLBACK_ON,
+)
+
+
+def local_review_fallback_of(policy: dict) -> str:
+    """Разрешена ли вторая дверь: нет ключа или нечитаемое значение — off."""
+    if (
+        isinstance(policy, dict)
+        and policy.get(LOCAL_REVIEW_FALLBACK_KEY) == LOCAL_REVIEW_FALLBACK_ON
+    ):
+        return LOCAL_REVIEW_FALLBACK_ON
+    return LOCAL_REVIEW_FALLBACK_OFF
+
+
+# «Мерж = доставка» (#1572). У проекта без релиз-PR (ветка работы совпадает с
+# релизной) released_sha не появляется, и срок исхода по его задачам не
+# вычислить. Выводить «мерж = доставка» из конфигурации веток нельзя: у
+# spike-bo свой CD, и ложная дата хуже пустой. Поэтому это явное решение
+# владельца. Нет ключа, false и нечитаемое значение — не доставка.
+MERGE_IS_DELIVERY_KEY = "merge_is_delivery"
+
+
+def merge_is_delivery_of(policy: dict) -> bool:
+    """Объявил ли владелец мерж доставкой: только литеральный ``true``."""
+    return isinstance(policy, dict) and policy.get(MERGE_IS_DELIVERY_KEY) is True
+
+
+async def merge_is_delivery_projects(db: aiosqlite.Connection) -> frozenset[int]:
+    """Проекты, объявившие мерж доставкой (#1572); читатель — тот же, что в сводке."""
+    return frozenset(
+        int(row["id"])
+        for row in await repo.list_projects(db, include_archived=True)
+        if merge_is_delivery_of(gate_policy_of(row))
+    )
+
+
+# Пути постановки (#1456). DoR проверял, что validation_commands есть, но не
+# что пути в них и в test_ref существуют на базе или создаются самой задачей:
+# #1392 ушла в работу с командой на несуществующий каталог, и исполнитель
+# залатал красную проверку подменой пути в продуктовом коде. ``warn`` —
+# одобрение проходит, нарушение названо в карточке; ``require`` — отказ с
+# путём. Нет ключа — ``warn``: проверка ничего не блокирует, а ложные
+# срабатывания видны сразу. Нечитаемое значение — тоже ``warn``.
+STATEMENT_PATHS_KEY = "statement_paths"
+STATEMENT_PATHS_OFF = "off"
+STATEMENT_PATHS_WARN = "warn"
+STATEMENT_PATHS_REQUIRE = "require"
+STATEMENT_PATHS_MODES: tuple[str, ...] = (
+    STATEMENT_PATHS_OFF,
+    STATEMENT_PATHS_WARN,
+    STATEMENT_PATHS_REQUIRE,
+)
+
+
+def statement_paths_of(policy: dict) -> str:
+    """Режим проверки путей постановки: нет ключа или нечитаемое — warn."""
+    if not isinstance(policy, dict):
+        return STATEMENT_PATHS_WARN
+    value = policy.get(STATEMENT_PATHS_KEY)
+    if isinstance(value, str) and value in STATEMENT_PATHS_MODES:
+        return value
+    return STATEMENT_PATHS_WARN
+
+
+# Предупреждения по путям диффа (#1589). Список {pattern, text}: правка пути,
+# за которой должен последовать ручной шаг вне CI, видна при сдаче, в брифе и в
+# карточке вердикта. Нет ключа, не список, мусорные записи — пустой список:
+# нечитаемая политика ничего не добавляет к ответам. Запись уже проверена
+# моделью; здесь читатель терпит то, что могло попасть в базу мимо неё.
+PATH_NOTICES_KEY = "path_notices"
+
+
+def path_notices_of(policy: dict) -> list[dict[str, str]]:
+    """Правила path_notices уже прочитанной политики; ``[]``, когда их нет."""
+    raw = policy.get(PATH_NOTICES_KEY) if isinstance(policy, dict) else None
+    if not isinstance(raw, list):
+        return []
+    rules: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pattern, text = item.get("pattern"), item.get("text")
+        if isinstance(pattern, str) and pattern.strip() and isinstance(text, str):
+            if text.strip():
+                rules.append({"pattern": pattern.strip(), "text": text.strip()})
+    return rules
+
+
+# #1591: пары «файл репо на голове релиза → серверная копия». Читатель терпит
+# то, что могло попасть в базу мимо модели: мусорная запись пропускается, а
+# запись с путём вне каталогов ХОСТА остаётся в списке — её отвергнет чтение
+# (release_artifacts.server_sha256), и причина будет названа, а не молчалива.
+RELEASE_ARTIFACTS_KEY = "release_artifacts"
+
+
+def release_artifacts_of(policy: dict) -> list[dict[str, str]]:
+    """Пары release_artifacts уже прочитанной политики; ``[]``, когда их нет."""
+    raw = policy.get(RELEASE_ARTIFACTS_KEY) if isinstance(policy, dict) else None
+    if not isinstance(raw, list):
+        return []
+    pairs: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        repo_path, server_path = item.get("repo_path"), item.get("server_path")
+        hint = item.get("update_hint")
+        if (
+            isinstance(repo_path, str)
+            and repo_path.strip()
+            and isinstance(server_path, str)
+            and server_path.strip()
+        ):
+            pairs.append(
+                {
+                    "repo_path": repo_path.strip(),
+                    "server_path": server_path.strip(),
+                    "update_hint": hint.strip() if isinstance(hint, str) else "",
+                }
+            )
+    return pairs
+
+
+# Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:
+# пока она действует, ЛЮБОЙ допуск новой работы в проект (одобрение черновика,
+# автоодобрение, создание сразу открытой задачи) требует разрешённого типа и
+# непустого обоснования. Черновики создаются как раньше. Один читатель
+# (``freeze_of``) и одна проверка (``freeze_admission``): у каждой двери нет
+# своей копии правила, иначе копии начнут расходиться.
+FREEZE_KEY = "freeze"
+FREEZE_REFUSED = "freeze_refused"
+
+
+@dataclass(frozen=True)
+class Freeze:
+    """Прочитанная заморозка: срок (UTC; ``None`` - до снятия), типы, примечание."""
+
+    until: datetime | None
+    allow_work_types: tuple[str, ...]
+    note: str
+    #: Запись нечитаема: заморозка действует и не пускает ничего. Нечитаемая
+    #: политика не должна читаться как разрешение.
+    unreadable: bool = False
+
+    def active_at(self, now: datetime) -> bool:
+        """Заморозка действует строго до ``until``: при ``now == until`` уже нет."""
+        return self.until is None or now < self.until
+
+    def until_text(self) -> str:
+        return self.until.isoformat() if self.until is not None else ""
+
+    def as_view(self, now: datetime) -> dict[str, Any]:
+        return {
+            "until": self.until_text() or None,
+            "allow_work_types": list(self.allow_work_types),
+            "note": self.note,
+            "active": self.active_at(now),
+        }
+
+
+def stored_policy_or_none(project: Any) -> dict | None:
+    """Сохранённая политика проекта; ``None`` - запись есть, но нечитаема.
+
+    Отличает «политики нет» (пустое значение - ``{}``) от «не смогли
+    прочитать» (битый JSON, не объект). ``gate_policy_of`` сворачивает оба
+    случая в ``{}``, и для читателей, чей пустой ответ значит «ничего не
+    делегировано», это верно. Допуск заморозки читает иначе: ``{}`` там -
+    «ограничений нет», и нечитаемая политика открывала бы доступ (#1594).
+    """
+    try:
+        raw = project["gate_policy"]
+    except (KeyError, IndexError):
+        return {}
+    except TypeError:
+        return None
+    try:
+        policy = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
+def freeze_of(policy: dict) -> Freeze | None:
+    """Заморозка уже прочитанной политики; ``None``, когда ключа нет."""
+    if not isinstance(policy, dict) or FREEZE_KEY not in policy:
+        return None
+    # Ключ ЕСТЬ: значение null, не объект или битое - сохранённая заморозка,
+    # которую не разобрали, и допуск закрыт. «Снять» значит УДАЛИТЬ ключ
+    # (PATCH {"freeze": null} его удаляет и null не сохраняет).
+    raw = policy[FREEZE_KEY]
+    try:
+        canon = validated_freeze(raw)
+        return Freeze(
+            parse_freeze_until(canon["until"]),
+            tuple(canon["allow_work_types"]),
+            canon["note"],
+        )
+    except (ValueError, TypeError):
+        return Freeze(None, (), "", unreadable=True)
+
+
+def freeze_view_of(policy: dict) -> dict[str, Any] | None:
+    """Заморозка для сводки: срок, типы, примечание и «действует ли сейчас»."""
+    freeze = freeze_of(policy)
+    return freeze.as_view(datetime.now(UTC)) if freeze is not None else None
+
+
+def freeze_show(view: Any) -> str:
+    """Читаемый вид заморозки для сводки политики, а не «N rule(s)»."""
+    if not isinstance(view, dict):
+        return "-"
+    until = view.get("until")
+    span = f"до {until}" if until else "до снятия"
+    state = "действует" if view.get("active") else "не действует"
+    types = ", ".join(view.get("allow_work_types") or []) or "ничего"
+    note = f"; {view['note']}" if view.get("note") else ""
+    return f"{span} ({state}); разрешены: {types}{note}"
+
+
+@dataclass(frozen=True)
+class FreezeRefusal:
+    """Отказ допуска: код недостающего условия и текст для человека."""
+
+    missing: str  # "work_type" | "freeze_rationale" | "policy"
+    text: str
+    until: str
+    allow_work_types: tuple[str, ...]
+    note: str
+
+    def detail(self) -> dict[str, Any]:
+        """Структурированный отказ для HTTPException (422)."""
+        return {
+            "error": FREEZE_REFUSED,
+            "reason": FREEZE_REFUSED,
+            "message": self.text,
+            "missing": self.missing,
+            "until": self.until or None,
+            "allow_work_types": list(self.allow_work_types),
+            "note": self.note,
+        }
+
+
+def freeze_admission(
+    project: Any,
+    work_type: str,
+    rationale: str,
+    *,
+    now: datetime | None = None,
+) -> FreezeRefusal | None:
+    """Пускает ли заморозка проекта новую работу; ``None`` - пускает (#1594).
+
+    ЕДИНСТВЕННАЯ проверка допуска: её зовут все двери одобрения и создания
+    открытой работы. Тип должен входить в ``allow_work_types`` И обоснование —
+    быть непустым после strip. Не действующая (``now >= until``) или отсутствующая
+    заморозка пускает всё; проект без строки (``None``) тоже.
+    """
+    if project is None:
+        return None
+    policy = stored_policy_or_none(project)
+    if policy is None:
+        # Решение заморозки (не остальных читателей): политику не прочитали -
+        # допуск закрыт, а не открыт.
+        return FreezeRefusal(
+            "policy",
+            "Политика проекта нечитаема (gate_policy не разобран): допуск "
+            "закрыт, пока запись не исправлена.",
+            "",
+            (),
+            "",
+        )
+    freeze = freeze_of(policy)
+    if freeze is None or not freeze.active_at(now or datetime.now(UTC)):
+        return None
+    wtype = str(getattr(work_type, "value", work_type) or "").strip()
+    span = f"до {freeze.until_text()}" if freeze.until else "до снятия"
+    tail = f" Примечание: {freeze.note}" if freeze.note else ""
+    allowed = ", ".join(freeze.allow_work_types) or "ничего"
+    if freeze.unreadable:
+        missing, why = "work_type", "запись freeze нечитаема, допуск закрыт"
+    elif wtype not in freeze.allow_work_types:
+        missing, why = "work_type", f"тип работы {wtype or '-'} не разрешён"
+    elif not (rationale or "").strip():
+        missing, why = "freeze_rationale", "нет обоснования freeze_rationale"
+    else:
+        return None
+    return FreezeRefusal(
+        missing,
+        f"Заморозка проекта {span}: {why}; разрешены: {allowed}.{tail}",
+        freeze.until_text(),
+        freeze.allow_work_types,
+        freeze.note,
+    )

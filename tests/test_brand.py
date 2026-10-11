@@ -125,15 +125,81 @@ def _clean_env(extra: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _module_attr(module: str, attr: str, env: dict[str, str]) -> str:
-    proc = subprocess.run(
-        [sys.executable, "-c", f"from {module} import {attr}; print({attr})"],
-        capture_output=True,
-        text=True,
-        env=_clean_env(env),
-        cwd=str(_REPO_ROOT),
-        check=True,
+_CHILD_DUMP_AFTER = 60
+_CHILD_TIMEOUT = 90
+
+
+def _run_child(
+    code: str,
+    env: dict[str, str],
+    *,
+    timeout: float = _CHILD_TIMEOUT,
+    dump_after: float = _CHILD_DUMP_AFTER,
+) -> "subprocess.CompletedProcess[str]":
+    """Дочерний процесс хаба с пределом (#1667).
+
+    Раньше subprocess.run ждал ребёнка без предела: на Linux-раннере ребёнок
+    иногда не завершался, и CI висел час. Теперь: -u (вывод не теряется в
+    буфере), faulthandler.dump_traceback_later ДО импортов кода ребёнка (стек
+    всех потоков уходит в stderr, пока ребёнок ещё жив) и timeout у родителя.
+    При ошибке и при timeout stderr ребёнка попадает в сообщение теста.
+    """
+    prelude = (
+        "import faulthandler, sys\n"
+        f"faulthandler.dump_traceback_later({dump_after}, exit=False, file=sys.stderr)\n"
     )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-u", "-c", prelude + code],
+            capture_output=True,
+            text=True,
+            env=_clean_env(env),
+            cwd=str(_REPO_ROOT),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        err = (
+            exc.stderr
+            if isinstance(exc.stderr, str)
+            else (exc.stderr or b"").decode(errors="replace")
+        )
+        out = (
+            exc.stdout
+            if isinstance(exc.stdout, str)
+            else (exc.stdout or b"").decode(errors="replace")
+        )
+        sys.stderr.write(f"child hub timed out after {timeout}s\nstderr:\n{err}\n")
+        pytest.fail(
+            f"child hub did not exit within {timeout}s\nstdout:\n{out}\nstderr:\n{err}"
+        )
+    if proc.returncode != 0:
+        sys.stderr.write(f"child hub failed rc={proc.returncode}\n{proc.stderr}\n")
+        pytest.fail(
+            f"child hub rc={proc.returncode}\nstdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def test_a_hung_child_hub_reports_its_stack() -> None:
+    """Ребёнок завис -> тест падает за timeout и показывает стек всех потоков."""
+    code = (
+        "import threading, time\n"
+        "def stuck_in_worker():\n"
+        "    time.sleep(60)\n"
+        "threading.Thread(target=stuck_in_worker, name='worker-x').start()\n"
+        "time.sleep(60)\n"
+    )
+    with pytest.raises(pytest.fail.Exception) as info:
+        _run_child(code, {}, timeout=6, dump_after=2)
+    message = str(info.value)
+    assert "did not exit within 6" in message
+    assert "most recent call first" in message
+    assert "stuck_in_worker" in message
+
+
+def _module_attr(module: str, attr: str, env: dict[str, str]) -> str:
+    proc = _run_child(f"from {module} import {attr}; print({attr})", env, timeout=60)
     return proc.stdout.strip()
 
 
@@ -147,14 +213,7 @@ def test_config_defaults_are_haiplane_family() -> None:
         "print(c.DISPATCH_BIN)\n"
         "print(c.VAST_JOB_BIN)\n"
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=_clean_env({}),
-        cwd=str(_REPO_ROOT),
-        check=True,
-    )
+    proc = _run_child(code, {}, timeout=60)
     db, workspace, transcripts, dispatch_bin, vast_bin = (
         proc.stdout.strip().splitlines()
     )
@@ -194,17 +253,11 @@ def test_legacy_only_tokens_do_not_authenticate(tmp_path: Path) -> None:
         "    anon = client.get('/api/tasks')\n"
         "print(anon.status_code)\n"
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=_clean_env(
-            {
-                _LEGACY_PREFIX + "HUB_TOKENS": "legacy:tok-legacy:human",
-                "HAIPLANE_HUB_DB": str(tmp_path / "hub.db"),
-            }
-        ),
-        cwd=str(_REPO_ROOT),
-        check=True,
+    proc = _run_child(
+        code,
+        {
+            _LEGACY_PREFIX + "HUB_TOKENS": "legacy:tok-legacy:human",
+            "HAIPLANE_HUB_DB": str(tmp_path / "hub.db"),
+        },
     )
     assert proc.stdout.strip() == "200", proc.stdout + proc.stderr

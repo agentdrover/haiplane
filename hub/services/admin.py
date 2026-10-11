@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -294,28 +295,52 @@ async def get_principal_permissions(
 
 
 async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str:
-    """Return the highest-privilege legacy role name for backward compat."""
+    """Return the highest-privilege legacy role name for backward compat.
+
+    ``ci_runner`` is listed explicitly and maps to ``agent``: it is a machine
+    key that lives in a CI secret (#1639). Without a listed role the principal
+    kind decides: ``human`` stays human, everything else is an agent.
+    """
+    # Role -> legacy role (first match in the order below wins):
+    #   super_admin, admin, security_admin -> admin
+    #   steward, watcher                   -> steward / watcher
+    #   operator, developer, viewer        -> human
+    #   reviewer_agent, agent, ci_runner   -> agent
+    # ci_runner sits above viewer on purpose: a CI key that also holds a viewer
+    # role must stay a machine. No match: kind=human -> human, any other kind
+    # (service, agent) or a missing principal -> agent, never human (#1639).
     slugs = await _get_principal_role_slugs(db, principal_id)
     for priority in (
         "super_admin",
         "admin",
         "security_admin",
         "steward",
+        "watcher",
         "operator",
         "developer",
         "reviewer_agent",
         "agent",
+        "ci_runner",
         "viewer",
     ):
         if priority in slugs:
             if priority in ("super_admin", "admin", "security_admin"):
                 return "admin"
-            if priority == "steward":
-                return "steward"
+            if priority in ("steward", "watcher"):
+                return priority
             if priority in ("operator", "developer", "viewer"):
                 return "human"
             return "agent"
-    return "human"
+    # No listed role matched. The principal's kind decides, and only a person
+    # may fall back to "human" (#1639): "human" opens every human gate, so a
+    # machine key (or a principal that does not exist) must never get it by
+    # default.
+    rows = await fetchall(
+        db, "SELECT kind FROM principals WHERE id = ?", (principal_id,)
+    )
+    if rows and rows[0][0] == "human":
+        return "human"
+    return "agent"
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +407,56 @@ async def set_principal_roles(
 # ---------------------------------------------------------------------------
 
 
+SCOPE_PROJECT_PREFIX = "project:"
+
+
+class ApiKeyScopeError(ValueError):
+    """A key cannot be bound to the named project (unknown or inactive)."""
+
+
+def parse_key_scopes(raw: Any) -> tuple[tuple[str, ...], bool]:
+    """Read ``api_keys.scopes`` (#1644): ``(project slugs, damaged)``.
+
+    ``'[]'`` is the legacy "no restriction" and gives ``((), False)``. Anything
+    that is not a JSON list of ``"project:<slug>"`` strings is damaged: the
+    caller refuses such a key instead of treating it as unrestricted.
+    """
+    # Only a well-formed JSON list is a binding; NULL, "" and the rest are
+    # damage, not "no restriction".
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return (), True
+    if not isinstance(data, list):
+        return (), True
+    slugs: list[str] = []
+    for item in data:
+        if (
+            not isinstance(item, str)
+            or not item.startswith(SCOPE_PROJECT_PREFIX)
+            or not item[len(SCOPE_PROJECT_PREFIX) :].strip()
+        ):
+            return (), True
+        slugs.append(item[len(SCOPE_PROJECT_PREFIX) :].strip())
+    return tuple(slugs), False
+
+
+async def _scope_entries(
+    db: aiosqlite.Connection, projects: list[str] | None
+) -> list[str]:
+    entries: list[str] = []
+    cleaned = [(s or "").strip() for s in projects or []]
+    if any(not s for s in cleaned):
+        # A blank slug would otherwise issue a key with no binding at all.
+        raise ApiKeyScopeError("project slug must not be blank")
+    for slug in dict.fromkeys(cleaned):
+        rows = await fetchall(db, "SELECT status FROM projects WHERE slug = ?", (slug,))
+        if not rows or dict(rows[0]).get("status") != "active":
+            raise ApiKeyScopeError(f"project {slug!r} not found or not active")
+        entries.append(f"{SCOPE_PROJECT_PREFIX}{slug}")
+    return entries
+
+
 async def create_api_key(
     db: aiosqlite.Connection,
     principal_id: int,
@@ -389,7 +464,9 @@ async def create_api_key(
     name: str,
     expires_days: int | None = None,
     created_by: int | None = None,
+    projects: list[str] | None = None,
 ) -> dict[str, Any]:
+    scopes = await _scope_entries(db, projects)
     plaintext, prefix, key_hash = generate_api_key()
     expires_at: str | None = None
     if expires_days:
@@ -398,9 +475,17 @@ async def create_api_key(
         ).isoformat()
 
     cursor = await db.execute(
-        "INSERT INTO api_keys (principal_id, name, key_prefix, key_hash, expires_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (principal_id, name, prefix, key_hash, expires_at, created_by),
+        "INSERT INTO api_keys (principal_id, name, key_prefix, key_hash, expires_at, "
+        "created_by, scopes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            principal_id,
+            name,
+            prefix,
+            key_hash,
+            expires_at,
+            created_by,
+            json.dumps(scopes),
+        ),
     )
     key_id = cursor.lastrowid
     await db.commit()
@@ -415,6 +500,8 @@ async def create_api_key(
         "created_by": created_by,
         "last_used_at": None,
         "revoked_at": None,
+        "scopes": scopes,
+        "scopes_damaged": False,
         "plaintext_key": plaintext,
     }
 
@@ -432,7 +519,15 @@ async def list_api_keys(
         rows = await fetchall(
             db, "SELECT * FROM api_keys ORDER BY id DESC LIMIT ?", (limit,)
         )
-    return [dict(r) for r in rows]
+    return [_key_view_row(dict(r)) for r in rows]
+
+
+def _key_view_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Replace the raw ``scopes`` text by the list the API and the UI show."""
+    slugs, damaged = parse_key_scopes(row.get("scopes"))
+    row["scopes"] = [f"{SCOPE_PROJECT_PREFIX}{s}" for s in slugs]
+    row["scopes_damaged"] = damaged
+    return row
 
 
 async def revoke_api_key(db: aiosqlite.Connection, key_id: int) -> bool:
@@ -489,6 +584,7 @@ async def resolve_api_key(
 
     perms = await get_principal_permissions(db, row["principal_id"])
     role = await get_effective_role(db, row["principal_id"])
+    slugs, damaged = parse_key_scopes(row.get("scopes"))
     return TokenIdentity(
         username=row["username"],
         role=role,
@@ -496,6 +592,8 @@ async def resolve_api_key(
         permissions=perms,
         auth_source="db_api_key",
         api_key_id=row["id"],
+        scopes=slugs or None,
+        scopes_damaged=damaged,
     )
 
 
@@ -551,6 +649,8 @@ async def resolve_browser_session(
     row = dict(rows[0])
     if row["status"] != "active":
         return None
+    if row["kind"] == "service":
+        return None  # #1644: a CI principal has no browser door
     try:
         exp = datetime.fromisoformat(row["expires_at"])
         if exp.tzinfo is None:
@@ -624,7 +724,8 @@ async def authenticate_password(
     """Verify username + password. Returns principal_id on success, None on failure."""
     rows = await fetchall(
         db,
-        "SELECT p.id, p.status, pc.password_hash, pc.failed_attempts, pc.locked_until "
+        "SELECT p.id, p.status, p.kind, pc.password_hash, pc.failed_attempts, "
+        "pc.locked_until "
         "FROM principals p "
         "JOIN password_credentials pc ON p.id = pc.principal_id "
         "WHERE p.username = ?",
@@ -633,7 +734,7 @@ async def authenticate_password(
     if not rows:
         return None
     row = dict(rows[0])
-    if row["status"] != "active":
+    if row["status"] != "active" or row["kind"] == "service":
         return None
     if row.get("locked_until"):
         try:
@@ -675,9 +776,21 @@ async def authenticate_password(
     return row["id"]
 
 
+class ServicePasswordError(ValueError):
+    """A service principal (CI) has no password and no browser login (#1644)."""
+
+
 async def set_password(
     db: aiosqlite.Connection, principal_id: int, password: str
 ) -> None:
+    kind_rows = await fetchall(
+        db, "SELECT kind FROM principals WHERE id = ?", (principal_id,)
+    )
+    if kind_rows and dict(kind_rows[0])["kind"] == "service":
+        raise ServicePasswordError(
+            "service principals authenticate with API keys only; "
+            "a password would open a browser session"
+        )
     pw_hash = hash_password(password)
     existing = await fetchall(
         db,

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -532,6 +533,78 @@ _CHECK_MEANING: dict[str, str] = {
 }
 
 
+# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
+_EVIDENCE_STATES = {
+    "мутации": frozenset(
+        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+    ),
+    "baseline": frozenset({"ran", "no_tests", "error"}),
+}
+
+
+def _evidence_block(label: str, raw: str | None, pinned: str):
+    """One stored evidence block as the brief reads it (#1606)."""
+    from hub.models import CIEvidenceBlock
+
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or not data:
+        return CIEvidenceBlock(
+            reason=(
+                f"не получено: {label} для коммита {pinned[:12]} CI не присылал "
+                "(шаг не запускался на обновлении ветки — это не результат)"
+            )
+        )
+    if data.get("state") not in _EVIDENCE_STATES[label]:
+        # Provenance alone does not make an object the step's report.
+        return CIEvidenceBlock(
+            reason=(
+                f"не получено: {label} для коммита {pinned[:12]} пришли в "
+                "нераспознанном виде (нет известного state) — результатом не считаются"
+            )
+        )
+    prov = data.get("provenance")
+    prov = prov if isinstance(prov, dict) and prov else {}
+    if prov:
+        run = (
+            f"прогон {prov.get('run_id') or '?'} "
+            f"({prov.get('event') or 'событие неизвестно'}), "
+            f"{prov.get('at') or 'время неизвестно'}"
+        )
+        if prov.get("run_url"):
+            run += f", {prov['run_url']}"
+    else:
+        run = "прогон неизвестен"
+    return CIEvidenceBlock(
+        state="received",
+        result=str(data.get("state") or ""),
+        run=run,
+        provenance=prov,
+        reason=str(data.get("reason") or ""),
+    )
+
+
+async def ci_evidence_state(db, task: dict):
+    """Mutation and baseline evidence stored for the pinned commit (#1606)."""
+    from hub import repository as repo_module
+    from hub.models import CIEvidenceBlock, CIEvidenceState
+
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        why = "не получено: коммит сдачи не закреплён"
+        return CIEvidenceState(
+            mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
+        )
+    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    stored = dict(row) if row is not None else {}
+    return CIEvidenceState(
+        mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
+        baseline=_evidence_block("baseline", stored.get("baseline"), pinned),
+    )
+
+
 async def prepass_state(db, task: dict):
     """Which deterministic checks passed on the commit under review (#875).
 
@@ -760,6 +833,44 @@ async def latest_submission_text(db, task_id: int) -> str:
     return ""
 
 
+_TIP_RE = re.compile(r"Branch tip at submission: ([0-9a-f]{7,40})")
+
+
+def submission_tip(text: str) -> str:
+    """The commit prefix a submission row names, or "" when it pinned none.
+
+    The hub writes it itself in a fixed shape (``submit_for_review``), which
+    makes the row the one record of which commit each submission handed over
+    (#1567): the task keeps only the latest.
+    """
+    match = _TIP_RE.search(text or "")
+    return match.group(1) if match else ""
+
+
+async def submission_standing(db, task_id: int, text: str, pinned: str = ""):
+    """The validation standing of ONE submission row (#1567).
+
+    The commit is the one the row names; ``pinned`` stands in only for a row
+    that names none. The report is read when the metric is read, never when
+    the row was written: CI answers after the submission far more often than
+    before it. A prefix is widened to the full sha the report is keyed on.
+    """
+    sha = submission_tip(text) or pinned.strip()
+    if sha:
+        from hub.db import fetchall
+
+        rows = await fetchall(
+            db,
+            "SELECT head_sha FROM ci_run_reports WHERE task_id = ? "
+            "AND substr(head_sha, 1, ?) = ? ORDER BY reported_at DESC, id DESC",
+            (task_id, len(sha), sha),
+        )
+        if rows:
+            sha = rows[0]["head_sha"]
+    prepass = await prepass_state(db, {"id": task_id, "submission_sha": sha})
+    return validation_standing(prepass, text)
+
+
 def run_lines_tally(standings) -> dict[str, Any]:
     """Submissions with a failed prepass AND lines about runs, with the sample.
 
@@ -895,6 +1006,30 @@ async def attach_observation_closures(db, view, task_row: dict[str, Any]) -> Non
     view.observation_closures = [closures[u] for u in uids if u in closures]
 
 
+async def attach_deferred_repeats(db, view) -> None:
+    """Mark confirmed findings that repeat one deferred to an undelivered task (#1448).
+
+    The predicate is gate_grounds.deferred_repeats — the one the autopilot and
+    the steward count by — so the card says "отложена до #N" exactly where the
+    gates stopped counting the finding. Only a CURRENT report: an older one
+    describes other code.
+    """
+    from hub.models import DeferredRepeatView
+    from hub.services.finding_identity import finding_uids
+    from hub.services.gate_grounds import deferred_repeats
+
+    if not getattr(view, "is_current", False) or not view.findings_confirmed:
+        view.deferred_repeats = []
+        return
+    findings = [f.model_dump(mode="json") for f in view.findings_confirmed]
+    repeats = await deferred_repeats(db, int(view.task_id), findings)
+    view.deferred_repeats = [
+        DeferredRepeatView(finding_uid=uid, **repeats[uid])
+        for uid in finding_uids(findings)
+        if uid in repeats
+    ]
+
+
 def undisposed_confirmed(machine_review) -> tuple[int, int]:
     """How many confirmed findings the report carries, and how many nobody judged.
 
@@ -945,6 +1080,21 @@ def _parse_dispatch_created(raw: str) -> datetime:
         except ValueError:
             continue
     return datetime.now(UTC)
+
+
+def parse_stamp(raw: str) -> datetime | None:
+    """Метка времени хаба (UTC, секунды) как datetime; пустая или нечитаемая — None.
+
+    «Неизвестно» не равно «сейчас» (#762): читатель, превращавший нечитаемую
+    метку в текущий момент, начинал отсчёт заново на каждом тике.
+    """
+    text = (raw or "").strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
 
 
 #: Долг второй двери: прогон ревью кончился без отчёта, строка нарочно
@@ -1014,6 +1164,158 @@ async def inflight_view(
         grace_until=grace.strftime("%Y-%m-%d %H:%M"),
         headline=headline,
     )
+
+
+#: Исходы читателя ожидания ревью (#1600). ``pending`` — ревью положено и ещё
+#: может прийти; всё остальное — окончательно, и ждать нечего.
+WAIT_PENDING = "pending"
+WAIT_TERMINAL = "terminal"
+#: Причины terminal, которые называет САМ читатель; отказы диспетчера без
+#: строки приходят словами review_dispatch.REFUSAL_*.
+TERMINAL_REPORT_READY = "report_ready"
+TERMINAL_NOT_REQUESTED = "review_not_requested"
+TERMINAL_NOT_DISPATCHABLE = "not_dispatchable"
+TERMINAL_FAILED_NO_RETRY = "failed_without_ask_again"
+TERMINAL_FINISHED_NO_REPORT = "finished_without_report"
+
+
+@dataclass(frozen=True)
+class ReviewWait:
+    """Где стоит ревью текущей сдачи для того, кому нужен его отчёт.
+
+    ``state`` — pending или terminal; ``reason`` — почему (для terminal код
+    исхода, для pending — пусто); ``detail`` — фраза для ленты;
+    ``since`` — момент сдачи, от которого меряется ожидание (None — неизвестен).
+    """
+
+    state: str
+    reason: str
+    detail: str
+    since: datetime | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self.state == WAIT_PENDING
+
+
+def _wait_terminal(reason: str, detail: str) -> ReviewWait:
+    return ReviewWait(WAIT_TERMINAL, reason, detail)
+
+
+async def _generation_submitted_at(
+    db, task_id: int, generation: int
+) -> datetime | None:
+    from hub.db import fetchall
+
+    rows = await fetchall(
+        db,
+        "SELECT submitted_at FROM submissions WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    if not rows:
+        return None
+    # Пустая или нечитаемая отметка — «неизвестно», а не «сейчас»: иначе
+    # ожидание начиналось бы заново на каждом тике и потолок не достигался.
+    return parse_stamp(str(dict(rows[0]).get("submitted_at") or ""))
+
+
+async def _pending_or_terminal_after_orders(
+    db, task: dict[str, Any], project: Any
+) -> ReviewWait:
+    """Что сказать, когда отчёта нет, ревью положено и активного заказа нет."""
+    from hub.db import fetchall
+    from hub.services import review_dispatch as dispatcher
+
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id DESC LIMIT 1",
+        (task_id, generation),
+    )
+    if rows:
+        last = dict(rows[0])
+        status = str(last.get("status") or "")
+        if status == "failed" and await dispatcher.ask_again_scheduled(db, last):
+            # Переспрос идёт тем же путём, что и первый заказ, и те же тихие
+            # отказы остановят и его: красный CI, прочитанный код, несходимость.
+            refusal = await dispatcher.dispatch_refusal(
+                db, task, project, read_only=True
+            )
+            if refusal:
+                return _wait_terminal(refusal, f"переспрос ревью не купят: {refusal}")
+            return ReviewWait(
+                WAIT_PENDING, "", "заказ ревью упал, переспрос назначен или готовится"
+            )
+        if status == "failed":
+            return _wait_terminal(
+                TERMINAL_FAILED_NO_RETRY,
+                "ревью упало и переспроса не будет (потолок или не облачный заказ)",
+            )
+        if status == "done":
+            return _wait_terminal(
+                TERMINAL_FINISHED_NO_REPORT,
+                "заказ ревью закрыт (done) без отчёта этой сдачи",
+            )
+        # Незнакомый статус — не «кончилось»: незнание не есть конец (#762).
+        return ReviewWait(WAIT_PENDING, "", f"заказ ревью в статусе {status!r}")
+    branch = (task.get("branch") or "").strip()
+    if not branch or not (task.get("submission_sha") or "").strip():
+        return _wait_terminal(
+            TERMINAL_NOT_DISPATCHABLE,
+            "у сдачи нет ветки или закреплённого коммита — ревью не закажут",
+        )
+    refusal = await dispatcher.dispatch_refusal(db, task, project, read_only=True)
+    if refusal:
+        return _wait_terminal(
+            refusal, f"диспетчер ревью отказал без строки заказа: {refusal}"
+        )
+    return ReviewWait(WAIT_PENDING, "", "ревью положено, но ещё не заказано")
+
+
+async def review_wait_view(db, task_row: dict[str, Any]) -> ReviewWait:
+    """Единый читатель ожидания отчёта ревью для сдачи (#1600).
+
+    Один ответ на вопрос «есть ли смысл ждать отчёт этой сдачи»: ``pending``
+    — ревью положено и ещё может прийти, ``terminal`` с причиной — не придёт
+    или не нужно. ``inflight_view`` отвечал None и на «ещё не заказано», и на
+    «окончательно кончилось»; различать их приходится здесь, а не вторым
+    читателем рядом.
+
+    Терминальность решают предикаты review_dispatch, а не копия условий:
+    ``review_dispatch_enabled`` (положено ли), ``dispatch_refusal`` (отказы
+    без строки) и ``ask_again_scheduled`` (переспрос #1242). Отчёт
+    спрашивается первым и решает в пользу прогона: он мог лечь раньше, чем
+    свип закрыл строку.
+    """
+    task_id = int(task_row["id"])
+    # Строка задачи читается целиком: поллер стюарда выбирает только id и
+    # поколение, а предикатам диспетчера нужны ветка, коммит и политика.
+    full = await repo_module.get_task(db, task_id)
+    task = dict(full) if full is not None else dict(task_row)
+    generation = int(task.get("submission_generation") or 0)
+    since = await _generation_submitted_at(db, task_id, generation)
+    if await repo_module.machine_reviews_of_generation(db, task_id, generation):
+        wait = _wait_terminal(TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
+    else:
+        wait = await _wait_without_report(db, task)
+    return ReviewWait(wait.state, wait.reason, wait.detail, since)
+
+
+async def _wait_without_report(db, task: dict[str, Any]) -> ReviewWait:
+    from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
+
+    task_id = int(task["id"])
+    project = await repo_module.resolve_project_for_task(db, task_id)
+    if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return _wait_terminal(
+            TERMINAL_NOT_REQUESTED, "проект не просит ревью этой сдачи"
+        )
+    view = await inflight_view(db, task, include_owed=True)
+    if view is not None:
+        return ReviewWait(WAIT_PENDING, "", view.headline)
+    return await _pending_or_terminal_after_orders(db, task, project)
 
 
 async def inflight_verdict_note(
@@ -1094,6 +1396,7 @@ async def report_view(
             )
         await attach_dispositions(db, machine_review)
         await attach_observation_closures(db, machine_review, task_row)
+        await attach_deferred_repeats(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
     return ReviewReport(

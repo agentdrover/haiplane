@@ -14,6 +14,9 @@ allowed to turn a completed deploy into a red job.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -89,3 +92,130 @@ def test_reporting_failure_does_not_fail_the_deploy(deploy_steps: list[dict]):
     assert step.get("continue-on-error") is True
     assert "::warning::" in step["run"], "a swallowed failure must still be visible"
     assert "::notice::" in step["run"], "a fork without secrets skips, and says so"
+
+
+# ---- #1590: итог бэкапа доезжает до отчёта о деплое -------------------------
+
+_SSH = """#!/usr/bin/env bash
+cat >/dev/null
+cat "$SSH_OUT"
+exit "$SSH_RC"
+"""
+
+_CURL = """#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --data-binary) cp "${2#@}" "$CURL_BODY"; shift ;;
+    -o) printf '{}' >"$2"; shift ;;
+  esac
+  shift
+done
+printf 200
+"""
+
+
+def _run(
+    step: dict, tmp_path: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess:
+    shell = tmp_path / "step.sh"
+    shell.write_text(step["run"])
+    return subprocess.run(
+        ["bash", str(shell)],
+        cwd=tmp_path,
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize(
+    ("ssh_out", "ssh_rc", "expected"),
+    [
+        (
+            "deploy ok\nbackup: ok /b/predeploy-1.db.gz size=10 integrity=ok seconds=1\n",
+            0,
+            "ok /b/predeploy-1.db.gz size=10 integrity=ok seconds=1",
+        ),
+        (
+            'backup: failed (cannot open "hub.db": it\'s locked)\n',
+            1,
+            'failed (cannot open "hub.db": it\'s locked)',
+        ),
+        (
+            "backup: skipped (обход DEPLOY_SKIP_BACKUP=1)\ndeploy ok\n",
+            0,
+            "skipped (обход DEPLOY_SKIP_BACKUP=1)",
+        ),
+        ("старый скрипт, строки backup нет\n", 1, None),
+    ],
+)
+def test_the_backup_verdict_reaches_the_report_at_any_exit_code(
+    deploy_steps: list[dict], tmp_path: Path, ssh_out: str, ssh_rc: int, expected
+):
+    # AC-3 (#1590): rollout захватывает вывод ssh, пишет строку backup в
+    # GITHUB_OUTPUT ДАЖЕ при ненулевом коде и возвращает исходный код; отчёт
+    # собирает JSON сериализатором — кавычки в причине его не ломают.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("ssh", _SSH), ("curl", _CURL)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy/remote-deploy.sh").write_text("echo remote\n")
+    out_file = tmp_path / "ssh.out"
+    out_file.write_text(ssh_out)
+    github_output = tmp_path / "github_output"
+    github_output.write_text("")
+    base = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(github_output),
+        "SSH_OUT": str(out_file),
+        "SSH_RC": str(ssh_rc),
+        "DEPLOY_USER": "u",
+        "DEPLOY_HOST": "h",
+    }
+
+    rollout = next(s for s in deploy_steps if s.get("id") == "rollout")
+    done = _run(rollout, tmp_path, base)
+    assert done.returncode == ssh_rc, "исходный код rollout потерян: " + done.stderr
+    outputs = dict(
+        line.split("=", 1)
+        for line in github_output.read_text().splitlines()
+        if "=" in line
+    )
+    assert outputs.get("backup") == expected
+
+    body_file = tmp_path / "body.json"
+    report = _run(
+        _callback(deploy_steps),
+        tmp_path,
+        {
+            **base,
+            "HAIPLANE_HUB_URL": "http://hub.invalid",
+            "HAIPLANE_HUB_CI_TOKEN": "t",
+            "ROLLOUT_OUTCOME": "success" if ssh_rc == 0 else "failure",
+            "DEPLOYED_SHA": "abcdef1",
+            "DEPLOYED_REF": "main",
+            "DEPLOYED_PROJECT": "default",
+            "BACKUP_LINE": outputs.get("backup", ""),
+            "CURL_BODY": str(body_file),
+        },
+    )
+    assert report.returncode == 0, report.stderr
+    body = json.loads(body_file.read_text())
+    assert body["sha"] == "abcdef1"
+    assert body["status"] == ("success" if ssh_rc == 0 else "failed")
+    assert body.get("backup") == expected
+
+
+def test_the_sha_travels_to_the_server_as_a_file_of_the_tree(deploy_steps: list[dict]):
+    # Ключ CI под forced command: ни аргументов, ни переменных — sha едет файлом.
+    step = next(
+        s for s in deploy_steps if s.get("name") == "Sync working tree to staging"
+    )
+    assert step["env"]["DEPLOYED_SHA"] == "${{ github.sha }}"
+    assert "> .deploy-sha" in step["run"]
+    assert step["run"].index(".deploy-sha") < step["run"].index("rsync")

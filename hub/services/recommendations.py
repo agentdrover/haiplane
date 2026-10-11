@@ -31,8 +31,14 @@ from hub.models import (
     Recommendation,
     RecommendationSeverity,
 )
-from hub.services.dor import DOR_ADVISORY_KEYS, DoREvaluation, evaluate_dor
-from hub import repository as repo
+from hub.services.dor import (
+    DOR_ADVISORY_KEYS,
+    STATEMENT_PATHS_CHECK,
+    STATEMENT_PATHS_MARK,
+    DoREvaluation,
+    evaluate_dor,
+)
+from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.models import ReadinessReport
 from hub.services.readiness import (
     DEFAULT_CONFIG,
@@ -157,6 +163,16 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
         ),
         "minutes": 3,
     },
+    "statement_paths_resolve": {
+        "field": "validation_commands",
+        "message": (
+            "A path in validation_commands or an AC test_ref is neither on "
+            "the base branch nor covered by affected_areas, so the executor "
+            "would meet a red check it cannot satisfy. Fix the path, or add "
+            "the file the task creates to affected_areas."
+        ),
+        "minutes": 3,
+    },
     "has_agent_fit": {
         "field": "agent_fit",
         "message": (
@@ -166,6 +182,31 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
             "who does the work, not just how it is written down."
         ),
         "minutes": 2,
+    },
+}
+
+# Templates of the two state-task checks (#1647). Kept apart from
+# CHECK_RECOMMENDATIONS on purpose: that table is pinned to DOR_CHECK_KEYS (a
+# commit task's table), and these two checks exist only on the state profile.
+STATE_CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
+    "has_rollback": {
+        "field": "rollback",
+        "message": (
+            "Write how to undo the result if the state turns out wrong "
+            "(e.g. 'put the old A record back: ns1.registrar, value from the "
+            "card'). A task about the state of the world must say how to go "
+            "back before anyone changes that state."
+        ),
+        "minutes": 3,
+    },
+    "has_state_ac": {
+        "field": "acceptance_criteria",
+        "message": (
+            "Add at least one acceptance criterion a person can check by "
+            "hand: verifiable_by manual, log_check or ui_check. A 'test' "
+            "criterion alone proves nothing about the outside world here."
+        ),
+        "minutes": 5,
     },
 }
 
@@ -822,7 +863,9 @@ def _recommendation_for(
     config: ReadinessConfig,
 ) -> Recommendation | None:
     """Build a recommendation for one failed DoR check."""
-    template = CHECK_RECOMMENDATIONS.get(check.key)
+    template = CHECK_RECOMMENDATIONS.get(check.key) or STATE_CHECK_RECOMMENDATIONS.get(
+        check.key
+    )
     if template is None:
         return None
     severity: RecommendationSeverity = "blocking" if is_required else "low"
@@ -833,10 +876,14 @@ def _recommendation_for(
         delta = 0
     else:
         delta = config.penalty_required if is_required else config.penalty_optional
+    message = template["message"]
+    if check.key == STATEMENT_PATHS_CHECK:
+        # The path is the point (#1456): name it, do not only describe the rule.
+        message = f"{message} {check.detail}"
     return Recommendation(
         field=template["field"],
         severity=severity,
-        message=template["message"],
+        message=message,
         expected_score_delta=delta,
         estimated_minutes=template["minutes"],
     )
@@ -861,6 +908,12 @@ def build_recommendations(
     for check in dor.checks:
         if check.passed:
             continue
+        if check.key == STATEMENT_PATHS_CHECK and not check.detail.startswith(
+            STATEMENT_PATHS_MARK
+        ):
+            # "Not checked" is the hub's gap, not the author's defect (#1456):
+            # it stays in the DoR table, with the reason, and asks nothing.
+            continue
         if check.key in DOR_ADVISORY_KEYS and check.key not in dor.advisory:
             # This work type is not asked for Discovery — stay quiet (#331).
             continue
@@ -871,24 +924,6 @@ def build_recommendations(
             recs.append(rec)
     recs.sort(key=lambda r: SEVERITY_ORDER[r.severity])
     return recs
-
-
-async def _project_repo_path(db, task_id: int) -> str | None:
-    """The project's working copy, or None when it declares none (#337).
-
-    Imported inside the function: orchestration reaches back into services,
-    and a module-level import here would close the cycle. Any failure to
-    resolve returns None, which every producer reads as "no ground to judge
-    on" — never as "nothing found".
-    """
-    try:
-        from hub.services.orchestration import project_git_context
-
-        ctx = await project_git_context(db, task_id)
-    except Exception:  # pragma: no cover - defensive: never break readiness
-        return None
-    value = ctx.get("repo")
-    return str(value) if value else None
 
 
 async def build_for_task(
@@ -908,19 +943,23 @@ async def calculate_readiness_with_recommendations(
     *,
     explain: bool = False,
     config: ReadinessConfig = DEFAULT_CONFIG,
+    snapshot: DorSnapshot | None = None,
 ) -> ReadinessReport:
     """End-to-end: ReadinessReport with score, dor checks, risks, and
-    populated recommendations — single DB roundtrip per data source.
+    populated recommendations — всё из ОДНОГО снимка БД (#1610).
+
+    ``snapshot`` передаёт одобрение: DoR и отпечаток обязаны считаться из тех
+    же данных. Без него снимок снимается здесь.
 
     Lives here (not in readiness.py) to keep readiness free of any
     knowledge of the recommendation engine. The dependency direction
     stays one-way: recommendations -> readiness/dor.
     """
-    dor = await evaluate_dor(db, task_id)
-    row = await repo.get_task(db, task_id)
-    # 'risks' is a guaranteed column post-migrations (review I10).
-    risks_raw = row["risks"] if row is not None else None
-    risks = parse_risks_from_row(risks_raw)
+    if snapshot is None:
+        snapshot = await load_dor_snapshot(db, task_id)
+    dor = await evaluate_dor(db, task_id, snapshot)
+    row = snapshot.task
+    risks = parse_risks_from_row(row["risks"])
 
     score, components = calculate_score_from_data(dor=dor, risks=risks, config=config)
     recs = build_recommendations(dor, config=config)
@@ -929,17 +968,14 @@ async def calculate_readiness_with_recommendations(
     # `score` or `dor.passed` above. Charging here would drop the whole
     # backlog retroactively on the day this ships — the mistake declined in
     # #6 and #331.
-    ac_rows = await repo.list_acceptance_criteria(db, task_id)
     recs.extend(
         run_statement_defect_producers(
             StatementInputs(
-                ac_rows=list(ac_rows),
-                scope_in=deserialize_str_list(row["scope_in"]) if row else [],
-                affected_areas=(
-                    deserialize_str_list(row["affected_areas"]) if row else []
-                ),
-                outcome_metric=(row["outcome_metric"] or "") if row else "",
-                repo_path=await _project_repo_path(db, task_id),
+                ac_rows=list(snapshot.acs),
+                scope_in=deserialize_str_list(row["scope_in"]),
+                affected_areas=deserialize_str_list(row["affected_areas"]),
+                outcome_metric=row["outcome_metric"] or "",
+                repo_path=snapshot.workspace_path or None,
             )
         )
     )

@@ -1897,6 +1897,79 @@ async def test_branch_diff_paths_reads_non_ascii_and_reports_unknown(
     assert await git_ops.branch_diff_paths("no-such-branch", repo=str(repo)) is None
 
 
+async def test_submission_paths_include_renames_and_deletions(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#1589 AC-4: real git; a rename names both ends, a deletion is listed.
+
+    ``--name-only`` shows only the new name of a rename (and no help for the
+    old one), so a file moved OUT of a watched path would read as untouched.
+    The surface check keeps its own source and must read as before.
+    """
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "deploy").mkdir()
+    (repo / "deploy" / "remote-deploy.sh").write_text("echo deploy script\n" * 20)
+    (repo / "deploy" / "gone.conf").write_text("to be removed\n" * 20)
+    (repo / "deploy" / "keep.txt").write_text("unchanged\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "base", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "-b", "task-1589/work", cwd=repo)
+    (repo / "docs").mkdir()
+    _run_git("git", "mv", "deploy/remote-deploy.sh", "docs/moved-deploy.sh", cwd=repo)
+    _run_git("git", "rm", "-q", "deploy/gone.conf", cwd=repo)
+    (repo / "docs" / "Новый.md").write_text("new\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "work", cwd=repo)
+
+    got = await git_ops.branch_touched_paths("task-1589/work", repo=str(repo))
+
+    assert got is not None
+    paths, sha = got
+    assert set(paths) == {
+        "deploy/gone.conf",
+        "deploy/remote-deploy.sh",
+        "docs/Новый.md",
+        "docs/moved-deploy.sh",
+    }
+    assert len(paths) == 4
+    assert "deploy/keep.txt" not in paths
+    import subprocess
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert sha == head
+
+    # The surface check's source is untouched: new name only, as before.
+    old_source = await git_ops.branch_diff_paths("task-1589/work", repo=str(repo))
+    assert old_source is not None
+    assert set(old_source) == {
+        "deploy/gone.conf",
+        "docs/Новый.md",
+        "docs/moved-deploy.sh",
+    }
+    assert "deploy/remote-deploy.sh" not in old_source
+
+    # A pinned head is read as itself; an unknown branch is unknown, not [].
+    pinned = await git_ops.branch_touched_paths(
+        "task-1589/work", repo=str(repo), head_sha=sha
+    )
+    assert pinned is not None and pinned[1] == sha
+    assert await git_ops.branch_touched_paths("no-such", repo=str(repo)) is None
+    assert (
+        await git_ops.branch_touched_paths(
+            "task-1589/work", repo=str(repo), head_sha="0" * 40
+        )
+        is None
+    )
+
+
 # ---- CI probe fallback (#606): the eye GitHub's token picker put out ----
 
 
@@ -3176,3 +3249,505 @@ async def test_delta_without_base_says_it_could_not_ask(
     assert (
         await git_ops.delta_without_base(str(clone), "develop", "f" * 40, current)
     ) is None
+
+
+async def test_worktree_hint_is_a_clone_relative_template(client, db):
+    # AC-1 (#1515): claim and pair-start name the worktree as a template relative
+    # to the caller's clone. The hub does not know the clone folder (the project
+    # repo agentdrover/Spike_bo may live in a clone called spike_bo), so the repo
+    # name must not leak into the path.
+    from hub import repository as repo_module
+    from hub.integrations.git_ops import worktree_hint
+
+    pid = await repo_module.create_project(
+        db, slug="spike", name="Spike", repo_name="agentdrover/Spike_bo"
+    )
+    created = await client.post("/api/tasks", json={"title": "Spike worktree hint"})
+    task_id = created.json()["id"]
+    await repo_module.update_task(db, task_id, project_id=pid)
+    await db.commit()
+
+    expected_path = f"../.<имя вашего клона>-worktrees/task-{task_id}"
+    assert worktree_hint(task_id).startswith(expected_path)
+
+    claim = await client.post(
+        f"/api/tasks/{task_id}/claim", json={"agent": "a", "session_id": "s"}
+    )
+    assert claim.status_code == 200
+    pair = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "plan": "Plan: work in own clone",
+            "assigned_agent": "a",
+            "session_id": "s",
+            "git_mode": "remote",
+        },
+    )
+    assert pair.status_code == 200, pair.text
+    for hint in (claim.json()["worktree_hint"], pair.json()["worktree_hint"]):
+        assert expected_path in hint
+        assert f"hp-hub worktree {task_id}" in hint
+        assert "spike_bo" not in hint.lower()
+        assert "agentdrover" not in hint.lower()
+
+
+async def test_reclaim_by_same_holder_keeps_the_worktree_hint(client):
+    # #1515: the idempotent second claim answers with the hint as well.
+    created = await client.post("/api/tasks", json={"title": "Reclaim hint"})
+    task_id = created.json()["id"]
+    body = {"agent": "a", "session_id": "s"}
+    first = await client.post(f"/api/tasks/{task_id}/claim", json=body)
+    again = await client.post(f"/api/tasks/{task_id}/claim", json=body)
+    assert again.status_code == 200
+    assert again.json()["worktree_hint"] == first.json()["worktree_hint"] != ""
+
+
+async def test_claim_race_won_by_same_holder_keeps_the_worktree_hint(client):
+    # #1515: the branch where a concurrent claim of the same holder wins.
+    from hub.models import TaskView
+    from hub.services import lifecycle
+
+    created = await client.post("/api/tasks", json={"title": "Race hint"})
+    task_id = created.json()["id"]
+    view = TaskView(**(await client.get(f"/api/tasks/{task_id}")).json())
+    with patch.object(
+        lifecycle, "_claim_write", new=AsyncMock(return_value=view)
+    ) as race:
+        resp = await client.post(
+            f"/api/tasks/{task_id}/claim", json={"agent": "a", "session_id": "s"}
+        )
+    race.assert_awaited_once()
+    assert resp.status_code == 200
+    assert resp.json()["worktree_hint"].startswith("../.<имя вашего клона>-worktrees/")
+
+
+# ---------------------------------------------------------------- снимок (#1599)
+
+
+def _snap_git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    return done.stdout.strip()
+
+
+def _tar_members(data: bytes) -> dict[str, tuple[bytes, str]]:
+    import io
+    import tarfile
+
+    found: dict[str, tuple[bytes, str]] = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        for member in tar:
+            body = tar.extractfile(member).read() if member.isreg() else b""
+            found[member.name.rstrip("/")] = (
+                body,
+                "dir" if member.isdir() else "file" if member.isreg() else "other",
+            )
+    return found
+
+
+async def test_the_snapshot_archive_is_bounded_while_reading(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """AC-4: архив читается порциями с потолком; бинарные байты сохранены.
+
+    Потолок проверен на ЧТЕНИИ, а не после него: ребёнок, который пишет без
+    конца, останавливается на потолке, его процесс убит и дождан, а память
+    не растёт сверх потолка. Прежний ``run_bytes`` собирал бы весь вывод
+    ``communicate()`` и мерил его потом.
+    """
+    import sys
+    import time
+    import tracemalloc
+
+    from hub.integrations import proc
+
+    # --- стадия 1: потоковый хелпер на заведомо бесконечном выводе.
+    pid_file = tmp_path / "child.pid"
+    done_file = tmp_path / "child.done"
+    flood = (
+        "import os, sys\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "chunk = b'z' * (1 << 20)\n"
+        "for _ in range(4000):\n"
+        "    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()\n"
+        f"open({str(done_file)!r}, 'w').write('x')\n"
+    )
+    tracemalloc.start()
+    started = time.monotonic()
+    rc, out, err = await proc.run_capped(
+        sys.executable, "-c", flood, max_bytes=1 << 20, timeout=30
+    )
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert rc == -2, (rc, err)
+    assert len(out) == 0 and "longer than" in err, (
+        "превышение потолка — отказ без вывода"
+    )
+    assert peak < 6 * (1 << 20), f"память выросла до {peak}: вывод копился целиком"
+    assert time.monotonic() - started < 10, "чтение не остановилось на потолке"
+    child = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("процесс, превысивший потолок, остался жить")
+    assert not done_file.exists(), "процесс дописал вывод до конца: его не остановили"
+
+    # stderr тоже ограничен: поток в stderr — отказ, а не рост памяти.
+    noisy = (
+        "import sys\n"
+        "while True:\n"
+        "    sys.stderr.write('e' * 100000); sys.stderr.flush()\n"
+    )
+    rc, out, err = await proc.run_capped(
+        sys.executable, "-c", noisy, max_bytes=1 << 20, max_stderr=50_000, timeout=30
+    )
+    assert rc == -3 and len(err) <= 50_000 + 200, (rc, len(err))
+
+    # Нормальный вывод — сырые байты как есть, без decode и strip.
+    payload = b"\xff\xfe\x00 tail\n\n"
+    rc, out, err = await proc.run_capped(
+        sys.executable,
+        "-c",
+        f"import sys; sys.stdout.buffer.write({payload!r})",
+        max_bytes=1024,
+    )
+    assert (rc, out) == (0, payload), "вывод искажён: завершающие переводы строк"
+
+    # --- стадия 2: настоящий git archive.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _snap_git(repo, "init", "-q", "-b", "main")
+    blob = b"\xff\xfe\xfd binary \x00 tail\n\n\n"
+    (repo / "binary.dat").write_bytes(blob)
+    (repo / "src").mkdir()
+    (repo / "src" / "module.py").write_text("VALUE = 1\n")
+    (repo / "target.txt").write_text("target\n")
+    (repo / "link").symlink_to("target.txt")
+    (repo / "ignored.txt").write_text("export-ignored\n")
+    (repo / ".gitattributes").write_text("ignored.txt export-ignore\n")
+    (repo / "big.bin").write_bytes(os.urandom(300_000))
+    _snap_git(repo, "add", "-A")
+    _snap_git(repo, "commit", "-qm", "c")
+    sha = _snap_git(repo, "rev-parse", "HEAD")
+    sub = _snap_git(repo, "rev-parse", "HEAD")
+    _snap_git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sub},vendor")
+    _snap_git(repo, "commit", "-qm", "with a submodule entry")
+    sha = _snap_git(repo, "rev-parse", "HEAD")
+
+    ok = await git_ops.snapshot_archive(str(repo), sha, 8 * 1024 * 1024)
+    assert ok.data is not None and ok.state == "ok", ok
+    members = _tar_members(ok.data)
+    assert members["binary.dat"][0] == blob, "бинарные байты снимка не равны blob"
+    assert (
+        members["binary.dat"][0]
+        == subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "blob", f"{sha}:binary.dat"],
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    assert members["src/module.py"][0] == b"VALUE = 1\n"
+    assert "link" not in members, "символьная ссылка не должна быть в снимке"
+    assert "ignored.txt" not in members, "export-ignore — политика git archive"
+    assert members.get("vendor", (b"", "dir"))[1] == "dir", (
+        "submodule не раскрывается: в снимке максимум пустой каталог"
+    )
+    assert "ссыл" in ok.note, "что исключено из снимка, называется"
+
+    # Потолок меньше архива: снимка нет, причина названа, процесс дождан.
+    small = await git_ops.snapshot_archive(str(repo), sha, 100_000)
+    assert small.data is None and small.state == "absent", small
+    assert "100000" in small.reason, small.reason
+    # Неизвестный sha: снимка нет, причина названа.
+    missing = await git_ops.snapshot_archive(str(repo), "0" * 40, 1 << 20)
+    assert missing.data is None and missing.reason, missing
+    # Пустое дерево — не «сбой монтирования», а отдельное состояние.
+    _snap_git(repo, "checkout", "-q", "--orphan", "empty")
+    _snap_git(repo, "rm", "-rfq", ".")
+    _snap_git(repo, "commit", "-qm", "empty", "--allow-empty")
+    empty = await git_ops.snapshot_archive(
+        str(repo), _snap_git(repo, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert empty.data is None and empty.state == "empty", empty
+
+
+async def test_the_snapshot_fetches_a_missing_commit_and_noop_names_its_absence(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """Объект sha доставляется при необходимости; без git снимка нет и это названо."""
+    from hub.integrations.noop import NoopGitOps
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _snap_git(origin, "init", "-q", "-b", "main")
+    (origin / "a.txt").write_text("a\n")
+    _snap_git(origin, "add", "-A")
+    _snap_git(origin, "commit", "-qm", "a")
+    clone = tmp_path / "clone"
+    _snap_git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _snap_git(origin, "checkout", "-q", "-b", "task-1/x")
+    (origin / "later.txt").write_text("later\n")
+    _snap_git(origin, "add", "-A")
+    _snap_git(origin, "commit", "-qm", "later")
+    sha = _snap_git(origin, "rev-parse", "HEAD")
+    assert await git_ops.commit_exists(str(clone), sha) is False, "предпосылка"
+
+    snap = await git_ops.snapshot_archive(str(clone), sha, 1 << 20, "task-1/x")
+    assert snap.state == "ok" and snap.data, snap
+    assert _tar_members(snap.data)["later.txt"][0] == b"later\n"
+
+    lost = await git_ops.snapshot_archive(str(clone), "f" * 40, 1 << 20, "no-such")
+    assert lost.state == "absent" and "не найден" in lost.reason, lost
+
+    nothing = await NoopGitOps().snapshot_archive("/x", "a" * 40, 100)
+    assert nothing.state == "absent" and nothing.reason and nothing.data is None
+
+
+async def test_a_cancelled_capped_read_takes_the_child_with_it(tmp_path: Path) -> None:
+    """Отмена чтения снимает процесс (группу), а не оставляет его без читателя."""
+    import asyncio
+    import sys
+    import time
+
+    from hub.integrations import proc
+
+    pid_file = tmp_path / "child.pid"
+    script = (
+        "import os, time\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+    task = asyncio.create_task(
+        proc.run_capped(sys.executable, "-c", script, max_bytes=1024, timeout=120)
+    )
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert pid_file.exists(), "предпосылка: процесс стартовал"
+    child = int(pid_file.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("процесс пережил отмену чтения")
+
+
+async def test_a_snapshot_with_nothing_left_is_not_called_an_empty_tree(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """«Всё отфильтровано» и «дерево пусто» — разные состояния (находка Codex)."""
+    only_link = tmp_path / "only_link"
+    only_link.mkdir()
+    _snap_git(only_link, "init", "-q", "-b", "main")
+    (only_link / "link").symlink_to("nowhere")
+    _snap_git(only_link, "add", "-A")
+    _snap_git(only_link, "commit", "-qm", "link only")
+    snap = await git_ops.snapshot_archive(
+        str(only_link), _snap_git(only_link, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "исключено 1 ссылок" in snap.reason, snap.reason
+
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    _snap_git(ignored, "init", "-q", "-b", "main")
+    (ignored / "a.txt").write_text("a\n")
+    (ignored / ".gitattributes").write_text("* export-ignore\n")
+    _snap_git(ignored, "add", "-A")
+    _snap_git(ignored, "commit", "-qm", "all ignored")
+    snap = await git_ops.snapshot_archive(
+        str(ignored), _snap_git(ignored, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "export-ignore" in snap.reason, snap.reason
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    _snap_git(blank, "init", "-q", "-b", "main")
+    _snap_git(blank, "commit", "-qm", "empty", "--allow-empty")
+    snap = await git_ops.snapshot_archive(
+        str(blank), _snap_git(blank, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "empty", snap
+
+
+def test_git_env_does_not_force_ssh_identity(monkeypatch, tmp_path):
+    # #1625 AC-1: a forced `-i` outranks the `Host` alias in ~/.ssh/config, so
+    # GitHub sees the first project's deploy key on every private repo.
+    from hub.integrations import proc
+
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_ed25519").write_text("not a real key")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+
+    cmd = proc.git_env()["GIT_SSH_COMMAND"]
+
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert " -i " not in f" {cmd} "
+
+
+def test_git_env_keeps_deployment_ssh_command(monkeypatch, tmp_path):
+    # #1625 AC-2: a deployment that declares its own transport keeps it.
+    from hub.integrations import proc
+
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_ed25519").write_text("not a real key")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /etc/hub/ssh_config")
+
+    assert proc.git_env()["GIT_SSH_COMMAND"] == "ssh -F /etc/hub/ssh_config"
+
+
+# --- общий reader файлов базовой ветки (#1630) ---
+
+
+async def test_base_file_reader_distinguishes_states(tmp_path, git_ops, db):
+    """AC-2: missing, пустой present, unreadable (ref, клон, нет workspace),
+    усечение с размером; pair_start успешен во всех случаях."""
+    from tests.working_rules_support import make_rules_repo
+
+    repo = make_rules_repo(
+        tmp_path / "ws",
+        {".hub/EMPTY.md": "", ".hub/AGENT_RULES.md": "x" * 500 + "\n"},
+    )
+
+    missing = await git_ops.read_file_at_ref(repo, "develop", ".hub/NOPE.md")
+    assert missing["state"] == "missing" and missing["sha"] and missing["content"] == ""
+
+    empty = await git_ops.read_file_at_ref(repo, "develop", ".hub/EMPTY.md")
+    assert (empty["state"], empty["content"], empty["size"]) == ("present", "", 0)
+
+    bad_ref = await git_ops.read_file_at_ref(repo, "no-such-branch", ".hub/EMPTY.md")
+    assert bad_ref["state"] == "unreadable" and "no-such-branch" in bad_ref["reason"]
+
+    not_a_clone = await git_ops.read_file_at_ref(
+        str(tmp_path), "develop", ".hub/EMPTY.md"
+    )
+    assert not_a_clone["state"] == "unreadable" and not_a_clone["reason"]
+
+    big = await git_ops.read_file_at_ref(
+        repo, "develop", ".hub/AGENT_RULES.md", limit_chars=100
+    )
+    assert big["state"] == "present" and big["truncated"] is True
+    assert len(big["content"]) == 100 and big["size"] == 501
+
+    # Файл больше 1 МиБ: present + truncated + size, а не unreadable (читается префикс).
+    huge_repo = make_rules_repo(
+        tmp_path / "huge", {".hub/AGENT_RULES.md": "y" * (1024 * 1024 + 1)}
+    )
+    huge = await git_ops.read_file_at_ref(huge_repo, "develop", ".hub/AGENT_RULES.md")
+    assert huge["state"] == "present" and huge["truncated"] is True
+    assert huge["size"] == 1024 * 1024 + 1 and len(huge["content"]) == 30000
+
+    # Проект без workspace_path: общий reader говорит unreadable, а не падает.
+    from hub.services.working_rules import AGENT_RULES_FILE, read_agent_rules
+
+    task_row = await db.execute_insert(
+        "INSERT INTO tasks (title, description, status, runtime) "
+        "VALUES ('t', '', 'open', 'auto')"
+    )
+    out = await read_agent_rules(db, task_row[0])
+    assert out["state"] == "unreadable" and "workspace_path" in out["reason"]
+    assert out["path"] == AGENT_RULES_FILE
+
+
+@pytest.mark.parametrize("case", ["missing", "empty", "badref", "no_workspace", "big"])
+async def test_pair_start_survives_every_reader_state(client, db, tmp_path, case):
+    """AC-2: pair_start успешен при любом состоянии чтения файла правил."""
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import (
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    files = {
+        "missing": {},
+        "empty": {".hub/AGENT_RULES.md": ""},
+        "badref": {".hub/AGENT_RULES.md": "a"},
+        "no_workspace": {},
+        "big": {".hub/AGENT_RULES.md": "z" * 40000},
+    }[case]
+    path = make_rules_repo(tmp_path / "ws", files)
+    plugins.git_ops = ReadingGitOps()
+    task_id = await task_in_project(
+        client,
+        db,
+        "" if case == "no_workspace" else path,
+        branch="ghost" if case == "badref" else "develop",
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    rules = resp.json()["working_rules"]["repository_rules"]
+    expected = {
+        "missing": "missing",
+        "empty": "present",
+        "badref": "unreadable",
+        "no_workspace": "unreadable",
+        "big": "present",
+    }[case]
+    assert rules["state"] == expected, rules
+    assert rules["trust"] == "repository_data"
+    if case == "big":
+        assert rules["truncated"] is True and rules["size"] == 40000
+
+
+async def test_run_bytes_cancel_kills_the_pipeline():
+    """#1630 (ревью): отмена во время чтения убивает группу процессов — конвейер
+    не переживает вызвавшую его задачу; отмена пробрасывается."""
+    import asyncio
+
+    from hub.integrations import proc
+
+    marker = "sleep 31.337"
+    task = asyncio.create_task(
+        proc.run_bytes("sh", "-c", f"{marker} | cat", timeout=60)
+    )
+    await asyncio.sleep(0.5)
+    alive = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+    assert alive.stdout.strip(), "конвейер должен жить до отмены"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    gone = subprocess.run(
+        ["ps", "-axo", "pid=,stat=,command="], capture_output=True, text=True
+    )
+    live = []
+    for line in gone.stdout.splitlines():
+        parts = line.split(None, 2)
+        # Зомби (Z) — уже убит и ждёт, пока init его подберёт.
+        if len(parts) == 3 and marker in parts[2] and not parts[1].startswith("Z"):
+            live.append(line)
+    assert live == [], live

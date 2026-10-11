@@ -14,6 +14,11 @@ Invariants enforced by the coverage tests:
 - ``human``/``agent_queue`` instances must name a surface and next actor and
   must NOT auto-transition (deadline is ``None``).
 
+Задача-состояние (result_kind=state, #1647) своих экземпляров не заводит: её
+running — это ``running:pair`` (никогда headless), её review — ``review:client``
+(человек, без машинного ревью), и оба описаны здесь без изменений. Отличается
+не владелец, а выход из review: APPROVED человека завершает такую задачу сам.
+
 The poller reads :func:`machine_deadline_policies` to drive deadline
 transitions; ``claimed`` (escalation ``open``) and missing-job escalation are
 implemented in #417 and only documented here so the matrix stays complete.

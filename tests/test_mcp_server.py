@@ -23,7 +23,6 @@ from hub.mcp_server import (
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
-    hub_approve_proposal,
     hub_claim_task,
     hub_create_task,
     hub_create_subtasks,
@@ -797,7 +796,7 @@ async def test_hub_report_done_needs_decision_error_envelope(
     assert payload["status"] == "needs_decision"
     assert payload["awaiting"] == "human_decision"
     assert payload["actor_hint"] == "human"
-    assert "hub_decide_task" in payload["next_action"]
+    assert "/decide" in payload["next_action"]
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +986,9 @@ async def test_hub_task_status_structured_content_matches_rest(
         "log_tail": [],
     }
     mock_api_get.return_value = rest_task
-    out = await hub_task_status(42)
+    # #1613: the whole REST object is what full=true returns; the default
+    # view is a card (AC-3), so equality holds only here.
+    out = await hub_task_status(42, full=True)
     structured = _mcp_structured(out)
     assert structured is not None
     assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
@@ -1871,6 +1872,61 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
     )
 
 
+@pytest.mark.parametrize(
+    ("passed_work_type", "stored_work_type"),
+    [("bug", "feature"), (None, "bug")],
+    ids=["work_type-argument", "work_type-on-task"],
+)
+async def test_bug_brief_requires_reproduce_first(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+    passed_work_type: str | None,
+    stored_work_type: str,
+) -> None:
+    """#914 AC-1: a bug brief orders the work — failing test first, fix second —
+    names the #913 gate and hands over the defect AC template. The work type is
+    the one the task will have after preparation: the argument when given, the
+    stored one otherwise."""
+    mock_api_get.return_value = {"id": 25, "risks": [], "work_type": stored_work_type}
+    kwargs: dict[str, Any] = {"problem_statement": "Crash on empty list."}
+    if passed_work_type:
+        kwargs["work_type"] = passed_work_type
+
+    msg = await hub_prepare_developer_task(task_id=25, mode="preview", **kwargs)
+
+    brief = json.loads(msg)["developer_handoff_text"]
+    reproduce = brief.index("Сначала воспроизведи")
+    fix = brief.index("Потом чини")
+    assert reproduce < fix, "the reproduce step comes before the fix"
+    assert "падающий тест" in brief
+    assert "#913" in brief and "merge-base" in brief
+    assert "засчитывается только failed" in brief
+    assert "error — не доказано" in brief
+    assert "test_ref" in brief
+    assert "Шаблон AC дефекта" in brief
+    assert "Given состояние, в котором дефект проявляется" in brief
+    assert "Then ожидаемое поведение" in brief
+    assert "verifiable_by=test" in brief
+    mock_api_post.assert_not_called()
+
+
+async def test_non_bug_brief_has_no_reproduce_step(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    """#914: every other work type gets the brief it had before."""
+    mock_api_get.return_value = {"id": 25, "risks": [], "work_type": "feature"}
+
+    msg = await hub_prepare_developer_task(
+        task_id=25, mode="preview", problem_statement="Add a report."
+    )
+
+    brief = json.loads(msg)["developer_handoff_text"]
+    assert "Сначала воспроизведи" not in brief
+    assert "Шаблон AC дефекта" not in brief
+    assert "#913" not in brief
+
+
 @pytest.mark.asyncio
 async def test_prepare_developer_task_defaults_validation_commands(
     mock_api_post: AsyncMock,
@@ -2209,6 +2265,33 @@ async def test_hub_submit_for_review_forwards_lifecycle_hint(
     assert "submitted for review" in payload["message"]
     assert "diff/PR" in payload["message"]
     assert "открыть не удалось" in payload["message"]
+
+
+async def test_submit_text_names_path_notices_only_when_there_is_something_to_say(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#1589: MCP-ответ на сдачу несёт matched/unknown и молчит при none и без ключа."""
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    base = {"id": 42, "status": "review", "submission_generation": 1}
+    shown = {
+        "generation": 1,
+        "state": "matched",
+        "text": "Предупреждение по путям диффа (path_notices): обновить копию",
+    }
+    for block, expect in (
+        (shown, True),
+        (
+            {**shown, "state": "unknown", "text": "проверка путей не выполнена: сеть"},
+            True,
+        ),
+        ({**shown, "state": "none", "text": "путей из правил в диффе нет"}, False),
+        (None, False),
+    ):
+        mock_api_post.return_value = {**base, "path_notices": block}
+        message = json.loads(await hub_submit_for_review(42))["message"]
+        assert (
+            "path_notices" in message or "проверка путей не выполнена" in message
+        ) is expect, block
 
 
 async def test_submit_answer_names_the_unchanged_generation(
@@ -2727,28 +2810,6 @@ async def test_hub_list_projects_names_the_forge(mock_api_get: AsyncMock) -> Non
     assert "@gitlab" not in text
 
 
-async def test_deprecated_alias_marks_and_counts(
-    mock_api_get: AsyncMock, mock_api_post: AsyncMock
-) -> None:
-    # AC-1 (#325): alias response carries deprecated + replacement, and the
-    # call is counted through the telemetry endpoint.
-    mock_api_get.side_effect = [
-        {"id": 5, "status": "draft"},  # prior read inside hub_approve_task
-        {"id": 5, "status": "open"},  # refreshed task
-    ]
-    mock_api_post.side_effect = [
-        {"id": 5, "status": "open"},  # approve call
-        {"ok": True},  # telemetry
-    ]
-    out = await hub_approve_proposal(5)
-    payload = json.loads(out)
-    assert payload["deprecated"] is True
-    assert "hub_approve_task" in payload["next_action"]
-    telemetry_call = mock_api_post.await_args_list[-1]
-    assert telemetry_call.args[0] == "/api/telemetry/deprecated-tool"
-    assert telemetry_call.args[1]["tool"] == "hub_approve_proposal"
-
-
 async def test_task_update_done_alias_marked_deprecated(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:
@@ -2922,35 +2983,6 @@ async def test_hub_submit_machine_review_names_the_report_outcome(
     assert "Исход отчёта" not in out.content[0].text
 
 
-async def test_hub_submit_steward_judgement(mock_api_post: AsyncMock) -> None:
-    from hub.mcp_server import hub_submit_steward_judgement
-
-    mock_api_post.return_value = {
-        "id": 1,
-        "task_id": 42,
-        "generation": 1,
-        "kind": "verdict",
-        "verdict": "escalate",
-        "escalate_reason": "low_confidence",
-        "submitted_verdict": "approve",
-    }
-    out = await hub_submit_steward_judgement(
-        42,
-        generation=1,
-        kind="verdict",
-        verdict="approve",
-        confidence="low",
-        grounds=[{"source": "ci_pinned_sha"}],
-    )
-    structured = _mcp_structured(out)
-    assert structured["steward_judgement"]["verdict"] == "escalate"
-    path, body = mock_api_post.await_args.args
-    assert path == "/api/tasks/42/steward-judgement"
-    assert body["verdict"] == "approve"
-    assert body["confidence"] == "low"
-    assert "tokens_spent" not in body
-
-
 async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     # #384: MCP wrapper summarises economics and recurring categories.
     from hub.mcp_server import hub_practice_metrics
@@ -3012,16 +3044,18 @@ async def test_hub_my_context_without_task_id(mock_api_get: AsyncMock) -> None:
     # AC-1 (#454): no task_id → general Hub context, no validation error.
     # #987 changed what the list means: it names live work, not holder history,
     # so this fixture now carries a running row beside the completed one.
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        {
-            "tasks": [
-                {"id": 451, "title": "Pair workspace", "status": "completed"},
-                {"id": 452, "title": "Live one", "status": "running"},
-            ],
-            "next_cursor": None,
-        },
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            {
+                "tasks": [
+                    {"id": 451, "title": "Pair workspace", "status": "completed"},
+                    {"id": 452, "title": "Live one", "status": "running"},
+                ],
+                "next_cursor": None,
+            },
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
@@ -3045,8 +3079,12 @@ async def test_hub_my_context_without_task_id_anonymous(
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
     assert "Workflow reference" in text
-    # No username → no task lookup, only the diagnostics probe (#530).
-    mock_api_get.assert_awaited_once_with("/api/diagnostics/identity")
+    # No username → no task lookup, only the diagnostics probe (#530) and the
+    # public /health read for the egress alert (#1645).
+    assert [c.args[0] for c in mock_api_get.await_args_list] == [
+        "/api/diagnostics/identity",
+        "/health",
+    ]
 
 
 async def test_hub_my_context_brief_alias(mock_api_get: AsyncMock) -> None:
@@ -3179,15 +3217,17 @@ async def test_hub_my_context_task_includes_worktree_from_context(
 
 async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> None:
     # AC-3 (#530): general context reports the active workspace mode.
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        [],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            [],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "Workspace mode: worktree" in text
     assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"
@@ -3452,23 +3492,51 @@ def test_mcp_initialize_server_name_is_haiplane_hub():
 # 151 completed rows against two live ones, and 48 of the newest 50 final.
 
 
+_POLICY_ANSWER = {
+    "slug": "default",
+    "keys": [],
+    "steward": {"requested": "off", "effective": "off"},
+}
+
+
+def _with_policy(responses: list[Any]) -> Any:
+    """Ответы по порядку; чтение политики проекта (#1594) идёт отдельным путём.
+
+    Общий контекст теперь читает политику default, и этот вызов не должен
+    занимать место в очереди ответов, написанной до него.
+    """
+    queue = list(responses)
+
+    async def _answer(path: str, *_a: Any, **_k: Any) -> Any:
+        if "/effective-policy" in path:
+            return _POLICY_ANSWER
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    return _answer
+
+
 def _page(rows: list[dict], cursor: int | None = None) -> dict:
     return {"tasks": rows, "next_cursor": cursor}
 
 
 async def test_my_context_drops_completed_claimed(mock_api_get: AsyncMock) -> None:
     """AC-1: digest and structured my_tasks name the running task, not the done one."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 900, "title": "Done long ago", "status": "completed"},
-                {"id": 901, "title": "Live work", "status": "running"},
-                {"id": 902, "title": "Abandoned", "status": "failed"},
-                {"id": 903, "title": "Turned down", "status": "rejected"},
-            ]
-        ),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 900, "title": "Done long ago", "status": "completed"},
+                    {"id": 901, "title": "Live work", "status": "running"},
+                    {"id": 902, "title": "Abandoned", "status": "failed"},
+                    {"id": 903, "title": "Turned down", "status": "rejected"},
+                ]
+            ),
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "#901" in text
@@ -3490,13 +3558,15 @@ async def test_my_context_waiting_is_client_driven_review(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-2: a review nobody automated is waiting on a human, not on me."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
-        # The compact card cannot carry review_job_id, so the exclusion is
-        # resolved with one status-filtered call.
-        [{"id": 910, "status": "review", "review_job_id": None}],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+            # The compact card cannot carry review_job_id, so the exclusion is
+            # resolved with one status-filtered call.
+            [{"id": 910, "status": "review", "review_job_id": None}],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     waiting = next(
         ln for ln in text.split("\\n") if ln.startswith("Waiting on a human")
@@ -3509,11 +3579,13 @@ async def test_my_context_headless_review_is_in_flight(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-3: a review the poller owns is still the agent's turn."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 911, "title": "Headless", "status": "review"}]),
-        [{"id": 911, "status": "review", "review_job_id": "job-7"}],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 911, "title": "Headless", "status": "review"}]),
+            [{"id": 911, "status": "review", "review_job_id": "job-7"}],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     in_flight = next(ln for ln in text.split("\\n") if ln.startswith("In flight"))
     assert "#911" in in_flight
@@ -3528,17 +3600,19 @@ async def test_my_context_pages_past_a_window_of_final_rows(
     The live shape on prod: the newest page is all final, and the running task
     sits below it. One page plus a filter would answer "none".
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 800 + i, "title": f"old {i}", "status": "completed"}
-                for i in range(50)
-            ],
-            cursor=800,
-        ),
-        _page([{"id": 700, "title": "Still running", "status": "running"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 800 + i, "title": f"old {i}", "status": "completed"}
+                    for i in range(50)
+                ],
+                cursor=800,
+            ),
+            _page([{"id": 700, "title": "Still running", "status": "running"}]),
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "#700" in text
@@ -3558,19 +3632,21 @@ async def test_my_context_says_when_the_walk_stopped_short(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-6: a bounded walk that hits its cap says so instead of implying it saw all."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        *[
-            _page(
-                [
-                    {"id": 5000 + p * 50 + i, "title": "old", "status": "completed"}
-                    for i in range(50)
-                ],
-                cursor=5000 + p * 50,
-            )
-            for p in range(5)
-        ],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            *[
+                _page(
+                    [
+                        {"id": 5000 + p * 50 + i, "title": "old", "status": "completed"}
+                        for i in range(50)
+                    ],
+                    cursor=5000 + p * 50,
+                )
+                for p in range(5)
+            ],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "claimed rows" in text, "the cap must be visible, not silent"
@@ -3588,10 +3664,12 @@ async def test_my_context_never_fetches_full_cards_it_drops(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-7: the uncapped mode=full call must not pay ~10 KB a row to discard it."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 920, "title": "Live", "status": "running"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 920, "title": "Live", "status": "running"}]),
+        ]
+    )
     await hub_my_context()  # no max_chars, mode=full — the expensive path
     claimed_call = mock_api_get.await_args_list[1].args[0]
     assert "claimed_by=cursor" in claimed_call
@@ -3602,10 +3680,12 @@ async def test_my_context_no_live_work_points_at_the_history(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-4's other half: completed work is not lost, it is one call away."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 930, "title": "Done", "status": "completed"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 930, "title": "Done", "status": "completed"}]),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "hub_list_tasks" in text and "claimed_by" in text
@@ -3618,15 +3698,17 @@ async def test_my_context_summary_keeps_in_flight_ids(mock_api_get: AsyncMock) -
     my_tasks may shrink under the cap as it did before (#834) — but a digest
     that cannot name the work it exists to name would be pointless.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 940, "title": "Live one", "status": "running"},
-                {"id": 941, "title": "Old", "status": "completed"},
-            ]
-        ),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 940, "title": "Live one", "status": "running"},
+                    {"id": 941, "title": "Old", "status": "completed"},
+                ]
+            ),
+        ]
+    )
     text = _mcp_text(await hub_my_context(mode="summary"))
     assert "#940" in text
     assert "#941" not in text
@@ -3640,11 +3722,13 @@ async def test_my_context_names_an_unreadable_page_instead_of_saying_none(
     Page one is all history and points at more; page two fails. "None live" on
     its own would state as fact something the hub never got to look at.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
-        HubApiError({"message": "boom"}),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
+            HubApiError({"message": "boom"}),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "could be read" in text or "could not be read" in text
@@ -3658,11 +3742,13 @@ async def test_my_context_says_when_review_bucketing_is_a_guess(
     Falling back to Waiting is the safer default, and it is still a guess: an
     agent that idles on a review the poller owns is waiting for nobody.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 610, "title": "Submitted", "status": "review"}]),
-        HubApiError({"message": "boom"}),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 610, "title": "Submitted", "status": "review"}]),
+            HubApiError({"message": "boom"}),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#610" in text
     assert "could not tell headless review" in text
@@ -3672,16 +3758,18 @@ async def test_my_context_digest_names_live_worktree(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-3 (#989): general digest lists the path next to an in-flight row."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 452, "title": "Live one", "status": "running"}]),
-        {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 452, "title": "Live one", "status": "running"}]),
+            {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "In flight" in text
     assert "#452" in text
@@ -3692,16 +3780,18 @@ async def test_my_context_digest_does_not_invent_worktree_for_claimed_only(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-4 (#989): claimed without a live tree does not invent a directory."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
-        {"id": 10, "worktree_path": ""},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
+            {"id": 10, "worktree_path": ""},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#10" in text
     assert "worktrees" not in text
@@ -3712,17 +3802,19 @@ async def test_my_context_digest_does_not_name_removed_review_worktree(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-7 (#989): a review row must not name the directory submit removed."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
-        [{"id": 910, "status": "review", "review_job_id": None}],
-        {"id": 910, "worktree_path": ""},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+            [{"id": 910, "status": "review", "review_job_id": None}],
+            {"id": 910, "worktree_path": ""},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#910" in text
     assert "task-910" not in text
@@ -4440,7 +4532,7 @@ async def test_a_task_write_names_the_task_id_it_already_knows(
 
     payload = srv.enrich_error_payload(exc.value.payload)
     assert payload["suggested_tool"] == "hub_task_status"
-    assert "hub_task_status(task_id=1250)" in payload["message"]
+    assert "hub_task_status(task_id=1250, updates=-1)" in payload["message"]
 
 
 def _write_routes_in_module() -> dict[str, str]:
@@ -5165,3 +5257,570 @@ def test_stateless_transport_leaves_no_tool_without_its_session():
         if tool.context_kwarg is not None
     ]
     assert needs_session == []
+
+
+async def test_claim_and_pair_start_messages_carry_worktree_hint(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#1515: both responses name where the worktree goes."""
+    hint = "../.<имя вашего клона>-worktrees/task-41 — `hp-hub worktree 41`"
+    mock_api_post.return_value = {"status": "claimed", "worktree_hint": hint}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {"id": 41, "status": "claimed", "claimed_by": "composer"},
+    ]
+    claim = json.loads(await hub_claim_task(41, "composer", session_id="s"))
+    assert f"Worktree: {hint}" in claim["message"]
+
+    mock_api_post.return_value = {"status": "running", "worktree_hint": hint}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "claimed"},
+        {"id": 41, "status": "running", "branch": "task-41/x"},
+    ]
+    pair = json.loads(await hub_pair_start(41, plan="Plan: x"))
+    assert f"Worktree: {hint}" in pair["message"]
+
+
+def _big_task(updates: int = 40, **extra: Any) -> dict[str, Any]:
+    """AC-1 fixture: long description/hints/result, 5 AC, a long feed."""
+    task: dict[str, Any] = {
+        "id": 1613,
+        "title": "Big card",
+        "status": "running",
+        "task_type": "task",
+        "work_type": "chore",
+        "size": "M",
+        "source": "agent",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 0,
+        "submission_generation": 2,
+        "submission_sha": "abc123",
+        "branch": "task-1613/x",
+        "pr_number": 77,
+        "review_verdict": "approved",
+        "review_approved_current": True,
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [],
+        },
+        "dependencies": {"blocked_by": [], "blocks": []},
+        "created_at": "2026-01-01T00:00:00Z",
+        "description": "D" * 6000,
+        "technical_hints": "H" * 3000,
+        "scope_in": ["in one", "in two"],
+        "scope_out": ["out one"],
+        "validation_commands": ["uv run pytest -q"],
+        "acceptance_criteria": [
+            {
+                "id": f"AC-{i}",
+                "given": "g" * 80,
+                "when": "w" * 80,
+                "then": "t" * 80,
+                "verifiable_by": "test",
+            }
+            for i in range(1, 6)
+        ],
+        "updates": [
+            {
+                "id": 1000 + i,
+                "task_id": 1613,
+                "created_at": f"2026-01-02T00:{i:02d}:00Z",
+                "kind": "status",
+                "agent": "a1",
+                "content": f"entry-{i} " + "u" * 290,
+            }
+            for i in range(updates)
+        ],
+        "result_text": "R" * 2000,
+        "log_tail": ["line1"],
+    }
+    task.update(extra)
+    return task
+
+
+def _shown_entries(text: str) -> list[int]:
+    return [int(m) for m in re.findall(r"entry-(\d+) ", text)]
+
+
+async def test_hub_task_status_is_compact_by_default_and_full_on_request(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-1 (#1613): compact default in both halves, bounds, full=true intact."""
+    from hub.services.mcp_telemetry import measure_response
+
+    rest = _big_task()
+    mock_api_get.return_value = rest
+    full = await hub_task_status(1613, full=True)
+    default = await hub_task_status(1613)
+
+    # Same measure, same fixture: the default costs at most a third.
+    assert measure_response(default) * 3 <= measure_response(full)
+    # full=true: the REST object byte for byte, whole feed, updates ignored.
+    assert _mcp_structured(full)["task"] == rest
+    for n in (0, -1, 10):
+        again = await hub_task_status(1613, full=True, updates=n)
+        assert _mcp_structured(again)["task"] == rest
+        assert _mcp_text(again) == _mcp_text(full)
+    assert len(_shown_entries(_mcp_text(full))) == 40
+
+    text, card = _mcp_text(default), _mcp_structured(default)["task"]
+    # Both halves are compact: no 6000-char description, no Given/When/Then.
+    assert "D" * 2000 not in text
+    assert "Given:" not in text
+    assert "description" not in card and "acceptance_criteria" not in card
+    assert len(card["updates"]) == 10 and card["updates_total"] == 40
+    assert _shown_entries(text) == list(range(30, 40))
+    # Bounds in both halves: what, shown/total, and the way to the rest.
+    assert "[bounded] updates 10/40" in text
+    assert "updates=-1" in text and "full=true" in text
+    assert "GET /api/tasks/1613/updates" in text
+    bound = next(b for b in card["bounds"] if b["field"] == "updates")
+    assert (bound["shown"], bound["total"]) == (10, 40)
+    assert "updates=-1" in bound["read_more"] and "full=true" in bound["read_more"]
+    assert "/api/tasks/1613/updates" in bound["read_more"]
+    fields = {b["field"] for b in card["bounds"]}
+    assert {"description", "technical_hints", "result_text"} <= fields
+    assert "[bounded] description 1500/6000" in text
+
+    none = await hub_task_status(1613, updates=0)
+    assert _shown_entries(_mcp_text(none)) == []
+    assert _mcp_structured(none)["task"]["updates"] == []
+    assert _mcp_structured(none)["task"]["updates_total"] == 40
+    assert "[bounded] updates 0/40" in _mcp_text(none)
+
+    whole = await hub_task_status(1613, updates=-1)
+    assert _shown_entries(_mcp_text(whole)) == list(range(40))
+    assert len(_mcp_structured(whole)["task"]["updates"]) == 40
+    assert "[bounded] updates" not in _mcp_text(whole)
+    assert "D" * 2000 not in _mcp_text(whole)
+
+    with pytest.raises(HubApiError) as exc:
+        await hub_task_status(1613, updates=-2)
+    assert exc.value.payload["reason"] == "invalid_updates"
+    assert "-1" in exc.value.payload["message"]
+
+
+async def test_a_write_pushed_out_of_the_window_is_found_with_the_full_feed(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-2 (#1613): a write 12 entries back is not in the window — and the
+    answer says to read updates=-1 before repeating it."""
+    task = _big_task(updates=0)
+    mine = {
+        "id": 5000,
+        "created_at": "2026-01-02T00:00:00Z",
+        "kind": "report",
+        "agent": "me",
+        "content": "MY-SUBMISSION-REPORT",
+    }
+    later = [
+        {
+            "id": 5001 + i,
+            "created_at": f"2026-01-02T01:{i:02d}:00Z",
+            "kind": "status",
+            "agent": "other",
+            "content": f"later-{i}",
+        }
+        for i in range(12)
+    ]
+    task["updates"] = [mine, *later]
+    mock_api_get.return_value = task
+
+    default = await hub_task_status(1613)
+    text = _mcp_text(default)
+    assert "MY-SUBMISSION-REPORT" not in text
+    assert "[bounded] updates 10/13" in text
+    assert "BEFORE repeating a write" in text and "updates=-1" in text
+    card = _mcp_structured(default)["task"]
+    assert all(u["id"] != 5000 for u in card["updates"])
+    note = next(b for b in card["bounds"] if b["field"] == "updates")["note"]
+    assert "updates=-1" in note
+
+    whole = await hub_task_status(1613, updates=-1)
+    assert "#5000" in _mcp_text(whole) and "MY-SUBMISSION-REPORT" in _mcp_text(whole)
+    assert any(
+        u["id"] == 5000 and u["content"] == "MY-SUBMISSION-REPORT"
+        for u in _mcp_structured(whole)["task"]["updates"]
+    )
+
+    # The other variant: no such write at all — absent from the full feed too.
+    task["updates"] = later
+    absent = await hub_task_status(1613, updates=-1)
+    assert "MY-SUBMISSION-REPORT" not in _mcp_text(absent)
+    assert all(u["id"] != 5000 for u in _mcp_structured(absent)["task"]["updates"])
+
+
+def test_the_transport_hint_sends_a_truncated_feed_check_to_the_full_feed() -> None:
+    """AC-2 (#1613): the hint a swallowed task write carries names updates=-1."""
+    from hub import mcp_server as srv
+
+    pattern, tool, advice = next(
+        row for row in srv._TRANSPORT_WRITE_CHECKS if row[1] == "hub_task_status"
+    )
+    assert pattern.match("/api/tasks/1250/updates")
+    assert "updates=-1" in advice and "{task_id}" in advice
+
+
+async def test_the_compact_task_card_keeps_the_required_fields(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-3 (#1613): every required card field is present and equals REST."""
+    rest = _big_task()
+    mock_api_get.return_value = rest
+    out = await hub_task_status(1613)
+    card = _mcp_structured(out)["task"]
+    required = (
+        "id title status work_type size submission_generation submission_sha "
+        "branch pr_number review_verdict review_approved_current latest_review "
+        "dependencies"
+    ).split()
+    for name in required:
+        assert name in card, name
+        assert card[name] == rest[name], name
+    assert card["acceptance_criteria_ids"] == [f"AC-{i}" for i in range(1, 6)]
+    assert card["updates_total"] == len(rest["updates"])
+    assert card["updates"] == [
+        {key: u[key] for key in ("id", "created_at", "kind", "agent", "content")}
+        for u in rest["updates"][-10:]
+    ]
+    assert isinstance(card["bounds"], list) and card["bounds"]
+    # Through the real FastMCP path: the SDK validates structuredContent
+    # against the published outputSchema (task: dict) on the server.
+    from hub import mcp_server as srv
+
+    called = await srv.mcp.call_tool("hub_task_status", {"task_id": 1613})
+    assert isinstance(called, (CallToolResult, tuple, list, dict))
+
+
+def _golden_task() -> dict[str, Any]:
+    """Fixture whose full=true text was captured from develop (74d48f5)."""
+    return {
+        "id": 321,
+        "title": "Golden",
+        "status": "review",
+        "source": "agent",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "description": "Describe it.",
+        "technical_hints": "Look here.",
+        "scope_in": ["a", "b"],
+        "scope_out": ["c"],
+        "validation_commands": ["uv run pytest -q"],
+        "lifecycle_hint": "waiting for ci",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [{"id": 1, "severity": "high", "message": "Fix"}],
+        },
+        "acceptance_criteria": [
+            {
+                "id": "AC-1",
+                "verifiable_by": "test",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+            }
+        ],
+        "updates": [
+            {
+                "id": 7,
+                "created_at": "2026-01-02T00:00:00Z",
+                "kind": "status",
+                "agent": "a1",
+                "content": "one",
+            },
+            {
+                "id": 8,
+                "created_at": "2026-01-03T00:00:00Z",
+                "kind": "report",
+                "agent": "",
+                "content": "two",
+            },
+        ],
+        "result_text": "Done.",
+        "log_tail": ["l1", "l2"],
+    }
+
+
+_GOLDEN_FULL_TEXT = "Task #321: Golden\nStatus: review\nSource: agent\nRuntime: auto\nAgent: tester\nJob ID: None\nExit code: None\nReview: enabled, cycle 1\nCreated: 2026-01-01T00:00:00Z\n\nDescription:\nDescribe it.\n\nTechnical hints:\nLook here.\n\nScope:\n  In: a; b\n  Out: c\n\nValidation commands:\n  - uv run pytest -q\n\nLifecycle: waiting for ci\n\nLatest review: CHANGES_REQUESTED for submission #2 (current)\n  1. [high] Fix\n\nAcceptance criteria:\n  AC-1 [test]\n    Given: g\n    When: w\n    Then: t\n\nUpdates:\n  [2026-01-02T00:00:00Z] (status) a1: one\n  [2026-01-03T00:00:00Z] (report) : two\n\nResult:\nDone.\n\nLog tail:\nl1\nl2"
+
+
+async def test_full_text_is_the_text_develop_produced(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#1613: full=true keeps the pre-change text byte for byte (reference
+    captured from develop 74d48f5, not produced by the code under test) —
+    including the id-less feed line — and checks no updates bound at all."""
+    mock_api_get.return_value = _golden_task()
+    for kwargs in ({"full": True}, {"full": True, "updates": -2}):
+        out = await hub_task_status(321, **kwargs)
+        assert json.loads(_mcp_text(out))["message"] == _GOLDEN_FULL_TEXT
+        assert _mcp_structured(out)["task"] == _golden_task()
+    with pytest.raises(HubApiError):
+        await hub_task_status(321, updates=-2)
+
+
+async def test_the_text_says_when_findings_are_cut_at_ten(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["latest_review"]["findings"] = [
+        {"id": i, "severity": "low", "message": f"finding-{i}"} for i in range(1, 51)
+    ]
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = _mcp_text(out)
+    assert "finding-10" in text and "finding-11" not in text
+    assert "[bounded] latest_review.findings 10/50 items — full: full=true" in text
+    # The card keeps the whole latest_review (equal to REST), so it states no cut.
+    card = _mcp_structured(out)["task"]
+    assert len(card["latest_review"]["findings"]) == 50
+    assert all(b["field"] != "latest_review.findings" for b in card["bounds"])
+
+
+async def test_bounds_count_what_was_cut_in_one_stated_unit(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["description"] = "x" * 1490 + " " * 40 + "tail" * 10  # blank run at the cut
+    task["updates"][1]["content"] = "L" * 2000
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = json.loads(_mcp_text(out))["message"]
+    card = _mcp_structured(out)["task"]
+
+    # (a) the cut entry is counted in characters of THAT entry
+    entry = next(b for b in card["bounds"] if b["field"] == "updates[#8].content")
+    assert (entry["unit"], entry["shown"], entry["total"]) == ("chars", 800, 2000)
+    assert "[bounded] updates[#8].content 800/2000 chars" in text
+    assert not any(b["field"] == "updates.content" for b in card["bounds"])
+
+    # (b) text and card state their own cuts: the card has no description at all
+    desc_text = "[bounded] description 1500/1570 chars"
+    assert desc_text in text
+    in_card = next(b for b in card["bounds"] if b["field"] == "description")
+    assert (in_card["shown"], in_card["total"]) == (0, 1570)
+    assert "description" not in card
+    # a short field is absent from the card too — and named
+    hints = next(b for b in card["bounds"] if b["field"] == "technical_hints")
+    assert (hints["shown"], hints["total"]) == (0, len("Look here."))
+    assert "technical_hints" not in text.split("[bounded]", 1)[1]
+
+    # (c) the declared omission is the real one: 1570-1500, the blank run kept
+    excerpt_line = next(
+        line for line in text.splitlines() if line.startswith("x" * 100)
+    )
+    assert excerpt_line.endswith("… [+70 chars]")
+    assert excerpt_line[: -len("… [+70 chars]")] == task["description"][:1500]
+
+
+def test_the_published_schema_has_no_generated_titles() -> None:
+    from hub import mcp_server as srv
+
+    tool = srv.mcp._tool_manager.get_tool("hub_task_status")
+    assert tool is not None
+    assert "title" not in tool.parameters
+    assert all("title" not in p for p in tool.parameters["properties"].values())
+
+
+async def _outcome_debt_tool(db, seen: list[str], **kwargs):
+    """Run hub_outcome_debt against the real service behind a recording stub."""
+    from urllib.parse import parse_qs, urlsplit
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+    from hub.services.outcomes import outcome_debt
+
+    async def fake_get(path: str, **_: object):
+        seen.append(path)
+        q = {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+        return await outcome_debt(
+            db,
+            status=q.get("status"),
+            limit=int(q["limit"]) if "limit" in q else None,
+            offset=int(q["offset"]) if "offset" in q else None,
+            only_counts=q.get("only_counts") == "true",
+        )
+
+    with patch.object(mcp_server, "_api_get", AsyncMock(side_effect=fake_get)):
+        result = await mcp_server.hub_outcome_debt(**kwargs)
+    text = "\n".join(b.text for b in result.content if hasattr(b, "text"))
+    return result, text
+
+
+async def test_hub_outcome_debt_defaults_to_counts_and_first_page(db) -> None:
+    """AC-4. No arguments: overdue, 20 rows, counters; text and structured
+    content carry the page only and name "показано 20 из 60" plus the next offset."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=60, observing=2, unknown=1, answered=1)
+    seen: list[str] = []
+
+    result, text = await _outcome_debt_tool(db, seen)
+
+    data = result.structuredContent["outcome_debt"]
+    assert "status=overdue" in seen[0] and "limit=20" in seen[0]
+    assert len(data["rows"]) == 20 and data["total_in_status"] == 60
+    assert data["overdue_total"] == 60 and data["observing_total"] == 2
+    for key in ("items", "overdue", "observing", "unknown", "answered"):
+        assert key not in data
+    assert "показано 20 из 60" in text and "offset=20" in text
+    assert text.count("metric:") == 20, "text rows are bounded by the page"
+
+
+async def test_hub_outcome_debt_never_says_no_debt_from_an_empty_page(db) -> None:
+    """AC-5. "No outcome debt" only when total is zero, never from an empty page."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, observing=2, unknown=1)
+    no_debt = "No outcome debt"
+
+    _, counts = await _outcome_debt_tool(db, [], only_counts=True)
+    _, answered = await _outcome_debt_tool(db, [], status="answered")
+    _, no_overdue = await _outcome_debt_tool(db, [])
+
+    for text in (counts, answered, no_overdue):
+        assert no_debt not in text
+        assert "0 overdue, 2 observing, 1 unknown" in text
+    assert "показано 0 из 0" in no_overdue
+
+    from hub import mcp_server  # empty hub: total is zero, the claim is true
+    from unittest.mock import AsyncMock, patch
+
+    empty = {"total": 0, "answered_total": 3, "rows": [], "next_offset": None}
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=empty)):
+        result = await mcp_server.hub_outcome_debt()
+    assert no_debt in result.content[0].text
+
+
+_OUTCOME_DEBT_HOW_TO_GET_ALL = (
+    "REST GET /api/metrics/outcome-debt без параметров",
+    "CLI hp-hub outcome-debt без флагов",
+    "status=overdue|observing|unknown|answered",
+)
+
+
+async def test_hub_outcome_debt_always_says_how_to_get_the_rest(db) -> None:
+    """AC-4 review P2. The way to the other statuses and the full JSON is in
+    every answer with debt: last page, offset past the end, counters only."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=2, observing=2, unknown=1)
+
+    _, last_page = await _outcome_debt_tool(db, [])
+    _, past_end = await _outcome_debt_tool(db, [], offset=200)
+    _, counts = await _outcome_debt_tool(db, [], only_counts=True)
+
+    assert "показано 2 из 2" in last_page and "последняя страница" in last_page
+    assert "offset=200 за концом списка, начните с offset=0" in past_end
+    assert "показано 0 из 2" in past_end
+    for text in (last_page, past_end, counts):
+        for phrase in _OUTCOME_DEBT_HOW_TO_GET_ALL:
+            assert phrase in text
+
+
+async def test_hub_outcome_debt_no_hint_when_there_is_no_debt(db) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+
+    empty = {"total": 0, "answered_total": 0, "rows": [], "next_offset": None}
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=empty)):
+        result = await mcp_server.hub_outcome_debt()
+
+    assert "REST GET" not in result.content[0].text
+
+
+async def test_submit_for_review_shows_ci_before_submit_refusal(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock, capsys
+) -> None:
+    """AC-5 (#1629): MCP и CLI показывают причину и подсказку отказа."""
+    from hub import cli
+    from hub.actionable_errors import ci_before_submit_unproven_detail
+
+    detail = ci_before_submit_unproven_detail(
+        ["отчёта CI о коммите abc нет"], head_sha="abc", cause="no_report"
+    )
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.side_effect = HubApiError(detail)
+    out = json.loads(await hub_submit_for_review(42, model="m", summary="s"))
+    assert out["reason"] == "ci_before_submit_unproven"
+    assert out["cause"] == "no_report"
+    assert out["hint"]
+
+    import io
+    import sys
+    import urllib.error
+    from unittest.mock import MagicMock
+
+    boom = urllib.error.HTTPError(
+        "http://hub/api/tasks/42/submit-review",
+        422,
+        "Unprocessable",
+        MagicMock(),
+        io.BytesIO(json.dumps({"detail": detail}).encode()),
+    )
+    with (
+        patch.object(sys, "argv", ["oc-hub", "submit-review", "42"]),
+        patch("urllib.request.urlopen", side_effect=boom),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        cli.main()
+    assert exit_info.value.code not in (0, None)
+    err = capsys.readouterr().err
+    assert "reason: ci_before_submit_unproven" in err
+    assert "Дождитесь отчёта CI" in err
+
+
+async def test_practice_metrics_text_names_window_beyond_history(
+    mock_api_get: AsyncMock,
+) -> None:
+    # #1621: окно длиннее хранения events называется в тексте ответа.
+    from hub.mcp_server import hub_practice_metrics
+
+    history_from = "2026-09-25T10:00:00+00:00"
+    mock_api_get.return_value = {
+        "since_days": 30,
+        "machine_reviews": {},
+        "events_history": {
+            "retention_days": 14,
+            "history_from": history_from,
+            "windows_beyond_history": ["current"],
+            "events_sections": [],
+            "note": "окно по events длиннее хранения: по политике хранения (14 дн.) "
+            f"данные раньше {history_from} не гарантированы; более старые "
+            "события могут оставаться до очистки",
+        },
+    }
+    text = _mcp_text(await hub_practice_metrics(since_days=30))
+    assert (
+        f"данные раньше {history_from} не гарантированы; более старые события "
+        "могут оставаться до очистки"
+    ) in text
+    assert "current" in text
+
+    mock_api_get.return_value = {
+        "since_days": 7,
+        "machine_reviews": {},
+        "events_history": {
+            "retention_days": 14,
+            "history_from": history_from,
+            "windows_beyond_history": [],
+            "events_sections": [],
+            "note": "",
+        },
+    }
+    text = _mcp_text(await hub_practice_metrics(since_days=7))
+    assert "длиннее хранения" not in text

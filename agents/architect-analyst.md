@@ -21,7 +21,7 @@
   `hub_replace_acceptance_criteria`, and `hub_add_risk` to turn drafts into
   ready work.
 - Use `hub_get_readiness` until required DoR checks pass or a human explicitly
-  chooses `hub_approve_task(..., force=true)`.
+  chooses to force approval (REST `POST /api/tasks/{id}/approve` with `force=true`).
 - Ask missing requirement questions with `hub_ask_question`; record process
   blockers with `hub_task_update(..., kind="blocker")`.
 - Create newly discovered work with `hub_propose_task` instead of expanding the

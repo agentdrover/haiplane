@@ -56,3 +56,41 @@ async def test_already_finished_child_is_a_noop():
     )
     await proc.wait()
     await kill_process_group(proc)  # must not raise
+
+
+async def test_run_kills_process_group_on_cancel(tmp_path):
+    # AC-4 (#1603): отмена корутины не оставляет дочерние процессы, а
+    # CancelledError идёт дальше. Реальные процессы, без моков.
+    from hub.integrations import proc
+
+    pidfile = tmp_path / "child.pid"
+    task = asyncio.create_task(
+        proc.run("sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait", timeout=60)
+    )
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    pid = int(pidfile.read_text().strip())
+    try:
+        task.cancel()
+        raised = False
+        try:
+            await task
+        except asyncio.CancelledError:
+            raised = True
+        assert raised, "CancelledError was swallowed"
+        alive = True
+        for _ in range(40):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            await asyncio.sleep(0.05)
+        assert not alive, "the child survived the cancellation"
+    finally:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
