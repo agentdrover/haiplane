@@ -64,6 +64,7 @@ SIGNATURES: dict[str, str] = {
     "ruff format --check": "ruff format --check",
     "mypy": "mypy",
     "complexity_budget.py": "complexity_budget.py",
+    "file_size_budget.py": "file_size_budget.py",
     "mcp_catalog_budget.py": "mcp_catalog_budget.py",
     "pytest": "pytest",
     "bandit": "bandit",

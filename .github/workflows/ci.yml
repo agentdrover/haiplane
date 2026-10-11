@@ -138,6 +138,13 @@ jobs:
         id: complexity
         run: uv run python scripts/complexity_budget.py
 
+      # #1669: размер .py-файла ничем не ограничен, а крупный дифф deep-ревью
+      # не дочитывает. Пороги по деревьям — в pyproject.toml, ledger — в
+      # docs/agent-context/file-size-budget.json. Печатается всегда.
+      - name: File size budget
+        id: file_size
+        run: uv run python scripts/file_size_budget.py
+
       - name: Check formatting
         id: format
         run: uv run ruff format --check hub tests
