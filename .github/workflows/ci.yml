@@ -143,6 +143,7 @@ jobs:
       # docs/agent-context/file-size-budget.json. Печатается всегда.
       - name: File size budget
         id: file_size
+        if: ${{ !cancelled() }}
         run: uv run python scripts/file_size_budget.py
 
       - name: Check formatting

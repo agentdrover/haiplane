@@ -52,6 +52,16 @@ def load_thresholds(root: Path) -> dict[str, int]:
     return {str(tree): int(limit) for tree, limit in section.items()}
 
 
+def count_lines(data: bytes) -> int:
+    """Физические строки, как `wc -l` плюс последняя строка без перевода.
+
+    str.splitlines() считает разделителями U+2028, form feed и другие, и файл
+    из 1500 физических строк с таким символом в литерале меряется как 1501.
+    CRLF — одна строка.
+    """
+    return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+
+
 def measure(root: Path, trees: list[str]) -> dict[str, int]:
     """Число строк каждого .py под деревьями, ключ — путь от корня."""
     sizes: dict[str, int] = {}
@@ -59,8 +69,7 @@ def measure(root: Path, trees: list[str]) -> dict[str, int]:
         for path in sorted((root / tree).rglob("*.py")):
             if _SKIP_DIRS & set(path.relative_to(root).parts):
                 continue
-            text = path.read_text(encoding="utf-8")
-            sizes[path.relative_to(root).as_posix()] = len(text.splitlines())
+            sizes[path.relative_to(root).as_posix()] = count_lines(path.read_bytes())
     return sizes
 
 
@@ -80,6 +89,12 @@ class Report:
     by_reason: dict[str, int]
 
     @property
+    def loud(self) -> tuple[tuple[str, int, int], ...]:
+        """Waived-файлы на ≥90% потолка, самые заполненные первыми."""
+        hot = [w for w in self.waived if w[1] * 100 >= LOUD_AT_PCT * w[2]]
+        return tuple(sorted(hot, key=lambda p: -(p[1] / p[2])))
+
+    @property
     def ok(self) -> bool:
         return not (self.new or self.over or self.stale)
 
@@ -90,6 +105,10 @@ class Report:
             "over": [{"path": p, "lines": n, "max": m} for p, n, m in self.over],
             "stale": [{"path": p, "reason": r} for p, r in self.stale],
             "waived_count": len(self.waived),
+            "loud": [
+                {"path": p, "lines": n, "max": m, "used_pct": round(100.0 * n / m, 1)}
+                for p, n, m in self.loud
+            ],
             "by_reason": dict(self.by_reason),
         }
 
@@ -160,10 +179,16 @@ def format_report(report: Report) -> str:
     lines.append(f"Исключений в силе: {len(report.waived) + len(report.over)}")
     for kind, count in sorted(report.by_reason.items()):
         lines.append(f"  {kind}: {count}")
-    for path, n, allowed in sorted(report.waived, key=lambda p: -(p[1] / p[2]))[:5]:
+    shown = sorted(report.waived, key=lambda p: -(p[1] / p[2]))[:5]
+    for path, n, allowed in shown:
         used = 100.0 * n / allowed
         mark = "  <-- запас почти съеден" if used >= LOUD_AT_PCT else ""
         lines.append(f"  {path} {n}/{allowed} ({used:.0f}%){mark}")
+    hidden = [w for w in report.loud if w not in shown]
+    if hidden:
+        lines.append(
+            f"  и ещё {len(hidden)} файлов ≥{LOUD_AT_PCT:.0f}% потолка (полный список: --json)"
+        )
     return "\n".join(lines)
 
 
