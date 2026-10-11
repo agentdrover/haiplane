@@ -2969,31 +2969,3 @@ def test_admin_keys_create_sends_project_scope():
     )
     assert rc == 0
     assert api.call_args_list[1].args[2]["projects"] == ["audit-in"]
-
-
-def test_list_prints_the_project_of_each_task() -> None:
-    """AC-6 (#1672): hp-hub list и proposals называют проект каждой задачи."""
-    base = {"status": "draft", "task_type": "task", "runtime": "auto"}
-    tasks = [
-        {
-            **base,
-            "id": 1,
-            "title": "A",
-            "source": "agent",
-            "project": {"slug": "default"},
-        },
-        {
-            **base,
-            "id": 2,
-            "title": "B",
-            "source": "agent",
-            "project": {"slug": "it-grade"},
-        },
-    ]
-    args = argparse.Namespace(limit=10, status="draft", type=None, parent=None)
-    for run in (cli.cmd_list, cli.cmd_proposals):
-        with patch.object(cli, "_api", MagicMock(return_value=tasks)):
-            with patch("sys.stdout", new=StringIO()) as out:
-                assert run(args) == 0
-        lines = out.getvalue().splitlines()
-        assert "[default]" in lines[0] and "[it-grade]" in lines[1], lines

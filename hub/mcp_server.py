@@ -3349,7 +3349,8 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
     """
     # Read the status BEFORE the call: afterwards the task has already moved,
     # and transition.from would report the destination as the origin (#369).
-    prior_status = await _prior_status(task_id)
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
     try:
         await _api_post(
             f"/api/tasks/{task_id}/question",
@@ -3360,7 +3361,7 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
         )
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     message = (
         f"Question posted on task #{task_id}. Task is now paused (needs_info). "
         "Waiting for human answer."
@@ -3381,7 +3382,8 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
         answer: The answer text
         resume: If True, resume work after the answer. Pair: no dispatch; headless: re-dispatch.
     """
-    prior_status = await _prior_status(task_id)
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
     try:
         result = await _api_post(
             f"/api/tasks/{task_id}/answer",
@@ -3392,7 +3394,7 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
         )
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _format_hub_api_error(exc, prior_task)
     status = task.get("status", result.get("status", "?"))
     message = f"Answer posted on task #{task_id} (status: {status})."
     return _format_mutation_success(message, task, transition_from=prior_status)

@@ -5953,6 +5953,21 @@ async def test_refusal_of_a_known_task_names_the_project(
     refused = json.loads(await hub_report_done(task.id, "готово", agent="a"))
     assert refused.get("reason"), refused  # это настоящий отказ, не успех
     assert refused["project"] == "proj-r"
+    # #1672: каждое место, где инструмент читает задачу до отказа.
+    finished = await services.create_task(
+        db, TaskCreate(title="d", task_type="task", parent_id=epic.id)
+    )
+    await repo.update_task(db, finished.id, status="completed")
+    await db.commit()
+    for refusal in (
+        await hub_ask_question(finished.id, "вопрос?", agent="a"),
+        await hub_answer_question(finished.id, "ответ"),
+        await hub_pair_start(finished.id, assigned_agent="a", session_id="s"),
+    ):
+        payload = json.loads(refusal)
+        # Настоящий отказ, не успех: перехода нет.
+        assert payload["transition"] is None, payload
+        assert payload["project"] == "proj-r", payload
     # Задача не прочитана (нет такой) — отказ без project.
     unknown = json.loads(await hub_report_done(987654, "готово", agent="a"))
     assert "project" not in unknown, unknown
