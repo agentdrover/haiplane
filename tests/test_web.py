@@ -7824,9 +7824,18 @@ async def test_web_archive_of_active_task_shows_the_refusal(client: AsyncClient,
     )
     assert page.status_code in (200, 409), page.status_code
     assert f"#{kid}" in page.text and "archive_active_work" in html.unescape(page.text)
-    assert re.search(r'name="cascade"[^>]*value="true"', page.text)
-    assert 'name="reason"' in page.text, "поле причины осталось на странице"
+    banner = page.text.split('id="archive-refusal"')[1].split("</form>")[0]
+    assert re.search(r'name="cascade"[^>]*value="true"', banner)
+    assert 'name="reason"' in banner, "поле причины осталось на странице"
     assert not await archived(db, epic) and not await archived(db, kid)
+
+    solo = await mk(db, "Одиночная", "running")
+    alone = await client.post(
+        f"/tasks/{solo}/web-archive", data={"cascade": "false", "reason": "  "}
+    )
+    assert alone.status_code in (200, 409)
+    banner = alone.text.split('id="archive-refusal"')[1].split("</form>")[0]
+    assert re.search(r'name="cascade"[^>]*value="false"', banner)
 
     done = await client.post(
         url,
