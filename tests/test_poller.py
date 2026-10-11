@@ -3143,7 +3143,7 @@ async def _refused_review_queue(client, db, monkeypatch, slugs: list[str]) -> li
     читает алерт, который пишет диспетчер, и связь с его текстом держит этот
     путь, а не копия строки в тесте.
     """
-    from tests.test_review_dispatch import (
+    from tests.review_dispatch_support import (
         _LIMIT_REFUSAL,
         _DispatchRecorder,
         _no_local_path,
@@ -3243,7 +3243,7 @@ async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatc
         generation_review,
         signal_state,
     )
-    from tests.test_review_dispatch import _DispatchRecorder, _wire
+    from tests.review_dispatch_support import _DispatchRecorder, _wire
 
     monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
     first, second = await _refused_review_queue(
@@ -3379,7 +3379,7 @@ async def test_fresh_refusals_keep_a_raised_signal_instead_of_a_false_clear(
         observe_outage,
         signal_state,
     )
-    from tests.test_review_dispatch import _submitted
+    from tests.review_dispatch_support import _submitted
 
     monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
     old = await _refused_review_queue(
@@ -3416,7 +3416,7 @@ async def _held_by_fresh_refusals(
     """Сценарий удержания: сигнал поднят по A и B, они ушли из review, C и D
     сданы и сразу отказаны — провайдер не ожил, картина очереди сменилась."""
     from hub.poller import _sweep_reviewer_unavailable
-    from tests.test_review_dispatch import _submitted
+    from tests.review_dispatch_support import _submitted
 
     monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
     old = await _refused_review_queue(

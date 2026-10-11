@@ -195,7 +195,7 @@ async def test_the_authors_claim_survives_the_dispatch_note(
     from hub.services.review_brief import build_review_brief
     from hub.services.steward_applied import _commit_signal
     from hub.integrations.registry import plugins
-    from tests.test_review_dispatch import (
+    from tests.review_dispatch_support import (
         _TIP,
         _DispatchRecorder,
         _node,

@@ -9,12 +9,12 @@ from httpx import AsyncClient
 from hub import config
 from hub.integrations import cursor_cloud
 from hub.services.review_dispatch import sweep_review_dispatches
-from tests.test_review_dispatch import (
-    _Sequence,
+from tests.review_dispatch_support import (
     _age_dispatches,
     _alerts_of,
     _no_local_path,
     _rows_of,
+    _Sequence,
     _submitted,
     _wire,
 )
