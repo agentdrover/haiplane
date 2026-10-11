@@ -19,6 +19,12 @@
   `task:#NNNN`, `permanent` с причиной или честное `unclaimed`. Запись
   снимается удалением строки: если нарушения больше нет, проверка сама
   потребует её убрать.
+- Файл .py выше порога размера красит CI (`scripts/file_size_budget.py`, #1669).
+  Пороги по деревьям — в `pyproject.toml` (`[tool.haiplane.file_size]`), ledger —
+  в `docs/agent-context/file-size-budget.json`. Новый файл выше порога или рост
+  файла из ledger выше потолка: разбейте файл; если нельзя, `--update` и впишите
+  `removed_by` руками (`task:#NNNN`, `permanent` с причиной или `unclaimed`).
+  Запись снимается удалением строки, когда файл вернулся под порог.
 - If a change touches MCP tool docstrings or signatures, it changes the published
   `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too).
   If the headroom is not enough, follow `working_headroom_note` in
