@@ -1,8 +1,10 @@
 name: Report AC tests and validation to Haiplane Hub
 description: >-
-  Run a task's bound AC tests and validation commands and report the result to
-  the hub as evidence about ONE commit. Never fails the job, never reports a
-  guess: silence is read by the hub as "unknown", never as success.
+  Run a task's bound AC tests and validation commands as evidence about ONE
+  commit. With hub-read-token (#1686) the results are written to results-dir
+  for a trusted workflow to send; with only hub-token the action sends them
+  itself (satellite repositories, until they move). Never fails the job, never
+  reports a guess: silence is read by the hub as "unknown", never as success.
 
 inputs:
   hub-url:
@@ -11,10 +13,25 @@ inputs:
     default: ""
   hub-token:
     description: >-
-      Token of a ci_runner principal. It holds one permission (tasks.ci_report)
-      and can neither move a task nor write a verdict — keep it that way.
+      Token of a ci_runner principal, used only when hub-read-token is absent
+      (the satellite mode). It holds one permission (tasks.ci_report) and can
+      neither move a task nor write a verdict — keep it that way. The hub's own
+      workflow does NOT pass it: the code of a task branch runs in this job.
     required: false
     default: ""
+  hub-read-token:
+    description: >-
+      Token of a ci_reader principal bound to the project (#1686): it can read
+      the task card and nothing else. With it the action sends nothing to the
+      hub; it writes the results to results-dir.
+    required: false
+    default: ""
+  results-dir:
+    description: >-
+      Directory the results are written to in collect mode. The workflow uploads
+      it as the artifact hub-ci-results-<run_attempt>.
+    required: false
+    default: "hub-ci-results"
   head-sha:
     description: >-
       The commit this run is evidence ABOUT — the BRANCH HEAD. On pull_request
@@ -106,6 +123,8 @@ runs:
       env:
         HAIPLANE_HUB_URL: ${{ inputs.hub-url }}
         HAIPLANE_HUB_CI_TOKEN: ${{ inputs.hub-token }}
+        HAIPLANE_HUB_CI_READ_TOKEN: ${{ inputs.hub-read-token }}
+        HAIPLANE_HUB_CI_RESULTS_DIR: ${{ inputs.results-dir }}
         HEAD_SHA: ${{ inputs.head-sha }}
         HAIPLANE_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
         HAIPLANE_HUB_CI_CHECKS: ${{ inputs.checks }}

@@ -304,6 +304,8 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
     # Role -> legacy role (first match in the order below wins):
     #   super_admin, admin, security_admin -> admin
     #   steward, watcher                   -> steward / watcher
+    #   ci_reader, ci_auditor              -> themselves (#1686): the legacy role
+    #                                         IS the confinement, as for watcher
     #   operator, developer, viewer        -> human
     #   reviewer_agent, agent, ci_runner   -> agent
     # ci_runner sits above viewer on purpose: a CI key that also holds a viewer
@@ -316,6 +318,8 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         "security_admin",
         "steward",
         "watcher",
+        "ci_reader",
+        "ci_auditor",
         "operator",
         "developer",
         "reviewer_agent",
@@ -326,7 +330,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         if priority in slugs:
             if priority in ("super_admin", "admin", "security_admin"):
                 return "admin"
-            if priority in ("steward", "watcher"):
+            if priority in ("steward", "watcher", "ci_reader", "ci_auditor"):
                 return priority
             if priority in ("operator", "developer", "viewer"):
                 return "human"

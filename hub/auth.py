@@ -422,6 +422,72 @@ def ci_scoped_route_allowed(
     )
 
 
+# ---------------------------------------------------------------------------
+# CI reader / CI auditor allowlists (#1686)
+# ---------------------------------------------------------------------------
+#
+# The CI job of a TASK BRANCH runs the branch's code, so the key it holds may
+# only read: ci_reader gets the card of a task (AC test refs, validation
+# commands) and nothing else. The key that files pip-audit drafts belongs to
+# the trusted workflow and has one route. Neither holds tasks.ci_report or
+# deploys.record, so neither can report a run. The project of the task and the
+# shape of the draft are checked in the handlers (hub/services/ci_scope.py).
+CI_READER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/tasks/{task_id}"),
+    ("GET", "/api/whoami"),
+)
+CI_AUDITOR_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("POST", "/api/tasks"),
+    ("GET", "/api/whoami"),
+)
+_CI_READER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in CI_READER_ALLOWLIST
+)
+_CI_AUDITOR_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in CI_AUDITOR_ALLOWLIST
+)
+
+
+def ci_key_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a ci_reader / ci_auditor key may reach ``(method, path)`` (#1686)."""
+    if identity is None:
+        return False
+    if identity.is_ci_reader:
+        allowed = _CI_READER_ALLOWED
+    elif identity.is_ci_auditor:
+        allowed = _CI_AUDITOR_ALLOWED
+    else:
+        return False
+    probe = "GET" if method == "HEAD" else method
+    return any(
+        probe == allowed_method and pattern.match(path)
+        for allowed_method, pattern in allowed
+    )
+
+
+def _ci_key_forbidden(method: str, path: str) -> Response:
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {
+                "detail": {
+                    "reason": "ci_key_route_forbidden",
+                    "actor_hint": "human",
+                    "message": (
+                        f"{method} {path}: ключ ci_reader читает только карточку "
+                        "задачи своего проекта, ключ ci_auditor заводит только "
+                        "черновики аудита зависимостей."
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
 def _ci_scoped_forbidden(method: str, path: str) -> Response:
     return Response(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -801,6 +867,10 @@ async def _role_gate(
     if _watcher_refused(identity, request.method, path):
         await _record_watcher_refusal(request, identity, path)
         return _watcher_forbidden(request.method, path)
+    if (identity.is_ci_reader or identity.is_ci_auditor) and not ci_key_route_allowed(
+        request.method, path, identity
+    ):
+        return _ci_key_forbidden(request.method, path)
     if identity.is_scoped_ci and not ci_scoped_route_allowed(
         request.method, path, identity
     ):

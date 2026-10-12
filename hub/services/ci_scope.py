@@ -29,6 +29,11 @@ REASON_REPORT = "ci_report_out_of_scope"
 REASON_DEPLOY = "ci_deploy_out_of_scope"
 REASON_DAMAGED = "ci_key_scope_damaged"
 REASON_INACTIVE = "ci_key_scope_project_inactive"
+# #1686: the ci_reader / ci_auditor keys have no legacy mode.
+REASON_READ = "ci_read_out_of_scope"
+REASON_AUDIT = "ci_audit_out_of_scope"
+REASON_UNBOUND = "ci_key_unbound"
+AUDIT_REQUEST_ID_PREFIX = "pip-audit:"
 
 
 class CIScopeRefused(Exception):
@@ -118,3 +123,57 @@ async def _flag_unscoped_key(db: Any, identity: Any) -> None:
             )
     except Exception:  # noqa: BLE001 - a missed flag must not stop CI
         log.warning("could not record the unscoped CI key event", exc_info=True)
+
+
+async def enforce_bound_ci_key(
+    db: Any,
+    identity: Any,
+    project_slug: str | None,
+    *,
+    entrance: str,
+) -> None:
+    """Scope check of a ci_reader / ci_auditor key (#1686): no legacy mode.
+
+    Unlike the reporting key, which keeps working without a scope while the
+    owner migrates (#1644), these two are new: a key without a scope, or with a
+    damaged one, is refused. Nothing is written.
+    """
+    out_reason = REASON_AUDIT if entrance == "audit" else REASON_READ
+    if getattr(identity, "scopes_damaged", False):
+        raise CIScopeRefused(
+            REASON_DAMAGED,
+            "scopes ключа повреждены: ключ отклонён. Выпустите новый ключ.",
+        )
+    scopes = getattr(identity, "scopes", None)
+    if not scopes:
+        raise CIScopeRefused(
+            REASON_UNBOUND,
+            "ключ не привязан к проекту: выпустите ключ с областью project:<slug>.",
+        )
+    await _require_active_projects(db, scopes)
+    if project_slug is None or project_slug not in scopes:
+        raise CIScopeRefused(
+            out_reason,
+            f"проект {project_slug!r} вне области ключа; его проекты: "
+            f"{', '.join(scopes)}.",
+        )
+
+
+def audit_draft_refusal(body: Any, client_request_id: str | None) -> str | None:
+    """Why a ci_auditor key may not file this task, or None when it may (#1686).
+
+    The key files one kind of task: the draft for an advisory, keyed
+    ``pip-audit:<id>`` and authored by an agent. Origin of the CI run is the
+    role of the key, so ``TaskSource`` is not widened.
+    """
+    key = client_request_id or ""
+    if not key.startswith(AUDIT_REQUEST_ID_PREFIX) or len(key) == len(
+        AUDIT_REQUEST_ID_PREFIX
+    ):
+        return "client_request_id должен быть вида pip-audit:<id>"
+    source = getattr(
+        getattr(body, "source", None), "value", getattr(body, "source", "")
+    )
+    if source != "agent":
+        return "source должен быть agent"
+    return None

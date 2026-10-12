@@ -8,6 +8,7 @@ CI authenticates as cannot do anything except report.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -944,3 +945,163 @@ async def test_a_failure_after_the_write_rolls_the_report_back(
         "SELECT 1 FROM ci_run_reports WHERE task_id = ?", (task_id,)
     )
     assert list(rows) == [], "the report must not survive a failed request"
+
+
+# ---- #1686: the key next to branch code reads; the audit key files drafts ----
+
+
+async def _role_key(hub, role: str, scopes_raw: str | None, name: str) -> dict:
+    """A REAL DB key of a fresh principal holding ``role``, bound by ``scopes_raw``."""
+    from hub.services import admin as admin_svc
+
+    principal = await admin_svc.create_principal(
+        hub.db, kind="service", username=f"{role}-{name}", role_slug=role
+    )
+    key = await admin_svc.create_api_key(hub.db, principal["id"], name=name)
+    if scopes_raw is not None:
+        await hub.db.execute(
+            "UPDATE api_keys SET scopes = ? WHERE id = ?", (scopes_raw, key["id"])
+        )
+    await hub.db.commit()
+    return {"Authorization": f"Bearer {key['plaintext_key']}"}
+
+
+_AUDIT_DRAFT = {
+    "title": "Уязвимость PYSEC-1 в pkg: обновить зависимость",
+    "description": "d",
+    "source": "agent",
+    "client_request_id": "pip-audit:PYSEC-1",
+}
+
+
+async def test_the_read_and_audit_keys_do_only_their_job(ci_runner_hub):
+    hub = ci_runner_hub
+    db, client = hub.db, hub.client
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    mine = await _project_task(db, "audit-in")
+    foreign = await _task(db, generation=1, sha="sha-pinned")
+
+    # ci_reader bound to audit-in: reads ITS task, nothing else.
+    reader = await _role_key(hub, "ci_reader", '["project:audit-in"]', "r1")
+    assert (await client.get(f"/api/tasks/{mine}", headers=reader)).status_code == 200
+    other = await client.get(f"/api/tasks/{foreign}", headers=reader)
+    assert other.status_code == 403, other.text
+    assert other.json()["detail"]["reason"] == "ci_read_out_of_scope"
+    report = {"head_sha": "sha-pinned", "ac_results": {"AC-1": "pass"}}
+    for method, path, body in (
+        ("POST", f"/api/tasks/{mine}/ci-run-report", report),
+        ("POST", "/api/tasks", {"title": "x"}),
+        ("POST", "/api/tasks", {**_AUDIT_DRAFT, "client_request_id": "pip-audit:Z"}),
+        ("POST", "/api/deploys", {"sha": "a" * 40, "ref": "main"}),
+        ("POST", f"/api/tasks/{mine}/refine", {"affected_areas": ["x"]}),
+    ):
+        resp = await client.request(method, path, json=body, headers=reader)
+        assert resp.status_code == 403, (path, resp.status_code, resp.text[:200])
+    # No scope, no reading: the new roles have no legacy mode.
+    unbound = await _role_key(hub, "ci_reader", None, "r2")
+    assert (await client.get(f"/api/tasks/{mine}", headers=unbound)).status_code == 403
+
+    # ci_auditor bound to default: pip-audit:<id> drafts, once.
+    auditor = await _role_key(hub, "ci_auditor", '["project:default"]', "a1")
+    first = await client.post("/api/tasks", json=_AUDIT_DRAFT, headers=auditor)
+    assert first.status_code == 201, first.text
+    assert first.json()["status"] == "draft"
+    filed = await repo.resolve_project_for_task(db, first.json()["id"])
+    assert dict(filed)["slug"] == "default", "the draft lands in the key's project"
+    again = await client.post("/api/tasks", json=_AUDIT_DRAFT, headers=auditor)
+    assert again.status_code == 200 and again.json()["id"] == first.json()["id"]
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM tasks WHERE title = ?", (_AUDIT_DRAFT["title"],)
+    )
+    assert rows[0][0] == 1, "the second post did not duplicate the draft"
+    for bad in (
+        {**_AUDIT_DRAFT, "client_request_id": "other:PYSEC-1"},
+        {k: v for k, v in _AUDIT_DRAFT.items() if k != "client_request_id"},
+        {**_AUDIT_DRAFT, "source": "human"},
+    ):
+        resp = await client.post("/api/tasks", json=bad, headers=auditor)
+        assert resp.status_code == 403, (bad, resp.text[:200])
+    assert (await client.get(f"/api/tasks/{mine}", headers=auditor)).status_code == 403
+    posted = await client.post(
+        f"/api/tasks/{foreign}/ci-run-report", json=report, headers=auditor
+    )
+    assert posted.status_code == 403
+    # Bound to another project, the auditor cannot file into default.
+    elsewhere = await _role_key(hub, "ci_auditor", '["project:audit-in"]', "a2")
+    refused = await client.post(
+        "/api/tasks",
+        json={**_AUDIT_DRAFT, "client_request_id": "pip-audit:PYSEC-2"},
+        headers=elsewhere,
+    )
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["reason"] == "ci_audit_out_of_scope"
+
+    # The run provenance survives the round trip; without it nothing changes.
+    prov = {
+        "run_id": "9001",
+        "run_attempt": "2",
+        "workflow_path": ".github/workflows/ci.yml@refs/heads/task-1/x",
+        "event": "pull_request",
+        "head_repository": "agentdrover/haiplane",
+        "run_conclusion": "success",
+        "artifact_id": "77",
+        "artifact_digest": "sha256:" + "ab" * 32,
+    }
+    with_prov = await _post_report(client, hub.ci, foreign, **prov)
+    assert with_prov["provenance"] == prov
+    stored = dict(await repo.get_ci_run_report(db, foreign, "sha-pinned"))
+    assert json.loads(stored["provenance"]) == prov
+    without = await _post_report(client, hub.ci, foreign)
+    assert without["provenance"] == {} and without["applied"] is True
+    assert (
+        dict(await repo.get_ci_run_report(db, foreign, "sha-pinned"))["provenance"]
+        == "{}"
+    )
+
+
+async def test_the_new_roles_hold_nothing_that_reports_a_run():
+    from hub.db import SYSTEM_ROLES
+
+    roles = {name: set(perms) for name, _label, _desc, perms in SYSTEM_ROLES}
+    assert roles["ci_reader"] == {"tasks.read"}
+    assert roles["ci_auditor"] == {"tasks.create"}
+
+
+async def test_provenance_migration_on_an_old_schema(tmp_path):
+    """A database that predates #1686 gets the column and the roles at start."""
+    import sqlite3
+
+    from hub import db as db_module
+
+    path = tmp_path / "old.db"
+    fresh = await db_module.connect(str(path))
+    await db_module.bootstrap(fresh)
+    await fresh.execute("INSERT INTO tasks (title) VALUES ('t')")
+    await fresh.execute(
+        "INSERT INTO ci_run_reports (task_id, head_sha, reported_by) "
+        "VALUES (1, 'old-sha', 'ci')"
+    )
+    await fresh.commit()
+    await fresh.close()
+    # Take the schema back to before this task.
+    raw = sqlite3.connect(path)
+    raw.execute("ALTER TABLE ci_run_reports DROP COLUMN provenance")
+    raw.execute("DELETE FROM _migrations WHERE name = 'add_ci_run_reports_provenance'")
+    raw.execute("DELETE FROM roles WHERE slug IN ('ci_reader', 'ci_auditor')")
+    raw.commit()
+    raw.close()
+
+    upgraded = await db_module.connect(str(path))
+    await db_module.bootstrap(upgraded)
+    await db_module.bootstrap(upgraded)  # twice: idempotent
+    row = dict(await repo.get_ci_run_report(upgraded, 1, "old-sha"))
+    assert row["provenance"] == "{}", "an old report reads as 'provenance not sent'"
+    roles = {
+        r[0]
+        for r in await upgraded.execute_fetchall(
+            "SELECT slug FROM roles WHERE slug IN ('ci_reader', 'ci_auditor')"
+        )
+    }
+    assert roles == {"ci_reader", "ci_auditor"}
+    await upgraded.close()

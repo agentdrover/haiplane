@@ -876,6 +876,43 @@ def _reject_chat_pair_dispatch(request: Request, body: TaskCreate) -> None:
         )
 
 
+async def _enforce_audit_key(request: Request, body: TaskCreate, idem_key) -> None:
+    """A ci_auditor key files pip-audit drafts of its own project, nothing else (#1686)."""
+    from hub.services import ci_scope
+
+    identity = current_identity(request)
+    if not identity.is_ci_auditor:
+        return
+    refusal = ci_scope.audit_draft_refusal(body, idem_key)
+    if refusal is not None:
+        raise HTTPException(
+            403,
+            detail=enrich_error_payload(
+                {
+                    "reason": "ci_audit_draft_only",
+                    "actor_hint": "human",
+                    "message": f"ключ ci_auditor: {refusal}.",
+                }
+            ),
+        )
+    db = _db(request)
+    project_row = (
+        await repo.resolve_project_for_task(db, body.parent_id)
+        if body.parent_id is not None
+        else await repo.get_project_by_slug(db, "default")
+    )
+    slug = str(dict(project_row)["slug"]) if project_row is not None else None
+    try:
+        await ci_scope.enforce_bound_ci_key(db, identity, slug, entrance="audit")
+    except ci_scope.CIScopeRefused as exc:
+        raise HTTPException(
+            403,
+            detail=enrich_error_payload(
+                {"reason": exc.reason, "actor_hint": "human", "message": exc.message}
+            ),
+        ) from None
+
+
 @app.post("/api/tasks", response_model=TaskView)
 async def api_create_task(body: TaskCreate, request: Request, response: Response):
     _reject_agent_authored_source(request, body.source)
@@ -884,6 +921,7 @@ async def api_create_task(body: TaskCreate, request: Request, response: Response
         request.headers.get("X-Client-Request-Id"),
         body.client_request_id,
     )
+    await _enforce_audit_key(request, body, idem_key)
     outcome = await services.create_task(
         _db(request),
         body,
@@ -1941,12 +1979,33 @@ async def api_list_tasks(
     )
 
 
+async def _enforce_reader_key(request: Request, db, task_id: int) -> None:
+    """A ci_reader key reads the card of a task of its own project only (#1686)."""
+    from hub.services import ci_scope
+
+    identity = current_identity(request)
+    if not identity.is_ci_reader:
+        return
+    project_row = await repo.resolve_bound_project(db, task_id)
+    slug = str(dict(project_row)["slug"]) if project_row is not None else "default"
+    try:
+        await ci_scope.enforce_bound_ci_key(db, identity, slug, entrance="read")
+    except ci_scope.CIScopeRefused as exc:
+        raise HTTPException(
+            403,
+            detail=enrich_error_payload(
+                {"reason": exc.reason, "actor_hint": "human", "message": exc.message}
+            ),
+        ) from None
+
+
 @app.get("/api/tasks/{task_id}", response_model=TaskView)
 async def api_get_task(task_id: int, request: Request):
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    await _enforce_reader_key(request, db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
@@ -2949,6 +3008,12 @@ async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
             # difference; model_fields_set keeps it.
             mutations=body.mutations if "mutations" in sent else None,
             baseline=body.baseline if "baseline" in sent else None,
+            # #1686: the run the trusted workflow says produced this report.
+            provenance={
+                name: getattr(body, name)
+                for name in models.CI_PROVENANCE_FIELDS
+                if getattr(body, name) is not None
+            },
             commit=False,
         )
     except LookupError:

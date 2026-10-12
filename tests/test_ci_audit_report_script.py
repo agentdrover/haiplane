@@ -92,7 +92,12 @@ def test_the_audit_step_cannot_block_delivery():
         "the delivery gate finds the job by this name (#605/#606)"
     )
     assert steps["Dependency vulnerability audit"].get("continue-on-error") is True
-    assert steps["File audit findings as Hub drafts"].get("continue-on-error") is True
+    # #1686: the drafts are filed by ci-report.yml; the job only hands the file
+    # over, and that hand-over cannot block delivery either.
+    assert "File audit findings as Hub drafts" not in steps
+    assert (
+        steps["Upload results for the trusted report"].get("continue-on-error") is True
+    )
 
     for blocking in ("Lint", "Test", "Secret scan", "Static security scan"):
         assert not steps[blocking].get("continue-on-error"), (

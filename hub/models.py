@@ -3725,6 +3725,30 @@ class CIRunReportSubmit(BaseModel):
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
     reported_by: str = Field("", max_length=100)
+    # #1686: which GitHub run produced the evidence, written by the trusted
+    # reporting workflow from the event payload. All optional: a report without
+    # them is accepted as before. Stored, not checked (the check is the hub's
+    # next step), so it proves nothing yet.
+    run_id: str | None = Field(default=None, max_length=32)
+    run_attempt: str | None = Field(default=None, max_length=16)
+    workflow_path: str | None = Field(default=None, max_length=300)
+    event: str | None = Field(default=None, max_length=40)
+    head_repository: str | None = Field(default=None, max_length=200)
+    run_conclusion: str | None = Field(default=None, max_length=40)
+    artifact_id: str | None = Field(default=None, max_length=32)
+    artifact_digest: str | None = Field(default=None, max_length=100)
+
+
+CI_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "run_id",
+    "run_attempt",
+    "workflow_path",
+    "event",
+    "head_repository",
+    "run_conclusion",
+    "artifact_id",
+    "artifact_digest",
+)
 
 
 class CIRunReportResult(BaseModel):
@@ -3739,6 +3763,8 @@ class CIRunReportResult(BaseModel):
     validation_status: str = ""
     mutations_state: str = "not_reported"
     baseline_state: str = "not_reported"
+    # #1686: the run provenance stored with the report; {} = none was sent.
+    provenance: dict[str, str] = Field(default_factory=dict)
 
 
 class OutcomeVerdict(str, Enum):

@@ -95,6 +95,7 @@ async def _store_ci_run_report(
     checks: dict[str, str] | None = None,
     mutations: dict[str, Any] | None = None,
     baseline: dict[str, Any] | None = None,
+    provenance: dict[str, str] | None = None,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -198,6 +199,11 @@ async def _store_ci_run_report(
         ),
         mutations=mutations_json,
         baseline=baseline_json,
+        provenance=json.dumps(
+            {k: v for k, v in (provenance or {}).items() if v},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
     )
 
     recorded: list[dict] = []
@@ -223,6 +229,7 @@ async def _store_ci_run_report(
         "validation_status": validation_status,
         "mutations_state": _stored_state(stored.get("mutations")),
         "baseline_state": _stored_state(stored.get("baseline")),
+        "provenance": _stored_provenance(stored.get("provenance")),
     }
 
 
@@ -239,6 +246,17 @@ async def accept_ci_run_report(
     if commit:
         await db.commit()
     return result
+
+
+def _stored_provenance(raw: str | None) -> dict[str, str]:
+    """The run provenance stored with a report (#1686); {} when none was sent."""
+    try:
+        block = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(block, dict):
+        return {}
+    return {str(k): str(v) for k, v in block.items()}
 
 
 def _stored_state(raw: str | None) -> str:

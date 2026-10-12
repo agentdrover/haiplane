@@ -140,7 +140,9 @@ def draft_payload(finding: dict) -> dict:
 
 def main() -> int:
     base = env_get("HUB_URL").rstrip("/")
-    token = env_get("HUB_CI_TOKEN")
+    # #1686: the key that files drafts is its own (role ci_auditor); the report
+    # key is the fallback only for satellites that still use one key.
+    token = env_get("HUB_CI_AUDIT_TOKEN") or env_get("HUB_CI_TOKEN")
     report_path = Path(os.environ.get("AUDIT_JSON") or "audit.json")
 
     if not report_path.exists():

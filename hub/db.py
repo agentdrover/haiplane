@@ -2781,6 +2781,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
             SELECT RAISE(ABORT, 'task_evidence is insert-only');
         END""",
     ),
+    (
+        # #1686: which GitHub run produced a CI report — a JSON object (run_id,
+        # run_attempt, workflow_path, event, head_repository, run_conclusion,
+        # artifact_id, artifact_digest). '{}' = the reporter did not say (every
+        # report before this task, and any reporter that predates the trusted
+        # workflow). Recorded, not checked: the check is the hub's next step.
+        "add_ci_run_reports_provenance",
+        "ALTER TABLE ci_run_reports ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}'",
+    ),
 ]
 
 
@@ -3656,6 +3665,27 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Watcher",
         "Только чтение: задачи, ревью, метрики, прод-состояние; не меняет ничего",
         ("tasks.read",),
+    ),
+    (
+        # #1686: the key the CI job of a TASK BRANCH holds. Its code is the
+        # branch's code, so the key can do one thing: read the card (AC test
+        # refs, validation commands) of a task of its own project. The route
+        # allowlist in hub/auth.py is the real gate; seeding is idempotent, so
+        # an existing database gets the role at the next start.
+        "ci_reader",
+        "CI Reader",
+        "Читает карточку задачи своего проекта; ничего не пишет и не сообщает",
+        ("tasks.read",),
+    ),
+    (
+        # #1686: the key of the trusted CI workflow that files pip-audit drafts.
+        # One route (POST /api/tasks, client_request_id pip-audit:<id>,
+        # source=agent) inside its own project. It holds neither tasks.ci_report
+        # nor deploys.record: it cannot report a run.
+        "ci_auditor",
+        "CI Auditor",
+        "Заводит черновики аудита зависимостей (pip-audit:<id>) в своём проекте",
+        ("tasks.create",),
     ),
 )
 
