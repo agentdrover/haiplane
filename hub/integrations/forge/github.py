@@ -34,6 +34,14 @@ from hub.integrations.protocols import (
 
 log = logging.getLogger(__name__)
 
+#: A read of a run for the check of a CI report (#1687) must not hold the
+#: poller for the 60 s a git call may take: GitHub that does not answer in this
+#: time is "not reachable", and the check is retried later.
+_CI_READ_TIMEOUT = 20
+#: Pages of 100 read for one list; a list that does not end by then is unknown.
+_CI_PAGE = 100
+_CI_MAX_PAGES = 10
+
 
 async def _gh(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
     repo = repo or proc.repo_root()
@@ -1174,7 +1182,9 @@ class GitHubForge:
 
     async def _api_json(self, endpoint: str, *, repo: str | None) -> tuple[Any, bool]:
         """``(json, absent)``: ``(None, False)`` — не смогли; ``(None, True)`` — нет."""
-        rc, out, err = await _gh("api", endpoint, repo=repo, check=False)
+        rc, out, err = await _gh(
+            "api", endpoint, repo=repo, check=False, timeout=_CI_READ_TIMEOUT
+        )
         if rc != 0:
             if self._api_missing(err):
                 return None, True
@@ -1209,6 +1219,40 @@ class GitHubForge:
             return None
         return self._run_facts(data)
 
+    async def _all_pages(
+        self, endpoint: str, key: str, *, repo: str | None
+    ) -> list[Any] | None:
+        """Every item of a paged list, ``[]`` if it is absent, None if unknown.
+
+        A list that GitHub says is longer than what was read (the next page
+        failed, or there are more pages than we read) is NOT returned: a hub
+        that took the first hundred runs for all of them could pick the wrong
+        current attempt.
+        """
+        items: list[Any] = []
+        for page in range(1, _CI_MAX_PAGES + 1):
+            data, absent = await self._api_json(
+                f"{endpoint}{'&' if '?' in endpoint else '?'}"
+                f"per_page={_CI_PAGE}&page={page}",
+                repo=repo,
+            )
+            if absent:
+                return [] if page == 1 else None
+            if not isinstance(data, dict) or not isinstance(data.get(key), list):
+                return None
+            got = [x for x in data[key] if isinstance(x, dict)]
+            items.extend(got)
+            raw_total = data.get("total_count")
+            total = raw_total if isinstance(raw_total, int) else None
+            if total is not None:
+                if len(items) >= total:
+                    return items
+                if len(data[key]) < _CI_PAGE:
+                    return None  # GitHub counts more than it handed over
+            elif len(data[key]) < _CI_PAGE:
+                return items
+        return None
+
     async def ci_runs_for_sha(
         self,
         head_sha: str,
@@ -1217,20 +1261,13 @@ class GitHubForge:
         gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
         """Прогоны workflow ci.yml по head_sha (последняя попытка каждого)."""
-        data, absent = await self._api_json(
+        runs = await self._all_pages(
             f"repos/{gh_repo or REPO_NAME}/actions/workflows/ci.yml/runs"
-            f"?head_sha={head_sha}&per_page=100",
+            f"?head_sha={head_sha}",
+            "workflow_runs",
             repo=repo,
         )
-        if absent:
-            return []
-        if not isinstance(data, dict) or not isinstance(
-            data.get("workflow_runs"), list
-        ):
-            return None
-        return [
-            self._run_facts(r) for r in data["workflow_runs"] if isinstance(r, dict)
-        ]
+        return None if runs is None else [self._run_facts(r) for r in runs]
 
     async def ci_run_artifacts(
         self,
@@ -1242,13 +1279,12 @@ class GitHubForge:
         """Артефакты прогона: список, ``[]`` если их нет, None если не смогли."""
         if not str(run_id).isdigit():
             return []
-        data, absent = await self._api_json(
-            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/artifacts?per_page=100",
+        found = await self._all_pages(
+            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/artifacts",
+            "artifacts",
             repo=repo,
         )
-        if absent:
-            return []
-        if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+        if found is None:
             return None
         return [
             {
@@ -1258,8 +1294,7 @@ class GitHubForge:
                 "size": a.get("size_in_bytes"),
                 "expired": bool(a.get("expired")),
             }
-            for a in data["artifacts"]
-            if isinstance(a, dict)
+            for a in found
         ]
 
     async def ci_artifact_zip(

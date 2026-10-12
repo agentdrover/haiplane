@@ -641,6 +641,12 @@ async def build_evidence_packet(
     )
     pinned_sha = (task.get("submission_sha") or "").strip()
     project_row = await repo.resolve_project_for_task(db, task_id)
+    if pinned_sha:
+        # #1687: the standing of the CI report is brought up to date BEFORE the
+        # brief is built — the brief reads the prepass and the AC results of
+        # the current attempt, and the task is read again after it.
+        await ci_trust.refresh_quietly(db, task_id, pinned_sha)
+        task = dict(await repo.get_task(db, task_id) or task)
     brief = await build_review_brief(db, task_id)
 
     # One walk of the branch feeds two facts, as in auto_verdict (#583).
@@ -649,10 +655,6 @@ async def build_evidence_packet(
         db, task, diff_paths, diff_reason
     )
 
-    if pinned_sha:
-        # #1687: the live packet asks GitHub which attempt is current NOW (a
-        # rerun nobody reported included) before it reads the CI fact.
-        await ci_trust.refresh_quietly(db, task_id, pinned_sha)
     facts = {
         f.source: f
         for f in [

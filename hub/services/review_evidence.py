@@ -652,6 +652,23 @@ async def prepass_state(db, task: dict):
     passed = sorted(k for k, v in checks.items() if v == CHECK_PASS)
     failed = sorted(k for k, v in checks.items() if v == CHECK_FAIL)
     skipped = sorted(k for k, v in checks.items() if v == CHECK_SKIPPED)
+    # #1687: the run as a whole counts, not only its steps. A run that ended in
+    # anything but success is a failed prepass even when each step it names
+    # passed; the steps stay listed on their own.
+    from hub.services.ci_trust import run_conclusion
+
+    conclusion = run_conclusion(dict(row))
+    if conclusion != "success":
+        failed = sorted({*failed, "прогон"})
+        return PrepassState(
+            state="failed",
+            reason=f"упали: {', '.join(failed)} (прогон закончился как "
+            f"{conclusion or 'неизвестно'})",
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            head_sha=pinned,
+        )
     return PrepassState(
         # A failed check is louder than a passing one: it means the code under
         # review is known-broken in a way a tool already proved, and the

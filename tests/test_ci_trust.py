@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -694,3 +695,465 @@ async def test_the_poller_rereads_the_current_attempt_of_tasks_in_review(db):
     GH.attempt(other, SHA, run_id="6102", attempt="2", artifact=False)
     await ci_trust.sweep(db)
     assert (await _standing(db, other))[0] == "verified"
+
+
+# ---- review round: races, outages, readers, pagination, budget -------------
+
+
+async def test_a_body_replaced_while_it_is_checked_is_checked_again(db, monkeypatch):
+    """The verdict belongs to the body it was computed for, not to the row id."""
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    honest = GH.attempt(
+        task_id, SHA, validation_status="fail", ac_results={"AC-1": "fail"}
+    )
+    forged = {**honest, "validation_status": "pass", "ac_results": {"AC-1": "pass"}}
+    await store_ci_run_report(db, task_id, **honest)
+    await db.commit()
+
+    real_zip = GH.ci_artifact_zip
+    replaced: list[int] = []
+
+    async def zip_then_replace(*args, **kwargs):
+        blob = await real_zip(*args, **kwargs)
+        if not replaced:  # the repeated POST arrives while the archive is read
+            replaced.append(1)
+            await store_ci_run_report(db, task_id, **forged)
+            await db.commit()
+        return blob
+
+    monkeypatch.setattr(plugins.git_ops, "ci_artifact_zip", zip_then_replace)
+    standing = await ci_trust.refresh(db, task_id, SHA)
+
+    assert replaced == [1]
+    assert (standing.trust, standing.reason) == ("unverified", "body_mismatch")
+    assert (await _standing(db, task_id))[:2] == ("unverified", "body_mismatch")
+    assert ("AC-1", "pass") not in (await _evidence(db, task_id))[0]
+    assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
+
+
+async def test_overlapping_refreshes_never_restore_an_older_picture(db, monkeypatch):
+    import asyncio
+
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6201", attempt="1"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_runs = GH.ci_runs_for_sha
+    seen: list[int] = []
+
+    async def slow_first_runs(*args, **kwargs):
+        picture = await real_runs(*args, **kwargs)  # the world as it is NOW
+        seen.append(1)
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()  # ... and the answer is slow to be used
+        return picture
+
+    monkeypatch.setattr(plugins.git_ops, "ci_runs_for_sha", slow_first_runs)
+    older = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await entered.wait()
+    rerun = GH.attempt(
+        task_id,
+        SHA,
+        run_id="6201",
+        attempt="2",
+        conclusion="failure",
+        validation_status="fail",
+        ac_results={"AC-1": "fail"},
+    )
+    await store_ci_run_report(db, task_id, **rerun)
+    await db.commit()
+    newer = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await asyncio.sleep(0.05)  # the second refresh has reached the first one's lock
+    release.set()
+    await asyncio.gather(older, newer)
+
+    assert (await _standing(db, task_id))[2] == "ci:6201:2"
+    results, validation, source = await _evidence(db, task_id)
+    assert results == [("AC-1", "fail")] and source == "ci:6201:2"
+
+
+async def test_without_a_current_confirmation_nothing_stays_proved(db, monkeypatch):
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6301"))
+    assert await _gap(db, task_id) is None
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+
+    # GitHub cannot be asked: the old green is history, not proof.
+    GH.down = True
+    out = await ci_trust.refresh(db, task_id, SHA)
+    assert out.forge_down is True
+    assert (await _standing(db, task_id))[:2] == ("unverified", "forge_unavailable")
+    assert (await _evidence(db, task_id))[0] == []
+    assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
+    held = await repo.list_ci_report_attempts(db, task_id, SHA)
+    assert held[0]["trust"] == "verified", "the past confirmation is kept as history"
+
+    # It answers again: the history is reused, nothing is downloaded twice.
+    GH.down = False
+    GH.calls.clear()
+    await ci_trust.refresh(db, task_id, SHA)
+    assert (await _standing(db, task_id))[:2] == ("verified", "")
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+    assert not any(c.startswith("zip:") for c in GH.calls)
+
+    # It answers with a list that does not hold the reported run.
+    GH.runs.clear()
+    await ci_trust.refresh(db, task_id, SHA)
+    assert (await _standing(db, task_id))[:2] == (
+        "unverified",
+        "current_attempt_unknown",
+    )
+    assert (await _evidence(db, task_id))[0] == []
+
+
+async def test_a_broken_check_fails_closed(db, monkeypatch):
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA))
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("the check itself broke")
+
+    monkeypatch.setattr(ci_trust, "_refresh_locked", broken)
+    assert await ci_trust.refresh_quietly(db, task_id, SHA) is None
+    assert (await _standing(db, task_id))[:2] == ("unverified", "check_failed")
+    assert (await _evidence(db, task_id))[0] == []
+    assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
+
+
+async def _task_whose_rerun_nobody_reported(db, run_id: str) -> int:
+    """Confirmed green is stored; a newer attempt is running and sent nothing."""
+    task_id = await _task(db)
+    out = await _post(db, task_id, GH.attempt(task_id, SHA, run_id=run_id, attempt="1"))
+    assert out["trust"] == "verified"
+    GH.attempt(
+        task_id, SHA, run_id=run_id, attempt="2", status="in_progress", artifact=False
+    )
+    return task_id
+
+
+async def test_readers_ask_which_attempt_is_current_before_they_read(db):
+    from hub.services.ac_tests import ac_tests_gap
+    from hub.services.review_brief import build_review_brief
+    from hub.services.steward_evidence import build_evidence_packet
+    from hub.services.validation_run import validation_gap
+
+    # The gates: the AC gap and the validation gap read the task AFTER the ask.
+    gate = await _task_whose_rerun_nobody_reported(db, "6401")
+    assert await ac_tests_gap(db, dict(await repo.get_task(db, gate))) is None
+    task = await ci_trust.refresh_for_gate(db, dict(await repo.get_task(db, gate)))
+    assert await ac_tests_gap(db, task)
+    task["validation_commands"] = '["x"]'
+    assert validation_gap(task)
+
+    # The brief: the pre-pass is not "covered" by the attempt that is gone.
+    brief_task = await _task_whose_rerun_nobody_reported(db, "6402")
+    brief = await build_review_brief(db, brief_task)
+    assert brief.prepass.state != "covered"
+    assert brief.ci_run_report.state == "unknown"
+    assert brief.ac_test_results == []
+
+    # The steward packet reads the CI fact of the current attempt too.
+    packet_task = await _task_whose_rerun_nobody_reported(db, "6403")
+    packet = await build_evidence_packet(db, packet_task)
+    assert packet.fact("ci_pinned_sha").is_absent
+
+
+async def test_the_steward_packet_asks_before_it_builds_the_brief(db, monkeypatch):
+    from hub.services import review_brief
+    from hub.services.steward_evidence import build_evidence_packet
+
+    task_id = await _task_whose_rerun_nobody_reported(db, "6404")
+    order: list[str] = []
+    real_refresh = ci_trust.refresh_quietly
+    real_brief = review_brief.build_review_brief
+
+    async def refresh_spy(*args, **kwargs):
+        order.append("refresh")
+        return await real_refresh(*args, **kwargs)
+
+    async def brief_spy(*args, **kwargs):
+        order.append("brief")
+        return await real_brief(*args, **kwargs)
+
+    monkeypatch.setattr(ci_trust, "refresh_quietly", refresh_spy)
+    monkeypatch.setattr(review_brief, "build_review_brief", brief_spy)
+    await build_evidence_packet(db, task_id)
+    assert order[0] == "refresh" and "brief" in order, order
+
+
+async def test_a_run_that_failed_is_not_a_checked_submission(db):
+    from hub.services import review_evidence
+
+    task_id = await _task(db)
+    await _post(
+        db,
+        task_id,
+        GH.attempt(task_id, SHA, conclusion="failure", validation_status="pass"),
+    )
+    task = dict(await repo.get_task(db, task_id))
+    prepass = await review_evidence.prepass_state(db, task)
+    assert prepass.state == "failed" and "прогон" in prepass.failed
+    assert prepass.passed == ["format", "lint", "tests", "types"], "steps stay listed"
+    standing = review_evidence.validation_standing(prepass, "")
+    assert standing.verified is False
+    assert standing.state == review_evidence.VALIDATION_FAILED
+
+    ok = await _task(db)
+    await _post(db, ok, GH.attempt(ok, SHA))
+    covered = await review_evidence.prepass_state(db, dict(await repo.get_task(db, ok)))
+    assert covered.state == "covered"
+
+
+# ---- the migration: a report that names its run is checked, not buried ----
+
+
+def _owner_count_query() -> str:
+    """The query deploy/CD.md hands the owner for prod, taken from the runbook itself."""
+    text = (Path(__file__).resolve().parent.parent / "deploy" / "CD.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"```\n(SELECT t\.status,.*?;)\n```", text, re.S)
+    assert match, "the runbook no longer carries the count query"
+    return match.group(1)
+
+
+async def test_a_report_that_names_its_run_is_queued_by_the_migration(tmp_path):
+    from hub import db as db_module
+
+    sent = GH.attempt(1, "prov-sha", run_id="6501", ac_results={"AC-1": "pass"})
+    path = tmp_path / "old.db"
+    fresh = await db_module.connect(str(path))
+    await db_module.bootstrap(fresh)
+    for title in ("names its run", "does not", "ran out of run"):
+        await fresh.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
+    rows = (
+        (1, "prov-sha", json.dumps(sent["provenance"])),
+        (2, "bare-sha", "{}"),
+        (3, "half-sha", json.dumps({"run_id": "1", "run_attempt": "1"})),
+    )
+    for task_id, sha, provenance in rows:
+        await fresh.execute(
+            "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, checks, "
+            "validation_status, provenance, reported_by) VALUES (?, ?, ?, ?, ?, ?, 'ci')",
+            (
+                task_id,
+                sha,
+                json.dumps(sent["ac_results"]),
+                json.dumps(sent["checks"]),
+                "pass",
+                provenance,
+            ),
+        )
+    await fresh.commit()
+    await fresh.close()
+    raw = sqlite3.connect(path)
+    for table, column in (
+        ("ci_run_reports", "trust"),
+        ("ci_run_reports", "trust_reason"),
+        ("ci_run_reports", "attempt_key"),
+        ("ac_test_results", "source"),
+        ("tasks", "validation_source"),
+    ):
+        raw.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    raw.execute("DROP TABLE ci_report_attempts")
+    raw.execute(
+        "DELETE FROM _migrations WHERE name LIKE '%ci_report_attempts%' "
+        "OR name IN ('add_ci_run_reports_trust', 'add_ci_run_reports_trust_reason', "
+        "'add_ci_run_reports_attempt_key', 'add_ac_test_results_source', "
+        "'add_tasks_validation_source', 'legacy_ac_test_results_source', "
+        "'legacy_tasks_validation_source', 'queue_provenanced_reports_for_verification')"
+    )
+    raw.commit()
+    raw.close()
+
+    from hub import db as db_module
+
+    upgraded = await db_module.connect(str(path))
+    try:
+        await db_module.bootstrap(upgraded)
+        await db_module.bootstrap(upgraded)  # twice: no second queue entry
+        queued = [
+            (r["task_id"], r["trust_final"], r["checked_at"])
+            for r in await upgraded.execute_fetchall(
+                "SELECT task_id, trust_final, checked_at FROM ci_report_attempts"
+            )
+        ]
+        assert queued == [(1, 0, None)], "only the report that names run AND artifact"
+        legacy = {
+            r["task_id"]: r["trust_reason"]
+            for r in await upgraded.execute_fetchall(
+                "SELECT task_id, trust_reason FROM ci_run_reports"
+            )
+        }
+        assert legacy == {1: "legacy", 2: "legacy", 3: "legacy"}
+
+        # The query the owner runs on prod: tasks in work whose pinned report
+        # names its run, i.e. the ones this migration queues.
+        await upgraded.execute(
+            "UPDATE tasks SET status='review', submission_sha='prov-sha' WHERE id=1"
+        )
+        await upgraded.execute(
+            "UPDATE tasks SET status='running', submission_sha='bare-sha' WHERE id=2"
+        )
+        await upgraded.commit()
+        counted = sorted(
+            tuple(r) for r in await upgraded.execute_fetchall(_owner_count_query())
+        )
+        assert counted == [("review", 1, 0), ("running", 0, 1)]
+
+        # The poller picks it up (never checked) and GitHub confirms it.
+        await ci_trust.sweep(upgraded)
+        row = dict(await repo.get_ci_run_report(upgraded, 1, "prov-sha"))
+        assert (row["trust"], row["trust_reason"]) == ("verified", "")
+        bare = dict(await repo.get_ci_run_report(upgraded, 2, "bare-sha"))
+        assert bare["trust_reason"] == "legacy"
+    finally:
+        await upgraded.close()
+
+
+# ---- the adapter reads every page, or says it does not know ---------------
+
+
+async def test_a_list_with_a_hidden_next_page_is_unknown_not_short(monkeypatch):
+    from hub.integrations.forge import github as gh_module
+
+    pages: dict[int, tuple[int, str, str]] = {}
+    asked: list[int] = []
+
+    async def fake_gh(*args, repo=None, **kw):
+        page = int(re.search(r"[&?]page=(\d+)", args[1]).group(1))
+        asked.append(page)
+        return pages[page]
+
+    def run(n: int) -> dict:
+        return {"id": n, "run_attempt": 1, "path": ".github/workflows/ci.yml"}
+
+    def listing(first: int, count: int, total: int) -> tuple[int, str, str]:
+        body = {
+            "total_count": total,
+            "workflow_runs": [run(i) for i in range(first, first + count)],
+        }
+        return 0, json.dumps(body), ""
+
+    monkeypatch.setattr(gh_module, "_gh", fake_gh)
+    forge = gh_module.GitHubForge()
+
+    pages.update({1: listing(0, 100, 130), 2: listing(100, 30, 130)})
+    runs = await forge.ci_runs_for_sha("abc", gh_repo="own/rep")
+    assert len(runs) == 130 and asked == [1, 2], "the second page is read"
+
+    asked.clear()
+    pages[2] = (1, "", "HTTP 502: bad gateway")  # the next page cannot be read
+    assert await forge.ci_runs_for_sha("abc", gh_repo="own/rep") is None
+
+    pages[2] = listing(100, 10, 130)  # GitHub counts more than it handed over
+    assert await forge.ci_runs_for_sha("abc", gh_repo="own/rep") is None
+
+    asked.clear()  # a list that never ends within the pages we read
+    for n in range(1, 12):
+        pages[n] = listing((n - 1) * 100, 100, 5000)
+    assert await forge.ci_runs_for_sha("abc", gh_repo="own/rep") is None
+    assert max(asked) == 10
+
+    art = {
+        "total_count": 120,
+        "artifacts": [{"id": i, "name": "n"} for i in range(100)],
+    }
+    pages.clear()
+    pages[1] = 0, json.dumps(art), ""
+    pages[2] = 1, "", "HTTP 500"
+    assert await forge.ci_run_artifacts("7", gh_repo="own/rep") is None
+
+
+# ---- the poller is not held hostage by GitHub ------------------------------
+
+
+async def _review_task_with_green(db, run_id: str) -> int:
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id=run_id))
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+    return task_id
+
+
+async def test_a_github_outage_costs_the_tick_one_failed_call(db):
+    first = await _review_task_with_green(db, "6601")
+    second = await _review_task_with_green(db, "6602")
+    GH.calls.clear()
+    GH.down = True
+    await ci_trust.sweep(db)
+    # The first task found GitHub down; the second was not sent to find out.
+    assert ci_trust.forge_recently_down() is True
+    asked = [c for c in GH.calls if c.startswith("runs:")]
+    assert len(asked) == 1, GH.calls
+    for task_id in (first, second):
+        assert (await _standing(db, task_id))[:2] == ("unverified", "forge_unavailable")
+        assert (await _evidence(db, task_id))[0] == []
+
+    # Inside the backoff nothing is asked at all.
+    GH.calls.clear()
+    await ci_trust.sweep(db)
+    assert GH.calls == []
+
+
+async def test_a_tick_stops_starting_checks_when_its_budget_is_spent(db, monkeypatch):
+    first = await _review_task_with_green(db, "6701")
+    second = await _review_task_with_green(db, "6702")
+    monkeypatch.setattr(ci_trust, "SWEEP_BUDGET_SECONDS", -1.0)
+    GH.calls.clear()
+    await ci_trust.sweep(db)
+    assert GH.calls == [], "no check was started"
+    # Deferred, not downgraded: nothing was learned, nothing is claimed.
+    assert (await _standing(db, first))[0] == "verified"
+    assert (await _standing(db, second))[0] == "verified"
+
+
+# ---- the metric does not count what GitHub did not confirm -----------------
+
+
+def test_the_economy_metric_counts_only_a_confirmed_green_run():
+    from hub.services.review_economy import _ci_row
+
+    ok = {
+        "trust": "verified",
+        "checks": json.dumps(GREEN_CHECKS),
+        "provenance": json.dumps({"run_conclusion": "success"}),
+    }
+    assert _ci_row(True, "pass", ok) == "green"
+    assert _ci_row(True, "fail", ok) == "red"
+    assert _ci_row(True, "pass", {**ok, "trust": "unverified"}) == "undetermined"
+    assert _ci_row(True, "fail", {**ok, "trust": "unverified"}) == "undetermined"
+    failed_run = {**ok, "provenance": json.dumps({"run_conclusion": "failure"})}
+    assert _ci_row(True, "pass", failed_run) == "undetermined"
+    assert _ci_row(False, None, None) == "no_report"
+
+
+async def test_an_approving_verdict_asks_before_it_reads_the_ac_results(
+    db, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.services.lifecycle import _vstep_ac_tests_green
+
+    monkeypatch.setattr(config, "SDD_AC_TESTS", "require")
+    task_id = await _task_whose_rerun_nobody_reported(db, "6405")
+    task = dict(await repo.get_task(db, task_id))
+    state = SimpleNamespace(
+        db=db,
+        task=task,
+        body=SimpleNamespace(verdict=SimpleNamespace(value="approved")),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await _vstep_ac_tests_green(state)
+    assert refused.value.status_code == 422
+    assert "ac_tests_not_green" in str(refused.value.detail)

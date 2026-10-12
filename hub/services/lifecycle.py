@@ -4453,7 +4453,10 @@ async def _vstep_ac_tests_green(state: VerdictContext) -> None:
     if config.SDD_AC_TESTS == "require" and state.body.verdict.value == "approved":
         from hub.services.ac_tests import ac_tests_gap
 
-        ac_gap = await ac_tests_gap(state.db, state.task)
+        # #1687: AC results are the current attempt's; ask which one is current
+        # before reading them, then read the task again.
+        task_now = await ci_trust.refresh_for_gate(state.db, state.task)
+        ac_gap = await ac_tests_gap(state.db, {**state.task, **task_now})
         if ac_gap:
             raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
 

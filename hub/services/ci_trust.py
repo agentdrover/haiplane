@@ -27,11 +27,13 @@ Three things are deliberately NOT guessed:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from hub import config
@@ -65,6 +67,8 @@ BODY_MISMATCH = "body_mismatch"
 FORGE_UNAVAILABLE = "forge_unavailable"
 NEWER_ATTEMPT_WITHOUT_REPORT = "newer_attempt_without_report"
 CURRENT_ATTEMPT_INCOMPLETE = "current_attempt_incomplete"
+CURRENT_ATTEMPT_UNKNOWN = "current_attempt_unknown"
+CHECK_FAILED = "check_failed"
 
 CANONICAL_WORKFLOW = ".github/workflows/ci.yml"
 ALLOWED_EVENTS = frozenset({"pull_request", "push", "workflow_dispatch"})
@@ -75,6 +79,14 @@ SUCCESS = "success"
 
 RETRY_MINUTES = 5
 GIVE_UP_MINUTES = 6 * 60
+# The poller's share of one tick (#1687): after this many seconds no new
+# verification is started (the rest waits for the next tick), and a GitHub that
+# just failed is not asked again for FORGE_BACKOFF_SECONDS.
+SWEEP_BUDGET_SECONDS = 20.0
+FORGE_BACKOFF_SECONDS = 60.0
+# A verification of one body is repeated at most this often when the body keeps
+# being replaced under it.
+MAX_CHECK_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,7 @@ class Standing:
     has_report: bool = False
     applied: bool = False
     ac_recorded: tuple[dict, ...] = ()
+    forge_down: bool = False
 
     @property
     def verified(self) -> bool:
@@ -131,13 +144,18 @@ def _json_map(raw: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def run_conclusion(report: Mapping[str, Any]) -> str:
+    """How the run behind a stored report ended, as GitHub confirmed it ('' if unsaid)."""
+    return str(_json_map(report.get("provenance")).get("run_conclusion") or "")
+
+
 def green_gap(report: Mapping[str, Any]) -> str | None:
     """Why a verified report is not a GREEN proof; None when it is.
 
     Green needs the run to have ended in ``success`` and each of lint, format,
     types, tests to be ``pass`` — an absent key or a skip proves nothing.
     """
-    conclusion = str(_json_map(report.get("provenance")).get("run_conclusion") or "")
+    conclusion = run_conclusion(report)
     if conclusion != SUCCESS:
         return f"прогон закончился как {conclusion or 'неизвестно'}, нужен success"
     checks = _json_map(report.get("checks"))
@@ -287,6 +305,14 @@ async def _check_artifact(
     except ci_artifact.ArtifactRefused as exc:
         log.info("CI artifact of task %s refused: %s", row["task_id"], exc)
         return UNVERIFIED, ARTIFACT_INVALID, True
+    if _json_map(row["submitted"]).get("partial"):
+        # Stored by the migration with the AC map already cut to the AC the hub
+        # knew then: compare those, not the ones it never kept.
+        expected["ac_results"] = {
+            k: v
+            for k, v in expected["ac_results"].items()
+            if k in submitted["ac_results"]
+        }
     if expected != ci_artifact.submitted_comparable(submitted):
         return UNVERIFIED, BODY_MISMATCH, True
     return VERIFIED, "", True
@@ -352,14 +378,17 @@ def _standing_attempt(
     }
     newest = rows[0]
     if runs is None:
-        # GitHub could not say which attempt is current: keep a confirmed
-        # projection, otherwise show the newest report with what is known of it.
-        held = by_key.get(projected_key)
-        pick = held if held is not None and held["trust"] == VERIFIED else newest
-        return pick, pick["trust"], pick["trust_reason"], projected_key
+        # GitHub could not say which attempt is current, so nothing is
+        # confirmed NOW. A past confirmation stays on its attempt row as
+        # history; it is not proof and the evidence it wrote is withdrawn.
+        return None, UNVERIFIED, FORGE_UNAVAILABLE, projected_key
     cur = current_attempt(runs, sha, gh_repo)
     if cur is None:
-        return newest, newest["trust"], newest["trust_reason"], ""
+        if newest["trust"] != VERIFIED:
+            return newest, newest["trust"], newest["trust_reason"], ""
+        # The reported run is not among the commit's runs GitHub lists: the
+        # current attempt cannot be established, whatever the report says.
+        return None, UNVERIFIED, CURRENT_ATTEMPT_UNKNOWN, ""
     key = attempt_key(cur["run_id"], cur["run_attempt"])
     if cur["status"] != "completed":
         return None, UNVERIFIED, CURRENT_ATTEMPT_INCOMPLETE, key
@@ -521,58 +550,156 @@ async def _project(
     )
 
 
+_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
 async def refresh(
-    db: Any, task_id: int, head_sha: str, *, backoff: bool = False
+    db: Any,
+    task_id: int,
+    head_sha: str,
+    *,
+    backoff: bool = False,
+    offline: bool = False,
 ) -> Standing | None:
     """Check what is unchecked, find the current attempt, project it. None: no report.
 
-    The network part runs first and holds no transaction; the write part is one
-    short transaction. Safe to call from any reader and from the poller; never
+    One refresh at a time per (task, commit): two overlapping refreshes would
+    each read the world at a different moment, and the one that finished last
+    would put its older picture over the newer one. The network part holds no
+    transaction; the write part is one short transaction. ``offline`` asks no
+    question of GitHub: what is not confirmed now is shown as unverified. Never
     raises on a GitHub failure (that is ``forge_unavailable``, not an error).
     """
     head_sha = (head_sha or "").strip()
     if not head_sha:
         return None
-    rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
-    if not rows:
-        return None
-    task = dict(await repo.get_task(db, task_id) or {})
-    if not task:
-        return None
-    gh_args = await _forge_args(db, task_id)
-    gh_repo = str(gh_args.get("gh_repo") or config.REPO_NAME)
-    verdicts: dict[int, Verdict] = {}
-    for row in rows:
-        # The poller tries an unchecked attempt again every RETRY_MINUTES, not
-        # every tick; a reader that needs the answer now asks without backoff.
-        waiting = backoff and row["checked_minutes_ago"] < RETRY_MINUTES
-        if not row["trust_final"] and not waiting:
-            verdicts[int(row["id"])] = await check_attempt(row, gh_args)
-    runs = await plugins.git_ops.ci_runs_for_sha(
-        head_sha,
-        repo=gh_args.get("repo"),
-        gh_repo=gh_args.get("gh_repo"),
-        forge=gh_args.get("forge", ""),
-    )
-    async with write_transaction(db):
-        for attempt_id, (trust, reason, final) in verdicts.items():
-            await repo.set_ci_attempt_trust(
-                db, attempt_id, trust=trust, trust_reason=reason, final=final
+    lock = _locks.setdefault((task_id, head_sha), asyncio.Lock())
+    try:
+        async with lock:
+            return await _refresh_locked(db, task_id, head_sha, backoff, offline)
+    finally:
+        # Forgotten once nobody holds or awaits it, so the table does not grow.
+        if not lock.locked() and not getattr(lock, "_waiters", None):
+            _locks.pop((task_id, head_sha), None)
+
+
+async def _refresh_locked(
+    db: Any, task_id: int, head_sha: str, backoff: bool, offline: bool
+) -> Standing | None:
+    gh_args: dict[str, Any] = {}
+    for round_no in range(MAX_CHECK_ROUNDS):
+        rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
+        if not rows:
+            return None
+        task = dict(await repo.get_task(db, task_id) or {})
+        if not task:
+            return None
+        if not gh_args:
+            gh_args = await _forge_args(db, task_id)
+        gh_repo = str(gh_args.get("gh_repo") or config.REPO_NAME)
+        verdicts: dict[int, tuple[Verdict, int]] = {}
+        runs: list[dict[str, Any]] | None = None
+        if not offline:
+            for row in rows:
+                # The poller tries an unchecked attempt again every
+                # RETRY_MINUTES, not every tick; a reader that needs the answer
+                # now asks without backoff.
+                waiting = backoff and row["checked_minutes_ago"] < RETRY_MINUTES
+                if not row["trust_final"] and not waiting:
+                    verdicts[int(row["id"])] = (
+                        await check_attempt(row, gh_args),
+                        int(row["body_version"]),
+                    )
+            runs = await plugins.git_ops.ci_runs_for_sha(
+                head_sha,
+                repo=gh_args.get("repo"),
+                gh_repo=gh_args.get("gh_repo"),
+                forge=gh_args.get("forge", ""),
             )
-        fresh = await repo.list_ci_report_attempts(db, task_id, head_sha)
-        task = dict(await repo.get_task(db, task_id) or task)
-        return await _project(db, task, head_sha, list(fresh), runs, gh_repo)
+        async with write_transaction(db):
+            stale = False
+            for attempt_id, ((trust, reason, final), version) in verdicts.items():
+                written = await repo.set_ci_attempt_trust(
+                    db,
+                    attempt_id,
+                    trust=trust,
+                    trust_reason=reason,
+                    final=final,
+                    body_version=version,
+                )
+                stale = stale or not written
+            if stale and round_no + 1 < MAX_CHECK_ROUNDS:
+                continue  # a body was replaced while it was being checked
+            fresh = await repo.list_ci_report_attempts(db, task_id, head_sha)
+            task = dict(await repo.get_task(db, task_id) or task)
+            standing = await _project(db, task, head_sha, list(fresh), runs, gh_repo)
+            return replace(standing, forge_down=runs is None)
+    return None  # pragma: no cover - the last round always returns
+
+
+async def _fail_closed(db: Any, task_id: int, head_sha: str) -> None:
+    """The check itself broke: show unverified and withdraw what CI wrote."""
+    async with write_transaction(db):
+        task = dict(await repo.get_task(db, task_id) or {})
+        stored = await repo.get_ci_run_report(db, task_id, head_sha)
+        if stored is not None:
+            await repo.set_ci_run_report_trust(
+                db,
+                task_id,
+                head_sha,
+                trust=UNVERIFIED,
+                trust_reason=CHECK_FAILED,
+                attempt_key="",
+            )
+        generation = int(task.get("submission_generation") or 0)
+        if (task.get("submission_sha") or "").strip() == head_sha and generation > 0:
+            await write_evidence(db, task_id, generation, None, UNVERIFIED, "")
 
 
 async def refresh_quietly(
-    db: Any, task_id: int, head_sha: str, *, backoff: bool = False
+    db: Any,
+    task_id: int,
+    head_sha: str,
+    *,
+    backoff: bool = False,
+    offline: bool = False,
 ) -> Standing | None:
-    """``refresh`` for readers that must go on without it (a failure is logged)."""
+    """``refresh`` for readers that must go on without it (a failure is logged).
+
+    A reader that goes on must not go on with the old picture: when the check
+    breaks, the standing becomes unverified(check_failed) and the evidence CI
+    wrote is withdrawn.
+    """
     try:
-        return await refresh(db, task_id, head_sha, backoff=backoff)
+        return await refresh(db, task_id, head_sha, backoff=backoff, offline=offline)
     except Exception:  # noqa: BLE001 - a reader must not die of the check
         log.exception("CI trust refresh for task %s failed", task_id)
+        try:
+            await _fail_closed(db, task_id, (head_sha or "").strip())
+        except Exception:  # noqa: BLE001
+            log.exception("CI trust fail-closed for task %s failed", task_id)
         return None
+
+
+async def refresh_for_gate(db: Any, task: Mapping[str, Any]) -> dict[str, Any]:
+    """Bring the standing of the task's pinned commit up to date; the task, reread.
+
+    For every gate that reads AC results or validation: they are written from
+    the CURRENT attempt, and which attempt is current is only known by asking.
+    """
+    sha = (task.get("submission_sha") or "").strip()
+    if not sha:
+        return dict(task)
+    await refresh_quietly(db, int(task["id"]), sha)
+    return dict(await repo.get_task(db, int(task["id"])) or task)
+
+
+_forge_down_until = 0.0
+
+
+def forge_recently_down() -> bool:
+    """GitHub failed a moment ago: ask nothing, show what is unconfirmed as such."""
+    return time.monotonic() < _forge_down_until
 
 
 async def sweep(db: Any) -> None:
@@ -583,7 +710,15 @@ async def sweep(db: Any) -> None:
     hours ``forge_unavailable`` is final). Tasks in review are refreshed every
     tick, because a rerun nobody reported changes which attempt is current
     without a single POST arriving.
+
+    The tick is not held hostage by GitHub: no new verification starts after
+    ``SWEEP_BUDGET_SECONDS`` (the rest waits for the next tick, its evidence
+    stays as unverified as it was), and once GitHub fails it is not asked again
+    for ``FORGE_BACKOFF_SECONDS`` — in that time the standing is only
+    recomputed offline, so nothing stays confirmed on the strength of a
+    GitHub that cannot be asked.
     """
+    global _forge_down_until
     pairs: dict[tuple[int, str], None] = {}
     for row in await repo.ci_attempts_awaiting_check(
         db, older_than_minutes=RETRY_MINUTES
@@ -591,5 +726,16 @@ async def sweep(db: Any) -> None:
         pairs[(int(row["task_id"]), str(row["head_sha"]))] = None
     for row in await repo.tasks_in_review_with_sha(db):
         pairs[(int(row["id"]), str(row["submission_sha"]))] = None
+    started = time.monotonic()
     for task_id, sha in pairs:
-        await refresh_quietly(db, task_id, sha, backoff=True)
+        if time.monotonic() - started > SWEEP_BUDGET_SECONDS:
+            log.warning(
+                "CI trust sweep out of budget; the rest waits for the next tick"
+            )
+            return
+        offline = forge_recently_down()
+        standing = await refresh_quietly(
+            db, task_id, sha, backoff=True, offline=offline
+        )
+        if standing is not None and standing.forge_down and not offline:
+            _forge_down_until = time.monotonic() + FORGE_BACKOFF_SECONDS

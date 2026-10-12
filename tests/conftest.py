@@ -494,3 +494,30 @@ def _forget_locator_answers():
     clear_locator_cache()
     yield
     clear_locator_cache()
+
+
+@pytest.fixture(autouse=True)
+def _repository_of_the_fake_github():
+    """HUB_REPO set by the fake GitHub's helpers lasts for one test (#1687).
+
+    The hub compares the repository of a CI run with its project's, or with
+    HUB_REPO when the project names none, and a run of an unknown repository is
+    not confirmed. Helpers of tests/ci_trust_support.py set HUB_REPO to the
+    repository the fake answers for; it must hold for the whole test (the brief
+    and the gates check again later) and must not leak into the next one.
+    """
+    before = config.REPO_NAME
+    yield
+    config.REPO_NAME = before
+
+
+@pytest.fixture(autouse=True)
+def _forget_forge_backoff():
+    """The poller's memory of a GitHub that just failed is per process, not per test (#1687)."""
+    from hub.services import ci_trust
+
+    ci_trust._forge_down_until = 0.0
+    ci_trust._locks.clear()
+    yield
+    ci_trust._forge_down_until = 0.0
+    ci_trust._locks.clear()

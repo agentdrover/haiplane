@@ -2814,7 +2814,9 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # whole comparable body as the reporter sent it (before the hub kept
         # only the AC it knows), which is what the artifact is compared with.
         # ``trust_final`` = 1 ends the retries (a definite answer, or the six
-        # hours for an unreachable GitHub ran out).
+        # hours for an unreachable GitHub ran out). ``body_version`` counts the
+        # replacements of the body: a verdict is written only for the version
+        # it was computed for, so a body replaced mid-check is checked again.
         "create_ci_report_attempts",
         """CREATE TABLE IF NOT EXISTS ci_report_attempts (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2832,6 +2834,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
             baseline          TEXT    NOT NULL DEFAULT '{}',
             provenance        TEXT    NOT NULL DEFAULT '{}',
             submitted         TEXT    NOT NULL DEFAULT '{}',
+            body_version      INTEGER NOT NULL DEFAULT 0,
             trust             TEXT    NOT NULL DEFAULT 'unverified',
             trust_reason      TEXT    NOT NULL DEFAULT 'pending',
             trust_final       INTEGER NOT NULL DEFAULT 0,
@@ -2839,6 +2842,31 @@ _MIGRATIONS: list[tuple[str, str]] = [
             reported_at       TEXT    NOT NULL DEFAULT (datetime('now')),
             UNIQUE (task_id, head_sha, run_id, run_attempt)
         )""",
+    ),
+    (
+        # Reports stored before this task that DO name their run and artifact
+        # (#1686) are not lost to "legacy": each becomes an unverified attempt,
+        # queued for the check like any other (the poller picks up an attempt
+        # that was never checked). ``partial`` marks that the AC map kept in the
+        # row is already filtered to the AC the hub knew, so the comparison with
+        # the artifact is limited to those. Reports without a named run stay
+        # legacy. OR IGNORE: the migration may be applied to a database that
+        # already holds attempts.
+        "queue_provenanced_reports_for_verification",
+        """INSERT OR IGNORE INTO ci_report_attempts (task_id, head_sha, run_id,
+            run_attempt, ac_results, checks, validation_status, validation_log,
+            reason, reported_by, mutations, baseline, provenance, submitted)
+        SELECT task_id, head_sha, json_extract(provenance, '$.run_id'),
+            json_extract(provenance, '$.run_attempt'), ac_results, checks,
+            validation_status, validation_log, reason, reported_by, mutations,
+            baseline, provenance,
+            json_object('ac_results', json(ac_results), 'partial', 1)
+        FROM ci_run_reports
+        WHERE json_valid(provenance) AND json_valid(ac_results)
+          AND COALESCE(json_extract(provenance, '$.run_id'), '') != ''
+          AND COALESCE(json_extract(provenance, '$.run_attempt'), '') != ''
+          AND COALESCE(json_extract(provenance, '$.artifact_id'), '') != ''
+          AND COALESCE(json_extract(provenance, '$.artifact_digest'), '') != ''""",
     ),
     (
         # Where a stored AC result came from: 'manual' (the hub ran it),

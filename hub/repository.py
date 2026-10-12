@@ -2345,12 +2345,13 @@ async def upsert_ci_run_report(
     second opinion — the same rule the merge ledger follows (#605).
 
     ``mutations`` / ``baseline`` of ``None`` mean "the report carried no such
-    key" (#1606): the step did not run, so a block stored earlier for this
-    commit stays. The decision is made inside ON CONFLICT, in the same
-    statement that writes — a read before the write would let two reports for
-    one commit pass each other and erase the evidence they meant to keep. Text
-    (including ``"{}"``) replaces: a step that ran and found nothing, or ended
-    in error, is a fact, not an absence.
+    key" (#1606): the step did not run, so a block stored earlier IN THIS ROW
+    stays. Since #1687 the row is the projection of the current attempt and the
+    hub writes it with the attempt's own text, so a block is inherited only
+    inside one attempt, never from another one (the latest attempt must carry
+    its own baseline). The decision is made inside ON CONFLICT, in the same
+    statement that writes. Text (including ``"{}"``) replaces: a step that ran
+    and found nothing, or ended in error, is a fact, not an absence.
     """
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
@@ -2460,9 +2461,11 @@ async def upsert_ci_report_attempt(
     """Store one attempt's report; a repeat of the SAME attempt replaces it (#1687).
 
     Another attempt is another row, so a late POST of an old attempt cannot
-    overwrite a newer one. Within one attempt the #1606 rule holds: a block the
-    report did not carry (``None``) keeps what that attempt stored before. A
-    replaced report starts unverified again — it is a new claim.
+    overwrite a newer one. Within one attempt a block the report did not carry
+    (``None``) keeps what that attempt stored before (#1606); across attempts
+    nothing is inherited (#1687): the latest attempt must carry its own blocks.
+    A replaced report starts unverified again — it is a new claim — and its
+    ``body_version`` moves.
     """
     await db.execute(
         "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
@@ -2479,6 +2482,7 @@ async def upsert_ci_report_attempt(
         "baseline=CASE WHEN ? THEN ci_report_attempts.baseline "
         "ELSE excluded.baseline END, "
         "provenance=excluded.provenance, submitted=excluded.submitted, "
+        "body_version=ci_report_attempts.body_version + 1, "
         "trust='unverified', trust_reason='pending', trust_final=0, "
         "checked_at=NULL, reported_at=datetime('now')",
         (
@@ -2530,12 +2534,21 @@ async def set_ci_attempt_trust(
     trust: str,
     trust_reason: str,
     final: bool,
-) -> None:
-    await db.execute(
+    body_version: int,
+) -> bool:
+    """Write a verdict, but only for the body it was computed for (#1687).
+
+    The check reads a snapshot of the row and takes a while; a repeated POST of
+    the same attempt may replace the body meanwhile (``body_version`` moves).
+    The verdict then belongs to a body that is gone, and writing it would make
+    the new body look confirmed: False is returned and the caller checks again.
+    """
+    cur = await db.execute(
         "UPDATE ci_report_attempts SET trust=?, trust_reason=?, trust_final=?, "
-        "checked_at=datetime('now') WHERE id=?",
-        (trust, trust_reason, 1 if final else 0, attempt_id),
+        "checked_at=datetime('now') WHERE id=? AND body_version=?",
+        (trust, trust_reason, 1 if final else 0, attempt_id, body_version),
     )
+    return cur.rowcount == 1
 
 
 async def tasks_in_review_with_sha(db: aiosqlite.Connection) -> list[aiosqlite.Row]:

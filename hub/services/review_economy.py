@@ -241,12 +241,24 @@ async def _findings_section(db: aiosqlite.Connection, scope: Scope) -> dict[str,
 CI_ROWS: tuple[str, ...] = ("red", "green", "undetermined", "skipped", "no_report")
 
 
-def _ci_row(reported: bool, status: str | None) -> str:
-    """Строка прогона по отчёту CI на закреплённом sha его сдачи."""
+def _ci_row(reported: bool, status: str | None, report: dict | None = None) -> str:
+    """Строка прогона по отчёту CI на закреплённом sha его сдачи.
+
+    #1687: зелёным считается только то, что GitHub подтвердил и что проходит
+    общий предикат зелёного (conclusion success, четыре проверки pass); отчёт,
+    которого GitHub не подтвердил, — «не определился», а не красный и не
+    зелёный: подделанный или доподлинный-но-старый pass в метрику не идёт.
+    """
+    from hub.services import ci_trust
     from hub.services.validation_run import FAIL, PASS, SKIPPED
 
     if not reported:
         return "no_report"
+    if report is not None:
+        if not ci_trust.is_verified(report):
+            return "undetermined"
+        if status == PASS and ci_trust.green_gap(report):
+            return "undetermined"
     return {FAIL: "red", PASS: "green", SKIPPED: "skipped"}.get(
         status or "", "undetermined"
     )
@@ -264,12 +276,22 @@ async def _red_ci_section(
     rows = await fetchall(
         db,
         "SELECT s.task_id, s.generation, c.id IS NOT NULL AS reported, "
-        "c.validation_status AS ci "
+        "c.validation_status AS ci, c.trust AS trust, c.checks AS checks, "
+        "c.provenance AS provenance "
         "FROM submissions s LEFT JOIN ci_run_reports c "
         "ON c.task_id = s.task_id AND c.head_sha = s.sha",
     )
     ci_of = {
-        (r["task_id"], r["generation"]): _ci_row(bool(r["reported"]), r["ci"])
+        (r["task_id"], r["generation"]): _ci_row(
+            bool(r["reported"]),
+            r["ci"],
+            {
+                "trust": r["trust"],
+                "checks": r["checks"],
+                "provenance": r["provenance"],
+                "trust_reason": "",
+            },
+        )
         for r in rows
     }
     by_row: dict[str, list[dict[str, Any]]] = {name: [] for name in CI_ROWS}

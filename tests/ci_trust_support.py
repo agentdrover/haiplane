@@ -251,8 +251,6 @@ async def accept_backed(db: Any, task_id: int, **report: Any) -> dict:
     attached to whatever ``plugins.git_ops`` is at the moment of the call, and
     the repository the hub compares with is fixed for the call.
     """
-    from unittest.mock import patch
-
     from hub.services.ci_report import accept_ci_run_report
 
     git = plugins.git_ops
@@ -260,10 +258,10 @@ async def accept_backed(db: Any, task_id: int, **report: Any) -> dict:
     if fake is None:
         fake = attach_fake_github(git)
         git._fake_github = fake  # type: ignore[attr-defined]
-    with patch.object(config, "REPO_NAME", REPO):
-        return await accept_ci_run_report(
-            db, task_id, **backed_report(fake, task_id, report)
-        )
+    config.REPO_NAME = REPO  # restored after the test by tests/conftest.py
+    return await accept_ci_run_report(
+        db, task_id, **backed_report(fake, task_id, report)
+    )
 
 
 def _stamped(block: dict | None, stamp: dict | None) -> dict | None:
@@ -287,6 +285,7 @@ def install_fake_github(monkeypatch) -> FakeGitHub:
 def attach_fake_github(target: Any) -> FakeGitHub:
     """The same for a git_ops object a test builds itself (no monkeypatch needed)."""
     fake = FakeGitHub()
+    config.REPO_NAME = REPO  # restored after the test by tests/conftest.py
     for name in _READS:
         setattr(target, name, getattr(fake, name))
     return fake
