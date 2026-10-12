@@ -5163,6 +5163,7 @@ async def upsert_agent_session(
     host: str = "",
     workspace: str = "",
     projects: str = "",
+    work_role: str = "",
 ) -> None:
     """Register a session, or refresh the one already under this id.
 
@@ -5180,13 +5181,14 @@ async def upsert_agent_session(
 
     ``projects`` is the JSON array of declared slugs (#1674); '' keeps the
     stored one, a non-empty value replaces it. It is a declaration, not an
-    address: it never makes the write conditional.
+    address: it never makes the write conditional. ``work_role`` (#1678) follows
+    the same rule as ``projects``: '' keeps, non-empty replaces.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
         "(session_id, principal_id, agent, model, host, workspace, projects, "
-        " started_at, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+        " work_role, started_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         "  principal_id = excluded.principal_id, "
         "  agent        = excluded.agent, "
@@ -5198,6 +5200,8 @@ async def upsert_agent_session(
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
         "  projects     = CASE WHEN excluded.projects = '' "
         "                 THEN agent_sessions.projects ELSE excluded.projects END, "
+        "  work_role    = CASE WHEN excluded.work_role = '' "
+        "                 THEN agent_sessions.work_role ELSE excluded.work_role END, "
         "  last_seen_at = datetime('now') "
         "WHERE (agent_sessions.principal_id IS NULL "
         "       OR agent_sessions.principal_id = excluded.principal_id) "
@@ -5208,7 +5212,7 @@ async def upsert_agent_session(
         "  AND (excluded.workspace = '' "
         "       OR COALESCE(agent_sessions.workspace, '') = '' "
         "       OR agent_sessions.workspace = excluded.workspace)",
-        (session_id, principal_id, agent, model, host, workspace, projects),
+        (session_id, principal_id, agent, model, host, workspace, projects, work_role),
     )
 
 
@@ -5400,11 +5404,26 @@ async def get_agent_message(
     return rows[0] if rows else None
 
 
-# The four ways a message can be addressed to the caller, as one predicate.
+# A role address (#1678) is resolved from the ONE session named by
+# :role_session — the caller's own session, passed only after the service has
+# confirmed it belongs to the caller's principal (both principal ids present and
+# equal). '' means "no such session": nothing matches.
+_ROLE_ADDRESSED = (
+    "to_ref IN ("
+    "SELECT s.work_role || '@' || j.value FROM agent_sessions s, "
+    "json_each(CASE WHEN s.projects = '' THEN '[]' ELSE s.projects END) j "
+    "WHERE s.session_id = :role_session AND :role_session <> '' "
+    "AND s.work_role <> '')"
+)
+
+# The ways a message can be addressed to the caller, as one predicate.
 # Task channels resolve through the tasks table rather than through a copy of
 # the claim kept here: the task stays the only place that knows who holds it.
+# A role address (#1678) is resolved from the ONE session the request names —
+# its declared work_role crossed with its declared projects — never from the
+# other sessions of the same principal; without :session it matches nothing.
 _INBOX_PREDICATE = (
-    "("
+    "("  # nosec B608
     "  (to_kind = 'session' AND to_ref = :session AND :session <> '')"
     "  OR (to_kind = 'agent' AND to_ref = :agent AND :agent <> '')"
     "  OR (to_kind = 'task' AND to_ref IN ("
@@ -5412,6 +5431,7 @@ _INBOX_PREDICATE = (
     "        WHERE (claimed_by = :agent AND :agent <> '')"
     "           OR (assigned_agent = :agent AND :agent <> '')"
     "           OR (claim_session_id = :session AND :session <> '')))"
+    f"  OR (to_kind = 'role' AND {_ROLE_ADDRESSED})"
     "  OR to_kind = 'project'"
     ")"
 )
@@ -5424,6 +5444,7 @@ async def list_inbox_messages(
     agent: str = "",
     after_id: int = 0,
     limit: int = 100,
+    role_session: str = "",
 ) -> list[aiosqlite.Row]:
     """Messages addressed to this caller with id > ``after_id``, oldest first.
 
@@ -5439,6 +5460,7 @@ async def list_inbox_messages(
             {
                 "after": after_id,
                 "session": session_id,
+                "role_session": role_session,
                 "agent": agent,
                 "limit": min(limit, 200),
             },
@@ -5447,13 +5469,32 @@ async def list_inbox_messages(
 
 
 async def list_thread_messages(
-    db: aiosqlite.Connection, thread_id: str, *, limit: int = 200
+    db: aiosqlite.Connection,
+    thread_id: str,
+    *,
+    limit: int = 200,
+    role_session: str | None = None,
 ) -> list[aiosqlite.Row]:
+    """A thread, oldest first.
+
+    ``role_session=None`` is the unfiltered read (a human identity). A string —
+    '' included — hides role mail the viewer session was not addressed by and did
+    not send, BEFORE the LIMIT, so a hidden row cannot use up the page (#1678).
+    """
     return list(
         await fetchall(
             db,
-            "SELECT * FROM agent_messages WHERE thread_id = ? ORDER BY id ASC LIMIT ?",
-            (thread_id, min(limit, 500)),
+            "SELECT * FROM agent_messages WHERE thread_id = :thread "  # nosec B608
+            "AND (:unfiltered = 1 OR to_kind <> 'role' "
+            "     OR (:role_session <> '' AND from_session_id = :role_session) "
+            f"     OR {_ROLE_ADDRESSED}) "
+            "ORDER BY id ASC LIMIT :limit",
+            {
+                "thread": thread_id,
+                "unfiltered": 1 if role_session is None else 0,
+                "role_session": role_session or "",
+                "limit": min(limit, 500),
+            },
         )
     )
 
@@ -5496,6 +5537,7 @@ async def count_visible_in_thread(
     *,
     session_id: str = "",
     agent: str = "",
+    role_session: str = "",
 ) -> int:
     """How many messages of this thread the caller may see (#801).
 
@@ -5509,8 +5551,18 @@ async def count_visible_in_thread(
             db,
             "SELECT COUNT(*) AS n FROM agent_messages "  # nosec B608
             f"WHERE thread_id = :thread AND ({_INBOX_PREDICATE} "
-            "  OR (from_agent = :agent AND :agent <> ''))",
-            {"thread": thread_id, "session": session_id, "agent": agent},
+            # The sender reads their thread back. For a role message that is the
+            # exact sending session, named and non-empty: sibling sessions of the
+            # same token, and a request without a session, are not its sender
+            # (#1678).
+            "  OR (from_agent = :agent AND :agent <> '' AND (to_kind <> 'role' "
+            "      OR (:role_session <> '' AND from_session_id = :role_session))))",
+            {
+                "thread": thread_id,
+                "session": session_id,
+                "role_session": role_session,
+                "agent": agent,
+            },
         )
     )
     return int(rows[0]["n"]) if rows else 0
@@ -5552,8 +5604,16 @@ async def prune_agent_messages(db: aiosqlite.Connection, *, keep_days: int = 14)
     return cur.rowcount or 0
 
 
+_NO_ROLE_MAIL = "AND to_kind <> 'role' "
+_NO_ROLE_WHERE = "WHERE to_kind <> 'role' "
+
+
 async def list_task_messages(
-    db: aiosqlite.Connection, task_id: int, *, limit: int = 200
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    limit: int = 200,
+    exclude_roles: bool = False,
 ) -> list[aiosqlite.Row]:
     """The conversation about one task, oldest first (#775).
 
@@ -5561,12 +5621,16 @@ async def list_task_messages(
     message addressed to someone in particular that names this task. Both are
     talk about this task, and an owner reading the card wants the conversation,
     not the addressing scheme.
+
+    ``exclude_roles`` (#1678) leaves role-addressed mail out: a reader without a
+    verified session has no role to read it under. Humans pass False.
     """
     return list(
         await fetchall(
             db,
-            "SELECT * FROM agent_messages "
-            "WHERE (to_kind = 'task' AND to_ref = ?) OR related_task_id = ? "
+            "SELECT * FROM agent_messages "  # nosec B608
+            "WHERE ((to_kind = 'task' AND to_ref = ?) OR related_task_id = ?) "
+            f"{_NO_ROLE_MAIL if exclude_roles else ''}"
             "ORDER BY id ASC LIMIT ?",
             (str(task_id), task_id, min(limit, 500)),
         )
@@ -5574,20 +5638,24 @@ async def list_task_messages(
 
 
 async def list_recent_threads(
-    db: aiosqlite.Connection, *, limit: int = 10
+    db: aiosqlite.Connection, *, limit: int = 10, exclude_roles: bool = False
 ) -> list[aiosqlite.Row]:
     """Last message of each thread plus its size, newest thread first (#775).
 
     Every thread, whatever it is addressed to — a conversation between two
     sessions with no task attached is exactly the kind the owner must not have
     to go looking for.
+
+    ``exclude_roles`` (#1678) drops role-addressed mail from the last message and
+    from the count: the panel has no verified session to read it under.
     """
     return list(
         await fetchall(
             db,
-            "SELECT m.*, t.messages AS messages FROM agent_messages m "
+            "SELECT m.*, t.messages AS messages FROM agent_messages m "  # nosec B608
             "JOIN (SELECT thread_id, COUNT(*) AS messages, MAX(id) AS last_id "
-            "      FROM agent_messages GROUP BY thread_id) t ON m.id = t.last_id "
+            f"      FROM agent_messages {_NO_ROLE_WHERE if exclude_roles else ''}"
+            "      GROUP BY thread_id) t ON m.id = t.last_id "
             "ORDER BY m.id DESC LIMIT ?",
             (min(limit, 50),),
         )

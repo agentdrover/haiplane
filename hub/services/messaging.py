@@ -37,11 +37,17 @@ from hub import config
 from hub import repository as repo
 from hub.mcp_envelope import enrich_error_payload
 from hub.models import MessageDelivery, MessageSend, MessageSendResult, MessageView
-from hub.services.sessions import session_view
+from hub.services.sessions import (
+    WORK_ROLES,
+    declared_projects,
+    session_view,
+)
 
-# What a message can be addressed to. Four forms, and no fifth: a broadcast to
-# everything would be a channel nobody owns and everybody mutes.
-ADDRESS_KINDS = frozenset({"session", "agent", "task", "project"})
+# What a message can be addressed to. Five forms, and no sixth: a broadcast to
+# everything would be a channel nobody owns and everybody mutes. ``role`` (#1678)
+# is "<work_role>@<project_slug>": every session that declared that role AND
+# that project, including ones that register after the message was written.
+ADDRESS_KINDS = frozenset({"session", "agent", "task", "project", "role"})
 
 # What a message can claim to be. The set is small on purpose — these are
 # coordination moves, not a general chat vocabulary, and a reader can tell at a
@@ -142,8 +148,80 @@ async def _own_session(
     return data
 
 
+def role_session_refs(row: aiosqlite.Row | dict) -> set[str]:
+    """The role addresses ONE session answers to: its work_role x its projects."""
+    data = dict(row)
+    role = (data.get("work_role") or "").strip()
+    if not role:
+        return set()
+    return {f"{role}@{slug}" for slug in declared_projects(data.get("projects"))}
+
+
+def role_session_owned(row: aiosqlite.Row | dict, principal_id: int | None) -> str:
+    """The session id role mail may be read under, or '' when ownership is unproven.
+
+    Role mail is private to a declared role, so the weak check the other
+    addresses use (same agent NAME when a principal id is missing) is not enough:
+    two principals can share a name. Here both principal ids must be present and
+    equal (#1678). Humans read role mail through the unfiltered paths, not here.
+    """
+    data = dict(row)
+    owner = data.get("principal_id")
+    if owner is None or principal_id is None or owner != principal_id:
+        return ""
+    return str(data.get("session_id") or "")
+
+
+async def _normalize_role_ref(db: aiosqlite.Connection, to_ref: str) -> str:
+    """``<work_role>@<project_slug>`` in canonical form, or a 422 saying which part."""
+    role, sep, slug = to_ref.strip().lower().partition("@")
+    if not sep or not role or not slug or "@" in slug:
+        raise _refuse(
+            422,
+            "invalid_role_address",
+            f"to_ref must look like '<work_role>@<project>', got '{to_ref}'",
+            "Example: steward@default.",
+        )
+    if role not in WORK_ROLES:
+        raise _refuse(
+            422,
+            "unknown_work_role",
+            f"unknown work role '{role}'",
+            f"Roles: {', '.join(WORK_ROLES)}.",
+        )
+    if await repo.get_project_by_slug(db, slug) is None:
+        raise _refuse(
+            422,
+            "unknown_project",
+            f"unknown project '{slug}'",
+            "Address a role in an existing project.",
+        )
+    return f"{role}@{slug}"
+
+
+async def _role_delivery(db: aiosqlite.Connection, to_ref: str) -> dict:
+    """How many sessions with this role and project are online right now."""
+    online = 0
+    for row in await repo.list_agent_sessions(db, limit=500):
+        if to_ref in role_session_refs(row) and session_view(row)["online"]:
+            online += 1
+    return {
+        "delivered_now": online > 0,
+        "addressee_online": online > 0,
+        "addressee_last_seen_age_seconds": None,
+        "online_sessions": online,
+        "note": (
+            f"сообщение лежит в ящике роли {to_ref}; в сети сессий с этой ролью "
+            f"и проектом: {online}. Прочтение не гарантировано: роль увидит "
+            "сообщение, когда прочитает ящик"
+        ),
+    }
+
+
 async def _delivery(db: aiosqlite.Connection, to_kind: str, to_ref: str) -> dict:
     """What can honestly be said about reaching this address, before writing."""
+    if to_kind == "role":
+        return await _role_delivery(db, to_ref)
     if to_kind == "session":
         row = await repo.get_agent_session(db, to_ref)
         if not row:
@@ -205,7 +283,8 @@ async def send_message(
             422,
             "invalid_address_kind",
             f"to_kind must be one of {sorted(ADDRESS_KINDS)}, got '{to_kind}'",
-            "session = one session, agent = an agent's mail, task/project = channels.",
+            "session = one session, agent = an agent's mail, task/project = channels, "
+            "role = <work_role>@<project>.",
         )
     kind = (body.kind or "note").strip().lower()
     if kind not in MESSAGE_KINDS:
@@ -223,6 +302,8 @@ async def send_message(
             "to_ref is required",
             "A message without an address has nowhere to arrive.",
         )
+    if to_kind == "role":
+        to_ref = await _normalize_role_ref(db, to_ref)
     text = (body.body or "").strip()
     if not text:
         raise _refuse(
@@ -355,10 +436,19 @@ async def addressable_refs(
     session_id = (session_id or "").strip()
     if session_id:
         await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        own_row = await repo.get_agent_session(db, session_id)
+        role_session = role_session_owned(own_row or {}, principal_id)
         tasks = await repo.list_addressable_task_ids(
             db, agent=agent, session_ids=[session_id]
         )
-        return {"agent": agent, "sessions": {session_id}, "tasks": set(tasks)}
+        return {
+            "agent": agent,
+            "sessions": {session_id},
+            "tasks": set(tasks),
+            # #1678: role mail is read as ONE session; without it nobody is asked.
+            "session_id": role_session,
+            "roles": role_session_refs(own_row or {}) if role_session else set(),
+        }
     sessions = []
     for row in await repo.list_agent_sessions(db, limit=500):
         data = dict(row)
@@ -369,7 +459,13 @@ async def addressable_refs(
         elif (data.get("agent") or "") == agent and agent:
             sessions.append(data["session_id"])
     tasks = await repo.list_addressable_task_ids(db, agent=agent, session_ids=sessions)
-    return {"agent": agent, "sessions": set(sessions), "tasks": set(tasks)}
+    return {
+        "agent": agent,
+        "sessions": set(sessions),
+        "tasks": set(tasks),
+        "session_id": "",
+        "roles": set(),
+    }
 
 
 def message_event_is_addressed(
@@ -404,6 +500,13 @@ def message_event_is_addressed(
     )
     to_kind = payload.get("to_kind")
     to_ref = payload.get("to_ref")
+    if to_kind == "role":
+        # #1678: role mail belongs to the sessions whose declared role and
+        # project match, and to the exact session that sent it. The shared
+        # agent name, handoff and for_session widen nothing here.
+        sender = payload.get("from_session_id") or ""
+        exact_sender = bool(refs.get("session_id")) and sender == refs["session_id"]
+        return exact_sender or to_ref in refs.get("roles", ())
     personal = to_kind == "session" and to_ref in refs["sessions"]
     named = (
         bool(payload.get("for_session"))
@@ -444,10 +547,17 @@ async def inbox(
     would hand the caller a wider address instead.
     """
     session_id = (session_id or "").strip()
+    role_session = ""
     if session_id:
-        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        own = await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        role_session = role_session_owned(own, principal_id)
     rows = await repo.list_inbox_messages(
-        db, session_id=session_id, agent=agent, after_id=after_id, limit=limit
+        db,
+        session_id=session_id,
+        agent=agent,
+        after_id=after_id,
+        limit=limit,
+        role_session=role_session,
     )
     views: list[dict[str, Any]] = []
     for row in rows:
@@ -482,12 +592,23 @@ async def thread(
     is the condition under which agent-to-agent messaging is allowed to exist
     at all (#775), and narrowing it here would trade one hole for a worse one.
     """
+    role_session = ""
     if session_id:
-        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
-    rows = await repo.list_thread_messages(db, thread_id, limit=limit)
+        own = await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        role_session = role_session_owned(own, principal_id)
+    # #1678: role mail the viewer was not addressed by is hidden in SQL, before
+    # the LIMIT: one visible message opens the thread, not the role mail inside
+    # it, and a hidden row must not use up the page. A human reads it all.
+    rows = await repo.list_thread_messages(
+        db, thread_id, limit=limit, role_session=None if is_human else role_session
+    )
     if not is_human:
         visible = await repo.count_visible_in_thread(
-            db, thread_id, session_id=session_id, agent=agent
+            db,
+            thread_id,
+            session_id=session_id,
+            agent=agent,
+            role_session=role_session,
         )
         if not visible:
             # Refuse with a reason rather than an empty list: "this thread is

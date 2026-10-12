@@ -416,3 +416,86 @@ async def test_handoff_still_wakes_the_fleet(client: AsyncClient, monkeypatch, d
     assert len(feed.json()["events"]) == 1, (
         "passing work is too expensive to wait for the next poll"
     )
+
+
+# ---- #1678: the role address wakes only the matching session ----
+
+
+async def test_role_mail_wakes_only_the_matching_session(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-3: note и handoff, с for_session и без: будится только S1 (роль и
+    проект совпали); своя отправка — только точная сессия отправителя."""
+    auth = _auth(monkeypatch)
+    alpha = auth["alpha"]
+    for slug in ("a", "b"):
+        await repo.create_project(db, slug=slug, name=slug)
+    await db.commit()
+    for sid, role, projects in (
+        ("s1", "steward", ["a"]),
+        ("s2", "steward", ["b"]),
+        ("s3", "executor", ["a"]),
+    ):
+        resp = await client.post(
+            "/api/sessions/register",
+            json={"session_id": sid, "work_role": role, "projects": projects},
+            headers=alpha,
+        )
+        assert resp.status_code == 200, resp.text
+    await repo.upsert_agent_session(
+        db, session_id="s-beta", principal_id=12, agent="beta"
+    )
+    await db.commit()
+
+    async def woken(sid: str, since: int = 0) -> list[int]:
+        suffix = f"&session_id={sid}" if sid else ""
+        feed = await client.get(
+            f"/api/events?kinds=message_posted&since={since}{suffix}", headers=alpha
+        )
+        assert feed.status_code == 200, feed.text
+        return [e["payload"]["message_id"] for e in feed.json()["events"]]
+
+    sent: list[int] = []
+    for kind, for_session in (
+        ("note", ""),
+        ("handoff", ""),
+        ("note", "s2"),
+        ("handoff", "s2"),
+        ("note", "s3"),
+    ):
+        resp = await client.post(
+            "/api/messages",
+            json={
+                "to_kind": "role",
+                "to_ref": "steward@a",
+                "body": "наблюдение",
+                "kind": kind,
+                "for_session": for_session,
+                "session_id": "s-beta",
+            },
+            headers=auth["beta"],
+        )
+        assert resp.status_code == 200, resp.text
+        sent.append(resp.json()["message"]["id"])
+
+    assert await woken("s1") == sent
+    for sid in ("s2", "s3", ""):
+        assert await woken(sid) == [], sid
+
+    # Отправка из S2 под тем же токеном: «своя» только для S2.
+    resp = await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "role",
+            "to_ref": "steward@a",
+            "body": "от s2",
+            "session_id": "s2",
+        },
+        headers=alpha,
+    )
+    mine = resp.json()["message"]["id"]
+    cursor = max(sent)
+    assert await woken("s2", cursor) == [mine]
+    assert await woken("s1", cursor) == [mine]  # роль и проект совпали
+    assert await woken("s3", cursor) == []
+    assert await woken("", cursor) == []
