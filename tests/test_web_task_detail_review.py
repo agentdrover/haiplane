@@ -17,7 +17,7 @@ import re
 
 from httpx import AsyncClient
 
-from tests.test_web import (
+from tests.web_support import (
     _machine_report,
     _web_task_in_review,
     _web_task_in_review_with_test_ac,
@@ -292,7 +292,7 @@ async def test_the_card_page_prints_the_circle_before_the_threshold(client, db):
 
     from hub import config
     from hub import repository as repo_module
-    from tests.test_web import _web_task_in_review
+    from tests.web_support import _web_task_in_review
 
     task_id = await _web_task_in_review(client)
 
