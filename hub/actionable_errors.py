@@ -111,6 +111,27 @@ def archive_active_work_detail(
     )
 
 
+def return_running_has_work_detail(signs: list[dict[str, Any]]) -> dict[str, Any]:
+    """409: возврат running-задачи в очередь при признаках работы (#1675)."""
+    named = "; ".join(f"{s['sign']}: {s['detail']}" for s in signs)
+    return enrich_error_payload(
+        {
+            "reason": "return_running_has_work",
+            "actor_hint": "human",
+            "message": f"у running-задачи есть признаки работы: {named}",
+            "hint": (
+                "Возврат в очередь допустим, когда нет ни одного признака. "
+                "abandon_active_job здесь не помогает: непустой job_id или "
+                "review_job_id блокирует всегда. Дождитесь конца работы или "
+                "снимите признак (завершите, освободите слот, отзовите сессию) "
+                "и повторите."
+            ),
+            "signs": signs,
+            "suggested_tool": None,
+        }
+    )
+
+
 def withdraw_agent_only_detail() -> dict[str, Any]:
     return enrich_error_payload(
         {

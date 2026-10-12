@@ -7456,11 +7456,7 @@ async def test_return_to_work_button_on_the_task_page(client: AsyncClient, db):
     assert 'name="abandon_active_job"' in form and "job-fix-1" in form
     assert "409" in form, "help-текст называет отказ без галочки"
 
-    await repo.update_task(db, task_id, status="running")
-    await db.commit()
-    page = (await client.get(f"/tasks/{task_id}")).text
-    assert action not in page, "из running возврата нет — нет и кнопки"
-
+    # Из running форма есть с #1675: см. test_return_to_work_form_for_running_task.
     await repo.update_task(db, task_id, status="review", job_id=None)
     await db.commit()
     resp = await client.post(
@@ -7852,3 +7848,62 @@ async def test_web_archive_of_active_task_shows_the_refusal(client: AsyncClient,
     assert len(forms) == 2, "обе формы архива"
     for form in forms:
         assert 'name="reason"' in form and "confirm(" in form, form
+
+
+async def test_return_to_work_form_for_running_task(client: AsyncClient, db):
+    # AC-6 (#1675): форма видна у running commit-задачи; без признаков возврат
+    # открывает задачу; с признаком или job - отказ называет его (не 500), а
+    # галочки abandon_active_job у running нет вовсе.
+    async def _running() -> int:
+        task_id = (
+            await client.post("/api/tasks", json={"title": "Web running"})
+        ).json()["id"]
+        await repo.update_task(db, task_id, status="running")
+        await db.commit()
+        return task_id
+
+    def _form(page: str, task_id: int) -> str:
+        action = f'action="/tasks/{task_id}/web-return-to-work"'
+        assert action in page, "форма возврата у running-задачи"
+        form = page[page.index(action) :]
+        return form[: form.index("</form>")]
+
+    idle = await _running()
+    form = _form((await client.get(f"/tasks/{idle}")).text, idle)
+    assert 'name="reason"' in form and "required" in form
+    assert 'name="abandon_active_job"' not in form
+
+    resp = await client.post(
+        f"/tasks/{idle}/web-return-to-work",
+        data={"reason": "Исполнитель ушёл"},
+        follow_redirects=False,
+    )
+    assert resp.status_code in (200, 303), resp.text
+    assert (await client.get(f"/api/tasks/{idle}")).json()["status"] == "open"
+
+    held = await _running()
+    await repo.update_task(db, held, claimed_by="agent-a")
+    await db.commit()
+    _form((await client.get(f"/tasks/{held}")).text, held)
+    resp = await client.post(
+        f"/tasks/{held}/web-return-to-work", data={"reason": "Попытка"}
+    )
+    assert resp.status_code == 409, resp.status_code
+    text = html.unescape(resp.text)
+    assert "return_running_has_work" in text and "claimed_by" in text, text
+    assert (await client.get(f"/api/tasks/{held}")).json()["status"] == "running"
+
+    jobbed = await _running()
+    await repo.update_task(db, jobbed, job_id="job-web-1")
+    await db.commit()
+    form = _form((await client.get(f"/tasks/{jobbed}")).text, jobbed)
+    assert 'name="abandon_active_job"' not in form, "для running галочки нет"
+    assert "Блокирует возврат" in form and "job-web-1" in form, (
+        "job назван блокером в самой форме"
+    )
+    resp = await client.post(
+        f"/tasks/{jobbed}/web-return-to-work",
+        data={"reason": "Попытка", "abandon_active_job": "true"},
+    )
+    assert resp.status_code == 409 and "job_id" in html.unescape(resp.text)
+    assert (await client.get(f"/api/tasks/{jobbed}")).json()["status"] == "running"
