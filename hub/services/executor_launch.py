@@ -441,7 +441,11 @@ async def _reserve(
         # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
         # и поколение прогона; нажавший человек — в аудите.
         code, _ttl = await chat_pair.issue_run_code(
-            db, task_id, generation, issued_by_principal_id=issuer_principal_id
+            db,
+            task_id,
+            generation,
+            issued_by_principal_id=issuer_principal_id,
+            executor_run_id=row_id,
         )
     return task, generation, row_id, code
 
@@ -517,7 +521,11 @@ async def _order(
     # Коммит до сети: открытая запись держала бы write-лок на весь вызов
     # провайдера (_CREATE_TIMEOUT), класс #1428.
     async with write_transaction(db):
-        await repo.set_executor_run_starting_ref(db, row_id, starting_ref)
+        # #1683: версия — из того же объекта skill, что ушёл в промпт выше;
+        # активную версию заново не читаем.
+        await repo.set_executor_run_starting_ref(
+            db, row_id, starting_ref, int(skill["version"])
+        )
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
         if failed.startswith(REASON_ANSWER_BLIND):

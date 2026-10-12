@@ -2925,6 +2925,12 @@ class WorkingRulesSkill(BaseModel):
     content: str = ""
     chars: int = 0
     reason: str = ""  # при unreadable: тип ошибки чтения, без секретов
+    # #1683: текст этой версии уже в заказе вызывающего прогона — content пуст,
+    # version и chars названы. ordered_version — версия в заказе, когда она
+    # известна; version_changed — активная версия ушла от заказанной.
+    delivered_in_order: bool = False
+    ordered_version: int | None = None
+    version_changed: bool = False
 
 
 class WorkingRulesPolicy(BaseModel):

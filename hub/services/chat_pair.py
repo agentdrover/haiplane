@@ -129,6 +129,7 @@ async def issue_code(
     bound_generation: int | None = None,
     channel: str = "",
     slot: str = "",
+    executor_run_id: int | None = None,
 ) -> tuple[str, int]:
     """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
 
@@ -172,8 +173,8 @@ async def issue_code(
     await db.execute(
         "INSERT INTO chat_pair_codes "
         "(principal_id, kind, bound_task_id, bound_generation, code_hash, "
-        " expires_at, channel, slot) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
+        " expires_at, channel, slot, executor_run_id) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?)",
         (
             principal_id,
             kind,
@@ -183,6 +184,7 @@ async def issue_code(
             f"+{int(ttl)} seconds",
             channel if kind == "implementer" else "",
             slot if kind == "implementer" else "",
+            executor_run_id if kind == "implementer" else None,
         ),
     )
     await db.commit()
@@ -200,6 +202,7 @@ async def issue_run_code(
     generation: int,
     *,
     issued_by_principal_id: int | None,
+    executor_run_id: int | None = None,
 ) -> tuple[str, int]:
     """Код implementer, который выписывает сам хаб на прогон исполнителя (#1439).
 
@@ -227,6 +230,8 @@ async def issue_run_code(
         # #1434: диспетчер хаба запускает облачного исполнителя — канал
         # известен по построению и ложится в карточку при захвате.
         channel="cloud",
+        # #1683: код помнит заказ, ради которого выписан; сессия наследует.
+        executor_run_id=executor_run_id,
     )
     await admin_svc.write_audit(
         db,
@@ -284,7 +289,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, c.channel, c.slot, p.username, p.status "
+        "c.bound_generation, c.channel, c.slot, c.executor_run_id, "
+        "p.username, p.status "
         "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
         "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
         "AND c.expires_at > datetime('now')",
@@ -368,8 +374,9 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
-        " bound_generation, token_hash, expires_at, channel, slot) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
+        " bound_generation, token_hash, expires_at, channel, slot, "
+        " executor_run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?)",
         (
             row["principal_id"],
             acting_id,
@@ -380,6 +387,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             f"+{int(ttl)} seconds",
             row.get("channel") or "",
             row.get("slot") or "",
+            row.get("executor_run_id"),
         ),
     )
     await db.commit()
@@ -396,6 +404,55 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
         "kind": kind,
         "bound_task_id": int(bound_task_id) if bound_task_id is not None else None,
         "expires_at": _as_iso(dict(stored[0])["expires_at"] if stored else None),
+    }
+
+
+async def ordered_skill_of_session(
+    db: aiosqlite.Connection, token: str, task_id: int
+) -> dict[str, Any] | None:
+    """Заказ, которым стартовала ВЫЗЫВАЮЩАЯ сессия implementer (#1683).
+
+    Цепочка: токен → chat_pair_sessions.executor_run_id (унаследован от
+    chat_pair_codes.executor_run_id при обмене) → executor_runs. Возвращает
+    ``{"executor_run_id", "skill_version"}`` или ``None``. ``None`` — на любую
+    неопределённость: нет токена, не implementer, ручной код, сессия отозвана
+    или истекла, строка заказа исчезла, заказ другой задачи или другого
+    поколения, версия не записана. Читатель тогда отдаёт навык целиком:
+    «отдали дважды» дешевле, чем «скрыли навык, которого не получали».
+    """
+    if not token or not isinstance(task_id, int):
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT executor_run_id, bound_task_id, bound_generation "
+        "FROM chat_pair_sessions WHERE token_hash = ? AND kind = 'implementer' "
+        "AND revoked_at IS NULL AND expires_at > datetime('now')",
+        (hash_pair_code(token),),
+    )
+    if len(rows) != 1:
+        return None
+    session = dict(rows[0])
+    run_id, generation = session.get("executor_run_id"), session.get("bound_generation")
+    if run_id is None or generation is None or session.get("bound_task_id") != task_id:
+        return None
+    runs = await fetchall(
+        db,
+        "SELECT id, task_id, submission_generation, ordered_skill_version "
+        "FROM executor_runs WHERE id = ?",
+        (int(run_id),),
+    )
+    if len(runs) != 1:
+        return None
+    run = dict(runs[0])
+    if (
+        run["task_id"] != task_id
+        or run["submission_generation"] != generation
+        or run["ordered_skill_version"] is None
+    ):
+        return None
+    return {
+        "executor_run_id": int(run["id"]),
+        "skill_version": int(run["ordered_skill_version"]),
     }
 
 

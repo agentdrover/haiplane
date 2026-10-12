@@ -489,6 +489,15 @@ def _warn_area_check(result: Any) -> None:
             f"{found['detail']}",
             file=sys.stderr,
         )
+    rules = result.get("working_rules") if isinstance(result, dict) else None
+    skill = rules.get("hub_skill") if isinstance(rules, dict) else None
+    if isinstance(skill, dict) and skill.get("delivered_in_order"):
+        # #1683: текст навыка в JSON опущен — он уже в заказе этого прогона.
+        print(
+            f"текст навыка v{skill.get('version')} уже в заказе этого прогона "
+            f"({skill.get('chars')} знаков), повторно не выдаётся",
+            file=sys.stderr,
+        )
     foreign = result.get("project_check") if isinstance(result, dict) else None
     if isinstance(foreign, dict) and foreign.get("task_project"):
         # #1674: the task belongs to a project the session did not declare.
