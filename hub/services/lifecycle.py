@@ -5844,6 +5844,16 @@ async def prepare_ci_standing(
     return fresh
 
 
+async def _task_inside_transaction(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any]:
+    """The task as the database holds it NOW, with what the caller prepared kept."""
+    fresh = dict(await repo.get_task(db, int(task["id"])) or task)
+    if PREPARED_CI_SHA in task:
+        fresh[PREPARED_CI_SHA] = task[PREPARED_CI_SHA]
+    return fresh
+
+
 async def _task_with_current_ci(
     db: aiosqlite.Connection, task: dict[str, Any], kind: str
 ) -> dict[str, Any]:
@@ -5909,6 +5919,9 @@ async def add_update(
     # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
     # which is why it must run under the same lock.
     async with defer_completions() as deferred_done, write_transaction(db):
+        # #1687: nothing is gated on a dict prepared before the lock: a POST may
+        # have withdrawn the CI evidence since. The task is read again HERE.
+        task = await _task_inside_transaction(db, task)
         # #364: the done row and the generation bump are written before the
         # git tail runs, and a git adapter that raises used to leave both
         # behind — reproduced: one done row and generation 1 after the

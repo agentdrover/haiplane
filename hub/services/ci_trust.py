@@ -399,12 +399,16 @@ def _standing_attempt(
         return None, UNVERIFIED, CURRENT_ATTEMPT_INCOMPLETE, key
     match = by_key.get(key)
     if match is None:
-        # A report about a run GitHub does not list for this commit is judged
-        # on its own (run_not_found, wrong_repository, ...). Only when the
-        # reported runs are real and a later attempt said nothing is the
-        # answer "newer attempt without report".
-        known = {r["run_id"] for r in canonical_runs(runs, sha, gh_repo)}
-        if not by_key or newest["run_id"] not in known:
+        # The attempt GitHub calls current has no report. A report that is
+        # itself unconfirmed keeps its own reason (run_not_found,
+        # wrong_repository, ...); a CONFIRMED one — of a run that is gone, or of
+        # an older attempt — is history and is never shown as the standing.
+        # VERIFIED comes back only for the current attempt, below.
+        if newest["trust"] != VERIFIED and (
+            not by_key
+            or newest["run_id"]
+            not in {r["run_id"] for r in canonical_runs(runs, sha, gh_repo)}
+        ):
             return newest, newest["trust"], newest["trust_reason"], ""
         return None, UNVERIFIED, NEWER_ATTEMPT_WITHOUT_REPORT, key
     reason = match["trust_reason"]

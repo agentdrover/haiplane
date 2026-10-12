@@ -1668,3 +1668,69 @@ async def test_a_timed_out_check_is_saved_as_tried_and_final_after_six_hours(
         for r in await repo.ci_attempts_awaiting_check(db, older_than_minutes=5)
     }
     assert waiting == set()
+
+
+# ---- round 4 ---------------------------------------------------------------
+
+
+async def test_a_post_between_the_refresh_and_the_transaction_refuses_the_done_report(
+    db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+    from hub.services.ci_report import store_ci_run_report
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="8101"))
+    await repo.update_task(
+        db, task_id, status="pending_report", auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    assert (await _evidence(db, task_id))[1] == "pass"
+
+    real_prepare = lifecycle.prepare_ci_standing
+
+    async def prepare_then_a_post_arrives(*args, **kwargs):
+        prepared = await real_prepare(*args, **kwargs)  # the refresh: still green
+        assert prepared["validation_status"] == "pass"
+        await store_ci_run_report(
+            db, task_id, **GH.attempt(task_id, SHA, run_id="8102")
+        )
+        await db.commit()  # ... and a new claim withdraws the evidence
+        return prepared
+
+    monkeypatch.setattr(lifecycle, "prepare_ci_standing", prepare_then_a_post_arrives)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
+
+
+async def test_a_deleted_run_and_a_newer_red_one_without_a_report_is_never_verified(db):
+    from hub.services.ac_tests import ac_tests_gap
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="8201", attempt="1"))
+    assert (await _gap(db, task_id)) is None
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+
+    # R1 is deleted on GitHub; R2 is a completed red run nobody reported.
+    GH.runs.pop(("8201", "1"))
+    GH.artifacts.pop("8201")
+    GH.attempt(task_id, SHA, run_id="8202", attempt="1", conclusion="failure")
+    await ci_trust.refresh(db, task_id, SHA)
+
+    assert (await _standing(db, task_id))[:2] == (
+        "unverified",
+        "newer_attempt_without_report",
+    )
+    assert (await _evidence(db, task_id))[0] == []
+    assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
+    assert await ac_tests_gap(db, dict(await repo.get_task(db, task_id)))
