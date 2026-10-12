@@ -21,7 +21,10 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import json
+
 import aiosqlite
+import pytest
 
 from hub import config
 from hub import repository as repo
@@ -37,6 +40,8 @@ from hub.services.steward_judgement import (
     record_steward_judgement,
 )
 from tests.test_steward_shadow import _project, _task
+
+_GROUND = {"source": "ci_pinned_sha", "detail": "ci_run 1234 success on sha abc123"}
 
 _STEWARD = TokenIdentity("steward-bot", "steward", principal_id=42)
 
@@ -321,3 +326,141 @@ async def test_a_judgement_after_the_run_timed_out_still_costs_its_run(
     await _sweep(db, usage={"totalUsage": {"totalTokens": 321}})
     row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
     assert row["tokens_spent"] == 321
+
+
+# ---------------------------------------------------------------------------
+# #1671: основание советника — source плюс непустой detail; судья не меняется
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "verdict", "confidence", "grounds", "stored", "reason"),
+    [
+        (
+            "blank",
+            "concur",
+            "medium",
+            [{"source": "ci_pinned_sha", "detail": "  "}],
+            "object",
+            "no_grounds",
+        ),
+        (
+            "absent",
+            "concur",
+            "medium",
+            [{"source": "ci_pinned_sha"}],
+            "object",
+            "no_grounds",
+        ),
+        (
+            "mixed",
+            "concur",
+            "medium",
+            [{"source": "ci_pinned_sha", "detail": " "}, _GROUND],
+            "concur",
+            "",
+        ),
+        ("filled", "concur", "medium", [_GROUND], "concur", ""),
+        (
+            "object-empty",
+            "object",
+            "medium",
+            [{"source": "ci_pinned_sha"}],
+            "object",
+            "no_grounds",
+        ),
+        ("low", "concur", "low", [_GROUND], "object", "low_confidence"),
+        (
+            "low-empty",
+            "concur",
+            "low",
+            [{"source": "ci_pinned_sha"}],
+            "object",
+            "low_confidence",
+        ),
+        ("no-confidence", "concur", "", [_GROUND], "object", "no_confidence"),
+        (
+            "empty-no-confidence",
+            "concur",
+            "",
+            [{"source": "ci_pinned_sha"}],
+            "object",
+            "no_grounds",
+        ),
+    ],
+)
+async def test_an_advisor_concur_without_a_filled_ground_detail_is_stored_as_object(
+    db: aiosqlite.Connection,
+    label: str,
+    verdict: str,
+    confidence: str,
+    grounds: list[dict],
+    stored: str,
+    reason: str,
+    monkeypatch,
+):
+    """#1671 AC-1: основание советника засчитывается с непустым detail (strip).
+
+    Присланные grounds и submitted_verdict хранятся как есть; порядок причин
+    low_confidence -> no_grounds -> no_confidence.
+    """
+    from tests.test_steward_advisor import (
+        _advise,
+        _advisor_run,
+        _in_review,
+        _judge,
+        _judge_row,
+        _judge_run,
+    )
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    monkeypatch.setattr(config, "STEWARD_RUN_DEADLINE_MIN", 30)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 60)
+    monkeypatch.setattr(config, "STEWARD_MODEL", "gpt-5.3-codex")
+    task_id = await _in_review(db, f"advisor-detail-{label}")
+    await _judge_run(db, task_id)
+    await _judge(db, task_id)
+    await _advisor_run(db, task_id)
+
+    saved = await _advise(
+        db, task_id, verdict=verdict, confidence=confidence, grounds=grounds
+    )
+
+    assert saved.verdict == stored
+    assert saved.submitted_verdict == verdict
+    assert saved.escalate_reason == reason
+    row = await _judge_row(db, task_id, "advisor")
+    assert json.loads(row["grounds"]) == [
+        {"source": g["source"], "detail": g.get("detail", "")} for g in grounds
+    ], "присланные основания сохранены как есть"
+
+
+@pytest.mark.parametrize("kind", ["verdict", "dor", "disposition"])
+@pytest.mark.parametrize("verdict", ["approve", "changes_requested"])
+async def test_the_judge_rule_for_empty_ground_details_is_unchanged(
+    db: aiosqlite.Connection, kind: str, verdict: str
+):
+    """#1671 AC-2: у судьи основание с пустым detail по-прежнему основание."""
+    project_id = await _project(db, f"judge-empty-detail-{kind}-{verdict}")
+    task_id = await _task(db, project_id)
+
+    view = await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind=kind,
+            verdict=verdict,
+            confidence="high",
+            grounds=[
+                {"source": "ci_pinned_sha", "detail": ""},
+                {"source": "risk_class", "detail": "   "},
+            ],
+            model="gpt-5.3-codex",
+        ),
+        _STEWARD,
+    )
+
+    assert view.verdict == verdict
+    assert view.escalate_reason == ""
+    assert view.submitted_verdict == verdict

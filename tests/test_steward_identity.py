@@ -783,7 +783,12 @@ async def test_the_advisor_pin_is_read_on_both_entrances(
             "kind": "advisor",
             "verdict": "concur",
             "confidence": "high",
-            "grounds": [{"source": "ci_pinned_sha"}],
+            "grounds": [
+                {
+                    "source": "ci_pinned_sha",
+                    "detail": "ci_run 1234 success on sha abc123",
+                }
+            ],
         },
     )
     assert filed.status_code == 403, filed.text
@@ -877,7 +882,9 @@ async def test_a_judge_session_over_http_cannot_file_the_advisor_judgement(
     body = {
         "generation": 1,
         "confidence": "high",
-        "grounds": [{"source": "ci_pinned_sha"}],
+        "grounds": [
+            {"source": "ci_pinned_sha", "detail": "ci_run 1234 success on sha abc123"}
+        ],
     }
 
     as_judge = await client.post(
@@ -987,7 +994,12 @@ async def test_the_local_advisor_exchange_works_over_real_codes_and_http(
             "kind": "advisor",
             "verdict": "concur",
             "confidence": "high",
-            "grounds": [{"source": "ci_pinned_sha"}],
+            "grounds": [
+                {
+                    "source": "ci_pinned_sha",
+                    "detail": "ci_run 1234 success on sha abc123",
+                }
+            ],
         }
         seen["wrong_generation"] = (
             await client.post(
