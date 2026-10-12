@@ -3263,8 +3263,17 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     # Never from inside a write transaction (the headless done path pins the
     # tip there): the stored standing is what such a path reads, and the
     # network refresh is done by the caller BEFORE it opens the transaction.
+    prepared = state.task.get(PREPARED_CI_SHA)
     if state.submission_sha and not state.db.in_transaction:
         await ci_trust.refresh_quietly(state.db, state.task_id, state.submission_sha)
+    elif (
+        state.submission_sha
+        and prepared is not None
+        and prepared != state.submission_sha
+    ):
+        # The tip the caller asked GitHub about is not the one pinned here:
+        # nothing is known about this one, so its evidence is not confirmed.
+        await ci_trust.invalidate(state.db, state.task, state.submission_sha)
 
 
 async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
@@ -5805,18 +5814,41 @@ async def _record_path_notices_for_done(
         await path_notices.record(db, int(task["id"]), outcome)
 
 
+#: Key under which ``prepare_ci_standing`` leaves, on the task dict, the commit
+#: it asked GitHub about (the branch tip that WILL be pinned; '' = unresolved).
+PREPARED_CI_SHA = "_ci_prepared_sha"
+
+
+async def prepare_ci_standing(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any]:
+    """Ask GitHub about every commit a transition may pin or read, BEFORE its transaction.
+
+    A transition that pins a commit and reads CI evidence runs inside a write
+    transaction, where a network call is forbidden. So the caller resolves the
+    branch tip that will be pinned (a first submission has no pinned commit
+    yet) and refreshes the standing of that commit and of the pinned one, then
+    carries the answer on the task dict. Inside the transaction the pin step
+    compares: a different commit pinned there counts as unconfirmed. Inside a
+    transaction already, nothing is asked and the task is returned as it is.
+    """
+    if db.in_transaction:
+        return task
+    task_id = int(task["id"])
+    tip, _ = await resolve_branch_tip(db, task_id, task.get("branch") or "")
+    pinned = (task.get("submission_sha") or "").strip()
+    for sha in dict.fromkeys(s for s in (tip, pinned) if s):
+        await ci_trust.refresh_quietly(db, task_id, sha)
+    fresh = dict(await repo.get_task(db, task_id) or task)
+    fresh[PREPARED_CI_SHA] = tip
+    return fresh
+
+
 async def _task_with_current_ci(
     db: aiosqlite.Connection, task: dict[str, Any], kind: str
 ) -> dict[str, Any]:
-    """A done report is gated on the CURRENT attempt's evidence (#1687).
-
-    Asked of GitHub here, BEFORE the write transaction of the report opens: a
-    network call must not hold the database lock, and inside the transaction
-    only the stored standing is read. The task is read again after the ask.
-    """
-    if kind != "done":
-        return task
-    return await ci_trust.refresh_for_gate(db, task)
+    """A done report is gated on the CURRENT attempt's evidence (#1687)."""
+    return await prepare_ci_standing(db, task) if kind == "done" else task
 
 
 async def add_update(

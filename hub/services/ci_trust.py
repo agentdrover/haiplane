@@ -657,9 +657,13 @@ async def _refresh_locked(
     db: Any, task_id: int, head_sha: str, backoff: bool, offline: bool
 ) -> Standing | None:
     gh_args: dict[str, Any] = {}
-    async with write_transaction(db):
-        version = await repo.bump_ci_state_version(db, task_id, head_sha)
-    for round_no in range(MAX_CHECK_ROUNDS):
+    for _round in range(MAX_CHECK_ROUNDS):
+        # EVERY round reserves a version of its own, atomically, before it asks
+        # anything: a round may write only if the database still holds exactly
+        # the version it reserved. Adopting the version somebody else moved to
+        # would let an answer computed before their write pass as current.
+        async with write_transaction(db):
+            version = await repo.bump_ci_state_version(db, task_id, head_sha)
         rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
         if not rows:
             return None
@@ -671,7 +675,16 @@ async def _refresh_locked(
         gh_repo = str(gh_args.get("gh_repo") or config.REPO_NAME)
         verdicts: dict[int, tuple[Verdict, int]] = {}
         runs: list[dict[str, Any]] | None = None
-        if not offline:
+        if offline:
+            # Not asked, so not confirmed: but the attempts that were due for a
+            # check are marked as tried now (and final once six hours old), so
+            # the poller neither hammers them nor waits for them forever.
+            verdicts = {
+                int(r["id"]): (_unavailable(r), int(r["body_version"]))
+                for r in rows
+                if not r["trust_final"]
+            }
+        else:
             verdicts, runs = await _ask_github(rows, head_sha, gh_args, backoff)
         async with write_transaction(db):
             now = await repo.ci_state_version(db, task_id, head_sha)
@@ -694,7 +707,6 @@ async def _refresh_locked(
                         db, task, head_sha, list(fresh), runs, gh_repo
                     )
                     return replace(standing, forge_down=runs is None)
-            version = now  # something newer happened while GitHub was asked
     return await _superseded(db, task_id, head_sha)
 
 

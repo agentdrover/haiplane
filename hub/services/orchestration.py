@@ -5979,6 +5979,12 @@ async def transition_after_agent_done(
     result_text: str | None = None,
 ) -> str:
     """Post-done lifecycle shared by headless poller and pair mode."""
+    if not db.in_transaction:
+        # #1687: GitHub is asked about the commit that will be pinned BEFORE
+        # anything here opens a transaction (pair mode arrives with this done).
+        from hub.services.lifecycle import prepare_ci_standing
+
+        task = await prepare_ci_standing(db, task)
     task_id = task["id"]
     branch = task.get("branch")
     if has_done and automation_not_applicable(task):

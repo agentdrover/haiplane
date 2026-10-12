@@ -1467,3 +1467,204 @@ async def test_a_tick_that_ran_out_of_budget_goes_on_where_it_stopped(db, monkey
     for _ in range(3):
         await ci_trust.sweep(db)
     assert handled == sorted(tasks), "every task got its turn, in order"
+
+
+# ---- round 3 ---------------------------------------------------------------
+
+
+async def test_a_retry_round_reserves_its_own_version_and_a_late_answer_loses(
+    db, monkeypatch
+):
+    """A conflicts and retries; B writes; A's retry answer arrives late and stale."""
+    import asyncio
+
+    from hub.integrations.registry import plugins
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="7301", attempt="1"))
+    real_runs = GH.ci_runs_for_sha
+    stale: list[list] = []
+    gates = {n: (asyncio.Event(), asyncio.Event()) for n in (1, 2, 3)}
+    calls: list[int] = []
+
+    async def hooked(*args, **kwargs):
+        calls.append(1)
+        n = len(calls)
+        if n == 3:  # A's retry: the answer it got was computed from OLD data
+            picture = list(stale[0])
+        else:
+            picture = await real_runs(*args, **kwargs)
+        if n == 1:
+            stale.append(list(picture))
+        if n in gates:
+            entered, release = gates[n]
+            entered.set()
+            await release.wait()
+        return picture
+
+    monkeypatch.setattr(plugins.git_ops, "ci_runs_for_sha", hooked)
+    # 1. A asks (call 1) and waits.
+    a = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await gates[1][0].wait()
+    # 2. A newer attempt exists, nobody reported it; B (another process) starts:
+    #    it reserves a version and asks (call 2) ... and waits.
+    GH.attempt(task_id, SHA, run_id="7301", attempt="2", artifact=False)
+    ci_trust._locks.clear()
+    b = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await gates[2][0].wait()
+    # 3. A's first round ends in a conflict and it retries (call 3, stale answer).
+    gates[1][1].set()
+    await gates[3][0].wait()
+    # 4. B finishes: it writes newer_attempt_without_report ...
+    gates[2][1].set()
+    await asyncio.sleep(0.05)
+    # 5. ... and only then A's stale retry answer arrives.
+    gates[3][1].set()
+    await asyncio.gather(a, b)
+
+    assert (await _standing(db, task_id))[:2] == (
+        "unverified",
+        "newer_attempt_without_report",
+    )
+    assert (await _evidence(db, task_id))[0] == []
+
+
+async def test_the_first_submission_asks_about_the_tip_that_will_be_pinned(
+    db, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from hub.services import lifecycle
+
+    task_id = await _task(db, generation=0, sha="")
+    await repo.update_task(db, task_id, branch="task-1/x")
+    await db.commit()
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="7401", attempt="1"))
+    GH.attempt(task_id, SHA, run_id="7401", attempt="2", artifact=False)
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(SHA, ""))
+    )
+    _forbid_network_in_transaction(db)
+
+    task = await lifecycle.prepare_ci_standing(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert task[lifecycle.PREPARED_CI_SHA] == SHA
+    assert (await _standing(db, task_id))[:2] == (
+        "unverified",
+        "newer_attempt_without_report",
+    )
+    # Inside a transaction nothing is asked and the task is returned as it is.
+    from hub.db import write_transaction
+
+    GH.calls.clear()
+    async with write_transaction(db):
+        same = await lifecycle.prepare_ci_standing(db, task)
+    assert same is task and GH.calls == []
+
+
+async def test_the_poller_and_refresh_entries_prepare_before_they_transition(
+    db, monkeypatch
+):
+    """transition_after_agent_done is the door of the poller and of refresh_task."""
+    from hub.services import orchestration
+
+    task_id = await _task(db, generation=0, sha="")
+    await repo.update_task(db, task_id, branch="task-1/x")
+    await db.commit()
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="7501", attempt="1"))
+    GH.attempt(task_id, SHA, run_id="7501", attempt="2", artifact=False)
+    from unittest.mock import AsyncMock
+
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(SHA, ""))
+    )
+    _forbid_network_in_transaction(db)
+    await orchestration.transition_after_agent_done(
+        db, dict(await repo.get_task(db, task_id)), has_done=True
+    )
+    assert (await _standing(db, task_id))[:2] == (
+        "unverified",
+        "newer_attempt_without_report",
+    )
+
+
+async def test_a_different_tip_pinned_inside_the_transaction_is_unconfirmed(
+    db, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from hub.db import write_transaction
+    from hub.services import lifecycle
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="7601"))
+    assert (await _standing(db, task_id))[0] == "verified"
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(SHA, ""))
+    )
+    task = dict(await repo.get_task(db, task_id))
+
+    def state(prepared):
+        return SimpleNamespace(
+            db=db,
+            task_id=task_id,
+            task={**task, lifecycle.PREPARED_CI_SHA: prepared},
+            submission_sha="",
+            sha_reason="",
+        )
+
+    async with write_transaction(db):  # the commit asked about is the one pinned
+        await lifecycle._step_pin_submission_sha(state(SHA))
+    assert (await _standing(db, task_id))[0] == "verified"
+    async with write_transaction(db):  # another commit was asked about
+        await lifecycle._step_pin_submission_sha(state("some-other-tip"))
+    assert (await _standing(db, task_id))[:2] == ("unverified", "pending")
+    assert (await _evidence(db, task_id))[0] == []
+
+
+async def test_a_timed_out_check_is_saved_as_tried_and_final_after_six_hours(
+    db, monkeypatch
+):
+    import asyncio
+
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    young = await _task(db)
+    old = await _task(db)
+    for task_id, run in ((young, "7701"), (old, "7702")):
+        await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id=run))
+    await db.execute(
+        "UPDATE ci_report_attempts SET reported_at = datetime('now', '-7 hours') "
+        "WHERE task_id = ?",
+        (old,),
+    )
+    await db.commit()
+
+    async def hangs(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", hangs)
+    monkeypatch.setattr(ci_trust, "REFRESH_DEADLINE_SECONDS", 0.2)
+    for task_id in (young, old):
+        await ci_trust.refresh(db, task_id, SHA)
+
+    rows = {
+        r["task_id"]: r
+        for r in await db.execute_fetchall(
+            "SELECT task_id, trust_reason, trust_final, checked_at FROM ci_report_attempts"
+        )
+    }
+    assert rows[young]["trust_reason"] == "forge_unavailable"
+    assert rows[young]["checked_at"] is not None and rows[young]["trust_final"] == 0
+    assert rows[old]["checked_at"] is not None and rows[old]["trust_final"] == 1
+    # The poller does not take them up again within the interval / at all.
+    waiting = {
+        r["task_id"]
+        for r in await repo.ci_attempts_awaiting_check(db, older_than_minutes=5)
+    }
+    assert waiting == set()
