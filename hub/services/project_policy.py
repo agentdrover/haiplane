@@ -679,6 +679,36 @@ def claim_area_check_of(policy: dict) -> str:
     return CLAIM_AREA_WARN
 
 
+# Сверка проекта задачи с проектами сессии при захвате (#1674). Сессия
+# объявляет проекты при регистрации; захват задачи другого проекта без
+# сверки был незаметен (инцидент #404). ``warn`` — захват проходит, расхождение
+# названо одной записью в карточке; ``require`` — отказ до любых записей.
+# В отличие от claim_area_check, нет ключа — ``warn``: сверка включена всем,
+# молчит она только там, где сессия ничего не объявила. Нечитаемое значение —
+# тоже ``warn``.
+CLAIM_PROJECT_CHECK_KEY = "claim_project_check"
+CLAIM_PROJECT_OFF = "off"
+CLAIM_PROJECT_WARN = "warn"
+CLAIM_PROJECT_REQUIRE = "require"
+CLAIM_PROJECT_CHECK_MODES: tuple[str, ...] = (
+    CLAIM_PROJECT_OFF,
+    CLAIM_PROJECT_WARN,
+    CLAIM_PROJECT_REQUIRE,
+)
+#: Начало записи в карточке при warn — по нему запись находят и не пишут дважды.
+CLAIM_PROJECT_MARK = "Захват задачи чужого проекта"
+
+
+def claim_project_check_of(policy: dict) -> str:
+    """Режим сверки проекта при захвате: нет ключа — warn, нечитаемое — warn."""
+    if not isinstance(policy, dict):
+        return CLAIM_PROJECT_WARN
+    value = policy.get(CLAIM_PROJECT_CHECK_KEY)
+    if isinstance(value, str) and value in CLAIM_PROJECT_CHECK_MODES:
+        return value
+    return CLAIM_PROJECT_WARN
+
+
 # Гейт красного теста для багов (#913). Багфикс сдавался без доказательства,
 # что тест из AC падал до фикса: единственным следом были мутации сдачи
 # (#1436) — слова автора. Доказательство даёт только прогон CI поверх кода
