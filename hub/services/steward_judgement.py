@@ -122,19 +122,35 @@ async def _served_packet_hash(db, task_id: int, generation: int, kind: str) -> s
     return str(dict(rows[0]).get("packet_hash") or "") if rows else ""
 
 
-def _downgrade_reason(verdict: str, confidence: str, grounds: list) -> str:
+def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
+    """Основания, которые засчитываются. У советника (#1671) — только с detail.
+
+    Источник без конкретного факта пакета человек и хаб проверить не могут,
+    поэтому основание советника с пустым или пробельным detail не считается.
+    """
+    if not detail_required:
+        return list(grounds)
+    return [g for g in grounds if (g.detail or "").strip()]
+
+
+def _downgrade_reason(
+    verdict: str, confidence: str, grounds: list, *, detail_required: bool = False
+) -> str:
     """Why a verdict is stored as an escalation, or "" when it stands.
 
     ``low`` confidence beats any verdict (#1022). An approve or a return that
     names no ground, or states no confidence, cannot be checked by a human or
     by the hub — it is stored as an escalation too (#1327). An escalation
     needs neither: it already says "I cannot judge this".
+
+    ``detail_required`` (the advisor, #1671): a ground counts only when its
+    ``detail`` is non-empty after strip.
     """
     if confidence == "low":
         return "low_confidence"
     if verdict == "escalate":
         return ""
-    if not grounds:
+    if not _counted_grounds(grounds, detail_required=detail_required):
         return "no_grounds"
     if not confidence:
         return "no_confidence"
@@ -152,7 +168,12 @@ def _effective_verdict(
     причиной; возражение остаётся возражением.
     """
     escalate_reason = (body.escalate_reason or "").strip()
-    downgrade = _downgrade_reason(submitted_verdict, confidence, body.grounds)
+    downgrade = _downgrade_reason(
+        submitted_verdict,
+        confidence,
+        body.grounds,
+        detail_required=body.kind == KIND_ADVISOR,
+    )
     if body.kind == KIND_ADVISOR:
         object_ = submitted_verdict == "object" or bool(downgrade)
         return ("object" if object_ else "concur"), downgrade
