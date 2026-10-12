@@ -2216,6 +2216,7 @@ async def pair_start_task(
     caller: str = "",
     implementer_principal_id: int | None = None,
     caller_is_agent: bool = False,
+    session_token: str = "",
 ) -> TaskView:
     """Start an open task in pair mode: running without headless dispatch.
 
@@ -2327,11 +2328,19 @@ async def pair_start_task(
             starting_status=starting_status,
             project_guard=project_guard,
         )
+    # #1683: навык, уже лежащий в заказе ВЫЗЫВАЮЩЕЙ сессии, второй раз не
+    # выдаётся. Слой собирается здесь, чтобы факт выдачи лёг в то же событие.
+    working_rules_block = None
+    skill_fact: dict[str, Any] = {}
+    if not state_task:
+        working_rules_block, skill_fact = await _build_pair_rules(
+            db, task_id, agent_rules, session_token if caller_is_agent else ""
+        )
     await log_activity(
         db,
         "task_pair_started",
         f"Task #{task_id} pair session started",
-        detail=mutation_activity_detail(),
+        detail=mutation_activity_detail(skill_fact),
     )
 
     # #484: the warning is written BEFORE the view is assembled, so it
@@ -2358,8 +2367,40 @@ async def pair_start_task(
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.worktree_hint = _worktree_hint(task_id)
-    tv.working_rules = await working_rules.build_working_rules(db, task_id, agent_rules)
+    tv.working_rules = working_rules_block
     return tv
+
+
+async def _build_pair_rules(
+    db: aiosqlite.Connection,
+    task_id: int,
+    agent_rules: dict[str, Any] | None,
+    session_token: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Блок «Правила работы» pair-start и факт выдачи навыка (#1683).
+
+    Привязка к заказу — только по токену вызывающей сессии implementer; нет
+    связи или она неоднозначна — навык целиком, факта нет.
+    """
+    from hub.services import chat_pair, working_rules
+
+    order = await chat_pair.ordered_skill_of_session(db, session_token, task_id)
+    block = await working_rules.build_working_rules(
+        db,
+        task_id,
+        agent_rules,
+        ordered_skill_version=order["skill_version"] if order else None,
+    )
+    if order is None:
+        return block, {}
+    skill = block.hub_skill
+    return block, {
+        "executor_run_id": order["executor_run_id"],
+        "skill_version": skill.version,
+        "ordered_skill_version": order["skill_version"],
+        "delivered_in_order": skill.delivered_in_order,
+        "omitted_chars": skill.chars if skill.delivered_in_order else 0,
+    }
 
 
 async def _resolve_branch_diff(
