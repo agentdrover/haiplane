@@ -5163,6 +5163,7 @@ async def upsert_agent_session(
     host: str = "",
     workspace: str = "",
     projects: str = "",
+    work_role: str = "",
 ) -> None:
     """Register a session, or refresh the one already under this id.
 
@@ -5180,13 +5181,14 @@ async def upsert_agent_session(
 
     ``projects`` is the JSON array of declared slugs (#1674); '' keeps the
     stored one, a non-empty value replaces it. It is a declaration, not an
-    address: it never makes the write conditional.
+    address: it never makes the write conditional. ``work_role`` (#1678) follows
+    the same rule as ``projects``: '' keeps, non-empty replaces.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
         "(session_id, principal_id, agent, model, host, workspace, projects, "
-        " started_at, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+        " work_role, started_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         "  principal_id = excluded.principal_id, "
         "  agent        = excluded.agent, "
@@ -5198,6 +5200,8 @@ async def upsert_agent_session(
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
         "  projects     = CASE WHEN excluded.projects = '' "
         "                 THEN agent_sessions.projects ELSE excluded.projects END, "
+        "  work_role    = CASE WHEN excluded.work_role = '' "
+        "                 THEN agent_sessions.work_role ELSE excluded.work_role END, "
         "  last_seen_at = datetime('now') "
         "WHERE (agent_sessions.principal_id IS NULL "
         "       OR agent_sessions.principal_id = excluded.principal_id) "
@@ -5208,7 +5212,7 @@ async def upsert_agent_session(
         "  AND (excluded.workspace = '' "
         "       OR COALESCE(agent_sessions.workspace, '') = '' "
         "       OR agent_sessions.workspace = excluded.workspace)",
-        (session_id, principal_id, agent, model, host, workspace, projects),
+        (session_id, principal_id, agent, model, host, workspace, projects, work_role),
     )
 
 
@@ -5400,9 +5404,12 @@ async def get_agent_message(
     return rows[0] if rows else None
 
 
-# The four ways a message can be addressed to the caller, as one predicate.
+# The ways a message can be addressed to the caller, as one predicate.
 # Task channels resolve through the tasks table rather than through a copy of
 # the claim kept here: the task stays the only place that knows who holds it.
+# A role address (#1678) is resolved from the ONE session the request names —
+# its declared work_role crossed with its declared projects — never from the
+# other sessions of the same principal; without :session it matches nothing.
 _INBOX_PREDICATE = (
     "("
     "  (to_kind = 'session' AND to_ref = :session AND :session <> '')"
@@ -5412,6 +5419,10 @@ _INBOX_PREDICATE = (
     "        WHERE (claimed_by = :agent AND :agent <> '')"
     "           OR (assigned_agent = :agent AND :agent <> '')"
     "           OR (claim_session_id = :session AND :session <> '')))"
+    "  OR (to_kind = 'role' AND to_ref IN ("
+    "        SELECT s.work_role || '@' || j.value FROM agent_sessions s, "
+    "          json_each(CASE WHEN s.projects = '' THEN '[]' ELSE s.projects END) j"
+    "        WHERE s.session_id = :session AND s.work_role <> ''))"
     "  OR to_kind = 'project'"
     ")"
 )
@@ -5509,7 +5520,11 @@ async def count_visible_in_thread(
             db,
             "SELECT COUNT(*) AS n FROM agent_messages "  # nosec B608
             f"WHERE thread_id = :thread AND ({_INBOX_PREDICATE} "
-            "  OR (from_agent = :agent AND :agent <> ''))",
+            # The sender reads their thread back. For a role message that is the
+            # exact sending session (or a sessionless sender): sibling sessions
+            # of the same token are not its sender (#1678).
+            "  OR (from_agent = :agent AND :agent <> '' AND (to_kind <> 'role' "
+            "      OR from_session_id = :session OR from_session_id = '')))",
             {"thread": thread_id, "session": session_id, "agent": agent},
         )
     )

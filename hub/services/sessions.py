@@ -53,6 +53,23 @@ _NOT_REGISTERED = (
 ONLINE = "online"
 OFFLINE = "offline"
 
+# #1678: рабочие роли сессии. Декларация для адресата to_kind='role', не право:
+# права идут от принципала (hub/auth.py), и из этого списка не выводятся.
+WORK_ROLES = ("steward", "executor", "watcher", "reviewer")
+
+
+def normalize_work_role(raw: str) -> str:
+    """Declared work role: strip+lower; '' means "not declared" (keeps the old one).
+
+    Anything outside WORK_ROLES is a 422 naming the value and the allowed set.
+    """
+    role = (raw or "").strip().lower()
+    if role and role not in WORK_ROLES:
+        raise HTTPException(
+            422, f"unknown work_role '{role}' — one of {', '.join(WORK_ROLES)}"
+        )
+    return role
+
 
 def _age_seconds(stamp: str | None, *, now: datetime | None = None) -> int | None:
     """Whole seconds since a SQLite timestamp, or None if it cannot be read.
@@ -128,6 +145,7 @@ def session_view(row: aiosqlite.Row | dict, *, now: datetime | None = None) -> d
         "host": data.get("host") or "",
         "workspace": data.get("workspace") or "",
         "projects": declared_projects(data.get("projects")),
+        "work_role": data.get("work_role") or "",
         "principal_id": data.get("principal_id"),
         "current_task_id": data.get("current_task_id"),
         "started_at": data.get("started_at") or "",
@@ -219,6 +237,7 @@ async def register_session(
             ),
         )
     projects = await normalize_projects(db, body.projects)
+    work_role = normalize_work_role(body.work_role)
     await repo.upsert_agent_session(
         db,
         session_id=session_id,
@@ -228,6 +247,7 @@ async def register_session(
         host=declared["host"],
         workspace=declared["workspace"],
         projects=json.dumps(projects) if projects else "",
+        work_role=work_role,
     )
     await db.commit()
     row = await repo.get_agent_session(db, session_id)
