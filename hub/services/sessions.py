@@ -31,6 +31,7 @@ is not (#771 AC-5).
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -72,6 +73,43 @@ def _age_seconds(stamp: str | None, *, now: datetime | None = None) -> int | Non
     return max(0, int((current - moment).total_seconds()))
 
 
+def declared_projects(raw: object) -> list[str]:
+    """Slugs a session declared (#1674); '' or anything unreadable is none."""
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if isinstance(v, str) and v]
+
+
+async def normalize_projects(db: aiosqlite.Connection, raw: list[str]) -> list[str]:
+    """Declared project slugs: strip+lower, no duplicates, order kept (#1674).
+
+    Only existing ACTIVE projects may be declared; the first other one is a
+    422 naming its slug. A declaration is checked, never turned into an
+    address: nothing here can produce a 409.
+    """
+    slugs: list[str] = []
+    for item in raw:
+        slug = item.strip().lower()
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    for slug in slugs:
+        project = await repo.get_project_by_slug(db, slug)
+        if project is None:
+            raise HTTPException(422, f"unknown project '{slug}'")
+        if project["status"] != "active" or project["archived"]:
+            raise HTTPException(
+                422,
+                f"project '{slug}' is not active (status: {project['status']})",
+            )
+    return slugs
+
+
 def session_view(row: aiosqlite.Row | dict, *, now: datetime | None = None) -> dict:
     """One registry row with presence computed at read time."""
     data = dict(row)
@@ -85,6 +123,7 @@ def session_view(row: aiosqlite.Row | dict, *, now: datetime | None = None) -> d
         "model": data.get("model") or "",
         "host": data.get("host") or "",
         "workspace": data.get("workspace") or "",
+        "projects": declared_projects(data.get("projects")),
         "principal_id": data.get("principal_id"),
         "current_task_id": data.get("current_task_id"),
         "started_at": data.get("started_at") or "",
@@ -175,6 +214,7 @@ async def register_session(
                 declared=diff,
             ),
         )
+    projects = await normalize_projects(db, body.projects)
     await repo.upsert_agent_session(
         db,
         session_id=session_id,
@@ -183,6 +223,7 @@ async def register_session(
         model=body.model.strip(),
         host=declared["host"],
         workspace=declared["workspace"],
+        projects=json.dumps(projects) if projects else "",
     )
     await db.commit()
     row = await repo.get_agent_session(db, session_id)

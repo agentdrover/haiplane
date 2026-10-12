@@ -6741,6 +6741,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "executor_task_token_ceiling": 24000000,
         "submission_contract": "warn",
         "claim_area_check": "warn",
+        "claim_project_check": "warn",
         "bug_red_test": "warn",
         "ci_before_submit": "warn",
         "statement_paths": "require",

@@ -862,3 +862,280 @@ async def test_state_task_is_not_an_undeclared_code_area(db):
     assert (await _pair_start(db, candidate, agent="exec-b")).status == "running"
     assert await _overlap_records(db, candidate) == []
     assert await _status(db, active_state) == "running"
+
+
+# ---------------------------------------------------------------------------
+# #1674: сессия объявляет проекты; захват задачи чужого проекта предупреждается
+# ---------------------------------------------------------------------------
+
+
+async def _session(db, session_id: str, projects: list[str] | None = None) -> None:
+    from hub import services
+    from hub.models import SessionRegister
+
+    for slug in projects or []:
+        await _project(db, slug, {})
+    await services.register_session(
+        db,
+        SessionRegister(session_id=session_id, projects=projects or []),
+        agent="exec-b",
+        principal_id=None,
+    )
+
+
+async def _claim_as(db, task_id: int, session_id: str):
+    from hub import services
+    from hub.models import TaskClaim
+
+    return await services.claim_task(
+        db, task_id, TaskClaim(agent="exec-b", session_id=session_id)
+    )
+
+
+async def _pair_start_as(db, task_id: int, session_id: str):
+    from hub import services
+    from hub.models import PairGitMode, TaskPairStart
+
+    return await services.pair_start_task(
+        db,
+        task_id,
+        TaskPairStart(
+            plan="p",
+            assigned_agent="exec-b",
+            session_id=session_id,
+            git_mode=PairGitMode.remote,
+        ),
+    )
+
+
+async def _project_records(db, task_id: int) -> list[str]:
+    return [
+        str(u["content"])
+        for u in await repo.get_task_updates(db, task_id)
+        if str(u["content"]).startswith(project_policy.CLAIM_PROJECT_MARK)
+    ]
+
+
+def _warned(task_project: str) -> dict:
+    return {
+        "mode": "warn",
+        "task_project": task_project,
+        "session_projects": ["pc-home"],
+    }
+
+
+async def _through_rest(client, monkeypatch):
+    """MCP-инструменты поверх настоящего REST: ответ захвата — тот, что отдал сервер."""
+    from hub import mcp_server
+
+    async def post(path: str, body=None, **_kw):
+        resp = await client.post(path, json=body)
+        assert resp.status_code < 400, resp.text
+        return resp.json()
+
+    async def get(path: str, **_kw):
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    return mcp_server
+
+
+async def test_claim_of_a_foreign_project_task_warns(db, client, monkeypatch):
+    """AC-1: warn — захват прошёл, одна alert-запись с обоими slug, REST и
+    structured MCP-результат несут project_check; повторный claim — без второй."""
+    project = await _project(db, "pc-foreign", {"claim_project_check": "warn"})
+    pid = int(project["id"])
+    await _session(db, "s-warn", ["pc-home"])
+
+    task = await _task(db, pid, title="foreign-db")
+    claimed = await _claim_as(db, task, "s-warn")
+    assert claimed.status == "claimed"
+    assert claimed.project_check == _warned("pc-foreign")
+    records = await _project_records(db, task)
+    assert len(records) == 1, records
+    assert "pc-home" in records[0] and "pc-foreign" in records[0]
+    again = await _claim_as(db, task, "s-warn")
+    assert again.status == "claimed"
+    assert await _project_records(db, task) == records
+
+    rest_task = await _task(db, pid, title="foreign-rest")
+    resp = await client.post(
+        f"/api/tasks/{rest_task}/claim",
+        json={"agent": "exec-b", "session_id": "s-warn"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_check"] == _warned("pc-foreign")
+    assert len(await _project_records(db, rest_task)) == 1
+
+    mcp_task = await _task(db, pid, title="foreign-mcp")
+    mcp_server = await _through_rest(client, monkeypatch)
+    out = json.loads(await mcp_server.hub_claim_task(mcp_task, "exec-b", "s-warn"))
+    assert out["project_check"] == _warned("pc-foreign")
+    assert "pc-foreign" in out["message"] and "pc-home" in out["message"]
+    assert len(await _project_records(db, mcp_task)) == 1
+
+
+async def test_pair_start_of_a_foreign_project_task_warns(db, client, monkeypatch):
+    """AC-2: pair-start из open и из собственного claimed — то же поведение."""
+    project = await _project(db, "pc-pair", {"claim_project_check": "warn"})
+    pid = int(project["id"])
+    await _session(db, "s-pair", ["pc-home"])
+
+    from_open = await _task(db, pid, title="pair-open")
+    started = await _pair_start_as(db, from_open, "s-pair")
+    assert started.status == "running"
+    assert started.project_check == _warned("pc-pair")
+    assert len(await _project_records(db, from_open)) == 1
+
+    from_claimed = await _task(db, pid, title="pair-claimed")
+    claimed = await _claim_as(db, from_claimed, "s-pair")
+    assert claimed.project_check == _warned("pc-pair")
+    started = await _pair_start_as(db, from_claimed, "s-pair")
+    assert started.status == "running"
+    assert started.project_check == _warned("pc-pair")
+    assert len(await _project_records(db, from_claimed)) == 1
+
+    rest_task = await _task(db, pid, title="pair-rest")
+    resp = await client.post(
+        f"/api/tasks/{rest_task}/pair-start",
+        json={
+            "plan": "p",
+            "assigned_agent": "exec-b",
+            "session_id": "s-pair",
+            "git_mode": "remote",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_check"] == _warned("pc-pair")
+
+    mcp_task = await _task(db, pid, title="pair-mcp")
+    mcp_server = await _through_rest(client, monkeypatch)
+    out = json.loads(
+        await mcp_server.hub_pair_start(
+            mcp_task,
+            plan="p",
+            assigned_agent="exec-b",
+            session_id="s-pair",
+            git_mode="remote",
+        )
+    )
+    assert out["project_check"] == _warned("pc-pair")
+    assert len(await _project_records(db, mcp_task)) == 1
+
+
+async def _activity_count(db) -> int:
+    rows = await fetchall(db, "SELECT COUNT(*) FROM activity_log")
+    return int(rows[0][0])
+
+
+async def test_claim_project_check_require_refuses_without_side_effects(db):
+    """AC-3: require — 409 project_check_refused до записывающей части
+    area-check; статус, claim, план, ветка, job, лента и activity не менялись."""
+    project = await _project(
+        db,
+        "pc-require",
+        {"claim_project_check": "require", "claim_area_check": "warn"},
+    )
+    pid = int(project["id"])
+    await _task(db, pid, status="running", areas=[_A_PATH])
+    await _session(db, "s-req", ["pc-home"])
+
+    for entrance, capture in (("claim", _claim_as), ("pair_start", _pair_start_as)):
+        b = await _task(db, pid, areas=[_B_PATH], title=f"req-{entrance}")
+        feed = [dict(u) for u in await repo.get_task_updates(db, b)]
+        before = dict(await repo.get_task(db, b))
+        activity = await _activity_count(db)
+        with pytest.raises(HTTPException) as caught:
+            await capture(db, b, "s-req")
+        assert caught.value.status_code == 409, entrance
+        detail = caught.value.detail
+        assert detail["reason"] == "project_check_refused", (entrance, detail)
+        assert detail["task_project"] == "pc-require"
+        assert detail["session_projects"] == ["pc-home"]
+        assert dict(await repo.get_task(db, b)) == before, entrance
+        assert [dict(u) for u in await repo.get_task_updates(db, b)] == feed
+        assert await _activity_count(db) == activity, entrance
+        assert await _overlap_records(db, b) == [], entrance
+
+    # pair-start из собственного claimed: проекты объявлены ПОСЛЕ захвата.
+    late = await _task(db, pid, areas=[_B_PATH], title="req-late")
+    await _session(db, "s-late")
+    assert (await _claim_as(db, late, "s-late")).status == "claimed"
+    await _session(db, "s-late", ["pc-home"])
+    before = dict(await repo.get_task(db, late))
+    feed = [dict(u) for u in await repo.get_task_updates(db, late)]
+    with pytest.raises(HTTPException) as caught:
+        await _pair_start_as(db, late, "s-late")
+    assert caught.value.detail["reason"] == "project_check_refused"
+    assert dict(await repo.get_task(db, late)) == before
+    assert [dict(u) for u in await repo.get_task_updates(db, late)] == feed
+
+
+async def test_project_check_is_silent_or_independent(db):
+    """AC-4: молчит без регистрации, при пустых projects, для своего проекта и
+    при off; не зависит от area-check (off) и в require отказывает."""
+    own = await _project(db, "pc-own", {"claim_project_check": "warn"})
+    off = await _project(db, "pc-off", {"claim_project_check": "off"})
+    await _session(db, "s-empty")
+    await _session(db, "s-decl", ["pc-home"])
+    await _session(db, "s-own", ["pc-own"])
+
+    cases = [
+        (int(own["id"]), "s-unregistered"),
+        (int(own["id"]), "s-empty"),
+        (int(own["id"]), "s-own"),
+        (int(off["id"]), "s-decl"),
+    ]
+    for n, (project_id, session_id) in enumerate(cases):
+        task = await _task(db, project_id, title=f"silent-{n}")
+        claimed = await _claim_as(db, task, session_id)
+        assert claimed.status == "claimed", cases[n]
+        assert claimed.project_check is None or claimed.project_check["mode"] == "off"
+        assert await _project_records(db, task) == [], cases[n]
+
+    warn = await _project(
+        db, "pc-indep", {"claim_project_check": "warn", "claim_area_check": "off"}
+    )
+    task = await _task(db, int(warn["id"]), title="indep-warn")
+    claimed = await _claim_as(db, task, "s-decl")
+    assert claimed.project_check == _warned("pc-indep")
+    assert len(await _project_records(db, task)) == 1
+
+    strict = await _project(
+        db,
+        "pc-indep-req",
+        {"claim_project_check": "require", "claim_area_check": "off"},
+    )
+    task = await _task(db, int(strict["id"]), title="indep-require")
+    with pytest.raises(HTTPException) as caught:
+        await _claim_as(db, task, "s-decl")
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "project_check_refused"
+    assert await _status(db, task) == "open"
+
+    # Нет ключа — warn (умолчание AC-7): проверка включена и там, где её не просили.
+    keyless = await _project(db, "pc-keyless", {})
+    task = await _task(db, int(keyless["id"]), title="keyless")
+    assert (await _claim_as(db, task, "s-decl")).project_check == _warned("pc-keyless")
+
+
+def test_cli_claim_names_the_foreign_project() -> None:
+    """Контракт #1674 в CLI: чужой проект уходит в stderr строкой."""
+    import argparse
+    from io import StringIO
+    from unittest.mock import MagicMock
+
+    from hub import cli
+
+    view = {"id": 9, "status": "claimed", "project_check": _warned("pc-foreign")}
+    err = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=view)),
+        patch("sys.stdout", new=StringIO()),
+        patch("sys.stderr", new=err),
+    ):
+        assert (
+            cli.cmd_claim(argparse.Namespace(task_id=9, agent="a", session_id="s")) == 0
+        )
+    assert "pc-foreign" in err.getvalue() and "pc-home" in err.getvalue()

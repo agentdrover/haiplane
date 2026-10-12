@@ -1698,13 +1698,14 @@ def _format_mutation_success(
     task: dict[str, Any],
     *,
     transition_from: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     envelope = build_mutation_envelope(
         task,
         transition_from=transition_from,
         transition_to=task.get("status"),
     )
-    return merge_mutation_response(message, envelope)
+    return merge_mutation_response(message, envelope, extra=extra)
 
 
 async def _read_task(task_id: int) -> dict[str, Any] | None:
@@ -1732,6 +1733,7 @@ async def _task_mutation_response(
     prior_status: str | None,
     task: dict[str, Any] | None,
     fallback_status: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     body = task or {"id": task_id, "status": fallback_status or "?"}
     if body.get("status") == "review" and "verdict_route" not in body:
@@ -1741,7 +1743,9 @@ async def _task_mutation_response(
         fresh = await _read_task(task_id) or {}
         if fresh.get("status") == "review":
             body = {**body, "verdict_route": fresh.get("verdict_route")}
-    return _format_mutation_success(message, body, transition_from=prior_status)
+    return _format_mutation_success(
+        message, body, transition_from=prior_status, extra=extra
+    )
 
 
 @mcp.tool()
@@ -2441,6 +2445,24 @@ def _area_check_note(result: dict[str, Any] | None) -> str:
     )
 
 
+def _project_check_note(result: dict[str, Any] | None) -> str:
+    """Warn-mode foreign project of a claim/pair-start, as one line (#1674)."""
+    found = (result or {}).get("project_check")
+    if not isinstance(found, dict) or not found.get("task_project"):
+        return ""
+    return (
+        f"\nForeign project (claim_project_check={found.get('mode', 'warn')}): "
+        f"task of {found['task_project']}, session declared "
+        f"{', '.join(found.get('session_projects') or [])}. Recorded in the card."
+    )
+
+
+def _project_check_extra(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """project_check from the capture RESULT, not from a re-read of the task (#1674)."""
+    found = (result or {}).get("project_check")
+    return {"project_check": found} if isinstance(found, dict) else None
+
+
 def _worktree_hint_note(result: dict[str, Any] | None) -> str:
     """Where the task worktree goes, from claim/pair-start (#1515)."""
     hint = (result or {}).get("worktree_hint")
@@ -2562,12 +2584,14 @@ async def hub_pair_start(
             "it and refuses a mismatch."
         )
     message += _working_rules_note(task_id, result)
+    message += _project_check_note(result)
     return await _task_mutation_response(
         task_id,
         message,
         prior_status=prior_status,
         task=task,
         fallback_status=status,
+        extra=_project_check_extra(result),
     )
 
 
@@ -3083,6 +3107,7 @@ async def hub_claim_task(
     holder = (task or result).get("claimed_by") or agent
     message = f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
     message += _area_check_note(result)
+    message += _project_check_note(result)
     message += _worktree_hint_note(result)
     return await _task_mutation_response(
         task_id,
@@ -3090,6 +3115,7 @@ async def hub_claim_task(
         prior_status=prior_status,
         task=task,
         fallback_status=status,
+        extra=_project_check_extra(result),
     )
 
 
@@ -4511,6 +4537,7 @@ async def hub_session_register(
     model: str = "",
     host: str = "",
     workspace: str = "",
+    projects: list[str] | None = None,
 ) -> CallToolResult:
     """Register this session so other sessions can address it (#771).
 
@@ -4526,6 +4553,7 @@ async def hub_session_register(
         model: The model running this session — a declaration, like the one on submit
         host: Machine this session runs on
         workspace: Working directory or worktree this session operates in
+        projects: Project slugs you work in (#1674); a claim or pair-start of another project's task is flagged. Omitted or [] keeps the old list
     """
     try:
         session = await _api_post(
@@ -4535,6 +4563,7 @@ async def hub_session_register(
                 "model": model,
                 "host": host,
                 "workspace": workspace,
+                "projects": projects or [],
             },
         )
     except HubApiError as exc:

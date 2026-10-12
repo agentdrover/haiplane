@@ -36,6 +36,10 @@ from hub.actionable_errors import (
 )
 from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
+from hub.services.session_project_check import (
+    foreign_project_check,
+    record_foreign_project,
+)
 from hub.services.sessions import note_session_task
 from hub.services.result_kind import is_state
 from hub.hub_instance import mutation_activity_detail
@@ -2259,6 +2263,9 @@ async def pair_start_task(
         # #1647: предмет в базовой ветке — проверка по коду; у state кода нет.
         await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
+    # #1674: the declared session against the task's project — refused (require)
+    # before any write, independent of the area check below.
+    project_check = await foreign_project_check(db, task_id, declared_session)
     # #1433: the same place for the same reason — refused before the plan and
     # the branch are written; the hold lasts until the transition is committed.
     # #1630: файл правил репозитория читается ЗДЕСЬ — после проверок допуска и
@@ -2281,6 +2288,7 @@ async def pair_start_task(
             declared_session=declared_session,
             starting_status=starting_status,
         )
+    await record_foreign_project(db, task_id, declared_session, project_check)
     await log_activity(
         db,
         "task_pair_started",
@@ -2300,6 +2308,7 @@ async def pair_start_task(
     if git_mode != PairGitMode.remote:
         tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
     tv.area_check = area_check
+    tv.project_check = project_check
     if state_task:
         # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
         # что уехало в базу: постановка state-задачи не о коде.
@@ -4877,6 +4886,9 @@ async def claim_task(
             f"can only claim open tasks, current status: {task['status']}",
         )
 
+    # #1674: the declared session against the task's project — require refuses
+    # before any write, independent of (and before) the area check below.
+    project_check = await foreign_project_check(db, task_id, body.session_id)
     # #1433: before the transition, and the hold lasts until its commit — a
     # refusal leaves the task open, a concurrent overlapping claim sees ours.
     async with capture_areas(db, task_id, task["status"]) as area_check:
@@ -4886,6 +4898,7 @@ async def claim_task(
     if won_by_same_holder is not None:
         won_by_same_holder.worktree_hint = _worktree_hint_for(task, task_id)
         return won_by_same_holder
+    await record_foreign_project(db, task_id, body.session_id, project_check)
     await log_activity(
         db,
         "task_claimed",
@@ -4897,6 +4910,7 @@ async def claim_task(
     updates = await repo.get_task_updates(db, task_id)
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     tv.area_check = area_check
+    tv.project_check = project_check
     tv.worktree_hint = _worktree_hint_for(task, task_id)
     return tv
 

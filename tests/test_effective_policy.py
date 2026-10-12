@@ -1234,3 +1234,44 @@ def test_local_review_fallback_reader_defaults_to_off():
     assert reader({"local_review_fallback": True}) == "off"
     assert reader({"local_review_fallback": 1}) == "off"
     assert reader(None) == "off"  # type: ignore[arg-type]
+
+
+async def test_claim_project_check_key_is_read_and_validated(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-7 (#1674): off/warn/require принимаются, иное — 422; без ключа и с
+    # нечитаемым значением ридер и сводка дают warn (у claim_area_check — off).
+    read = project_policy.claim_project_check_of
+    assert read({}) == "warn"
+    assert read({"claim_project_check": "off"}) == "off"
+    assert read({"claim_project_check": "require"}) == "require"
+    assert read({"claim_project_check": "requre"}) == "warn"
+    assert read({"claim_project_check": 1}) == "warn"
+
+    resp = await client.post("/api/projects", json={"slug": "pck", "name": "Pck"})
+    pid = resp.json()["id"]
+    for mode in ("off", "warn", "require"):
+        ok = await client.patch(
+            f"/api/projects/{pid}", json={"gate_policy": {"claim_project_check": mode}}
+        )
+        assert ok.status_code == 200, ok.text
+        row = _by_key((await client.get("/api/projects/pck/effective-policy")).json())
+        assert row["claim_project_check"]["value"] == mode
+        assert row["claim_project_check"]["source"] == "project"
+    bad = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"claim_project_check": "maybe"}}
+    )
+    assert bad.status_code == 422, bad.text
+    assert "claim_project_check" in bad.text
+
+    keyless = await _project(db, "pck-none", {})
+    data = (await client.get("/api/projects/pck-none/effective-policy")).json()
+    row = _by_key(data)["claim_project_check"]
+    assert (row["value"], row["source"], row["default"]) == ("warn", "default", "warn")
+    assert _by_key(data)["claim_area_check"]["value"] == "off"
+    garbled = await _project(db, "pck-garbled", {"claim_project_check": "requre"})
+    data = (await client.get("/api/projects/pck-garbled/effective-policy")).json()
+    assert _by_key(data)["claim_project_check"]["value"] == "warn"
+    assert keyless != garbled
+    assert "claim_project_check" in GATE_POLICY_KEYS
+    assert effective_policy.unsummarised_keys() == []

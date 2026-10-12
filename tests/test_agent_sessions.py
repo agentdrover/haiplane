@@ -9,6 +9,8 @@ one that makes it safe to ship: the existing lifecycle never depends on it.
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 from httpx import AsyncClient
 
@@ -500,3 +502,77 @@ async def test_same_principal_register_refreshes_without_changing_owner(
     assert row["agent"] == "agent-a"
     assert row["model"] == "fable"
     assert row["last_seen_at"] > frozen
+
+
+# ---- #1674: the session declares its projects ----
+
+
+async def _mk_project(db: aiosqlite.Connection, slug: str, status: str = "active"):
+    pid = await repo.create_project(db, slug=slug, name=slug)
+    await db.execute("UPDATE projects SET status = ? WHERE id = ?", (status, pid))
+    await db.commit()
+
+
+async def test_register_keeps_and_replaces_declared_projects(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-5: сохранение/замена по правилу, нормализация, 422 с именем slug,
+    защиты #977/#1288 работают; MCP говорит то же, что REST."""
+    from hub import mcp_server
+
+    agent = _auth(monkeypatch)
+    await _mk_project(db, "alpha")
+    await _mk_project(db, "beta")
+    await _mk_project(db, "gamma", status="pending")
+
+    async def register(**body):
+        return await client.post(
+            "/api/sessions/register", json={"session_id": "s-p", **body}, headers=agent
+        )
+
+    resp = await register(projects=[" Alpha ", "alpha", "BETA"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["projects"] == ["alpha", "beta"]
+    stored = (await _rows(db, "s-p"))[0]["projects"]
+    assert json.loads(stored) == ["alpha", "beta"]
+
+    # Без поля и с [] прежнее значение остаётся.
+    assert (await register()).json()["projects"] == ["alpha", "beta"]
+    assert (await register(projects=[])).json()["projects"] == ["alpha", "beta"]
+    # Непустой список заменяет.
+    assert (await register(projects=["beta"])).json()["projects"] == ["beta"]
+
+    for slug, word in (("nowhere", "nowhere"), ("gamma", "gamma")):
+        bad = await register(projects=["alpha", slug])
+        assert bad.status_code == 422, bad.text
+        assert word in bad.text
+    assert (await register()).json()["projects"] == ["beta"], "422 ничего не записал"
+
+    # #977: чужой принципал получает 409, список не тронут.
+    rival = {"Authorization": "Bearer rival-token"}
+    monkeypatch.setattr(
+        __import__("hub.config", fromlist=["HUB_TOKENS"]),
+        "HUB_TOKENS",
+        {**_tokens(), "rival-token": TokenIdentity("rival", "agent", principal_id=8)},
+    )
+    stolen = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-p", "projects": ["alpha"]},
+        headers=rival,
+    )
+    assert stolen.status_code == 409, stolen.text
+    # #1288: другой host — 409, список не тронут.
+    await register(host="mac-1")
+    moved = await register(host="mac-2", projects=["alpha"])
+    assert moved.status_code == 409, moved.text
+    assert (await register()).json()["projects"] == ["beta"]
+
+    # MCP: тот же ответ, что отдал REST.
+    async def post(path, body=None, **_kw):
+        resp = await client.post(path, json=body, headers=agent)
+        assert resp.status_code < 400, resp.text
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    out = await mcp_server.hub_session_register("s-p", projects=["alpha", "beta"])
+    assert out.structuredContent["session"]["projects"] == ["alpha", "beta"]

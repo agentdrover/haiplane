@@ -368,6 +368,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1433: сверка областей при захвате задачи. Не гейт и ничего не
     # делегирует. Читатель: project_policy.claim_area_check_of.
     "claim_area_check",
+    # #1674: сверка проекта задачи с проектами сессии при захвате. Не гейт и
+    # ничего не делегирует. Читатель: project_policy.claim_project_check_of.
+    "claim_project_check",
     # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
     # project_policy.bug_red_test_of.
     "bug_red_test",
@@ -804,6 +807,21 @@ def _validate_claim_area_check(policy: dict[str, Any]) -> None:
             "gate_policy claim_area_check must be one of "
             f"{', '.join(CLAIM_AREA_CHECK_MODES)}, "
             f"got: {policy['claim_area_check']!r}"
+        )
+
+
+def _validate_claim_project_check(policy: dict[str, Any]) -> None:
+    """Refuse a project-check mode the reader would read as warn by accident (#1674)."""
+    from hub.services.project_policy import CLAIM_PROJECT_CHECK_MODES
+
+    if (
+        "claim_project_check" in policy
+        and policy["claim_project_check"] not in CLAIM_PROJECT_CHECK_MODES
+    ):
+        raise ValueError(
+            "gate_policy claim_project_check must be one of "
+            f"{', '.join(CLAIM_PROJECT_CHECK_MODES)}, "
+            f"got: {policy['claim_project_check']!r}"
         )
 
 
@@ -2004,6 +2022,9 @@ class SessionRegister(BaseModel):
     model: str = Field("", max_length=100)
     host: str = Field("", max_length=200)
     workspace: str = Field("", max_length=500)
+    # #1674: проекты, в которых работает сессия. Декларация, не адрес: omitted
+    # или [] сохраняют прежнее значение, непустой список заменяет его.
+    projects: list[str] = Field(default_factory=list, max_length=50)
 
 
 class SessionView(BaseModel):
@@ -2021,6 +2042,7 @@ class SessionView(BaseModel):
     model: str = ""
     host: str = ""
     workspace: str = ""
+    projects: list[str] = Field(default_factory=list)
     principal_id: int | None = None
     current_task_id: int | None = None
     started_at: str = ""
@@ -3202,6 +3224,10 @@ class TaskView(BaseModel):
     # (path, with_task_id, with_path, detail). None means none was found or
     # the check is off; in require the overlap is a refusal, not this field.
     area_check: dict[str, Any] | None = None
+    # #1674: the foreign-project mismatch of this claim/pair-start in warn mode
+    # ({mode, task_project, session_projects}). None means the session declared
+    # nothing, the project is its own or the check is off.
+    project_check: dict[str, Any] | None = None
     # #1589: the path-notice result of THIS submission, set on submit responses
     # only. None = no rules were configured, nothing to say.
     path_notices: PathNoticesView | None = None
@@ -3396,6 +3422,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_bug_red_test(v)
     _validate_ci_before_submit(v)
     _validate_claim_area_check(v)
+    _validate_claim_project_check(v)
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
