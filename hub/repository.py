@@ -2274,12 +2274,7 @@ async def upsert_ac_test_result(
 async def drop_ci_ac_test_results(
     db: aiosqlite.Connection, task_id: int, *, keep_source: str = ""
 ) -> None:
-    """Remove AC results written from CI, except those of ``keep_source`` (#1687).
-
-    Evidence is bound to the attempt that produced it: when the current attempt
-    changes or stops being trusted, what an earlier one wrote is withdrawn, not
-    left to look like a pass.
-    """
+    """Withdraw AC results written from CI, except ``keep_source``'s (#1687)."""
     await db.execute(
         "DELETE FROM ac_test_results WHERE task_id=? AND source LIKE 'ci:%' "
         "AND source != ?",
@@ -2302,12 +2297,7 @@ async def drop_ci_validation(
 async def list_ac_test_results(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
-    """The recorded AC test results of a task (any generation).
-
-    Results of source ``legacy`` (#1687) are not returned: they were written
-    before the hub could tell a real CI run from a claim, and they are no longer
-    a pass.
-    """
+    """The recorded AC test results of a task; ``legacy`` ones are not a pass (#1687)."""
     return await fetchall(
         db,
         "SELECT * FROM ac_test_results WHERE task_id=? AND source != 'legacy'",
@@ -2512,7 +2502,7 @@ async def upsert_ci_report_attempt(
 async def bump_ci_state_version(
     db: aiosqlite.Connection, task_id: int, head_sha: str
 ) -> int:
-    """Move the state version of a commit's CI standing; the new value (#1687)."""
+    """Move the state version of a commit's CI standing (#1687); the new value."""
     await db.execute(
         "INSERT INTO ci_report_state (task_id, head_sha, version) VALUES (?, ?, 1) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET version = version + 1",
@@ -2562,13 +2552,7 @@ async def set_ci_attempt_trust(
     final: bool,
     body_version: int,
 ) -> bool:
-    """Write a verdict, but only for the body it was computed for (#1687).
-
-    The check reads a snapshot of the row and takes a while; a repeated POST of
-    the same attempt may replace the body meanwhile (``body_version`` moves).
-    The verdict then belongs to a body that is gone, and writing it would make
-    the new body look confirmed: False is returned and the caller checks again.
-    """
+    """Write a verdict only for the body it was computed for; False if it moved (#1687)."""
     cur = await db.execute(
         "UPDATE ci_report_attempts SET trust=?, trust_reason=?, trust_final=?, "
         "checked_at=datetime('now') WHERE id=? AND body_version=?",
@@ -2578,7 +2562,7 @@ async def set_ci_attempt_trust(
 
 
 async def tasks_in_review_with_sha(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
-    """Tasks under review that pinned a commit and have a CI report for it."""
+    """Tasks in review with a pinned commit that has CI attempts."""
     return await fetchall(
         db,
         "SELECT t.id, t.submission_sha FROM tasks t WHERE t.status='review' "
