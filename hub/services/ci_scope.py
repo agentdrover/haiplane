@@ -162,9 +162,12 @@ async def enforce_bound_ci_key(
 def audit_draft_refusal(body: Any, client_request_id: str | None) -> str | None:
     """Why a ci_auditor key may not file this task, or None when it may (#1686).
 
-    The key files one kind of task: the draft for an advisory, keyed
-    ``pip-audit:<id>`` and authored by an agent. Origin of the CI run is the
-    role of the key, so ``TaskSource`` is not widened.
+    The key files one kind of task: a plain, parentless draft for an advisory,
+    keyed ``pip-audit:<id>`` and authored by an agent. Anything that could put
+    the draft somewhere else — an epic, a ``project``, a parent, an immediate
+    run — is refused: such a task lands in a project the check did not look at.
+    Origin of the CI run is the role of the key, so ``TaskSource`` is not
+    widened.
     """
     key = client_request_id or ""
     if not key.startswith(AUDIT_REQUEST_ID_PREFIX) or len(key) == len(
@@ -176,4 +179,13 @@ def audit_draft_refusal(body: Any, client_request_id: str | None) -> str | None:
     )
     if source != "agent":
         return "source должен быть agent"
+    task_type = getattr(getattr(body, "task_type", None), "value", "task")
+    if task_type != "task":
+        return "task_type должен быть task"
+    if getattr(body, "project", None):
+        return "project задавать нельзя: черновик создаётся в проекте default"
+    if getattr(body, "parent_id", None) is not None:
+        return "parent_id задавать нельзя: черновик не имеет родителя"
+    if getattr(body, "run_immediately", False):
+        return "run_immediately недопустим"
     return None

@@ -369,6 +369,29 @@ async def test_submission_adopts_the_report_end_to_end(
     client: AsyncClient, db, monkeypatch
 ):
     """The live sequence: CI reports the PR head, then the agent submits."""
+    await _adoption_flow(client, db, monkeypatch)
+
+
+async def test_the_brief_shows_the_stored_provenance_as_unverified(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1686: the run the reporter named reaches the review brief, labelled."""
+    prov = {"run_id": "9001", "run_attempt": "2", "event": "pull_request"}
+    task_id, brief = await _adoption_flow(client, db, monkeypatch, **prov)
+    report = brief["ci_run_report"]
+    assert report["provenance"] == prov
+    assert report["provenance_note"] == "not verified with GitHub (#1687)"
+
+
+async def test_the_brief_has_no_provenance_label_when_none_was_sent(
+    client: AsyncClient, db, monkeypatch
+):
+    _task_id, brief = await _adoption_flow(client, db, monkeypatch)
+    assert brief["ci_run_report"]["provenance"] == {}
+    assert brief["ci_run_report"]["provenance_note"] == ""
+
+
+async def _adoption_flow(client: AsyncClient, db, monkeypatch, **provenance):
 
     class _Git(NoopGitOps):
         async def fetch_base(self, repo: str, base: str):
@@ -418,6 +441,7 @@ async def test_submission_adopts_the_report_end_to_end(
             "head_sha": "sha-pr-head",
             "ac_results": {"AC-1": "pass"},
             "validation_status": "pass",
+            **provenance,
         },
         headers=ci,
     )
@@ -441,6 +465,7 @@ async def test_submission_adopts_the_report_end_to_end(
     assert any("CI run report adopted" in u["content"] for u in updates), (
         "the adoption must be visible in the task feed, not only in the database"
     )
+    return task_id, brief
 
 
 # ---- the identity CI uses can only report ----
@@ -1105,3 +1130,76 @@ async def test_provenance_migration_on_an_old_schema(tmp_path):
     }
     assert roles == {"ci_reader", "ci_auditor"}
     await upgraded.close()
+
+
+async def test_the_audit_key_files_only_plain_parentless_drafts(ci_runner_hub):
+    """#1686 round 2: no field moves the draft out of the project the key covers."""
+    hub = ci_runner_hub
+    db, client = hub.db, hub.client
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    in_foreign = await _project_task(db, "foreign")
+    epic = (
+        await db.execute_fetchall(
+            "SELECT parent_id FROM tasks WHERE id = ?", (in_foreign,)
+        )
+    )[0][0]
+    auditor = await _role_key(hub, "ci_auditor", '["project:default"]', "a-round2")
+
+    async def count() -> int:
+        return (await db.execute_fetchall("SELECT COUNT(*) FROM tasks"))[0][0]
+
+    before = await count()
+    attempts = {
+        "an epic bound to a foreign project": {
+            **_AUDIT_DRAFT,
+            "client_request_id": "pip-audit:E1",
+            "task_type": "epic",
+            "project": "foreign",
+        },
+        "a task naming a foreign project": {
+            **_AUDIT_DRAFT,
+            "client_request_id": "pip-audit:T1",
+            "project": "foreign",
+        },
+        "a child of a foreign epic": {
+            **_AUDIT_DRAFT,
+            "client_request_id": "pip-audit:C1",
+            "parent_id": epic,
+        },
+        "an epic without a project": {
+            **_AUDIT_DRAFT,
+            "client_request_id": "pip-audit:E2",
+            "task_type": "epic",
+        },
+        "a draft that starts a run": {
+            **_AUDIT_DRAFT,
+            "client_request_id": "pip-audit:R1",
+            "run_immediately": True,
+        },
+    }
+    for label, body in attempts.items():
+        resp = await client.post("/api/tasks", json=body, headers=auditor)
+        assert resp.status_code == 403, (label, resp.status_code, resp.text[:200])
+        assert resp.json()["detail"]["reason"] == "ci_audit_draft_only", label
+    assert await count() == before, "a refused draft creates nothing"
+
+    plain = await client.post("/api/tasks", json=_AUDIT_DRAFT, headers=auditor)
+    assert plain.status_code == 201, plain.text
+    landed = await repo.resolve_project_for_task(db, plain.json()["id"])
+    assert dict(landed)["slug"] == "default"
+    repeat = await client.post("/api/tasks", json=_AUDIT_DRAFT, headers=auditor)
+    assert repeat.status_code == 200 and repeat.json()["id"] == plain.json()["id"]
+    assert await count() == before + 1
+
+    # The project of the key must be active at the moment of the write.
+    await db.execute("UPDATE projects SET status = 'pending' WHERE slug = 'default'")
+    await db.commit()
+    stopped = await client.post(
+        "/api/tasks",
+        json={**_AUDIT_DRAFT, "client_request_id": "pip-audit:P1"},
+        headers=auditor,
+    )
+    assert stopped.status_code == 403
+    assert stopped.json()["detail"]["reason"] == "ci_key_scope_project_inactive"
+    assert await count() == before + 1

@@ -896,12 +896,14 @@ async def _enforce_audit_key(request: Request, body: TaskCreate, idem_key) -> No
             ),
         )
     db = _db(request)
-    project_row = (
-        await repo.resolve_project_for_task(db, body.parent_id)
+    # A plain parentless task is bound to nothing: the hub files it in default.
+    # The real binding is read the same way as for the reader and the report key.
+    bound = (
+        await repo.resolve_bound_project(db, body.parent_id)
         if body.parent_id is not None
-        else await repo.get_project_by_slug(db, "default")
+        else None
     )
-    slug = str(dict(project_row)["slug"]) if project_row is not None else None
+    slug = str(dict(bound)["slug"]) if bound is not None else "default"
     try:
         await ci_scope.enforce_bound_ci_key(db, identity, slug, entrance="audit")
     except ci_scope.CIScopeRefused as exc:
@@ -921,12 +923,18 @@ async def api_create_task(body: TaskCreate, request: Request, response: Response
         request.headers.get("X-Client-Request-Id"),
         body.client_request_id,
     )
-    await _enforce_audit_key(request, body, idem_key)
-    outcome = await services.create_task(
-        _db(request),
-        body,
-        client_request_id=idem_key,
-    )
+    if current_identity(request).is_ci_auditor:
+        # #1686: the project check and the insert share one write transaction,
+        # so the project cannot change between them.
+        async with write_transaction(_db(request)):
+            await _enforce_audit_key(request, body, idem_key)
+            outcome = await services.create_task(
+                _db(request), body, client_request_id=idem_key
+            )
+    else:
+        outcome = await services.create_task(
+            _db(request), body, client_request_id=idem_key
+        )
     if idem_key:
         response.status_code = (
             status.HTTP_201_CREATED if outcome.is_new else status.HTTP_200_OK

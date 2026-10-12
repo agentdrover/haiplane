@@ -248,6 +248,14 @@ async def accept_ci_run_report(
     return result
 
 
+PROVENANCE_NOTE = "not verified with GitHub (#1687)"
+
+
+def stored_provenance(report_row: dict) -> dict[str, str]:
+    """Provenance of a stored report row, for the brief (#1686)."""
+    return _stored_provenance(report_row.get("provenance"))
+
+
 def _stored_provenance(raw: str | None) -> dict[str, str]:
     """The run provenance stored with a report (#1686); {} when none was sent."""
     try:

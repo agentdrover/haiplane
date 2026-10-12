@@ -1496,6 +1496,10 @@ class CIRunReportState(BaseModel):
     state: str = "unknown"
     reason: str = "отчёт CI о прогоне не запрашивался"
     head_sha: str = ""
+    # #1686: which GitHub run the reporter SAID produced the report; {} when it
+    # did not say. Recorded only: the hub does not check it against GitHub yet.
+    provenance: dict[str, str] = Field(default_factory=dict)
+    provenance_note: str = ""
 
 
 class CIEvidenceBlock(BaseModel):
