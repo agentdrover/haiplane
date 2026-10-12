@@ -599,6 +599,37 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> list[dict[str, Any]] | None: ...
+    # #1687: прогон CI для сверки отчёта; None = спросить не удалось.
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None: ...
+    async def ci_runs_for_sha(
+        self,
+        head_sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict[str, Any]] | None: ...
+    async def ci_run_artifacts(
+        self,
+        run_id: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict[str, Any]] | None: ...
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> bytes | None: ...
     # Читатели git и GitHub, которые вызываются из services/, но в протоколе
     # отсутствовали: реализации (git_ops, noop) их имеют, контракт — нет. То
     # есть подменить плагин по этому протоколу было можно только угадав, что
@@ -944,6 +975,30 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None: ...
+    # #1687: чтение прогона для сверки отчёта CI. Три формы ответа: данные;
+    # «спросили, там пусто» (``{}``, ``[]``, ``b""``); «спросить не удалось» (None).
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any] | None: ...
+    async def ci_runs_for_sha(
+        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None: ...
+    async def ci_run_artifacts(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None: ...
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bytes | None: ...
     async def ci_failure_logs(
         self,
         pr_number: int,

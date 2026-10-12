@@ -144,6 +144,10 @@ async def test_an_unconfigured_hub_is_not_upgraded_by_the_resolver():
 #: ``forge`` молча уходит к адаптеру, настроенному при старте.
 _FORGE_REACHING = (
     "branch_ci_runs",
+    "ci_artifact_zip",
+    "ci_run_artifacts",
+    "ci_run_attempt",
+    "ci_runs_for_sha",
     "check_pr_ci",
     "check_pr_mergeable",
     "create_pr",

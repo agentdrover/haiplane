@@ -238,6 +238,8 @@ async def _ci_report(
         reason="",
         reported_by="github-actions",
         checks=json.dumps(checks or {}),
+        trust="verified",
+        trust_reason="",
     )
 
 

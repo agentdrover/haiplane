@@ -2253,25 +2253,64 @@ async def upsert_ac_test_result(
     ac_id: str,
     generation: int,
     status: str,
+    source: str = "manual",
 ) -> None:
-    """Record the latest test result for one AC, stamped with its generation."""
+    """Record the latest test result for one AC, stamped with its generation.
+
+    ``source`` says who produced it (#1687): ``manual`` (the hub ran the test),
+    or ``ci:<run>:<attempt>`` (written from a verified CI attempt).
+    """
     await db.execute(
         "INSERT INTO ac_test_results (task_id, ac_id, submission_generation, "
-        "status, created_at) VALUES (?, ?, ?, ?, datetime('now')) "
+        "status, created_at, source) VALUES (?, ?, ?, ?, datetime('now'), ?) "
         "ON CONFLICT(task_id, ac_id) DO UPDATE SET "
         "submission_generation=excluded.submission_generation, "
-        "status=excluded.status, created_at=excluded.created_at",
-        (task_id, ac_id, generation, status),
+        "status=excluded.status, created_at=excluded.created_at, "
+        "source=excluded.source",
+        (task_id, ac_id, generation, status, source),
+    )
+
+
+async def drop_ci_ac_test_results(
+    db: aiosqlite.Connection, task_id: int, *, keep_source: str = ""
+) -> None:
+    """Remove AC results written from CI, except those of ``keep_source`` (#1687).
+
+    Evidence is bound to the attempt that produced it: when the current attempt
+    changes or stops being trusted, what an earlier one wrote is withdrawn, not
+    left to look like a pass.
+    """
+    await db.execute(
+        "DELETE FROM ac_test_results WHERE task_id=? AND source LIKE 'ci:%' "
+        "AND source != ?",
+        (task_id, keep_source),
+    )
+
+
+async def drop_ci_validation(
+    db: aiosqlite.Connection, task_id: int, *, keep_source: str = ""
+) -> None:
+    """Withdraw the validation result written from CI, unless it is ``keep_source``'s."""
+    await db.execute(
+        "UPDATE tasks SET validation_generation=NULL, validation_status=NULL, "
+        "validation_log=NULL, validation_source='manual' "
+        "WHERE id=? AND validation_source LIKE 'ci:%' AND validation_source != ?",
+        (task_id, keep_source),
     )
 
 
 async def list_ac_test_results(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
-    """All recorded AC test results for a task (any generation)."""
+    """The recorded AC test results of a task (any generation).
+
+    Results of source ``legacy`` (#1687) are not returned: they were written
+    before the hub could tell a real CI run from a claim, and they are no longer
+    a pass.
+    """
     return await fetchall(
         db,
-        "SELECT * FROM ac_test_results WHERE task_id=?",
+        "SELECT * FROM ac_test_results WHERE task_id=? AND source != 'legacy'",
         (task_id,),
     )
 
@@ -2293,8 +2332,14 @@ async def upsert_ci_run_report(
     mutations: str | None = None,
     baseline: str | None = None,
     provenance: str = "{}",
+    trust: str = "unverified",
+    trust_reason: str = "pending",
+    attempt_key: str = "",
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
+
+    Since #1687 the row is the projection of the CURRENT attempt of the commit
+    (see hub.services.ci_trust); ``trust`` says whether GitHub confirmed it.
 
     Re-running CI on the same commit updates the row rather than adding a
     second opinion — the same rule the merge ledger follows (#605).
@@ -2310,8 +2355,9 @@ async def upsert_ci_run_report(
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
         "validation_status, validation_log, reason, reported_by, checks, "
-        "mutations, baseline, provenance, reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "mutations, baseline, provenance, trust, trust_reason, attempt_key, "
+        "reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
         "ac_results=excluded.ac_results, "
         "validation_status=excluded.validation_status, "
@@ -2323,6 +2369,8 @@ async def upsert_ci_run_report(
         "baseline=CASE WHEN ? THEN ci_run_reports.baseline "
         "ELSE excluded.baseline END, "
         "provenance=excluded.provenance, "
+        "trust=excluded.trust, trust_reason=excluded.trust_reason, "
+        "attempt_key=excluded.attempt_key, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -2336,6 +2384,9 @@ async def upsert_ci_run_report(
             "{}" if mutations is None else mutations,
             "{}" if baseline is None else baseline,
             provenance,
+            trust,
+            trust_reason,
+            attempt_key,
             1 if mutations is None else 0,
             1 if baseline is None else 0,
         ),
@@ -2369,6 +2420,147 @@ async def latest_ci_run_report(
         (task_id,),
     )
     return rows[0] if rows else None
+
+
+async def set_ci_run_report_trust(
+    db: aiosqlite.Connection,
+    task_id: int,
+    head_sha: str,
+    *,
+    trust: str,
+    trust_reason: str,
+    attempt_key: str,
+) -> None:
+    """Change only the trust of the projected report of a commit (#1687)."""
+    await db.execute(
+        "UPDATE ci_run_reports SET trust=?, trust_reason=?, attempt_key=? "
+        "WHERE task_id=? AND head_sha=?",
+        (trust, trust_reason, attempt_key, task_id, head_sha),
+    )
+
+
+async def upsert_ci_report_attempt(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    head_sha: str,
+    run_id: str,
+    run_attempt: str,
+    ac_results: str,
+    checks: str,
+    validation_status: str,
+    validation_log: str,
+    reason: str,
+    reported_by: str,
+    mutations: str | None,
+    baseline: str | None,
+    provenance: str,
+    submitted: str,
+) -> None:
+    """Store one attempt's report; a repeat of the SAME attempt replaces it (#1687).
+
+    Another attempt is another row, so a late POST of an old attempt cannot
+    overwrite a newer one. Within one attempt the #1606 rule holds: a block the
+    report did not carry (``None``) keeps what that attempt stored before. A
+    replaced report starts unverified again — it is a new claim.
+    """
+    await db.execute(
+        "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+        "ac_results, checks, validation_status, validation_log, reason, "
+        "reported_by, mutations, baseline, provenance, submitted, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(task_id, head_sha, run_id, run_attempt) DO UPDATE SET "
+        "ac_results=excluded.ac_results, checks=excluded.checks, "
+        "validation_status=excluded.validation_status, "
+        "validation_log=excluded.validation_log, reason=excluded.reason, "
+        "reported_by=excluded.reported_by, "
+        "mutations=CASE WHEN ? THEN ci_report_attempts.mutations "
+        "ELSE excluded.mutations END, "
+        "baseline=CASE WHEN ? THEN ci_report_attempts.baseline "
+        "ELSE excluded.baseline END, "
+        "provenance=excluded.provenance, submitted=excluded.submitted, "
+        "trust='unverified', trust_reason='pending', trust_final=0, "
+        "checked_at=NULL, reported_at=datetime('now')",
+        (
+            task_id,
+            head_sha,
+            run_id,
+            run_attempt,
+            ac_results,
+            checks,
+            validation_status,
+            validation_log,
+            reason,
+            reported_by,
+            "{}" if mutations is None else mutations,
+            "{}" if baseline is None else baseline,
+            provenance,
+            submitted,
+            1 if mutations is None else 0,
+            1 if baseline is None else 0,
+        ),
+    )
+
+
+_ATTEMPT_AGE = (
+    "CAST((julianday('now') - julianday(reported_at)) * 1440 AS INTEGER) "
+    "AS age_minutes, "
+    "CASE WHEN checked_at IS NULL THEN 1000000 ELSE "
+    "CAST((julianday('now') - julianday(checked_at)) * 1440 AS INTEGER) END "
+    "AS checked_minutes_ago"
+)
+
+
+async def list_ci_report_attempts(
+    db: aiosqlite.Connection, task_id: int, head_sha: str
+) -> list[aiosqlite.Row]:
+    """Every attempt reported for a commit, newest report first (#1687)."""
+    return await fetchall(
+        db,
+        f"SELECT *, {_ATTEMPT_AGE} FROM ci_report_attempts "  # nosec B608 - a constant fragment
+        "WHERE task_id=? AND head_sha=? ORDER BY id DESC",
+        (task_id, head_sha),
+    )
+
+
+async def set_ci_attempt_trust(
+    db: aiosqlite.Connection,
+    attempt_id: int,
+    *,
+    trust: str,
+    trust_reason: str,
+    final: bool,
+) -> None:
+    await db.execute(
+        "UPDATE ci_report_attempts SET trust=?, trust_reason=?, trust_final=?, "
+        "checked_at=datetime('now') WHERE id=?",
+        (trust, trust_reason, 1 if final else 0, attempt_id),
+    )
+
+
+async def tasks_in_review_with_sha(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Tasks under review that pinned a commit and have a CI report for it."""
+    return await fetchall(
+        db,
+        "SELECT t.id, t.submission_sha FROM tasks t WHERE t.status='review' "
+        "AND t.submission_sha IS NOT NULL AND t.submission_sha != '' "
+        "AND EXISTS (SELECT 1 FROM ci_report_attempts a "
+        "WHERE a.task_id=t.id AND a.head_sha=t.submission_sha)",
+    )
+
+
+async def ci_attempts_awaiting_check(
+    db: aiosqlite.Connection, *, older_than_minutes: int
+) -> list[aiosqlite.Row]:
+    """Attempts whose check is not final, last tried more than N minutes ago."""
+    return await fetchall(
+        db,
+        f"SELECT *, {_ATTEMPT_AGE} FROM ci_report_attempts "  # nosec B608 - a constant fragment
+        "WHERE trust_final=0 AND (checked_at IS NULL OR "
+        "(julianday('now') - julianday(checked_at)) * 1440 >= ?) "
+        "ORDER BY id",
+        (older_than_minutes,),
+    )
 
 
 # --- events feed (#349) ----------------------------------------------------

@@ -8,6 +8,7 @@ CI authenticates as cannot do anything except report.
 
 from __future__ import annotations
 
+import itertools
 import json
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,33 @@ from hub.services.ci_report import (
     accept_ci_run_report,
     adopt_ci_run_report,
 )
+from tests.ci_trust_support import FakeGitHub, backed_report, install_fake_github
+
+# #1687: a report counts only for what GitHub confirms, so these tests run
+# against a fake GitHub. ``accept`` and ``_post_report`` register the run a
+# trusted reporter would have produced (a fresh attempt per call) and send the
+# matching report; the checks of the trust itself are in test_ci_trust.py.
+GH: FakeGitHub = FakeGitHub()
+_RUNS = itertools.count(7000)
+
+
+@pytest.fixture(autouse=True)
+def _github(monkeypatch):
+    global GH
+    GH = install_fake_github(monkeypatch)
+
+
+def _registered(task_id: int, report: dict, *, run_id: str | None = None) -> dict:
+    """The report ``report`` describes, with the run behind it on the fake GitHub."""
+    return backed_report(
+        GH, task_id, report, run_id=str(next(_RUNS)) if run_id is None else run_id
+    )
+
+
+async def accept(db, task_id: int, **report):
+    """accept_ci_run_report for a run that really happened."""
+    return await accept_ci_run_report(db, task_id, **_registered(task_id, report))
+
 
 # Commit stand-ins are deliberately NOT hex. detect-secrets flags hex
 # high-entropy strings, and that scan runs in the same CI job whose outcome the
@@ -79,7 +107,7 @@ async def test_a_report_without_a_commit_is_refused(db):
     # applied to any code, which is exactly what the pin (#572) exists to stop.
     task_id = await _task(db, generation=1, sha="sha-pinned")
     with pytest.raises(ValueError, match="head_sha"):
-        await accept_ci_run_report(db, task_id, head_sha="  ", ac_results={})
+        await accept(db, task_id, head_sha="  ", ac_results={})
 
 
 async def test_an_unknown_status_is_refused_rather_than_coerced(db):
@@ -87,11 +115,11 @@ async def test_an_unknown_status_is_refused_rather_than_coerced(db):
     # something it does understand — that is how a red run becomes a green one.
     task_id = await _task(db, generation=1, sha="sha-pinned")
     with pytest.raises(ValueError, match="unknown AC status"):
-        await accept_ci_run_report(
+        await accept(
             db, task_id, head_sha="sha-pinned", ac_results={"AC-1": "probably"}
         )
     with pytest.raises(ValueError, match="unknown validation status"):
-        await accept_ci_run_report(
+        await accept(
             db,
             task_id,
             head_sha="sha-pinned",
@@ -105,7 +133,7 @@ async def test_a_report_may_not_invent_acceptance_criteria(db):
     # AC-2 is manual and AC-9 does not exist: both are named back to the caller
     # instead of being dropped in silence.
     task_id = await _task(db, generation=1, sha="sha-pinned")
-    out = await accept_ci_run_report(
+    out = await accept(
         db,
         task_id,
         head_sha="sha-pinned",
@@ -120,7 +148,7 @@ async def test_a_report_for_another_commit_is_kept_but_not_applied(db):
     # Kept, because it is true evidence about that commit and the task may yet
     # pin it. Not applied, because the code under review is different.
     task_id = await _task(db, generation=1, sha="sha-pinned-one")
-    out = await accept_ci_run_report(
+    out = await accept(
         db, task_id, head_sha="sha-not-pinned", ac_results={"AC-1": "pass"}
     )
     assert out["applied"] is False
@@ -134,7 +162,7 @@ async def test_an_unknown_validation_result_is_not_written_as_a_failure(db):
     # would make the gate say "validation_commands не прошли: статус unknown" —
     # an accusation about the work for something that never ran.
     task_id = await _task(db, generation=1, sha="sha-pinned")
-    out = await accept_ci_run_report(
+    out = await accept(
         db,
         task_id,
         head_sha="sha-pinned",
@@ -153,12 +181,8 @@ async def test_an_unknown_validation_result_is_not_written_as_a_failure(db):
 
 async def test_re_reporting_the_same_commit_updates_instead_of_duplicating(db):
     task_id = await _task(db, generation=1, sha="sha-pinned")
-    await accept_ci_run_report(
-        db, task_id, head_sha="sha-pinned", ac_results={"AC-1": "fail"}
-    )
-    await accept_ci_run_report(
-        db, task_id, head_sha="sha-pinned", ac_results={"AC-1": "pass"}
-    )
+    await accept(db, task_id, head_sha="sha-pinned", ac_results={"AC-1": "fail"})
+    await accept(db, task_id, head_sha="sha-pinned", ac_results={"AC-1": "pass"})
     rows = await db.execute_fetchall(
         "SELECT COUNT(*) FROM ci_run_reports WHERE task_id=?", (task_id,)
     )
@@ -173,7 +197,7 @@ async def test_a_mutation_report_is_stored_and_grants_nothing(db):
     import json
 
     task_id = await _task(db, generation=1, sha="sha-pinned")
-    out = await accept_ci_run_report(
+    out = await accept(
         db,
         task_id,
         head_sha="sha-pinned",
@@ -192,7 +216,7 @@ async def test_a_mutation_report_is_stored_and_grants_nothing(db):
 
 async def test_a_report_without_mutations_says_none_were_reported(db):
     task_id = await _task(db, generation=1, sha="sha-pinned")
-    out = await accept_ci_run_report(db, task_id, head_sha="sha-pinned", ac_results={})
+    out = await accept(db, task_id, head_sha="sha-pinned", ac_results={})
     assert out["mutations_state"] == "not_reported"
     stored = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
     assert stored["mutations"] == "{}"
@@ -201,7 +225,7 @@ async def test_a_report_without_mutations_says_none_were_reported(db):
 async def test_an_oversized_mutation_report_is_refused(db):
     task_id = await _task(db, generation=1, sha="sha-pinned")
     with pytest.raises(ValueError, match="mutations"):
-        await accept_ci_run_report(
+        await accept(
             db,
             task_id,
             head_sha="sha-pinned",
@@ -219,22 +243,29 @@ _PROV_1 = {
     "event": "workflow_dispatch",
     "at": "2026-10-06T10:00:00Z",
 }
-_FULL_MUTATIONS = {"state": "ran", "survivors": [], "provenance": _PROV_1}
-_FULL_BASELINE = {
+_FULL_MUTATIONS_BARE = {"state": "ran", "survivors": []}
+_FULL_MUTATIONS = {**_FULL_MUTATIONS_BARE, "provenance": _PROV_1}
+_FULL_BASELINE_BARE = {
     "state": "ran",
     "merge_base": "base-sha",
     "tests": {"tests/test_x.py::test_a": "failed"},
-    "provenance": _PROV_1,
 }
+_FULL_BASELINE = {**_FULL_BASELINE_BARE, "provenance": _PROV_1}
 
 
 async def _post_report(client: AsyncClient, ci, task_id: int, **keys):
-    body = {
+    """POST the report of a run registered on the fake GitHub; the JSON answer."""
+    report = {
         "head_sha": "sha-pinned",
         "ac_results": {"AC-1": "pass"},
         "validation_status": "pass",
         **keys,
     }
+    run_id = keys.pop("run_id", None)
+    sent = _registered(task_id, report, run_id=run_id)
+    body = {k: v for k, v in sent.items() if v is not None and k != "provenance"}
+    body.update(sent["provenance"])
+    body.update({k: v for k, v in keys.items() if k == "reported_by"})
     resp = await client.post(
         f"/api/tasks/{task_id}/ci-run-report", json=body, headers=ci
     )
@@ -253,40 +284,59 @@ async def _stored_evidence(db, task_id: int) -> tuple[dict, dict, dict]:
     )
 
 
+async def _resend(client: AsyncClient, ci, task_id: int, sent: dict, **changes):
+    """POST the SAME attempt again, with ``changes`` to the body (None drops a key)."""
+    body = {k: v for k, v in sent.items() if k != "provenance"}
+    body.update(sent["provenance"])
+    body.update(changes)
+    body = {k: v for k, v in body.items() if v is not None}
+    resp = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report", json=body, headers=ci
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 async def test_a_report_without_evidence_keys_keeps_the_stored_evidence(
     client: AsyncClient, db, monkeypatch
 ):
-    """AC-2: absent key = the step did not run; present key (even {}) replaces."""
+    """AC-2: absent key = the step did not run; present key (even {}) replaces.
+
+    Since #1687 the rule holds WITHIN one attempt: the same attempt reported
+    again is an update of its row, another attempt is another row.
+    """
     ci = _ci_token_headers(monkeypatch)
     task_id = await _task(db, generation=1, sha="sha-pinned")
-
-    await _post_report(
-        client,
-        ci,
+    sent = GH.attempt(
         task_id,
+        "sha-pinned",
         checks={"lint": "pass"},
-        mutations=_FULL_MUTATIONS,
-        baseline=_FULL_BASELINE,
+        mutations=_FULL_MUTATIONS_BARE,
+        baseline=_FULL_BASELINE_BARE,
+        stamp=False,
     )
+    sent["mutations"] = _FULL_MUTATIONS
+    sent["baseline"] = _FULL_BASELINE
+    await _resend(client, ci, task_id, sent)
 
-    # A synchronize-style report: no mutations, no baseline, newer checks.
-    out = await _post_report(client, ci, task_id, checks={"lint": "fail"})
+    # A synchronize-style report of the same attempt: no mutations, no baseline.
+    out = await _resend(client, ci, task_id, sent, mutations=None, baseline=None)
     mutations, baseline, checks = await _stored_evidence(db, task_id)
     assert mutations == _FULL_MUTATIONS, "an absent key must not erase the evidence"
     assert baseline == _FULL_BASELINE
     assert mutations["provenance"] == _PROV_1, "provenance travels with its block"
-    assert checks == {"lint": "fail"}, "checks are always the latest report's"
+    assert checks == {"lint": "pass"}
     assert out["mutations_state"] == "ran" and out["baseline_state"] == "ran"
 
     # A present error replaces — the failure must be visible, not hidden.
     error = {"state": "error", "reason": "timeout", "provenance": _PROV_1}
-    await _post_report(client, ci, task_id, mutations=error)
+    await _resend(client, ci, task_id, sent, mutations=error, baseline=None)
     mutations, baseline, _ = await _stored_evidence(db, task_id)
     assert mutations == error
     assert baseline == _FULL_BASELINE, "the other key is still untouched"
 
     # A present empty object replaces too.
-    await _post_report(client, ci, task_id, mutations={}, baseline={})
+    await _resend(client, ci, task_id, sent, mutations={}, baseline={})
     mutations, baseline, _ = await _stored_evidence(db, task_id)
     assert mutations == {} and baseline == {}
 
@@ -294,19 +344,28 @@ async def test_a_report_without_evidence_keys_keeps_the_stored_evidence(
 async def test_both_report_orders_leave_the_same_evidence(
     client: AsyncClient, db, monkeypatch
 ):
-    """AC-2: synchronize-then-opened and opened-then-synchronize agree."""
+    """AC-2: the two halves of one attempt's report arrive in either order."""
     ci = _ci_token_headers(monkeypatch)
     first = await _task(db, generation=1, sha="sha-pinned")
-    await _post_report(client, ci, first, checks={"lint": "pass"})
-    await _post_report(
-        client, ci, first, mutations=_FULL_MUTATIONS, baseline=_FULL_BASELINE
-    )
-
     second = await _task(db, generation=1, sha="sha-pinned")
-    await _post_report(
-        client, ci, second, mutations=_FULL_MUTATIONS, baseline=_FULL_BASELINE
-    )
-    await _post_report(client, ci, second, checks={"lint": "pass"})
+    for task_id, order in ((first, "checks-first"), (second, "evidence-first")):
+        sent = GH.attempt(
+            task_id,
+            "sha-pinned",
+            run_id=f"80{task_id}",
+            checks={"lint": "pass"},
+            mutations=_FULL_MUTATIONS_BARE,
+            baseline=_FULL_BASELINE_BARE,
+            stamp=False,
+        )
+        sent["mutations"], sent["baseline"] = _FULL_MUTATIONS, _FULL_BASELINE
+        bare = dict(mutations=None, baseline=None)
+        if order == "checks-first":
+            await _resend(client, ci, task_id, sent, **bare)
+            await _resend(client, ci, task_id, sent)
+        else:
+            await _resend(client, ci, task_id, sent)
+            await _resend(client, ci, task_id, sent, **bare)
 
     one = await _stored_evidence(db, first)
     two = await _stored_evidence(db, second)
@@ -323,7 +382,7 @@ async def test_a_report_filed_before_submission_is_adopted_when_the_sha_is_pinne
     # makes that order work — the report waits for the commit to become the one
     # under review.
     task_id = await _task(db)  # never submitted
-    out = await accept_ci_run_report(
+    out = await accept(
         db, task_id, head_sha="sha-early-run", ac_results={"AC-1": "pass"}
     )
     assert out["applied"] is False, "nothing to apply to yet"
@@ -372,23 +431,19 @@ async def test_submission_adopts_the_report_end_to_end(
     await _adoption_flow(client, db, monkeypatch)
 
 
-async def test_the_brief_shows_the_stored_provenance_as_unverified(
+async def test_the_brief_shows_the_run_and_what_github_made_of_it(
     client: AsyncClient, db, monkeypatch
 ):
-    """#1686: the run the reporter named reaches the review brief, labelled."""
-    prov = {"run_id": "9001", "run_attempt": "2", "event": "pull_request"}
-    task_id, brief = await _adoption_flow(client, db, monkeypatch, **prov)
+    """#1686, #1687: the run the reporter named reaches the review brief, with its trust."""
+    task_id, brief = await _adoption_flow(
+        client, db, monkeypatch, run_id="9001", attempt="2", event="pull_request"
+    )
     report = brief["ci_run_report"]
-    assert report["provenance"] == prov
-    assert report["provenance_note"] == "not verified with GitHub (#1687)"
-
-
-async def test_the_brief_has_no_provenance_label_when_none_was_sent(
-    client: AsyncClient, db, monkeypatch
-):
-    _task_id, brief = await _adoption_flow(client, db, monkeypatch)
-    assert brief["ci_run_report"]["provenance"] == {}
-    assert brief["ci_run_report"]["provenance_note"] == ""
+    assert report["provenance"]["run_id"] == "9001"
+    assert report["provenance"]["run_attempt"] == "2"
+    assert report["provenance"]["event"] == "pull_request"
+    assert report["trust"] == "verified" and report["trust_reason"] == ""
+    assert "claimed by the reporter" in report["provenance_note"]
 
 
 async def _adoption_flow(client: AsyncClient, db, monkeypatch, **provenance):
@@ -401,6 +456,8 @@ async def _adoption_flow(client: AsyncClient, db, monkeypatch, **provenance):
             return "sha-pr-head"
 
     monkeypatch.setattr(plugins, "git_ops", _Git())
+    global GH
+    GH = install_fake_github(monkeypatch)
     monkeypatch.setattr(
         orchestration,
         "project_git_context",
@@ -435,18 +492,21 @@ async def _adoption_flow(client: AsyncClient, db, monkeypatch, **provenance):
 
     # CI finishes first — before any submission exists.
     ci = _ci_token_headers(monkeypatch)
+    sent = GH.attempt(
+        task_id,
+        "sha-pr-head",
+        ac_results={"AC-1": "pass"},
+        validation_status="pass",
+        **provenance,
+    )
+    body = {k: v for k, v in sent.items() if v is not None and k != "provenance"}
+    body.update(sent["provenance"])
     resp = await client.post(
-        f"/api/tasks/{task_id}/ci-run-report",
-        json={
-            "head_sha": "sha-pr-head",
-            "ac_results": {"AC-1": "pass"},
-            "validation_status": "pass",
-            **provenance,
-        },
-        headers=ci,
+        f"/api/tasks/{task_id}/ci-run-report", json=body, headers=ci
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["applied"] is False
+    assert resp.json()["trust"] == "verified"
 
     resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={}, headers=ci)
     assert resp.status_code == 200, resp.text
@@ -750,15 +810,15 @@ async def test_the_real_reporter_payload_still_passes_for_an_unscoped_key(
     """#1644: scripts/ci_report_to_hub.py payload shape keeps working (require)."""
     hub = ci_runner_hub
     task_id = await _task(hub.db, generation=1, sha="sha-pinned")
-    payload = {
-        "head_sha": "sha-pinned",
-        "ac_results": {"AC-1": "pass"},
-        "validation_status": "pass",
-        "validation_log": "ok",
-        "reason": "",
-        "reported_by": "github-actions",
-        "checks": {"ruff": "pass", "mypy": "skipped"},
-    }
+    sent = GH.attempt(
+        task_id,
+        "sha-pinned",
+        validation_log="ok",
+        checks={"ruff": "pass", "mypy": "skipped"},
+    )
+    payload = {k: v for k, v in sent.items() if v is not None and k != "provenance"}
+    payload.update(sent["provenance"])
+    payload["reason"] = ""
     resp = await hub.client.post(
         f"/api/tasks/{task_id}/ci-run-report", json=payload, headers=hub.ci
     )
@@ -864,7 +924,7 @@ async def test_guard_and_write_of_a_report_share_one_write_transaction(
 
     real_resolve = repo.resolve_bound_project
     real_enforce = ci_scope.enforce_ci_project_scope
-    real_accept = hub_app.accept_ci_run_report
+    real_accept = hub_app.store_ci_run_report
 
     async def resolve(db, task_id):
         seen["resolver"] = db.in_transaction
@@ -880,7 +940,7 @@ async def test_guard_and_write_of_a_report_share_one_write_transaction(
 
     monkeypatch.setattr(repo, "resolve_bound_project", resolve)
     monkeypatch.setattr(ci_scope, "enforce_ci_project_scope", enforce)
-    monkeypatch.setattr(hub_app, "accept_ci_run_report", accept)
+    monkeypatch.setattr(hub_app, "store_ci_run_report", accept)
     await _post_report(hub.client, scoped, mine)
     assert seen == {"resolver": True, "guard": True, "accept": True}, seen
 
@@ -950,14 +1010,18 @@ async def test_default_scoped_key_cannot_report_for_an_inactive_foreign_project(
 async def test_a_failure_after_the_write_rolls_the_report_back(
     ci_runner_hub, monkeypatch
 ):
-    """P3: the handler owns the transaction until the result is read back."""
+    """P3: the handler owns the transaction until the first half is done."""
+    from hub import app as hub_app
+
     hub = ci_runner_hub
     task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    real_store = hub_app.store_ci_run_report
 
     async def boom(*a, **kw):
-        raise RuntimeError("read-back failed")
+        await real_store(*a, **kw)
+        raise RuntimeError("failed after the write")
 
-    monkeypatch.setattr(repo, "get_ci_run_report", boom)
+    monkeypatch.setattr(hub_app, "store_ci_run_report", boom)
     try:
         await hub.client.post(
             f"/api/tasks/{task_id}/ci-run-report",
@@ -967,7 +1031,7 @@ async def test_a_failure_after_the_write_rolls_the_report_back(
     except RuntimeError:
         pass
     rows = await hub.db.execute_fetchall(
-        "SELECT 1 FROM ci_run_reports WHERE task_id = ?", (task_id,)
+        "SELECT 1 FROM ci_report_attempts WHERE task_id = ?", (task_id,)
     )
     assert list(rows) == [], "the report must not survive a failed request"
 
@@ -1062,27 +1126,27 @@ async def test_the_read_and_audit_keys_do_only_their_job(ci_runner_hub):
     assert refused.status_code == 403
     assert refused.json()["detail"]["reason"] == "ci_audit_out_of_scope"
 
-    # The run provenance survives the round trip; without it nothing changes.
-    prov = {
-        "run_id": "9001",
-        "run_attempt": "2",
-        "workflow_path": ".github/workflows/ci.yml@refs/heads/task-1/x",
-        "event": "pull_request",
-        "head_repository": "agentdrover/haiplane",
-        "run_conclusion": "success",
-        "artifact_id": "77",
-        "artifact_digest": "sha256:" + "ab" * 32,
-    }
-    with_prov = await _post_report(client, hub.ci, foreign, **prov)
-    assert with_prov["provenance"] == prov
+    # The run provenance survives the round trip; without it the report is
+    # stored and is not evidence (#1687).
+    with_prov = await _post_report(client, hub.ci, foreign, run_id="9001")
+    assert with_prov["provenance"]["run_id"] == "9001"
+    assert with_prov["trust"] == "verified"
     stored = dict(await repo.get_ci_run_report(db, foreign, "sha-pinned"))
-    assert json.loads(stored["provenance"]) == prov
-    without = await _post_report(client, hub.ci, foreign)
-    assert without["provenance"] == {} and without["applied"] is True
-    assert (
-        dict(await repo.get_ci_run_report(db, foreign, "sha-pinned"))["provenance"]
-        == "{}"
+    assert json.loads(stored["provenance"])["run_id"] == "9001"
+    bare = await client.post(
+        f"/api/tasks/{foreign}/ci-run-report", json=report, headers=hub.ci
     )
+    assert bare.status_code == 200, bare.text
+    # A report that names no run is stored as its own (unverified) claim and
+    # changes nothing: the current attempt, confirmed above, still stands.
+    without = bare.json()
+    assert without["provenance"]["run_id"] == "9001"
+    assert without["trust"] == "verified"
+    kept = await repo.list_ci_report_attempts(db, foreign, "sha-pinned")
+    assert [(r["run_id"], r["trust_reason"]) for r in kept] == [
+        ("", "no_provenance"),
+        ("9001", ""),
+    ]
 
 
 async def test_the_new_roles_hold_nothing_that_reports_a_run():

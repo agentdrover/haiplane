@@ -1142,6 +1142,152 @@ class GitHubForge:
             for r in runs
         ]
 
+    # -- прогон CI для сверки отчёта (#1687) ---------------------------------
+    #
+    # Все четыре метода только читают (PAT хаба read-only) и отвечают в трёх
+    # формах, а не в двух: данные; «спросили, там пусто» (``{}`` / ``[]`` /
+    # ``b""``); «спросить не удалось» (None). Последние два лечатся разными
+    # руками — ровно разница #725, и сверка отчёта ею живёт: пустой ответ —
+    # это опровержение, None — повод повторить.
+
+    @staticmethod
+    def _api_missing(err: str) -> bool:
+        low = (err or "").lower()
+        return "404" in low or "not found" in low or "410" in low or "gone" in low
+
+    @staticmethod
+    def _run_facts(run: dict[str, Any]) -> dict[str, Any]:
+        head_repo = run.get("head_repository") or {}
+        repo_obj = run.get("repository") or {}
+        return {
+            "run_id": str(run.get("id") or ""),
+            "run_attempt": str(run.get("run_attempt") or ""),
+            "path": str(run.get("path") or ""),
+            "head_sha": str(run.get("head_sha") or ""),
+            "status": str(run.get("status") or "").lower(),
+            "conclusion": str(run.get("conclusion") or "").lower(),
+            "event": str(run.get("event") or ""),
+            "run_started_at": str(run.get("run_started_at") or ""),
+            "repository": str(repo_obj.get("full_name") or ""),
+            "head_repository": str(head_repo.get("full_name") or ""),
+        }
+
+    async def _api_json(self, endpoint: str, *, repo: str | None) -> tuple[Any, bool]:
+        """``(json, absent)``: ``(None, False)`` — не смогли; ``(None, True)`` — нет."""
+        rc, out, err = await _gh("api", endpoint, repo=repo, check=False)
+        if rc != 0:
+            if self._api_missing(err):
+                return None, True
+            log.warning(
+                "gh api %s unavailable: %s", endpoint, (err or "").strip()[:200]
+            )
+            return None, False
+        try:
+            return json.loads(out), False
+        except (json.JSONDecodeError, TypeError):
+            log.warning("gh api %s: invalid json", endpoint)
+            return None, False
+
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Попытка прогона: факты о ней, ``{}`` если такой нет, None если не смогли."""
+        if not (str(run_id).isdigit() and str(attempt).isdigit()):
+            return {}
+        data, absent = await self._api_json(
+            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/attempts/{attempt}",
+            repo=repo,
+        )
+        if absent:
+            return {}
+        if not isinstance(data, dict):
+            return None
+        return self._run_facts(data)
+
+    async def ci_runs_for_sha(
+        self,
+        head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Прогоны workflow ci.yml по head_sha (последняя попытка каждого)."""
+        data, absent = await self._api_json(
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows/ci.yml/runs"
+            f"?head_sha={head_sha}&per_page=100",
+            repo=repo,
+        )
+        if absent:
+            return []
+        if not isinstance(data, dict) or not isinstance(
+            data.get("workflow_runs"), list
+        ):
+            return None
+        return [
+            self._run_facts(r) for r in data["workflow_runs"] if isinstance(r, dict)
+        ]
+
+    async def ci_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Артефакты прогона: список, ``[]`` если их нет, None если не смогли."""
+        if not str(run_id).isdigit():
+            return []
+        data, absent = await self._api_json(
+            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/artifacts?per_page=100",
+            repo=repo,
+        )
+        if absent:
+            return []
+        if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+            return None
+        return [
+            {
+                "id": str(a.get("id") or ""),
+                "name": str(a.get("name") or ""),
+                "digest": str(a.get("digest") or ""),
+                "size": a.get("size_in_bytes"),
+                "expired": bool(a.get("expired")),
+            }
+            for a in data["artifacts"]
+            if isinstance(a, dict)
+        ]
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bytes | None:
+        """Архив артефакта целиком в память; ``b""`` — нет или больше потолка."""
+        if not str(artifact_id).isdigit():
+            return b""
+        rc, out, err = await proc.run_capped(
+            GH_BIN,
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/artifacts/{artifact_id}/zip",
+            cwd=repo or proc.repo_root(),
+            timeout=90,
+            max_bytes=max_bytes,
+        )
+        if rc == 0:
+            return out
+        if rc == -2 or self._api_missing(err):
+            return b""
+        log.warning("artifact %s unavailable: rc=%s %s", artifact_id, rc, err[:200])
+        return None
+
     async def ci_failure_logs(
         self,
         pr_number: int,

@@ -588,7 +588,6 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
 
 async def ci_evidence_state(db, task: dict):
     """Mutation and baseline evidence stored for the pinned commit (#1606)."""
-    from hub import repository as repo_module
     from hub.models import CIEvidenceBlock, CIEvidenceState
 
     pinned = (task.get("submission_sha") or "").strip()
@@ -597,7 +596,10 @@ async def ci_evidence_state(db, task: dict):
         return CIEvidenceState(
             mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
         )
-    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    from hub.services.ci_trust import trusted_report
+
+    # #1687: mutations and baseline are evidence only from a confirmed report.
+    row = await trusted_report(db, int(task.get("id") or 0), pinned)
     stored = dict(row) if row is not None else {}
     return CIEvidenceState(
         mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
@@ -613,7 +615,6 @@ async def prepass_state(db, task: dict):
     reviewer's silence on a class, and collapsing them would hand out that
     silence for free — the same substitution #549 removed from coverage.
     """
-    from hub import repository as repo_module
     from hub.models import PrepassState
     from hub.services.ci_report import CHECK_FAIL, CHECK_PASS, CHECK_SKIPPED
 
@@ -623,7 +624,9 @@ async def prepass_state(db, task: dict):
             state="unknown",
             reason="коммит сдачи не закреплён — предпас не с чем сверить",
         )
-    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    from hub.services.ci_trust import trusted_report
+
+    row = await trusted_report(db, int(task.get("id") or 0), pinned)
     if row is None:
         return PrepassState(
             state="unknown",

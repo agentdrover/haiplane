@@ -1240,8 +1240,21 @@ async def test_ci_before_submit_requires_proven_green(client, db):
     assert _REF_1  # nodeid AC-1 известен хабу — иначе отчёт его бы проигнорировал
     await _nothing_recorded(db, task_id, feed_before, dispatch)
 
+    # #1687: зелёный — это четыре проверки pass, а не «ни одной красной».
     await _ci_report(
         client, task_id, validation_status="pass", checks={"lint": "pass"}, **ref_ok
+    )
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    assert _detail(resp)["cause"] == "not_green"
+    await _nothing_recorded(db, task_id, feed_before, dispatch)
+
+    await _ci_report(
+        client,
+        task_id,
+        validation_status="pass",
+        checks={"lint": "pass", "format": "pass", "types": "pass", "tests": "pass"},
+        **ref_ok,
     )
     resp, dispatch = await _submit(client, task_id)
     assert resp.status_code == 200, resp.text
@@ -1308,7 +1321,9 @@ def test_ci_green_proof_predicate_reads_damaged_fields_as_malformed():
 
     rows = [{"ac_id": "AC-1", "verifiable_by": "test", "test_ref": "tests/t.py::t"}]
     good = {
-        "checks": '{"lint": "pass"}',
+        "trust": "verified",
+        "provenance": '{"run_conclusion": "success"}',
+        "checks": '{"lint": "pass", "format": "pass", "types": "pass", "tests": "pass"}',
         "ac_results": '{"AC-1": "pass"}',
         "validation_status": "pass",
     }

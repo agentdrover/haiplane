@@ -16,6 +16,7 @@ import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
+from tests.ci_trust_support import backed_body, install_fake_github
 from hub.services.finding_identity import finding_uids
 from hub.services.lifecycle import maybe_rollup_parent, repair_stale_parent_completions
 
@@ -807,6 +808,7 @@ async def _submission_line(
             return "sha-pr-head"
 
     monkeypatch.setattr(plugins, "git_ops", _Git())
+    gh = install_fake_github(monkeypatch)
     monkeypatch.setattr(
         orchestration,
         "project_git_context",
@@ -844,11 +846,15 @@ async def _submission_line(
     if report:
         resp = await client.post(
             f"/api/tasks/{task_id}/ci-run-report",
-            json={
-                "head_sha": "sha-pr-head",
-                "ac_results": ac_results,
-                "validation_status": "pass",
-            },
+            json=backed_body(
+                gh,
+                task_id,
+                {
+                    "head_sha": "sha-pr-head",
+                    "ac_results": ac_results,
+                    "validation_status": "pass",
+                },
+            ),
             headers=ci,
         )
         assert resp.status_code == 200, resp.text

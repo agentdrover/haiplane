@@ -2790,6 +2790,81 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_ci_run_reports_provenance",
         "ALTER TABLE ci_run_reports ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}'",
     ),
+    # ---- #1687: the hub no longer takes a CI report on its word. ci_run_reports
+    # keeps ONE row per (task, commit) that every reader already uses, and from
+    # now on it is the projection of the CURRENT attempt (ci_report_attempts
+    # holds every attempt separately). trust says whether GitHub confirmed the
+    # report; the DEFAULT is the migration: a row written before this task has
+    # no run to check, so it reads as unverified(legacy) and is never a pass.
+    (
+        "add_ci_run_reports_trust",
+        "ALTER TABLE ci_run_reports ADD COLUMN trust TEXT NOT NULL DEFAULT 'unverified'",
+    ),
+    (
+        "add_ci_run_reports_trust_reason",
+        "ALTER TABLE ci_run_reports ADD COLUMN trust_reason TEXT NOT NULL DEFAULT 'legacy'",
+    ),
+    (
+        "add_ci_run_reports_attempt_key",
+        "ALTER TABLE ci_run_reports ADD COLUMN attempt_key TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # One row per (task, commit, run, attempt): a late POST of an old
+        # attempt can no longer overwrite a newer one. ``submitted`` is the
+        # whole comparable body as the reporter sent it (before the hub kept
+        # only the AC it knows), which is what the artifact is compared with.
+        # ``trust_final`` = 1 ends the retries (a definite answer, or the six
+        # hours for an unreachable GitHub ran out).
+        "create_ci_report_attempts",
+        """CREATE TABLE IF NOT EXISTS ci_report_attempts (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            head_sha          TEXT    NOT NULL,
+            run_id            TEXT    NOT NULL DEFAULT '',
+            run_attempt       TEXT    NOT NULL DEFAULT '',
+            ac_results        TEXT    NOT NULL DEFAULT '{}',
+            checks            TEXT    NOT NULL DEFAULT '{}',
+            validation_status TEXT    NOT NULL DEFAULT '',
+            validation_log    TEXT    NOT NULL DEFAULT '',
+            reason            TEXT    NOT NULL DEFAULT '',
+            reported_by       TEXT    NOT NULL DEFAULT '',
+            mutations         TEXT    NOT NULL DEFAULT '{}',
+            baseline          TEXT    NOT NULL DEFAULT '{}',
+            provenance        TEXT    NOT NULL DEFAULT '{}',
+            submitted         TEXT    NOT NULL DEFAULT '{}',
+            trust             TEXT    NOT NULL DEFAULT 'unverified',
+            trust_reason      TEXT    NOT NULL DEFAULT 'pending',
+            trust_final       INTEGER NOT NULL DEFAULT 0,
+            checked_at        TEXT,
+            reported_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, head_sha, run_id, run_attempt)
+        )""",
+    ),
+    (
+        # Where a stored AC result came from: 'manual' (the hub ran it),
+        # 'ci:<run>:<attempt>' (written from a verified CI attempt) or 'legacy'.
+        "add_ac_test_results_source",
+        "ALTER TABLE ac_test_results ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+    ),
+    (
+        "add_tasks_validation_source",
+        "ALTER TABLE tasks ADD COLUMN validation_source TEXT NOT NULL DEFAULT 'manual'",
+    ),
+    (
+        # Existing CI evidence has no run to check: of the results already on a
+        # task that ever got a CI report, none can be told from CI-written ones,
+        # so they all become 'legacy' (unverified, not a pass). Idempotent: only
+        # rows still marked 'manual' are touched.
+        "legacy_ac_test_results_source",
+        "UPDATE ac_test_results SET source='legacy' WHERE source='manual' "
+        "AND task_id IN (SELECT task_id FROM ci_run_reports)",
+    ),
+    (
+        "legacy_tasks_validation_source",
+        "UPDATE tasks SET validation_source='legacy' WHERE validation_source='manual' "
+        "AND validation_status IS NOT NULL "
+        "AND id IN (SELECT task_id FROM ci_run_reports)",
+    ),
 ]
 
 

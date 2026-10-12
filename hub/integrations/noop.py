@@ -703,6 +703,44 @@ class NoopGitOps:
         # runs" is a different answer that would read as a green base (#929).
         return None
 
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict | None:
+        return None
+
+    async def ci_runs_for_sha(
+        self,
+        head_sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict] | None:
+        return None
+
+    async def ci_run_artifacts(
+        self,
+        run_id: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict] | None:
+        return None
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> bytes | None:
+        return None
+
     async def pr_base_freshness(
         self,
         pr_number: int,
@@ -977,6 +1015,36 @@ class NoopForge:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def ci_runs_for_sha(
+        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_run_artifacts(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bytes | None:
         return None
 
     async def ci_failure_logs(

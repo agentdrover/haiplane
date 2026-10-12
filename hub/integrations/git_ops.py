@@ -3268,6 +3268,52 @@ class GitOpsIntegration:
             branch, limit, repo=repo, gh_repo=gh_repo
         )
 
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None:
+        return await self._forge_for(forge).ci_run_attempt(
+            run_id, attempt, repo=repo, gh_repo=gh_repo
+        )
+
+    async def ci_runs_for_sha(
+        self,
+        head_sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict[str, Any]] | None:
+        return await self._forge_for(forge).ci_runs_for_sha(
+            head_sha, repo=repo, gh_repo=gh_repo
+        )
+
+    async def ci_run_artifacts(
+        self,
+        run_id: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict[str, Any]] | None:
+        return await self._forge_for(forge).ci_run_artifacts(
+            run_id, repo=repo, gh_repo=gh_repo
+        )
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> bytes | None:
+        return await self._forge_for(forge).ci_artifact_zip(
+            artifact_id, max_bytes=max_bytes, repo=repo, gh_repo=gh_repo
+        )
+
     async def check_pr_ci(
         self,
         pr_number: int,

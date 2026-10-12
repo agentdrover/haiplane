@@ -39,6 +39,7 @@ from tests.test_finding_evidence import (
     _sha,
     _task_on_clone,
 )
+from tests.ci_trust_support import VERIFIED_ROW
 
 
 async def _submit(
@@ -84,6 +85,7 @@ async def _green_ci(db: aiosqlite.Connection, task_id: int, sha: str) -> None:
         validation_log="",
         reason="",
         reported_by="ci",
+        **VERIFIED_ROW,
     )
     await db.commit()
 

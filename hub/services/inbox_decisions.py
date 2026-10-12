@@ -29,6 +29,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.services import project_path, review_evidence, state_review
 from hub.services.result_kind import automation_not_applicable
+from hub.services import ci_trust
 from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
@@ -135,10 +136,12 @@ async def _ci_ground(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     if not pinned:
         return "CI: коммит сдачи не закреплён"
     report = await repo.get_ci_run_report(db, int(task["id"]), pinned)
-    if report is None:
+    if report is None or not ci_trust.is_verified(dict(report)):
         _, reason = await ci_report_state(db, task)
         return f"CI: {reason}"
     status = str(dict(report).get("validation_status") or "").strip()
+    if status == VALIDATION_PASS and ci_trust.green_gap(dict(report)):
+        return f"CI на {pinned[:12]}: зелёным не доказан"
     if status == VALIDATION_PASS:
         return f"CI зелёный на {pinned[:12]}"
     if status == VALIDATION_FAIL:

@@ -1637,6 +1637,19 @@ async def _sweep_executor_slots(db) -> None:
         log.exception("executor slot sweep failed")
 
 
+async def _sweep_ci_trust(db) -> None:
+    # #1687: a CI report is worth what GitHub confirms. Retries the reports
+    # GitHub could not be asked about (every 5 minutes, up to 6 hours) and
+    # re-reads which attempt is current for the tasks under review, because a
+    # rerun that never reported changes it without any POST.
+    try:
+        from hub.services.ci_trust import sweep
+
+        await sweep(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("CI trust sweep failed")
+
+
 async def _sweep_expired_claims(db) -> None:
     # Claim lease expiry (#417): a claim held past the lease without a
     # pair start is auto-released back to open so the task returns to
@@ -2382,6 +2395,9 @@ class Sweep:
 SWEEPS: tuple[Sweep, ...] = (
     Sweep("policy_schedule", _sweep_policy_schedule),
     Sweep("running_dispatch", _sweep_running_dispatch),
+    # #1687: before review settlement, which reads CI evidence — the standing
+    # of the CI report (attempt, trust) is refreshed first.
+    Sweep("ci_trust", _sweep_ci_trust),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),
     Sweep("parent_rollup", _sweep_parent_rollup),

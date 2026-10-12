@@ -21,6 +21,7 @@ from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.ci_report import VALIDATION_PASS
+from tests.ci_trust_support import VERIFIED_ROW
 
 _TIP = "a" * 40
 
@@ -175,6 +176,7 @@ async def _submitted_task(
             validation_log="",
             reason="",
             reported_by="ci",
+            **VERIFIED_ROW,
         )
         await db.commit()
     return task_id

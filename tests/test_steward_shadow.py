@@ -37,6 +37,7 @@ from hub.services.steward_shadow import (
     start_due_runs,
     start_run,
 )
+from tests.ci_trust_support import VERIFIED_ROW
 
 _CREATED = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
 
@@ -2046,6 +2047,7 @@ async def _historical_submission(
         validation_log="",
         reason="",
         reported_by="ci",
+        **VERIFIED_ROW,
     )
     await repo.insert_event(
         db,

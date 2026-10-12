@@ -24,6 +24,7 @@ from hub.services.ac_tests import (
     current_ac_test_results,
     run_ac_tests,
 )
+from tests.ci_trust_support import VERIFIED_ROW
 
 
 async def _task_with_test_acs(db):
@@ -204,6 +205,7 @@ async def test_missing_ci_report_is_unknown_not_fail(db):
         validation_log="",
         reason="",
         reported_by="github-actions",
+        **VERIFIED_ROW,
     )
     await db.commit()
     state, reason = await ci_report_state(

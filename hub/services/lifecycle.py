@@ -69,6 +69,7 @@ from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome
+from hub.services import ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
@@ -3182,7 +3183,8 @@ async def _step_bug_red_test(state: SubmitContext) -> None:
     if mode == RED_TEST_OFF:
         return
     sha = state.submission_sha
-    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    # #1687: the baseline counts only from a report GitHub confirmed.
+    report = await ci_trust.trusted_report(state.db, state.task_id, sha)
     baseline = (
         red_test_gate.parse_baseline(dict(report).get("baseline"))
         if report is not None
@@ -3255,6 +3257,11 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     state.submission_sha, state.sha_reason = await resolve_branch_tip(
         state.db, state.task_id, state.task.get("branch") or ""
     )
+    # #1687: the CI report for this commit is checked against GitHub NOW, also
+    # a rerun nobody reported, so the gates below and the adoption inside the
+    # lock read a standing that is current, not the one the last POST left.
+    if state.submission_sha:
+        await ci_trust.refresh_quietly(state.db, state.task_id, state.submission_sha)
 
 
 async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
@@ -3760,7 +3767,13 @@ def _submission_update_text(
             " Пересдача из needs_decision после merge_failed: конфликт с базой "
             "слит автором, без решения человека (#1362)."
         )
-    if adopted:
+    if adopted and adopted.get("not_adopted"):
+        # #1687: a report GitHub did not confirm is not evidence, and the feed
+        # says so instead of printing a result that was never written.
+        content += (
+            f" CI run report NOT adopted for this commit: {adopted['not_adopted']}."
+        )
+    elif adopted:
         # #1056: the count used to stand here, so five not_found results
         # printed exactly like five passing ones. The reader of the feed —
         # the human at the gate — got "5 AC result(s)" as if it were

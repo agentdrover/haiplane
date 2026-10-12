@@ -430,6 +430,9 @@ async def _ci_run_report_state(db, task_id: int, task_view) -> CIRunReportState:
         else None
     )
     if stored is not None:
+        from hub.services.ci_trust import trust_of
+
+        state.trust, state.trust_reason = trust_of(dict(stored))
         state.provenance = stored_provenance(dict(stored))
         if state.provenance:
             state.provenance_note = PROVENANCE_NOTE
