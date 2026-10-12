@@ -98,6 +98,9 @@ def delivery_kinds(monkeypatch) -> list[str]:
     return seen
 
 
+_GROUND = {"source": "ci_pinned_sha", "detail": "ci_run 1234 success on sha abc123"}
+
+
 def _judge_identity() -> TokenIdentity:
     return TokenIdentity("steward-bot", "steward", principal_id=42)
 
@@ -116,7 +119,19 @@ def _submit(kind: str, verdict: str, **over) -> StewardJudgementSubmit:
         kind=kind,
         verdict=verdict,
         confidence=over.pop("confidence", "high"),
-        grounds=over.pop("grounds", [{"source": "ci_pinned_sha"}]),
+        grounds=over.pop(
+            "grounds",
+            [
+                {
+                    "source": "ci_pinned_sha",
+                    **(
+                        {"detail": "ci_run 1234 success on sha abc123"}
+                        if kind == "advisor"
+                        else {}
+                    ),
+                }
+            ],
+        ),
         **over,
     )
 
@@ -300,9 +315,9 @@ async def test_a_second_answer_is_refused_and_the_order_is_closed(
 @pytest.mark.parametrize(
     ("confidence", "grounds", "reason"),
     [
-        ("low", [{"source": "ci_pinned_sha"}], "low_confidence"),
+        ("low", [_GROUND], "low_confidence"),
         ("high", [], "no_grounds"),
-        ("", [{"source": "ci_pinned_sha"}], "no_confidence"),
+        ("", [_GROUND], "no_confidence"),
     ],
 )
 async def test_a_concur_without_ground_or_confidence_is_stored_as_an_objection(
@@ -2351,3 +2366,113 @@ async def test_the_local_advisor_doors_refuse_a_state_task(
         assert closed["status"] == "refused" and not closed["started_at"], closed
         assert len(local_identity) == minted and len(svc.jobs) == published
     assert cursor_attempt.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# #1671: основание советника — source плюс непустой detail
+# ---------------------------------------------------------------------------
+
+
+async def test_the_advisor_prompt_requires_a_concrete_detail_per_ground(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service
+):
+    """#1671 AC-3: промт, положенный в локальное задание, требует detail."""
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+
+    svc = local_service()
+    task_id, order = await _ordered_advisor(db, "local-prompt-detail")
+
+    async def _judge_now():
+        await _advise(db, task_id)
+
+    svc.judge = _judge_now
+    assert await start_advisor_run(db, dict(order)) is True
+    await wait_for_local_advisors()
+
+    assert svc.jobs and svc.jobs[0]["profile"] == "advisor"
+    prompt = svc.prompts[0]
+    assert "detail с конкретным фактом пакета" in prompt
+    assert "значение, число, sha или поле" in prompt
+    assert "только по названному смыслу поля" in prompt
+    assert "старт или конец прогона" in prompt
+    assert "Согласие без заполненного основания" in prompt
+    assert "хранится как возражение" in prompt
+
+
+async def test_an_unfounded_advisor_concur_flows_as_an_objection_and_details_reach_the_human(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1671 AC-4: полный путь пустого согласия и detail в передаче человеку."""
+    from hub.services.steward_applied import ESCALATED_TO_HUMAN, apply_self_approval
+    from hub.services.steward_exit import (
+        contour_counts,
+        current_false_approvals,
+        record_false_approvals,
+    )
+
+    await _act(monkeypatch)
+    task_id = await _in_review(db, "advisor-unfounded-flow")
+    await _green(db, task_id)
+    h = await _real_packet_hash(db, task_id)
+    await _judge_run(db, task_id, packet=h)
+    await _judge(db, task_id)
+    await _advisor_run(db, task_id, packet=h)
+    long_detail = "ci_run 77 success on sha deadbeef " + "x" * 400
+    saved = await _advise(
+        db,
+        task_id,
+        verdict="concur",
+        grounds=[
+            {"source": "ci_pinned_sha", "detail": ""},
+            {"source": "risk_class", "detail": "   "},
+        ],
+    )
+    assert (saved.verdict, saved.escalate_reason) == ("object", "no_grounds")
+
+    events = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind=?",
+        (task_id, "steward_advisor_recorded"),
+    )
+    assert [json.loads(e["payload"])["verdict"] for e in events] == ["object"]
+    order = (
+        await fetchall(
+            db,
+            "SELECT status FROM steward_runs WHERE task_id=? AND kind='advisor'",
+            (task_id,),
+        )
+    )[0]
+    assert order["status"] == "judged", "заказ закрыт ответом"
+
+    outcome, detail = await apply_self_approval(db, task_id, 1)
+
+    assert outcome == ESCALATED_TO_HUMAN, detail
+    assert await _no_verdict(db, task_id), "approve судьи не применён"
+    counts = await contour_counts(db)
+    assert (counts.object, counts.concur) == (1, 0)
+    await record_false_approvals(db)
+    assert await current_false_approvals(db) == []
+
+    # both_sides: непустой detail советника доходит до человека, до 200 знаков.
+    other = await _in_review(db, "advisor-unfounded-flow-detail")
+    await _green(db, other)
+    h2 = await _real_packet_hash(db, other)
+    await _judge_run(db, other, packet=h2)
+    await _judge(db, other)
+    await _advisor_run(db, other, packet=h2)
+    await _advise(
+        db,
+        other,
+        verdict="object",
+        grounds=[
+            {"source": "ci_pinned_sha", "detail": long_detail},
+            {"source": "risk_class", "detail": ""},
+        ],
+        findings=[{"title": "CI на другом sha"}],
+    )
+    await apply_self_approval(db, other, 1)
+    text = " ".join(dict(u)["content"] for u in await repo.get_task_updates(db, other))
+    assert f"ci_pinned_sha (ci_run 77 success on sha deadbeef {'x' * 166})" in text
+    assert "x" * 167 not in text, "обрезка до 200 знаков"
+    assert "risk_class (" not in text, "пустой detail скобок не даёт"

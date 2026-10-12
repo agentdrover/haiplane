@@ -308,8 +308,13 @@ def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
         f"4. Верни ровно одно суждение: POST {hub_base}/api/tasks/{task_id}"
         "/steward-judgement (curl — в блоке доступа ниже) с "
         "kind=advisor: verdict concur (согласен) или object (возражаю), "
-        "confidence, grounds из закрытого множества источников; при object "
-        "в findings назови, что именно не так.\n\n"
+        "confidence, grounds; при object в findings назови, что именно не так.\n"
+        "5. Каждое основание в grounds — это source из закрытого множества "
+        "источников И detail с конкретным фактом пакета (значение, число, sha "
+        "или поле), а не пересказ. Согласие без заполненного основания "
+        "(detail пуст) хранится как возражение.\n"
+        "6. Время в пакете толкуй только по названному смыслу поля; старт или "
+        "конец прогона из отметки времени не выводи.\n\n"
         "Сомневаешься — возражай: возражение возвращает решение человеку и "
         "стоит дёшево, а согласие без основания превращает approve в вердикт.\n\n"
         + delivery
@@ -583,13 +588,20 @@ async def advisor_state(
     )
 
 
-def _sources(raw: Any) -> str:
+def _sources(raw: Any, *, with_detail: bool = False) -> str:
     try:
         grounds = json.loads(raw) if isinstance(raw, str) else (raw or [])
     except ValueError:
         return ""
-    names = [str(g.get("source")) for g in grounds if isinstance(g, dict)]
-    return ", ".join(n for n in names if n and n != "None")
+    names = []
+    for g in grounds:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("source"))
+        detail = str(g.get("detail") or "").strip()[:200] if with_detail else ""
+        if name and name != "None":
+            names.append(f"{name} ({detail})" if detail else name)
+    return ", ".join(names)
 
 
 def _findings(raw: Any) -> str:
@@ -623,7 +635,7 @@ def both_sides(state: AdvisorState) -> str:
         said = (
             f"советник ({a.get('model') or 'модель не названа'}): "
             f"{a.get('verdict')}, уверенность {a.get('confidence') or '—'}, "
-            f"основания: {_sources(a.get('grounds')) or '—'}"
+            f"основания: {_sources(a.get('grounds'), with_detail=True) or '—'}"
         )
         if a.get("escalate_reason"):
             said += f", причина: {a['escalate_reason']}"
