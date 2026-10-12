@@ -1107,11 +1107,10 @@ def cmd_force_complete(args: argparse.Namespace) -> int:
 
 def cmd_archive(args: argparse.Namespace) -> int:
     cascade = not args.no_cascade
-    result = _api(
-        "POST",
-        f"/api/tasks/{args.task_id}/archive",
-        {"cascade": cascade},
-    )
+    body: dict[str, Any] = {"cascade": cascade}
+    if getattr(args, "reason", ""):
+        body["reason"] = args.reason
+    result = _api("POST", f"/api/tasks/{args.task_id}/archive", body)
     _print_json(result)
     return 0
 
@@ -2751,6 +2750,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cascade",
         action="store_true",
         help="Archive only this task, not descendants",
+    )
+    p_archive.add_argument(
+        "--reason",
+        default="",
+        help="Why (required when the task or a descendant has work in progress)",
     )
     p_archive.set_defaults(func=cmd_archive)
 

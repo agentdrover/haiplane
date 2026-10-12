@@ -19,6 +19,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    archive_active_work_detail,
     claim_area_conflict_detail,
     submission_contract_violated_detail,
     bug_red_test_unproven_detail,
@@ -49,6 +50,7 @@ from hub.db import (
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
+    archive_guard,
     prevention_gate,
     project_policy,
     ci_green_proof,
@@ -6633,20 +6635,59 @@ async def archive_task(
     task_id: int,
     *,
     cascade: bool = True,
+    reason: str = "",
+    actor: str = "",
+    principal_id: int | None = None,
 ) -> TaskView:
-    """Mark task (and optionally subtree) archived — excluded from default lists."""
-    row = await repo.get_task(db, task_id)
-    if not row:
-        raise TaskNotFoundError(f"task {task_id} not found")
-    ids = await repo.collect_subtree_ids(db, task_id) if cascade else [task_id]
-    await repo.set_tasks_archived(db, ids, 1)
-    await db.commit()
-    await log_activity(
-        db,
-        "task_archived",
-        f"Task #{task_id} archived (cascade={cascade}, count={len(ids)})",
-        detail=mutation_activity_detail(),
-    )
+    """Mark task (and optionally subtree) archived — excluded from default lists.
+
+    Признаки работы (``archive_guard``) без непустой причины — 409 с названием
+    работы (#1673). Чтение, проверка и запись — одна транзакция: признаки
+    читаются уже под write-локом, и сбой аудита откатывает архив.
+    """
+    reason = (reason or "").strip()
+    async with db_module.write_transaction(db):
+        row = await repo.get_task(db, task_id)
+        if not row:
+            raise TaskNotFoundError(f"task {task_id} not found")
+        ids = await repo.collect_subtree_ids(db, task_id) if cascade else [task_id]
+        blocking = await archive_guard.blocking_work(db, ids)
+        if blocking and not reason:
+            project = await repo.resolve_project_for_task(db, task_id)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=archive_active_work_detail(
+                    project["slug"] if project is not None else "default", blocking
+                ),
+            )
+        await repo.set_tasks_archived(db, ids, 1)
+        for entry in blocking:
+            await repo.add_task_update(
+                db,
+                entry["task_id"],
+                actor,
+                "decision",
+                f"Архив при работе в ходу (статус {entry['status']}): {reason}. "
+                f"actor={actor}; cascade={cascade}; затронуто: {ids}",
+                principal_id=principal_id,
+                author_kind="principal" if principal_id is not None else "anonymous",
+            )
+        detail = {
+            **json.loads(mutation_activity_detail()),
+            "actor": actor,
+            "cascade": cascade,
+            "ids": ids,
+        }
+        if reason:
+            detail["reason"] = reason
+            detail["blocking"] = [b["task_id"] for b in blocking]
+        await log_activity(
+            db,
+            "task_archived",
+            f"Task #{task_id} archived (cascade={cascade}, count={len(ids)})",
+            detail=json.dumps(detail, ensure_ascii=False),
+            commit=False,
+        )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     task_view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
