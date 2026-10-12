@@ -56,6 +56,9 @@ def with_instance_echo(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, **instance_echo_fields()}
 
 
-def mutation_activity_detail() -> str:
-    """JSON detail for activity_log on task mutations."""
-    return json.dumps(instance_echo_fields(), ensure_ascii=False)
+def mutation_activity_detail(extra: dict[str, Any] | None = None) -> str:
+    """JSON detail for activity_log on task mutations.
+
+    ``extra`` (#1683) — факты события рядом с эхом экземпляра.
+    """
+    return json.dumps({**instance_echo_fields(), **(extra or {})}, ensure_ascii=False)

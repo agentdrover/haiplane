@@ -6656,15 +6656,21 @@ async def set_executor_run_agent(
 
 
 async def set_executor_run_starting_ref(
-    db: aiosqlite.Connection, row_id: int, starting_ref: str
+    db: aiosqlite.Connection,
+    row_id: int,
+    starting_ref: str,
+    ordered_skill_version: int | None = None,
 ) -> None:
     """Записать ссылку, от которой заказан прогон (#1563). Коммит — за вызывающим.
 
     Пишется ДО заказа провайдеру: слепой исход (ответ не пришёл) всё равно
-    оставляет в строке то, что хаб отправил.
+    оставляет в строке то, что хаб отправил. ``ordered_skill_version`` (#1683) —
+    версия навыка, вставленная в промпт этого заказа, в той же записи.
     """
     await db.execute(
-        "UPDATE executor_runs SET starting_ref=? WHERE id=?", (starting_ref, row_id)
+        "UPDATE executor_runs SET starting_ref=?, "
+        "ordered_skill_version=COALESCE(?, ordered_skill_version) WHERE id=?",
+        (starting_ref, ordered_skill_version, row_id),
     )
 
 
