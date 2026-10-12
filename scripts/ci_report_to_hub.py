@@ -15,8 +15,23 @@ Two rules this script exists to obey:
   AC and left unreported for validation, with the reason attached. A false
   ``fail`` would block a verdict for something unrelated to the work.
 
-Env: HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_TOKEN (both absent ⇒ report
-nothing and say so),
+Two modes (#1686). The code of a task branch runs here, so the key that makes
+the hub believe a report must never be in this process:
+
+* collect — HAIPLANE_HUB_CI_READ_TOKEN is set (a ci_reader key, which can only
+  read a task's card). The AC tests and validation commands run with every
+  HAIPLANE_HUB_* variable and every secret-looking variable removed from their
+  environment, and the result is WRITTEN to
+  ``$HAIPLANE_HUB_CI_RESULTS_DIR/results.json`` (default ``hub-ci-results``) for
+  the workflow to upload as an artifact. Nothing is sent to the hub; the
+  trusted ci-report.yml workflow on the default branch does that
+  (scripts/ci_trusted_report.py).
+* send — only HAIPLANE_HUB_CI_TOKEN is set: the pre-#1686 behaviour that
+  satellite repositories still use through the composite action until their
+  own task moves them. The children still run without the secrets.
+
+Env: HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_READ_TOKEN or HAIPLANE_HUB_CI_TOKEN
+(none ⇒ report nothing and say so),
 GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
 HAIPLANE_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
 pytest`` — this repository's own way, and exactly what a satellite repository
@@ -80,6 +95,34 @@ _DEFAULT_AC_RUNNER = "uv run pytest"
 def _remaining() -> float:
     """Seconds left before the reporter must stop launching work and send."""
     return _REPORT_DEADLINE - (time.monotonic() - _STARTED)
+
+
+# #1686: names the children of this script must not inherit. HAIPLANE_HUB_* is
+# the hub's own namespace (URL, report key, read key, audit key); the pattern
+# catches the secrets a workflow adds under other names (GITHUB_TOKEN,
+# ACTIONS_RUNTIME_TOKEN, cloud keys). A secret under a name that matches neither
+# is the workflow author's to keep out of the job environment.
+_SECRET_NAME = re.compile(
+    r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_?KEY|API_?KEY|ACCESS_?KEY)",
+    re.IGNORECASE,
+)
+
+
+def child_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment AC tests and validation commands run in (#1686).
+
+    A copy of the process environment without ``HAIPLANE_HUB_*`` and without
+    anything whose name says it is a secret. Branch code — a test, a
+    conftest.py, a pytest plugin — runs in the child, so what is not in its
+    environment cannot be read, printed or sent.
+    """
+    source = os.environ if environ is None else environ
+    return {
+        name: value
+        for name, value in source.items()
+        if not name.upper().startswith("HAIPLANE_HUB_")
+        and not _SECRET_NAME.search(name)
+    }
 
 
 def env_get(suffix: str) -> str:
@@ -270,6 +313,7 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
                 text=True,
                 timeout=max(1.0, deadline - time.monotonic()),
                 check=False,
+                env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             log(f"pytest could not run ({exc}) — every AC stays not_found")
@@ -532,6 +576,7 @@ def run_validation(
                 text=True,
                 timeout=min(_RUN_TIMEOUT, max(1.0, _remaining())),
                 check=False,
+                env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return "unknown", "\n".join(logs)[-_LOG_TAIL:], f"команда прервана: {exc}"
@@ -730,12 +775,75 @@ def attach_evidence(payload: dict, keep: set[str]) -> None:
             )
 
 
+RESULTS_SCHEMA = 1
+RESULTS_FILE = "results.json"
+
+
+def build_results(task: dict, head_sha: str) -> dict:
+    """Run the task's AC tests and validation; the report body."""
+    nodeid_by_ac: dict[str, str] = {}
+    for ac in task.get("acceptance_criteria") or []:
+        if (ac.get("verifiable_by") or "") != "test":
+            continue
+        ref = (ac.get("test_ref") or "").strip()
+        if "::" in ref:
+            nodeid_by_ac[ac["id"]] = ref
+    ran = run_nodeids(sorted(set(nodeid_by_ac.values())))
+    ac_results = {
+        ac_id: ("pass" if ran[nodeid] else "fail") if nodeid in ran else "not_found"
+        for ac_id, nodeid in nodeid_by_ac.items()
+    }
+
+    ran_commands = parse_ran_commands(env_get("HUB_CI_RAN"))
+    if ran_commands:
+        log(
+            f"this job already ran {len(ran_commands)} command(s); "
+            "their outcomes can be reused"
+        )
+    v_status, v_log, v_reason = run_validation(
+        task.get("validation_commands") or [], ran_commands
+    )
+
+    checks = parse_checks(env_get("HUB_CI_CHECKS"))
+    if checks:
+        log(f"deterministic checks reported: {checks}")
+
+    payload = {
+        "head_sha": head_sha,
+        "ac_results": ac_results,
+        "validation_status": v_status,
+        "validation_log": v_log,
+        "reason": v_reason,
+        "reported_by": "github-actions",
+        "checks": checks,
+    }
+    attach_evidence(payload, set(nodeid_by_ac.values()))
+    return payload
+
+
+def write_results(payload: dict, task_id: int) -> str:
+    """Write the collected results for the trusted reporter; return the path.
+
+    Written next to nothing else the reporter trusts: the workflow uploads this
+    directory as an artifact, and the reporter reads it as DATA only.
+    """
+    out_dir = env_get("HUB_CI_RESULTS_DIR") or "hub-ci-results"
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, RESULTS_FILE)
+    document = {"schema": RESULTS_SCHEMA, "task_id": task_id, **payload}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, ensure_ascii=False, sort_keys=True)
+    return path
+
+
 def main() -> int:
     base = env_get("HUB_URL").rstrip("/")
-    token = env_get("HUB_CI_TOKEN")
+    read_token = env_get("HUB_CI_READ_TOKEN")
+    # Collect mode never touches the report key, even if the environment has it.
+    token = read_token or env_get("HUB_CI_TOKEN")
     if not base or not token:
         log(
-            "HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN "
+            "HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_READ_TOKEN "
             "not configured — reporting nothing; the hub will read this as "
             "unknown, not as failure"
         )
@@ -757,46 +865,23 @@ def main() -> int:
         )
         return 0
 
-    nodeid_by_ac: dict[str, str] = {}
-    for ac in task.get("acceptance_criteria") or []:
-        if (ac.get("verifiable_by") or "") != "test":
-            continue
-        ref = (ac.get("test_ref") or "").strip()
-        if "::" in ref:
-            nodeid_by_ac[ac["id"]] = ref
-    ran = run_nodeids(sorted(set(nodeid_by_ac.values())))
-    ac_results = {
-        ac_id: ("pass" if ran[nodeid] else "fail") if nodeid in ran else "not_found"
-        for ac_id, nodeid in nodeid_by_ac.items()
-    }
+    payload = build_results(task, head_sha)
+    if read_token:
+        path = write_results(payload, task_id)
+        log(
+            f"collected {len(payload['ac_results'])} AC result(s), "
+            f"validation={payload['validation_status']}; written to {path} — "
+            "the trusted workflow reports them"
+        )
+        return 0
 
-    ran = parse_ran_commands(env_get("HUB_CI_RAN"))
-    if ran:
-        log(f"this job already ran {len(ran)} command(s); their outcomes can be reused")
-    v_status, v_log, v_reason = run_validation(
-        task.get("validation_commands") or [], ran
-    )
-
-    checks = parse_checks(env_get("HUB_CI_CHECKS"))
-    if checks:
-        log(f"deterministic checks reported: {checks}")
-
-    payload = {
-        "head_sha": head_sha,
-        "ac_results": ac_results,
-        "validation_status": v_status,
-        "validation_log": v_log,
-        "reason": v_reason,
-        "reported_by": "github-actions",
-        "checks": checks,
-    }
-    attach_evidence(payload, set(nodeid_by_ac.values()))
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")
         return 0
     log(
-        f"reported {len(ac_results)} AC result(s), validation={v_status}; "
+        f"reported {len(payload['ac_results'])} AC result(s), "
+        f"validation={payload['validation_status']}; "
         f"applied={result.get('applied')} ({result.get('reason')}); "
         f"mutations={result.get('mutations_state', 'not accepted by this hub')}; "
         f"baseline={result.get('baseline_state', 'not accepted by this hub')}"

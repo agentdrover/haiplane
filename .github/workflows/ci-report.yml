@@ -1,0 +1,57 @@
+name: CI report
+
+# #1686: the ONLY place the key that the hub believes a CI report with is used
+# (besides the deploy job of ci.yml, which runs from main only).
+#
+# The job "test" of ci.yml runs the code of a task branch, so it holds no such
+# key. It uploads its results as the artifact hub-ci-results-<run_attempt>; when
+# that run completes, GitHub starts THIS workflow from the DEFAULT branch:
+#   * the workflow definition is the default branch's, not the branch's;
+#   * github.sha is the default branch head, so the checkout below contains no
+#     code of the branch under test;
+#   * the secrets live in the environment hub-report, whose deployment branches
+#     are limited to the default branch.
+# The artifact is DATA. scripts/ci_trusted_report.py reads it in memory with
+# strict limits and takes every fact about the run (commit, run id, attempt,
+# workflow path, event, head repository, conclusion) from the event payload.
+#
+# This workflow must not grow a step that builds, installs or executes anything
+# from the artifact or from the run's branch: no cache, no uv sync, no project
+# dependencies. tests/test_ci_workflow_contract.py pins that.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report:
+    name: Send CI results to Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: hub-report
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # github.sha of a workflow_run event is the default branch head; it is
+          # spelled out so that no later edit can point this at the run's head.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      # The script itself refuses (and logs why) a run whose workflow path is not
+      # .github/workflows/ci.yml, whose head repository is not this repository,
+      # or whose event is not pull_request, push or workflow_dispatch. It never
+      # fails the job: a refusal prints its reason and the hub reads silence as
+      # "unknown".
+      - name: Send the results of the finished run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAIPLANE_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL }}
+          HAIPLANE_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
+          HAIPLANE_HUB_CI_AUDIT_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_AUDIT_TOKEN }}
+        run: python3 scripts/ci_trusted_report.py

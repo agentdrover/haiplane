@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 
@@ -1015,3 +1016,386 @@ def test_durations_flags_do_not_change_what_a_pytest_run_selects(script):
     assert (
         script._selection_key("uv run pytest -q --durations tests/test_web.py") != plain
     )
+
+
+# ---- #1686: the branch's code never sees a hub key -------------------------
+
+
+_ENV_PROBE_TEST = """\
+import json, os, pathlib
+
+
+def test_dump_env():
+    pathlib.Path(os.environ.get("PROBE_OUT", "/dev/null") + ".test").write_text(
+        json.dumps(sorted(os.environ))
+    )
+"""
+
+
+def test_tests_and_validation_run_without_hub_secrets(script, monkeypatch, tmp_path):
+    """AC-2: a test or a validation command of the branch finds no HAIPLANE_HUB_*."""
+    import sys
+
+    probe_test = tmp_path / "test_env_probe.py"
+    probe_test.write_text(_ENV_PROBE_TEST)
+    probe_cmd = tmp_path / "dump_env.py"
+    probe_cmd.write_text(
+        "import json, os, pathlib\n"
+        "pathlib.Path(os.environ['PROBE_OUT'] + '.cmd').write_text("
+        "json.dumps(sorted(os.environ)))\n"
+    )
+    out = tmp_path / "probe"
+    results_dir = tmp_path / "results"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PROBE_OUT", str(out))
+    monkeypatch.setenv("KEEP_ME", "1")
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_READ_TOKEN", "read-secret")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "report-secret")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_CI_AUDIT_TOKEN", "audit-secret")  # noqa: S105
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")  # noqa: S105
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_CI_RESULTS_DIR", str(results_dir))
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", f"{sys.executable} -m pytest")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-1686/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+
+    posts: list[tuple[str, str]] = []
+
+    def fake_request(url, token, payload=None):
+        posts.append((url, token))
+        if payload is not None:
+            return {"applied": True, "reason": "ok"}
+        return {
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "verifiable_by": "test",
+                    "test_ref": "test_env_probe.py::test_dump_env",
+                }
+            ],
+            "validation_commands": [f"{sys.executable} {probe_cmd}"],
+        }
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    assert script.main() == 0
+
+    for suffix in (".test", ".cmd"):
+        names = json.loads(Path(str(out) + suffix).read_text())
+        assert "KEEP_ME" in names and "PATH" in names, "the rest of the env stays"
+        for name in names:
+            assert not name.startswith("HAIPLANE_HUB_"), (suffix, name)
+        assert "GITHUB_TOKEN" not in names and "AWS_SECRET_ACCESS_KEY" not in names
+
+    # Collect mode: the card is read with the READ key, nothing is sent, and
+    # the results wait in the directory the workflow uploads.
+    assert posts == [("https://hub.example/api/tasks/1686", "read-secret")]
+    written = json.loads((results_dir / "results.json").read_text())
+    assert written["task_id"] == 1686 and written["head_sha"] == "sha-head"
+    assert written["ac_results"] == {"AC-1": "pass"}
+    assert written["validation_status"] == "pass"
+
+
+def test_child_env_drops_the_hub_namespace_and_secret_names(script):
+    env = {
+        "PATH": "/bin",
+        "HAIPLANE_HUB_CI_TOKEN": "x",
+        "haiplane_hub_url": "x",
+        "ACTIONS_RUNTIME_TOKEN": "x",
+        "MY_PASSWORD": "x",
+        "HOME": "/h",
+        "HAIPLANE_OTHER": "kept",
+    }
+    assert script.child_env(env) == {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "HAIPLANE_OTHER": "kept",
+    }
+
+
+# ---- #1686: the trusted reporter reads an artifact as data -------------------
+
+
+_TRUSTED = Path(__file__).resolve().parent.parent / "scripts" / "ci_trusted_report.py"
+
+
+@pytest.fixture
+def trusted():
+    spec = importlib.util.spec_from_file_location("ci_trusted_report", _TRUSTED)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+REPO = "agentdrover/haiplane"
+SHA = "a" * 40
+
+
+def _event(**over) -> dict:
+    run = {
+        "id": 9001,
+        "run_attempt": 2,
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "head_sha": SHA,
+        "head_branch": "task-1686/x",
+        "conclusion": "success",
+        "head_repository": {"full_name": REPO},
+    }
+    run.update(over)
+    return {"workflow_run": run}
+
+
+def _results(**over) -> dict:
+    doc = {
+        "schema": 1,
+        "task_id": 1686,
+        "head_sha": SHA,
+        "ac_results": {"AC-1": "pass"},
+        "validation_status": "pass",
+        "validation_log": "ok",
+        "reason": "",
+        "checks": {"lint": "pass"},
+    }
+    doc.update(over)
+    return doc
+
+
+def _zip(members: dict[str, bytes], *, symlinks: tuple[str, ...] = ()) -> bytes:
+    import io
+    import stat
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            info = zipfile.ZipInfo(name)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            if name in symlinks:
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, data)
+    return buf.getvalue()
+
+
+class _FakeApi:
+    def __init__(self, blob: bytes, *, artifacts=None):
+        self.blob = blob
+        self.calls: list[tuple] = []
+        self._artifacts = artifacts
+
+    def list_artifacts(self, repository, run_id, name):
+        import hashlib
+
+        self.calls.append(("list", repository, run_id, name))
+        if self._artifacts is not None:
+            return {"artifacts": self._artifacts}
+        return {
+            "artifacts": [
+                {
+                    "id": 77,
+                    "name": name,
+                    "size_in_bytes": len(self.blob),
+                    "expired": False,
+                    "digest": "sha256:" + hashlib.sha256(self.blob).hexdigest(),
+                    "archive_download_url": "https://api.invalid/zip",
+                    "workflow_run": {"id": 9001, "head_sha": SHA},
+                }
+            ]
+        }
+
+    def download(self, url):
+        self.calls.append(("download", url))
+        return self.blob
+
+
+def _tree(root: Path) -> list[tuple[str, bytes]]:
+    return sorted(
+        (str(p.relative_to(root)), p.read_bytes())
+        for p in root.rglob("*")
+        if p.is_file()
+    )
+
+
+def _run(trusted, tmp_path, event, api, posts, **env):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir(exist_ok=True)
+    (checkout / "scripts").mkdir(exist_ok=True)
+    (checkout / "scripts" / "ci_report_to_hub.py").write_text("# trusted\n")
+    environ = {
+        "GITHUB_REPOSITORY": REPO,
+        "GITHUB_WORKSPACE": str(checkout),
+        "RUNNER_TEMP": str(tmp_path / "runner"),
+        "HAIPLANE_HUB_URL": "https://hub.example",
+        "HAIPLANE_HUB_CI_TOKEN": "report-key",
+        **env,
+    }
+
+    def post(url, token, payload):
+        posts.append((url, token, payload))
+        return {"applied": True, "reason": "ok", "id": 5}
+
+    return trusted.run(event, environ, api, post)
+
+
+def test_the_trusted_reporter_treats_the_artifact_as_data(trusted, tmp_path, capsys):
+    """AC-3: a hostile archive is refused whole; hostile text is only text."""
+    import stat  # noqa: F401
+
+    ok = json.dumps(_results()).encode()
+    cases = {
+        "parent traversal": _zip(
+            {"results.json": ok, "../scripts/ci_report_to_hub.py": b"x"}
+        ),
+        "absolute path": _zip({"results.json": ok, "/etc/cron.d/x": b"x"}),
+        # The link itself is a valid results file: only the link check refuses it.
+        "symbolic link": _zip({"results.json": ok}, symlinks=("results.json",)),
+        "an extra file": _zip({"results.json": ok, "evil.sh": b"rm -rf /"}),
+        "a nested path": _zip({"sub/results.json": ok}),
+        "too many files": _zip({f"f{i}.json": b"{}" for i in range(11)}),
+        "archive size": _zip(
+            {"results.json": ok, "audit.json": os.urandom(6 * 1024 * 1024)}
+        ),
+        "unpacked size": _zip(
+            {"results.json": ok, "audit.json": b"0" * (21 * 1024 * 1024)}
+        ),
+    }
+    checkout = tmp_path / "checkout"
+    for label, blob in cases.items():
+        posts: list = []
+        _run(trusted, tmp_path, _event(), _FakeApi(blob), posts)
+        assert posts == [], label
+        log = capsys.readouterr().out
+        assert "not reporting" in log, (label, log)
+        assert _tree(checkout) == [("scripts/ci_report_to_hub.py", b"# trusted\n")], (
+            label,
+            "the checkout is untouched",
+        )
+        # The download directory is wiped by the test, as a fresh runner would.
+        import shutil
+
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+
+    # A string that would run in a shell reaches the hub as the text it is.
+    marker = tmp_path / "x"
+    hostile = f"$(touch {marker}) `touch {marker}` ; touch {marker}"
+    posts = []
+    blob = _zip({"results.json": json.dumps(_results(validation_log=hostile)).encode()})
+    _run(trusted, tmp_path, _event(), _FakeApi(blob), posts)
+    assert len(posts) == 1
+    url, token, body = posts[0]
+    assert url == "https://hub.example/api/tasks/1686/ci-run-report"
+    assert token == "report-key"
+    assert body["validation_log"] == hostile
+    assert not marker.exists(), "nothing in the artifact was executed"
+    assert _tree(checkout) == [("scripts/ci_report_to_hub.py", b"# trusted\n")]
+    # The facts about the run come from the event; the artifact is named.
+    assert body["head_sha"] == SHA
+    assert (body["run_id"], body["run_attempt"], body["event"]) == (
+        "9001",
+        "2",
+        "pull_request",
+    )
+    assert body["artifact_id"] == "77" and body["artifact_digest"].startswith("sha256:")
+    assert body["head_repository"] == REPO and body["run_conclusion"] == "success"
+
+
+def test_only_the_canonical_ci_run_is_reported(trusted, tmp_path, capsys):
+    """AC-4: another workflow, another repository, another commit: nothing is sent."""
+    import shutil
+
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    refused = {
+        "another workflow": (_event(path=".github/workflows/other.yml"), "path"),
+        "another repository": (
+            _event(head_repository={"full_name": "evil/haiplane"}),
+            "head repository",
+        ),
+        "an event outside the list": (_event(event="schedule"), "event"),
+        "the artifact is about another commit": (_event(head_sha="b" * 40), "commit"),
+    }
+    for label, (event, fragment) in refused.items():
+        posts: list = []
+        api = _FakeApi(blob)
+        if label.startswith("the artifact"):
+            # The artifact says SHA, the event says another commit.
+            api = _FakeApi(blob, artifacts=None)
+        _run(trusted, tmp_path, event, api, posts)
+        assert posts == [], label
+        log = capsys.readouterr().out
+        assert "not reporting" in log and fragment in log, (label, log)
+        if label != "the artifact is about another commit":
+            assert api.calls == [], f"{label}: the artifact was not even fetched"
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+
+    # A results file that names another commit than the event is refused too.
+    posts = []
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+    wrong = _zip({"results.json": json.dumps(_results(head_sha="c" * 40)).encode()})
+    _run(trusted, tmp_path, _event(), _FakeApi(wrong), posts)
+    assert posts == [] and "another commit" in capsys.readouterr().out
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+
+    # The documented "@ref" suffix of the path is not a different workflow.
+    posts = []
+    suffixed = _event(path=".github/workflows/ci.yml@refs/heads/task-1686/x")
+    _run(trusted, tmp_path, suffixed, _FakeApi(blob), posts)
+    assert len(posts) == 1
+    assert posts[0][2]["workflow_path"].endswith("@refs/heads/task-1686/x")
+
+
+def test_the_artifact_of_another_attempt_is_not_substituted(trusted, tmp_path, capsys):
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    other_attempt = {
+        "id": 1,
+        "name": "hub-ci-results-1",
+        "size_in_bytes": 10,
+        "expired": False,
+        "archive_download_url": "u",
+    }
+    posts: list = []
+    api = _FakeApi(blob, artifacts=[other_attempt])
+    _run(trusted, tmp_path, _event(), api, posts)
+    assert posts == [] and "no artifact" in capsys.readouterr().out
+    assert ("download", "u") not in api.calls
+
+    twice = [{**other_attempt, "name": "hub-ci-results-2"}] * 2
+    _run(trusted, tmp_path, _event(), _FakeApi(blob, artifacts=twice), posts)
+    assert posts == [] and "refusing to choose" in capsys.readouterr().out
+
+
+def test_audit_drafts_are_filed_for_pushes_to_develop_only(trusted, tmp_path):
+    audit = {
+        "dependencies": [
+            {
+                "name": "pkg",
+                "version": "1",
+                "vulns": [{"id": "PYSEC-1", "fix_versions": []}],
+            }
+        ]
+    }
+    blob = _zip({"audit.json": json.dumps(audit).encode()})
+    for event, expected in (
+        (_event(event="push", head_branch="develop"), 1),
+        (_event(event="push", head_branch="main"), 1),
+        (_event(event="push", head_branch="task-1/x"), 0),
+        (_event(event="pull_request", head_branch="develop"), 0),
+        (_event(event="workflow_dispatch", head_branch="develop"), 0),
+    ):
+        import shutil
+
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+        posts: list = []
+        _run(
+            trusted,
+            tmp_path,
+            event,
+            _FakeApi(blob),
+            posts,
+            HAIPLANE_HUB_CI_AUDIT_TOKEN="audit-key",
+        )
+        drafts = [p for p in posts if p[0].endswith("/api/tasks")]
+        assert len(drafts) == expected, event
+        for _url, token, body in drafts:
+            assert token == "audit-key", "drafts use the audit key, not the report key"
+            assert body["client_request_id"] == "pip-audit:PYSEC-1"
+            assert body["source"] == "agent"
