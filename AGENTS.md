@@ -25,6 +25,12 @@
   файла из ledger выше потолка: разбейте файл; если нельзя, `--update` и впишите
   `removed_by` руками (`task:#NNNN`, `permanent` с причиной или `unclaimed`).
   Запись снимается удалением строки, когда файл вернулся под порог.
+  Предупреждения «вырос сверх замера» (файл из ledger) и «у порога» (файл вне
+  ledger, `near_pct` в `pyproject.toml`) CI не красят (#1676). Тест или код не
+  ужимается ради порога — не ужимать, а делить по темам: новый тест кладите в
+  тематический файл (существующий или новый `tests/test_<область>_<тема>.py`),
+  новый код — в отдельный модуль. «У порога» — повод разделить файл в той задаче,
+  которая его вызвала, или завести задачу на разделение.
 - If a change touches MCP tool docstrings or signatures, it changes the published
   `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too).
   If the headroom is not enough, follow `working_headroom_note` in

@@ -34,11 +34,13 @@ def _make_tree(
     hub: int = 1500,
     scripts: int = 1500,
     tests: int = 3000,
+    near_pct: int | None = 90,
     waivers: list[dict] | None = None,
 ) -> None:
+    near = "" if near_pct is None else f"near_pct = {near_pct}\n"
     (root / "pyproject.toml").write_text(
         "[tool.haiplane.file_size]\n"
-        f"hub = {hub}\nscripts = {scripts}\ntests = {tests}\n",
+        f"hub = {hub}\nscripts = {scripts}\ntests = {tests}\n{near}",
         encoding="utf-8",
     )
     ledger = root / LEDGER_REL
@@ -72,7 +74,7 @@ def test_new_file_over_threshold_is_named(tmp_path):
 
 
 def test_waived_file_cannot_outgrow_its_ceiling(tmp_path):
-    """AC-2: потолок = замер + 5%; 90% потолка называется вслух."""
+    """AC-2: потолок = замер + 5%; на потолке зелено, выше красно."""
     entry = {
         "path": "hub/old.py",
         "measured": 2000,
@@ -92,9 +94,7 @@ def test_waived_file_cannot_outgrow_its_ceiling(tmp_path):
     assert _run(tmp_path).returncode == 0
 
     _write_lines(tmp_path, "hub/old.py", 1890)
-    proc = _run(tmp_path)
-    assert proc.returncode == 0
-    assert "запас почти съеден" in proc.stdout
+    assert _run(tmp_path).returncode == 0
 
 
 def _waiver(path: str, measured: int = 1600) -> dict:
@@ -144,23 +144,110 @@ def test_thresholds_come_from_pyproject_per_tree(tmp_path, tree, limit):
     assert str(limit + 1) in proc.stdout
 
 
-def test_all_files_at_ninety_percent_are_in_json(tmp_path):
-    """P2-1: --json называет все файлы на ≥90% потолка, текст — пять и счёт."""
-    waivers = [
-        {"path": f"hub/w{i}.py", "measured": 2000, "max": 2100, "removed_by": "u"}
-        for i in range(6)
-    ]
-    _make_tree(tmp_path, waivers=waivers)
-    for i in range(6):
-        _write_lines(tmp_path, f"hub/w{i}.py", 1890)
+def _grown_waiver(path: str) -> dict:
+    return {"path": path, "measured": 2000, "max": 2100, "removed_by": "u"}
+
+
+@pytest.mark.parametrize(
+    ("lines", "grown"), [(1890, False), (2000, False), (2001, True), (2100, True)]
+)
+def test_waived_file_that_grew_past_its_measure_is_named(tmp_path, lines, grown):
+    """AC-1: файл из ledger сверх замера называется, но CI не краснеет."""
+    _make_tree(tmp_path, waivers=[_grown_waiver("hub/old.py")])
+    _write_lines(tmp_path, "hub/old.py", lines)
+    proc = _run(tmp_path)
+    assert proc.returncode == 0, proc.stdout
     data = json.loads(_run(tmp_path, "--json").stdout)
-    assert sorted(item["path"] for item in data["loud"]) == [
+    assert "loud" not in data
+    if grown:
+        assert data["grown"] == [
+            {"path": "hub/old.py", "lines": lines, "measured": 2000, "max": 2100}
+        ]
+        assert "вырос сверх замера" in proc.stdout
+        assert "hub/old.py" in proc.stdout
+        assert "2000" in proc.stdout
+        assert str(lines) in proc.stdout
+    else:
+        assert data["grown"] == []
+        assert "вырос сверх замера" not in proc.stdout
+        assert "запас почти съеден" not in proc.stdout
+        assert "hub/old.py" not in proc.stdout
+
+
+def test_unwaived_file_near_its_threshold_is_named(tmp_path):
+    """AC-2: файл вне ledger у порога называется; near_pct — не дерево."""
+    limits = {"hub": 100, "scripts": 200, "tests": 300}
+    _make_tree(tmp_path, **limits)
+    for tree, limit in limits.items():
+        _write_lines(tmp_path, f"{tree}/below.py", limit * 9 // 10 - 1)
+        _write_lines(tmp_path, f"{tree}/edge.py", limit * 9 // 10)
+        _write_lines(tmp_path, f"{tree}/full.py", limit)
+    proc = _run(tmp_path, "--json")
+    assert proc.returncode == 0, proc.stdout
+    near = {item["path"]: item for item in json.loads(proc.stdout)["near"]}
+    expected = {}
+    for tree, limit in limits.items():
+        assert f"{tree}/below.py" not in near
+        for name, lines in (("edge", limit * 9 // 10), ("full", limit)):
+            expected[f"{tree}/{name}.py"] = {
+                "path": f"{tree}/{name}.py",
+                "lines": lines,
+                "threshold": limit,
+                "used_pct": round(100.0 * lines / limit, 1),
+            }
+    assert near == expected
+    assert "у порога" in _run(tmp_path).stdout
+    # near_pct не дерево измерения: каталог с таким именем не обходится
+    _write_lines(tmp_path, "near_pct/f.py", 5000)
+    assert _run(tmp_path).returncode == 0
+
+    _make_tree(tmp_path, **limits, near_pct=80)
+    data = json.loads(_run(tmp_path, "--json").stdout)
+    paths = {item["path"] for item in data["near"]}
+    assert "hub/below.py" in paths  # 89 >= 80
+    assert "tests/below.py" in paths  # 269 >= 240
+
+    _make_tree(tmp_path, **limits, near_pct=None)
+    proc = _run(tmp_path)
+    assert proc.returncode != 0
+    assert "pyproject.toml: нет ключа near_pct" in proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_near_list_is_complete_in_json_and_short_in_text(tmp_path):
+    """AC-3: JSON отдаёт все near и grown, текст — пять near и счёт."""
+    _make_tree(tmp_path, hub=100, scripts=200, tests=300)
+    near_files = {
+        "hub/a.py": 91,  # 91%
+        "hub/b.py": 99,  # 99%
+        "scripts/c.py": 198,  # 99%
+        "scripts/d.py": 182,  # 91%
+        "tests/e.py": 300,  # 100%
+        "tests/f.py": 285,  # 95%
+        "tests/g.py": 271,  # 90.3%
+    }
+    for path, lines in near_files.items():
+        _write_lines(tmp_path, path, lines)
+    waivers = [_grown_waiver(f"hub/w{i}.py") for i in range(6)]
+    _make_tree(tmp_path, hub=100, scripts=200, tests=300, waivers=waivers)
+    for i in range(6):
+        _write_lines(tmp_path, f"hub/w{i}.py", 2001 + i)
+    data = json.loads(_run(tmp_path, "--json").stdout)
+    assert sorted(i["path"] for i in data["near"]) == sorted(near_files)
+    assert sorted(i["path"] for i in data["grown"]) == [
         f"hub/w{i}.py" for i in range(6)
     ]
-    assert data["loud"][0]["max"] == 2100
-    assert data["loud"][0]["used_pct"] == 90.0
     text = _run(tmp_path).stdout
-    assert "и ещё 1 файлов" in text
+    assert text.count("вырос сверх замера") == 1  # заголовок раздела
+    for i in range(6):
+        assert f"hub/w{i}.py" in text
+    top5 = ["tests/e.py", "hub/b.py", "scripts/c.py", "tests/f.py", "hub/a.py"]
+    for path in top5:
+        assert path in text
+    for path in ("scripts/d.py", "tests/g.py"):
+        assert path not in text
+    assert "и ещё 2 файлов у порога (полный список: --json)" in text
+    assert "разделите по темам до того, как файл упрётся в порог" in text
 
 
 @pytest.mark.parametrize(
@@ -257,6 +344,19 @@ def test_repository_is_green_under_the_size_budget():
         [sys.executable, str(SCRIPT)], capture_output=True, text=True, cwd=REPO_ROOT
     )
     assert proc.returncode == 0, proc.stdout
+    data = json.loads(
+        subprocess.run(
+            [sys.executable, str(SCRIPT), "--json"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        ).stdout
+    )
+    assert "grown" in data
+    assert "near" in data
+    assert "loud" not in data
+    assert "tests/test_cli.py" not in {item["path"] for item in data["near"]}
+    assert "не ужимать" in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
     # Ровно проверка, без --update: подмена на перезапись ledger прошла бы
     # поиск по подстроке, а проверкой быть перестала бы.
     step = re.search(

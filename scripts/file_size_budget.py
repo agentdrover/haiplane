@@ -20,7 +20,10 @@ docs/agent-context/file-size-budget.json, записи адресуются пу
 
 Потолок с запасом, а не точная заморозка — урок #829: две ветки, правящие один
 большой файл, не должны конфликтовать по ledger. Запас оплачивается
-видимостью: на 90% потолка проверка говорит отдельной строкой.
+видимостью, и CI она не красит (#1676):
+  * «вырос сверх замера» — файл из ledger длиннее своего замера;
+  * «у порога» — файл вне ledger не короче near_pct% порога своего дерева
+    (near_pct живёт в pyproject.toml рядом с порогами и деревом не является).
 """
 
 from __future__ import annotations
@@ -36,20 +39,36 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEDGER_REL = Path("docs") / "agent-context" / "file-size-budget.json"
 DEFAULT_HEADROOM_PCT = 5.0
-# Доля потолка, после которой запас называется вслух (#829).
-LOUD_AT_PCT = 90.0
+NEAR_KEY = "near_pct"
+NEAR_SHOWN = 5
 UNCLAIMED = "unclaimed"
 _SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
 
 
-def load_thresholds(root: Path) -> dict[str, int]:
-    """Пороги по деревьям из pyproject.toml корня."""
+def _file_size_section(root: Path) -> dict:
     data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     try:
-        section = data["tool"]["haiplane"]["file_size"]
+        return data["tool"]["haiplane"]["file_size"]
     except KeyError:
         raise SystemExit("pyproject.toml: нет секции [tool.haiplane.file_size]")
-    return {str(tree): int(limit) for tree, limit in section.items()}
+
+
+def load_thresholds(root: Path) -> dict[str, int]:
+    """Пороги по деревьям из pyproject.toml корня (near_pct — не дерево)."""
+    section = _file_size_section(root)
+    return {
+        str(tree): int(limit) for tree, limit in section.items() if tree != NEAR_KEY
+    }
+
+
+def load_near_pct(root: Path) -> float:
+    """Доля порога, с которой файл вне ledger называется «у порога»."""
+    section = _file_size_section(root)
+    if NEAR_KEY not in section:
+        raise SystemExit(
+            f"pyproject.toml: нет ключа {NEAR_KEY} в [tool.haiplane.file_size]"
+        )
+    return float(section[NEAR_KEY])
 
 
 def count_lines(data: bytes) -> int:
@@ -87,16 +106,17 @@ class Report:
     stale: tuple[tuple[str, str], ...]  # путь, причина
     waived: tuple[tuple[str, int, int], ...]  # путь, строк, потолок
     by_reason: dict[str, int]
-
-    @property
-    def loud(self) -> tuple[tuple[str, int, int], ...]:
-        """Waived-файлы на ≥90% потолка, самые заполненные первыми."""
-        hot = [w for w in self.waived if w[1] * 100 >= LOUD_AT_PCT * w[2]]
-        return tuple(sorted(hot, key=lambda p: -(p[1] / p[2])))
+    grown: tuple[tuple[str, int, int, int], ...] = ()  # путь, строк, замер, потолок
+    near: tuple[tuple[str, int, int], ...] = ()  # путь, строк, порог
 
     @property
     def ok(self) -> bool:
         return not (self.new or self.over or self.stale)
+
+    @property
+    def near_ranked(self) -> tuple[tuple[str, int, int], ...]:
+        """Файлы у порога, самые заполненные первыми."""
+        return tuple(sorted(self.near, key=lambda p: (-(p[1] / p[2]), p[0])))
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -105,9 +125,18 @@ class Report:
             "over": [{"path": p, "lines": n, "max": m} for p, n, m in self.over],
             "stale": [{"path": p, "reason": r} for p, r in self.stale],
             "waived_count": len(self.waived),
-            "loud": [
-                {"path": p, "lines": n, "max": m, "used_pct": round(100.0 * n / m, 1)}
-                for p, n, m in self.loud
+            "grown": [
+                {"path": p, "lines": n, "measured": m, "max": x}
+                for p, n, m, x in self.grown
+            ],
+            "near": [
+                {
+                    "path": p,
+                    "lines": n,
+                    "threshold": t,
+                    "used_pct": round(100.0 * n / t, 1),
+                }
+                for p, n, t in self.near_ranked
             ],
             "by_reason": dict(self.by_reason),
         }
@@ -118,13 +147,18 @@ def _threshold(path: str, thresholds: dict[str, int]) -> int:
 
 
 def check(
-    sizes: dict[str, int], thresholds: dict[str, int], ledger: dict[str, dict]
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    ledger: dict[str, dict],
+    near_pct: float,
 ) -> Report:
     """Свести замеры с ledger. Чистая функция: ни файловой системы, ни конфига."""
     new: list[tuple[str, int, int]] = []
     over: list[tuple[str, int, int]] = []
     waived: list[tuple[str, int, int]] = []
     stale: list[tuple[str, str]] = []
+    grown: list[tuple[str, int, int, int]] = []
+    near: list[tuple[str, int, int]] = []
     by_reason: dict[str, int] = {}
 
     for path, lines in sizes.items():
@@ -133,6 +167,8 @@ def check(
         if entry is None:
             if lines > limit:
                 new.append((path, lines, limit))
+            elif lines * 100 >= near_pct * limit:
+                near.append((path, lines, limit))
             continue
         if lines <= limit:
             continue  # запись stale, ниже
@@ -140,6 +176,9 @@ def check(
         by_reason[kind] = by_reason.get(kind, 0) + 1
         allowed = int(entry["max"])
         (over if lines > allowed else waived).append((path, lines, allowed))
+        measured = int(entry["measured"])
+        if measured < lines <= allowed:
+            grown.append((path, lines, measured, allowed))
 
     for path in sorted(ledger):
         lines = sizes.get(path)
@@ -153,6 +192,8 @@ def check(
         stale=tuple(stale),
         waived=tuple(sorted(waived)),
         by_reason=by_reason,
+        grown=tuple(sorted(grown)),
+        near=tuple(sorted(near)),
     )
 
 
@@ -179,16 +220,24 @@ def format_report(report: Report) -> str:
     lines.append(f"Исключений в силе: {len(report.waived) + len(report.over)}")
     for kind, count in sorted(report.by_reason.items()):
         lines.append(f"  {kind}: {count}")
-    shown = sorted(report.waived, key=lambda p: -(p[1] / p[2]))[:5]
-    for path, n, allowed in shown:
-        used = 100.0 * n / allowed
-        mark = "  <-- запас почти съеден" if used >= LOUD_AT_PCT else ""
-        lines.append(f"  {path} {n}/{allowed} ({used:.0f}%){mark}")
-    hidden = [w for w in report.loud if w not in shown]
-    if hidden:
+    if report.grown:
         lines.append(
-            f"  и ещё {len(hidden)} файлов ≥{LOUD_AT_PCT:.0f}% потолка (полный список: --json)"
+            f"Файл из ledger вырос сверх замера ({len(report.grown)}), CI не красит:"
         )
+        for path, n, measured, allowed in report.grown:
+            lines.append(f"  {path} — {n} > замер {measured} (потолок {allowed})")
+    if report.near:
+        lines.append(
+            f"Файл у порога ({len(report.near)}), CI не красит: разделите по темам "
+            "до того, как файл упрётся в порог:"
+        )
+        ranked = report.near_ranked
+        for path, n, limit in ranked[:NEAR_SHOWN]:
+            lines.append(f"  {path} — {n}/{limit} ({100.0 * n / limit:.0f}%)")
+        if len(ranked) > NEAR_SHOWN:
+            lines.append(
+                f"  и ещё {len(ranked) - NEAR_SHOWN} файлов у порога (полный список: --json)"
+            )
     return "\n".join(lines)
 
 
@@ -254,7 +303,7 @@ def main() -> int:
         print(f"ledger перезаписан: {count} исключений")
         return 0
 
-    report = check(sizes, thresholds, load_ledger(ledger_path))
+    report = check(sizes, thresholds, load_ledger(ledger_path), load_near_pct(root))
     if args.json:
         print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     else:
