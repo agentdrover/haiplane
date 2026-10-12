@@ -186,6 +186,10 @@ async def store_ci_run_report(
         provenance=json.dumps(claimed, ensure_ascii=False, sort_keys=True),
         submitted=json.dumps({"ac_results": sent}, ensure_ascii=False, sort_keys=True),
     )
+    # #1687: a new claim makes the standing UNCONFIRMED until it is settled
+    # against GitHub — in the same transaction, so no reader in between sees the
+    # previous confirmation (or the evidence it wrote) as current.
+    await ci_trust.invalidate(db, dict(row), head_sha)
     return {
         "head_sha": head_sha,
         "ac_ignored": ignored,

@@ -2844,6 +2844,21 @@ _MIGRATIONS: list[tuple[str, str]] = [
         )""",
     ),
     (
+        # The state version of one commit's CI standing: bumped by every POST
+        # of any attempt and at the start of every refresh. A refresh writes
+        # its projection and the evidence only if the version is still the one
+        # it captured, in one short write transaction, so a picture taken
+        # before a newer fact arrived can never be written over it — in this
+        # process or in another one.
+        "create_ci_report_state",
+        """CREATE TABLE IF NOT EXISTS ci_report_state (
+            task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            head_sha TEXT    NOT NULL,
+            version  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, head_sha)
+        )""",
+    ),
+    (
         # Reports stored before this task that DO name their run and artifact
         # (#1686) are not lost to "legacy": each becomes an unverified attempt,
         # queued for the check like any other (the poller picks up an attempt

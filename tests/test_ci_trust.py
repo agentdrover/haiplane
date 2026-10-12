@@ -1157,3 +1157,313 @@ async def test_an_approving_verdict_asks_before_it_reads_the_ac_results(
         await _vstep_ac_tests_green(state)
     assert refused.value.status_code == 422
     assert "ac_tests_not_green" in str(refused.value.detail)
+
+
+# ---- round 2: the database decides, not the process ------------------------
+
+
+async def _slow_first_runs(monkeypatch):
+    """The first answer about the commit's runs is taken now and used later."""
+    import asyncio
+
+    from hub.integrations.registry import plugins
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_runs = GH.ci_runs_for_sha
+    seen: list[int] = []
+
+    async def slow(*args, **kwargs):
+        picture = await real_runs(*args, **kwargs)
+        seen.append(1)
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()
+        return picture
+
+    monkeypatch.setattr(plugins.git_ops, "ci_runs_for_sha", slow)
+    return entered, release
+
+
+def _red_rerun(task_id: int, run_id: str) -> dict:
+    return GH.attempt(
+        task_id,
+        SHA,
+        run_id=run_id,
+        attempt="2",
+        conclusion="failure",
+        validation_status="fail",
+        ac_results={"AC-1": "fail"},
+    )
+
+
+async def test_a_delayed_refresh_cannot_write_over_a_newer_post(db, monkeypatch):
+    """No second refresh, no lock to save it: only the database version."""
+    import asyncio
+
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6801", attempt="1"))
+    entered, release = await _slow_first_runs(monkeypatch)
+    older = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await entered.wait()
+    await store_ci_run_report(db, task_id, **_red_rerun(task_id, "6801"))
+    await db.commit()
+    release.set()
+    await older
+
+    assert (await _standing(db, task_id))[2] == "ci:6801:2"
+    results, validation, source = await _evidence(db, task_id)
+    assert results == [("AC-1", "fail")] and source == "ci:6801:2"
+
+
+async def test_the_same_race_through_two_independent_instances(db, monkeypatch):
+    """Another process has its own lock table: here, a table emptied mid-flight."""
+    import asyncio
+
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6802", attempt="1"))
+    entered, release = await _slow_first_runs(monkeypatch)
+    first = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await entered.wait()
+    await store_ci_run_report(db, task_id, **_red_rerun(task_id, "6802"))
+    await db.commit()
+    ci_trust._locks.clear()  # the other process knows nothing of the first lock
+    other = await ci_trust.refresh(db, task_id, SHA)
+    assert other.attempt_key == "ci:6802:2"
+    release.set()  # ... and only now the first one finishes with its old picture
+    await first
+
+    assert (await _standing(db, task_id))[2] == "ci:6802:2"
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "fail")]
+
+
+async def test_a_version_moved_by_another_process_makes_the_refresh_ask_again(
+    db, monkeypatch
+):
+    import asyncio
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6803"))
+    projected: list[int] = []
+    real_project = ci_trust._project
+
+    async def counting(*args, **kwargs):
+        projected.append(1)
+        return await real_project(*args, **kwargs)
+
+    monkeypatch.setattr(ci_trust, "_project", counting)
+    entered, release = await _slow_first_runs(monkeypatch)
+    task = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await entered.wait()
+    await db.execute(  # what another process does: one row, no Python object shared
+        "UPDATE ci_report_state SET version = version + 1 WHERE task_id = ?",
+        (task_id,),
+    )
+    await db.commit()
+    release.set()
+    standing = await task
+    assert standing.trust == "verified"
+    assert projected == [1], "the stale picture was not written; the second round was"
+
+
+async def test_a_check_that_is_always_overtaken_is_superseded_not_guessed(
+    db, monkeypatch
+):
+    from hub.integrations.registry import plugins
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6804"))
+    real_runs = GH.ci_runs_for_sha
+
+    async def always_overtaken(*args, **kwargs):
+        picture = await real_runs(*args, **kwargs)
+        await db.execute(
+            "UPDATE ci_report_state SET version = version + 1 WHERE task_id = ?",
+            (task_id,),
+        )
+        await db.commit()
+        return picture
+
+    monkeypatch.setattr(plugins.git_ops, "ci_runs_for_sha", always_overtaken)
+    standing = await ci_trust.refresh(db, task_id, SHA)
+    assert (standing.trust, standing.reason) == ("unverified", "check_superseded")
+    assert (await _standing(db, task_id))[:2] == ("unverified", "check_superseded")
+    assert (await _evidence(db, task_id))[0] == []
+
+
+async def test_a_post_withdraws_the_standing_until_it_is_settled(db):
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6805"))
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+    await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id="6806"))
+    await db.commit()
+    assert (await _standing(db, task_id))[:2] == ("unverified", "pending")
+    assert (await _evidence(db, task_id))[0] == []
+    assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
+
+
+# ---- round 2: no network inside a write transaction ------------------------
+
+
+def _forbid_network_in_transaction(db) -> None:
+    """Every call to the fake GitHub asserts that the database is not in a transaction."""
+    for name in (
+        "ci_run_attempt",
+        "ci_runs_for_sha",
+        "ci_run_artifacts",
+        "ci_artifact_zip",
+    ):
+        real = getattr(GH, name)
+
+        async def checked(*args, __real=real, __name=name, **kwargs):
+            assert not db.in_transaction, f"{__name} called inside a write transaction"
+            return await __real(*args, **kwargs)
+
+        setattr(GH, name, checked)
+        from hub.integrations.registry import plugins
+
+        setattr(plugins.git_ops, name, checked)
+
+
+async def test_a_done_report_is_gated_on_the_current_attempt_and_asks_outside_the_lock(
+    db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task_whose_rerun_nobody_reported(db, "6901")
+    await repo.update_task(
+        db,
+        task_id,
+        status="pending_report",
+        auto_review=0,
+        validation_commands='["x"]',
+    )
+    await db.commit()
+    assert (await _evidence(db, task_id))[1] == "pass", "the old green is still stored"
+    _forbid_network_in_transaction(db)
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
+    assert any(c.startswith("runs:") for c in GH.calls), "GitHub WAS asked, outside"
+
+
+async def test_the_pin_step_does_not_ask_github_from_inside_a_transaction(
+    db, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from hub.db import write_transaction
+    from hub.services import lifecycle
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="6902"))
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(SHA, ""))
+    )
+
+    def state():
+        return SimpleNamespace(
+            db=db,
+            task_id=task_id,
+            task={"branch": "b"},
+            submission_sha="",
+            sha_reason="",
+        )
+
+    GH.calls.clear()
+    async with write_transaction(db):
+        await lifecycle._step_pin_submission_sha(state())
+    assert GH.calls == [], "inside a transaction only the stored standing is read"
+    await lifecycle._step_pin_submission_sha(state())
+    assert any(c.startswith("runs:") for c in GH.calls), "outside it, GitHub is asked"
+
+
+# ---- round 2: one deadline for a refresh ------------------------------------
+
+
+async def test_a_refresh_has_one_deadline_for_every_call_to_github(db, monkeypatch):
+    import asyncio
+    import time
+
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id="7001"))
+    await db.commit()
+
+    async def hangs(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", hangs)
+    monkeypatch.setattr(ci_trust, "REFRESH_DEADLINE_SECONDS", 0.2)
+    started = time.monotonic()
+    standing = await ci_trust.refresh(db, task_id, SHA)
+    assert time.monotonic() - started < 5
+    assert (standing.trust, standing.reason) == ("unverified", "forge_unavailable")
+    assert (await _evidence(db, task_id))[0] == []
+
+    # The wait for the per-commit lock counts against the same deadline.
+    lock = asyncio.Lock()
+    await lock.acquire()
+    ci_trust._locks[(task_id, SHA)] = lock
+    started = time.monotonic()
+    standing = await ci_trust.refresh(db, task_id, SHA)
+    assert time.monotonic() - started < 5
+    assert standing.trust == "unverified"
+
+
+async def test_the_first_failure_of_github_ends_the_questions_of_that_refresh(db):
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    for n in range(4):  # four attempts, none checked yet
+        await store_ci_run_report(
+            db, task_id, **GH.attempt(task_id, SHA, run_id=f"710{n}")
+        )
+    await db.commit()
+    GH.down = True
+    GH.calls.clear()
+    standing = await ci_trust.refresh(db, task_id, SHA)
+    assert len(GH.calls) == 1, GH.calls
+    assert (standing.trust, standing.reason) == ("unverified", "forge_unavailable")
+    assert standing.forge_down is True
+
+
+async def test_a_tick_that_ran_out_of_budget_goes_on_where_it_stopped(db, monkeypatch):
+    from types import SimpleNamespace
+
+    tasks = [await _review_task_with_green(db, f"72{n:02d}") for n in range(3)]
+    clock = [0.0]
+    monkeypatch.setattr(
+        ci_trust, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=None)
+    )
+    monkeypatch.setattr(ci_trust, "SWEEP_BUDGET_SECONDS", 0.5)
+    real = ci_trust.refresh_quietly
+    handled: list[int] = []
+
+    async def slow(db_, task_id, sha, **kwargs):
+        handled.append(task_id)
+        clock[0] += 1.0  # each refresh spends the whole budget
+        return await real(db_, task_id, sha, **kwargs)
+
+    monkeypatch.setattr(ci_trust, "refresh_quietly", slow)
+    for _ in range(3):
+        await ci_trust.sweep(db)
+    assert handled == sorted(tasks), "every task got its turn, in order"

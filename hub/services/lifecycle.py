@@ -3260,7 +3260,10 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     # #1687: the CI report for this commit is checked against GitHub NOW, also
     # a rerun nobody reported, so the gates below and the adoption inside the
     # lock read a standing that is current, not the one the last POST left.
-    if state.submission_sha:
+    # Never from inside a write transaction (the headless done path pins the
+    # tip there): the stored standing is what such a path reads, and the
+    # network refresh is done by the caller BEFORE it opens the transaction.
+    if state.submission_sha and not state.db.in_transaction:
         await ci_trust.refresh_quietly(state.db, state.task_id, state.submission_sha)
 
 
@@ -5802,6 +5805,20 @@ async def _record_path_notices_for_done(
         await path_notices.record(db, int(task["id"]), outcome)
 
 
+async def _task_with_current_ci(
+    db: aiosqlite.Connection, task: dict[str, Any], kind: str
+) -> dict[str, Any]:
+    """A done report is gated on the CURRENT attempt's evidence (#1687).
+
+    Asked of GitHub here, BEFORE the write transaction of the report opens: a
+    network call must not hold the database lock, and inside the transaction
+    only the stored standing is read. The task is read again after the ask.
+    """
+    if kind != "done":
+        return task
+    return await ci_trust.refresh_for_gate(db, task)
+
+
 async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
@@ -5820,7 +5837,7 @@ async def add_update(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
-    task = dict(row)
+    task = await _task_with_current_ci(db, dict(row), body.kind)
 
     if body.kind == "done":
         # #971: the hub can now deliver approved pair work on its own, so an

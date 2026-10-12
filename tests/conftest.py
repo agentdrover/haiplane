@@ -517,7 +517,9 @@ def _forget_forge_backoff():
     from hub.services import ci_trust
 
     ci_trust._forge_down_until = 0.0
+    ci_trust._sweep_cursor = None
     ci_trust._locks.clear()
     yield
     ci_trust._forge_down_until = 0.0
+    ci_trust._sweep_cursor = None
     ci_trust._locks.clear()

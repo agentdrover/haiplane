@@ -2504,6 +2504,32 @@ async def upsert_ci_report_attempt(
             1 if baseline is None else 0,
         ),
     )
+    # Any POST of any attempt is a new fact about the commit: a refresh that
+    # started before it must not write its (older) picture over it.
+    await bump_ci_state_version(db, task_id, head_sha)
+
+
+async def bump_ci_state_version(
+    db: aiosqlite.Connection, task_id: int, head_sha: str
+) -> int:
+    """Move the state version of a commit's CI standing; the new value (#1687)."""
+    await db.execute(
+        "INSERT INTO ci_report_state (task_id, head_sha, version) VALUES (?, ?, 1) "
+        "ON CONFLICT(task_id, head_sha) DO UPDATE SET version = version + 1",
+        (task_id, head_sha),
+    )
+    return await ci_state_version(db, task_id, head_sha)
+
+
+async def ci_state_version(
+    db: aiosqlite.Connection, task_id: int, head_sha: str
+) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT version FROM ci_report_state WHERE task_id=? AND head_sha=?",
+        (task_id, head_sha),
+    )
+    return int(rows[0][0]) if rows else 0
 
 
 _ATTEMPT_AGE = (
