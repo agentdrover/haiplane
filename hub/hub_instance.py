@@ -59,6 +59,7 @@ def with_instance_echo(payload: dict[str, Any]) -> dict[str, Any]:
 def mutation_activity_detail(extra: dict[str, Any] | None = None) -> str:
     """JSON detail for activity_log on task mutations.
 
-    ``extra`` (#1683) — факты события рядом с эхом экземпляра.
+    ``extra`` (#1683) — факты события рядом с эхом экземпляра; поля экземпляра
+    (#1689) ставятся поверх extra и перезаписать их нельзя.
     """
-    return json.dumps({**instance_echo_fields(), **(extra or {})}, ensure_ascii=False)
+    return json.dumps({**(extra or {}), **instance_echo_fields()}, ensure_ascii=False)
