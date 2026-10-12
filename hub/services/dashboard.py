@@ -238,6 +238,8 @@ async def get_inbox_data(
     # insulting for one that reported an hour ago. One query per stale row;
     # the section is short by construction (it is the list a human reads).
     stale_meta: dict[int, dict[str, str]] = {}
+    # #1672: the row names the project; one batch read, not one per row.
+    stale_projects = await project_refs(db, [int(r["id"]) for r in stale_rows])
     for r in stale_rows:
         d = dict(r)
         waiting_for = str(d.get("waiting_for") or "")
@@ -249,6 +251,7 @@ async def get_inbox_data(
                     f"до {waiting_until} (UTC)."
                 ),
                 "kind": "lapsed_wait",
+                "project": _slug_of(stale_projects, d["id"]),
             }
             continue
         last_at = await repo.last_activity_at(db, d["id"])
@@ -260,6 +263,7 @@ async def get_inbox_data(
                 else "В ленте задачи нет ни одной записи."
             ),
             "kind": "silence",
+            "project": _slug_of(stale_projects, d["id"]),
         }
 
     questions: list[dict[str, Any]] = []
@@ -532,6 +536,44 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     return cards
 
 
+async def project_refs(
+    db: aiosqlite.Connection, task_ids: list[int]
+) -> dict[int, TaskProjectRef]:
+    """Project of each task, resolved in memory from two reads (#1672, #485).
+
+    The semantics are ``repo.resolve_project_with_source`` — the epic's project,
+    'default' outside any epic or for a pending proposal — computed by the same
+    resolver the orchestrator queue uses, over the tasks' ancestry loaded in
+    one statement. Ancestors outside the page are part of that read.
+    """
+    from hub.services.orchestrator_queue import project_resolver
+
+    ancestry = await repo.list_task_ancestry(db, task_ids)
+    if not ancestry:
+        return {}
+    owner_of = project_resolver(
+        await repo.list_projects(db, include_archived=True), missing_is_none=True
+    )
+    refs: dict[int, TaskProjectRef] = {}
+    for task_id in task_ids:
+        project = owner_of(ancestry, task_id)
+        if project is not None:
+            refs[task_id] = TaskProjectRef(id=int(project["id"]), slug=project["slug"])
+    return refs
+
+
+def _slug_of(refs: dict[int, TaskProjectRef], task_id: int) -> str:
+    ref = refs.get(int(task_id))
+    return ref.slug if ref is not None else ""
+
+
+async def attach_projects(db: aiosqlite.Connection, views: list[TaskView]) -> None:
+    """Fill ``project`` on every view of a list; a list never queries per task."""
+    refs = await project_refs(db, [v.id for v in views])
+    for view in views:
+        view.project = refs.get(view.id)
+
+
 async def list_tasks(
     db: aiosqlite.Connection,
     *,
@@ -591,11 +633,13 @@ async def list_tasks(
         project_id=project_id,
     )
     views = [row_to_task(r) for r in rows]
+    if paged:
+        has_more = len(views) > limit
+        views = views[:limit]
+    await attach_projects(db, views)
     if not paged:
         return views
 
-    has_more = len(views) > limit
-    views = views[:limit]
     next_cursor = views[-1].id if has_more and views else None
     if mode == "summary":
         tasks: list[dict[str, Any]] = [
@@ -608,6 +652,7 @@ async def list_tasks(
                 "priority": v.priority.value,
                 "readiness_score": v.readiness_score,
                 "dor_passed": v.dor_passed,
+                "project": v.project.model_dump() if v.project else None,
             }
             for v in views
         ]

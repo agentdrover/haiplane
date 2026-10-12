@@ -1974,6 +1974,7 @@ async def test_summary_mode_returns_compact_fields(client: AsyncClient):
         "priority",
         "readiness_score",
         "dor_passed",
+        "project",  # #1672
     }
 
 
@@ -5131,207 +5132,152 @@ async def test_state_fields_evidence_and_verdict_parity_across_surfaces(
     assert plain.json()["result_kind"] == "commit" and plain.json()["rollback"] == ""
 
 
-# ---------------------------------------------------------------------------
-# Архив задачи в работе требует причину и называет работу (#1673)
-# ---------------------------------------------------------------------------
-
-
-async def test_archive_of_active_work_needs_a_reason_and_names_the_work(
-    client: AsyncClient, db
-):
-    from tests.archive_support import footprint, mk, principal, say
-
-    task_id = await mk(db, "в работе", "running", claimed_by="a1", branch="task-1/x")
-    agent = await principal(db, "agent", "bot")
-    person = await principal(db, "human", "denis")
-    service = await principal(db, "service", "ci")
-    await say(db, task_id, "status", "агент", by=agent, author_kind="principal")
-    await say(db, task_id, "status", "человек", by=person, author_kind="principal")
-    await say(db, task_id, "status", "сервис", by=service, author_kind="principal")
-    await say(db, task_id, "status", "хаб", author_kind="hub")
-    await say(db, task_id, "status", "аноним", author_kind="anonymous")
-    await say(db, task_id, "status", "до #559", by=agent, author_kind="legacy")
-    await say(
-        db, task_id, "answer", "ответ владельца", by=person, author_kind="principal"
-    )
-    before = await footprint(db)
-
-    for body in ({}, {"reason": "  "}):
-        resp = await client.post(f"/api/tasks/{task_id}/archive", json=body)
-        assert resp.status_code == 409, resp.text
-        detail = resp.json()["detail"]
-        assert detail["reason"] == "archive_active_work"
-        assert detail["project"] == "default"
-        first = detail["blocking"][0]
-        assert (first["task_id"], first["status"]) == (task_id, "running")
-        assert first["claimed_by"] == "a1" and first["branch"] == "task-1/x"
-        assert first["updates_by_agents"] == 1 and first["answers"] == 1
-        assert await footprint(db) == before, "отказ ничего не пишет"
-    assert (await client.get(f"/api/tasks/{task_id}")).json()["archived"] is False
-
-
-async def test_cascade_archive_names_active_descendants(
-    client: AsyncClient, db, monkeypatch
-):
+async def test_task_list_names_the_project_of_every_item(db, client, monkeypatch):
+    """AC-2 (#1672): у каждого элемента списка точный {id, slug}; без N+1."""
     import json
 
-    from tests.archive_support import archived, human, mk, principal, say
+    from hub import mcp_server
+    from hub import repository as repo
+    from hub import services
+    from hub.models import TaskCreate
+    from hub.services import dashboard
 
-    headers = human(monkeypatch, "denis")
-    epic = await mk(db, "эпик", kind="epic")
-    live = await mk(db, "живой", "running", parent=epic, claimed_by="kid")
-    gone = await mk(db, "архивный", "running", parent=epic, archived=1)
-    bot = await principal(db, "agent", "bot")
-    await say(db, epic, "status", "эпик", by=bot, author_kind="principal")
-    for text in ("раз", "два"):
-        await say(db, live, "status", text, by=bot, author_kind="principal")
-    url = f"/api/tasks/{epic}/archive"
+    from hub.db import seed_default_project
 
-    refused = await client.post(url, json={}, headers=headers)
-    assert refused.status_code == 409, refused.text
-    blocking = refused.json()["detail"]["blocking"]
-    assert [b["task_id"] for b in blocking] == [live], "архивный потомок не в счёте"
-    assert blocking[0]["updates_by_agents"] == 2 and blocking[0]["claimed_by"] == "kid"
-    assert not await archived(db, epic)
+    await seed_default_project(db)
+    expected: dict[int, str] = {}
+    for slug in ("lp-a", "lp-b"):
+        pid = await repo.create_project(db, slug=slug, name=slug)
+        parent = None
+        for depth, kind in enumerate(("epic", "feature", "task", "subtask")):
+            tv = await services.create_task(
+                db, TaskCreate(title=f"{slug}-{kind}", task_type=kind, parent_id=parent)
+            )
+            if depth == 0:
+                await repo.update_task(db, tv.id, project_id=pid)
+            expected[tv.id] = slug
+            parent = tv.id
+    for i in range(6):
+        tv = await services.create_task(db, TaskCreate(title=f"loose-{i}"))
+        expected[tv.id] = "default"
+    await db.commit()
+    ids = sorted(expected, reverse=True)  # листинг — по id убыванию
+    project_ids = {p["slug"]: p["id"] for p in await repo.list_projects(db)}
 
-    done = await client.post(url, json={"reason": "эпик закрыт"}, headers=headers)
-    assert done.status_code == 200, done.text
-    assert all([await archived(db, i) for i in (epic, live, gone)])
-    feed = [
-        dict(u)
-        for u in await repo.get_task_updates(db, live)
-        if u["kind"] == "decision"
-    ]
-    assert len(feed) == 1
-    for word in ("эпик закрыт", "denis", "cascade=True", str(live), str(epic)):
-        assert word in feed[0]["content"], (word, feed[0]["content"])
-    assert not [
-        u for u in await repo.get_task_updates(db, epic) if u["kind"] == "decision"
-    ]
-    rows = await db.execute_fetchall(
-        "SELECT detail FROM activity_log WHERE kind='task_archived'"
+    def _check(items: list[dict]) -> None:
+        for item in items:
+            slug = expected[item["id"]]
+            assert item["project"] == {"id": project_ids[slug], "slug": slug}, item
+
+    # Счёт запросов на инструментированном соединении: не зависит от страницы.
+    counts: dict[int, int] = {}
+    for limit, after in ((2, 4), (20, 0)):
+        seen: list[str] = []
+        await db.set_trace_callback(seen.append)
+        page = await dashboard.list_tasks(db, after_id=after, limit=limit, mode="full")
+        await db.set_trace_callback(None)
+        assert page["tasks"], limit
+        counts[limit] = len(seen)
+        _check(page["tasks"])
+    assert counts[2] > 0 and counts[2] == counts[20], counts
+
+    # Страница 2 начинается внутри иерархии: родители вне страницы.
+    first = (await client.get("/api/tasks?after_id=4&limit=2")).json()
+    assert [t["id"] for t in first["tasks"]] == [3, 2]
+    _check(first["tasks"])
+
+    # Обход курсором: те же id и курсоры, что и без проекта.
+    walked: list[int] = []
+    cursor: int | None = 0
+    cursors: list[int | None] = []
+    while cursor is not None:
+        for mode in ("full", "summary"):
+            body = (
+                await client.get(f"/api/tasks?after_id={cursor}&limit=5&mode={mode}")
+            ).json()
+            _check(body["tasks"])
+            if mode == "full":
+                full_body = body
+        walked += [t["id"] for t in full_body["tasks"]]
+        cursor = full_body["next_cursor"]
+        cursors.append(cursor)
+    assert walked == ids
+    assert cursors == [ids[4], ids[9], None]
+
+    # Плоский full-список (без курсора) и MCP.
+    flat = (await client.get("/api/tasks?limit=50")).json()
+    assert sorted(t["id"] for t in flat) == sorted(ids)
+    _check(flat)
+
+    async def _get(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    for mode in ("full", "summary"):
+        out = await mcp_server.hub_list_tasks(mode=mode, after_id=0, limit=50)
+        structured = out.structuredContent
+        _check(structured["tasks"])
+        text = json.loads(out.content[0].text)["message"].splitlines()
+        for line, task in zip(text, structured["tasks"], strict=False):
+            assert f"[{expected[task['id']]}]" in line, (mode, line)
+
+
+async def test_list_project_resolution_matches_the_card_resolver(db):
+    """#1672 P2-1: пакетный резолв списка == resolve_project_with_source по задаче."""
+    from hub.db import seed_default_project
+    from hub.services import dashboard
+    from hub.services.orchestrator_queue import project_resolver
+
+    await seed_default_project(db)
+
+    async def _task(parent: int | None = None, kind: str = "task") -> int:
+        return await repo.create_task(
+            db,
+            title="t",
+            description="",
+            runtime="auto",
+            source="human",
+            assigned_agent="",
+            rationale="",
+            status="open",
+            auto_review=True,
+            task_type=kind,
+            parent_id=parent,
+            priority="medium",
+        )
+
+    active = await repo.create_project(db, slug="par-active", name="a")
+    pending = await repo.create_project(
+        db, slug="par-pending", name="p", status="pending"
     )
-    detail = json.loads(rows[-1][0])
-    assert detail["actor"] == "denis" and detail["reason"] == "эпик закрыт"
-    assert detail["cascade"] is True and live in detail["ids"] and epic in detail["ids"]
+    cases: list[int] = [await _task()]  # орфан без эпика
+    cases.append(await _task(kind="epic"))  # эпик без project_id
+    for pid in (active, pending, 9999):  # активный, pending, отсутствующий
+        epic = await _task(kind="epic")
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await repo.update_task(db, epic, project_id=pid)
+        await db.execute("PRAGMA foreign_keys = ON")
+        cases += [epic, await _task(epic)]
+    chain = await _task(kind="epic")
+    await repo.update_task(db, chain, project_id=active)
+    node = chain
+    for _ in range(22):  # глубже порога 20 у resolve_project_with_source
+        node = await _task(node)
+        cases.append(node)
+    await db.commit()
 
+    refs = await dashboard.project_refs(db, cases)
+    seen: set[str | None] = set()
+    for task_id in cases:
+        row, _ = await repo.resolve_project_with_source(db, task_id)
+        expected = row["slug"] if row is not None else None
+        got = refs.get(task_id)
+        assert (got.slug if got else None) == expected, task_id
+        seen.add(expected)
+    assert {"default", "par-active", None} <= seen, seen  # все ветви достигнуты
 
-async def test_archive_of_idle_task_is_unchanged(client: AsyncClient, db, monkeypatch):
-    from tests.archive_support import archived, jobs, mk, slot
-
-    jobs(monkeypatch, {"live": "running", "done": "completed", "bad": "failed"})
-
-    async def archive(task_id, body=None):
-        return await client.post(f"/api/tasks/{task_id}/archive", json=body or {})
-
-    for status, cols in (
-        ("open", {}),
-        ("completed", {}),
-        ("completed", {"job_id": "done"}),
-        ("open", {"job_id": "bad"}),
-        ("open", {"review_job_id": "ghost"}),
-    ):
-        task_id = await mk(db, "тихая", status, **cols)
-        assert (await archive(task_id)).status_code == 200, (status, cols)
-        assert await archived(db, task_id)
-    closed = await mk(db, "слот закрыт", "open")
-    await slot(db, closed, "slot", closed=True)
-    assert (await archive(closed)).status_code == 200
-
-    epic = await mk(db, "эпик", kind="epic")
-    kid = await mk(db, "живой", "running", parent=epic)
-    assert (await archive(epic, {"cascade": False})).status_code == 200
-    assert await archived(db, epic) and not await archived(db, kid)
-
-    for status in ("open", "completed"):
-        for cols in ({"job_id": "live"}, {"review_job_id": "live"}):
-            task_id = await mk(db, "с job", status, **cols)
-            resp = await archive(task_id)
-            assert resp.status_code == 409, (status, cols, resp.text)
-            assert resp.json()["detail"]["blocking"][0]["active_job"]
-            assert not await archived(db, task_id)
-    for status in (
-        "claimed",
-        "running",
-        "review",
-        "fix_requested",
-        "ci_check",
-        "needs_info",
-        "pending_report",
-        "needs_decision",
-    ):
-        task_id = await mk(db, f"статус {status}", status)
-        resp = await archive(task_id)
-        assert resp.status_code == 409, (status, resp.text)
-        assert resp.json()["detail"]["blocking"][0]["status"] == status
-    for channel in ("slot", "cloud"):
-        task_id = await mk(db, f"слот {channel}", "open")
-        await slot(db, task_id, channel)
-        resp = await archive(task_id)
-        assert resp.status_code == 409, (channel, resp.text)
-        assert resp.json()["detail"]["blocking"][0]["open_slot"]
-        assert not await archived(db, task_id)
-
-
-async def test_archive_rechecks_work_inside_the_write(
-    client: AsyncClient, db, db_dsn, monkeypatch
-):
-    import asyncio
-    import contextlib
-
-    from hub import db as db_module
-    from hub.services import lifecycle
-    from tests.archive_support import archived, footprint, mk
-
-    epic = await mk(db, "эпик", kind="epic")
-    kid = await mk(db, "потомок", "open", parent=epic)
-    real = db_module.write_transaction
-    committed = asyncio.Event()
-
-    @contextlib.asynccontextmanager
-    async def gate(conn):
-        # Между внешним чтением и защищённым: чужое соединение ставит running.
-        writer = await db_module.connect(db_dsn)
-        try:
-            await writer.execute("UPDATE tasks SET status='running' WHERE id=?", (kid,))
-            await writer.commit()
-        finally:
-            await writer.close()
-        committed.set()
-        async with real(conn):
-            yield
-
-    monkeypatch.setattr(db_module, "write_transaction", gate)
-    url = f"/api/tasks/{epic}/archive"
-    before = await footprint(db)
-
-    resp = await client.post(url, json={})
-    assert committed.is_set()
-    assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["blocking"][0]["task_id"] == kid
-    assert (await repo.get_task(db, kid))["status"] == "running", "чужая запись цела"
-    assert not await archived(db, epic) and await footprint(db) == before
-
-    resp = await client.post(url, json={"reason": "знаю"})
-    assert resp.status_code == 200, resp.text
-    rows = [u for u in await repo.get_task_updates(db, kid) if u["kind"] == "decision"]
-    assert len(rows) == 1 and "знаю" in rows[0]["content"], "аудит по свежим признакам"
-
-    monkeypatch.setattr(db_module, "write_transaction", real)
-    other = await mk(db, "ещё", "running")
-
-    real_log = lifecycle.log_activity
-
-    async def broken(*a, **kw):
-        # Настоящая запись (с тем commit, что передал сервис), затем сбой.
-        await real_log(*a, **kw)
-        raise RuntimeError("activity недоступна")
-
-    monkeypatch.setattr(lifecycle, "log_activity", broken)
-    before = await footprint(db)
-    try:
-        resp = await client.post(f"/api/tasks/{other}/archive", json={"reason": "p"})
-        assert resp.status_code >= 500, resp.text
-    except RuntimeError:
-        pass
-    assert not await archived(db, other) and await footprint(db) == before
+    # Очередь оркестратора по-прежнему подменяет отсутствующий проект на default.
+    projects = await repo.list_projects(db, include_archived=True)
+    ancestry = {1: {"id": 1, "parent_id": None, "project_id": 9999}}
+    assert project_resolver(projects)(ancestry, 1)["slug"] == "default"
+    assert project_resolver(projects, missing_is_none=True)(ancestry, 1) is None

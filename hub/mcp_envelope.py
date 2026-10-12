@@ -31,6 +31,7 @@ MUTATION_ENVELOPE_FIELDS = (
     "transition",
     "next_action",
     "actor_hint",
+    "project",
 )
 
 
@@ -192,13 +193,20 @@ def build_mutation_envelope(
     if resolved_status == "review" and reason is None:
         next_action = next_action_of(route) or next_action
 
-    return {
+    envelope: dict[str, Any] = {
         "status": resolved_status,
         "awaiting": awaiting,
         "transition": transition,
         "next_action": next_action,
         "actor_hint": actor_hint,
     }
+    # #1672: the slug of the project the KNOWN task belongs to. A refusal that
+    # names no task has none, and says nothing rather than guessing 'default'.
+    project = (task or {}).get("project")
+    slug = project.get("slug") if isinstance(project, dict) else None
+    if slug:
+        envelope["project"] = slug
+    return envelope
 
 
 def merge_mutation_response(
