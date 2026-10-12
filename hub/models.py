@@ -2272,9 +2272,14 @@ class TaskReorder(BaseModel):
 
 
 class TaskArchive(BaseModel):
-    """Archive hides tasks from default lists; optional subtree cascade."""
+    """Archive hides tasks from default lists; optional subtree cascade.
+
+    ``reason`` is required when the task or a descendant shows signs of work
+    (#1673); otherwise optional.
+    """
 
     cascade: bool = True
+    reason: str = ""
 
 
 class TaskUnarchive(BaseModel):

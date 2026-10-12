@@ -88,6 +88,29 @@ def permission_denied_detail(permission: str) -> dict[str, Any]:
     )
 
 
+def archive_active_work_detail(
+    project: str, blocking: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """409: архив задачи с признаками работы без причины (#1673)."""
+    ids = ", ".join(f"#{b['task_id']}" for b in blocking)
+    return enrich_error_payload(
+        {
+            "reason": "archive_active_work",
+            "actor_hint": "human",
+            "message": f"архив затронет работу в ходу: {ids}",
+            "hint": (
+                "Архив не останавливает исполнителя и уводит задачу из watchdog "
+                "и инбокса. Повторите с reason (hp-hub archive --reason, поле "
+                "reason у hub_archive_task и POST /archive), если работа не "
+                "нужна, или оставьте задачу."
+            ),
+            "project": project,
+            "blocking": blocking,
+            "suggested_tool": None,
+        }
+    )
+
+
 def withdraw_agent_only_detail() -> dict[str, Any]:
     return enrich_error_payload(
         {
