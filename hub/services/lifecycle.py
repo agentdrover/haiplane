@@ -37,6 +37,7 @@ from hub.actionable_errors import (
 )
 from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
+from hub.services.session_project_check import SessionProjectGuard
 from hub.services.sessions import note_session_task
 from hub.services.result_kind import is_state
 from hub.hub_instance import mutation_activity_detail
@@ -1951,7 +1952,11 @@ async def refuse_opening_without_subject(
 
 @contextlib.asynccontextmanager
 async def capture_areas(
-    db: aiosqlite.Connection, task_id: int, current_status: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    current_status: str,
+    *,
+    project_guard: SessionProjectGuard | None = None,
 ) -> AsyncIterator[dict[str, Any] | None]:
     """Сверка областей при захвате задачи — одна на четыре входа (#1433).
 
@@ -1967,27 +1972,41 @@ async def capture_areas(
       путём (повторная встреча того же пересечения — claim, затем
       pair_start — вторую не пишет); вызывающий получает пересечение;
     * require — отказ структурной ошибкой до перехода статуса.
+
+    ``project_guard`` (#1674) — сверка проекта сессии: берёт write-лок и
+    выполняется первой, до записывающей части area-check; её транзакцию
+    закрывает запись захвата, при исключении она откатывается.
     """
     from hub.services.orchestrator_queue import capture_hold
     from hub.services.project_policy import CLAIM_AREA_MARK, CLAIM_AREA_REQUIRE
 
     async with capture_hold(db, task_id) as (mode, conflict):
-        if conflict is None:
-            yield None
-            return
-        if mode == CLAIM_AREA_REQUIRE:
-            raise HTTPException(
-                409,
-                detail=claim_area_conflict_detail(
-                    task_id=task_id, current_status=current_status, conflict=conflict
-                ),
-            )
-        text = f"{CLAIM_AREA_MARK} (claim_area_check={mode}): {conflict['detail']}."
-        updates = await repo.get_task_updates(db, task_id)
-        if not any(str(u["content"]) == text for u in updates):
-            await repo.add_task_update(db, task_id, "hub", "alert", text)
-            await db.commit()
-        yield {"mode": mode, **conflict}
+        try:
+            if project_guard is not None:
+                await project_guard.enter(db, task_id)
+            if conflict is None:
+                yield None
+                return
+            if mode == CLAIM_AREA_REQUIRE:
+                raise HTTPException(
+                    409,
+                    detail=claim_area_conflict_detail(
+                        task_id=task_id,
+                        current_status=current_status,
+                        conflict=conflict,
+                    ),
+                )
+            text = f"{CLAIM_AREA_MARK} (claim_area_check={mode}): {conflict['detail']}."
+            updates = await repo.get_task_updates(db, task_id)
+            if not any(str(u["content"]) == text for u in updates):
+                await repo.add_task_update(db, task_id, "hub", "alert", text)
+                if project_guard is None or not project_guard.opened:
+                    await db.commit()
+            yield {"mode": mode, **conflict}
+        except BaseException:
+            if project_guard is not None:
+                await project_guard.abort(db)
+            raise
 
 
 async def start_task(
@@ -2069,25 +2088,23 @@ async def _pair_start_write(
     implementer_principal_id: int | None,
     declared_session: str,
     starting_status: str,
+    project_guard: SessionProjectGuard,
 ) -> PairGitMode:
     """Plan, branch and the transition to running, up to the commit (#1433).
 
     Runs inside ``capture_areas``: the area hold lasts until this commit, so a
     concurrent overlapping capture cannot slip through the seconds that branch
     preparation takes (#365 K4).
+
+    Two phases (#1674, review): the SLOW one — git branch/worktree, network,
+    callbacks that commit — runs first, with no write transaction open. Then
+    one SHORT ``BEGIN IMMEDIATE``: the task, its holder, the session and the
+    project are re-read, the project check and its alert, the plan and the
+    transition are written, one commit. No external call sits inside it.
     """
     body = body or TaskPairStart()
 
-    if body.plan:
-        await repo.add_task_update(
-            db,
-            task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
-        )
-
-    if not await repo.has_plan_updates(db, task_id):
+    if not body.plan and not await repo.has_plan_updates(db, task_id):
         raise HTTPException(
             400,
             "Plan required before pair-start. "
@@ -2134,6 +2151,26 @@ async def _pair_start_write(
     if declared_session:
         update_fields["claim_session_id"] = declared_session
 
+    await project_guard.lock(db, task_id)
+    fresh = _existing_task(await repo.get_task(db, task_id), task_id)
+    if fresh["status"] != starting_status or (
+        starting_status == "claimed"
+        and (fresh["claimed_by"], fresh["claim_session_id"])
+        != (task.get("claimed_by"), task.get("claim_session_id"))
+    ):
+        raise HTTPException(
+            409,
+            f"Task #{task_id} left {starting_status!r} during pair-start; "
+            "retry from its current status",
+        )
+    if body.plan:
+        await repo.add_task_update(
+            db,
+            task_id,
+            task.get("assigned_agent", ""),
+            "status",
+            f"Plan: {body.plan}",
+        )
     # #365 K4: the status was written unconditionally, and everything between
     # the check above and this line is a window — branch preparation talks to
     # git and can take seconds. Another claim, a human decision or the poller
@@ -2261,6 +2298,9 @@ async def pair_start_task(
         # #1647: предмет в базовой ветке — проверка по коду; у state кода нет.
         await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
+    # #1674: the declared session against the task's project — checked UNDER
+    # the capture's write lock (the guard), independent of the area check.
+    project_guard = SessionProjectGuard(declared_session, deferred=True)
     # #1433: the same place for the same reason — refused before the plan and
     # the branch are written; the hold lasts until the transition is committed.
     # #1630: файл правил репозитория читается ЗДЕСЬ — после проверок допуска и
@@ -2272,7 +2312,9 @@ async def pair_start_task(
     agent_rules = (
         None if state_task else await working_rules.read_agent_rules(db, task_id)
     )
-    async with capture_areas(db, task_id, starting_status) as area_check:
+    async with capture_areas(
+        db, task_id, starting_status, project_guard=project_guard
+    ) as area_check:
         git_mode = await _pair_start_write(
             db,
             task_id,
@@ -2282,6 +2324,7 @@ async def pair_start_task(
             implementer_principal_id=implementer_principal_id,
             declared_session=declared_session,
             starting_status=starting_status,
+            project_guard=project_guard,
         )
     await log_activity(
         db,
@@ -2302,6 +2345,7 @@ async def pair_start_task(
     if git_mode != PairGitMode.remote:
         tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
     tv.area_check = area_check
+    tv.project_check = project_guard.check
     if state_task:
         # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
         # что уехало в базу: постановка state-задачи не о коде.
@@ -4879,13 +4923,19 @@ async def claim_task(
             f"can only claim open tasks, current status: {task['status']}",
         )
 
+    # #1674: the declared session against the task's project — checked UNDER
+    # the capture's write lock (the guard), before the area check writes.
+    project_guard = SessionProjectGuard(body.session_id)
     # #1433: before the transition, and the hold lasts until its commit — a
     # refusal leaves the task open, a concurrent overlapping claim sees ours.
-    async with capture_areas(db, task_id, task["status"]) as area_check:
+    async with capture_areas(
+        db, task_id, task["status"], project_guard=project_guard
+    ) as area_check:
         won_by_same_holder = await _claim_write(
             db, task_id, body, implementer_principal_id
         )
     if won_by_same_holder is not None:
+        await project_guard.abort(db)
         won_by_same_holder.worktree_hint = _worktree_hint_for(task, task_id)
         return won_by_same_holder
     await log_activity(
@@ -4899,6 +4949,7 @@ async def claim_task(
     updates = await repo.get_task_updates(db, task_id)
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     tv.area_check = area_check
+    tv.project_check = project_guard.check
     tv.worktree_hint = _worktree_hint_for(task, task_id)
     return tv
 

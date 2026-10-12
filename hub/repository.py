@@ -5162,6 +5162,7 @@ async def upsert_agent_session(
     model: str = "",
     host: str = "",
     workspace: str = "",
+    projects: str = "",
 ) -> None:
     """Register a session, or refresh the one already under this id.
 
@@ -5176,12 +5177,16 @@ async def upsert_agent_session(
     row as-is so a raced register cannot steal the address between the
     service's checks and this write — the same-principal collision that made
     a task's ``claim_session_id`` point at another machine's worktree.
+
+    ``projects`` is the JSON array of declared slugs (#1674); '' keeps the
+    stored one, a non-empty value replaces it. It is a declaration, not an
+    address: it never makes the write conditional.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
-        "(session_id, principal_id, agent, model, host, workspace, "
+        "(session_id, principal_id, agent, model, host, workspace, projects, "
         " started_at, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         "  principal_id = excluded.principal_id, "
         "  agent        = excluded.agent, "
@@ -5191,6 +5196,8 @@ async def upsert_agent_session(
         "                 THEN agent_sessions.host ELSE excluded.host END, "
         "  workspace    = CASE WHEN excluded.workspace = '' "
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
+        "  projects     = CASE WHEN excluded.projects = '' "
+        "                 THEN agent_sessions.projects ELSE excluded.projects END, "
         "  last_seen_at = datetime('now') "
         "WHERE (agent_sessions.principal_id IS NULL "
         "       OR agent_sessions.principal_id = excluded.principal_id) "
@@ -5201,7 +5208,7 @@ async def upsert_agent_session(
         "  AND (excluded.workspace = '' "
         "       OR COALESCE(agent_sessions.workspace, '') = '' "
         "       OR agent_sessions.workspace = excluded.workspace)",
-        (session_id, principal_id, agent, model, host, workspace),
+        (session_id, principal_id, agent, model, host, workspace, projects),
     )
 
 
