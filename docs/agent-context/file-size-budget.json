@@ -174,12 +174,6 @@
       "measured": 4799,
       "max": 5039,
       "removed_by": "unclaimed"
-    },
-    {
-      "path": "tests/test_web.py",
-      "measured": 7812,
-      "max": 8203,
-      "removed_by": "unclaimed"
     }
   ]
 }

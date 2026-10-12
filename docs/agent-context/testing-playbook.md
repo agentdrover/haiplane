@@ -23,7 +23,7 @@ Pick the smallest useful validation set first, then widen only if the diff cross
 | DoR / readiness / recommendations | `uv run pytest tests/test_dor.py tests/test_readiness.py tests/test_recommendations.py -q` |
 | MCP tools | `uv run pytest tests/test_mcp_server.py -q` |
 | CLI | `uv run pytest tests/test_cli*.py -q` |
-| Web dashboard and templates | `uv run pytest tests/test_web.py -q` |
+| Web dashboard and templates | `uv run pytest tests/test_web*.py -q` |
 | Poller or orchestration flows | `uv run pytest tests/test_poller.py -q` |
 | Auth | `uv run pytest tests/test_auth.py -q` |
 
@@ -55,3 +55,14 @@ Key regression anchors: stale-approval invalidation, gate routing of done
 reports (review / ci_check / needs_decision at cycle limit), MCP envelope
 projection (`awaiting=review`, `actor_hint`), poller convergence on
 `transition_after_agent_done`, and the audited `force_complete` override.
+
+## Web tests moved by theme (#1677)
+
+`tests/test_web.py` was split by meaning into `tests/test_web*.py` (tasks and
+inbox, `_queue`, `_projects`, `_policy`, `_review_verdict`, `_review_evidence`,
+`_admin`, `_ui`); shared helpers and the autouse fixture
+`_form_carries_policy_version` live in `tests/web_support.py`. Test bodies are
+unchanged, but a test's nodeid changed with its file: old nodeids in closed
+tasks (`tests/test_web.py::name`) are not rewritten (variant 1); find a test by
+name with `grep -rn "def <name>" tests/test_web*.py`. Each file stays under
+2000 lines and 200 000 bytes so the AC locator can read it (256 KB limit).
