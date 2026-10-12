@@ -548,6 +548,13 @@ async def test_register_keeps_and_replaces_declared_projects(
         assert word in bad.text
     assert (await register()).json()["projects"] == ["beta"], "422 ничего не записал"
 
+    # Пустой после strip slug — 422, а не молчаливое отбрасывание (#1674).
+    for payload in ([" "], ["alpha", " "], [""]):
+        empty = await register(projects=payload)
+        assert empty.status_code == 422, (payload, empty.text)
+        assert "empty" in empty.text, payload
+    assert (await register()).json()["projects"] == ["beta"], "пустой slug не записан"
+
     # #977: чужой принципал получает 409, список не тронут.
     rival = {"Authorization": "Bearer rival-token"}
     monkeypatch.setattr(

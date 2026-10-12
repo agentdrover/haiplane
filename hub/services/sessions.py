@@ -96,7 +96,11 @@ async def normalize_projects(db: aiosqlite.Connection, raw: list[str]) -> list[s
     slugs: list[str] = []
     for item in raw:
         slug = item.strip().lower()
-        if slug and slug not in slugs:
+        if not slug:
+            raise HTTPException(
+                422, "project slug must not be empty — name a project or omit it"
+            )
+        if slug not in slugs:
             slugs.append(slug)
     for slug in slugs:
         project = await repo.get_project_by_slug(db, slug)

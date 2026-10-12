@@ -1139,3 +1139,104 @@ def test_cli_claim_names_the_foreign_project() -> None:
             cli.cmd_claim(argparse.Namespace(task_id=9, agent="a", session_id="s")) == 0
         )
     assert "pc-foreign" in err.getvalue() and "pc-home" in err.getvalue()
+
+
+@pytest.mark.parametrize("entrance", ["claim", "pair_start"])
+@pytest.mark.parametrize("change", ["session_projects", "task_project"])
+async def test_require_is_rechecked_under_the_capture_write_lock(
+    db, db_dsn, entrance: str, change: str
+):
+    """Находка ревью P2-1: конкурентная запись, взявшая write-лок раньше захвата,
+    меняет projects сессии или проект задачи — require отказывает по новому
+    состоянию, захвата нет. Проверка до транзакции захвата это пропускала."""
+    import asyncio
+
+    from hub import db as db_module
+
+    await _session(db, "s-race", ["pc-race-own"])
+    own = await _project(db, "pc-race-own", {"claim_project_check": "require"})
+    other = await _project(db, "pc-race-other", {"claim_project_check": "require"})
+    task = await _task(db, int(own["id"]), title="race")
+    capture = {"claim": _claim_as, "pair_start": _pair_start_as}[entrance]
+
+    locked, release = asyncio.Event(), asyncio.Event()
+
+    async def concurrent_writer() -> None:
+        conn = await db_module.connect(db_dsn)
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            if change == "session_projects":
+                await conn.execute(
+                    "UPDATE agent_sessions SET projects = ? WHERE session_id = ?",
+                    (json.dumps(["pc-race-other"]), "s-race"),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE tasks SET project_id = ? WHERE id = ?",
+                    (int(other["id"]), task),
+                )
+            locked.set()
+            await release.wait()
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    writer = asyncio.create_task(concurrent_writer())
+    await locked.wait()
+    before = dict(await repo.get_task(db, task))
+    captured = asyncio.create_task(capture(db, task, "s-race"))
+    await asyncio.sleep(0.3)
+    assert not captured.done(), "захват должен ждать write-лок, а не читать мимо него"
+    release.set()
+    await writer
+    with pytest.raises(HTTPException) as caught:
+        await captured
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "project_check_refused"
+    after = dict(await repo.get_task(db, task))
+    if change == "task_project":
+        before["project_id"] = after["project_id"] = None
+    assert after == before, "захвата нет: ни claim, ни статуса, ни сессии"
+    session = dict(await repo.get_agent_session(db, "s-race"))
+    assert session["current_task_id"] is None
+    assert await _project_records(db, task) == []
+
+
+async def test_overlapping_captures_write_one_project_alert(db, db_dsn):
+    """Находка ревью P2-2: проверка «есть ли запись» и вставка — одна
+    транзакция; два перекрывающихся вызова дают одну alert-запись."""
+    import asyncio
+
+    from hub import db as db_module
+    from hub.services import session_project_check as spc
+
+    project = await _project(db, "pc-dedup", {})
+    task = await _task(db, int(project["id"]), title="dedup")
+    check = {"mode": "warn", "task_project": "pc-dedup", "session_projects": ["x"]}
+    db2 = await db_module.connect(db_dsn)
+
+    arrived = 0
+    both = asyncio.Event()
+    real = repo.get_task_updates
+
+    async def meeting(conn, task_id):
+        nonlocal arrived
+        rows = await real(conn, task_id)
+        arrived += 1
+        if arrived >= 2:
+            both.set()
+        try:
+            await asyncio.wait_for(both.wait(), 0.5)
+        except TimeoutError:
+            pass
+        return rows
+
+    try:
+        with patch.object(repo, "get_task_updates", meeting):
+            await asyncio.gather(
+                spc.record_foreign_project(db, task, "s-1", check),
+                spc.record_foreign_project(db2, task, "s-1", check),
+            )
+    finally:
+        await db2.close()
+    assert len(await _project_records(db, task)) == 1
