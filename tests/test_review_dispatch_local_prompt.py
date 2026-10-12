@@ -1997,3 +1997,166 @@ async def test_a_policy_closed_order_without_a_principal_is_not_settled_by_any_r
     )
     await db.commit()
     assert (await _all_dispatches(db, task_id))[0]["status"] == "failed"
+
+
+# --- #1681: ожидание локальных прогонов с пределом ---------------------------
+
+
+def _register_fake_run(rd, dispatch_id: int, task_id: int, coro):
+    """Прогон в реестре, как его кладёт _start_local_run: задача, ручка, pop."""
+    task = asyncio.get_running_loop().create_task(coro)
+    rd._LOCAL_RUNS[dispatch_id] = rd._LocalRunHandle(
+        task=task, db_path="", dispatch_id=dispatch_id, task_id=task_id, generation=1
+    )
+    task.add_done_callback(lambda _t: rd._LOCAL_RUNS.pop(dispatch_id, None))
+    return task
+
+
+async def test_wait_for_local_runs_names_the_stuck_run():
+    """AC-3 (#1681): зависший прогон назван ДО отмены, завершившийся ожидается."""
+    from hub.services import review_dispatch as rd
+
+    async def _never_finishes():
+        await asyncio.Event().wait()
+
+    async def _finishes_soon():
+        await asyncio.sleep(0.05)
+
+    before = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+    stuck = _register_fake_run(rd, 880001, 4242, _never_finishes())
+    quick = _register_fake_run(rd, 880002, 4243, _finishes_soon())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        with pytest.raises(rd.LocalRunsStuck) as caught:
+            await rd.wait_for_local_runs(0.3, cancel_grace=0.5)
+        elapsed = loop.time() - started
+        text = str(caught.value)
+        assert 0.3 <= elapsed < 0.3 + 0.5 + 1.0, "предел плюс ограниченная отмена"
+        assert "task_id=4242" in text and "dispatch_id=880001" in text
+        assert "task_id=4243" not in text, "завершившийся не назван зависшим"
+        assert "_never_finishes" in text and "Task pending" in text, (
+            "снимок снят ДО отмены: задача ещё pending"
+        )
+        assert quick.done() and not quick.cancelled(), "быстрый ожидается как прежде"
+        assert stuck.cancelled(), "зависший отменён"
+        assert not rd._LOCAL_RUNS, "реестр чист"
+    finally:
+        for dispatch_id in (880001, 880002):
+            rd._LOCAL_RUNS.pop(dispatch_id, None)
+        stuck.cancel()
+        await asyncio.gather(stuck, quick, return_exceptions=True)
+    leftover = {
+        t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+    } - before
+    assert not leftover, "после теста фоновых задач нет"
+
+
+async def test_wait_for_local_runs_without_arguments_still_works():
+    """AC-3 (#1681): вызов без аргументов дожидается естественного конца."""
+    from hub.services import review_dispatch as rd
+
+    async def _finishes_soon():
+        await asyncio.sleep(0.05)
+
+    task = _register_fake_run(rd, 880003, 4244, _finishes_soon())
+    await rd.wait_for_local_runs()
+    assert task.done() and not task.cancelled() and not rd._LOCAL_RUNS
+
+
+async def test_wait_for_local_runs_lets_the_loop_drop_a_finished_run():
+    """Причина #1681: готовый прогон в реестре не должен занимать цикл событий.
+
+    Python 3.12 завершает gather над готовыми задачами сразу, без остановки;
+    «while _LOCAL_RUNS: await gather(...)» тогда крутился без отдачи цикла, и
+    pop-колбэк готового прогона никогда не доходил до очереди. Здесь снятие
+    записи стоит в таймере — доходит только если ожидание отдаёт цикл.
+    """
+    from hub.services import review_dispatch as rd
+
+    async def _done():
+        return None
+
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_done())
+    await task
+    rd._LOCAL_RUNS[880004] = rd._LocalRunHandle(
+        task=task, db_path="", dispatch_id=880004, task_id=4245, generation=1
+    )
+    loop.call_later(0.05, rd._LOCAL_RUNS.pop, 880004, None)
+    try:
+        await asyncio.wait_for(rd.wait_for_local_runs(), timeout=3)
+        assert not rd._LOCAL_RUNS
+    finally:
+        rd._LOCAL_RUNS.pop(880004, None)
+
+
+async def test_cancelling_the_waiter_cancels_the_runs():
+    """Ревью P2 (#1681): отмена ожидания снимает прогоны и чистит реестр."""
+    from hub.services import review_dispatch as rd
+
+    async def _never_finishes():
+        await asyncio.Event().wait()
+
+    run = _register_fake_run(rd, 880005, 4246, _never_finishes())
+    waiter = asyncio.get_running_loop().create_task(
+        rd.wait_for_local_runs(30, cancel_grace=1)
+    )
+    try:
+        await asyncio.sleep(0.05)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert run.cancelled() and not rd._LOCAL_RUNS
+    finally:
+        rd._LOCAL_RUNS.pop(880005, None)
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_a_run_that_ignores_cancellation_is_detached_and_named(caplog):
+    """Ревью P2 (#1681): не слушающийся прогон отцеплен от реестра и назван."""
+    from hub.services import review_dispatch as rd
+
+    release = asyncio.Event()
+
+    async def _stubborn():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    run = _register_fake_run(rd, 880006, 4247, _stubborn())
+    try:
+        with caplog.at_level("ERROR"):
+            with pytest.raises(rd.LocalRunsStuck) as caught:
+                await rd.wait_for_local_runs(0.1, cancel_grace=0.1)
+        assert "не закончились: 1" in str(caught.value)
+        assert not rd._LOCAL_RUNS, "брошенный прогон не держит реестр хаба"
+        assert "task #4247" in caplog.text and "abandoned" in caplog.text
+    finally:
+        rd._LOCAL_RUNS.pop(880006, None)
+        release.set()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_the_deadline_also_names_a_finished_run_nobody_removed():
+    """Ревью 912 (#1681): предел безусловен, готовая неснятая запись тоже виновна."""
+    from hub.services import review_dispatch as rd
+
+    async def _done():
+        return None
+
+    task = asyncio.get_running_loop().create_task(_done())
+    await task
+    rd._LOCAL_RUNS[880007] = rd._LocalRunHandle(
+        task=task, db_path="", dispatch_id=880007, task_id=4248, generation=1
+    )  # pop-колбэка нет: запись сама не уйдёт
+    try:
+        with pytest.raises(rd.LocalRunsStuck) as caught:
+            await asyncio.wait_for(rd.wait_for_local_runs(0.2), timeout=5)
+        assert "task_id=4248" in str(caught.value) and "state=done" in str(caught.value)
+        assert not rd._LOCAL_RUNS, "неснятая запись убрана из реестра"
+    finally:
+        rd._LOCAL_RUNS.pop(880007, None)
