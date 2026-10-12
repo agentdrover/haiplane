@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import io
 import json
 import logging
 import math
@@ -5571,12 +5572,102 @@ async def _start_local_run(
     task.add_done_callback(lambda _t: _LOCAL_RUNS.pop(dispatch_id, None))
 
 
-async def wait_for_local_runs() -> None:
-    """Дождаться прогонов этого процесса — их естественного конца. Для тестов."""
-    while _LOCAL_RUNS:
-        await asyncio.gather(
-            *[h.task for h in _LOCAL_RUNS.values()], return_exceptions=True
+# Предел ожидания прогонов для тестов (#1681). Самое долгое ожидание прогона с
+# подменённым ревьюером в наборе — около 4 с, под нагрузкой вдвое-втрое больше.
+# 60 с — запас на порядок и заметно меньше 300 с pytest-timeout: зависший
+# прогон получает имя раньше, чем сигнал таймаута оборвёт тест молча.
+LOCAL_RUNS_WAIT_DEADLINE_S = 60.0
+# Сколько ждать, пока отменённые прогоны действительно закончатся.
+LOCAL_RUNS_CANCEL_GRACE_S = 5.0
+
+
+class LocalRunsStuck(TimeoutError):
+    """Локальные прогоны не завершились к пределу; в тексте — их снимок."""
+
+
+def _stuck_runs_snapshot(handles: list[_LocalRunHandle]) -> str:
+    """Кто не завершился: task_id, dispatch_id и стек каждой задачи. До отмены."""
+    parts = []
+    for h in handles:
+        buf = io.StringIO()
+        h.task.print_stack(limit=8, file=buf)
+        state = "done" if h.task.done() else "pending"
+        parts.append(
+            f"task_id={h.task_id} dispatch_id={h.dispatch_id} state={state} "
+            f"generation={h.generation} db_path={h.db_path!r}\n{buf.getvalue()}"
         )
+    return "\n".join(parts)
+
+
+async def wait_for_local_runs(
+    deadline: float | None = None, *, cancel_grace: float | None = None
+) -> None:
+    """Дождаться прогонов этого процесса — их естественного конца. Для тестов.
+
+    ``deadline`` — один предел на весь цикл (по умолчанию
+    ``LOCAL_RUNS_WAIT_DEADLINE_S``). По истечении СНАЧАЛА снимается список
+    незавершённых прогонов со стеками, затем они отменяются с ограниченным
+    ожиданием (``cancel_grace``), затем ``LocalRunsStuck`` со снимком (#1681).
+
+    Ждём через asyncio.wait, а не gather: в Python 3.12 gather над готовыми
+    задачами завершается синхронно, без уступки циклу, и цикл «пока реестр не
+    пуст» крутился бесконечно, не давая pop-колбэку готового прогона выполниться.
+    """
+    loop = asyncio.get_running_loop()
+    end = loop.time() + (LOCAL_RUNS_WAIT_DEADLINE_S if deadline is None else deadline)
+    grace = LOCAL_RUNS_CANCEL_GRACE_S if cancel_grace is None else cancel_grace
+    try:
+        while _LOCAL_RUNS:
+            tasks = [h.task for h in _LOCAL_RUNS.values()]
+            await asyncio.wait(tasks, timeout=max(end - loop.time(), 0))
+            if loop.time() >= end:
+                await asyncio.sleep(0)  # pop-колбэки готовых успевают отработать
+            # Предел безусловный: по его истечении виновна КАЖДАЯ запись реестра,
+            # в том числе готовая, но не снятая (класс #1681: pop не отработал).
+            stuck = list(_LOCAL_RUNS.values()) if loop.time() >= end else []
+            if stuck:
+                snapshot = _stuck_runs_snapshot(stuck)
+                for h in stuck:
+                    if h.task.done() and _LOCAL_RUNS.get(h.dispatch_id) is h:
+                        del _LOCAL_RUNS[h.dispatch_id]
+                alive = await _cancel_runs_bounded(
+                    [h for h in stuck if not h.task.done()], grace
+                )
+                tail = f"; после отмены не закончились: {alive}" if alive else ""
+                raise LocalRunsStuck(
+                    f"локальные прогоны не завершились за предел{tail}\n{snapshot}"
+                )
+            await asyncio.sleep(0)  # уступка циклу: pop-колбэки готовых прогонов
+    except asyncio.CancelledError:
+        # Отмена самого ожидания снимает и прогоны: asyncio.wait, в отличие от
+        # прежнего gather, их не отменяет, и они остались бы жить в реестре.
+        pending = [h for h in _LOCAL_RUNS.values() if not h.task.done()]
+        await _cancel_runs_bounded(pending, grace)
+        raise
+
+
+async def _cancel_runs_bounded(handles: list[_LocalRunHandle], grace: float) -> int:
+    """Отменить прогоны и подождать не дольше ``grace``; вернуть число живых.
+
+    Прогон, проигнорировавший отмену, отцепляется от реестра и называется в
+    логе брошенным: остановка хаба не должна ждать то, что не слушается.
+    """
+    if not handles:
+        return 0
+    for h in handles:
+        h.task.cancel()
+    _, alive = await asyncio.wait([h.task for h in handles], timeout=grace)
+    for h in handles:
+        if h.task in alive:
+            if _LOCAL_RUNS.get(h.dispatch_id) is h:
+                del _LOCAL_RUNS[h.dispatch_id]
+            log.error(
+                "local review run of task #%s (dispatch #%s) ignored cancellation "
+                "and is abandoned",
+                h.task_id,
+                h.dispatch_id,
+            )
+    return len(alive)
 
 
 _LATE_STOPS: set[asyncio.Future[None]] = set()
