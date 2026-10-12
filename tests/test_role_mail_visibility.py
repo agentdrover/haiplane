@@ -28,6 +28,7 @@ def _tokens() -> dict[str, TokenIdentity]:
         "alpha-token": TokenIdentity("alpha", "agent", principal_id=11),
         "beta-token": TokenIdentity("beta", "agent", principal_id=12),
         "watch-token": TokenIdentity("watch", "watcher", principal_id=14),
+        "nopid-token": TokenIdentity("alpha", "agent"),
         "human-token": TokenIdentity("denis", "human", principal_id=1),
     }
 
@@ -39,7 +40,7 @@ def _auth(monkeypatch) -> dict[str, dict[str, str]]:
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     return {
         name: {"Authorization": f"Bearer {name}-token"}
-        for name in ("alpha", "beta", "watch", "human")
+        for name in ("alpha", "beta", "watch", "nopid", "human")
     }
 
 
@@ -184,3 +185,97 @@ async def test_events_feed_judges_role_mail_for_every_non_human(
     assert "role" not in kinds(mismatch)
     human = await feed(auth["human"])
     assert kinds(human) == ["role", "project"]
+
+
+async def test_role_mail_needs_proven_session_ownership(
+    client: AsyncClient, monkeypatch, db
+):
+    """P1 (delta): a caller without a principal id matches a session by agent
+    NAME elsewhere; for role mail that is not ownership. Two principals sharing
+    one agent name must not read each other's role mail on any surface."""
+    auth = _auth(monkeypatch)
+    await _seed(db)
+    # alpha under ANOTHER principal (21) holds a matching steward session.
+    await repo.upsert_agent_session(
+        db,
+        session_id="s-other",
+        principal_id=21,
+        agent="alpha",
+        projects=json.dumps(["a"]),
+        work_role="steward",
+    )
+    await db.commit()
+    role_msg = await _send(
+        db, agent="beta", principal=12, session_id="s-beta",
+        to_kind="role", to_ref="steward@a",
+    )  # fmt: skip
+    nopid = auth["nopid"]
+
+    inbox = await client.get("/api/messages?session_id=s-other", headers=nopid)
+    assert inbox.status_code == 200, inbox.text
+    assert SECRET not in inbox.text
+    thread = await client.get(
+        f"/api/messages?thread_id={role_msg.thread_id}&session_id=s-other",
+        headers=nopid,
+    )
+    assert thread.status_code == 403, thread.text
+    # A visible non-role reply opens the thread, but not the role row inside it.
+    reply = await _send(
+        db, agent="beta", principal=12, session_id="s-beta", to_kind="project",
+        to_ref="a", reply_to=role_msg.id, body="канал проекта",
+    )  # fmt: skip
+    opened = await client.get(
+        f"/api/messages?thread_id={role_msg.thread_id}&session_id=s-other",
+        headers=nopid,
+    )
+    assert [m["id"] for m in opened.json()] == [reply.id]
+    # Sending from that session is not proof of ownership either.
+    sent_by_other = await _send(
+        db, agent="alpha", principal=21, session_id="s-other",
+        to_kind="role", to_ref="steward@b",
+    )  # fmt: skip
+    feed = await client.get(
+        "/api/events?kinds=message_posted&session_id=s-other", headers=nopid
+    )
+    assert feed.status_code == 200
+    assert [e["payload"]["to_kind"] for e in feed.json()["events"]] == []
+    assert sent_by_other.id not in [
+        e["payload"]["message_id"] for e in feed.json()["events"]
+    ]
+
+    # The real owner (principal 21) still reads it.
+    monkeypatch.setattr(
+        __import__("hub.config", fromlist=["HUB_TOKENS"]),
+        "HUB_TOKENS",
+        {
+            **_tokens(),
+            "owner21-token": TokenIdentity("alpha", "agent", principal_id=21),
+        },
+    )
+    owner = {"Authorization": "Bearer owner21-token"}
+    mine = await client.get("/api/messages?session_id=s-other", headers=owner)
+    assert [m["id"] for m in mine.json()] == [role_msg.id, reply.id]
+
+
+async def test_thread_limit_counts_only_visible_rows(
+    client: AsyncClient, monkeypatch, db
+):
+    """P2 (delta): a hidden role message first and a visible reply second must
+    not turn limit=1 into an empty page; the human's full thread is unchanged."""
+    auth = _auth(monkeypatch)
+    await _seed(db)
+    hidden = await _send(
+        db, agent="beta", principal=12, session_id="s-beta",
+        to_kind="role", to_ref="steward@a",
+    )  # fmt: skip
+    own = await _send(
+        db, agent="alpha", principal=11, session_id="s2",
+        to_kind="session", to_ref="s2", reply_to=hidden.id, body="мой ответ",
+    )  # fmt: skip
+    url = f"/api/messages?thread_id={hidden.thread_id}"
+    page = await client.get(url + "&session_id=s2&limit=1", headers=auth["alpha"])
+    assert [m["id"] for m in page.json()] == [own.id]
+    human = await client.get(url + "&limit=2", headers=auth["human"])
+    assert [m["id"] for m in human.json()] == [hidden.id, own.id]
+    capped = await client.get(url + "&limit=1", headers=auth["human"])
+    assert [m["id"] for m in capped.json()] == [hidden.id]

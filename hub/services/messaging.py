@@ -157,19 +157,19 @@ def role_session_refs(row: aiosqlite.Row | dict) -> set[str]:
     return {f"{role}@{slug}" for slug in declared_projects(data.get("projects"))}
 
 
-def role_row_visible(row: dict, refs: set[str], session_id: str) -> bool:
-    """May a non-human reader see this stored message? Only role mail is judged.
+def role_session_owned(row: aiosqlite.Row | dict, principal_id: int | None) -> str:
+    """The session id role mail may be read under, or '' when ownership is unproven.
 
-    Role mail is visible to the session the request names when its declared role
-    and project match, and to the exact (non-empty) sending session. Everything
-    else, a request without a session included, is out (#1678).
+    Role mail is private to a declared role, so the weak check the other
+    addresses use (same agent NAME when a principal id is missing) is not enough:
+    two principals can share a name. Here both principal ids must be present and
+    equal (#1678). Humans read role mail through the unfiltered paths, not here.
     """
-    if (row.get("to_kind") or "") != "role":
-        return True
-    sender = row.get("from_session_id") or ""
-    if session_id and sender == session_id:
-        return True
-    return (row.get("to_ref") or "") in refs
+    data = dict(row)
+    owner = data.get("principal_id")
+    if owner is None or principal_id is None or owner != principal_id:
+        return ""
+    return str(data.get("session_id") or "")
 
 
 async def _normalize_role_ref(db: aiosqlite.Connection, to_ref: str) -> str:
@@ -437,6 +437,7 @@ async def addressable_refs(
     if session_id:
         await _own_session(db, session_id, agent=agent, principal_id=principal_id)
         own_row = await repo.get_agent_session(db, session_id)
+        role_session = role_session_owned(own_row or {}, principal_id)
         tasks = await repo.list_addressable_task_ids(
             db, agent=agent, session_ids=[session_id]
         )
@@ -445,8 +446,8 @@ async def addressable_refs(
             "sessions": {session_id},
             "tasks": set(tasks),
             # #1678: role mail is read as ONE session; without it nobody is asked.
-            "session_id": session_id,
-            "roles": role_session_refs(own_row or {}),
+            "session_id": role_session,
+            "roles": role_session_refs(own_row or {}) if role_session else set(),
         }
     sessions = []
     for row in await repo.list_agent_sessions(db, limit=500):
@@ -546,10 +547,17 @@ async def inbox(
     would hand the caller a wider address instead.
     """
     session_id = (session_id or "").strip()
+    role_session = ""
     if session_id:
-        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        own = await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        role_session = role_session_owned(own, principal_id)
     rows = await repo.list_inbox_messages(
-        db, session_id=session_id, agent=agent, after_id=after_id, limit=limit
+        db,
+        session_id=session_id,
+        agent=agent,
+        after_id=after_id,
+        limit=limit,
+        role_session=role_session,
     )
     views: list[dict[str, Any]] = []
     for row in rows:
@@ -584,20 +592,23 @@ async def thread(
     is the condition under which agent-to-agent messaging is allowed to exist
     at all (#775), and narrowing it here would trade one hole for a worse one.
     """
-    own_row: dict = {}
+    role_session = ""
     if session_id:
-        own_row = await _own_session(
-            db, session_id, agent=agent, principal_id=principal_id
-        )
-    rows = await repo.list_thread_messages(db, thread_id, limit=limit)
+        own = await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        role_session = role_session_owned(own, principal_id)
+    # #1678: role mail the viewer was not addressed by is hidden in SQL, before
+    # the LIMIT: one visible message opens the thread, not the role mail inside
+    # it, and a hidden row must not use up the page. A human reads it all.
+    rows = await repo.list_thread_messages(
+        db, thread_id, limit=limit, role_session=None if is_human else role_session
+    )
     if not is_human:
-        # #1678: one visible message opens the thread, but not the role mail
-        # inside it that this session was not addressed by (a reply_to chain
-        # can put a foreign role message into a thread the caller can see).
-        refs = role_session_refs(own_row)
-        rows = [r for r in rows if role_row_visible(dict(r), refs, session_id)]
         visible = await repo.count_visible_in_thread(
-            db, thread_id, session_id=session_id, agent=agent
+            db,
+            thread_id,
+            session_id=session_id,
+            agent=agent,
+            role_session=role_session,
         )
         if not visible:
             # Refuse with a reason rather than an empty list: "this thread is

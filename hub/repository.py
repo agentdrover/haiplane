@@ -5404,6 +5404,18 @@ async def get_agent_message(
     return rows[0] if rows else None
 
 
+# A role address (#1678) is resolved from the ONE session named by
+# :role_session — the caller's own session, passed only after the service has
+# confirmed it belongs to the caller's principal (both principal ids present and
+# equal). '' means "no such session": nothing matches.
+_ROLE_ADDRESSED = (
+    "to_ref IN ("
+    "SELECT s.work_role || '@' || j.value FROM agent_sessions s, "
+    "json_each(CASE WHEN s.projects = '' THEN '[]' ELSE s.projects END) j "
+    "WHERE s.session_id = :role_session AND :role_session <> '' "
+    "AND s.work_role <> '')"
+)
+
 # The ways a message can be addressed to the caller, as one predicate.
 # Task channels resolve through the tasks table rather than through a copy of
 # the claim kept here: the task stays the only place that knows who holds it.
@@ -5411,7 +5423,7 @@ async def get_agent_message(
 # its declared work_role crossed with its declared projects — never from the
 # other sessions of the same principal; without :session it matches nothing.
 _INBOX_PREDICATE = (
-    "("
+    "("  # nosec B608
     "  (to_kind = 'session' AND to_ref = :session AND :session <> '')"
     "  OR (to_kind = 'agent' AND to_ref = :agent AND :agent <> '')"
     "  OR (to_kind = 'task' AND to_ref IN ("
@@ -5419,10 +5431,7 @@ _INBOX_PREDICATE = (
     "        WHERE (claimed_by = :agent AND :agent <> '')"
     "           OR (assigned_agent = :agent AND :agent <> '')"
     "           OR (claim_session_id = :session AND :session <> '')))"
-    "  OR (to_kind = 'role' AND to_ref IN ("
-    "        SELECT s.work_role || '@' || j.value FROM agent_sessions s, "
-    "          json_each(CASE WHEN s.projects = '' THEN '[]' ELSE s.projects END) j"
-    "        WHERE s.session_id = :session AND s.work_role <> ''))"
+    f"  OR (to_kind = 'role' AND {_ROLE_ADDRESSED})"
     "  OR to_kind = 'project'"
     ")"
 )
@@ -5435,6 +5444,7 @@ async def list_inbox_messages(
     agent: str = "",
     after_id: int = 0,
     limit: int = 100,
+    role_session: str = "",
 ) -> list[aiosqlite.Row]:
     """Messages addressed to this caller with id > ``after_id``, oldest first.
 
@@ -5450,6 +5460,7 @@ async def list_inbox_messages(
             {
                 "after": after_id,
                 "session": session_id,
+                "role_session": role_session,
                 "agent": agent,
                 "limit": min(limit, 200),
             },
@@ -5458,13 +5469,32 @@ async def list_inbox_messages(
 
 
 async def list_thread_messages(
-    db: aiosqlite.Connection, thread_id: str, *, limit: int = 200
+    db: aiosqlite.Connection,
+    thread_id: str,
+    *,
+    limit: int = 200,
+    role_session: str | None = None,
 ) -> list[aiosqlite.Row]:
+    """A thread, oldest first.
+
+    ``role_session=None`` is the unfiltered read (a human identity). A string —
+    '' included — hides role mail the viewer session was not addressed by and did
+    not send, BEFORE the LIMIT, so a hidden row cannot use up the page (#1678).
+    """
     return list(
         await fetchall(
             db,
-            "SELECT * FROM agent_messages WHERE thread_id = ? ORDER BY id ASC LIMIT ?",
-            (thread_id, min(limit, 500)),
+            "SELECT * FROM agent_messages WHERE thread_id = :thread "  # nosec B608
+            "AND (:unfiltered = 1 OR to_kind <> 'role' "
+            "     OR (:role_session <> '' AND from_session_id = :role_session) "
+            f"     OR {_ROLE_ADDRESSED}) "
+            "ORDER BY id ASC LIMIT :limit",
+            {
+                "thread": thread_id,
+                "unfiltered": 1 if role_session is None else 0,
+                "role_session": role_session or "",
+                "limit": min(limit, 500),
+            },
         )
     )
 
@@ -5507,6 +5537,7 @@ async def count_visible_in_thread(
     *,
     session_id: str = "",
     agent: str = "",
+    role_session: str = "",
 ) -> int:
     """How many messages of this thread the caller may see (#801).
 
@@ -5525,8 +5556,13 @@ async def count_visible_in_thread(
             # same token, and a request without a session, are not its sender
             # (#1678).
             "  OR (from_agent = :agent AND :agent <> '' AND (to_kind <> 'role' "
-            "      OR (:session <> '' AND from_session_id = :session))))",
-            {"thread": thread_id, "session": session_id, "agent": agent},
+            "      OR (:role_session <> '' AND from_session_id = :role_session))))",
+            {
+                "thread": thread_id,
+                "session": session_id,
+                "role_session": role_session,
+                "agent": agent,
+            },
         )
     )
     return int(rows[0]["n"]) if rows else 0
