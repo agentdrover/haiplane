@@ -345,6 +345,22 @@ async def test_a_judgement_after_the_run_timed_out_still_costs_its_run(
             "no_grounds",
         ),
         (
+            "tabs-and-unicode-space",
+            "concur",
+            "medium",
+            [{"source": "ci_pinned_sha", "detail": "\t\n\u00a0\u3000 "}],
+            "object",
+            "no_grounds",
+        ),
+        (
+            "padded-filled",
+            "concur",
+            "medium",
+            [{"source": "ci_pinned_sha", "detail": "\n sha abc123 \t"}],
+            "concur",
+            "",
+        ),
+        (
             "absent",
             "concur",
             "medium",
