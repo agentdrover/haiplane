@@ -2025,6 +2025,9 @@ class SessionRegister(BaseModel):
     # #1674: проекты, в которых работает сессия. Декларация, не адрес: omitted
     # или [] сохраняют прежнее значение, непустой список заменяет его.
     projects: list[str] = Field(default_factory=list, max_length=50)
+    # #1678: рабочая роль сессии (steward|executor|watcher|reviewer) — декларация
+    # для адресата «роль в проекте», не право. omitted или '' сохраняют прежнюю.
+    work_role: str = Field("", max_length=50)
 
 
 class SessionView(BaseModel):
@@ -2043,6 +2046,7 @@ class SessionView(BaseModel):
     host: str = ""
     workspace: str = ""
     projects: list[str] = Field(default_factory=list)
+    work_role: str = ""
     principal_id: int | None = None
     current_task_id: int | None = None
     started_at: str = ""
@@ -2127,6 +2131,9 @@ class MessageDelivery(BaseModel):
     delivered_now: bool | None = None
     addressee_online: bool | None = None
     addressee_last_seen_age_seconds: int | None = None
+    # #1678: для адреса «роль в проекте» — сколько сессий с этой ролью и проектом
+    # сейчас в сети (None у остальных адресов). Это счёт, не обещание прочтения.
+    online_sessions: int | None = None
     note: str = ""
 
 

@@ -1045,7 +1045,9 @@ async def web_dashboard(
     # belongs to an agent, not to a project, and a thread the owner cannot see
     # is the one thing this feature is not allowed to have.
     agent_sessions = await services.get_agent_sessions_panel(db)
-    message_threads = await services.get_message_threads_panel(db)
+    message_threads = await services.get_message_threads_panel(
+        db, is_human=current_identity(request).is_human
+    )
     ctx: dict[str, Any] = {
         "delivery_refusal": await _registry_refusal(db, delivery_refused),
         "data": data,
@@ -2768,7 +2770,10 @@ async def _web_task_detail_page(
     # people and agents talking. Merged into one stream both would lose their
     # meaning.
     task_messages = [
-        services.message_view(row) for row in await repo.list_task_messages(db, task_id)
+        services.message_view(row)
+        for row in await repo.list_task_messages(
+            db, task_id, exclude_roles=not current_identity(request).is_human
+        )
     ]
 
     # #814: what was observed in production, and on which build. The delivered

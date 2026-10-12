@@ -4442,8 +4442,8 @@ async def hub_send_message(
     gets "stored, not delivered now".
 
     Args:
-        to_kind: session | agent | task | project
-        to_ref: session id, agent name, task id, or project slug
+        to_kind: session | agent | task | project | role
+        to_ref: session id, agent name, task id, project slug, or role@project
         body: What you want to say; link the task or PR, do not paste diffs.
         kind: note | question | answer | handoff | claim_request
         session_id: YOUR session id — carries your model and provenance
@@ -4539,6 +4539,7 @@ async def hub_session_register(
     host: str = "",
     workspace: str = "",
     projects: list[str] | None = None,
+    work_role: str = "",
 ) -> CallToolResult:
     """Register this session so other sessions can address it (#771).
 
@@ -4555,6 +4556,7 @@ async def hub_session_register(
         host: Machine this session runs on
         workspace: Working directory or worktree this session operates in
         projects: Project slugs you work in (#1674); a claim or pair-start of another project's task is flagged. Omitted or [] keeps the old list
+        work_role: steward|executor|watcher|reviewer; '' keeps the old one
     """
     try:
         session = await _api_post(
@@ -4565,6 +4567,7 @@ async def hub_session_register(
                 "host": host,
                 "workspace": workspace,
                 "projects": projects or [],
+                "work_role": work_role,
             },
         )
     except HubApiError as exc:

@@ -2723,6 +2723,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE agent_sessions ADD COLUMN projects TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # #1678: рабочая роль, которую сессия объявила при регистрации
+        # (steward|executor|watcher|reviewer). '' у существующих строк — «не
+        # объявлена». Декларация для адресата to_kind='role', не право.
+        "add_agent_sessions_work_role",
+        "ALTER TABLE agent_sessions ADD COLUMN work_role TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         # #1647: доказательства сдачи state-задачи. Одна строка на (задача,
         # поколение, AC). Только вставка: UPDATE запрещён триггером ниже, а
         # кода, который правит или удаляет строки, нет. principal_id — автор из

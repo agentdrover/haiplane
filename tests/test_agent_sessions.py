@@ -583,3 +583,101 @@ async def test_register_keeps_and_replaces_declared_projects(
     monkeypatch.setattr(mcp_server, "_api_post", post)
     out = await mcp_server.hub_session_register("s-p", projects=["alpha", "beta"])
     assert out.structuredContent["session"]["projects"] == ["alpha", "beta"]
+
+
+# ---- #1678: the session declares its working role ----
+
+
+async def test_register_keeps_and_replaces_work_role(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-1: сохранение/замена по правилу, нормализация, 422 на неизвестную
+    роль, work_role в SessionView (REST и MCP), миграция идемпотентна на БД
+    без колонки и на свежей."""
+    from hub import mcp_server
+    from hub.db import _MIGRATIONS, _SCHEMA, _migrate
+
+    agent = _auth(monkeypatch)
+
+    async def register(**body):
+        return await client.post(
+            "/api/sessions/register", json={"session_id": "s-r", **body}, headers=agent
+        )
+
+    first = await register(work_role="steward")
+    assert first.status_code == 200, first.text
+    assert first.json()["work_role"] == "steward"
+    assert (await _rows(db, "s-r"))[0]["work_role"] == "steward"
+
+    # Без поля и с '' прежнее значение остаётся.
+    assert (await register()).json()["work_role"] == "steward"
+    assert (await register(work_role="")).json()["work_role"] == "steward"
+    # Непустое заменяет; пробелы и регистр нормализуются.
+    assert (await register(work_role=" Executor ")).json()["work_role"] == "executor"
+
+    for bad_role in ("boss", "admin", "human", "stewards"):
+        bad = await register(work_role=bad_role)
+        assert bad.status_code == 422, (bad_role, bad.text)
+        assert bad_role in bad.text
+    assert (await register()).json()["work_role"] == "executor", "422 ничего не записал"
+    # Роль объявляется независимо от списка проектов и не выводит прав.
+    assert (await register(work_role="watcher")).json()["work_role"] == "watcher"
+
+    listed = await client.get("/api/sessions", headers=agent)
+    assert [s["work_role"] for s in listed.json()] == ["watcher"]
+
+    async def post(path, body=None, **_kw):
+        resp = await client.post(path, json=body, headers=agent)
+        assert resp.status_code < 400, resp.text
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    out = await mcp_server.hub_session_register("s-r", work_role="reviewer")
+    assert out.structuredContent["session"]["work_role"] == "reviewer"
+    out = await mcp_server.hub_session_register("s-r")
+    assert out.structuredContent["session"]["work_role"] == "reviewer"
+
+    # Миграция: свежая БД уже с колонкой, БД без неё получает её, повтор — no-op.
+    import hub.db as db_module
+
+    name = "add_agent_sessions_work_role"
+    trimmed = [m for m in _MIGRATIONS if m[0] != name]
+    assert len(trimmed) == len(_MIGRATIONS) - 1, "миграция должна быть в списке"
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await _migrate(conn)
+        await _migrate(conn)
+        cols = {
+            r["name"]: dict(r)
+            for r in await conn.execute_fetchall("PRAGMA table_info(agent_sessions)")
+        }
+        assert cols["work_role"]["notnull"] == 1
+
+        old = await aiosqlite.connect(":memory:")
+        old.row_factory = aiosqlite.Row
+        try:
+            await old.executescript(_SCHEMA)
+            monkeypatch.setattr(db_module, "_MIGRATIONS", trimmed)
+            await _migrate(old)
+            assert "work_role" not in {
+                r["name"]
+                for r in await old.execute_fetchall("PRAGMA table_info(agent_sessions)")
+            }
+            await old.execute(
+                "INSERT INTO agent_sessions (session_id, agent) VALUES ('old', 'bot')"
+            )
+            await old.commit()
+            monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+            await _migrate(old)
+            await _migrate(old)
+            rows = await old.execute_fetchall(
+                "SELECT * FROM agent_sessions WHERE session_id = 'old'"
+            )
+            assert rows[0]["work_role"] == ""
+            assert services.session_view(rows[0])["work_role"] == ""
+        finally:
+            await old.close()
+    finally:
+        await conn.close()
