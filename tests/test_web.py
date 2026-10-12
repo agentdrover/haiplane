@@ -7810,3 +7810,44 @@ async def test_project_form_local_review_fallback_keeps_the_full_form_neighbours
             "ci_runner": "make test",
             "wip_limit": 2,
         }
+
+
+async def test_web_archive_of_active_task_shows_the_refusal(client: AsyncClient, db):
+    from tests.archive_support import archived, mk
+
+    epic = await mk(db, "Эпик", kind="epic")
+    kid = await mk(db, "Живой потомок", "running", parent=epic)
+    url = f"/tasks/{epic}/web-archive"
+
+    page = await client.post(
+        url, data={"cascade": "true", "reason": "  "}, follow_redirects=False
+    )
+    assert page.status_code in (200, 409), page.status_code
+    assert f"#{kid}" in page.text and "archive_active_work" in html.unescape(page.text)
+    banner = page.text.split('id="archive-refusal"')[1].split("</form>")[0]
+    assert re.search(r'name="cascade"[^>]*value="true"', banner)
+    assert 'name="reason"' in banner, "поле причины осталось на странице"
+    assert not await archived(db, epic) and not await archived(db, kid)
+
+    solo = await mk(db, "Одиночная", "running")
+    alone = await client.post(
+        f"/tasks/{solo}/web-archive", data={"cascade": "false", "reason": "  "}
+    )
+    assert alone.status_code in (200, 409)
+    banner = alone.text.split('id="archive-refusal"')[1].split("</form>")[0]
+    assert re.search(r'name="cascade"[^>]*value="false"', banner)
+
+    done = await client.post(
+        url,
+        data={"cascade": "true", "reason": "владелец закрыл эпик"},
+        follow_redirects=False,
+    )
+    assert done.status_code == 303, done.text
+    assert await archived(db, epic) and await archived(db, kid)
+
+    fresh = await mk(db, "Свежая", "open")
+    card = (await client.get(f"/tasks/{fresh}")).text
+    forms = re.findall(r"<form[^>]*web-archive.*?</form>", card, flags=re.S)
+    assert len(forms) == 2, "обе формы архива"
+    for form in forms:
+        assert 'name="reason"' in form and "confirm(" in form, form
