@@ -489,6 +489,15 @@ def _warn_area_check(result: Any) -> None:
             f"{found['detail']}",
             file=sys.stderr,
         )
+    foreign = result.get("project_check") if isinstance(result, dict) else None
+    if isinstance(foreign, dict) and foreign.get("task_project"):
+        # #1674: the task belongs to a project the session did not declare.
+        print(
+            f"foreign project (claim_project_check={foreign.get('mode', 'warn')}): "
+            f"task project {foreign['task_project']}, session declared "
+            f"{', '.join(foreign.get('session_projects') or [])}",
+            file=sys.stderr,
+        )
 
 
 def cmd_pair_start(args: argparse.Namespace) -> int:

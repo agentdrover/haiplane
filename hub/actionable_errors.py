@@ -1022,6 +1022,42 @@ def claim_area_conflict_detail(
     )
 
 
+def project_check_refused_detail(
+    *,
+    task_id: int,
+    task_project: str,
+    session_projects: list[str],
+    current_status: str,
+) -> dict[str, Any]:
+    """Захват отказан сверкой проекта в режиме require (#1674).
+
+    Отказ стоит до любых записей: статус, claim, план, ветка и job не менялись.
+    """
+    declared = ", ".join(session_projects)
+    return enrich_error_payload(
+        {
+            "reason": "project_check_refused",
+            "actor_hint": "agent",
+            "retry_by_same_caller": False,
+            "current_status": current_status,
+            "task_id": task_id,
+            "task_project": task_project,
+            "session_projects": session_projects,
+            "message": (
+                f"Task #{task_id} is not captured: claim_project_check=require "
+                f"refused it: the task belongs to project {task_project}, the "
+                f"session declared {declared}"
+            ),
+            "hint": (
+                f"The task stays {current_status}. Take a task of {declared}, "
+                f"or register the session with projects including {task_project} "
+                "(hub_session_register)."
+            ),
+            "suggested_tool": "hub_session_register",
+        }
+    )
+
+
 def changes_requested_requires_content_detail() -> dict[str, Any]:
     """A verdict that sends work back has to say what to redo (#1010).
 

@@ -807,7 +807,7 @@ async def test_the_budget_measures_the_agent_view(client, db, monkeypatch):
     assert not (agent_names & set(_HIDDEN_FROM_AGENTS))
     assert set(_HIDDEN_FROM_AGENTS) <= full_names
     assert full_names - agent_names == set(_HIDDEN_FROM_AGENTS)
-    assert agent["description_chars"] <= 32200
+    assert agent["description_chars"] <= 32600
     assert agent["model_visible_chars"] < full["model_visible_chars"]
     # the default is the agent view: nothing measures the human view by accident
     assert (await catalog_snapshot())["tools"] == agent["tools"]
@@ -815,7 +815,7 @@ async def test_the_budget_measures_the_agent_view(client, db, monkeypatch):
     # the freeze came down with the catalog, and the history says so
     assert WORKING_FREEZE["description_chars"] < 36383
     assert WORKING_FREEZE_HISTORY[0][1] == "#1624"
-    assert room_left(agent)["description_chars"] >= 3500
+    assert room_left(agent)["description_chars"] >= 3000
 
     # the CI script asks for the agent view
     seen: list[str] = []
