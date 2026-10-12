@@ -1315,7 +1315,10 @@ async def test_the_full_cycle_changes_requested_return_edit_resubmit(
         assert again.status_code == 409, (how, again.text)
 
     commit_id = await make_state_task(db, result_kind="commit")
-    await db.execute("UPDATE tasks SET status='running' WHERE id=?", (commit_id,))
+    # #1675: из running commit-задача возвращается сама (при отсутствии работы),
+    # поэтому «чужой» статус здесь needs_info: ответ на вопрос возвращает пару
+    # в running, и возврат оттуда для commit по-прежнему закрыт.
+    await db.execute("UPDATE tasks SET status='needs_info' WHERE id=?", (commit_id,))
     await db.commit()
     refused = await client.post(
         f"/api/tasks/{commit_id}/return-to-work", json={"reason": "x"}

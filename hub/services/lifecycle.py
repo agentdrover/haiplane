@@ -40,6 +40,7 @@ from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.session_project_check import SessionProjectGuard
 from hub.services.sessions import note_session_task
 from hub.services.result_kind import is_state
+from hub.services.return_running import RETURN_RUNNING_STATUSES, return_running_to_open
 from hub.hub_instance import mutation_activity_detail
 from hub.db import (
     deserialize_str_list,
@@ -5291,6 +5292,9 @@ async def close_approval_for_rework(
 #: a verdict, or sent back and waiting on its executor. Both can be stranded
 #: by an executor who is gone; every other status already has its own exit.
 RETURN_TO_WORK_STATUSES = frozenset({"review", "fix_requested"})
+# #1675: running commit-задача возвращается отдельным путём и только без
+# признаков работы (hub/services/return_running.py). Константа выше НЕ
+# расширяется: её читает executor_launch.
 
 
 def _active_jobs_on_task(task: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -5367,7 +5371,9 @@ async def return_to_work(
 ) -> TaskView:
     """Human action: take an abandoned submission back to ``open`` (#1356).
 
-    From ``review`` or ``fix_requested`` only. It is the rework decision
+    From ``review`` or ``fix_requested``; a commit task in ``running`` goes
+    the separate way of :mod:`hub.services.return_running` (#1675), and only
+    with no sign of work. It is the rework decision
     without the dispatch: the approval window closes through the SAME
     :func:`close_approval_for_rework`, the claim comes off exactly as in
     :func:`release_task` (implementer principal included), and the task is
@@ -5392,6 +5398,8 @@ async def return_to_work(
     # complete, decide accept) state-задачу иначе нельзя ни сдать, ни одобрить:
     # зависимые ждут принятия, а пути к нему нет. Вызывающий — человек (REST и
     # веб-форма проверяют роль); commit-задача из completed по-прежнему 400.
+    if from_status in RETURN_RUNNING_STATUSES and not state_task:
+        return await return_running_to_open(db, task_id, body, actor=actor)
     allowed = RETURN_TO_WORK_STATUSES | (
         {"running", "needs_info", "open", "completed"} if state_task else frozenset()
     )

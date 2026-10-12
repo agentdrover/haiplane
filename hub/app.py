@@ -3475,6 +3475,13 @@ async def api_return_to_work(
     current approval exactly as rework does, takes the claim off, and leaves
     branch, PR and submission history in place. No MCP tool on purpose: the
     catalog is at its budget and the action belongs to a human.
+
+    A commit task in ``running`` (#1675) is returned too, but only when it has
+    NO sign of work: claimed_by, job_id/review_job_id (abandon_active_job does
+    not override them), an open executor slot of any channel, a running
+    executor run, a live implementer session, an online claim session, a
+    declared wait still in force. Otherwise 409 ``return_running_has_work``
+    lists the signs found; the check and the move are one write transaction.
     """
     return await services.return_to_work(
         _db(request), task_id, body, actor=identity.username
