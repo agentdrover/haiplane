@@ -2139,3 +2139,24 @@ async def test_a_run_that_ignores_cancellation_is_detached_and_named(caplog):
         rd._LOCAL_RUNS.pop(880006, None)
         release.set()
         await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_the_deadline_also_names_a_finished_run_nobody_removed():
+    """Ревью 912 (#1681): предел безусловен, готовая неснятая запись тоже виновна."""
+    from hub.services import review_dispatch as rd
+
+    async def _done():
+        return None
+
+    task = asyncio.get_running_loop().create_task(_done())
+    await task
+    rd._LOCAL_RUNS[880007] = rd._LocalRunHandle(
+        task=task, db_path="", dispatch_id=880007, task_id=4248, generation=1
+    )  # pop-колбэка нет: запись сама не уйдёт
+    try:
+        with pytest.raises(rd.LocalRunsStuck) as caught:
+            await asyncio.wait_for(rd.wait_for_local_runs(0.2), timeout=5)
+        assert "task_id=4248" in str(caught.value) and "state=done" in str(caught.value)
+        assert not rd._LOCAL_RUNS, "неснятая запись убрана из реестра"
+    finally:
+        rd._LOCAL_RUNS.pop(880007, None)

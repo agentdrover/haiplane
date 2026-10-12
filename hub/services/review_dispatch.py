@@ -5591,8 +5591,9 @@ def _stuck_runs_snapshot(handles: list[_LocalRunHandle]) -> str:
     for h in handles:
         buf = io.StringIO()
         h.task.print_stack(limit=8, file=buf)
+        state = "done" if h.task.done() else "pending"
         parts.append(
-            f"task_id={h.task_id} dispatch_id={h.dispatch_id} "
+            f"task_id={h.task_id} dispatch_id={h.dispatch_id} state={state} "
             f"generation={h.generation} db_path={h.db_path!r}\n{buf.getvalue()}"
         )
     return "\n".join(parts)
@@ -5619,10 +5620,19 @@ async def wait_for_local_runs(
         while _LOCAL_RUNS:
             tasks = [h.task for h in _LOCAL_RUNS.values()]
             await asyncio.wait(tasks, timeout=max(end - loop.time(), 0))
-            stuck = [h for h in _LOCAL_RUNS.values() if not h.task.done()]
-            if stuck and loop.time() >= end:
+            if loop.time() >= end:
+                await asyncio.sleep(0)  # pop-колбэки готовых успевают отработать
+            # Предел безусловный: по его истечении виновна КАЖДАЯ запись реестра,
+            # в том числе готовая, но не снятая (класс #1681: pop не отработал).
+            stuck = list(_LOCAL_RUNS.values()) if loop.time() >= end else []
+            if stuck:
                 snapshot = _stuck_runs_snapshot(stuck)
-                alive = await _cancel_runs_bounded(stuck, grace)
+                for h in stuck:
+                    if h.task.done() and _LOCAL_RUNS.get(h.dispatch_id) is h:
+                        del _LOCAL_RUNS[h.dispatch_id]
+                alive = await _cancel_runs_bounded(
+                    [h for h in stuck if not h.task.done()], grace
+                )
                 tail = f"; после отмены не закончились: {alive}" if alive else ""
                 raise LocalRunsStuck(
                     f"локальные прогоны не завершились за предел{tail}\n{snapshot}"
