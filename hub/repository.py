@@ -5521,10 +5521,11 @@ async def count_visible_in_thread(
             "SELECT COUNT(*) AS n FROM agent_messages "  # nosec B608
             f"WHERE thread_id = :thread AND ({_INBOX_PREDICATE} "
             # The sender reads their thread back. For a role message that is the
-            # exact sending session (or a sessionless sender): sibling sessions
-            # of the same token are not its sender (#1678).
+            # exact sending session, named and non-empty: sibling sessions of the
+            # same token, and a request without a session, are not its sender
+            # (#1678).
             "  OR (from_agent = :agent AND :agent <> '' AND (to_kind <> 'role' "
-            "      OR from_session_id = :session OR from_session_id = '')))",
+            "      OR (:session <> '' AND from_session_id = :session))))",
             {"thread": thread_id, "session": session_id, "agent": agent},
         )
     )
@@ -5567,8 +5568,16 @@ async def prune_agent_messages(db: aiosqlite.Connection, *, keep_days: int = 14)
     return cur.rowcount or 0
 
 
+_NO_ROLE_MAIL = "AND to_kind <> 'role' "
+_NO_ROLE_WHERE = "WHERE to_kind <> 'role' "
+
+
 async def list_task_messages(
-    db: aiosqlite.Connection, task_id: int, *, limit: int = 200
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    limit: int = 200,
+    exclude_roles: bool = False,
 ) -> list[aiosqlite.Row]:
     """The conversation about one task, oldest first (#775).
 
@@ -5576,12 +5585,16 @@ async def list_task_messages(
     message addressed to someone in particular that names this task. Both are
     talk about this task, and an owner reading the card wants the conversation,
     not the addressing scheme.
+
+    ``exclude_roles`` (#1678) leaves role-addressed mail out: a reader without a
+    verified session has no role to read it under. Humans pass False.
     """
     return list(
         await fetchall(
             db,
-            "SELECT * FROM agent_messages "
-            "WHERE (to_kind = 'task' AND to_ref = ?) OR related_task_id = ? "
+            "SELECT * FROM agent_messages "  # nosec B608
+            "WHERE ((to_kind = 'task' AND to_ref = ?) OR related_task_id = ?) "
+            f"{_NO_ROLE_MAIL if exclude_roles else ''}"
             "ORDER BY id ASC LIMIT ?",
             (str(task_id), task_id, min(limit, 500)),
         )
@@ -5589,20 +5602,24 @@ async def list_task_messages(
 
 
 async def list_recent_threads(
-    db: aiosqlite.Connection, *, limit: int = 10
+    db: aiosqlite.Connection, *, limit: int = 10, exclude_roles: bool = False
 ) -> list[aiosqlite.Row]:
     """Last message of each thread plus its size, newest thread first (#775).
 
     Every thread, whatever it is addressed to — a conversation between two
     sessions with no task attached is exactly the kind the owner must not have
     to go looking for.
+
+    ``exclude_roles`` (#1678) drops role-addressed mail from the last message and
+    from the count: the panel has no verified session to read it under.
     """
     return list(
         await fetchall(
             db,
-            "SELECT m.*, t.messages AS messages FROM agent_messages m "
+            "SELECT m.*, t.messages AS messages FROM agent_messages m "  # nosec B608
             "JOIN (SELECT thread_id, COUNT(*) AS messages, MAX(id) AS last_id "
-            "      FROM agent_messages GROUP BY thread_id) t ON m.id = t.last_id "
+            f"      FROM agent_messages {_NO_ROLE_WHERE if exclude_roles else ''}"
+            "      GROUP BY thread_id) t ON m.id = t.last_id "
             "ORDER BY m.id DESC LIMIT ?",
             (min(limit, 50),),
         )

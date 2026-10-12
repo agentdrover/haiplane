@@ -157,6 +157,21 @@ def role_session_refs(row: aiosqlite.Row | dict) -> set[str]:
     return {f"{role}@{slug}" for slug in declared_projects(data.get("projects"))}
 
 
+def role_row_visible(row: dict, refs: set[str], session_id: str) -> bool:
+    """May a non-human reader see this stored message? Only role mail is judged.
+
+    Role mail is visible to the session the request names when its declared role
+    and project match, and to the exact (non-empty) sending session. Everything
+    else, a request without a session included, is out (#1678).
+    """
+    if (row.get("to_kind") or "") != "role":
+        return True
+    sender = row.get("from_session_id") or ""
+    if session_id and sender == session_id:
+        return True
+    return (row.get("to_ref") or "") in refs
+
+
 async def _normalize_role_ref(db: aiosqlite.Connection, to_ref: str) -> str:
     """``<work_role>@<project_slug>`` in canonical form, or a 422 saying which part."""
     role, sep, slug = to_ref.strip().lower().partition("@")
@@ -569,10 +584,18 @@ async def thread(
     is the condition under which agent-to-agent messaging is allowed to exist
     at all (#775), and narrowing it here would trade one hole for a worse one.
     """
+    own_row: dict = {}
     if session_id:
-        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        own_row = await _own_session(
+            db, session_id, agent=agent, principal_id=principal_id
+        )
     rows = await repo.list_thread_messages(db, thread_id, limit=limit)
     if not is_human:
+        # #1678: one visible message opens the thread, but not the role mail
+        # inside it that this session was not addressed by (a reply_to chain
+        # can put a foreign role message into a thread the caller can see).
+        refs = role_session_refs(own_row)
+        rows = [r for r in rows if role_row_visible(dict(r), refs, session_id)]
         visible = await repo.count_visible_in_thread(
             db, thread_id, session_id=session_id, agent=agent
         )
