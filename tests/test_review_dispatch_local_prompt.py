@@ -2089,3 +2089,53 @@ async def test_wait_for_local_runs_lets_the_loop_drop_a_finished_run():
         assert not rd._LOCAL_RUNS
     finally:
         rd._LOCAL_RUNS.pop(880004, None)
+
+
+async def test_cancelling_the_waiter_cancels_the_runs():
+    """Ревью P2 (#1681): отмена ожидания снимает прогоны и чистит реестр."""
+    from hub.services import review_dispatch as rd
+
+    async def _never_finishes():
+        await asyncio.Event().wait()
+
+    run = _register_fake_run(rd, 880005, 4246, _never_finishes())
+    waiter = asyncio.get_running_loop().create_task(
+        rd.wait_for_local_runs(30, cancel_grace=1)
+    )
+    try:
+        await asyncio.sleep(0.05)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert run.cancelled() and not rd._LOCAL_RUNS
+    finally:
+        rd._LOCAL_RUNS.pop(880005, None)
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_a_run_that_ignores_cancellation_is_detached_and_named(caplog):
+    """Ревью P2 (#1681): не слушающийся прогон отцеплен от реестра и назван."""
+    from hub.services import review_dispatch as rd
+
+    release = asyncio.Event()
+
+    async def _stubborn():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    run = _register_fake_run(rd, 880006, 4247, _stubborn())
+    try:
+        with caplog.at_level("ERROR"):
+            with pytest.raises(rd.LocalRunsStuck) as caught:
+                await rd.wait_for_local_runs(0.1, cancel_grace=0.1)
+        assert "не закончились: 1" in str(caught.value)
+        assert not rd._LOCAL_RUNS, "брошенный прогон не держит реестр хаба"
+        assert "task #4247" in caplog.text and "abandoned" in caplog.text
+    finally:
+        rd._LOCAL_RUNS.pop(880006, None)
+        release.set()
+        await asyncio.gather(run, return_exceptions=True)
