@@ -1442,6 +1442,25 @@ async def api_list_events(
             item["payload"] = _json.loads(item.get("payload") or "{}")
         except (TypeError, ValueError):
             item["payload"] = {}
+        # #1678: role mail is judged for EVERY non-human identity (watcher and
+        # steward principals included), whatever else their feed is narrowed by.
+        if (
+            item.get("kind") == services.MESSAGE_EVENT_KIND
+            and not identity.is_agent
+            and not identity.is_human
+            and item["payload"].get("to_kind") == "role"
+        ):
+            if refs is None:
+                refs = await services.addressable_refs(
+                    db,
+                    agent=identity.username,
+                    principal_id=identity.principal_id,
+                    session_id=session_id,
+                )
+            if not services.message_event_is_addressed(
+                item["payload"], refs, for_wakeup=True
+            ):
+                continue
         if item.get("kind") == services.MESSAGE_EVENT_KIND and identity.is_agent:
             if refs is None:
                 refs = await services.addressable_refs(

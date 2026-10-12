@@ -715,18 +715,21 @@ async def get_agent_sessions_panel(db: aiosqlite.Connection) -> list[dict]:
 
 
 async def get_message_threads_panel(
-    db: aiosqlite.Connection, *, limit: int = 10
+    db: aiosqlite.Connection, *, limit: int = 10, is_human: bool = True
 ) -> list[dict]:
     """Latest message of each thread with its size (#775).
 
     Every thread is here, including ones addressed straight from one session to
     another with no task attached: the channel is allowed to exist precisely
-    because the owner sees all of it.
+    because the owner sees all of it. A non-human identity has no verified
+    session here, so role-addressed mail stays out of its panel (#1678).
     """
     from hub.services.messaging import message_view
 
     threads: list[dict] = []
-    for row in await repo.list_recent_threads(db, limit=limit):
+    for row in await repo.list_recent_threads(
+        db, limit=limit, exclude_roles=not is_human
+    ):
         data = dict(row)
         view = message_view(data)
         view["messages"] = data.get("messages") or 1

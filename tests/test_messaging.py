@@ -628,3 +628,145 @@ async def test_personal_addressing_is_unchanged(client: AsyncClient, monkeypatch
     assert [m["body"] for m in mine.json()] == ["лично тебе"]
     theirs = await client.get("/api/messages?session_id=s-gamma", headers=auth["gamma"])
     assert theirs.json() == []
+
+
+# ---- #1678: the address "role in a project" ----
+
+
+async def _mk_projects(db: aiosqlite.Connection, *slugs: str) -> None:
+    for slug in slugs:
+        await repo.create_project(db, slug=slug, name=slug)
+    await db.commit()
+
+
+async def _register_role(
+    client: AsyncClient, headers: dict, session_id: str, role: str, projects: list[str]
+) -> None:
+    resp = await client.post(
+        "/api/sessions/register",
+        json={"session_id": session_id, "work_role": role, "projects": projects},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def _send_role(client, headers, to_ref, session_id="", **extra):
+    return await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "role",
+            "to_ref": to_ref,
+            "body": "стюарду проекта: проверь релиз",
+            "session_id": session_id,
+            **extra,
+        },
+        headers=headers,
+    )
+
+
+async def test_role_mail_reaches_only_the_matching_session(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-2: под одним токеном ящик и тред видит только сессия с совпадающими
+    ролью и проектом; без session_id, с чужим и неизвестным — не видит."""
+    auth = _auth(monkeypatch)
+    await _mk_projects(db, "a", "b")
+    alpha = auth["alpha"]
+    await _register_role(client, alpha, "s1", "steward", ["a"])
+    await _register_role(client, alpha, "s2", "steward", ["b"])
+    await _register_role(client, alpha, "s3", "executor", ["a"])
+    await _register(client, auth["beta"], "s-beta")
+
+    sent = await _send_role(client, auth["beta"], "steward@a", session_id="s-beta")
+    assert sent.status_code == 200, sent.text
+    mid = sent.json()["message"]["id"]
+    assert sent.json()["message"]["to_kind"] == "role"
+
+    seen = await client.get("/api/messages?session_id=s1", headers=alpha)
+    assert [m["id"] for m in seen.json()] == [mid]
+    assert seen.json()[0]["matched_by"] == "role"
+    for sid in ("s2", "s3"):
+        other = await client.get(f"/api/messages?session_id={sid}", headers=alpha)
+        assert other.status_code == 200 and other.json() == [], sid
+    bare = await client.get("/api/messages", headers=alpha)
+    assert bare.status_code == 200 and bare.json() == []
+    for sid in ("s-beta", "nope"):  # чужая и неизвестная
+        odd = await client.get(f"/api/messages?session_id={sid}", headers=alpha)
+        assert odd.status_code in (403, 404), (sid, odd.text)
+        assert "стюарду проекта" not in odd.text
+
+    # Тред: то же правило; отправитель и человек читают, как прежде.
+    def thread(sid=""):
+        suffix = f"&session_id={sid}" if sid else ""
+        return client.get(f"/api/messages?thread_id={mid}{suffix}", headers=alpha)
+
+    assert [m["id"] for m in (await thread("s1")).json()] == [mid]
+    for sid in ("s2", "s3", ""):
+        resp = await thread(sid)
+        assert resp.status_code == 403, (sid, resp.text)
+    by_sender = await client.get(
+        f"/api/messages?thread_id={mid}&session_id=s-beta", headers=auth["beta"]
+    )
+    assert [m["id"] for m in by_sender.json()] == [mid]
+    by_human = await client.get(f"/api/messages?thread_id={mid}", headers=auth["human"])
+    assert [m["id"] for m in by_human.json()] == [mid]
+
+    # Отправка из S2 под тем же токеном: «своей» для S3 (того же агента) она
+    # не становится, S2 читает свой тред как точная сессия отправителя.
+    again = await _send_role(client, alpha, "steward@a", session_id="s2")
+    assert again.status_code == 200, again.text
+    second = again.json()["message"]["id"]
+    t = f"/api/messages?thread_id={second}&session_id="
+    assert (await client.get(t + "s1", headers=alpha)).status_code == 200
+    assert (await client.get(t + "s2", headers=alpha)).status_code == 200
+    assert (await client.get(t + "s3", headers=alpha)).status_code == 403
+    inbox_s3 = await client.get("/api/messages?session_id=s3", headers=alpha)
+    assert inbox_s3.json() == []
+
+
+async def test_role_address_is_validated_and_kept_for_later_sessions(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-4: 422 на грамматику, роль и проект; без онлайн-сессий сообщение
+    сохраняется и не обещает прочтения; позже пришедшая сессия его видит."""
+    auth = _auth(monkeypatch)
+    await _mk_projects(db, "a")
+    alpha = auth["alpha"]
+    before = len(list(await db.execute_fetchall("SELECT id FROM agent_messages")))
+    for bad, reason in (
+        ("steward", "invalid_role_address"),
+        ("steward@", "invalid_role_address"),
+        ("@a", "invalid_role_address"),
+        ("steward@a@b", "invalid_role_address"),
+        ("boss@a", "unknown_work_role"),
+        ("steward@nowhere", "unknown_project"),
+    ):
+        resp = await _send_role(client, auth["beta"], bad)
+        assert resp.status_code == 422, (bad, resp.text)
+        assert reason in resp.text, (bad, resp.text)
+    after = len(list(await db.execute_fetchall("SELECT id FROM agent_messages")))
+    assert after == before, "отказы ничего не пишут"
+
+    kept = await _send_role(client, auth["beta"], " Steward@A ")
+    assert kept.status_code == 200, kept.text
+    body = kept.json()
+    assert body["message"]["to_ref"] == "steward@a", "адрес нормализован"
+    assert body["delivery"]["online_sessions"] == 0
+    assert body["delivery"]["addressee_online"] is False
+    assert body["delivery"]["delivered_now"] is False
+    mid = body["message"]["id"]
+
+    await _register_role(client, alpha, "late", "steward", ["a"])
+    inbox = await client.get("/api/messages?session_id=late", headers=alpha)
+    assert [m["id"] for m in inbox.json()] == [mid]
+
+    # Сессия с совпавшей ролью, но давно не подававшая признаков жизни, не в счёт.
+    await _register_role(client, alpha, "stale", "steward", ["a"])
+    await db.execute(
+        "UPDATE agent_sessions SET last_seen_at = '2020-01-01 00:00:00' "
+        "WHERE session_id = 'stale'"
+    )
+    await db.commit()
+    online = await _send_role(client, auth["beta"], "steward@a")
+    assert online.json()["delivery"]["online_sessions"] == 1
+    assert "рочтение не гарантировано" in online.json()["delivery"]["note"]
