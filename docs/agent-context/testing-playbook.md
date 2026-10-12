@@ -22,7 +22,7 @@ Pick the smallest useful validation set first, then widen only if the diff cross
 | Lifecycle and service logic | `uv run pytest tests/test_services.py -q` |
 | DoR / readiness / recommendations | `uv run pytest tests/test_dor.py tests/test_readiness.py tests/test_recommendations.py -q` |
 | MCP tools | `uv run pytest tests/test_mcp_server.py -q` |
-| CLI | `uv run pytest tests/test_cli.py -q` |
+| CLI | `uv run pytest tests/test_cli*.py -q` |
 | Web dashboard and templates | `uv run pytest tests/test_web.py -q` |
 | Poller or orchestration flows | `uv run pytest tests/test_poller.py -q` |
 | Auth | `uv run pytest tests/test_auth.py -q` |
@@ -48,7 +48,7 @@ poller review handling, `refresh_task`) must run the focused gate suites
 before the full run:
 
 ```bash
-uv run pytest tests/test_services.py tests/test_api.py tests/test_mcp_server.py tests/test_poller.py tests/test_cli.py -q
+uv run pytest tests/test_services.py tests/test_api.py tests/test_mcp_server.py tests/test_poller.py tests/test_cli*.py -q
 ```
 
 Key regression anchors: stale-approval invalidation, gate routing of done

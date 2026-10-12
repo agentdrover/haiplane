@@ -427,7 +427,16 @@ async def _judge(
             kind="verdict",
             verdict=verdict,
             confidence=confidence,
-            grounds=[{"source": "ci_pinned_sha"}] if grounds is None else grounds,
+            grounds=(
+                [
+                    {
+                        "source": "ci_pinned_sha",
+                        "detail": "ci_run 1234 success on sha abc123",
+                    }
+                ]
+                if grounds is None
+                else grounds
+            ),
             escalate_reason="precondition_failed" if verdict == "escalate" else None,
             model="gpt-5.3-codex",
         ),
@@ -526,7 +535,16 @@ async def _advise(
             kind="advisor",
             verdict=verdict,
             confidence=confidence,
-            grounds=[{"source": "ci_pinned_sha"}] if grounds is None else grounds,
+            grounds=(
+                [
+                    {
+                        "source": "ci_pinned_sha",
+                        "detail": "ci_run 1234 success on sha abc123",
+                    }
+                ]
+                if grounds is None
+                else grounds
+            ),
             findings=findings or [],
             model="claude-sonnet-5",
         ),
