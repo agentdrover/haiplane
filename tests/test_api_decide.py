@@ -15,10 +15,19 @@ review_verdict было бы самым коротким способом пол
 
 from __future__ import annotations
 
+import asyncio
+import json
+from contextlib import asynccontextmanager
+
 import aiosqlite
+import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 
+from hub import db as db_module
 from hub import repository as repo
+from hub import services
+from hub.models import TaskReturnToWork
 from tests.test_pair_merge_gate import _approved_pair_task, _git
 
 
@@ -469,7 +478,15 @@ async def test_returning_to_work_is_human_only_and_status_bound(
         assert resp.status_code == 422, (body, resp.text)
         await _unchanged()
 
-    for status in ("open", "running", "needs_decision", "completed", "claimed"):
+    # #1675: running вынесен из этого списка - из него commit-задача возвращается,
+    # когда у неё нет ни одного признака работы (test_running_*).
+    for status in (
+        "open",
+        "needs_info",
+        "needs_decision",
+        "completed",
+        "claimed",
+    ):
         await repo.update_task(db, task_id, status=status)
         await db.commit()
         snapshot["status"] = status
@@ -653,3 +670,358 @@ async def test_a_late_machine_review_lands_on_a_returned_task_without_approving_
         (task_id,),
     )
     assert [r[0] for r in rows] == [1], "отчёт сохранён за той сдачей, которую читал"
+
+
+# ---- #1675: возврат running-задачи без признаков работы ----
+
+_PAST = "2020-01-01 00:00:00"
+_FUTURE = "2999-01-01 00:00:00"
+
+
+async def _running_commit(client: AsyncClient, db: aiosqlite.Connection) -> int:
+    task_id = (await client.post("/api/tasks", json={"title": "Running idle"})).json()[
+        "id"
+    ]
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    return task_id
+
+
+async def _sql(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> None:
+    await db.execute(sql, params)
+    await db.commit()
+
+
+async def _pair_session(db, task_id, *, kind="implementer", bound=None, **cols):
+    principal = (await (await db.execute("SELECT id FROM principals")).fetchone())[0]
+    fields = {
+        "principal_id": principal,
+        "kind": kind,
+        "bound_task_id": task_id if bound is None else bound,
+        "token_hash": f"hash-{kind}-{task_id}-{len(cols)}-{cols.get('tag', '')}",
+        "expires_at": _FUTURE,
+        **{k: v for k, v in cols.items() if k != "tag"},
+    }
+    await db.execute(
+        f"INSERT INTO chat_pair_sessions ({', '.join(fields)}) "  # nosec B608
+        f"VALUES ({', '.join('?' * len(fields))})",
+        tuple(fields.values()),
+    )
+    await db.commit()
+
+
+async def _register_session(db, session_id: str, *, last_seen: str | None = None):
+    await repo.upsert_agent_session(
+        db, session_id=session_id, principal_id=None, agent="agent-a"
+    )
+    if last_seen:
+        await db.execute(
+            "UPDATE agent_sessions SET last_seen_at=? WHERE session_id=?",
+            (last_seen, session_id),
+        )
+    await db.commit()
+
+
+async def _run(db, task_id, *, outcome="running", agent_id="bc-1", run_id="r-1"):
+    await _sql(
+        db,
+        "INSERT INTO executor_runs (task_id, agent_id, run_id, outcome) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, agent_id, run_id, outcome),
+    )
+
+
+async def _slot(db, task_id, channel, *, released=None):
+    await _sql(
+        db,
+        "INSERT INTO executor_slots (task_id, channel, slot, released_at) "
+        "VALUES (?, ?, 's1', ?)",
+        (task_id, channel, released),
+    )
+
+
+async def _set(db, task_id, **fields):
+    await repo.update_task(db, task_id, **fields)
+    await db.commit()
+
+
+# Признак -> (как его создать, имя признака в отказе). Каждый - один и только он.
+_SIGNS = {
+    "claimed_by": lambda db, t: _set(db, t, claimed_by="agent-a"),
+    "job_id": lambda db, t: _set(db, t, job_id="job-live-1"),
+    "review_job_id": lambda db, t: _set(db, t, review_job_id="job-rev-1"),
+    "open_slot": lambda db, t: _slot(db, t, "slot"),
+    "open_slot_cloud": lambda db, t: _slot(db, t, "cloud"),
+    "executor_run": lambda db, t: _run(db, t),
+    "executor_run_booking": lambda db, t: _run(db, t, agent_id="", run_id=""),
+    "implementer_session": lambda db, t: _pair_session(db, t),
+    "executor_online": lambda db, t: _online_claim(db, t),
+    "declared_wait": lambda db, t: _set(
+        db, t, waiting_for="CI", waiting_until=_FUTURE, waiting_declared_by="a"
+    ),
+}
+_SIGN_CODE = {
+    "open_slot_cloud": "open_slot",
+    "executor_run_booking": "executor_run",
+}
+
+
+async def _online_claim(db, task_id):
+    await _register_session(db, "sess-live")
+    await _set(db, task_id, claim_session_id="sess-live")
+
+
+async def _snapshot(db, task_id):
+    task = dict(await repo.get_task(db, task_id))
+    feed = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    return task, feed, len(events)
+
+
+async def test_running_task_without_work_returns_to_open(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # AC-1: ни одного признака - open, захват снят, решение и событие записаны.
+    task_id = await _running_commit(client, db)
+    # claim_session_id указывает на сессию, которой нет в реестре: не признак.
+    await _set(db, task_id, claim_session_id="sess-gone")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "исполнитель ушёл"}
+    )
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["status"] == "open"
+    assert card["claimed_by"] is None and card["claim_session_id"] is None
+    assert card["job_id"] is None and card["review_job_id"] is None
+    feed = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    decision = [u for u in feed if u["kind"] == "decision"]
+    assert decision, f"решение в ленте: {feed}"
+    text = decision[-1]["content"]
+    assert "исполнитель ушёл" in text and "running" in text, text
+    events = [
+        dict(e)
+        for e in await repo.list_events(db, since=0)
+        if dict(e)["kind"] == "task_returned_to_work"
+    ]
+    assert len(events) == 1 and events[0]["task_id"] == task_id
+    payload = json.loads(events[0]["payload"])
+    assert payload["from_status"] == "running"
+    assert payload["reason"] == "исполнитель ушёл"
+    assert payload["previous_session"] == "sess-gone"
+
+
+async def test_running_with_any_sign_of_work_is_not_returned(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # AC-2: каждый признак по отдельности - 409 с его именем, задача цела,
+    # abandon_active_job отказ не обходит; обратные случаи - возврат проходит.
+    for name, make in _SIGNS.items():
+        for abandon in (False, True):
+            task_id = await _running_commit(client, db)
+            await make(db, task_id)
+            before = await _snapshot(db, task_id)
+            resp = await client.post(
+                f"/api/tasks/{task_id}/return-to-work",
+                json={"reason": "проверка", "abandon_active_job": abandon},
+            )
+            assert resp.status_code == 409, (name, abandon, resp.text)
+            detail = resp.json()["detail"]
+            assert detail["reason"] == "return_running_has_work", (name, detail)
+            code = _SIGN_CODE.get(name, name)
+            assert [s["sign"] for s in detail["signs"]] == [code], (name, detail)
+            assert await _snapshot(db, task_id) == before, (name, abandon)
+
+    async def _closed_slot(db, t):
+        await _slot(db, t, "slot", released=_PAST)
+
+    async def _terminal_run(db, t):
+        await _run(db, t, outcome="completed")
+
+    async def _expired(db, t):
+        await _pair_session(db, t, expires_at=_PAST)
+
+    async def _revoked(db, t):
+        await _pair_session(db, t, revoked_at=_PAST)
+
+    async def _foreign(db, t):
+        other = await _running_commit(client, db)
+        await _pair_session(db, t, bound=other)
+
+    async def _intake(db, t):
+        await _pair_session(db, t, kind="intake")
+
+    async def _reviewer(db, t):
+        await _pair_session(db, t, kind="reviewer")
+
+    async def _offline(db, t):
+        await _register_session(db, "sess-old", last_seen=_PAST)
+        await _set(db, t, claim_session_id="sess-old")
+
+    async def _past_wait(db, t):
+        await _set(db, t, waiting_for="CI", waiting_until=_PAST)
+
+    for name, make in {
+        "closed_slot": _closed_slot,
+        "terminal_run": _terminal_run,
+        "expired_session": _expired,
+        "revoked_session": _revoked,
+        "foreign_session": _foreign,
+        "intake_session": _intake,
+        "reviewer_session": _reviewer,
+        "offline_claim": _offline,
+        "expired_wait": _past_wait,
+    }.items():
+        task_id = await _running_commit(client, db)
+        await make(db, task_id)
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work", json={"reason": "обратный"}
+        )
+        assert resp.status_code == 200, (name, resp.text)
+        assert resp.json()["status"] == "open", name
+
+
+async def test_expired_wait_is_closed_on_return(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # AC-3: просроченное (и неполное) ожидание очищается с записью аудита, но
+    # только если других признаков нет.
+    for fields in (
+        {"waiting_for": "CI main", "waiting_until": _PAST, "waiting_declared_by": "x"},
+        {"waiting_for": "CI main", "waiting_until": "", "waiting_declared_by": "x"},
+    ):
+        task_id = await _running_commit(client, db)
+        await _set(db, task_id, **fields)
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work", json={"reason": "вернуть"}
+        )
+        assert resp.status_code == 200, resp.text
+        card = resp.json()
+        assert card["status"] == "open"
+        assert (card["waiting_for"], card["waiting_until"]) == ("", "")
+        assert card["waiting_declared_by"] == ""
+        feed = " ".join(
+            dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+        )
+        assert "CI main" in feed and "ожидани" in feed.lower(), feed
+
+    task_id = await _running_commit(client, db)
+    await _set(
+        db,
+        task_id,
+        waiting_for="CI main",
+        waiting_until=_PAST,
+        waiting_declared_by="x",
+        claimed_by="agent-a",
+    )
+    before = await _snapshot(db, task_id)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "вернуть"}
+    )
+    assert resp.status_code == 409, resp.text
+    assert [s["sign"] for s in resp.json()["detail"]["signs"]] == ["claimed_by"]
+    assert await _snapshot(db, task_id) == before, "ожидание не тронуто, аудита нет"
+
+
+async def test_return_running_rechecks_inside_the_write(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn, monkeypatch
+) -> None:
+    # AC-4: признак, появившийся после внешнего чтения, ловится перечиткой под
+    # write-локом: 409, конкурентная запись сохранена, задача не изменилась.
+    from hub.services import return_running
+
+    concurrent_writes = {
+        "slot": (
+            "INSERT INTO executor_slots (task_id, channel, slot) "
+            "VALUES (?, 'slot', 's9')",
+            "open_slot",
+        ),
+        "wait": (
+            "UPDATE tasks SET waiting_for='CI', waiting_until='2999-01-01 00:00:00',"
+            " waiting_declared_by='a' WHERE id=?",
+            "declared_wait",
+        ),
+    }
+    for name, (sql, code) in concurrent_writes.items():
+        task_id = await _running_commit(client, db)
+        before = (await _snapshot(db, task_id))[0]
+        outer_read_done, committed = asyncio.Event(), asyncio.Event()
+        real = return_running.write_transaction
+
+        @asynccontextmanager
+        async def _gated(conn, _real=real):
+            outer_read_done.set()  # внешнее чтение позади, лока ещё нет
+            await committed.wait()
+            async with _real(conn):
+                yield
+
+        monkeypatch.setattr(return_running, "write_transaction", _gated)
+
+        async def _writer(sql=sql, task_id=task_id):
+            await outer_read_done.wait()
+            other = await db_module.connect(db_dsn)
+            try:
+                await other.execute(sql, (task_id,))
+                await other.commit()
+            finally:
+                await other.close()
+            committed.set()
+
+        writer = asyncio.create_task(_writer())
+        conn = await db_module.connect(db_dsn)
+        try:
+            with pytest.raises(HTTPException) as caught:
+                await services.return_to_work(
+                    conn,
+                    task_id,
+                    TaskReturnToWork(reason="гонка"),
+                    actor="denis",
+                )
+        finally:
+            await conn.close()
+        await writer
+        assert caught.value.status_code == 409, name
+        assert caught.value.detail["reason"] == "return_running_has_work"
+        assert [s["sign"] for s in caught.value.detail["signs"]] == [code], name
+        after = dict(await repo.get_task(db, task_id))
+        assert after["status"] == "running", name
+        for field in ("claimed_by", "claim_session_id", "job_id", "status_entered_at"):
+            assert after[field] == before[field], (name, field)
+        if name == "slot":
+            rows = await (
+                await db.execute(
+                    "SELECT COUNT(*) FROM executor_slots WHERE task_id=? "
+                    "AND released_at IS NULL",
+                    (task_id,),
+                )
+            ).fetchone()
+            assert rows[0] == 1, "конкурентная запись сохранена"
+        else:
+            assert after["waiting_for"] == "CI", "объявленное ожидание сохранено"
+        monkeypatch.undo()
+
+
+async def test_return_running_for_state_and_needs_info_keeps_old_rules(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # AC-5 (дополнение): needs_info commit - 400 и после этой задачи; state из
+    # running идёт прежним путём, даже с признаком работы (claimed_by); общая
+    # константа не расширена - её читает оркестратор (executor_launch).
+    from hub.services import lifecycle, return_running
+
+    assert lifecycle.RETURN_TO_WORK_STATUSES == {"review", "fix_requested"}
+    assert return_running.RETURN_RUNNING_STATUSES == {"running"}
+    task_id = await _running_commit(client, db)
+    await _set(db, task_id, status="needs_info")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "нет"}
+    )
+    assert resp.status_code == 400, resp.text
+
+    state_id = await _running_commit(client, db)
+    await _set(db, state_id, result_kind="state", claimed_by="agent-a")
+    resp = await client.post(
+        f"/api/tasks/{state_id}/return-to-work", json={"reason": "state как раньше"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "open"

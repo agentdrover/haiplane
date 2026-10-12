@@ -2714,7 +2714,10 @@ def build_parser() -> argparse.ArgumentParser:
         "return-to-work",
         help=(
             "Human-only: return a review/fix_requested task to open — closes the "
-            "current approval like rework, takes the claim off, keeps branch/PR"
+            "current approval like rework, takes the claim off, keeps branch/PR. "
+            "A commit task in running returns only with no sign of work (no "
+            "holder, job, open slot, live run/session, declared wait); else 409 "
+            "return_running_has_work"
         ),
     )
     p_return.add_argument("task_id", type=int)
@@ -2728,7 +2731,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Drop a dispatch job the registry still calls active (a dead "
             "executor's job stays 'running'); without it such a task is a 409. "
-            "The process is not killed, only unlinked from the task"
+            "The process is not killed, only unlinked from the task. Does not "
+            "apply to running tasks: a non-empty job there always blocks"
         ),
     )
     p_return.set_defaults(func=cmd_return_to_work)
