@@ -46,11 +46,13 @@ EXCEPTIONS: dict[str, str] = {
         "данные для гейта красного теста (#913): только ветки task-*, exit 0 "
         "всегда — падение теста на базе это доказательство, а не провал"
     ),
-    "Report AC tests and validation to Hub": "отчётность, не проверка",
-    "Dependency vulnerability audit": (
-        "advisory: continue-on-error, находки уезжают драфтами в хаб, красным не бывает"
+    "Collect AC test and validation results for the Hub": (
+        "сбор данных для отчёта, не проверка — #1686"
     ),
-    "File audit findings as Hub drafts": (
+    "Upload results for the trusted report": (
+        "передача артефакта ci-report.yml, не проверка — #1686"
+    ),
+    "Dependency vulnerability audit": (
         "advisory: continue-on-error, находки уезжают драфтами в хаб, красным не бывает"
     ),
 }

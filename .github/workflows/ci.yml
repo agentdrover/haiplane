@@ -280,27 +280,35 @@ jobs:
       # SDD gates is produced here and reported back. Placed AFTER the main test
       # step and marked continue-on-error on purpose: the delivery gate
       # (#605/#606) decides whether a PR may merge by reading this job's
-      # outcome, so a reporting hiccup must never turn into a merge block for
-      # every task. Without the secrets the script reports nothing and says so —
+      # outcome, so a collecting hiccup must never turn into a merge block for
+      # every task. Without the secrets the script collects nothing and says so —
       # the hub reads silence as unknown, never as success.
       # #761: the same composite action satellite repositories use, so there is
-      # one reporter with one behaviour instead of this step and a copy of it
+      # one collector with one behaviour instead of this step and a copy of it
       # that drifts. The commit passed below must be the BRANCH HEAD: on
       # pull_request events GITHUB_SHA is a throwaway merge of head into base,
       # which exists in no branch and can never equal the tip the hub pinned at
       # submission (#572).
-      - name: Report AC tests and validation to Hub
+      # #1686: THIS JOB RUNS THE BRANCH'S CODE (tests, conftest.py, the action
+      # and the scripts themselves). It therefore holds no key that makes the
+      # hub believe a report: the only hub secret here is a read-only key for
+      # the task card. The collector runs the AC tests and the validation
+      # commands without any HAIPLANE_HUB_* variable and writes the results to
+      # hub-ci-results/, uploaded below as an artifact. The report itself is
+      # sent by .github/workflows/ci-report.yml, which GitHub runs from the
+      # default branch after this workflow completes.
+      - name: Collect AC test and validation results for the Hub
         if: ${{ always() }}
         continue-on-error: true
-        # #1666: the reporter has its own overall deadline (17 min, see
+        # #1666: the collector has its own overall deadline (17 min, see
         # _REPORT_DEADLINE in scripts/ci_report_to_hub.py): past it no command
-        # is launched, the rest is reported as not run, and the report is sent
-        # before this 20 min ceiling can cut the step.
+        # is launched, the rest is recorded as not run, and the results are
+        # written before this 20 min ceiling can cut the step.
         timeout-minutes: 20
         uses: ./.github/actions/hub-ci-report
         with:
           hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
-          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
+          hub-read-token: ${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: uv run pytest
           # #1270: its own key in the hub's report, not a `checks` entry.
@@ -335,21 +343,29 @@ jobs:
       # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery
       # for the whole repository without a single commit — and an advisory may
       # have no fixed version at all, which made that freeze open-ended. It
-      # still runs, still prints, and its findings become hub drafts in the next
-      # step: a step that can never fail is a step nobody reads, so the record
-      # has to land somewhere with an owner.
+      # still runs, still prints, and its findings become hub drafts: a step that
+      # can never fail is a step nobody reads, so the record has to land
+      # somewhere with an owner.
+      # #1686: the drafts are filed by ci-report.yml from this file (push to
+      # develop or main only), with a key of their own; this job sends nothing.
       - name: Dependency vulnerability audit
         continue-on-error: true
-        run: uv run pip-audit --progress-spinner off -f json -o audit.json
+        run: |
+          mkdir -p hub-ci-results
+          uv run pip-audit --progress-spinner off -f json -o hub-ci-results/audit.json
 
-      - name: File audit findings as Hub drafts
+      # #1686: the hand-over to ci-report.yml. The name carries the attempt of
+      # THIS run, so a re-run is never confused with the first attempt. The
+      # directory holds data only; the reporter reads it as such.
+      - name: Upload results for the trusted report
         if: ${{ always() }}
         continue-on-error: true
-        env:
-          HAIPLANE_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL }}
-          HAIPLANE_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
-          AUDIT_JSON: audit.json
-        run: uv run python scripts/ci_report_audit_to_hub.py
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-results-${{ github.run_attempt }}
+          path: hub-ci-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Static security scan
         run: uv run bandit -r hub -q

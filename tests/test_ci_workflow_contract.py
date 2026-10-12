@@ -39,9 +39,11 @@ def test_deploy_callback_env_keys_match_run_body() -> None:
 
 def test_report_and_audit_use_canonical_secrets() -> None:
     text = _text()
-    # Report step inputs (the hub-ci-report composite action).
+    # Collect step inputs (the hub-ci-report composite action): the URL and the
+    # READ key. The report key is not an input of this job any more (#1686).
     assert f"hub-url: {URL_SECRET}" in text
-    assert f"hub-token: {TOKEN_SECRET}" in text
+    assert "hub-read-token: ${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}" in text
+    assert "hub-token:" not in text
 
 
 def test_no_legacy_names_anywhere() -> None:
@@ -280,3 +282,79 @@ def test_the_deploy_ships_hashed_lock_exports() -> None:
     # The test job tests the committed lock, not a re-resolved one.
     install = _step("test", "Install dependencies")
     assert install["run"].strip() == "uv sync --locked --dev"
+
+
+# ---- #1686: the code of a task branch never sees the report key -----------------
+
+WORKFLOWS = ROOT / ".github" / "workflows"
+REPORT_SECRETS = ("HAIPLANE_HUB_CI_TOKEN", "HAIPLANE_HUB_CI_AUDIT_TOKEN")
+# The only places that may hold the report key: the trusted workflow that runs
+# from the default branch, and the deploy job (main only, environment production).
+ALLOWED_HOLDERS = {("ci-report.yml", "report"), ("ci.yml", "deploy")}
+
+
+def _mentions(node) -> list[str]:
+    import json
+
+    text = json.dumps(node, default=str)
+    return [name for name in REPORT_SECRETS if name in text]
+
+
+def test_branch_code_never_sees_the_report_token() -> None:
+    """AC-1 (#1686): who may read the report key is a closed list, read from YAML."""
+    import re
+
+    import yaml
+
+    holders: set[tuple[str, str]] = set()
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        top = {k: v for k, v in doc.items() if k != "jobs"}
+        assert not _mentions(top), f"{path.name}: workflow-level mention"
+        for job_id, job in doc["jobs"].items():
+            if _mentions(job):
+                holders.add((path.name, job_id))
+    assert holders == ALLOWED_HOLDERS, holders
+
+    # The composite action and the satellite template are not holders either.
+    for action in (ROOT / ".github" / "actions").rglob("*.y*ml"):
+        assert "secrets." not in action.read_text(encoding="utf-8"), action
+
+    # The job of the branch's code: no report key, not even as an input name.
+    test_job = _doc()["jobs"]["test"]
+    for step in test_job["steps"]:
+        assert not _mentions(step), step.get("name")
+        assert "hub-token" not in (step.get("with") or {}), step.get("name")
+    assert "environment" not in test_job, "job test needs no environment secrets"
+    names = [s.get("name") for s in test_job["steps"]]
+    assert "File audit findings as Hub drafts" not in names
+    upload = _step("test", "Upload results for the trusted report")
+    assert upload["with"]["name"] == "hub-ci-results-${{ github.run_attempt }}"
+
+    # ci-report.yml: workflow_run only, the default branch, nothing built there.
+    report_text = (WORKFLOWS / "ci-report.yml").read_text(encoding="utf-8")
+    report = yaml.safe_load(report_text)
+    triggers = report.get("on", report.get(True))
+    assert set(triggers) == {"workflow_run"}, triggers
+    assert triggers["workflow_run"]["workflows"] == ["CI"]
+    assert triggers["workflow_run"]["types"] == ["completed"]
+    job = report["jobs"]["report"]
+    assert job["environment"] == "hub-report"
+    checkout = next(s for s in job["steps"] if "checkout" in str(s.get("uses")))
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert checkout["with"]["persist-credentials"] is False
+    code = "\n".join(
+        line for line in report_text.splitlines() if not line.lstrip().startswith("#")
+    )
+    for forbidden in ("cache", "uv sync", "setup-uv", "setup-python", "pip install"):
+        assert forbidden not in code, forbidden
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.search(r"@[0-9a-f]{40}$", step["uses"]), step["uses"]
+    sender = next(s for s in job["steps"] if "run" in s)
+    assert sender["run"].strip() == "python3 scripts/ci_trusted_report.py"
+
+    # What the script checks before it sends anything.
+    script = (ROOT / "scripts" / "ci_trusted_report.py").read_text(encoding="utf-8")
+    assert 'EXPECTED_WORKFLOW_PATH = ".github/workflows/ci.yml"' in script
+    assert "head_repository" in script and "ALLOWED_EVENTS" in script

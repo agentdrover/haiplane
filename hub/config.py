@@ -788,6 +788,10 @@ STEWARD_PERMS: frozenset[str] = frozenset(
 # Watcher (#1556): read-only. One verb, and the real gate is the positive
 # method+path list in hub/auth.py, not this set.
 WATCHER_PERMS: frozenset[str] = frozenset({"tasks.read"})
+# #1686: the CI keys that run next to branch code. The route allowlists in
+# hub/auth.py are the gate; these are the ceiling of what a stored role may add.
+CI_READER_PERMS: frozenset[str] = frozenset({"tasks.read"})
+CI_AUDITOR_PERMS: frozenset[str] = frozenset({"tasks.create"})
 
 
 class TokenIdentity:
@@ -867,6 +871,16 @@ class TokenIdentity:
         return self.role == "watcher"
 
     @property
+    def is_ci_reader(self) -> bool:
+        """The read-only key of a task branch's CI job (#1686)."""
+        return self.role == "ci_reader"
+
+    @property
+    def is_ci_auditor(self) -> bool:
+        """The key that files pip-audit drafts (#1686)."""
+        return self.role == "ci_auditor"
+
+    @property
     def is_scoped_ci(self) -> bool:
         """A CI key bound to projects (#1644): confined to the CI routes.
 
@@ -882,7 +896,12 @@ class TokenIdentity:
 
     @property
     def is_human(self) -> bool:
-        if self.is_steward or self.is_watcher:
+        if (
+            self.is_steward
+            or self.is_watcher
+            or self.is_ci_reader
+            or self.is_ci_auditor
+        ):
             return False
         if self.role in ("human", "admin", "super_admin"):
             return True
@@ -899,6 +918,12 @@ class TokenIdentity:
     def has_permission(self, perm: str) -> bool:
         if self.role == "super_admin":
             return True
+        if self.is_ci_reader or self.is_ci_auditor:
+            # Never widened by a stored permission set (#1686), as for a watcher.
+            allowed = CI_READER_PERMS if self.is_ci_reader else CI_AUDITOR_PERMS
+            return perm in allowed and (
+                not self.permissions or perm in self.permissions
+            )
         if self.is_steward:
             held = self.permissions if self.permissions else STEWARD_PERMS
             return perm in held

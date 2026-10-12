@@ -56,7 +56,7 @@ from hub.models import (
 )
 from hub.services import call_sites, path_notices, review_evidence
 from hub.services.ac_tests import current_ac_test_results
-from hub.services.ci_report import ci_report_state
+from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
@@ -413,6 +413,29 @@ async def reviewer_harness_skill(db) -> ReviewerHarnessSkill:
     )
 
 
+async def _ci_run_report_state(db, task_id: int, task_view) -> CIRunReportState:
+    """CI run evidence for the commit under review, with the run it names (#546, #1686)."""
+    ci_state, ci_reason = await ci_report_state(
+        db, {"id": task_id, "submission_sha": task_view.submission_sha}
+    )
+    state = CIRunReportState(
+        state=ci_state,
+        reason=ci_reason,
+        head_sha=task_view.submission_sha or "",
+    )
+    # #1686: the run the reporter named, labelled for what it is — a claim.
+    stored = (
+        await repo.get_ci_run_report(db, task_id, task_view.submission_sha)
+        if task_view.submission_sha
+        else None
+    )
+    if stored is not None:
+        state.provenance = stored_provenance(dict(stored))
+        if state.provenance:
+            state.provenance_note = PROVENANCE_NOTE
+    return state
+
+
 async def build_review_brief(
     db, task_id: int, *, self_review_warning: SelfReviewWarning | None = None
 ) -> ReviewBrief | None:
@@ -564,16 +587,8 @@ async def build_review_brief(
     # #546: is there run evidence for the COMMIT under review? Two states only,
     # and the unknown one always carries its cause — a reviewer must be able to
     # tell "nobody ran it" from "it ran and failed".
-    ci_state, ci_reason = await timer.run(
-        "db_reads",
-        ci_report_state(
-            db, {"id": task_id, "submission_sha": task_view.submission_sha}
-        ),
-    )
-    ci_run_report = CIRunReportState(
-        state=ci_state,
-        reason=ci_reason,
-        head_sha=task_view.submission_sha or "",
+    ci_run_report = await timer.run(
+        "db_reads", _ci_run_report_state(db, task_id, task_view)
     )
 
     # #1606: mutations and baseline are NOT part of every run any more — a
@@ -624,7 +639,7 @@ async def build_review_brief(
         has_test_acs=any(a.verifiable_by.value == "test" for a in ac_models),
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
-        ci_state=ci_state,
+        ci_state=ci_run_report.state,
         freshness=freshness,
         sha_check=sha_check,
         live_check=live_check,

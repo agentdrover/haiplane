@@ -388,6 +388,99 @@ CI остаётся финальной защитой: проверка её н�
 одобрений и зелёный «Ruff and pytest»), а гейт и так мержит только на зелёном
 CI.
 
+## Отчёт CI не исполняется кодом ветки задачи (#1686)
+
+Job `test` в `ci.yml` исполняет код ветки: тесты, `conftest.py`, action и
+скрипты. Поэтому в нём нет ключа, которым хаб принимает отчёт CI. Устройство:
+
+| Шаг | Где работает | Что держит |
+|---|---|---|
+| Сбор: AC-тесты и команды проверки без `HAIPLANE_HUB_*` и без секретов в env | job `test` (код ветки) | только `HAIPLANE_HUB_CI_READ_TOKEN` (роль `ci_reader`: читает карточку задачи своего проекта) |
+| Передача | артефакт `hub-ci-results-<run_attempt>` | данные: `results.json`, `audit.json` |
+| Отправка отчёта и черновиков аудита | `ci-report.yml` на `workflow_run`, всегда с default-ветки | `HAIPLANE_HUB_CI_TOKEN` (роль `ci_runner`), `HAIPLANE_HUB_CI_AUDIT_TOKEN` (роль `ci_auditor`) |
+| Отчёт о выкате | job `deploy` (только `main`) | `HAIPLANE_HUB_CI_TOKEN` |
+
+`ci-report.yml` берёт факты о прогоне (коммит, id прогона, попытку, путь
+workflow, событие, репозиторий ветки, итог) из события GitHub, а не из
+артефакта. Артефакт читается в памяти по именам, с пределами (архив до 5 МБ, до
+10 файлов, распакованное до 20 МБ), без ссылок и без путей вне корня. Строки из
+него идут только в тело запроса к хабу. Черновики аудита зависимостей
+заводятся только для `push` в `develop` и `main`.
+
+Хаб сохраняет происхождение отчёта (`run_id`, `run_attempt`, `workflow_path`,
+`event`, `head_repository`, `run_conclusion`, `artifact_id`, `artifact_digest`).
+Сверка происхождения с GitHub — следующая задача; пока оно только записано.
+
+### Порядок выката — строго такой
+
+Default-ветка репозитория — **`main`**. GitHub запускает `workflow_run` из
+default-ветки, поэтому `ci-report.yml` начинает работать только после того, как
+он попал в `main`. Отсюда порядок:
+
+- (a) Гейт `ci_before_submit` переводится в `warn` (политика проекта), пока
+  отчёты не идут.
+- (b) Слияние задачи, авторелиз в `main` и деплой. После этого роли `ci_reader`
+  и `ci_auditor` созданы миграцией старта, а `ci-report.yml` лежит в `main`.
+- (c) Владелец создаёт ключи, environments и секреты (шаги 1–5 ниже).
+- (d) Уборка секретов уровня репозитория (шаг 6).
+- (e) Живая проверка — канарейка AC-6 (шаг 7).
+- (f) Гейт `ci_before_submit` возвращается в `require`.
+
+Значения ниже — подстановки. Настоящие ключи не записываются ни в документы, ни в
+ленту, ни в логи; вывод команд, который их содержит, не копируется.
+
+1. **Принципалы и ключи в хабе.** Принципалов заводят через REST (в
+   `oc-hub admin agents create` роли пока только `agent` и `watcher`):
+
+   ```
+   POST /api/admin/principals  {"kind": "service", "username": "<имя-читателя>", "role": "ci_reader"}
+   POST /api/admin/principals  {"kind": "service", "username": "<имя-аудитора>", "role": "ci_auditor"}
+   oc-hub admin keys create --principal <имя-читателя> --name ci-read --project default
+   oc-hub admin keys create --principal <имя-аудитора> --name ci-audit --project default
+   ```
+
+   Ключ без `--project` эти роли отклоняют: режима «без области» у них нет.
+   Ключ аудитора заводит только простые черновики без родителя и без `project`,
+   они всегда попадают в проект `default`. Ключ показывается один раз; его сразу
+   кладут в секрет по шагам 2–3, минуя чат и файлы. Ключ `ci_runner` (отчёт) не
+   меняется.
+2. **Environment `hub-report`** (Settings → Environments → New environment):
+   `Deployment branches and tags` → `Selected branches and tags` → правило
+   только для `main`, без тегов. Секреты environment: `HAIPLANE_HUB_CI_TOKEN`
+   (текущий ключ `ci_runner`), `HAIPLANE_HUB_CI_AUDIT_TOKEN` (ключ `ci_auditor`).
+3. **Секрет репозитория** `HAIPLANE_HUB_CI_READ_TOKEN` — ключ `ci_reader`.
+   `HAIPLANE_HUB_URL` остаётся секретом репозитория.
+4. **Environment `production`**: `Deployment branches and tags` → `Selected` —
+   только `main`, без тегов. Секреты, которые читает job `deploy`, переезжают в
+   него: `HAIPLANE_HUB_CI_TOKEN`, `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`.
+5. **Проверить правила веток** обоих environments (`gh api
+   repos/<владелец>/<репозиторий>/environments/<имя>` — смотреть
+   `deployment_branch_policy` и список политик, значений секретов там нет).
+6. **Убрать секреты уровня репозитория (и организации), которые переехали:**
+   `HAIPLANE_HUB_CI_TOKEN`, `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`
+   (`gh secret delete <ИМЯ> --repo <владелец>/<репозиторий>`), а также
+   устаревшие репозиторные секреты со старым префиксом имени продукта — токен
+   CI и URL хаба. Делать после шагов 2–5: раньше — деплой и отчёты останутся
+   без ключа. Проверка, без значений: `gh secret list --repo <владелец>/<репозиторий>`
+   не содержит этих имён; `gh secret list --env hub-report` и `--env production`
+   содержат свои.
+7. **Живая проверка (AC-6 задачи).** На ветке-канарейке `workflow_dispatch` CI с
+   шагом в job `test`, который печатает *длину* `HAIPLANE_HUB_CI_TOKEN`, и двумя
+   добавленными job — с `environment: hub-report` и `environment: production` —
+   которые печатают длину секрета. Ожидается: в job `test` длина 0; оба job с
+   environment не допущены правилом веток (GitHub пишет отказ по правилу
+   развёртывания, ни один шаг не выполнен); отчёт по канарейке пришёл в хаб от
+   `ci-report.yml` с происхождением; после `push` в `main` пришёл отчёт о выкате.
+   Канарейку удалить после проверки.
+
+Пока шаги 1–3 не сделаны, отчёты CI не доходят до хаба: `ci_before_submit` в
+режиме `require` отвечает «нет отчёта» явно — поэтому до (f) он стоит в `warn`.
+Откат: вернуть `HAIPLANE_HUB_CI_TOKEN` секретом репозитория и откатить коммит
+задачи.
+
+Репозитории-спутники используют action `hub-ci-report` с `hub-token` по-старому
+(отправка из job ветки); перевод их на эту схему — отдельная задача.
+
 ## CSRF для cookie-сессий (#1664)
 
 Изменяющий запрос с cookie-сессией (веб-формы и REST) проверяется одним
