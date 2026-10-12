@@ -47,7 +47,7 @@ def _clean_limiter():
 
 
 @pytest.fixture
-async def hub(client, db, monkeypatch):
+async def hub(client, db, db_dsn, monkeypatch):
     monkeypatch.setattr(
         config, "HUB_TOKENS", {AGENT_TOKEN: TokenIdentity("bot", "agent")}
     )
@@ -60,6 +60,7 @@ async def hub(client, db, monkeypatch):
     return SimpleNamespace(
         client=client,
         db=db,
+        db_dsn=db_dsn,
         human_id=int(human["id"]),
         human_auth={"Authorization": f"Bearer {key['plaintext_key']}"},
         agent_auth={"Authorization": f"Bearer {AGENT_TOKEN}"},
@@ -69,13 +70,30 @@ async def hub(client, db, monkeypatch):
 
 
 def _provider(hub, monkeypatch) -> None:
-    """Провайдер подменён; в момент вызова читает, что уже лежит в строке."""
+    """Провайдер подменён; в момент вызова читает зафиксированную строку заказа.
+
+    #1689: у писателя нет открытой транзакции, а независимое соединение (WAL)
+    видит версию именно строки этого заказа — незакоммиченное оно не увидит.
+    """
+    order_rows: list[int] = []
+    real_set_ref = repo.set_executor_run_starting_ref
+
+    async def _capture(db, row_id, *args, **kw):
+        order_rows.append(int(row_id))
+        return await real_set_ref(db, row_id, *args, **kw)
+
+    monkeypatch.setattr(repo, "set_executor_run_starting_ref", _capture)
 
     async def _create(**kw):
         hub.calls.append(kw)
-        rows = await hub.db.execute_fetchall(
-            "SELECT ordered_skill_version FROM executor_runs ORDER BY id DESC LIMIT 1"
-        )
+        assert hub.db.in_transaction is False
+        assert order_rows, "строка заказа не захвачена"
+        async with aiosqlite.connect(hub.db_dsn, uri=True) as reader:
+            reader.row_factory = aiosqlite.Row
+            rows = await reader.execute_fetchall(
+                "SELECT ordered_skill_version FROM executor_runs WHERE id = ?",
+                (order_rows[-1],),
+            )
         hub.seen_version_at_call.append(rows[0]["ordered_skill_version"])
         return _CREATED, None
 
