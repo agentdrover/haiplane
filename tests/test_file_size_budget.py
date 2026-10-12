@@ -174,6 +174,20 @@ def test_waived_file_that_grew_past_its_measure_is_named(tmp_path, lines, grown)
         assert "hub/old.py" not in proc.stdout
 
 
+def test_file_above_its_ceiling_or_threshold_is_red_not_a_warning(tmp_path):
+    """AC-1/AC-2: верхние границы — выше max файл over, выше порога new."""
+    _make_tree(tmp_path, scripts=100, waivers=[_grown_waiver("hub/old.py")])
+    _write_lines(tmp_path, "hub/old.py", 2101)
+    _write_lines(tmp_path, "scripts/big.py", 101)
+    proc = _run(tmp_path, "--json")
+    assert proc.returncode != 0
+    data = json.loads(proc.stdout)
+    assert [i["path"] for i in data["over"]] == ["hub/old.py"]
+    assert data["grown"] == []
+    assert [i["path"] for i in data["new"]] == ["scripts/big.py"]
+    assert data["near"] == []
+
+
 def test_unwaived_file_near_its_threshold_is_named(tmp_path):
     """AC-2: файл вне ledger у порога называется; near_pct — не дерево."""
     limits = {"hub": 100, "scripts": 200, "tests": 300}
@@ -212,6 +226,17 @@ def test_unwaived_file_near_its_threshold_is_named(tmp_path):
     assert proc.returncode != 0
     assert "pyproject.toml: нет ключа near_pct" in proc.stdout + proc.stderr
     assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_update_with_missing_near_pct_is_an_error_and_keeps_the_ledger(tmp_path):
+    """near_pct читается до любого режима: --update без ключа ledger не трогает."""
+    _make_tree(tmp_path, near_pct=None, waivers=[_grown_waiver("hub/old.py")])
+    _write_lines(tmp_path, "hub/old.py", 2000)
+    before = (tmp_path / LEDGER_REL).read_bytes()
+    proc = _run(tmp_path, "--update")
+    assert proc.returncode != 0
+    assert "pyproject.toml: нет ключа near_pct" in proc.stdout + proc.stderr
+    assert (tmp_path / LEDGER_REL).read_bytes() == before
 
 
 def test_near_list_is_complete_in_json_and_short_in_text(tmp_path):

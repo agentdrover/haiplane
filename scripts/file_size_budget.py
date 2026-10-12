@@ -295,6 +295,7 @@ def main() -> int:
 
     root = Path(args.root).resolve()
     thresholds = load_thresholds(root)
+    near_pct = load_near_pct(root)  # до любого режима, в том числе --update
     sizes = measure(root, list(thresholds))
     ledger_path = root / LEDGER_REL
 
@@ -303,7 +304,7 @@ def main() -> int:
         print(f"ledger перезаписан: {count} исключений")
         return 0
 
-    report = check(sizes, thresholds, load_ledger(ledger_path), load_near_pct(root))
+    report = check(sizes, thresholds, load_ledger(ledger_path), near_pct)
     if args.json:
         print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     else:
