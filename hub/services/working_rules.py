@@ -211,6 +211,7 @@ async def build_working_rules(
     repository: dict[str, Any] | None = None,
     *,
     summary: bool = False,
+    ordered_skill_version: int | None = None,
 ) -> WorkingRules:
     """Собрать блок. ``repository`` — уже прочитанный файл (pair_start читает его
     заранее, до записей); None — прочитать здесь (GET /context ничего не пишет).
@@ -229,7 +230,28 @@ async def build_working_rules(
         block.mode = "summary"
         block.hub_skill.content = ""
         block.repository_rules.content = ""
+    else:
+        apply_order_reference(block.hub_skill, ordered_skill_version)
     return block
+
+
+def apply_order_reference(skill: WorkingRulesSkill, ordered: int | None) -> int:
+    """Заказ вызывающего прогона уже нёс эту версию — убрать текст (#1683).
+
+    ``ordered`` — версия из заказа ВЫЗЫВАЮЩЕЙ сессии (None: связи нет, и слой
+    не трогается). Только активный навык: inactive и unreadable остаются как
+    есть. Возвращает число опущенных знаков.
+    """
+    if ordered is None or skill.state != "active":
+        return 0
+    skill.ordered_version = ordered
+    if skill.version != ordered:
+        skill.version_changed = True
+        return 0
+    omitted = len(skill.content)
+    skill.delivered_in_order = True
+    skill.content = ""
+    return omitted
 
 
 def _cut(text: str, cap: int | None) -> tuple[str, bool]:
@@ -315,9 +337,20 @@ def render_working_rules(
         return "\n".join(summary_lines(wr, full_pointer))
 
     lines = ["## Правила работы", wr.preamble, ""]
-    if skill.state == "active":
+    if skill.state == "active" and skill.delivered_in_order:
+        lines.append(f"### Навык хаба {skill.name} v{skill.version} (доверенный слой)")
+        lines.append(
+            f"текст навыка v{skill.version} уже в заказе этого прогона "
+            f"({skill.chars} знаков), повторно не выдаётся"
+        )
+    elif skill.state == "active":
         text, cut = _cut(skill.content, skill_cap)
         lines.append(f"### Навык хаба {skill.name} v{skill.version} (доверенный слой)")
+        if skill.version_changed:
+            lines.append(
+                f"[версия навыка сменилась: в заказе была v{skill.ordered_version}, "
+                f"сейчас v{skill.version}; ниже новый текст целиком]"
+            )
         lines.append(text)
         if cut:
             lines.append(

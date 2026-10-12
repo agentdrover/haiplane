@@ -63,6 +63,24 @@
 - registry wiring
 - calling service or poller path
 
+### Pair-start and the discipline skill already in the order (#1683)
+
+- `hub_skill` in the `working_rules` of a pair-start answer carries
+  `delivered_in_order=true` (with `version`, `chars`, empty `content`) only
+  when the skill version recorded in the CALLER's own cloud order
+  (`executor_runs.ordered_skill_version`) equals the active version. MCP and CLI
+  print the line "текст навыка v<N> уже в заказе этого прогона".
+- The link is the caller's token only: `executor_runs.id` →
+  `chat_pair_codes.executor_run_id` → `chat_pair_sessions.executor_run_id`
+  (inherited at redeem), checked against task and generation. Any gap (manual
+  code, NULL version, other task or generation, revoked session) means the full
+  text. A changed version sends the full text plus `ordered_version` and
+  `version_changed=true`.
+- Not affected: `GET /context`, `hub_my_context(mode=full)`, local pair-start
+  (human, agent key), the order prompt (always the full skill).
+- The fact of issue (`executor_run_id`, `skill_version`, `delivered_in_order`,
+  `omitted_chars`) is in the detail of the `task_pair_started` activity entry.
+
 ## Contract-Smell Checklist
 
 - Does the same concept have different names across API, CLI, MCP, and DB?

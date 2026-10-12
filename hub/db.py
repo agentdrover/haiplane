@@ -2291,6 +2291,23 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE executor_runs ADD COLUMN starting_ref TEXT",
     ),
     (
+        # #1683: версия навыка дисциплины, вставленная в заказ. NULL — у строк
+        # до миграции и у заказа, не дошедшего до записи: «не записано», и
+        # читатель отдаёт навык целиком.
+        "add_executor_runs_ordered_skill_version",
+        "ALTER TABLE executor_runs ADD COLUMN ordered_skill_version INTEGER",
+    ),
+    (
+        # #1683: какой заказ выписал код implementer; сессия наследует связь
+        # при обмене. NULL — ручной код и строки до миграции.
+        "add_chat_pair_codes_executor_run_id",
+        "ALTER TABLE chat_pair_codes ADD COLUMN executor_run_id INTEGER",
+    ),
+    (
+        "add_chat_pair_sessions_executor_run_id",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
+    ),
+    (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
         "idx_events_kind_project",
