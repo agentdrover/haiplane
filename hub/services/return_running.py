@@ -26,7 +26,7 @@ from hub.actionable_errors import return_running_has_work_detail
 from hub.db import fetchall, write_transaction
 from hub.models import TaskReturnToWork, TaskView
 from hub.services.orchestrator_queue import current_wait
-from hub.services.sessions import note_session_task, pair_executor_online
+from hub.services.sessions import pair_executor_online
 
 #: Статусы, из которых commit-задача возвращается ПРИ ОТСУТСТВИИ работы. Это
 #: отдельный набор: ``lifecycle.RETURN_TO_WORK_STATUSES`` читает ещё и
@@ -153,7 +153,15 @@ async def return_running_to_open(
             job_id=None,
             review_job_id=None,
         )
-        await note_session_task(db, task.get("claim_session_id") or "", None)
+        # Указатель сессии снимается только если он на ЭТУ задачу, а
+        # last_seen_at не трогается: возврат делает человек, это не признак
+        # жизни сессии (иначе offline-сессия стала бы online и начала бы
+        # блокировать возврат других задач через pair_executor_online).
+        await db.execute(
+            "UPDATE agent_sessions SET current_task_id = NULL "
+            "WHERE session_id = ? AND current_task_id = ?",
+            (task.get("claim_session_id") or "", task_id),
+        )
         await repo.add_task_update(
             db,
             task_id,

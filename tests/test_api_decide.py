@@ -1025,3 +1025,181 @@ async def test_return_running_for_state_and_needs_info_keeps_old_rules(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "open"
+
+
+async def _session_row(db, session_id: str) -> dict:
+    cur = await db.execute(
+        "SELECT current_task_id, last_seen_at FROM agent_sessions WHERE session_id=?",
+        (session_id,),
+    )
+    return dict(await cur.fetchone())
+
+
+async def test_return_running_leaves_the_session_alive_signs_alone(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # Находка ревью P2-1: возврат не освежает last_seen_at (offline не станет
+    # online) и не стирает указатель сессии на ДРУГУЮ задачу.
+    other = await _running_commit(client, db)
+    task_id = await _running_commit(client, db)
+    await _register_session(db, "sess-elsewhere", last_seen=_PAST)
+    await _sql(
+        db,
+        "UPDATE agent_sessions SET current_task_id=? WHERE session_id=?",
+        (other, "sess-elsewhere"),
+    )
+    await _set(db, task_id, claim_session_id="sess-elsewhere")
+    before = await _session_row(db, "sess-elsewhere")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "чужой указатель"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _session_row(db, "sess-elsewhere") == before
+    assert before["current_task_id"] == other and before["last_seen_at"] == _PAST
+
+    mine = await _running_commit(client, db)
+    await _register_session(db, "sess-mine", last_seen=_PAST)
+    await _sql(
+        db,
+        "UPDATE agent_sessions SET current_task_id=? WHERE session_id=?",
+        (mine, "sess-mine"),
+    )
+    await _set(db, mine, claim_session_id="sess-mine")
+    resp = await client.post(
+        f"/api/tasks/{mine}/return-to-work", json={"reason": "свой указатель"}
+    )
+    assert resp.status_code == 200, resp.text
+    after = await _session_row(db, "sess-mine")
+    assert after == {"current_task_id": None, "last_seen_at": _PAST}
+
+
+async def test_return_running_writer_waits_for_the_write_lock(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn, monkeypatch
+) -> None:
+    # Находка ревью P2-2(а): между чтением признаков и переходом чужая запись
+    # (открыть слот) обязана ЖДАТЬ write-лок, а не вклиниваться. Без
+    # BEGIN IMMEDIATE писатель коммитится сразу и задача уходит в open при
+    # открытом слоте.
+    from hub.services import return_running
+
+    task_id = await _running_commit(client, db)
+    real_signs = return_running.work_signs
+    state: dict = {"writer_done_in_window": None}
+
+    async def _signs_then_a_writer_tries(conn, task):
+        signs = await real_signs(conn, task)
+        done = asyncio.Event()
+
+        async def _writer():
+            other = await db_module.connect(db_dsn)
+            try:
+                await other.execute(
+                    "INSERT INTO executor_slots (task_id, channel, slot) "
+                    "VALUES (?, 'slot', 's7')",
+                    (task_id,),
+                )
+                await other.commit()
+            finally:
+                await other.close()
+            done.set()
+
+        state["writer"] = asyncio.create_task(_writer())
+        await asyncio.sleep(0.5)  # окно между чтением признаков и записью
+        state["writer_done_in_window"] = done.is_set()
+        return signs
+
+    monkeypatch.setattr(return_running, "work_signs", _signs_then_a_writer_tries)
+    conn = await db_module.connect(db_dsn)
+    try:
+        card = await services.return_to_work(
+            conn, task_id, TaskReturnToWork(reason="окно"), actor="denis"
+        )
+    finally:
+        await conn.close()
+    await state["writer"]
+    assert state["writer_done_in_window"] is False, "писатель ждёт лок возврата"
+    assert card.status.value == "open"
+    row = await (
+        await db.execute(
+            "SELECT COUNT(*) FROM executor_slots WHERE task_id=? "
+            "AND released_at IS NULL",
+            (task_id,),
+        )
+    ).fetchone()
+    assert row[0] == 1, "запись писателя пришла после возврата и сохранена"
+
+
+async def test_return_running_rolls_back_every_step_on_a_late_failure(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn, monkeypatch
+) -> None:
+    # Находка ревью P2-2(б): сбой ПОСЛЕ последнего шага (запись activity) откатывает
+    # всё: статус, ожидание, окно одобрения, указатель сессии, decision, событие,
+    # activity. Проверка - с отдельного соединения, то есть по закоммиченному.
+    task_id = await _running_commit(client, db)
+    await _register_session(db, "sess-rb", last_seen=_PAST)
+    await _sql(
+        db,
+        "UPDATE agent_sessions SET current_task_id=? WHERE session_id=?",
+        (task_id, "sess-rb"),
+    )
+    await _set(
+        db,
+        task_id,
+        claim_session_id="sess-rb",
+        waiting_for="CI",
+        waiting_until=_PAST,
+        waiting_declared_by="x",
+        review_verdict="approved",
+        review_verdict_generation=1,
+        submission_generation=1,
+        claimed_at=_PAST,
+    )
+
+    async def _state(c):
+        task = dict(await repo.get_task(c, task_id))
+        feed = [dict(u)["content"] for u in await repo.get_task_updates(c, task_id)]
+        events = [dict(e)["kind"] for e in await repo.list_events(c, since=0)]
+        acts = await (await c.execute("SELECT COUNT(*) FROM activity_log")).fetchone()
+        return (
+            {
+                k: task[k]
+                for k in (
+                    "status",
+                    "waiting_for",
+                    "waiting_until",
+                    "waiting_declared_by",
+                    "review_verdict_closed_generation",
+                    "claim_session_id",
+                    "claimed_at",
+                    "review_cycle",
+                )
+            },
+            feed,
+            events,
+            acts[0],
+            await _session_row(c, "sess-rb"),
+        )
+
+    before = await _state(db)
+    real_log = db_module.log_activity
+
+    async def _log_then_fail(*args, **kwargs):
+        await real_log(*args, **kwargs)
+        raise RuntimeError("сбой после записи activity")
+
+    monkeypatch.setattr(db_module, "log_activity", _log_then_fail)
+    conn = await db_module.connect(db_dsn)
+    try:
+        with pytest.raises(RuntimeError):
+            await services.return_to_work(
+                conn, task_id, TaskReturnToWork(reason="откат"), actor="denis"
+            )
+    finally:
+        await conn.close()
+    monkeypatch.undo()
+    fresh = await db_module.connect(db_dsn)
+    try:
+        assert await _state(fresh) == before
+        assert before[0]["status"] == "running"
+    finally:
+        await fresh.close()
