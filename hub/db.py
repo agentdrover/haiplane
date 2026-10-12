@@ -2717,6 +2717,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE submissions ADD COLUMN state_snapshot TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # #1674: проекты, которые сессия объявила при регистрации (JSON-массив
+        # slug). '' у существующих строк читается как «не объявлено».
+        "add_agent_sessions_projects",
+        "ALTER TABLE agent_sessions ADD COLUMN projects TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         # #1647: доказательства сдачи state-задачи. Одна строка на (задача,
         # поколение, AC). Только вставка: UPDATE запрещён триггером ниже, а
         # кода, который правит или удаляет строки, нет. principal_id — автор из

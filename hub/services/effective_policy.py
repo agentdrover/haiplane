@@ -152,6 +152,10 @@ REGISTRY: dict[str, PolicyEntry] = {
     "claim_area_check": PolicyEntry(
         project_policy.claim_area_check_of, "project_policy.claim_area_check_of"
     ),
+    "claim_project_check": PolicyEntry(
+        project_policy.claim_project_check_of,
+        "project_policy.claim_project_check_of",
+    ),
     "bug_red_test": PolicyEntry(
         project_policy.bug_red_test_of, "project_policy.bug_red_test_of"
     ),

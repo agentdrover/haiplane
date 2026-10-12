@@ -1370,3 +1370,48 @@ async def test_freeze_rationale_column_present_and_empty_for_old_rows():
         await _migrate(conn)  # повторный проход миграций ничего не ломает
     finally:
         await conn.close()
+
+
+async def test_agent_sessions_projects_column_is_idempotent(monkeypatch):
+    # AC-6 (#1674): БД без колонки и свежая БД — колонка есть после миграций,
+    # повторный прогон ничего не ломает, legacy '' читается как [].
+    import hub.db as db_module
+    from hub.services.sessions import session_view
+
+    name = "add_agent_sessions_projects"
+    trimmed = [m for m in _MIGRATIONS if m[0] != name]
+    assert len(trimmed) == len(_MIGRATIONS) - 1, "миграция должна быть в списке"
+
+    fresh = await _make_db()
+    try:
+        cols = await _table_columns(fresh, "agent_sessions")
+        assert "projects" in cols
+        assert cols["projects"]["notnull"] == 1
+        await _migrate(fresh)
+        await _migrate(fresh)
+    finally:
+        await fresh.close()
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", trimmed)
+        await _migrate(conn)
+        assert "projects" not in await _table_columns(conn, "agent_sessions")
+        await conn.execute(
+            "INSERT INTO agent_sessions (session_id, agent) VALUES ('legacy', 'bot')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+        await _migrate(conn)
+        assert "projects" in await _table_columns(conn, "agent_sessions")
+        rows = await conn.execute_fetchall(
+            "SELECT * FROM agent_sessions WHERE session_id = 'legacy'"
+        )
+        assert rows[0]["projects"] == ""
+        assert session_view(rows[0])["projects"] == []
+    finally:
+        await conn.close()
