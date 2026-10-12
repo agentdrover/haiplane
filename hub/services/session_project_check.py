@@ -88,30 +88,45 @@ async def record_foreign_project(
 
 
 class SessionProjectGuard:
-    """Сверка проекта под write-локом захвата (#1674, находка ревью).
+    """Сверка проекта под коротким write-локом захвата (#1674, находки ревью).
 
     Читать сессию и проект до транзакции захвата нельзя: смена ``projects``
     сессии или проекта задачи между проверкой и записью обходила бы require.
-    ``enter`` берёт write-лок (BEGIN IMMEDIATE), перечитывает сессию и проект,
-    отказывает в require и в warn пишет alert — всё до записывающей части
-    area-check и без промежуточного commit. Транзакцию закрывает запись
-    захвата; при исключении ``abort`` откатывает её.
+    ``lock`` берёт write-лок (BEGIN IMMEDIATE), перечитывает сессию и проект,
+    отказывает в require и в warn пишет alert. Лок держится от ``lock`` до
+    коммита записи захвата и не содержит внешних вызовов: git и сеть делаются
+    ДО него. При исключении ``abort`` откатывает транзакцию вместе с alert.
+
+    ``deferred`` — для входа с медленной подготовкой (pair-start с git): в
+    ``enter`` (начало захвата) делается только чтение без лока — require
+    отказывает раньше, чем начнётся git, — а лок и запись берёт ``lock``
+    после подготовки.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, *, deferred: bool = False) -> None:
         self.session_id = (session_id or "").strip()
+        self.deferred = deferred
         self.check: dict[str, Any] | None = None
         self.opened = False
 
     async def enter(self, db: aiosqlite.Connection, task_id: int) -> None:
-        if not self.session_id:
+        if self.deferred:
+            if self.session_id:
+                await foreign_project_check(db, task_id, self.session_id)
             return
+        if self.session_id:
+            await self.lock(db, task_id)
+
+    async def lock(self, db: aiosqlite.Connection, task_id: int) -> None:
         if not db.in_transaction:
             await db.execute("BEGIN IMMEDIATE")
             self.opened = True
+        if not self.session_id:
+            return
         self.check = await foreign_project_check(db, task_id, self.session_id)
         await record_foreign_project(db, task_id, self.session_id, self.check)
 
     async def abort(self, db: aiosqlite.Connection) -> None:
         if self.opened and db.in_transaction:
             await db.rollback()
+        self.opened = False

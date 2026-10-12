@@ -2086,25 +2086,23 @@ async def _pair_start_write(
     implementer_principal_id: int | None,
     declared_session: str,
     starting_status: str,
+    project_guard: SessionProjectGuard,
 ) -> PairGitMode:
     """Plan, branch and the transition to running, up to the commit (#1433).
 
     Runs inside ``capture_areas``: the area hold lasts until this commit, so a
     concurrent overlapping capture cannot slip through the seconds that branch
     preparation takes (#365 K4).
+
+    Two phases (#1674, review): the SLOW one — git branch/worktree, network,
+    callbacks that commit — runs first, with no write transaction open. Then
+    one SHORT ``BEGIN IMMEDIATE``: the task, its holder, the session and the
+    project are re-read, the project check and its alert, the plan and the
+    transition are written, one commit. No external call sits inside it.
     """
     body = body or TaskPairStart()
 
-    if body.plan:
-        await repo.add_task_update(
-            db,
-            task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
-        )
-
-    if not await repo.has_plan_updates(db, task_id):
+    if not body.plan and not await repo.has_plan_updates(db, task_id):
         raise HTTPException(
             400,
             "Plan required before pair-start. "
@@ -2151,6 +2149,26 @@ async def _pair_start_write(
     if declared_session:
         update_fields["claim_session_id"] = declared_session
 
+    await project_guard.lock(db, task_id)
+    fresh = _existing_task(await repo.get_task(db, task_id), task_id)
+    if fresh["status"] != starting_status or (
+        starting_status == "claimed"
+        and (fresh["claimed_by"], fresh["claim_session_id"])
+        != (task.get("claimed_by"), task.get("claim_session_id"))
+    ):
+        raise HTTPException(
+            409,
+            f"Task #{task_id} left {starting_status!r} during pair-start; "
+            "retry from its current status",
+        )
+    if body.plan:
+        await repo.add_task_update(
+            db,
+            task_id,
+            task.get("assigned_agent", ""),
+            "status",
+            f"Plan: {body.plan}",
+        )
     # #365 K4: the status was written unconditionally, and everything between
     # the check above and this line is a window — branch preparation talks to
     # git and can take seconds. Another claim, a human decision or the poller
@@ -2280,7 +2298,7 @@ async def pair_start_task(
     await refuse_opening_over_review_limit(db, task_id, task)
     # #1674: the declared session against the task's project — checked UNDER
     # the capture's write lock (the guard), independent of the area check.
-    project_guard = SessionProjectGuard(declared_session)
+    project_guard = SessionProjectGuard(declared_session, deferred=True)
     # #1433: the same place for the same reason — refused before the plan and
     # the branch are written; the hold lasts until the transition is committed.
     # #1630: файл правил репозитория читается ЗДЕСЬ — после проверок допуска и
@@ -2304,6 +2322,7 @@ async def pair_start_task(
             implementer_principal_id=implementer_principal_id,
             declared_session=declared_session,
             starting_status=starting_status,
+            project_guard=project_guard,
         )
     await log_activity(
         db,

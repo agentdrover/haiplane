@@ -1240,3 +1240,134 @@ async def test_overlapping_captures_write_one_project_alert(db, db_dsn):
     finally:
         await db2.close()
     assert len(await _project_records(db, task)) == 1
+
+
+class _SpyGit:
+    """git_ops, который смотрит, не открыта ли write-транзакция, и может мешать."""
+
+    def __init__(self, db, *, fail=None, before_return=None) -> None:
+        self.db = db
+        self.fail = fail
+        self.before_return = before_return
+        self.in_transaction: list[bool] = []
+
+    async def pair_prepare_branch(
+        self,
+        task_id,
+        title,
+        *,
+        branch_slug="",
+        repo=None,
+        base_branch=None,
+        notify=None,
+    ):
+        self.in_transaction.append(self.db.in_transaction)
+        if notify is not None:
+            await notify("auto-push inside git")  # коммитит: вне транзакции захвата
+        if self.fail is not None:
+            raise self.fail
+        if self.before_return is not None:
+            await self.before_return(task_id)
+        return f"task-{task_id}/spy"
+
+    def __getattr__(self, name):
+        from hub.integrations.registry import plugins
+
+        return getattr(type(plugins.git_ops), name).__get__(self)
+
+
+async def _hub_pair_start(db, task_id: int, session_id: str):
+    from hub import services
+    from hub.models import PairGitMode, TaskPairStart
+
+    return await services.pair_start_task(
+        db,
+        task_id,
+        TaskPairStart(
+            plan="p",
+            assigned_agent="exec-b",
+            session_id=session_id,
+            git_mode=PairGitMode.hub,
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ["off", "warn", "require"])
+@pytest.mark.parametrize("registered", [True, False])
+async def test_pair_start_runs_git_outside_the_write_transaction(
+    db, monkeypatch, mode: str, registered: bool
+):
+    """Блокер ревью P2-A/B: git, сеть и колбэки с commit идут ДО write-лока, при
+    любом режиме и с сессией или без — лок короткий и без внешних вызовов."""
+    from hub.integrations.registry import plugins
+
+    own = "pc-git-own" if mode == "require" else "pc-git-foreign"
+    project = await _project(db, own, {"claim_project_check": mode})
+    if registered:
+        await _session(db, "s-git", ["pc-git-own"])
+        project = await _project(db, own, {"claim_project_check": mode})
+    task = await _task(db, int(project["id"]), title="git-outside")
+    spy = _SpyGit(db)
+    monkeypatch.setattr(plugins, "git_ops", spy)
+
+    started = await _hub_pair_start(db, task, "s-git" if registered else "")
+    assert started.status == "running"
+    assert spy.in_transaction == [False], "git вызван под открытой транзакцией"
+    assert not db.in_transaction
+
+
+async def test_git_failure_leaves_no_alert_and_no_capture(db, monkeypatch):
+    """Находка P2-B: отказ git не оставляет ни alert, ни плана, ни захвата."""
+    from hub.integrations.git_ops import PairBranchConflictError
+    from hub.integrations.registry import plugins
+
+    project = await _project(db, "pc-gitfail", {"claim_project_check": "warn"})
+    await _session(db, "s-gf", ["pc-home"])
+    task = await _task(db, int(project["id"]), title="git-fails")
+    monkeypatch.setattr(
+        plugins, "git_ops", _SpyGit(db, fail=PairBranchConflictError("dirty"))
+    )
+    before = dict(await repo.get_task(db, task))
+    with pytest.raises(HTTPException) as caught:
+        await _hub_pair_start(db, task, "s-gf")
+    assert caught.value.status_code == 422
+    assert dict(await repo.get_task(db, task)) == before
+    assert await _project_records(db, task) == []
+    assert not [
+        u for u in await repo.get_task_updates(db, task) if "Plan:" in u["content"]
+    ]
+    assert not db.in_transaction
+
+
+async def test_locked_refusal_after_git_rolls_back_the_alert(db, db_dsn, monkeypatch):
+    """Находка P2-B: git прошёл, а короткая проверка под локом отказала (задача
+    ушла из open) — alert откатан вместе с остальным, транзакция закрыта."""
+    from hub import db as db_module
+    from hub.integrations.registry import plugins
+
+    project = await _project(db, "pc-late", {"claim_project_check": "warn"})
+    await _session(db, "s-late2", ["pc-home"])
+    task = await _task(db, int(project["id"]), title="left-open")
+
+    async def move_task(task_id: int) -> None:
+        other = await db_module.connect(db_dsn)
+        try:
+            await other.execute(
+                "UPDATE tasks SET status='failed' WHERE id=?", (task_id,)
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+    spy = _SpyGit(db, before_return=move_task)
+    monkeypatch.setattr(plugins, "git_ops", spy)
+    with pytest.raises(HTTPException) as caught:
+        await _hub_pair_start(db, task, "s-late2")
+    assert caught.value.status_code == 409
+    assert spy.in_transaction == [False]
+    assert not db.in_transaction
+    assert await _project_records(db, task) == []
+    assert not [
+        u for u in await repo.get_task_updates(db, task) if "Plan:" in u["content"]
+    ]
+    assert dict(await repo.get_task(db, task))["claim_session_id"] is None
