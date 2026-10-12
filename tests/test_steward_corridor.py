@@ -454,7 +454,7 @@ async def test_unresolved_findings_are_never_shown_as_clean(client, db):
     роняет этот тест: ступень станет ``clean``, и все три поверхности
     послушно напечатают чистоту.
     """
-    from tests.test_web import _web_task_in_review_with_test_ac
+    from tests.web_support import _web_task_in_review_with_test_ac
 
     task_id = await _web_task_in_review_with_test_ac(client, db)
     stored = await _report_with_unresolved(client, task_id)
@@ -743,7 +743,7 @@ async def test_the_report_feed_carries_unresolved_and_the_outcome(client, db):
     import json as _json
 
     from hub import repository as repo_module
-    from tests.test_web import _web_task_in_review_with_test_ac
+    from tests.web_support import _web_task_in_review_with_test_ac
 
     task_id = await _web_task_in_review_with_test_ac(client, db)
     await _report_with_unresolved(client, task_id)
