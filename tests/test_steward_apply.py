@@ -28,7 +28,7 @@ from hub.services.steward_apply import (
     apply_refusals,
 )
 from tests.test_steward_shadow import _project, _task
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import VERIFIED_ROW, seed_clean_integrity
 
 _PINNED = "a" * 40
 
@@ -63,6 +63,8 @@ async def _green(
         reported_by="ci",
         **VERIFIED_ROW,
     )
+    # #1688: the diff of the pinned commit was scanned and shows no CI inputs.
+    await seed_clean_integrity(db, task_id, _PINNED)
     await repo.insert_machine_review(
         db,
         task_id=task_id,

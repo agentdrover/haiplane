@@ -1910,6 +1910,7 @@ async def test_brief_reports_block_timings(
         "base_merge": 50,
         "call_sites": 60,
         "verdict_route": 70,
+        "ci_integrity": 0,
         "db_reads": 5 + 3,
         # 4 ms of sha_check_of, a pure transformation, sit in assemble too.
         "assemble": 7 + 1 + 4,

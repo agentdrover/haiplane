@@ -48,7 +48,7 @@ from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
-from hub.services import ci_trust
+from hub.services import ci_integrity, ci_trust
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
 
@@ -244,12 +244,15 @@ CODE_CLASS_MISSING = "risk_class_missing"
 CODE_CLASS_RAISED = "risk_class_raised"
 CODE_MODEL_UNDECLARED = "model_undeclared"
 CODE_TEXT_ORIGIN = "text_recovered_report"
+#: #1688: дифф меняет входы CI (или не прочитан) — автопилот не решает.
+CODE_CI_INTEGRITY = "ci_integrity"
 #: #1602: на default автопилот вердикта не ставит никогда (замок #743).
 CODE_DEFAULT_LOCKED = "default_project_autopilot_locked"
 
 #: Наблюдения, которые стойка не делала, когда её спросили без сети.
 PENDING_BRANCH = "branch"
 PENDING_PROVIDER_USAGE = "provider_usage"
+PENDING_CI_INTEGRITY = "ci_integrity"
 
 
 @dataclass(frozen=True)
@@ -518,6 +521,9 @@ async def _observed_facts_stage(
         return _refuse_with(
             CODE_CI_NOT_GREEN, "CI на закреплённом коммите не зелёный", ctx
         )
+    refused = await _integrity_stage(db, task_id, ctx)
+    if refused is not None:
+        return refused
     if not ctx.observe:
         # Вершина и дифф — сеть. Класс риска от них не зависит и читается.
         ctx.pending.append(PENDING_BRANCH)
@@ -525,6 +531,30 @@ async def _observed_facts_stage(
             return _refuse_with(CODE_CLASS_MISSING, "класс риска не вычислен", ctx)
         return None
     return await _branch_stage(db, task_id, ctx)
+
+
+async def _integrity_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    """#1688: дифф, меняющий входы CI, автопилот не решает — справка владельцу.
+
+    Дифф читается ДО решения (сеть), здесь же и сверяется с базой. Без сети
+    (``observe=False``) непросмотренный дифф — условие ответа, а не отказ.
+    """
+    if ctx.observe:
+        await ci_integrity.ensure_scan(db, task_id)
+    standing = await ci_integrity.standing_of(db, ctx.task)
+    if standing.scan.state == ci_integrity.UNSCANNED and not ctx.observe:
+        ctx.pending.append(PENDING_CI_INTEGRITY)
+        return None
+    if standing.gap is None:
+        return None
+    return _refuse_with(
+        CODE_CI_INTEGRITY,
+        standing.reason,
+        ctx,
+        note=f"Автовердикт НЕ вынесен: {standing.reason}",
+    )
 
 
 async def _branch_stage(

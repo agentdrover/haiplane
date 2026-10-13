@@ -90,6 +90,9 @@ _PENDING_TEXT = {
         "вершина ветки на месте, дифф в заявленных областях и класс не "
         "вырос (проверка по сети, при показе не делалась)"
     ),
+    "ci_integrity": (
+        "дифф не меняет входы CI (проверка по клону, при показе не делалась)"
+    ),
     "provider_usage": (
         "провайдер подтвердит, что пустое ревью — работа (биллинг по сети, "
         "при показе не проверялся)"
@@ -123,6 +126,22 @@ async def _text_origin_refusal(
     ):
         return None
     return text_origin_refusal(row)
+
+
+async def _ci_integrity_refusal(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[str, str] | None:
+    """``(код, причина)``, если сохранённая проверка целостности CI не чиста (#1688).
+
+    Только база: непросмотренный дифф здесь не отказ (стюард просмотрит его
+    сам, прежде чем применять). Причина несёт справку владельцу.
+    """
+    from hub.services import auto_verdict, ci_integrity
+
+    standing = await ci_integrity.standing_of(db, task)
+    if standing.gap is None or standing.scan.state == ci_integrity.UNSCANNED:
+        return None
+    return auto_verdict.CODE_CI_INTEGRITY, standing.reason
 
 
 async def _steward_route(
@@ -193,6 +212,35 @@ async def _steward_route(
 async def verdict_route(
     db: aiosqlite.Connection, task_id: int, *, observe: bool = False
 ) -> VerdictRoute:
+    """Маршрут вердикта, а к нему справка по целостности CI, какой бы ни был маршрут (#1688).
+
+    Справка нужна владельцу и там, где вердикт и так за ним (политика human,
+    автопилот выключен): ручной вердикт читает её, прежде чем одобрить.
+    """
+    import dataclasses
+
+    from hub import repository as repo
+    from hub.services import ci_integrity
+
+    route = await _decide_route(db, task_id, observe=observe)
+    if route.decider == DECIDER_NONE:
+        return route
+    task = dict(await repo.get_task(db, task_id) or {})
+    standing = await ci_integrity.standing_of(db, task)
+    if (
+        standing.gap is None
+        or standing.scan.state == ci_integrity.UNSCANNED
+        or standing.note in route.reason
+    ):
+        return route
+    return dataclasses.replace(
+        route, reason=f"{route.reason}. Справка по CI: {standing.reason}"
+    )
+
+
+async def _decide_route(
+    db: aiosqlite.Connection, task_id: int, *, observe: bool = False
+) -> VerdictRoute:
     """Кто вынесет вердикт текущей сдачи — читатель, ничего не пишет.
 
     ``observe=False`` (по умолчанию) не ходит в сеть: ветку и биллинг
@@ -234,6 +282,9 @@ async def verdict_route(
         text_origin = await _text_origin_refusal(db, task)
         if text_origin is not None:
             return _human(*text_origin)
+        integrity = await _ci_integrity_refusal(db, task)
+        if integrity is not None:
+            return _human(*integrity)
         return await _steward_route(db, task, project, stance)
     if stance.code == auto_verdict.CODE_NOT_DELEGATED and (
         project is not None and project_policy.gate_lock_applies(project["slug"])
