@@ -347,8 +347,39 @@ async def test_notices_wait_for_a_steward_who_comes_later(
     assert bodies[0]["reason"] == "needs_decision"
 
 
+def _string_constants() -> dict[str, set[str]]:
+    """Every module-level ``NAME = "text"`` in hub, by name (imports share the name)."""
+    found: dict[str, set[str]] = {}
+    for path in pathlib.Path("hub").rglob("*.py"):
+        for node in ast.parse(path.read_text()).body:
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        found.setdefault(target.id, set()).add(node.value.value)
+    return found
+
+
 def test_no_needs_decision_event_bypasses_the_notice_wrapper():
-    """Every place that writes the event goes through the one wrapper."""
+    """Every place that writes the event goes through the one wrapper.
+
+    A literal and a NAME bound to the string (``ESCALATED_TO_HUMAN``, or
+    ``mod.NAME``) are the same event: both are resolved to their value.
+    """
+    consts = _string_constants()
+
+    def values(node: ast.expr) -> set[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.Name):
+            return consts.get(node.id, set())
+        if isinstance(node, ast.Attribute):
+            return consts.get(node.attr, set())
+        return set()
+
     offenders = []
     for path in pathlib.Path("hub").rglob("*.py"):
         if path.name == "watch_notices.py":
@@ -360,13 +391,32 @@ def test_no_needs_decision_event_bypasses_the_notice_wrapper():
             ):
                 continue
             for kw in node.keywords:
-                if (
-                    kw.arg == "kind"
-                    and isinstance(kw.value, ast.Constant)
-                    and kw.value.value == "needs_decision"
-                ):
+                if kw.arg == "kind" and "needs_decision" in values(kw.value):
                     offenders.append(f"{path}:{node.lineno}")
     assert offenders == []
+
+
+async def test_steward_escalation_after_the_review_budget_is_announced(
+    db: aiosqlite.Connection,
+):
+    from hub.services import steward_applied
+
+    await make_project(db, "default")
+    task_id = await ci_check_task(db, None)
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
+    await steward_applied._hand_to_the_human(db, task_id, 99)
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+    events = [
+        e for e in await events_of(db, "needs_decision") if e["task_id"] == task_id
+    ]
+    assert len(events) == 1
+    assert events[0]["payload"] == {"reason": "review_cycle_limit"}
+    got = [n["data"] for n in await notices(db, "default")]
+    assert [d["task_id"] for d in got] == [task_id]
+    assert got[0]["source_event_id"] == events[0]["id"]
 
 
 async def test_unknown_task_gives_no_notice(db: aiosqlite.Connection):
