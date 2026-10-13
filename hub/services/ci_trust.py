@@ -28,11 +28,12 @@ Three things are deliberately NOT guessed:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -560,6 +561,48 @@ async def _project(
 
 
 _locks: dict[tuple[int, str], asyncio.Lock] = {}
+_in_recheck: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ci_trust_in_recheck", default=False
+)
+
+
+async def recheck_in_transaction(
+    db: Any, *gates: Callable[[], Awaitable[None]]
+) -> None:
+    """The ONE place where a decision is re-made inside the transaction that applies it.
+
+    A gate that depends on CI evidence asks GitHub BEFORE the write transaction
+    (``prepare_ci_standing`` / ``refresh_for_gate``) and decides; between that
+    decision and the write a new report may have been accepted and committed,
+    which withdraws the evidence. So the transaction that applies the decision
+    first runs the same gates again, here: each gate rereads the projection,
+    the task, the AC results and the baseline from the database and refuses with
+    its own error if its predicate no longer holds. Nothing in here may call
+    GitHub — ``refresh`` raises while a recheck is running.
+    """
+    if not db.in_transaction:
+        raise RuntimeError("recheck_in_transaction outside a write transaction")
+    token = _in_recheck.set(True)
+    try:
+        for gate in gates:
+            await gate()
+    finally:
+        _in_recheck.reset(token)
+
+
+async def pass_gap(db: Any, task_id: int, head_sha: str) -> str | None:
+    """Why the commit has no confirmed GREEN pass in the database right now; None if it has.
+
+    The predicate automation (the autopilot, the steward) approves on: a report
+    GitHub confirmed, whose validation passed, and the green proof holds.
+    """
+    row = await trusted_report(db, task_id, head_sha)
+    if row is None:
+        return "нет отчёта CI, подтверждённого GitHub, о закреплённом коммите"
+    report = dict(row)
+    if str(report.get("validation_status") or "").strip() != "pass":
+        return f"validation_status={report.get('validation_status') or 'пусто'}, нужен pass"
+    return green_gap(report)
 
 
 async def invalidate(db: Any, task: Mapping[str, Any], head_sha: str) -> None:
@@ -607,6 +650,8 @@ async def refresh(
     head_sha = (head_sha or "").strip()
     if not head_sha:
         return None
+    if _in_recheck.get():
+        raise RuntimeError("no call to GitHub inside the in-transaction recheck")
     lock = _locks.setdefault((task_id, head_sha), asyncio.Lock())
     limit = REFRESH_DEADLINE_SECONDS if deadline is None else deadline
     try:

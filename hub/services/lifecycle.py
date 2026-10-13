@@ -4040,6 +4040,11 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        # #1687: the CI gates decided before the lock; a report accepted since
+        # then withdrew the evidence. They are asked again here, of the database.
+        await ci_trust.recheck_in_transaction(
+            db, lambda: _step_bug_red_test(state), lambda: _step_ci_before_submit(state)
+        )
         if not await repo.transition_status_if(
             db,
             task_id,
@@ -4463,14 +4468,39 @@ async def _vstep_ac_tests_green(state: VerdictContext) -> None:
     # current verifiable_by=test AC green. Only APPROVED is gated — a reviewer
     # must always be able to reject red work (lesson from #382).
     if config.SDD_AC_TESTS == "require" and state.body.verdict.value == "approved":
+        # #1687: AC results are the current attempt's; ask which one is current
+        # BEFORE the transaction; the same gate runs again inside it.
+        await ci_trust.refresh_for_gate(state.db, state.task)
+        await _ac_tests_gate(state)
+
+
+async def _ac_tests_gate(state: VerdictContext) -> None:
+    """The AC predicate of an approval, over the database as it is now (no network)."""
+    if config.SDD_AC_TESTS == "require" and state.body.verdict.value == "approved":
         from hub.services.ac_tests import ac_tests_gap
 
-        # #1687: AC results are the current attempt's; ask which one is current
-        # before reading them, then read the task again.
-        task_now = await ci_trust.refresh_for_gate(state.db, state.task)
-        ac_gap = await ac_tests_gap(state.db, {**state.task, **task_now})
+        task = dict(await repo.get_task(state.db, state.task_id) or state.task)
+        ac_gap = await ac_tests_gap(state.db, task)
         if ac_gap:
             raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
+
+
+async def _automation_ci_gate(state: VerdictContext) -> None:
+    """An approval by automation (the autopilot, the steward) needs a confirmed green pass.
+
+    Both decide on CI evidence before they call the verdict door; the transaction
+    that records the verdict asks the database again, so an approval never rests
+    on evidence a newer report has since withdrawn.
+    """
+    from hub.services.auto_verdict import _POLICY_ACTOR
+
+    automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
+    if not automated or state.body.verdict.value != "approved":
+        return
+    sha = (state.pinned_sha or state.task.get("submission_sha") or "").strip()
+    gap = await ci_trust.pass_gap(state.db, state.task_id, sha) if sha else None
+    if gap:
+        raise HTTPException(422, f"ci_not_green: {gap}")
 
 
 async def _vstep_branch_tip_matches(state: VerdictContext) -> None:
@@ -4780,6 +4810,9 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     inflight_note = state.inflight_note
 
     async with write_transaction(db):
+        await ci_trust.recheck_in_transaction(
+            db, lambda: _ac_tests_gate(state), lambda: _automation_ci_gate(state)
+        )
         findings_json = json.dumps(
             [f.model_dump(exclude_none=True) for f in body.findings],
             ensure_ascii=False,
@@ -5844,6 +5877,25 @@ async def prepare_ci_standing(
     return fresh
 
 
+async def _done_validation_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
+    """A done report that would complete the task needs a passing validation (#510).
+
+    The predicate is evaluated over the task as the transaction reads it now.
+    """
+    if config.SDD_VALIDATION != "require" or completion_requires_review(task):
+        return
+
+    async def gate() -> None:
+        from hub.services.validation_run import validation_gap
+
+        fresh = dict(await repo.get_task(db, int(task["id"])) or task)
+        vgap = validation_gap(fresh)
+        if vgap:
+            raise HTTPException(422, f"validation_failed: {vgap}")
+
+    await ci_trust.recheck_in_transaction(db, gate)
+
+
 async def _task_inside_transaction(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> dict[str, Any]:
@@ -5989,15 +6041,7 @@ async def add_update(
                 # red/absent. Only completion-bound reports are gated — one that
                 # routes to review (completion_requires_review) is untouched, and
                 # the poller path (transition_after_agent_done) is not affected.
-                if (
-                    config.SDD_VALIDATION == "require"
-                    and not completion_requires_review(task)
-                ):
-                    from hub.services.validation_run import validation_gap
-
-                    vgap = validation_gap(task)
-                    if vgap:
-                        raise HTTPException(422, f"validation_failed: {vgap}")
+                await _done_validation_gate(db, task)
                 if task["status"] == "pending_report":
                     # #1155: на ЭТОМ маршруте конвейер гейтов не доезжает —
                     # обе ветки ниже уходят из pending_report сами, не зовя

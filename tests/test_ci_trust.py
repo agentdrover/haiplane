@@ -1150,6 +1150,7 @@ async def test_an_approving_verdict_asks_before_it_reads_the_ac_results(
     task = dict(await repo.get_task(db, task_id))
     state = SimpleNamespace(
         db=db,
+        task_id=task_id,
         task=task,
         body=SimpleNamespace(verdict=SimpleNamespace(value="approved")),
     )
@@ -1734,3 +1735,81 @@ async def test_a_deleted_run_and_a_newer_red_one_without_a_report_is_never_verif
     assert (await _evidence(db, task_id))[0] == []
     assert (await _gap(db, task_id)).cause == ci_green_proof.UNVERIFIED
     assert await ac_tests_gap(db, dict(await repo.get_task(db, task_id)))
+
+
+# ---- round 5: ONE rule for every gate --------------------------------------
+#
+# Network before the transaction; inside the transaction that applies the
+# decision the gate rereads the database and decides again (ci_trust.
+# recheck_in_transaction). One regression test per entry: a report POSTed
+# between the gate and the apply gives a refusal.
+
+
+async def _a_report_arrives(db, task_id: int, run_id: str) -> None:
+    """A new claim for the same commit is accepted and committed (not yet settled)."""
+    from hub.services.ci_report import store_ci_run_report
+
+    await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id=run_id))
+    await db.commit()
+
+
+@pytest.mark.parametrize(
+    ("agent", "steward", "ac_mode", "expected"),
+    [
+        ("reviewer", False, "require", "ac_tests_not_green"),
+        ("policy", False, "off", "ci_not_green"),
+        ("steward", True, "off", "ci_not_green"),
+    ],
+)
+async def test_a_report_between_the_verdict_gate_and_its_apply_refuses_the_approval(
+    db, monkeypatch, agent, steward, ac_mode, expected
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_AC_TESTS", ac_mode)
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9101"))
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
+    real_apply = lifecycle._apply_verdict
+
+    async def a_report_arrives_first(state):
+        await _a_report_arrives(db, task_id, "9102")
+        return await real_apply(state)
+
+    monkeypatch.setattr(lifecycle, "_apply_verdict", a_report_arrives_first)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=agent),
+            self_approved=True,
+            applied_by_steward=steward,
+        )
+    assert refused.value.status_code == 422
+    assert expected in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["review_verdict"] in (None, "")
+
+
+async def test_the_recheck_helper_refuses_to_run_outside_a_transaction_and_to_ask_github(
+    db,
+):
+    with pytest.raises(RuntimeError):
+        await ci_trust.recheck_in_transaction(db)
+
+    from hub.db import write_transaction
+
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9103"))
+
+    async def asks_github():
+        await ci_trust.refresh(db, task_id, SHA)
+
+    async with write_transaction(db):
+        with pytest.raises(RuntimeError):
+            await ci_trust.recheck_in_transaction(db, asks_github)

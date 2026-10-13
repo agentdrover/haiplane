@@ -514,12 +514,7 @@ async def _observed_facts_stage(
     if ctx.observe:
         # #1687: also a rerun nobody reported, asked of GitHub now.
         await ci_trust.refresh_quietly(db, task_id, ctx.pinned_sha)
-    ci = await ci_trust.trusted_report(db, task_id, ctx.pinned_sha)
-    if (
-        ci is None
-        or (ci["validation_status"] or "") != VALIDATION_PASS
-        or ci_trust.green_gap(dict(ci))
-    ):
+    if await ci_trust.pass_gap(db, task_id, ctx.pinned_sha):
         return _refuse_with(
             CODE_CI_NOT_GREEN, "CI на закреплённом коммите не зелёный", ctx
         )

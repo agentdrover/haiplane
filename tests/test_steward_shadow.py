@@ -37,7 +37,7 @@ from hub.services.steward_shadow import (
     start_due_runs,
     start_run,
 )
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import VERIFIED_ROW, seed_verified_report
 
 _CREATED = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
 
@@ -3541,6 +3541,9 @@ async def test_act_approve_only_with_advisor_concur_on_same_packet(
     async def _submission(slug: str) -> tuple[int, str]:
         task_id = await _task(db, project_id)
         await repo.update_task(db, task_id, review_job_id="")
+        # #1687: the steward's approval is re-checked against the database
+        # inside the verdict transaction, so the CI it relies on is really there.
+        await seed_verified_report(db, task_id, "a" * 40, validation_status="pass")
         await db.commit()
         return task_id, packet_hash(await build_evidence_packet(db, task_id, 1))
 
