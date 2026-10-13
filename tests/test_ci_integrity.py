@@ -274,6 +274,28 @@ async def test_an_explained_ci_change_goes_to_the_owner_with_a_note(
     assert ok.status_code == 200, ok.text
 
 
+async def test_the_steward_gate_and_route_name_the_ci_change(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """The steward's gatekeeper refuses the approve and the route names the human."""
+    from hub.services.verdict_route import verdict_route
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _submitted_task(client, db, "ci-steward", {"verdict": "steward"})
+    await ci_integrity.ensure_scan(db, task_id)
+    await _post_review(
+        client,
+        task_id,
+        ci_integrity={"verdict": "explained", "explanation_ru": "ci.yml по задаче"},
+    )
+    refusals = await steward_apply.apply_refusals(db, task_id)
+    assert any("входы CI" in detail for _, detail in refusals), refusals
+    route = await verdict_route(db, task_id)
+    assert route.final == "human" and route.code == auto_verdict.CODE_CI_INTEGRITY
+    assert "ci.yml по задаче" in route.reason
+
+
 async def test_a_suspicious_ci_change_is_a_finding(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
 ):
