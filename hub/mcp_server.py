@@ -1373,6 +1373,22 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     return parts
 
 
+def _brief_ci_integrity_lines(brief: dict[str, Any]) -> list[str]:
+    """#1688: the signs, the question and the owner's note - nothing when clean."""
+    block = brief.get("ci_integrity")
+    if not isinstance(block, dict):
+        return []
+    lines = [f"\nCI integrity: {block.get('gap') or block.get('state')}"]
+    lines.extend(
+        f"  {s.get('path')}:{s.get('line')} [{s.get('rule')}]"
+        for s in (block.get("signs") or [])[:20]
+    )
+    lines.append(f"  Question: {block.get('question', '')}")
+    if block.get("note"):
+        lines.append(f"  Note: {block['note']}")
+    return lines
+
+
 def _status_review_lines(task: dict[str, Any]) -> list[str]:
     latest_review = task.get("latest_review")
     if not latest_review:
@@ -2973,6 +2989,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         elif base.get("reason"):
             parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
     parts.extend(_brief_evidence_lines(brief))
+    parts.extend(_brief_ci_integrity_lines(brief))
     if brief.get("stacking_warning"):
         parts.append(f"\n{brief['stacking_warning']}")
     notices_text = _path_notices_text(brief.get("path_notices"))
@@ -3704,6 +3721,7 @@ async def hub_submit_machine_review(
     orchestrator: str = "",
     model: str = "",
     agent: str = "",
+    ci_integrity: dict[str, Any] | None = None,
 ) -> CallToolResult:
     """Submit a structured multi-agent review report (#381).
 
@@ -3737,6 +3755,8 @@ async def hub_submit_machine_review(
         orchestrator: Client name (e.g. claude-code-workflow).
         model: Model id used by review agents.
         agent: Submitting agent name.
+        ci_integrity: {verdict: explained|suspicious, explanation_ru} — only
+            when the brief carries a ci_integrity block (#1688).
     """
     body: dict[str, Any] = {
         "raw_count": raw_count,
@@ -3756,6 +3776,7 @@ async def hub_submit_machine_review(
         ("agent_count", agent_count),
         ("tokens_spent", tokens_spent),
         ("duration_ms", duration_ms),
+        ("ci_integrity", ci_integrity),
     ):
         if value is not None:
             body[key] = value

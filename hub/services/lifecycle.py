@@ -69,7 +69,7 @@ from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome
-from hub.services import ci_trust
+from hub.services import ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
@@ -4498,6 +4498,7 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
 
     automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
     if not automated or state.body.verdict.value != "approved":
+        await ci_integrity.verdict_gate(state)  # #1688: an agent's self-approval
         return
     if state.expected_generation is None:
         raise HTTPException(
@@ -4518,6 +4519,7 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     )
     if gap:
         raise HTTPException(422, f"ci_not_green: {gap}")
+    await ci_integrity.verdict_gate(state)  # #1688
 
 
 async def _vstep_branch_tip_matches(state: VerdictContext) -> None:
@@ -4550,6 +4552,11 @@ async def _vstep_branch_tip_matches(state: VerdictContext) -> None:
                 )
             elif current_tip != state.pinned_sha:
                 state.diverged_tip = current_tip
+
+
+async def _vstep_ci_integrity_scanned(state: VerdictContext) -> None:
+    """#1688: the diff of an automated approval is read before the write lock."""
+    await ci_integrity.scan_for_automated_approval(state)
 
 
 async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
@@ -4625,6 +4632,7 @@ VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
     ),
     Step("ac_tests_green", _vstep_ac_tests_green, mode=policy("SDD_AC_TESTS")),
     Step("branch_tip_matches", _vstep_branch_tip_matches, refuses=False),
+    Step("ci_integrity_scanned", _vstep_ci_integrity_scanned, refuses=False),
     Step("approval_blind_spots", _vstep_approval_blind_spots, refuses=False),
     Step("auto_draft_out_of_scope", _vstep_auto_draft_out_of_scope, refuses=False),
 )

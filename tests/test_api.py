@@ -1509,8 +1509,11 @@ async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypa
     assert resp.json()["latest_review"]["self_approved"] is False
 
 
-async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkeypatch):
+async def test_self_review_allowed_with_solo_opt_out(
+    client: AsyncClient, db, monkeypatch
+):
     from hub import config
+    from tests.ci_trust_support import seed_clean_integrity
 
     monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
@@ -1518,6 +1521,11 @@ async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkey
     impl = {"Authorization": "Bearer impl-token"}
 
     task_id = await _task_in_review(client, "Solo mode", impl)
+    # #1688: an agent's own approval needs the diff scanned; this one is clean.
+    sha = "e" * 40
+    await repo.update_task(db, task_id, submission_sha=sha)
+    await seed_clean_integrity(db, task_id, sha)
+    await db.commit()
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
         json={"verdict": "approved", "agent": "impl-bot"},

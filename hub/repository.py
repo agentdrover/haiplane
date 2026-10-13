@@ -1612,6 +1612,7 @@ async def insert_machine_review(
     self_reviewed: bool = False,
     principal_id: int | None = None,
     carried_from_review_id: int | None = None,
+    ci_integrity: tuple[str, str] = ("", ""),  # (verdict, explanation) #1688
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
@@ -1619,8 +1620,8 @@ async def insert_machine_review(
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, incomplete_reason, "
         "unresolved, lost_dimensions, profile, self_reviewed, principal_id, "
-        "carried_from_review_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "carried_from_review_id, ci_integrity_verdict, ci_integrity_explanation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1643,6 +1644,7 @@ async def insert_machine_review(
             int(self_reviewed),
             principal_id,
             carried_from_review_id,
+            *ci_integrity,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]

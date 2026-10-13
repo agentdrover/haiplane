@@ -2116,6 +2116,85 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def integrity_read(
+        self, repo: str, base: str, sha: str
+    ) -> dict[str, str] | None:
+        """The diff ``base...sha`` for the CI integrity scan, of EXACTLY that commit (#1688).
+
+        ``{"diff", "base_sha", "head_sha"}``, or None when it cannot be read;
+        ``base_sha`` is the MERGE-BASE of the base branch and the head.
+        The head is resolved as an OBJECT (``<sha>^{commit}``), never through
+        ``_resolve_ref_remote_first``: that tries ``origin/<name>`` first, so a
+        branch NAMED with the full sha of a malicious commit B and pointing at
+        a clean A would have A scanned and stored as the scan of B. The result
+        must equal the requested sha or nothing is returned. The base is a
+        branch name and is resolved by full ref name (``refs/remotes/origin/``,
+        then ``refs/heads/``), so no other ref can shadow it.
+
+        The text is forced (``--text --no-textconv --no-ext-diff``): a
+        ``-diff`` attribute would otherwise turn a hook into «Binary files differ».
+        """
+        wanted = (sha or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", wanted):
+            return None
+
+        async def _object() -> str | None:
+            rc, out, _ = await _git(
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{wanted}^{{commit}}",
+                repo=repo,
+                check=False,
+            )
+            return out.strip().lower() if rc == 0 and out.strip() else None
+
+        head = await _object()
+        await _git("fetch", "origin", base, repo=repo, check=False)
+        if head is None:
+            await _git("fetch", "origin", wanted, repo=repo, check=False)
+            head = await _object()
+        if head != wanted:
+            return None
+        base_sha = None
+        for ref in (f"refs/remotes/origin/{base}", f"refs/heads/{base}"):
+            rc, out, _ = await _git(
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{ref}^{{commit}}",
+                repo=repo,
+                check=False,
+            )
+            if rc == 0 and out.strip():
+                base_sha = out.strip()
+                break
+        if base_sha is None:
+            return None
+        # The comparison point is the MERGE-BASE, not the tip of the base: the
+        # diff and the base-side files must describe the same commit, and a
+        # base that moved since the branch was cut is none of the author's work.
+        rc, merge_base, _ = await _git(
+            "merge-base", base_sha, head, repo=repo, check=False
+        )
+        if rc != 0 or not merge_base.strip():
+            return None
+        base_sha = merge_base.strip()
+        rc, diff, _ = await _git(
+            "diff",
+            "--text",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--no-color",
+            "-U0",
+            f"{base_sha}..{head}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return None
+        return {"diff": diff, "base_sha": base_sha, "head_sha": head}
+
     async def delta_without_base(
         self, repo: str, base: str, prev: str, current: str
     ) -> str | None:

@@ -719,6 +719,25 @@ async def text_origin_refusals(
     return [(REFUSED_PRECONDITION, refusal[1])] if refusal else []
 
 
+async def integrity_refusals(
+    db: aiosqlite.Connection, task_id: int
+) -> list[tuple[str, str]]:
+    """Дифф меняет входы CI или не прочитан: approve стюарда не применяется (#1688).
+
+    Дифф читается здесь, ДО записи вердикта (сеть); транзакция вердикта потом
+    перечитывает базу тем же ``_automation_ci_gate``.
+    """
+    from hub import repository as repo
+    from hub.services import ci_integrity
+
+    await ci_integrity.ensure_scan(db, task_id)
+    task = dict(await repo.get_task(db, task_id) or {"id": task_id})
+    standing = await ci_integrity.standing_of(db, task)
+    if standing.gap is None:
+        return []
+    return [(REFUSED_PRECONDITION, standing.reason)]
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -744,6 +763,7 @@ async def apply_refusals(
 
     out = [not_delegated] if not_delegated else []
     out.extend(await text_origin_refusals(db, task_id, generation))
+    out.extend(await integrity_refusals(db, task_id))
     out.extend(precondition_refusals(packet))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:

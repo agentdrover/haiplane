@@ -54,7 +54,7 @@ from hub.models import (
     TaskProjectRef,
     TaskStatus,
 )
-from hub.services import call_sites, path_notices, review_evidence
+from hub.services import call_sites, ci_integrity, path_notices, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
@@ -815,6 +815,13 @@ async def _late_reads(
     late["verdict_route"] = (
         await timer.run("verdict_route", _brief_verdict_route(db, task_view))
         if task_view.status == TaskStatus.review
+        else None
+    )
+    # #1688: signs that the diff touches CI inputs, with the question to the
+    # reviewer and the owner's note. Only for a pinned commit; None = no signs.
+    late["ci_integrity"] = (
+        await timer.run("ci_integrity", ci_integrity.brief_state(db, task_id))
+        if (task_view.submission_sha or "").strip()
         else None
     )
     return late

@@ -53,6 +53,14 @@ class _PinnedGitOps(NoopGitOps):
     async def branch_diff_paths(self, branch, base_branch=None, repo=None):
         return self._paths
 
+    async def branch_diff(self, repo, base, branch, context=0):
+        return ""  # #1688: no change to CI inputs
+
+    async def integrity_read(self, repo, base, sha):
+        # #1688: the scan reads the diff of the exact commit; an empty one
+        # shows no change to CI inputs.
+        return {"diff": "", "base_sha": "b" * 40, "head_sha": sha}
+
 
 async def _node(
     db: aiosqlite.Connection, *, title: str, task_type: str, parent_id: int | None

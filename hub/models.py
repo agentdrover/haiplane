@@ -1902,6 +1902,10 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    # #1688: signs that the diff changes how CI gets or passes results, the
+    # question put to the reviewer, and the owner's note. None = no signs, the
+    # brief reads as before.
+    ci_integrity: dict[str, Any] | None = None
     # #1606: mutation and baseline evidence for this commit, each block with the
     # run it came from; "не получено" when the CI run for it skipped the step.
     ci_evidence: CIEvidenceState = Field(default_factory=lambda: CIEvidenceState())
@@ -3931,6 +3935,56 @@ def claims_text_origin(orchestrator: str | None) -> bool:
     return any(value.startswith(origin + ":") for origin in TEXT_ORIGINS)
 
 
+# The reviewer's answer to the CI integrity question (#1688). The vocabulary
+# and the owner-note limit live here, with the contract that carries them:
+# hub.services.ci_integrity reads them, it does not redefine them.
+CI_INTEGRITY_EXPLAINED = "explained"
+CI_INTEGRITY_SUSPICIOUS = "suspicious"
+CI_INTEGRITY_VERDICTS = (CI_INTEGRITY_EXPLAINED, CI_INTEGRITY_SUSPICIOUS)
+CI_INTEGRITY_NOTE_LIMIT = 600
+
+
+class CIIntegrityAnswer(BaseModel):
+    """What the reviewer says about a diff that touches CI inputs (#1688).
+
+    ``explained`` — the change is legitimate for the task, and the note tells
+    the owner what changes, why, and the risk (low/high). ``suspicious`` — it
+    looks like tampering with how CI obtains or passes results.
+
+    Lenient on purpose, like ``incomplete_reason``: the only path the cloud
+    reviewer has is the text block, and ``parse_report_block`` drops a report
+    whose fields the contract refuses — a too-long note would then cost the
+    findings too. A verdict outside the vocabulary is read as NO answer (and
+    logged), never mapped to the nearest word; a note over the limit is cut,
+    not refused.
+    """
+
+    verdict: str = ""
+    explanation_ru: str = ""
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _known_verdict(cls, v: Any) -> str:
+        text = "" if v is None else str(v).strip().lower()
+        if text in CI_INTEGRITY_VERDICTS:
+            return text
+        if text:
+            _models_log.warning(
+                "machine review gave an unknown ci_integrity verdict %r; read as no "
+                "answer",
+                text[:40],
+            )
+        return ""
+
+    @field_validator("explanation_ru", mode="before")
+    @classmethod
+    def _cut_note(cls, v: Any) -> str:
+        text = "" if v is None else str(v).strip()
+        if len(text) <= CI_INTEGRITY_NOTE_LIMIT:
+            return text
+        return text[: CI_INTEGRITY_NOTE_LIMIT - 1].rstrip() + "…"
+
+
 class MachineReviewSubmit(BaseModel):
     """Structured multi-agent review report (#381).
 
@@ -3975,6 +4029,9 @@ class MachineReviewSubmit(BaseModel):
     )
     lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
+    # #1688: the answer to the CI integrity question, asked only when the diff
+    # shows signs. Absent = the reviewer did not answer.
+    ci_integrity: CIIntegrityAnswer | None = None
 
     @field_validator("incomplete_reason", mode="before")
     @classmethod
@@ -4255,6 +4312,9 @@ class MachineReviewView(BaseModel):
     # alone would mistake for "someone else looked" (#1231, f9ac6478eaeb2ac2).
     principal_id: int | None = None
     created_at: str = ""
+    # #1688: the reviewer's answer to the CI integrity question; "" = no answer.
+    ci_integrity_verdict: str = ""
+    ci_integrity_explanation: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)

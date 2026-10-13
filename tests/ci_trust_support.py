@@ -324,3 +324,13 @@ async def seed_verified_report(
         attempt_key="ci:1:1",
         **row,
     )
+    # #1688: a steward/autopilot approval also needs the diff scanned for CI
+    # inputs (tests of the scan itself seed their own state). Clean here.
+    await seed_clean_integrity(db, task_id, head_sha)
+
+
+async def seed_clean_integrity(db: Any, task_id: int, head_sha: str) -> None:
+    """The stored result of a scan that found nothing in the diff of ``head_sha``."""
+    from hub import repository_ci_integrity as store
+
+    await store.save_ci_integrity_scan(db, task_id, head_sha, "clean", "[]", "")
