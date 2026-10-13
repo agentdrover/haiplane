@@ -4489,16 +4489,33 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     """An approval by automation (the autopilot, the steward) needs a confirmed green pass.
 
     Both decide on CI evidence before they call the verdict door; the transaction
-    that records the verdict asks the database again, so an approval never rests
-    on evidence a newer report has since withdrawn.
+    that records the verdict asks the database again — about the submission the
+    database holds NOW, not the one the decision was prepared for: the caller
+    names the generation it judged, and a resubmission since then cancels the
+    decision. The commit is read from the task row here, never from the context.
     """
     from hub.services.auto_verdict import _POLICY_ACTOR
 
     automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
     if not automated or state.body.verdict.value != "approved":
         return
-    sha = (state.pinned_sha or state.task.get("submission_sha") or "").strip()
-    gap = await ci_trust.pass_gap(state.db, state.task_id, sha) if sha else None
+    if state.expected_generation is None:
+        raise HTTPException(
+            422, "automated approval must name the generation it judged"
+        )
+    task = dict(await repo.get_task(state.db, state.task_id) or state.task)
+    if int(task.get("submission_generation") or 0) != state.expected_generation:
+        raise HTTPException(
+            409,
+            f"вердикт о сдаче {state.expected_generation} не записан: поколение "
+            "уже другое",
+        )
+    sha = (task.get("submission_sha") or "").strip()
+    gap = (
+        await ci_trust.pass_gap(state.db, state.task_id, sha)
+        if sha
+        else "коммит сдачи не закреплён"
+    )
     if gap:
         raise HTTPException(422, f"ci_not_green: {gap}")
 

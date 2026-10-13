@@ -705,6 +705,9 @@ async def _approve(db: aiosqlite.Connection, task_id: int, facts: dict) -> bool:
         task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=_POLICY_ACTOR),
         self_approved=facts["self_reviewed"],
+        # The generation the grounds were gathered for: a resubmission since
+        # then cancels the decision instead of being approved by it (#1687).
+        expected_generation=facts["generation"],
     )
     proven = facts["proven_usage"]
     await repo.add_task_update(

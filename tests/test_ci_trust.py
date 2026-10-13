@@ -1745,11 +1745,15 @@ async def test_a_deleted_run_and_a_newer_red_one_without_a_report_is_never_verif
 # between the gate and the apply gives a refusal.
 
 
-async def _a_report_arrives(db, task_id: int, run_id: str) -> None:
-    """A new claim for the same commit is accepted and committed (not yet settled)."""
+async def _a_report_arrives(db, task_id: int, run_id: str, real: bool = True) -> None:
+    """A new claim for the same commit is accepted and committed (not yet settled).
+
+    ``real=False``: GitHub has no artifact for it, so settling it cannot confirm it.
+    """
     from hub.services.ci_report import store_ci_run_report
 
-    await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id=run_id))
+    sent = GH.attempt(task_id, SHA, run_id=run_id, artifact=real)
+    await store_ci_run_report(db, task_id, **sent)
     await db.commit()
 
 
@@ -1790,6 +1794,7 @@ async def test_a_report_between_the_verdict_gate_and_its_apply_refuses_the_appro
             TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=agent),
             self_approved=True,
             applied_by_steward=steward,
+            expected_generation=1 if agent != "reviewer" else None,
         )
     assert refused.value.status_code == 422
     assert expected in str(refused.value.detail)
@@ -1813,3 +1818,144 @@ async def test_the_recheck_helper_refuses_to_run_outside_a_transaction_and_to_as
     async with write_transaction(db):
         with pytest.raises(RuntimeError):
             await ci_trust.recheck_in_transaction(db, asks_github)
+
+
+@pytest.mark.parametrize(("agent", "steward"), [("policy", False), ("steward", True)])
+async def test_a_resubmission_between_the_decision_and_the_apply_cancels_the_approval(
+    db, monkeypatch, agent, steward
+):
+    """Automation judged generation 1 (green); the task is resubmitted as 2 (no CI)."""
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_AC_TESTS", "off")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9201"))
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+    real_apply = lifecycle._apply_verdict
+
+    async def resubmitted_first(state):
+        await repo.bump_submission_generation(db, task_id)
+        await repo.update_task(db, task_id, submission_sha="sha-new-without-ci")
+        await db.commit()
+        return await real_apply(state)
+
+    monkeypatch.setattr(lifecycle, "_apply_verdict", resubmitted_first)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=agent),
+            self_approved=True,
+            applied_by_steward=steward,
+            expected_generation=1,
+        )
+    assert refused.value.status_code == 409
+    row = dict(await repo.get_task(db, task_id))
+    assert row["submission_generation"] == 2
+    assert row["review_verdict"] in (None, ""), "generation 2 was not approved"
+
+
+async def test_an_automated_approval_must_name_the_generation_it_judged(
+    db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_AC_TESTS", "off")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9202"))
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="policy"),
+            self_approved=True,
+        )
+    assert refused.value.status_code == 422
+    assert "generation" in str(refused.value.detail)
+
+
+async def test_a_report_between_the_done_flow_and_its_deferred_completion_refuses_it(
+    db, monkeypatch
+):
+    """The write of ``completed`` asks the validation gate again, of the database."""
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9301"))
+    await repo.update_task(
+        db, task_id, status="running", auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    assert (await _evidence(db, task_id))[1] == "pass"
+    _forbid_network_in_transaction(db)
+
+    real_finish = lifecycle._finish_deferred_done
+
+    async def a_report_arrives_first(*args, **kwargs):
+        await _a_report_arrives(db, task_id, "9302", real=False)
+        return await real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_finish_deferred_done", a_report_arrives_first)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_the_deferred_completion_asks_github_before_it_writes_completed(
+    db, monkeypatch
+):
+    """A rerun nobody reported appears after the done flow: only the ask finds it."""
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9401", attempt="1"))
+    await repo.update_task(
+        db, task_id, status="running", auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    _forbid_network_in_transaction(db)
+    real_finish = lifecycle._finish_deferred_done
+
+    async def a_rerun_starts_first(*args, **kwargs):
+        GH.attempt(
+            task_id,
+            SHA,
+            run_id="9401",
+            attempt="2",
+            status="in_progress",
+            artifact=False,
+        )
+        return await real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_finish_deferred_done", a_rerun_starts_first)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
