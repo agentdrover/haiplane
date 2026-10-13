@@ -2908,6 +2908,39 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "AND validation_status IS NOT NULL "
         "AND id IN (SELECT task_id FROM ci_run_reports)",
     ),
+    # ---- #1688: the diff of a submission is scanned for signs that it changes
+    # how CI gets or passes its results (hub/services/ci_integrity.py).
+    (
+        # One row per (task, commit): the commit is immutable, so a scan of it
+        # never goes stale and a resubmission with the same sha reuses it.
+        # ``state`` is clean | signs | unreadable. A commit with NO row was
+        # never scanned, which is its own state in the reader (unscanned) and
+        # is never read as clean: absence of a scan is not absence of signs.
+        "create_ci_integrity_scans",
+        """CREATE TABLE IF NOT EXISTS ci_integrity_scans (
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            head_sha   TEXT    NOT NULL,
+            state      TEXT    NOT NULL,
+            signs      TEXT    NOT NULL DEFAULT '[]',
+            reason     TEXT    NOT NULL DEFAULT '',
+            scanned_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (task_id, head_sha)
+        )""",
+    ),
+    (
+        # The reviewer's answer to the integrity question, per report (reports
+        # are per generation). '' = the reviewer did not answer: history, and
+        # any report written without the field. Never back-filled with either
+        # word — an empty answer is "did not answer", not "explained".
+        "add_machine_reviews_ci_integrity_verdict",
+        "ALTER TABLE machine_reviews ADD COLUMN ci_integrity_verdict TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_machine_reviews_ci_integrity_explanation",
+        "ALTER TABLE machine_reviews ADD COLUMN ci_integrity_explanation TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
 ]
 
 

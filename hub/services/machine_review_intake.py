@@ -31,6 +31,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
+from hub.services import ci_integrity
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -272,6 +273,8 @@ async def record_machine_review(
     # on the same terms. A harness that invents one would win over the derived
     # value silently, and an id nobody can reproduce identifies nothing.
     services.refuse_supplied_uid(body.unresolved, section="unresolved")
+    # #1688: a "suspicious" answer about CI integrity is a confirmed high finding.
+    body = ci_integrity.with_suspicion_finding(body)
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
     raw_count = body.raw_count
     if raw_count < adjudicated:
@@ -378,6 +381,7 @@ async def record_machine_review(
         # which stays the caller's self-description. The dispatch sweep
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
+        ci_integrity=ci_integrity.stored_answer(body),
     )
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу

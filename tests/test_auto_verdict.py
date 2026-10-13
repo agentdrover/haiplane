@@ -66,6 +66,11 @@ class _PinnedGitOps(NoopGitOps):
     async def branch_diff_paths(self, branch, base_branch=None, repo=None):
         return self._paths
 
+    async def branch_diff(self, repo, base, branch, context=0):
+        # #1688: the integrity scan reads the diff of the pinned commit; an
+        # empty one shows no change to CI inputs.
+        return ""
+
     async def push_branch(self, branch, repo=None, force=False):
         return True
 

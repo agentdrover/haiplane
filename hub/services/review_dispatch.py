@@ -51,7 +51,7 @@ from hub.models import (
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
 )
-from hub.services import call_sites, project_policy, review_ci_gate
+from hub.services import call_sites, ci_integrity, project_policy, review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
@@ -2160,6 +2160,7 @@ def _review_prompt(
     needs_container: bool = False,
     inline_diff: bool = False,
     snapshot: SnapshotArchive | None = None,
+    ci_integrity_block: str = "",
 ) -> str:
     if inline_diff:
         # #1598: у локального ревьюера нет ни клона, ни права запускать — общее
@@ -2200,6 +2201,8 @@ def _review_prompt(
         # #1254: symbols only tests call, as a question with two answers.
         # Empty adds nothing, so an order without candidates is unchanged.
         + only_tests_block
+        # #1688: only when the diff shows signs that it touches CI inputs.
+        + ci_integrity_block
         # #1238: and the order of attempts before "the environment refused".
         # Both profiles get it: the deep harness lost the test dimension on
         # exactly the same missing tool as a cheap one would.
@@ -3417,6 +3420,10 @@ async def _carry_the_report_over(
         profile=source.get("profile") or "",
         principal_id=source.get("principal_id"),
         carried_from_review_id=root,
+        ci_integrity=(
+            source.get("ci_integrity_verdict") or "",
+            source.get("ci_integrity_explanation") or "",
+        ),
     )
     await repo.add_task_update(
         db,
@@ -3704,6 +3711,7 @@ async def prepare_review_order(
             needs_container=task_needs_container(task),
             inline_diff=inline_diff,
             snapshot=snapshot,
+            ci_integrity_block=await ci_integrity.order_section(db, task_id),
         ),
         rules_note=rules_note,
         diff_note=diff_note,

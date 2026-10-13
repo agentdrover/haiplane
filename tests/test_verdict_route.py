@@ -311,7 +311,8 @@ async def test_condition_names_every_unchecked_ground(
     )
     route = await verdict_route(db, task_id)
     assert route.decider == "policy"
-    assert set(route.pending) == {"branch", "provider_usage"}
+    # #1688: the diff scan of CI inputs is a third ground that needs the clone.
+    assert set(route.pending) == {"branch", "provider_usage", "ci_integrity"}
     assert "вершина ветки" in route.condition
     assert "провайдер" in route.condition
     assert "провайдер" in (await _status(client, task_id))["verdict_route"]["line"]

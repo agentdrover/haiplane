@@ -132,6 +132,7 @@ EXPECTED_VERDICT_ORDER = (
     "machine_review_present",
     "ac_tests_green",
     "branch_tip_matches",
+    "ci_integrity_scanned",
     "approval_blind_spots",
     "auto_draft_out_of_scope",
 )
