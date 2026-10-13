@@ -39,7 +39,7 @@ from typing import Any
 
 from hub import config
 from hub import repository as repo
-from hub.db import write_transaction
+from hub.db import fetchall, write_transaction
 from hub.integrations.registry import plugins
 from hub.services import ci_artifact
 from hub.services.ac_tests import record_ac_test_results
@@ -599,7 +599,8 @@ async def evidence_sha(db: Any, task_id: int, source: str) -> str:
     parts = source.split(":")
     if len(parts) != 3 or parts[0] != "ci":
         return ""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT head_sha FROM ci_report_attempts "
         "WHERE task_id=? AND run_id=? AND run_attempt=? LIMIT 1",
         (task_id, parts[1], parts[2]),
