@@ -1500,6 +1500,10 @@ class CIRunReportState(BaseModel):
     # did not say. Recorded only: the hub does not check it against GitHub yet.
     provenance: dict[str, str] = Field(default_factory=dict)
     provenance_note: str = ""
+    # #1687: GitHub's confirmation of the report: verified | unverified, with
+    # the reason for the second; "" when no report is stored for the commit.
+    trust: str = ""
+    trust_reason: str = ""
 
 
 class CIEvidenceBlock(BaseModel):
@@ -3769,6 +3773,11 @@ class CIRunReportResult(BaseModel):
     baseline_state: str = "not_reported"
     # #1686: the run provenance stored with the report; {} = none was sent.
     provenance: dict[str, str] = Field(default_factory=dict)
+    # #1687: whether GitHub confirmed the report: ``verified`` or ``unverified``
+    # with the reason (legacy, forge_unavailable, body_mismatch, ...). An
+    # unverified report is stored and shown but is not evidence.
+    trust: str = "unverified"
+    trust_reason: str = ""
 
 
 class OutcomeVerdict(str, Enum):

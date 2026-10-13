@@ -35,6 +35,13 @@ from hub.integrations.registry import plugins
 from hub.models import AcceptanceCriterion, TaskRefine, validated_gate_policy
 from hub.services import red_test_gate
 from hub.services.project_policy import BUG_RED_TEST_KEY, bug_red_test_of
+from tests.ci_trust_support import REPO as GH_REPO
+from tests.ci_trust_support import FakeGitHub, attach_fake_github
+
+# #1687: a report counts only for the run GitHub confirms; _running_bug attaches
+# a fake GitHub to the task's git_ops and _post_as_ci registers the run behind
+# each report.
+GH: FakeGitHub = FakeGitHub()
 
 _ROOT = Path(__file__).resolve().parents[1]
 _BASELINE_SCRIPT = _ROOT / "scripts" / "red_test_baseline.py"
@@ -97,7 +104,7 @@ async def _running_bug(
 ) -> int:
     """Pair-задача в running: два AC с тестом и один ручной."""
     pid = await repo.create_project(
-        db, slug=slug, name=slug.title(), workspace_path="/tmp/ws"
+        db, slug=slug, name=slug.title(), workspace_path="/tmp/ws", repo_name=GH_REPO
     )
     if mode is not None:
         await repo.update_project(
@@ -116,6 +123,8 @@ async def _running_bug(
     await db.commit()
 
     plugins.git_ops = _PinnedGitOps()
+    global GH
+    GH = attach_fake_github(plugins.git_ops)
     started = await services.pair_start_task(db, task_id, caller="dev-agent")
     assert started.status.value == "running"
     return task_id
@@ -130,13 +139,36 @@ async def _report_baseline(
         body["baseline"] = baseline
     resp = await _post_as_ci(client, task_id, body)
     assert resp.status_code == 200, resp.text
+    print("TRUSTDBG", resp.json()["trust"], resp.json()["trust_reason"])
     return resp.json()
+
+
+def _backed_by_a_run(task_id: int, body: dict[str, Any]) -> dict[str, Any]:
+    """The body, with the run a trusted reporter would have named (#1687).
+
+    A body that is not a whole report (no head_sha, or a status the hub refuses)
+    is sent as it is: those tests are about the refusal.
+    """
+    if not body.get("head_sha"):
+        return body
+    sent = GH.attempt(
+        task_id,
+        body["head_sha"],
+        ac_results=body.get("ac_results") or {},
+        checks=body.get("checks") or {},
+        validation_status=body.get("validation_status") or "",
+        validation_log=body.get("validation_log") or "",
+        baseline=body.get("baseline"),
+        stamp=False,
+    )
+    return {**body, **sent["provenance"]}
 
 
 async def _post_as_ci(client: AsyncClient, task_id: int, body: dict[str, Any]):
     """POST ci-run-report под токеном с tasks.ci_report — как ходит CI."""
     from hub import config
 
+    body = _backed_by_a_run(task_id, body)
     tokens = config.parse_tokens("ci:ci-token:admin")
     with (
         patch.object(config, "HUB_TOKENS", tokens),
@@ -216,13 +248,16 @@ async def test_bug_without_failing_baseline_is_refused(client: AsyncClient, db):
     assert violations[0].startswith("AC-1") and "зелёный до фикса" in violations[0]
     await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
 
-    # #1606: отчёт без ключа baseline (прогон synchronize) сохранённое не
-    # стирает — отказ прежний, и он по-прежнему называет красный-до-фикса AC-1.
+    # #1687: доказательство принадлежит попытке, которая его прислала. Более
+    # новая попытка без ключа baseline (прогон synchronize) становится текущей,
+    # и baseline прежней перестаёт быть доказательством. (Внутри ОДНОЙ попытки
+    # отсутствующий ключ по-прежнему ничего не стирает, #1606: см.
+    # test_a_report_without_evidence_keys_keeps_the_stored_evidence.)
     await _report_baseline(client, task_id, None)
     resp, _ = await _submit(client, task_id)
     assert resp.status_code == 422, resp.text
     violations = _detail(resp)["violations"]
-    assert len(violations) == 1 and violations[0].startswith("AC-1"), violations
+    assert len(violations) == 2 and all("нет baseline" in v for v in violations)
 
 
 # --------------------------------------------------------------------------
@@ -649,12 +684,19 @@ async def test_bug_require_needs_a_baseline_before_any_submission(
     assert all("нет baseline" in v for v in _detail(resp)["violations"])
     await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
 
-    # Ручной прогон (dispatch) до сдачи присылает baseline; последующий отчёт
-    # без ключа его не стирает, и сдача проходит.
+    # Ручной прогон (dispatch) до сдачи присылает baseline: текущая попытка его
+    # несёт, и сдача проходит. Более новая попытка без ключа (#1687) baseline
+    # прежней не наследует: гейт не ослаблен тем, что отчёт пришёл без ключа.
     await _report_baseline(
         client, task_id, _baseline({_REF_1: "failed", _REF_2: "failed"})
     )
     await _report_baseline(client, task_id, None)
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
+    await _report_baseline(
+        client, task_id, _baseline({_REF_1: "failed", _REF_2: "failed"})
+    )
     resp, _ = await _submit(client, task_id)
     assert resp.status_code == 200, resp.text
 

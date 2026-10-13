@@ -52,6 +52,7 @@ from hub.services.steward_dispatch import (
 )
 from hub.services.steward_evidence import build_evidence_packet, packet_hash
 from hub.services.steward_judgement import record_steward_judgement
+from tests.ci_trust_support import seed_verified_report
 from tests.local_advisor_support import GLM as _GLM
 from tests.local_advisor_support import beat_caps as _beat_caps
 from tests.local_advisor_support import capabilities as _capabilities
@@ -109,6 +110,9 @@ async def _in_review(db: aiosqlite.Connection, slug: str, **kw) -> int:
     project_id = await _project(db, slug)
     task_id = await _task(db, project_id, **kw)
     await repo.update_task(db, task_id, review_job_id="")
+    # #1687: the steward's approval is checked against the database inside the
+    # verdict transaction, so the CI it relies on is really there.
+    await seed_verified_report(db, task_id, "a" * 40, validation_status="pass")
     await db.commit()
     return task_id
 

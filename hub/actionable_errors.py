@@ -970,7 +970,7 @@ def ci_before_submit_unproven_detail(
 ) -> dict[str, Any]:
     """Явная сдача без доказанного зелёного CI в режиме require (#1629).
 
-    Причина в ``cause``: no_report | red | validation_not_pass | malformed.
+    Причина в ``cause``: no_report | unverified | red | validation_not_pass | not_green | malformed.
     Подсказка не обещает, что push сам запускает CI: у проекта может не быть
     ни отчётчика CI, ни validation_commands — тогда доказательство недоступно,
     и это решение владельца, а не повод повторять сдачу.

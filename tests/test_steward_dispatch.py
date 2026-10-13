@@ -2132,8 +2132,8 @@ async def test_every_steward_start_attempt_rechecks_review_state(
 
 async def _ci_red(db: aiosqlite.Connection, task_id: int) -> None:
     await db.execute(
-        "INSERT INTO ci_run_reports (task_id, head_sha, checks, validation_status) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO ci_run_reports (task_id, head_sha, checks, validation_status, "
+        "trust, trust_reason) VALUES (?, ?, ?, ?, 'verified', '')",
         (task_id, "a" * 40, json.dumps({"lint": "fail"}), ""),
     )
     await db.commit()

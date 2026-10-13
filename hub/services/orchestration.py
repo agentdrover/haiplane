@@ -21,7 +21,13 @@ import aiosqlite
 
 from hub import brand, commit_scope, config
 from hub import repository as repo
-from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
+from hub.db import (
+    deserialize_str_list,
+    fetchall,
+    get_breadcrumb,
+    log_activity,
+    write_transaction,
+)
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
 from hub.services.defect_clocks import (
@@ -5523,29 +5529,52 @@ async def _complete_without_review(
     # WITHOUT bumping the generation — no new work is being submitted,
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
-    await repo.update_task(
-        db,
-        task_id,
-        status="completed",
-        exit_code=exit_code,
-        result_text=result_text,
-    )
-    await repo.insert_event(
-        db,
-        kind="task_completed",
-        task_id=task_id,
-        actor=task.get("assigned_agent") or "agent",
-        payload={"via": "report_done"},
-    )
-    # #1437: сюда сходятся все пути transition_after_agent_done — headless
-    # поллер, одобрение ревью поллером, ручное обновление задания. Не все
-    # сворачивали родителя; повтор за done-flow безвреден (закрытый родитель
-    # пропускается).
-    from hub.services.lifecycle import maybe_rollup_parent
-
-    await maybe_rollup_parent(db, task_id)
-    log.info("Task #%d → completed after done report", task_id)
+    await _write_completed(db, task, exit_code, result_text)
     return "completed"
+
+
+async def _write_completed(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    exit_code: int | None,
+    result_text: str | None,
+) -> None:
+    """The write of ``completed`` after a done report, with its validation gate.
+
+    #1687: a done report completed after its own transaction (the deferred
+    completion) decided on validation evidence that a newer CI report may have
+    withdrawn since. The transaction that writes ``completed`` asks the same
+    gate again, of the database; GitHub was asked before it (the caller),
+    and the network delivery (merge) happened before it too.
+    """
+    task_id = task["id"]
+    async with write_transaction(db):
+        if _running_deferred.get():
+            from hub.services.lifecycle import _done_validation_gate
+
+            await _done_validation_gate(db, task)
+        await repo.update_task(
+            db,
+            task_id,
+            status="completed",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        await repo.insert_event(
+            db,
+            kind="task_completed",
+            task_id=task_id,
+            actor=task.get("assigned_agent") or "agent",
+            payload={"via": "report_done"},
+        )
+        # #1437: сюда сходятся все пути transition_after_agent_done — headless
+        # поллер, одобрение ревью поллером, ручное обновление задания. Не все
+        # сворачивали родителя; повтор за done-flow безвреден (закрытый
+        # родитель пропускается).
+        from hub.services.lifecycle import maybe_rollup_parent
+
+        await maybe_rollup_parent(db, task_id)
+    log.info("Task #%d → completed after done report", task_id)
 
 
 async def _local_tip(branch: str, git_repo: str | None) -> str:
@@ -5958,9 +5987,17 @@ async def run_deferred_completions(
             row = await repo.get_task(db, item["task_id"])
             if row is None or dict(row)["status"] not in ("running", "claimed"):
                 continue
+            task = dict(row)
+            if config.SDD_VALIDATION == "require":
+                # #1687: GitHub is asked before the transaction that writes
+                # ``completed`` (not inside it); that transaction asks the
+                # validation gate again of the database.
+                from hub.services.lifecycle import prepare_ci_standing
+
+                task = await prepare_ci_standing(db, task)
             await _complete_without_review(
                 db,
-                dict(row),
+                task,
                 has_done=True,
                 exit_code=item["exit_code"],
                 result_text=item["result_text"],
@@ -5979,6 +6016,12 @@ async def transition_after_agent_done(
     result_text: str | None = None,
 ) -> str:
     """Post-done lifecycle shared by headless poller and pair mode."""
+    if not db.in_transaction:
+        # #1687: GitHub is asked about the commit that will be pinned BEFORE
+        # anything here opens a transaction (pair mode arrives with this done).
+        from hub.services.lifecycle import prepare_ci_standing
+
+        task = await prepare_ci_standing(db, task)
     task_id = task["id"]
     branch = task.get("branch")
     if has_done and automation_not_applicable(task):

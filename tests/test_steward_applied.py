@@ -41,7 +41,21 @@ from hub.services.steward_applied import (
     self_approval_for,
 )
 from hub.services.steward_evidence import ReviewBrief
-from tests.test_steward_shadow import _project, _task
+from tests.ci_trust_support import seed_verified_report
+from tests.test_steward_shadow import _project
+from tests.test_steward_shadow import _task as _shadow_task
+
+
+async def _task(db: aiosqlite.Connection, project_id: int, **kwargs) -> int:
+    """A steward test task whose CI is really there (#1687).
+
+    The steward's approval is checked against the database inside the verdict
+    transaction, so the confirmed green report it relies on has to exist.
+    """
+    task_id = await _shadow_task(db, project_id, **kwargs)
+    await seed_verified_report(db, task_id, "a" * 40, validation_status="pass")
+    await db.commit()
+    return task_id
 
 
 async def _judge(

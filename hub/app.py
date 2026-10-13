@@ -185,7 +185,7 @@ from hub.services.diagnostics import (
     build_whoami,
 )
 from hub.services.ac_tests import run_ac_tests
-from hub.services.ci_report import accept_ci_run_report
+from hub.services.ci_report import settle_ci_run_report, store_ci_run_report
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.review_brief import build_review_brief, reviewer_harness_skill
@@ -2998,7 +2998,7 @@ async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
         )
     sent = body.model_fields_set
     try:
-        result = await accept_ci_run_report(
+        result = await store_ci_run_report(
             db,
             task_id,
             head_sha=body.head_sha,
@@ -3022,7 +3022,6 @@ async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
                 for name in models.CI_PROVENANCE_FIELDS
                 if getattr(body, name) is not None
             },
-            commit=False,
         )
     except LookupError:
         raise HTTPException(404, "task not found") from None
@@ -3055,7 +3054,10 @@ async def api_ci_run_report(
     # UPSERT are read and written under ONE write transaction. Without it the
     # epic's project could change between the guard and the write.
     async with write_transaction(db):
-        result = await _accept_ci_report_checked(db, identity, task_id, body)
+        stored = await _accept_ci_report_checked(db, identity, task_id, body)
+    # #1687: the claim is stored; what it is worth is decided against GitHub,
+    # outside the transaction (it downloads), and written in a short one.
+    result = await settle_ci_run_report(db, task_id, stored)
     return CIRunReportResult(**result)
 
 

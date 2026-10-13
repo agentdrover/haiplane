@@ -891,6 +891,40 @@ class GitVerseForge:
             )
         return self._outcome_of(mine)
 
+    # #1687: сверка отчёта CI по прогону GitHub Actions. У GitVerse нет ни
+    # попыток, ни артефактов в том виде, в каком их читает сверка, поэтому на
+    # этом форже отчёт остаётся неподтверждённым: «спросить не удалось», а не
+    # «там пусто».
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def ci_runs_for_sha(
+        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_run_artifacts(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bytes | None:
+        return None
+
     async def branch_ci_runs(
         self,
         branch: str,

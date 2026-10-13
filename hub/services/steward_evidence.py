@@ -46,6 +46,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
+from hub.services import ci_trust
 from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
@@ -273,7 +274,14 @@ async def _ci_fact(
             NO_CI_FOR_SHA,
             f"для закреплённого {pinned_sha[:12]} прогон не отчитан",
         )
+    # #1687: a report GitHub did not confirm is a claim, not a fact about the
+    # run — the steward sees it as absent, with the reason.
+    trust, why = ci_trust.trust_of(dict(row))
+    if trust != ci_trust.VERIFIED:
+        return absent(source, NO_CI_FOR_SHA, ci_trust.unverified_note(why))
     status = (dict(row).get("validation_status") or "").strip()
+    if status == VALIDATION_PASS and ci_trust.green_gap(dict(row)):
+        status = "not_green"
     if status not in _CONCLUSIVE_CI:
         return absent(
             source,
@@ -633,6 +641,12 @@ async def build_evidence_packet(
     )
     pinned_sha = (task.get("submission_sha") or "").strip()
     project_row = await repo.resolve_project_for_task(db, task_id)
+    if pinned_sha:
+        # #1687: the standing of the CI report is brought up to date BEFORE the
+        # brief is built — the brief reads the prepass and the AC results of
+        # the current attempt, and the task is read again after it.
+        await ci_trust.refresh_quietly(db, task_id, pinned_sha)
+        task = dict(await repo.get_task(db, task_id) or task)
     brief = await build_review_brief(db, task_id)
 
     # One walk of the branch feeds two facts, as in auto_verdict (#583).

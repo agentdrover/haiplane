@@ -28,6 +28,7 @@ from hub.services.steward_apply import (
     apply_refusals,
 )
 from tests.test_steward_shadow import _project, _task
+from tests.ci_trust_support import VERIFIED_ROW
 
 _PINNED = "a" * 40
 
@@ -60,6 +61,7 @@ async def _green(
         validation_log="",
         reason="",
         reported_by="ci",
+        **VERIFIED_ROW,
     )
     await repo.insert_machine_review(
         db,
@@ -130,6 +132,7 @@ async def test_precondition_failure_escalates(
         validation_log="",
         reason="",
         reported_by="ci",
+        **VERIFIED_ROW,
     )
     await db.commit()
     red_refusals = await apply_refusals(db, red)

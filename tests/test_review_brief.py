@@ -430,10 +430,10 @@ async def _report_checks(
     tasks.ci_report permission, and wiring a ci_runner token here would test
     the auth layer rather than the prepass.
     """
-    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import accept_backed
 
     row = dict(await repo.get_task(db, task_id))
-    await accept_ci_run_report(
+    await accept_backed(
         db,
         task_id,
         head_sha=head_sha or row["submission_sha"],
@@ -1573,6 +1573,8 @@ async def _store_report(db, task_id: int, *, mutations: dict, baseline: dict):
         checks="{}",
         mutations=json.dumps(mutations),
         baseline=json.dumps(baseline),
+        trust="verified",
+        trust_reason="",
     )
     await db.commit()
 

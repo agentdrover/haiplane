@@ -296,6 +296,7 @@ async def record_validation_result(
     generation: int,
     status: str,
     log_tail: str = "",
+    source: str = "manual",
 ) -> dict:
     """Write the validation outcome for ``generation``. Does NOT commit (#546).
 
@@ -309,6 +310,7 @@ async def record_validation_result(
         validation_generation=generation,
         validation_status=status,
         validation_log=log_tail,
+        validation_source=source,
     )
     return {"status": status, "generation": generation}
 
@@ -361,6 +363,8 @@ def validation_gap(task: dict) -> str | None:
     if not commands:
         return None
     generation = task.get("submission_generation") or 0
+    if task.get("validation_source") == "legacy":
+        return "validation_commands: результат записан до сверки CI с GitHub (unverified, legacy)"
     if task.get("validation_generation") != generation:
         return "validation_commands не прогонялись для текущего поколения"
     if task.get("validation_status") != PASS:
