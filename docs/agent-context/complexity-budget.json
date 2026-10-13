@@ -21,9 +21,13 @@
     "  permanent  — исключение остаётся, и написано почему;",
     "  unclaimed  — долг, за которым не стоит задача.",
     "",
-    "unclaimed сейчас 27 из 30, и это записано, а не скрыто: эпик #1064 берёт",
-    "гейты (#1067) и поля MCP (#1068) — это 8 записей, плюс build_parser",
-    "постоянным. Молчание о непокрытом читается как 'покрыто всё'."
+    "unclaimed без задачи не должен доходить до потолка (#1693): исключение",
+    "unclaimed с живым замером от 90% своего max красит CI — назначьте task:#N",
+    "или permanent с причиной. Формат removed_by проверяется. Молчание о",
+    "непокрытом читается как 'покрыто всё'.",
+    "",
+    "Замеры: --refresh-measured обновляет только measured и не трогает max;",
+    "--update — полная перезаморозка потолков, решение человека (AGENTS.md)."
   ],
   "headroom_pct": 15.0,
   "waivers": [
@@ -31,23 +35,23 @@
       "path": "hub/app.py",
       "function": "api_task_context",
       "rule": "C901",
-      "measured": 37,
+      "measured": 38,
       "max": 43,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1691 — разбиение api_task_context"
     },
     {
       "path": "hub/app.py",
       "function": "api_task_context",
       "rule": "PLR0915",
-      "measured": 108,
+      "measured": 117,
       "max": 125,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1691 — разбиение api_task_context"
     },
     {
       "path": "hub/cli.py",
       "function": "build_parser",
       "rule": "PLR0915",
-      "measured": 383,
+      "measured": 433,
       "max": 441,
       "removed_by": "permanent — плоское объявление аргументов argparse: 383 оператора подряд, ни одной ветки (в C901 не попадает вовсе). Разбиение раздробит один читаемый список на десяток функций и ухудшит его."
     },
@@ -79,25 +83,25 @@
       "path": "hub/mcp_server.py",
       "function": "hub_prepare_developer_task",
       "rule": "C901",
-      "measured": 20,
+      "measured": 18,
       "max": 23,
-      "removed_by": "task:#1068 — 33 параметра выводятся из модели, а не перечисляются"
+      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
     },
     {
       "path": "hub/mcp_server.py",
       "function": "hub_prepare_developer_task",
       "rule": "PLR0915",
-      "measured": 66,
+      "measured": 75,
       "max": 76,
-      "removed_by": "task:#1068 — 33 параметра выводятся из модели, а не перечисляются"
+      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
     },
     {
       "path": "hub/mcp_server.py",
       "function": "hub_project_status",
       "rule": "C901",
-      "measured": 17,
+      "measured": 18,
       "max": 20,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1691 — разбиение hub_project_status"
     },
     {
       "path": "hub/mcp_structured.py",
@@ -129,29 +133,29 @@
       "rule": "C901",
       "measured": 23,
       "max": 27,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1690 — разбиение add_update"
     },
     {
       "path": "hub/services/lifecycle.py",
       "function": "add_update",
       "rule": "PLR0915",
-      "measured": 84,
+      "measured": 92,
       "max": 97,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1690 — разбиение add_update"
     },
     {
       "path": "hub/services/lifecycle.py",
       "function": "create_task",
       "rule": "C901",
-      "measured": 18,
+      "measured": 19,
       "max": 21,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1692 — разбиение create_task"
     },
     {
       "path": "hub/services/orchestration.py",
       "function": "_human_gate_metrics",
       "rule": "C901",
-      "measured": 28,
+      "measured": 29,
       "max": 33,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
@@ -159,7 +163,7 @@
       "path": "hub/services/orchestration.py",
       "function": "_human_gate_metrics",
       "rule": "PLR0915",
-      "measured": 88,
+      "measured": 91,
       "max": 102,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
@@ -175,9 +179,9 @@
       "path": "hub/web.py",
       "function": "_web_task_detail_page",
       "rule": "PLR0915",
-      "measured": 62,
+      "measured": 69,
       "max": 72,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+      "removed_by": "task:#1691 — разбиение _web_task_detail_page"
     }
   ]
 }

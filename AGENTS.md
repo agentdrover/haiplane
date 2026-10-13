@@ -19,6 +19,10 @@
   `task:#NNNN`, `permanent` с причиной или честное `unclaimed`. Запись
   снимается удалением строки: если нарушения больше нет, проверка сама
   потребует её убрать.
+  `unclaimed` с живым замером от 90% своего `max` тоже красит CI (#1693):
+  назначьте `task:#N` или `permanent — <причина>`; формат `removed_by`
+  проверяется. Замеры обновляет `--refresh-measured` (меняет только `measured`,
+  `max` не трогает); `--update` пересчитывает и потолки — это решение человека.
 - Файл .py выше порога размера красит CI (`scripts/file_size_budget.py`, #1669).
   Пороги по деревьям — в `pyproject.toml` (`[tool.haiplane.file_size]`), ledger —
   в `docs/agent-context/file-size-budget.json`. Новый файл выше порога или рост
