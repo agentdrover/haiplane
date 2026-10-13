@@ -876,3 +876,19 @@ def test_environment_keys_by_keyword_and_computed_keys_are_seen():
         "token_read",
         "env_key_computed",
     }
+
+
+def test_pytest_config_is_a_sign_at_any_depth():
+    """pytest finds the config nearest to the tests: nested files count like the root ones."""
+    for path in (
+        "tests/pytest.ini",
+        "pkg/pytest.ini",
+        "tests/tox.ini",
+        "src/setup.cfg",
+        "tests/pytest.toml",
+        "a/b/.pytest.toml",
+    ):
+        assert (path, "pytest_config") in _rules(_diff(path, ["[pytest]"])), path
+    nested = _diff("pkg/pyproject.toml", ["x = 1"])
+    assert ("pkg/pyproject.toml", "pytest_config") in _rules(nested)
+    assert _rules(_diff("pkg/setup.py", ["x = 1"])) == set()

@@ -40,9 +40,13 @@ Path rules (a file that CI trusts):
                   guess.
 ``conftest``      ``conftest.py`` at any level: pytest imports it before any
                   test and it can rewrite results of the whole run.
-``pytest_config`` ``[tool.pytest*]`` in ``pyproject.toml`` (and ``pytest.ini``,
-                  ``tox.ini``, ``setup.cfg``): plugins, addopts and markers
-                  change what a run means.
+``pytest_config`` the ``tool.pytest`` tables of the root ``pyproject.toml``
+                  (compared as data, base against head), ANY change to a
+                  nested ``pyproject.toml``, and ``pytest.ini``, ``.pytest.ini``,
+                  ``pytest.toml``, ``.pytest.toml``, ``tox.ini``, ``setup.cfg`` at
+                  any depth: pytest picks the config nearest to the tests it
+                  runs (``pytest tests/`` finds ``tests/pytest.ini``), and
+                  plugins, addopts and markers change what a run means.
 ``lockfile``      ``uv.lock``: the resolved environment CI installs.
 
 Line rules (added lines of test files and ``conftest.py`` only):
@@ -353,7 +357,7 @@ def _path_rule(path: str) -> str | None:
         return RULE_MAKEFILE
     if base == "conftest.py":
         return RULE_CONFTEST
-    if path in PYTEST_CONFIG_FILES:
+    if base in PYTEST_CONFIG_FILES:  # at ANY depth, like conftest.py
         return RULE_PYTEST_CONFIG
     if path == "uv.lock":
         return RULE_LOCKFILE
@@ -479,6 +483,9 @@ def scan_diff(
             rule = _path_rule(path)
             if rule:
                 add(path, 0, rule)
+        nested = [p for p in fd.paths() if p.endswith("/pyproject.toml")]
+        if nested:  # not the root one: not compared, any change is a sign
+            add(nested[0], 0, RULE_PYTEST_CONFIG)
         if "pyproject.toml" in fd.paths() and (
             fd.deleted
             or pyproject_changes_pytest(
