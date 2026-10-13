@@ -57,7 +57,7 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import base_merge, workflow_seed
+from hub.services import base_merge, watch_notices, workflow_seed
 from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
@@ -2057,9 +2057,8 @@ async def dispatch_task(
             f"рабочем каталоге. Закоммитьте или спрячьте их и решите через "
             f"REST POST /api/tasks/<id>/decide.",
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "dispatch_workspace_not_ready", "branch": branch},
@@ -5380,9 +5379,8 @@ async def _deliver_completed_pair_task(
                 "ci_fix_cycle_limit" if budget_spent else "merge_gate", detail
             ),
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor=task.get("assigned_agent") or "agent",
             payload={
@@ -5482,9 +5480,8 @@ async def _complete_without_review(
                     "почините доступ к GitHub и пересдайте done; accept "
                     "завершит задачу БЕЗ доставки ветки.",
                 )
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task_id,
                     actor=task.get("assigned_agent") or "agent",
                     payload={
@@ -5679,9 +5676,8 @@ async def _route_after_done(
             "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
             "рабочего каталога и решите через REST POST /api/tasks/<id>/decide.",
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "done_checkout_failed", "branch": branch},
@@ -5744,9 +5740,8 @@ async def _route_after_done(
                     "Решите через REST POST /api/tasks/<id>/decide: расширить область, "
                     "убрать чужие правки или закоммитить как есть.",
                 )
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task_id,
                     actor="hub",
                     payload={
@@ -5799,9 +5794,8 @@ async def _route_after_done(
             f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
             f"переписать историю чужой ветки. Решите через REST POST /api/tasks/<id>/decide.",
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "done_branch_mismatch", "branch": branch},
@@ -6137,9 +6131,8 @@ async def transition_after_agent_done(
             f"{config.MAX_REVIEW_CYCLES}) without APPROVED review. "
             "Human decision required (REST POST /api/tasks/<id>/decide).",
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "review_cycle_limit"},
@@ -6283,9 +6276,8 @@ async def dispatch_review(
         # Universal Review Gate (#309): failure to dispatch a reviewer must
         # never complete the task — escalate to the human Decision Gate.
         await repo.update_task(db, task_id, status="needs_decision")
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "review_dispatch_failed"},
@@ -6354,9 +6346,8 @@ async def dispatch_fix(
             status="needs_decision",
             review_cycle=review_cycle,
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "fix_dispatch_failed"},
@@ -6458,9 +6449,8 @@ async def dispatch_arbiter(
         await repo.update_task(
             db, task_id, status="needs_decision", arbiter_state="finished"
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "arbiter_dispatch_failed"},
@@ -6516,9 +6506,8 @@ async def dispatch_ci_fix(
             result.get("error"),
         )
         await repo.update_task(db, task_id, status="needs_decision")
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": "ci_fix_dispatch_failed"},

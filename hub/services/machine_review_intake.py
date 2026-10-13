@@ -31,7 +31,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
-from hub.services import ci_integrity
+from hub.services import ci_integrity, watch_notices
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -401,7 +401,7 @@ async def record_machine_review(
         incomplete=body.incomplete is True,
         raw_count=raw_count,
     )
-    await repo.insert_event(
+    completed_id = await repo.insert_event(
         db,
         kind="machine_review_completed",
         task_id=task_id,
@@ -413,7 +413,17 @@ async def record_machine_review(
             "outcome": outcome,
             "raw": raw_count,
             "generation": generation,
+            # #1679: id отчёта — ключ дедупа уведомления стюарду.
+            "review_id": new_review_id,
         },
+    )
+    await watch_notices.notify_steward(
+        db,
+        "machine_review",
+        task_id=task_id,
+        source_key=f"machine_review:{new_review_id}",
+        source_event_id=completed_id,
+        review_id=new_review_id,
     )
     await _alert_no_candidates(db, task_id, body, raw_count, generation)
     await _retract_no_candidates_alert(

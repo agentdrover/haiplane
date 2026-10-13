@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.services import watch_notices
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
@@ -183,9 +184,8 @@ async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
         "Dispatch job missing beyond grace period. Manual decision required.",
     )
     await repo.update_task(db, task["id"], status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task["id"],
         actor="hub",
         payload={"reason": reason},
@@ -268,9 +268,8 @@ async def _sweep_running_dispatch(db) -> None:
                     exit_code=job.get("exit_code"),
                     result_text=job.get("result_text"),
                 )
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task["id"],
                     actor="hub",
                     payload={"reason": "blocker_reported"},
@@ -345,9 +344,8 @@ async def _finish_arbiter(db, task: dict, job: dict, job_status: str) -> None:
     reason = "arbiter_job_failed" if job_status == "failed" else "arbitration_finished"
     await repo.mark_arbiter_finished(db, task["id"])
     await repo.update_task(db, task["id"], status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task["id"],
         actor="hub",
         payload={"reason": reason},
@@ -375,9 +373,8 @@ async def _finish_arbiter(db, task: dict, job: dict, job_status: str) -> None:
 async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
     """Universal Review Gate (#309): a crashed review job never completes the task."""
     await repo.update_task(db, task["id"], status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task["id"],
         actor="hub",
         payload={"reason": "review_job_failed"},
@@ -477,9 +474,8 @@ async def _defer_scanned_approval(db, task: dict, scanned) -> None:
         "(hub_submit_review) или примите решение вручную (REST POST /api/tasks/<id>/decide).",
     )
     await repo.update_task(db, task["id"], status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task["id"],
         actor="hub",
         payload={
@@ -609,9 +605,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
                     "человеку (REST POST /api/tasks/<id>/decide).",
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task["id"],
                     actor="hub",
                     payload={"reason": "stacking", "detail": stacked, "pr": pr_num},
@@ -691,9 +686,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
             "Решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.update_task(db, task["id"], status="needs_decision")
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task["id"],
             actor="hub",
             payload={"reason": reason, "pr": pr_num},
@@ -768,9 +762,8 @@ async def _mark_no_clear_verdict(db, task: dict) -> None:
         "Manual decision required.",
     )
     await repo.update_task(db, task["id"], status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task["id"],
         actor="hub",
         payload={"reason": "no_clear_verdict"},
@@ -872,6 +865,12 @@ async def _ensure_pr_for_ci(db, task: dict, ctx: dict, workspace) -> bool:
             )
             await repo.update_task(db, task["id"], status="needs_decision")
             await repo.reset_ci_check_state(db, task["id"])
+            await watch_notices.emit_needs_decision(
+                db,
+                task_id=task["id"],
+                actor="hub",
+                payload={"reason": "ci_no_pr", "attempts": attempts},
+            )
             await db.commit()
             await services.maybe_destroy_vast(db, task)
         else:
@@ -948,9 +947,8 @@ async def _sweep_ci_check(db) -> None:
                     + (f" Запрос прогона не сделан: {why_not}" if why_not else ""),
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task["id"],
                     actor="hub",
                     payload={"reason": "ci_untested", "sha": sha},
@@ -1014,9 +1012,8 @@ async def _sweep_ci_check(db) -> None:
                         "Manual intervention required.",
                     )
                     await repo.update_task(db, task["id"], status="needs_decision")
-                    await repo.insert_event(
+                    await watch_notices.emit_needs_decision(
                         db,
-                        kind="needs_decision",
                         task_id=task["id"],
                         actor="hub",
                         payload={"reason": "ci_fix_cycle_limit"},
@@ -1096,6 +1093,9 @@ async def _stale_task_tick(
             f"«{waiting_for}» до {waiting_until}, срок вышел "
             f"{_age_phrase(overdue)} назад. {action}",
         )
+        await _announce_stale(
+            db, task_id, status, rung, f"stale:{task_id}:{status}:{rung}"
+        )
         await db.commit()
         await log_activity(
             db,
@@ -1134,6 +1134,7 @@ async def _stale_task_tick(
         f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'})."
         f"{await _slot_phrase(db, task_id)} {action}",
     )
+    await _announce_stale(db, task_id, status, rung, f"stale:{task_id}:{status}:{rung}")
     await db.commit()
     await log_activity(
         db,
@@ -1146,6 +1147,40 @@ async def _stale_task_tick(
         status,
         _age_phrase(silence),
         rung,
+    )
+
+
+async def _announce_stale(
+    db, task_id: int, status: str, mark: str, source_key: str
+) -> None:
+    """Событие простоя и уведомление стюарду — в транзакции записи об простое (#1679).
+
+    Вызывается после ``add_task_update`` и до commit: запись, событие и
+    уведомление атомарны. Ключ дедуплицирует рубеж (или окно черновика) на всю
+    жизнь, как и ``stale_rung_raised`` / ``has_stale_alert`` до него.
+    """
+    project, _ = await repo.resolve_project_with_source(db, task_id)
+    project_id = int(project["id"]) if project is not None else None
+    event_id = await repo.insert_event(
+        db,
+        kind="task_stale",
+        task_id=task_id,
+        project_id=project_id,
+        actor="hub",
+        payload={
+            "project_id": project_id,
+            "task_id": task_id,
+            "status": status,
+            "rung": mark,
+        },
+    )
+    await watch_notices.notify_steward(
+        db,
+        "stale",
+        task_id=task_id,
+        project_id=project_id,
+        source_key=source_key,
+        source_event_id=event_id,
     )
 
 
@@ -1260,7 +1295,7 @@ async def _sweep_unrefined_drafts(db) -> None:
 
             readiness = await calculate_readiness_with_recommendations(db, task["id"])
             missing = ", ".join(readiness.missing_required) or "—"
-            await repo.add_task_update(
+            update_id = await repo.add_task_update(
                 db,
                 task["id"],
                 "hub",
@@ -1271,6 +1306,9 @@ async def _sweep_unrefined_drafts(db) -> None:
                 f"(missing: {missing}). hub_refine_task доведёт "
                 "постановку до готовности — без этого одобрение "
                 "владельцем невозможно (422 dor_failed).",
+            )
+            await _announce_stale(
+                db, task["id"], "draft", "window", f"stale_draft:{update_id}"
             )
             await db.commit()
             await log_activity(
@@ -1728,9 +1766,8 @@ async def _sweep_machine_deadlines(db) -> None:
                     "Manual decision required.",
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
-                await repo.insert_event(
+                await watch_notices.emit_needs_decision(
                     db,
-                    kind="needs_decision",
                     task_id=task["id"],
                     actor="hub",
                     payload={"reason": policy.reason},
@@ -1770,9 +1807,8 @@ async def _sweep_stale_arbiter(db) -> None:
                 status="needs_decision",
                 arbiter_state="finished",
             )
-            await repo.insert_event(
+            await watch_notices.emit_needs_decision(
                 db,
-                kind="needs_decision",
                 task_id=task["id"],
                 actor="hub",
                 payload={"reason": "arbiter_dispatch_ambiguous"},
@@ -2057,9 +2093,8 @@ async def _deliver_pair_task(db, task: dict) -> None:
             "ветке. Решение за человеком (REST POST /api/tasks/<id>/decide)."
             + services.base_conflict_resubmit_hint(reason, detail),
         )
-        await repo.insert_event(
+        await watch_notices.emit_needs_decision(
             db,
-            kind="needs_decision",
             task_id=task_id,
             actor="hub",
             payload={"reason": reason, "detail": detail, "via": "poller"},
@@ -2249,7 +2284,14 @@ async def _write_release_note(
     """Event (when given) and feed entry in one commit; False if it failed."""
     try:
         if event is not None:
-            await repo.insert_event(db, kind=kind, actor="hub", **event)
+            event_id = await repo.insert_event(db, kind=kind, actor="hub", **event)
+            await watch_notices.notify_steward(
+                db,
+                "release",
+                project_id=event.get("project_id"),
+                source_key=f"release:{event_id}",
+                source_event_id=event_id,
+            )
         await log_activity(db, kind, summary, detail)
         return True
     except Exception:

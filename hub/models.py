@@ -408,6 +408,17 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # заменяет, а ограничивает и его, и автоодобрение. Читатель:
     # project_policy.freeze_of; единственная проверка: freeze_admission.
     "freeze",
+    # #1679: какие поводы хаб кладёт в ящик steward@<проект>. Не гейт и ничего
+    # не делегирует. Читатель: project_policy.steward_watch_of.
+    "steward_watch",
+)
+# Поводы наблюдения стюарда (#1679): ровно пять значений steward_watch.
+STEWARD_WATCH_REASONS: tuple[str, ...] = (
+    "needs_decision",
+    "machine_review",
+    "release",
+    "base_branch_red",
+    "stale",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -631,6 +642,31 @@ def _validate_release_artifacts(policy: dict[str, Any]) -> None:
             }
         )
     policy["release_artifacts"] = cleaned
+
+
+def _validate_steward_watch(policy: dict[str, Any]) -> None:
+    """``steward_watch`` — список поводов из ``STEWARD_WATCH_REASONS`` (#1679).
+
+    ``[]`` — наблюдение выключено; ключа нет — включены все пять. Неизвестное
+    значение, повтор и не список — отказ: тихо проглоченная опечатка выключила
+    бы повод, о котором хозяин проекта думает, что он включён.
+    """
+    if "steward_watch" not in policy:
+        return
+    watch = policy["steward_watch"]
+    if not isinstance(watch, list):
+        raise ValueError(
+            "gate_policy steward_watch must be a list of "
+            f"{', '.join(STEWARD_WATCH_REASONS)}, got: {type(watch).__name__}"
+        )
+    for reason in watch:
+        if not isinstance(reason, str) or reason not in STEWARD_WATCH_REASONS:
+            raise ValueError(
+                "gate_policy steward_watch holds only "
+                f"{', '.join(STEWARD_WATCH_REASONS)}, got: {reason!r}"
+            )
+    if len(set(watch)) != len(watch):
+        raise ValueError("gate_policy steward_watch names a reason twice")
 
 
 def _validate_count(policy: dict[str, Any], key: str) -> None:
@@ -3466,6 +3502,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_path_notices(v)
     _validate_release_artifacts(v)
     _validate_freeze(v)
+    _validate_steward_watch(v)
     return v
 
 

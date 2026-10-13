@@ -37,6 +37,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.registry import plugins
+from hub.services import watch_notices
 from hub.services.project_policy import base_branch_of, forge_of
 
 log = logging.getLogger("hub.red_base")
@@ -174,7 +175,7 @@ async def check_project(db: aiosqlite.Connection, project_row: Any) -> BaseCiSta
     if await already_announced(db, project["id"], state.red_sha):
         return state
     state.met = await _commits_between(project, state.last_green_sha, state.red_sha)
-    await repo.insert_event(
+    event_id = await repo.insert_event(
         db,
         kind=EVENT_KIND,
         project_id=project["id"],
@@ -186,6 +187,15 @@ async def check_project(db: aiosqlite.Connection, project_row: Any) -> BaseCiSta
             "last_green_sha": state.last_green_sha,
             "met": state.met[:20],
         },
+    )
+    # #1679: ключ несёт проект и sha — повтор того же красного не даёт второго
+    # уведомления, даже если already_announced его не увидел (ретенция ленты).
+    await watch_notices.notify_steward(
+        db,
+        "base_branch_red",
+        project_id=project["id"],
+        source_key=f"base_branch_red:{project['id']}:{state.red_sha}",
+        source_event_id=event_id,
     )
     met_note = (
         "; встретились: " + ", ".join(s[:80] for s in state.met[:5])

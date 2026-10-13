@@ -1415,3 +1415,25 @@ async def test_agent_sessions_projects_column_is_idempotent(monkeypatch):
         assert session_view(rows[0])["projects"] == []
     finally:
         await conn.close()
+
+
+async def test_watch_notices_table_is_idempotent_and_keys_are_unique():
+    """#1679: ключи уведомлений стюарду — пожизненный дедуп, повтор ключа игнорируется."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "watch_notices")
+        assert set(cols) == {"key", "created_at"}
+        assert cols["created_at"]["notnull"] == 1
+        await _migrate(conn)  # повторный проход ничего не ломает
+        await _migrate(conn)
+        first = await conn.execute(
+            "INSERT OR IGNORE INTO watch_notices(key) VALUES ('k:1')"
+        )
+        again = await conn.execute(
+            "INSERT OR IGNORE INTO watch_notices(key) VALUES ('k:1')"
+        )
+        assert (first.rowcount, again.rowcount) == (1, 0)
+        rows = await conn.execute_fetchall("SELECT key, created_at FROM watch_notices")
+        assert [r["key"] for r in rows] == ["k:1"] and rows[0]["created_at"]
+    finally:
+        await conn.close()

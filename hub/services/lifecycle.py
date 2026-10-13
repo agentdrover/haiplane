@@ -38,6 +38,7 @@ from hub.actionable_errors import (
 from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.session_project_check import SessionProjectGuard
+from hub.services.done_hold import hold_done_report
 from hub.services.sessions import note_session_task
 from hub.services.result_kind import is_state
 from hub.services.return_running import RETURN_RUNNING_STATUSES, return_running_to_open
@@ -6184,29 +6185,7 @@ async def add_update(
                     # сдачу мимо доставки, а живое — уводит, как и уводило.
                     holding = blocker_holding_the_done_report(updates_list)
                     if holding is not None:
-                        note = blocker_note(holding)
-                        await repo.update_task(db, task_id, status="needs_decision")
-                        await repo.add_task_update(
-                            db,
-                            task_id,
-                            "hub",
-                            "alert",
-                            # #952: same rule as the merge-gate alert — the
-                            # task is entering needs_decision, where a fresh
-                            # done report is refused, so the hint must route
-                            # through the decision, not around it.
-                            f"Отчёт о готовности не пошёл в доставку: после "
-                            f"последней сдачи записан блокер — {note}. Решение "
-                            "за человеком (REST POST /api/tasks/<id>/decide): rework вернёт "
-                            "задачу в running — снимите препятствие и "
-                            "пересдайте done; accept завершит без доставки.",
-                        )
-                        await log_activity(
-                            db,
-                            "task_needs_decision",
-                            f"Task #{task_id} → needs_decision ({note})",
-                            detail=mutation_activity_detail(),
-                        )
+                        await hold_done_report(db, task_id, blocker_note(holding))
                     else:
                         await transition_after_agent_done(db, task, has_done=True)
                     if was_claimed:
