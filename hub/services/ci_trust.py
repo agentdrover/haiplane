@@ -142,6 +142,18 @@ async def trusted_report(db: Any, task_id: int, head_sha: str) -> Any:
     return row if row is not None and is_verified(dict(row)) else None
 
 
+async def unconfirmed_reason(db: Any, task_id: int, head_sha: str) -> str:
+    """ "CI-отчёт не подтверждён: <reason>" when a report is stored but unconfirmed, else ''.
+
+    Tells "CI never sent a report" (no row) from "CI sent one and GitHub did not
+    confirm it", which readers must not blur.
+    """
+    row = await repo.get_ci_run_report(db, task_id, head_sha) if head_sha else None
+    if row is None or is_verified(dict(row)):
+        return ""
+    return unverified_note(trust_of(dict(row))[1])
+
+
 def _json_map(raw: Any) -> dict[str, Any]:
     try:
         value = json.loads(raw or "{}") if isinstance(raw, str) else raw
@@ -687,20 +699,64 @@ async def refresh(
         raise RuntimeError("no call to GitHub inside the in-transaction recheck")
     lock = _locks.setdefault((task_id, head_sha), asyncio.Lock())
     limit = REFRESH_DEADLINE_SECONDS if deadline is None else deadline
+    reserved: list[int] = []  # the versions the rounds of THIS refresh reserved
     try:
         try:
             async with asyncio.timeout(limit):
                 async with lock:
                     return await _refresh_locked(
-                        db, task_id, head_sha, backoff, offline
+                        db, task_id, head_sha, backoff, offline, reserved
                     )
         except TimeoutError:
             log.warning("CI trust refresh of task %s timed out; offline", task_id)
-            return await _refresh_locked(db, task_id, head_sha, backoff, True)
+            return await _offline_after_timeout(
+                db, task_id, head_sha, reserved[-1] if reserved else None
+            )
     finally:
         # Forgotten once nobody holds or awaits it, so the table does not grow.
         if not lock.locked() and not getattr(lock, "_waiters", None):
             _locks.pop((task_id, head_sha), None)
+
+
+async def _offline_after_timeout(
+    db: Any, task_id: int, head_sha: str, reserved: int | None
+) -> Standing | None:
+    """What a refresh that ran out of time may still say, without superseding anyone.
+
+    It writes "not confirmed" (and marks the due attempts as tried) only while
+    the version its own last round reserved is still the current one. Once
+    another refresh or a POST moved the version, newer work stands and this one
+    keeps its hands off: the standing is simply read back.
+    """
+    rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
+    task = dict(await repo.get_task(db, task_id) or {})
+    if not rows or not task:
+        return None
+    if reserved is not None:
+        gh_args = await _forge_args(db, task_id)
+        verdicts = {
+            int(r["id"]): (_unavailable(r), int(r["body_version"]))
+            for r in rows
+            if not r["trust_final"]
+        }
+        standing = await _write_round(
+            db,
+            task_id,
+            head_sha,
+            reserved,
+            verdicts,
+            None,
+            str(gh_args.get("gh_repo") or config.REPO_NAME),
+        )
+        if standing is not None:
+            return standing
+    stored = await repo.get_ci_run_report(db, task_id, head_sha)
+    trust, reason = (
+        trust_of(dict(stored)) if stored is not None else (UNVERIFIED, PENDING)
+    )
+    return Standing(
+        trust=trust, reason=reason, has_report=stored is not None, forge_down=True
+    )
 
 
 async def _ask_github(
@@ -736,7 +792,12 @@ async def _ask_github(
 
 
 async def _refresh_locked(
-    db: Any, task_id: int, head_sha: str, backoff: bool, offline: bool
+    db: Any,
+    task_id: int,
+    head_sha: str,
+    backoff: bool,
+    offline: bool,
+    reserved: list[int],
 ) -> Standing | None:
     gh_args: dict[str, Any] = {}
     for _round in range(MAX_CHECK_ROUNDS):
@@ -746,6 +807,7 @@ async def _refresh_locked(
         # would let an answer computed before their write pass as current.
         async with write_transaction(db):
             version = await repo.bump_ci_state_version(db, task_id, head_sha)
+        reserved.append(version)
         rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
         if not rows:
             return None
@@ -768,28 +830,48 @@ async def _refresh_locked(
             }
         else:
             verdicts, runs = await _ask_github(rows, head_sha, gh_args, backoff)
-        async with write_transaction(db):
-            now = await repo.ci_state_version(db, task_id, head_sha)
-            if now == version:
-                stale = False
-                for attempt_id, ((trust, reason, final), body) in verdicts.items():
-                    written = await repo.set_ci_attempt_trust(
-                        db,
-                        attempt_id,
-                        trust=trust,
-                        trust_reason=reason,
-                        final=final,
-                        body_version=body,
-                    )
-                    stale = stale or not written
-                if not stale:
-                    fresh = await repo.list_ci_report_attempts(db, task_id, head_sha)
-                    task = dict(await repo.get_task(db, task_id) or task)
-                    standing = await _project(
-                        db, task, head_sha, list(fresh), runs, gh_repo
-                    )
-                    return replace(standing, forge_down=runs is None)
+        standing = await _write_round(
+            db, task_id, head_sha, version, verdicts, runs, gh_repo
+        )
+        if standing is not None:
+            return standing
     return await _superseded(db, task_id, head_sha)
+
+
+async def _write_round(
+    db: Any,
+    task_id: int,
+    head_sha: str,
+    version: int,
+    verdicts: dict[int, tuple[Verdict, int]],
+    runs: list[dict[str, Any]] | None,
+    gh_repo: str,
+) -> Standing | None:
+    """Write a round's verdicts and the projection, only if its version is current.
+
+    One short transaction. None: the version moved (or a body was replaced
+    meanwhile) and nothing of this round was projected.
+    """
+    async with write_transaction(db):
+        if await repo.ci_state_version(db, task_id, head_sha) != version:
+            return None
+        stale = False
+        for attempt_id, ((trust, reason, final), body) in verdicts.items():
+            written = await repo.set_ci_attempt_trust(
+                db,
+                attempt_id,
+                trust=trust,
+                trust_reason=reason,
+                final=final,
+                body_version=body,
+            )
+            stale = stale or not written
+        if stale:
+            return None
+        fresh = await repo.list_ci_report_attempts(db, task_id, head_sha)
+        task = dict(await repo.get_task(db, task_id) or {})
+        standing = await _project(db, task, head_sha, list(fresh), runs, gh_repo)
+        return replace(standing, forge_down=runs is None)
 
 
 async def _superseded(db: Any, task_id: int, head_sha: str) -> Standing:

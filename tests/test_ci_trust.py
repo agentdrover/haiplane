@@ -2153,3 +2153,124 @@ async def test_a_task_without_validation_commands_is_not_blocked_by_evidence_of_
         db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
     )
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+# ---- deep review 917 --------------------------------------------------------
+
+
+async def test_a_timeout_is_never_taken_for_a_missing_run_because_of_digits_in_an_id(
+    db, monkeypatch
+):
+    """The message of a timeout carries the endpoint; ids with 404 or 410 are not "not found"."""
+    from hub.integrations import proc
+    from hub.integrations.forge import github as gh_module
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    async def timed_out(*args, repo=None, **kw):
+        return 124, "", f"timed out after 20s: gh api {args[1]}"
+
+    async def zip_timed_out(*cmd, **kw):
+        return 124, b"", f"timed out after 90s: gh api {cmd[2]}"
+
+    monkeypatch.setattr(gh_module, "_gh", timed_out)
+    monkeypatch.setattr(proc, "run_capped", zip_timed_out)
+    forge = gh_module.GitHubForge()
+    run_id, sha = "18594041234", "a410b404c410"
+    assert await forge.ci_run_attempt(run_id, "1", gh_repo="own/rep") is None
+    assert await forge.ci_runs_for_sha(sha, gh_repo="own/rep") is None
+    assert await forge.ci_run_artifacts(run_id, gh_repo="own/rep") is None
+    assert (
+        await forge.ci_artifact_zip("4041041", max_bytes=5, gh_repo="own/rep") is None
+    )
+    # ... while GitHub's own 404 / 410 still mean "absent".
+    for text in ("gh: Not Found (HTTP 404)", "HTTP 410: Gone (https://x)"):
+        assert gh_module.GitHubForge._api_missing(text) is True
+    assert (
+        gh_module.GitHubForge._api_missing("timed out after 20s: gh api runs/404")
+        is False
+    )
+
+    # End to end: the report stays retryable (not final) instead of run_not_found.
+    for name in (
+        "ci_run_attempt",
+        "ci_runs_for_sha",
+        "ci_run_artifacts",
+        "ci_artifact_zip",
+    ):
+        monkeypatch.setattr(plugins.git_ops, name, _bound(forge, name), raising=False)
+    task_id = await _task(db)
+    sent = GH.attempt(task_id, SHA, run_id=run_id)
+    await store_ci_run_report(db, task_id, **sent)
+    await db.commit()
+    standing = await ci_trust.refresh(db, task_id, SHA)
+    assert (standing.trust, standing.reason) == ("unverified", "forge_unavailable")
+    row = (await repo.list_ci_report_attempts(db, task_id, SHA))[0]
+    assert row["trust_final"] == 0 and row["trust_reason"] == "forge_unavailable"
+
+
+def _bound(forge, name):
+    method = getattr(forge, name)
+
+    async def call(*args, forge="", **kwargs):  # the git_ops signature carries `forge`
+        return await method(*args, **kwargs)
+
+    return call
+
+
+async def test_a_timed_out_refresh_does_not_overwrite_a_newer_confirmation(
+    db, monkeypatch
+):
+    import asyncio
+
+    from hub.integrations.registry import plugins
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    await store_ci_run_report(db, task_id, **GH.attempt(task_id, SHA, run_id="9901"))
+    await db.commit()
+    real = GH.ci_run_attempt
+    calls: list[int] = []
+
+    async def first_call_hangs(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            await asyncio.sleep(30)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", first_call_hangs)
+    monkeypatch.setattr(ci_trust, "REFRESH_DEADLINE_SECONDS", 0.6)
+    slow = asyncio.create_task(ci_trust.refresh(db, task_id, SHA))
+    await asyncio.sleep(0.15)  # the slow refresh reserved its version and hangs
+    ci_trust._locks.clear()  # another refresh (another process) is not blocked by it
+    other = await ci_trust.refresh(db, task_id, SHA)
+    assert other.trust == "verified"
+    await slow  # its deadline passes; its offline fallback must keep its hands off
+
+    assert (await _standing(db, task_id))[:2] == ("verified", "")
+    assert (await _evidence(db, task_id))[0] == [("AC-1", "pass")]
+
+
+async def test_an_unconfirmed_report_is_not_shown_as_if_ci_never_sent_one(db):
+    from hub.services import review_evidence
+    from hub.services.ci_report import store_ci_run_report
+
+    task_id = await _task(db)
+    task = dict(await repo.get_task(db, task_id))
+    none_sent = await review_evidence.prepass_state(db, task)
+    assert "не присылал" in none_sent.reason
+
+    sent = GH.attempt(task_id, SHA, run_id="9902")
+    sent["validation_status"] = "fail"  # the body differs from the artifact
+    await store_ci_run_report(db, task_id, **sent)
+    await db.commit()
+    await ci_trust.refresh(db, task_id, SHA)
+    prepass = await review_evidence.prepass_state(db, task)
+    assert prepass.state == "unknown"
+    assert "CI-отчёт не подтверждён: body_mismatch" in prepass.reason
+    assert "не присылал" not in prepass.reason
+    assert "CI-отчёт не подтверждён: body_mismatch" in review_evidence.prepass_block(
+        prepass
+    )
+    evidence = await review_evidence.ci_evidence_state(db, task)
+    assert "не подтверждён: body_mismatch" in evidence.baseline.reason

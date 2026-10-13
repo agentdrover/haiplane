@@ -596,10 +596,16 @@ async def ci_evidence_state(db, task: dict):
         return CIEvidenceState(
             mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
         )
-    from hub.services.ci_trust import trusted_report
+    from hub.services.ci_trust import trusted_report, unconfirmed_reason
 
     # #1687: mutations and baseline are evidence only from a confirmed report.
     row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
+        text = f"не получено: {why}"
+        return CIEvidenceState(
+            mutations=CIEvidenceBlock(reason=text),
+            baseline=CIEvidenceBlock(reason=text),
+        )
     stored = dict(row) if row is not None else {}
     return CIEvidenceState(
         mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
@@ -624,9 +630,12 @@ async def prepass_state(db, task: dict):
             state="unknown",
             reason="коммит сдачи не закреплён — предпас не с чем сверить",
         )
-    from hub.services.ci_trust import trusted_report
+    from hub.services.ci_trust import trusted_report, unconfirmed_reason
 
     row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
+        # A report WAS sent, and GitHub did not confirm it: say that, not "never sent".
+        return PrepassState(state="unknown", head_sha=pinned, reason=why)
     if row is None:
         return PrepassState(
             state="unknown",

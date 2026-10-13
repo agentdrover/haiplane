@@ -1160,8 +1160,16 @@ class GitHubForge:
 
     @staticmethod
     def _api_missing(err: str) -> bool:
-        low = (err or "").lower()
-        return "404" in low or "not found" in low or "410" in low or "gone" in low
+        """GitHub itself said "no such thing": its HTTP status, 404 or 410.
+
+        Read from the status gh prints ("HTTP 404"), never from digits anywhere
+        in the message: a timeout message carries the endpoint, and a run id or a
+        sha may contain "404". Whatever is not a clear 404/410 is "unknown".
+        """
+        text = err or ""
+        if text.startswith("timed out"):
+            return False
+        return re.search(r"\bHTTP (404|410)\b", text) is not None
 
     @staticmethod
     def _run_facts(run: dict[str, Any]) -> dict[str, Any]:
