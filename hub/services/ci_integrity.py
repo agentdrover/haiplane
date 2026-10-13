@@ -497,7 +497,7 @@ def scan_diff(
 
 def _scan_lines(fd: _FileDiff, path: str, text: str | None, add: Any) -> None:
     """The line rules on the ADDED lines of one test file; the syntax tree for env reads."""
-    reads: list[int] | None = None
+    reads: list[tuple[int, str]] | None = None
     if path.endswith(".py") and fd.added and not fd.deleted:
         reads = env_reads(text, {n for n, _ in fd.added}) if text is not None else None
         if reads is None:
