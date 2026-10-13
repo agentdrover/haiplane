@@ -5924,26 +5924,34 @@ async def _validation_gap_of_the_work(
     from hub.services.validation_run import validation_gap
 
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
+    # Nothing is declared to validate: nothing to cover, whatever commit it is.
+    if not json.loads(fresh.get("validation_commands") or "[]"):
+        return None
+    gap = validation_gap(fresh)
+    source = str(fresh.get("validation_source") or "manual")
+    if source == "manual" and not gap:
+        # A run the owner or the hub made by hand keeps its meaning (#510):
+        # #1687 is about CI evidence, which names a commit; a manual record does not.
+        return None
     pinned = (fresh.get("submission_sha") or "").strip()
     sha = (task.get(PREPARED_CI_SHA) or "").strip() or pinned
     if sha and pinned and sha != pinned:
-        if not json.loads(fresh.get("validation_commands") or "[]"):
-            return None
         report = await ci_trust.trusted_report(db, int(fresh["id"]), sha)
         status = str(dict(report).get("validation_status") or "") if report else ""
-        if status != "pass":
+        if (
+            report is None
+            or status != "pass"
+            or not ci_trust.can_testify_pass(dict(report))
+        ):
             return (
                 f"вершина ветки {sha[:12]} не совпадает с закреплённым "
                 f"{pinned[:12]}; подтверждённая validation вершины: "
-                f"{status or 'нет'}, нужен pass"
+                f"{status or 'нет'}, нужен pass успешного прогона"
             )
         return None
-    gap = validation_gap(fresh)
     if gap or not sha:
         return gap
-    source_sha = await ci_trust.evidence_sha(
-        db, int(fresh["id"]), str(fresh.get("validation_source") or "")
-    )
+    source_sha = await ci_trust.evidence_sha(db, int(fresh["id"]), source)
     if source_sha and source_sha != sha:
         return (
             f"validation записана по коммиту {source_sha[:12]}, а работа — {sha[:12]}"

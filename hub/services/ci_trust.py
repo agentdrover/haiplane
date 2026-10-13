@@ -155,6 +155,21 @@ def run_conclusion(report: Mapping[str, Any]) -> str:
     return str(_json_map(report.get("provenance")).get("run_conclusion") or "")
 
 
+def run_succeeded(report: Mapping[str, Any]) -> bool:
+    """The run behind a stored report ended in ``success`` (what GitHub confirmed)."""
+    return run_conclusion(report) == SUCCESS
+
+
+def can_testify_pass(report: Mapping[str, Any]) -> bool:
+    """A report's ``pass`` counts as evidence: confirmed by GitHub AND the run succeeded.
+
+    The ONE predicate for it: ``write_evidence`` writes a ``pass`` to the task by
+    it and the completion gate accepts a tip's validation by it, so the two
+    cannot drift apart.
+    """
+    return is_verified(report) and run_succeeded(report)
+
+
 def green_gap(report: Mapping[str, Any]) -> str | None:
     """Why a verified report is not a GREEN proof; None when it is.
 
@@ -443,7 +458,7 @@ async def write_evidence(
     # A run that did not end in success never writes a ``pass``. A missing or
     # skipped check does not stop the per-AC facts from being recorded:
     # ``green_gap`` is the stricter question the gates ask of the same row.
-    green = str(_json_map(row["provenance"]).get("run_conclusion") or "") == SUCCESS
+    green = can_testify_pass({"trust": trust, "provenance": row["provenance"]})
     ac = {
         str(k): str(v)
         for k, v in _json_map(row["ac_results"]).items()

@@ -2041,3 +2041,115 @@ async def lifecycle_gap(db, task):
     from hub.services.lifecycle import _validation_gap_of_the_work
 
     return await _validation_gap_of_the_work(db, task)
+
+
+# ---- round 8: the done gate's three corners ---------------------------------
+
+
+@pytest.mark.parametrize("status", ["pending_report", "running"])
+async def test_a_tip_whose_run_failed_cannot_complete_the_work_even_with_a_pass(
+    db, monkeypatch, status
+):
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    tip = "sha-tip-failed-run"
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9701"))
+    await _post(  # confirmed, validation pass, but the RUN ended in failure
+        db, task_id, GH.attempt(task_id, tip, run_id="9702", conclusion="failure")
+    )
+    await repo.update_task(
+        db, task_id, status=status, auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(tip, ""))
+    )
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+def test_writing_a_pass_and_accepting_one_share_one_predicate():
+    ok = {"trust": "verified", "provenance": json.dumps({"run_conclusion": "success"})}
+    assert ci_trust.can_testify_pass(ok) is True
+    assert ci_trust.can_testify_pass({**ok, "trust": "unverified"}) is False
+    failed = {**ok, "provenance": json.dumps({"run_conclusion": "failure"})}
+    assert ci_trust.can_testify_pass(failed) is False
+
+
+@pytest.mark.parametrize("status", ["pending_report", "running"])
+async def test_a_manual_validation_still_completes_work_whose_tip_has_no_ci(
+    db, monkeypatch, status
+):
+    from unittest.mock import AsyncMock
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+    from hub.services.validation_run import record_validation_result
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)  # A pinned, generation 1, no CI at all
+    await record_validation_result(
+        db, task_id, generation=1, status="pass", source="manual"
+    )
+    await repo.update_task(
+        db, task_id, status=status, auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=("sha-tip-b", ""))
+    )
+    await lifecycle.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_a_task_without_validation_commands_is_not_blocked_by_evidence_of_a_commit(
+    db, monkeypatch
+):
+    """CI-written validation from A; B is resubmitted and approved; nothing to validate."""
+    from unittest.mock import AsyncMock
+
+    from hub import config
+    from hub.models import ReviewVerdict, TaskReviewVerdict, TaskUpdateCreate
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    monkeypatch.setattr(config, "SDD_AC_TESTS", "off")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9801"))
+    task = dict(await repo.get_task(db, task_id))
+    assert (
+        task["validation_source"].startswith("ci:")
+        and task["validation_commands"] == "[]"
+    )
+    # Generation 2: another commit, no CI; a reviewer approves it.
+    await repo.bump_submission_generation(db, task_id)
+    await repo.update_task(db, task_id, submission_sha="sha-b", status="review")
+    await db.commit()
+    await lifecycle.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+        self_approved=True,
+    )
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=("sha-b", ""))
+    )
+    await lifecycle.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
