@@ -5903,14 +5903,52 @@ async def _done_validation_gate(db: aiosqlite.Connection, task: dict[str, Any]) 
         return
 
     async def gate() -> None:
-        from hub.services.validation_run import validation_gap
-
-        fresh = dict(await repo.get_task(db, int(task["id"])) or task)
-        vgap = validation_gap(fresh)
+        vgap = await _validation_gap_of_the_work(db, task)
         if vgap:
             raise HTTPException(422, f"validation_failed: {vgap}")
 
     await ci_trust.recheck_in_transaction(db, gate)
+
+
+async def _validation_gap_of_the_work(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str | None:
+    """Why the validation evidence does not cover the work being completed, or None.
+
+    The work is the tip the caller prepared (the branch as GitHub saw it), or
+    the pinned commit when there is no newer tip. Evidence of ANOTHER commit is
+    no evidence: when the tip is not the pinned commit, the tip's own confirmed
+    report decides; when it is, the validation written on the task must come
+    from an attempt of that very commit.
+    """
+    from hub.services.validation_run import validation_gap
+
+    fresh = dict(await repo.get_task(db, int(task["id"])) or task)
+    pinned = (fresh.get("submission_sha") or "").strip()
+    sha = (task.get(PREPARED_CI_SHA) or "").strip() or pinned
+    if sha and pinned and sha != pinned:
+        if not json.loads(fresh.get("validation_commands") or "[]"):
+            return None
+        report = await ci_trust.trusted_report(db, int(fresh["id"]), sha)
+        status = str(dict(report).get("validation_status") or "") if report else ""
+        if status != "pass":
+            return (
+                f"вершина ветки {sha[:12]} не совпадает с закреплённым "
+                f"{pinned[:12]}; подтверждённая validation вершины: "
+                f"{status or 'нет'}, нужен pass"
+            )
+        return None
+    gap = validation_gap(fresh)
+    if gap or not sha:
+        return gap
+    source_sha = await ci_trust.evidence_sha(
+        db, int(fresh["id"]), str(fresh.get("validation_source") or "")
+    )
+    if source_sha and source_sha != sha:
+        return (
+            f"validation записана по коммиту {source_sha[:12]}, а работа — {sha[:12]}"
+        )
+    return None
 
 
 async def _task_inside_transaction(

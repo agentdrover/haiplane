@@ -590,6 +590,23 @@ async def recheck_in_transaction(
         _in_recheck.reset(token)
 
 
+async def evidence_sha(db: Any, task_id: int, source: str) -> str:
+    """The commit a piece of CI-written evidence (its ``source`` key) is about; '' if none.
+
+    ``source`` is ``ci:<run>:<attempt>`` for evidence written from a confirmed
+    attempt; ``manual`` / ``legacy`` name no commit.
+    """
+    parts = source.split(":")
+    if len(parts) != 3 or parts[0] != "ci":
+        return ""
+    rows = await db.execute_fetchall(
+        "SELECT head_sha FROM ci_report_attempts "
+        "WHERE task_id=? AND run_id=? AND run_attempt=? LIMIT 1",
+        (task_id, parts[1], parts[2]),
+    )
+    return str(rows[0][0]) if rows else ""
+
+
 async def pass_gap(db: Any, task_id: int, head_sha: str) -> str | None:
     """Why the commit has no confirmed GREEN pass in the database right now; None if it has.
 

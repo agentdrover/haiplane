@@ -1959,3 +1959,85 @@ async def test_the_deferred_completion_asks_github_before_it_writes_completed(
         )
     assert "validation_failed" in str(refused.value.detail)
     assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+# ---- round 7: the evidence is of the commit being completed -----------------
+
+
+@pytest.mark.parametrize("status", ["pending_report", "running"])
+@pytest.mark.parametrize("tip_validation", ["fail", "pass"])
+async def test_a_done_report_is_judged_on_the_tip_it_completes_not_on_the_pinned_commit(
+    db, monkeypatch, status, tip_validation
+):
+    """A is pinned with a passing validation; the branch is already at B."""
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    tip = "sha-tip-b"
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)  # pinned SHA = A, generation 1
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9501"))
+    assert (await _evidence(db, task_id))[1] == "pass", "A's pass is stored on the task"
+    await _post(
+        db,
+        task_id,
+        GH.attempt(
+            task_id,
+            tip,
+            run_id="9502",
+            validation_status=tip_validation,
+            ac_results={"AC-1": tip_validation},
+        ),
+    )
+    await repo.update_task(
+        db, task_id, status=status, auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(tip, ""))
+    )
+    done = TaskUpdateCreate(agent="dev", kind="done", content="done")
+
+    if tip_validation == "fail":
+        with pytest.raises(HTTPException) as refused:
+            await lifecycle.add_update(db, task_id, done)
+        assert refused.value.status_code == 422
+        assert "validation_failed" in str(refused.value.detail)
+        assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+    else:
+        await lifecycle.add_update(db, task_id, done)
+        assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_validation_written_from_another_commit_does_not_cover_the_work(
+    db, monkeypatch
+):
+    from hub import config
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="9601"))
+    await _post(db, task_id, GH.attempt(task_id, "sha-other", run_id="9602"))
+    await repo.update_task(db, task_id, validation_commands='["x"]')
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+    assert await lifecycle_gap(db, task) is None
+
+    # The task row says its validation came from the attempt of ANOTHER commit.
+    await db.execute(
+        "UPDATE tasks SET validation_source = 'ci:9602:1' WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    gap = await lifecycle_gap(db, dict(await repo.get_task(db, task_id)))
+    assert gap and "sha-other"[:12] in gap
+
+
+async def lifecycle_gap(db, task):
+    from hub.services.lifecycle import _validation_gap_of_the_work
+
+    return await _validation_gap_of_the_work(db, task)
