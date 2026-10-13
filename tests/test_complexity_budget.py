@@ -332,8 +332,10 @@ def test_repository_ledger_passes_and_refresh_keeps_ceilings(
         "hub/mcp_server.py::hub_prepare_developer_task::C901": "task:#1691",
         "hub/services/lifecycle.py::create_task::C901": "task:#1692",
     }
+    # Запись снимают разбиением функции (#1690–#1692): снятая запись — не ошибка.
     for key, task in hot.items():
-        assert str(ledger[key]["removed_by"]).startswith(task), key
+        if key in ledger:
+            assert str(ledger[key]["removed_by"]).startswith(task), key
 
     copy = tmp_path / "ledger.json"
     original = json.loads(budget.LEDGER_PATH.read_text(encoding="utf-8"))
