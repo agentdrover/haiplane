@@ -279,46 +279,44 @@ def _side(text: str, prefix: str) -> str:
     return name[len(prefix) :] if name.startswith(prefix) else ""
 
 
+def _header_line(cur: _FileDiff, line: str) -> None:
+    """One line between ``diff --git`` and the first hunk."""
+    if line.startswith("rename from "):
+        cur.moved = True
+        cur.old = _unquote(line[len("rename from ") :])
+    elif line.startswith("rename to "):
+        cur.new = _unquote(line[len("rename to ") :])
+    elif line.startswith("deleted file mode"):
+        cur.deleted = True
+    elif line.startswith(("old mode ", "copy from ")):
+        cur.moved = True
+    elif line.startswith("index "):
+        cur.content_changed = True
+    elif line.startswith(("Binary files ", "GIT binary patch")):
+        cur.binary = True
+    elif line.startswith("--- ") and line[4:] != "/dev/null":
+        cur.old = _side(line[4:], "a/") or cur.old
+    elif line.startswith("+++ ") and line[4:] != "/dev/null":
+        cur.new = _side(line[4:], "b/") or cur.new
+
+
 def parse_diff(diff: str) -> list[_FileDiff]:
     """File blocks of a unified diff with old/new paths, hunks and +/- lines."""
     files: list[_FileDiff] = []
     cur: _FileDiff | None = None
-    in_hunk, new_no = False, 0
+    new_no = 0
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             old, new = _split_header(line[len("diff --git ") :])
             cur = _FileDiff(old=old, new=new)
             files.append(cur)
-            in_hunk = False
+        elif cur is None:
             continue
-        if cur is None:
-            continue
-        if not in_hunk:
-            if line.startswith("rename from "):
-                cur.moved = True
-                cur.old = _unquote(line[len("rename from ") :])
-            elif line.startswith("rename to "):
-                cur.new = _unquote(line[len("rename to ") :])
-            elif line.startswith("deleted file mode"):
-                cur.deleted = True
-            elif line.startswith(("rename from ", "old mode ", "copy from ")):
-                cur.moved = True
-            elif line.startswith("index "):
-                cur.content_changed = True
-            elif line.startswith(("Binary files ", "GIT binary patch")):
-                cur.binary = True
-            elif line.startswith("--- ") and line[4:] != "/dev/null":
-                cur.old = _side(line[4:], "a/") or cur.old
-            elif line.startswith("+++ ") and line[4:] != "/dev/null":
-                cur.new = _side(line[4:], "b/") or cur.new
-            elif (m := _HUNK.match(line)) is not None:
-                in_hunk = True
-                new_no = int(m.group(1))
-                cur.hunks.append((new_no, int(m.group(2) or 1)))
-            continue
-        if (m := _HUNK.match(line)) is not None:
+        elif (m := _HUNK.match(line)) is not None:
             new_no = int(m.group(1))
             cur.hunks.append((new_no, int(m.group(2) or 1)))
+        elif not cur.hunks:
+            _header_line(cur, line)
         elif line.startswith("+"):
             cur.added.append((new_no, line[1:]))
             new_no += 1
@@ -417,6 +415,8 @@ def env_reads(source: str, added: set[int]) -> list[int] | None:
         return None
     found: list[int] = []
     for node in ast.walk(tree):
+        if not isinstance(node, (ast.Subscript, ast.Call)):
+            continue
         key: ast.expr | None = None
         if isinstance(node, ast.Subscript) and _is_environ(node.value):
             key = node.slice

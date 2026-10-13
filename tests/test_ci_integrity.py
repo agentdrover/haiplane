@@ -212,6 +212,10 @@ def test_env_reads_are_found_in_the_syntax_tree_across_lines():
     got = scan_diff(diff, {"tests/test_z.py": multi})
     assert {s.line for s in got if s.rule == "token_read"} == {3, 6, 10}
     assert not any(s.rule == "text_not_read" for s in got)
+    # only the middle line of a multi-line read is added: the read is still this diff's
+    middle = _diff("tests/test_z.py", ['    "HAIPLANE_HUB_CI_TOKEN"'], start=4)
+    only = scan_diff(middle, {"tests/test_z.py": multi})
+    assert {s.line for s in only if s.rule == "token_read"} == {3}
     # the line regex alone would have missed all three
     assert not [
         s
