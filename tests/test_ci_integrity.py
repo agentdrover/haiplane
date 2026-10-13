@@ -795,3 +795,84 @@ async def test_the_manual_gate_card_keeps_the_owners_note(
         assert "Правка ci.yml по задаче." in route.as_dict()["line"]
     body = await _status(client, task_id)
     assert "Правка ci.yml по задаче." in body["verdict_route"]["line"]
+
+
+# ---- diverged base: the merge-base is the comparison point -------------------
+
+_PP = '[project]\nname = "x"\nversion = "{v}"\n\n[tool.pytest.ini_options]\naddopts = "{a}"\n'
+
+
+async def _scan_real(clone, monkeypatch, sha: str):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setattr(plugins, "git_ops", GitOpsIntegration())
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": str(clone), "base_branch": "main"}),
+    )
+    return await ci_integrity._scan_now(None, 1, sha)
+
+
+async def test_a_moved_base_does_not_change_what_the_branch_changed(clone, monkeypatch):
+    """P1: the diff and the base pyproject.toml both come from the merge-base."""
+    ws = clone
+    _commit(ws, "pyproject.toml", _PP.format(v="1", a="-q"), "pyproject")
+    _git(ws, "push", "-q", "origin", "main")
+    fork = _git(ws, "rev-parse", "HEAD")
+    # task A changes only the version
+    _git(ws, "checkout", "-q", "-b", "task-a", fork)
+    only_version = _commit(ws, "pyproject.toml", _PP.format(v="2", a="-q"), "version")
+    # task B changes pytest to what develop will say
+    _git(ws, "checkout", "-q", "-b", "task-b", fork)
+    same_as_main = _commit(ws, "pyproject.toml", _PP.format(v="1", a="-q -x"), "pytest")
+    # the base moves on: pytest addopts changed there
+    _git(ws, "checkout", "-q", "main")
+    _commit(ws, "pyproject.toml", _PP.format(v="1", a="-q -x"), "main moved")
+    _git(ws, "push", "-q", "origin", "main")
+
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    got = await GitOpsIntegration().integrity_read(str(ws), "main", only_version)
+    assert got is not None and got["base_sha"] == fork, "the merge-base, not the tip"
+
+    a = await _scan_real(ws, monkeypatch, only_version)
+    assert a.state == CLEAN, a  # A: not blocked by a base that moved
+    b = await _scan_real(ws, monkeypatch, same_as_main)
+    assert b.state == SIGNS and {s.rule for s in b.signs} == {"pytest_config"}, (
+        b
+    )  # B: still seen
+
+
+# ---- keyword and computed environment keys ------------------------------------
+
+
+def test_environment_keys_by_keyword_and_computed_keys_are_seen():
+    """P1: key=/name= forms are token reads; a key the scan cannot evaluate is a sign."""
+
+    def rules(src: str) -> set[str]:
+        diff = _diff("tests/test_k.py", src.splitlines())
+        return {s.rule for s in scan_diff(diff, {"tests/test_k.py": src})}
+
+    assert "token_read" in rules(
+        'import os\nx = os.environ.get(key="HAIPLANE_HUB_CI_TOKEN")\n'
+    )
+    assert "token_read" in rules('import os\nx = os.getenv(key="SOME_TOKEN")\n')
+    assert "token_read" in rules(
+        'import os\nx = os.getenv(name="HAIPLANE_A", default="")\n'
+    )
+    assert "env_key_computed" in rules("import os\nk = 'a'\nx = os.environ[k]\n")
+    assert "env_key_computed" in rules(
+        "import os\nx = os.environ.get('HAI' + 'PLANE_X')\n"
+    )
+    assert "env_key_computed" in rules("import os\nx = os.getenv(key=name)\n")
+    assert "env_key_computed" in rules("import os\nx = os.getenv(**kw)\n")
+    # a harmless constant key is neither
+    assert not rules("import os\nx = os.environ.get('HOME')\n") & {
+        "token_read",
+        "env_key_computed",
+    }

@@ -2121,7 +2121,8 @@ class GitOpsIntegration:
     ) -> dict[str, str] | None:
         """The diff ``base...sha`` for the CI integrity scan, of EXACTLY that commit (#1688).
 
-        ``{"diff", "base_sha", "head_sha"}``, or None when it cannot be read.
+        ``{"diff", "base_sha", "head_sha"}``, or None when it cannot be read;
+        ``base_sha`` is the MERGE-BASE of the base branch and the head.
         The head is resolved as an OBJECT (``<sha>^{commit}``), never through
         ``_resolve_ref_remote_first``: that tries ``origin/<name>`` first, so a
         branch NAMED with the full sha of a malicious commit B and pointing at
@@ -2170,6 +2171,15 @@ class GitOpsIntegration:
                 break
         if base_sha is None:
             return None
+        # The comparison point is the MERGE-BASE, not the tip of the base: the
+        # diff and the base-side files must describe the same commit, and a
+        # base that moved since the branch was cut is none of the author's work.
+        rc, merge_base, _ = await _git(
+            "merge-base", base_sha, head, repo=repo, check=False
+        )
+        if rc != 0 or not merge_base.strip():
+            return None
+        base_sha = merge_base.strip()
         rc, diff, _ = await _git(
             "diff",
             "--text",
@@ -2177,7 +2187,7 @@ class GitOpsIntegration:
             "--no-ext-diff",
             "--no-color",
             "-U0",
-            f"{base_sha}...{head}",
+            f"{base_sha}..{head}",
             repo=repo,
             check=False,
         )

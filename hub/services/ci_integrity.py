@@ -131,6 +131,7 @@ RULE_PYTEST_CONFIG = "pytest_config"
 RULE_LOCKFILE = "lockfile"
 RULE_HOOK = "pytest_report_hook"
 RULE_ENV_READ = "token_read"
+RULE_ENV_COMPUTED = "env_key_computed"
 RULE_REPORT_FILE = "report_file"
 RULE_EXIT = "hard_exit"
 RULE_DETACHED = "detached"
@@ -146,6 +147,7 @@ RULE_TEXT: dict[str, str] = {
     RULE_LOCKFILE: "uv.lock",
     RULE_HOOK: "хук pytest, меняющий итог прогона",
     RULE_ENV_READ: "чтение переменной с токеном",
+    RULE_ENV_COMPUTED: "ключ переменной окружения вычисляется",
     RULE_REPORT_FILE: "имя файла отчёта CI",
     RULE_EXIT: "os._exit",
     RULE_DETACHED: "процесс без ожидания (start_new_session/daemon)",
@@ -403,32 +405,49 @@ def _is_env_getter(node: ast.expr) -> bool:
 _SECRET_NAME = re.compile(r"HAIPLANE_|TOKEN")
 
 
-def env_reads(source: str, added: set[int]) -> list[int] | None:
-    """Lines of reads of a ``HAIPLANE_``/``TOKEN`` environment name touching ``added``.
+_KEY_ARGS = ("key", "name")
+
+
+def _env_key(node: ast.Subscript | ast.Call) -> tuple[bool, ast.expr | None]:
+    """(is an environment read, its key expression) of a subscript or call."""
+    if isinstance(node, ast.Subscript):
+        return (True, node.slice) if _is_environ(node.value) else (False, None)
+    if not _is_env_getter(node.func):
+        return False, None
+    if node.args:
+        return True, node.args[0]
+    named = [k.value for k in node.keywords if k.arg in _KEY_ARGS]
+    return True, named[0] if named else None
+
+
+def env_reads(source: str, added: set[int]) -> list[tuple[int, str]] | None:
+    """``(line, rule)`` of environment reads touching ``added`` lines; None = no parse.
 
     Found in the syntax tree, so ``os.environ[`` / ``"HAIPLANE_..."`` / ``]``
-    spread over lines is seen. None = the file does not parse.
+    spread over lines and ``key=`` / ``name=`` keyword forms are seen. A
+    constant key naming ``HAIPLANE_``/``TOKEN`` is ``token_read``; a key the
+    scan cannot evaluate (a variable, an expression, a splat) is
+    ``env_key_computed``: it cannot be proven harmless.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    found: list[int] = []
+    found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Subscript, ast.Call)):
             continue
-        key: ast.expr | None = None
-        if isinstance(node, ast.Subscript) and _is_environ(node.value):
-            key = node.slice
-        elif isinstance(node, ast.Call) and node.args and _is_env_getter(node.func):
-            key = node.args[0]
-        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
-            continue
-        if not _SECRET_NAME.search(key.value):
+        is_read, key = _env_key(node)
+        if not is_read:
             continue
         last = getattr(node, "end_lineno", None) or node.lineno
-        if any(node.lineno <= n <= last for n in added):
-            found.append(node.lineno)
+        if not any(node.lineno <= n <= last for n in added):
+            continue
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            if _SECRET_NAME.search(key.value):
+                found.append((node.lineno, RULE_ENV_READ))
+        else:
+            found.append((node.lineno, RULE_ENV_COMPUTED))
     return found
 
 
@@ -485,8 +504,8 @@ def _scan_lines(fd: _FileDiff, path: str, text: str | None, add: Any) -> None:
             add(
                 path, 0, RULE_UNREAD
             )  # unparseable or unread: a sign, regex as fallback
-        for line in reads or []:
-            add(path, line, RULE_ENV_READ)
+        for line, rule in reads or []:
+            add(path, line, rule)
     for no, line_text in fd.added:
         for rule, pattern in _LINE_RULES:
             if rule == RULE_ENV_READ and reads is not None:
