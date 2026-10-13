@@ -55,8 +55,8 @@ def _diff(
     return head + body
 
 
-def _rules(diff: str, pyproject: str | None = None) -> set[tuple[str, str]]:
-    return {(s.path, s.rule) for s in scan_diff(diff, pyproject)}
+def _rules(diff: str, head: dict | None = None, base: dict | None = None):
+    return {(s.path, s.rule) for s in scan_diff(diff, head, base)}
 
 
 _PYPROJECT = """[project]
@@ -96,7 +96,7 @@ def test_the_scan_names_each_kind_of_ci_input():
             _diff("pyproject.toml", ['addopts = "-q -p evil"'], start=5),
             "pyproject.toml",
             "pytest_config",
-            _PYPROJECT,
+            {"pyproject.toml": _PYPROJECT.replace('"-q"', '"-q -p evil"')},
         ),
         (_diff("uv.lock", ['version = "1"']), "uv.lock", "lockfile", None),
         (
@@ -112,13 +112,15 @@ def test_the_scan_names_each_kind_of_ci_input():
             None,
         ),
     ]
-    for diff, path, rule, pyproject in cases:
-        assert (path, rule) in _rules(diff, pyproject), (path, rule)
+    for diff, path, rule, head in cases:
+        got = _rules(diff, head, {"pyproject.toml": _PYPROJECT})
+        assert (path, rule) in got, (path, rule)
     plain = _diff("hub/app.py", ["x = 1"]) + _diff("tests/test_app.py", ["assert 1"])
-    assert scan_diff(plain) == []
+    assert scan_diff(plain, {"tests/test_app.py": "assert 1\n"}) == []
     # a pyproject edit outside the pytest tables is not a sign
     other = _diff("pyproject.toml", ["line-length = 100"], start=9)
-    assert scan_diff(other, _PYPROJECT) == []
+    head = {"pyproject.toml": _PYPROJECT.replace("= 88", "= 100")}
+    assert scan_diff(other, head, {"pyproject.toml": _PYPROJECT}) == []
 
 
 def test_every_line_rule_and_both_sides_of_a_rename_or_delete():
@@ -163,23 +165,87 @@ def test_every_line_rule_and_both_sides_of_a_rename_or_delete():
     assert ("tox.ini", "pytest_config") in _rules(_diff("tox.ini", ["[pytest]"]))
 
 
-def test_pyproject_pytest_tables_are_found_in_the_changed_lines():
-    """A removed table header, a deletion inside a table and an unread file all count."""
-    removed_header = (
-        "diff --git a/pyproject.toml b/pyproject.toml\n"
-        "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
-        '@@ -4,2 +3,0 @@\n-[tool.pytest.ini_options]\n-addopts = "-q"\n'
+def test_pytest_configuration_is_compared_as_data_not_as_text():
+    """Quoted and dotted spellings, new pytest.toml files, deletions and unread files all count."""
+    bare = _diff("pyproject.toml", ["x = 1"], start=9)
+    cases = {
+        # [tool."pytest".ini_options] is the same table as [tool.pytest.ini_options]
+        "quoted table": '[project]\nname = "x"\n\n[tool."pytest".ini_options]\naddopts = "-p evil"\n',
+        "dotted key": '[project]\nname = "x"\n[tool]\npytest.ini_options.addopts = "-p evil"\n',
+        "new table": '[project]\nname = "x"\n[tool.pytest]\nini_options = {addopts = "-q"}\n',
+    }
+    for name, head in cases.items():
+        got = _rules(bare, {"pyproject.toml": head}, {"pyproject.toml": _PYPROJECT})
+        assert ("pyproject.toml", "pytest_config") in got, name
+    # an unrelated change, in any spelling of the table, stays quiet
+    same = _PYPROJECT.replace(
+        "[tool.pytest.ini_options]", '[tool."pytest".ini_options]'
     )
-    assert ("pyproject.toml", "pytest_config") in _rules(removed_header, "x = 1\n")
-    inside_deletion = (
-        "diff --git a/pyproject.toml b/pyproject.toml\n"
-        "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
-        '@@ -6,1 +5,0 @@\n-asyncio_mode = "auto"\n'
+    assert not _rules(bare, {"pyproject.toml": same}, {"pyproject.toml": _PYPROJECT})
+    # unread or broken files are never "no change"
+    assert _rules(bare, None, {"pyproject.toml": _PYPROJECT})
+    assert _rules(bare, {"pyproject.toml": "= broken"}, {"pyproject.toml": ""})
+    # new files that pytest reads first, and the other config homes
+    for path in ("pytest.toml", ".pytest.toml", "pytest.ini", "tox.ini", "setup.cfg"):
+        assert (path, "pytest_config") in _rules(_diff(path, ["[pytest]"])), path
+    deleted = (
+        "diff --git a/pyproject.toml b/pyproject.toml\ndeleted file mode 100644\n"
+        "--- a/pyproject.toml\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-x\n"
     )
-    assert ("pyproject.toml", "pytest_config") in _rules(inside_deletion, _PYPROJECT)
-    unread = _diff("pyproject.toml", ["line-length = 100"], start=9)
-    assert ("pyproject.toml", "pytest_config") in _rules(unread, None)
-    assert ci_integrity.pytest_sections(_PYPROJECT) == [(4, 7)]
+    assert ("pyproject.toml", "pytest_config") in _rules(deleted)
+
+
+def test_env_reads_are_found_in_the_syntax_tree_across_lines():
+    """os.environ[...] and os.getenv(...) spread over lines are seen; unparseable text is a sign."""
+    multi = (
+        "import os\n\n"
+        "tok = os.environ[\n"
+        '    "HAIPLANE_HUB_CI_TOKEN"\n'
+        "]\n"
+        "other = os.getenv(\n"
+        '    "SOME_TOKEN",\n'
+        '    "",\n'
+        ")\n"
+        'third = os.environ.get(\n    "HAIPLANE_X"\n)\n'
+    )
+    diff = _diff("tests/test_z.py", multi.splitlines(), start=1)
+    got = scan_diff(diff, {"tests/test_z.py": multi})
+    assert {s.line for s in got if s.rule == "token_read"} == {3, 6, 10}
+    assert not any(s.rule == "text_not_read" for s in got)
+    # the line regex alone would have missed all three
+    assert not [
+        s
+        for s in scan_diff(_diff("tests/test_z.py", ["]"]), {"tests/test_z.py": "]"})
+        if s.rule == "token_read"
+    ]
+    # an environment read that touches no added line is not this diff's
+    old = "import os\nx = os.environ['HAIPLANE_A']\ny = 1\n"
+    added_y = _diff("tests/test_z.py", ["y = 1"], start=3)
+    assert not any(
+        s.rule == "token_read" for s in scan_diff(added_y, {"tests/test_z.py": old})
+    )
+    # unparseable or unread: a sign, with the line regex as the fallback
+    broken = ['t = os.environ["HAIPLANE_HUB_CI_TOKEN"', "def ("]
+    bd = _diff("tests/test_z.py", broken)
+    rules = {s.rule for s in scan_diff(bd, {"tests/test_z.py": "\n".join(broken)})}
+    assert "text_not_read" in rules and "token_read" in rules
+    assert "text_not_read" in {s.rule for s in scan_diff(bd)}
+
+
+def test_a_binary_representation_of_a_test_file_is_not_clean():
+    """git's «Binary files differ» for a test or conftest file is a sign, not silence."""
+    binary = (
+        "diff --git a/tests/test_q.py b/tests/test_q.py\nindex 111..222 100644\n"
+        "Binary files a/tests/test_q.py and b/tests/test_q.py differ\n"
+    )
+    assert ("tests/test_q.py", "text_not_read") in _rules(binary)
+    no_hunk = "diff --git a/tests/test_q.py b/tests/test_q.py\nindex 111..222 100644\n"
+    assert ("tests/test_q.py", "text_not_read") in _rules(no_hunk)
+    pure_rename = (
+        "diff --git a/tests/a.py b/tests/b.py\nsimilarity index 100%\n"
+        "rename from tests/a.py\nrename to tests/b.py\n"
+    )
+    assert _rules(pure_rename) == set()
 
 
 def test_the_ci_script_list_covers_what_ci_calls():
@@ -208,19 +274,32 @@ def test_the_ci_script_list_covers_what_ci_calls():
 
 @pytest.fixture
 def ci_diff(monkeypatch):
-    """What the pinned commit's diff says; set ``ci_diff.value`` (None = not received)."""
+    """What the pinned commit says: ``value`` is its diff (None = not received),
+    ``files`` maps a path to its text at that commit, ``head`` overrides the sha
+    the clone claims to have resolved."""
 
     class Box:
         value: str | None = ""
+        files: dict = {}
+        head: str | None = None
 
     box = Box()
+    box.files = {}
 
-    async def branch_diff(self, repo_path, base, branch, context=0):
+    async def integrity_read(self, repo_path, base, sha):
         if isinstance(box.value, Exception):
             raise box.value
-        return box.value
+        if box.value is None:
+            return None
+        return {"diff": box.value, "base_sha": "b" * 40, "head_sha": box.head or sha}
 
-    monkeypatch.setattr(_PinnedGitOps, "branch_diff", branch_diff)
+    async def read_file_at_ref(self, repo_path, ref, path, *, limit_chars=30000):
+        if path in box.files:
+            return {"state": "present", "content": box.files[path], "truncated": False}
+        return {"state": "missing", "content": "", "truncated": False}
+
+    monkeypatch.setattr(_PinnedGitOps, "integrity_read", integrity_read)
+    monkeypatch.setattr(_PinnedGitOps, "read_file_at_ref", read_file_at_ref)
     return box
 
 
@@ -340,6 +419,7 @@ async def test_a_change_without_signs_flows_as_before(
     ci_diff.value = _diff("hub/app.py", ["x = 1"]) + _diff(
         "tests/test_app.py", ["assert 1"]
     )
+    ci_diff.files = {"tests/test_app.py": "assert 1\n"}
     task_id = await _auto_task(client, db, monkeypatch, "ci-clean")
     await _post_review(client, task_id)
 
@@ -537,3 +617,177 @@ async def test_the_migration_is_idempotent_on_an_old_schema(monkeypatch):
         assert new <= applied
     finally:
         await conn.close()
+
+
+# ---- the exact commit, the real git ---------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+def _commit(ws: Path, name: str, text: str, message: str) -> str:
+    (ws / name).parent.mkdir(parents=True, exist_ok=True)
+    (ws / name).write_text(text)
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-q", "-m", message)
+    return _git(ws, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def clone(tmp_path):
+    """origin + a workspace clone on ``main`` with one commit."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True
+    )
+    ws = tmp_path / "ws"
+    subprocess.run(["git", "clone", "-q", str(origin), str(ws)], check=True)
+    _git(ws, "checkout", "-q", "-b", "main")
+    _commit(ws, "README.md", "hi\n", "base")
+    _git(ws, "push", "-q", "origin", "main")
+    return ws
+
+
+async def test_the_scan_reads_the_exact_commit_not_a_branch_named_like_it(clone):
+    """P1: a remote branch NAMED with the sha of a bad commit B, pointing at a clean A, does not swap B."""
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    ws = clone
+    _git(ws, "checkout", "-q", "-b", "clean")
+    clean = _commit(ws, "docs/a.md", "a\n", "clean A")
+    _git(ws, "checkout", "-q", "main")
+    _git(ws, "checkout", "-q", "-b", "evil")
+    evil = _commit(
+        ws,
+        "tests/conftest.py",
+        "def pytest_sessionfinish(session):\n    pass\n",
+        "bad B",
+    )
+    _git(ws, "push", "-q", "origin", f"{clean}:refs/heads/{evil}")
+    _git(ws, "fetch", "-q", "origin")
+    assert _git(ws, "rev-parse", f"origin/{evil}") == clean, "the shadow ref exists"
+
+    got = await GitOpsIntegration().integrity_read(str(ws), "main", evil)
+    assert got is not None and got["head_sha"] == evil
+    assert "tests/conftest.py" in got["diff"] and "docs/a.md" not in got["diff"]
+    # the old resolver reads the shadow, which is the defect
+    shadow = await GitOpsIntegration().branch_diff(str(ws), "main", evil)
+    assert shadow is not None and "docs/a.md" in shadow and "conftest" not in shadow
+    # an abbreviated or unknown sha is not a commit to scan
+    assert await GitOpsIntegration().integrity_read(str(ws), "main", evil[:12]) is None
+    assert await GitOpsIntegration().integrity_read(str(ws), "main", "f" * 40) is None
+    # a base name that is not a branch cannot be shadowed into a diff either
+    assert await GitOpsIntegration().integrity_read(str(ws), "nope", evil) is None
+
+
+async def test_a_result_for_another_commit_is_never_stored_as_this_ones(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """The service refuses a diff whose head is not the pinned sha."""
+    ci_diff.value = ""
+    ci_diff.head = "c" * 40
+    task_id = await _submitted_task(client, db, "ci-other-sha", {"verdict": "human"})
+    scan = await ci_integrity.ensure_scan(db, task_id)
+    assert scan.state == UNREADABLE and "другому коммиту" in scan.reason
+    stored = await store.get_ci_integrity_scan(db, task_id, _TIP)
+    assert stored is not None and stored["state"] == UNREADABLE
+
+
+async def test_a_dash_diff_attribute_does_not_hide_a_hook(clone):
+    """P2: with `-diff` git prints «Binary files differ»; the scan asks for text and sees the hook."""
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    ws = clone
+    _git(ws, "checkout", "-q", "-b", "attr")
+    _commit(ws, ".gitattributes", "tests/** -diff\n", "attr")
+    sha = _commit(
+        ws, "tests/test_h.py", "def pytest_sessionfinish(session):\n    pass\n", "hook"
+    )
+    plain = _git(ws, "diff", "-U0", "main...attr")
+    assert "Binary files" in plain, "the trick works against a plain diff"
+    got = await GitOpsIntegration().integrity_read(str(ws), "main", sha)
+    assert got is not None and "pytest_sessionfinish" in got["diff"]
+    rules = {s.rule for s in scan_diff(got["diff"], {"tests/test_h.py": "x = 1\n"})}
+    assert "pytest_report_hook" in rules
+
+
+# ---- self-approval and the card of a manual gate -----------------------------
+
+
+async def test_an_agent_cannot_self_approve_a_ci_change(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """P1: REVIEW_SELF_APPROVE=allow is automation for this check; a clean diff keeps its path."""
+    from hub.models import TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+
+    ci_diff.value = _WORKFLOW_DIFF
+    signed = await _submitted_task(client, db, "ci-self", {"verdict": "human"})
+    with pytest.raises(HTTPException) as err:
+        await record_review_verdict(
+            db,
+            signed,
+            TaskReviewVerdict(agent="dev-agent", verdict=ReviewVerdict.approved),
+            self_approved=True,
+            agent_caller=True,
+        )
+    assert err.value.status_code == 422 and "ci_integrity" in str(err.value.detail)
+    assert (await _status(client, signed))["review_verdict"] is None
+    # a human (not an agent token) stays free to decide
+    await record_review_verdict(
+        db,
+        signed,
+        TaskReviewVerdict(agent="denis", verdict=ReviewVerdict.approved),
+        self_approved=True,
+        agent_caller=False,
+    )
+    assert (await _status(client, signed))["review_verdict"] == "approved"
+
+    # a clean diff keeps the current path for the agent's own approval
+    ci_diff.value = ""
+    clean = await _submitted_task(client, db, "ci-self-clean", {"verdict": "human"})
+    await record_review_verdict(
+        db,
+        clean,
+        TaskReviewVerdict(agent="dev-agent", verdict=ReviewVerdict.approved),
+        self_approved=True,
+        agent_caller=True,
+    )
+    assert (await _status(client, clean))["review_verdict"] == "approved"
+
+
+async def test_the_manual_gate_card_keeps_the_owners_note(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """P2: verdict=human or a disabled autopilot still shows the stored note on the route line."""
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _submitted_task(client, db, "ci-manual", {"verdict": "human"})
+    await _post_review(
+        client,
+        task_id,
+        ci_integrity={
+            "verdict": "explained",
+            "explanation_ru": "Правка ci.yml по задаче.",
+        },
+    )
+    await ci_integrity.ensure_scan(db, task_id)
+    for observe in (False, True):
+        from hub.services.verdict_route import verdict_route
+
+        route = await verdict_route(db, task_id, observe=observe)
+        assert route.final == "human"
+        assert "Правка ci.yml по задаче." in route.reason
+        assert "Правка ci.yml по задаче." in route.as_dict()["line"]
+    body = await _status(client, task_id)
+    assert "Правка ci.yml по задаче." in body["verdict_route"]["line"]

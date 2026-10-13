@@ -247,6 +247,12 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def integrity_read(
+        self, repo: str, base: str, sha: str
+    ) -> dict[str, str] | None:
+        """No git here - the integrity scan must read this as "could not look" (#1688)."""
+        return None
+
     async def delta_without_base(
         self, repo: str, base: str, prev: str, current: str
     ) -> str | None:

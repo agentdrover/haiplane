@@ -68,14 +68,18 @@ answer to "does it touch CI" is "unknown", never "no".
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import posixpath
 import re
+import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
@@ -116,7 +120,7 @@ CI_SCRIPTS: frozenset[str] = frozenset(
 )
 
 PYTEST_CONFIG_FILES: frozenset[str] = frozenset(
-    {"pytest.ini", "tox.ini", "setup.cfg", ".pytest.ini"}
+    {"pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg"}
 )
 
 RULE_WORKFLOW = "ci_workflow"
@@ -130,6 +134,7 @@ RULE_ENV_READ = "token_read"
 RULE_REPORT_FILE = "report_file"
 RULE_EXIT = "hard_exit"
 RULE_DETACHED = "detached"
+RULE_UNREAD = "text_not_read"
 
 #: Wording of each rule for the reviewer and the owner (Russian: both read it).
 RULE_TEXT: dict[str, str] = {
@@ -144,6 +149,7 @@ RULE_TEXT: dict[str, str] = {
     RULE_REPORT_FILE: "имя файла отчёта CI",
     RULE_EXIT: "os._exit",
     RULE_DETACHED: "процесс без ожидания (start_new_session/daemon)",
+    RULE_UNREAD: "текст файла не прочитан (бинарный дифф, не разобран или не получен)",
 }
 
 _LINE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -211,6 +217,12 @@ class _FileDiff:
     old: str = ""
     new: str = ""
     deleted: bool = False
+    #: git printed «Binary files differ» / a binary patch instead of text
+    binary: bool = False
+    #: the block has an ``index a..b`` line (the content changed)
+    content_changed: bool = False
+    #: rename / mode-only blocks legitimately carry no hunk
+    moved: bool = False
     #: (new_start, new_len) of each hunk
     hunks: list[tuple[int, int]] = field(default_factory=list)
     added: list[tuple[int, str]] = field(default_factory=list)
@@ -283,11 +295,18 @@ def parse_diff(diff: str) -> list[_FileDiff]:
             continue
         if not in_hunk:
             if line.startswith("rename from "):
+                cur.moved = True
                 cur.old = _unquote(line[len("rename from ") :])
             elif line.startswith("rename to "):
                 cur.new = _unquote(line[len("rename to ") :])
             elif line.startswith("deleted file mode"):
                 cur.deleted = True
+            elif line.startswith(("rename from ", "old mode ", "copy from ")):
+                cur.moved = True
+            elif line.startswith("index "):
+                cur.content_changed = True
+            elif line.startswith(("Binary files ", "GIT binary patch")):
+                cur.binary = True
             elif line.startswith("--- ") and line[4:] != "/dev/null":
                 cur.old = _side(line[4:], "a/") or cur.old
             elif line.startswith("+++ ") and line[4:] != "/dev/null":
@@ -341,54 +360,92 @@ def _path_rule(path: str) -> str | None:
     return None
 
 
-_PYTEST_HEADER = re.compile(r"^\s*\[\[?tool\.pytest[^\]]*\]\]?")
-_ANY_HEADER = re.compile(r"^\s*\[")
-
-
-def pytest_sections(text: str) -> list[tuple[int, int]]:
-    """1-based inclusive line ranges of the ``[tool.pytest*]`` tables."""
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    for no, line in enumerate(text.splitlines(), 1):
-        if _ANY_HEADER.match(line):
-            if start:
-                ranges.append((start, no - 1))
-                start = 0
-            if _PYTEST_HEADER.match(line):
-                start = no
-    if start:
-        ranges.append((start, len(text.splitlines())))
-    return ranges
-
-
-def _pyproject_touches_pytest(fd: _FileDiff, text: str | None) -> bool:
-    """Do the changed lines of ``pyproject.toml`` sit in a ``[tool.pytest*]`` table?
-
-    A pure deletion (new length 0) is positioned by the line after which it
-    happened, so it counts when that line is inside a table or on its edge. The
-    removal of a whole table is seen by its header among the removed lines.
-    """
-    if fd.deleted:
-        return True
-    if any(_PYTEST_HEADER.match(t) for t in fd.removed):
-        return True
-    if any(_PYTEST_HEADER.match(t) for _, t in fd.added):
-        return True
+def _toml_pytest(text: str | None) -> tuple[bool, Any]:
+    """(readable, the ``tool.pytest`` subtree) of a pyproject text; "" = no file."""
     if text is None:
-        return True  # unread file: unknown is never "no"
-    for start, length in fd.hunks:
-        lo, hi = (start, start + length - 1) if length else (start, start + 1)
-        if any(lo <= end and hi >= begin for begin, end in pytest_sections(text)):
-            return True
-    return False
+        return False, None
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return False, None
+    tool = data.get("tool")
+    return True, tool.get("pytest") if isinstance(tool, dict) else None
 
 
-def scan_diff(diff: str, pyproject_text: str | None = None) -> list[Sign]:
+def pyproject_changes_pytest(head: str | None, base: str | None) -> bool:
+    """Does the ``tool.pytest`` subtree differ between base and head? Unread = yes.
+
+    Semantic, not textual: ``[tool."pytest".ini_options]``, dotted and quoted
+    keys all parse to the same subtree, so no spelling hides a change.
+    """
+    head_ok, head_tree = _toml_pytest(head)
+    base_ok, base_tree = _toml_pytest(base)
+    return not (head_ok and base_ok) or head_tree != base_tree
+
+
+def _is_environ(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    ) or (isinstance(node, ast.Name) and node.id == "environ")
+
+
+def _is_env_getter(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "getenv"
+    if not isinstance(node, ast.Attribute):
+        return False
+    if node.attr == "getenv":
+        return isinstance(node.value, ast.Name) and node.value.id == "os"
+    return node.attr == "get" and _is_environ(node.value)
+
+
+_SECRET_NAME = re.compile(r"HAIPLANE_|TOKEN")
+
+
+def env_reads(source: str, added: set[int]) -> list[int] | None:
+    """Lines of reads of a ``HAIPLANE_``/``TOKEN`` environment name touching ``added``.
+
+    Found in the syntax tree, so ``os.environ[`` / ``"HAIPLANE_..."`` / ``]``
+    spread over lines is seen. None = the file does not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    found: list[int] = []
+    for node in ast.walk(tree):
+        key: ast.expr | None = None
+        if isinstance(node, ast.Subscript) and _is_environ(node.value):
+            key = node.slice
+        elif isinstance(node, ast.Call) and node.args and _is_env_getter(node.func):
+            key = node.args[0]
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            continue
+        if not _SECRET_NAME.search(key.value):
+            continue
+        last = getattr(node, "end_lineno", None) or node.lineno
+        if any(node.lineno <= n <= last for n in added):
+            found.append(node.lineno)
+    return found
+
+
+def scan_diff(
+    diff: str,
+    head: Mapping[str, str | None] | None = None,
+    base: Mapping[str, str | None] | None = None,
+) -> list[Sign]:
     """Signs in a unified diff (``-U0`` is enough). Deterministic, no model.
 
-    Both sides of a rename and a deletion count: moving ``conftest.py`` away or
-    deleting a CI script changes CI as much as editing it.
+    ``head`` / ``base`` map a path to its text at the head / base commit, for
+    the files that need more than the diff: ``pyproject.toml`` (semantic
+    compare) and the changed ``.py`` test files (syntax tree). A missing key or
+    a None value means «not read», which is a sign, never «clean». Both sides
+    of a rename and a deletion count.
     """
+    head, base = head or {}, base or {}
     signs: list[Sign] = []
     seen: set[tuple[str, int, str]] = set()
 
@@ -403,18 +460,39 @@ def scan_diff(diff: str, pyproject_text: str | None = None) -> list[Sign]:
             rule = _path_rule(path)
             if rule:
                 add(path, 0, rule)
-        if "pyproject.toml" in fd.paths() and _pyproject_touches_pytest(
-            fd, pyproject_text
+        if "pyproject.toml" in fd.paths() and (
+            fd.deleted
+            or pyproject_changes_pytest(
+                head.get("pyproject.toml"), base.get("pyproject.toml")
+            )
         ):
             add("pyproject.toml", fd.hunks[0][0] if fd.hunks else 0, RULE_PYTEST_CONFIG)
         if not any(_is_test_file(p) for p in fd.paths()):
             continue
         path = fd.new or fd.old
-        for no, text in fd.added:
-            for rule, pattern in _LINE_RULES:
-                if pattern.search(text):
-                    add(path, no, rule)
+        if fd.binary or (not fd.hunks and fd.content_changed and not fd.moved):
+            add(path, 0, RULE_UNREAD)
+        _scan_lines(fd, path, head.get(path), add)
     return signs[:MAX_SIGNS]
+
+
+def _scan_lines(fd: _FileDiff, path: str, text: str | None, add: Any) -> None:
+    """The line rules on the ADDED lines of one test file; the syntax tree for env reads."""
+    reads: list[int] | None = None
+    if path.endswith(".py") and fd.added and not fd.deleted:
+        reads = env_reads(text, {n for n, _ in fd.added}) if text is not None else None
+        if reads is None:
+            add(
+                path, 0, RULE_UNREAD
+            )  # unparseable or unread: a sign, regex as fallback
+        for line in reads or []:
+            add(path, line, RULE_ENV_READ)
+    for no, line_text in fd.added:
+        for rule, pattern in _LINE_RULES:
+            if rule == RULE_ENV_READ and reads is not None:
+                continue
+            if pattern.search(line_text):
+                add(path, no, rule)
 
 
 # --- the stored scan and what it means -----------------------------------
@@ -440,6 +518,16 @@ def _from_row(row: dict[str, Any]) -> Scan:
     return Scan(str(row["state"]), signs, str(row.get("reason") or ""))
 
 
+async def _read_text(git: Any, repo_path: str, ref: str, path: str) -> str | None:
+    """Text of ``path`` at an exact commit: "" when the file is absent, None when unread."""
+    got = await git.read_file_at_ref(repo_path, ref, path, limit_chars=400_000)
+    if got.get("state") == "missing":
+        return ""
+    if got.get("state") != "present" or got.get("truncated"):
+        return None
+    return str(got.get("content") or "")
+
+
 async def _scan_now(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan:
     """Read the diff of the pinned commit and scan it. NETWORK: never inside a write transaction."""
     from hub.integrations.registry import plugins
@@ -451,18 +539,32 @@ async def _scan_now(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan:
         base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
         if not workspace or not base:
             return Scan(UNREADABLE, reason="клон проекта на хабе не настроен")
-        diff = await plugins.git_ops.branch_diff(workspace, base, sha, 0)
-        if diff is None:
+        git = plugins.git_ops
+        material = await git.integrity_read(workspace, base, sha)
+        if material is None:
             return Scan(UNREADABLE, reason="git не отдал дифф сдачи")
-        text = None
-        if "pyproject.toml" in diff:
-            text = await plugins.git_ops.file_at_ref(workspace, sha, "pyproject.toml")
+        if (material.get("head_sha") or "").lower() != sha.lower():
+            return Scan(UNREADABLE, reason="дифф относится к другому коммиту")
+        diff = material["diff"]
+        head: dict[str, str | None] = {}
+        base_texts: dict[str, str | None] = {}
+        for fd in parse_diff(diff):
+            path = fd.new or fd.old
+            if fd.deleted:
+                continue
+            if path == "pyproject.toml":
+                head[path] = await _read_text(git, workspace, sha, path)
+                base_texts[path] = await _read_text(
+                    git, workspace, material["base_sha"], path
+                )
+            elif _is_test_file(path) and path.endswith(".py") and fd.added:
+                head[path] = await _read_text(git, workspace, sha, path)
     except Exception as exc:  # noqa: BLE001 - an unreadable diff is the answer
         log.warning(
             "ci integrity: could not read the diff of task #%s: %s", task_id, exc
         )
         return Scan(UNREADABLE, reason="дифф не получен: ошибка чтения")
-    signs = scan_diff(diff, text)
+    signs = scan_diff(diff, head, base_texts)
     return Scan(SIGNS if signs else CLEAN, tuple(signs))
 
 
@@ -619,11 +721,35 @@ async def scan_for_automated_approval(state: Any) -> None:
     ``state`` is the verdict context; it is duck-typed to keep this module free
     of the lifecycle import.
     """
+    if is_automation(state) and state.body.verdict.value == "approved":
+        await ensure_scan(state.db, state.task_id)
+
+
+def is_automation(state: Any) -> bool:
+    """Who is not a human reading the note: steward, autopilot, an agent approving its own work.
+
+    A self-approval (``REVIEW_SELF_APPROVE=allow``) by an agent token is
+    automation for THIS check; a human caller stays free to approve.
+    """
     from hub.services.auto_verdict import _POLICY_ACTOR
 
-    automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
-    if automated and state.body.verdict.value == "approved":
-        await ensure_scan(state.db, state.task_id)
+    return bool(
+        state.applied_by_steward
+        or state.body.agent == _POLICY_ACTOR
+        or (state.self_approved and state.agent_caller)
+    )
+
+
+async def verdict_gate(state: Any) -> None:
+    """In the verdict transaction: an automated APPROVED of signs is refused (422).
+
+    Reads the database only; run through ``ci_trust.recheck_in_transaction``.
+    """
+    if not is_automation(state) or state.body.verdict.value != "approved":
+        return
+    task = dict(await repo.get_task(state.db, state.task_id) or {})
+    if gap := await gap_of(state.db, task):
+        raise HTTPException(422, f"ci_integrity: {gap}")
 
 
 def stored_answer(body: MachineReviewSubmit) -> tuple[str, str]:

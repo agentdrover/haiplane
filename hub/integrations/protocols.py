@@ -653,6 +653,9 @@ class GitOpsPlugin(Protocol):
     async def branch_diff(
         self, repo: str, base: str, branch: str, context: int = 0
     ) -> str | None: ...
+    async def integrity_read(
+        self, repo: str, base: str, sha: str
+    ) -> dict[str, str] | None: ...
     async def delta_without_base(
         self, repo: str, base: str, prev: str, current: str
     ) -> str | None: ...

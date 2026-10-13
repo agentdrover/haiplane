@@ -4496,6 +4496,7 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     """
     from hub.services.auto_verdict import _POLICY_ACTOR
 
+    await ci_integrity.verdict_gate(state)  # #1688: also a self-approval
     automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
     if not automated or state.body.verdict.value != "approved":
         return
@@ -4518,8 +4519,6 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     )
     if gap:
         raise HTTPException(422, f"ci_not_green: {gap}")
-    if integrity_gap := await ci_integrity.gap_of(state.db, task):
-        raise HTTPException(422, f"ci_integrity: {integrity_gap}")
 
 
 async def _vstep_branch_tip_matches(state: VerdictContext) -> None:

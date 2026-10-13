@@ -212,6 +212,35 @@ async def _steward_route(
 async def verdict_route(
     db: aiosqlite.Connection, task_id: int, *, observe: bool = False
 ) -> VerdictRoute:
+    """Маршрут вердикта, а к нему справка по целостности CI, какой бы ни был маршрут (#1688).
+
+    Справка нужна владельцу и там, где вердикт и так за ним (политика human,
+    автопилот выключен): ручной вердикт читает её, прежде чем одобрить.
+    """
+    import dataclasses
+
+    from hub import repository as repo
+    from hub.services import ci_integrity
+
+    route = await _decide_route(db, task_id, observe=observe)
+    if route.decider == DECIDER_NONE:
+        return route
+    task = dict(await repo.get_task(db, task_id) or {})
+    standing = await ci_integrity.standing_of(db, task)
+    if (
+        standing.gap is None
+        or standing.scan.state == ci_integrity.UNSCANNED
+        or standing.note in route.reason
+    ):
+        return route
+    return dataclasses.replace(
+        route, reason=f"{route.reason}. Справка по CI: {standing.reason}"
+    )
+
+
+async def _decide_route(
+    db: aiosqlite.Connection, task_id: int, *, observe: bool = False
+) -> VerdictRoute:
     """Кто вынесет вердикт текущей сдачи — читатель, ничего не пишет.
 
     ``observe=False`` (по умолчанию) не ходит в сеть: ветку и биллинг
