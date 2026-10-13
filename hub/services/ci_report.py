@@ -29,12 +29,11 @@ import logging
 from typing import Any
 
 from hub import repository as repo
-from hub.services import red_test_gate
+from hub.services import ci_trust, red_test_gate
 from hub.services.ac_tests import (
     FAIL as AC_FAIL,
     NOT_FOUND as AC_NOT_FOUND,
     PASS as AC_PASS,
-    record_ac_test_results,
     test_ac_nodeids,
 )
 from hub.services.validation_run import (
@@ -42,7 +41,6 @@ from hub.services.validation_run import (
     PASS as VALIDATION_PASS,
     SKIPPED as VALIDATION_SKIPPED,
     UNKNOWN as VALIDATION_UNKNOWN,
-    record_validation_result,
 )
 
 log = logging.getLogger("hub")
@@ -82,7 +80,7 @@ def _pinned_sha(task: dict) -> str:
     return (task.get("submission_sha") or "").strip()
 
 
-async def _store_ci_run_report(
+async def store_ci_run_report(
     db: Any,
     task_id: int,
     *,
@@ -97,12 +95,13 @@ async def _store_ci_run_report(
     baseline: dict[str, Any] | None = None,
     provenance: dict[str, str] | None = None,
 ) -> dict:
-    """Store a CI run report and stamp it if it covers the pinned commit.
+    """Store what a CI run claims about one attempt. No commit, no GitHub.
 
-    Returns a dict describing what was done, including why it was NOT applied
-    when that is the case. Raises ValueError for a malformed report (the caller
-    turns it into a 4xx) — a report the hub cannot understand is refused rather
-    than half-stored.
+    First half of accepting a report (#1687). The report is a claim: it is kept
+    as the row of its attempt, unverified, and nothing is written onto the task.
+    ``settle_ci_run_report`` asks GitHub and decides what the claim is worth.
+    Raises ValueError for a malformed report (the caller turns it into a 4xx) —
+    a report the hub cannot understand is refused rather than half-stored.
     """
     head_sha = (head_sha or "").strip()
     if not head_sha:
@@ -111,7 +110,6 @@ async def _store_ci_run_report(
     row = await repo.get_task(db, task_id)
     if row is None:
         raise LookupError("task not found")
-    task = dict(row)
 
     validation_status = (validation_status or "").strip()
     if validation_status and validation_status not in VALIDATION_STATUSES:
@@ -149,6 +147,7 @@ async def _store_ci_run_report(
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
     ignored: list[str] = []
+    sent: dict[str, str] = {}
     for ac_id, status in (ac_results or {}).items():
         status = (status or "").strip()
         if status not in AC_STATUSES:
@@ -156,6 +155,7 @@ async def _store_ci_run_report(
                 f"unknown AC status {status!r} for {ac_id}; "
                 f"expected one of {sorted(AC_STATUSES)}"
             )
+        sent[ac_id] = status
         # A report may only speak for AC the hub itself considers machine
         # verifiable. Anything else is recorded as ignored and named in the
         # response: dropping it silently is how a report starts inventing AC.
@@ -164,91 +164,111 @@ async def _store_ci_run_report(
         else:
             ignored.append(ac_id)
 
-    generation = task.get("submission_generation") or 0
-    pinned = _pinned_sha(task)
-    applied = False
-    if not pinned:
-        applied_reason = (
-            "не применён: коммит сдачи не закреплён "
-            "(задача ещё не сдавалась или вершину не удалось определить)"
-        )
-    elif pinned != head_sha:
-        applied_reason = (
-            f"не применён: отчёт о коммите {head_sha[:12]}, "
-            f"а на ревью закреплён {pinned[:12]}"
-        )
-    elif generation <= 0:
-        applied_reason = "не применён: у задачи нет ни одной сдачи"
-    else:
-        applied = True
-        applied_reason = f"применён к сдаче #{generation} ({pinned[:12]})"
-
-    await repo.upsert_ci_run_report(
+    claimed = {k: v for k, v in (provenance or {}).items() if v}
+    await repo.upsert_ci_report_attempt(
         db,
         task_id=task_id,
         head_sha=head_sha,
+        run_id=claimed.get("run_id", ""),
+        run_attempt=claimed.get("run_attempt", ""),
         ac_results=json.dumps(accepted, ensure_ascii=False, sort_keys=True),
-        validation_status=validation_status,
-        validation_log=validation_log or "",
-        reason=reason or "",
-        reported_by=reported_by or "",
         checks=json.dumps(
             {k: (v or "").strip() for k, v in (checks or {}).items()},
             ensure_ascii=False,
             sort_keys=True,
         ),
+        validation_status=validation_status,
+        validation_log=validation_log or "",
+        reason=reason or "",
+        reported_by=reported_by or "",
         mutations=mutations_json,
         baseline=baseline_json,
-        provenance=json.dumps(
-            {k: v for k, v in (provenance or {}).items() if v},
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
+        provenance=json.dumps(claimed, ensure_ascii=False, sort_keys=True),
+        submitted=json.dumps({"ac_results": sent}, ensure_ascii=False, sort_keys=True),
     )
+    # #1687: a new claim makes the standing UNCONFIRMED until it is settled
+    # against GitHub — in the same transaction, so no reader in between sees the
+    # previous confirmation (or the evidence it wrote) as current.
+    await ci_trust.invalidate(db, dict(row), head_sha)
+    return {
+        "head_sha": head_sha,
+        "ac_ignored": ignored,
+        "validation_status": validation_status,
+    }
 
-    recorded: list[dict] = []
-    if applied:
-        recorded = await _stamp(
-            db,
-            task_id,
-            generation=generation,
-            ac_results=accepted,
-            validation_status=validation_status,
-            validation_log=validation_log or "",
+
+def _applied_reason(
+    task: dict, head_sha: str, standing: ci_trust.Standing | None
+) -> tuple[bool, str]:
+    """Whether the verified report counts for this submission, and the words for it."""
+    if standing is None or not standing.verified:
+        why = ci_trust.unverified_note(standing.reason if standing else "pending")
+        return False, f"не применён: {why}"
+    generation = task.get("submission_generation") or 0
+    pinned = _pinned_sha(task)
+    if not pinned:
+        return False, (
+            "не применён: коммит сдачи не закреплён "
+            "(задача ещё не сдавалась или вершину не удалось определить)"
         )
-    # What the commit now holds, not what this report carried: a report without
-    # the keys leaves the stored blocks, and the answer must say so.
-    stored = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
+    if pinned != head_sha:
+        return False, (
+            f"не применён: отчёт о коммите {head_sha[:12]}, "
+            f"а на ревью закреплён {pinned[:12]}"
+        )
+    if generation <= 0:
+        return False, "не применён: у задачи нет ни одной сдачи"
+    return True, f"применён к сдаче #{generation} ({pinned[:12]})"
+
+
+async def settle_ci_run_report(db: Any, task_id: int, stored: dict) -> dict:
+    """Second half (#1687): ask GitHub, project the current attempt, describe it.
+
+    Runs outside any transaction (it downloads); the writes it makes are one
+    short transaction of their own. Returns the intake answer.
+    """
+    head_sha = stored["head_sha"]
+    standing = await ci_trust.refresh_quietly(db, task_id, head_sha)
+    task = dict(await repo.get_task(db, task_id) or {})
+    applied, applied_reason = _applied_reason(task, head_sha, standing)
+    current = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
+    generation = task.get("submission_generation") or 0
+    trust, why = (
+        ci_trust.trust_of(current) if current else (ci_trust.UNVERIFIED, "pending")
+    )
     return {
         "applied": applied,
         "reason": applied_reason,
         "head_sha": head_sha,
         "submission_generation": generation if applied else None,
-        "ac_recorded": recorded,
-        "ac_ignored": ignored,
-        "validation_status": validation_status,
-        "mutations_state": _stored_state(stored.get("mutations")),
-        "baseline_state": _stored_state(stored.get("baseline")),
-        "provenance": _stored_provenance(stored.get("provenance")),
+        "ac_recorded": list(standing.ac_recorded) if standing and applied else [],
+        "ac_ignored": stored["ac_ignored"],
+        "validation_status": stored["validation_status"],
+        "mutations_state": _stored_state(current.get("mutations")),
+        "baseline_state": _stored_state(current.get("baseline")),
+        "provenance": _stored_provenance(current.get("provenance")),
+        "trust": trust,
+        "trust_reason": why,
     }
 
 
 async def accept_ci_run_report(
     db: Any, task_id: int, *, commit: bool = True, **report: Any
 ) -> dict:
-    """Store a CI run report (see ``_store_ci_run_report``) and, by default, commit.
+    """Store a CI run report, check it against GitHub, and describe the outcome.
 
-    The request handler passes ``commit=False``: it owns the write transaction
-    until the result is read back (#1644), so a failure after the write rolls
-    the report back instead of leaving it behind a 500.
+    The request handler does the two halves itself: it owns the write
+    transaction for the first (#1644: the key's scope, the generation and the
+    write stay together) and runs the second after it, because the second talks
+    to GitHub and must not hold the database for that long.
     """
-    result = await _store_ci_run_report(db, task_id, **report)
+    stored = await store_ci_run_report(db, task_id, **report)
     if commit:
         await db.commit()
-    return result
+    return await settle_ci_run_report(db, task_id, stored)
 
 
-PROVENANCE_NOTE = "not verified with GitHub (#1687)"
+PROVENANCE_NOTE = "claimed by the reporter; see trust for what GitHub confirmed (#1687)"
 
 
 def stored_provenance(report_row: dict) -> dict[str, str]:
@@ -295,66 +315,36 @@ def _checked_baseline(baseline: dict[str, Any] | None) -> str:
     return text
 
 
-async def _stamp(
-    db: Any,
-    task_id: int,
-    *,
-    generation: int,
-    ac_results: dict[str, str],
-    validation_status: str,
-    validation_log: str,
-) -> list[dict]:
-    """Write the report's facts through the shared record paths. No commit."""
-    recorded: list[dict] = []
-    if ac_results:
-        recorded = await record_ac_test_results(db, task_id, ac_results, generation)
-    if validation_status in VALIDATION_WRITABLE:
-        await record_validation_result(
-            db,
-            task_id,
-            generation=generation,
-            status=validation_status,
-            log_tail=validation_log,
-        )
-    return recorded
-
-
 async def adopt_ci_run_report(db: Any, task_id: int, head_sha: str, generation: int):
-    """Stamp an already-stored report when submission pins its commit (#546).
+    """Write an already-stored report when submission pins its commit (#546).
 
     The usual order is CI first, submission second: the run finishes when the PR
     opens, long before the hub pins anything. Without this the evidence would
     sit in the table forever while the gate reported "never ran". Called inside
-    the submission write lock, so it must not commit.
+    the submission write lock, so it must not commit and does not ask GitHub:
+    the check ran just before (``ci_trust.refresh``), and a report it did not
+    confirm is adopted as nothing (#1687) — the same outcome as one that arrives
+    after the submission.
     """
     head_sha = (head_sha or "").strip()
     if not head_sha or generation <= 0:
         return None
-    row = await repo.get_ci_run_report(db, task_id, head_sha)
-    if row is None:
+    adopted = await ci_trust.adopt(db, task_id, head_sha, generation)
+    if adopted is None:
         return None
-    stored = dict(row)
-    try:
-        ac_results = json.loads(stored.get("ac_results") or "{}")
-    except (ValueError, TypeError):
-        log.warning("CI report for #%s has unreadable ac_results", task_id)
-        ac_results = {}
-    if not isinstance(ac_results, dict):
-        ac_results = {}
-    recorded = await _stamp(
-        db,
-        task_id,
-        generation=generation,
-        ac_results={str(k): str(v) for k, v in ac_results.items()},
-        validation_status=(stored.get("validation_status") or "").strip(),
-        validation_log=stored.get("validation_log") or "",
-    )
-    return {
+    trust, reason, recorded = adopted
+    stored = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
+    out: dict[str, Any] = {
         "head_sha": head_sha,
         "submission_generation": generation,
         "ac_recorded": recorded,
-        "validation_status": (stored.get("validation_status") or "").strip(),
+        "validation_status": (stored.get("validation_status") or "").strip()
+        if trust == ci_trust.VERIFIED
+        else "",
     }
+    if trust != ci_trust.VERIFIED:
+        out["not_adopted"] = ci_trust.unverified_note(reason)
+    return out
 
 
 async def ci_report_state(db: Any, task: dict) -> tuple[str, str]:
@@ -369,7 +359,11 @@ async def ci_report_state(db: Any, task: dict) -> tuple[str, str]:
     pinned = _pinned_sha(task)
     if not pinned:
         return STATE_UNKNOWN, ("коммит сдачи не закреплён — отчёт CI не с чем сверить")
-    if await repo.get_ci_run_report(db, task_id, pinned):
+    report = await repo.get_ci_run_report(db, task_id, pinned)
+    if report:
+        trust, reason = ci_trust.trust_of(dict(report))
+        if trust != ci_trust.VERIFIED:
+            return STATE_UNKNOWN, ci_trust.unverified_note(reason)
         return STATE_CURRENT, ""
     latest = await repo.latest_ci_run_report(db, task_id)
     if latest is not None:

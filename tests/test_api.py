@@ -7,6 +7,7 @@ import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
+from tests.ci_trust_support import FakeGitHub, backed_body, install_fake_github
 
 
 async def test_create_task_api(client: AsyncClient):
@@ -3452,6 +3453,9 @@ def _ci_headers(monkeypatch) -> dict:
     return {"Authorization": "Bearer ci-token"}
 
 
+_GH: FakeGitHub = FakeGitHub()
+
+
 async def _ci_reporting_task(client: AsyncClient, monkeypatch, tip: str) -> int:
     """A submitted pair task whose pinned tip is ``tip``, with one test-AC."""
     from unittest.mock import AsyncMock
@@ -3468,6 +3472,8 @@ async def _ci_reporting_task(client: AsyncClient, monkeypatch, tip: str) -> int:
             return tip
 
     monkeypatch.setattr(plugins, "git_ops", _Git())
+    global _GH
+    _GH = install_fake_github(monkeypatch)
     monkeypatch.setattr(
         orchestration,
         "project_git_context",
@@ -3511,7 +3517,9 @@ async def test_ci_reports_ac_test_results(client: AsyncClient, monkeypatch):
     ci = _ci_headers(monkeypatch)
     resp = await client.post(
         f"/api/tasks/{task_id}/ci-run-report",
-        json={"head_sha": "sha-report-one", "ac_results": {"AC-1": "pass"}},
+        json=backed_body(
+            _GH, task_id, {"head_sha": "sha-report-one", "ac_results": {"AC-1": "pass"}}
+        ),
         headers=ci,
     )
     assert resp.status_code == 200, resp.text
@@ -3536,11 +3544,15 @@ async def test_ci_reports_validation_result(client: AsyncClient, db, monkeypatch
     ci = _ci_headers(monkeypatch)
     resp = await client.post(
         f"/api/tasks/{task_id}/ci-run-report",
-        json={
-            "head_sha": "sha-report-two",
-            "validation_status": "pass",
-            "validation_log": "$ uv run pytest -q\n1358 passed",
-        },
+        json=backed_body(
+            _GH,
+            task_id,
+            {
+                "head_sha": "sha-report-two",
+                "validation_status": "pass",
+                "validation_log": "$ uv run pytest -q\n1358 passed",
+            },
+        ),
         headers=ci,
     )
     assert resp.status_code == 200, resp.text
@@ -3574,7 +3586,9 @@ async def test_ci_report_keeps_the_mutation_run_under_its_own_key(
     }
     resp = await client.post(
         f"/api/tasks/{task_id}/ci-run-report",
-        json={"head_sha": "sha-report-mut", "mutations": mutations},
+        json=backed_body(
+            _GH, task_id, {"head_sha": "sha-report-mut", "mutations": mutations}
+        ),
         headers=_ci_headers(monkeypatch),
     )
     assert resp.status_code == 200, resp.text
@@ -3623,7 +3637,11 @@ async def test_ci_report_rejects_bad_token_and_stale_generation(
 
     other_commit = await client.post(
         f"/api/tasks/{task_id}/ci-run-report",
-        json={"head_sha": "sha-other-commit", "ac_results": {"AC-1": "pass"}},
+        json=backed_body(
+            _GH,
+            task_id,
+            {"head_sha": "sha-other-commit", "ac_results": {"AC-1": "pass"}},
+        ),
         headers=ci,
     )
     assert other_commit.status_code == 200, other_commit.text

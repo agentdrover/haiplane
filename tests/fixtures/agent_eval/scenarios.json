@@ -143,7 +143,9 @@
               "validation_status": "fail",
               "validation_log": "pytest: 3 failed",
               "reason": "ci red",
-              "reported_by": "ci"
+              "reported_by": "ci",
+              "trust": "verified",
+              "trust_reason": ""
             }
           }
         ]

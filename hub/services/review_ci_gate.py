@@ -37,6 +37,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import ci_trust
 from hub.services.ci_report import CHECK_FAIL
 from hub.services.validation_run import FAIL as VALIDATION_FAIL
 
@@ -98,7 +99,8 @@ async def _pinned_ci(
 ) -> tuple[Any, list[str]]:
     """Отчёт CI о закреплённом коммите и названия упавших проверок. Только чтение."""
     sha = (task.get("submission_sha") or "").strip()
-    report = await repo.get_ci_run_report(db, int(task["id"]), sha)
+    # #1687: an unconfirmed report decides nothing in either direction.
+    report = await ci_trust.trusted_report(db, int(task["id"]), sha)
     return report, ([] if report is None else failed_checks(dict(report)))
 
 

@@ -48,6 +48,7 @@ from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
+from hub.services import ci_trust
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
 
@@ -510,8 +511,10 @@ async def _observed_facts_stage(
     ctx.pinned_sha = (task.get("submission_sha") or "").strip()
     if not ctx.pinned_sha:
         return _refuse_with(CODE_NO_PIN, "коммит сдачи не закреплён", ctx)
-    ci = await repo.get_ci_run_report(db, task_id, ctx.pinned_sha)
-    if ci is None or (ci["validation_status"] or "") != VALIDATION_PASS:
+    if ctx.observe:
+        # #1687: also a rerun nobody reported, asked of GitHub now.
+        await ci_trust.refresh_quietly(db, task_id, ctx.pinned_sha)
+    if await ci_trust.pass_gap(db, task_id, ctx.pinned_sha):
         return _refuse_with(
             CODE_CI_NOT_GREEN, "CI на закреплённом коммите не зелёный", ctx
         )
@@ -702,6 +705,9 @@ async def _approve(db: aiosqlite.Connection, task_id: int, facts: dict) -> bool:
         task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=_POLICY_ACTOR),
         self_approved=facts["self_reviewed"],
+        # The generation the grounds were gathered for: a resubmission since
+        # then cancels the decision instead of being approved by it (#1687).
+        expected_generation=facts["generation"],
     )
     proven = facts["proven_usage"]
     await repo.add_task_update(

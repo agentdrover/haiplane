@@ -286,6 +286,7 @@ async def record_ac_test_results(
     task_id: int,
     statuses: dict[str, str],
     generation: int,
+    source: str = "manual",
 ) -> list[dict]:
     """Write per-AC outcomes for ``generation``. Does NOT commit (#546).
 
@@ -293,11 +294,12 @@ async def record_ac_test_results(
     report intake (#546) both come through here, so a result written by a
     runner and a result written by a report are the same fact, stored the same
     way. Callers own the transaction — the submission path needs these rows to
-    land inside its own write lock.
+    land inside its own write lock. ``source`` (#1687) is ``manual`` for a hub
+    run and ``ci:<run>:<attempt>`` for a verified CI attempt.
     """
     recorded: list[dict] = []
     for ac_id, status in statuses.items():
-        await repo.upsert_ac_test_result(db, task_id, ac_id, generation, status)
+        await repo.upsert_ac_test_result(db, task_id, ac_id, generation, status, source)
         recorded.append({"ac_id": ac_id, "status": status, "generation": generation})
     return recorded
 

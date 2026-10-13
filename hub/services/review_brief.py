@@ -430,10 +430,33 @@ async def _ci_run_report_state(db, task_id: int, task_view) -> CIRunReportState:
         else None
     )
     if stored is not None:
+        from hub.services.ci_trust import trust_of
+
+        state.trust, state.trust_reason = trust_of(dict(stored))
         state.provenance = stored_provenance(dict(stored))
         if state.provenance:
             state.provenance_note = PROVENANCE_NOTE
     return state
+
+
+async def _row_after_ci_refresh(db, task_id: int, row):
+    """The task row, read again after the CI standing was brought up to date.
+
+    #1687: which attempt is current is known only by asking, and every block of
+    the brief (prepass, mutations, baseline, AC results) reads what the current
+    attempt wrote — so the question comes FIRST. A task without a code result,
+    or without a pinned commit, has no CI standing to refresh.
+    """
+    from hub.services import ci_trust
+
+    task_row = dict(row)
+    sha = (task_row.get("submission_sha") or "").strip()
+    if automation_not_applicable(task_row) or not sha:
+        return row
+    await ci_trust.refresh_quietly(
+        db, task_id, sha, offline=ci_trust.forge_recently_down()
+    )
+    return await repo.get_task(db, task_id) or row
 
 
 async def build_review_brief(
@@ -454,6 +477,7 @@ async def build_review_brief(
     row = await timer.run("db_reads", repo.get_task(db, task_id))
     if not row:
         return None
+    row = await _row_after_ci_refresh(db, task_id, row)
     task_row = dict(row)
     if automation_not_applicable(task_row):
         # #1648: у задачи-состояния нет ветки, диффа и CI — вычислять нечего.

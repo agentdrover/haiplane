@@ -17,12 +17,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from hub.services import ci_trust
 from hub.services.ac_tests import FAIL as AC_FAIL, NOT_FOUND as AC_NOT_FOUND
 from hub.services.ci_report import AC_STATUSES, CHECK_FAIL, CHECK_OUTCOMES
 from hub.services.test_locator import parse_test_locator
 from hub.services.validation_run import PASS as VALIDATION_PASS
 
 NO_REPORT = "no_report"
+UNVERIFIED = "unverified"
+NOT_GREEN = "not_green"
 RED = "red"
 VALIDATION_NOT_PASS = "validation_not_pass"  # nosec B105 - cause name
 MALFORMED = "malformed"
@@ -88,6 +91,11 @@ def proof_gap(
     """None — зелёный о ``sha`` доказан; иначе Gap с причиной."""
     if report is None or not sha:
         return Gap(NO_REPORT, [f"отчёта CI о коммите {sha[:12] or '—'} нет"])
+    # #1687: a report GitHub did not confirm is not evidence of anything. The
+    # row of a caller that never says (a plain dict) is unverified too.
+    trust, why = ci_trust.trust_of(report)
+    if trust != ci_trust.VERIFIED:
+        return Gap(UNVERIFIED, [ci_trust.unverified_note(why)])
     checks = _parsed(report.get("checks"), CHECK_OUTCOMES)
     ac_results = _parsed(report.get("ac_results"), AC_STATUSES)
     if checks is None or ac_results is None:
@@ -106,6 +114,11 @@ def proof_gap(
         return Gap(
             VALIDATION_NOT_PASS, [f"validation_status={status or 'пусто'}, нужен pass"]
         )
+    # #1687: green is the run ending in success with lint, format, types and
+    # tests each pass; an absent key or a skip is not a pass.
+    not_green = ci_trust.green_gap(report)
+    if not_green:
+        return Gap(NOT_GREEN, [not_green])
     return None
 
 

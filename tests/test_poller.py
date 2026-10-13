@@ -2687,6 +2687,8 @@ async def test_the_sweep_order_is_pinned(db):
         # этот момент, действует уже для решений этого же прохода.
         "policy_schedule",
         "running_dispatch",
+        # #1687: the CI report's standing is refreshed before review settles.
+        "ci_trust",
         "review",
         "pair_delivery",
         # #1437: свёртка родителей сразу за доставкой — фича, последнюю

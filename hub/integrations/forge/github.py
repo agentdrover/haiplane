@@ -34,6 +34,14 @@ from hub.integrations.protocols import (
 
 log = logging.getLogger(__name__)
 
+#: A read of a run for the check of a CI report (#1687) must not hold the
+#: poller for the 60 s a git call may take: GitHub that does not answer in this
+#: time is "not reachable", and the check is retried later.
+_CI_READ_TIMEOUT = 20
+#: Pages of 100 read for one list; a list that does not end by then is unknown.
+_CI_PAGE = 100
+_CI_MAX_PAGES = 10
+
 
 async def _gh(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
     repo = repo or proc.repo_root()
@@ -1141,6 +1149,187 @@ class GitHubForge:
             }
             for r in runs
         ]
+
+    # -- прогон CI для сверки отчёта (#1687) ---------------------------------
+    #
+    # Все четыре метода только читают (PAT хаба read-only) и отвечают в трёх
+    # формах, а не в двух: данные; «спросили, там пусто» (``{}`` / ``[]`` /
+    # ``b""``); «спросить не удалось» (None). Последние два лечатся разными
+    # руками — ровно разница #725, и сверка отчёта ею живёт: пустой ответ —
+    # это опровержение, None — повод повторить.
+
+    @staticmethod
+    def _api_missing(err: str) -> bool:
+        """GitHub itself said "no such thing": its HTTP status, 404 or 410.
+
+        Read from the status gh prints ("HTTP 404"), never from digits anywhere
+        in the message: a timeout message carries the endpoint, and a run id or a
+        sha may contain "404". Whatever is not a clear 404/410 is "unknown".
+        """
+        text = err or ""
+        if text.startswith("timed out"):
+            return False
+        return re.search(r"\bHTTP (404|410)\b", text) is not None
+
+    @staticmethod
+    def _run_facts(run: dict[str, Any]) -> dict[str, Any]:
+        head_repo = run.get("head_repository") or {}
+        repo_obj = run.get("repository") or {}
+        return {
+            "run_id": str(run.get("id") or ""),
+            "run_attempt": str(run.get("run_attempt") or ""),
+            "path": str(run.get("path") or ""),
+            "head_sha": str(run.get("head_sha") or ""),
+            "status": str(run.get("status") or "").lower(),
+            "conclusion": str(run.get("conclusion") or "").lower(),
+            "event": str(run.get("event") or ""),
+            "run_started_at": str(run.get("run_started_at") or ""),
+            "repository": str(repo_obj.get("full_name") or ""),
+            "head_repository": str(head_repo.get("full_name") or ""),
+        }
+
+    async def _api_json(self, endpoint: str, *, repo: str | None) -> tuple[Any, bool]:
+        """``(json, absent)``: ``(None, False)`` — не смогли; ``(None, True)`` — нет."""
+        rc, out, err = await _gh(
+            "api", endpoint, repo=repo, check=False, timeout=_CI_READ_TIMEOUT
+        )
+        if rc != 0:
+            if self._api_missing(err):
+                return None, True
+            log.warning(
+                "gh api %s unavailable: %s", endpoint, (err or "").strip()[:200]
+            )
+            return None, False
+        try:
+            return json.loads(out), False
+        except (json.JSONDecodeError, TypeError):
+            log.warning("gh api %s: invalid json", endpoint)
+            return None, False
+
+    async def ci_run_attempt(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Попытка прогона: факты о ней, ``{}`` если такой нет, None если не смогли."""
+        if not (str(run_id).isdigit() and str(attempt).isdigit()):
+            return {}
+        data, absent = await self._api_json(
+            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/attempts/{attempt}",
+            repo=repo,
+        )
+        if absent:
+            return {}
+        if not isinstance(data, dict):
+            return None
+        return self._run_facts(data)
+
+    async def _all_pages(
+        self, endpoint: str, key: str, *, repo: str | None
+    ) -> list[Any] | None:
+        """Every item of a paged list, ``[]`` if it is absent, None if unknown.
+
+        A list that GitHub says is longer than what was read (the next page
+        failed, or there are more pages than we read) is NOT returned: a hub
+        that took the first hundred runs for all of them could pick the wrong
+        current attempt.
+        """
+        items: list[Any] = []
+        for page in range(1, _CI_MAX_PAGES + 1):
+            data, absent = await self._api_json(
+                f"{endpoint}{'&' if '?' in endpoint else '?'}"
+                f"per_page={_CI_PAGE}&page={page}",
+                repo=repo,
+            )
+            if absent:
+                return [] if page == 1 else None
+            if not isinstance(data, dict) or not isinstance(data.get(key), list):
+                return None
+            got = [x for x in data[key] if isinstance(x, dict)]
+            items.extend(got)
+            raw_total = data.get("total_count")
+            total = raw_total if isinstance(raw_total, int) else None
+            if total is not None:
+                if len(items) >= total:
+                    return items
+                if len(data[key]) < _CI_PAGE:
+                    return None  # GitHub counts more than it handed over
+            elif len(data[key]) < _CI_PAGE:
+                return items
+        return None
+
+    async def ci_runs_for_sha(
+        self,
+        head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Прогоны workflow ci.yml по head_sha (последняя попытка каждого)."""
+        runs = await self._all_pages(
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows/ci.yml/runs"
+            f"?head_sha={head_sha}",
+            "workflow_runs",
+            repo=repo,
+        )
+        return None if runs is None else [self._run_facts(r) for r in runs]
+
+    async def ci_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Артефакты прогона: список, ``[]`` если их нет, None если не смогли."""
+        if not str(run_id).isdigit():
+            return []
+        found = await self._all_pages(
+            f"repos/{gh_repo or REPO_NAME}/actions/runs/{run_id}/artifacts",
+            "artifacts",
+            repo=repo,
+        )
+        if found is None:
+            return None
+        return [
+            {
+                "id": str(a.get("id") or ""),
+                "name": str(a.get("name") or ""),
+                "digest": str(a.get("digest") or ""),
+                "size": a.get("size_in_bytes"),
+                "expired": bool(a.get("expired")),
+            }
+            for a in found
+        ]
+
+    async def ci_artifact_zip(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bytes | None:
+        """Архив артефакта целиком в память; ``b""`` — нет или больше потолка."""
+        if not str(artifact_id).isdigit():
+            return b""
+        rc, out, err = await proc.run_capped(
+            GH_BIN,
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/artifacts/{artifact_id}/zip",
+            cwd=repo or proc.repo_root(),
+            timeout=90,
+            max_bytes=max_bytes,
+        )
+        if rc == 0:
+            return out
+        if rc == -2 or self._api_missing(err):
+            return b""
+        log.warning("artifact %s unavailable: rc=%s %s", artifact_id, rc, err[:200])
+        return None
 
     async def ci_failure_logs(
         self,

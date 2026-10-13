@@ -48,9 +48,9 @@ async def _submitted(client: AsyncClient, db, title: str, summary: str) -> int:
 
 
 async def _prepass(db, task_id: int, checks: dict) -> None:
-    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import accept_backed
 
-    await accept_ci_run_report(
+    await accept_backed(
         db,
         task_id,
         head_sha=_PINNED_SHA,
@@ -190,7 +190,7 @@ async def test_the_authors_claim_survives_the_dispatch_note(
 ):
     from hub.models import TaskRefine, TaskSubmitReview
     from hub.services import lifecycle
-    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import accept_backed
     from hub.services.orchestration import practice_metrics
     from hub.services.review_brief import build_review_brief
     from hub.services.steward_applied import _commit_signal
@@ -226,7 +226,7 @@ async def test_the_authors_claim_survives_the_dispatch_note(
     plugins.git_ops = _PinnedGitOps(_TIP, ["docs/notes.md"])
     await lifecycle.pair_start_task(db, task_id, caller="dev-agent")
     # The prepass of #1168: lint and security green, the suite red.
-    await accept_ci_run_report(
+    await accept_backed(
         db,
         task_id,
         head_sha=_TIP,

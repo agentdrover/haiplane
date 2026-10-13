@@ -588,7 +588,6 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
 
 async def ci_evidence_state(db, task: dict):
     """Mutation and baseline evidence stored for the pinned commit (#1606)."""
-    from hub import repository as repo_module
     from hub.models import CIEvidenceBlock, CIEvidenceState
 
     pinned = (task.get("submission_sha") or "").strip()
@@ -597,7 +596,16 @@ async def ci_evidence_state(db, task: dict):
         return CIEvidenceState(
             mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
         )
-    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    from hub.services.ci_trust import trusted_report, unconfirmed_reason
+
+    # #1687: mutations and baseline are evidence only from a confirmed report.
+    row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
+        text = f"не получено: {why}"
+        return CIEvidenceState(
+            mutations=CIEvidenceBlock(reason=text),
+            baseline=CIEvidenceBlock(reason=text),
+        )
     stored = dict(row) if row is not None else {}
     return CIEvidenceState(
         mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
@@ -613,7 +621,6 @@ async def prepass_state(db, task: dict):
     reviewer's silence on a class, and collapsing them would hand out that
     silence for free — the same substitution #549 removed from coverage.
     """
-    from hub import repository as repo_module
     from hub.models import PrepassState
     from hub.services.ci_report import CHECK_FAIL, CHECK_PASS, CHECK_SKIPPED
 
@@ -623,7 +630,12 @@ async def prepass_state(db, task: dict):
             state="unknown",
             reason="коммит сдачи не закреплён — предпас не с чем сверить",
         )
-    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    from hub.services.ci_trust import trusted_report, unconfirmed_reason
+
+    row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
+        # A report WAS sent, and GitHub did not confirm it: say that, not "never sent".
+        return PrepassState(state="unknown", head_sha=pinned, reason=why)
     if row is None:
         return PrepassState(
             state="unknown",
@@ -649,6 +661,23 @@ async def prepass_state(db, task: dict):
     passed = sorted(k for k, v in checks.items() if v == CHECK_PASS)
     failed = sorted(k for k, v in checks.items() if v == CHECK_FAIL)
     skipped = sorted(k for k, v in checks.items() if v == CHECK_SKIPPED)
+    # #1687: the run as a whole counts, not only its steps. A run that ended in
+    # anything but success is a failed prepass even when each step it names
+    # passed; the steps stay listed on their own.
+    from hub.services.ci_trust import run_conclusion
+
+    conclusion = run_conclusion(dict(row))
+    if conclusion != "success":
+        failed = sorted({*failed, "прогон"})
+        return PrepassState(
+            state="failed",
+            reason=f"упали: {', '.join(failed)} (прогон закончился как "
+            f"{conclusion or 'неизвестно'})",
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            head_sha=pinned,
+        )
     return PrepassState(
         # A failed check is louder than a passing one: it means the code under
         # review is known-broken in a way a tool already proved, and the

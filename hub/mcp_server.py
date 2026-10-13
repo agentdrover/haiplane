@@ -2844,6 +2844,13 @@ def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
             f"\nМерж в базу [{merge_state['state']}]: {merge_state.get('reason', '')}"
         )
         parts.extend(f"  - {path}" for path in merge_state.get("files") or [])
+    # #1687: a CI report GitHub did not confirm is not evidence, and the reader
+    # of the brief is told so in words rather than by the absence of a pass.
+    ci_report = brief.get("ci_run_report") or {}
+    if ci_report.get("trust") == "unverified":
+        parts.append(
+            f"\nCI-отчёт не подтверждён: {ci_report.get('trust_reason') or 'без причины'}"
+        )
     coverage = brief.get("evidence_coverage") or {}
     if coverage.get("headline"):
         parts.append(

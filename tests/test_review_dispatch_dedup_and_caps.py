@@ -883,7 +883,7 @@ async def test_a_late_ci_report_orders_nothing(
 ):
     # AC-3: отложенного пути нет — ни приём отчёта CI, ни поллер ревью не
     # заказывают; событие о красном остаётся одним.
-    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import accept_backed
 
     recorder = _DispatchRecorder({"agent": {"id": "bc-late"}, "run": {"id": "r"}})
     _wire(monkeypatch, recorder)
@@ -902,7 +902,7 @@ async def test_a_late_ci_report_orders_nothing(
     assert len(recorder.calls) == 1, "заказ только у сдачи без отчёта"
 
     for task_id, status in ((red, "pass"), (ordered, "pass"), (ordered, "fail")):
-        await accept_ci_run_report(
+        await accept_backed(
             db,
             task_id,
             head_sha=_TIP,
