@@ -46,11 +46,21 @@ _CHANGED = "раздел изменился (ветка сдвинулась и�
 # Heuristic states first: a reader with a short budget meets the sites that
 # nobody touched before the ones that are fine.
 _STATE_ORDER = ("untouched_sites", "only_tests", "no_callers")
+# Every TEXT field of the classification, most useful first. A field missing
+# here would have a class but no place in the answer; a test compares the two.
 _STATEMENT_FIELDS = (
     "description",
     "technical_hints",
     "scope_growth",
     "latest_submission_summary",
+    "scope_in",
+    "scope_out",
+    "validation_commands",
+    "outcome_metric",
+    "outcome_indicator",
+    "outcome_deadline",
+    "outcome_revisit_condition",
+    "redesign_rationale",
 )
 _BLOCK_ORDER = ("acceptance_criteria", "call_sites", *_STATEMENT_FIELDS)
 
@@ -128,15 +138,21 @@ def _identity(brief: dict[str, Any]) -> dict[str, Any]:
 # cannot be forgotten here, and a new brief field cannot appear without a class.
 
 
-def _finding_digest(items: list[dict[str, Any]], key: str = "title") -> dict[str, Any]:
-    shown = [
+def _rows(items: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
+    """The MANDATORY children of ``prefix`` for each element; free text is capped."""
+    names = fields_of(MANDATORY, prefix)
+    return [
         {
-            "severity": f.get("severity"),
-            "title": _cap(f.get(key), TITLE_CAP),
-            **({"uid": f["finding_uid"]} if f.get("finding_uid") else {}),
+            n: _cap(it.get(n), TITLE_CAP) if isinstance(it.get(n), str) else it.get(n)
+            for n in names
         }
-        for f in items[:FINDINGS_SHOWN]
+        for it in items
     ]
+
+
+def _finding_digest(items: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    """Up to FINDINGS_SHOWN rows of the listed children, the rest by count."""
+    shown = _rows(items[:FINDINGS_SHOWN], prefix)
     return {
         "total": len(items),
         "shown": len(shown),
@@ -145,11 +161,18 @@ def _finding_digest(items: list[dict[str, Any]], key: str = "title") -> dict[str
     }
 
 
+#: Lists of a machine review carried as one row per entry (decision values, no
+#: free text), and lists carried as a digest of at most FINDINGS_SHOWN rows.
+_ROW_LISTS = ("dispositions", "observation_closures", "deferred_repeats")
+_DIGEST_LISTS = ("findings_confirmed", "unresolved")
+
+
 def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
     """None stays None: no report is not a clean report.
 
-    Lists are carried as ``<name>_count``; the two that name defects also as a
-    digest. Scalars (incomplete=None, self_reviewed, principal_id, ...) as they are.
+    Every list is carried as ``<name>_count``; defect lists also as a digest and
+    decision lists as rows. Scalars (incomplete=None, self_reviewed,
+    principal_id, ...) as they are.
     """
     if not isinstance(mr, dict):
         return None
@@ -160,8 +183,10 @@ def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
             part[f"{name}_count"] = len(value)
         else:
             part[name] = value
-    part["findings_confirmed"] = _finding_digest(mr.get("findings_confirmed") or [])
-    part["unresolved"] = _finding_digest(mr.get("unresolved") or [])
+    for name in _DIGEST_LISTS:
+        part[name] = _finding_digest(mr.get(name) or [], f"machine_review.{name}")
+    for name in _ROW_LISTS:
+        part[name] = _rows(mr.get(name) or [], f"machine_review.{name}")
     return part
 
 
@@ -175,7 +200,7 @@ def _latest_review_part(review: dict[str, Any] | None) -> dict[str, Any] | None:
     }
     findings = review.get("findings") or []
     part["findings_count"] = len(findings)
-    part["findings"] = _finding_digest(findings, "message")
+    part["findings"] = _finding_digest(findings, "latest_review.findings")
     return part
 
 
@@ -234,6 +259,7 @@ def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
     rows = brief.get("locator_resolution") or []
     return {
         "total": len(rows),
+        "rows": _rows(rows, "locator_resolution"),
         "unresolved": [
             {"ac_id": r.get("ac_id"), "status": r.get("status")}
             for r in rows
@@ -388,25 +414,34 @@ def _call_sites_block(brief: dict[str, Any], level: int) -> dict[str, Any]:
 
 
 def _statement_texts(brief: dict[str, Any]) -> dict[str, str]:
-    texts = {
-        "description": str(brief.get("description") or ""),
-        "technical_hints": str(brief.get("technical_hints") or ""),
-        "scope_growth": "\n".join(str(x) for x in brief.get("scope_growth") or []),
-        "latest_submission_summary": str(brief.get("latest_submission_summary") or ""),
-    }
-    return {name: text for name, text in texts.items() if text}
+    texts = {}
+    for name in _STATEMENT_FIELDS:
+        value = brief.get(name)
+        text = (
+            "\n".join(str(x) for x in value)
+            if isinstance(value, list)
+            else str(value or "")
+        )
+        if text:
+            texts[name] = text
+    return texts
 
 
 def _text_block(text: str, level: int) -> dict[str, Any]:
+    """Counts always; the text and the ``truncated`` marker only when they say something."""
     clipped = text[:level]
-    return {
-        "text": clipped,
+    cut = len(clipped) < len(text)
+    block: dict[str, Any] = {
         "shown": len(clipped),
         "omitted": len(text) - len(clipped),
         "total": len(text),
-        "truncated": len(clipped) < len(text),
-        "hint": "section=statement" if level < len(text) else "",
+        "hint": "section=statement" if cut else "",
     }
+    if clipped:
+        block["text"] = clipped
+    if cut:
+        block["truncated"] = True
+    return block
 
 
 def _blocks(brief: dict[str, Any], levels: dict[str, int]) -> dict[str, Any]:
@@ -481,11 +516,55 @@ def _verdict_lines(proj: dict[str, Any]) -> list[str]:
     return lines
 
 
+_ROW_EXTRAS = ("id", "scope", "linked_task_id", "file", "line", "finding_uid")
+
+
+def _row_text(row: dict[str, Any]) -> str:
+    title = row.get("title") or row.get("message") or ""
+    extras = " ".join(
+        f"{k}={row[k]}" for k in _ROW_EXTRAS if row.get(k) not in (None, "")
+    )
+    return f"[{row.get('severity')}] {title}" + (f" ({extras})" if extras else "")
+
+
 def _digest_lines(label: str, digest: dict[str, Any]) -> list[str]:
     lines = [f"{label}: {digest['total']}"]
-    lines.extend(f"  - [{f['severity']}] {f['title']}" for f in digest["items"])
+    lines.extend(f"  - {_row_text(f)}" for f in digest["items"])
     if digest["omitted"]:
         lines.append(f"  … and {digest['omitted']} more (section=machine_review)")
+    return lines
+
+
+def _decision_lines(mr: dict[str, Any]) -> list[str]:
+    """What was decided about each finding, by uid (the free text stays in full)."""
+    lines = [
+        f"  disposition {r['finding_uid']}: {r['disposition']} (by {r['decided_by']})"
+        for r in mr["dispositions"]
+    ]
+    lines.extend(
+        f"  closed by live check {r['live_check_id']}: {r['finding_uid']} (hand "
+        f"{r['hand'] or '-'})"
+        for r in mr["observation_closures"]
+    )
+    lines.extend(
+        f"  deferred repeat {r['finding_uid']} -> task #{r['linked_task_id']}"
+        for r in mr["deferred_repeats"]
+    )
+    return lines
+
+
+def _boundary_lines(proj: dict[str, Any]) -> list[str]:
+    """Review boundaries: what the verdict is judged against."""
+    lines = []
+    if proj["constraints"]:
+        lines.append("Constraints: " + "; ".join(proj["constraints"]))
+    if proj["out_of_scope_for_review"]:
+        lines.append(
+            "Out of scope for review: " + "; ".join(proj["out_of_scope_for_review"])
+        )
+    if proj["review_checklist"]:
+        lines.append("Review checklist:")
+        lines.extend(f"  - {item}" for item in proj["review_checklist"])
     return lines
 
 
@@ -523,6 +602,7 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
             f"  CI integrity answer: {mr['ci_integrity_verdict']} "
             f"{mr['ci_integrity_explanation']}".rstrip()
         )
+    lines.extend(_decision_lines(mr))
     if mr["findings_confirmed"]["total"]:
         lines.extend(_digest_lines("Confirmed findings", mr["findings_confirmed"]))
     if mr["unresolved"]["total"]:
@@ -707,6 +787,7 @@ def _head_lines(proj: dict[str, Any]) -> list[str]:
     else:
         lines.extend(_diff_lines(proj))
     lines.extend(_rules_lines(proj["catalogue_rules"]))
+    lines.extend(_boundary_lines(proj))
     if proj["review_circle"]:
         lines.append(
             f"Review circle: {proj['review_circle'].get('laps')} laps — "
@@ -723,7 +804,7 @@ def _block_head(name: str, block: dict[str, Any]) -> str:
     line = f"{name}: {block['shown']}/{block['total']} shown"
     if block["omitted"]:
         line += f", {block['omitted']} omitted"
-    if block["truncated"]:
+    if block.get("truncated"):
         line += ", shown elements cut"
     if block["hint"]:
         line += f" ({block['hint']})"
@@ -748,7 +829,8 @@ def _block_lines(blocks: dict[str, Any]) -> list[str]:
         lines.extend(f"    - {address}" for address in row["untouched"])
     for name, block in (blocks.get("statement") or {}).items():
         lines.append(_block_head(f"Statement/{name}", block))
-        lines.append(block["text"])
+        if block.get("text"):
+            lines.append(block["text"])
     return lines
 
 

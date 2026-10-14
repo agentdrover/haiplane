@@ -106,10 +106,16 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "scope_in": (TEXT, ""),
     "scope_out": (TEXT, ""),
     "scope_growth": (TEXT, ""),
-    "out_of_scope_for_review": (TEXT, ""),
-    "review_checklist": (TEXT, ""),
+    "out_of_scope_for_review": (
+        MANDATORY,
+        "review boundaries: what the verdict is judged against",
+    ),
+    "review_checklist": (
+        MANDATORY,
+        "review boundaries: what the verdict is judged against",
+    ),
     "validation_commands": (TEXT, ""),
-    "constraints": (TEXT, ""),
+    "constraints": (MANDATORY, "review boundaries: what the verdict is judged against"),
     "technical_hints": (TEXT, ""),
     "outcome_metric": (TEXT, ""),
     "outcome_indicator": (TEXT, ""),
@@ -162,7 +168,129 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
         FULL_ONLY,
         "timestamp of the report; is_current carries the freshness",
     ),
+    "machine_review.findings_confirmed.title": (MANDATORY, ""),
+    "machine_review.findings_confirmed.severity": (MANDATORY, ""),
+    "machine_review.findings_confirmed.finding_uid": (MANDATORY, ""),
+    "machine_review.findings_confirmed.category": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.file": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.line": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.detail": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.locator": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.start_line": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_confirmed.end_line": (
+        FULL_ONLY,
+        "where/why of the finding; section=machine_review pages it",
+    ),
+    "machine_review.findings_rejected.title": (
+        FULL_ONLY,
+        "refuted finding; only the count is decision data",
+    ),
+    "machine_review.findings_rejected.category": (
+        FULL_ONLY,
+        "refuted finding; only the count is decision data",
+    ),
+    "machine_review.findings_rejected.reason": (
+        FULL_ONLY,
+        "refuted finding; only the count is decision data",
+    ),
+    "machine_review.unresolved.title": (MANDATORY, ""),
+    "machine_review.unresolved.finding_uid": (MANDATORY, ""),
+    "machine_review.unresolved.why": (
+        FULL_ONLY,
+        "free text of what stopped the verification",
+    ),
+    "machine_review.dispositions.finding_uid": (MANDATORY, ""),
+    "machine_review.dispositions.finding_index": (MANDATORY, ""),
+    "machine_review.dispositions.disposition": (MANDATORY, ""),
+    "machine_review.dispositions.decided_by": (MANDATORY, ""),
+    "machine_review.dispositions.finding_title": (
+        FULL_ONLY,
+        "free text; finding_uid identifies the finding",
+    ),
+    "machine_review.dispositions.note": (FULL_ONLY, "free text of the disposition"),
+    "machine_review.dispositions.decided_at": (FULL_ONLY, "timestamp of the decision"),
+    "machine_review.observation_closures.finding_uid": (MANDATORY, ""),
+    "machine_review.observation_closures.live_check_id": (MANDATORY, ""),
+    "machine_review.observation_closures.hand": (MANDATORY, ""),
+    "machine_review.observation_closures.recorded_agent": (
+        FULL_ONLY,
+        "who recorded the check; hand names whose hand closed it",
+    ),
+    "machine_review.observation_closures.recorded_at": (
+        FULL_ONLY,
+        "timestamp of the record",
+    ),
+    "machine_review.deferred_repeats.finding_uid": (MANDATORY, ""),
+    "machine_review.deferred_repeats.linked_task_id": (MANDATORY, ""),
+    "machine_review.deferred_repeats.title": (
+        FULL_ONLY,
+        "free text; finding_uid and the linked task identify it",
+    ),
+    "latest_review.findings.id": (MANDATORY, ""),
+    "latest_review.findings.severity": (MANDATORY, ""),
+    "latest_review.findings.message": (MANDATORY, ""),
+    "latest_review.findings.scope": (MANDATORY, ""),
+    "latest_review.findings.linked_task_id": (MANDATORY, ""),
+    "latest_review.findings.file": (MANDATORY, ""),
+    "latest_review.findings.line": (MANDATORY, ""),
+    "latest_review.findings.recommendation": (
+        FULL_ONLY,
+        "free-text advice; message states the finding",
+    ),
+    "locator_resolution.ac_id": (MANDATORY, ""),
+    "locator_resolution.status": (MANDATORY, ""),
+    "locator_resolution.locator": (
+        FULL_ONLY,
+        "the test_ref text; status says whether it resolves",
+    ),
+    "locator_resolution.reason": (FULL_ONLY, "how the status was reached"),
+    "base_merge.state": (MANDATORY, ""),
+    "base_merge.reason": (MANDATORY, ""),
+    "base_merge.files": (MANDATORY, ""),
+    "diff_base.state": (MANDATORY, ""),
+    "diff_base.reason": (MANDATORY, ""),
+    "diff_base.base": (FULL_ONLY, "named in diff_command"),
+    "diff_base.source": (FULL_ONLY, "where the base name came from"),
+    "diff_base.sha": (
+        FULL_ONLY,
+        "resolved commit; the submission identity is submission_sha",
+    ),
 }
+
+#: Parents the projection carries REDUCED (rows of chosen children, not the whole
+#: object): every child of each of them must be classified too.
+REDUCED: frozenset[str] = frozenset(
+    {
+        "machine_review.findings_confirmed",
+        "machine_review.findings_rejected",
+        "machine_review.unresolved",
+        "machine_review.dispositions",
+        "machine_review.observation_closures",
+        "machine_review.deferred_repeats",
+        "latest_review.findings",
+        "locator_resolution",
+        "base_merge",
+        "diff_base",
+    }
+)
 
 
 def fields_of(cls: str, prefix: str = "") -> list[str]:

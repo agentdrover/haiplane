@@ -77,7 +77,7 @@ def _machine(confirmed: int, unresolved: int, **extra: Any) -> dict[str, Any]:
         "profile": "deep",
         "findings_confirmed": [
             {
-                "title": f"Находка {i} " + "т" * 250,
+                "title": f"Находка {i} " + "т" * 100,
                 "severity": "high" if i % 2 else "low",
             }
             for i in range(confirmed)
@@ -955,7 +955,7 @@ def test_cut_elements_carry_a_hint_and_a_truncated_marker():
     whole = proj.brief_result(
         _brief(ac=1, call_sites={"status": "analysed", "entries": []})
     )
-    short = _brief(ac=1)
+    short = _brief(ac=1, confirmed=0, unresolved=0)
     short["acceptance_criteria"][0]["then"] = "коротко"
     short["call_sites"]["entries"] = []
     clean = proj.brief_result(short).structuredContent["brief"]["blocks"]
@@ -998,13 +998,14 @@ def _unclassified(model: type[BaseModel], prefix: str = "") -> list[str]:
     missing = []
     for name, info in model.model_fields.items():
         path = f"{prefix}{name}"
-        if path in fields.FIELD_CLASS:
-            continue
         nested = _nested_model(info.annotation)
         split = any(k.startswith(path + ".") for k in fields.FIELD_CLASS)
-        if nested is not None and split:
+        if nested is not None and (split or path in fields.REDUCED):
+            # A split or REDUCED parent is not classified as a whole: each child is.
+            if path not in fields.FIELD_CLASS and not split:
+                missing.append(path)
             missing += _unclassified(nested, path + ".")
-        else:
+        elif path not in fields.FIELD_CLASS:
             missing.append(path)
     return missing
 
@@ -1027,7 +1028,19 @@ def test_every_brief_field_has_a_class():
         if klass == "FULL_ONLY":
             assert reason.strip(), f"{path}: FULL_ONLY needs a reason"
     parents = {p.split(".")[0] for p in fields.FIELD_CLASS if "." in p}
-    assert parents == {"latest_review", "review_report", "machine_review"}
+    assert parents == {
+        "latest_review",
+        "review_report",
+        "machine_review",
+        "locator_resolution",
+        "base_merge",
+        "diff_base",
+    }
+    # Every REDUCED parent has its children classified (the walk below enforces
+    # that they are all there); and every TEXT field has a place in the answer.
+    for parent in fields.REDUCED:
+        assert any(k.startswith(parent + ".") for k in fields.FIELD_CLASS), parent
+    assert set(proj._STATEMENT_FIELDS) == set(fields.fields_of("TEXT"))
 
 
 def test_a_new_field_is_refused_until_it_is_classified(monkeypatch):
@@ -1050,19 +1063,44 @@ def _clean() -> dict[str, Any]:
         prose=1,
         confirmed=0,
         unresolved=0,
-        machine_review=_machine(
-            0,
-            0,
-            incomplete=False,
-            principal_id=5,
-            self_reviewed=False,
-            is_current=True,
-            lost_dimensions=[],
-        ),
+        machine_review={
+            **_machine(
+                0,
+                0,
+                incomplete=False,
+                principal_id=5,
+                self_reviewed=False,
+                is_current=True,
+                lost_dimensions=[],
+                findings_confirmed=[{"title": "t", "severity": "low"}],
+                findings_rejected=[{"title": "r", "reason": "x"}],
+                dispositions=[
+                    {
+                        "finding_index": 0,
+                        "finding_uid": "u1",
+                        "finding_title": "t",
+                        "disposition": "fixed",
+                        "decided_by": "a",
+                    }
+                ],
+                observation_closures=[
+                    {"finding_uid": "u1", "live_check_id": 1, "hand": "h"}
+                ],
+                deferred_repeats=[{"finding_uid": "u1", "linked_task_id": 5}],
+            ),
+            "unresolved": [{"title": "u", "why": "w"}],
+        },
+        locator_resolution=[
+            {"ac_id": "AC-1", "locator": "t::x", "status": "resolvable", "reason": ""}
+        ],
+        base_merge={"state": "clean", "reason": "ok", "files": []},
         latest_review={
             "verdict": "approved",
             "submission_generation": 2,
             "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "low", "message": "m", "scope": "in_scope"}
+            ],
         },
         ci_run_report={"state": "current", "reason": "ok", "trust": "verified"},
         ci_evidence={
@@ -1175,7 +1213,10 @@ _BAD: dict[str, tuple[str, Any]] = {
     "project": ("project", {"id": 1, "slug": "zz"}),
     "locator_resolution": (
         "locator_resolution",
-        [{"ac_id": "AC-1", "locator": None, "status": "missing", "reason": ""}],
+        [
+            {"ac_id": "AC-1", "locator": "t::x", "status": "resolvable", "reason": ""},
+            {"ac_id": "AC-2", "locator": None, "status": "missing", "reason": ""},
+        ],
     ),
     "ac_test_results": (
         "ac_test_results",
@@ -1232,7 +1273,10 @@ _BAD: dict[str, tuple[str, Any]] = {
     "latest_review.self_approved": ("latest_review.self_approved", True),
     "latest_review.findings": (
         "latest_review.findings",
-        [{"id": 1, "severity": "high", "message": "m"}],
+        [
+            {"id": 1, "severity": "low", "message": "m", "scope": "in_scope"},
+            {"id": 2, "severity": "high", "message": "m2"},
+        ],
     ),
     "review_report.state": ("review_report.state", "stale"),
     "review_report.branch": ("review_report.branch", "b2"),
@@ -1247,18 +1291,21 @@ _BAD: dict[str, tuple[str, Any]] = {
     "machine_review.raw_count": ("machine_review.raw_count", 9),
     "machine_review.findings_confirmed": (
         "machine_review.findings_confirmed",
-        [{"title": "t", "severity": "high"}],
+        [{"title": "t", "severity": "low"}, {"title": "t2", "severity": "high"}],
     ),
     "machine_review.findings_rejected": (
         "machine_review.findings_rejected",
-        [{"title": "r"}],
+        [{"title": "r"}, {"title": "r2"}],
     ),
     "machine_review.incomplete": ("machine_review.incomplete", None),
     "machine_review.incomplete_reason": (
         "machine_review.incomplete_reason",
         "environment",
     ),
-    "machine_review.unresolved": ("machine_review.unresolved", [{"title": "u"}]),
+    "machine_review.unresolved": (
+        "machine_review.unresolved",
+        [{"title": "u"}, {"title": "u2"}],
+    ),
     "machine_review.lost_dimensions": ("machine_review.lost_dimensions", ["security"]),
     "machine_review.profile": ("machine_review.profile", "lite"),
     "machine_review.submitted_by": ("machine_review.submitted_by", "author"),
@@ -1272,16 +1319,13 @@ _BAD: dict[str, tuple[str, Any]] = {
         "machine_review.ci_integrity_explanation",
         "почему",
     ),
-    "machine_review.dispositions": ("machine_review.dispositions", [{"uid": "x"}]),
+    "machine_review.dispositions": ("machine_review.dispositions", [{"x": 1}]),
     "machine_review.observation_closures": (
         "machine_review.observation_closures",
-        [{"uid": "x"}],
+        [{"x": 1}],
     ),
-    "machine_review.deferred_repeats": (
-        "machine_review.deferred_repeats",
-        [{"uid": "x"}],
-    ),
-    "machine_review.outcome": ("machine_review.outcome", "confirmed_findings"),
+    "machine_review.deferred_repeats": ("machine_review.deferred_repeats", [{"x": 1}]),
+    "machine_review.outcome": ("machine_review.outcome", "clean_run"),
     "machine_review.outcome_label": ("machine_review.outcome_label", "иное"),
     "machine_review.outcome_names_clean": ("machine_review.outcome_names_clean", True),
     "machine_review.second_door_channel": (
@@ -1295,13 +1339,63 @@ _BAD: dict[str, tuple[str, Any]] = {
 }
 
 
+def _child(parent: str, name: str, value: Any) -> tuple[str, tuple[str, Any]]:
+    """A child of the first element of a list: the CONTENT changes, the length not."""
+    return f"{parent}.{name}", (f"{parent}.0.{name}", value)
+
+
+_BAD |= dict(
+    [
+        _child("machine_review.findings_confirmed", "title", "другая"),
+        _child("machine_review.findings_confirmed", "severity", "high"),
+        _child("machine_review.findings_confirmed", "finding_uid", "zzz"),
+        _child("machine_review.unresolved", "title", "другая"),
+        _child("machine_review.unresolved", "finding_uid", "zzz"),
+        _child("machine_review.dispositions", "finding_uid", "u2"),
+        _child("machine_review.dispositions", "finding_index", 3),
+        _child("machine_review.dispositions", "disposition", "wont_fix"),
+        _child("machine_review.dispositions", "decided_by", "other"),
+        _child("machine_review.observation_closures", "finding_uid", "u2"),
+        _child("machine_review.observation_closures", "live_check_id", 2),
+        _child("machine_review.observation_closures", "hand", "other"),
+        _child("machine_review.deferred_repeats", "finding_uid", "u2"),
+        _child("machine_review.deferred_repeats", "linked_task_id", 6),
+        _child("latest_review.findings", "id", 2),
+        _child("latest_review.findings", "severity", "high"),
+        _child("latest_review.findings", "message", "другое"),
+        _child("latest_review.findings", "scope", "out_of_scope"),
+        _child("latest_review.findings", "linked_task_id", 9),
+        _child("latest_review.findings", "file", "a.py"),
+        _child("latest_review.findings", "line", 3),
+        _child("locator_resolution", "ac_id", "AC-7"),
+        _child("locator_resolution", "status", "missing"),
+    ]
+)
+_BAD |= {
+    "base_merge.state": ("base_merge.state", "conflicting"),
+    "base_merge.reason": ("base_merge.reason", "другая"),
+    "base_merge.files": ("base_merge.files", ["a.py"]),
+    "diff_base.state": ("diff_base.state", "unverified"),
+    "diff_base.reason": ("diff_base.reason", "не проверена"),
+    "constraints": ("constraints", ["не трогать REST"]),
+    "out_of_scope_for_review": ("out_of_scope_for_review", ["этап 2"]),
+    "review_checklist": ("review_checklist", ["проверить конверт"]),
+}
+
+
 def _set(node: dict[str, Any], dotted: str, value: Any) -> None:
     *parents, last = dotted.split(".")
     for part in parents:
-        if not isinstance(node.get(part), dict):
+        if isinstance(node, list):
+            node = node[int(part)]
+            continue
+        if not isinstance(node.get(part), (dict, list)):
             node[part] = {}
         node = node[part]
-    node[last] = value
+    if isinstance(node, list):
+        node[int(last)] = value
+    else:
+        node[last] = value
 
 
 def _mandatory_paths() -> list[str]:
@@ -1347,4 +1441,96 @@ _STRUCTURED_ONLY = {
     "machine_review.submitted_by",
     "machine_review.outcome",
     "machine_review.lost_dimensions",
+    "machine_review.dispositions.finding_index",
+    "locator_resolution.ac_id",
+    "base_merge.reason",
+    "base_merge.files",
+    "diff_base.reason",
 }
+
+
+# --- review round 3 ----------------------------------------------------------
+
+
+def test_every_text_field_is_rendered_with_counts():
+    """P2-1: каждое TEXT-поле реально есть в ответе - с shown/omitted/total."""
+    brief = _clean()
+    for name in fields.fields_of("TEXT"):
+        value = brief.get(name)
+        brief[name] = (
+            ["элемент один", "элемент два"]
+            if isinstance(value, list)
+            else "текст " + name
+        )
+    statement = _answer(brief)["blocks"]["statement"]
+    assert set(statement) == set(fields.fields_of("TEXT"))
+    for name, block in statement.items():
+        assert (
+            block["total"] > 0 and block["shown"] + block["omitted"] == block["total"]
+        ), name
+        assert {"shown", "omitted", "total", "hint"} <= set(block), name
+    text = _text_of(brief)
+    for name in fields.fields_of("TEXT"):
+        assert f"Statement/{name}:" in text, name
+
+
+def test_review_boundaries_are_carried_in_both_halves():
+    """P2-1: constraints, out_of_scope_for_review, review_checklist - решающие."""
+    brief = _clean()
+    brief["constraints"] = ["REST не меняется"]
+    brief["out_of_scope_for_review"] = ["этап 2 #1652"]
+    brief["review_checklist"] = ["проверить конверт"]
+    answer, text = _answer(brief), _text_of(brief)
+    assert answer["constraints"] == ["REST не меняется"]
+    assert answer["out_of_scope_for_review"] == ["этап 2 #1652"]
+    assert answer["review_checklist"] == ["проверить конверт"]
+    for needle in (
+        "Constraints: REST не меняется",
+        "Out of scope for review: этап 2 #1652",
+        "  - проверить конверт",
+    ):
+        assert needle in text, needle
+
+
+def test_dispositions_closures_and_repeats_carry_the_decision_value():
+    """P2-2: wont_fix и false_positive по одной находке - разные ответы."""
+    a, b = _clean(), _clean()
+    a["machine_review"]["dispositions"][0]["disposition"] = "wont_fix"
+    b["machine_review"]["dispositions"][0]["disposition"] = "false_positive"
+    assert _answer(a) != _answer(b)
+    assert "disposition u1: wont_fix" in _text_of(a)
+    assert "disposition u1: false_positive" in _text_of(b)
+    row = _answer(a)["machine_review"]["dispositions"][0]
+    assert row == {
+        "finding_uid": "u1",
+        "finding_index": 0,
+        "disposition": "wont_fix",
+        "decided_by": "a",
+    }, "uid и решение, без свободного текста"
+    c = _clean()
+    c["machine_review"]["deferred_repeats"][0]["linked_task_id"] = 77
+    assert "deferred repeat u1 -> task #77" in _text_of(c)
+    d = _clean()
+    d["machine_review"]["observation_closures"][0]["hand"] = "other"
+    assert "closed by live check 1: u1 (hand other)" in _text_of(d)
+
+
+def test_verdict_findings_keep_scope_and_linked_task():
+    """P2-3: in_scope и out_of_scope находки не похожи друг на друга."""
+    a, b = _clean(), _clean()
+    a["latest_review"]["findings"] = [
+        {"id": 4, "severity": "high", "message": "m", "scope": "in_scope"}
+    ]
+    b["latest_review"]["findings"] = [
+        {
+            "id": 4,
+            "severity": "high",
+            "message": "m",
+            "scope": "out_of_scope",
+            "linked_task_id": 9,
+        }
+    ]
+    assert _answer(a) != _answer(b)
+    row = _answer(b)["latest_review"]["findings"]["items"][0]
+    assert (row["id"], row["scope"], row["linked_task_id"]) == (4, "out_of_scope", 9)
+    assert "id=4 scope=out_of_scope linked_task_id=9" in _text_of(b)
