@@ -2603,6 +2603,203 @@ async def _card_machine_report(
     return False, report, report.machine_review
 
 
+async def _card_executor_offers(
+    db: aiosqlite.Connection, task_id: int, row: Any
+) -> tuple[Any, bool, bool]:
+    """Прогоны облачного исполнителя и кнопки повтора и слияния."""
+    # #1410: прогоны облачного исполнителя — центы и исход по каждому.
+    from hub.services.executor_dispatch import executor_runs_view
+
+    executor_runs = await executor_runs_view(db, task_id)
+    # #1444: кнопка повторного прогона — только когда он вообще возможен.
+    from hub.services.executor_launch import repair_offered as _repair_offered
+
+    repair_offered = bool(executor_runs) and await _repair_offered(db, dict(row))
+    # #1445: кнопка прогона слияния — только на конфликте с базой.
+    from hub.services.executor_launch import merge_offered as _merge_offered
+
+    merge_offered = bool(executor_runs) and await _merge_offered(db, dict(row))
+    return executor_runs, repair_offered, merge_offered
+
+
+async def _card_finding_touch(
+    db: aiosqlite.Connection, task_id: int, machine_review: Any
+) -> list[dict[str, Any]]:
+    """Какие файлы сдачи затрагивают подтверждённые находки."""
+    if machine_review is None or not machine_review.findings_confirmed:
+        return []
+    return await evidence_for_findings(
+        db,
+        task_id,
+        [f.model_dump() for f in machine_review.findings_confirmed],
+        generation=int(machine_review.submission_generation),
+    )
+
+
+async def _card_delivery(
+    db: aiosqlite.Connection, task_id: int, task: Any, state_card: bool
+) -> Any:
+    """Доставка: слито не значит запущено (#497).
+
+    The hub records both facts now — its own merge (#534) and the deploy CI
+    reported (#839, #496) — and this compares them. Computed, never stored:
+    the answer changes with every release. Сбой не роняет карточку.
+    """
+    if state_card or task.status.value not in ("completed", "review", "fix_requested"):
+        return None
+    from hub.services.delivery_state import delivery_state
+
+    try:
+        return await delivery_state(db, task_id)
+    except Exception as exc:  # noqa: BLE001 - the card must render regardless
+        log.warning("delivery state failed for #%s: %s", task_id, exc)
+        return None
+
+
+async def _card_change_map(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: Any,
+    evidence: Any,
+    machine_review: Any,
+    state_card: bool,
+) -> dict[str, Any] | None:
+    """Критерии против изменений (#825).
+
+    Built from the numstat of the pinned submission — paths, not hunks: the
+    hunks load on demand (#824), and this map only needs to know which files
+    moved.
+    """
+    if evidence is None or state_card:
+        return None
+    from hub.services import change_map as change_map_service
+    from hub.services.task_diff import READ, submission_files
+
+    listing = await submission_files(db, task_id)
+    if listing["state"] != READ:
+        # Same rule as every other block here: no map is a stated cause,
+        # never an empty list that reads as "nothing changed" (#725).
+        return {"unavailable": listing["reason"]}
+    findings = []
+    if machine_review is not None and machine_review.is_current:
+        findings = list(machine_review.findings_confirmed or [])
+    return change_map_service.build(
+        listing["files"],
+        evidence.acceptance_criteria,
+        evidence.ac_test_results,
+        task.affected_areas or [],
+        findings,
+    )
+
+
+async def _card_review_runs(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Во что обошлись прогоны ревью (#893): прогоны, переносы, сумма.
+
+    Measured across eleven billed runs, the run is the unit that tracks spend —
+    none billed under 777k tokens, and the size of the diff explained none of
+    the spread — so five resubmissions cost five entry prices. A sum alone
+    would hide that; the count is the point. Runs whose bill never arrived say
+    "неизвестно", never nothing, because a missing bill is not a free run (#725).
+
+    #1361: a report CARRIED over a base-only merge is a row, not a run — it
+    cost nothing and read nothing. Counting it made the card say "2 runs,
+    bill known for 1 of 2" about a single paid run. Carries are listed apart.
+    """
+    report_rows = [dict(r) for r in await repo.list_machine_reviews(db, task_id)]
+    generation_of = {
+        int(r["id"]): int(r["submission_generation"] or 0) for r in report_rows
+    }
+    review_runs = [
+        {
+            "generation": int(r["submission_generation"] or 0),
+            "profile": (r["profile"] or "") or "не заявлен",
+            "provider_tokens": r["provider_tokens"],
+            "tokens_spent": r["tokens_spent"],
+            "created_at": r["created_at"],
+        }
+        for r in report_rows
+        if r.get("carried_from_review_id") is None
+    ]
+    review_carries = [
+        {
+            "generation": int(r["submission_generation"] or 0),
+            "from_generation": generation_of.get(int(r["carried_from_review_id"])),
+        }
+        for r in report_rows
+        if r.get("carried_from_review_id") is not None
+    ]
+    billed = [
+        r["provider_tokens"] for r in review_runs if r["provider_tokens"] is not None
+    ]
+    review_runs_cost = {
+        "runs": len(review_runs),
+        "billed_runs": len(billed),
+        "provider_total": sum(billed) if billed else None,
+    }
+    return review_runs, review_carries, review_runs_cost
+
+
+async def _card_live_checks(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str | None, list[dict[str, Any]]]:
+    """Репозиторий PR, поставленный коммит и наблюдения на проде (#814).
+
+    The delivered sha is what the evidence should be about — a record taken
+    elsewhere is shown with that said out loud rather than quietly counted as
+    proof. PR-ссылка строится от репозитория проекта задачи, не от жёстко
+    зашитого слага: хаб обслуживает несколько проектов с разными репозиториями.
+    """
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    pr_repo = ""
+    if project_row is not None:
+        pr_repo = (dict(project_row).get("repo") or "").strip()
+    if not pr_repo:
+        pr_repo = config.REPO_NAME
+
+    delivered_sha = await repo.merge_sha_for_task(db, task_id)
+    live_checks = [
+        {
+            **services.live_check_view(row),
+            "sha_mismatch": bool(
+                delivered_sha
+                and (dict(row).get("sha") or "")
+                and dict(row).get("sha") != delivered_sha
+            ),
+        }
+        for row in await repo.list_live_checks(db, task_id)
+    ]
+    return pr_repo, delivered_sha, live_checks
+
+
+def _card_response(
+    request: Request, context: dict[str, Any], status_code: int
+) -> HTMLResponse:
+    """Страница карточки с cookie CSRF.
+
+    #990: reuse the shared cookie. Minting on every card GET (including the
+    15s HTMX poller) 403s an open form in another tab. verify_csrf stays
+    strict equality; we only skip minting when the cookie already exists.
+    """
+    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
+        request,
+        "task_detail.html",
+        {**context, "csrf_token": csrf_token},
+        status_code=status_code,
+    )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
 async def _web_task_detail_page(
     request: Request,
     task_id: int,
@@ -2652,111 +2849,15 @@ async def _web_task_detail_page(
     steward_judgement = (
         None if state_card else await _steward_recommendation(db, task_id, dict(row))
     )
-    # #1410: прогоны облачного исполнителя — центы и исход по каждому.
-    from hub.services.executor_dispatch import executor_runs_view
-
-    executor_runs = await executor_runs_view(db, task_id)
-    # #1444: кнопка повторного прогона — только когда он вообще возможен.
-    from hub.services.executor_launch import repair_offered as _repair_offered
-
-    repair_offered = bool(executor_runs) and await _repair_offered(db, dict(row))
-    # #1445: кнопка прогона слияния — только на конфликте с базой.
-    from hub.services.executor_launch import merge_offered as _merge_offered
-
-    merge_offered = bool(executor_runs) and await _merge_offered(db, dict(row))
-
-    finding_touch: list[dict[str, Any]] = []
-    if machine_review is not None and machine_review.findings_confirmed:
-        finding_touch = await evidence_for_findings(
-            db,
-            task_id,
-            [f.model_dump() for f in machine_review.findings_confirmed],
-            generation=int(machine_review.submission_generation),
-        )
-
-    # #497: merged is not running. The hub records both facts now — its own
-    # merge (#534) and the deploy CI reported (#839, #496) — and this compares
-    # them. Computed, never stored: the answer changes with every release.
-    delivery = None
-    if not state_card and task.status.value in (
-        "completed",
-        "review",
-        "fix_requested",
-    ):
-        from hub.services.delivery_state import delivery_state
-
-        try:
-            delivery = await delivery_state(db, task_id)
-        except Exception as exc:  # noqa: BLE001 - the card must render regardless
-            log.warning("delivery state failed for #%s: %s", task_id, exc)
-            delivery = None
-
-    # #825: the criteria and the changes, laid against each other. Built from
-    # the numstat of the pinned submission — paths, not hunks: the hunks load
-    # on demand (#824), and this map only needs to know which files moved.
-    change_map = None
-    if evidence is not None and not state_card:
-        from hub.services import change_map as change_map_service
-        from hub.services.task_diff import READ, submission_files
-
-        listing = await submission_files(db, task_id)
-        if listing["state"] == READ:
-            findings = []
-            if machine_review is not None and machine_review.is_current:
-                findings = list(machine_review.findings_confirmed or [])
-            change_map = change_map_service.build(
-                listing["files"],
-                evidence.acceptance_criteria,
-                evidence.ac_test_results,
-                task.affected_areas or [],
-                findings,
-            )
-        else:
-            # Same rule as every other block here: no map is a stated cause,
-            # never an empty list that reads as "nothing changed" (#725).
-            change_map = {"unavailable": listing["reason"]}
-
-    # #893: what this task has cost in REVIEW RUNS. Measured across eleven
-    # billed runs, the run is the unit that tracks spend — none billed under
-    # 777k tokens, and the size of the diff explained none of the spread — so
-    # five resubmissions cost five entry prices. A sum alone would hide that;
-    # the count is the point. Runs whose bill never arrived say "неизвестно",
-    # never nothing, because a missing bill is not a free run (#725).
-    #
-    # #1361: a report CARRIED over a base-only merge is a row, not a run — it
-    # cost nothing and read nothing. Counting it made the card say "2 runs,
-    # bill known for 1 of 2" about a single paid run. Carries are listed apart.
-    report_rows = [dict(r) for r in await repo.list_machine_reviews(db, task_id)]
-    generation_of = {
-        int(r["id"]): int(r["submission_generation"] or 0) for r in report_rows
-    }
-    review_runs = [
-        {
-            "generation": int(r["submission_generation"] or 0),
-            "profile": (r["profile"] or "") or "не заявлен",
-            "provider_tokens": r["provider_tokens"],
-            "tokens_spent": r["tokens_spent"],
-            "created_at": r["created_at"],
-        }
-        for r in report_rows
-        if r.get("carried_from_review_id") is None
-    ]
-    review_carries = [
-        {
-            "generation": int(r["submission_generation"] or 0),
-            "from_generation": generation_of.get(int(r["carried_from_review_id"])),
-        }
-        for r in report_rows
-        if r.get("carried_from_review_id") is not None
-    ]
-    review_runs_billed = [
-        r["provider_tokens"] for r in review_runs if r["provider_tokens"] is not None
-    ]
-    review_runs_cost = {
-        "runs": len(review_runs),
-        "billed_runs": len(review_runs_billed),
-        "provider_total": sum(review_runs_billed) if review_runs_billed else None,
-    }
+    executor_runs, repair_offered, merge_offered = await _card_executor_offers(
+        db, task_id, row
+    )
+    finding_touch = await _card_finding_touch(db, task_id, machine_review)
+    delivery = await _card_delivery(db, task_id, task, state_card)
+    change_map = await _card_change_map(
+        db, task_id, task, evidence, machine_review, state_card
+    )
+    review_runs, review_carries, review_runs_cost = await _card_review_runs(db, task_id)
 
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
@@ -2775,39 +2876,10 @@ async def _web_task_detail_page(
             db, task_id, exclude_roles=not current_identity(request).is_human
         )
     ]
+    pr_repo, delivered_sha, live_checks = await _card_live_checks(db, task_id)
 
-    # #814: what was observed in production, and on which build. The delivered
-    # sha is what the evidence should be about — a record taken elsewhere is
-    # shown with that said out loud rather than quietly counted as proof.
-    # PR-ссылка строится от репозитория проекта задачи, не от жёстко зашитого
-    # слага: хаб обслуживает несколько проектов с разными репозиториями.
-    project_row = await repo.resolve_project_for_task(db, task_id)
-    pr_repo = ""
-    if project_row is not None:
-        pr_repo = (dict(project_row).get("repo") or "").strip()
-    if not pr_repo:
-        pr_repo = config.REPO_NAME
-
-    delivered_sha = await repo.merge_sha_for_task(db, task_id)
-    live_checks = [
-        {
-            **services.live_check_view(row),
-            "sha_mismatch": bool(
-                delivered_sha
-                and (dict(row).get("sha") or "")
-                and dict(row).get("sha") != delivered_sha
-            ),
-        }
-        for row in await repo.list_live_checks(db, task_id)
-    ]
-
-    # #990: reuse the shared cookie. Minting on every card GET (including the
-    # 15s HTMX poller) 403s an open form in another tab. verify_csrf stays
-    # strict equality; we only skip minting when the cookie already exists.
-    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
-    response = TEMPLATES.TemplateResponse(
+    return _card_response(
         request,
-        "task_detail.html",
         {
             "task": task,
             "pr_repo": pr_repo,
@@ -2840,23 +2912,13 @@ async def _web_task_detail_page(
             "approve_error": approve_error,
             "approve_message": await _freeze_message(request, task_id, approve_error),
             "review_error": review_error,
-            "csrf_token": csrf_token,
             "implementer_code": implementer_code,
             "implementer_error": implementer_error,
             "archive_refusal": archive_refusal,
             "implementer_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
         },
-        status_code=status_code,
+        status_code,
     )
-    response.set_cookie(
-        key=CSRF_COOKIE_NAME,
-        value=csrf_token,
-        max_age=600,
-        httponly=True,
-        samesite="strict",
-        secure=config.HUB_COOKIE_SECURE,
-    )
-    return response
 
 
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)
