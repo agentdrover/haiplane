@@ -446,6 +446,11 @@ def _state(tmp_path: Path, sid: str = MINE) -> dict:
     return json.loads(_state_path(tmp_path, sid).read_text())
 
 
+def _core(tmp_path: Path) -> dict:
+    """The cursor and range, without the remembered last refusal."""
+    return {k: v for k, v in _state(tmp_path).items() if k != "refused"}
+
+
 def _ack_path(tmp_path: Path, sid: str = MINE) -> Path:
     return tmp_path / f"hub-wait.{sid}.ack.json"
 
@@ -554,12 +559,12 @@ def test_issued_range_is_fixed_until_the_agent_acks_it(tmp_path, monkeypatch, ca
 
     # Wrong acks: past the range, inside the range.
     for bad in (9, 2):
-        before = _state_path(tmp_path).read_text()
+        before = _core(tmp_path)
         _ack(tmp_path, bad)
         assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
         out = capsys.readouterr().out
         assert "отклон" in out and "#1" in out, f"ack {bad} is refused out loud"
-        assert _state_path(tmp_path).read_text() == before, "state untouched"
+        assert _core(tmp_path) == before, "state untouched"
 
     _ack(tmp_path, 3)  # the right ack
     assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
@@ -570,10 +575,10 @@ def test_issued_range_is_fixed_until_the_agent_acks_it(tmp_path, monkeypatch, ca
 
     # Below the cursor: an ack cannot roll it back.
     _ack(tmp_path, 1)
-    before = _state_path(tmp_path).read_text()
+    before = _core(tmp_path)
     assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
     assert "отклон" in capsys.readouterr().out
-    assert _state_path(tmp_path).read_text() == before
+    assert _core(tmp_path) == before
 
 
 def test_watch_reads_every_page_or_none(tmp_path, monkeypatch, capsys):
@@ -941,9 +946,67 @@ def test_an_ack_refusal_wakes_even_with_nothing_to_issue(tmp_path, monkeypatch, 
     _state_path(tmp_path).write_text(json.dumps({"accepted_id": 3, "issued": None}))
     for bad in (1, 9):
         _ack(tmp_path, bad)
-        before = _state_path(tmp_path).read_text()
+        before = _core(tmp_path)
         assert _go(_fresh(tmp_path, monkeypatch, _Mailbox()), monkeypatch) == 2
         assert "отклон" in capsys.readouterr().out
-        assert _state_path(tmp_path).read_text() == before
+        assert _core(tmp_path) == before
     _ack(tmp_path, 3)
     assert _go(_fresh(tmp_path, monkeypatch, _Mailbox()), monkeypatch) is None
+
+
+def test_following_the_printed_ack_instruction_literally_accepts_the_range(
+    tmp_path, monkeypatch, capsys
+):
+    """Round 3: the wake text names the ack FILE; an old ack file does not block it."""
+    import re
+
+    box = _Mailbox(_free(1), _free(2))
+    _write_watch(tmp_path)
+    _ack(tmp_path, 0)  # an ack file from an earlier round already exists
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "в своей записи" not in out and "записи watch" not in out
+    name = re.search(r"\.claude/(hub-wait\.[^\s]+\.ack\.json)", out).group(1)
+    content = json.loads(re.search(r"содержимым (\{[^}]*\})", out).group(1))
+    assert "os.replace" in out and "временный" in out
+    tmp = tmp_path / (name + ".tmp")  # the instruction: temp file, then rename
+    tmp.write_text(json.dumps(content))
+    os.replace(tmp, tmp_path / name)
+
+    box.messages.append(_free(3))
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert _state(tmp_path)["accepted_id"] == 2
+    assert _state(tmp_path)["issued"]["ids"] == [3], "later mail is not blocked"
+
+
+def test_a_stale_refused_ack_wakes_once_not_forever(tmp_path, monkeypatch, capsys):
+    """Round 3: both state copies damaged, mail gone by retention, ack 2 is old."""
+    _write_watch(tmp_path)
+    _ack(tmp_path, 2)
+    _state_path(tmp_path).write_text("{broken")
+    (tmp_path / f"hub-wait.{MINE}.watch-state.prev.json").write_text("nope")
+    box = _Mailbox()  # everything expired
+    ack = _ack_path(tmp_path)
+    ack_before = (ack.read_bytes(), ack.stat().st_mtime_ns)
+
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2  # recovery
+    assert "повреждено" in capsys.readouterr().out
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2  # one refusal
+    assert "отклон" in capsys.readouterr().out
+    for _ in range(3):  # ...then silence on every following Stop
+        assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) is None
+        assert capsys.readouterr().out == ""
+    assert _state(tmp_path)["accepted_id"] == 0, "a refused ack never moves the cursor"
+    assert (ack.read_bytes(), ack.stat().st_mtime_ns) == ack_before
+
+    _ack(tmp_path, 1)  # the ack changed: one new refusal
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert "отклон" in capsys.readouterr().out
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) is None
+
+    box.messages.append(_free(3))  # new mail is issued normally and can be acked
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert "#3:" in capsys.readouterr().out
+    _ack(tmp_path, 3)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) is None
+    assert _state(tmp_path)["accepted_id"] == 3

@@ -494,10 +494,13 @@ def _read_state_file(path: Path) -> dict | None:
         accepted = data["accepted_id"]
         if not _is_int(accepted) or accepted < 0:
             return None
-        return {
+        state = {
             "accepted_id": accepted,
             "issued": _valid_issued(data.get("issued")),
         }
+        if isinstance(data.get("refused"), dict):
+            state["refused"] = data["refused"]  # последний показанный отказ
+        return state
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
@@ -670,6 +673,20 @@ def watch_step(base: str, auth: str, session: str, wait: dict) -> list[str] | No
         if fresh:
             ids = [m["id"] for m in fresh]
             state["issued"] = {"from": ids[0], "to": ids[-1], "ids": ids}
+    if not notes:
+        # Отказ будит один раз: пока подтверждение и состояние те же, молчим,
+        # иначе устаревший ack при пустом ящике будил бы на каждом Stop вечно.
+        key = {
+            "ack": seed,
+            "accepted_id": state["accepted_id"],
+            "issued_to": (state["issued"] or {}).get("to"),
+        }
+        if refusal and state.get("refused") == key:
+            refusal = ""
+        elif refusal:
+            state["refused"] = key
+        else:
+            state.pop("refused", None)
     if json.dumps(state, sort_keys=True) != before:
         save_watch_state(session, state)
     issued = state["issued"]
@@ -697,8 +714,10 @@ def watch_step(base: str, auth: str, session: str, wait: dict) -> list[str] | No
         except Exception:
             lines.append(f"  #{i}: тело не показано (сообщение не разобрано)")
     lines.append(
-        f"  Обработав, подтверди: в своей записи watch поставь acked_id={issued['to']} "
-        "(только это поле, остальные ожидания не трогай)."
+        f"  Обработав, подтверди: запиши файл .claude/hub-wait.{session}.ack.json "
+        f'с содержимым {{"acked_id": {issued["to"]}}} — сначала во временный '
+        "файл рядом, затем переименуй его поверх (os.replace). Файлы ожиданий "
+        "не правь."
     )
     return lines
 
