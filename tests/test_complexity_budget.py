@@ -327,6 +327,18 @@ def test_add_update_and_its_parts_have_no_waivers(violations, ledger):
     ] == []
 
 
+def test_create_task_and_its_parts_have_no_waivers(violations, ledger):
+    """#1692 AC-1: create_task и вынесенные этапы укладываются в пороги без исключений."""
+    parts = ("hub/services/lifecycle.py::create_task", "hub/services/task_create.py")
+    assert [k for k in ledger if k.startswith(parts)] == []
+    assert [
+        v.key
+        for v in violations
+        if v.path == "hub/services/task_create.py"
+        or v.key == "hub/services/lifecycle.py::create_task"
+    ] == []
+
+
 def test_repository_ledger_passes_and_refresh_keeps_ceilings(
     violations, ledger, monkeypatch, tmp_path
 ):
