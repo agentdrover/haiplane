@@ -3731,9 +3731,13 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
     этого же теста) видели чужие живые ``sleep`` и падали, а ожидание запуска
     было фиксированным сном 0,5 с. Теперь оболочка пишет свой pid в файл в
     ``tmp_path`` (``start_new_session`` — pid оболочки и есть id группы), запуск
-    ждётся опросом с пределом, а группа убирается в ``finally``.
+    ждётся опросом с пределом. Аварийная уборка в ``finally`` не шлёт сигналов
+    после того, как группа подтверждённо пуста, и убивает только процессы с
+    запомненной личностью (pid + время старта), а не всё, что носит номер
+    группы: освободившийся номер мог достаться чужой группе.
     """
     import asyncio
+    import contextlib
     import signal
     import time
 
@@ -3741,8 +3745,14 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
 
     pidfile = tmp_path / "shell.pid"
 
-    def group() -> list[tuple[int, str, str]]:
-        """Члены группы ``pgid`` как ``(pid, stat, command)``; зомби — отдельно."""
+    def started_at(pid: int) -> str:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout
+        return out.strip()
+
+    def group(pgid: int) -> list[tuple[int, str, str]]:
+        """Члены группы как ``(pid, stat, command)``; зомби не отфильтрованы."""
         out = subprocess.run(
             ["ps", "-axo", "pid=,pgid=,stat=,command="],
             capture_output=True,
@@ -3755,9 +3765,9 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
                 members.append((int(parts[0]), parts[2], parts[3]))
         return members
 
-    def live() -> list[tuple[int, str, str]]:
+    def live(pgid: int) -> list[tuple[int, str, str]]:
         # Зомби (Z) — уже убит и ждёт, пока init его подберёт.
-        return [m for m in group() if not m[1].startswith("Z")]
+        return [m for m in group(pgid) if not m[1].startswith("Z")]
 
     async def until(check, limit: float = 20.0) -> bool:
         deadline = time.monotonic() + limit
@@ -3768,18 +3778,23 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
         return check()
 
     pgid = 0
+    seen: dict[int, str] = {}  # pid -> время старта, снято пока процесс жив
+    confirmed_gone = False
     task = asyncio.create_task(
-        proc.run_bytes("sh", "-c", f"echo $$ > {pidfile}; sleep 60 | cat", timeout=120)
+        proc.run_bytes("sh", "-c", f"echo $$ > {pidfile}; sleep 60 | cat", timeout=60)
     )
     try:
         assert await until(lambda: pidfile.exists() and pidfile.read_text().strip()), (
             "конвейер не запустился"
         )
         pgid = int(pidfile.read_text().strip())
-        assert await until(lambda: any(c.startswith("sleep") for _, _, c in live())), (
-            group()
-        )
-        alive = live()
+        seen[pgid] = started_at(pgid)
+        assert await until(
+            lambda: any(c.startswith("sleep") for _, _, c in live(pgid))
+        ), group(pgid)
+        alive = live(pgid)
+        for pid, _, _ in alive:
+            seen.setdefault(pid, started_at(pid))
         assert any(pid == pgid for pid, _, _ in alive), "оболочка должна жить"
         assert any(c.startswith("sleep") for _, _, c in alive), "sleep должен жить"
 
@@ -3788,12 +3803,18 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
             await task
 
         # SIGKILL доходит до цели не мгновенно: ждём, пока группа опустеет.
-        assert await until(lambda: live() == [], limit=10.0), live()
+        confirmed_gone = await until(lambda: live(pgid) == [], limit=10.0)
+        assert confirmed_gone, live(pgid)
     finally:
-        if not task.done():
-            task.cancel()
-        if pgid > 1 and live():
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        # Отмена и ожидание задачи — на любом пути, в том числе при провале
+        # запуска: асинхронная уборка run_bytes не должна пережить тест.
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if pgid > 1 and not confirmed_gone:
+            # Сигналы — только процессам, чья личность запомнена: номер группы
+            # без живых оригиналов мог перейти к чужой группе.
+            for pid, _, _ in live(pgid):
+                if seen.get(pid) and seen[pid] == started_at(pid):
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(pid, signal.SIGKILL)

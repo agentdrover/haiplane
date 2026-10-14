@@ -4706,8 +4706,40 @@ async def test_git_ops_update_by_push_never_overwrites_a_racing_push(
             "head_moved",
         ),
         # Настоящий код ответа сервера остаётся отказом прав.
-        (1, "fatal: unable to access 'https://x/': error: 403", "refused"),
+        (
+            1,
+            "fatal: unable to access 'https://x/': The requested URL returned error: 403",
+            "refused",
+        ),
         (1, "remote: HTTP 403 Forbidden", "refused"),
+        # Имя ветки, путь и URL — не диагностика: слова из них не отказ прав.
+        *[
+            (
+                1,
+                f" ! [rejected]        HEAD -> task-1/{word} (stale info)",
+                "head_moved",
+            )
+            for word in ("protected", "permission", "denied", "declined", "403")
+        ],
+        (
+            1,
+            "To /srv/403/repo.git\n"
+            " ! [rejected]        HEAD -> task-1/x (fetch first)\n"
+            "error: failed to push some refs to '/srv/403/repo.git'",
+            "head_moved",
+        ),
+        (
+            1,
+            "fatal: unable to access 'https://h/protected/403/denied.git/': "
+            "Could not resolve host: h",
+            "unavailable",
+        ),
+        (
+            128,
+            "fatal: '/srv/protected/403/repo.git' does not appear to be a git "
+            "repository\nfatal: Could not read from remote repository.",
+            "unavailable",
+        ),
     ],
 )
 async def test_git_ops_update_by_push_classifies_push_failures(
