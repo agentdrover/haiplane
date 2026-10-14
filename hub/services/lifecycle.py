@@ -73,19 +73,11 @@ from hub.services import ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
-from hub.services import review_limit
 from hub.services.review_limit import (
     run_allowed_by_review_limit,
     refuse_opening_over_review_limit,
 )
 from hub.services.outcomes import outcome_status_for_task
-from hub.services.task_idempotency import (
-    IdempotencyRecord,
-    hash_task_create_payload,
-    idempotency_conflict_detail,
-    normalize_task_create,
-    resolve_client_request_id,
-)
 from hub.models import (
     ACTIVE_STATUSES,
     BatchApprove,
@@ -969,11 +961,6 @@ class CreateTaskOutcome:
         return getattr(self.task, name)
 
 
-async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
-    row = await repo.get_task(db, task_id)
-    return row_to_task(row)  # type: ignore[arg-type]
-
-
 def _require_freeze_admission(
     project: Any, work_type: Any, rationale: str, *, where: str = ""
 ) -> None:
@@ -1009,49 +996,6 @@ async def _project_of_new_task(
     return await repo.get_project_by_slug(db, "default")
 
 
-async def _epic_project_at_creation(db: aiosqlite.Connection, body: TaskCreate) -> Any:
-    """Строка проекта, к которому привязывается создаваемый эпик (#346); иначе None."""
-    if not body.project:
-        return None
-    if body.task_type != TaskType.epic:
-        raise HTTPException(
-            422, "project can only be set on epics; children inherit it"
-        )
-    project_row = await repo.get_project_by_slug(db, body.project)
-    if project_row is None:
-        raise HTTPException(422, f"unknown project slug: {body.project!r}")
-    if project_row["archived"] or project_row["status"] != "active":
-        raise HTTPException(
-            422,
-            f"project {body.project!r} is not active "
-            "(pending proposals and archived projects cannot take epics)",
-        )
-    return project_row
-
-
-async def _replay_after_conflict(
-    db: aiosqlite.Connection, idem_key: str | None, request_hash: str | None
-) -> CreateTaskOutcome:
-    """Гонка за ключ идемпотентности: вернуть победителя или 409 (прежняя логика).
-
-    Без ключа или без записи по нему исходная IntegrityError пробрасывается.
-    """
-    if not idem_key:
-        raise
-    existing = await repo.get_task_idempotency_key(db, idem_key)
-    if not existing:
-        raise
-    if existing["request_hash"] != request_hash:
-        record = IdempotencyRecord(
-            client_request_id=idem_key,
-            task_id=int(existing["task_id"]),
-            request_hash=existing["request_hash"],
-        )
-        raise HTTPException(409, idempotency_conflict_detail(record)) from None
-    task = await _load_task_view(db, int(existing["task_id"]))
-    return CreateTaskOutcome(task=task, is_new=False)
-
-
 async def create_task(
     db: aiosqlite.Connection,
     body: TaskCreate,
@@ -1063,174 +1007,19 @@ async def create_task(
 
     ``force_draft`` keeps the task a draft whoever files it (#915): a human
     reporting a production defect is not a human approving its fix.
+
+    The stages live in ``hub.services.task_create`` (#1692); the insert
+    transaction and its three rollback paths are owned by
+    ``task_create.insert_in_transaction``, dispatch and ``task_created`` run
+    after its commit and never on a replay.
     """
-    idem_key = resolve_client_request_id(
-        None, client_request_id or body.client_request_id
-    )
+    from hub.services import task_create
 
-    err = await db_module.validate_hierarchy(db, body.task_type.value, body.parent_id)
-    if err:
-        raise HTTPException(
-            400,
-            detail=hierarchy_error_detail(
-                err,
-                task_type=body.task_type.value,
-                parent_id=body.parent_id,
-            ),
-        )
-    if is_state(body) and body.run_immediately:
-        # #1647: до вставки строки — отказ не оставляет задачи, брони и job.
-        from hub.services.state_task import refusal_for_door
-
-        raise refusal_for_door("run_immediately")
-    await _refuse_state_parent(db, body.parent_id)
-
-    # Bind an epic to a project at creation (#346). Only epics carry
-    # project_id — children resolve it by walking up to the root epic.
-    bound_project = await _epic_project_at_creation(db, body)
-    project_id: int | None = bound_project["id"] if bound_project else None
-
-    initial_status, normalized = normalize_task_create(body)
-    if force_draft:
-        initial_status = "draft"
-    request_hash = hash_task_create_payload(normalized) if idem_key else None
-    run_check, run_held = await _plan_created_run(db, normalized)
-    if run_held:
-        initial_status = "open"
-
-    owns_tx = not db.in_transaction
-    try:
-        # #1594: write-лок берётся ДО чтения политики проекта. Допуск заморозки
-        # и вставка - одна транзакция: правка политики между ними иначе
-        # пропускала бы работу, запрещённую уже действующей заморозкой.
-        if owns_tx:
-            await db.execute("BEGIN IMMEDIATE")
-        # #1647: тот же вопрос ещё раз — под замком, которым защищена вставка:
-        # конкурентный refine мог перевести листовой draft в state после первой
-        # проверки. Refine читает детей под своей транзакцией, значит из двух
-        # операций выигрывает одна.
-        await _refuse_state_parent(db, body.parent_id)
-        if idem_key:
-            existing = await repo.get_task_idempotency_key(db, idem_key)
-            if existing:
-                if existing["request_hash"] != request_hash:
-                    record = IdempotencyRecord(
-                        client_request_id=idem_key,
-                        task_id=int(existing["task_id"]),
-                        request_hash=existing["request_hash"],
-                    )
-                    raise HTTPException(
-                        409,
-                        idempotency_conflict_detail(record),
-                    )
-                await db.commit()
-                task = await _load_task_view(db, int(existing["task_id"]))
-                return CreateTaskOutcome(task=task, is_new=False)
-
-        # #1594: уже одобренная работа входит в проект только через допуск
-        # заморозки. После поиска по ключу: повтор успешного создания вернул
-        # бы существующую задачу выше, и заморозка к нему не применяется;
-        # проверяется только новая вставка. Черновик (в т.ч. от агента) не
-        # ограничивается.
-        if initial_status != "draft":
-            _require_freeze_admission(
-                await _project_of_new_task(db, normalized.parent_id, bound_project),
-                normalized.work_type,
-                normalized.freeze_rationale,
-            )
-
-        # Structured-aware insert so all fields from TaskCreate (work_type,
-        # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
-        # the lifecycle normalizations that also feed the idempotency hash.
-        task_id = await repo.create_task_full(db, normalized, status=initial_status)
-        if project_id is not None:
-            await repo.update_task(db, task_id, project_id=project_id)
-
-        # Shadow risk class (#582): derived from the declared areas, never
-        # from anything the author says about risk. No declared areas → the
-        # class honestly stays "not computed" (NULL from the migration).
-        risk, risk_reasons = derive_risk_class(
-            normalized.affected_areas, await risk_map_for_task(db, task_id)
-        )
-        if risk is not None:
-            await repo.update_task(
-                db,
-                task_id,
-                risk_class=risk.value,
-                risk_class_reasons=db_module.serialize_str_list(risk_reasons),
-            )
-
-        if idem_key and request_hash is not None:
-            await repo.insert_task_idempotency_key(
-                db,
-                client_request_id=idem_key,
-                task_id=task_id,
-                request_hash=request_hash,
-            )
-
-        await db.commit()
-    except HTTPException:
-        if owns_tx:
-            await db.rollback()
-        raise
-    except aiosqlite.IntegrityError:
-        await db.rollback()
-        return await _replay_after_conflict(db, idem_key, request_hash)
-    except BaseException:
-        # Любое иное исключение (ValueError, OperationalError, отмена) не должно
-        # оставлять BEGIN IMMEDIATE открытым и write-лок занятым (#1594).
-        if owns_tx and db.in_transaction:
-            await db.rollback()
-        raise
-
-    result: dict[str, Any] = {}
-    if _wants_run(normalized):
-        result = await _run_created_task(db, task_id, run_check, run_held)
-
-    await log_activity(
-        db,
-        "task_created",
-        f"{normalized.task_type.value.capitalize()} #{task_id}: {normalized.title}",
-        json.dumps(result, ensure_ascii=False) if result else None,
-    )
-
-    task = await _load_task_view(db, task_id)
-    return CreateTaskOutcome(task=task, is_new=True)
-
-
-def _wants_run(normalized: TaskCreate) -> bool:
-    return normalized.run_immediately and normalized.source != TaskSource.agent
-
-
-async def _plan_created_run(
-    db: aiosqlite.Connection, normalized: TaskCreate
-) -> tuple[review_limit.ReviewQueueCheck | None, bool]:
-    """Decide the run of create(run_immediately) BEFORE the row exists (#1264).
-
-    A held run inserts the row as open straight away — never running without
-    a job, not even between two commits. Only the initial status changes, not
-    ``normalized``: the idempotency hash must not depend on the queue.
-    """
-    if not _wants_run(normalized):
-        return None, False
-    check = await review_limit.check_review_queue_for_new_task(
-        db, normalized.parent_id, normalized.class_of_service
-    )
-    return check, check is not None and check.outcome == review_limit.HELD
-
-
-async def _run_created_task(
-    db: aiosqlite.Connection,
-    task_id: int,
-    check: review_limit.ReviewQueueCheck | None,
-    held: bool,
-) -> dict[str, Any]:
-    """Card note for the limit's outcome, then the dispatch it allowed."""
-    await review_limit.note_run_check(db, task_id, check, "создана")
-    if held:
-        return {}
-    row = await repo.get_task(db, task_id)
-    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+    plan = await task_create.prepare_create(db, body, client_request_id, force_draft)
+    inserted = await task_create.insert_in_transaction(db, body, plan)
+    if isinstance(inserted, CreateTaskOutcome):
+        return inserted
+    return await task_create.finish_create(db, plan, inserted)
 
 
 async def _require_bulk_admission(

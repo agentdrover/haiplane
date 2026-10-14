@@ -88,14 +88,6 @@
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
-      "path": "hub/services/lifecycle.py",
-      "function": "create_task",
-      "rule": "C901",
-      "measured": 19,
-      "max": 21,
-      "removed_by": "task:#1692 — разбиение create_task"
-    },
-    {
       "path": "hub/services/orchestration.py",
       "function": "_human_gate_metrics",
       "rule": "C901",
