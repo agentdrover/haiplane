@@ -36,12 +36,15 @@
   отправитель, тип и id — тела нет: его агент читает инбоксом под своей
   авторизацией, и оно остаётся входными данными, а не инструкцией.
 - Дежурство (#1680): запись {"kind": "watch", "owner": "<sid>",
-  "session_id": "<sid>", "acked_id": N} следит за ящиком роли постоянно и без
+  "session_id": "<sid>"} следит за ящиком роли постоянно и без
   потерь. Курсор принадлежит ХУКУ: он лежит в .claude/hub-wait.<sid>.watch-state.json
-  (accepted_id — принятый курсор, issued — выданный диапазон {from,to,ids}).
+  (accepted_id — принятый курсор, issued — выданный диапазон {from,to,ids});
+  каждое сохранение пишет и контрольную копию .watch-state.prev.json.
   Хук фиксирует ВСЕ новые id как issued, будит и предъявляет каждый id с
-  разрешёнными полями. Подтверждает проснувшийся агент: правит в своей записи
-  только acked_id = issued.to. Новый процесс хука сверяет это значение со своим
+  разрешёнными полями. Подтверждает проснувшийся агент: пишет в СВОЙ файл
+  .claude/hub-wait.<sid>.ack.json {"acked_id": issued.to} (tmp + replace); хук
+  его только читает. Запись watch хук не переписывает; acked_id в ней читается
+  один релиз как запас, пока файла подтверждения нет. Новый процесс хука сверяет это значение со своим
   состоянием; неверное отклоняет вслух и ничего не меняет. Неподтверждённый
   диапазон будит снова на каждом Stop и refire-капом не удаляется. Watch берётся
   ТОЛЬКО при известном session_id и живёт дольше MAX_WAIT_SEC; обычные ожидания
@@ -85,6 +88,8 @@ MAX_WAIT_SEC = int(os.environ.get("HUB_WAIT_MAX_SEC", "14400"))  # 4 часа
 HOOK_TIMEOUT_SEC = int(os.environ.get("HUB_WAIT_HOOK_TIMEOUT_SEC", "14700"))
 REARM_MARGIN_SEC = int(os.environ.get("HUB_WAIT_REARM_MARGIN_SEC", "300"))
 WATCH_STATE_SUFFIX = ".watch-state.json"
+WATCH_PREV_SUFFIX = ".watch-state.prev.json"
+ACK_SUFFIX = ".ack.json"
 WATCH_PAGE = 20  # размер страницы ящика
 WATCH_RANGE_MAX = 200  # предел одного диапазона; остаток — после подтверждения
 
@@ -248,6 +253,14 @@ def own_state_file(session: str) -> Path:
     return CLAUDE_DIR / (f"hub-wait.{session}.json" if session else "hub-wait.json")
 
 
+def is_watch_side_file(path: Path) -> bool:
+    """Файлы дежурства рядом с ожиданиями: ack агента и состояние хука (с копией).
+
+    Под маску ``hub-wait.*.json`` они попадают, но ожиданий в них нет."""
+    name = path.name
+    return name.endswith(ACK_SUFFIX) or ".watch-state" in name
+
+
 def state_files(session: str) -> list[Path]:
     """Файлы, которые этот поллер читает.
 
@@ -260,11 +273,7 @@ def state_files(session: str) -> list[Path]:
         return sorted(
             {
                 SHARED_STATE_FILE,
-                *(
-                    p
-                    for p in CLAUDE_DIR.glob(STATE_GLOB)
-                    if not p.name.endswith(WATCH_STATE_SUFFIX)
-                ),
+                *(p for p in CLAUDE_DIR.glob(STATE_GLOB) if not is_watch_side_file(p)),
             },
             key=lambda p: p.name,
         )
@@ -387,8 +396,8 @@ def wait_file_lock(path: Path):
     """Короткая advisory-блокировка вокруг read-modify-write файла ожиданий.
 
     Парный замок лежит рядом (``<файл>.rmw.lock``) и под маску поиска ожиданий
-    не попадает. Агент правит acked_id атомарной заменой файла; замок делает
-    безопасным собственное чтение-изменение-запись хука."""
+    не попадает. Замок делает безопасным чтение-изменение-запись хука против
+    других писателей файла ожиданий; ack агента живёт в отдельном файле."""
     if fcntl is None:  # pragma: no cover
         yield
         return
@@ -410,7 +419,7 @@ def apply_fired_updates(path: Path, updates: list[tuple[str, dict | None]]) -> N
     """Под замком: перечитать файл и изменить ТОЛЬКО сработавшие записи.
 
     ``updates`` — (исходная запись как JSON, новая запись или None для
-    удаления). Запись, которую агент успел изменить (например, acked_id), с
+    удаления). Запись, которую агент успел изменить (например, переписанную), с
     исходной не совпадёт и останется как есть; остальные не трогаются."""
     with wait_file_lock(path):
         try:
@@ -454,28 +463,68 @@ def _valid_issued(issued: object) -> dict | None:
     return {"from": issued["from"], "to": issued["to"], "ids": list(ids)}
 
 
-def load_watch_state(session: str) -> tuple[dict | None, str]:
-    """(состояние, статус): ok | new (файла нет) | damaged (есть, но нечитаем)."""
-    path = watch_state_file(session)
+def watch_prev_file(session: str) -> Path:
+    return CLAUDE_DIR / f"hub-wait.{session}{WATCH_PREV_SUFFIX}"
+
+
+def ack_file(session: str) -> Path:
+    """Подтверждение агента: пишет ТОЛЬКО агент (tmp + replace), хук лишь читает."""
+    return CLAUDE_DIR / f"hub-wait.{session}{ACK_SUFFIX}"
+
+
+def read_ack(session: str, wait: dict) -> object:
+    """Значение acked_id от агента: файл подтверждения, иначе запись watch.
+
+    Запись watch читается один релиз как миграционный запас и только когда файла
+    подтверждения нет. Файл есть, но нечитаем — значение невалидно (None нельзя:
+    оно означает «подтверждения нет»)."""
+    path = ack_file(session)
     if not path.exists():
-        return None, "new"
+        return wait.get("acked_id")
+    try:
+        data = json.loads(path.read_text())
+        return data["acked_id"] if isinstance(data, dict) else "invalid"
+    except (OSError, ValueError, KeyError):
+        return "invalid"
+
+
+def _read_state_file(path: Path) -> dict | None:
     try:
         data = json.loads(path.read_text())
         accepted = data["accepted_id"]
         if not _is_int(accepted) or accepted < 0:
-            raise ValueError
+            return None
         return {
             "accepted_id": accepted,
             "issued": _valid_issued(data.get("issued")),
-        }, "ok"
-    except (OSError, ValueError, KeyError, TypeError):
-        return None, "damaged"
+        }
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def load_watch_state(session: str) -> tuple[dict | None, str]:
+    """(состояние, статус): ok | new | checkpoint | lost.
+
+    new — нет ни состояния, ни контрольной копии. checkpoint — основной файл
+    повреждён или пропал, взята копия. lost — повреждены оба: курсор 0, то есть
+    выдать заново всё, что ещё хранится. Дубль дешевле потери."""
+    main, prev = watch_state_file(session), watch_prev_file(session)
+    if not main.exists() and not prev.exists():
+        return None, "new"
+    state = _read_state_file(main)
+    if state is not None:
+        return state, "ok"
+    state = _read_state_file(prev)
+    if state is not None:
+        return state, "checkpoint"
+    return {"accepted_id": 0, "issued": None}, "lost"
 
 
 def save_watch_state(session: str, state: dict) -> None:
-    """Атомарно: временный файл и rename, чтобы обрыв не оставил полфайла."""
-    path = watch_state_file(session)
-    atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2))
+    """Атомарно (tmp + replace) основной файл и его контрольную копию."""
+    text = json.dumps(state, ensure_ascii=False, indent=2)
+    atomic_write(watch_state_file(session), text)
+    atomic_write(watch_prev_file(session), text)
 
 
 def reconcile_ack(state: dict, acked: object) -> str:
@@ -580,58 +629,41 @@ def describe_message(mid: int, msg: dict | None, fetched: bool) -> str:
     )
 
 
-def hub_max_id(base: str, auth: str, session: str) -> int | None:
-    """Наибольший id ящика на хабе; None, если хоть одна страница не ответила."""
-    after = 0
-    for _ in range(10_000):
-        page = fetch_inbox(base, auth, session, after, 200)
-        if page is None:
-            return None
-        ids = [m["id"] for m in page if isinstance(m, dict) and _is_int(m.get("id"))]
-        if not ids or max(ids) <= after:
-            return after
-        after = max(ids)
-        if len(page) < 200:
-            return after
-    return after
-
-
-def _initial_state(
-    base: str, auth: str, session: str, seed: object
-) -> tuple[dict | None, list[str]]:
+def _initial_state(session: str, seed: object) -> tuple[dict, list[str]]:
     """Состояние для цикла; на первой активации сохраняется ДО сетевого чтения.
 
-    Нет файла — первая активация, курсор из записи агента (один раз). Файл есть,
-    но нечитаем — acked_id агента не проверен, и ему верить нельзя: курсор
-    берётся с хаба, и пробуждение говорит об этом вслух."""
+    Нет файлов — первая активация, курсор из подтверждения агента (один раз).
+    Основной файл повреждён — берётся контрольная копия. Повреждены оба —
+    курсор 0: ничего не теряем, возможны повторы. Подтверждению агента при
+    восстановлении не верят (его сверяет только исправное состояние)."""
     state, status = load_watch_state(session)
-    if state is not None:
+    if status == "ok":
         return state, []
     if status == "new":
         cursor = seed if _is_int(seed) and seed >= 0 else 0
         state = {"accepted_id": cursor, "issued": None}
         save_watch_state(session, state)
         return state, []
-    top = hub_max_id(base, auth, session)
-    if top is None:
-        return None, []  # хаб не ответил — повтор на следующем цикле
-    state = {"accepted_id": top, "issued": None}
     save_watch_state(session, state)
+    if status == "checkpoint":
+        return state, [
+            "- дежурство: основной файл состояния повреждён — восстановлено из "
+            "контрольной копии, возможны повторы. Подтверждение агента в этом "
+            "цикле не учтено."
+        ]
     return state, [
-        "- дежурство: состояние хука повреждено; курсор взят с хаба "
-        f"(#{top}), сообщения до него не предъявляются. acked_id агента не "
-        "использован."
+        "- дежурство: состояние повреждено — диапазон выдан заново, возможны "
+        "повторы. Подтверждение агента в этом цикле не учтено."
     ]
 
 
 def watch_step(base: str, auth: str, session: str, wait: dict) -> list[str] | None:
     """Один цикл дежурства: сверка ack, чтение, выдача. Строки пробуждения или None."""
-    seed = wait.get("acked_id")
-    state, notes = _initial_state(base, auth, session, seed)
-    if state is None:
-        return None
+    seed = read_ack(session, wait)
+    state, notes = _initial_state(session, seed)
     before = json.dumps(state, sort_keys=True)
-    refusal = reconcile_ack(state, seed)
+    # При восстановлении подтверждению агента не верим: сверка только после.
+    refusal = "" if notes else reconcile_ack(state, seed)
     fresh: list[dict] | None = None
     if state["issued"] is None:
         fresh = read_new_messages(base, auth, session, state["accepted_id"])

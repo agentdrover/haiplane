@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -445,8 +446,20 @@ def _state(tmp_path: Path, sid: str = MINE) -> dict:
     return json.loads(_state_path(tmp_path, sid).read_text())
 
 
+def _ack_path(tmp_path: Path, sid: str = MINE) -> Path:
+    return tmp_path / f"hub-wait.{sid}.ack.json"
+
+
 def _ack(tmp_path: Path, value: int, sid: str = MINE) -> None:
-    """What the woken agent does: edit acked_id in its own wait file, nothing else."""
+    """What the woken agent does: replace its OWN ack file atomically."""
+    path = _ack_path(tmp_path, sid)
+    tmp = path.with_name(path.name + ".agent.tmp")
+    tmp.write_text(json.dumps({"acked_id": value}))
+    os.replace(tmp, path)
+
+
+def _ack_legacy(tmp_path: Path, value: int, sid: str = MINE) -> None:
+    """The old way (one release of fallback): acked_id inside the watch record."""
     path = tmp_path / f"hub-wait.{sid}.json"
     data = json.loads(path.read_text())
     for w in data["waits"]:
@@ -742,19 +755,42 @@ def test_the_first_cursor_is_saved_before_the_first_read(tmp_path, monkeypatch, 
     assert state["accepted_id"] == 0 and state["issued"]["to"] == 3
 
 
-def test_a_damaged_state_never_trusts_the_agents_ack(tmp_path, monkeypatch, capsys):
-    _write_watch(tmp_path, acked=100)
+def test_a_damaged_state_recovers_from_the_checkpoint(tmp_path, monkeypatch, capsys):
+    """Round 2: duplicates are better than loss — the checkpoint, not the hub max."""
+    _write_watch(tmp_path, acked=0)
+    box = _Mailbox(_free(1), _free(2), _free(3))
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    capsys.readouterr()
+    assert (
+        _state_path(tmp_path).read_text()
+        == (tmp_path / f"hub-wait.{MINE}.watch-state.prev.json").read_text()
+    ), "every save writes the checkpoint too"
+
     _state_path(tmp_path).write_text("{broken")
+    _ack(tmp_path, 100)  # a stray ack must not be trusted during recovery
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "контрольной копии" in out and "повторы" in out
+    assert all(f"#{i}:" in out for i in (1, 2, 3)), "nothing is lost"
+    assert "отклон" not in out
+    state = _state(tmp_path)
+    assert state["accepted_id"] == 0 and state["issued"]["ids"] == [1, 2, 3]
+
+
+def test_both_state_files_damaged_reissue_everything_retained(
+    tmp_path, monkeypatch, capsys
+):
+    _write_watch(tmp_path, acked=0)
+    _state_path(tmp_path).write_text("{broken")
+    (tmp_path / f"hub-wait.{MINE}.watch-state.prev.json").write_text("nope")
+    _ack(tmp_path, 100)
     box = _Mailbox(_free(1), _free(2), _free(3))
     assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
     out = capsys.readouterr().out
-    assert "повреждено" in out and "#3" in out
-    assert "#1:" not in out, "mail before the hub's current maximum is not replayed"
-    assert _state(tmp_path) == {"accepted_id": 3, "issued": None}
-
-    box.messages.append(_free(4))
-    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
-    assert _state(tmp_path)["issued"]["ids"] == [4]
+    assert "диапазон выдан заново" in out and "возможны повторы" in out
+    assert all(f"#{i}:" in out for i in (1, 2, 3)), "nothing is lost"
+    assert _state(tmp_path)["accepted_id"] == 0
+    assert _state(tmp_path)["issued"]["ids"] == [1, 2, 3]
 
 
 def test_an_ack_written_between_the_hooks_read_and_write_survives(
@@ -766,23 +802,75 @@ def test_an_ack_written_between_the_hooks_read_and_write_survives(
     path = tmp_path / f"hub-wait.{MINE}.json"
     module = _fresh(tmp_path, monkeypatch, _Mailbox())
 
+    seen: list[bytes] = []
+
     def slow_fetch(base, auth, tid):  # the agent acks while the hook is mid-cycle
         _ack(tmp_path, 7)
+        seen.append(_ack_path(tmp_path).read_bytes())
         return {"id": 5, "title": "t", "status": "done"}
 
     monkeypatch.setattr(module, "fetch_task", slow_fetch)
     assert _go(module, monkeypatch) == 2
     waits = json.loads(path.read_text())["waits"]
-    watch = next(w for w in waits if w.get("kind") == "watch")
     task = next(w for w in waits if w.get("task_id") == 5)
-    assert watch["acked_id"] == 7, "the agent's ack survived the hook's rewrite"
     assert task["refire_count"] == 1
+    assert json.loads(_ack_path(tmp_path).read_text()) == {"acked_id": 7}
+    assert _ack_path(tmp_path).read_bytes() == seen[0], "the hook never writes it"
     assert not list(tmp_path.glob("*.tmp")), "written through tmp + replace"
+
+
+def test_the_hook_only_reads_the_ack_file(tmp_path, monkeypatch, capsys):
+    """Round 2: the ack lives in the agent's own file; the hook never touches it."""
+    box = _Mailbox(_free(1), _free(2))
+    _write_watch(tmp_path)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    _ack(tmp_path, 2)
+    ack = _ack_path(tmp_path)
+    before = (ack.read_bytes(), ack.stat().st_mtime_ns, ack.stat().st_ino)
+    box.messages.append(_free(3))
+    assert (
+        _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    )  # accepts, issues 3
+    assert _state(tmp_path)["accepted_id"] == 2
+    after = (ack.read_bytes(), ack.stat().st_mtime_ns, ack.stat().st_ino)
+    assert after == before, "not rewritten, renamed or deleted"
+    _ack(tmp_path, 9)  # a bad ack
+    before = (ack.read_bytes(), ack.stat().st_mtime_ns)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert (ack.read_bytes(), ack.stat().st_mtime_ns) == before, "even a refused one"
+
+
+def test_the_legacy_record_ack_is_only_a_fallback(tmp_path, monkeypatch, capsys):
+    box = _Mailbox(_free(1), _free(2))
+    _write_watch(tmp_path)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    _ack_legacy(tmp_path, 2)  # no ack file: the record is read
+    box.messages.append(_free(3))
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert _state(tmp_path)["accepted_id"] == 2
+
+    _ack(tmp_path, 0)  # the ack file wins over a record that says otherwise
+    _ack_legacy(tmp_path, 3)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert _state(tmp_path)["accepted_id"] == 2, "record ignored while the file exists"
+
+
+def test_side_files_are_never_read_as_wait_files(tmp_path, monkeypatch):
+    module = _load(tmp_path, monkeypatch)
+    for name in (
+        f"hub-wait.{MINE}.ack.json",
+        f"hub-wait.{MINE}.watch-state.json",
+        f"hub-wait.{MINE}.watch-state.prev.json",
+    ):
+        (tmp_path / name).write_text(json.dumps({"waits": [_wait(1)]}))
+    (tmp_path / f"hub-wait.{MINE}.json.rmw.lock").write_text("")
+    (tmp_path / f"hub-wait.{THEIRS}.json").write_text(json.dumps({"waits": []}))
+    names = {p.name for p in module.state_files("")}
+    assert names == {"hub-wait.json", f"hub-wait.{THEIRS}.json"}
 
 
 def test_the_rewrite_waits_for_the_file_lock(tmp_path):
     import fcntl
-    import os
     import threading
 
     module = _load(tmp_path)
