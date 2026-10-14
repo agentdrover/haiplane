@@ -10,6 +10,7 @@
     uv run python scripts/complexity_budget.py            # проверка
     uv run python scripts/complexity_budget.py --json     # машиночитаемо
     uv run python scripts/complexity_budget.py --update   # перезаписать ledger
+    uv run python scripts/complexity_budget.py --refresh-measured  # только measured
 
 Пороги живут в pyproject.toml ([tool.ruff.lint.mccabe] и
 [tool.ruff.lint.pylint]) — здесь их копии нет. Правила C901 и PLR0915 не
@@ -19,12 +20,20 @@
 расставить по hub/, чего задача не делает. Поэтому правила селектит эта
 проверка, а ledger исключений лежит в docs/agent-context/complexity-budget.json.
 
-Три способа покраснеть, и все три названы поимённо:
+Пять способов покраснеть, и все названы поимённо:
   * нарушение, которого нет в ledger — новая сложность;
   * запись ledger без нарушения — исключение пережило свою причину и должно
     быть снято (иначе список превращается в унаследованный мусор, который
     никто не решается тронуть);
-  * нарушение выше собственного потолка — waived-функция продолжила расти.
+  * нарушение выше собственного потолка — waived-функция продолжила расти;
+  * исключение «unclaimed» с живым замером от 90% своего потолка (#1693): долг
+    без владельца не должен молча доходить до предела — назначьте задачу или
+    объявите исключение постоянным с причиной;
+  * removed_by не по формату: пусто, TODO, «permanent —» без причины.
+
+``--update`` — полная перезаморозка: пересчитывает и measured, и все max, то
+есть пополняет запас; это решение человека (AGENTS.md). Для плановой сверки
+замеров есть ``--refresh-measured``: меняет только measured, max не трогает.
 
 Потолок с запасом, а не точная заморозка — урок #829. Точная заморозка
 означала бы, что любая правка внутри waived-функции обязана редактировать
@@ -53,6 +62,11 @@ DEFAULT_HEADROOM_PCT = 15.0
 # Доля потолка, после которой запас называется вслух. Запас, за которым никто
 # не следит, — это способ тихо перестать проверять (#829).
 LOUD_AT_PCT = 90.0
+# Доля потолка, от которой исключение без задачи красит CI (#1693). Сравнение
+# целочисленное (value * 100 >= max * 90): float на границе 18/20 не врёт, но
+# и проверять, что не врёт, незачем.
+UNCLAIMED_FAIL_PCT = 90
+REMOVED_BY_HINT = "назначьте task:#N или permanent — <причина>"
 
 
 @dataclass(frozen=True)
@@ -195,6 +209,29 @@ def load_ledger(path: Path = LEDGER_PATH) -> dict[str, dict]:
     return {f"{w['path']}::{w['function']}::{w['rule']}": w for w in raw["waivers"]}
 
 
+def validate_removed_by(text: object) -> str | None:
+    """Текст ошибки формата ``removed_by`` или ``None``, если формат верен.
+
+    ``task:#<число>`` (описание после «—» не обязательно), ``permanent — <причина>``
+    или ``unclaimed — <причина>``. Пустое поле, TODO и «permanent —» без причины
+    — ошибка всегда: причина — единственное, что машина не выводит.
+    """
+    raw = str(text or "").strip()
+    kind, _, reason = (part.strip() for part in raw.partition("—"))
+    if not raw:
+        return "пусто"
+    if kind.startswith("task:#"):
+        return None if kind[6:].isdigit() else "task без номера"
+    if kind in ("permanent", "unclaimed"):
+        return None if reason else f"{kind} без причины"
+    return f"неизвестный формат {raw!r}"
+
+
+def _reason_kind(entry: dict) -> str:
+    """Вид причины для счётчика: task:#N → ``task:#N``, иначе первое слово."""
+    return str(entry.get("removed_by", "")).split("—")[0].strip() or "?"
+
+
 @dataclass(frozen=True)
 class Report:
     """Что бюджет говорит о текущем дереве."""
@@ -205,10 +242,14 @@ class Report:
     waived: tuple[tuple[Violation, int], ...]
     # Сколько исключений за какой причиной: task:#NNNN / permanent / unclaimed.
     by_reason: dict[str, int]
+    # (ключ записи, что не так) — формат removed_by нарушен (#1693).
+    invalid: tuple[tuple[str, str], ...] = ()
+    # unclaimed-записи, чей живой замер >= UNCLAIMED_FAIL_PCT от потолка (#1693).
+    hot: tuple[tuple[Violation, int], ...] = ()
 
     @property
     def ok(self) -> bool:
-        return not (self.new or self.stale or self.over)
+        return not (self.new or self.stale or self.over or self.invalid or self.hot)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -216,6 +257,10 @@ class Report:
             "new": [v.as_dict() for v in self.new],
             "stale": list(self.stale),
             "over": [dict(v.as_dict(), max=m) for v, m in self.over],
+            "invalid_removed_by": [
+                {"key": key, "problem": problem} for key, problem in self.invalid
+            ],
+            "unclaimed_near_ceiling": [dict(v.as_dict(), max=m) for v, m in self.hot],
             "waived_count": len(self.waived),
             "by_reason": dict(self.by_reason),
         }
@@ -226,6 +271,7 @@ def check(violations: list[Violation], ledger: dict[str, dict]) -> Report:
     new: list[Violation] = []
     over: list[tuple[Violation, int]] = []
     waived: list[tuple[Violation, int]] = []
+    hot: list[tuple[Violation, int]] = []
     seen: set[str] = set()
     by_reason: dict[str, int] = {}
 
@@ -237,21 +283,34 @@ def check(violations: list[Violation], ledger: dict[str, dict]) -> Report:
             continue
         seen.add(key)
         # "task:#1067 — ..." / "permanent — ..." / "unclaimed — ..."
-        kind = str(entry.get("removed_by", "")).split("—")[0].strip() or "?"
+        kind = _reason_kind(entry)
         by_reason[kind] = by_reason.get(kind, 0) + 1
         allowed = int(entry["max"])
         if violation.value > allowed:
             over.append((violation, allowed))
         else:
             waived.append((violation, allowed))
+            if (
+                kind == "unclaimed"
+                and violation.value * 100 >= allowed * UNCLAIMED_FAIL_PCT
+            ):
+                hot.append((violation, allowed))
 
     stale = tuple(sorted(set(ledger) - seen))
+    # Формат проверяется у всего ledger, а не только у живых записей.
+    invalid = tuple(
+        (key, problem)
+        for key, entry in sorted(ledger.items())
+        if (problem := validate_removed_by(entry.get("removed_by")))
+    )
     return Report(
         new=tuple(new),
         stale=stale,
         over=tuple(over),
         waived=tuple(waived),
         by_reason=by_reason,
+        invalid=invalid,
+        hot=tuple(hot),
     )
 
 
@@ -272,6 +331,20 @@ def format_report(report: Report) -> str:
             lines.append(
                 f"  {v.path}::{v.function} — {v.rule} {v.value} > потолок {allowed}"
             )
+    if report.hot:
+        lines.append(
+            f"ИСКЛЮЧЕНИЕ БЕЗ ЗАДАЧИ У ПОТОЛКА (от {UNCLAIMED_FAIL_PCT}%) ({len(report.hot)}):"
+        )
+        for v, allowed in report.hot:
+            used = 100.0 * v.value / allowed
+            lines.append(
+                f"  {v.path}::{v.function} — {v.rule} {v.value}/{allowed} "
+                f"({used:.0f}%): {REMOVED_BY_HINT}"
+            )
+    if report.invalid:
+        lines.append(f"REMOVED_BY НЕ ПО ФОРМАТУ ({len(report.invalid)}):")
+        for key, problem in report.invalid:
+            lines.append(f"  {key} — {problem}; {REMOVED_BY_HINT}")
     if report.stale:
         lines.append(f"ИСКЛЮЧЕНИЕ ПЕРЕЖИЛО ПРИЧИНУ ({len(report.stale)}):")
         for key in report.stale:
@@ -336,23 +409,59 @@ def write_ledger(
     )
 
 
-def main() -> int:
+def refresh_measured(violations: list[Violation], path: Path = LEDGER_PATH) -> int:
+    """Обновить в ledger только ``measured``; ``max`` и причины остаются как есть.
+
+    В отличие от ``write_ledger`` не добавляет и не снимает записи и не
+    пересчитывает потолки: запас не пополняется молча. Возвращает число
+    записей, у которых замер изменился.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    live = {f"{v.key}::{v.rule}": v.value for v in violations}
+    changed = 0
+    for waiver in raw["waivers"]:
+        key = f"{waiver['path']}::{waiver['function']}::{waiver['rule']}"
+        if key in live and waiver.get("measured") != live[key]:
+            waiver["measured"] = live[key]
+            changed += 1
+    path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return changed
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="машиночитаемый вывод")
-    parser.add_argument(
-        "--update", action="store_true", help="перезаписать ledger по факту"
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--update",
+        action="store_true",
+        help="полная перезаморозка: measured и все max (решение человека)",
+    )
+    mode.add_argument(
+        "--refresh-measured",
+        action="store_true",
+        help="обновить только measured, max не трогать",
     )
     parser.add_argument("--target", default=TARGET, help="что проверять")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--ledger", type=Path, default=LEDGER_PATH, help="путь к ledger исключений"
+    )
+    args = parser.parse_args(argv)
 
     violations = collect_violations(args.target)
 
     if args.update:
-        write_ledger(violations)
+        write_ledger(violations, args.ledger)
         print(f"ledger перезаписан: {len(violations)} исключений")
         return 0
+    if args.refresh_measured:
+        changed = refresh_measured(violations, args.ledger)
+        print(f"measured обновлён у {changed} записей, max не тронуты")
+        return 0
 
-    report = check(violations, load_ledger())
+    report = check(violations, load_ledger(args.ledger))
     if args.json:
         print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     else:
