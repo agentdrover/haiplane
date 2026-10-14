@@ -51,7 +51,9 @@ def _html(resp) -> dict[str, Any]:
     return {
         "status": resp.status_code,
         "set_cookie": norm(cookie),
-        "content_type": resp.headers.get("content-type", ""),
+        "headers": {
+            k: v for k, v in sorted(resp.headers.items()) if k not in ("date", "server")
+        },
         "body": norm(resp.text),
     }
 
@@ -219,6 +221,21 @@ async def snapshot_rest_context(client: AsyncClient, db) -> dict[str, Any]:
     out["rest_big_summary"] = _rest(
         await client.get(f"/api/tasks/{big}/context?mode=summary&max_chars=1500")
     )
+    huge = await _create(client, title="Огромная")
+    refined = await client.post(
+        f"/api/tasks/{huge}/refine",
+        json={
+            "problem_statement": "п" * 2000,
+            "business_value": "б" * 500,
+            "user_story": "у" * 1000,
+            "scope_in": ["с" * 300] * 8,
+            "scope_out": ["в" * 300] * 8,
+        },
+    )
+    assert refined.status_code == 200, refined.text
+    out["rest_huge_summary_default_cap"] = _rest(
+        await client.get(f"/api/tasks/{huge}/context?mode=summary")
+    )
     return out
 
 
@@ -279,6 +296,14 @@ async def snapshot_web_cards(client: AsyncClient, db) -> dict[str, Any]:
             )
         )
 
+    # Последний отчёт несёт подтверждённые находки: карточка читает их, а
+    # карта изменений получает их же (отчёты выше пусты и скрывают эту ветку).
+    filled = await _submitted(client, "Карточка с находками", None)
+    r = await client.post(f"/api/tasks/{filled}/machine-review", json=_REPORT_BODY)
+    assert r.status_code == 200, r.text
+    with _frozen_card():
+        out["web_commit_review_findings"] = _html(await client.get(f"/tasks/{filled}"))
+
     plain = await _create(client, title="Простая")
     with _frozen_card():
         out["web_commit_open"] = _html(await client.get(f"/tasks/{plain}"))
@@ -305,30 +330,35 @@ async def snapshot_web_cards(client: AsyncClient, db) -> dict[str, Any]:
 
 
 async def _machine_reports(client: AsyncClient, db, task_id: int) -> None:
-    body = {
-        "harness_skill": "lite-diff-review",
-        "agent_count": 1,
-        "tokens_spent": 12000,
-        "model": "grok-4.6",
-        "raw_count": 2,
-        "findings_confirmed": [
-            {
-                "locator": "file",
-                "title": "граница",
-                "severity": "medium",
-                "file": "hub/a.py",
-            }
-        ],
-        "findings_rejected": [
-            {"title": "nit", "category": "style", "reason": "не дефект"}
-        ],
-        "incomplete": False,
-        "unresolved": [],
-        "lost_dimensions": [],
-        "agent": "cursor-cloud-reviewer",
-    }
+    body = _REPORT_BODY
     r = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
     assert r.status_code == 200, r.text
+    await _extra_report_rows(client, db, task_id)
+
+
+_REPORT_BODY = {
+    "harness_skill": "lite-diff-review",
+    "agent_count": 1,
+    "tokens_spent": 12000,
+    "model": "grok-4.6",
+    "raw_count": 2,
+    "findings_confirmed": [
+        {
+            "locator": "file",
+            "title": "граница",
+            "severity": "medium",
+            "file": "hub/a.py",
+        }
+    ],
+    "findings_rejected": [{"title": "nit", "category": "style", "reason": "не дефект"}],
+    "incomplete": False,
+    "unresolved": [],
+    "lost_dimensions": [],
+    "agent": "cursor-cloud-reviewer",
+}
+
+
+async def _extra_report_rows(client: AsyncClient, db, task_id: int) -> None:
     row = await repo.get_task(db, task_id)
     gen = dict(row)["submission_generation"]
     rid = await repo.insert_machine_review(
@@ -497,7 +527,11 @@ async def snapshot_mcp(_unused=None) -> dict[str, Any]:
     }
 
     async def prep(
-        name: str, kwargs: dict, cur: dict = current, ready: dict = readiness
+        name: str,
+        kwargs: dict,
+        cur: dict = current,
+        ready: dict = readiness,
+        fail: str = "",
     ):
         calls: list[Any] = []
 
@@ -513,12 +547,16 @@ async def snapshot_mcp(_unused=None) -> dict[str, Any]:
             calls.append(
                 ["POST", path, json.loads(norm(json.dumps(body, ensure_ascii=False)))]
             )
+            if fail and path.endswith(fail):
+                raise RuntimeError(f"отказ {fail}")
             if path.endswith("/refine"):
                 return {"updated_columns": ["size", "problem_statement"]}
             return {}
 
         async def put(path: str, body: Any = None, *a: Any, **k: Any):
             calls.append(["PUT", path, body])
+            if fail and path.endswith(fail):
+                raise RuntimeError(f"отказ {fail}")
             return [{"id": "AC-1"}, {"id": "AC-2"}]
 
         with (
@@ -550,6 +588,10 @@ async def snapshot_mcp(_unused=None) -> dict[str, Any]:
     await prep(
         "preview_no_ac", {"risks": [risk], "mode": "preview", "risk_mode": "append"}
     )
+    await prep("fail_refine", fields, fail="/refine")
+    await prep("fail_acceptance_criteria", fields, fail="/acceptance_criteria")
+    await prep("fail_risks", fields, fail="/risks")
+    await prep("fail_updates", fields, fail="/updates")
     await prep("bad_mode", {"mode": "x"})
     await prep("bad_risk_mode", {"risk_mode": "x"})
     return out
