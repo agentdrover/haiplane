@@ -93,17 +93,24 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
 async def note_judged_without_ci(
     db: aiosqlite.Connection, task_id: int, generation: int, note: str
 ) -> None:
-    """Одна строка в ленте на поколение: судим, не дождавшись подтверждённого CI."""
-    # «Проверил — вставил» под BEGIN IMMEDIATE: два тика не пишут две строки.
+    """Одна строка в ленте задачи на поколение: судим без подтверждённого CI.
+
+    Строка — запись task_updates (её видит человек в карточке) и событие для
+    надзора. Дедупликация по метке поколения в тексте записи, «проверил —
+    вставил» под BEGIN IMMEDIATE: два тика не пишут две строки.
+    """
+    mark = f"[ci-wait gen {generation}]"
     async with write_transaction(db):
         rows = await fetchall(
             db,
-            "SELECT 1 FROM events WHERE task_id=? AND kind=? "
-            "AND json_extract(payload, '$.generation')=? LIMIT 1",
-            (task_id, EVENT_JUDGED_WITHOUT_CI, generation),
+            "SELECT 1 FROM task_updates WHERE task_id=? AND content LIKE ? LIMIT 1",
+            (task_id, f"%{mark}%"),
         )
         if rows:
             return
+        await repo.add_task_update(
+            db, task_id, "hub", "status", f"{note} {mark}", author_kind="hub"
+        )
         await repo.insert_event(
             db,
             kind=EVENT_JUDGED_WITHOUT_CI,

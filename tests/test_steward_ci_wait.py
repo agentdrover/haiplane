@@ -183,12 +183,95 @@ async def test_window_expiry_starts_judge_with_one_feed_line(
         assert await sh.start_due_runs(db) == 0
         assert provider.await_count == 1
 
-    lines = await _events(db, EVENT_JUDGED_WITHOUT_CI)
-    assert len(lines) == 1, "строка в ленте одна на поколение, на обоих путях"
-    payload = json.loads(lines[0]["payload"])
-    assert payload["generation"] == 1
-    assert "ждали 130 мин" in payload["detail"]
-    assert "current_attempt_incomplete" in payload["detail"]
+    updates = await _ci_updates(db, task_id)
+    assert len(updates) == 1, "строка в ленте задачи одна на поколение, на обоих путях"
+    assert "ждали 130 мин" in updates[0]
+    assert "current_attempt_incomplete" in updates[0]
+    assert len(await _events(db, EVENT_JUDGED_WITHOUT_CI)) == 1
+
+
+async def test_placed_order_started_after_the_window_writes_the_feed_line(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Путь старта размещённого заказа: строка появляется после старта, не раньше."""
+    _start_env(monkeypatch)
+    task_id = await _ready_task(db, "ci-wait-start-line", minutes=130)
+    await _incomplete(db, task_id)
+    order = await _placed_order(db, task_id)
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(None, None)),
+    ):
+        assert await sh.start_run(db, order) is False
+    assert await _ci_updates(db, task_id) == [], (
+        "провайдер отказал — строки быть не должно"
+    )
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=CREATED),
+    ):
+        assert await sh.start_run(db, order) is True
+    assert len(await _ci_updates(db, task_id)) == 1
+
+
+async def _ci_updates(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    rows = await fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id=? AND content LIKE ?",
+        (task_id, "%без подтверждённого CI%"),
+    )
+    return [str(dict(r)["content"]) for r in rows]
+
+
+async def test_no_feed_line_when_the_order_is_refused_for_the_quota(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Квота исчерпана: заказа нет — и строки «судим без CI» тоже."""
+    _start_env(monkeypatch)
+    task_id = await _ready_task(db, "ci-wait-quota", minutes=130)
+    await _incomplete(db, task_id)
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 0)
+
+    assert await order_due_runs(db) == 0
+    assert await _steward_rows(db, task_id) == []
+    assert await _ci_updates(db, task_id) == [], "строка закреплена без заказа"
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 20)
+    assert await order_due_runs(db) == 1
+    assert len(await _ci_updates(db, task_id)) == 1
+
+
+async def test_window_renewal_after_ci_wait_names_ci(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Продление окна слота после ожидания CI называет CI, а не отчёт ревью."""
+    _start_env(monkeypatch)
+    task_id = await _ready_task(db, "ci-wait-renew")
+    await _incomplete(db, task_id)
+    run = await _placed_order(db, task_id)
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-45 minutes') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(None, None)),
+    ):
+        await sweep_steward_runs(db)  # ждём CI: отсрочка записана
+        await _verified(db, task_id)
+        await db.execute(
+            "UPDATE steward_runs SET deadline_at=datetime('now', '-45 minutes') "
+            "WHERE id=?",
+            (run["id"],),
+        )
+        await db.commit()
+        await sweep_steward_runs(db)
+
+    renewed = await _events(db, "steward_run_window_renewed")
+    assert len(renewed) == 1
+    because = json.loads(renewed[0]["payload"])["because"]
+    assert "CI" in because and "отчёт ревью" not in because
 
 
 @pytest.mark.parametrize(

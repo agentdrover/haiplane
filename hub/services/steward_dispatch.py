@@ -848,6 +848,16 @@ async def _note_ci(
         await note_judged_without_ci(db, task_id, generation, gate.ci_note)
 
 
+async def note_ci_after_start(
+    db: aiosqlite.Connection, order: dict[str, Any], task: dict[str, Any]
+) -> None:
+    """Судья стартовал — если без подтверждённого CI, строка в ленте (#1695)."""
+    if order.get("kind", KIND_VERDICT) != KIND_VERDICT:
+        return
+    gate = await review_wait_gate(db, task)
+    await _note_ci(db, int(order["task_id"]), int(order["generation"]), gate)
+
+
 async def hold_start_for_review(
     db: aiosqlite.Connection, order: dict[str, Any], task: dict[str, Any]
 ) -> bool:
@@ -869,7 +879,6 @@ async def hold_start_for_review(
         return False
     gate = await review_wait_gate(db, task)
     if not gate.blocker:
-        await _note_ci(db, int(order["task_id"]), int(order["generation"]), gate)
         return False
     await _defer(db, int(order["task_id"]), int(order["generation"]), gate.blocker)
     await _push_start_deadline(db, int(order["id"]))
@@ -889,15 +898,22 @@ async def _push_start_deadline(db: aiosqlite.Connection, run_id: int) -> None:
 EVENT_WINDOW_RENEWED = "steward_run_window_renewed"
 
 
-async def _waited_for_review(db: aiosqlite.Connection, run: dict[str, Any]) -> bool:
-    """Слот этой сдачи уже откладывался из-за ревью (есть запись об отсрочке)."""
+async def _waited_for_review(
+    db: aiosqlite.Connection, run: dict[str, Any]
+) -> str | None:
+    """Слот этой сдачи уже откладывался (есть запись об отсрочке): её причина.
+
+    None — не откладывался. Причина нужна, чтобы продление окна называло то,
+    чего ждали: отчёт ревью или подтверждённый CI (#1695).
+    """
     rows = await fetchall(
         db,
-        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "SELECT json_extract(payload, '$.detail') AS detail FROM events "
+        "WHERE task_id=? AND kind=? "
         "AND json_extract(payload, '$.generation')=? LIMIT 1",
         (run["task_id"], EVENT_DEFERRED, run["generation"]),
     )
-    return bool(rows)
+    return str(dict(rows[0]).get("detail") or "") if rows else None
 
 
 async def _renew_once(
@@ -955,9 +971,15 @@ async def _waits_for_review(
         await _defer(db, int(run["task_id"]), int(run["generation"]), gate.blocker)
         await _push_start_deadline(db, int(run["id"]))
         return True
-    if not await _waited_for_review(db, run):
+    waited_for = await _waited_for_review(db, run)
+    if waited_for is None:
         return False
-    return await _renew_once(db, run, gate.because or "отчёт ревью получен")
+    ready = (
+        "CI сдачи подтверждён, ожидание кончилось"
+        if waited_for.startswith("CI")
+        else "отчёт ревью получен"
+    )
+    return await _renew_once(db, run, gate.because or ready)
 
 
 async def order_due_runs(db: aiosqlite.Connection) -> int:
@@ -996,9 +1018,9 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         if stale:
             await _close_generation_as_refused(db, task_id, generation, stale)
             continue
-        await _note_ci(db, task_id, generation, gate)
         if await order_run(db, task_id, generation, why=gate.because) is not None:
             ordered += 1
+            await _note_ci(db, task_id, generation, gate)
     return ordered
 
 
