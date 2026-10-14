@@ -1,0 +1,114 @@
+"""Ждать ли судье стюарда отчёта CI по сдаче (#1695).
+
+Наблюдено 14.10.2026: #1691 и #1692 — судья стартовал, пока шёл прогон PR, и
+вынес escalate по ``ci_pinned_sha absent`` (``current_attempt_incomplete``).
+Через 2–15 минут отчёт стал ``verified``, но суждение на (task, generation,
+kind) одно (#1022) и не пересчитывается: эскалация ложная, прогон оплачен.
+
+Этот модуль только ЧИТАЕТ: ответ даёт ``ci_wait_view``, а страж
+``steward_dispatch.review_wait_gate`` решает, держать ли заказ. Читатель
+смотрит в ``ci_run_reports`` (проекция по коммиту) и ``ci_report_attempts``
+(попытки) и не ходит к форжу. Правило не зависит от ``ci_before_submit``: тот
+ключ по умолчанию ``off`` и не означает «CI нет».
+
+НЕ ждать:
+  * ``trust=verified`` (зелёный или красный — судья прочтёт и то и другое);
+  * ``trust=unverified`` и у строки ТЕКУЩЕЙ попытки (``attempt_key`` проекции)
+    ``trust_final=1``. Окончательность прошлой попытки не в счёт.
+
+Ждать (в пределах окна STEWARD_REVIEW_WAIT_MAX, общего с ожиданием ревью):
+  * отчёта по коммиту нет (неизвестность: первый прогон, missing_run, проект
+    без CI) — отсутствие данных не данные;
+  * ``attempt_key`` проекции пуст или без строки попытки;
+  * ``trust=unverified`` и ``trust_final=0``, любой временный reason.
+
+Сдача без закреплённого коммита ждать нечего: ответ «не ждём».
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import aiosqlite
+
+from hub import repository as repo
+from hub.db import fetchall
+from hub.services import ci_trust
+
+EVENT_JUDGED_WITHOUT_CI = "steward_judges_without_verified_ci"
+
+
+@dataclass(frozen=True)
+class CiWait:
+    """``waiting`` — отчёт ещё может прийти; ``state`` — фраза для ленты."""
+
+    waiting: bool
+    state: str = ""
+
+
+NOT_WAITING = CiWait(False)
+
+
+async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait:
+    """Единый читатель: есть ли смысл ждать подтверждённый CI этой сдачи."""
+    task_id = int(task["id"])
+    # Поллер стюарда выбирает только id и поколение (как и review_wait_view):
+    # закреплённый коммит читается из строки задачи, а не из переданного среза.
+    full = await repo.get_task(db, task_id)
+    sha = str((dict(full) if full is not None else task).get("submission_sha") or "")
+    sha = sha.strip()
+    if not sha:
+        return NOT_WAITING
+    report = await repo.get_ci_run_report(db, task_id, sha)
+    if report is None:
+        return CiWait(True, "отчёта CI по закреплённому коммиту нет")
+    row = dict(report)
+    trust, reason = ci_trust.trust_of(row)
+    if trust == ci_trust.VERIFIED:
+        return NOT_WAITING
+    key = str(row.get("attempt_key") or "")
+    attempt = await _attempt_of(db, task_id, sha, key)
+    if attempt is None:
+        return CiWait(
+            True,
+            f"unverified({reason}): у текущей попытки {key or '—'} нет строки учёта",
+        )
+    if int(attempt.get("trust_final") or 0):
+        return NOT_WAITING
+    return CiWait(True, f"unverified({reason}), проверка не окончательна")
+
+
+async def _attempt_of(
+    db: aiosqlite.Connection, task_id: int, sha: str, key: str
+) -> dict[str, Any] | None:
+    """Строка ТЕКУЩЕЙ попытки проекции; пустой ключ строки не имеет."""
+    if not key:
+        return None
+    for row in await repo.list_ci_report_attempts(db, task_id, sha):
+        item = dict(row)
+        if ci_trust.attempt_key(item["run_id"], item["run_attempt"]) == key:
+            return item
+    return None
+
+
+async def note_judged_without_ci(
+    db: aiosqlite.Connection, task_id: int, generation: int, note: str
+) -> None:
+    """Одна строка в ленте на поколение: судим, не дождавшись подтверждённого CI."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? LIMIT 1",
+        (task_id, EVENT_JUDGED_WITHOUT_CI, generation),
+    )
+    if rows:
+        return
+    await repo.insert_event(
+        db,
+        kind=EVENT_JUDGED_WITHOUT_CI,
+        task_id=task_id,
+        actor="hub",
+        payload={"generation": generation, "detail": note},
+    )
+    await db.commit()
