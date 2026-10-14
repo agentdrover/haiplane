@@ -907,11 +907,25 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
 
 
 def cmd_review_brief(args: argparse.Namespace) -> int:
+    """#1682: the projection by default, one section with --section, all with --full."""
     result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
     _print_verdict_route(result)
     _print_ci_integrity(result)
-    _print_json(result)
-    return 0
+    if getattr(args, "full", False):
+        _print_json(result)
+        return 0
+    from hub.services import review_brief_projection as projection
+
+    section = getattr(args, "section", "") or ""
+    answer = projection.brief_result(
+        result,
+        section,
+        getattr(args, "offset", 0) or 0,
+        getattr(args, "expect", "") or "",
+    )
+    payload = answer.structuredContent or {}
+    _print_json(payload.get("brief") or payload.get("page") or payload)
+    return 2 if "reason" in payload else 0
 
 
 def cmd_review_verdict(args: argparse.Namespace) -> int:
@@ -2525,9 +2539,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_review_brief = sub.add_parser(
         "review-brief",
-        help="Get the full review brief (ACs, scope, validation, latest verdict)",
+        help="Get the review brief: compact projection, --section pages, --full whole",
     )
     p_review_brief.add_argument("task_id", type=int)
+    p_review_brief.add_argument(
+        "--section",
+        default="",
+        choices=[
+            "",
+            "call_sites",
+            "acceptance_criteria",
+            "statement",
+            "machine_review",
+        ],
+        help="One section, paged (default: the compact projection)",
+    )
+    p_review_brief.add_argument("--offset", type=int, default=0)
+    p_review_brief.add_argument(
+        "--expect", default="", help="fingerprint of the previous page"
+    )
+    p_review_brief.add_argument(
+        "--full", action="store_true", help="The whole brief, as before"
+    )
     p_review_brief.set_defaults(func=cmd_review_brief)
 
     p_review_verdict = sub.add_parser(

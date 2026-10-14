@@ -2178,7 +2178,7 @@ async def test_hub_review_brief_marks_self_approved_verdict(
             "findings": [],
         },
     }
-    out = await hub_get_review_brief(43)
+    out = await hub_get_review_brief(43, section="full")
     text = json.loads(_mcp_text(out))["message"]
     assert (
         "Latest verdict: APPROVED for submission #1 "
@@ -2379,7 +2379,7 @@ async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
         "latest_submission_summary": "Implemented",
         "latest_review": None,
     }
-    out = await hub_get_review_brief(42)
+    out = await hub_get_review_brief(42, section="full")
     payload = _mcp_structured(out)
     text = _mcp_text(out)
     text = json.loads(text)["message"]
@@ -5908,7 +5908,7 @@ async def test_mutation_envelope_and_brief_name_the_project(
         "submission_generation": 1,
         "review_cycle": 0,
     }
-    out = await hub_get_review_brief(42)
+    out = await hub_get_review_brief(42, section="full")
     text = json.loads(_mcp_text(out))["message"]
     assert "Project: P" in text.splitlines()
 

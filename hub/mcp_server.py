@@ -53,6 +53,7 @@ from hub.workflow_reference import (
 from mcp.types import CallToolResult
 
 from hub.mcp_task_card import bounds_lines, build_compact_view
+from hub.services import review_brief_projection as brief_projection
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -2915,13 +2916,14 @@ def _state_review_lines(state: dict[str, Any]) -> list[str]:
 
 
 @mcp.tool()
-async def hub_get_review_brief(task_id: int) -> CallToolResult:
+async def hub_get_review_brief(
+    task_id: int, section: str = "", offset: int = 0, expect: str = ""
+) -> CallToolResult:
     """REVIEWER step: everything needed to review someone else's work (#308).
 
-    Not a step the submitting author runs. Returns acceptance criteria, scope,
-    validation commands, review checklist, branch/PR metadata with an advisory
-    diff command, the latest submission summary and the latest verdict with
-    findings.
+    Not a step the submitting author runs. Default: a compact projection
+    (<=12000 chars: verdicts, findings, CI trust, evidence, ACs, call sites);
+    section pages the rest, full is the whole brief.
 
     Fail-fast self-review check (#433): if YOU implemented this task the
     response opens with a self_review_warning — hand the review to an
@@ -2929,11 +2931,25 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
 
     Args:
         task_id: The task ID to review
+        section: call_sites|acceptance_criteria|statement|machine_review|full
+        offset: Page start
+        expect: Previous page fingerprint
     """
     try:
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _error_result(exc)
+    mode = "full" if section == "full" else ("section" if section else "projection")
+    if mode == "full":
+        result = _full_brief_result(brief)
+    else:
+        result = brief_projection.brief_result(brief, section, offset, expect)
+    brief_projection.log_issue(result, task_id, mode, section, offset)
+    return result
+
+
+def _full_brief_result(brief: dict[str, Any]) -> CallToolResult:
+    """The whole brief: prose text plus the brief in structuredContent (#308)."""
     parts = []
     # #433: fail-fast self-review notice goes FIRST so the reviewer stops
     # before spending review effort — hub_submit_review would reject anyway.

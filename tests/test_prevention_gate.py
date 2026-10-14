@@ -576,7 +576,7 @@ async def _brief_text(brief: dict) -> str:
     from hub import mcp_server
 
     with patch.object(mcp_server, "_api_get", AsyncMock(return_value=brief)):
-        result = await mcp_server.hub_get_review_brief(brief["task_id"])
+        result = await mcp_server.hub_get_review_brief(brief["task_id"], section="full")
     return result.content[0].text
 
 
