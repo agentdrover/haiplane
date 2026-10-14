@@ -1152,7 +1152,12 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     low = (err or "").lower()
     if rc == _TIMEOUT_RC:
         return BranchUpdateOutcome.unavailable
-    if any(w in low for w in ("permission", "denied", "protected", "declined", "403")):
+    # "403" — только отдельным числом (код ответа сервера): имя временной ветки
+    # ``task-N/gate-update-<8 hex sha>`` стоит в строке отказа аренды, и sha вида
+    # ``…1403ab…`` иначе читался бы как «нет прав» (refused, к человеку).
+    if any(
+        w in low for w in ("permission", "denied", "protected", "declined")
+    ) or re.search(r"\b403\b", low):
         return BranchUpdateOutcome.refused
     if any(
         w in low
