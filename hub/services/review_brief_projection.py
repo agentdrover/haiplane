@@ -25,6 +25,7 @@ from typing import Any
 
 from mcp.types import CallToolResult
 
+from hub.services.review_brief_fields import MANDATORY, TEXT, fields_of
 from hub.mcp_structured import structured_echo_result, structured_error_result
 
 logger = logging.getLogger(__name__)
@@ -121,13 +122,17 @@ def _identity(brief: dict[str, Any]) -> dict[str, Any]:
 
 
 # --- the part that is never cut ------------------------------------------------
+#
+# Driven by FIELD_CLASS (hub/services/review_brief_fields.py): every MANDATORY
+# entry of the table is carried, so a field the table calls decision data
+# cannot be forgotten here, and a new brief field cannot appear without a class.
 
 
-def _finding_digest(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _finding_digest(items: list[dict[str, Any]], key: str = "title") -> dict[str, Any]:
     shown = [
         {
             "severity": f.get("severity"),
-            "title": _cap(f.get("title"), TITLE_CAP),
+            "title": _cap(f.get(key), TITLE_CAP),
             **({"uid": f["finding_uid"]} if f.get("finding_uid") else {}),
         }
         for f in items[:FINDINGS_SHOWN]
@@ -141,45 +146,52 @@ def _finding_digest(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
-    """None stays None: no report is not a clean report."""
+    """None stays None: no report is not a clean report.
+
+    Lists are carried as ``<name>_count``; the two that name defects also as a
+    digest. Scalars (incomplete=None, self_reviewed, principal_id, ...) as they are.
+    """
     if not isinstance(mr, dict):
         return None
-    confirmed = mr.get("findings_confirmed") or []
-    unresolved = mr.get("unresolved") or []
-    return {
-        "id": mr.get("id"),
-        "is_current": mr.get("is_current"),
-        "outcome": mr.get("outcome"),
-        "profile": mr.get("profile"),
-        # None = "never stated", passed as it is, never turned into complete.
-        "incomplete": mr.get("incomplete"),
-        "incomplete_reason": mr.get("incomplete_reason"),
-        "findings_confirmed_count": len(confirmed),
-        "findings_rejected_count": len(mr.get("findings_rejected") or []),
-        "unresolved_count": len(unresolved),
-        "lost_dimensions_count": len(mr.get("lost_dimensions") or []),
-        "findings_confirmed": _finding_digest(confirmed),
-        "unresolved": _finding_digest(unresolved),
-    }
+    part: dict[str, Any] = {}
+    for name in fields_of(MANDATORY, "machine_review"):
+        value = mr.get(name)
+        if isinstance(value, list):
+            part[f"{name}_count"] = len(value)
+        else:
+            part[name] = value
+    part["findings_confirmed"] = _finding_digest(mr.get("findings_confirmed") or [])
+    part["unresolved"] = _finding_digest(mr.get("unresolved") or [])
+    return part
 
 
 def _latest_review_part(review: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(review, dict):
         return None
-    return {
-        "verdict": review.get("verdict"),
-        "is_current": review.get("is_current"),
-        "closed_by_decision": review.get("closed_by_decision"),
-        "self_approved": review.get("self_approved"),
-        "submission_generation": review.get("submission_generation"),
-        "findings_count": len(review.get("findings") or []),
+    part = {
+        name: review.get(name)
+        for name in fields_of(MANDATORY, "latest_review")
+        if name != "findings"
     }
+    findings = review.get("findings") or []
+    part["findings_count"] = len(findings)
+    part["findings"] = _finding_digest(findings, "message")
+    return part
 
 
-def _diff_base_part(base: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(base, dict):
+def _review_report_part(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
         return None
-    return {"state": base.get("state"), "reason": base.get("reason")}
+    part = {
+        name: report.get(name)
+        for name in fields_of(MANDATORY, "review_report")
+        if name != "machine_review"
+    }
+    inner = report.get("machine_review")
+    # The report's own machine review is the same record as machine_review in
+    # the usual case; its id makes any difference between the two visible.
+    part["machine_review_id"] = inner.get("id") if isinstance(inner, dict) else None
+    return part
 
 
 def _base_merge_part(merge: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -192,57 +204,95 @@ def _base_merge_part(merge: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def _cautions(brief: dict[str, Any]) -> dict[str, Any]:
-    """Warnings the full text put near the top; short, so they are not cut either."""
-    notices = brief.get("path_notices")
-    circle = brief.get("review_circle") or {}
+def _diff_base_part(base: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(base, dict):
+        return None
+    return {"state": base.get("state"), "reason": base.get("reason")}
+
+
+def _ac_results_part(brief: dict[str, Any]) -> dict[str, Any]:
+    """Current negative AC results by id - they survive a truncated AC block.
+
+    Everything that is not a current pass is listed: fail and not_found, and
+    any status this code does not know. A stale result is counted, not hidden.
+    """
+    results = brief.get("ac_test_results") or []
+    current = [r for r in results if r.get("is_current")]
     return {
-        # #1589: manual server steps for the paths this generation touched.
-        "path_notices": (
-            notices
-            if isinstance(notices, dict) and notices.get("state") != "none"
-            else None
-        ),
-        "review_circle": circle if circle.get("laps") else None,
-        "stacking_warning": brief.get("stacking_warning") or None,
+        "total": len(results),
+        "current": len(current),
+        "stale": len(results) - len(current),
+        "negative": [
+            {"ac_id": r.get("ac_id"), "status": r.get("status")}
+            for r in current
+            if r.get("status") != "pass"
+        ],
     }
+
+
+def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
+    rows = brief.get("locator_resolution") or []
+    return {
+        "total": len(rows),
+        "unresolved": [
+            {"ac_id": r.get("ac_id"), "status": r.get("status")}
+            for r in rows
+            if r.get("status") != "resolvable"
+        ],
+    }
+
+
+def _verdict_route_part(route: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(route, dict):
+        return None
+    return {k: route.get(k) for k in ("code", "decider", "final", "line")}
+
+
+def _freshness_part(block: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(block, dict):
+        return None
+    return {
+        "state": block.get("state"),
+        "reason": block.get("reason"),
+        "deliveries_count": len(block.get("deliveries") or []),
+        "omitted": block.get("omitted"),
+    }
+
+
+#: Top-level MANDATORY fields that are not carried as they are.
+_REDUCERS: dict[str, Callable[[dict[str, Any]], Any]] = {
+    "project": lambda b: (b.get("project") or {}).get("slug") or None,
+    "ac_test_results": _ac_results_part,
+    "locator_resolution": _locators_part,
+    "base_merge": lambda b: _base_merge_part(b.get("base_merge")),
+    "diff_base": lambda b: _diff_base_part(b.get("diff_base")),
+    "verdict_route": lambda b: _verdict_route_part(b.get("verdict_route")),
+    "statement_freshness": lambda b: _freshness_part(b.get("statement_freshness")),
+    "review_circle": lambda b: (
+        b.get("review_circle") if (b.get("review_circle") or {}).get("laps") else None
+    ),
+    "path_notices": lambda b: (
+        b.get("path_notices")
+        if (b.get("path_notices") or {}).get("state") not in (None, "none")
+        else None
+    ),
+    "diff_command": lambda b: b.get("diff_command") or None,
+    "stacking_warning": lambda b: b.get("stacking_warning") or None,
+    "state_review": lambda b: b.get("state_review") or None,
+    "catalogue_rules": lambda b: b.get("catalogue_rules") or [],
+}
 
 
 def mandatory_part(brief: dict[str, Any]) -> dict[str, Any]:
     """Decision-critical fields. Whatever the budget, none of them is cut."""
-    project = brief.get("project")
-    report = brief.get("review_report")
-    return {
-        "projection": True,
-        "task_id": brief.get("task_id"),
-        "title": brief.get("title"),
-        "status": brief.get("status"),
-        "project": project.get("slug") if isinstance(project, dict) else None,
-        "review_cycle": brief.get("review_cycle", 0),
-        "result_kind": brief.get("result_kind"),
-        **_identity(brief),
-        "branch": brief.get("branch"),
-        "sha_check": brief.get("sha_check"),
-        "sha_check_reason": brief.get("sha_check_reason"),
-        "self_review_warning": brief.get("self_review_warning"),
-        "latest_review": _latest_review_part(brief.get("latest_review")),
-        "current_generation_review": brief.get("current_generation_review"),
-        "review_report": (
-            {"state": report.get("state")} if isinstance(report, dict) else None
-        ),
-        "machine_review": _machine_review_part(brief.get("machine_review")),
-        "evidence_coverage": brief.get("evidence_coverage"),
-        # #1687: how far the CI report is trusted, with the reason.
-        "ci_run_report": brief.get("ci_run_report"),
-        # #1688: signs, the question, the answer and the owner's note, whole.
-        "ci_integrity": brief.get("ci_integrity"),
-        "base_merge": _base_merge_part(brief.get("base_merge")),
-        "state_review": brief.get("state_review") or None,
-        "diff_command": brief.get("diff_command") or None,
-        "diff_base": _diff_base_part(brief.get("diff_base")),
-        "catalogue_rules": brief.get("catalogue_rules") or [],
-        **_cautions(brief),
-    }
+    part: dict[str, Any] = {"projection": True}
+    for name in fields_of(MANDATORY):
+        reduce = _REDUCERS.get(name)
+        part[name] = reduce(brief) if reduce else brief.get(name)
+    part["latest_review"] = _latest_review_part(brief.get("latest_review"))
+    part["review_report"] = _review_report_part(brief.get("review_report"))
+    part["machine_review"] = _machine_review_part(brief.get("machine_review"))
+    return part
 
 
 # --- blocks that give way to the budget ---------------------------------------
@@ -404,6 +454,8 @@ def _verdict_lines(proj: dict[str, Any]) -> list[str]:
             if review["self_approved"]
             else ""
         )
+        if review["closed_by_decision"]:
+            fresh += " [closed by the rework decision]"
         lines.append(
             f"Latest verdict: {str(review['verdict'] or '?').upper()} for "
             f"submission #{review['submission_generation']} ({fresh}){solo}; "
@@ -412,9 +464,20 @@ def _verdict_lines(proj: dict[str, Any]) -> list[str]:
     gen = proj["current_generation_review"]
     if gen:
         lines.append(f"Current-generation review: {gen.get('headline') or gen}")
+    if review:
+        lines.extend(_digest_lines("Findings of that verdict", review["findings"]))
     report = proj["review_report"]
     if report:
-        lines.append(f"Review report: {report['state']}")
+        lines.append(
+            f"Review report: {report['state']} (machine review #"
+            f"{report['machine_review_id']}), diff {report['diff_files']} files/"
+            f"{report['diff_lines']} lines {report['diff_note'] or ''}".rstrip()
+        )
+    if proj["review_in_flight"]:
+        lines.append(f"Review in flight: {proj['review_in_flight'].get('headline')}")
+    route = proj["verdict_route"]
+    if route and route.get("line"):
+        lines.append(f"Verdict route: {route['line']}")
     return lines
 
 
@@ -434,8 +497,8 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
     ]
     head = (
         f"Machine review #{mr['id']}: outcome={mr['outcome']}, profile="
-        f"{mr['profile'] or '-'}, current={mr['is_current']}, incomplete="
-        f"{incomplete}"
+        f"{mr['profile'] or '-'}, model={mr['model'] or '-'}, current="
+        f"{mr['is_current']}, incomplete={incomplete}"
     )
     if mr["incomplete_reason"]:
         head += f" ({mr['incomplete_reason']})"
@@ -443,12 +506,71 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
         head,
         f"  confirmed {mr['findings_confirmed_count']}, rejected "
         f"{mr['findings_rejected_count']}, unresolved {mr['unresolved_count']}, "
-        f"lost dimensions {mr['lost_dimensions_count']}",
+        f"lost dimensions {mr['lost_dimensions_count']}, dispositions "
+        f"{mr['dispositions_count']}, deferred repeats {mr['deferred_repeats_count']}"
+        f", closures {mr['observation_closures_count']}",
     ]
+    if mr["self_reviewed"]:
+        lines.append("  SELF-REVIEWED: the author reviewed their own work")
+    elif mr["principal_id"] is None:
+        lines.append("  independence NOT established (no reviewer principal recorded)")
+    if mr["second_door_channel"] or mr["second_door_reason"]:
+        lines.append(
+            f"  channel: {mr['second_door_channel']} ({mr['second_door_reason']})"
+        )
+    if mr["ci_integrity_verdict"] or mr["ci_integrity_explanation"]:
+        lines.append(
+            f"  CI integrity answer: {mr['ci_integrity_verdict']} "
+            f"{mr['ci_integrity_explanation']}".rstrip()
+        )
     if mr["findings_confirmed"]["total"]:
         lines.extend(_digest_lines("Confirmed findings", mr["findings_confirmed"]))
     if mr["unresolved"]["total"]:
         lines.extend(_digest_lines("Unresolved findings", mr["unresolved"]))
+    return lines
+
+
+def _checks_lines(proj: dict[str, Any]) -> list[str]:
+    """Outcomes of the mechanical checks - failures and unknowns are named."""
+    lines = []
+    pre = proj["prepass"] or {}
+    mark = " FAILED" if pre.get("state") == "failed" or pre.get("failed") else ""
+    lines.append(
+        f"Pre-pass [{pre.get('state', '?')}]{mark}: {pre.get('reason', '')}"
+        + (f" | failed: {', '.join(pre['failed'])}" if pre.get("failed") else "")
+        + (f" | skipped: {', '.join(pre['skipped'])}" if pre.get("skipped") else "")
+    )
+    val = proj["validation"] or {}
+    lines.append(
+        f"Validation [{val.get('state', '?')}] verified={val.get('verified')}"
+        f"{' NEEDS HUMAN COMPARE' if val.get('needs_human_compare') else ''}: "
+        f"{val.get('headline', '')}"
+    )
+    acr = proj["ac_test_results"]
+    bad = ", ".join(f"{r['ac_id']}={r['status']}" for r in acr["negative"])
+    lines.append(
+        f"AC test results: {acr['current']} current, {acr['stale']} stale"
+        + (f" | NOT PASSING: {bad}" if bad else "")
+    )
+    loc = proj["locator_resolution"]
+    if loc["unresolved"]:
+        lines.append(
+            "AC locators not resolved: "
+            + ", ".join(f"{r['ac_id']}={r['status']}" for r in loc["unresolved"])
+        )
+    for name in ("mutations", "baseline"):
+        block = (proj["ci_evidence"] or {}).get(name) or {}
+        lines.append(
+            f"CI {name} [{block.get('state', '?')}]: {block.get('reason', '')}"
+        )
+    live = proj["live_check"] or {}
+    lines.append(
+        f"Live check [{live.get('state', '?')}]"
+        f"{' SHA MISMATCH' if live.get('sha_mismatch') else ''}: {live.get('reason', '')}"
+    )
+    fresh = proj["statement_freshness"]
+    if fresh:
+        lines.append(f"Statement freshness [{fresh['state']}]: {fresh['reason']}")
     return lines
 
 
@@ -494,13 +616,18 @@ def _integrity_lines(block: dict[str, Any] | None) -> list[str]:
 
 def _diff_lines(proj: dict[str, Any]) -> list[str]:
     base = proj["diff_base"] or {}
+    unverified = base.get("state") != "resolved"
     if proj["diff_command"]:
         lines = [f"Diff: {proj['diff_command']}"]
-        if base.get("state") != "resolved" and base.get("reason"):
-            lines.append(f"  base NOT verified: {base['reason']}")
+        if unverified:
+            lines.append(
+                f"  base NOT verified [{base.get('state')}]: {base.get('reason') or ''}"
+            )
         return lines
-    if base.get("reason"):
-        return [f"Diff: NOT AVAILABLE — {base['reason']}"]
+    if unverified and (base.get("reason") or base.get("state")):
+        return [
+            f"Diff: NOT AVAILABLE [{base.get('state')}] — {base.get('reason') or ''}"
+        ]
     return []
 
 
@@ -636,6 +763,9 @@ def _projection_summary(proj: dict[str, Any], exceeded: bool) -> str:
     lines.extend(_head_lines(proj))
     lines.extend(_verdict_lines(proj))
     lines.extend(_machine_lines(proj["machine_review"]))
+    if proj["profile_downgrade"]:
+        lines.append(f"PROFILE DOWNGRADED: {proj['profile_downgrade'].get('headline')}")
+    lines.extend(_checks_lines(proj))
     lines.extend(_evidence_lines(proj))
     lines.extend(_block_lines(proj["blocks"]))
     if exceeded:
@@ -710,18 +840,7 @@ class _Section:
 
 def _statement_section(brief: dict[str, Any]) -> _Section:
     parts = []
-    for name in (
-        "description",
-        "scope_in",
-        "scope_out",
-        "out_of_scope_for_review",
-        "review_checklist",
-        "validation_commands",
-        "constraints",
-        "technical_hints",
-        "scope_growth",
-        "latest_submission_summary",
-    ):
+    for name in fields_of(TEXT):
         value = brief.get(name)
         if not value:
             continue

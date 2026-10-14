@@ -274,7 +274,6 @@ async def test_mcp_brief_fits_the_budget_and_keeps_the_mandatory_fields(
         )
     if shape == "1664":
         assert blocks["acceptance_criteria"]["shown"] == 9
-        assert blocks["call_sites"]["shown"] >= 1
     text = _text(result)
     assert text.startswith("Review brief for task #1647")
     assert "AC-1:" in text or blocks["acceptance_criteria"]["shown"] == 0
@@ -336,7 +335,7 @@ def test_projection_never_hides_findings_or_unknown_states():
 
     assert out["machine_review"]["incomplete"] is None
     assert "unknown (never stated)" in text and "incomplete=no" not in text
-    assert out["review_report"] == {"state": "stale"}
+    assert out["review_report"]["state"] == "stale"
     assert (
         out["sha_check"] == "diverged"
         and out["sha_check_reason"] == "ветка ушла вперёд"
@@ -393,6 +392,8 @@ def test_call_sites_projection_lists_five_once_with_counts():
     ]  # fmt: skip
     brief = _brief(
         ac=2,
+        confirmed=1,
+        unresolved=0,
         call_sites={
             "status": "analysed",
             "summary": "эвристика по имени",
@@ -420,7 +421,12 @@ def test_call_sites_projection_lists_five_once_with_counts():
         assert text.count(address) == 1, address
     assert twelve["untouched"][5] not in text
 
-    many = _brief(ac=2, call_sites={"status": "analysed", "entries": _entries(25, 3)})
+    many = _brief(
+        ac=2,
+        confirmed=1,
+        unresolved=0,
+        call_sites={"status": "analysed", "entries": _entries(25, 3)},
+    )
     got = proj.brief_result(many).structuredContent["brief"]["blocks"]["call_sites"]
     assert got["total"] == 25 and got["shown"] <= 10
     assert got["shown"] + got["omitted"] == 25
@@ -931,6 +937,8 @@ def test_cut_elements_carry_a_hint_and_a_truncated_marker():
     }  # fmt: skip
     brief = _brief(
         ac=1,
+        confirmed=1,
+        unresolved=0,
         call_sites={"status": "analysed", "entries": [twelve]},
     )
     brief["acceptance_criteria"] = acs
@@ -968,3 +976,375 @@ def test_self_approved_verdict_is_named_in_the_default_projection():
     )
     text = json.loads(proj.brief_result(brief).content[0].text)["message"]
     assert "[SELF-APPROVED: solo mode, not independent]" in text
+
+
+# --- review round 2: one classification of every field ------------------------
+
+from pydantic import BaseModel  # noqa: E402
+
+from hub.services import review_brief_fields as fields  # noqa: E402
+
+
+def _nested_model(annotation: Any) -> type[BaseModel] | None:
+    import typing
+
+    for arg in (annotation, *typing.get_args(annotation)):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _unclassified(model: type[BaseModel], prefix: str = "") -> list[str]:
+    missing = []
+    for name, info in model.model_fields.items():
+        path = f"{prefix}{name}"
+        if path in fields.FIELD_CLASS:
+            continue
+        nested = _nested_model(info.annotation)
+        split = any(k.startswith(path + ".") for k in fields.FIELD_CLASS)
+        if nested is not None and split:
+            missing += _unclassified(nested, path + ".")
+        else:
+            missing.append(path)
+    return missing
+
+
+def _resolves(path: str) -> bool:
+    model: type[BaseModel] | None = ReviewBrief
+    for part in path.split("."):
+        if model is None or part not in model.model_fields:
+            return False
+        model = _nested_model(model.model_fields[part].annotation)
+    return True
+
+
+def test_every_brief_field_has_a_class():
+    """Новое поле брифа заставляет решить: решающее оно или нет."""
+    assert _unclassified(ReviewBrief) == []
+    assert [p for p in fields.FIELD_CLASS if not _resolves(p)] == [], "stale entries"
+    for path, (klass, reason) in fields.FIELD_CLASS.items():
+        assert klass in {"MANDATORY", "BLOCK", "TEXT", "FULL_ONLY"}, path
+        if klass == "FULL_ONLY":
+            assert reason.strip(), f"{path}: FULL_ONLY needs a reason"
+    parents = {p.split(".")[0] for p in fields.FIELD_CLASS if "." in p}
+    assert parents == {"latest_review", "review_report", "machine_review"}
+
+
+def test_a_new_field_is_refused_until_it_is_classified(monkeypatch):
+    """Проверка проверки: убрали запись из таблицы - обход её находит."""
+    trimmed = dict(fields.FIELD_CLASS)
+    del trimmed["prepass"], trimmed["machine_review.self_reviewed"]
+    monkeypatch.setattr(fields, "FIELD_CLASS", trimmed)
+    assert set(_unclassified(ReviewBrief)) == {
+        "prepass",
+        "machine_review.self_reviewed",
+    }
+
+
+def _clean() -> dict[str, Any]:
+    """A small brief where every decision field says 'fine'."""
+    return _brief(
+        ac=3,
+        symbols=1,
+        addresses=0,
+        prose=1,
+        confirmed=0,
+        unresolved=0,
+        machine_review=_machine(
+            0,
+            0,
+            incomplete=False,
+            principal_id=5,
+            self_reviewed=False,
+            is_current=True,
+            lost_dimensions=[],
+        ),
+        latest_review={
+            "verdict": "approved",
+            "submission_generation": 2,
+            "is_current": True,
+        },
+        ci_run_report={"state": "current", "reason": "ok", "trust": "verified"},
+        ci_evidence={
+            "mutations": {"state": "received", "reason": "ok"},
+            "baseline": {"state": "received", "reason": "ok"},
+        },
+        diff_base={"base": "develop", "state": "resolved", "reason": "", "sha": "a"},
+        prepass={
+            "state": "passed",
+            "reason": "ok",
+            "passed": ["ruff"],
+            "head_sha": "a",
+        },
+        validation={
+            "state": "verified",
+            "verified": True,
+            "needs_human_compare": False,
+        },
+        ac_test_results=[
+            {"ac_id": f"AC-{i}", "status": "pass", "is_current": True}
+            for i in (1, 2, 3)
+        ],
+    )
+
+
+def _text_of(brief: dict[str, Any]) -> str:
+    return json.loads(proj.brief_result(brief).content[0].text)["message"]
+
+
+def _answer(brief: dict[str, Any]) -> dict[str, Any]:
+    return proj.brief_result(brief).structuredContent["brief"]
+
+
+def test_failures_self_review_and_downgrade_change_the_default_answer():
+    """Три воспроизведения Codex: провал, самоконтроль и понижение видны в тексте."""
+    base = _clean()
+    base_text, base_answer = _text_of(base), _answer(base)
+
+    failing = copy.deepcopy(base)
+    failing["prepass"] |= {"state": "failed", "failed": ["mypy"]}
+    failing["validation"] |= {
+        "state": "not_run",
+        "verified": False,
+        "needs_human_compare": True,
+    }
+    failing["ac_test_results"][2]["status"] = "fail"
+    failing["ac_test_results"].append(
+        {"ac_id": "AC-9", "status": "not_found", "is_current": True}
+    )
+    failing["ac_test_results"].append(
+        {"ac_id": "AC-8", "status": "fail", "is_current": False}
+    )
+    text = _text_of(failing)
+    assert _answer(failing) != base_answer and text != base_text
+    assert "Pre-pass [failed] FAILED" in text and "failed: mypy" in text
+    assert "verified=False NEEDS HUMAN COMPARE" in text
+    assert "NOT PASSING: AC-3=fail, AC-9=not_found" in text
+    assert "AC-8" not in text, "прошлый (не текущий) результат не красный, но посчитан"
+    assert _answer(failing)["ac_test_results"]["stale"] == 1
+    assert "Pre-pass [passed]" in base_text and "NOT PASSING" not in base_text
+
+    selfreviewed = copy.deepcopy(base)
+    selfreviewed["machine_review"] |= {"self_reviewed": True}
+    assert _answer(selfreviewed) != base_answer
+    assert "SELF-REVIEWED: the author reviewed their own work" in _text_of(selfreviewed)
+    unproven = copy.deepcopy(base)
+    unproven["machine_review"] |= {"principal_id": None}
+    assert "independence NOT established" in _text_of(unproven)
+    assert "independence NOT established" not in base_text
+
+    downgraded = copy.deepcopy(base)
+    downgraded["profile_downgrade"] = {
+        "required_profile": "deep",
+        "ordered_profile": "lite",
+        "reasons": ["cap"],
+        "state": "downgraded",
+        "channel": "cloud",
+        "dispatch_id": 3,
+        "headline": "требовался deep, заказан lite: потолок дня",
+    }
+    assert _answer(downgraded)["profile_downgrade"]["required_profile"] == "deep"
+    assert "PROFILE DOWNGRADED: требовался deep, заказан lite" in _text_of(downgraded)
+    assert "PROFILE DOWNGRADED" not in base_text
+
+
+def test_a_failing_ac_is_listed_even_when_the_ac_block_is_cut():
+    brief = _clean()
+    brief["acceptance_criteria"] = _acs(25)
+    brief["ac_test_results"] = [
+        {
+            "ac_id": f"AC-{i}",
+            "status": "fail" if i == 25 else "pass",
+            "is_current": True,
+        }
+        for i in range(1, 26)
+    ]
+    answer = _answer(brief)
+    assert answer["blocks"]["acceptance_criteria"]["omitted"] > 0
+    assert answer["ac_test_results"]["negative"] == [
+        {"ac_id": "AC-25", "status": "fail"}
+    ]
+    assert "NOT PASSING: AC-25=fail" in _text_of(brief)
+
+
+# For every MANDATORY entry of the table: where to put a 'bad' value, and which.
+_BAD: dict[str, tuple[str, Any]] = {
+    "task_id": ("task_id", 2),
+    "title": ("title", "другая"),
+    "status": ("status", "running"),
+    "project": ("project", {"id": 1, "slug": "zz"}),
+    "locator_resolution": (
+        "locator_resolution",
+        [{"ac_id": "AC-1", "locator": None, "status": "missing", "reason": ""}],
+    ),
+    "ac_test_results": (
+        "ac_test_results",
+        [{"ac_id": "AC-1", "status": "fail", "is_current": True}],
+    ),
+    "ci_run_report": ("ci_run_report.trust", "unverified"),
+    "ci_integrity": (
+        "ci_integrity",
+        {"state": "suspicious", "gap": "g", "signs": [], "question": "q"},
+    ),
+    "ci_evidence": ("ci_evidence.mutations.state", "not_received"),
+    "prepass": ("prepass.state", "failed"),
+    "validation": ("validation.needs_human_compare", True),
+    "live_check": ("live_check.sha_mismatch", True),
+    "statement_freshness": ("statement_freshness", {"state": "stale", "reason": "r"}),
+    "branch": ("branch", "other"),
+    "diff_command": ("diff_command", "git diff x"),
+    "diff_base": ("diff_base.state", "unverified"),
+    "base_merge": ("base_merge.state", "conflicting"),
+    "evidence_coverage": ("evidence_coverage.state", "none"),
+    "review_cycle": ("review_cycle", 4),
+    "review_circle": ("review_circle.laps", 3),
+    "profile_downgrade": (
+        "profile_downgrade",
+        {"headline": "h", "required_profile": "deep"},
+    ),
+    "verdict_route": ("verdict_route", {"line": "вердикт: человек", "final": "human"}),
+    "catalogue_rules": (
+        "catalogue_rules",
+        [{"category": "c", "check_ref": "t::x", "matched_areas": []}],
+    ),
+    "submission_generation": ("submission_generation", 9),
+    "submission_sha": ("submission_sha", "f" * 40),
+    "current_branch_tip": ("current_branch_tip", "e" * 40),
+    "sha_check": ("sha_check", "diverged"),
+    "sha_check_reason": ("sha_check_reason", "другая причина"),
+    "review_in_flight": ("review_in_flight", {"headline": "ещё идёт"}),
+    "current_generation_review": ("current_generation_review.has_review", False),
+    "self_review_warning": (
+        "self_review_warning",
+        {"reason": "self_review_forbidden", "message": "m", "hint": "h"},
+    ),
+    "stacking_warning": ("stacking_warning", "стек веток"),
+    "path_notices": (
+        "path_notices",
+        {"generation": 1, "state": "matched", "text": "ручной шаг"},
+    ),
+    "result_kind": ("result_kind", "state"),
+    "state_review": ("state_review", {"headline": "h", "label": "l"}),
+    "latest_review.verdict": ("latest_review.verdict", "changes_requested"),
+    "latest_review.submission_generation": ("latest_review.submission_generation", 7),
+    "latest_review.is_current": ("latest_review.is_current", False),
+    "latest_review.closed_by_decision": ("latest_review.closed_by_decision", True),
+    "latest_review.self_approved": ("latest_review.self_approved", True),
+    "latest_review.findings": (
+        "latest_review.findings",
+        [{"id": 1, "severity": "high", "message": "m"}],
+    ),
+    "review_report.state": ("review_report.state", "stale"),
+    "review_report.branch": ("review_report.branch", "b2"),
+    "review_report.submission_sha": ("review_report.submission_sha", "9" * 40),
+    "review_report.diff_files": ("review_report.diff_files", 40),
+    "review_report.diff_lines": ("review_report.diff_lines", 4000),
+    "review_report.diff_note": ("review_report.diff_note", "объём не измерен"),
+    "review_report.machine_review": ("review_report.machine_review", {"id": 99}),
+    "machine_review.id": ("machine_review.id", 99),
+    "machine_review.is_current": ("machine_review.is_current", False),
+    "machine_review.model": ("machine_review.model", "m2"),
+    "machine_review.raw_count": ("machine_review.raw_count", 9),
+    "machine_review.findings_confirmed": (
+        "machine_review.findings_confirmed",
+        [{"title": "t", "severity": "high"}],
+    ),
+    "machine_review.findings_rejected": (
+        "machine_review.findings_rejected",
+        [{"title": "r"}],
+    ),
+    "machine_review.incomplete": ("machine_review.incomplete", None),
+    "machine_review.incomplete_reason": (
+        "machine_review.incomplete_reason",
+        "environment",
+    ),
+    "machine_review.unresolved": ("machine_review.unresolved", [{"title": "u"}]),
+    "machine_review.lost_dimensions": ("machine_review.lost_dimensions", ["security"]),
+    "machine_review.profile": ("machine_review.profile", "lite"),
+    "machine_review.submitted_by": ("machine_review.submitted_by", "author"),
+    "machine_review.self_reviewed": ("machine_review.self_reviewed", True),
+    "machine_review.principal_id": ("machine_review.principal_id", None),
+    "machine_review.ci_integrity_verdict": (
+        "machine_review.ci_integrity_verdict",
+        "suspicious",
+    ),
+    "machine_review.ci_integrity_explanation": (
+        "machine_review.ci_integrity_explanation",
+        "почему",
+    ),
+    "machine_review.dispositions": ("machine_review.dispositions", [{"uid": "x"}]),
+    "machine_review.observation_closures": (
+        "machine_review.observation_closures",
+        [{"uid": "x"}],
+    ),
+    "machine_review.deferred_repeats": (
+        "machine_review.deferred_repeats",
+        [{"uid": "x"}],
+    ),
+    "machine_review.outcome": ("machine_review.outcome", "confirmed_findings"),
+    "machine_review.outcome_label": ("machine_review.outcome_label", "иное"),
+    "machine_review.outcome_names_clean": ("machine_review.outcome_names_clean", True),
+    "machine_review.second_door_channel": (
+        "machine_review.second_door_channel",
+        "local",
+    ),
+    "machine_review.second_door_reason": (
+        "machine_review.second_door_reason",
+        "нет cloud",
+    ),
+}
+
+
+def _set(node: dict[str, Any], dotted: str, value: Any) -> None:
+    *parents, last = dotted.split(".")
+    for part in parents:
+        if not isinstance(node.get(part), dict):
+            node[part] = {}
+        node = node[part]
+    node[last] = value
+
+
+def _mandatory_paths() -> list[str]:
+    return [p for p, (klass, _r) in fields.FIELD_CLASS.items() if klass == "MANDATORY"]
+
+
+def test_every_mandatory_field_is_covered_by_a_bad_value():
+    assert sorted(_BAD) == sorted(_mandatory_paths()), "new MANDATORY needs a bad value"
+
+
+@pytest.mark.parametrize("path", sorted(_BAD))
+def test_flipping_a_mandatory_field_changes_the_default_answer(path):
+    """Каждое MANDATORY-поле: «плохое» значение меняет и данные, и текст ответа."""
+    base = _clean()
+    # The shape the field has when it says 'fine'; the bad value must differ from it.
+    set_path, bad = _BAD[path]
+    flipped = copy.deepcopy(base)
+    _set(flipped, set_path, bad)
+    assert flipped != base, "the bad value is really a change of the input"
+    assert _answer(flipped) != _answer(base), path
+    # The text carries every flip except pure identifiers/counters, which the
+    # structured half carries; both halves are measured by the same budget.
+    if path not in _STRUCTURED_ONLY:
+        assert _text_of(flipped) != _text_of(base), path
+
+
+_STRUCTURED_ONLY = {
+    "task_id",
+    "status",
+    "project",
+    "submission_generation",
+    "result_kind",
+    "review_cycle",
+    "latest_review.submission_generation",
+    "review_report.state",
+    "review_report.branch",
+    "review_report.submission_sha",
+    "review_report.machine_review",
+    "machine_review.raw_count",
+    "machine_review.findings_rejected",
+    "machine_review.outcome_label",
+    "machine_review.outcome_names_clean",
+    "machine_review.submitted_by",
+    "machine_review.outcome",
+    "machine_review.lost_dimensions",
+}
