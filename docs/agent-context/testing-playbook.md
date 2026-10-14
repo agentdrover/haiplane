@@ -66,3 +66,8 @@ unchanged, but a test's nodeid changed with its file: old nodeids in closed
 tasks (`tests/test_web.py::name`) are not rewritten (variant 1); find a test by
 name with `grep -rn "def <name>" tests/test_web*.py`. Each file stays under
 2000 lines and 200 000 bytes so the AC locator can read it (256 KB limit).
+
+## Бюджет сложности (#1066, #1693)
+
+- `uv run python scripts/complexity_budget.py` красит CI при исключении `unclaimed`, у которого живой замер от 90% своего `max`, и при `removed_by` не по формату (`task:#N`, `permanent — <причина>`, `unclaimed — <причина>`). Лечение: назначить задачу или объявить постоянным с причиной.
+- Сверить `measured` без пополнения запаса: `--refresh-measured`. `--update` пересчитывает потолки и остаётся решением человека.

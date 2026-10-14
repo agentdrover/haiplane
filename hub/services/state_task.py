@@ -40,7 +40,12 @@ from hub.models import (
     TaskSubmitReview,
     TaskView,
 )
-from hub.services import prevention_gate, state_evidence, submission_contract
+from hub.services import (
+    prevention_gate,
+    state_evidence,
+    submission_contract,
+    watch_notices,
+)
 from hub.services.gate_pipeline import Step, run_steps
 from hub.services.result_kind import is_state, qualifying_ac_count
 
@@ -598,9 +603,8 @@ async def record_state_verdict(
             )
         if hold_code:
             await repo.add_task_update(db, task_id, "hub", "alert", hold_text)
-            await repo.insert_event(
+            await watch_notices.emit_needs_decision(
                 db,
-                kind="needs_decision",
                 task_id=task_id,
                 actor=agent,
                 payload={"reason": hold_code, "via": "state_approved"},

@@ -49,6 +49,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import watch_notices
 from hub.services.metrics_scope import Scope
 from hub.integrations import cursor_cloud
 
@@ -596,9 +597,8 @@ async def _silent_to_human(
     if task is None or dict(task).get("status") != "running":
         return
     await repo.update_task(db, task_id, status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task_id,
         actor="hub",
         payload={
@@ -914,9 +914,8 @@ async def _to_human_decision(db: aiosqlite.Connection, task_id: int) -> None:
     if task is None or dict(task).get("status") != "running":
         return
     await repo.update_task(db, task_id, status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task_id,
         actor="hub",
         payload={"reason": EVENT_OVER_CEILING},
@@ -1034,9 +1033,8 @@ async def _release_stopped(db: aiosqlite.Connection, row: dict[str, Any]) -> Non
         f"{row['submission_generation']}) закончился исходом {outcome} без сдачи"
     )
     await repo.update_task(db, task_id, status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task_id,
         actor="hub",
         payload={
@@ -1369,9 +1367,8 @@ async def _answer_to_decision(db: aiosqlite.Connection, task_id: int, why: str) 
         return
     detail = f"{REASON_NO_CONTINUATION}: {why}"
     await repo.update_task(db, task_id, status="needs_decision")
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task_id,
         actor="hub",
         payload={"reason": EVENT_ANSWER_NO_CONTINUATION, "detail": detail},

@@ -186,6 +186,9 @@ REGISTRY: dict[str, PolicyEntry] = {
         "project_policy.freeze_of",
         show=project_policy.freeze_show,
     ),
+    "steward_watch": PolicyEntry(
+        project_policy.steward_watch_of, "project_policy.steward_watch_of"
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",

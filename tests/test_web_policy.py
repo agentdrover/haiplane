@@ -873,6 +873,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
             "allow_work_types": ["bug", "chore"],
             "note": "до MS-A2",
         },
+        "steward_watch": ["needs_decision", "release"],
         "release_artifacts": [
             {
                 "repo_path": "deploy/x.sh",
