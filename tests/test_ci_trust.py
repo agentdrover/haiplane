@@ -1714,6 +1714,62 @@ async def test_a_post_between_the_refresh_and_the_transaction_refuses_the_done_r
     assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
 
 
+async def test_a_change_between_prepare_and_the_transaction_is_judged_inside_it(
+    db, monkeypatch
+):
+    """The prepared task asks for review (gate skipped); inside the transaction it does not.
+
+    ``auto_review`` flips off and a new report withdraws the evidence AFTER the
+    prepare step. Only the task re-read inside the transaction
+    (``_task_inside_transaction``) and the gate re-run there
+    (``ci_trust.recheck_in_transaction``) can see it: the done report is refused.
+    """
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+    from hub.services.ci_report import store_ci_run_report
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)
+    await _post(db, task_id, GH.attempt(task_id, SHA, run_id="8151"))
+    await repo.update_task(
+        db, task_id, status="pending_report", auto_review=1, validation_commands='["x"]'
+    )
+    await db.commit()
+
+    real_prepare = lifecycle.prepare_ci_standing
+
+    async def prepare_then_the_task_changes(*args, **kwargs):
+        prepared = await real_prepare(*args, **kwargs)
+        assert prepared["auto_review"], "the prepared task still asks for review"
+        await repo.update_task(db, task_id, auto_review=0)
+        await store_ci_run_report(
+            db, task_id, **GH.attempt(task_id, SHA, run_id="8152")
+        )
+        await db.commit()
+        return prepared
+
+    rechecks: list[int] = []
+    real_recheck = ci_trust.recheck_in_transaction
+
+    async def counting_recheck(*args, **kwargs):
+        rechecks.append(1)
+        return await real_recheck(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "prepare_ci_standing", prepare_then_the_task_changes)
+    monkeypatch.setattr(ci_trust, "recheck_in_transaction", counting_recheck)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert rechecks == [1], "the decision is re-made through the one helper"
+    assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
+
+
 async def test_a_deleted_run_and_a_newer_red_one_without_a_report_is_never_verified(db):
     from hub.services.ac_tests import ac_tests_gap
 

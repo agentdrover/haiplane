@@ -5175,6 +5175,49 @@ async def test_failing_git_tail_leaves_no_done_report(
     )
 
 
+async def test_failing_pending_report_route_leaves_no_done_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1690: the pending_report route runs inside the done_flow savepoint.
+
+    A failure after its first step takes back the done row and the generation
+    bump; a commit inside the route would have released the savepoint.
+    """
+    from hub.services import lifecycle
+
+    task_id = await repo.create_task(
+        db,
+        title="Pending report, review on",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("path notices exploded")
+
+    monkeypatch.setattr(lifecycle, "_record_path_notices_for_done", explode)
+    with pytest.raises(RuntimeError):
+        await services.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="готово")
+        )
+
+    updates = await repo.get_task_updates(db, task_id)
+    assert not [u for u in updates if u["kind"] == "done"]
+    row = dict(await repo.get_task(db, task_id))
+    assert row["submission_generation"] == 0
+    assert row["status"] == "pending_report"
+
+
 async def test_retry_after_a_failing_git_tail_does_not_pile_up_done_rows(
     db: aiosqlite.Connection, monkeypatch
 ):
