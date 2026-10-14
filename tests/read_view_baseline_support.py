@@ -240,7 +240,7 @@ async def snapshot_rest_context(client: AsyncClient, db) -> dict[str, Any]:
 
 
 @contextmanager
-def _frozen_card(*, delivery: str = "real", files: str = "read"):
+def _frozen_card(*, delivery: str = "real", files: str = "read", offers: bool = False):
     """Карточка без случайности: токен CSRF фиксирован, git и доставка заданы."""
     patches = [patch("hub.web.generate_csrf_token", return_value=_ID_FIXED_CSRF)]
     if delivery == "raises":
@@ -254,7 +254,10 @@ def _frozen_card(*, delivery: str = "real", files: str = "read"):
         listing = {
             "state": "read",
             "reason": "",
-            "files": [{"path": "hub/app.py", "added": 3, "removed": 1}],
+            "files": [
+                {"path": "hub/app.py", "added": 3, "removed": 1},
+                {"path": "hub/a.py", "added": 1, "removed": 0},
+            ],
         }
     else:
         listing = {"state": "unreadable", "reason": "git не отвечает", "files": []}
@@ -264,6 +267,14 @@ def _frozen_card(*, delivery: str = "real", files: str = "read"):
             new=AsyncMock(return_value=listing),
         )
     )
+    if offers:
+        for name in ("repair_offered", "merge_offered"):
+            patches.append(
+                patch(
+                    f"hub.services.executor_launch.{name}",
+                    new=AsyncMock(return_value=True),
+                )
+            )
     for p in patches:
         p.start()
     try:
@@ -304,10 +315,28 @@ async def snapshot_web_cards(client: AsyncClient, db) -> dict[str, Any]:
     with _frozen_card():
         out["web_commit_review_findings"] = _html(await client.get(f"/tasks/{filled}"))
 
+    await repo.create_executor_run(
+        db,
+        task_id=filled,
+        submission_generation=1,
+        agent_id="agent-x",
+        run_id="run-x",
+        model="m-1",
+    )
+    await db.commit()
+    with _frozen_card(offers=True):
+        out["web_commit_review_findings_runs_offers"] = _html(
+            await client.get(f"/tasks/{filled}")
+        )
+
     plain = await _create(client, title="Простая")
     with _frozen_card():
         out["web_commit_open"] = _html(await client.get(f"/tasks/{plain}"))
         out["web_missing"] = _html(await client.get("/tasks/999999"))
+    with _frozen_card(offers=True):
+        out["web_commit_open_offers_without_runs"] = _html(
+            await client.get(f"/tasks/{plain}")
+        )
     plain_done = await _create(client, title="Завершённая")
     await db.execute("UPDATE tasks SET status='completed' WHERE id=?", (plain_done,))
     await db.commit()
