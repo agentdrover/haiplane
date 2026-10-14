@@ -347,8 +347,14 @@ async def snapshot_web_cards(client: AsyncClient, db) -> dict[str, Any]:
             await client.get(f"/tasks/{plain_done}")
         )
 
-    state = await _create(client, title="Состояние")
-    await client.post(f"/api/tasks/{state}/refine", json={"result_kind": "state"})
+    # Вид результата задаётся при создании: refine переводит в state только
+    # черновик (на открытой задаче даёт 422), а карточка иначе осталась бы
+    # commit-карточкой.
+    state = await _create(
+        client, title="Состояние", result_kind="state", rollback="откат"
+    )
+    got = await client.get(f"/api/tasks/{state}")
+    assert got.json()["result_kind"] == "state", got.text
     with _frozen_card():
         out["web_state_open"] = _html(await client.get(f"/tasks/{state}"))
     await db.execute("UPDATE tasks SET status='review' WHERE id=?", (state,))
