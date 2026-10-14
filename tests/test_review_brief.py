@@ -1796,25 +1796,27 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
     from hub import cli
 
     monkeypatch.setattr(cli, "_api", lambda *_a, **_k: brief)
-    cli.cmd_review_brief(argparse.Namespace(task_id=task_id))
+    cli.cmd_review_brief(argparse.Namespace(task_id=task_id, full=True))
     printed = capsys.readouterr().out
     cli_brief = _json.loads(printed[printed.index("{") :])
     assert cli_brief["diff_base"]["state"] == "not_applicable"
     assert cli_brief["diff_base"]["reason"]
 
     monkeypatch.setattr(mcp_server, "_api_get", fake_get)
-    text = (await mcp_server.hub_get_review_brief(task_id)).content[0].text
-    for needle in (
-        "результат: состояние",
-        ROLLBACK,
-        "поколение 2",
-        "expected_generation=2",
-        "повторное наблюдение, поколение 2",
-        "2026-10-09T12:00:00Z",
-        "не применимо",
-    ):
-        assert needle in text, needle
-    assert "sha_check: unknown" not in text and "Branch:" not in text
+    for section in ("", "full"):  # the whole decision block is in the default too
+        result = await mcp_server.hub_get_review_brief(task_id, section=section)
+        text = result.content[0].text
+        for needle in (
+            "результат: состояние",
+            ROLLBACK,
+            "поколение 2",
+            "expected_generation=2",
+            "повторное наблюдение, поколение 2",
+            "2026-10-09T12:00:00Z",
+            "не применимо",
+        ):
+            assert needle in text, needle
+        assert "sha_check: unknown" not in text and "Branch:" not in text
 
 
 # ---- #1652: the brief says where its assembly spent the time ----
@@ -1939,7 +1941,7 @@ async def test_brief_reports_block_timings(
     assert "diff_base" in rest["timings"]["blocks"]
 
     with patch("hub.mcp_server._api_get", AsyncMock(return_value=rest)):
-        out = await hub_get_review_brief(task_id)
+        out = await hub_get_review_brief(task_id, section="full")
     assert out.structuredContent["brief"]["timings"] == rest["timings"]
 
     stdout = StringIO()
@@ -1947,7 +1949,7 @@ async def test_brief_reports_block_timings(
         patch.object(cli, "_api", MagicMock(return_value=rest)),
         patch("sys.stdout", new=stdout),
     ):
-        cli.cmd_review_brief(MagicMock(task_id=task_id))
+        cli.cmd_review_brief(MagicMock(task_id=task_id, full=True))
     assert json.loads(stdout.getvalue())["timings"] == rest["timings"]
 
 
@@ -1958,7 +1960,7 @@ async def _mcp_brief_text(brief: dict) -> str:
     from hub.mcp_server import hub_get_review_brief
 
     with patch("hub.mcp_server._api_get", AsyncMock(return_value=brief)):
-        out = await hub_get_review_brief(brief["task_id"])
+        out = await hub_get_review_brief(brief["task_id"], section="full")
     return json.loads(out.content[0].text)["message"]
 
 

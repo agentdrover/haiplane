@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar
 import urllib.parse
 from datetime import UTC, datetime
 from collections.abc import Callable
@@ -53,6 +54,7 @@ from hub.workflow_reference import (
 from mcp.types import CallToolResult
 
 from hub.mcp_task_card import bounds_lines, build_compact_view
+from hub.services import review_brief_projection as brief_projection
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -68,6 +70,11 @@ from hub.mcp_structured import (
     structured_echo_result,
     structured_error_result,
     structured_tool_result,
+)
+
+
+_DISCARDED_ARGUMENTS: ContextVar[list[str]] = ContextVar(
+    "discarded_arguments", default=[]
 )
 
 
@@ -153,7 +160,11 @@ class InstrumentedFastMCP(FastMCP):
             # runs so no REST request or mutation happens (#1624).
             if name in AGENT_HIDDEN_TOOLS and not identity_is_human():
                 raise ToolError(_human_only_refusal(name, arguments))
-            result = await super().call_tool(name, arguments)
+            token = _DISCARDED_ARGUMENTS.set(discarded)
+            try:
+                result = await super().call_tool(name, arguments)
+            finally:
+                _DISCARDED_ARGUMENTS.reset(token)
         except Exception as exc:
             await record_call(
                 tool=name,
@@ -169,6 +180,16 @@ class InstrumentedFastMCP(FastMCP):
                 raise
             raise ToolError(_format_hub_api_error(refusal)) from exc
         result = attach_unknown_arguments(result, discarded)
+        if name == "hub_get_review_brief" and isinstance(result, CallToolResult):
+            # After every transformation: the size the client really receives.
+            section = str(arguments.get("section") or "")
+            brief_projection.log_issue(
+                result,
+                arguments.get("task_id"),
+                brief_projection.mode_of(section),
+                section,
+                arguments.get("offset") or 0,
+            )
         await record_call(
             tool=name,
             arguments=arguments,
@@ -2918,13 +2939,14 @@ def _state_review_lines(state: dict[str, Any]) -> list[str]:
 
 
 @mcp.tool()
-async def hub_get_review_brief(task_id: int) -> CallToolResult:
+async def hub_get_review_brief(
+    task_id: int, section: str = "", offset: int = 0, expect: str = ""
+) -> CallToolResult:
     """REVIEWER step: everything needed to review someone else's work (#308).
 
-    Not a step the submitting author runs. Returns acceptance criteria, scope,
-    validation commands, review checklist, branch/PR metadata with an advisory
-    diff command, the latest submission summary and the latest verdict with
-    findings.
+    Not a step the submitting author runs. Default: a compact projection
+    (<=12000 chars: verdicts, findings, CI trust, evidence, ACs, call sites);
+    section pages the rest, full is the whole brief.
 
     Fail-fast self-review check (#433): if YOU implemented this task the
     response opens with a self_review_warning — hand the review to an
@@ -2932,11 +2954,24 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
 
     Args:
         task_id: The task ID to review
+        section: call_sites|acceptance_criteria|statement|machine_review|verdict_findings|full
+        offset: Page start
+        expect: Previous page fingerprint
     """
     try:
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _error_result(exc)
+    if section == "full":
+        return _full_brief_result(brief)
+    # The funnel adds unknown_arguments afterwards; fit against that shape (#1682).
+    names = _DISCARDED_ARGUMENTS.get()
+    with brief_projection.finalizing(lambda r: attach_unknown_arguments(r, names)):
+        return brief_projection.brief_result(brief, section, offset, expect)
+
+
+def _full_brief_result(brief: dict[str, Any]) -> CallToolResult:
+    """The whole brief: prose text plus the brief in structuredContent (#308)."""
     parts = []
     # #433: fail-fast self-review notice goes FIRST so the reviewer stops
     # before spending review effort — hub_submit_review would reject anyway.
