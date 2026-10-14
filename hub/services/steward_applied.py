@@ -48,6 +48,7 @@ import aiosqlite
 from fastapi import HTTPException
 
 from hub import repository as repo
+from hub.services import watch_notices
 from hub.models import ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
@@ -357,9 +358,8 @@ async def _hand_to_the_human(
     # что счётчик исчерпанных бюджетов расходится в зависимости от того,
     # кто вернул работу, — а весь эпик стоит на сравнении этих двух
     # маршрутов.
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind=ESCALATED_TO_HUMAN,
         task_id=task_id,
         actor=_STEWARD_ACTOR,
         payload={"reason": "review_cycle_limit"},

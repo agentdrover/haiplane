@@ -2747,6 +2747,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE agent_sessions ADD COLUMN work_role TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # #1679: пожизненный дедуп уведомлений стюарду; ключи не стареют.
+        "create_watch_notices",
+        "CREATE TABLE IF NOT EXISTS watch_notices (key TEXT NOT NULL UNIQUE, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    ),
+    (
         # #1647: доказательства сдачи state-задачи. Одна строка на (задача,
         # поколение, AC). Только вставка: UPDATE запрещён триггером ниже, а
         # кода, который правит или удаляет строки, нет. principal_id — автор из
