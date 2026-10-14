@@ -129,22 +129,6 @@
     },
     {
       "path": "hub/services/lifecycle.py",
-      "function": "add_update",
-      "rule": "C901",
-      "measured": 23,
-      "max": 27,
-      "removed_by": "task:#1690 — разбиение add_update"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "add_update",
-      "rule": "PLR0915",
-      "measured": 92,
-      "max": 97,
-      "removed_by": "task:#1690 — разбиение add_update"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
       "function": "create_task",
       "rule": "C901",
       "measured": 19,
