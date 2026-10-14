@@ -2292,6 +2292,253 @@ async def _context_path_brief(
     )
 
 
+async def _context_navigation(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any, list[dict[str, Any]]]:
+    """Навигация /context: цепочка предков, дети, прогресс, соседи."""
+    breadcrumb = await db_module.get_breadcrumb(db, task_id)
+    children = await db_module.get_children(db, task_id)
+    progress = await db_module.get_progress(db, task_id) if children else None
+
+    siblings: list[dict[str, Any]] = []
+    if task.get("parent_id"):
+        sib_rows = await repo.get_siblings(db, task["parent_id"], task_id)
+        siblings = [dict(r) for r in sib_rows]
+    return breadcrumb, children, progress, siblings
+
+
+async def _context_task_view(
+    db: aiosqlite.Connection, row: Any, task_id: int
+) -> tuple[Any, Any, str]:
+    """Задача с критериями, проектом и живым деревом: ``(view, project, advisory)``."""
+    # Structured fields already come out of row_to_task after #39.
+    task_view = services.row_to_task(row)
+    ac_rows = await repo.list_acceptance_criteria(db, task_id)
+    task_view.acceptance_criteria = [services.row_to_ac(r) for r in ac_rows]
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
+    # #989: /context skipped enrich_task_view, so GET filling the field
+    # was not enough — name the live pair tree on both surfaces.
+    task_view = await services.apply_live_worktree(db, task_view)
+    worktree_advisory = await services.worktree_session_advisory(db, task_view)
+    return task_view, project_row, worktree_advisory
+
+
+def _context_readiness_summary(readiness_full: Any) -> dict[str, Any]:
+    """Сводка готовности для /context.
+
+    Required-only list comes straight from ReadinessReport (review I1);
+    do NOT recompute it from dor_checks — the latter contains every
+    check, including those optional for the current work_type.
+    """
+    blocking_recommendations = [
+        r for r in readiness_full.recommendations if r.severity == "blocking"
+    ][:5]
+    return {
+        "score": readiness_full.score,
+        "dor_passed": readiness_full.dor_passed,
+        "missing_required": readiness_full.missing_required,
+        "blocking_recommendations": [r.model_dump() for r in blocking_recommendations],
+    }
+
+
+async def _context_parent_goal(
+    db: aiosqlite.Connection, breadcrumb: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Ближайший предок типа epic/feature.
+
+    The breadcrumb already includes the current task as its last element;
+    iterate in reverse, skip self, and stop at the first match.
+    """
+    for node in reversed(breadcrumb[:-1]):  # exclude current task
+        if node.get("task_type") not in ("epic", "feature"):
+            continue
+        goal_row = await repo.get_task(db, node["id"])
+        if goal_row is None:
+            return None
+        goal_task = dict(goal_row)
+        return {
+            "id": goal_task["id"],
+            "task_type": goal_task.get("task_type", "task"),
+            "title": goal_task.get("title", ""),
+            "problem_statement": goal_task.get("problem_statement") or "",
+            "business_value": goal_task.get("business_value") or "",
+        }
+    return None
+
+
+def _context_head_lines(
+    task: dict[str, Any],
+    task_view: Any,
+    worktree_advisory: str,
+    breadcrumb: list[dict[str, Any]],
+    progress: Any,
+    siblings: list[dict[str, Any]],
+    children: list[dict[str, Any]],
+) -> list[str]:
+    """Путь, тип и статус, дерево, прогресс, соседи и дети."""
+    breadcrumb_str = " > ".join(
+        f"{c['task_type'].capitalize()}: {c['title']} (#{c['id']})" for c in breadcrumb
+    )
+    lines = ["## Current Work Context", f"Path: {breadcrumb_str}"]
+    lines.append(
+        f"Type: {task.get('task_type', 'task')} | Status: {task['status']} "
+        f"| Priority: {task.get('priority', 'medium')}"
+    )
+    if task_view.worktree_path:
+        lines.append(f"Worktree: {task_view.worktree_path}")
+    if worktree_advisory:
+        lines.append(worktree_advisory)
+    if progress:
+        lines.append(
+            f"Progress: {progress['completed']}/{progress['total']} "
+            f"completed ({progress['percent']}%)"
+        )
+    if siblings:
+        sib_strs = [f"{s['title']} (#{s['id']}/{s['status']})" for s in siblings[:5]]
+        lines.append(f"Siblings: {', '.join(sib_strs)}")
+    if children:
+        child_strs = [f"{c['title']} (#{c['id']}/{c['status']})" for c in children[:8]]
+        lines.append(f"Children: {', '.join(child_strs)}")
+    return lines
+
+
+def _context_goal_lines(
+    parent_goal: dict[str, Any] | None, task_view: Any
+) -> list[str]:
+    """Цель родителя и повествование самой задачи."""
+    lines: list[str] = []
+    if parent_goal:
+        lines.append(
+            f"Parent goal: {parent_goal['task_type'].capitalize()} "
+            f"#{parent_goal['id']} — {parent_goal['title']}"
+        )
+        if parent_goal["problem_statement"]:
+            lines.append(f"  Problem: {parent_goal['problem_statement']}")
+        if parent_goal["business_value"]:
+            lines.append(f"  Value: {parent_goal['business_value']}")
+    if task_view.user_story:
+        lines.append(f"User story: {task_view.user_story}")
+    if task_view.problem_statement:
+        lines.append(f"Problem: {task_view.problem_statement}")
+    if task_view.business_value:
+        lines.append(f"Value: {task_view.business_value}")
+    return lines
+
+
+def _context_outcome_lines(task_view: Any) -> list[str]:
+    """Исход, пересмотр, решение о переделке и пригодность агенту."""
+    lines: list[str] = []
+    if task_view.outcome_metric:
+        # Discovery (#331): the number that should move, and when we check.
+        outcome = f"Outcome: {task_view.outcome_metric}"
+        if task_view.outcome_indicator:
+            outcome += f" (leading: {task_view.outcome_indicator})"
+        if task_view.outcome_deadline:
+            outcome += f" by {task_view.outcome_deadline}"
+        lines.append(outcome)
+    if task_view.outcome_revisit_condition:
+        lines.append(f"Revisit if: {task_view.outcome_revisit_condition}")
+    if task_view.redesign_decision:
+        decision = f"Redesign decision: {task_view.redesign_decision.value}"
+        if task_view.redesign_rationale:
+            decision += f" — {task_view.redesign_rationale}"
+        lines.append(decision)
+    if task_view.agent_fit:
+        lines.append(f"Agent fit: {task_view.agent_fit.value}")
+    return lines
+
+
+def _context_scope_lines(task_view: Any) -> list[str]:
+    """Объём, проверки, критерии и риски."""
+    lines: list[str] = []
+    if task_view.scope_in:
+        lines.append(f"In-scope: {', '.join(task_view.scope_in)}")
+    if task_view.scope_out:
+        lines.append(f"Out-of-scope: {', '.join(task_view.scope_out)}")
+    if task_view.validation_commands:
+        lines.append("Validation: " + " && ".join(task_view.validation_commands))
+    if task_view.acceptance_criteria:
+        ac_ids = ", ".join(ac.id for ac in task_view.acceptance_criteria)
+        lines.append(
+            f"Acceptance criteria ({len(task_view.acceptance_criteria)}): {ac_ids}"
+        )
+    if task_view.risks:
+        # Use .value so the digest reads as 'security:high', not
+        # 'RiskKind.security:RiskSeverity.high' (review I4).
+        risk_brief = ", ".join(
+            f"{r.kind.value}:{r.severity.value}" for r in task_view.risks[:5]
+        )
+        lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
+    return lines
+
+
+def _context_review_lines(task_view: Any) -> list[str]:
+    """Последнее ревью и до десяти его находок."""
+    lr = task_view.latest_review
+    if not lr:
+        return []
+    freshness = latest_review_freshness(lr.is_current, lr.closed_by_decision)
+    solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
+    lines = [
+        f"Latest review: {lr.verdict.value.upper()} "
+        f"for submission #{lr.submission_generation} ({freshness}){solo}"
+    ]
+    for finding in lr.findings[:10]:
+        scope_mark = ""
+        if finding.scope == FindingScope.out_of_scope:
+            scope_mark = (
+                f" [out-of-scope → #{finding.linked_task_id}]"
+                if finding.linked_task_id
+                else " [out-of-scope]"
+            )
+        lines.append(
+            f"  {finding.id}. [{finding.severity.value}]{scope_mark} {finding.message}"
+        )
+    return lines
+
+
+def _context_readiness_lines(readiness_summary: dict[str, Any]) -> list[str]:
+    lines = [
+        f"Readiness: score={readiness_summary['score']} "
+        f"dor_passed={'yes' if readiness_summary['dor_passed'] else 'no'}"
+    ]
+    if readiness_summary["missing_required"]:
+        lines.append(
+            f"  Missing required: {', '.join(readiness_summary['missing_required'])}"
+        )
+    return lines
+
+
+def _context_place_rules(lines: list[str], rules_text: str, mode: str) -> None:
+    """Правила рабочего процесса и карта жизненного цикла встают по режиму."""
+    if mode == "summary":
+        # Сводка стоит в начале: потолок режет хвост, и место под правила
+        # занято до сокращения остального контекста.
+        lines.insert(2, rules_text)
+    else:
+        lines.append("")
+        lines.append(rules_text)
+        lines.append("")
+        lines.extend(lifecycle_map_lines())
+
+
+def _context_truncate(
+    lines: list[str], response: Response, mode: str, max_chars: int | None
+) -> str:
+    """Текст дайджеста под потолком; обрезка помечает ответ ``X-Hub-Truncated``."""
+    effective_max_chars = max_chars
+    if mode == "summary" and effective_max_chars is None:
+        effective_max_chars = 4000
+    context_text, char_truncated = truncate_text("\n".join(lines), effective_max_chars)
+    if char_truncated:
+        response.headers["X-Hub-Truncated"] = "true"
+    return context_text
+
+
 @app.get("/api/tasks/{task_id}/context", response_model=TaskContextView)
 async def api_task_context(
     task_id: int,
@@ -2316,166 +2563,29 @@ async def api_task_context(
         raise HTTPException(404, "task not found")
     task = dict(row)
 
-    breadcrumb = await db_module.get_breadcrumb(db, task_id)
-    children = await db_module.get_children(db, task_id)
-    progress = await db_module.get_progress(db, task_id) if children else None
-
-    siblings: list[dict[str, Any]] = []
-    if task.get("parent_id"):
-        sib_rows = await repo.get_siblings(db, task["parent_id"], task_id)
-        siblings = [dict(r) for r in sib_rows]
-
-    # --- Hydrate the current task with ACs (structured fields already
-    # come out of row_to_task after #39).
-    task_view = services.row_to_task(row)
-    ac_rows = await repo.list_acceptance_criteria(db, task_id)
-    task_view.acceptance_criteria = [services.row_to_ac(r) for r in ac_rows]
-    project_row = await repo.resolve_project_for_task(db, task_id)
-    if project_row is not None:
-        task_view.project = TaskProjectRef(
-            id=project_row["id"], slug=project_row["slug"]
-        )
-    # #989: /context skipped enrich_task_view, so GET filling the field
-    # was not enough — name the live pair tree on both surfaces.
-    task_view = await services.apply_live_worktree(db, task_view)
-    worktree_advisory = await services.worktree_session_advisory(db, task_view)
-
-    # --- Readiness summary. Reuse the same calculator as /readiness so
-    # /context and /readiness can never drift.
+    breadcrumb, children, progress, siblings = await _context_navigation(
+        db, task_id, task
+    )
+    task_view, project_row, worktree_advisory = await _context_task_view(
+        db, row, task_id
+    )
+    # Reuse the same calculator as /readiness so /context and /readiness can
+    # never drift.
     readiness_full = await services.get_readiness(db, task_id, explain=False)
-    # Required-only list comes straight from ReadinessReport (review I1);
-    # do NOT recompute it from dor_checks — the latter contains every
-    # check, including those optional for the current work_type.
-    missing_required = readiness_full.missing_required
-    blocking_recommendations = [
-        r for r in readiness_full.recommendations if r.severity == "blocking"
-    ][:5]
-    readiness_summary = {
-        "score": readiness_full.score,
-        "dor_passed": readiness_full.dor_passed,
-        "missing_required": missing_required,
-        "blocking_recommendations": [r.model_dump() for r in blocking_recommendations],
-    }
-
-    # --- Parent goal: nearest ancestor of type epic/feature. The
-    # breadcrumb already includes the current task as its last element;
-    # iterate in reverse, skip self, and stop at the first match.
-    parent_goal: dict[str, Any] | None = None
-    for node in reversed(breadcrumb[:-1]):  # exclude current task
-        if node.get("task_type") in ("epic", "feature"):
-            goal_row = await repo.get_task(db, node["id"])
-            if goal_row is not None:
-                goal_task = dict(goal_row)
-                parent_goal = {
-                    "id": goal_task["id"],
-                    "task_type": goal_task.get("task_type", "task"),
-                    "title": goal_task.get("title", ""),
-                    "problem_statement": goal_task.get("problem_statement") or "",
-                    "business_value": goal_task.get("business_value") or "",
-                }
-            break
+    readiness_summary = _context_readiness_summary(readiness_full)
+    parent_goal = await _context_parent_goal(db, breadcrumb)
 
     # --- Human/LLM digest. Structure matters: keep stable section headers
     # so downstream prompts can grep/extract predictably.
-    breadcrumb_str = " > ".join(
-        f"{c['task_type'].capitalize()}: {c['title']} (#{c['id']})" for c in breadcrumb
+    lines = _context_head_lines(
+        task, task_view, worktree_advisory, breadcrumb, progress, siblings, children
     )
-    lines = ["## Current Work Context", f"Path: {breadcrumb_str}"]
-    lines.append(
-        f"Type: {task.get('task_type', 'task')} | Status: {task['status']} "
-        f"| Priority: {task.get('priority', 'medium')}"
-    )
-    if task_view.worktree_path:
-        lines.append(f"Worktree: {task_view.worktree_path}")
-    if worktree_advisory:
-        lines.append(worktree_advisory)
-    if progress:
-        lines.append(
-            f"Progress: {progress['completed']}/{progress['total']} "
-            f"completed ({progress['percent']}%)"
-        )
-    if siblings:
-        sib_strs = [f"{s['title']} (#{s['id']}/{s['status']})" for s in siblings[:5]]
-        lines.append(f"Siblings: {', '.join(sib_strs)}")
-    if children:
-        child_strs = [f"{c['title']} (#{c['id']}/{c['status']})" for c in children[:8]]
-        lines.append(f"Children: {', '.join(child_strs)}")
-    if parent_goal:
-        lines.append(
-            f"Parent goal: {parent_goal['task_type'].capitalize()} "
-            f"#{parent_goal['id']} — {parent_goal['title']}"
-        )
-        if parent_goal["problem_statement"]:
-            lines.append(f"  Problem: {parent_goal['problem_statement']}")
-        if parent_goal["business_value"]:
-            lines.append(f"  Value: {parent_goal['business_value']}")
-    if task_view.user_story:
-        lines.append(f"User story: {task_view.user_story}")
-    if task_view.problem_statement:
-        lines.append(f"Problem: {task_view.problem_statement}")
-    if task_view.business_value:
-        lines.append(f"Value: {task_view.business_value}")
-    if task_view.outcome_metric:
-        # Discovery (#331): the number that should move, and when we check.
-        outcome = f"Outcome: {task_view.outcome_metric}"
-        if task_view.outcome_indicator:
-            outcome += f" (leading: {task_view.outcome_indicator})"
-        if task_view.outcome_deadline:
-            outcome += f" by {task_view.outcome_deadline}"
-        lines.append(outcome)
-    if task_view.outcome_revisit_condition:
-        lines.append(f"Revisit if: {task_view.outcome_revisit_condition}")
-    if task_view.redesign_decision:
-        decision = f"Redesign decision: {task_view.redesign_decision.value}"
-        if task_view.redesign_rationale:
-            decision += f" — {task_view.redesign_rationale}"
-        lines.append(decision)
-    if task_view.agent_fit:
-        lines.append(f"Agent fit: {task_view.agent_fit.value}")
-    if task_view.scope_in:
-        lines.append(f"In-scope: {', '.join(task_view.scope_in)}")
-    if task_view.scope_out:
-        lines.append(f"Out-of-scope: {', '.join(task_view.scope_out)}")
-    if task_view.validation_commands:
-        lines.append("Validation: " + " && ".join(task_view.validation_commands))
-    if task_view.acceptance_criteria:
-        ac_ids = ", ".join(ac.id for ac in task_view.acceptance_criteria)
-        lines.append(
-            f"Acceptance criteria ({len(task_view.acceptance_criteria)}): {ac_ids}"
-        )
-    if task_view.risks:
-        # Use .value so the digest reads as 'security:high', not
-        # 'RiskKind.security:RiskSeverity.high' (review I4).
-        risk_brief = ", ".join(
-            f"{r.kind.value}:{r.severity.value}" for r in task_view.risks[:5]
-        )
-        lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
-    if task_view.latest_review:
-        lr = task_view.latest_review
-        freshness = latest_review_freshness(lr.is_current, lr.closed_by_decision)
-        solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
-        lines.append(
-            f"Latest review: {lr.verdict.value.upper()} "
-            f"for submission #{lr.submission_generation} ({freshness}){solo}"
-        )
-        for finding in lr.findings[:10]:
-            scope_mark = ""
-            if finding.scope == FindingScope.out_of_scope:
-                scope_mark = (
-                    f" [out-of-scope → #{finding.linked_task_id}]"
-                    if finding.linked_task_id
-                    else " [out-of-scope]"
-                )
-            lines.append(
-                f"  {finding.id}. [{finding.severity.value}]{scope_mark} "
-                f"{finding.message}"
-            )
-    lines.append(
-        f"Readiness: score={readiness_summary['score']} "
-        f"dor_passed={'yes' if readiness_summary['dor_passed'] else 'no'}"
-    )
-    if missing_required:
-        lines.append(f"  Missing required: {', '.join(missing_required)}")
+    lines += _context_goal_lines(parent_goal, task_view)
+    lines += _context_outcome_lines(task_view)
+    lines += _context_scope_lines(task_view)
+    lines += _context_review_lines(task_view)
+    lines += _context_readiness_lines(readiness_summary)
+
     # #1630: «Правила работы» — тот же блок, что в pair-start. Чтение файла
     # правил ничего не пишет; в summary тексты слоёв опущены.
     from hub.services import working_rules as working_rules_service
@@ -2490,24 +2600,8 @@ async def api_task_context(
     path_brief = await _context_path_brief(
         request, db, project_row, breadcrumb, siblings, children, mode
     )
-    if mode == "summary":
-        # Сводка стоит в начале: потолок режет хвост, и место под правила
-        # занято до сокращения остального контекста.
-        lines.insert(2, rules_text)
-    else:
-        lines.append("")
-        lines.append(rules_text)
-    if mode == "full":
-        lines.append("")
-        lines.extend(lifecycle_map_lines())
-
-    effective_max_chars = max_chars
-    if mode == "summary" and effective_max_chars is None:
-        effective_max_chars = 4000
-
-    context_text, char_truncated = truncate_text("\n".join(lines), effective_max_chars)
-    if char_truncated:
-        response.headers["X-Hub-Truncated"] = "true"
+    _context_place_rules(lines, rules_text, mode)
+    context_text = _context_truncate(lines, response, mode, max_chars)
 
     return {
         "task_id": task_id,

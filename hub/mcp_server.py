@@ -853,66 +853,69 @@ def _format_task(t: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _status_section(
+    heading: str,
+    items: list[dict[str, Any]],
+    render: Callable[[Any], str],
+    limit: int | None = None,
+) -> list[str]:
+    """Секция обзора: заголовок и строки ``- …``; пустая секция не пишется."""
+    if not items:
+        return []
+    return [heading, *(f"- {render(item)}" for item in items[:limit])]
+
+
+def _commit_line(commit: dict[str, Any]) -> str:
+    msg = commit.get("message", "").split("\n")[0][:80]
+    return f"{commit.get('sha', '')} {msg}"
+
+
+def _status_sections(data: dict[str, Any]) -> list[str]:
+    """Восемь секций обзора по порядку; начальные переносы входят в заголовки."""
+    parts: list[str] = []
+    parts += _status_section(
+        "## Drafts (need approval)", data.get("draft_tasks", []), _format_task
+    )
+    parts += _status_section(
+        "\n## Needs Info (agent asked a question)",
+        data.get("needs_info_tasks", []),
+        _format_task,
+    )
+    parts += _status_section(
+        "\n## Under Review",
+        data.get("review_tasks", []),
+        lambda t: f"{_format_task(t)} (review cycle {t.get('review_cycle', 0) + 1})",
+    )
+    parts += _status_section(
+        "\n## Needs Decision (arbiter report ready)",
+        data.get("needs_decision_tasks", []),
+        lambda t: f"{_format_task(t)} — ARBITER REPORT READY, human must decide",
+    )
+    parts += _status_section(
+        "\n## Active Tasks (open / running)", data.get("active_tasks", []), _format_task
+    )
+    parts += _status_section(
+        "\n## Open PRs",
+        data.get("open_prs", []),
+        lambda pr: f"#{pr['number']} {pr['title']} ({pr.get('headRefName', '')})",
+    )
+    parts += _status_section(
+        "\n## Recent Commits", data.get("recent_commits", []), _commit_line, 5
+    )
+    parts += _status_section(
+        "\n## Recent Decisions",
+        data.get("recent_decisions", []),
+        lambda d: d.get("title", "Decision"),
+        5,
+    )
+    return parts
+
+
 @mcp.tool()
 async def hub_project_status() -> CallToolResult:
     """Get project overview: active tasks, drafts needing approval, tasks with questions, open PRs, recent commits, decisions."""
     data = await _api_get("/api/dashboard")
-    parts: list[str] = []
-
-    drafts = data.get("draft_tasks", [])
-    if drafts:
-        parts.append("## Drafts (need approval)")
-        for t in drafts:
-            parts.append(f"- {_format_task(t)}")
-
-    needs_info = data.get("needs_info_tasks", [])
-    if needs_info:
-        parts.append("\n## Needs Info (agent asked a question)")
-        for t in needs_info:
-            parts.append(f"- {_format_task(t)}")
-
-    review = data.get("review_tasks", [])
-    if review:
-        parts.append("\n## Under Review")
-        for t in review:
-            cycle = t.get("review_cycle", 0)
-            parts.append(f"- {_format_task(t)} (review cycle {cycle + 1})")
-
-    needs_decision = data.get("needs_decision_tasks", [])
-    if needs_decision:
-        parts.append("\n## Needs Decision (arbiter report ready)")
-        for t in needs_decision:
-            parts.append(
-                f"- {_format_task(t)} — ARBITER REPORT READY, human must decide"
-            )
-
-    tasks = data.get("active_tasks", [])
-    if tasks:
-        parts.append("\n## Active Tasks (open / running)")
-        for t in tasks:
-            parts.append(f"- {_format_task(t)}")
-
-    prs = data.get("open_prs", [])
-    if prs:
-        parts.append("\n## Open PRs")
-        for pr in prs:
-            parts.append(
-                f"- #{pr['number']} {pr['title']} ({pr.get('headRefName', '')})"
-            )
-
-    commits = data.get("recent_commits", [])
-    if commits:
-        parts.append("\n## Recent Commits")
-        for c in commits[:5]:
-            msg = c.get("message", "").split("\n")[0][:80]
-            parts.append(f"- {c.get('sha', '')} {msg}")
-
-    decisions = data.get("recent_decisions", [])
-    if decisions:
-        parts.append("\n## Recent Decisions")
-        for d in decisions[:5]:
-            title = d.get("title", "Decision")
-            parts.append(f"- {title}")
+    parts = _status_sections(data)
 
     queue, queue_error = await _orchestrator_queue()
     parts.extend(_queue_lines(queue))
@@ -5306,6 +5309,174 @@ def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def _prepare_refine_body(fields: dict[str, Any], analyst: str) -> dict[str, Any]:
+    """Тело refine для hub_prepare_developer_task (#1691).
+
+    Два поля идут НЕ через refine, и это не забывчивость: критерии приёмки
+    заменяются атомарно своим вызовом, а риски добавляются с учётом
+    risk_mode (dedupe/append/replace). Отправить их сюда значило бы сделать
+    обе операции обычным PATCH и потерять и атомарность, и режим.
+    """
+    work_type = fields.get("work_type")
+    if fields.get("wip_tag") is None and (work_type is None or work_type == "feature"):
+        fields["wip_tag"] = "feature_work"
+    refine_body: dict[str, Any] = {
+        k: v
+        for k, v in fields.items()
+        if v is not None and k not in ("acceptance_criteria", "risks")
+    }
+    refine_body["prepared_by"] = analyst
+    refine_body["prepared_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+    return refine_body
+
+
+def _prepare_default_validation(
+    refine_body: dict[str, Any],
+    fields: dict[str, Any],
+    effective_work_type: Any,
+    current_task: dict[str, Any],
+) -> None:
+    """Код получает базовый набор проверок, если ни вызов, ни задача его не назвали.
+
+    #543: the format gate used to reach a task only if the analyst happened to
+    remember it, and CI never ran on develop — that pair let the #505–#510
+    stack land six unformatted files. An explicit argument always wins,
+    including an explicit empty list, which means "no commands" rather than
+    "use the default". Docs tasks get nothing: there is no code to lint.
+    """
+    if (
+        fields.get("validation_commands") is None
+        and effective_work_type != "docs"
+        and not (current_task.get("validation_commands") or [])
+    ):
+        refine_body["validation_commands"] = list(BASE_VALIDATION_COMMANDS)
+
+
+def _prepare_risk_plan(
+    risk_mode: str,
+    risks: list[dict[str, Any]] | None,
+    existing_risks: list[dict[str, Any]],
+    refine_body: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(incoming, duplicates, to_add)``; режим replace кладёт риски в refine."""
+    existing_risk_keys = {_risk_key(risk) for risk in existing_risks}
+    incoming_risks = risks or []
+    duplicate_risks = [
+        risk for risk in incoming_risks if _risk_key(risk) in existing_risk_keys
+    ]
+    if risk_mode == "dedupe":
+        risks_to_add = [
+            risk for risk in incoming_risks if _risk_key(risk) not in existing_risk_keys
+        ]
+    elif risk_mode == "append":
+        risks_to_add = incoming_risks
+    else:
+        risks_to_add = []
+        if risks is not None:
+            refine_body["risks"] = risks
+    return incoming_risks, duplicate_risks, risks_to_add
+
+
+def _prepare_plan(
+    refine_body: dict[str, Any],
+    current_task: dict[str, Any],
+    acceptance_criteria: list[dict[str, Any]] | None,
+    existing_acs: list[dict[str, Any]],
+    risks: list[dict[str, Any]] | None,
+    risk_mode: str,
+    risk_counts: tuple[int, int, int, int],
+) -> tuple[list[str], dict[str, Any]]:
+    """Плановые операции и diff; ``risk_counts`` — existing, incoming, dup, to_add."""
+    existing_n, incoming_n, duplicate_n, to_add_n = risk_counts
+    planned_operations: list[str] = []
+    if refine_body:
+        planned_operations.append("refine_task")
+    if acceptance_criteria is not None:
+        planned_operations.append("replace_acceptance_criteria")
+    if risk_mode == "replace" and risks is not None:
+        planned_operations.append("replace_risks")
+    elif to_add_n:
+        planned_operations.extend("add_risk" for _ in range(to_add_n))
+    planned_operations.append("write_analyst_update")
+    structured_fields_to_change = [
+        key for key, val in refine_body.items() if current_task.get(key) != val
+    ]
+    diff = {
+        "structured_fields_to_change": sorted(structured_fields_to_change),
+        "will_replace_acceptance_criteria": acceptance_criteria is not None,
+        "existing_acceptance_criteria_count": len(existing_acs),
+        "new_acceptance_criteria_count": len(acceptance_criteria)
+        if acceptance_criteria is not None
+        else None,
+        "risk_mode": risk_mode,
+        "existing_risks_count": existing_n,
+        "incoming_risks_count": incoming_n,
+        "duplicate_risks_count": duplicate_n,
+        "risks_to_add_count": to_add_n,
+    }
+    return planned_operations, diff
+
+
+async def _prepare_write_changes(
+    task_id: int,
+    refine_body: dict[str, Any],
+    acceptance_criteria: list[dict[str, Any]] | None,
+    risks_to_add: list[dict[str, Any]],
+) -> tuple[list[str], int | None, int]:
+    """Записи: refine, замена критериев, добавление рисков по одному."""
+    updated_columns: list[str] = []
+    if refine_body:
+        refine_result = await _api_post(f"/api/tasks/{task_id}/refine", refine_body)
+        updated_columns = sorted(refine_result.get("updated_columns") or [])
+
+    ac_count: int | None = None
+    if acceptance_criteria is not None:
+        ac_result = await _api_put(
+            f"/api/tasks/{task_id}/acceptance_criteria",
+            acceptance_criteria,
+        )
+        ac_count = (
+            len(ac_result) if isinstance(ac_result, list) else len(acceptance_criteria)
+        )
+
+    risks_added = 0
+    for risk in risks_to_add:
+        await _api_post(f"/api/tasks/{task_id}/risks", risk)
+        risks_added += 1
+    return updated_columns, ac_count, risks_added
+
+
+async def _prepare_write_update(
+    task_id: int,
+    analyst: str,
+    readiness: dict[str, Any],
+    ac_count: int | None,
+    risks_added: int,
+    duplicate_count: int,
+    handoff_text: str,
+) -> None:
+    """Запись аналитика в ленту: готовность, критерии, риски и передача."""
+    missing_required = readiness.get("missing_required") or []
+    update_message = (
+        "Analyst preparation complete: "
+        f"readiness score={readiness.get('score')}, "
+        f"dor_passed={'yes' if bool(readiness.get('dor_passed')) else 'no'}, "
+        f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
+        f"risks_added={risks_added}, duplicate_risks={duplicate_count}.\n\n"
+        f"Developer handoff:\n{handoff_text}"
+    )
+    if missing_required:
+        update_message += " Missing required: " + ", ".join(missing_required) + "."
+    await _api_post(
+        f"/api/tasks/{task_id}/updates",
+        {
+            "agent": analyst,
+            "kind": "status",
+            "content": update_message,
+        },
+    )
+
+
 # Поля TaskRefine, которых hub_prepare_developer_task НЕ публикует (#1068).
 # Инструмент — операция аналитика над УЖЕ созданной задачей, поэтому поля
 # создания и паспорта дефекта в него не входят.
@@ -5367,86 +5538,37 @@ async def hub_prepare_developer_task(
 
     # Имена, которые тело читает дальше по коду. Явно и в одном месте: раньше
     # они приходили параметрами, и список параметров дублировал список полей.
-    work_type = fields.get("work_type")
     acceptance_criteria = fields.get("acceptance_criteria")
     risks = fields.get("risks")
     validation_commands = fields.get("validation_commands")
-    problem_statement = fields.get("problem_statement")
-    business_value = fields.get("business_value")
-    scope_in = fields.get("scope_in")
-    scope_out = fields.get("scope_out")
     affected_areas = fields.get("affected_areas")
-    review_checklist = fields.get("review_checklist")
 
-    if fields.get("wip_tag") is None and (work_type is None or work_type == "feature"):
-        fields["wip_tag"] = "feature_work"
-
-    # Два поля идут НЕ через refine, и это не забывчивость: критерии приёмки
-    # заменяются атомарно своим вызовом, а риски добавляются с учётом
-    # risk_mode (dedupe/append/replace). Отправить их сюда значило бы сделать
-    # обе операции обычным PATCH и потерять и атомарность, и режим.
-    refine_body: dict[str, Any] = {
-        k: v
-        for k, v in fields.items()
-        if v is not None and k not in ("acceptance_criteria", "risks")
-    }
-    refine_body["prepared_by"] = analyst
-    refine_body["prepared_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
-
+    refine_body = _prepare_refine_body(fields, analyst)
     current_task = await _api_get(f"/api/tasks/{task_id}")
-
-    # #543: hand code tasks the base validation set when neither the caller nor
-    # the task already names one. The format gate used to reach a task only if
-    # the analyst happened to remember it, and CI never ran on develop — that
-    # pair let the #505–#510 stack land six unformatted files. An explicit
-    # argument always wins, including an explicit empty list, which means "no
-    # commands" rather than "use the default". Docs tasks get nothing: there is
-    # no code to lint.
-    effective_work_type = work_type or current_task.get("work_type")
-    if (
-        validation_commands is None
-        and effective_work_type != "docs"
-        and not (current_task.get("validation_commands") or [])
-    ):
-        refine_body["validation_commands"] = list(BASE_VALIDATION_COMMANDS)
+    effective_work_type = fields.get("work_type") or current_task.get("work_type")
+    _prepare_default_validation(refine_body, fields, effective_work_type, current_task)
 
     existing_acs: list[dict[str, Any]] = []
     if acceptance_criteria is not None:
         existing_acs = await _api_get(f"/api/tasks/{task_id}/acceptance_criteria")
 
     existing_risks = current_task.get("risks") or []
-    existing_risk_keys = {_risk_key(risk) for risk in existing_risks}
-    incoming_risks = risks or []
-    duplicate_risks = [
-        risk for risk in incoming_risks if _risk_key(risk) in existing_risk_keys
-    ]
-    if risk_mode == "dedupe":
-        risks_to_add = [
-            risk for risk in incoming_risks if _risk_key(risk) not in existing_risk_keys
-        ]
-    elif risk_mode == "append":
-        risks_to_add = incoming_risks
-    else:
-        risks_to_add = []
-        if risks is not None:
-            refine_body["risks"] = risks
-
-    structured_fields_to_change = [
-        key for key, val in refine_body.items() if current_task.get(key) != val
-    ]
+    incoming_risks, duplicate_risks, risks_to_add = _prepare_risk_plan(
+        risk_mode, risks, existing_risks, refine_body
+    )
 
     handoff_text = _developer_handoff_text(
         task_id,
         work_type=effective_work_type,
-        problem_statement=problem_statement,
-        business_value=business_value,
-        scope_in=scope_in,
-        scope_out=scope_out,
+        problem_statement=fields.get("problem_statement"),
+        business_value=fields.get("business_value"),
+        scope_in=fields.get("scope_in"),
+        scope_out=fields.get("scope_out"),
         affected_areas=affected_areas,
         validation_commands=validation_commands,
         acceptance_criteria=acceptance_criteria,
         risks=risks,
-        review_checklist=review_checklist,
+        review_checklist=fields.get("review_checklist"),
     )
     quality_warnings = _prepare_quality_warnings(
         acceptance_criteria,
@@ -5456,29 +5578,20 @@ async def hub_prepare_developer_task(
         validation_commands,
         risk_mode,
     )
-    planned_operations: list[str] = []
-    if refine_body:
-        planned_operations.append("refine_task")
-    if acceptance_criteria is not None:
-        planned_operations.append("replace_acceptance_criteria")
-    if risk_mode == "replace" and risks is not None:
-        planned_operations.append("replace_risks")
-    elif risks_to_add:
-        planned_operations.extend("add_risk" for _ in risks_to_add)
-    planned_operations.append("write_analyst_update")
-    diff = {
-        "structured_fields_to_change": sorted(structured_fields_to_change),
-        "will_replace_acceptance_criteria": acceptance_criteria is not None,
-        "existing_acceptance_criteria_count": len(existing_acs),
-        "new_acceptance_criteria_count": len(acceptance_criteria)
-        if acceptance_criteria is not None
-        else None,
-        "risk_mode": risk_mode,
-        "existing_risks_count": len(existing_risks),
-        "incoming_risks_count": len(incoming_risks),
-        "duplicate_risks_count": len(duplicate_risks),
-        "risks_to_add_count": len(risks_to_add),
-    }
+    planned_operations, diff = _prepare_plan(
+        refine_body,
+        current_task,
+        acceptance_criteria,
+        existing_acs,
+        risks,
+        risk_mode,
+        (
+            len(existing_risks),
+            len(incoming_risks),
+            len(duplicate_risks),
+            len(risks_to_add),
+        ),
+    )
 
     if mode == "preview":
         return json.dumps(
@@ -5497,49 +5610,19 @@ async def hub_prepare_developer_task(
             indent=2,
         )
 
-    updated_columns: list[str] = []
-    if refine_body:
-        refine_result = await _api_post(f"/api/tasks/{task_id}/refine", refine_body)
-        cols = refine_result.get("updated_columns") or []
-        updated_columns = sorted(cols) if isinstance(cols, list) else sorted(cols)
-
-    ac_count: int | None = None
-    if acceptance_criteria is not None:
-        ac_result = await _api_put(
-            f"/api/tasks/{task_id}/acceptance_criteria",
-            acceptance_criteria,
-        )
-        ac_count = (
-            len(ac_result) if isinstance(ac_result, list) else len(acceptance_criteria)
-        )
-
-    risks_added = 0
-    for risk in risks_to_add:
-        await _api_post(f"/api/tasks/{task_id}/risks", risk)
-        risks_added += 1
-
+    updated_columns, ac_count, risks_added = await _prepare_write_changes(
+        task_id, refine_body, acceptance_criteria, risks_to_add
+    )
     readiness = await _api_get(f"/api/tasks/{task_id}/readiness")
     dor_passed = bool(readiness.get("dor_passed"))
-    missing_required = readiness.get("missing_required") or []
-    next_action = "ready_for_developer" if dor_passed else "needs_analyst_followup"
-    score = readiness.get("score")
-
-    update_message = (
-        "Analyst preparation complete: "
-        f"readiness score={score}, dor_passed={'yes' if dor_passed else 'no'}, "
-        f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
-        f"risks_added={risks_added}, duplicate_risks={len(duplicate_risks)}.\n\n"
-        f"Developer handoff:\n{handoff_text}"
-    )
-    if missing_required:
-        update_message += " Missing required: " + ", ".join(missing_required) + "."
-    await _api_post(
-        f"/api/tasks/{task_id}/updates",
-        {
-            "agent": analyst,
-            "kind": "status",
-            "content": update_message,
-        },
+    await _prepare_write_update(
+        task_id,
+        analyst,
+        readiness,
+        ac_count,
+        risks_added,
+        len(duplicate_risks),
+        handoff_text,
     )
 
     return json.dumps(
@@ -5551,14 +5634,16 @@ async def hub_prepare_developer_task(
                 "acceptance_criteria_count": ac_count,
                 "risks_added": risks_added,
                 "duplicate_risks_count": len(duplicate_risks),
-                "readiness_score": score,
+                "readiness_score": readiness.get("score"),
                 "dor_passed": dor_passed,
-                "missing_required": missing_required,
+                "missing_required": readiness.get("missing_required") or [],
                 "recommendations_count": len(readiness.get("recommendations") or []),
                 "diff": diff,
                 "quality_warnings": quality_warnings,
                 "developer_handoff_text": handoff_text,
-                "next_action": next_action,
+                "next_action": (
+                    "ready_for_developer" if dor_passed else "needs_analyst_followup"
+                ),
             }
         ),
         ensure_ascii=False,
