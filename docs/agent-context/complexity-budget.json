@@ -32,22 +32,6 @@
   "headroom_pct": 15.0,
   "waivers": [
     {
-      "path": "hub/app.py",
-      "function": "api_task_context",
-      "rule": "C901",
-      "measured": 38,
-      "max": 43,
-      "removed_by": "task:#1691 — разбиение api_task_context"
-    },
-    {
-      "path": "hub/app.py",
-      "function": "api_task_context",
-      "rule": "PLR0915",
-      "measured": 117,
-      "max": 125,
-      "removed_by": "task:#1691 — разбиение api_task_context"
-    },
-    {
       "path": "hub/cli.py",
       "function": "build_parser",
       "rule": "PLR0915",
@@ -78,30 +62,6 @@
       "measured": 16,
       "max": 19,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/mcp_server.py",
-      "function": "hub_prepare_developer_task",
-      "rule": "C901",
-      "measured": 18,
-      "max": 23,
-      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
-    },
-    {
-      "path": "hub/mcp_server.py",
-      "function": "hub_prepare_developer_task",
-      "rule": "PLR0915",
-      "measured": 75,
-      "max": 76,
-      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
-    },
-    {
-      "path": "hub/mcp_server.py",
-      "function": "hub_project_status",
-      "rule": "C901",
-      "measured": 18,
-      "max": 20,
-      "removed_by": "task:#1691 — разбиение hub_project_status"
     },
     {
       "path": "hub/mcp_structured.py",
@@ -150,14 +110,6 @@
       "measured": 20,
       "max": 23,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/web.py",
-      "function": "_web_task_detail_page",
-      "rule": "PLR0915",
-      "measured": 69,
-      "max": 72,
-      "removed_by": "task:#1691 — разбиение _web_task_detail_page"
     }
   ]
 }
