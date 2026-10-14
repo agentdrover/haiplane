@@ -854,8 +854,14 @@ async def note_ci_after_start(
     """Судья стартовал — если без подтверждённого CI, строка в ленте (#1695)."""
     if order.get("kind", KIND_VERDICT) != KIND_VERDICT:
         return
-    gate = await review_wait_gate(db, task)
-    await _note_ci(db, int(order["task_id"]), int(order["generation"]), gate)
+    note = str(order.get("ci_note") or "")
+    if not note:
+        return
+    from hub.services.steward_ci_wait import note_judged_without_ci
+
+    await note_judged_without_ci(
+        db, int(order["task_id"]), int(order["generation"]), note
+    )
 
 
 async def hold_start_for_review(
@@ -879,6 +885,10 @@ async def hold_start_for_review(
         return False
     gate = await review_wait_gate(db, task)
     if not gate.blocker:
+        # Основание запускать без CI запоминается ДО обращения к провайдера:
+        # CI мог подтвердиться, пока шёл вызов, а аудит должен назвать то,
+        # что видел судья на старте (#1695).
+        order["ci_note"] = gate.ci_note
         return False
     await _defer(db, int(order["task_id"]), int(order["generation"]), gate.blocker)
     await _push_start_deadline(db, int(order["id"]))
@@ -975,7 +985,7 @@ async def _waits_for_review(
     if waited_for is None:
         return False
     ready = (
-        "CI сдачи подтверждён, ожидание кончилось"
+        "ожидание CI кончилось: CI подтверждён или проверка окончательна"
         if waited_for.startswith("CI")
         else "отчёт ревью получен"
     )

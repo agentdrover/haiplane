@@ -214,6 +214,28 @@ async def test_placed_order_started_after_the_window_writes_the_feed_line(
     assert len(await _ci_updates(db, task_id)) == 1
 
 
+async def test_feed_line_names_the_ci_state_the_judge_started_on(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """CI подтвердился, пока шёл вызов провайдера: строка всё равно называет
+    то, что было на старте."""
+    _start_env(monkeypatch)
+    task_id = await _ready_task(db, "ci-wait-during-call", minutes=130)
+    await _incomplete(db, task_id)
+    order = await _placed_order(db, task_id)
+
+    async def _provider(*_a, **_k):
+        await _verified(db, task_id)
+        return CREATED
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(side_effect=_provider),
+    ):
+        assert await sh.start_run(db, order) is True
+    assert len(await _ci_updates(db, task_id)) == 1
+
+
 async def _ci_updates(db: aiosqlite.Connection, task_id: int) -> list[str]:
     rows = await fetchall(
         db,
