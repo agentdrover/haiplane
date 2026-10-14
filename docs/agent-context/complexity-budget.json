@@ -142,14 +142,6 @@
       "measured": 20,
       "max": 23,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/web.py",
-      "function": "_web_task_detail_page",
-      "rule": "PLR0915",
-      "measured": 69,
-      "max": 72,
-      "removed_by": "task:#1691 — разбиение _web_task_detail_page"
     }
   ]
 }
