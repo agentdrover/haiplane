@@ -627,8 +627,12 @@ async def snapshot_mcp(_unused=None) -> dict[str, Any]:
 
 
 async def snapshot_all(client: AsyncClient, db) -> dict[str, Any]:
+    # Имя машины и адрес хаба зависят от того, где идёт прогон (CI, ноутбук):
+    # эхо экземпляра в MCP-ответах закреплено.
+    echo = {"instance": "local", "base_url": "http://hub.test", "server_id": "host-1"}
     out: dict[str, Any] = {}
-    out.update(await snapshot_rest_context(client, db))
-    out.update(await snapshot_web_cards(client, db))
-    out.update(await snapshot_mcp())
+    with patch("hub.hub_instance.instance_echo_fields", return_value=echo):
+        out.update(await snapshot_rest_context(client, db))
+        out.update(await snapshot_web_cards(client, db))
+        out.update(await snapshot_mcp())
     return out
