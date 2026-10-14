@@ -38,7 +38,6 @@ from hub.actionable_errors import (
 from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.session_project_check import SessionProjectGuard
-from hub.services.done_hold import hold_done_report
 from hub.services.sessions import note_session_task
 from hub.services.result_kind import is_state
 from hub.services.return_running import RETURN_RUNNING_STATUSES, return_running_to_open
@@ -129,7 +128,6 @@ from hub.models import (
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
     apply_live_worktree,
-    defer_completions,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -5999,261 +5997,25 @@ async def add_update(
     update claiming to be from a reviewer proved nothing (#559). The name is
     still stored as sent — a display name is allowed to differ from the
     principal — but now the fact sits next to it.
+
+    The stages live in ``hub.services.task_updates`` (#1690); the transaction,
+    its savepoint and the rollback are owned by ``task_updates.apply_update``.
     """
+    from hub.services import task_updates
+
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
     task = await _task_with_current_ci(db, dict(row), body.kind)
-
-    if body.kind == "done":
-        # #971: the hub can now deliver approved pair work on its own, so an
-        # agent that went away and came back may find its task already
-        # complete. Refusing its report with "task_already_terminal" would be
-        # true and useless: nothing is wrong, the work shipped, and the only
-        # thing still missing is the account of it. The report is taken as
-        # what it now is — a record — and the terminal guard stays exactly as
-        # strict for every other way a task can end.
-        if task.get(
-            "status"
-        ) == "completed" and await repo.completed_by_poller_delivery(db, task_id):
-            body = body.model_copy(update={"kind": "status"})
-        else:
-            # #1647: done-отчёт state-задачи — не сдача и не завершение.
-            # До вставки строки: отказ не оставляет ни done-строки, ни bump.
-            from hub.services.state_task import refuse_done_report
-
-            refuse_done_report(task)
-            _validate_done_report(task)
-
-    # #498: work that never started its way out, named while the report is
-    # being written rather than found weeks later. Advisory by design: the
-    # completion is not blocked, and anything unknown stays silent.
-    undelivered = ""
-    if body.kind == "done":
-        from hub.services.delivery_gate import undelivered_warning
-
-        try:
-            undelivered = await undelivered_warning(db, task)
-        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
-            log.warning("delivery check for #%s failed: %s", task_id, exc)
-
-    # Serialize the whole mutation (insert + status transition + commits) on the
-    # shared connection so it cannot interleave with a refinement ``_atomic``
-    # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
-    # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
-    # which is why it must run under the same lock.
-    async with defer_completions() as deferred_done, write_transaction(db):
-        # #1687: nothing is gated on a dict prepared before the lock: a POST may
-        # have withdrawn the CI evidence since. The task is read again HERE.
-        task = await _task_inside_transaction(db, task)
-        # #364: the done row and the generation bump are written before the
-        # git tail runs, and a git adapter that raises used to leave both
-        # behind — reproduced: one done row and generation 1 after the
-        # failure, then two and 2 after a retry, so the feed accumulated
-        # completion reports that never happened. git itself cannot be rolled
-        # back, but the database can, and it is the database that made the
-        # false claim. Verified before writing this that no commit runs
-        # between the insert and the git steps on this path; a commit would
-        # have released the savepoint and defeated the rollback silently.
-        await db.execute("SAVEPOINT done_flow")
-        released = False
-        try:
-            update_id = await repo.add_task_update(
-                db,
-                task_id,
-                body.agent,
-                body.kind,
-                body.content,
-                principal_id=principal_id,
-                # "anonymous" is not "hub": an open-mode request really has no
-                # identity, while the hub writing its own alerts has none by
-                # nature. Telling them apart is the point of the field.
-                author_kind="principal" if principal_id is not None else "anonymous",
-            )
-            # #919: inside the savepoint, before any route — a refused close
-            # of a prod defect takes its done row back with it.
-            await prevention_gate.record_done_prevention(
-                db,
-                task,
-                kind=body.kind,
-                prevention=body.prevention,
-                actor=body.agent or task.get("assigned_agent") or "agent",
-            )
-
-            if body.finding_outcomes:
-                # #1155: ответ автора про находки предыдущей сдачи — ЗДЕСЬ, до
-                # любой развилки маршрутов и до бампа поколения. До развилки —
-                # потому что done-отчёт уходит тремя дорогами (pending_report →
-                # review, pair running → transition_after_agent_done, поллер), и
-                # поставить запись в одну значило бы потерять ответ на двух. До
-                # бампа — потому что исходы принадлежат поколению, на которое
-                # ОТВЕЧАЮТ, а не тому, что начинается этим отчётом (#911).
-                #
-                # Внутри савпоинта: отказ разбора (422) откатывает и строку
-                # отчёта, и исходы — принять отчёт, потеряв ответ, было бы той
-                # же тишиной, только оплаченной попыткой её нарушить.
-                #
-                # Условие на ПОЛЕ, а не на kind: отчёт уже завершённой задачи
-                # выше переписан в kind='status' (#971), и ответ автора не
-                # должен исчезать вместе с этой переменой.
-                outcome_note = await record_done_report_outcomes(
-                    db,
-                    task,
-                    body.finding_outcomes,
-                    reported_by=(body.agent or task.get("assigned_agent") or ""),
-                )
-                if outcome_note:
-                    await repo.add_task_update(
-                        db, task_id, "hub", "status", outcome_note
-                    )
-
-            if body.kind == "done":
-                # Verifiable SDD (#510): under 'require', a done report that would
-                # complete the task is blocked while the current validation run is
-                # red/absent. Only completion-bound reports are gated — one that
-                # routes to review (completion_requires_review) is untouched, and
-                # the poller path (transition_after_agent_done) is not affected.
-                await _done_validation_gate(db, task)
-                if task["status"] == "pending_report":
-                    # #1155: на ЭТОМ маршруте конвейер гейтов не доезжает —
-                    # обе ветки ниже уходят из pending_report сами, не зовя
-                    # transition_after_agent_done. Значит сказать о находках,
-                    # на которые отчёт не ответил, больше некому: воспроизведено
-                    # зондом — задача в pending_report с открытой находкой
-                    # поколения 1 уезжала в review на поколении 2, и в ленте не
-                    # было ни слова. А после бампа гейт спрашивает уже о
-                    # поколении 2, где отчётов ревью нет вовсе, — вопрос
-                    # исчезает вместе с ответом, тихо.
-                    #
-                    # Тот же шаг и тот же потолок warn, что у конвейера. Перед
-                    # развилкой, а не в ветке review: маршрут «завершить без
-                    # ревью» уносит незакрытую находку ещё дальше.
-                    still_open_note = await unanswered_findings_note(db, task)
-                    if still_open_note:
-                        await repo.add_task_update(
-                            db, task_id, "hub", "alert", still_open_note
-                        )
-                    if completion_requires_review(task):
-                        # Universal Review Gate (#306): even the pending_report
-                        # path may not complete unreviewed work — the done
-                        # report becomes a submission for client-driven review.
-                        generation = await repo.bump_submission_generation(db, task_id)
-                        # #1589: и этот вход — сдача; без гейтов конвейера он
-                        # иначе остался бы без предупреждений по путям.
-                        await _record_path_notices_for_done(db, task)
-                        await repo.update_task(
-                            db, task_id, status="review", review_job_id=None
-                        )
-                        await repo.add_task_update(
-                            db,
-                            task_id,
-                            "hub",
-                            "status",
-                            f"Universal Review Gate: done report routed to review "
-                            f"(submission #{generation}). Obtain an APPROVED "
-                            "verdict via hub_submit_review, then report done "
-                            "again.",
-                        )
-                        await log_activity(
-                            db,
-                            "task_review_required",
-                            f"Task #{task_id} → review (gate) on report from {body.agent}",
-                            detail=mutation_activity_detail(),
-                        )
-                    else:
-                        await repo.update_task(db, task_id, status="completed")
-                        await log_activity(
-                            db,
-                            "task_completed",
-                            f"Task #{task_id} completed with report from {body.agent}",
-                            detail=mutation_activity_detail(),
-                        )
-                        await maybe_rollup_parent(db, task_id)
-                elif task["status"] in ("running", "claimed") and not task.get(
-                    "job_id"
-                ):
-                    # A done report on a pair-running task OR on a reserved (claimed)
-                    # task must never be silently dropped: route both through the
-                    # shared post-done transition. A claimed task never pair-started,
-                    # so it has no branch — transition_after_agent_done then routes
-                    # it to completed (no branch ⇒ ci_check is skipped).
-                    was_claimed = task["status"] == "claimed"
-                    updates_rows = await repo.get_task_updates(db, task_id)
-                    updates_list = [dict(r) for r in updates_rows]
-                    # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а
-                    # не любой в истории. Снятое препятствие больше не уводит
-                    # сдачу мимо доставки, а живое — уводит, как и уводило.
-                    holding = blocker_holding_the_done_report(updates_list)
-                    if holding is not None:
-                        await hold_done_report(db, task_id, blocker_note(holding))
-                    else:
-                        await transition_after_agent_done(db, task, has_done=True)
-                    if was_claimed:
-                        await repo.update_task(
-                            db, task_id, claimed_by=None, claim_session_id=None
-                        )
-                    refreshed = await repo.get_task(db, task_id)
-                    if refreshed and dict(refreshed)["status"] == "completed":
-                        await maybe_rollup_parent(db, task_id)
-                # open + done without pair-start: rejected before insert (AC-2)
-            else:
-                await repo.update_task(db, task_id)
-
-            await db.commit()
-            await log_activity(
-                db,
-                "task_update",
-                f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
-                detail=mutation_activity_detail(),
-            )
-
-        except BaseException:
-            # Roll back to before the done row. RELEASE after ROLLBACK TO is
-            # required: rolling back to a savepoint does not remove it (#364).
-            await _release_done_flow(db, rollback=True)
-            released = True
-            raise
-        finally:
-            if not released:
-                await _release_done_flow(db)
-
-    await _finish_deferred_done(db, task_id, deferred_done)
-
-    if body.kind == "done":
-        await _try_restore_pair_workspace(db, task_id)
-        # #897, the third door: a ``pending_report`` task with auto_review off
-        # completes right here, without the delivery gate ever running. The
-        # gate's own path arrives here too and answers "delivered" for free
-        # (the merge it recorded is the first thing checked), so this is one
-        # call for both — and the entrance that has no gate is not left out
-        # because the two obvious ones were closed.
-        after = await repo.get_task(db, task_id)
-        if after is not None and dict(after)["status"] == "completed":
-            await note_completion_without_delivery(
-                db, task_id, via="report_done", actor=body.agent or "agent"
-            )
-
-    if undelivered:
-        # #967 (review finding): the snapshot above predates the transition,
-        # and the transition can now ANSWER it — the hub opens the PR itself
-        # (and may merge it within the same done report), and a refusal
-        # writes its own, louder needs_decision alert. "Хаб не знает ни PR"
-        # over a freshly recorded PR, or "задача завершена" next to
-        # needs_decision, is the lie that teaches readers to skip the
-        # warning — the exact failure AC-2 of #498 names. The review-routing
-        # path is untouched: there the snapshot is still true.
-        fresh_row = await repo.get_task(db, task_id)
-        fresh = dict(fresh_row) if fresh_row is not None else {}
-        if fresh.get("pr_number") or fresh.get("status") == "needs_decision":
-            undelivered = ""
-    if undelivered:
-        await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
-        await db.commit()
-
-    update_row = await repo.get_task_update_by_id(db, update_id)
-    view = TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
-    view.warnings = await _done_report_warnings(db, task, body.kind, undelivered)
-    return view
+    body = await task_updates.normalize_done_report(db, task, body)
+    undelivered = await task_updates.undelivered_advisory(db, task, body)
+    task, deferred_done, update_id = await task_updates.apply_update(
+        db, task, body, principal_id
+    )
+    undelivered = await task_updates.finish_update(
+        db, task_id, body, deferred_done, undelivered
+    )
+    return await task_updates.view_of_update(db, task, body, update_id, undelivered)
 
 
 async def refresh_task(

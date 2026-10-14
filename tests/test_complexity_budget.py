@@ -315,6 +315,18 @@ def test_verdict_does_not_depend_on_the_measured_field():
     assert budget.check([_violation("probe", 10)], ledger).ok
 
 
+def test_add_update_and_its_parts_have_no_waivers(violations, ledger):
+    """#1690 AC-1: add_update и вынесенные этапы укладываются в пороги без исключений."""
+    parts = ("hub/services/lifecycle.py::add_update", "hub/services/task_updates.py")
+    assert [k for k in ledger if k.startswith(parts)] == []
+    assert [
+        v.key
+        for v in violations
+        if v.path == "hub/services/task_updates.py"
+        or v.key == "hub/services/lifecycle.py::add_update"
+    ] == []
+
+
 def test_repository_ledger_passes_and_refresh_keeps_ceilings(
     violations, ledger, monkeypatch, tmp_path
 ):
@@ -322,8 +334,6 @@ def test_repository_ledger_passes_and_refresh_keeps_ceilings(
     assert budget.check(violations, ledger).ok
 
     hot = {
-        "hub/services/lifecycle.py::add_update::PLR0915": "task:#1690",
-        "hub/services/lifecycle.py::add_update::C901": "task:#1690",
         "hub/app.py::api_task_context::PLR0915": "task:#1691",
         "hub/app.py::api_task_context::C901": "task:#1691",
         "hub/web.py::_web_task_detail_page::PLR0915": "task:#1691",
