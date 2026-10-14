@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar
 import urllib.parse
 from datetime import UTC, datetime
 from collections.abc import Callable
@@ -69,6 +70,11 @@ from hub.mcp_structured import (
     structured_echo_result,
     structured_error_result,
     structured_tool_result,
+)
+
+
+_DISCARDED_ARGUMENTS: ContextVar[list[str]] = ContextVar(
+    "discarded_arguments", default=[]
 )
 
 
@@ -154,7 +160,11 @@ class InstrumentedFastMCP(FastMCP):
             # runs so no REST request or mutation happens (#1624).
             if name in AGENT_HIDDEN_TOOLS and not identity_is_human():
                 raise ToolError(_human_only_refusal(name, arguments))
-            result = await super().call_tool(name, arguments)
+            token = _DISCARDED_ARGUMENTS.set(discarded)
+            try:
+                result = await super().call_tool(name, arguments)
+            finally:
+                _DISCARDED_ARGUMENTS.reset(token)
         except Exception as exc:
             await record_call(
                 tool=name,
@@ -170,6 +180,16 @@ class InstrumentedFastMCP(FastMCP):
                 raise
             raise ToolError(_format_hub_api_error(refusal)) from exc
         result = attach_unknown_arguments(result, discarded)
+        if name == "hub_get_review_brief" and isinstance(result, CallToolResult):
+            # After every transformation: the size the client really receives.
+            section = str(arguments.get("section") or "")
+            brief_projection.log_issue(
+                result,
+                arguments.get("task_id"),
+                brief_projection.mode_of(section),
+                section,
+                arguments.get("offset") or 0,
+            )
         await record_call(
             tool=name,
             arguments=arguments,
@@ -2939,13 +2959,12 @@ async def hub_get_review_brief(
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _error_result(exc)
-    mode = "full" if section == "full" else ("section" if section else "projection")
-    if mode == "full":
-        result = _full_brief_result(brief)
-    else:
-        result = brief_projection.brief_result(brief, section, offset, expect)
-    brief_projection.log_issue(result, task_id, mode, section, offset)
-    return result
+    if section == "full":
+        return _full_brief_result(brief)
+    # The funnel adds unknown_arguments afterwards; fit against that shape (#1682).
+    names = _DISCARDED_ARGUMENTS.get()
+    with brief_projection.finalizing(lambda r: attach_unknown_arguments(r, names)):
+        return brief_projection.brief_result(brief, section, offset, expect)
 
 
 def _full_brief_result(brief: dict[str, Any]) -> CallToolResult:

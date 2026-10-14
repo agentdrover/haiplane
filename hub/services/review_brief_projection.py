@@ -17,6 +17,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +39,7 @@ ADDRESSES_SHOWN = 5
 STATEMENT_CAP = 1_500
 CAVEAT_CAP = 600
 
+LIST_TAG = "_list"
 SECTIONS = ("call_sites", "acceptance_criteria", "statement", "machine_review", "full")
 _CHANGED = "раздел изменился (ветка сдвинулась или пересдача) — начните с offset=0"
 # Heuristic states first: a reader with a short budget meets the sites that
@@ -55,8 +59,37 @@ def result_chars(result: CallToolResult) -> int:
     return len(result.model_dump_json(by_alias=True, exclude_none=True))
 
 
+_FINALIZE: ContextVar[Callable[[CallToolResult], CallToolResult] | None] = ContextVar(
+    "review_brief_finalize", default=None
+)
+
+
+@contextmanager
+def finalizing(wrap: Callable[[CallToolResult], CallToolResult]) -> Iterator[None]:
+    """Fit against the result AFTER the transport funnel has wrapped it.
+
+    The funnel (InstrumentedFastMCP.call_tool) adds ``unknown_arguments`` to
+    both halves of the result once the tool returned. The budget is measured
+    on that final shape, so the caller passes the same wrapper here.
+    """
+    token = _FINALIZE.set(wrap)
+    try:
+        yield
+    finally:
+        _FINALIZE.reset(token)
+
+
+def _size(result: CallToolResult) -> int:
+    wrap = _FINALIZE.get()
+    return result_chars(wrap(result) if wrap else result)
+
+
+def mode_of(section: str) -> str:
+    return "full" if section == "full" else ("section" if section else "projection")
+
+
 def log_issue(
-    result: CallToolResult, task_id: int, mode: str, section: str, offset: int
+    result: CallToolResult, task_id: Any, mode: str, section: str, offset: Any
 ) -> int:
     """Write the size of EVERY issued answer to the log, with its mode (#1682)."""
     size = result_chars(result)
@@ -143,19 +176,10 @@ def _latest_review_part(review: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def _state_review_part(state: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(state, dict):
+def _diff_base_part(base: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(base, dict):
         return None
-    return {
-        key: state.get(key)
-        for key in (
-            "label",
-            "generation",
-            "headline",
-            "missing_ac",
-            "expected_generation",
-        )
-    }
+    return {"state": base.get("state"), "reason": base.get("reason")}
 
 
 def _base_merge_part(merge: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -213,7 +237,10 @@ def mandatory_part(brief: dict[str, Any]) -> dict[str, Any]:
         # #1688: signs, the question, the answer and the owner's note, whole.
         "ci_integrity": brief.get("ci_integrity"),
         "base_merge": _base_merge_part(brief.get("base_merge")),
-        "state_review": _state_review_part(brief.get("state_review")),
+        "state_review": brief.get("state_review") or None,
+        "diff_command": brief.get("diff_command") or None,
+        "diff_base": _diff_base_part(brief.get("diff_base")),
+        "catalogue_rules": brief.get("catalogue_rules") or [],
         **_cautions(brief),
     }
 
@@ -221,22 +248,31 @@ def mandatory_part(brief: dict[str, Any]) -> dict[str, Any]:
 # --- blocks that give way to the budget ---------------------------------------
 
 
-def _count_block(items: list[Any], shown: int, section: str) -> dict[str, Any]:
+def _count_block(
+    items: list[Any], shown: int, section: str, cut_inside: bool = False
+) -> dict[str, Any]:
+    """Counts of a block; the hint also appears when a SHOWN element was cut."""
+    more = shown < len(items) or cut_inside
     return {
         "shown": shown,
         "omitted": len(items) - shown,
         "total": len(items),
-        "hint": f"section={section}" if shown < len(items) else "",
+        "truncated": cut_inside,
+        "hint": f"section={section}" if more else "",
     }
 
 
 def _ac_block(brief: dict[str, Any], level: int) -> dict[str, Any]:
     acs = brief.get("acceptance_criteria") or []
-    block = _count_block(acs, level, "acceptance_criteria")
-    block["items"] = [
-        {"id": ac.get("id"), "then": _cap(ac.get("then"), TITLE_CAP)}
-        for ac in acs[:level]
-    ]
+    items = []
+    for ac in acs[:level]:
+        row = {"id": ac.get("id"), "then": _cap(ac.get("then"), TITLE_CAP)}
+        if len(str(ac.get("then") or "")) > TITLE_CAP:
+            row["truncated"] = True
+        items.append(row)
+    cut = any(r.get("truncated") for r in items)
+    block = _count_block(acs, level, "acceptance_criteria", cut)
+    block["items"] = items
     return block
 
 
@@ -245,7 +281,7 @@ def _symbol_row(
 ) -> dict[str, Any]:
     addresses = list(dict.fromkeys(entry.get("untouched") or []))
     shown = addresses[:ADDRESSES_SHOWN]
-    row = {
+    row: dict[str, Any] = {
         "symbol": entry.get("symbol"),
         "defined_in": entry.get("defined_in"),
         "state": entry.get("state"),
@@ -254,6 +290,7 @@ def _symbol_row(
         "shown": len(shown),
         "omitted": len(addresses) - len(shown),
         "untouched": shown,
+        "truncated": len(addresses) > len(shown),
     }
     outcome = outcomes.get(str(entry.get("symbol")))
     if outcome:
@@ -277,18 +314,26 @@ def _call_sites_block(brief: dict[str, Any], level: int) -> dict[str, Any]:
     by_state: dict[str, int] = {}
     for entry in entries:
         by_state[str(entry.get("state"))] = by_state.get(str(entry.get("state")), 0) + 1
-    block = _count_block(entries, level, "call_sites")
-    block["by_state"] = by_state
-    block["caveats"] = {
+    caveats = {
         key: _cap(section.get(key), CAVEAT_CAP)
-        for key in ("status", "reason", "summary", "note", "only_tests_state")
+        for key in (
+            "status",
+            "reason",
+            "summary",
+            "note",
+            "only_tests_state",
+            "only_tests_summary",
+        )
         if section.get(key)
     }
-    if section.get("only_tests_summary"):
-        block["caveats"]["only_tests_summary"] = _cap(
-            section["only_tests_summary"], CAVEAT_CAP
-        )
-    block["items"] = [_symbol_row(e, outcomes) for e in entries[:level]]
+    rows = [_symbol_row(e, outcomes) for e in entries[:level]]
+    cut = any(r["truncated"] for r in rows) or any(
+        len(str(section.get(k) or "")) > CAVEAT_CAP for k in caveats
+    )
+    block = _count_block(entries, level, "call_sites", cut)
+    block["by_state"] = by_state
+    block["caveats"] = caveats
+    block["items"] = rows
     return block
 
 
@@ -309,6 +354,7 @@ def _text_block(text: str, level: int) -> dict[str, Any]:
         "shown": len(clipped),
         "omitted": len(text) - len(clipped),
         "total": len(text),
+        "truncated": len(clipped) < len(text),
         "hint": "section=statement" if level < len(text) else "",
     }
 
@@ -353,9 +399,14 @@ def _verdict_lines(proj: dict[str, Any]) -> list[str]:
         fresh = latest_review_freshness(
             bool(review["is_current"]), bool(review["closed_by_decision"])
         )
+        solo = (
+            " [SELF-APPROVED: solo mode, not independent]"
+            if review["self_approved"]
+            else ""
+        )
         lines.append(
             f"Latest verdict: {str(review['verdict'] or '?').upper()} for "
-            f"submission #{review['submission_generation']} ({fresh}); "
+            f"submission #{review['submission_generation']} ({fresh}){solo}; "
             f"{review['findings_count']} finding(s)"
         )
     gen = proj["current_generation_review"]
@@ -441,23 +492,94 @@ def _integrity_lines(block: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _diff_lines(proj: dict[str, Any]) -> list[str]:
+    base = proj["diff_base"] or {}
+    if proj["diff_command"]:
+        lines = [f"Diff: {proj['diff_command']}"]
+        if base.get("state") != "resolved" and base.get("reason"):
+            lines.append(f"  base NOT verified: {base['reason']}")
+        return lines
+    if base.get("reason"):
+        return [f"Diff: NOT AVAILABLE — {base['reason']}"]
+    return []
+
+
+def _state_review_lines(state: dict[str, Any]) -> list[str]:
+    """What a state task accepts: the whole block, as the full text prints it."""
+    generation = state.get("generation", 0)
+    lines = [
+        f"{state.get('label', 'результат: состояние')} — поколение {generation}",
+        str(state.get("headline") or ""),
+        f"Rollback: {state.get('rollback') or 'не назван'}",
+        "Evidence of the current generation (the author's word, not run by the hub):",
+    ]
+    for ev in state.get("evidence") or []:
+        lines.append(
+            f"  {ev.get('ac_id', '?')} | действие: {ev.get('action', '')} | "
+            f"наблюдение: {ev.get('observed', '')} | над чем: {ev.get('target', '')}"
+            f" | когда: {ev.get('observed_at', '')} | автор: {ev.get('author', '')}"
+        )
+    lines.extend(
+        f"  {a} | записи этого поколения нет" for a in state.get("missing_ac") or []
+    )
+    na = state.get("not_applicable") or []
+    if na:
+        lines.append(
+            "Проверки кода — не применимо: "
+            + "; ".join(f"{c.get('check', '?')} ({c.get('reason', '')})" for c in na)
+        )
+    lines.append(
+        f"Verdict: only a human, with expected_generation={state.get('expected_generation', generation)}."
+    )
+    return [line for line in lines if line]
+
+
+def _rules_lines(rules: list[dict[str, Any]]) -> list[str]:
+    """Catalogue rules of the area (#920); nothing when there are none."""
+    if not rules:
+        return []
+    lines = [
+        "Rules from the catalogue (category_checks) for this area — classes "
+        "already paid for; check they did not come back:"
+    ]
+    for rule in rules:
+        defects = rule.get("source_defects") or []
+        source = (
+            ", ".join(f"#{d['task_id']} {d.get('title', '')}".rstrip() for d in defects)
+            if defects
+            else "no defect recorded (rule from the recurrence debt, #878)"
+        )
+        lines.append(
+            f"  - {rule['category']} → check: {rule['check_ref']} "
+            f"| defect: {source} | area: {', '.join(rule.get('matched_areas') or [])}"
+        )
+    return lines
+
+
 def _head_lines(proj: dict[str, Any]) -> list[str]:
     lines = [
         f"Review brief for task #{proj['task_id']}: {proj['title']} "
         "[projection; whole brief: section=full]",
         f"Status: {proj['status']} | submission #{proj['submission_generation']} "
         f"| review cycle {proj['review_cycle']}",
-        f"Branch: {proj['branch'] or '-'} | submitted {proj['submission_sha'] or '-'}"
-        f" | tip {proj['current_branch_tip'] or '-'} | sha_check="
-        f"{proj['sha_check']} ({proj['sha_check_reason'] or '-'})",
     ]
+    if not proj["state_review"]:  # a state task has no branch, diff or CI
+        lines.append(
+            f"Branch: {proj['branch'] or '-'} | submitted "
+            f"{proj['submission_sha'] or '-'} | tip "
+            f"{proj['current_branch_tip'] or '-'} | sha_check="
+            f"{proj['sha_check']} ({proj['sha_check_reason'] or '-'})"
+        )
     if proj["project"]:
         lines.insert(1, f"Project: {proj['project']}")
     merge = proj["base_merge"]
     if merge and merge["state"] in ("conflicting", "unknown"):
         lines.append(f"Base merge [{merge['state']}]: {merge['reason']}")
     if proj["state_review"]:
-        lines.append(f"State task: {proj['state_review']['headline']}")
+        lines.extend(_state_review_lines(proj["state_review"]))
+    else:
+        lines.extend(_diff_lines(proj))
+    lines.extend(_rules_lines(proj["catalogue_rules"]))
     if proj["review_circle"]:
         lines.append(
             f"Review circle: {proj['review_circle'].get('laps')} laps — "
@@ -473,7 +595,11 @@ def _head_lines(proj: dict[str, Any]) -> list[str]:
 def _block_head(name: str, block: dict[str, Any]) -> str:
     line = f"{name}: {block['shown']}/{block['total']} shown"
     if block["omitted"]:
-        line += f", {block['omitted']} omitted ({block['hint']})"
+        line += f", {block['omitted']} omitted"
+    if block["truncated"]:
+        line += ", shown elements cut"
+    if block["hint"]:
+        line += f" ({block['hint']})"
     return line
 
 
@@ -544,14 +670,14 @@ def _projection_result(
 def fit_levels(brief: dict[str, Any]) -> tuple[dict[str, int], bool]:
     """Largest levels, in priority order, whose FINAL result fits the budget."""
     levels = {name: 0 for name in _BLOCK_ORDER}
-    if result_chars(_projection_result(brief, levels)) > MAX_CHARS:
+    if _size(_projection_result(brief, levels)) > MAX_CHARS:
         return levels, True
     maxes = _max_levels(brief)
     for name in _BLOCK_ORDER:
         low, high = 0, maxes[name]
         while low < high:
             mid = (low + high + 1) // 2
-            fits = result_chars(_projection_result(brief, {**levels, name: mid}))
+            fits = _size(_projection_result(brief, {**levels, name: mid}))
             low, high = (mid, high) if fits <= MAX_CHARS else (low, mid - 1)
         levels[name] = low
     return levels, False
@@ -604,21 +730,40 @@ def _statement_section(brief: dict[str, Any]) -> _Section:
     return _Section("chars", text="\n".join(parts))
 
 
-def _machine_section(brief: dict[str, Any]) -> _Section:
-    report = brief.get("machine_review") or {}
-    section = _Section("findings")
-    for key, value in report.items():
-        if isinstance(value, list):
-            section.items.extend({"kind": key, "value": item} for item in value)
+META_CAP = 500
+
+
+def _move_bulky(data: dict[str, Any], items: list[Any], tag: str) -> dict[str, Any]:
+    """Keep small scalars as page metadata; everything else becomes elements.
+
+    A list contributes one element per entry, a bulky scalar one element. So no
+    page is made large by its metadata, only by a single element of its own.
+    """
+    meta: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, list) and value:
+            items.extend({tag: key, "value": v} for v in value)
+        elif len(json.dumps(value, ensure_ascii=False, default=str)) > META_CAP:
+            items.append({tag: key, "value": value})
         else:
-            section.meta[key] = value
+            meta[key] = value
+    return meta
+
+
+def _machine_section(brief: dict[str, Any]) -> _Section:
+    section = _Section("findings")
+    section.meta = _move_bulky(
+        dict(brief.get("machine_review") or {}), section.items, "kind"
+    )
     return section
 
 
 def _call_sites_section(brief: dict[str, Any]) -> _Section:
+    """Symbols first; the other lists and bulky texts follow as tagged elements."""
     data = dict(brief.get("call_sites") or {})
-    entries = data.pop("entries", None) or []
-    return _Section("symbols", items=list(entries), meta=data)
+    items = list(data.pop("entries", None) or [])
+    meta = _move_bulky(data, items, LIST_TAG)
+    return _Section("symbols", items=items, meta=meta)
 
 
 def _load_section(brief: dict[str, Any], name: str) -> _Section:
@@ -695,6 +840,14 @@ def _page_result(
     return structured_echo_result(summary, page=page)
 
 
+def _element_alone_over(section: _Section, offset: int) -> bool:
+    """Does the first element of the page exceed the ceiling by itself?"""
+    if section.text is not None:
+        return False
+    first = section.items[offset : offset + 1]
+    return len(json.dumps(first, ensure_ascii=False)) * 2 > MAX_CHARS
+
+
 def _fit_page(
     brief: dict[str, Any], name: str, section: _Section, fp: str, offset: int
 ) -> CallToolResult:
@@ -702,14 +855,16 @@ def _fit_page(
     low, high = min(1, remaining), remaining
     while low < high:
         mid = (low + high + 1) // 2
-        size = result_chars(_page_result(brief, name, section, fp, offset, mid))
+        size = _size(_page_result(brief, name, section, fp, offset, mid))
         low, high = (mid, high) if size <= MAX_CHARS else (low, mid - 1)
     result = _page_result(brief, name, section, fp, offset, low)
-    if result_chars(result) <= MAX_CHARS:
+    if _size(result) <= MAX_CHARS:
         return result
-    # One element bigger than the ceiling goes out alone, and says so.
+    # The exception is for ONE element that alone exceeds the ceiling; a page
+    # over it for any other reason (large scalar metadata) is named as such.
     summary, page = _page(brief, name, section, fp, offset, low)
-    page["bounds"] = {"limit": MAX_CHARS, "note": EXCEEDED_NOTE}
+    reason = "element" if _element_alone_over(section, offset) else "metadata"
+    page["bounds"] = {"limit": MAX_CHARS, "note": EXCEEDED_NOTE, "reason": reason}
     return structured_echo_result(f"[{EXCEEDED_NOTE}] {summary}", page=page)
 
 

@@ -458,11 +458,16 @@ def test_sections_page_back_into_the_whole():
     pages = _pages(big, "call_sites")
     assert [p for p in pages if "bounds" in p] and len(pages) > 3
     joined = [e for p in pages for e in p["items"]]
-    assert joined == big["call_sites"]["entries"], "без пропусков и дублей"
-    meta = {k: v for k, v in big["call_sites"].items() if k != "entries"}
+    extras = [
+        {"_list": "only_tests", "value": o} for o in big["call_sites"]["only_tests"]
+    ]
+    assert joined == [*big["call_sites"]["entries"], *extras], "без пропусков и дублей"
+    meta = {
+        k: v for k, v in big["call_sites"].items() if k not in ("entries", "only_tests")
+    }
     assert pages[0]["meta"] == meta and all("meta" not in p for p in pages[1:])
     huge_pages = [
-        p for p in pages if any(e["symbol"] == "hub.huge" for e in p["items"])
+        p for p in pages if any(e.get("symbol") == "hub.huge" for e in p["items"])
     ]
     assert len(huge_pages) == 1 and len(huge_pages[0]["items"]) == 1
     assert huge_pages[0]["bounds"]["note"] == "превышен потолок"
@@ -850,3 +855,116 @@ def test_oversized_mandatory_part_is_sent_whole_and_flagged():
     assert out["blocks"]["acceptance_criteria"]["total"] == 25, "счётчики остаются"
     fits = proj.brief_result(_brief()).structuredContent["brief"]
     assert "bounds" not in fits
+
+
+# --- review round on e5f52936 -------------------------------------------------
+
+
+@pytest.mark.usefixtures("stateless_hub")
+async def test_unknown_arguments_are_inside_the_budget_and_the_log(
+    client, served, caplog
+):
+    """P2-1: funnel добавляет unknown_arguments; бюджет и лог — на итоговом виде."""
+    served["brief"] = SHAPES["1647"]()
+    caplog.set_level(logging.INFO, logger=proj.__name__)
+
+    plain = await _mcp(client)
+    extra = await _mcp(client, limit=100, another_unknown_argument="x")
+
+    assert extra["structuredContent"]["unknown_arguments"] == [
+        "another_unknown_argument",
+        "limit",
+    ]
+    for result in (plain, extra):
+        assert _wire_chars(result) <= 12_000, _wire_chars(result)
+    rows = _logged(caplog)
+    assert [int(r["chars"]) for r in rows[-2:]] == [
+        _wire_chars(plain),
+        _wire_chars(extra),
+    ], "лог после всех преобразований равен размеру на проводе"
+
+
+def test_page_with_large_metadata_stays_within_the_ceiling():
+    """P2-2: метаданные не раздувают страницу: списки и крупные тексты — элементы."""
+    brief = _brief(
+        call_sites={
+            "status": "analysed",
+            "summary": "с" * 3000,
+            "entries": [
+                {"symbol": f"s{i}", "defined_in": "a.py", "state": "all_touched",
+                 "statement": "x", "total_sites": 1, "untouched": []}
+                for i in range(200)
+            ],
+            "only_tests_state": "named",
+            "only_tests": [
+                {"symbol": f"s{i}", "outcome": "cleared", "call_path": "p" * 40}
+                for i in range(200)
+            ],
+        }
+    )  # fmt: skip
+    pages = _pages(brief, "call_sites")
+    assert len(pages) > 2
+    assert all("bounds" not in p for p in pages), "ни одна страница не сверх потолка"
+    items = [i for p in pages for i in p["items"]]
+    assert len(items) == 200 + 200 + 1, "символы, only_tests и крупный текст"
+    assert {"_list": "summary", "value": "с" * 3000} in items
+    assert (
+        pages[0]["meta"]["status"] == "analysed" and "summary" not in pages[0]["meta"]
+    )
+    machine = _brief(
+        machine_review=_machine(3, 1, incomplete=True, incomplete_reason="н" * 2000)
+    )
+    mpages = _pages(machine, "machine_review")
+    assert {"kind": "incomplete_reason", "value": "н" * 2000} in [
+        i for p in mpages for i in p["items"]
+    ]
+
+
+def test_cut_elements_carry_a_hint_and_a_truncated_marker():
+    """P3-4: подсказка и truncated и тогда, когда урезан сам показанный элемент."""
+    acs = _acs(1)
+    assert len(acs[0]["then"]) > 200
+    twelve = {
+        "symbol": "hub.twelve", "defined_in": "hub/t.py", "state": "untouched_sites",
+        "statement": "s", "total_sites": 12,
+        "untouched": [f"hub/site_{i}.py:{i + 1}" for i in range(9)],
+    }  # fmt: skip
+    brief = _brief(
+        ac=1,
+        call_sites={"status": "analysed", "entries": [twelve]},
+    )
+    brief["acceptance_criteria"] = acs
+    blocks = proj.brief_result(brief).structuredContent["brief"]["blocks"]
+    ac = blocks["acceptance_criteria"]
+    assert (ac["shown"], ac["omitted"]) == (1, 0)
+    assert ac["truncated"] is True and ac["hint"] == "section=acceptance_criteria"
+    assert ac["items"][0]["truncated"] is True
+    cs = blocks["call_sites"]
+    assert (cs["shown"], cs["omitted"]) == (1, 0)
+    assert cs["truncated"] is True and cs["hint"] == "section=call_sites"
+    assert cs["items"][0]["truncated"] is True
+
+    whole = proj.brief_result(
+        _brief(ac=1, call_sites={"status": "analysed", "entries": []})
+    )
+    short = _brief(ac=1)
+    short["acceptance_criteria"][0]["then"] = "коротко"
+    short["call_sites"]["entries"] = []
+    clean = proj.brief_result(short).structuredContent["brief"]["blocks"]
+    assert clean["acceptance_criteria"]["truncated"] is False
+    assert clean["acceptance_criteria"]["hint"] == ""
+    assert whole is not None
+
+
+def test_self_approved_verdict_is_named_in_the_default_projection():
+    """P2-3: [SELF-APPROVED] остаётся в тексте проекции."""
+    brief = _brief(
+        latest_review={
+            "verdict": "approved",
+            "submission_generation": 2,
+            "is_current": True,
+            "self_approved": True,
+        }
+    )
+    text = json.loads(proj.brief_result(brief).content[0].text)["message"]
+    assert "[SELF-APPROVED: solo mode, not independent]" in text

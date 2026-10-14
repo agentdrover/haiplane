@@ -1803,20 +1803,20 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
     assert cli_brief["diff_base"]["reason"]
 
     monkeypatch.setattr(mcp_server, "_api_get", fake_get)
-    text = (
-        (await mcp_server.hub_get_review_brief(task_id, section="full")).content[0].text
-    )
-    for needle in (
-        "результат: состояние",
-        ROLLBACK,
-        "поколение 2",
-        "expected_generation=2",
-        "повторное наблюдение, поколение 2",
-        "2026-10-09T12:00:00Z",
-        "не применимо",
-    ):
-        assert needle in text, needle
-    assert "sha_check: unknown" not in text and "Branch:" not in text
+    for section in ("", "full"):  # the whole decision block is in the default too
+        result = await mcp_server.hub_get_review_brief(task_id, section=section)
+        text = result.content[0].text
+        for needle in (
+            "результат: состояние",
+            ROLLBACK,
+            "поколение 2",
+            "expected_generation=2",
+            "повторное наблюдение, поколение 2",
+            "2026-10-09T12:00:00Z",
+            "не применимо",
+        ):
+            assert needle in text, needle
+        assert "sha_check: unknown" not in text and "Branch:" not in text
 
 
 # ---- #1652: the brief says where its assembly spent the time ----
