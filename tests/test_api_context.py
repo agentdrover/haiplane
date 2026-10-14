@@ -490,3 +490,32 @@ async def test_summary_context_keeps_rules_under_a_big_statement(client):
     assert "Правила работы (сводка)" in ctx["context_text"]
     assert ctx["working_rules"]["mode"] == "summary"
     assert ctx["working_rules"]["repository_rules"]["content"] == ""
+
+
+# ---------------------------------------------------------------------------
+# #1691: функции чтения и показа разбиты без изменения ответов
+# ---------------------------------------------------------------------------
+
+
+async def test_context_and_views_match_the_pre_refactor_baseline(client, db):
+    """AC-2 (#1691): REST /context (full, summary, усечение), HTML карточки
+    (commit и state, cookie, 403), MCP hub_project_status и
+    hub_prepare_developer_task отдают то же, что отдавали до разбиения.
+
+    Эталон снят на базе до правки; сравнение — по статусу, заголовкам, телу и
+    cookie, MCP — по тексту и structuredContent."""
+    import json
+    import os
+    from pathlib import Path
+
+    from tests.read_view_baseline_support import snapshot_all
+
+    golden = Path(__file__).parent / "golden" / "read_views_1691.json"
+    got = await snapshot_all(client, db)
+    rendered = json.dumps(got, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    if os.environ.get("HUB_UPDATE_READ_VIEW_BASELINE") == "1":
+        golden.write_text(rendered, encoding="utf-8")
+    want = json.loads(golden.read_text(encoding="utf-8"))
+    assert sorted(got) == sorted(want)
+    for name in sorted(want):
+        assert got[name] == want[name], f"ответ {name} разошёлся с эталоном"

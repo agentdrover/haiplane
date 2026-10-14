@@ -360,3 +360,20 @@ def test_refresh_measured_and_update_are_mutually_exclusive(tmp_path):
         budget.main(
             ["--ledger", str(tmp_path / "x.json"), "--update", "--refresh-measured"]
         )
+
+
+READ_AND_VIEW_FUNCTIONS = (
+    "hub/app.py::api_task_context",
+    "hub/mcp_server.py::hub_prepare_developer_task",
+    "hub/web.py::_web_task_detail_page",
+    "hub/mcp_server.py::hub_project_status",
+)
+
+
+def test_read_and_view_functions_have_no_waivers(violations, ledger):
+    """AC-1 (#1691): четыре функции чтения и показа уложены в пороги — ни
+    нарушений на дереве, ни записей в ledger, и дерево зелёное без них."""
+    for name in READ_AND_VIEW_FUNCTIONS:
+        assert not [k for k in ledger if k.startswith(f"{name}::")], name
+        assert not [v for v in violations if v.key == name], name
+    assert budget.check(violations, ledger).ok
