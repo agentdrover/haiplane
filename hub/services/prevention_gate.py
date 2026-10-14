@@ -39,6 +39,7 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import FINAL_STATUSES, DefectPrevention
+from hub.services import watch_notices
 
 _FINAL = frozenset(s.value for s in FINAL_STATUSES)
 
@@ -237,9 +238,8 @@ async def hold_completion(
         "пересдал отчёт с выводом; accept закроет её без вывода, и это "
         "будет записано отдельным событием.",
     )
-    await repo.insert_event(
+    await watch_notices.emit_needs_decision(
         db,
-        kind="needs_decision",
         task_id=task_id,
         actor=actor,
         payload={"reason": "prevention_missing", "via": via},

@@ -22,7 +22,13 @@ import aiosqlite
 
 from hub import config, git_policy
 from hub import repository as repo
-from hub.models import DEFAULT_FORGE, FORGES, parse_freeze_until, validated_freeze
+from hub.models import (
+    DEFAULT_FORGE,
+    FORGES,
+    STEWARD_WATCH_REASONS,
+    parse_freeze_until,
+    validated_freeze,
+)
 
 log = logging.getLogger(__name__)
 
@@ -904,6 +910,21 @@ def release_artifacts_of(policy: dict) -> list[dict[str, str]]:
                 }
             )
     return pairs
+
+
+# Наблюдение стюарда (#1679): какие поводы хаб кладёт в steward@<проект>. Нет
+# ключа — все пять; ``[]`` — выключено. Читатель терпит то, что могло попасть в
+# базу мимо модели: нечитаемое значение читается как умолчание, а неизвестные
+# элементы списка отбрасываются, — наблюдение не должно молчать из-за опечатки.
+STEWARD_WATCH_KEY = "steward_watch"
+
+
+def steward_watch_of(policy: dict) -> tuple[str, ...]:
+    """Поводы, включённые у проекта; все пять, когда ключа нет или он нечитаем."""
+    raw = policy.get(STEWARD_WATCH_KEY) if isinstance(policy, dict) else None
+    if not isinstance(raw, list):
+        return STEWARD_WATCH_REASONS
+    return tuple(r for r in STEWARD_WATCH_REASONS if r in raw)
 
 
 # Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:

@@ -1275,3 +1275,66 @@ async def test_claim_project_check_key_is_read_and_validated(
     assert keyless != garbled
     assert "claim_project_check" in GATE_POLICY_KEYS
     assert effective_policy.unsummarised_keys() == []
+
+
+async def test_steward_watch_key_is_read_and_validated(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-6 (#1679): без ключа — все пять поводов, [] — выключено, неизвестное
+    # значение и не список — 422, PATCH null — сброс; политика читается в
+    # момент события, прошлые события не догоняются.
+    from tests.watch_notice_support import (
+        ci_check_task,
+        escalate_no_pr,
+        make_project,
+        notices,
+        set_watch,
+    )
+
+    read = project_policy.steward_watch_of
+    five = ["needs_decision", "machine_review", "release", "base_branch_red", "stale"]
+    assert list(read({})) == five
+    assert list(read({"steward_watch": []})) == []
+    assert list(read({"steward_watch": ["release"]})) == ["release"]
+    assert list(read({"steward_watch": "release"})) == five  # нечитаемое — умолчание
+    assert "steward_watch" in GATE_POLICY_KEYS
+    assert effective_policy.unsummarised_keys() == []
+
+    resp = await client.post("/api/projects", json={"slug": "sw", "name": "Sw"})
+    pid = resp.json()["id"]
+    url = f"/api/projects/{pid}"
+    ok = await client.patch(url, json={"gate_policy": {"steward_watch": ["release"]}})
+    assert ok.status_code == 200, ok.text
+    row = _by_key((await client.get("/api/projects/sw/effective-policy")).json())
+    assert row["steward_watch"]["value"] == ["release"]
+    assert row["steward_watch"]["source"] == "project"
+    assert row["steward_watch"]["default"] == five
+    off = await client.patch(url, json={"gate_policy": {"steward_watch": []}})
+    assert off.status_code == 200, off.text
+    for bad in (["nope"], "release", {"release": True}, [1], ["release", None]):
+        resp = await client.patch(url, json={"gate_policy": {"steward_watch": bad}})
+        assert resp.status_code == 422, (bad, resp.text)
+        assert "steward_watch" in resp.text
+    reset = await client.patch(url, json={"gate_policy": {"steward_watch": None}})
+    assert reset.status_code == 200, reset.text
+    row = _by_key((await client.get("/api/projects/sw/effective-policy")).json())
+    assert row["steward_watch"]["source"] == "default"
+    assert row["steward_watch"]["value"] == five
+
+    # Политика на момент события: выключено -> событие -> включено = уведомления нет.
+    await make_project(db, "tw")
+    await set_watch(db, "tw", [])
+    muted = await ci_check_task(db, (await repo.get_project_by_slug(db, "tw"))["id"])
+    await escalate_no_pr(db, muted)
+    await set_watch(db, "tw", None)
+    assert await notices(db, "tw") == []
+    # Включено -> событие -> выключено до любого чтения = уведомление есть.
+    loud = await ci_check_task(db, (await repo.get_project_by_slug(db, "tw"))["id"])
+    await escalate_no_pr(db, loud)
+    await set_watch(db, "tw", [])
+    assert [n["data"]["task_id"] for n in await notices(db, "tw")] == [loud]
+    # Выключен именно этот повод: другие поводы пишутся, этот — нет.
+    await set_watch(db, "tw", ["release"])
+    third = await ci_check_task(db, (await repo.get_project_by_slug(db, "tw"))["id"])
+    await escalate_no_pr(db, third)
+    assert [n["data"]["task_id"] for n in await notices(db, "tw")] == [loud]
