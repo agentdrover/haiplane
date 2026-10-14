@@ -32,22 +32,6 @@
   "headroom_pct": 15.0,
   "waivers": [
     {
-      "path": "hub/app.py",
-      "function": "api_task_context",
-      "rule": "C901",
-      "measured": 38,
-      "max": 43,
-      "removed_by": "task:#1691 — разбиение api_task_context"
-    },
-    {
-      "path": "hub/app.py",
-      "function": "api_task_context",
-      "rule": "PLR0915",
-      "measured": 117,
-      "max": 125,
-      "removed_by": "task:#1691 — разбиение api_task_context"
-    },
-    {
       "path": "hub/cli.py",
       "function": "build_parser",
       "rule": "PLR0915",
