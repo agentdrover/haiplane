@@ -572,11 +572,13 @@ async def _finding_in(db, areas: list[str], category: str) -> int:
     return task_id
 
 
-async def _brief_text(brief: dict) -> str:
+async def _brief_text(brief: dict, section: str = "full") -> str:
     from hub import mcp_server
 
     with patch.object(mcp_server, "_api_get", AsyncMock(return_value=brief)):
-        result = await mcp_server.hub_get_review_brief(brief["task_id"])
+        result = await mcp_server.hub_get_review_brief(
+            brief["task_id"], section=section
+        )
     return result.content[0].text
 
 
@@ -609,10 +611,11 @@ async def test_rule_reaches_review_brief(client, db):
     assert rule["matched_areas"] == [_RULE_AREA]
     assert rule["created_at"], "the rule says since when it stands"
 
-    text = await _brief_text(brief)
-    assert "category_checks" in text
-    assert "tests/test_poller.py::test_ttl" in text
-    assert f"#{defect}" in text
+    for section in ("", "full"):  # the rule is read by the default projection too
+        text = await _brief_text(brief, section)
+        assert "category_checks" in text, section
+        assert "tests/test_poller.py::test_ttl" in text, section
+        assert f"#{defect}" in text, section
 
 
 async def test_no_rules_no_section(client, db):
@@ -624,7 +627,8 @@ async def test_no_rules_no_section(client, db):
 
     empty = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert empty["catalogue_rules"] == []
-    assert "category_checks" not in await _brief_text(empty)
+    for section in ("", "full"):
+        assert "category_checks" not in await _brief_text(empty, section)
 
     # A rule elsewhere is still not a rule of this area.
     await _finding_in(db, [_RULE_AREA], "timeouts")
@@ -634,7 +638,8 @@ async def test_no_rules_no_section(client, db):
     await db.commit()
     other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert other["catalogue_rules"] == []
-    assert "category_checks" not in await _brief_text(other)
+    for section in ("", "full"):
+        assert "category_checks" not in await _brief_text(other, section)
 
 
 async def test_rule_area_is_where_the_class_was_met(client, db):
@@ -676,7 +681,8 @@ async def test_rule_area_is_where_the_class_was_met(client, db):
     by_task_area = await rules_for(["hub/web.py"])
     assert set(by_task_area) == {"naming"}
     assert by_task_area["naming"]["source_defects"] == []
-    assert "no defect recorded" in await _brief_text(briefs[-1])
+    for section in ("", "full"):
+        assert "no defect recorded" in await _brief_text(briefs[-1], section)
     assert set(await rules_for(["hub/cli.py"])) == {"styling"}
     assert set(await rules_for(["hub/poller.py"])) == {"locks"}
     # A directory area holds the files under it.
