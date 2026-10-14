@@ -582,7 +582,7 @@ def test_watch_reads_every_page_or_none(tmp_path, monkeypatch, capsys):
     _write_watch(tmp_path)
     clock = _Clock(max_sleeps=0)
     assert _go(_fresh(tmp_path, monkeypatch, broken, clock), monkeypatch) is None
-    assert not _state_path(tmp_path).exists(), "no issued range from a partial read"
+    assert _state(tmp_path)["issued"] is None, "no issued range from a partial read"
     assert capsys.readouterr().out == "", "and nobody is woken"
 
     # Next cycle (same process) the read succeeds and the WHOLE range is issued.
@@ -699,3 +699,163 @@ def test_retained_away_messages_are_shown_as_unavailable(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "ретенц" not in out, "an unanswered hub is not a deleted message"
     assert "не получен" in out and "#1" in out
+
+
+# ---------------------------------------------------------------------------
+# Раунд ревью Codex по c60f1552: перевооружение, первый курсор, замок, типы, отказ.
+# ---------------------------------------------------------------------------
+
+
+def test_watch_rearms_before_the_outer_hook_timeout(tmp_path, monkeypatch, capsys):
+    """P1: with an empty mailbox the hook still wakes the session before the
+    host's own timeout would kill it silently; nothing is acked or counted."""
+    _write_watch(tmp_path)
+    path = tmp_path / f"hub-wait.{MINE}.json"
+    before = path.read_bytes()
+    clock = _Clock(advance=5000, max_sleeps=20)
+    module = _fresh(tmp_path, monkeypatch, _Mailbox(), clock)
+    module.HOOK_TIMEOUT_SEC = 14700
+    module.REARM_MARGIN_SEC = 300
+
+    assert _go(module, monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "перевооружение" in out
+    assert clock.now >= 14400, "not a second earlier than timeout minus margin"
+    assert clock.sleeps == 3, "two quiet cycles (5000s, 10000s) did not re-arm"
+    assert path.read_bytes() == before, "no refire counter, no ack"
+    assert _state(tmp_path) == {"accepted_id": 0, "issued": None}
+
+
+def test_the_first_cursor_is_saved_before_the_first_read(tmp_path, monkeypatch, capsys):
+    """P2: an ack typed before any message cannot become the accepted cursor."""
+    _write_watch(tmp_path, acked=0)
+    box = _Mailbox()
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) is None
+    assert _state(tmp_path) == {"accepted_id": 0, "issued": None}
+
+    box.messages += [_free(1), _free(2), _free(3)]
+    _ack(tmp_path, 100)  # Codex's scenario: a stray ack, then mail arrives
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "отклон" in out and "#1" in out and "#3" in out
+    state = _state(tmp_path)
+    assert state["accepted_id"] == 0 and state["issued"]["to"] == 3
+
+
+def test_a_damaged_state_never_trusts_the_agents_ack(tmp_path, monkeypatch, capsys):
+    _write_watch(tmp_path, acked=100)
+    _state_path(tmp_path).write_text("{broken")
+    box = _Mailbox(_free(1), _free(2), _free(3))
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "повреждено" in out and "#3" in out
+    assert "#1:" not in out, "mail before the hub's current maximum is not replayed"
+    assert _state(tmp_path) == {"accepted_id": 3, "issued": None}
+
+    box.messages.append(_free(4))
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    assert _state(tmp_path)["issued"]["ids"] == [4]
+
+
+def test_an_ack_written_between_the_hooks_read_and_write_survives(
+    tmp_path, monkeypatch, capsys
+):
+    """P2: the hook rewrites only the fired records, from a fresh read."""
+    task_wait = _wait(5, owner=MINE, reason="жду")
+    _write_watch(tmp_path, task_wait)
+    path = tmp_path / f"hub-wait.{MINE}.json"
+    module = _fresh(tmp_path, monkeypatch, _Mailbox())
+
+    def slow_fetch(base, auth, tid):  # the agent acks while the hook is mid-cycle
+        _ack(tmp_path, 7)
+        return {"id": 5, "title": "t", "status": "done"}
+
+    monkeypatch.setattr(module, "fetch_task", slow_fetch)
+    assert _go(module, monkeypatch) == 2
+    waits = json.loads(path.read_text())["waits"]
+    watch = next(w for w in waits if w.get("kind") == "watch")
+    task = next(w for w in waits if w.get("task_id") == 5)
+    assert watch["acked_id"] == 7, "the agent's ack survived the hook's rewrite"
+    assert task["refire_count"] == 1
+    assert not list(tmp_path.glob("*.tmp")), "written through tmp + replace"
+
+
+def test_the_rewrite_waits_for_the_file_lock(tmp_path):
+    import fcntl
+    import os
+    import threading
+
+    module = _load(tmp_path)
+    path = tmp_path / f"hub-wait.{MINE}.json"
+    _write(path, _wait(5, owner=MINE))
+    orig = json.dumps(_wait(5, owner=MINE), sort_keys=True, ensure_ascii=False)
+    new = {**_wait(5, owner=MINE), "refire_count": 1}
+    fd = os.open(tmp_path / f"hub-wait.{MINE}.json.rmw.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    t = threading.Thread(target=module.apply_fired_updates, args=(path, [(orig, new)]))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive(), "the hook must wait while someone else holds the lock"
+    assert "refire_count" not in path.read_text()
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    t.join(5)
+    assert json.loads(path.read_text())["waits"] == [new]
+    os.close(fd)
+
+
+def test_a_malformed_v1_notice_never_aborts_the_range(tmp_path, monkeypatch, capsys):
+    """P2: every field is type-checked; one bad message is one metadata line."""
+
+    def v1(mid: int, **over) -> dict:
+        msg = _hub_note(mid, slug="MARK" + str(mid))
+        body = {**json.loads(msg["body"]), **over}
+        msg["body"] = json.dumps(body)
+        return msg
+
+    box = _Mailbox(
+        v1(1, reason=[]),
+        v1(2, reason={}),
+        v1(3, source_key=5),
+        v1(4, review_id="x"),
+        v1(5, task_id=True),
+        _hub_note(6),
+    )
+    _write_watch(tmp_path)
+    assert _go(_fresh(tmp_path, monkeypatch, box), monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert all(f"#{i}:" in out for i in range(1, 7))
+    for i in range(1, 6):
+        assert f"MARK{i}" not in out
+    assert "не разобрано" not in out, "type checks, not the safety net, handle these"
+    assert "needs_decision" in out
+
+
+def test_a_formatting_failure_is_one_line_not_the_range(tmp_path, monkeypatch, capsys):
+    box = _Mailbox(_free(1), _free(2))
+    _write_watch(tmp_path)
+    module = _fresh(tmp_path, monkeypatch, box)
+    real = module.describe_message
+
+    def flaky(mid, msg, fetched):
+        if mid == 1:
+            raise RuntimeError("boom")
+        return real(mid, msg, fetched)
+
+    monkeypatch.setattr(module, "describe_message", flaky)
+    assert _go(module, monkeypatch) == 2
+    out = capsys.readouterr().out
+    assert "#1: тело не показано (сообщение не разобрано)" in out and "#2:" in out
+
+
+def test_an_ack_refusal_wakes_even_with_nothing_to_issue(tmp_path, monkeypatch, capsys):
+    """P3: the refusal is a diagnostic wake of its own."""
+    _write_watch(tmp_path, acked=3)
+    _state_path(tmp_path).write_text(json.dumps({"accepted_id": 3, "issued": None}))
+    for bad in (1, 9):
+        _ack(tmp_path, bad)
+        before = _state_path(tmp_path).read_text()
+        assert _go(_fresh(tmp_path, monkeypatch, _Mailbox()), monkeypatch) == 2
+        assert "отклон" in capsys.readouterr().out
+        assert _state_path(tmp_path).read_text() == before
+    _ack(tmp_path, 3)
+    assert _go(_fresh(tmp_path, monkeypatch, _Mailbox()), monkeypatch) is None
