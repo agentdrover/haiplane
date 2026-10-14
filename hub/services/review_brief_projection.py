@@ -41,7 +41,17 @@ STATEMENT_CAP = 1_500
 CAVEAT_CAP = 600
 
 LIST_TAG = "_list"
-SECTIONS = ("call_sites", "acceptance_criteria", "statement", "machine_review", "full")
+SECTIONS = (
+    "call_sites",
+    "acceptance_criteria",
+    "statement",
+    "machine_review",
+    "verdict_findings",
+    "full",
+)
+# Only prose excerpts are cut. Identifiers and locators (file, line, id, uid,
+# linked task, scope, sha, ...) are carried whole: a cut path reads as another path.
+PROSE_FIELDS = frozenset({"title", "message"})
 _CHANGED = "раздел изменился (ветка сдвинулась или пересдача) — начните с offset=0"
 # Heuristic states first: a reader with a short budget meets the sites that
 # nobody touched before the ones that are fine.
@@ -143,20 +153,27 @@ def _rows(items: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
     names = fields_of(MANDATORY, prefix)
     return [
         {
-            n: _cap(it.get(n), TITLE_CAP) if isinstance(it.get(n), str) else it.get(n)
+            n: _cap(it.get(n), TITLE_CAP) if n in PROSE_FIELDS else it.get(n)
             for n in names
         }
         for it in items
     ]
 
 
-def _finding_digest(items: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
-    """Up to FINDINGS_SHOWN rows of the listed children, the rest by count."""
+def _finding_digest(
+    items: list[dict[str, Any]], prefix: str, section: str
+) -> dict[str, Any]:
+    """Up to FINDINGS_SHOWN rows of the listed children, the rest by count.
+
+    ``section`` is the section that really holds the omitted items.
+    """
     shown = _rows(items[:FINDINGS_SHOWN], prefix)
+    omitted = len(items) - len(shown)
     return {
         "total": len(items),
         "shown": len(shown),
-        "omitted": len(items) - len(shown),
+        "omitted": omitted,
+        "hint": f"section={section}" if omitted else "",
         "items": shown,
     }
 
@@ -184,7 +201,9 @@ def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
         else:
             part[name] = value
     for name in _DIGEST_LISTS:
-        part[name] = _finding_digest(mr.get(name) or [], f"machine_review.{name}")
+        part[name] = _finding_digest(
+            mr.get(name) or [], f"machine_review.{name}", "machine_review"
+        )
     for name in _ROW_LISTS:
         part[name] = _rows(mr.get(name) or [], f"machine_review.{name}")
     return part
@@ -200,7 +219,9 @@ def _latest_review_part(review: dict[str, Any] | None) -> dict[str, Any] | None:
     }
     findings = review.get("findings") or []
     part["findings_count"] = len(findings)
-    part["findings"] = _finding_digest(findings, "latest_review.findings")
+    part["findings"] = _finding_digest(
+        findings, "latest_review.findings", "verdict_findings"
+    )
     return part
 
 
@@ -531,7 +552,7 @@ def _digest_lines(label: str, digest: dict[str, Any]) -> list[str]:
     lines = [f"{label}: {digest['total']}"]
     lines.extend(f"  - {_row_text(f)}" for f in digest["items"])
     if digest["omitted"]:
-        lines.append(f"  … and {digest['omitted']} more (section=machine_review)")
+        lines.append(f"  … and {digest['omitted']} more ({digest['hint']})")
     return lines
 
 
@@ -959,6 +980,13 @@ def _machine_section(brief: dict[str, Any]) -> _Section:
     return section
 
 
+def _verdict_findings_section(brief: dict[str, Any]) -> _Section:
+    """The findings of the latest verdict, whole; the verdict's scalars as meta."""
+    review = dict(brief.get("latest_review") or {})
+    items = list(review.pop("findings", None) or [])
+    return _Section("findings", items=items, meta=review)
+
+
 def _call_sites_section(brief: dict[str, Any]) -> _Section:
     """Symbols first; the other lists and bulky texts follow as tagged elements."""
     data = dict(brief.get("call_sites") or {})
@@ -974,6 +1002,8 @@ def _load_section(brief: dict[str, Any], name: str) -> _Section:
         return _statement_section(brief)
     if name == "machine_review":
         return _machine_section(brief)
+    if name == "verdict_findings":
+        return _verdict_findings_section(brief)
     return _call_sites_section(brief)
 
 

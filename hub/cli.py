@@ -2551,6 +2551,7 @@ def build_parser() -> argparse.ArgumentParser:
             "acceptance_criteria",
             "statement",
             "machine_review",
+            "verdict_findings",
         ],
         help="One section, paged (default: the compact projection)",
     )

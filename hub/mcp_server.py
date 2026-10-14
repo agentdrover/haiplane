@@ -2954,7 +2954,7 @@ async def hub_get_review_brief(
 
     Args:
         task_id: The task ID to review
-        section: call_sites|acceptance_criteria|statement|machine_review|full
+        section: call_sites|acceptance_criteria|statement|machine_review|verdict_findings|full
         offset: Page start
         expect: Previous page fingerprint
     """

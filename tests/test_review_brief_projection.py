@@ -506,7 +506,8 @@ def test_sections_page_back_into_the_whole():
     payload = unknown.structuredContent
     assert payload["reason"] == "unknown_section"
     assert set(payload["allowed"]) == {
-        "call_sites", "acceptance_criteria", "statement", "machine_review", "full"
+        "call_sites", "acceptance_criteria", "statement", "machine_review",
+        "verdict_findings", "full",
     }  # fmt: skip
     assert (
         proj.brief_result(big, "call_sites", 10_000).structuredContent["reason"]
@@ -1534,3 +1535,114 @@ def test_verdict_findings_keep_scope_and_linked_task():
     row = _answer(b)["latest_review"]["findings"]["items"][0]
     assert (row["id"], row["scope"], row["linked_task_id"]) == (4, "out_of_scope", 9)
     assert "id=4 scope=out_of_scope linked_task_id=9" in _text_of(b)
+
+
+# --- review round 4 ----------------------------------------------------------
+
+
+def _verdict_with(n: int) -> dict[str, Any]:
+    return {
+        "verdict": "changes_requested",
+        "submission_generation": 2,
+        "is_current": True,
+        "findings": [
+            {
+                "id": i,
+                "severity": "high",
+                "message": f"находка {i}",
+                "file": f"hub/f{i}.py",
+                "line": i,
+                "scope": "out_of_scope" if i % 2 else "in_scope",
+                **({"linked_task_id": 100 + i} if i % 2 else {}),
+            }
+            for i in range(1, n + 1)
+        ],
+    }
+
+
+def test_identifiers_are_carried_whole_only_prose_is_cut():
+    """Путь файла находки не режется: два длинных пути, различные после 200-го знака."""
+    prefix = "hub/" + "d" * 205
+    a, b = _clean(), _clean()
+    a["latest_review"]["findings"][0]["file"] = prefix + "/a.py"
+    b["latest_review"]["findings"][0]["file"] = prefix + "/b.py"
+    assert len(prefix) > 200
+    row_a = _answer(a)["latest_review"]["findings"]["items"][0]
+    assert row_a["file"] == prefix + "/a.py", "файл целиком"
+    assert _answer(a) != _answer(b) and _text_of(a) != _text_of(b)
+    assert prefix + "/a.py" in _text_of(a)
+    # prose is still cut, and says so through the digest hint source (section).
+    long_message = _clean()
+    long_message["latest_review"]["findings"][0]["message"] = "м" * 400
+    cut = _answer(long_message)["latest_review"]["findings"]["items"][0]["message"]
+    assert len(cut) == 200 and cut.endswith("…")
+    assert proj.PROSE_FIELDS == {"title", "message"}
+
+
+def test_all_verdict_findings_are_recovered_by_paging_the_named_section():
+    brief = _clean()
+    brief["latest_review"] = _verdict_with(11)
+    digest = _answer(brief)["latest_review"]["findings"]
+    assert (digest["total"], digest["shown"], digest["omitted"]) == (11, 10, 1)
+    assert digest["hint"] == "section=verdict_findings"
+    assert "… and 1 more (section=verdict_findings)" in _text_of(brief)
+    pages = _pages(brief, "verdict_findings")
+    got = [f for p in pages for f in p["items"]]
+    assert [f["id"] for f in got] == list(range(1, 12))
+    eleventh = got[10]
+    assert (eleventh["scope"], eleventh["linked_task_id"]) == ("out_of_scope", 111)
+    assert pages[0]["meta"]["verdict"] == "changes_requested"
+
+
+def _walk_blocks(node: Any, path: str = ""):
+    """Every dict of the projection that reports omitted items and a hint."""
+    if isinstance(node, dict):
+        if node.get("omitted") and "hint" in node:
+            yield path, node
+        for key, value in node.items():
+            yield from _walk_blocks(value, f"{path}.{key}" if path else key)
+
+
+def test_every_hint_names_a_section_that_holds_the_omitted_items():
+    brief = _brief(
+        ac=25, symbols=30, confirmed=12, unresolved=12, latest_review=_verdict_with(11)
+    )
+    answer = proj.brief_result(brief).structuredContent["brief"]
+    seen = {path: block for path, block in _walk_blocks(answer)}
+    assert {
+        "blocks.acceptance_criteria",
+        "blocks.call_sites",
+        "machine_review.findings_confirmed",
+        "machine_review.unresolved",
+        "latest_review.findings",
+    } <= set(seen), sorted(seen)
+    for path, block in seen.items():
+        hint = block["hint"]
+        assert hint.startswith("section="), (path, hint)
+        name = hint.split("=", 1)[1]
+        assert name in proj.SECTIONS and name != "full", (path, name)
+        pages = _pages(brief, name)
+        items = [i for p in pages for i in p.get("items", [])]
+        if path.startswith("blocks.statement."):
+            field = path.rsplit(".", 1)[1]
+            assert brief[field] if isinstance(brief[field], str) else True
+            continue
+        source = {
+            "blocks.acceptance_criteria": brief["acceptance_criteria"],
+            "blocks.call_sites": brief["call_sites"]["entries"],
+            "latest_review.findings": brief["latest_review"]["findings"],
+        }.get(path)
+        if source is None:  # machine_review.<list>: tagged elements
+            key = path.split(".", 1)[1]
+            source = [{"kind": key, "value": v} for v in brief["machine_review"][key]]
+        assert block["total"] == len(source), path
+        missing = [e for e in source if e not in items]
+        assert missing == [], (path, hint, len(missing))
+    # statement texts: the hinted section holds the whole field
+    statement = "".join(p["text"] for p in _pages(brief, "statement"))
+    for field, block in answer["blocks"].get("statement", {}).items():
+        if block["omitted"]:
+            assert block["hint"] == "section=statement"
+            value = brief[field]
+            parts = [value] if isinstance(value, str) else [str(v) for v in value]
+            assert all(part in statement for part in parts), field
