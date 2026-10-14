@@ -853,66 +853,69 @@ def _format_task(t: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _status_section(
+    heading: str,
+    items: list[dict[str, Any]],
+    render: Callable[[Any], str],
+    limit: int | None = None,
+) -> list[str]:
+    """Секция обзора: заголовок и строки ``- …``; пустая секция не пишется."""
+    if not items:
+        return []
+    return [heading, *(f"- {render(item)}" for item in items[:limit])]
+
+
+def _commit_line(commit: dict[str, Any]) -> str:
+    msg = commit.get("message", "").split("\n")[0][:80]
+    return f"{commit.get('sha', '')} {msg}"
+
+
+def _status_sections(data: dict[str, Any]) -> list[str]:
+    """Восемь секций обзора по порядку; начальные переносы входят в заголовки."""
+    parts: list[str] = []
+    parts += _status_section(
+        "## Drafts (need approval)", data.get("draft_tasks", []), _format_task
+    )
+    parts += _status_section(
+        "\n## Needs Info (agent asked a question)",
+        data.get("needs_info_tasks", []),
+        _format_task,
+    )
+    parts += _status_section(
+        "\n## Under Review",
+        data.get("review_tasks", []),
+        lambda t: f"{_format_task(t)} (review cycle {t.get('review_cycle', 0) + 1})",
+    )
+    parts += _status_section(
+        "\n## Needs Decision (arbiter report ready)",
+        data.get("needs_decision_tasks", []),
+        lambda t: f"{_format_task(t)} — ARBITER REPORT READY, human must decide",
+    )
+    parts += _status_section(
+        "\n## Active Tasks (open / running)", data.get("active_tasks", []), _format_task
+    )
+    parts += _status_section(
+        "\n## Open PRs",
+        data.get("open_prs", []),
+        lambda pr: f"#{pr['number']} {pr['title']} ({pr.get('headRefName', '')})",
+    )
+    parts += _status_section(
+        "\n## Recent Commits", data.get("recent_commits", []), _commit_line, 5
+    )
+    parts += _status_section(
+        "\n## Recent Decisions",
+        data.get("recent_decisions", []),
+        lambda d: d.get("title", "Decision"),
+        5,
+    )
+    return parts
+
+
 @mcp.tool()
 async def hub_project_status() -> CallToolResult:
     """Get project overview: active tasks, drafts needing approval, tasks with questions, open PRs, recent commits, decisions."""
     data = await _api_get("/api/dashboard")
-    parts: list[str] = []
-
-    drafts = data.get("draft_tasks", [])
-    if drafts:
-        parts.append("## Drafts (need approval)")
-        for t in drafts:
-            parts.append(f"- {_format_task(t)}")
-
-    needs_info = data.get("needs_info_tasks", [])
-    if needs_info:
-        parts.append("\n## Needs Info (agent asked a question)")
-        for t in needs_info:
-            parts.append(f"- {_format_task(t)}")
-
-    review = data.get("review_tasks", [])
-    if review:
-        parts.append("\n## Under Review")
-        for t in review:
-            cycle = t.get("review_cycle", 0)
-            parts.append(f"- {_format_task(t)} (review cycle {cycle + 1})")
-
-    needs_decision = data.get("needs_decision_tasks", [])
-    if needs_decision:
-        parts.append("\n## Needs Decision (arbiter report ready)")
-        for t in needs_decision:
-            parts.append(
-                f"- {_format_task(t)} — ARBITER REPORT READY, human must decide"
-            )
-
-    tasks = data.get("active_tasks", [])
-    if tasks:
-        parts.append("\n## Active Tasks (open / running)")
-        for t in tasks:
-            parts.append(f"- {_format_task(t)}")
-
-    prs = data.get("open_prs", [])
-    if prs:
-        parts.append("\n## Open PRs")
-        for pr in prs:
-            parts.append(
-                f"- #{pr['number']} {pr['title']} ({pr.get('headRefName', '')})"
-            )
-
-    commits = data.get("recent_commits", [])
-    if commits:
-        parts.append("\n## Recent Commits")
-        for c in commits[:5]:
-            msg = c.get("message", "").split("\n")[0][:80]
-            parts.append(f"- {c.get('sha', '')} {msg}")
-
-    decisions = data.get("recent_decisions", [])
-    if decisions:
-        parts.append("\n## Recent Decisions")
-        for d in decisions[:5]:
-            title = d.get("title", "Decision")
-            parts.append(f"- {title}")
+    parts = _status_sections(data)
 
     queue, queue_error = await _orchestrator_queue()
     parts.extend(_queue_lines(queue))
