@@ -121,6 +121,20 @@ def fetch_task(base: str, auth: str, task_id: int) -> dict | None:
         return None  # сеть моргнула — попробуем в следующем цикле
 
 
+# Класс последней неудачи чтения ящика ("" — чтение удалось): auth / not found /
+# network. Только класс: ни токен, ни адрес в вывод не идут.
+LAST_FETCH_ERROR = ""
+
+
+def _error_class(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (401, 403):
+            return "auth"
+        if exc.code == 404:
+            return "not found"
+    return "network"
+
+
 def fetch_inbox(
     base: str, auth: str, session: str, after_id: int, limit: int = 20
 ) -> list | None:
@@ -132,12 +146,23 @@ def fetch_inbox(
     """
     url = f"{base}/api/messages?session_id={session}&after_id={after_id}&limit={limit}"
     req = urllib.request.Request(url, headers={"Authorization": auth})
+    global LAST_FETCH_ERROR
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+    ) as exc:
+        LAST_FETCH_ERROR = _error_class(exc)
         return None  # сеть моргнула — попробуем в следующем цикле
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list):
+        LAST_FETCH_ERROR = "network"
+        return None
+    LAST_FETCH_ERROR = ""
+    return data
 
 
 def fetch_events(base: str, auth: str, since: int, wait: int = 0) -> dict | None:
@@ -551,14 +576,21 @@ def reconcile_ack(state: dict, acked: object) -> str:
     return f"acked_id={acked}: ничего не выдано сверх принятого {accepted}"
 
 
+# Итог последнего чтения ящика дежурством: "" — прочитан, иначе класс неудачи.
+LAST_WATCH_READ = ""
+
+
 def read_new_messages(
     base: str, auth: str, session: str, after: int, cap: int = WATCH_RANGE_MAX
 ) -> list[dict] | None:
     """Все страницы ящика после курсора (до cap штук). Ошибка любой — None."""
+    global LAST_WATCH_READ
+    LAST_WATCH_READ = ""
     found: list[dict] = []
     while len(found) < cap:
         page = fetch_inbox(base, auth, session, after, WATCH_PAGE)
         if page is None:
+            LAST_WATCH_READ = LAST_FETCH_ERROR or "network"
             return None
         rows = [m for m in page if isinstance(m, dict) and _is_int(m.get("id"))]
         rows = sorted((m for m in rows if m["id"] > after), key=lambda m: m["id"])
@@ -824,11 +856,19 @@ def main() -> int:
                     # Внешний таймаут хука в Claude Code оборвал бы поллер молча
                     # и без пробуждения; выходим сами, пока он не наступил. Не
                     # ack и не refire: ничего в файлах не меняется.
-                    watch_lines = [
-                        "- дежурство: перевооружение, новых сообщений нет. "
-                        "Действий не требуется: заверши ход, следующий Stop "
-                        "запустит хук снова."
-                    ]
+                    if LAST_WATCH_READ:
+                        watch_lines = [
+                            "- дежурство: перевооружение; ящик НЕ прочитан: "
+                            f"{LAST_WATCH_READ} — проверьте регистрацию сессии "
+                            "и токен; откройте hub_inbox. Заверши ход: "
+                            "следующий Stop запустит хук снова."
+                        ]
+                    else:
+                        watch_lines = [
+                            "- дежурство: перевооружение; почта прочитана, новых "
+                            "сообщений нет. Действий не требуется: заверши ход, "
+                            "следующий Stop запустит хук снова."
+                        ]
             if fired or watch_lines:
                 # Доставка «хотя бы раз», не «ровно раз»: сработавшее ожидание
                 # НЕ удаляем, а помечаем fired_at/refire_count и оставляем в
@@ -859,8 +899,8 @@ def main() -> int:
                         # инбоксом под авторизацией самого агента, и оно ВХОД,
                         # а не команда (docs/agent-onboarding.md).
                         senders = ", ".join(
-                            f"#{m.get('id')} от {m.get('from_agent') or '?'}"
-                            f" ({m.get('kind') or 'note'})"
+                            f"#{_label(m.get('id'))} от {_label(m.get('from_agent'))}"
+                            f" ({_label(m.get('kind') or 'note')})"
                             for m in (obj.get("messages") or [])[:5]
                         )
                         lines.append(
