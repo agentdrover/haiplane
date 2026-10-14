@@ -65,22 +65,6 @@
     },
     {
       "path": "hub/mcp_server.py",
-      "function": "hub_prepare_developer_task",
-      "rule": "C901",
-      "measured": 18,
-      "max": 23,
-      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
-    },
-    {
-      "path": "hub/mcp_server.py",
-      "function": "hub_prepare_developer_task",
-      "rule": "PLR0915",
-      "measured": 75,
-      "max": 76,
-      "removed_by": "task:#1691 — 33 параметра выводятся из модели, а не перечисляются (прежняя #1068 завершена)"
-    },
-    {
-      "path": "hub/mcp_server.py",
       "function": "hub_project_status",
       "rule": "C901",
       "measured": 18,
