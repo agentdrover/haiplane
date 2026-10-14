@@ -33,7 +33,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub.services import ci_trust
 
 EVENT_JUDGED_WITHOUT_CI = "steward_judges_without_verified_ci"
@@ -60,55 +60,54 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
     sha = sha.strip()
     if not sha:
         return NOT_WAITING
-    report = await repo.get_ci_run_report(db, task_id, sha)
-    if report is None:
+    # ОДИН запрос: проекция и строка её текущей попытки читаются из одного
+    # снимка. Двумя запросами обновление CI между ними подсунуло бы
+    # окончательность попытки A под ключом уже переключённой проекции на B.
+    rows = await fetchall(
+        db,
+        "SELECT r.trust, r.trust_reason, r.attempt_key, a.id AS attempt_id, "
+        "a.trust_final FROM ci_run_reports r LEFT JOIN ci_report_attempts a "
+        "ON a.task_id=r.task_id AND a.head_sha=r.head_sha "
+        "AND r.attempt_key != '' AND a.run_id != '' AND a.run_attempt != '' "
+        "AND 'ci:' || a.run_id || ':' || a.run_attempt = r.attempt_key "
+        "WHERE r.task_id=? AND r.head_sha=?",
+        (task_id, sha),
+    )
+    if not rows:
         return CiWait(True, "отчёта CI по закреплённому коммиту нет")
-    row = dict(report)
+    row = dict(rows[0])
     trust, reason = ci_trust.trust_of(row)
     if trust == ci_trust.VERIFIED:
         return NOT_WAITING
-    key = str(row.get("attempt_key") or "")
-    attempt = await _attempt_of(db, task_id, sha, key)
-    if attempt is None:
+    if row["attempt_id"] is None:
+        key = str(row.get("attempt_key") or "")
         return CiWait(
             True,
             f"unverified({reason}): у текущей попытки {key or '—'} нет строки учёта",
         )
-    if int(attempt.get("trust_final") or 0):
+    if int(row.get("trust_final") or 0):
         return NOT_WAITING
     return CiWait(True, f"unverified({reason}), проверка не окончательна")
-
-
-async def _attempt_of(
-    db: aiosqlite.Connection, task_id: int, sha: str, key: str
-) -> dict[str, Any] | None:
-    """Строка ТЕКУЩЕЙ попытки проекции; пустой ключ строки не имеет."""
-    if not key:
-        return None
-    for row in await repo.list_ci_report_attempts(db, task_id, sha):
-        item = dict(row)
-        if ci_trust.attempt_key(item["run_id"], item["run_attempt"]) == key:
-            return item
-    return None
 
 
 async def note_judged_without_ci(
     db: aiosqlite.Connection, task_id: int, generation: int, note: str
 ) -> None:
     """Одна строка в ленте на поколение: судим, не дождавшись подтверждённого CI."""
-    rows = await fetchall(
-        db,
-        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
-        "AND json_extract(payload, '$.generation')=? LIMIT 1",
-        (task_id, EVENT_JUDGED_WITHOUT_CI, generation),
-    )
-    if rows:
-        return
-    await repo.insert_event(
-        db,
-        kind=EVENT_JUDGED_WITHOUT_CI,
-        task_id=task_id,
-        actor="hub",
-        payload={"generation": generation, "detail": note},
-    )
-    await db.commit()
+    # «Проверил — вставил» под BEGIN IMMEDIATE: два тика не пишут две строки.
+    async with write_transaction(db):
+        rows = await fetchall(
+            db,
+            "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+            "AND json_extract(payload, '$.generation')=? LIMIT 1",
+            (task_id, EVENT_JUDGED_WITHOUT_CI, generation),
+        )
+        if rows:
+            return
+        await repo.insert_event(
+            db,
+            kind=EVENT_JUDGED_WITHOUT_CI,
+            task_id=task_id,
+            actor="hub",
+            payload={"generation": generation, "detail": note},
+        )
