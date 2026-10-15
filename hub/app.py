@@ -766,9 +766,10 @@ async def api_chat_pair_redeem(
     if chat_pair.redeem_limit_reached(caller):
         raise HTTPException(429, detail=chat_pair_rate_limited_detail())
 
-    session = await chat_pair.redeem_code(_db(request), body.code)
+    session, refusal = await chat_pair.redeem_code_explained(_db(request), body.code)
     if session is None:
         chat_pair.record_redeem_attempt(caller)
+        await chat_pair.audit_redeem_refusal(_db(request), caller, refusal)
         raise HTTPException(401, detail=chat_pair_invalid_detail())
 
     await admin_svc.write_audit(
