@@ -710,6 +710,13 @@ HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")
 # a permission set that is a constant here rather than a copy of the issuer's
 # rights — the same principal is often ``admin`` in production.
 CHAT_PAIR_CODE_SECONDS = int(env_get("CHAT_PAIR_CODE_SECONDS", "300"))
+# Reviewer code (#1694): a cloud run may take a while to reach its first
+# action, and the code is single-use, bound to one task in review and one
+# generation, and burned by the next issue — so a longer window costs little.
+# HAIPLANE_CHAT_PAIR_REVIEWER_CODE_SECONDS; other kinds keep the value above.
+CHAT_PAIR_REVIEWER_CODE_SECONDS = int(
+    env_get("CHAT_PAIR_REVIEWER_CODE_SECONDS", "3600")
+)
 CHAT_PAIR_TTL_SECONDS = int(env_get("CHAT_PAIR_TTL_SECONDS", "7200"))
 CHAT_PAIR_REDEEM_MAX = int(env_get("CHAT_PAIR_REDEEM_MAX", "10"))
 CHAT_PAIR_REDEEM_WINDOW_SECONDS = int(env_get("CHAT_PAIR_REDEEM_WINDOW_SECONDS", "300"))
