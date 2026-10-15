@@ -37,6 +37,11 @@ artifacts = [
     "hub/workflow_templates/*.yml",
 ]
 
+# Навыки хаба (#1701): текст живёт в skills/ в корне репозитория, в wheel
+# он ложится в hub/_skills, откуда его читает hub.skill_files.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "hub/_skills"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -59,6 +64,7 @@ dev = [
     "bandit>=1.9.4",
     "cosmic-ray>=8.7,<9",
     "detect-secrets>=1.5.0",
+    "hatchling>=1.32.4",
     "mypy>=1.19.1",
     "pip-audit>=2.10.0",
     "pytest>=9.0.3",
