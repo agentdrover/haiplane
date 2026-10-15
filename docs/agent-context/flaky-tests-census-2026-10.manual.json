@@ -1,0 +1,1142 @@
+{
+ "classes": {
+  "tests/test_agent_eval_contract.py::test_critical_approve_with_error_is_quality_failed": {
+   "class": "детерминированная регрессия",
+   "why": "ветка задачи, поправлена автором"
+  },
+  "tests/test_agent_eval_contract.py::test_duplicate_with_critical_approve_is_quality_failed": {
+   "class": "детерминированная регрессия",
+   "why": "то же"
+  },
+  "tests/test_agent_eval_contract.py::test_validate_rejects_outcome_downgrade_to_infrastructure": {
+   "class": "детерминированная регрессия",
+   "why": "то же"
+  },
+  "tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline": {
+   "class": "общее состояние вне теста",
+   "why": "эталон записан с именем хоста автора (server_id 'MacBook-Pro-…local'), на раннере 'runner…'. Поймано CI ветки до мержа"
+  },
+  "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate": {
+   "class": "дочерние процессы",
+   "why": "дочерний процесс с TestClient не завершался: pytest-timeout 300 с; исправлено #1666, #1667"
+  },
+  "tests/test_ci_trust.py::test_a_retry_round_reserves_its_own_version_and_a_late_answer_loses": {
+   "class": "иное",
+   "why": "по отчёту исполнителя #1684 падает под нагрузкой N=5; причина не установлена"
+  },
+  "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push": {
+   "class": "гонки git",
+   "why": "гонка пуша: git пишет формулировку, которую _push_refusal относит к refused вместо head_moved; исправлено #1684"
+  },
+  "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row": {
+   "class": "сон и стена",
+   "why": "checked_at пишется datetime('now') с точностью до секунды; пересечение границы секунды между созданием двух строк переворачивает ротацию"
+  },
+  "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop": {
+   "class": "планировщик asyncio",
+   "why": "пороги по стене (0.4+0.5 с, 0.3 с) и счётчик итераций цикла под нагрузкой"
+  },
+  "tests/test_git_ops.py::test_run_bytes_cancel_kills_the_pipeline": {
+   "class": "дочерние процессы",
+   "why": "ищет конвейер pgrep по строке 'sleep 31.337' по всей машине и ждёт запуска фиксированным сном 0,5 с; исправлено #1684"
+  },
+  "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret": {
+   "class": "иное",
+   "why": "иголка '250' (длина подложенного значения) попадает в случайный шестнадцатеричный адрес объекта в журнале aiosqlite"
+  },
+  "tests/test_lifecycle.py::test_disposed_findings_produce_no_note": {
+   "class": "детерминированная регрессия",
+   "why": "TypeError: у функции появился обязательный аргумент"
+  },
+  "tests/test_lifecycle.py::test_second_report_names_the_dispatched_reviewer": {
+   "class": "детерминированная регрессия",
+   "why": "то же: у функции появился обязательный аргумент"
+  },
+  "tests/test_local_checks_match_ci.py::test_a_new_uncovered_step_breaks_the_build": {
+   "class": "детерминированная регрессия",
+   "why": "новый шаг CI без цели make"
+  },
+  "tests/test_local_checks_match_ci.py::test_every_ci_static_check_has_a_make_target": {
+   "class": "детерминированная регрессия",
+   "why": "то же"
+  },
+  "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown": {
+   "class": "дочерние процессы",
+   "why": "TimeoutError на воркере-подпроцессе с 3 МБ stdout"
+  },
+  "tests/test_mcp_catalog_budget.py::test_description_chars_stay_under_freeze": {
+   "class": "детерминированная регрессия",
+   "why": "каталог выше потолка на 109 символов"
+  },
+  "tests/test_mcp_catalog_budget.py::test_the_report_leads_with_the_limit_that_binds": {
+   "class": "детерминированная регрессия",
+   "why": "то же: каталог выше потолка"
+  },
+  "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path": {
+   "class": "общее состояние вне теста",
+   "why": "RuntimeError: StreamableHTTPSessionManager.run() once per instance: одноразовый объект модуля, тест несовместим с другими в одном процессе; в одиночку 3/3 зелёные, в одном процессе повтор падает"
+  },
+  "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name": {
+   "class": "детерминированная регрессия",
+   "why": "сканирует содержимое дерева и называет файл с вхождением; красный на каждом из 6 деревьев"
+  },
+  "tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base": {
+   "class": "общее состояние вне теста",
+   "why": "тест наследует HAIPLANE_HUB_CI_BASELINE_OUTCOME: с переменной красный, без неё зелёный на том же дереве (rD)"
+  },
+  "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]": {
+   "class": "детерминированная регрессия",
+   "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
+  },
+  "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded": {
+   "class": "детерминированная регрессия",
+   "why": "то же"
+  },
+  "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review": {
+   "class": "детерминированная регрессия",
+   "why": "то же"
+  },
+  "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code": {
+   "class": "сон и стена",
+   "why": "гонка по стене: срок кода доступа против нагрузки раннера (docstring теста называет её сам)"
+  },
+  "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker": {
+   "class": "дочерние процессы",
+   "why": "ждущий acquire (bash-скрипт) не остановился после смерти родителя"
+  },
+  "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker": {
+   "class": "дочерние процессы",
+   "why": "bash-скрипт не уложился в 10 с"
+  },
+  "tests/test_review_drain.py::test_no_active_jobs_or_no_spool_is_immediate": {
+   "class": "сон и стена",
+   "why": "assert time.monotonic() - started < 3 вокруг bash-скрипта; исправлено #1684"
+  },
+  "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently": {
+   "class": "сон и стена",
+   "why": "продление маркера против TTL по стене; исправлено #1627"
+  },
+  "tests/test_review_evidence.py::test_the_authors_claim_survives_the_dispatch_note": {
+   "class": "детерминированная регрессия",
+   "why": "красный на дереве падения, поправлен автором"
+  },
+  "tests/test_steward_dispatch.py::test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit": {
+   "class": "иное",
+   "why": "по отчёту исполнителя #1684 падает под нагрузкой N=5; причина не установлена"
+  },
+  "tests/test_web.py::test_saving_the_project_form_keeps_unknown_policy_keys": {
+   "class": "детерминированная регрессия",
+   "why": "новый ключ политики без образца значения"
+  },
+  "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged": {
+   "class": "детерминированная регрессия",
+   "why": "изменён набор переходов жизненного цикла"
+  }
+ },
+ "extra_rows": [
+  {
+   "branch": "task-1681/flaky-local-prompt",
+   "created_at": "2026-10-12T15:20:27Z",
+   "event": "pull_request",
+   "evidence": {
+    "class": {
+     "class": "общее состояние вне теста",
+     "why": "тест наследует HAIPLANE_HUB_CI_BASELINE_OUTCOME от шага отчёта"
+    },
+    "hypothesis_verified": true,
+    "passes_on_same_tree": [],
+    "reason": "шаг Test зелёный, упал validation в шаге отчёта; тот же head_sha 1085dd6a прошёл validation=pass в двух dispatch-прогонах (38269548817, 38274142103), где шаг baseline выполнялся; на PR-прогоне шаг baseline пропущен",
+    "reproduction": "тест зелёный на дереве 7b0f949 без переменных и красный с HAIPLANE_HUB_CI_BASELINE_OUTCOME=skipped (local_runs, метки plain и env_baseline_skipped)",
+    "source_of_nodeid": "карточка #1685 (заметка стюарда 12.10); журнал job даёт только 'validation=fail', подробностей и артефакта (hub-ci-results) нет",
+    "test_file_in_run_diff": false
+   },
+   "head_sha": "git:1085dd6aca3dab8d95050816ba63798cde47561a",
+   "nodeid": "tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base",
+   "pytest_outcome": "failed_in_validation_step",
+   "run_attempt": 1,
+   "run_id": 38269508400,
+   "status": "confirmed",
+   "tested_sha": "git:5e6ebf098862a840d7be37a55d5978d88f5168e8",
+   "tested_tree": "git:7b0f94928d842ea030e9b67a14683f2c4a4b7f01"
+  },
+  {
+   "branch": "task-1681/flaky-local-prompt",
+   "created_at": "2026-10-12",
+   "event": "local",
+   "evidence": {
+    "class": {
+     "class": "дочерние процессы",
+     "why": "ищет конвейер pgrep по строке 'sleep 31.337' по всей машине и ждёт запуска фиксированным сном 0,5 с; исправлено #1684"
+    },
+    "executor_report": "падал при 4-5 параллельных полных прогонах; исправлен #1684",
+    "reason": "локальное падение в прогоне исполнителя #1681 без прогона ci.yml и записанного дерева: tested_tree восстановить нельзя",
+    "test_file_in_run_diff": null
+   },
+   "head_sha": null,
+   "nodeid": "tests/test_git_ops.py::test_run_bytes_cancel_kills_the_pipeline",
+   "pytest_outcome": "failed",
+   "run_attempt": null,
+   "run_id": null,
+   "status": "unconfirmed",
+   "tested_sha": null,
+   "tested_tree": null
+  },
+  {
+   "branch": "task-1681/flaky-local-prompt",
+   "created_at": "2026-10-12",
+   "event": "local",
+   "evidence": {
+    "class": {
+     "class": "сон и стена",
+     "why": "assert time.monotonic() - started < 3 вокруг bash-скрипта; исправлено #1684"
+    },
+    "executor_report": "падал при 4-5 параллельных полных прогонах и, по заметке, в CI 11.10; в переписи ci.yml такого прогона нет (искали по FAILED в шаге Test); исправлен #1684",
+    "reason": "локальное падение в прогоне исполнителя #1681 без прогона ci.yml и записанного дерева: tested_tree восстановить нельзя",
+    "test_file_in_run_diff": null
+   },
+   "head_sha": null,
+   "nodeid": "tests/test_review_drain.py::test_no_active_jobs_or_no_spool_is_immediate",
+   "pytest_outcome": "failed",
+   "run_attempt": null,
+   "run_id": null,
+   "status": "unconfirmed",
+   "tested_sha": null,
+   "tested_tree": null
+  },
+  {
+   "branch": "task-1682/*",
+   "created_at": "2026-10-14",
+   "event": "local",
+   "evidence": {
+    "class": {
+     "class": "сон и стена",
+     "why": "checked_at пишется datetime('now') с точностью до секунды; пересечение границы секунды между созданием двух строк переворачивает ротацию"
+    },
+    "executor_report": "упал в полном прогоне -n auto, отдельно и при повторе зелёный; тот же nodeid подтверждён по CI в двух строках переписи",
+    "reason": "локальное падение в прогоне исполнителя #1682 без прогона ci.yml и записанного дерева: tested_tree восстановить нельзя",
+    "test_file_in_run_diff": null
+   },
+   "head_sha": null,
+   "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+   "pytest_outcome": "failed",
+   "run_attempt": null,
+   "run_id": null,
+   "status": "unconfirmed",
+   "tested_sha": null,
+   "tested_tree": null
+  },
+  {
+   "branch": "task-1684/*",
+   "created_at": "2026-10-15",
+   "event": "local",
+   "evidence": {
+    "class": {
+     "class": "иное",
+     "why": "по отчёту исполнителя #1684 падает под нагрузкой N=5; причина не установлена"
+    },
+    "executor_report": "3 из 10 полных прогонов при N=5",
+    "reason": "локальное падение в прогоне исполнителя #1684 без прогона ci.yml и записанного дерева: tested_tree восстановить нельзя",
+    "test_file_in_run_diff": null
+   },
+   "head_sha": null,
+   "nodeid": "tests/test_steward_dispatch.py::test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit",
+   "pytest_outcome": "failed",
+   "run_attempt": null,
+   "run_id": null,
+   "status": "unconfirmed",
+   "tested_sha": null,
+   "tested_tree": null
+  },
+  {
+   "branch": "task-1684/*",
+   "created_at": "2026-10-15",
+   "event": "local",
+   "evidence": {
+    "class": {
+     "class": "иное",
+     "why": "по отчёту исполнителя #1684 падает под нагрузкой N=5; причина не установлена"
+    },
+    "executor_report": "1 из 10 при N=5; тест добавлен #1687",
+    "reason": "локальное падение в прогоне исполнителя #1684 без прогона ci.yml и записанного дерева: tested_tree восстановить нельзя",
+    "test_file_in_run_diff": null
+   },
+   "head_sha": null,
+   "nodeid": "tests/test_ci_trust.py::test_a_retry_round_reserves_its_own_version_and_a_late_answer_loses",
+   "pytest_outcome": "failed",
+   "run_attempt": null,
+   "run_id": null,
+   "status": "unconfirmed",
+   "tested_sha": null,
+   "tested_tree": null
+  }
+ ],
+ "fixes": {
+  "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate": {
+   "task": "#1666, #1667"
+  },
+  "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push": {
+   "note": "в develop 315f45fe",
+   "task": "#1684"
+  },
+  "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently": {
+   "task": "#1627"
+  }
+ },
+ "loaded_seconds_per_repeat": {
+  "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate": 5.167,
+  "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push": 2.566,
+  "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row": 0.408,
+  "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop": 1.387,
+  "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret": 0.466,
+  "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown": 0.21,
+  "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code": 5.898,
+  "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker": 0.65,
+  "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker": 0.517,
+  "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently": 3.844
+ },
+ "local_runs": [
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree b8f9f259ec9b> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:b8f9f259ec9b3f0690209210acdfce0fd964bc10"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 8c9549b4c468> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:8c9549b4c46803c025f3a53905c70e1c154d7d44"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 4f3a04b666b6> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:4f3a04b666b653c130900925c9fa0ccd8763580f"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree e1dfa9c21059> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:e1dfa9c2105983b53df7f10499ba8fba142452ea"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 477d2573fbb7> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:477d2573fbb73d4784b49982732be9512e149889"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9200277377f5> pytest tests/test_mcp_catalog_budget.py::test_description_chars_stay_under_freeze -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_catalog_budget.py::test_description_chars_stay_under_freeze",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9200277377f5> pytest tests/test_mcp_catalog_budget.py::test_the_report_leads_with_the_limit_that_binds -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_catalog_budget.py::test_the_report_leads_with_the_limit_that_binds",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
+   "passed": 10,
+   "runs": 10,
+   "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 65c81e2113ee> pytest tests/test_agent_eval_contract.py::test_critical_approve_with_error_is_quality_failed -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_agent_eval_contract.py::test_critical_approve_with_error_is_quality_failed",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 65c81e2113ee> pytest tests/test_agent_eval_contract.py::test_duplicate_with_critical_approve_is_quality_failed -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_agent_eval_contract.py::test_duplicate_with_critical_approve_is_quality_failed",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 65c81e2113ee> pytest tests/test_agent_eval_contract.py::test_validate_rejects_outcome_downgrade_to_infrastructure -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_agent_eval_contract.py::test_validate_rejects_outcome_downgrade_to_infrastructure",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 4d05d0042be0> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:4d05d0042be0d1baf8ebc9737dd94362f3f09891"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
+   "failed": 9,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
+   "passed": 1,
+   "runs": 10,
+   "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree bf618dac4ad3> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
+   "failed": 10,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
+   "passed": 0,
+   "runs": 10,
+   "tree": "git:bf618dac4ad38a51687c68444fa4cf784f6c5817"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 94460dd923d9> pytest tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline",
+   "passed": 10,
+   "runs": 10,
+   "tree": "git:94460dd923d97ae66176fa55164733c0c640a480"
+  },
+  {
+   "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
+   "passed": 10,
+   "runs": 10,
+   "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat_single",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
+   "passed": 1,
+   "runs": 1,
+   "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat_single",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
+   "passed": 1,
+   "runs": 1,
+   "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat_single",
+   "load": "idle",
+   "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
+   "passed": 1,
+   "runs": 1,
+   "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3f58abe628ac> pytest tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3f58abe628ac> pytest tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree fad97f120892> pytest tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree fad97f120892> pytest tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 12c160bf30dd> pytest tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 12c160bf30dd> pytest tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
+   "passed": 39,
+   "runs": 40,
+   "tree": "git:12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 1966da8454bc> pytest tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:1966da8454bc036bc9739cef6c84d65ecc369d42"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 1966da8454bc> pytest tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:1966da8454bc036bc9739cef6c84d65ecc369d42"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree a820ae609ac1> pytest tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker -q -p repeatplug -p no:cacheprovider",
+   "failed": 2,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
+   "passed": 38,
+   "runs": 40,
+   "tree": "git:a820ae609ac106090350b2e42b3c5c069147cea4"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree a820ae609ac1> pytest tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker -q -p repeatplug -p no:cacheprovider",
+   "failed": 2,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
+   "passed": 38,
+   "runs": 40,
+   "tree": "git:a820ae609ac106090350b2e42b3c5c069147cea4"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 829580a5c467> pytest tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:829580a5c4675421feca13e9035f0c0684ead2a1"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 829580a5c467> pytest tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:829580a5c4675421feca13e9035f0c0684ead2a1"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 44b99d672c84> pytest tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 44b99d672c84> pytest tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 7137ddb596b0> pytest tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:7137ddb596b04c904991aca7c8e17ae2eaff0730"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 7137ddb596b0> pytest tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:7137ddb596b04c904991aca7c8e17ae2eaff0730"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "idle40",
+   "load": "idle",
+   "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
+  },
+  {
+   "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded40",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
+   "passed": 40,
+   "runs": 40,
+   "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree bd0294701c93> pytest tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:bd0294701c9378422c3914c95f296eded01e9051"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree b740202d652c> pytest tests/test_lifecycle.py::test_disposed_findings_produce_no_note -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_lifecycle.py::test_disposed_findings_produce_no_note",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree b740202d652c> pytest tests/test_lifecycle.py::test_second_report_names_the_dispatched_reviewer -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_lifecycle.py::test_second_report_names_the_dispatched_reviewer",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2e0451943501> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2e0451943501> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2e0451943501> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9f253d536447> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9f253d536447> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9f253d536447> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2500e9747156> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2500e9747156> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 2500e9747156> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 01066a7a99b5> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 01066a7a99b5> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 01066a7a99b5> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 60ac76bb8425> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 60ac76bb8425> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 60ac76bb8425> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3dc4c6e41374> pytest tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed] -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3dc4c6e41374> pytest tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3dc4c6e41374> pytest tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 0b00dce0a5b0> pytest tests/test_review_evidence.py::test_the_authors_claim_survives_the_dispatch_note -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_review_evidence.py::test_the_authors_claim_survives_the_dispatch_note",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:0b00dce0a5b09c7f4f3a0f5a7dd336941958a6b9"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9200277377f5> pytest tests/test_local_checks_match_ci.py::test_a_new_uncovered_step_breaks_the_build -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_local_checks_match_ci.py::test_a_new_uncovered_step_breaks_the_build",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9200277377f5> pytest tests/test_local_checks_match_ci.py::test_every_ci_static_check_has_a_make_target -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_local_checks_match_ci.py::test_every_ci_static_check_has_a_make_target",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
+  },
+  {
+   "command": "REPS=3 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9200277377f5> pytest tests/test_web.py::test_saving_the_project_form_keeps_unknown_policy_keys -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "local_repeat",
+   "load": "idle",
+   "nodeid": "tests/test_web.py::test_saving_the_project_form_keeps_unknown_policy_keys",
+   "passed": 0,
+   "runs": 3,
+   "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 7b0f94928d84> pytest tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "plain",
+   "load": "idle",
+   "nodeid": "tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base",
+   "passed": 1,
+   "runs": 1,
+   "tree": "git:7b0f94928d842ea030e9b67a14683f2c4a4b7f01"
+  },
+  {
+   "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 7b0f94928d84> pytest tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base -q -p repeatplug -p no:cacheprovider",
+   "failed": 1,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "env_baseline_skipped",
+   "load": "idle",
+   "nodeid": "tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base",
+   "passed": 0,
+   "runs": 1,
+   "tree": "git:7b0f94928d842ea030e9b67a14683f2c4a4b7f01"
+  },
+  {
+   "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3f58abe628ac> pytest tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret -q -p repeatplug -p no:cacheprovider",
+   "failed": 3,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded400",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
+   "passed": 397,
+   "runs": 400,
+   "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+  },
+  {
+   "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree fad97f120892> pytest tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row -q -p repeatplug -p no:cacheprovider",
+   "failed": 4,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded400",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+   "passed": 396,
+   "runs": 400,
+   "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
+  },
+  {
+   "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded400",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
+   "passed": 400,
+   "runs": 400,
+   "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
+  },
+  {
+   "command": "REPS=150 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 44b99d672c84> pytest tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded150",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
+   "passed": 150,
+   "runs": 150,
+   "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
+  },
+  {
+   "command": "REPS=120 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded120",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
+   "passed": 120,
+   "runs": 120,
+   "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
+  },
+  {
+   "command": "REPS=100 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 001d4b561290> pytest tests/test_steward_dispatch.py::test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded100",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_steward_dispatch.py::test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit",
+   "passed": 100,
+   "runs": 100,
+   "tree": "git:001d4b56129043373a6859911f4d8cb13649be79"
+  },
+  {
+   "command": "REPS=100 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 001d4b561290> pytest tests/test_ci_trust.py::test_a_retry_round_reserves_its_own_version_and_a_late_answer_loses -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded100",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_ci_trust.py::test_a_retry_round_reserves_its_own_version_and_a_late_answer_loses",
+   "passed": 100,
+   "runs": 100,
+   "tree": "git:001d4b56129043373a6859911f4d8cb13649be79"
+  },
+  {
+   "command": "REPS=100 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree c8fe20902b42> pytest tests/test_git_ops.py::test_run_bytes_cancel_kills_the_pipeline -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded100_before_1684",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_git_ops.py::test_run_bytes_cancel_kills_the_pipeline",
+   "passed": 100,
+   "runs": 100,
+   "tree": "git:c8fe20902b42237f3bf3433138aede4741587319"
+  },
+  {
+   "command": "REPS=100 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree c8fe20902b42> pytest tests/test_review_drain.py::test_no_active_jobs_or_no_spool_is_immediate -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded100_before_1684",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_review_drain.py::test_no_active_jobs_or_no_spool_is_immediate",
+   "passed": 100,
+   "runs": 100,
+   "tree": "git:c8fe20902b42237f3bf3433138aede4741587319"
+  },
+  {
+   "command": "REPS=100 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree c8fe20902b42> pytest tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push -q -p repeatplug -p no:cacheprovider",
+   "failed": 0,
+   "host": "macOS 26.6 (Darwin 25.6.0 arm64), 8 cores, Python 3.12, uv; другие сессии держат load average 4-17",
+   "label": "loaded100_before_1684",
+   "load": "16 CPU-bound python processes",
+   "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
+   "passed": 100,
+   "runs": 100,
+   "tree": "git:c8fe20902b42237f3bf3433138aede4741587319"
+  }
+ ],
+ "m1_reproduced": [
+  "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+  "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
+  "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
+  "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker"
+ ],
+ "note": "Ручные входы переписи: локальные повторы (команда и нагрузка записаны), класс причины, фиксы, строки вне ci.yml."
+}
