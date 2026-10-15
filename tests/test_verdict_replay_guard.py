@@ -586,3 +586,143 @@ async def test_the_review_order_is_built_with_the_live_generation(
     task = dict(await repo.get_task(db, task_id))
     await orchestration.dispatch_review(db, task)
     assert seen["generation"] == 2
+
+
+# ---- the review form, as a browser sends it ---------------------------------
+
+
+def _browser_post(page: str, **typed: str) -> dict[str, str]:
+    """The fields a browser sends for the verdict form: hidden inputs, checked
+    boxes and what was typed. An unchecked checkbox sends nothing."""
+    import re
+
+    form = re.search(r'<form[^>]*id="review-verdict-form".*?</form>', page, re.S).group(
+        0
+    )
+    data: dict[str, str] = {}
+    for tag in re.findall(r"<input[^>]*>", form):
+        name = re.search(r'name="([^"]+)"', tag)
+        value = re.search(r'value="([^"]*)"', tag)
+        if not name or "csrf" in name.group(1).lower():
+            continue
+        if 'type="hidden"' in tag:
+            data[name.group(1)] = value.group(1) if value else ""
+    data.update(typed)
+    return data
+
+
+async def test_the_form_never_sends_a_replacement_unless_asked(
+    client: AsyncClient, db: aiosqlite.Connection, hdr: dict
+):
+    task_id = await _in_review(client, hdr)
+    # A reviewer agent writes the first verdict through the rendered form.
+    page = (await client.get(f"/tasks/{task_id}", headers=hdr["rev"])).text
+    assert 'name="supersedes_revision"' not in page
+    first = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data=_browser_post(page, verdict="changes_requested", comments=CR_COMMENTS),
+        headers=hdr["rev"],
+        follow_redirects=False,
+    )
+    assert first.status_code == 303 and "review_error" not in first.headers["location"]
+    assert (await _snapshot(db, task_id))["revision"] == 1
+
+    # With a verdict standing the human's page offers the replacement as a box
+    # (the card shows the form while the task is in review: headless review).
+    await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+    await db.commit()
+    page = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
+    assert 'type="checkbox" name="supersedes_revision" value="1"' in page
+    before = await _snapshot(db, task_id)
+    unchecked = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data=_browser_post(page, verdict="approved", comments="ок"),
+        headers=hdr["human"],
+        follow_redirects=False,
+    )
+    assert "review_error" in unchecked.headers["location"], unchecked.headers
+    assert await _snapshot(db, task_id) == before
+    checked = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data=_browser_post(
+            page, verdict="approved", comments="ок", supersedes_revision="1"
+        ),
+        headers=hdr["human"],
+        follow_redirects=False,
+    )
+    assert "review_error" not in checked.headers["location"], checked.headers
+    after = await _snapshot(db, task_id)
+    assert after["verdict"] == "approved" and after["revision"] == 2
+
+    # After a resubmission the new generation has no verdict: no box again.
+    await repo.bump_submission_generation(db, task_id)
+    await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+    await db.commit()
+    page = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
+    assert 'name="expected_generation" value="2"' in page
+    assert 'name="supersedes_revision"' not in page
+
+
+# ---- the poller and a resubmission inside the tick ---------------------------
+
+
+async def _mergeable_review_task(db: aiosqlite.Connection):
+    """An approved headless review task whose PR the conveyor WOULD merge."""
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.protocols import (
+        CIProbeOutcome,
+        CIProbeResult,
+        StackProbeOutcome,
+        StackProbeResult,
+    )
+
+    task_id = await _headless_review_task(db)
+    await repo.update_task(db, task_id, pr_number=77, branch="task-1/x")
+    await db.execute(
+        "UPDATE tasks SET review_verdict='approved', "
+        "review_verdict_generation=submission_generation, "
+        "review_verdict_revision=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    git = NoopGitOps()
+    git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_pass")
+    )
+    git.merge_pr = AsyncMock(return_value=True)
+    git.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(outcome=StackProbeOutcome.clear, reason="")
+    )
+    plugins.git_ops = git
+    plugins.dispatch = _job()
+    return task_id, git
+
+
+async def test_a_resubmission_inside_the_tick_does_not_merge(
+    db: aiosqlite.Connection,
+):
+    from hub import poller
+
+    # Control: nothing moved, the very same set-up merges.
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        patch("hub.poller._record_merge_and_tidy", new_callable=AsyncMock),
+    ):
+        await poller._review_task_tick(db, snapshot, {"status": "completed"})
+    git.merge_pr.assert_awaited()
+
+    # Resubmitted between the tick's snapshot and the delivery decision.
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))  # what the tick read
+    await repo.bump_submission_generation(db, task_id)  # resubmitted since
+    await db.commit()
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        patch("hub.poller._record_merge_and_tidy", new_callable=AsyncMock),
+    ):
+        await poller._review_task_tick(db, snapshot, {"status": "completed"})
+        await poller._deliver_approved_review(db, snapshot)  # the step itself
+    git.merge_pr.assert_not_called()
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"

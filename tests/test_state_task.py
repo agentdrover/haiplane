@@ -591,7 +591,7 @@ async def test_the_web_form_carries_the_generation_and_completes_a_state_task(
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
-async def test_a_commit_task_form_carries_the_generation_and_the_revision(
+async def test_a_commit_task_form_carries_the_generation_only(
     client: AsyncClient, db: aiosqlite.Connection
 ):
     # #1706: the commit form now names the generation it shows and the revision
@@ -604,7 +604,9 @@ async def test_a_commit_task_form_carries_the_generation_and_the_revision(
     await db.commit()
     page = (await client.get(f"/tasks/{commit_id}")).text
     assert 'name="expected_generation" value="1"' in page
-    assert 'name="supersedes_revision" value="0"' in page
+    assert 'name="supersedes_revision"' not in page, (
+        "no verdict stands: nothing to replace"
+    )
 
 
 # --- логи -------------------------------------------------------------------

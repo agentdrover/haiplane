@@ -422,7 +422,17 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
     # moment ago is the failure this task exists to stop.
     fresh = await repo.get_task(db, task["id"])
     if fresh is not None:
-        task = {**task, **{k: dict(fresh)[k] for k in _VERDICT_FIELDS}}
+        live = dict(fresh)
+        if live.get("submission_generation") != task.get("submission_generation"):
+            # Resubmitted inside this tick: a verdict of the generation the tick
+            # read judges work that is no longer the live one, and delivering
+            # on it merges code nobody reviewed.
+            log.warning(
+                "Poll: task #%d was resubmitted during the tick; verdict not used",
+                task["id"],
+            )
+            return VERDICT_NOT_WRITTEN
+        task = {**task, **{k: live[k] for k in _VERDICT_FIELDS}}
     persisted = task.get("review_verdict")
     if persisted and task.get("review_verdict_generation") == task.get(
         "submission_generation"
@@ -582,8 +592,28 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
     )
 
 
+async def _approval_still_current(db, task: dict) -> bool:
+    """The approval is re-read right before the merge (#1706).
+
+    The tick's snapshot can be older than a resubmission or a replacement; a
+    merge on the snapshot's word is the one step that cannot be taken back.
+    """
+    row = await repo.get_task(db, task["id"])
+    live = dict(row) if row is not None else {}
+    current = (
+        live.get("review_verdict") == "approved"
+        and live.get("review_verdict_generation") == live.get("submission_generation")
+        and live.get("submission_generation") == task.get("submission_generation")
+    )
+    if not current:
+        log.warning("Poll: task #%d approval no longer current; no merge", task["id"])
+    return current
+
+
 async def _deliver_approved_review(db, task: dict) -> None:
     """An approved verdict is not delivery (#363): merge first, complete after."""
+    if not await _approval_still_current(db, task):
+        return
     pr_num = task.get("pr_number")
     merged = False
     if pr_num:
