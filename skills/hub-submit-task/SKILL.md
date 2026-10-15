@@ -100,7 +100,7 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 - Для `bug_red_test` мутации не доказательство: красный базовый прогон CI
   проверяется отдельно (#913, `red_test_gate`).
 
-## 5. До сдачи: пуш, CI нужного sha, критик на ядре
+## 5. До сдачи: пуш, CI нужного sha, второе ревью (правило — local-executor-hub-repo, этап 2 п. 6)
 
 1. Коммит сделан, дерево чистое. Хук `.githooks/pre-push` отказывает в пуше с
    грязным деревом и из ветки с именем вне `task-*/*`, `fix/*`, `chore/*`,

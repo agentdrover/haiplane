@@ -867,6 +867,10 @@ def test_codex_second_review_rule_lives_in_one_skill():
     assert "Второй ревьюер Codex — всегда" not in rule
     assert "На ядре хаба (lifecycle" not in ref
     assert ref.count("codex exec") == 0
+    # «Ядро» как условие критика запрещено во всём тексте, заголовки тоже.
+    for banned in ("на ядре", "только ядро", "критик на ядре"):
+        assert banned not in ref.lower(), banned
+    assert "второе ревью (правило — local-executor-hub-repo" in ref
 
 
 def test_machine_review_cycle_describes_both_decisions():
