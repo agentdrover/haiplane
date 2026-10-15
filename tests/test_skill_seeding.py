@@ -613,13 +613,45 @@ def test_a_skill_file_without_a_matching_name_fails(tmp_path):
     (root / "bare").mkdir()
     (root / "bare" / "SKILL.md").write_text("# без front-matter\n")
     _write_skill(root, "executor-pair-discipline")
+    (root / "broken").mkdir()
+    (root / "broken" / "SKILL.md").write_text(
+        "---\nname: broken\ndescription: [\n---\nx\n"
+    )
+    (root / "listdesc").mkdir()
+    (root / "listdesc" / "SKILL.md").write_text(
+        "---\nname: listdesc\ndescription: [a, b]\n---\nx\n"
+    )
 
     problems = skill_files.skill_file_problems(root)
     joined = "\n".join(problems)
-    for name in ("no-name", "wrong-dir", "no-desc", "bare", "executor-pair-discipline"):
+    for name in (
+        "no-name",
+        "wrong-dir",
+        "no-desc",
+        "bare",
+        "executor-pair-discipline",
+        "broken",
+        "listdesc",
+    ):
         assert f"/{name}/SKILL.md" in joined, name
     assert "good-one" not in joined
     assert [f.name for f in skill_files.load_skill_files(root)] == ["good-one"]
+
+
+async def test_broken_front_matter_leaves_the_active_seed_version_alone(
+    db: aiosqlite.Connection, skills_tree: Path, caplog
+):
+    """Битый YAML не заменяет активную seed-версию: файл пропущен с warning."""
+    (skills_tree / "zz-broken").mkdir()
+    (skills_tree / "zz-broken" / "SKILL.md").write_text(
+        "---\nname: zz-broken\ndescription: [\n---\nновый текст\n"
+    )
+    await _install(db, "zz-broken", [(1, OLD_TEXT, "active", "seed", "seed")])
+    before = await _versions(db, "zz-broken")
+    with caplog.at_level(logging.WARNING, logger="hub.skill_files"):
+        await seed_default_skills(db)
+    assert await _versions(db, "zz-broken") == before
+    assert any("zz-broken" in r.getMessage() for r in caplog.records)
 
 
 def test_every_skill_file_in_the_repository_is_valid():
@@ -719,9 +751,21 @@ def test_skills_are_seeded_from_the_built_wheel(tmp_path):
     """AC-5: wheel собран, старт вне checkout засевает навыки из пакета."""
     out = tmp_path / "dist"
     build = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(out), str(REPO)],
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-isolation",
+            "--offline",
+            "--python",
+            sys.executable,
+            "--out-dir",
+            str(out),
+            str(REPO),
+        ],
         capture_output=True,
         text=True,
+        timeout=150,
     )
     assert build.returncode == 0, build.stderr
     wheel = next(out.glob("*.whl"))
@@ -755,6 +799,7 @@ def test_skills_are_seeded_from_the_built_wheel(tmp_path):
         env=env,
         capture_output=True,
         text=True,
+        timeout=100,
     )
     assert proc.returncode == 0, proc.stderr
     names = eval(proc.stdout.strip().splitlines()[-1])

@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml  # type: ignore[import-untyped]
+
 logger = logging.getLogger(__name__)
 
 #: Навыки, текст которых живёт в ``hub.db``. Файл skills/<имя> для них —
@@ -60,16 +62,16 @@ def skills_root() -> Path | None:
     return None
 
 
-def _front_matter(text: str) -> dict[str, str]:
+def _front_matter(text: str) -> dict[str, object] | None:
+    """Разобранный front-matter; None — блока нет или это не YAML-словарь."""
     match = _FRONT_MATTER.match(text)
     if match is None:
-        return {}
-    fields: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        key, sep, value = line.partition(":")
-        if sep:
-            fields[key.strip()] = value.strip()
-    return fields
+        return None
+    try:
+        parsed = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def skill_file_problems(root: Path) -> list[str]:
@@ -89,10 +91,14 @@ def skill_file_problems(root: Path) -> list[str]:
         if directory in LEGACY_NO_FRONT_MATTER:
             continue
         fields = _front_matter(text)
+        if fields is None:
+            problems.append(f"{label}: front-matter отсутствует или не разбирается")
+            continue
         if fields.get("name") != directory:
             problems.append(f"{label}: name не совпадает с каталогом {directory!r}")
-        if not fields.get("description"):
-            problems.append(f"{label}: нет description")
+        description = fields.get("description")
+        if not isinstance(description, str) or not description.strip():
+            problems.append(f"{label}: description не непустая строка")
     return problems
 
 
