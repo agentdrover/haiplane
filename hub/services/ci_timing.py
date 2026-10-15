@@ -89,17 +89,24 @@ def _job_seconds(job: CIJobTiming) -> float | None:
     return max(0.0, (end - start).total_seconds())
 
 
-def summarize(body: CIRunTimingSubmit) -> tuple[float | None, dict[str, float]]:
-    """(runner seconds or None when unknown, seconds per named step)."""
+def summarize(
+    body: CIRunTimingSubmit,
+) -> tuple[float | None, dict[str, float], bool]:
+    """(runner seconds or None, seconds per named step, complete).
+
+    ``complete`` only when there is at least one job and EVERY job has both
+    times: a sum over the jobs that have them is a lower bound, not a measure.
+    """
     if body.state != STATE_OK:
-        return None, {}
+        return None, {}, False
     known = [s for s in map(_job_seconds, body.jobs) if s is not None]
     steps: dict[str, float] = {}
     for job in body.jobs:
         for step in job.steps:
             if step.seconds is not None:
                 steps[step.key] = steps.get(step.key, 0.0) + step.seconds
-    return (sum(known) if known else None), steps
+    complete = bool(body.jobs) and len(known) == len(body.jobs)
+    return (sum(known) if known else None), steps, complete
 
 
 async def store_ci_run_timing(
@@ -115,20 +122,21 @@ async def store_ci_run_timing(
     completed = _parse(body.completed_at)
     if completed is None:
         raise ValueError(f"completed_at {body.completed_at!r} is not an ISO time")
-    runner, steps = summarize(body)
+    runner, steps, complete = summarize(body)
     await db.execute(
         "INSERT INTO ci_attempt_timings (task_id, run_id, run_attempt, head_sha, "
         "event, conclusion, completed_at, state, reason, jobs, runner_seconds, "
-        "steps_seconds, reported_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "complete, steps_seconds, reported_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(task_id, run_id, run_attempt) DO UPDATE SET "
         "head_sha=excluded.head_sha, event=excluded.event, "
         "conclusion=excluded.conclusion, completed_at=excluded.completed_at, "
         "state=excluded.state, reason=excluded.reason, jobs=excluded.jobs, "
-        "runner_seconds=excluded.runner_seconds, "
+        "runner_seconds=excluded.runner_seconds, complete=excluded.complete, "
         "steps_seconds=excluded.steps_seconds, reported_by=excluded.reported_by, "
         "received_at=datetime('now') "
-        "WHERE excluded.runner_seconds IS NOT NULL "
-        "OR ci_attempt_timings.runner_seconds IS NULL",
+        "WHERE excluded.complete = 1 OR (ci_attempt_timings.complete = 0 "
+        "AND (excluded.runner_seconds IS NOT NULL "
+        "OR ci_attempt_timings.runner_seconds IS NULL))",
         (
             task_id,
             body.run_id,
@@ -141,6 +149,7 @@ async def store_ci_run_timing(
             body.reason,
             json.dumps([j.model_dump() for j in body.jobs], ensure_ascii=False),
             runner,
+            int(complete),
             json.dumps(steps, sort_keys=True),
             reported_by,
         ),
@@ -164,6 +173,7 @@ def _task_totals(rows: list[Any]) -> dict[int, dict[str, Any]]:
                 "task_id": row["task_id"],
                 "attempts": 0,
                 "unknown_attempts": 0,
+                "incomplete_attempts": 0,
                 "seconds": None,
             },
         )
@@ -172,14 +182,21 @@ def _task_totals(rows: list[Any]) -> dict[int, dict[str, Any]]:
             item["unknown_attempts"] += 1
         else:
             item["seconds"] = (item["seconds"] or 0.0) + row["runner_seconds"]
+            item["incomplete_attempts"] += 0 if row["complete"] else 1
     return tasks
 
 
-def _class_rows(rows: list[Any], tasks: dict[int, dict[str, Any]]) -> list[dict]:
+def _class_rows(rows: list[Any]) -> list[dict]:
+    """Classes are built from complete measurements only; the rest is counted
+    as partial or unknown in ``attempts`` and ``by_task``."""
     groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    per_task: dict[int, float] = {}
     for row in rows:
-        if row["runner_seconds"] is None:
+        if row["runner_seconds"] is None or not row["complete"]:
             continue
+        per_task[row["task_id"]] = (
+            per_task.get(row["task_id"], 0.0) + row["runner_seconds"]
+        )
         key = (row["work_type"] or "", row["size"] or "", row["risk_class"] or "")
         group = groups.setdefault(
             key, {"tasks": set(), "runner": 0.0, "mutations": 0.0, "ac_collect": 0.0}
@@ -191,7 +208,7 @@ def _class_rows(rows: list[Any], tasks: dict[int, dict[str, Any]]) -> list[dict]
         group["ac_collect"] += steps.get("ac_collect", 0.0)
     out = []
     for (work_type, size, risk), group in sorted(groups.items()):
-        totals = [tasks[t]["seconds"] for t in group["tasks"]]
+        totals = [per_task[t] for t in group["tasks"]]
         out.append(
             {
                 "work_type": work_type or "не задан",
@@ -234,7 +251,7 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
     where, params = scope.where("t.completed_at", task_column="t.task_id")
     rows = await fetchall(
         db,
-        "SELECT t.task_id, t.runner_seconds, t.steps_seconds, k.work_type, "  # nosec B608
+        "SELECT t.task_id, t.runner_seconds, t.complete, t.steps_seconds, k.work_type, "  # nosec B608
         "k.size, k.risk_class FROM ci_attempt_timings t "
         f"JOIN tasks k ON k.id = t.task_id WHERE {where} ORDER BY t.id",
         params,
@@ -244,11 +261,15 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
         tasks.values(), key=lambda i: (-(i["seconds"] or 0.0), i["task_id"])
     )
     unknown = sum(1 for r in rows if r["runner_seconds"] is None)
+    partial = sum(
+        1 for r in rows if r["runner_seconds"] is not None and not r["complete"]
+    )
     return {
         "window_by": "completed_at (время завершения из события)",
         "attempts": {
             "received": len(rows),
-            "timed": len(rows) - unknown,
+            "timed": len(rows) - unknown - partial,
+            "partial_duration": partial,
             "unknown_duration": unknown,
         },
         "by_task": [
@@ -261,12 +282,15 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
                 if i["seconds"] is None
                 else _minutes(i["seconds"]),
                 # True: the sum leaves out attempts whose duration is unknown.
-                "partial": i["seconds"] is not None and i["unknown_attempts"] > 0,
-                "measured_attempts": i["attempts"] - i["unknown_attempts"],
+                "partial": i["seconds"] is not None
+                and (i["unknown_attempts"] > 0 or i["incomplete_attempts"] > 0),
+                "measured_attempts": i["attempts"]
+                - i["unknown_attempts"]
+                - i["incomplete_attempts"],
             }
             for i in ranked[:BY_TASK_LIMIT]
         ],
         "by_task_more": max(0, len(ranked) - BY_TASK_LIMIT),
-        "by_class": _class_rows(rows, tasks),
+        "by_class": _class_rows(rows),
         "missing_among_received_ci_reports": await _missing_among_received(db, scope),
     }

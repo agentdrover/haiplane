@@ -3698,7 +3698,12 @@ async def test_ci_minutes_per_task_and_class(db: aiosqlite.Connection):
     await db.commit()
 
     section = (await practice_metrics(db, since_days=30))["ci_minutes"]
-    assert section["attempts"] == {"received": 6, "timed": 5, "unknown_duration": 1}
+    assert section["attempts"] == {
+        "received": 6,
+        "timed": 5,
+        "partial_duration": 0,
+        "unknown_duration": 1,
+    }
     assert section["by_task"] == [
         {
             "task_id": a,

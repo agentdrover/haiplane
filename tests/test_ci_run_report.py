@@ -1382,3 +1382,48 @@ async def test_ci_run_timing_is_scoped_like_the_ci_report(ci_runner_hub, scoped_
     assert bad.status_code == 400, bad.text
     gone = await _post_timing(hub.client, hub.ci, 999999, _timing_body())
     assert gone.status_code == 404, gone.text
+
+
+async def test_a_partial_resend_never_replaces_a_complete_measure(ci_runner_hub):
+    """#1700 review: a job without completed_at is a lower bound, not the sum."""
+    from hub.services.ci_timing import ci_minutes_metrics
+    from hub.services.metrics_scope import Scope
+
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+
+    def two_jobs(*, second_done: bool) -> dict:
+        body = _timing_body("6001", "1", minutes=10)
+        second = dict(body["jobs"][0], name="second")
+        if not second_done:
+            second["completed_at"] = None
+        body["jobs"] = [body["jobs"][0], second]  # 600 s + 600 s (or 600 s alone)
+        return body
+
+    assert (
+        await _post_timing(hub.client, hub.ci, task_id, two_jobs(second_done=True))
+    ).status_code == 200
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    assert metrics["by_task"][0]["runner_minutes"] == 20.0
+    assert metrics["by_task"][0]["partial"] is False
+
+    assert (
+        await _post_timing(hub.client, hub.ci, task_id, two_jobs(second_done=False))
+    ).status_code == 200
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    assert metrics["by_task"][0]["runner_minutes"] == 20.0, "the complete measure stays"
+
+    # A partial attempt that stands alone is shown as partial, not as exact.
+    other = await _task(hub.db, generation=1, sha="sha-pinned")
+    await _post_timing(hub.client, hub.ci, other, two_jobs(second_done=False))
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    row = next(r for r in metrics["by_task"] if r["task_id"] == other)
+    assert (row["runner_minutes"], row["partial"], row["measured_attempts"]) == (
+        10.0,
+        True,
+        0,
+    )
+    assert metrics["attempts"]["partial_duration"] == 1
+    assert metrics["by_class"] == [] or all(
+        c["tasks"] == 1 for c in metrics["by_class"]
+    ), "the partial attempt is not in a class"

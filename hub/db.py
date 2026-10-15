@@ -2970,6 +2970,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
             reason         TEXT    NOT NULL DEFAULT '',
             jobs           TEXT    NOT NULL DEFAULT '[]',
             runner_seconds REAL,
+            complete       INTEGER NOT NULL DEFAULT 0,
             steps_seconds  TEXT    NOT NULL DEFAULT '{}',
             reported_by    TEXT    NOT NULL DEFAULT '',
             received_at    TEXT    NOT NULL DEFAULT (datetime('now')),
