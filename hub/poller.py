@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import contextlib
 import os
 from collections.abc import Awaitable, Callable, Iterator
@@ -16,7 +17,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
-from hub.services import watch_notices
+from hub.services import delivery_writes, watch_notices
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
@@ -592,18 +593,8 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
     )
 
 
-async def _approval_still_current(db, task: dict) -> bool:
-    """The approval, re-read: the tick's snapshot may predate a replacement (#1706)."""
-    row = await repo.get_task(db, task["id"])
-    live = dict(row) if row is not None else {}
-    current = bool(
-        live
-        and services.review_approved_for_current_submission(live)
-        and live.get("submission_generation") == task.get("submission_generation")
-    )
-    if not current:
-        log.warning("Poll: task #%d approval no longer current; no merge", task["id"])
-    return current
+async def _nothing_to_write() -> None:
+    """An outcome with nothing to write: only the approval is (re)checked."""
 
 
 async def _deliver_approved_review(db, task: dict) -> None:
@@ -643,31 +634,15 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
                 return
             if stacked:
-                if not await _approval_still_current(db, task):
-                    return  # the probes took time; the approval did not outlive them
-                await repo.add_task_update(
+                written, _ = await services.record_delivery_outcome(
                     db,
-                    task["id"],
-                    "hub",
-                    "blocker",
-                    f"Доставка остановлена: PR #{pr_num} — {stacked}. "
-                    "Ожидание здесь ничего не решит, поэтому задача передана "
-                    "человеку (REST POST /api/tasks/<id>/decide).",
+                    task,
+                    partial(
+                        delivery_writes.stop_on_stacking, db, task, pr_num, stacked
+                    ),
                 )
-                await repo.update_task(db, task["id"], status="needs_decision")
-                await watch_notices.emit_needs_decision(
-                    db,
-                    task_id=task["id"],
-                    actor="hub",
-                    payload={"reason": "stacking", "detail": stacked, "pr": pr_num},
-                )
-                await db.commit()
-                log.warning(
-                    "Poll: task #%d delivery stopped, human needed (%s)",
-                    task["id"],
-                    stacked,
-                )
-                await services.maybe_destroy_vast(db, task)
+                if written:
+                    await services.maybe_destroy_vast(db, task)
                 return
             # The hold is over. Clearing the ledger entry is what the pair path
             # does on its own success (line ~1678); writing into a shared dict
@@ -675,20 +650,18 @@ async def _deliver_approved_review(db, task: dict) -> None:
             # grows for the lifetime of the process — and how the NEXT hold on
             # this task would be silently swallowed as a repeat of this one.
             _pair_delivery_waits.pop(task["id"], None)
-            # The last read before the irreversible step: the CI and stacking
-            # probes above are network calls, and a replacement, a return to
-            # work or a resubmission may land while they run (#1706).
-            if not await _approval_still_current(db, task):
+            # #1706: the ONE merge point. The approval is read afresh and the
+            # merge registered with no await between the two; the probes above
+            # are network calls and a replacement, a return to work or a
+            # resubmission may land while they run.
+            step, _detail = await services.merge_if_approval_stands(db, task, mctx)
+            if step is services.MergeStep.APPROVAL_GONE:
+                await services.record_delivery_outcome(db, task, _nothing_to_write)
                 return
-            merged = await plugins.git_ops.merge_pr(
-                pr_num,
-                task["id"],
-                task["title"],
-                repo=mworkspace,
-                gh_repo=mgh_repo,
-                forge=mctx.get("forge", ""),
-            )
-            if merged:
+            if step is services.MergeStep.IN_FLIGHT:
+                return  # a neighbour path is merging this PR: next sweep looks again
+            merged = step in (services.MergeStep.MERGED, services.MergeStep.ALREADY)
+            if step is services.MergeStep.MERGED:
                 # Record the commit the merge produced, not
                 # the PR number: the number lives in the
                 # subject the pusher writes, the SHA does
@@ -698,20 +671,11 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 # that counts for every project (#534).
                 await _record_merge_and_tidy(db, task, pr_num, mctx)
         elif ci.outcome == CIProbeOutcome.failed:
-            if not await _approval_still_current(db, task):
+            written, _ = await services.record_delivery_outcome(
+                db, task, partial(delivery_writes.note_ci_failed, db, task, pr_num)
+            )
+            if not written:
                 return
-            log.warning(
-                "Poll: task #%d CI failed on PR #%d",
-                task["id"],
-                pr_num,
-            )
-            await repo.add_task_update(
-                db,
-                task["id"],
-                "hub",
-                "alert",
-                f"CI failed on PR #{pr_num}. Manual check required.",
-            )
         else:
             log.info(
                 "Poll: task #%d CI %s on PR #%d, will retry",
@@ -731,37 +695,19 @@ async def _deliver_approved_review(db, task: dict) -> None:
         # status is supposed to rule out. Pending probes
         # already `continue` above and retry; reaching here
         # without a merge means a human has to look.
-        if not await _approval_still_current(db, task):
-            return  # "Ревью одобрено" is no longer true: write nothing (#1706)
         reason = "ci_failed" if ci.outcome == CIProbeOutcome.failed else "merge_failed"
-        await repo.add_task_update(
+
+        written, _ = await services.record_delivery_outcome(
             db,
-            task["id"],
-            "hub",
-            "blocker",
-            f"Ревью одобрено, но PR #{pr_num} не влит "
-            f"({reason}). Задача не может считаться "
-            "выполненной, пока работа не в базовой ветке. "
-            "Решите через REST POST /api/tasks/<id>/decide.",
+            task,
+            partial(delivery_writes.hand_headless_to_human, db, task, pr_num, reason),
         )
-        await repo.update_task(db, task["id"], status="needs_decision")
-        await watch_notices.emit_needs_decision(
-            db,
-            task_id=task["id"],
-            actor="hub",
-            payload={"reason": reason, "pr": pr_num},
-        )
-        await db.commit()
-        log.warning(
-            "Poll: task #%d approved but PR #%d not merged (%s) → needs_decision",
-            task["id"],
-            pr_num,
-            reason,
-        )
-        await services.maybe_destroy_vast(db, task)
+        if written:
+            await services.maybe_destroy_vast(db, task)
         return
     if not merged and not pr_num:
-        if not await _approval_still_current(db, task):
+        stands, _ = await services.record_delivery_outcome(db, task, _nothing_to_write)
+        if not stands:
             return
         log.info("Poll: task #%d approved (no PR)", task["id"])
     # Converge on the same gate-checked completion used by
@@ -2079,6 +2025,11 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
+    if not ok and detail.startswith(services.APPROVAL_CHANGED_PREFIX):
+        # An explicit outcome, not a wait: the approval is gone and the sweep
+        # does not come back to this delivery (#1706).
+        await services.record_delivery_outcome(db, task, _nothing_to_write)
+        return
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
@@ -2140,32 +2091,24 @@ async def _deliver_pair_task(db, task: dict) -> None:
                     f"{detail} (бюджет починки исчерпан: "
                     f"{task.get('ci_fix_cycle')}/{config.MAX_CI_FIX_CYCLES})"
                 )
+
         # Terminal from here: every wait branch above (transient, and the
         # recoverable-with-executor-online one just above) returns before
         # reaching this line, so this write happens at most once per task,
         # and the commit a few lines down covers it.
-        if delivery_pr.reason:
-            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
-        await repo.update_task(db, task_id, status="needs_decision")
-        await repo.add_task_update(
+        await services.record_delivery_outcome(
             db,
-            task_id,
-            "hub",
-            "alert",
-            f"Ревью одобрено, но PR #{pr_num} не доставлен — {detail}. "
-            "Задача не может считаться выполненной, пока работа не в базовой "
-            "ветке. Решение за человеком (REST POST /api/tasks/<id>/decide)."
-            + services.base_conflict_resubmit_hint(reason, detail),
-        )
-        await watch_notices.emit_needs_decision(
-            db,
-            task_id=task_id,
-            actor="hub",
-            payload={"reason": reason, "detail": detail, "via": "poller"},
-        )
-        await db.commit()
-        log.info(
-            "Poll: task #%d → needs_decision: merge gate refused (%s)", task_id, detail
+            task,
+            partial(
+                delivery_writes.hand_pair_to_human,
+                db,
+                task_id,
+                pr_num,
+                detail,
+                reason,
+                delivery_pr.reason,
+                services.base_conflict_resubmit_hint(reason, detail),
+            ),
         )
         return
 
@@ -2256,17 +2199,26 @@ async def _note_pair_delivery_wait(
     closes every path that skipped it.
     """
     key = f"{resolver_note}\x1f{detail}"
-    if _pair_delivery_waits.get(task_id) != key:
-        _pair_delivery_waits[task_id] = key
-        message = f"Доставка отложена: PR #{pr_num} — {detail}. " + (
-            hint
-            or "Это временное состояние, решение человека не требуется — хаб "
-            "вернётся к нему следующим циклом."
-        )
-        if resolver_note:
-            message = f"{resolver_note} {message}"
-        await repo.add_task_update(db, task_id, "hub", "status", message)
-        log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
+
+    async def _write() -> None:
+        if _pair_delivery_waits.get(task_id) != key:
+            _pair_delivery_waits[task_id] = key
+            message = f"Доставка отложена: PR #{pr_num} — {detail}. " + (
+                hint
+                or "Это временное состояние, решение человека не требуется — хаб "
+                "вернётся к нему следующим циклом."
+            )
+            if resolver_note:
+                message = f"{resolver_note} {message}"
+            await repo.add_task_update(db, task_id, "hub", "status", message)
+            log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
+
+    # #1706: "delivery postponed" says the work is approved and will be
+    # delivered; the one outcome writer checks that it still is.
+    row = await repo.get_task(db, task_id)
+    await services.record_delivery_outcome(
+        db, dict(row) if row else {"id": task_id, "pr_number": pr_num}, _write
+    )
     await db.commit()
 
 

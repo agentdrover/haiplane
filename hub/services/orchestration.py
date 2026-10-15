@@ -11,7 +11,7 @@ import logging
 import re
 import os
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -3824,6 +3824,8 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
 PR_DRAFT_PREFIX = "pr_draft"
 # #1706: одобрение, с которым доставка началась, к моменту мержа уже не действует
 # (вердикт заменён, работа возвращена или пересдана, пока шли пробы CI и стопки).
+# Это ЯВНЫЙ исход, не ожидание: он не входит в TRANSIENT_GATE_PREFIXES, потому что
+# хаб к такой доставке сам не вернётся — дальше решает текущий вердикт.
 APPROVAL_CHANGED_PREFIX = "approval_changed"
 # #1186: the base of a stack is not a decision to make — it merges on its own
 # schedule and this delivery becomes possible the moment it does. Same class as
@@ -3913,7 +3915,6 @@ TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.unavailable.value}",
     f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
-    APPROVAL_CHANGED_PREFIX,
     STACKED_BASE_PREFIX,
     STACK_UNKNOWN_PREFIX,
     # #1233: база слита в ветку и запушена, конфликта больше нет — доставка
@@ -4333,17 +4334,60 @@ async def _gate_merge_outcome(key: tuple[int, int]) -> GateMergeSeen:
     return GateMergeSeen.MERGED if merged else GateMergeSeen.ABSENT
 
 
-async def _registered_gate_merge(
-    key: tuple[int, int], task: dict[str, Any], ctx: dict[str, Any]
-) -> tuple[bool, str]:
-    """Мерж форжем под записью в ``_gate_merges`` (#1398).
+class MergeStep(enum.Enum):
+    """Чем кончилась попытка мержа в единственной точке вызова форжа (#1706)."""
 
-    Между проверкой ``_gate_merge_outcome`` и записью здесь нет ни одного
-    ``await``, поэтому второй путь не может встать между ними.
+    MERGED = "merged"
+    REFUSED = "refused"
+    ALREADY = "already"  # гейт уже влил этот PR в этом процессе (#1398)
+    IN_FLIGHT = "in_flight"  # соседний путь ещё вливает, ждать больше нельзя (#1407)
+    APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
+
+
+async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Действует ли одобрение ПРЯМО СЕЙЧАС: свежее чтение, канонический предикат.
+
+    ``not completion_requires_review`` — тот же предикат Universal Review Gate
+    (#306), что у done-отчёта: у задачи с auto_review=False ревью не требуется,
+    у остальных нужен APPROVED на текущей сдаче, не закрытый решением человека
+    (#1286). Снимок вызывающего не читается вовсе: его возраст и есть дефект.
     """
-    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-    _gate_merges[key] = fut
+    row = await repo.get_task(db, int(task["id"]))
+    return row is not None and not completion_requires_review(dict(row))
+
+
+async def merge_if_approval_stands(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[MergeStep, str]:
+    """ЕДИНСТВЕННЫЙ вызов форжа для мержа PR задачи (#1706).
+
+    Через него идут pair-поллер, headless-конвейер, done-отчёт, отложенное
+    завершение и ручная доставка. Свежая проверка одобрения и регистрация мержа
+    в ``_gate_merges`` стоят ПОДРЯД, без ``await`` между ними: цикл событий не
+    передаёт управление, пока проверка и запись Future не закончились, поэтому
+    ни замена вердикта, ни соседний путь не успевают встать между ними.
+
+    Порядок #1398 сохранён: уже идущий мерж ждут, а не повторяют. Ожидание — это
+    ``await``, поэтому после него проверка делается ЗАНОВО: за минуту ожидания
+    одобрение могло уйти.
+    """
+    key = (int(task["id"]), int(task["pr_number"]))
+    while True:
+        row = await repo.get_task(db, key[0])
+        # --- ниже до регистрации Future нет ни одного await ---
+        if row is None or completion_requires_review(dict(row)):
+            return MergeStep.APPROVAL_GONE, ""
+        if key not in _gate_merges:
+            fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            _gate_merges[key] = fut
+            break
+        seen = await _gate_merge_outcome(key)
+        if seen is GateMergeSeen.MERGED:
+            return MergeStep.ALREADY, ""
+        if seen is GateMergeSeen.IN_FLIGHT:
+            return MergeStep.IN_FLIGHT, ""
     merged = False
+    detail = ""
     try:
         merged, detail = await plugins.git_ops.merge_pr_with_detail(
             key[1],
@@ -4357,7 +4401,47 @@ async def _registered_gate_merge(
         fut.set_result(merged)
         if not merged and _gate_merges.get(key) is fut:
             _gate_merges.pop(key, None)
-    return merged, detail
+    return (MergeStep.MERGED if merged else MergeStep.REFUSED), detail
+
+
+async def _nothing() -> None:
+    """Пустая запись: исход, которому нечего писать, кроме объяснения."""
+
+
+async def _note_approval_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
+    """Сказать один раз, что одобрения больше нет, и не обещать вернуться."""
+    text = (
+        f"Доставка PR #{task.get('pr_number')} не выполнена: одобрение, с которым "
+        "она началась, больше не действует (вердикт заменён, работа возвращена в "
+        "доработку или пересдана). Что дальше, определяет текущий вердикт на "
+        "карточке; хаб к этой доставке сам не вернётся."
+    )
+    updates = await repo.get_task_updates(db, int(task["id"]))
+    if updates and (dict(updates[-1]).get("content") or "") == text:
+        return
+    await repo.add_task_update(db, int(task["id"]), "hub", "status", text)
+    await db.commit()
+
+
+async def record_delivery_outcome(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    write: Callable[[], Awaitable[Any]],
+    *,
+    fallback: Any = None,
+) -> tuple[bool, Any]:
+    """ЕДИНСТВЕННОЕ место, где пишется исход доставки (#1706).
+
+    «Ревью одобрено, но не доставлено», needs_decision по гейту, «доставка
+    отложена» и им подобные тексты утверждают, что работа одобрена. Здесь одобрение
+    читается заново, и если его нет — вместо запрошенной записи пишется одно
+    явное объяснение (``_note_approval_gone``), а ``write`` не вызывается.
+    Возвращает ``(записано ли, результат write либо fallback)``.
+    """
+    if not await approval_stands(db, task):
+        await _note_approval_gone(db, task)
+        return False, fallback
+    return True, await write()
 
 
 async def _gate_merge_step(
@@ -4373,11 +4457,11 @@ async def _gate_merge_step(
     разрешается однозначно. Оба вопроса задаются ТОЛЬКО после отказа мержа:
     у зелёной доставки нет причины за них платить.
     """
+    step, merge_detail = await merge_if_approval_stands(db, task, ctx)
     key = (int(task["id"]), int(task["pr_number"]))
-    seen = await _gate_merge_outcome(key)
-    if seen is GateMergeSeen.MERGED:
+    if step is MergeStep.ALREADY:
         return (True, "already delivered"), ""
-    if seen is GateMergeSeen.IN_FLIGHT:
+    if step is MergeStep.IN_FLIGHT:
         # #1407: ожидание истекло, а первый вызов форжа жив. Второй вызов
         # перезаписал бы его Future и получил бы отказ по уже влитому PR.
         return (
@@ -4386,15 +4470,13 @@ async def _gate_merge_step(
             f"#{key[1]} вливает соседний путь гейта, форж не ответил за "
             f"{GATE_MERGE_WAIT_SECONDS:g} с; второй мерж не запускается",
         ), ""
-    # #1706: the last read before the irreversible step, AFTER the wait above
-    # (it can last a minute). CI, stacking and base probes are network calls; a
-    # replacement of the verdict, a return to work or a resubmission may land
-    # while they run, and the merge would deliver on the snapshot's word.
-    changed = await _approval_changed_since(db, task)
-    if changed:
-        return (False, changed), ""
-    merged, merge_detail = await _registered_gate_merge(key, task, ctx)
-    if not merged:
+    if step is MergeStep.APPROVAL_GONE:
+        return (
+            False,
+            f"{APPROVAL_CHANGED_PREFIX}: одобрение, с которым началась доставка, "
+            "уже не действует — PR не влит",
+        ), ""
+    if step is MergeStep.REFUSED:
         return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
     return None, merge_detail
 
@@ -4777,34 +4859,6 @@ async def _record_branch_update(
             "behind_by": fresh.behind_by,
             "generation": int(task.get("submission_generation") or 0),
         },
-    )
-
-
-async def _approval_changed_since(
-    db: aiosqlite.Connection, task: dict[str, Any]
-) -> str:
-    """A reason when the approval the caller handed in no longer stands, else ''.
-
-    Only a task that WAS approved on its current submission is held to it: the
-    gate also serves callers that deliver without a verdict (the human's
-    pr_disposition path checks the verdict itself, before the gate). The read
-    is fresh and uses the canonical predicate, which knows the window a human
-    closed (#1286), and the generation must be the one the caller read.
-    """
-    if not review_approved_for_current_submission(task):
-        return ""
-    row = await repo.get_task(db, int(task["id"]))
-    live = dict(row) if row is not None else {}
-    if (
-        live
-        and review_approved_for_current_submission(live)
-        and live.get("submission_generation") == task.get("submission_generation")
-    ):
-        return ""
-    return (
-        f"{APPROVAL_CHANGED_PREFIX}: одобрение, с которым началась доставка, "
-        "уже не действует (вердикт заменён, работа возвращена или пересдана) — "
-        "PR не влит"
     )
 
 
@@ -5259,16 +5313,8 @@ BASE_FRESHNESS_WAIT_HINT = (
     "зелёного CI на новой голове. Пересдавать НЕ нужно: слияние базы гейтом — "
     "не авторская правка, вердикт сохраняется (#1361)."
 )
-# #1706: вердикт заменён, работа возвращена или пересдана, пока шли пробы.
-APPROVAL_CHANGED_WAIT_HINT = (
-    "Это временное состояние, решение человека не требуется: одобрение, с "
-    "которым началась доставка, уже не действует, PR не влит. Что делать "
-    "дальше, говорит текущий вердикт на карточке; ничего пересдавать из-за "
-    "этого отказа не нужно."
-)
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
-    (APPROVAL_CHANGED_PREFIX, APPROVAL_CHANGED_WAIT_HINT),
     (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
     ((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX), STACKED_BASE_WAIT_HINT),
     (MERGE_REFUSAL_UNVERIFIED_PREFIX, MERGE_REFUSAL_UNVERIFIED_WAIT_HINT),
@@ -5311,6 +5357,146 @@ def _transient_wait_cause(detail: str, delivery_pr: DeliveryPR) -> str:
     )
 
 
+async def _write_gate_refusal(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    detail: str,
+    delivery_pr: DeliveryPR,
+) -> str:
+    """The feed lines and the status for a gate refusal on the done path.
+
+    Moved out of ``_deliver_completed_pair_task`` unchanged (#1706): it is the
+    ``write`` of ``record_delivery_outcome``, which re-reads the approval first.
+    """
+    task_id = task["id"]
+    # #951: a temporary state is not a decision. CI still running
+    # (or unreadable this minute) resolves itself — the poller in
+    # the same situation just retries next pass, and on 25.08.2026
+    # the done-flow's needs_decision here cost a human rework for
+    # a CI that went green four minutes later (#949). The task
+    # stays in running: the existing stale watches and the #418
+    # deadline backstop keep it from waiting forever. Terminal
+    # refusals — a red CI, a merge GitHub refused, a closed PR —
+    # still call a human below: those need an actual decision.
+    if detail.startswith(TRANSIENT_GATE_PREFIXES):
+        # #959: waiting is still right, but the reason has to be
+        # the true one. When the PR itself could not be read, "wait
+        # for a green CI" names a check that never ran and points
+        # at a PR the gate never established — the shape of hint
+        # #952 removed from the terminal branch, here in the
+        # patient one. A draft is a third cause (#1053): CI is
+        # already green, and resubmitting would stale the verdict.
+        cause = _transient_wait_cause(detail, delivery_pr)
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка отложена: PR #{task['pr_number']} — {detail}. {cause}",
+        )
+        log.info(
+            "Task #%d stays running: merge gate waiting (%s)",
+            task_id,
+            detail,
+        )
+        return "running"
+    budget_spent = False
+    if detail.startswith(RECOVERABLE_GATE_PREFIXES):
+        # #1030: the executor is right here — it just reported —
+        # so the refusal it can cure itself keeps the task on the
+        # conveyor instead of handing a human a door the agent
+        # cannot walk back through. The budget is what stops this
+        # from being an infinite loop: after MAX_CI_FIX_CYCLES
+        # attempts on a still-red CI the escalation below is the
+        # honest answer, and it names the spent budget as the
+        # cause rather than the CI outcome.
+        cycle = 0
+        if detail.startswith(CI_BUDGET_GATE_PREFIXES):
+            cycle, budget_spent = await charge_ci_fix_budget(db, task)
+        if not budget_spent:
+            attempt = f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}." if cycle else ""
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Доставка не состоялась: PR #{task['pr_number']} — "
+                f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
+            )
+            log.info(
+                "Task #%d stays running: recoverable gate refusal (%s)",
+                task_id,
+                detail,
+            )
+            return "running"
+    await repo.update_task(db, task_id, status="needs_decision")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        # #952: this line is written TOGETHER with the transition
+        # to needs_decision, and is read AFTER it — so it may only
+        # name actions that status accepts. "Report done again"
+        # is not one of them: the hub itself refuses it there
+        # (human_decision_required), which on 25.08.2026 sent an
+        # agent down a dead end the hint had pointed to (#949).
+        f"Done report NOT completed: PR #{task['pr_number']} is not "
+        f"delivered — {detail}."
+        + (
+            # #1030: after the budget the cause is no longer "the
+            # CI is red" but "the executor has had its tries" —
+            # naming the CI outcome alone would read as a first
+            # refusal and hide that the conveyor already gave way.
+            f" Бюджет починки исчерпан "
+            f"({task.get('ci_fix_cycle')}/"
+            f"{config.MAX_CI_FIX_CYCLES})."
+            if budget_spent
+            else ""
+        )
+        + " Решение за человеком "
+        "(REST POST /api/tasks/<id>/decide): rework вернёт задачу в running — "
+        "устраните причину и пересдайте done; accept завершит "
+        "задачу БЕЗ доставки PR."
+        + base_conflict_resubmit_hint(
+            "ci_fix_cycle_limit" if budget_spent else "merge_gate", detail
+        ),
+    )
+    await watch_notices.emit_needs_decision(
+        db,
+        task_id=task_id,
+        actor=task.get("assigned_agent") or "agent",
+        payload={
+            "reason": ("ci_fix_cycle_limit" if budget_spent else "merge_gate"),
+            "detail": detail,
+        },
+    )
+    log.info(
+        "Task #%d → needs_decision: merge gate refused (%s)",
+        task_id,
+        detail,
+    )
+    return "needs_decision"
+
+
+async def _record_gate_refusal(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    detail: str,
+    delivery_pr: DeliveryPR,
+) -> str:
+    """Write a gate refusal through the one outcome function (#1706)."""
+    if detail.startswith(APPROVAL_CHANGED_PREFIX):
+        await record_delivery_outcome(db, task, _nothing, fallback=None)
+        return "running"
+
+    async def write() -> str:
+        return await _write_gate_refusal(db, task, detail, delivery_pr)
+
+    _, outcome = await record_delivery_outcome(db, task, write, fallback="running")
+    return outcome
+
+
 async def _deliver_completed_pair_task(
     db: aiosqlite.Connection, task: dict[str, Any], delivery_pr: DeliveryPR
 ) -> str | None:
@@ -5334,116 +5520,7 @@ async def _deliver_completed_pair_task(
     else:
         ok, detail = await merge_before_completion(db, task)
     if not ok:
-        # #951: a temporary state is not a decision. CI still running
-        # (or unreadable this minute) resolves itself — the poller in
-        # the same situation just retries next pass, and on 25.08.2026
-        # the done-flow's needs_decision here cost a human rework for
-        # a CI that went green four minutes later (#949). The task
-        # stays in running: the existing stale watches and the #418
-        # deadline backstop keep it from waiting forever. Terminal
-        # refusals — a red CI, a merge GitHub refused, a closed PR —
-        # still call a human below: those need an actual decision.
-        if detail.startswith(TRANSIENT_GATE_PREFIXES):
-            # #959: waiting is still right, but the reason has to be
-            # the true one. When the PR itself could not be read, "wait
-            # for a green CI" names a check that never ran and points
-            # at a PR the gate never established — the shape of hint
-            # #952 removed from the terminal branch, here in the
-            # patient one. A draft is a third cause (#1053): CI is
-            # already green, and resubmitting would stale the verdict.
-            cause = _transient_wait_cause(detail, delivery_pr)
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                f"Доставка отложена: PR #{task['pr_number']} — {detail}. {cause}",
-            )
-            log.info(
-                "Task #%d stays running: merge gate waiting (%s)",
-                task_id,
-                detail,
-            )
-            return "running"
-        budget_spent = False
-        if detail.startswith(RECOVERABLE_GATE_PREFIXES):
-            # #1030: the executor is right here — it just reported —
-            # so the refusal it can cure itself keeps the task on the
-            # conveyor instead of handing a human a door the agent
-            # cannot walk back through. The budget is what stops this
-            # from being an infinite loop: after MAX_CI_FIX_CYCLES
-            # attempts on a still-red CI the escalation below is the
-            # honest answer, and it names the spent budget as the
-            # cause rather than the CI outcome.
-            cycle = 0
-            if detail.startswith(CI_BUDGET_GATE_PREFIXES):
-                cycle, budget_spent = await charge_ci_fix_budget(db, task)
-            if not budget_spent:
-                attempt = (
-                    f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}." if cycle else ""
-                )
-                await repo.add_task_update(
-                    db,
-                    task_id,
-                    "hub",
-                    "alert",
-                    f"Доставка не состоялась: PR #{task['pr_number']} — "
-                    f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
-                )
-                log.info(
-                    "Task #%d stays running: recoverable gate refusal (%s)",
-                    task_id,
-                    detail,
-                )
-                return "running"
-        await repo.update_task(db, task_id, status="needs_decision")
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            # #952: this line is written TOGETHER with the transition
-            # to needs_decision, and is read AFTER it — so it may only
-            # name actions that status accepts. "Report done again"
-            # is not one of them: the hub itself refuses it there
-            # (human_decision_required), which on 25.08.2026 sent an
-            # agent down a dead end the hint had pointed to (#949).
-            f"Done report NOT completed: PR #{task['pr_number']} is not "
-            f"delivered — {detail}."
-            + (
-                # #1030: after the budget the cause is no longer "the
-                # CI is red" but "the executor has had its tries" —
-                # naming the CI outcome alone would read as a first
-                # refusal and hide that the conveyor already gave way.
-                f" Бюджет починки исчерпан "
-                f"({task.get('ci_fix_cycle')}/"
-                f"{config.MAX_CI_FIX_CYCLES})."
-                if budget_spent
-                else ""
-            )
-            + " Решение за человеком "
-            "(REST POST /api/tasks/<id>/decide): rework вернёт задачу в running — "
-            "устраните причину и пересдайте done; accept завершит "
-            "задачу БЕЗ доставки PR."
-            + base_conflict_resubmit_hint(
-                "ci_fix_cycle_limit" if budget_spent else "merge_gate", detail
-            ),
-        )
-        await watch_notices.emit_needs_decision(
-            db,
-            task_id=task_id,
-            actor=task.get("assigned_agent") or "agent",
-            payload={
-                "reason": ("ci_fix_cycle_limit" if budget_spent else "merge_gate"),
-                "detail": detail,
-            },
-        )
-        log.info(
-            "Task #%d → needs_decision: merge gate refused (%s)",
-            task_id,
-            detail,
-        )
-        return "needs_decision"
+        return await _record_gate_refusal(db, task, detail, delivery_pr)
     # #812: delivery succeeded, so the release range grew. Opening or
     # refreshing the release PR is best-effort and never blocks the
     # done report: the report answers about this task, and a release
@@ -6032,6 +6109,12 @@ async def run_deferred_completions(
             if row is None or dict(row)["status"] not in ("running", "claimed"):
                 continue
             task = dict(row)
+            # #1706: the done report was committed while the task was approved;
+            # a replacement or a return to work since then cancels the
+            # completion — it is not a delivery the hub may finish on its own.
+            stands, _ = await record_delivery_outcome(db, task, _nothing)
+            if not stands:
+                continue
             if config.SDD_VALIDATION == "require":
                 # #1687: GitHub is asked before the transaction that writes
                 # ``completed`` (not inside it); that transaction asks the

@@ -754,60 +754,123 @@ async def test_a_resubmission_inside_the_tick_does_not_merge(
     git.merge_pr.assert_not_called()
 
 
-# ---- the shared delivery gate re-reads the approval before it merges ---------
+# ---- ONE merge point: every network probe x every path x every change --------
+
+_CHANGES = ["replaced", "resubmitted", "returned"]
+_OUTCOME_PHRASES = ("Ревью одобрено", "Доставлено хабом", "Доставка отложена")
 
 
-class _ChangingSpy:
-    """A merge double whose CI probe lets the world move while it runs."""
-
-    def __init__(
-        self, db: aiosqlite.Connection, task_id: int, change: str, ci="passed"
-    ):
-        from tests.test_accept_without_delivery import _MergeSpy
-
-        self.inner = _MergeSpy(ci=ci)
-        self.db, self.task_id, self.change = db, task_id, change
-
-    async def check_pr_ci(self, *args, **kwargs):
-        if self.change == "replaced":
-            await self.db.execute(
-                "UPDATE tasks SET review_verdict='changes_requested', "
-                "review_verdict_revision=review_verdict_revision+1 WHERE id=?",
-                (self.task_id,),
-            )
-        elif self.change == "resubmitted":
-            await repo.bump_submission_generation(self.db, self.task_id)
-        elif self.change == "returned":
-            await repo.close_review_verdict_window(self.db, self.task_id)
-        await self.db.commit()
-        return await self.inner.check_pr_ci(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
+async def _fire(db: aiosqlite.Connection, task_id: int, change: str) -> None:
+    """The world moves while a network probe is running."""
+    if change == "replaced":
+        await db.execute(
+            "UPDATE tasks SET review_verdict='changes_requested', "
+            "review_verdict_revision=review_verdict_revision+1 WHERE id=?",
+            (task_id,),
+        )
+    elif change == "resubmitted":
+        await repo.bump_submission_generation(db, task_id)
+    else:
+        await repo.close_review_verdict_window(db, task_id)
+    await db.commit()
 
 
-@pytest.mark.parametrize("change", ["replaced", "resubmitted", "returned"])
-@pytest.mark.parametrize("path", ["pair_gate", "manual_delivery"])
-async def test_the_gate_does_not_merge_on_a_stale_approval(
-    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, path: str, change: str
+def _arm(git, probe: str, db: aiosqlite.Connection, task_id: int, change: str) -> None:
+    """Wrap one probe of the git double: the change lands inside the call."""
+    original = getattr(git, probe)
+
+    async def wrapped(*args, **kwargs):
+        await _fire(db, task_id, change)
+        result = original(*args, **kwargs)
+        return await result if hasattr(result, "__await__") else result
+
+    setattr(git, probe, wrapped)
+
+
+async def _nothing_was_said_or_done(
+    db: aiosqlite.Connection, task_id: int, git, before_status: str
+) -> None:
+    assert git.merge_pr.await_count == 0, "the forge was never asked to merge"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == before_status, "no needs_decision, no completed"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    for phrase in _OUTCOME_PHRASES:
+        assert phrase not in feed, f"{phrase!r} written over an approval that was gone"
+    assert not await repo.pipeline_merge_recorded(db, task_id, 77)
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "check_pr_ci",
+        "pr_is_draft",
+        "pr_base_freshness",
+        # The probe answers something the gate turns into an OUTCOME: red CI is
+        # a hand-over to a human, a pending CI is a "delivery postponed" line.
+        "check_pr_ci:failed",
+        "check_pr_ci:pending",
+    ],
+)
+@pytest.mark.parametrize("path", ["pair_sweep", "done_report", "deferred_completion"])
+async def test_no_merge_and_no_outcome_on_any_gate_path(
+    db: aiosqlite.Connection, path: str, probe: str, change: str
 ):
+    """Matrix (#1706): the single merge point holds on every route into the gate."""
+    from hub.integrations.protocols import CIProbeOutcome
     from hub.services import orchestration
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+        _report_done,
+    )
+
+    method, _, answer = probe.partition(":")
+    git = _git(CIProbeOutcome[answer or "passed"], merged=True)
+    task_id = await _approved_pair_task(db)
+    before = dict(await repo.get_task(db, task_id))["status"]
+    if path == "deferred_completion":
+        # The change lands between the done report's commit and its completion.
+        pending: list[dict] = [
+            {"task_id": task_id, "exit_code": None, "result_text": "done"}
+        ]
+        await _fire(db, task_id, change)
+        await orchestration.run_deferred_completions(db, pending)
+    else:
+        _arm(git, method, db, task_id, change)
+        if path == "pair_sweep":
+            await _drain_pair_delivery(db)
+        else:
+            await _report_done(db, task_id)
+    await _nothing_was_said_or_done(db, task_id, git, before)
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_no_merge_on_manual_delivery_whatever_moves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, change: str
+):
     from tests.test_accept_without_delivery import (
         _approved_task,
         _decide_deliver,
         _install,
+        _MergeSpy,
     )
 
-    task_id = await _approved_task(client, db, title=f"{path}-{change}", pr=950)
-    spy = _ChangingSpy(db, task_id, change)
+    task_id = await _approved_task(client, db, title=f"manual-{change}", pr=950)
+    spy = _MergeSpy()
     _install(monkeypatch, spy)
-    if path == "pair_gate":
-        snapshot = dict(await repo.get_task(db, task_id))
-        ok, detail = await orchestration.merge_before_completion(db, snapshot)
-        assert not ok and detail.startswith(orchestration.APPROVAL_CHANGED_PREFIX)
-    else:
-        await _decide_deliver(client, task_id)
-    assert spy.inner.merged == [], "no merge on an approval that no longer stands"
+    real = plugins.git_ops.check_pr_ci
+
+    async def moved(*args, **kwargs):
+        await _fire(db, task_id, change)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(plugins.git_ops, "check_pr_ci", moved)
+    await _decide_deliver(client, task_id)
+    assert spy.merged == [], "no merge on an approval that no longer stands"
     assert not await repo.pipeline_merge_recorded(db, task_id, 950)
 
 
@@ -815,15 +878,50 @@ async def test_the_gate_still_merges_when_nothing_moved(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
     from hub.services import orchestration
-    from tests.test_accept_without_delivery import _approved_task, _install
+    from tests.test_accept_without_delivery import _approved_task, _install, _MergeSpy
 
     task_id = await _approved_task(client, db, title="control", pr=951)
-    spy = _ChangingSpy(db, task_id, "nothing")
+    spy = _MergeSpy()
     _install(monkeypatch, spy)
     ok, _ = await orchestration.merge_before_completion(
         db, dict(await repo.get_task(db, task_id))
     )
-    assert ok and spy.inner.merged == [951]
+    assert ok and spy.merged == [951]
+
+
+async def test_poller_and_done_flow_at_once_call_the_forge_once(db_dsn, db):
+    """Concurrent sweep + done report: one forge call, no phantom manual merge."""
+    import asyncio
+
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+        _report_done,
+    )
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    async def slow_merge(*_a, **_k):
+        await asyncio.sleep(0.2)
+        return True
+
+    git.merge_pr = AsyncMock(side_effect=slow_merge)
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    await other.execute("PRAGMA busy_timeout = 5000")
+    other.row_factory = aiosqlite.Row
+    try:
+        await asyncio.gather(_drain_pair_delivery(db), _report_done(other, task_id))
+    finally:
+        await other.close()
+    assert git.merge_pr.await_count == 1, "exactly one call of the forge"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "merged_outside_gate" not in feed
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
 # ---- the headless conveyor writes no outcome on a stale approval ---------------
@@ -882,27 +980,32 @@ async def test_a_stale_approval_leaves_no_approved_outcome(
 async def test_the_wait_for_a_neighbour_merge_is_not_a_blind_spot(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    """Codex round 3: the gate may wait for another path's merge, then merge itself."""
+    """The gate may wait for another path's merge; the approval is read AFTER it."""
+    import asyncio
+
     from hub.services import orchestration
-    from tests.test_accept_without_delivery import _approved_task, _install
+    from tests.test_accept_without_delivery import _approved_task, _install, _MergeSpy
 
     task_id = await _approved_task(client, db, title="waits", pr=952)
-    spy = _ChangingSpy(db, task_id, "nothing")
+    spy = _MergeSpy()
     _install(monkeypatch, spy)
-
-    async def _waited(key):
-        await db.execute(
-            "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?", (task_id,)
+    neighbour: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    orchestration._gate_merges[(task_id, 952)] = neighbour  # a path is merging it
+    gate = asyncio.create_task(
+        orchestration.merge_before_completion(
+            db, dict(await repo.get_task(db, task_id))
         )
-        await db.commit()
-        return orchestration.GateMergeSeen.ABSENT
-
-    monkeypatch.setattr(orchestration, "_gate_merge_outcome", _waited)
-    ok, detail = await orchestration.merge_before_completion(
-        db, dict(await repo.get_task(db, task_id))
     )
+    await asyncio.sleep(0.2)  # the gate is waiting for the neighbour
+    await db.execute(
+        "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?", (task_id,)
+    )
+    await db.commit()
+    orchestration._gate_merges.pop((task_id, 952), None)
+    neighbour.set_result(False)  # the neighbour's merge was refused
+    ok, detail = await gate
     assert not ok and detail.startswith(orchestration.APPROVAL_CHANGED_PREFIX)
-    assert spy.inner.merged == []
+    assert spy.merged == []
 
 
 async def test_the_fix_order_is_built_from_the_verdict_that_stands(
@@ -955,3 +1058,70 @@ async def test_the_fix_order_is_built_from_the_verdict_that_stands(
         await poller._review_task_tick(db, snapshot, {"status": "completed"})
     patch.stopall()
     assert seen and "fix the race" in seen[0]
+
+
+async def test_check_and_registration_have_no_await_between(db, monkeypatch):
+    """The atomicity itself: no suspension between the fresh read and the Future."""
+    import asyncio
+
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+    )
+
+    _git(CIProbeOutcome.passed, merged=True)
+    await _approved_pair_task(db)
+    ticks = 0
+    read_at: list[int] = []
+    seen: list[int] = []
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    class Registry(dict):
+        def __setitem__(self, key, value):
+            seen.append(ticks - read_at[-1])  # loop turns since the last read
+            super().__setitem__(key, value)
+
+    real = repo.get_task
+
+    async def get_task(*args, **kwargs):
+        row = await real(*args, **kwargs)
+        read_at.append(ticks)
+        return row
+
+    monkeypatch.setattr(orchestration, "_gate_merges", Registry())
+    monkeypatch.setattr(orchestration.repo, "get_task", get_task)
+    runner = asyncio.create_task(ticker())
+    try:
+        await _drain_pair_delivery(db)
+    finally:
+        runner.cancel()
+    assert seen, "the merge was registered"
+    assert seen == [0] * len(seen), "the loop turned between the check and the Future"
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_a_task_without_a_pr_is_not_completed_on_a_gone_approval(
+    db: aiosqlite.Connection, change: str
+):
+    """No PR, no merge point: the deferred completion itself must look again."""
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    from hub.integrations.protocols import CIProbeOutcome
+
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    before = dict(await repo.get_task(db, task_id))["status"]
+    await _fire(db, task_id, change)
+    await orchestration.run_deferred_completions(
+        db, [{"task_id": task_id, "exit_code": None, "result_text": "done"}]
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == before
