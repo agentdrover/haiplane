@@ -69,7 +69,7 @@ def _front_matter(text: str) -> dict[str, object] | None:
         return None
     try:
         parsed = yaml.safe_load(match.group(1))
-    except yaml.YAMLError:
+    except Exception:  # noqa: BLE001 - YAML бросает и ValueError (дата, !!int)
         return None
     return parsed if isinstance(parsed, dict) else None
 

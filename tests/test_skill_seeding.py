@@ -638,20 +638,28 @@ def test_a_skill_file_without_a_matching_name_fails(tmp_path):
     assert [f.name for f in skill_files.load_skill_files(root)] == ["good-one"]
 
 
+@pytest.mark.parametrize(
+    "description",
+    ["[", "2026-13-01", "!!int abc"],
+    ids=["bracket", "bad-date", "bad-tag"],
+)
 async def test_broken_front_matter_leaves_the_active_seed_version_alone(
-    db: aiosqlite.Connection, skills_tree: Path, caplog
+    db: aiosqlite.Connection, skills_tree: Path, caplog, description: str
 ):
-    """Битый YAML не заменяет активную seed-версию: файл пропущен с warning."""
+    """Битый YAML не заменяет активную seed-версию и не роняет засев."""
     (skills_tree / "zz-broken").mkdir()
     (skills_tree / "zz-broken" / "SKILL.md").write_text(
-        "---\nname: zz-broken\ndescription: [\n---\nновый текст\n"
+        f"---\nname: zz-broken\ndescription: {description}\n---\nновый текст\n"
     )
+    good = _write_skill(skills_tree, "zz-good")
     await _install(db, "zz-broken", [(1, OLD_TEXT, "active", "seed", "seed")])
+    await _install(db, "zz-good", [])
     before = await _versions(db, "zz-broken")
     with caplog.at_level(logging.WARNING, logger="hub.skill_files"):
         await seed_default_skills(db)
     assert await _versions(db, "zz-broken") == before
     assert any("zz-broken" in r.getMessage() for r in caplog.records)
+    assert await _served(db, "zz-good") == good, "остальные файлы засеяны"
 
 
 def test_every_skill_file_in_the_repository_is_valid():
