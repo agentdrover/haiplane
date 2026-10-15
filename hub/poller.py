@@ -593,14 +593,9 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
 
 
 async def _approval_still_current(db, task: dict) -> bool:
-    """The approval is re-read right before the merge (#1706).
-
-    The tick's snapshot can be older than a resubmission or a replacement; a
-    merge on the snapshot's word is the one step that cannot be taken back.
-    """
+    """The approval, re-read: the tick's snapshot may predate a replacement (#1706)."""
     row = await repo.get_task(db, task["id"])
     live = dict(row) if row is not None else {}
-    # The canonical predicate, which also knows the window a human closed (#1286).
     current = bool(
         live
         and services.review_approved_for_current_submission(live)
@@ -860,6 +855,9 @@ async def _review_task_tick(db, task: dict, job: dict) -> None:
     if verdict == "approved":
         await _deliver_approved_review(db, task)
     elif verdict == "changes_requested":
+        # The text of the verdict is read with it: a replacement between the two
+        # reads would send the executor yesterday's APPROVED (#1706).
+        updates_list = [dict(u) for u in await repo.get_task_updates(db, task["id"])]
         await _request_review_fixes(db, task, updates_list)
     elif verdict in (SCANNED_APPROVAL_DEFERRED, VERDICT_NOT_WRITTEN):
         return  # routed to a human with the quoted line / write refused (#1706)

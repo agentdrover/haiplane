@@ -4383,6 +4383,13 @@ async def _gate_merge_step(
             f"#{key[1]} вливает соседний путь гейта, форж не ответил за "
             f"{GATE_MERGE_WAIT_SECONDS:g} с; второй мерж не запускается",
         ), ""
+    # #1706: the last read before the irreversible step, AFTER the wait above
+    # (it can last a minute). CI, stacking and base probes are network calls; a
+    # replacement of the verdict, a return to work or a resubmission may land
+    # while they run, and the merge would deliver on the snapshot's word.
+    changed = await _approval_changed_since(db, task)
+    if changed:
+        return (False, changed), ""
     merged, merge_detail = await _registered_gate_merge(key, task, ctx)
     if not merged:
         return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
@@ -4893,14 +4900,6 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        # #1706: the last read before the irreversible step. CI, stacking and
-        # base probes are network calls; a replacement of the verdict, a return
-        # to work or a resubmission may land while they run, and the merge below
-        # would deliver on the snapshot's word.
-        changed = await _approval_changed_since(db, task)
-        if changed:
-            return False, changed
-
         decided, merge_detail = await _gate_merge_step(db, task, ctx)
         key = (int(task_id), int(pr_num))
         if decided is not None and not (
@@ -5257,8 +5256,16 @@ BASE_FRESHNESS_WAIT_HINT = (
     "зелёного CI на новой голове. Пересдавать НЕ нужно: слияние базы гейтом — "
     "не авторская правка, вердикт сохраняется (#1361)."
 )
+# #1706: вердикт заменён, работа возвращена или пересдана, пока шли пробы.
+APPROVAL_CHANGED_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: одобрение, с "
+    "которым началась доставка, уже не действует, PR не влит. Что делать "
+    "дальше, говорит текущий вердикт на карточке; ничего пересдавать из-за "
+    "этого отказа не нужно."
+)
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
+    (APPROVAL_CHANGED_PREFIX, APPROVAL_CHANGED_WAIT_HINT),
     (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
     ((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX), STACKED_BASE_WAIT_HINT),
     (MERGE_REFUSAL_UNVERIFIED_PREFIX, MERGE_REFUSAL_UNVERIFIED_WAIT_HINT),

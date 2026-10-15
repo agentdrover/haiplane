@@ -877,3 +877,81 @@ async def test_a_stale_approval_leaves_no_approved_outcome(
     )
     assert "Ревью одобрено" not in texts and "CI failed" not in texts
     assert "Доставка остановлена" not in texts
+
+
+async def test_the_wait_for_a_neighbour_merge_is_not_a_blind_spot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 3: the gate may wait for another path's merge, then merge itself."""
+    from hub.services import orchestration
+    from tests.test_accept_without_delivery import _approved_task, _install
+
+    task_id = await _approved_task(client, db, title="waits", pr=952)
+    spy = _ChangingSpy(db, task_id, "nothing")
+    _install(monkeypatch, spy)
+
+    async def _waited(key):
+        await db.execute(
+            "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?", (task_id,)
+        )
+        await db.commit()
+        return orchestration.GateMergeSeen.ABSENT
+
+    monkeypatch.setattr(orchestration, "_gate_merge_outcome", _waited)
+    ok, detail = await orchestration.merge_before_completion(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert not ok and detail.startswith(orchestration.APPROVAL_CHANGED_PREFIX)
+    assert spy.inner.merged == []
+
+
+async def test_the_fix_order_is_built_from_the_verdict_that_stands(
+    db: aiosqlite.Connection,
+):
+    """Codex round 3: the text of the verdict is read with the verdict."""
+    from hub import poller
+
+    task_id = await _headless_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "Review verdict: APPROVED"
+    )
+    await db.execute(
+        "UPDATE tasks SET review_verdict='approved', review_verdict_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    snapshot = dict(await repo.get_task(db, task_id))
+    real = poller._resolve_review_verdict
+
+    async def _replaced_after_the_tick_read_the_feed(db_, task_, updates_):
+        # The tick has read the feed (APPROVED); a human replaces the verdict now.
+        await repo.add_task_update(
+            db_,
+            task_id,
+            "denis",
+            "review",
+            "Review verdict: CHANGES_REQUESTED\nfix the race",
+        )
+        await db_.execute(
+            "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?",
+            (task_id,),
+        )
+        await db_.commit()
+        return await real(db_, task_, updates_)
+
+    patch.object(
+        poller, "_resolve_review_verdict", _replaced_after_the_tick_read_the_feed
+    ).start()
+    plugins.dispatch = _job()
+    seen: list[str] = []
+
+    async def _fix(_db, _task, text):
+        seen.append(text)
+
+    with (
+        patch.object(poller.services, "dispatch_fix", _fix),
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+    ):
+        await poller._review_task_tick(db, snapshot, {"status": "completed"})
+    patch.stopall()
+    assert seen and "fix the race" in seen[0]
