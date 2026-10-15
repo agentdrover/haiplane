@@ -4438,10 +4438,14 @@ async def record_delivery_outcome(
     явное объяснение (``_note_approval_gone``), а ``write`` не вызывается.
     Возвращает ``(записано ли, результат write либо fallback)``.
     """
-    if not await approval_stands(db, task):
+    async with write_transaction(db):
+        # The read and the first SQL of ``write`` share one write transaction:
+        # a verdict writer on another connection cannot land between them.
+        stands = await approval_stands(db, task)
+        result = await write() if stands else fallback
+    if not stands:
         await _note_approval_gone(db, task)
-        return False, fallback
-    return True, await write()
+    return stands, result
 
 
 async def _gate_merge_step(
@@ -5535,6 +5539,50 @@ async def _deliver_completed_pair_task(
     return None
 
 
+async def _hand_off_missing_pr(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str | None,
+    diff: list[str] | None,
+    create_reason: str,
+) -> str:
+    """Коммиты подтверждены, PR открыть не удалось: к человеку (#967), через писатель (#1706)."""
+    task_id = task["id"]
+
+    async def write() -> str:
+        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            # #952: names only actions needs_decision accepts.
+            f"Done report NOT completed: ветка {branch} меняет "
+            f"{len(diff or [])} файл(ов), а {create_reason}. "
+            "Решение за человеком (REST POST /api/tasks/<id>/decide): rework "
+            "вернёт задачу в running — откройте PR руками или "
+            "почините доступ к GitHub и пересдайте done; accept "
+            "завершит задачу БЕЗ доставки ветки.",
+        )
+        await watch_notices.emit_needs_decision(
+            db,
+            task_id=task_id,
+            actor=task.get("assigned_agent") or "agent",
+            payload={"reason": "delivery_pr_missing", "detail": create_reason},
+        )
+        log.info(
+            "Task #%d → needs_decision: commits confirmed on %s "
+            "and no PR could be opened (%s)",
+            task_id,
+            branch,
+            create_reason,
+        )
+        return "needs_decision"
+
+    _, outcome = await record_delivery_outcome(db, task, write, fallback="running")
+    return outcome
+
+
 async def _complete_without_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -5593,37 +5641,7 @@ async def _complete_without_review(
                     "файл(ов), а открытого PR не было (#967).",
                 )
             elif create_reason:
-                await repo.update_task(db, task_id, status="needs_decision")
-                await repo.add_task_update(
-                    db,
-                    task_id,
-                    "hub",
-                    "alert",
-                    # #952: names only actions needs_decision accepts.
-                    f"Done report NOT completed: ветка {branch} меняет "
-                    f"{len(diff or [])} файл(ов), а {create_reason}. "
-                    "Решение за человеком (REST POST /api/tasks/<id>/decide): rework "
-                    "вернёт задачу в running — откройте PR руками или "
-                    "почините доступ к GitHub и пересдайте done; accept "
-                    "завершит задачу БЕЗ доставки ветки.",
-                )
-                await watch_notices.emit_needs_decision(
-                    db,
-                    task_id=task_id,
-                    actor=task.get("assigned_agent") or "agent",
-                    payload={
-                        "reason": "delivery_pr_missing",
-                        "detail": create_reason,
-                    },
-                )
-                log.info(
-                    "Task #%d → needs_decision: commits confirmed on %s "
-                    "and no PR could be opened (%s)",
-                    task_id,
-                    branch,
-                    create_reason,
-                )
-                return "needs_decision"
+                return await _hand_off_missing_pr(db, task, branch, diff, create_reason)
     if pr_note:
         # The gate could not look. Completion still follows today's rule,
         # but the reader is told which check did not run — an absent line
@@ -5653,7 +5671,9 @@ async def _complete_without_review(
     # WITHOUT bumping the generation — no new work is being submitted,
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
-    await _write_completed(db, task, exit_code, result_text)
+    if not await _write_completed(db, task, exit_code, result_text):
+        await _note_approval_gone(db, task)
+        return "running"
     return "completed"
 
 
@@ -5662,8 +5682,13 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-) -> None:
+) -> bool:
     """The write of ``completed`` after a done report, with its validation gate.
+
+    #1706: the approval is read inside the same write transaction as the
+    ``completed`` it authorises. ``False`` — it is gone (a replacement, a
+    return to work, a resubmission landed while the network steps ran); nothing
+    is written and the caller says so instead of completing.
 
     #1687: a done report completed after its own transaction (the deferred
     completion) decided on validation evidence that a newer CI report may have
@@ -5673,6 +5698,8 @@ async def _write_completed(
     """
     task_id = task["id"]
     async with write_transaction(db):
+        if not await approval_stands(db, task):
+            return False
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 
@@ -5699,6 +5726,7 @@ async def _write_completed(
 
         await maybe_rollup_parent(db, task_id)
     log.info("Task #%d → completed after done report", task_id)
+    return True
 
 
 async def _local_tip(branch: str, git_repo: str | None) -> str:

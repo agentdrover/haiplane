@@ -1125,3 +1125,85 @@ async def test_a_task_without_a_pr_is_not_completed_on_a_gone_approval(
         db, [{"task_id": task_id, "exit_code": None, "result_text": "done"}]
     )
     assert dict(await repo.get_task(db, task_id))["status"] == before
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_no_completion_when_the_approval_goes_during_the_pr_lookup(
+    db: aiosqlite.Connection, monkeypatch, change: str
+):
+    """Codex round 4: a task without a PR reached ``completed`` on a gone approval."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    real = orchestration.pr_for_delivery
+
+    async def lookup(*args, **kwargs):
+        await _fire(db, task_id, change)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "pr_for_delivery", lookup)
+    await _report_done(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_a_failed_pr_creation_writes_no_needs_decision_over_a_gone_approval(
+    db: aiosqlite.Connection, monkeypatch, change: str
+):
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    before = dict(await repo.get_task(db, task_id))["status"]
+
+    async def diff(*_a, **_k):
+        return ["hub/x.py"]
+
+    async def create(*_a, **_k):
+        await _fire(db, task_id, change)
+        return None, "GitHub не ответил"
+
+    monkeypatch.setattr(orchestration, "_confirmed_branch_diff", diff)
+    monkeypatch.setattr(orchestration, "ensure_delivery_pr", create)
+    await _report_done(db, task_id)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == before, "no needs_decision over a verdict that is gone"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "Done report NOT completed" not in feed
+
+
+async def test_the_outcome_check_and_write_hold_one_write_lock(db_dsn, db):
+    """Codex round 4 (P2): a verdict writer cannot land between check and write."""
+    import sqlite3
+
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task
+
+    task_id = await _approved_pair_task(db, pr_number=None)
+    other = await aiosqlite.connect(db_dsn, uri=True, timeout=0)
+    await other.execute("PRAGMA busy_timeout = 0")
+    locked: list[bool] = []
+
+    async def write() -> None:
+        try:
+            await other.execute(
+                "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?",
+                (task_id,),
+            )
+        except (sqlite3.OperationalError, aiosqlite.OperationalError):
+            locked.append(True)
+
+    try:
+        stands, _ = await orchestration.record_delivery_outcome(
+            db, dict(await repo.get_task(db, task_id)), write
+        )
+    finally:
+        await other.close()
+    assert stands and locked == [True], "the other connection was held off"
