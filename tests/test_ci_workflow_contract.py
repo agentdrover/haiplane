@@ -358,3 +358,19 @@ def test_branch_code_never_sees_the_report_token() -> None:
     script = (ROOT / "scripts" / "ci_trusted_report.py").read_text(encoding="utf-8")
     assert 'EXPECTED_WORKFLOW_PATH = ".github/workflows/ci.yml"' in script
     assert "head_repository" in script and "ALLOWED_EVENTS" in script
+
+
+def test_the_timing_read_stays_a_read_of_the_github_api() -> None:
+    """#1700: the third send adds no way to run anything from the run's branch."""
+    script = (ROOT / "scripts" / "ci_trusted_report.py").read_text(encoding="utf-8")
+    for forbidden in ("subprocess", "os.system", "eval(", "exec(", "__import__"):
+        assert forbidden not in script, forbidden
+    assert "/attempts/{attempt}/jobs" in script
+    import yaml
+
+    report = yaml.safe_load((WORKFLOWS / "ci-report.yml").read_text(encoding="utf-8"))
+    steps = report["jobs"]["report"]["steps"]
+    assert [s.get("name") for s in steps] == [
+        "Checkout the default branch",
+        "Send the results of the finished run",
+    ], "the timing rides the existing step"

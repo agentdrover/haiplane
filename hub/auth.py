@@ -401,6 +401,7 @@ def watcher_route_allowed(
 CI_SCOPED_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/tasks/{task_id}"),
     ("POST", "/api/tasks/{task_id}/ci-run-report"),
+    ("POST", "/api/tasks/{task_id}/ci-run-timing"),
     ("POST", "/api/deploys"),
     ("GET", "/api/whoami"),
 )

@@ -2966,6 +2966,35 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_review_verdict_digest",
         "ALTER TABLE tasks ADD COLUMN review_verdict_digest TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # #1700: how long one finished CI attempt of a task branch took. Statistics
+        # only: no gate reads it, and it is written by the trusted workflow's key
+        # from GitHub's own job records. One row per (task, run, attempt): a
+        # resent timing updates the row, a rerun is a second row. ``completed_at``
+        # is the completion time from the event ('YYYY-MM-DD HH:MM:SS' UTC, the
+        # window of the metrics); ``state`` is ok | timing_unavailable. The
+        # seconds are NULL when unknown — NULL is "not measured", never zero.
+        "create_ci_attempt_timings",
+        """CREATE TABLE IF NOT EXISTS ci_attempt_timings (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            run_id         TEXT    NOT NULL,
+            run_attempt    TEXT    NOT NULL,
+            head_sha       TEXT    NOT NULL DEFAULT '',
+            event          TEXT    NOT NULL DEFAULT '',
+            conclusion     TEXT    NOT NULL DEFAULT '',
+            completed_at   TEXT    NOT NULL,
+            state          TEXT    NOT NULL DEFAULT 'ok',
+            reason         TEXT    NOT NULL DEFAULT '',
+            jobs           TEXT    NOT NULL DEFAULT '[]',
+            runner_seconds REAL,
+            complete       INTEGER NOT NULL DEFAULT 0,
+            steps_seconds  TEXT    NOT NULL DEFAULT '{}',
+            reported_by    TEXT    NOT NULL DEFAULT '',
+            received_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, run_id, run_attempt)
+        )""",
+    ),
 ]
 
 
