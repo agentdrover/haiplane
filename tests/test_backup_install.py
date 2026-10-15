@@ -77,7 +77,10 @@ def test_install_needs_root_after_the_keys_are_valid(tmp_path):
 
 def test_no_key_material_is_kept_in_the_repository():
     # an ssh public key body or an age recipient in any shipped file would be a fixed identity
-    for path in BACKUP_DIR.iterdir():
+    # shipped files only: a __pycache__ directory (an import elsewhere) is not one
+    shipped = [p for p in BACKUP_DIR.iterdir() if p.is_file() and p.suffix != ".pyc"]
+    assert {p.name for p in shipped} >= {"install.sh", "hub-snapshot.py", "README.md"}
+    for path in shipped:
         text = path.read_text()
         assert not re.search(r"AAAAC3NzaC1lZDI1NTE5AAAA[A-Za-z0-9+/]{20,}", text), path
         assert not re.search(r"age1[0-9a-z]{50,}", text), path
@@ -212,3 +215,25 @@ def test_sshd_is_reloaded_on_every_run_and_before_the_key_appears():
     assert any('if [ "$SERVICES" = 1 ]' in line for line in before)
     assert "CHANGED" not in "".join(before), "the reload must not depend on a change"
     assert 'command="%s/snapshot-serve.sh %s"' in text
+
+
+def test_the_scan_survives_a_bytecode_directory_left_by_an_import(
+    tmp_path, monkeypatch
+):
+    """Order independence: the module imported first, this scan second."""
+    import sys
+
+    from tests.backup_support import load_snapshot
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    cache = BACKUP_DIR / "__pycache__"
+    existed = cache.exists()
+    load_snapshot()
+    cache.mkdir(exist_ok=True)
+    try:
+        test_no_key_material_is_kept_in_the_repository()
+    finally:
+        if not existed:
+            import shutil
+
+            shutil.rmtree(cache, ignore_errors=True)
