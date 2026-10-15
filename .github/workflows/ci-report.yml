@@ -15,6 +15,10 @@ name: CI report
 # strict limits and takes every fact about the run (commit, run id, attempt,
 # workflow path, event, head repository, conclusion) from the event payload.
 #
+# #1700: the same script also reads GitHub's job records of the finished run
+# (GET .../runs/{id}/attempts/{n}/jobs, the token above is enough) and sends the
+# durations to the hub with the same key. It is data about time: no step is added
+# for it, and nothing from the artifact or the branch is built or run for it.
 # This workflow must not grow a step that builds, installs or executes anything
 # from the artifact or from the run's branch: no cache, no uv sync, no project
 # dependencies. tests/test_ci_workflow_contract.py pins that.

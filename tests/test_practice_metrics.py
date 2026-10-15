@@ -2645,6 +2645,8 @@ LEGACY_KEYS = {
     "executor_runs",
     "review_economy",
     "events_history",
+    # #1700: minutes of CI; one more section, not a different slice.
+    "ci_minutes",
 }
 
 
@@ -3620,3 +3622,171 @@ async def test_events_history_boundary_is_exact_and_shadow_ignores_window(
     assert (
         short["steward_shadow"]["human_table"] == long_["steward_shadow"]["human_table"]
     )
+
+
+# ---- #1700: minutes of CI per task and per class -----------------------------
+
+
+def _iso(hours_ago: float) -> str:
+    moment = datetime.now(UTC) - timedelta(hours=hours_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _attempt(run_id: str, seconds: int | None, *, hours_ago: float = 1, **steps: int):
+    """One attempt that ran ``seconds`` in total (GitHub's times, fixed)."""
+    from hub.services.ci_timing import CIRunTimingSubmit
+
+    jobs = []
+    if seconds is not None:
+        end = f"2026-10-15T{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}Z"
+        jobs = [
+            {
+                "name": "Ruff and pytest",
+                "started_at": "2026-10-15T00:00:00Z",
+                "completed_at": end,
+                "steps": [
+                    {"key": key, "seconds": float(value)}
+                    for key, value in steps.items()
+                ],
+            }
+        ]
+    return CIRunTimingSubmit(
+        run_id=run_id,
+        run_attempt="1",
+        completed_at=_iso(hours_ago),
+        state="ok" if seconds is not None else "timing_unavailable",
+        jobs=jobs,
+    )
+
+
+async def _classed(db, title: str, work_type: str, size: str, risk: str) -> int:
+    task_id = await _task(db, title=title)
+    await db.execute(
+        "UPDATE tasks SET work_type = ?, size = ?, risk_class = ? WHERE id = ?",
+        (work_type, size, risk, task_id),
+    )
+    return task_id
+
+
+async def test_ci_minutes_per_task_and_class(db: aiosqlite.Connection):
+    """AC-6: minutes per task, median/max and step shares per class, unknowns apart."""
+    from hub.services.ci_timing import store_ci_run_timing
+
+    a = await _classed(db, "a", "feature", "M", "R2")
+    b = await _classed(db, "b", "feature", "M", "R2")
+    e = await _classed(db, "e", "feature", "M", "R2")
+    c = await _classed(db, "c", "bug", "S", "R1")
+    old = await _classed(db, "outside the window", "feature", "M", "R2")
+    plan = [
+        (a, _attempt("1", 1200, mutations=600, ac_collect=300)),
+        (a, _attempt("2", 600, mutations=120)),  # a rerun: both count, once each
+        (b, _attempt("3", 1200, mutations=480, ac_collect=300)),
+        (e, _attempt("4", 360)),
+        (c, _attempt("5", None)),  # GitHub's jobs could not be read
+        (c, _attempt("6", 360)),
+        (old, _attempt("7", 3600, hours_ago=24 * 60)),
+    ]
+    for task_id, body in plan:
+        await store_ci_run_timing(db, task_id, body, reported_by="ci")
+    # Two CI reports reached the hub; only one of them has a timing.
+    for task_id, run_id in ((a, "1"), (a, "99")):
+        await db.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "reported_at) VALUES (?, 'sha', ?, '1', ?)",
+            (task_id, run_id, _ts(1)),
+        )
+    await db.commit()
+
+    section = (await practice_metrics(db, since_days=30))["ci_minutes"]
+    assert section["attempts"] == {
+        "received": 6,
+        "timed": 5,
+        "partial_duration": 0,
+        "unknown_duration": 1,
+    }
+    assert section["by_task"] == [
+        {
+            "task_id": a,
+            "attempts": 2,
+            "unknown_attempts": 0,
+            "runner_minutes": 30.0,
+            "partial": False,
+            "measured_attempts": 2,
+        },
+        {
+            "task_id": b,
+            "attempts": 1,
+            "unknown_attempts": 0,
+            "runner_minutes": 20.0,
+            "partial": False,
+            "measured_attempts": 1,
+        },
+        {
+            "task_id": e,
+            "attempts": 1,
+            "unknown_attempts": 0,
+            "runner_minutes": 6.0,
+            "partial": False,
+            "measured_attempts": 1,
+        },
+        {
+            "task_id": c,
+            "attempts": 2,
+            "unknown_attempts": 1,
+            "runner_minutes": 6.0,
+            "partial": True,
+            "measured_attempts": 1,
+        },
+    ]
+    assert section["by_class"] == [
+        {
+            "work_type": "bug",
+            "size": "S",
+            "risk_class": "R1",
+            "tasks": 1,
+            "median_task_minutes": 6.0,
+            "max_task_minutes": 6.0,
+            "mutations_share": 0.0,
+            "ac_collect_share": 0.0,
+        },
+        {
+            "work_type": "feature",
+            "size": "M",
+            "risk_class": "R2",
+            "tasks": 3,
+            "median_task_minutes": 20.0,
+            "max_task_minutes": 30.0,
+            # (600 + 120 + 480) / 3360 s and (300 + 300) / 3360 s
+            "mutations_share": 0.357,
+            "ac_collect_share": 0.179,
+        },
+    ]
+    missing = section["missing_among_received_ci_reports"]
+    assert (missing["received_ci_reports"], missing["without_timing"]) == (2, 1)
+    assert "полученных отчётов" in missing["note"]
+
+
+async def test_a_task_with_no_measured_attempt_has_no_minutes_not_zero(
+    db: aiosqlite.Connection,
+):
+    """#1700 review: unknown is null; a mixed sum says it is partial."""
+    from hub.services.ci_timing import store_ci_run_timing
+
+    blind = await _classed(db, "blind", "feature", "M", "R2")
+    mixed = await _classed(db, "mixed", "feature", "M", "R2")
+    for task_id, body in (
+        (blind, _attempt("1", None)),
+        (blind, _attempt("2", None)),
+        (mixed, _attempt("3", None)),
+        (mixed, _attempt("4", 600)),
+    ):
+        await store_ci_run_timing(db, task_id, body, reported_by="ci")
+    await db.commit()
+    rows = {
+        r["task_id"]: r
+        for r in (await practice_metrics(db, since_days=30))["ci_minutes"]["by_task"]
+    }
+    assert rows[blind]["runner_minutes"] is None
+    assert (rows[blind]["partial"], rows[blind]["measured_attempts"]) == (False, 0)
+    assert rows[mixed]["runner_minutes"] == 10.0
+    assert (rows[mixed]["partial"], rows[mixed]["measured_attempts"]) == (True, 1)
