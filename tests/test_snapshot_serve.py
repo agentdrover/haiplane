@@ -18,6 +18,7 @@ from tests.backup_support import (
     STATE_DIR,
     as_root,
     need_root_host,
+    SharedLock,
     run_install,
     shared_keys,
     sshd_path,
@@ -226,8 +227,15 @@ class Server:
 @pytest.fixture
 def server(tmp_path):
     need_root_host()
-    first = run_install()
-    assert first.returncode == 0, first.stdout + first.stderr
+    host = SharedLock()
+    host.__enter__()  # exclusive while installing, shared while the daemon is in use
+    try:
+        first = run_install(held=host)
+        assert first.returncode == 0, first.stdout + first.stderr
+        host.downgrade()
+    except BaseException:
+        host.__exit__(None, None, None)
+        raise
     now = datetime.datetime.now(datetime.timezone.utc)
     names = []
     payloads = {}
@@ -269,6 +277,7 @@ def server(tmp_path):
     srv.stop()
     for name in names:
         as_root(["rm", "-f", STATE_DIR + "/" + name])
+    host.__exit__(None, None, None)
 
 
 def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):

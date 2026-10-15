@@ -86,7 +86,7 @@ def test_no_key_material_is_kept_in_the_repository():
 
 def test_install_is_idempotent_and_least_privilege():
     need_root_host()
-    first = run_install()
+    first = run_install(lock_account=True)
     assert first.returncode == 0, first.stdout + first.stderr
     before = installed_state()
     second = run_install()

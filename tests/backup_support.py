@@ -166,13 +166,23 @@ def sshd_path() -> str:
 
 
 class SharedLock:
-    """One lock for every xdist worker: the installation is a machine-wide thing."""
+    """One lock per host for every xdist worker: the installation is machine-wide.
+
+    The installer takes it exclusively; a test that is using the installed service
+    (the real sshd) downgrades to a shared hold, so no other test reinstalls under it.
+    """
+
+    def __init__(self, shared: bool = False):
+        self.shared = shared
 
     def __enter__(self):
         SHARED.mkdir(parents=True, exist_ok=True)
         self.handle = open(SHARED / "lock", "w")
         fcntl.flock(self.handle, fcntl.LOCK_EX)
         return self
+
+    def downgrade(self) -> None:
+        fcntl.flock(self.handle, fcntl.LOCK_SH)
 
     def __exit__(self, *exc):
         self.handle.close()
@@ -192,19 +202,31 @@ def shared_keys() -> dict[str, Path]:
     return {"key": key, "pub": Path(str(key) + ".pub"), "recipient": recipient}
 
 
-def run_install(extra: list[str] | None = None) -> subprocess.CompletedProcess:
-    with SharedLock():
-        keys = shared_keys()
-        args = [
-            "sh",
-            str(INSTALL),
-            "--ssh-pubkey-file",
-            str(keys["pub"]),
-            "--age-recipient-file",
-            str(keys["recipient"]),
-            "--no-services",
-        ] + (extra or [])
-        return as_root(args, text=True)
+def run_install(
+    extra: list[str] | None = None,
+    held: SharedLock | None = None,
+    lock_account: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run the real install.sh under the host lock (``held``: the caller already has it).
+
+    ``lock_account`` first puts the account into the '!' state that useradd leaves,
+    which the installer must repair (sshd without PAM refuses such an account)."""
+    if held is None:
+        with SharedLock() as taken:
+            return run_install(extra, taken, lock_account)
+    if lock_account and as_root(["getent", "passwd", "backup"]).returncode == 0:
+        as_root(["usermod", "-L", "backup"], check=True)
+    keys = shared_keys()
+    args = [
+        "sh",
+        str(INSTALL),
+        "--ssh-pubkey-file",
+        str(keys["pub"]),
+        "--age-recipient-file",
+        str(keys["recipient"]),
+        "--no-services",
+    ] + (extra or [])
+    return as_root(args, text=True)
 
 
 def installed_state() -> str:
