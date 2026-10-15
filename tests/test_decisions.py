@@ -344,6 +344,8 @@ async def _chat_pair_session(hub, kind):
         code, _ = await cp.issue_run_code(
             hub.db, task_id, 2, issued_by_principal_id=hub.op_id
         )
+    elif kind == "intake":
+        code, _ = await cp.issue_code(hub.db, hub.op_id, kind="intake")
     else:
         code, _ = await cp.issue_code(
             hub.db,
@@ -376,7 +378,9 @@ async def test_decisions_access_matches_dashboard(hub):
         "watcher": await _role_headers(hub, "watcher"),
         "steward": await _role_headers(hub, "steward"),
         "ci_reader": await _role_headers(hub, "ci_reader"),
+        "ci_auditor": await _role_headers(hub, "ci_auditor"),
         "anonymous": {},
+        "chat-pair intake": await _chat_pair_session(hub, "intake"),
         "chat-pair implementer": await _chat_pair_session(hub, "implementer"),
         "chat-pair reviewer": await _chat_pair_session(hub, "reviewer"),
     }
@@ -413,3 +417,29 @@ async def test_decisions_access_matches_dashboard(hub):
             else:
                 with pytest.raises(mcp_server.HubApiError):
                     await mcp_server.hub_list_decisions()
+
+
+async def test_origin_is_shown_next_to_the_signature(client, db):
+    """Подпись agent — слова клиента; проверенное авторство показывается рядом."""
+    task_id = await _task(db, "Подпись")
+    await _decision(
+        db,
+        task_id,
+        "Решил агент",
+        "2026-10-01 10:00:00",
+        agent="human",
+        principal_id=42,
+        author_kind="principal",
+    )
+    page = await client.get("/")
+    assert page.status_code == 200
+    assert "human (principal #42)" in page.text
+
+    async def via_client(path, *a, **k):
+        return (await client.get(path)).json()
+
+    with patch("hub.mcp_server._api_get", new=AsyncMock(side_effect=via_client)):
+        text = json.loads(
+            "".join(b.text for b in (await mcp_server.hub_list_decisions()).content)
+        )["message"]
+    assert "(human, principal #42)" in text

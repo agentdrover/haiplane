@@ -894,10 +894,16 @@ def _commit_line(commit: dict[str, Any]) -> str:
 
 def _decision_line(d: dict[str, Any]) -> str:
     """Запись ленты kind=decision: задача и происхождение (#1698)."""
-    who = d.get("agent") or d.get("author_kind") or ""
-    return f"#{d.get('task_id', '?')} {d.get('task_title', 'Decision')}" + (
-        f" ({who})" if who else ""
-    )
+    return f"#{d.get('task_id', '?')} {d.get('task_title', 'Decision')}" + _origin(d)
+
+
+def _origin(d: dict[str, Any]) -> str:
+    """Подпись (agent — слова клиента) рядом с проверенным авторством."""
+    kind = d.get("author_kind") or ""
+    who = f"{kind} #{d['principal_id']}" if d.get("principal_id") else kind
+    sign = d.get("agent") or ""
+    parts = [p for p in (sign, who) if p]
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 def _status_sections(data: dict[str, Any]) -> list[str]:
@@ -5060,7 +5066,9 @@ async def hub_list_decisions(limit: int = 10) -> CallToolResult:
         )
     lines = []
     for d in decisions:
-        lines.append(f"- #{d.get('task_id')} {d.get('task_title', 'Decision')}")
+        lines.append(
+            f"- #{d.get('task_id')} {d.get('task_title', 'Decision')}{_origin(d)}"
+        )
         if d.get("content"):
             lines.append(f"  {d['content'][:200]}")
     return structured_echo_result("\n".join(lines), decisions=decisions, source="hub")
