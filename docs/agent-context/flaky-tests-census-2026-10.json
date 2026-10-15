@@ -197,9 +197,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 1925,
-        "failures": 1,
-        "since": "2026-08-28T12:21:27Z"
+        "executions": 1968,
+        "failures": 0,
+        "since": "2026-08-28T12:21:27Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -225,19 +226,18 @@
         }
       ],
       "message": "TypeError: upsert_finding_disposition() missing 1 required keyword-only argument: 'finding_uid'",
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-08-28T12:21:27Z",
+        "task": 1012,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:f4a2f48a2d",
           "date": "2026-08-28T12:21:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1012
-          },
           "subject": "feat(task): geit-verdikta-molchit-kogda-chelovek-odobryaet-vopreki-svezh (#1012)",
           "task": 1012
         },
@@ -248,19 +248,22 @@
             "task": 1007
           }
         ],
-        "last_changed": {
-          "commit": "git:167162c42b",
-          "date": "2026-08-28T13:37:02Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4
-            },
-            "runs": 4,
-            "success": 3,
-            "task": 1007
+        "changes": [
+          {
+            "commit": "git:f4a2f48a2d",
+            "date": "2026-08-28T12:21:27Z",
+            "task": 1012
           },
-          "subject": "feat(task): identichnost-nahodki-finding-uid-i-lokator-vmesto-indeksa-v (#1007)",
-          "task": 1007
+          {
+            "commit": "git:167162c42b",
+            "date": "2026-08-28T13:37:02Z",
+            "task": 1007
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:f4a2f48a2d",
+          "date": "2026-08-28T12:21:27Z",
+          "task": 1012
         }
       },
       "summary_line": "2 failed, 2478 passed, 3 warnings in 213.64s (0:03:33)",
@@ -281,9 +284,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 1925,
-        "failures": 1,
-        "since": "2026-08-28T12:21:27Z"
+        "executions": 1968,
+        "failures": 0,
+        "since": "2026-08-28T12:21:27Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -309,19 +313,18 @@
         }
       ],
       "message": "AssertionError: {\"detail\":\"confirmed findings #0 do not say where they sit: set 'locator' to 'lines' (with file and start_line), 'file' (module known, line not) or 'none' (no place could be identified",
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-08-28T12:21:27Z",
+        "task": 1012,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:f4a2f48a2d",
           "date": "2026-08-28T12:21:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1012
-          },
           "subject": "feat(task): geit-verdikta-molchit-kogda-chelovek-odobryaet-vopreki-svezh (#1012)",
           "task": 1012
         },
@@ -337,17 +340,27 @@
             "task": 185
           }
         ],
-        "last_changed": {
-          "commit": "git:c48028c77b",
-          "date": "2026-08-29T12:18:27Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 185
+        "changes": [
+          {
+            "commit": "git:f4a2f48a2d",
+            "date": "2026-08-28T12:21:27Z",
+            "task": 1012
           },
-          "subject": "fix: skip parent rollup when the feature has its own work (#1043) (#185)",
-          "task": 185
+          {
+            "commit": "git:167162c42b",
+            "date": "2026-08-28T13:37:02Z",
+            "task": 1007
+          },
+          {
+            "commit": "git:c48028c77b",
+            "date": "2026-08-29T12:18:27Z",
+            "task": 185
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:f4a2f48a2d",
+          "date": "2026-08-28T12:21:27Z",
+          "task": 1012
         }
       },
       "summary_line": "2 failed, 2478 passed, 3 warnings in 213.64s (0:03:33)",
@@ -368,9 +381,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -392,21 +406,26 @@
         }
       ],
       "message": "AssertionError: deploy/LOCAL-REVIEW.md: 3 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -428,9 +447,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -452,21 +472,26 @@
         }
       ],
       "message": "AssertionError: docs/spikes/1168-report-quality-escalations.md: 2 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -488,9 +513,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 1530,
+        "executions": 1557,
         "failures": 1,
-        "since": "2026-09-10T03:40:56Z"
+        "since": "2026-09-10T03:40:56Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "иное",
@@ -546,18 +572,17 @@
           "run_id": 34465955512
         }
       ],
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-09-10T03:40:56Z",
+        "task": 1236,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:2be573fd2d",
           "date": "2026-09-10T03:40:56Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1236
-          },
           "subject": "feat(task): zhivoi-zond-postanovka-obyavlyaet-chitayuschuyu-proverku-hab (#1236)",
           "task": 1236
         },
@@ -573,18 +598,26 @@
             "task": 1362
           }
         ],
-        "last_changed": {
-          "commit": "git:2be573fd2d",
-          "date": "2026-09-10T03:40:56Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
+        "changes": [
+          {
+            "commit": "git:2be573fd2d",
+            "date": "2026-09-10T03:40:56Z",
             "task": 1236
           },
-          "subject": "feat(task): zhivoi-zond-postanovka-obyavlyaet-chitayuschuyu-proverku-hab (#1236)",
+          {
+            "commit": "git:e6fd6a0250",
+            "date": "2026-09-10T14:53:53Z",
+            "task": 1251
+          },
+          {
+            "commit": "git:d2104ca3cb",
+            "date": "2026-09-25T03:33:26Z",
+            "task": 1362
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:2be573fd2d",
+          "date": "2026-09-10T03:40:56Z",
           "task": 1236
         }
       },
@@ -606,9 +639,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -630,21 +664,26 @@
         }
       ],
       "message": "AssertionError: docs/specs/steward-first-judgement.md: 3 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -666,9 +705,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 1439,
+        "executions": 1472,
         "failures": 2,
-        "since": "2026-09-17T09:53:05Z"
+        "since": "2026-09-17T09:53:05Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -719,34 +759,31 @@
           "run_id": 35780018844
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-09-17T09:53:05Z",
+        "task": 1204,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 14
-            },
-            "runs": 14,
-            "success": 14,
-            "task": 1204
-          },
           "subject": "feat(task): osnovanie-prinyatoe-chelovekom-bez-dostavki-nevidimo-dlya-us (#1204)",
           "task": 1204
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:064e31e002",
+            "date": "2026-09-17T09:53:05Z",
+            "task": 1204
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 14
-            },
-            "runs": 14,
-            "success": 14,
-            "task": 1204
-          },
-          "subject": "feat(task): osnovanie-prinyatoe-chelovekom-bez-dostavki-nevidimo-dlya-us (#1204)",
           "task": 1204
         }
       },
@@ -768,9 +805,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1405,
-        "failures": 2,
-        "since": "2026-09-22T17:37:26Z"
+        "executions": 1279,
+        "failures": 1,
+        "since": "2026-09-22T17:37:26Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -810,19 +848,17 @@
           "run_id": 35782262855
         }
       ],
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-22T17:37:26Z",
+        "task": 1208,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 8,
-              "workflow_dispatch": 1
-            },
-            "runs": 9,
-            "success": 9,
-            "task": 1208
-          },
           "subject": "feat(task): dokument-vykata-lokalnogo-revyuera-uchit-nerabochei-nastroik (#1208)",
           "task": 1208
         },
@@ -833,19 +869,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:0468fb265f",
-          "date": "2026-09-22T17:37:26Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 8,
-              "workflow_dispatch": 1
-            },
-            "runs": 9,
-            "success": 9,
+        "changes": [
+          {
+            "commit": "git:0468fb265f",
+            "date": "2026-09-22T17:37:26Z",
             "task": 1208
           },
-          "subject": "feat(task): dokument-vykata-lokalnogo-revyuera-uchit-nerabochei-nastroik (#1208)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:0468fb265f",
+          "date": "2026-09-22T17:37:26Z",
           "task": 1208
         }
       },
@@ -867,9 +905,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1405,
-        "failures": 2,
-        "since": "2026-09-22T17:37:26Z"
+        "executions": 1279,
+        "failures": 1,
+        "since": "2026-09-22T17:37:26Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -886,19 +925,17 @@
           "run_id": 35806396435
         }
       ],
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-22T17:37:26Z",
+        "task": 1208,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 8,
-              "workflow_dispatch": 1
-            },
-            "runs": 9,
-            "success": 9,
-            "task": 1208
-          },
           "subject": "feat(task): dokument-vykata-lokalnogo-revyuera-uchit-nerabochei-nastroik (#1208)",
           "task": 1208
         },
@@ -909,19 +946,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:0468fb265f",
-          "date": "2026-09-22T17:37:26Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 8,
-              "workflow_dispatch": 1
-            },
-            "runs": 9,
-            "success": 9,
+        "changes": [
+          {
+            "commit": "git:0468fb265f",
+            "date": "2026-09-22T17:37:26Z",
             "task": 1208
           },
-          "subject": "feat(task): dokument-vykata-lokalnogo-revyuera-uchit-nerabochei-nastroik (#1208)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:0468fb265f",
+          "date": "2026-09-22T17:37:26Z",
           "task": 1208
         }
       },
@@ -943,9 +982,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -967,21 +1007,26 @@
         }
       ],
       "message": "AssertionError: docs/specs/mcp-session-restart.md: 4 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -1003,9 +1048,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 1439,
+        "executions": 1472,
         "failures": 2,
-        "since": "2026-09-17T09:53:05Z"
+        "since": "2026-09-17T09:53:05Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -1027,34 +1073,31 @@
           "run_id": 36056525687
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-09-17T09:53:05Z",
+        "task": 1204,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 14
-            },
-            "runs": 14,
-            "success": 14,
-            "task": 1204
-          },
           "subject": "feat(task): osnovanie-prinyatoe-chelovekom-bez-dostavki-nevidimo-dlya-us (#1204)",
           "task": 1204
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:064e31e002",
+            "date": "2026-09-17T09:53:05Z",
+            "task": 1204
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 14
-            },
-            "runs": 14,
-            "success": 14,
-            "task": 1204
-          },
-          "subject": "feat(task): osnovanie-prinyatoe-chelovekom-bez-dostavki-nevidimo-dlya-us (#1204)",
           "task": 1204
         }
       },
@@ -1076,9 +1119,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1100,21 +1144,26 @@
         }
       ],
       "message": "AssertionError: docs/spikes/1401-review-context-package.md: 1 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -1382,9 +1431,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1409,20 +1459,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -1433,19 +1481,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -1467,9 +1517,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1259,
-        "failures": 9,
-        "since": "2026-09-23T05:34:07Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1494,19 +1545,20 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "git:91959bafe2",
-          "date": "2026-09-23T05:34:07Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 371
-          },
-          "subject": "feat(task): Дельта пересдачи включает привезённое базой, и дорогой профиль ревью покупается по чужому коду (#1249) (#371)",
-          "task": 371
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
+          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          "task": 1400
         },
         "changed_after_failure": [
           {
@@ -1515,19 +1567,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -1549,9 +1603,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1576,20 +1631,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -1600,19 +1653,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -1757,9 +1812,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1784,20 +1840,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -1808,19 +1862,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -1842,9 +1898,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1259,
-        "failures": 9,
-        "since": "2026-09-23T05:34:07Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1869,19 +1926,20 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "git:91959bafe2",
-          "date": "2026-09-23T05:34:07Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 371
-          },
-          "subject": "feat(task): Дельта пересдачи включает привезённое базой, и дорогой профиль ревью покупается по чужому коду (#1249) (#371)",
-          "task": 371
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
+          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          "task": 1400
         },
         "changed_after_failure": [
           {
@@ -1890,19 +1948,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -1924,9 +1984,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -1951,20 +2012,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -1975,19 +2034,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2132,9 +2193,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2159,20 +2221,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -2183,19 +2243,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2217,9 +2279,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1259,
-        "failures": 9,
-        "since": "2026-09-23T05:34:07Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2244,19 +2307,20 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "git:91959bafe2",
-          "date": "2026-09-23T05:34:07Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 371
-          },
-          "subject": "feat(task): Дельта пересдачи включает привезённое базой, и дорогой профиль ревью покупается по чужому коду (#1249) (#371)",
-          "task": 371
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
+          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          "task": 1400
         },
         "changed_after_failure": [
           {
@@ -2265,19 +2329,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2299,9 +2365,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2326,20 +2393,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -2350,19 +2415,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2384,9 +2451,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2411,20 +2479,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -2435,19 +2501,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2469,9 +2537,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1259,
-        "failures": 9,
-        "since": "2026-09-23T05:34:07Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2496,19 +2565,20 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "git:91959bafe2",
-          "date": "2026-09-23T05:34:07Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 371
-          },
-          "subject": "feat(task): Дельта пересдачи включает привезённое базой, и дорогой профиль ревью покупается по чужому коду (#1249) (#371)",
-          "task": 371
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
+          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          "task": 1400
         },
         "changed_after_failure": [
           {
@@ -2517,19 +2587,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2551,9 +2623,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1094,
-        "failures": 9,
-        "since": "2026-09-25T10:37:44Z"
+        "executions": 957,
+        "failures": 6,
+        "since": "2026-09-25T10:37:44Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2578,20 +2651,18 @@
         }
       ],
       "message": "assert False",
+      "premerge_ci": {
+        "executions": 4,
+        "failures": 0,
+        "merged_at": "2026-09-25T10:37:44Z",
+        "task": 1400,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
-            "task": 1400
-          },
           "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
           "task": 1400
         },
@@ -2602,19 +2673,21 @@
             "task": 1670
           }
         ],
-        "last_changed": {
-          "commit": "git:7d57cfa84e",
-          "date": "2026-09-25T10:37:44Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 2
-            },
-            "runs": 4,
-            "success": 4,
+        "changes": [
+          {
+            "commit": "git:7d57cfa84e",
+            "date": "2026-09-25T10:37:44Z",
             "task": 1400
           },
-          "subject": "feat(task): delta-peresdachi-schitaetsya-ot-pokoleniya-n-1-dazhe-esli-eg (#1400)",
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:7d57cfa84e",
+          "date": "2026-09-25T10:37:44Z",
           "task": 1400
         }
       },
@@ -2765,9 +2838,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1147,
+        "executions": 1179,
         "failures": 1,
-        "since": "2026-09-24T19:53:16Z"
+        "since": "2026-09-24T19:53:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2792,20 +2866,18 @@
         }
       ],
       "message": "assert 0 == 1",
+      "premerge_ci": {
+        "executions": 6,
+        "failures": 0,
+        "merged_at": "2026-09-24T19:53:16Z",
+        "task": 1246,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:f39eae579a",
           "date": "2026-09-24T19:53:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
-            "task": 1246
-          },
           "subject": "feat(task): istochnik-pravdy-o-validatsii-predpas-geita-a-ne-zayavlenie (#1246)",
           "task": 1246
         },
@@ -2826,19 +2898,31 @@
             "task": 1687
           }
         ],
-        "last_changed": {
-          "commit": "git:f39eae579a",
-          "date": "2026-09-24T19:53:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
+        "changes": [
+          {
+            "commit": "git:f39eae579a",
+            "date": "2026-09-24T19:53:16Z",
             "task": 1246
           },
-          "subject": "feat(task): istochnik-pravdy-o-validatsii-predpas-geita-a-ne-zayavlenie (#1246)",
+          {
+            "commit": "git:7adf719832",
+            "date": "2026-09-26T09:54:46Z",
+            "task": 1405
+          },
+          {
+            "commit": "git:4596fa9c5a",
+            "date": "2026-10-11T21:54:22Z",
+            "task": 1670
+          },
+          {
+            "commit": "git:49a72f952f",
+            "date": "2026-10-13T14:49:30Z",
+            "task": 1687
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:f39eae579a",
+          "date": "2026-09-24T19:53:16Z",
           "task": 1246
         }
       },
@@ -2860,9 +2944,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1777,
+        "executions": 1816,
         "failures": 1,
-        "since": "2026-08-30T20:23:49Z"
+        "since": "2026-08-30T20:23:49Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2887,35 +2972,37 @@
         }
       ],
       "message": "assert 2 == 1",
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-08-30T20:23:49Z",
+        "task": 1080,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1080
-          },
           "subject": "ci(task): validatsiya-zadachi-zelena-pri-krasnom-ci-make-lint-ne-prove (#1080)",
           "task": 1080
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:07654213f2",
+            "date": "2026-08-30T20:23:49Z",
+            "task": 1080
+          },
+          {
+            "commit": "git:14a112fcd0",
+            "date": "2026-09-24T04:09:16Z",
+            "task": 1358
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:14a112fcd0",
           "date": "2026-09-24T04:09:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1358
-          },
-          "subject": "docs(task): holodnyi-start-iz-docker-compose-yml-nigde-ne-proveryaetsya (#1358)",
           "task": 1358
         }
       },
@@ -2937,9 +3024,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1777,
+        "executions": 1816,
         "failures": 1,
-        "since": "2026-08-30T20:23:49Z"
+        "since": "2026-08-30T20:23:49Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -2964,35 +3052,32 @@
         }
       ],
       "message": "assert [\"шаг 'Red-te...S с причиной\"] == []",
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-08-30T20:23:49Z",
+        "task": 1080,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1080
-          },
           "subject": "ci(task): validatsiya-zadachi-zelena-pri-krasnom-ci-make-lint-ne-prove (#1080)",
           "task": 1080
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:07654213f2",
+            "date": "2026-08-30T20:23:49Z",
+            "task": 1080
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1
-            },
-            "runs": 1,
-            "success": 1,
-            "task": 1080
-          },
-          "subject": "ci(task): validatsiya-zadachi-zelena-pri-krasnom-ci-make-lint-ne-prove (#1080)",
           "task": 1080
         }
       },
@@ -3014,9 +3099,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1951,
+        "executions": 1938,
         "failures": 1,
-        "since": "2026-08-28T08:47:36Z"
+        "since": "2026-08-28T08:47:36Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -3038,35 +3124,42 @@
         }
       ],
       "message": "AssertionError: description_chars: the catalog is 36491, over the working freeze 36383 by 109. This is the limit that binds — the 'budgets' ceiling carries a percentage headroom, catches slow drift an",
+      "premerge_ci": {
+        "executions": 0,
+        "failures": 0,
+        "merged_at": "2026-08-28T08:47:36Z",
+        "task": 988,
+        "unverifiable_attempts": 0
+      },
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:1019c7dc19",
           "date": "2026-08-28T08:47:36Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2
-            },
-            "runs": 2,
-            "success": 2,
-            "task": 988
-          },
           "subject": "feat(task): shrink-mcp-catalog-and-split-author-reviewer-in-the-map (#988)",
           "task": 988
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:1019c7dc19",
+            "date": "2026-08-28T08:47:36Z",
+            "task": 988
+          },
+          {
+            "commit": "git:2550dd2ce2",
+            "date": "2026-08-28T20:07:55Z",
+            "task": 1031
+          },
+          {
+            "commit": "git:19df910efb",
+            "date": "2026-08-30T16:06:50Z",
+            "task": 1071
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2
-            },
-            "runs": 2,
-            "success": 2,
-            "task": 1071
-          },
-          "subject": "feat(task): tri-potolka-kataloga-mcp-sporyat-mezhdu-soboi-i-svyazyvaet-r (#1071)",
           "task": 1071
         }
       },
@@ -3088,9 +3181,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1809,
+        "executions": 1848,
         "failures": 1,
-        "since": "2026-08-30T16:06:50Z"
+        "since": "2026-08-30T16:06:50Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -3112,35 +3206,32 @@
         }
       ],
       "message": "AssertionError: the report must print the live room under the freeze for description_chars",
+      "premerge_ci": {
+        "executions": 1,
+        "failures": 0,
+        "merged_at": "2026-08-30T16:06:50Z",
+        "task": 1071,
+        "unverifiable_attempts": 0
+      },
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2
-            },
-            "runs": 2,
-            "success": 2,
-            "task": 1071
-          },
           "subject": "feat(task): tri-potolka-kataloga-mcp-sporyat-mezhdu-soboi-i-svyazyvaet-r (#1071)",
           "task": 1071
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:19df910efb",
+            "date": "2026-08-30T16:06:50Z",
+            "task": 1071
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2
-            },
-            "runs": 2,
-            "success": 2,
-            "task": 1071
-          },
-          "subject": "feat(task): tri-potolka-kataloga-mcp-sporyat-mezhdu-soboi-i-svyazyvaet-r (#1071)",
           "task": 1071
         }
       },
@@ -3162,9 +3253,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 1222,
+        "executions": 1143,
         "failures": 1,
-        "since": "2026-09-23T13:32:49Z"
+        "since": "2026-09-23T13:32:49Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -3189,20 +3281,18 @@
         }
       ],
       "message": "AssertionError: дайте образец значения для ['bug_red_test']",
+      "premerge_ci": {
+        "executions": 2,
+        "failures": 0,
+        "merged_at": "2026-09-23T13:32:49Z",
+        "task": 1335,
+        "unverifiable_attempts": 0
+      },
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
           "commit": "git:08d8ec15ee",
           "date": "2026-09-23T13:32:49Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 1,
-              "workflow_dispatch": 1
-            },
-            "runs": 2,
-            "success": 2,
-            "task": 1335
-          },
           "subject": "feat(task): sohranenie-formy-proekta-stiraet-klyuchi-gate-policy-kotoryh (#1335)",
           "task": 1335
         },
@@ -3213,20 +3303,22 @@
             "task": 1677
           }
         ],
-        "last_changed": {
-          "commit": "git:c1dc9f55cb",
-          "date": "2026-09-27T18:58:55Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 3
-            },
-            "runs": 6,
-            "success": 5,
-            "task": 1443
+        "changes": [
+          {
+            "commit": "git:08d8ec15ee",
+            "date": "2026-09-23T13:32:49Z",
+            "task": 1335
           },
-          "subject": "feat(task): f5-1-summarnyi-potolok-stoimosti-ispolnitelya-na-zadachu-nov (#1443)",
-          "task": 1443
+          {
+            "commit": "git:5d6db80f9e",
+            "date": "2026-10-12T11:07:13Z",
+            "task": 1677
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:08d8ec15ee",
+          "date": "2026-09-23T13:32:49Z",
+          "task": 1335
         }
       },
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
@@ -3247,9 +3339,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 506,
-        "failures": 6,
-        "since": "2026-10-05T14:55:25Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -3301,19 +3394,17 @@
           "run_id": 37372824107
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
@@ -3329,19 +3420,26 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:404f1986f1",
-          "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
             "task": 1588
           },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
+            "task": 1595
+          },
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:404f1986f1",
+          "date": "2026-10-05T14:55:25Z",
           "task": 1588
         }
       },
@@ -3363,9 +3461,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
+        "executions": 521,
         "failures": 5,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -3420,36 +3519,31 @@
           "run_id": 37417138058
         }
       ],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         }
       },
@@ -3471,9 +3565,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
+        "executions": 521,
         "failures": 5,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -3490,36 +3585,31 @@
           "run_id": 37417203373
         }
       ],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         }
       },
@@ -3541,9 +3631,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
+        "executions": 521,
         "failures": 5,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -3560,36 +3651,31 @@
           "run_id": 37417203373
         }
       ],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         }
       },
@@ -3611,9 +3697,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 506,
-        "failures": 6,
-        "since": "2026-10-05T14:55:25Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -3632,19 +3719,17 @@
           "run_id": 37434439310
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
@@ -3655,19 +3740,26 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:13dd461659",
-          "date": "2026-10-06T05:53:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          },
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
             "task": 1595
           },
-          "subject": "test(task): flaki-drain-testov-1588-gonka-snyatiya-markera-pri-obryve-ac (#1595)",
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:13dd461659",
+          "date": "2026-10-06T05:53:27Z",
           "task": 1595
         }
       },
@@ -3689,9 +3781,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 932,
+        "executions": 951,
         "failures": 3,
-        "since": "2026-09-27T07:34:16Z"
+        "since": "2026-09-27T07:34:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "гонки git",
@@ -3734,19 +3827,17 @@
           "run_id": 37438529641
         }
       ],
+      "premerge_ci": {
+        "executions": 8,
+        "failures": 0,
+        "merged_at": "2026-09-27T07:34:16Z",
+        "task": 1419,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
-            "task": 1419
-          },
           "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
           "task": 1419
         },
@@ -3757,19 +3848,21 @@
             "task": 1684
           }
         ],
-        "last_changed": {
-          "commit": "git:344e053b16",
-          "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
+        "changes": [
+          {
+            "commit": "git:344e053b16",
+            "date": "2026-09-27T07:34:16Z",
             "task": 1419
           },
-          "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
+          {
+            "commit": "git:315f45feaa",
+            "date": "2026-10-15T04:58:53Z",
+            "task": 1684
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:344e053b16",
+          "date": "2026-09-27T07:34:16Z",
           "task": 1419
         }
       },
@@ -3791,9 +3884,10 @@
     "event": "push",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
-        "failures": 6,
-        "since": "2026-10-05T15:12:58Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -3812,18 +3906,19 @@
           "run_id": 37494739969
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
-          "commit": "git:da8e3bebfb",
-          "date": "2026-10-05T15:12:58Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 0
-          },
-          "subject": "feat(task): release-develop-main (#0)",
-          "task": 0
+          "commit": "git:404f1986f1",
+          "date": "2026-10-05T14:55:25Z",
+          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
+          "task": 1588
         },
         "changed_after_failure": [
           {
@@ -3832,17 +3927,27 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:5f398a95c5",
-          "date": "2026-10-06T06:00:14Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 0
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
           },
-          "subject": "feat(task): release-develop-main (#0)",
-          "task": 0
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
+            "task": 1595
+          },
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:13dd461659",
+          "date": "2026-10-06T05:53:27Z",
+          "task": 1595
         }
       },
       "summary_line": "1 failed, 5280 passed, 1 skipped, 4 warnings in 341.81s (0:05:41)",
@@ -3863,9 +3968,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 501,
+        "executions": 521,
         "failures": 1,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -3921,36 +4027,36 @@
           "run_id": 37539110579
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          },
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
+            "task": 1595
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:13dd461659",
           "date": "2026-10-06T05:53:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
-            "task": 1595
-          },
-          "subject": "test(task): flaki-drain-testov-1588-gonka-snyatiya-markera-pri-obryve-ac (#1595)",
           "task": 1595
         }
       },
@@ -3972,9 +4078,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
-        "failures": 6,
-        "since": "2026-10-05T15:12:58Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -3998,18 +4105,19 @@
           "run_id": 37582340752
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
-          "commit": "git:da8e3bebfb",
-          "date": "2026-10-05T15:12:58Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 0
-          },
-          "subject": "feat(task): release-develop-main (#0)",
-          "task": 0
+          "commit": "git:404f1986f1",
+          "date": "2026-10-05T14:55:25Z",
+          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
+          "task": 1588
         },
         "changed_after_failure": [
           {
@@ -4018,17 +4126,27 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:5f398a95c5",
-          "date": "2026-10-06T06:00:14Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 0
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
           },
-          "subject": "feat(task): release-develop-main (#0)",
-          "task": 0
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
+            "task": 1595
+          },
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:13dd461659",
+          "date": "2026-10-06T05:53:27Z",
+          "task": 1595
         }
       },
       "summary_line": "1 failed, 5389 passed, 2 skipped, 4 warnings in 351.05s (0:05:51)",
@@ -4049,9 +4167,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 506,
-        "failures": 6,
-        "since": "2026-10-05T14:55:25Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -4080,19 +4199,17 @@
           "run_id": 37671487317
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
@@ -4103,19 +4220,26 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:13dd461659",
-          "date": "2026-10-06T05:53:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          },
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
             "task": 1595
           },
-          "subject": "test(task): flaki-drain-testov-1588-gonka-snyatiya-markera-pri-obryve-ac (#1595)",
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:13dd461659",
+          "date": "2026-10-06T05:53:27Z",
           "task": 1595
         }
       },
@@ -4137,9 +4261,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 506,
-        "failures": 6,
-        "since": "2026-10-05T14:55:25Z"
+        "executions": 521,
+        "failures": 5,
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "сон и стена",
@@ -4158,19 +4283,17 @@
           "run_id": 37669109202
         }
       ],
+      "premerge_ci": {
+        "executions": 5,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
@@ -4181,19 +4304,26 @@
             "task": 1627
           }
         ],
-        "last_changed": {
-          "commit": "git:13dd461659",
-          "date": "2026-10-06T05:53:27Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          },
+          {
+            "commit": "git:13dd461659",
+            "date": "2026-10-06T05:53:27Z",
             "task": 1595
           },
-          "subject": "test(task): flaki-drain-testov-1588-gonka-snyatiya-markera-pri-obryve-ac (#1595)",
+          {
+            "commit": "git:ea5a72a474",
+            "date": "2026-10-07T20:48:41Z",
+            "task": 1627
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:13dd461659",
+          "date": "2026-10-06T05:53:27Z",
           "task": 1595
         }
       },
@@ -4215,9 +4345,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 296,
-        "failures": 1,
-        "since": "2026-10-09T13:30:57Z"
+        "executions": 287,
+        "failures": 0,
+        "since": "2026-10-09T23:59:48Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -4273,13 +4404,19 @@
       ],
       "message": "TimeoutError",
       "passes_on_same_tree": [],
+      "premerge_ci": {
+        "executions": 6,
+        "failures": 1,
+        "merged_at": "2026-10-09T23:59:48Z",
+        "task": 1650,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
-          "commit": "git:a6e29e4410",
-          "date": "2026-10-09T13:30:57Z",
-          "premerge_ci": null,
-          "subject": "fix(hub): analyse AC locator files in a bounded worker process (#1650 round 3)",
-          "task": null
+          "commit": "git:29a78cc1d8",
+          "date": "2026-10-09T23:59:48Z",
+          "subject": "test(task): hab-ispolnyaet-kod-iz-vetki-zadachi-pri-sbore-testov-pytest (#1650)",
+          "task": 1650
         },
         "changed_after_failure": [
           {
@@ -4288,13 +4425,14 @@
             "task": 1650
           }
         ],
-        "last_changed": {
-          "commit": "git:a6e29e4410",
-          "date": "2026-10-09T13:30:57Z",
-          "premerge_ci": null,
-          "subject": "fix(hub): analyse AC locator files in a bounded worker process (#1650 round 3)",
-          "task": null
-        }
+        "changes": [
+          {
+            "commit": "git:29a78cc1d8",
+            "date": "2026-10-09T23:59:48Z",
+            "task": 1650
+          }
+        ],
+        "last_changed_before_failure": null
       },
       "summary_line": "1 failed, 5582 passed, 2 skipped, 5 warnings in 290.28s (0:04:50)",
       "test_file_in_run_diff": true
@@ -4314,9 +4452,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
+        "executions": 521,
         "failures": 5,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -4343,36 +4482,31 @@
           "run_id": 38039801108
         }
       ],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         }
       },
@@ -4508,9 +4642,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 1,
-        "since": "2026-08-23T21:51:16Z"
+        "since": "2026-08-23T21:51:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -4552,11 +4687,11 @@
           "run_id": 38057528563
         }
       ],
+      "premerge_ci": null,
       "source": {
         "added": {
           "commit": "git:a90881bac9",
           "date": "2026-08-23T20:54:09Z",
-          "premerge_ci": null,
           "subject": "feat: read HAIPLANE_ env with <legacy-name>_ fallback",
           "task": null
         },
@@ -4567,11 +4702,26 @@
             "task": 1667
           }
         ],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:a90881bac9",
+            "date": "2026-08-23T20:54:09Z",
+            "task": null
+          },
+          {
+            "commit": "git:771f889437",
+            "date": "2026-08-24T11:09:48Z",
+            "task": null
+          },
+          {
+            "commit": "git:a9e1804a48",
+            "date": "2026-10-10T22:01:50Z",
+            "task": 1667
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
-          "premerge_ci": null,
-          "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
           "task": null
         }
       },
@@ -4593,9 +4743,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -4617,21 +4768,26 @@
         }
       ],
       "message": "AssertionError: tests/test_app_shutdown.py: 1 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -4653,9 +4809,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 932,
+        "executions": 951,
         "failures": 3,
-        "since": "2026-09-27T07:34:16Z"
+        "since": "2026-09-27T07:34:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "гонки git",
@@ -4680,19 +4837,17 @@
           "run_id": 38083662166
         }
       ],
+      "premerge_ci": {
+        "executions": 8,
+        "failures": 0,
+        "merged_at": "2026-09-27T07:34:16Z",
+        "task": 1419,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
-            "task": 1419
-          },
           "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
           "task": 1419
         },
@@ -4703,19 +4858,21 @@
             "task": 1684
           }
         ],
-        "last_changed": {
-          "commit": "git:344e053b16",
-          "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
+        "changes": [
+          {
+            "commit": "git:344e053b16",
+            "date": "2026-09-27T07:34:16Z",
             "task": 1419
           },
-          "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
+          {
+            "commit": "git:315f45feaa",
+            "date": "2026-10-15T04:58:53Z",
+            "task": 1684
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:344e053b16",
+          "date": "2026-09-27T07:34:16Z",
           "task": 1419
         }
       },
@@ -4737,9 +4894,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 2082,
+        "executions": 2127,
         "failures": 2,
-        "since": "2026-08-23T21:51:16Z"
+        "since": "2026-08-23T21:51:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "общее состояние вне теста",
@@ -4795,25 +4953,46 @@
       ],
       "message": "RuntimeError: StreamableHTTPSessionManager .run() can only be called once per instance. Create a new instance if you need to run again.",
       "passes_on_same_tree": [],
+      "premerge_ci": {
+        "executions": 0,
+        "failures": 0,
+        "merged_at": "2026-06-05T05:33:12Z",
+        "task": 1,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:6fd02b0552",
           "date": "2026-06-05T05:33:12Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 1
-          },
           "subject": "fix: harden MCP transport and security checks (#1)",
           "task": 1
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:6fd02b0552",
+            "date": "2026-06-05T05:33:12Z",
+            "task": 1
+          },
+          {
+            "commit": "git:9a9c3fe2e8",
+            "date": "2026-08-22T06:11:28Z",
+            "task": 895
+          },
+          {
+            "commit": "git:b0f228ca11",
+            "date": "2026-08-23T20:29:21Z",
+            "task": null
+          },
+          {
+            "commit": "git:771f889437",
+            "date": "2026-08-24T11:09:48Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
-          "premerge_ci": null,
-          "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
           "task": null
         }
       },
@@ -4835,9 +5014,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2082,
+        "executions": 2127,
         "failures": 2,
-        "since": "2026-08-23T21:51:16Z"
+        "since": "2026-08-23T21:51:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "общее состояние вне теста",
@@ -4893,25 +5073,46 @@
       ],
       "message": "RuntimeError: StreamableHTTPSessionManager .run() can only be called once per instance. Create a new instance if you need to run again.",
       "passes_on_same_tree": [],
+      "premerge_ci": {
+        "executions": 0,
+        "failures": 0,
+        "merged_at": "2026-06-05T05:33:12Z",
+        "task": 1,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:6fd02b0552",
           "date": "2026-06-05T05:33:12Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 1
-          },
           "subject": "fix: harden MCP transport and security checks (#1)",
           "task": 1
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:6fd02b0552",
+            "date": "2026-06-05T05:33:12Z",
+            "task": 1
+          },
+          {
+            "commit": "git:9a9c3fe2e8",
+            "date": "2026-08-22T06:11:28Z",
+            "task": 895
+          },
+          {
+            "commit": "git:b0f228ca11",
+            "date": "2026-08-23T20:29:21Z",
+            "task": null
+          },
+          {
+            "commit": "git:771f889437",
+            "date": "2026-08-24T11:09:48Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
-          "premerge_ci": null,
-          "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
           "task": null
         }
       },
@@ -4933,9 +5134,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 2081,
+        "executions": 2121,
         "failures": 7,
-        "since": "2026-08-24T11:09:08Z"
+        "since": "2026-08-24T11:09:08Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "детерминированная регрессия",
@@ -4957,21 +5159,26 @@
         }
       ],
       "message": "AssertionError: tests/test_agent_eval_sandbox.py: 1 вхожд.",
+      "premerge_ci": null,
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:ac9dd151f1",
+            "date": "2026-08-24T11:09:08Z",
+            "task": null
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
-          "premerge_ci": null,
-          "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
           "task": null
         }
       },
@@ -4993,9 +5200,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 505,
+        "executions": 521,
         "failures": 5,
-        "since": "2026-10-05T14:55:25Z"
+        "since": "2026-10-05T14:55:25Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "дочерние процессы",
@@ -5017,36 +5225,31 @@
           "run_id": 38181418208
         }
       ],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-05T14:55:25Z",
+        "task": 1588,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
           "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:404f1986f1",
+            "date": "2026-10-05T14:55:25Z",
+            "task": 1588
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 3,
-              "workflow_dispatch": 2
-            },
-            "runs": 5,
-            "success": 5,
-            "task": 1588
-          },
-          "subject": "feat(task): deploi-zhdet-iduschie-lokalnye-deep-revyu-do-30-min-pered-re (#1588)",
           "task": 1588
         }
       },
@@ -5068,9 +5271,10 @@
     "event": "pull_request",
     "evidence": {
       "ci_rate": {
-        "executions": 932,
+        "executions": 951,
         "failures": 3,
-        "since": "2026-09-27T07:34:16Z"
+        "since": "2026-09-27T07:34:16Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "гонки git",
@@ -5095,19 +5299,17 @@
           "run_id": 38240612238
         }
       ],
+      "premerge_ci": {
+        "executions": 8,
+        "failures": 0,
+        "merged_at": "2026-09-27T07:34:16Z",
+        "task": 1419,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
-            "task": 1419
-          },
           "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
           "task": 1419
         },
@@ -5118,19 +5320,21 @@
             "task": 1684
           }
         ],
-        "last_changed": {
-          "commit": "git:344e053b16",
-          "date": "2026-09-27T07:34:16Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 4,
-              "workflow_dispatch": 4
-            },
-            "runs": 8,
-            "success": 8,
+        "changes": [
+          {
+            "commit": "git:344e053b16",
+            "date": "2026-09-27T07:34:16Z",
             "task": 1419
           },
-          "subject": "ci(task): geit-merzhit-pr-tolko-pri-zelenom-ci-na-aktualnoi-baze-otsta (#1419)",
+          {
+            "commit": "git:315f45feaa",
+            "date": "2026-10-15T04:58:53Z",
+            "task": 1684
+          }
+        ],
+        "last_changed_before_failure": {
+          "commit": "git:344e053b16",
+          "date": "2026-09-27T07:34:16Z",
           "task": 1419
         }
       },
@@ -5177,9 +5381,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 45,
-        "failures": 1,
-        "since": "2026-10-14T04:31:53Z"
+        "executions": 20,
+        "failures": 0,
+        "since": "2026-10-14T17:51:06Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "общее состояние вне теста",
@@ -5202,17 +5407,18 @@
       ],
       "message": "AssertionError: ответ mcp_prepare_apply_all_append разошёлся с эталоном",
       "passes_on_same_tree": [],
+      "premerge_ci": {
+        "executions": 6,
+        "failures": 1,
+        "merged_at": "2026-10-14T17:51:06Z",
+        "task": 1691,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
-          "commit": "git:e193b62db4",
-          "date": "2026-10-14T04:31:53Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
-            "task": 1691
-          },
-          "subject": "test(task): etalony otvetov chteniya i pokaza do refaktoringa (#1691)",
+          "commit": "git:8a836b14cb",
+          "date": "2026-10-14T17:51:06Z",
+          "subject": "feat(task): snizit-do-porogov-slozhnosti-funktsii-chteniya-i-pokaza-u-po (#1691)",
           "task": 1691
         },
         "changed_after_failure": [
@@ -5222,18 +5428,14 @@
             "task": 1691
           }
         ],
-        "last_changed": {
-          "commit": "git:e193b62db4",
-          "date": "2026-10-14T04:31:53Z",
-          "premerge_ci": {
-            "by_event": {},
-            "runs": 0,
-            "success": 0,
+        "changes": [
+          {
+            "commit": "git:8a836b14cb",
+            "date": "2026-10-14T17:51:06Z",
             "task": 1691
-          },
-          "subject": "test(task): etalony otvetov chteniya i pokaza do refaktoringa (#1691)",
-          "task": 1691
-        }
+          }
+        ],
+        "last_changed_before_failure": null
       },
       "summary_line": "1 failed, 6274 passed, 2 skipped, 4 warnings in 513.38s (0:08:33)",
       "test_file_in_run_diff": true
@@ -5253,9 +5455,10 @@
     "event": "workflow_dispatch",
     "evidence": {
       "ci_rate": {
-        "executions": 295,
+        "executions": 300,
         "failures": 1,
-        "since": "2026-10-09T16:23:23Z"
+        "since": "2026-10-09T16:23:23Z",
+        "unverifiable_attempts": 0
       },
       "class": {
         "class": "планировщик asyncio",
@@ -5311,36 +5514,31 @@
       ],
       "message": "assert 2 >= 3",
       "passes_on_same_tree": [],
+      "premerge_ci": {
+        "executions": 3,
+        "failures": 0,
+        "merged_at": "2026-10-09T16:23:23Z",
+        "task": 1645,
+        "unverifiable_attempts": 0
+      },
       "source": {
         "added": {
           "commit": "git:d195106aff",
           "date": "2026-10-09T16:23:23Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
-            "task": 1645
-          },
           "subject": "feat(task): hab-obnaruzhivaet-nedostupnost-kontrolnoi-tochki-ishodyasche (#1645)",
           "task": 1645
         },
         "changed_after_failure": [],
-        "last_changed": {
+        "changes": [
+          {
+            "commit": "git:d195106aff",
+            "date": "2026-10-09T16:23:23Z",
+            "task": 1645
+          }
+        ],
+        "last_changed_before_failure": {
           "commit": "git:d195106aff",
           "date": "2026-10-09T16:23:23Z",
-          "premerge_ci": {
-            "by_event": {
-              "pull_request": 2,
-              "workflow_dispatch": 1
-            },
-            "runs": 3,
-            "success": 3,
-            "task": 1645
-          },
-          "subject": "feat(task): hab-obnaruzhivaet-nedostupnost-kontrolnoi-tochki-ishodyasche (#1645)",
           "task": 1645
         }
       },

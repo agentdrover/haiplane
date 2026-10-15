@@ -71,6 +71,12 @@ ROW_KEYS = (
 
 GIT_TAG = "git:"
 HASH_RE = re.compile(r"[0-9a-f]{7,40}")
+# Поля, значения которых берутся из источника-хеша: GitHub API (head_sha), строка
+# `git log -1 --format=%H` журнала checkout, `Current tree:` журнала и вывод git
+# (rev-parse, log). Остальные строки не трогаются: hex в сообщении теста или в
+# произвольном тексте должен по-прежнему видеть detect-secrets.
+SHA_KEYS = frozenset({"head_sha", "tested_sha", "tested_tree", "tree", "commit"})
+SHA_LIST_KEYS = frozenset({"commits"})
 
 
 LEGACY_NAME = "open" + "claw"  # собрано, чтобы файл не ловил сам себя
@@ -83,28 +89,45 @@ def scrub_legacy(text: str) -> str:
     return LEGACY_RE.sub("<legacy-name>", text)
 
 
-def tag_hashes(value):
-    """Хеши git пишутся как «git:<hex>»: detect-secrets читает кавычки с одним
-    hex как High Entropy String и красит Secret scan на публичных SHA. Менять
-    scripts/secret_scan.py ради данных нельзя (это ci_script под ci_integrity),
-    поэтому формат данных иной; load_manual возвращает чистые хеши."""
-    if isinstance(value, str):
-        return GIT_TAG + value if HASH_RE.fullmatch(value) else scrub_legacy(value)
-    if isinstance(value, list):
-        return [tag_hashes(item) for item in value]
+def _map_hashes(value, convert, key=None):
     if isinstance(value, dict):
-        return {key: tag_hashes(item) for key, item in value.items()}
+        return {k: _map_hashes(v, convert, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_map_hashes(v, convert, key) for v in value]
+    if isinstance(value, str) and (key in SHA_KEYS or key in SHA_LIST_KEYS):
+        return convert(value)
+    return value
+
+
+def _add_tag(text: str) -> str:
+    return GIT_TAG + text if HASH_RE.fullmatch(text) else text
+
+
+def _drop_tag(text: str) -> str:
+    return text[len(GIT_TAG) :] if text.startswith(GIT_TAG) else text
+
+
+def tag_hashes(value):
+    """Хеши git пишутся как «git:<hex>» только в полях SHA_KEYS: detect-secrets
+    читает кавычки с одним hex как High Entropy String и красит Secret scan на
+    публичных SHA. Менять scripts/secret_scan.py ради данных нельзя (это
+    ci_script под ci_integrity), поэтому формат данных иной. Прочие строки идут
+    как есть (кроме замены прежнего имени продукта)."""
+    return _scrub_all(_map_hashes(value, _add_tag))
+
+
+def _scrub_all(value):
+    if isinstance(value, str):
+        return scrub_legacy(value)
+    if isinstance(value, list):
+        return [_scrub_all(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub_all(v) for k, v in value.items()}
     return value
 
 
 def untag_hashes(value):
-    if isinstance(value, str):
-        return value[len(GIT_TAG) :] if value.startswith(GIT_TAG) else value
-    if isinstance(value, list):
-        return [untag_hashes(item) for item in value]
-    if isinstance(value, dict):
-        return {key: untag_hashes(item) for key, item in value.items()}
-    return value
+    return _map_hashes(value, _drop_tag)
 
 
 class MissingResource(Exception):
@@ -528,62 +551,114 @@ def task_of(subject: str) -> int | None:
     return int(found.group(1)) if found else None
 
 
-def premerge_ci(runs: dict[int, dict], task: int | None, merged_at: str) -> dict | None:
-    """Прогоны ci.yml на ветках задачи до мержа: верхняя оценка проверок теста в CI."""
-    if task is None:
+class BlobReader:
+    """Один процесс `git cat-file --batch`: есть ли объект и что лежит в файле."""
+
+    def __init__(self, repo_dir: Path) -> None:
+        self.proc = subprocess.Popen(
+            ["git", "cat-file", "--batch"],
+            cwd=repo_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        self.cache: dict[str, bytes | None] = {}
+
+    def read(self, spec: str) -> bytes | None:
+        if spec not in self.cache:
+            self.proc.stdin.write(spec.encode() + b"\n")
+            self.proc.stdin.flush()
+            header = self.proc.stdout.readline().split()
+            body = None
+            if len(header) == 3 and header[1] in (b"blob", b"commit"):
+                size = int(header[2])
+                body = self.proc.stdout.read(size + 1)[:size]
+            self.cache[spec] = body
+        return self.cache[spec]
+
+    def close(self) -> None:
+        self.proc.stdin.close()
+        self.proc.wait()
+
+
+def test_exists(blobs: BlobReader, sha: str, nodeid: str) -> bool | None:
+    """Есть ли функция теста в дереве коммита; None — коммита нет локально."""
+    if blobs.read(sha) is None:
         return None
-    mine = [
-        r
-        for r in runs.values()
-        if r["head_branch"].startswith(f"task-{task}/") and r["created_at"] <= merged_at
-    ]
-    by_event: dict[str, int] = {}
-    for run in mine:
-        by_event[run["event"]] = by_event.get(run["event"], 0) + 1
+    text = blobs.read(f"{sha}:{test_path(nodeid)}")
+    pattern = rf"def {re.escape(func_name(nodeid))}\b".encode()
+    return bool(text and re.search(pattern, text))
+
+
+def count_executions(
+    pool: list[dict],
+    blobs: BlobReader,
+    nodeid: str,
+    since: str,
+    until: str | None,
+    branch_prefix: str | None,
+) -> dict:
+    """Уникальные (run_id, attempt), где шаг Test выполнялся и тест был в дереве.
+
+    Проверка наличия идёт по head_sha прогона (мерж-коммит PR локально обычно
+    недоступен); коммит без объекта считается отдельно и в знаменатель не входит.
+    """
+    done = failed = unverifiable = 0
+    for rec in pool:
+        if rec["created_at"] < since or (until and rec["created_at"] > until):
+            continue
+        if branch_prefix and not rec["branch"].startswith(branch_prefix):
+            continue
+        present = test_exists(blobs, rec["head_sha"], nodeid)
+        if present is None:
+            unverifiable += 1
+        elif present and rec["failed"] is not None:
+            done += 1
+            failed += 1 if nodeid in rec["failed"] else 0
     return {
-        "task": task,
-        "runs": len(mine),
-        "success": sum(1 for r in mine if r["conclusion"] == "success"),
-        "by_event": dict(sorted(by_event.items())),
+        "executions": done,
+        "failures": failed,
+        "unverifiable_attempts": unverifiable,
     }
 
 
-def source_of(nodeid: str, rec: dict, runs: dict[int, dict], repo_dir: Path) -> dict:
-    """Задача, добавившая тест, и задача, менявшая его последней до падения."""
-    ref = (
-        rec["tested_sha"]
-        if rec["tested_sha"]
-        and git("cat-file", "-e", rec["tested_sha"], cwd=repo_dir) is not None
-        else rec["head_sha"]
-    )
-    lines = commit_lines(repo_dir, ref, nodeid) or commit_lines(
-        repo_dir, HISTORY_REF[0], nodeid
-    )
+def source_of(nodeid: str, repo_dir: Path) -> dict:
+    """Задача, добавившая тест (дата мержа = дата коммита в истории), и последняя
+    менявшая его. Только история HISTORY_REF: от наличия мерж-коммита PR в локальном
+    клоне результат не зависит. Нет тела теста в истории — источник неизвестен."""
+    lines = commit_lines(repo_dir, HISTORY_REF[0], nodeid)
     if not lines:
-        return {"reason": "no commit found by git log -L / -S"}
-    out = {}
-    for key, (sha, when, subject) in (("last_changed", lines[0]), ("added", lines[-1])):
-        task = task_of(subject)
-        out[key] = {
-            "commit": sha[:10],
-            "date": when,
-            "subject": subject,
-            "task": task,
-            "premerge_ci": premerge_ci(runs, task, when),
+        return {
+            "reason": f"nodeid not found in the history of {HISTORY_REF[0]}: source unknown"
         }
-    later = commit_lines(repo_dir, HISTORY_REF[0], nodeid)
-    out["changed_after_failure"] = [
-        {"commit": sha[:10], "date": when, "task": task_of(subject)}
-        for sha, when, subject in reversed(later)
-        if when > rec["created_at"]
-    ][:3]
+    out: dict = {
+        "changes": [
+            {"commit": sha[:10], "date": when, "task": task_of(subject)}
+            for sha, when, subject in reversed(lines)
+        ][:6]
+    }
+    sha, when, subject = lines[-1]
+    out["added"] = {
+        "commit": sha[:10],
+        "date": when,
+        "subject": subject,
+        "task": task_of(subject),
+    }
     return out
+
+
+def last_change_before(source: dict, moment: str) -> dict | None:
+    before = [c for c in source.get("changes", []) if c["date"] <= moment]
+    return before[-1] if before else None
+
+
+def changes_after(source: dict, moment: str) -> list[dict]:
+    return [c for c in source.get("changes", []) if c["date"] > moment][:3]
 
 
 def attach_context(
     evidence: dict, rec: dict, nodeid: str | None, ctx: tuple, status: str
 ) -> None:
-    runs, manual, repo_dir = ctx[0], ctx[2], ctx[3]
+    manual, repo_dir = ctx[2], ctx[3]
     if nodeid is None:
         return
     evidence["fixed_by"] = manual.get("fixes", {}).get(nodeid)
@@ -591,71 +666,146 @@ def attach_context(
         nodeid, {"class": "unknown", "why": "not assessed"}
     )
     if status == "confirmed" or evidence.get("test_file_in_run_diff") is False:
-        evidence["source"] = source_of(nodeid, rec, runs, repo_dir)
+        source = source_of(nodeid, repo_dir)
+        source["last_changed_before_failure"] = last_change_before(
+            source, rec["created_at"]
+        )
+        source["changed_after_failure"] = changes_after(source, rec["created_at"])
+        evidence["source"] = source
 
 
-def add_rates(rows: list[dict], runs: dict[int, dict], window_start: str) -> None:
-    """Сколько раз тест исполнялся в CI с момента добавления и сколько раз упал.
+def add_rates(
+    rows: list[dict], pool: list[dict], blobs: BlobReader, window_start: str
+) -> None:
+    """Знаменатель частоты и проверки до мержа по уникальным (run_id, attempt).
 
-    Исполнения: успешные PR- и dispatch-прогоны (каждый attempt гонял pytest;
-    push исключён, там pytest бывает пропущен по дедупу дерева) плюс упавшие
-    attempt этого nodeid. Оценка нижняя: упавшие прогоны других шагов не
-    считаются, а Test в них мог не дойти.
+    Исполнение = attempt ci.yml не из push (там pytest бывает пропущен по дедупу
+    дерева), где шаг Test выполнялся (success/failure; упавший без разобранных
+    nodeid не берётся) и функция теста есть в дереве head_sha. Окно — от даты
+    мержа добавившего коммита (в окне не раньше его начала). До мержа считаются
+    attempt на ветках `task-N/` задачи-источника, созданные не позже даты мержа.
     """
+    cache: dict[str, tuple[dict, dict | None]] = {}
     for row in rows:
-        added = ((row["evidence"].get("source") or {}).get("added") or {}).get("date")
+        source = row["evidence"].get("source") or {}
+        added = source.get("added")
         if not added or not row["nodeid"]:
             continue
-        failed = [
-            r
-            for r in rows
-            if r["nodeid"] == row["nodeid"]
-            and r["created_at"] >= max(added, window_start)
-            and r["run_id"]
-        ]
-        done = sum(
-            r["run_attempt"]
-            for r in runs.values()
-            if r["event"] != "push"
-            and r["conclusion"] == "success"
-            and r["created_at"] >= max(added, window_start)
+        nodeid = row["nodeid"]
+        if nodeid not in cache:
+            since = max(added["date"], window_start)
+            after = count_executions(pool, blobs, nodeid, since, None, None)
+            after["since"] = since
+            pre = None
+            if added["task"]:
+                pre = count_executions(
+                    pool,
+                    blobs,
+                    nodeid,
+                    window_start,
+                    added["date"],
+                    f"task-{added['task']}/",
+                )
+                pre.update(task=added["task"], merged_at=added["date"])
+            cache[nodeid] = (after, pre)
+        row["evidence"]["ci_rate"] = cache[nodeid][0]
+        row["evidence"]["premerge_ci"] = cache[nodeid][1]
+
+
+def attempt_record(item: dict, failed: set[str] | None) -> dict:
+    return {
+        "run_id": item["id"],
+        "attempt": item["run_attempt"],
+        "created_at": item["created_at"],
+        "branch": item["head_branch"],
+        "head_sha": item["head_sha"],
+        "failed": failed,
+    }
+
+
+def missing_objects(shas: list[str], repo_dir: Path) -> list[str]:
+    proc = subprocess.run(
+        ["git", "cat-file", "--batch-check"],
+        input="\n".join(shas) + "\n",
+        capture_output=True,
+        text=True,
+        cwd=repo_dir,
+    )
+    return [sha for sha in shas if f"{sha} missing" in proc.stdout.splitlines()]
+
+
+def ensure_objects(runs: dict[int, dict], repo_dir: Path) -> None:
+    """Головы всех прогонов должны быть в клоне: от этого зависят diff_files,
+    next_green_commits и проверка «тест есть в дереве». Недостающие подкачиваются
+    одним fetch всех PR-голов (refs/census/pr/*), остаток — по одному sha; так
+    результат не зависит от того, что клон уже видел."""
+    wanted = sorted({r["head_sha"] for r in runs.values()})
+    missing = missing_objects(wanted, repo_dir)
+    if missing:
+        git(
+            "fetch",
+            "-q",
+            "--no-tags",
+            "origin",
+            "+refs/pull/*/head:refs/census/pr/*",
+            cwd=repo_dir,
         )
-        row["evidence"]["ci_rate"] = {
-            "since": max(added, window_start),
-            "executions": done + len(failed),
-            "failures": len(failed),
-        }
+        missing = missing_objects(missing, repo_dir)
+    for sha in missing:
+        git("fetch", "-q", "--no-tags", "origin", sha, cwd=repo_dir)
+
+
+def rows_for_attempt(gh: Gh, rec: dict, ctx: tuple, repo_dir: Path) -> list[dict]:
+    tree = rec["tree_hint"] or (
+        tree_of(gh, rec["tested_sha"], repo_dir) if rec["tested_sha"] else None
+    )
+    changed = diff_files(rec, repo_dir) if rec["tested_sha"] else None
+    rows = []
+    for nodeid in rec["nodeids"] or [None]:
+        status, evidence = classify(gh, rec, nodeid, tree, ctx)
+        evidence["summary_line"] = rec["summary"]
+        evidence["message"] = rec["messages"].get(nodeid)
+        evidence["failed_in_attempt"] = len(rec["nodeids"])
+        evidence["test_file_in_run_diff"] = (
+            None if changed is None or nodeid is None else test_path(nodeid) in changed
+        )
+        attach_context(evidence, rec, nodeid, ctx, status)
+        rows.append(row_for(rec, nodeid, tree, status, evidence))
+    return rows
+
+
+def pool_failed(rec: dict) -> set[str] | None:
+    """nodeid, упавшие в attempt, где Test выполнялся; None — выполнение не доказано."""
+    if rec["test_step"] == "success":
+        return set()
+    if rec["test_step"] == "failure" and rec["nodeids"]:
+        return set(rec["nodeids"])
+    return None
 
 
 def census_rows(
     gh: Gh, runs: dict[int, dict], manual: dict, repo_dir: Path
 ) -> list[dict]:
+    ensure_objects(runs, repo_dir)
     ctx = (runs, passing_trees(gh, runs, repo_dir), manual, repo_dir)
     rows: list[dict] = []
+    pool: list[dict] = []
     for run in sorted(runs.values(), key=lambda r: r["id"]):
         for item in attempts_of(gh, run):
+            if item["conclusion"] == "success" and item["event"] != "push":
+                pool.append(attempt_record(item, set()))
             if item["conclusion"] not in FAIL_CONCLUSIONS:
                 continue
             rec = failed_attempt(gh, item, item["run_attempt"])
-            if rec["test_step"] != "failure":
-                continue
-            tree = rec["tree_hint"] or (
-                tree_of(gh, rec["tested_sha"], repo_dir) if rec["tested_sha"] else None
-            )
-            changed = diff_files(rec, repo_dir) if rec["tested_sha"] else None
-            for nodeid in rec["nodeids"] or [None]:
-                status, evidence = classify(gh, rec, nodeid, tree, ctx)
-                evidence["summary_line"] = rec["summary"]
-                evidence["message"] = rec["messages"].get(nodeid)
-                evidence["failed_in_attempt"] = len(rec["nodeids"])
-                evidence["test_file_in_run_diff"] = (
-                    None
-                    if changed is None or nodeid is None
-                    else test_path(nodeid) in changed
-                )
-                attach_context(evidence, rec, nodeid, ctx, status)
-                rows.append(row_for(rec, nodeid, tree, status, evidence))
-    add_rates(rows, runs, min(r["created_at"] for r in runs.values()))
+            if item["event"] != "push":
+                pool.append(attempt_record(item, pool_failed(rec)))
+            if rec["test_step"] == "failure":
+                rows += rows_for_attempt(gh, rec, ctx, repo_dir)
+    blobs = BlobReader(repo_dir)
+    try:
+        add_rates(rows, pool, blobs, min(r["created_at"] for r in runs.values()))
+    finally:
+        blobs.close()
     rows += [
         {key: extra.get(key) for key in ROW_KEYS}
         for extra in manual.get("extra_rows", [])
@@ -705,13 +855,16 @@ def flake_candidates(rows: list[dict]) -> dict[str, list[dict]]:
 
 
 def premerge_line(nodeid: str, group: list[dict]) -> str:
-    """Строка таблицы гипотезы: сколько раз тест прошёл в CI до мержа и что из этого следует."""
-    keyed = next((r for r in group if r["evidence"].get("source")), group[0])
+    """Строка таблицы гипотезы: сколько раз тест исполнялся в CI до мержа и что из этого следует."""
+    keyed = next((r for r in group if r["evidence"].get("ci_rate")), group[0])
     ev = keyed["evidence"]
     added = ((ev.get("source") or {}).get("added")) or {}
-    pre = added.get("premerge_ci") or {}
-    rate = ev.get("ci_rate") or {}
-    runs, fails, execs = pre.get("runs"), rate.get("failures"), rate.get("executions")
+    pre, rate = ev.get("premerge_ci") or {}, ev.get("ci_rate") or {}
+    runs, fails, execs = (
+        pre.get("executions"),
+        rate.get("failures"),
+        rate.get("executions"),
+    )
     chance = "n/a"
     if runs and execs and fails is not None:
         chance = f"{1 - (1 - fails / execs) ** runs:.3f}"
@@ -719,7 +872,7 @@ def premerge_line(nodeid: str, group: list[dict]) -> str:
     statuses = tally(group, lambda r: r["status"])
     return (
         f"| {nodeid} | {class_of(keyed)} | {statuses} | {base}/{len(group)} "
-        f"| {added.get('task')} | {runs} | {fails}/{execs} | {chance} |"
+        f"| {added.get('task')} | {runs} ({pre.get('failures')} failed) | {fails}/{execs} | {chance} |"
     )
 
 
@@ -736,7 +889,7 @@ def summarize(rows: list[dict]) -> str:
         f"  by class: {tally(flaky_rows, class_of)}",
         f"  rows on develop/main: {sum(1 for r in flaky_rows if r['branch'] in {'develop', 'main'})}",
         "",
-        "| nodeid | class | statuses | rows on develop/main | source task | pre-merge CI runs (upper bound) | CI failures/executions in window | P(at least one failure in the pre-merge runs) |",
+        "| nodeid | class | statuses | rows on develop/main | source task | pre-merge executions on the source branch (failed) | CI failures/executions in window | P(at least one failure in the pre-merge runs) |",
         "|---|---|---|---|---|---|---|---|",
     ]
     lines += [premerge_line(nodeid, group) for nodeid, group in sorted(flaky.items())]
