@@ -195,6 +195,7 @@ from hub.services.tree_output import (
     truncate_text,
 )
 from hub.poller import start_poller
+from hub.decisions_api import router as decisions_router
 from hub.verdict_evidence_api import router as verdict_evidence_router
 from hub.web import router as web_router
 
@@ -238,11 +239,6 @@ def _register_plugins() -> None:
         from hub.integrations.github import GitHubIntegration
 
         plugins.github = GitHubIntegration()
-
-    if config.N4L_BIN:
-        from hub.integrations.notes import NotesIntegration
-
-        plugins.notes = NotesIntegration()
 
     if config.VAST_ENABLED and config.VAST_JOB_BIN:
         from hub.integrations.vast import VastIntegration
@@ -544,6 +540,7 @@ app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOS
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 app.include_router(verdict_evidence_router)
+app.include_router(decisions_router)
 
 
 def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:
@@ -1936,12 +1933,6 @@ async def api_deprecated_tool_call(request: Request, body: dict[str, Any]):
         f"{tool} called{f' by {agent}' if agent else ''}; use {replacement}",
     )
     return {"ok": True}
-
-
-@app.get("/api/integrations/notes")
-async def api_notes_availability():
-    """Diagnose the notesforllm link (#251): available | no_binary | no_space | error."""
-    return await plugins.notes.availability()
 
 
 @app.get("/api/tasks", response_model=None)

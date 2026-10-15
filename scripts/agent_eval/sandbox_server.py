@@ -27,7 +27,6 @@ _ADAPTERS = (
     ("git_ops", "NoopGitOps"),
     ("forge", "NoopForge"),
     ("github", "NoopGitHub"),
-    ("notes", "NoopNotes"),
     ("vast", "NoopVast"),
     ("transcripts", "NoopTranscripts"),
 )

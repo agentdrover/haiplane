@@ -23,7 +23,6 @@ from hub.integrations.noop import (
     NoopDispatch,
     NoopGitHub,
     NoopGitOps,
-    NoopNotes,
     NoopTranscripts,
     NoopVast,
 )
@@ -198,14 +197,12 @@ def _setup_mock_plugins():
     orig_dispatch = plugins.dispatch
     orig_git_ops = plugins.git_ops
     orig_github = plugins.github
-    orig_notes = plugins.notes
     orig_vast = plugins.vast
     orig_transcripts = plugins.transcripts
 
     plugins.dispatch = MockDispatch()
     plugins.git_ops = MockGitOps()
     plugins.github = NoopGitHub()
-    plugins.notes = NoopNotes()
     plugins.vast = NoopVast()
     plugins.transcripts = NoopTranscripts()
 
@@ -214,7 +211,6 @@ def _setup_mock_plugins():
     plugins.dispatch = orig_dispatch
     plugins.git_ops = orig_git_ops
     plugins.github = orig_github
-    plugins.notes = orig_notes
     plugins.vast = orig_vast
     plugins.transcripts = orig_transcripts
 

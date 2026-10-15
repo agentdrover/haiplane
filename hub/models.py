@@ -2251,7 +2251,9 @@ class TaskDecide(BaseModel):
     action: str = Field(..., pattern="^(accept|rework)$")
     instructions: str = Field("", max_length=10000)
     decision_summary: str = Field("", max_length=5000)
-    record_decision: bool = False
+    record_decision: bool = Field(
+        False, description="Устарел: решение всегда пишется в ленту задачи."
+    )
     pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
 
 

@@ -678,10 +678,6 @@
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-decision-summary">Decision reason / summary</label>
                     <textarea id="task-decision-summary" name="decision_summary" class="task-action-control task-action-textarea" placeholder="Why you are accepting or sending back for rework..."></textarea>
-                    <label class="task-action-checkbox">
-                        <input type="checkbox" name="record_decision" value="true">
-                        Save decision to notes
-                    </label>
                     <label class="task-action-label" for="task-pr-disposition">PR при принятии{% if task.pr_number %} (#{{ task.pr_number }}){% endif %}</label>
                     {{ pr_disposition_select(task, 'task-pr-disposition', 'task-action-control') }}
                     <button class="btn btn-success task-action-btn" type="submit" name="action" value="accept">Accept as Completed</button>

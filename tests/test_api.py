@@ -761,7 +761,7 @@ async def test_decide_task_rework_with_summary_api(client: AsyncClient, db):
 
 
 async def test_decide_task_record_decision_api(client: AsyncClient, db):
-    """record_decision=True should not break flow with noop notes adapter."""
+    """record_decision=True is accepted and ignored (#1698)."""
     resp = await client.post("/api/tasks", json={"title": "Record decision"})
     task_id = resp.json()["id"]
     await repo.update_task(db, task_id, status="needs_decision")
@@ -2032,15 +2032,6 @@ async def test_already_iso_timestamp_not_double_converted(client: AsyncClient):
     assert to_iso_utc("2026-07-11T10:00:00+00:00") == "2026-07-11T10:00:00+00:00"
     assert to_iso_utc(None) is None
     assert to_iso_utc("") == ""
-
-
-async def test_notes_availability_endpoint(client: AsyncClient):
-    # (#251) diagnostic endpoint; test plugins are Noop → disabled.
-    resp = await client.get("/api/integrations/notes")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] in ("available", "no_binary", "no_space", "error")
-    assert "detail" in body
 
 
 # ---- Project read layer (#336) ----

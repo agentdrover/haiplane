@@ -459,7 +459,7 @@ scope/validation и id критериев приёмки без Given/When/Then.
 
 **Предложения / решения / диспетч**
 - `hub_list_proposals` (одобряет и отклоняет человек: `/api/tasks/{id}/approve`, `/reject`)
-- `hub_list_decisions`
+- `hub_list_decisions` (записи ленты задач kind=decision с происхождением, `GET /api/decisions`)
 - `hub_dispatch_jobs`
 - `hub_prepare_developer_task`
 
