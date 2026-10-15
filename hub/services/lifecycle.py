@@ -5439,13 +5439,9 @@ async def decide_task(
 ) -> TaskView:
     """Human decision after arbiter review: accept or rework.
 
-    When ``decision_summary`` is provided it is always recorded in the
-    task update log regardless of the ``record_decision`` flag, so the
-    context is visible even without a notes integration.
-
-    When ``record_decision`` is True the summary is additionally persisted
-    through the notes plugin (if configured). If the notes adapter is
-    unavailable or returns None the core lifecycle continues unaffected.
+    The decision is always recorded in the task update log (kind=decision),
+    with ``Decision: <summary>`` when ``decision_summary`` is provided.
+    ``record_decision`` is accepted for compatibility and ignored (#1698).
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -5553,21 +5549,6 @@ async def decide_task(
             f"Task #{task_id}: rework requested after arbitration",
             detail=mutation_activity_detail(),
         )
-
-    if body.record_decision and summary_text:
-        try:
-            await plugins.notes.save_decision(
-                task_id=task_id,
-                action=body.action,
-                summary=summary_text,
-                context=body.instructions or "",
-            )
-        except Exception:
-            log.warning(
-                "Failed to save decision to notes for task #%s (non-fatal)",
-                task_id,
-                exc_info=True,
-            )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)

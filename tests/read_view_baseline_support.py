@@ -469,7 +469,18 @@ def _dashboard(kind: str) -> dict[str, Any]:
             {"sha": f"abc{i}", "message": f"сообщение {i}\nвторая строка " + "х" * 100}
             for i in range(7)
         ],
-        "recent_decisions": [{"title": f"Решение {i}"} for i in range(7)] + [{}],
+        "recent_decisions": [
+            {
+                "id": i,
+                "task_id": 20 + i,
+                "task_title": f"Решение {i}",
+                "content": f"запись {i}",
+                "agent": "human",
+                "author_kind": "hub",
+            }
+            for i in range(7)
+        ]
+        + [{}],
     }
 
 

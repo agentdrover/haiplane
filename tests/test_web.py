@@ -635,7 +635,7 @@ async def test_web_decide_task_form_has_summary_field(client: AsyncClient, db):
     page = await client.get(f"/tasks/{task_id}")
     assert page.status_code == 200
     assert 'name="decision_summary"' in page.text
-    assert 'name="record_decision"' in page.text
+    assert 'name="record_decision"' not in page.text
     assert "task-action-state--danger" in page.text
 
 

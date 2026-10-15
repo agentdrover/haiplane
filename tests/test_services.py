@@ -1467,10 +1467,10 @@ async def test_decide_task_rework_without_dispatch_returns_to_open(
     assert not tv.job_id
 
 
-async def test_decide_task_record_decision_noop_does_not_break(
+async def test_decide_task_record_decision_is_ignored(
     db: aiosqlite.Connection,
 ):
-    """record_decision=True with noop notes adapter must not fail."""
+    """record_decision=True is accepted and ignored (#1698)."""
     task_id = await repo.create_task(
         db,
         title="Record noop",
