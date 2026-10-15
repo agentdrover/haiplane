@@ -26,6 +26,7 @@ import json
 import logging
 import secrets
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -297,7 +298,13 @@ class RedeemRefusal:
 #: keeps at most one per client address per window (#1694); every other reason
 #: needs a real row and is written each time.
 UNKNOWN_AUDIT_WINDOW_SECONDS: Final[float] = 60.0
-_unknown_audit_seen: dict[str, float] = {}
+#: Hard cap of the thinning counter (#1694): addresses are attacker-chosen, so
+#: the table cannot grow with them. Insertion order IS time order (an address is
+#: re-inserted at the tail only when its entry has lapsed), so expiry pops from
+#: the head and each call is O(1) amortised. A full table suppresses NEW
+#: ``unknown`` rows — a skipped audit row is acceptable, unbounded memory is not.
+UNKNOWN_AUDIT_CAPACITY: Final[int] = 1024
+_unknown_audit_seen: OrderedDict[str, float] = OrderedDict()
 
 
 def _clock() -> float:
@@ -312,22 +319,26 @@ def unknown_refusal_audit_due(key: str) -> bool:
     would make a limiter change silently change what the audit keeps.
     """
     now = _clock()
-    last = _unknown_audit_seen.get(key)
-    if last is not None and now - last < UNKNOWN_AUDIT_WINDOW_SECONDS:
+    seen = _unknown_audit_seen
+    while seen:
+        oldest = next(iter(seen))
+        if now - seen[oldest] < UNKNOWN_AUDIT_WINDOW_SECONDS:
+            break
+        del seen[oldest]
+    if key in seen:
         return False
-    if len(_unknown_audit_seen) > 1024:
-        for stale in [
-            k
-            for k, t in _unknown_audit_seen.items()
-            if now - t >= UNKNOWN_AUDIT_WINDOW_SECONDS
-        ]:
-            del _unknown_audit_seen[stale]
-    _unknown_audit_seen[key] = now
+    if len(seen) >= UNKNOWN_AUDIT_CAPACITY:
+        return False
+    seen[key] = now
     return True
 
 
 async def audit_redeem_refusal(
-    db: aiosqlite.Connection, caller: str, refusal: RedeemRefusal | None
+    db: aiosqlite.Connection,
+    caller: str,
+    refusal: RedeemRefusal | None,
+    *,
+    thinned: bool = False,
 ) -> None:
     """Why a redeem was refused — closed admin audit only (#1694).
 
@@ -338,7 +349,11 @@ async def audit_redeem_refusal(
     """
     if refusal is None:
         return
-    if refusal.reason == "unknown" and not unknown_refusal_audit_due(caller):
+    if (
+        refusal.reason == "unknown"
+        and not thinned
+        and not unknown_refusal_audit_due(caller)
+    ):
         return
     from hub.services import admin as admin_svc
 
@@ -363,6 +378,35 @@ async def audit_redeem_refusal(
         )
     except Exception:  # noqa: BLE001 - диагностика не имеет права ломать ответ
         log.warning("chat-pair: could not audit a refused redeem (%s)", refusal.reason)
+
+
+async def audit_redeem_refusal_detached(
+    app: Any, caller: str, refusal: RedeemRefusal | None
+) -> None:
+    """Background half of the audit: runs after the 401 has been sent (#1694).
+
+    Writing inline would make the response time name the reason (a repeated
+    ``unknown`` skips the write, the rest wait for INSERT and commit). The
+    request's own connection is closed by the time this runs, so it takes one
+    of its own — the same way a detached provisioning does.
+    """
+    if refusal is None:
+        return
+    if refusal.reason == "unknown" and not unknown_refusal_audit_due(caller):
+        return
+    conn = None
+    dsn = getattr(app.state, "dsn", None)
+    try:
+        if dsn:
+            from hub import db as db_module
+
+            conn = await db_module.connect(dsn)
+        await audit_redeem_refusal(conn or app.state.db, caller, refusal, thinned=True)
+    except Exception:  # noqa: BLE001 - диагностика не имеет права ломать ответ
+        log.warning("chat-pair: could not audit a refused redeem (%s)", refusal.reason)
+    finally:
+        if conn is not None:
+            await conn.close()
 
 
 def _row_refusal(row: dict[str, Any], reason: str) -> RedeemRefusal:

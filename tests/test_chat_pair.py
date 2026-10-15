@@ -10,6 +10,7 @@ chat-pair.md rev. 4 указано в docstring каждого теста.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -1776,8 +1777,77 @@ async def _post_redeem(hub, code: str, ip: str = CALLER_IP):
     )
 
 
+async def _asgi_redeem(code: str, ip: str) -> tuple[int, float]:
+    """Обмен напрямую через ASGI: (статус, секунды до отправки ответа).
+
+    Клиент httpx ждёт конца приложения, включая фоновые задачи, и поэтому
+    скрыл бы задержку записи в аудит; здесь время берётся в момент отправки
+    последнего куска ответа.
+    """
+    import asyncio
+
+    from hub.app import app
+
+    payload = json.dumps({"code": code}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/auth/chat-pair/redeem",
+        "raw_path": b"/api/auth/chat-pair/redeem",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+            (b"x-forwarded-for", ip.encode()),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+    delivered = False
+    never = asyncio.Event()
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await never.wait()
+        return {"type": "http.disconnect"}
+
+    status = 0
+    answered_at = 0.0
+    started = time.monotonic()
+
+    async def send(message):
+        nonlocal status, answered_at
+        if message["type"] == "http.response.start":
+            status = message["status"]
+        elif message["type"] == "http.response.body" and not message.get("more_body"):
+            answered_at = time.monotonic() - started
+
+    await app(scope, receive, send)
+    return status, answered_at
+
+
 async def _refusals(hub) -> list[dict]:
-    """Записи об отказах в порядке записи; detail разобран."""
+    """Записи об отказах в порядке записи; detail разобран.
+
+    Запись идёт фоном после ответа (#1694) и клиент может вернуться раньше
+    неё, поэтому сперва ждём, пока число записей перестанет меняться.
+    """
+    count_sql = (
+        "SELECT COUNT(*) AS n FROM admin_audit_log "
+        "WHERE action = 'chat_pair_redeem_refused'"
+    )
+    stable, last = 0, -1
+    while stable < 5:
+        await asyncio.sleep(0.02)
+        now = (await _rows(hub.db, count_sql))[0]["n"]
+        stable, last = (stable + 1, last) if now == last else (0, now)
     rows = await _rows(
         hub.db,
         "SELECT * FROM admin_audit_log WHERE action = 'chat_pair_redeem_refused' "
@@ -1923,6 +1993,24 @@ async def test_a_refused_redeem_is_explained_only_in_the_admin_audit(
     assert "198.51.100." not in everything
     assert CALLER_IP not in everything
 
+    # Время ответа не называет причину: запись в аудит идёт после ответа.
+    real_write = admin_svc.write_audit
+
+    async def _slow_write(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return await real_write(*args, **kwargs)
+
+    monkeypatch.setattr(admin_svc, "write_audit", _slow_write)
+    before = len(await _refusals(hub))
+    _t, fresh = await _reviewer_code(hub, "задержка аудита")
+    await _age_code(hub, fresh, 3601)
+    for i, candidate in enumerate((fresh, spent, "YYYYYYYY"), start=80):
+        status, took = await _asgi_redeem(candidate, f"198.51.100.{i}")
+        assert status == 401
+        assert took < 0.1, f"ответ ждал запись аудита: {took:.3f} с"
+    monkeypatch.setattr(admin_svc, "write_audit", real_write)
+    assert len(await _refusals(hub)) == before + 3
+
     # Читает только admin.audit.read: ни лента, ни прочие ключи записи не видят.
     assert (
         await hub.client.get("/api/admin/audit", headers=hub.admin_auth)
@@ -1978,6 +2066,22 @@ async def test_unknown_code_refusals_are_thinned_in_the_audit(hub, monkeypatch):
     blocked = await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.9")
     assert blocked.status_code == 429
     assert blocked.json()["detail"]["reason"] == "chat_pair_rate_limited"
+
+    # Счётчик прореживания ограничен: поток новых адресов не растит память.
+    cp._unknown_audit_seen.clear()
+    for n in range(cp.UNKNOWN_AUDIT_CAPACITY + 50):
+        cp.unknown_refusal_audit_due(f"10.1.{n // 250}.{n % 250}")
+    assert len(cp._unknown_audit_seen) == cp.UNKNOWN_AUDIT_CAPACITY
+    assert cp.unknown_refusal_audit_due("10.9.9.9") is False
+    # Старые записи уходят с головы, и место освобождается.
+    monkeypatch.setattr(cp, "_clock", lambda: time.monotonic() + 61)
+    assert cp.unknown_refusal_audit_due("10.9.9.9") is True
+    assert len(cp._unknown_audit_seen) == 1
+    # Лимитер 429 от счётчика не зависит.
+    cp.chat_pair_limiter._buckets.clear()
+    for _ in range(10):
+        assert (await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.10")).status_code == 401
+    assert (await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.10")).status_code == 429
 
 
 @pytest.mark.asyncio

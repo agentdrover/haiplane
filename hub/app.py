@@ -29,6 +29,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hub import brand, config, models, services, skill_publish
@@ -753,7 +754,7 @@ async def api_chat_pair_start(request: Request) -> ChatPairStartView:
 @app.post("/api/auth/chat-pair/redeem", response_model=ChatPairRedeemed)
 async def api_chat_pair_redeem(
     body: ChatPairRedeem, request: Request
-) -> ChatPairRedeemed:
+) -> ChatPairRedeemed | JSONResponse:
     """Public: exchange a code for a short session with fixed narrow rights.
 
     The only unauthenticated write in the hub, and every guard here exists
@@ -769,8 +770,13 @@ async def api_chat_pair_redeem(
     session, refusal = await chat_pair.redeem_code_explained(_db(request), body.code)
     if session is None:
         chat_pair.record_redeem_attempt(caller)
-        await chat_pair.audit_redeem_refusal(_db(request), caller, refusal)
-        raise HTTPException(401, detail=chat_pair_invalid_detail())
+        return JSONResponse(
+            status_code=401,
+            content={"detail": chat_pair_invalid_detail()},
+            background=BackgroundTask(
+                chat_pair.audit_redeem_refusal_detached, request.app, caller, refusal
+            ),
+        )
 
     await admin_svc.write_audit(
         _db(request),
