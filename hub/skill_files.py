@@ -27,11 +27,10 @@ CODE_SEEDED_SKILLS = frozenset(
     {"multi-agent-review", "machine-review-cycle", "executor-pair-discipline"}
 )
 
-#: Файлы, выгруженные с прода как есть, без front-matter. Добавить в них
-#: front-matter значит изменить активный навык базы (новый хеш → черновик),
-#: поэтому первый выкат оставляет их байт в байт. Список только сокращается:
-#: правка текста — задача второго ревью.
-LEGACY_NO_FRONT_MATTER = frozenset({"local-executor-hub-repo"})
+#: Файлы, выгруженные с прода как есть, без front-matter. Список только
+#: сокращается: правка текста навыка добавляет front-matter и убирает имя
+#: отсюда (#1702 убрал последнее).
+LEGACY_NO_FRONT_MATTER: frozenset[str] = frozenset()
 
 #: Метки навыка при первой вставке в пустую базу; у остальных — ``[]``.
 _TAGS = {
