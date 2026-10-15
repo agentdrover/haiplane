@@ -3650,6 +3650,10 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     # omitting these from some other role.
     "steward.evidence.read",
     "steward.judgement.write",
+    # #1697: the steward's judgement text and the machine report of a
+    # generation, for the person (or session) who rules on it. Not the
+    # steward's own verb: it must not read what it said before.
+    "verdict.evidence.read",
 )
 
 # #614: which of the permissions above actually decide anything.
@@ -3689,6 +3693,7 @@ ENFORCED_PERMISSIONS: tuple[str, ...] = (
     "tasks.human_gate",
     "steward.evidence.read",
     "steward.judgement.write",
+    "verdict.evidence.read",
 )
 
 DECLARED_ONLY_PERMISSIONS: tuple[str, ...] = (
@@ -3731,6 +3736,7 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
             "tasks.archive",
             "tasks.delete",
             "integrations.vast.manage",
+            "verdict.evidence.read",
         ),
     ),
     (
@@ -3747,6 +3753,7 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
             "tasks.archive",
             "tasks.delete",
             "integrations.vast.manage",
+            "verdict.evidence.read",
         ),
     ),
     (
@@ -3777,6 +3784,7 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
             "tasks.refine",
             "tasks.update",
             "tasks.agent_report",
+            "verdict.evidence.read",
         ),
     ),
     (

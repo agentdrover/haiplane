@@ -42,7 +42,12 @@ def test_cmd_submit_review_prints_path_notices_as_returned() -> None:
 def test_cmd_review_brief() -> None:
     mock_api = MagicMock(return_value={"task_id": 42, "title": "T"})
     args = argparse.Namespace(task_id=42)
-    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+    with (
+        patch.object(cli, "_api", mock_api),
+        patch.object(cli, "_verdict_block", MagicMock(return_value="блок")),
+        patch("sys.stdout", new=StringIO()),
+        patch("sys.stderr", new=StringIO()),
+    ):
         rc = cli.cmd_review_brief(args)
     assert rc == 0
     mock_api.assert_called_once_with("GET", "/api/tasks/42/review-brief")

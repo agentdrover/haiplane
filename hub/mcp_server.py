@@ -55,6 +55,7 @@ from mcp.types import CallToolResult
 
 from hub.mcp_task_card import bounds_lines, build_compact_view
 from hub.services import review_brief_projection as brief_projection
+from hub.services import verdict_evidence
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -2962,15 +2963,39 @@ async def hub_get_review_brief(
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _error_result(exc)
+    # #1697: the verdict block rides on the projection and the full text only.
+    block = "" if section not in ("", "full") else await _verdict_block(task_id)
     if section == "full":
-        return _full_brief_result(brief)
+        return _full_brief_result(brief, block)
     # The funnel adds unknown_arguments afterwards; fit against that shape (#1682).
     names = _DISCARDED_ARGUMENTS.get()
-    with brief_projection.finalizing(lambda r: attach_unknown_arguments(r, names)):
-        return brief_projection.brief_result(brief, section, offset, expect)
+
+    def final(result: CallToolResult) -> CallToolResult:
+        shown = verdict_evidence.append_to_result(result, block) if block else result
+        return attach_unknown_arguments(shown, names)
+
+    with brief_projection.finalizing(final):
+        result = brief_projection.brief_result(brief, section, offset, expect)
+    return verdict_evidence.append_to_result(result, block) if block else result
 
 
-def _full_brief_result(brief: dict[str, Any]) -> CallToolResult:
+async def _verdict_block(task_id: int) -> str:
+    """#1697: the "Для вердикта" text; a refused role is told so in one line."""
+    try:
+        evidence = await _api_get(f"/api/tasks/{task_id}/verdict-evidence")
+    except HubApiError as exc:
+        payload = exc.payload
+        if payload.get("reason") == "permission_denied" or (
+            payload.get("status_code") == 403
+        ):
+            return verdict_evidence.ROLE_REFUSED_LINE
+        return (
+            f"Для вердикта: доказательства не получены ({payload.get('message', '')})"
+        )
+    return verdict_evidence.format_block(evidence)
+
+
+def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult:
     """The whole brief: prose text plus the brief in structuredContent (#308)."""
     parts = []
     # #433: fail-fast self-review notice goes FIRST so the reviewer stops
@@ -3053,6 +3078,8 @@ def _full_brief_result(brief: dict[str, Any]) -> CallToolResult:
         )
         for finding in (latest_review.get("findings") or [])[:20]:
             parts.append(_finding_line(finding))
+    if block:
+        parts.append(f"\n{block}")
     parts.append(
         "\nSubmit the verdict with hub_submit_review "
         "(verdict=approved|changes_requested, findings for changes_requested; "
