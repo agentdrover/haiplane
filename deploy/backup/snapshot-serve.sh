@@ -1,5 +1,5 @@
 #!/bin/sh
-# ForceCommand of the `backup` user (#1707): serves the newest published copy.
+# ForceCommand of the `haiplane-backup` user (#1707): serves the newest published copy.
 #
 #   snapshot latest | daily | latest-meta | daily-meta
 #

@@ -127,9 +127,9 @@ def as_root(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 def as_backup(args: list[str]) -> subprocess.CompletedProcess:
     prefix = (
-        ["runuser", "-u", "backup", "--"]
+        ["runuser", "-u", "haiplane-backup", "--"]
         if os.geteuid() == 0
-        else ["sudo", "-n", "-u", "backup"]
+        else ["sudo", "-n", "-u", "haiplane-backup"]
     )
     return subprocess.run(prefix + list(args), capture_output=True, text=True)
 
@@ -214,8 +214,11 @@ def run_install(
     if held is None:
         with SharedLock() as taken:
             return run_install(extra, taken, lock_account)
-    if lock_account and as_root(["getent", "passwd", "backup"]).returncode == 0:
-        as_root(["usermod", "-L", "backup"], check=True)
+    if (
+        lock_account
+        and as_root(["getent", "passwd", "haiplane-backup"]).returncode == 0
+    ):
+        as_root(["usermod", "-L", "haiplane-backup"], check=True)
     keys = shared_keys()
     args = [
         "sh",
@@ -256,6 +259,6 @@ def installed_state() -> str:
             ["sh", "-c", "[ -f '%s' ] && sha256sum '%s'" % (path, path)], text=True
         )
         parts.append(body.stdout)
-    parts.append(as_root(["getent", "passwd", "backup"], text=True).stdout)
-    parts.append(as_root(["getent", "shadow", "backup"], text=True).stdout)
+    parts.append(as_root(["getent", "passwd", "haiplane-backup"], text=True).stdout)
+    parts.append(as_root(["getent", "shadow", "haiplane-backup"], text=True).stdout)
     return "".join(parts)

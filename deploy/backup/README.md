@@ -8,7 +8,7 @@
 | Файл | Что делает |
 |---|---|
 | `hub-snapshot.py` | `hourly`: sqlite backup API, проверка, шифрование age. `daily`: tar по allowlist, шифрование age потоком |
-| `snapshot-serve.sh` | ForceCommand пользователя `backup`: отдаёт самую новую копию, больше ничего |
+| `snapshot-serve.sh` | ForceCommand пользователя `haiplane-backup`: отдаёт самую новую копию, больше ничего |
 | `install.sh` | установка владельцем одной командой, идемпотентна |
 
 ## Установка (владелец, sudo)
@@ -31,13 +31,15 @@ sudo sh deploy/backup/install.sh \
 
 Что появляется:
 
-- пользователь `backup`: shell `/bin/sh`, без пароля (`usermod -p '*'`), домашний каталог
-  `/var/lib/haiplane-backup-home` и `.ssh` принадлежат root, `authorized_keys` — root:root 0644
-  с опцией `restrict`;
-- `/etc/ssh/sshd_config.d/60-haiplane-backup.conf`: `Match User backup`, ForceCommand,
-  без пароля, TTY, пробросов и туннелей; `sshd -t` до перезагрузки, затем проверка `sshd -T`:
+- отдельный системный пользователь `haiplane-backup` (системный `backup`, uid 34, не трогается): shell `/bin/sh`, без пароля (`usermod -p '*'`), домашний каталог
+  `/var/lib/haiplane-backup-home` и `.ssh` принадлежат root, `authorized_keys` — root:root 0644,
+  ключ с опциями `restrict,command="…/snapshot-serve.sh …"`: принудительная команда стоит в самом ключе и
+  действует, даже если sshd ещё не перезагружен;
+- `/etc/ssh/sshd_config.d/60-haiplane-backup.conf`: `Match User haiplane-backup`, ForceCommand,
+  без пароля, TTY, пробросов и туннелей; `sshd -t` до перезагрузки, затем проверка `sshd -T`, затем reload (на каждом запуске, не только при изменении),
+  и только после этого появляется ключ:
   если основной `sshd_config` не включает `sshd_config.d`, установка падает;
-- `/var/lib/haiplane-backup` (0750 root:backup): копии 0640 root:backup, `work/` — точка
+- `/var/lib/haiplane-backup` (0750 root:haiplane-backup): копии 0640 root:haiplane-backup, `work/` — точка
   монтирования tmpfs 512 МБ только для открытого текста часового снимка;
 - `/etc/haiplane-backup/recipient.txt` (открытый ключ age) и `paths.conf` (allowlist daily,
   файл создаётся один раз, дальше его правит владелец);
@@ -52,10 +54,10 @@ sudo sh deploy/backup/install.sh \
 ## Контракт забора
 
 ```
-ssh backup@HOST snapshot latest       # hub-<UTC>.db.age
-ssh backup@HOST snapshot daily        # conf-<UTC>.tar.age
-ssh backup@HOST snapshot latest-meta  # JSON часовой копии
-ssh backup@HOST snapshot daily-meta   # JSON суточной копии
+ssh haiplane-backup@HOST snapshot latest       # hub-<UTC>.db.age
+ssh haiplane-backup@HOST snapshot daily        # conf-<UTC>.tar.age
+ssh haiplane-backup@HOST snapshot latest-meta  # JSON часовой копии
+ssh haiplane-backup@HOST snapshot daily-meta   # JSON суточной копии
 ```
 
 Код возврата: 0 отдано; 3 копии нет; 4 копия старше порога (часовая 90 мин, суточная 26 ч);
@@ -112,9 +114,9 @@ sha256 с manifest и положить файлы на место вручную
 ## Проверка владельцем после установки
 
 ```sh
-ssh backup@HOST snapshot latest-meta   # JSON с hub_commit и schema_migrations
-ssh backup@HOST id                     # отказ, rc 2
-sftp backup@HOST                       # отказ
+ssh haiplane-backup@HOST snapshot latest-meta   # JSON с hub_commit и schema_migrations
+ssh haiplane-backup@HOST id                     # отказ, rc 2
+sftp haiplane-backup@HOST                       # отказ
 ```
 
 ## Откат установки
@@ -127,5 +129,5 @@ sudo sshd -t && sudo systemctl reload ssh
 sudo systemctl daemon-reload
 sudo rm -r /usr/local/lib/haiplane-backup /var/lib/haiplane-backup-home
 # копии: /var/lib/haiplane-backup; ключ получателя: /etc/haiplane-backup
-sudo userdel backup   # только если пользователя создал install.sh, а не дистрибутив
+sudo userdel haiplane-backup
 ```

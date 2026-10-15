@@ -100,20 +100,24 @@ def test_install_is_idempotent_and_least_privilege():
     assert stat_of(HOME_DIR) == "root:root 755"
     assert stat_of(HOME_DIR + "/.ssh") == "root:root 755"
     assert stat_of(HOME_DIR + "/.ssh/authorized_keys") == "root:root 644"
-    assert stat_of(STATE_DIR) == "root:backup 750"
+    assert stat_of(STATE_DIR) == "root:haiplane-backup 750"
     assert stat_of(LIB_DIR + "/snapshot-serve.sh") == "root:root 755"
 
     account = (
-        as_root(["getent", "passwd", "backup"], text=True).stdout.strip().split(":")
+        as_root(["getent", "passwd", "haiplane-backup"], text=True)
+        .stdout.strip()
+        .split(":")
     )
     assert account[5] == HOME_DIR and account[6] == "/bin/sh"
     assert (
-        as_root(["getent", "shadow", "backup"], text=True).stdout.split(":")[1] == "*"
+        as_root(["getent", "shadow", "haiplane-backup"], text=True).stdout.split(":")[1]
+        == "*"
     )
 
     keys = shared_keys()
     authorized = as_root(["cat", HOME_DIR + "/.ssh/authorized_keys"], text=True).stdout
-    assert authorized == "restrict " + keys["pub"].read_text().strip() + "\n"
+    forced = 'restrict,command="%s/snapshot-serve.sh %s" ' % (LIB_DIR, STATE_DIR)
+    assert authorized == forced + keys["pub"].read_text().strip() + "\n"
     # the user reads what it needs and changes nothing of it
     assert as_backup(["cat", HOME_DIR + "/.ssh/authorized_keys"]).returncode == 0
     assert (
@@ -127,7 +131,7 @@ def test_install_is_idempotent_and_least_privilege():
 
     dropin = as_root(["cat", DROPIN], text=True).stdout
     for line in (
-        "Match User backup",
+        "Match User haiplane-backup",
         "ForceCommand %s/snapshot-serve.sh %s" % (LIB_DIR, STATE_DIR),
         "PasswordAuthentication no",
         "AllowTcpForwarding no",
@@ -139,7 +143,7 @@ def test_install_is_idempotent_and_least_privilege():
         assert line in dropin.replace("    ", ""), line
     assert as_root([sshd_path(), "-t"], text=True).returncode == 0
     effective = as_root(
-        [sshd_path(), "-T", "-C", "user=backup,host=localhost,addr=127.0.0.1"],
+        [sshd_path(), "-T", "-C", "user=haiplane-backup,host=localhost,addr=127.0.0.1"],
         text=True,
     ).stdout.splitlines()
     for line in (
@@ -193,3 +197,18 @@ def test_ci_installs_the_tools_and_forbids_skips():
         and "sudo -n true" in step
     )
     assert "continue-on-error" not in step and "|| true" not in step
+
+
+def test_sshd_is_reloaded_on_every_run_and_before_the_key_appears():
+    """A run that failed after writing the drop-in must not leave sshd on the old config.
+
+    systemd is not available to the test, so the contract is read from the script:
+    one unconditional reload, placed before the authorized_keys file is written."""
+    text = (BACKUP_DIR / "install.sh").read_text()
+    reload_at = text.index("systemctl reload ssh")
+    key_at = text.index('put_file "$AUTH_KEYS"')
+    assert reload_at < key_at
+    before = text[:reload_at].rsplit("\n", 3)[-3:]
+    assert any('if [ "$SERVICES" = 1 ]' in line for line in before)
+    assert "CHANGED" not in "".join(before), "the reload must not depend on a change"
+    assert 'command="%s/snapshot-serve.sh %s"' in text

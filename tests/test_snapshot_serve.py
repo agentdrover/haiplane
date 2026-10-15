@@ -14,6 +14,7 @@ import pytest
 
 from tests.backup_support import (
     BACKUP_DIR,
+    HOME_DIR,
     LIB_DIR,
     STATE_DIR,
     as_root,
@@ -134,7 +135,7 @@ def _free_port() -> int:
 
 
 class Server:
-    def __init__(self, tmp_path: Path):
+    def __init__(self, tmp_path: Path, include_dropin: bool = True):
         self.tmp = tmp_path
         self.port = _free_port()
         keys = shared_keys()
@@ -157,7 +158,9 @@ class Server:
                     "AuthorizedKeysFile .ssh/authorized_keys",
                     "StrictModes yes",
                     "LogLevel INFO",
-                    "Include /etc/ssh/sshd_config.d/60-haiplane-backup.conf",
+                    "Include /etc/ssh/sshd_config.d/60-haiplane-backup.conf"
+                    if include_dropin
+                    else "# the drop-in is NOT loaded (sshd that was not reloaded)",
                     "",
                 ]
             )
@@ -172,7 +175,7 @@ class Server:
                 "-f",
                 str(self.config),
                 "-C",
-                "user=backup,host=127.0.0.1,addr=127.0.0.1",
+                "user=haiplane-backup,host=127.0.0.1,addr=127.0.0.1",
             ],
             text=True,
         )
@@ -262,7 +265,7 @@ def server(tmp_path):
                     "-o",
                     "root",
                     "-g",
-                    "backup",
+                    "haiplane-backup",
                     str(src),
                     STATE_DIR + "/" + src.name,
                 ]
@@ -301,7 +304,7 @@ def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):
         ("snapshot daily", daily),
         ("snapshot daily-meta", daily_meta),
     ):
-        done = server.ssh("backup@127.0.0.1", command)
+        done = server.ssh("haiplane-backup@127.0.0.1", command)
         assert (done.returncode, done.stdout) == (0, expected), (command, done.stderr)
 
     refused = [
@@ -315,25 +318,25 @@ def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):
         "cat /etc/passwd",
     ]
     for command in refused:
-        done = server.ssh("backup@127.0.0.1", command)
+        done = server.ssh("haiplane-backup@127.0.0.1", command)
         assert done.returncode == 2 and done.stdout == b"", (
             command,
             done.stdout,
             done.stderr,
         )
     shell = server.ssh(
-        "-T", "backup@127.0.0.1"
+        "-T", "haiplane-backup@127.0.0.1"
     )  # no command: a login shell is asked for
     assert shell.returncode == 2 and shell.stdout == b""
 
     target = tmp_path / "pulled"
-    scp = server.ssh("backup@127.0.0.1:/etc/passwd", str(target), tool="scp")
+    scp = server.ssh("haiplane-backup@127.0.0.1:/etc/passwd", str(target), tool="scp")
     assert scp.returncode != 0 and not target.exists()
     sftp = subprocess.run(
         [
             "sftp", "-P", str(server.port), "-F", "/dev/null", "-i", str(server.key),
             "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null", "-b", "-", "backup@127.0.0.1",
+            "-o", "UserKnownHostsFile=/dev/null", "-b", "-", "haiplane-backup@127.0.0.1",
         ],
         input=b"ls /\n",
         capture_output=True,
@@ -346,18 +349,18 @@ def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):
         ["ssh", "-p", str(server.port), "-F", "/dev/null", "-o", "PubkeyAuthentication=no",
          "-o", "PreferredAuthentications=password", "-o", "BatchMode=yes",
          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-         "backup@127.0.0.1", "snapshot latest-meta"],
+         "haiplane-backup@127.0.0.1", "snapshot latest-meta"],
         capture_output=True,
         timeout=60,
     )  # fmt: skip
     assert password.returncode == 255 and password.stdout == b""
 
     # channels, checked apart from the command's own return code
-    pty = server.ssh("-tt", "backup@127.0.0.1", "snapshot latest-meta")
+    pty = server.ssh("-tt", "haiplane-backup@127.0.0.1", "snapshot latest-meta")
     assert b"PTY allocation request failed" in pty.stderr
 
     remote = server.ssh(
-        "backup@127.0.0.1",
+        "haiplane-backup@127.0.0.1",
         "snapshot latest-meta",
         extra=["-o", "ExitOnForwardFailure=yes", "-R", "0:127.0.0.1:9"],
     )
@@ -370,7 +373,7 @@ def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):
     local = _free_port()
     control = str(tmp_path / "ctl")
     opened = server.ssh(
-        "backup@127.0.0.1",
+        "haiplane-backup@127.0.0.1",
         extra=[
             "-f", "-N", "-M", "-S", control, "-o", "ExitOnForwardFailure=yes",
             "-L", "%d:127.0.0.1:%d" % (local, target_side.getsockname()[1]),
@@ -389,8 +392,39 @@ def test_only_the_four_commands_are_served_over_real_sshd(server, tmp_path):
             target_side.accept()  # nothing ever reached the target through the tunnel
     finally:
         subprocess.run(
-            ["ssh", "-S", control, "-O", "exit", "backup@127.0.0.1"],
+            ["ssh", "-S", control, "-O", "exit", "haiplane-backup@127.0.0.1"],
             capture_output=True,
             timeout=30,
         )
         target_side.close()
+
+
+def test_the_key_restricts_an_sshd_that_never_loaded_the_dropin(server, tmp_path):
+    """Install stopped before the reload: the old sshd must still give no shell and no `id`."""
+    keys = as_root(["cat", HOME_DIR + "/.ssh/authorized_keys"], text=True).stdout
+    assert keys.startswith(
+        'restrict,command="%s/snapshot-serve.sh %s" ' % (LIB_DIR, STATE_DIR)
+    )
+    bare_dir = tmp_path / "bare"
+    bare_dir.mkdir()
+    bare = Server(bare_dir, include_dropin=False)
+    bare.start()
+    try:
+        assert (
+            "forcecommand none" in bare.effective()
+        )  # nothing but the key restricts it
+        for words in (("id",), ("sh",), ("snapshot latest; id",)):
+            done = bare.ssh("haiplane-backup@127.0.0.1", *words)
+            assert done.returncode == 2 and done.stdout == b"", (
+                words,
+                done.stdout,
+                done.stderr,
+            )
+        shell = bare.ssh("haiplane-backup@127.0.0.1", extra=["-T"])
+        assert shell.returncode == 2 and shell.stdout == b""
+        tty = bare.ssh("-tt", "haiplane-backup@127.0.0.1")
+        assert tty.stdout == b"" and b"PTY allocation request failed" in tty.stderr
+        ok = bare.ssh("haiplane-backup@127.0.0.1", "snapshot latest-meta")
+        assert ok.returncode == 0 and ok.stdout == server.payloads["hourly"][1]
+    finally:
+        bare.stop()

@@ -85,7 +85,7 @@ class Config(object):
         self.age = e.get("SNAP_AGE") or "age"
         self.systemctl = e.get("SNAP_SYSTEMCTL") or "systemctl"
         self.db = e.get("SNAP_DB") or ""
-        self.group = e.get("SNAP_GROUP", "backup")
+        self.group = e.get("SNAP_GROUP", "haiplane-backup")
         self.require_tmpfs = e.get("SNAP_REQUIRE_TMPFS", "1") != "0"
         self.lock_wait = float(e.get("SNAP_LOCK_WAIT") or 120)
 

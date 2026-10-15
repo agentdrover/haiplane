@@ -13,17 +13,17 @@
 # argument an earlier installed one is kept.
 #
 # What it sets up:
-#   user `backup` (shell /bin/sh, no password, home owned by root, authorized_keys
+#   user `haiplane-backup` (not the distribution's `backup`) (shell /bin/sh, no password, home owned by root, authorized_keys
 #   owned by root: the user reads it but cannot change it), sshd drop-in with
-#   `Match User backup` -> ForceCommand snapshot-serve.sh (no tty, no forwarding),
-#   /var/lib/haiplane-backup (0750 root:backup), scripts in /usr/local/lib/haiplane-backup,
+#   `Match User haiplane-backup` -> ForceCommand snapshot-serve.sh (no tty, no forwarding),
+#   /var/lib/haiplane-backup (0750 root:haiplane-backup), scripts in /usr/local/lib/haiplane-backup,
 #   haiplane-snapshot-hourly.timer and haiplane-snapshot-daily.timer.
 # The nightly haiplane-hub-backup is not touched.
 
 set -eu
 
 SRC_DIR=$(cd "$(dirname "$0")" && pwd)
-USER_NAME=backup
+USER_NAME=haiplane-backup
 HOME_DIR=/var/lib/haiplane-backup-home
 STATE_DIR=/var/lib/haiplane-backup
 ETC_DIR=/etc/haiplane-backup
@@ -101,6 +101,14 @@ for f in hub-snapshot.py snapshot-serve.sh; do
     [ -f "$SRC_DIR/$f" ] || die "missing $SRC_DIR/$f"
 done
 
+AUTH_KEYS=$HOME_DIR/.ssh/authorized_keys
+# An earlier installed key is kept; its options are rebuilt below.
+if [ -z "$SSH_KEY" ] && [ -f "$AUTH_KEYS" ]; then
+    SSH_KEY=$(sed -n -e 's/^restrict,command="[^"]*" //p' -e 's/^restrict //p' "$AUTH_KEYS" | head -n 1)
+fi
+[ -n "$SSH_KEY" ] || die "no ssh key yet: pass --ssh-pubkey or --ssh-pubkey-file" 2
+[ -n "$RECIPIENT" ] || [ -f "$ETC_DIR/recipient.txt" ] || die "no age recipient yet: pass --age-recipient or --age-recipient-file" 2
+
 CHANGED=0
 note() {
     CHANGED=1
@@ -153,11 +161,6 @@ if [ -n "$RECIPIENT" ]; then
 fi
 [ -f "$ETC_DIR/recipient.txt" ] || die "no age recipient yet: pass --age-recipient or --age-recipient-file" 2
 
-if [ -n "$SSH_KEY" ]; then
-    printf 'restrict %s\n' "$SSH_KEY" >"$TMP/authorized_keys"
-    put_file "$HOME_DIR/.ssh/authorized_keys" 0644 "$TMP/authorized_keys"
-fi
-[ -f "$HOME_DIR/.ssh/authorized_keys" ] || die "no ssh key yet: pass --ssh-pubkey or --ssh-pubkey-file" 2
 
 # What the archive may contain. Written once; the owner edits it afterwards.
 if [ ! -f "$ETC_DIR/paths.conf" ]; then
@@ -194,7 +197,6 @@ Match User $USER_NAME
 EOF
 [ -d /run/sshd ] || install -d -m 0755 /run/sshd
 install -d -m 0755 -o root -g root "$(dirname "$DROPIN")"
-SSHD_CHANGED=0
 if ! { [ -f "$DROPIN" ] && cmp -s "$TMP/dropin" "$DROPIN"; }; then
     [ ! -f "$DROPIN" ] || cp -p "$DROPIN" "$TMP/dropin.old"
     install -m 0644 -o root -g root "$TMP/dropin" "$DROPIN"
@@ -206,7 +208,6 @@ if ! { [ -f "$DROPIN" ] && cmp -s "$TMP/dropin" "$DROPIN"; }; then
         fi
         die "sshd -t rejected the new configuration; the drop-in was rolled back"
     fi
-    SSHD_CHANGED=1
     note "$DROPIN"
 fi
 # The drop-in counts only if the main sshd_config includes it: ask sshd itself.
@@ -216,6 +217,17 @@ for want in "forcecommand $LIB_DIR/snapshot-serve.sh $STATE_DIR" "passwordauthen
     printf '%s\n' "$effective" | grep -qx "$want" ||
         die "sshd does not apply '$want' to $USER_NAME: does /etc/ssh/sshd_config have 'Include /etc/ssh/sshd_config.d/*.conf'?"
 done
+
+# The checked configuration is loaded on EVERY run, not only when the drop-in
+# changed: a run that failed after writing the drop-in must not leave sshd on the
+# old configuration. Only after that the key (and with it the way in) appears.
+if [ "$SERVICES" = 1 ]; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd
+fi
+# The forced command is in the key itself, so it holds even for an sshd that has
+# not loaded the drop-in: `restrict` alone would still run any command.
+printf 'restrict,command="%s/snapshot-serve.sh %s" %s\n' "$LIB_DIR" "$STATE_DIR" "$SSH_KEY" >"$TMP/authorized_keys"
+put_file "$AUTH_KEYS" 0644 "$TMP/authorized_keys"
 
 # ---- timers -------------------------------------------------------------------
 unit_service() { # NAME KIND DESCRIPTION EXTRA
@@ -269,9 +281,6 @@ if [ "$SERVICES" = 1 ]; then
         systemctl daemon-reload
     fi
     systemctl enable --now haiplane-snapshot-hourly.timer haiplane-snapshot-daily.timer
-    if [ "$SSHD_CHANGED" = 1 ]; then
-        systemctl reload ssh 2>/dev/null || systemctl reload sshd
-    fi
 fi
 
 if [ "$CHANGED" = 0 ]; then
