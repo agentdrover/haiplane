@@ -711,8 +711,8 @@ def test_each_skill_file_is_read_once(skills_tree: Path, monkeypatch):
 
 def test_every_skill_file_in_the_repository_is_valid():
     assert skill_files.skill_file_problems(REPO / "skills") == []
-    # Исключение без front-matter — только выгрузка прода как есть.
-    assert skill_files.LEGACY_NO_FRONT_MATTER == {"local-executor-hub-repo"}
+    # Исключений без front-matter больше нет: последнее снято правкой #1702.
+    assert skill_files.LEGACY_NO_FRONT_MATTER == frozenset()
 
 
 #: Хеши активных навыков прода на 15.10.2026 (выгрузка GET /api/skills/{name}).
@@ -757,7 +757,13 @@ def _sha(text: str) -> str:
 async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     db: aiosqlite.Connection,
 ):
-    """Главное требование выката: хеши совпали с базой — ни версии, ни черновика."""
+    """Выкат #1702 на состояние прода 15.10.
+
+    Неизменённые навыки (хеш совпал с базой) — ни версии, ни черновика.
+    Изменённые намеренно: активированные админом получают черновик, активная
+    версия прежняя (человек активирует сам); seed получает новую активную.
+    """
+    changed_by_admin = {"local-executor-hub-repo", "hub-submit-task"}
     sources = {
         "local-executor-hub-repo": (REPO / "skills/local-executor-hub-repo/SKILL.md"),
         "hub-review-report-reading": REPO / "skills/hub-review-report-reading/SKILL.md",
@@ -766,10 +772,17 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     texts = {n: p.read_bytes().decode("utf-8") for n, p in sources.items()}
     texts["executor-pair-discipline"] = EXECUTOR_PAIR_DISCIPLINE_SKILL
     texts["machine-review-cycle"] = MACHINE_REVIEW_CYCLE_SKILL
+    prod_text = {}
     for name, (digest, version, created_by, activated_by) in PROD_ACTIVE.items():
-        assert _sha(texts[name]) == digest, f"{name}: текст разошёлся с базой прода"
+        if name in changed_by_admin or name == "machine-review-cycle":
+            # Текст прода до #1702: хеш прежний, поэтому текст берём заглушкой.
+            assert _sha(texts[name]) != digest, f"{name}: текст не менялся"
+            prod_text[name] = f"текст прода {name}"
+        else:
+            assert _sha(texts[name]) == digest, f"{name}: текст разошёлся с базой"
+            prod_text[name] = texts[name]
         await _install(
-            db, name, [(version, texts[name], "active", created_by, activated_by)]
+            db, name, [(version, prod_text[name], "active", created_by, activated_by)]
         )
     # multi-agent-review в проде правил человек (v10): активная версия не наша.
     # Её черновик из кода уже лежит рядом и сегодня, до этой задачи.
@@ -781,13 +794,97 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     ]
     await _install(db, "multi-agent-review", mar)
 
+    unchanged = [
+        n for n in PROD_ACTIVE if n not in changed_by_admin | {"machine-review-cycle"}
+    ] + ["multi-agent-review"]
     names = [*PROD_ACTIVE, "multi-agent-review"]
     before = {n: await _versions(db, n) for n in names}
     await seed_default_skills(db)
     await seed_default_skills(db)
     after = {n: await _versions(db, n) for n in names}
 
-    assert after == before
+    for name in unchanged:
+        assert after[name] == before[name], name
+    for name in changed_by_admin:
+        version, created_by, activated_by = (
+            PROD_ACTIVE[name][1],
+            PROD_ACTIVE[name][2],
+            PROD_ACTIVE[name][3],
+        )
+        assert after[name] == [
+            {
+                "version": version,
+                "content": prod_text[name],
+                "status": "active",
+                "created_by": created_by,
+                "activated_by": activated_by,
+            },
+            {
+                "version": version + 1,
+                "content": texts[name],
+                "status": "draft",
+                "created_by": "seed",
+                "activated_by": "",
+            },
+        ], name
+        assert await _served(db, name) == prod_text[name], name
+    mrc = after["machine-review-cycle"]
+    assert [(v["version"], v["status"]) for v in mrc] == [(5, "draft"), (6, "active")]
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+def _between(text: str, start: str, end: str) -> str:
+    a = text.index(start)
+    return text[a : text.index(end, a)]
+
+
+def test_codex_second_review_rule_lives_in_one_skill():
+    """AC-1: правило второго ревью записано один раз, второй навык ссылается."""
+    rule = (REPO / "skills/local-executor-hub-repo/SKILL.md").read_text("utf-8")
+    ref = (REPO / "skills/hub-submit-task/SKILL.md").read_text("utf-8")
+    section = _between(rule, "6. **Второй ревьюер Codex", "## Этап 3.")
+    for needle in (
+        "R2",
+        "не посчитан",
+        "APPROVAL_DECIDERS",
+        "_PROCESS_SURFACES",
+        "process_surface_reasons",
+        "kind=security",
+        "| R1 + `kind=security` | нужен |",
+        "| R1 + правка `hub/services/auto_approve.py` (решатель) | нужен |",
+        "| R2 без решателей, поверхностей и security | нужен |",
+        "| `risk_class` пуст или нечитаем, признаков нет | нужен |",
+        "| R1, только документация, security нет | не нужен |",
+    ):
+        assert needle in section, needle
+    # Ссылка в hub-submit-task есть, второй формулировки правила нет.
+    item = _between(ref, "4. Второй ревьюер Codex", "5. Локальные проверки")
+    assert "local-executor-hub-repo" in item
+    for needle in ("R2", "APPROVAL_DECIDERS", "_PROCESS_SURFACES", "| нужен |"):
+        assert needle not in ref, needle
+    # Старые формулировки обоих навыков исчезли.
+    assert "всегда, если команда" not in rule
+    assert "Второй ревьюер Codex — всегда" not in rule
+    assert "На ядре хаба (lifecycle" not in ref
+    assert ref.count("codex exec") == 0
+
+
+def test_machine_review_cycle_describes_both_decisions():
+    """AC-2: «Когда обязателен» описывает оба решения и не знает про размер."""
+    section = _between(MACHINE_REVIEW_CYCLE_SKILL, "## Когда обязателен", "## Шаги")
+    for needle in (
+        "machine_review_required",
+        "hub/services/orchestration.py",
+        "pick_review_profile",
+        "hub/services/review_dispatch.py",
+        "override",
+        "docs, chore и spike",
+        "kind=security",
+        "не читает",
+    ):
+        assert needle in section, needle
+    assert "размеры XS/S" not in MACHINE_REVIEW_CYCLE_SKILL
+    assert "XS/S — нет" not in MACHINE_REVIEW_CYCLE_SKILL
 
 
 async def test_a_code_seeded_name_never_comes_from_a_file(

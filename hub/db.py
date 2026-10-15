@@ -3946,14 +3946,26 @@ MACHINE_REVIEW_CYCLE_SKILL = """\
 контракт один.
 
 ## Когда обязателен
-Политика (#382): каскад override задачи > политика проекта (off|auto|always)
-> автоправила (docs/chore/spike и размеры XS/S — нет; refactor и
-feature/bug M+ — да; риск high или security — всегда). Хаб сам сообщает:
-`lifecycle_hint` в ответе `hub_submit_for_review`, предупреждение в панели
-ревью, событие `machine_review_requested` в фиде. Режим
-HAIPLANE_MACHINE_REVIEW=require
+Два независимых решения, оба считает хаб; размер задачи (XS/S) ни одно из них
+не читает.
+
+1. Нужен ли отчёт — `machine_review_required`
+   (`hub/services/orchestration.py`). Каскад: override задачи (`require` /
+   `skip`) > политика проекта (off|always|auto) > автоправила. Автоправила по
+   порядку: риск high или `kind=security` — всегда; типы docs, chore и spike
+   освобождены; остальное — да, при любом размере (#806).
+2. Какой профиль ревью — `pick_review_profile`
+   (`hub/services/review_dispatch.py`): deep (многоагентный харнесс) или lite
+   (один проход). Решают запрос человека, `kind=security`, решатели одобрения,
+   процессные поверхности в добавленных строках, класс риска (с R3; класс не
+   посчитан — тоже deep), дифф только из документации — lite.
+
+Хаб сам сообщает результат: `lifecycle_hint` в ответе `hub_submit_for_review`,
+предупреждение в панели ревью, событие `machine_review_requested` в фиде.
+Режим HAIPLANE_MACHINE_REVIEW=require
 блокирует человеческий вердикт без актуального отчёта; дефолт warn —
-только предупреждает.
+только предупреждает. Второй ревьюер Codex перед сдачей — другое правило, оно в
+навыке `local-executor-hub-repo`.
 
 ## Шаги
 1. `hub_get_skill("multi-agent-review")` — актуальная версия промта-харнесса
