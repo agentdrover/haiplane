@@ -1904,7 +1904,8 @@ def _delivery_block(task_id: int, code: str, base_url: str) -> str:
     return (
         "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ, ДО ЧТЕНИЯ КОДА. У тебя нет "
         "инструментов MCP, поэтому отчёт сдаётся обычным HTTP. Код ниже "
-        "живёт МИНУТЫ, а твой прогон длится дольше — обменяй его сразу, "
+        f"одноразовый и живёт {config.CHAT_PAIR_REVIEWER_CODE_SECONDS} с "
+        "от выдачи, а твой прогон длится дольше — обменяй его сразу, "
         "иначе он протухнет к моменту отчёта:\n"
         f"  curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
         "-H 'Content-Type: application/json' "
