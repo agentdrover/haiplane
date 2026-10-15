@@ -67,7 +67,7 @@ class CIRunTimingSubmit(BaseModel):
     conclusion: str = Field("", max_length=40)
     # The completion time the EVENT carries (the run's updated_at).
     completed_at: str = Field(..., min_length=1, max_length=40)
-    state: Literal["ok", "timing_unavailable"] = STATE_OK
+    state: Literal["ok", "timing_unavailable"] = "ok"
     reason: str = Field("", max_length=500)
     jobs: list[CIJobTiming] = Field(default_factory=list, max_length=50)
 
