@@ -54,6 +54,7 @@ from hub.services.finding_evidence import evidence_for_findings, evidence_for_re
 from hub.services.finding_identity import finding_uids
 from hub.services.lifecycle import DELIVER_DISPOSITION, REGISTRY_REFUSAL_PREFIX
 from hub.services.review_evidence import inflight_view
+from hub.services import verdict_evidence
 from hub.version import get_app_version
 from hub.models import (
     DeliveryAcknowledgement,
@@ -2573,13 +2574,10 @@ async def _steward_recommendation(
         return None
     out = dict(judged)
     # Grounds are stored as a JSON string, and an empty list is "[]" — which
-    # a template reads as truthy. Parsed here so "no grounds" and "grounds,
-    # here they are" look different to the human at the gate.
-    try:
-        parsed = json.loads(out.get("grounds") or "[]")
-    except (TypeError, ValueError):
-        parsed = []
-    out["grounds"] = parsed if isinstance(parsed, list) else []
+    # a template reads as truthy. Parsed here (by the parser the verdict
+    # evidence route shares, #1697) so "no grounds" and "grounds, here they
+    # are" look different to the human at the gate.
+    out["grounds"] = verdict_evidence.parse_grounds(out.get("grounds"))
     return out
 
 
