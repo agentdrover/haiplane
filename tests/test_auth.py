@@ -761,7 +761,13 @@ def test_password_complexity_accepts_valid():
 # The classification lives in hub/db.py; these tests derive the real answer FROM
 # THE CODE, so the two cannot drift apart quietly.
 
-_SOURCE_FILES = ("hub/app.py", "hub/web.py", "hub/mcp_server.py", "hub/cli.py")
+_SOURCE_FILES = (
+    "hub/app.py",
+    "hub/web.py",
+    "hub/mcp_server.py",
+    "hub/cli.py",
+    "hub/verdict_evidence_api.py",
+)
 # Permissions consulted without require_permission: config.py reads these two
 # directly to answer is_admin / is_human, and require_human_or_admin is built on
 # is_human. Listed explicitly because a regex over require_permission would

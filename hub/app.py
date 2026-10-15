@@ -196,6 +196,7 @@ from hub.services.tree_output import (
     truncate_text,
 )
 from hub.poller import start_poller
+from hub.verdict_evidence_api import router as verdict_evidence_router
 from hub.web import router as web_router
 
 logging.basicConfig(
@@ -543,6 +544,7 @@ app.add_middleware(McpStreamableAcceptCompatMiddleware)
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
+app.include_router(verdict_evidence_router)
 
 
 def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:

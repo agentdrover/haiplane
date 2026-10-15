@@ -2393,7 +2393,8 @@ async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
     assert "hub_submit_review" in text
     assert "WARNING" not in text
     assert payload["brief"]["task_id"] == 42
-    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+    # #1697: the full text also asks for the verdict evidence.
+    mock_api_get.assert_any_await("/api/tasks/42/review-brief")
 
 
 async def test_hub_get_review_brief_self_review_warning(
@@ -2424,7 +2425,8 @@ async def test_hub_get_review_brief_self_review_warning(
     assert (
         structured["brief"]["self_review_warning"]["reason"] == "self_review_forbidden"
     )
-    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+    # #1697: the full text also asks for the verdict evidence.
+    mock_api_get.assert_any_await("/api/tasks/42/review-brief")
 
 
 async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> None:

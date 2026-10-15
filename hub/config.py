@@ -960,6 +960,7 @@ _HUMAN_DEFAULT_PERMS = frozenset(
         "tasks.archive",
         "tasks.delete",
         "integrations.vast.manage",
+        "verdict.evidence.read",
     }
 )
 _AGENT_DEFAULT_PERMS = frozenset(
@@ -969,6 +970,7 @@ _AGENT_DEFAULT_PERMS = frozenset(
         "tasks.refine",
         "tasks.update",
         "tasks.agent_report",
+        "verdict.evidence.read",
     }
 )
 
