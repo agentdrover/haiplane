@@ -1142,21 +1142,61 @@ async def _push_tree_head(
     return rc, err
 
 
+_PUSH_STATUS_RE = re.compile(
+    r"^\s*!\s*\[(remote rejected|rejected)\]\s+\S+\s+->\s+\S+(?:\s+\((.*)\))?\s*$"
+)
+_PUSH_URL_RE = re.compile(r"\S+://\S+|'[^']*'")
+# Код 403 — только в ответе сервера, не любое число внутри пути, имени или sha.
+_PUSH_HTTP_403_RE = re.compile(r"error: 403|\bhttp(?:/[\d.]+)?\s+403\b|\b403 forbidden")
+_PUSH_DENIAL_WORDS = ("permission", "denied", "protected", "declined")
+
+
+def _push_diagnostics(err: str) -> tuple[str, bool]:
+    """Только диагностика git push: ``(текст, аренда_отказала)``.
+
+    Имена веток, пути и URL в выводе — не причина отказа: в строке отказа аренды
+    стоит имя временной ветки ``task-N/gate-update-<sha>``, а путь или имя
+    ветки может содержать «protected» или «403». Поэтому разбираются строки
+    статуса (`` ! [rejected] SRC -> DST (ПРИЧИНА)``) — берётся только причина, —
+    а остальные строки читаются без URL и кавычек; строки «To <путь>», «hint:» и
+    «failed to push some refs» не читаются вовсе.
+    """
+    parts: list[str] = []
+    lease_rejected = False
+    for raw in (err or "").splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith(("to ", "hint:", "everything ")):
+            continue
+        status = _PUSH_STATUS_RE.match(raw)
+        if status:
+            lease_rejected = lease_rejected or status.group(1) == "rejected"
+            parts.append(status.group(2) or "")
+            continue
+        for prefix in ("remote:", "fatal:", "error:"):
+            if line.lower().startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if line.lower().startswith("failed to push"):
+            continue
+        parts.append(_PUSH_URL_RE.sub("", line))
+    return "\n".join(parts).lower(), lease_rejected
+
+
 def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     """Отказ пуша обновлённой ветки — чьи руки его лечат (#1419).
 
     Как у пути API: аренда (голова уехала) — head_moved, повтор; таймаут и
     сеть — unavailable, повтор; к человеку (refused) — только отказ прав или
-    защиты ветки на стороне сервера.
+    защиты ветки на стороне сервера. Решает диагностика git
+    (``_push_diagnostics``), а не весь stderr.
     """
-    low = (err or "").lower()
     if rc == _TIMEOUT_RC:
         return BranchUpdateOutcome.unavailable
-    if any(w in low for w in ("permission", "denied", "protected", "declined", "403")):
+    low, lease_rejected = _push_diagnostics(err)
+    if any(w in low for w in _PUSH_DENIAL_WORDS) or _PUSH_HTTP_403_RE.search(low):
         return BranchUpdateOutcome.refused
-    if any(
-        w in low
-        for w in ("stale info", "[rejected]", "non-fast-forward", "fetch first")
+    if lease_rejected or any(
+        w in low for w in ("stale info", "non-fast-forward", "fetch first")
     ):
         return BranchUpdateOutcome.head_moved
     return BranchUpdateOutcome.unavailable
@@ -4563,7 +4603,7 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 detail = (err or "").strip()
-                low = detail.lower()
+                low, _ = _push_diagnostics(detail)
                 # Отказ ДОСТУПА проверяется первым и отдельно: «Permission
                 # denied (publickey)» содержит слово denied и попадал в ветку
                 # про защиту базы — то есть отказ называл причину, которой
