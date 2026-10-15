@@ -405,6 +405,7 @@ SCANNED_APPROVAL_DEFERRED = "scanned_approval_deferred"
 # #1706: a scanned verdict the write refused (resubmitted, or one already
 # stands). The task is left as it is; the next tick judges what is live.
 VERDICT_NOT_WRITTEN = "verdict_not_written"
+_VERDICT_FIELDS = ("review_verdict", "review_verdict_generation")
 
 
 async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> str:
@@ -416,6 +417,12 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
     # Structured channel first (#326): a persisted verdict for
     # the CURRENT submission wins; text scanning stays as the
     # fallback for legacy reviewers and dispatch logs.
+    # #1706: the verdict is read FRESH. The tick's snapshot may be older than a
+    # human's replacement, and delivering on a verdict that was replaced a
+    # moment ago is the failure this task exists to stop.
+    fresh = await repo.get_task(db, task["id"])
+    if fresh is not None:
+        task = {**task, **{k: dict(fresh)[k] for k in _VERDICT_FIELDS}}
     persisted = task.get("review_verdict")
     if persisted and task.get("review_verdict_generation") == task.get(
         "submission_generation"

@@ -149,6 +149,16 @@ async def test_human_supersedes_by_current_revision_only(
     assert agent_try.status_code in (403, 409), agent_try.text
     assert await _snapshot(db, task_id) == before
 
+    # A replacement names the generation too: the revision belongs to the task,
+    # not to the submission, and a resubmission would carry it over (Codex P2).
+    no_generation = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "denis", "supersedes_revision": 1},
+        headers=hdr["human"],
+    )
+    assert no_generation.status_code == 422, no_generation.text
+    assert await _snapshot(db, task_id) == before
+
     body = {
         "verdict": "approved",
         "agent": "denis",
@@ -332,22 +342,20 @@ async def test_poller_never_overwrites_a_verdict(db: aiosqlite.Connection):
     assert after["revision"] == before["revision"] == 3
     assert after["verdict"] == "changes_requested"
 
-    # A recognised CHANGES_REQUESTED must not land over a standing verdict...
+    # The verdict is read FRESH: a snapshot that still says approved, while a
+    # human has since replaced it, must not be delivered on (Codex P1).
     plugins.dispatch = _job("verdict: CHANGES_REQUESTED")
     task = dict(await repo.get_task(db, task_id))
-    await db.execute(
-        "UPDATE tasks SET review_verdict='approved', review_findings='[]' WHERE id=?",
-        (task_id,),
-    )
-    await db.commit()
-    task = dict(await repo.get_task(db, task_id))
-    task["review_verdict_generation"] = 0  # the snapshot the tick carries is older
-    await _resolve_review_verdict(db, task, [])
+    task["review_verdict"] = "approved"  # what the tick read a moment ago
+    assert await _resolve_review_verdict(db, task, []) == "changes_requested"
     row = dict(await repo.get_task(db, task_id))
-    assert row["review_verdict"] == "approved", (
-        "a standing verdict is never overwritten"
+    assert row["review_verdict_revision"] == 3, "and nothing was written"
+
+    # A recognised CHANGES_REQUESTED does not land over a standing verdict: the
+    # write itself refuses (the verdict appeared after the tick read it).
+    assert not await repo.record_review_verdict(
+        db, task_id, "changes_requested", expected_generation=1
     )
-    assert row["review_verdict_revision"] == 3
 
     # ... nor over a resubmitted generation (the job judged the old one).
     await db.execute(

@@ -158,6 +158,17 @@ async def decide(
             "supersedes_revision агенту и автоматике не принимается.",
             "Если вердикт стоит ошибочно, скажите об этом человеку.",
         )
+    if supersedes is not None and expected_generation is None:
+        # Ревизия растёт по задаче, а не по сдаче: без названного поколения
+        # устаревшая замена легла бы на пересданную работу (Codex P2).
+        raise _refusal(
+            422,
+            "verdict_replacement_needs_generation",
+            "замена вердикта требует expected_generation: ревизия не привязана "
+            "к сдаче, и без поколения замена могла бы лечь на пересданную работу.",
+            "Прочитайте бриф и повторите с --expected-generation <N> "
+            "--supersedes-revision <R>.",
+        )
     if not standing_on(task):
         return Outcome.first, None
     st = await _standing(db, task)
