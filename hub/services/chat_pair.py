@@ -22,8 +22,12 @@ enough, because several hub branches read "not an agent" as "a human".
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Final
 
 import aiosqlite
@@ -168,7 +172,11 @@ async def issue_code(
             "AND redeemed_at IS NULL",
             (principal_id, kind),
         )
-    ttl = config.CHAT_PAIR_CODE_SECONDS
+    ttl = (
+        config.CHAT_PAIR_REVIEWER_CODE_SECONDS
+        if kind == "reviewer"
+        else config.CHAT_PAIR_CODE_SECONDS
+    )
     code = generate_pair_code()
     await db.execute(
         "INSERT INTO chat_pair_codes "
@@ -270,96 +278,218 @@ def _implementer_may_redeem(task: dict[str, Any], pinned: Any) -> bool:
     return int(pinned) == next_generation
 
 
-async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any] | None:
-    """Exchange a code for a session. ``None`` for every way that can fail.
+@dataclass(frozen=True)
+class RedeemRefusal:
+    """Why a redeem was refused — for the closed admin audit, never the client.
 
-    Unknown, already spent and expired are ONE answer on purpose: three
-    distinguishable refusals would tell a caller enumerating codes which
-    guesses were close.
-
-    The one exception is the capture check of #1433: a VALID implementer code
-    on an open task whose areas overlap started work under
-    ``claim_area_check=require`` raises the structured 409 naming the
-    neighbour, and the code stays unspent.
+    The client always gets the one indistinguishable 401. ``reason`` is a
+    closed word (no code, no hash, no address); ``kind`` and the binding are
+    what the code itself says, so they exist only when a row was found.
     """
-    normalized = normalize_pair_code(raw_code)
-    if len(normalized) != CODE_LENGTH:
-        return None
 
+    reason: str
+    kind: str = ""
+    bound_task_id: int | None = None
+    bound_generation: int | None = None
+    principal_id: int | None = None
+
+
+#: Unknown codes are the one refusal an outsider can mint at will, so the audit
+#: keeps at most one per client address per window (#1694); every other reason
+#: needs a real row and is written each time.
+UNKNOWN_AUDIT_WINDOW_SECONDS: Final[float] = 60.0
+#: Hard cap of the thinning counter (#1694): addresses are attacker-chosen, so
+#: the table cannot grow with them. Insertion order IS time order (an address is
+#: re-inserted at the tail only when its entry has lapsed), so expiry pops from
+#: the head and each call is O(1) amortised. A full table suppresses NEW
+#: ``unknown`` rows — a skipped audit row is acceptable, unbounded memory is not.
+UNKNOWN_AUDIT_CAPACITY: Final[int] = 1024
+_unknown_audit_seen: OrderedDict[str, float] = OrderedDict()
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def unknown_refusal_audit_due(key: str) -> bool:
+    """Whether an ``unknown`` refusal from this address may enter the audit now.
+
+    A counter of its own, in process memory: the limiter counts attempts to
+    block, this one counts audit rows to spare the journal — sharing them
+    would make a limiter change silently change what the audit keeps.
+    """
+    now = _clock()
+    seen = _unknown_audit_seen
+    while seen:
+        oldest = next(iter(seen))
+        if now - seen[oldest] < UNKNOWN_AUDIT_WINDOW_SECONDS:
+            break
+        del seen[oldest]
+    if key in seen:
+        return False
+    if len(seen) >= UNKNOWN_AUDIT_CAPACITY:
+        return False
+    seen[key] = now
+    return True
+
+
+async def audit_redeem_refusal(
+    db: aiosqlite.Connection,
+    caller: str,
+    refusal: RedeemRefusal | None,
+    *,
+    thinned: bool = False,
+) -> None:
+    """Why a redeem was refused — closed admin audit only (#1694).
+
+    Not the event feed (agents read it) and not the response (it would be an
+    oracle for guessing codes). No code, no hash, no address in the row; the
+    address only keys the in-memory thinning of ``unknown``. A failed write
+    must not turn the 401 into a 500.
+    """
+    if refusal is None:
+        return
+    if (
+        refusal.reason == "unknown"
+        and not thinned
+        and not unknown_refusal_audit_due(caller)
+    ):
+        return
+    from hub.services import admin as admin_svc
+
+    try:
+        await admin_svc.write_audit(
+            db,
+            actor_id=refusal.principal_id,
+            action="chat_pair_redeem_refused",
+            target_type="chat_pair",
+            target_id=(
+                str(refusal.bound_task_id) if refusal.bound_task_id is not None else ""
+            ),
+            summary=f"pairing code redeem refused: {refusal.reason}",
+            detail=json.dumps(
+                {
+                    "reason": refusal.reason,
+                    "kind": refusal.kind,
+                    "bound_task_id": refusal.bound_task_id,
+                    "bound_generation": refusal.bound_generation,
+                }
+            ),
+        )
+    except Exception:  # noqa: BLE001 - диагностика не имеет права ломать ответ
+        log.warning("chat-pair: could not audit a refused redeem (%s)", refusal.reason)
+
+
+async def audit_redeem_refusal_detached(
+    app: Any, caller: str, refusal: RedeemRefusal | None
+) -> None:
+    """Background half of the audit: runs after the 401 has been sent (#1694).
+
+    Writing inline would make the response time name the reason (a repeated
+    ``unknown`` skips the write, the rest wait for INSERT and commit). The
+    request's own connection is closed by the time this runs, so it takes one
+    of its own — the same way a detached provisioning does.
+    """
+    if refusal is None:
+        return
+    if refusal.reason == "unknown" and not unknown_refusal_audit_due(caller):
+        return
+    conn = None
+    dsn = getattr(app.state, "dsn", None)
+    try:
+        if dsn:
+            from hub import db as db_module
+
+            conn = await db_module.connect(dsn)
+        await audit_redeem_refusal(conn or app.state.db, caller, refusal, thinned=True)
+    except Exception:  # noqa: BLE001 - диагностика не имеет права ломать ответ
+        log.warning("chat-pair: could not audit a refused redeem (%s)", refusal.reason)
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
+def _row_refusal(row: dict[str, Any], reason: str) -> RedeemRefusal:
+    return RedeemRefusal(
+        reason,
+        kind=(row.get("kind") or "intake").strip().lower() or "intake",
+        bound_task_id=row.get("bound_task_id"),
+        bound_generation=row.get("bound_generation"),
+        principal_id=row.get("principal_id"),
+    )
+
+
+async def _task_row(db: aiosqlite.Connection, task_id: int) -> dict[str, Any] | None:
     rows = await fetchall(
         db,
-        "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, c.channel, c.slot, c.executor_run_id, "
-        "p.username, p.status "
-        "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
-        "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
-        "AND c.expires_at > datetime('now')",
-        (hash_pair_code(normalized),),
+        "SELECT status, submission_generation FROM tasks WHERE id = ?",
+        (int(task_id),),
     )
-    if not rows:
-        return None
-    row = dict(rows[0])
-    if row["status"] != "active":
-        return None
+    return dict(rows[0]) if rows else None
 
-    kind = (row.get("kind") or "intake").strip().lower() or "intake"
+
+async def _implementer_refusal(
+    db: aiosqlite.Connection, row: dict[str, Any]
+) -> tuple[dict[str, Any] | None, RedeemRefusal | None]:
+    """Implementer branch: the acting agent, or the reason it is refused."""
     bound_task_id = row.get("bound_task_id")
-    acting_id: int | None = None
-    acting_username = row["username"]
-    if kind == "implementer":
-        if bound_task_id is None:
-            return None
-        task_rows = await fetchall(
-            db,
-            "SELECT status, submission_generation FROM tasks WHERE id = ?",
-            (int(bound_task_id),),
-        )
-        if not task_rows or not _implementer_may_redeem(
-            dict(task_rows[0]), row.get("bound_generation")
-        ):
-            return None
-        if dict(task_rows[0]).get("status") == "open":
-            # #1433: код на open-задачу — вход в её захват, третий рядом с
-            # claim и pair_start; сверка та же и до траты кода. Отказ — не
-            # None: он возможен только с действительным кодом и называет
-            # соседа, а не угадывание кода.
-            from hub.services.lifecycle import capture_areas
+    if bound_task_id is None:
+        return None, _row_refusal(row, "implementer_unbound")
+    task = await _task_row(db, int(bound_task_id))
+    if task is None or not _implementer_may_redeem(task, row.get("bound_generation")):
+        return None, _row_refusal(row, "implementer_refused")
+    if task.get("status") == "open":
+        # #1433: код на open-задачу — вход в её захват, третий рядом с
+        # claim и pair_start; сверка та же и до траты кода. Отказ — не
+        # None: он возможен только с действительным кодом и называет
+        # соседа, а не угадывание кода.
+        from hub.services.lifecycle import capture_areas
 
-            async with capture_areas(db, int(bound_task_id), "open"):
-                pass
-        acting = await get_acting_agent(db)
-        if acting is None:
-            return None
-        acting_id = int(acting["id"])
-        acting_username = str(acting["username"])
-    elif kind == "reviewer":
-        # #1084: minted by the dispatch, not by a person, and spent by the
-        # cloud run it was minted for. It acts AS its issuer — the reviewer
-        # principal the dispatch resolved from CURSOR_REVIEWER_HUB_TOKEN — so
-        # the report lands under the identity the dispatch already pinned
-        # (#1025) and needs no second rule to be recognised as its own.
-        #
-        # The task must be IN REVIEW: a code outliving its submission would
-        # let a run file a report against work that has moved on.
-        if bound_task_id is None:
-            return None
-        task_rows = await fetchall(
-            db,
-            "SELECT status, submission_generation FROM tasks WHERE id = ?",
-            (int(bound_task_id),),
-        )
-        if not task_rows or dict(task_rows[0]).get("status") != "review":
-            return None
-        # The submission, not just the status. A resubmission during a live
-        # run keeps the task in review, so status alone would let a code
-        # minted for generation N be spent against N+1 — a report about the
-        # old diff, recorded as a report about the new one.
-        pinned = row.get("bound_generation")
-        if pinned is not None:
-            current = dict(task_rows[0]).get("submission_generation") or 0
-            if int(pinned) != int(current):
-                return None
+        async with capture_areas(db, int(bound_task_id), "open"):
+            pass
+    acting = await get_acting_agent(db)
+    if acting is None:
+        return None, _row_refusal(row, "no_acting_agent")
+    return acting, None
 
+
+async def _reviewer_refusal(
+    db: aiosqlite.Connection, row: dict[str, Any]
+) -> RedeemRefusal | None:
+    """Reviewer branch (#1084): the reason the code cannot be spent, or None.
+
+    Minted by the dispatch, not by a person, and spent by the cloud run it was
+    minted for. The task must be IN REVIEW: a code outliving its submission
+    would let a run file a report against work that has moved on. And the
+    SUBMISSION, not just the status: a resubmission during a live run keeps the
+    task in review, so status alone would let a code minted for generation N be
+    spent against N+1 — a report about the old diff, recorded as one about the
+    new.
+    """
+    bound_task_id = row.get("bound_task_id")
+    if bound_task_id is None:
+        return _row_refusal(row, "reviewer_unbound")
+    task = await _task_row(db, int(bound_task_id))
+    if task is None or task.get("status") != "review":
+        return _row_refusal(row, "task_not_in_review")
+    pinned = row.get("bound_generation")
+    if pinned is not None and int(pinned) != int(
+        task.get("submission_generation") or 0
+    ):
+        return _row_refusal(row, "generation_mismatch")
+    return None
+
+
+async def _spend_code(
+    db: aiosqlite.Connection,
+    row: dict[str, Any],
+    *,
+    kind: str,
+    acting_id: int | None,
+    acting_username: str,
+) -> dict[str, Any] | None:
+    """Mark the code spent and mint the session; None if someone spent it first."""
+    bound_task_id = row.get("bound_task_id")
     cursor = await db.execute(
         "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "
         "WHERE id = ? AND redeemed_at IS NULL",
@@ -405,6 +535,144 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
         "bound_task_id": int(bound_task_id) if bound_task_id is not None else None,
         "expires_at": _as_iso(dict(stored[0])["expires_at"] if stored else None),
     }
+
+
+async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any] | None:
+    """Exchange a code for a session. ``None`` for every way that can fail.
+
+    The caller that needs to know WHY uses :func:`redeem_code_explained`.
+    """
+    session, _refusal = await redeem_code_explained(db, raw_code)
+    return session
+
+
+async def redeem_code_explained(
+    db: aiosqlite.Connection, raw_code: str
+) -> tuple[dict[str, Any] | None, RedeemRefusal | None]:
+    """Exchange a code for a session, naming the reason when it fails (#1694).
+
+    The reason goes to the closed admin audit and nowhere else: unknown, spent
+    and expired stay ONE answer to the client on purpose, because three
+    distinguishable refusals would tell a caller enumerating codes which
+    guesses were close. Priority when several apply: spent, expired, then the
+    rest.
+
+    The one exception is the capture check of #1433: a VALID implementer code
+    on an open task whose areas overlap started work under
+    ``claim_area_check=require`` raises the structured 409 naming the
+    neighbour, and the code stays unspent.
+    """
+    normalized = normalize_pair_code(raw_code)
+    if len(normalized) != CODE_LENGTH:
+        return None, RedeemRefusal("unknown")
+
+    rows = await fetchall(
+        db,
+        "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
+        "c.bound_generation, c.channel, c.slot, c.executor_run_id, "
+        "c.redeemed_at IS NOT NULL AS spent, "
+        "c.expires_at <= datetime('now') AS expired, "
+        "p.username, p.status "
+        "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
+        "WHERE c.code_hash = ?",
+        (hash_pair_code(normalized),),
+    )
+    if not rows:
+        return None, RedeemRefusal("unknown")
+    row = dict(rows[0])
+    if row["spent"]:
+        return None, _row_refusal(row, "spent")
+    if row["expired"]:
+        return None, _row_refusal(row, "expired")
+    if row["status"] != "active":
+        return None, _row_refusal(row, "principal_inactive")
+
+    kind = (row.get("kind") or "intake").strip().lower() or "intake"
+    acting_id: int | None = None
+    acting_username = row["username"]
+    if kind == "implementer":
+        acting, refusal = await _implementer_refusal(db, row)
+        if refusal is not None or acting is None:
+            return None, refusal
+        acting_id = int(acting["id"])
+        acting_username = str(acting["username"])
+    elif kind == "reviewer":
+        refusal = await _reviewer_refusal(db, row)
+        if refusal is not None:
+            return None, refusal
+
+    session = await _spend_code(
+        db, row, kind=kind, acting_id=acting_id, acting_username=acting_username
+    )
+    if session is None:
+        return None, _row_refusal(row, "spent")
+    return session, None
+
+
+async def redeem_for_request(request: Any, raw_code: str) -> Any:
+    """The body of ``POST /api/auth/chat-pair/redeem`` (moved out of app.py).
+
+    The only unauthenticated write in the hub, and every guard here exists
+    because of that: a limiter of its own (not the login one — a shared bucket
+    would lock the operator out of /login), one indistinguishable refusal for
+    unknown/spent/expired, and a code that is gone the moment it is spent.
+
+    A refusal is the same 401 whatever the reason; the reason goes to the
+    closed audit AFTER the answer is sent (#1694), because inline the response
+    time would name it.
+    """
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    from starlette.background import BackgroundTask
+
+    from hub.actionable_errors import (
+        chat_pair_invalid_detail,
+        chat_pair_rate_limited_detail,
+    )
+    from hub.auth import client_ip
+    from hub.hub_instance import hub_base_url
+    from hub.models import ChatPairRedeemed
+    from hub.services import admin as admin_svc
+
+    caller = client_ip(request)
+    if redeem_limit_reached(caller):
+        raise HTTPException(429, detail=chat_pair_rate_limited_detail())
+
+    db = getattr(request.state, "db", None) or request.app.state.db
+    session, refusal = await redeem_code_explained(db, raw_code)
+    if session is None:
+        record_redeem_attempt(caller)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": chat_pair_invalid_detail()},
+            background=BackgroundTask(
+                audit_redeem_refusal_detached, request.app, caller, refusal
+            ),
+        )
+
+    await admin_svc.write_audit(
+        db,
+        actor_id=session["principal_id"],
+        action="chat_pair_redeem",
+        target_type="chat_pair",
+        target_id=str(session["principal_id"]),
+        summary="pairing code redeemed for a chat session",
+    )
+    implementer = session.get("kind") == "implementer"
+    return ChatPairRedeemed(
+        token=session["token"],
+        expires_at=session["expires_at"],
+        username=session["username"],
+        role="agent" if implementer else "human",
+        base_url=hub_base_url(),
+        permissions=sorted(
+            config.CHAT_PAIR_IMPLEMENTER_PERMS
+            if implementer
+            else config.CHAT_PAIR_PERMS
+        ),
+        kind=session.get("kind") or "intake",
+        bound_task_id=session.get("bound_task_id"),
+    )
 
 
 async def ordered_skill_of_session(
@@ -681,16 +949,23 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     """Drop what can no longer be used: the reaper's half of the channel.
 
     Spent codes linger for a retention window so "was this code used?" has an
-    answer for a while; everything expired or revoked goes immediately.
+    answer for a while; everything expired or revoked goes immediately — except reviewer codes,
+    which are kept the same window for diagnosis (#1694).
     Dead implementer sessions unstick their bound pair task first (#983),
     otherwise purge would delete the only row that still named the task.
     """
     await release_expired_implementer_tasks(db)
     hours = int(config.CHAT_PAIR_SPENT_RETENTION_HOURS)
+    # Reviewer rows stay a window past their end (#1694): a refused redeem is
+    # explained by looking the row up, and a row dropped the minute it expired
+    # turns "expired" into "unknown". Spent reviewer rows count from redeemed_at.
     codes = await db.execute(
-        "DELETE FROM chat_pair_codes WHERE expires_at < datetime('now') "
-        "OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))",
-        (f"-{hours} hours",),
+        "DELETE FROM chat_pair_codes WHERE "
+        "(kind = 'reviewer' AND ((redeemed_at IS NULL AND expires_at < datetime('now', ?)) "
+        "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?)))) "
+        "OR (kind <> 'reviewer' AND (expires_at < datetime('now') "
+        "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))))",
+        (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
     )
     sessions = await db.execute(
         "DELETE FROM chat_pair_sessions WHERE expires_at < datetime('now') "

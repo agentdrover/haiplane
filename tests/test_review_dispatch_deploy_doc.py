@@ -1226,7 +1226,9 @@ async def test_a_purged_access_code_is_replaced_before_the_run_starts(
             # дожил бы на проде.
             await queued.wait()
             await db.execute(
-                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 hour')"
+                # Строки ревьюера хранятся сутки после срока (#1694): чтобы
+                # сборщик их удалил, состариваем за границу хранения.
+                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-25 hours')"
             )
             await db.commit()
             purged.append(await chat_pair.purge_expired(db))

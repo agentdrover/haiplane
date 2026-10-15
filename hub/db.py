@@ -9,6 +9,7 @@ from typing import Any
 import aiosqlite
 
 from hub import skill_publish
+from hub.skill_files import load_skill_files
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
@@ -4188,7 +4189,7 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
     swallowed ``IntegrityError`` leaves the transaction aborted and the next
     seed in the loop dies on a healthy statement (#1028).
     """
-    seeds = (
+    seeds: tuple[tuple[str, str, str, str], ...] = (
         (
             "multi-agent-review",
             "prompt",
@@ -4208,6 +4209,7 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             '["executor", "workflow", "discipline"]',
         ),
     )
+    seeds += tuple((f.name, f.kind, f.content, f.tags) for f in load_skill_files())
     for name, kind, content, tags in seeds:
         rows = await fetchall(
             db,
@@ -4227,9 +4229,15 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         if active is not None and not _is_seed_word(active):
             # Case 2. Someone published this; our text waits beside it.
             if not any(str(r["content"]) == content for r in rows):
-                await _insert_seed_skill(
+                if await _insert_seed_skill(
                     db, name, kind, content, tags, next_version, "draft"
-                )
+                ):
+                    log.warning(
+                        "skill %s: the active version was published by a person; "
+                        "the shipped text is filed as draft v%d, not activated",
+                        name,
+                        next_version,
+                    )
             continue
         # Case 3. The shipped text has to become the one agents read.
         shipped = next((r for r in rows if str(r["content"]) == content), None)
