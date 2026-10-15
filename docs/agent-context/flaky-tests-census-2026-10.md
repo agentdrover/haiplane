@@ -14,6 +14,8 @@ uv run python scripts/flaky_census.py <те же аргументы> --summary  
 uv run python scripts/flaky_census.py <те же аргументы> --markdown   # таблица приложения
 ```
 
+Хеши git (`head_sha`, `tested_sha`, `tested_tree`, короткие коммиты в `evidence`, деревья в `.manual.json`) записаны как `git:<hex>`: `detect-secrets` в шаге Secret scan читает кавычки с одним hex как High Entropy String (152 ложных находки на сырых SHA), а менять `scripts/secret_scan.py` ради данных нельзя — это `ci_script` под правилом ci_integrity. Скрипт добавляет префикс при записи и снимает при чтении `--manual`; для сырого значения достаточно отрезать `git:`.
+
 Нужны `gh` с правом чтения и локальный клон с `origin/develop` (`git fetch origin`). Только `gh api` GET и git; секреты не читаются. Ответы API кэшируются в `--cache-dir` (по умолчанию `.flaky-cache`, в коммит не входит). Повторный запуск при тех же границах и том же `--history-ref` даёт байт-в-байт тот же JSON: проверено `cmp` между файлом в репозитории и холодным прогоном с пустым кэшем (279 вызовов gh, около 7 минут). Окно должно кончаться закрытым днём: при `--until` равном сегодняшнему дню новые прогоны меняют счётчики. Базу релизных PR скрипт выводит из ветки головы (develop → main, main → develop), потому что GitHub со временем очищает `pull_requests` у старых прогонов.
 
 ## Охват

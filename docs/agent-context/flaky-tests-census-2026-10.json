@@ -119,7 +119,7 @@
         "why": "изменён набор переходов жизненного цикла"
       },
       "commits": [
-        "cf2ae9b6"
+        "git:cf2ae9b6"
       ],
       "failed_in_attempt": 1,
       "fixed_by": null,
@@ -133,7 +133,7 @@
           "nodeid": "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged",
           "passed": 0,
           "runs": 3,
-          "tree": "bd0294701c9378422c3914c95f296eded01e9051"
+          "tree": "git:bd0294701c9378422c3914c95f296eded01e9051"
         }
       ],
       "message": "AssertionError: assert [('draft', 'o...'agent'), ...] == [('draft', 'o...'agent'), ...]",
@@ -141,14 +141,14 @@
       "summary_line": "1 failed, 2410 passed, 3 warnings in 226.77s (0:03:46)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "1019c7dc198672ba61082b1e182ad64810eb178d",
+    "head_sha": "git:1019c7dc198672ba61082b1e182ad64810eb178d",
     "nodeid": "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 33156749350,
     "status": "fixed",
-    "tested_sha": "1019c7dc198672ba61082b1e182ad64810eb178d",
-    "tested_tree": "bd0294701c9378422c3914c95f296eded01e9051"
+    "tested_sha": "git:1019c7dc198672ba61082b1e182ad64810eb178d",
+    "tested_tree": "git:bd0294701c9378422c3914c95f296eded01e9051"
   },
   {
     "branch": "develop",
@@ -160,7 +160,7 @@
         "why": "изменён набор переходов жизненного цикла"
       },
       "commits": [
-        "cf2ae9b6"
+        "git:cf2ae9b6"
       ],
       "failed_in_attempt": 1,
       "fixed_by": null,
@@ -174,7 +174,7 @@
           "nodeid": "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged",
           "passed": 0,
           "runs": 3,
-          "tree": "bd0294701c9378422c3914c95f296eded01e9051"
+          "tree": "git:bd0294701c9378422c3914c95f296eded01e9051"
         }
       ],
       "message": "AssertionError: assert [('draft', 'o...'agent'), ...] == [('draft', 'o...'agent'), ...]",
@@ -182,14 +182,14 @@
       "summary_line": "1 failed, 2410 passed, 3 warnings in 183.06s (0:03:03)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "1019c7dc198672ba61082b1e182ad64810eb178d",
+    "head_sha": "git:1019c7dc198672ba61082b1e182ad64810eb178d",
     "nodeid": "tests/test_workflow_reference.py::test_lifecycle_transitions_unchanged",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 33156752766,
     "status": "fixed",
-    "tested_sha": "6cdb53f4daccf47a57e684ad3133a13b69a7285a",
-    "tested_tree": "bd0294701c9378422c3914c95f296eded01e9051"
+    "tested_sha": "git:6cdb53f4daccf47a57e684ad3133a13b69a7285a",
+    "tested_tree": "git:bd0294701c9378422c3914c95f296eded01e9051"
   },
   {
     "branch": "task-1007/finding-uid-locator",
@@ -206,8 +206,8 @@
         "why": "TypeError: у функции появился обязательный аргумент"
       },
       "commits": [
-        "628489c9",
-        "f4a2f48a"
+        "git:628489c9",
+        "git:f4a2f48a"
       ],
       "failed_in_attempt": 2,
       "fixed_by": null,
@@ -221,14 +221,14 @@
           "nodeid": "tests/test_lifecycle.py::test_disposed_findings_produce_no_note",
           "passed": 0,
           "runs": 3,
-          "tree": "b740202d652c0bc48728178ff0b403acc3197bc5"
+          "tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
         }
       ],
       "message": "TypeError: upsert_finding_disposition() missing 1 required keyword-only argument: 'finding_uid'",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "f4a2f48a2d",
+          "commit": "git:f4a2f48a2d",
           "date": "2026-08-28T12:21:27Z",
           "premerge_ci": {
             "by_event": {
@@ -243,13 +243,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "167162c42b",
+            "commit": "git:167162c42b",
             "date": "2026-08-28T13:37:02Z",
             "task": 1007
           }
         ],
         "last_changed": {
-          "commit": "167162c42b",
+          "commit": "git:167162c42b",
           "date": "2026-08-28T13:37:02Z",
           "premerge_ci": {
             "by_event": {
@@ -266,14 +266,14 @@
       "summary_line": "2 failed, 2478 passed, 3 warnings in 213.64s (0:03:33)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "9c0a741888c4ff9b4a50004e91a031415a11a409",
+    "head_sha": "git:9c0a741888c4ff9b4a50004e91a031415a11a409",
     "nodeid": "tests/test_lifecycle.py::test_disposed_findings_produce_no_note",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 33171935998,
     "status": "fixed",
-    "tested_sha": "5fbe6274e6114ccec832477f67e9cf5105662f2d",
-    "tested_tree": "b740202d652c0bc48728178ff0b403acc3197bc5"
+    "tested_sha": "git:5fbe6274e6114ccec832477f67e9cf5105662f2d",
+    "tested_tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
   },
   {
     "branch": "task-1007/finding-uid-locator",
@@ -290,8 +290,8 @@
         "why": "то же: у функции появился обязательный аргумент"
       },
       "commits": [
-        "628489c9",
-        "f4a2f48a"
+        "git:628489c9",
+        "git:f4a2f48a"
       ],
       "failed_in_attempt": 2,
       "fixed_by": null,
@@ -305,14 +305,14 @@
           "nodeid": "tests/test_lifecycle.py::test_second_report_names_the_dispatched_reviewer",
           "passed": 0,
           "runs": 3,
-          "tree": "b740202d652c0bc48728178ff0b403acc3197bc5"
+          "tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
         }
       ],
       "message": "AssertionError: {\"detail\":\"confirmed findings #0 do not say where they sit: set 'locator' to 'lines' (with file and start_line), 'file' (module known, line not) or 'none' (no place could be identified",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "f4a2f48a2d",
+          "commit": "git:f4a2f48a2d",
           "date": "2026-08-28T12:21:27Z",
           "premerge_ci": {
             "by_event": {
@@ -327,18 +327,18 @@
         },
         "changed_after_failure": [
           {
-            "commit": "167162c42b",
+            "commit": "git:167162c42b",
             "date": "2026-08-28T13:37:02Z",
             "task": 1007
           },
           {
-            "commit": "c48028c77b",
+            "commit": "git:c48028c77b",
             "date": "2026-08-29T12:18:27Z",
             "task": 185
           }
         ],
         "last_changed": {
-          "commit": "c48028c77b",
+          "commit": "git:c48028c77b",
           "date": "2026-08-29T12:18:27Z",
           "premerge_ci": {
             "by_event": {},
@@ -353,14 +353,14 @@
       "summary_line": "2 failed, 2478 passed, 3 warnings in 213.64s (0:03:33)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "9c0a741888c4ff9b4a50004e91a031415a11a409",
+    "head_sha": "git:9c0a741888c4ff9b4a50004e91a031415a11a409",
     "nodeid": "tests/test_lifecycle.py::test_second_report_names_the_dispatched_reviewer",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 33171935998,
     "status": "fixed",
-    "tested_sha": "5fbe6274e6114ccec832477f67e9cf5105662f2d",
-    "tested_tree": "b740202d652c0bc48728178ff0b403acc3197bc5"
+    "tested_sha": "git:5fbe6274e6114ccec832477f67e9cf5105662f2d",
+    "tested_tree": "git:b740202d652c0bc48728178ff0b403acc3197bc5"
   },
   {
     "branch": "task-1180/local-reviewer",
@@ -388,14 +388,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "b8f9f259ec9b3f0690209210acdfce0fd964bc10"
+          "tree": "git:b8f9f259ec9b3f0690209210acdfce0fd964bc10"
         }
       ],
       "message": "AssertionError: deploy/LOCAL-REVIEW.md: 3 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -403,7 +403,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -413,14 +413,14 @@
       "summary_line": "1 failed, 3289 passed, 1 skipped, 3 warnings in 109.27s (0:01:49)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "961881d33b6e764f3c368ba41050b5ee9481f0dd",
+    "head_sha": "git:961881d33b6e764f3c368ba41050b5ee9481f0dd",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 34022980998,
     "status": "unconfirmed",
-    "tested_sha": "bc76799eccead8e6fcab8548ecec10bbaeb62784",
-    "tested_tree": "b8f9f259ec9b3f0690209210acdfce0fd964bc10"
+    "tested_sha": "git:bc76799eccead8e6fcab8548ecec10bbaeb62784",
+    "tested_tree": "git:b8f9f259ec9b3f0690209210acdfce0fd964bc10"
   },
   {
     "branch": "task-1168/escalation-report-quality",
@@ -448,14 +448,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "8c9549b4c46803c025f3a53905c70e1c154d7d44"
+          "tree": "git:8c9549b4c46803c025f3a53905c70e1c154d7d44"
         }
       ],
       "message": "AssertionError: docs/spikes/1168-report-quality-escalations.md: 2 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -463,7 +463,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -473,14 +473,14 @@
       "summary_line": "1 failed, 3480 passed, 1 skipped, 3 warnings in 129.85s (0:02:09)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1f047cb7a91f138a026081c5894840f930de28b1",
+    "head_sha": "git:1f047cb7a91f138a026081c5894840f930de28b1",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 34350251898,
     "status": "unconfirmed",
-    "tested_sha": "4a8265a886c4e57925a39dd57787e7f0715540a3",
-    "tested_tree": "8c9549b4c46803c025f3a53905c70e1c154d7d44"
+    "tested_sha": "git:4a8265a886c4e57925a39dd57787e7f0715540a3",
+    "tested_tree": "git:8c9549b4c46803c025f3a53905c70e1c154d7d44"
   },
   {
     "branch": "task-1235/circle-detector",
@@ -508,7 +508,7 @@
           "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
           "passed": 40,
           "runs": 40,
-          "tree": "3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+          "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3f58abe628ac> pytest tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret -q -p repeatplug -p no:cacheprovider",
@@ -519,7 +519,7 @@
           "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
           "passed": 40,
           "runs": 40,
-          "tree": "3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+          "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
         },
         {
           "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 3f58abe628ac> pytest tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret -q -p repeatplug -p no:cacheprovider",
@@ -530,7 +530,7 @@
           "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
           "passed": 397,
           "runs": 400,
-          "tree": "3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+          "tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
         }
       ],
       "message": "AssertionError: длина ключа утекла в журнал",
@@ -548,7 +548,7 @@
       ],
       "source": {
         "added": {
-          "commit": "2be573fd2d",
+          "commit": "git:2be573fd2d",
           "date": "2026-09-10T03:40:56Z",
           "premerge_ci": {
             "by_event": {
@@ -563,18 +563,18 @@
         },
         "changed_after_failure": [
           {
-            "commit": "e6fd6a0250",
+            "commit": "git:e6fd6a0250",
             "date": "2026-09-10T14:53:53Z",
             "task": 1251
           },
           {
-            "commit": "d2104ca3cb",
+            "commit": "git:d2104ca3cb",
             "date": "2026-09-25T03:33:26Z",
             "task": 1362
           }
         ],
         "last_changed": {
-          "commit": "2be573fd2d",
+          "commit": "git:2be573fd2d",
           "date": "2026-09-10T03:40:56Z",
           "premerge_ci": {
             "by_event": {
@@ -591,14 +591,14 @@
       "summary_line": "1 failed, 3578 passed, 1 skipped, 3 warnings in 153.22s (0:02:33)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "2ac3bd8a79221f31e0c96a6e797b447090bcba5c",
+    "head_sha": "git:2ac3bd8a79221f31e0c96a6e797b447090bcba5c",
     "nodeid": "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 34451276933,
     "status": "confirmed",
-    "tested_sha": "dd9a7dba6d27c8704dd1ec90da4ca0903268647c",
-    "tested_tree": "3f58abe628acc7ee522905ee8cc84a2c838d87ea"
+    "tested_sha": "git:dd9a7dba6d27c8704dd1ec90da4ca0903268647c",
+    "tested_tree": "git:3f58abe628acc7ee522905ee8cc84a2c838d87ea"
   },
   {
     "branch": "task-1269/steward-first-judgement",
@@ -626,14 +626,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "4f3a04b666b653c130900925c9fa0ccd8763580f"
+          "tree": "git:4f3a04b666b653c130900925c9fa0ccd8763580f"
         }
       ],
       "message": "AssertionError: docs/specs/steward-first-judgement.md: 3 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -641,7 +641,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -651,14 +651,14 @@
       "summary_line": "1 failed, 3937 passed, 1 skipped, 3 warnings in 181.34s (0:03:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "bed4a3f31cb23f68459374453edf484ad2e079ec",
+    "head_sha": "git:bed4a3f31cb23f68459374453edf484ad2e079ec",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 35772345819,
     "status": "unconfirmed",
-    "tested_sha": "bed4a3f31cb23f68459374453edf484ad2e079ec",
-    "tested_tree": "4f3a04b666b653c130900925c9fa0ccd8763580f"
+    "tested_sha": "git:bed4a3f31cb23f68459374453edf484ad2e079ec",
+    "tested_tree": "git:4f3a04b666b653c130900925c9fa0ccd8763580f"
   },
   {
     "branch": "develop",
@@ -686,7 +686,7 @@
           "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
           "passed": 40,
           "runs": 40,
-          "tree": "fad97f120892a9505c2c5b3ecb053b7d1303808b"
+          "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree fad97f120892> pytest tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row -q -p repeatplug -p no:cacheprovider",
@@ -697,7 +697,7 @@
           "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
           "passed": 40,
           "runs": 40,
-          "tree": "fad97f120892a9505c2c5b3ecb053b7d1303808b"
+          "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
         },
         {
           "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree fad97f120892> pytest tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row -q -p repeatplug -p no:cacheprovider",
@@ -708,7 +708,7 @@
           "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
           "passed": 396,
           "runs": 400,
-          "tree": "fad97f120892a9505c2c5b3ecb053b7d1303808b"
+          "tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
         }
       ],
       "message": "AssertionError: при потолке меньше числа живых строк свип обязан начинать со САМОЙ СТАРОЙ (467 ч), а не с самой молодой: [1]",
@@ -721,7 +721,7 @@
       ],
       "source": {
         "added": {
-          "commit": "064e31e002",
+          "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
           "premerge_ci": {
             "by_event": {
@@ -736,7 +736,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "064e31e002",
+          "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
           "premerge_ci": {
             "by_event": {
@@ -753,14 +753,14 @@
       "summary_line": "1 failed, 3960 passed, 1 skipped, 3 xfailed, 3 warnings in 228.04s (0:03:48)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "f72bd23487559477068a50584c33b1fded18acd2",
+    "head_sha": "git:f72bd23487559477068a50584c33b1fded18acd2",
     "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 35780035532,
     "status": "confirmed",
-    "tested_sha": "fd5d49efa8d1fd8599136c43f12e2c831af57dad",
-    "tested_tree": "fad97f120892a9505c2c5b3ecb053b7d1303808b"
+    "tested_sha": "git:fd5d49efa8d1fd8599136c43f12e2c831af57dad",
+    "tested_tree": "git:fad97f120892a9505c2c5b3ecb053b7d1303808b"
   },
   {
     "branch": "develop",
@@ -788,7 +788,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
           "passed": 40,
           "runs": 40,
-          "tree": "12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
+          "tree": "git:12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 12c160bf30dd> pytest tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code -q -p repeatplug -p no:cacheprovider",
@@ -799,7 +799,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
           "passed": 39,
           "runs": 40,
-          "tree": "12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
+          "tree": "git:12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
         }
       ],
       "message": "AssertionError: код доступа был мёртв на старте прогона: [True, False]. Второй в очереди не выкупит основной канал отчёта и свалится в слабый путь через stdout — или потеряет отчёт вовсе",
@@ -812,7 +812,7 @@
       ],
       "source": {
         "added": {
-          "commit": "0468fb265f",
+          "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
           "premerge_ci": {
             "by_event": {
@@ -828,13 +828,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "0468fb265f",
+          "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
           "premerge_ci": {
             "by_event": {
@@ -852,14 +852,14 @@
       "summary_line": "1 failed, 3960 passed, 1 skipped, 3 xfailed, 3 warnings in 173.28s (0:02:53)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ac7bdc5765afa37e95f3096f0c9ace291b043552",
+    "head_sha": "git:ac7bdc5765afa37e95f3096f0c9ace291b043552",
     "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 35785728735,
     "status": "confirmed",
-    "tested_sha": "ac7bdc5765afa37e95f3096f0c9ace291b043552",
-    "tested_tree": "12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
+    "tested_sha": "git:ac7bdc5765afa37e95f3096f0c9ace291b043552",
+    "tested_tree": "git:12c160bf30dd0c02863a27e7e5d0aed99ff5f187"
   },
   {
     "branch": "task-1275/stack-walk-undecided-statuses",
@@ -888,7 +888,7 @@
       ],
       "source": {
         "added": {
-          "commit": "0468fb265f",
+          "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
           "premerge_ci": {
             "by_event": {
@@ -904,13 +904,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "0468fb265f",
+          "commit": "git:0468fb265f",
           "date": "2026-09-22T17:37:26Z",
           "premerge_ci": {
             "by_event": {
@@ -928,14 +928,14 @@
       "summary_line": "1 failed, 3995 passed, 1 skipped, 2 xfailed, 3 warnings in 231.95s (0:03:51)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "fb2c93d9a1667274fca6ad3efc74d85fc80e9898",
+    "head_sha": "git:fb2c93d9a1667274fca6ad3efc74d85fc80e9898",
     "nodeid": "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 35806396435,
     "status": "confirmed",
-    "tested_sha": "fb2c93d9a1667274fca6ad3efc74d85fc80e9898",
-    "tested_tree": "a106556a5bb2add6a641ca0cdd4a6ab02c27932e"
+    "tested_sha": "git:fb2c93d9a1667274fca6ad3efc74d85fc80e9898",
+    "tested_tree": "git:a106556a5bb2add6a641ca0cdd4a6ab02c27932e"
   },
   {
     "branch": "task-1363/mcp-session-restart",
@@ -963,14 +963,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "e1dfa9c2105983b53df7f10499ba8fba142452ea"
+          "tree": "git:e1dfa9c2105983b53df7f10499ba8fba142452ea"
         }
       ],
       "message": "AssertionError: docs/specs/mcp-session-restart.md: 4 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -978,7 +978,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -988,14 +988,14 @@
       "summary_line": "1 failed, 4226 passed, 1 skipped, 3 warnings in 204.82s (0:03:24)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "60df0e74b34b15318c0aa00cc890b61d8b0d444e",
+    "head_sha": "git:60df0e74b34b15318c0aa00cc890b61d8b0d444e",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 35966739991,
     "status": "unconfirmed",
-    "tested_sha": "60df0e74b34b15318c0aa00cc890b61d8b0d444e",
-    "tested_tree": "e1dfa9c2105983b53df7f10499ba8fba142452ea"
+    "tested_sha": "git:60df0e74b34b15318c0aa00cc890b61d8b0d444e",
+    "tested_tree": "git:e1dfa9c2105983b53df7f10499ba8fba142452ea"
   },
   {
     "branch": "task-1274/orchestrator-queue-shadow",
@@ -1029,7 +1029,7 @@
       ],
       "source": {
         "added": {
-          "commit": "064e31e002",
+          "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
           "premerge_ci": {
             "by_event": {
@@ -1044,7 +1044,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "064e31e002",
+          "commit": "git:064e31e002",
           "date": "2026-09-17T09:53:05Z",
           "premerge_ci": {
             "by_event": {
@@ -1061,14 +1061,14 @@
       "summary_line": "1 failed, 4272 passed, 1 skipped, 3 warnings in 196.23s (0:03:16)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ba86b5d34d22ef54bdcc49eb0a2411d5f5c66eda",
+    "head_sha": "git:ba86b5d34d22ef54bdcc49eb0a2411d5f5c66eda",
     "nodeid": "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36056014437,
     "status": "confirmed",
-    "tested_sha": "96abdc18b36e1dd6b271e3d2313031d790ebb9f1",
-    "tested_tree": "7359ec4c2bdc53ea244fcdd7bda4a3e57f5a9e58"
+    "tested_sha": "git:96abdc18b36e1dd6b271e3d2313031d790ebb9f1",
+    "tested_tree": "git:7359ec4c2bdc53ea244fcdd7bda4a3e57f5a9e58"
   },
   {
     "branch": "task-1401/review-context-package",
@@ -1096,14 +1096,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "477d2573fbb73d4784b49982732be9512e149889"
+          "tree": "git:477d2573fbb73d4784b49982732be9512e149889"
         }
       ],
       "message": "AssertionError: docs/spikes/1401-review-context-package.md: 1 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -1111,7 +1111,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -1121,14 +1121,14 @@
       "summary_line": "1 failed, 4267 passed, 1 skipped, 3 warnings in 224.09s (0:03:44)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "203d2f36b8b475d5101e4b562cab82332348be6b",
+    "head_sha": "git:203d2f36b8b475d5101e4b562cab82332348be6b",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36114877269,
     "status": "unconfirmed",
-    "tested_sha": "203d2f36b8b475d5101e4b562cab82332348be6b",
-    "tested_tree": "477d2573fbb73d4784b49982732be9512e149889"
+    "tested_sha": "git:203d2f36b8b475d5101e4b562cab82332348be6b",
+    "tested_tree": "git:477d2573fbb73d4784b49982732be9512e149889"
   },
   {
     "branch": "develop",
@@ -1140,7 +1140,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1154,7 +1154,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1162,14 +1162,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 214.73s (0:03:34)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125011361,
     "status": "fixed",
-    "tested_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1181,7 +1181,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1195,7 +1195,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1203,14 +1203,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 214.73s (0:03:34)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125011361,
     "status": "fixed",
-    "tested_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1222,7 +1222,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1236,7 +1236,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1244,14 +1244,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 214.73s (0:03:34)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125011361,
     "status": "fixed",
-    "tested_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1263,7 +1263,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1277,7 +1277,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1285,14 +1285,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 216.20s (0:03:36)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125015796,
     "status": "fixed",
-    "tested_sha": "74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1304,7 +1304,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1318,7 +1318,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1326,14 +1326,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 216.20s (0:03:36)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125015796,
     "status": "fixed",
-    "tested_sha": "74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1345,7 +1345,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1359,7 +1359,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+          "tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
         }
       ],
       "message": "assert False",
@@ -1367,14 +1367,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 216.20s (0:03:36)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
+    "head_sha": "git:7d57cfa84e473be613c90a3fdf1500bfc0dff02e",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125015796,
     "status": "fixed",
-    "tested_sha": "74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
-    "tested_tree": "2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
+    "tested_sha": "git:74f15f8d80564bd10e2c39a07b8f7e7d26f3882c",
+    "tested_tree": "git:2e0451943501df28bbd9f1c7c8e1b8c71e26e8ed"
   },
   {
     "branch": "develop",
@@ -1391,7 +1391,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1405,14 +1405,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1428,13 +1428,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1452,14 +1452,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 253.15s (0:04:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125033313,
     "status": "fixed",
-    "tested_sha": "d162a40abc17904b9800015147efa287a05ea86a",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1476,7 +1476,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1490,14 +1490,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "91959bafe2",
+          "commit": "git:91959bafe2",
           "date": "2026-09-23T05:34:07Z",
           "premerge_ci": {
             "by_event": {},
@@ -1510,13 +1510,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1534,14 +1534,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 253.15s (0:04:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125033313,
     "status": "fixed",
-    "tested_sha": "d162a40abc17904b9800015147efa287a05ea86a",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1558,7 +1558,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1572,14 +1572,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1595,13 +1595,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1619,14 +1619,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 253.15s (0:04:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125033313,
     "status": "fixed",
-    "tested_sha": "d162a40abc17904b9800015147efa287a05ea86a",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1638,7 +1638,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1652,7 +1652,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
@@ -1660,14 +1660,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 198.72s (0:03:18)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125038431,
     "status": "fixed",
-    "tested_sha": "9418002b376753dc7fa32e5b60810a24835169bb",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:9418002b376753dc7fa32e5b60810a24835169bb",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1679,7 +1679,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1693,7 +1693,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
@@ -1701,14 +1701,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 198.72s (0:03:18)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125038431,
     "status": "fixed",
-    "tested_sha": "9418002b376753dc7fa32e5b60810a24835169bb",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:9418002b376753dc7fa32e5b60810a24835169bb",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1720,7 +1720,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1734,7 +1734,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+          "tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
         }
       ],
       "message": "assert False",
@@ -1742,14 +1742,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 198.72s (0:03:18)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "d162a40abc17904b9800015147efa287a05ea86a",
+    "head_sha": "git:d162a40abc17904b9800015147efa287a05ea86a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125038431,
     "status": "fixed",
-    "tested_sha": "9418002b376753dc7fa32e5b60810a24835169bb",
-    "tested_tree": "9f253d536447c0bdb508c46c395fbef9dc9acd6f"
+    "tested_sha": "git:9418002b376753dc7fa32e5b60810a24835169bb",
+    "tested_tree": "git:9f253d536447c0bdb508c46c395fbef9dc9acd6f"
   },
   {
     "branch": "develop",
@@ -1766,7 +1766,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1780,14 +1780,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1803,13 +1803,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1827,14 +1827,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 133.53s (0:02:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125058990,
     "status": "fixed",
-    "tested_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "develop",
@@ -1851,7 +1851,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1865,14 +1865,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "91959bafe2",
+          "commit": "git:91959bafe2",
           "date": "2026-09-23T05:34:07Z",
           "premerge_ci": {
             "by_event": {},
@@ -1885,13 +1885,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1909,14 +1909,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 133.53s (0:02:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125058990,
     "status": "fixed",
-    "tested_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "develop",
@@ -1933,7 +1933,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -1947,14 +1947,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1970,13 +1970,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -1994,14 +1994,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 133.53s (0:02:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125058990,
     "status": "fixed",
-    "tested_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "develop",
@@ -2013,7 +2013,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2027,7 +2027,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
@@ -2035,14 +2035,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 215.52s (0:03:35)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125065600,
     "status": "fixed",
-    "tested_sha": "d6bd89cf15e201722e763e15f496d537809f25be",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:d6bd89cf15e201722e763e15f496d537809f25be",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "develop",
@@ -2054,7 +2054,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2068,7 +2068,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
@@ -2076,14 +2076,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 215.52s (0:03:35)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125065600,
     "status": "fixed",
-    "tested_sha": "d6bd89cf15e201722e763e15f496d537809f25be",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:d6bd89cf15e201722e763e15f496d537809f25be",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "develop",
@@ -2095,7 +2095,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2109,7 +2109,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+          "tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
         }
       ],
       "message": "assert False",
@@ -2117,14 +2117,14 @@
       "summary_line": "3 failed, 4322 passed, 1 skipped, 3 warnings in 215.52s (0:03:35)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "1e1f2910f0644ee6236734e86bfd601beaf6990d",
+    "head_sha": "git:1e1f2910f0644ee6236734e86bfd601beaf6990d",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36125065600,
     "status": "fixed",
-    "tested_sha": "d6bd89cf15e201722e763e15f496d537809f25be",
-    "tested_tree": "2500e97471566ceecd37421451f9e32fa06a158b"
+    "tested_sha": "git:d6bd89cf15e201722e763e15f496d537809f25be",
+    "tested_tree": "git:2500e97471566ceecd37421451f9e32fa06a158b"
   },
   {
     "branch": "task-1410/executor-run-row",
@@ -2141,7 +2141,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2155,14 +2155,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+          "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2178,13 +2178,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2202,14 +2202,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 214.58s (0:03:34)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "head_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126237189,
     "status": "fixed",
-    "tested_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
-    "tested_tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+    "tested_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "tested_tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
   },
   {
     "branch": "task-1410/executor-run-row",
@@ -2226,7 +2226,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2240,14 +2240,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+          "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "91959bafe2",
+          "commit": "git:91959bafe2",
           "date": "2026-09-23T05:34:07Z",
           "premerge_ci": {
             "by_event": {},
@@ -2260,13 +2260,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2284,14 +2284,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 214.58s (0:03:34)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "head_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126237189,
     "status": "fixed",
-    "tested_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
-    "tested_tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+    "tested_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "tested_tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
   },
   {
     "branch": "task-1410/executor-run-row",
@@ -2308,7 +2308,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2322,14 +2322,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+          "tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2345,13 +2345,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2369,14 +2369,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 214.58s (0:03:34)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "head_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126237189,
     "status": "fixed",
-    "tested_sha": "ae7279bf4a3033c9397a0cbbb558c560554e174a",
-    "tested_tree": "01066a7a99b5db53692cee90145fb56778b91c4a"
+    "tested_sha": "git:ae7279bf4a3033c9397a0cbbb558c560554e174a",
+    "tested_tree": "git:01066a7a99b5db53692cee90145fb56778b91c4a"
   },
   {
     "branch": "task-1407/gate-merge-wait-and-unread",
@@ -2393,7 +2393,7 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2407,14 +2407,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+          "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2430,13 +2430,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2454,14 +2454,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 218.90s (0:03:38)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
+    "head_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126937499,
     "status": "fixed",
-    "tested_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
-    "tested_tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+    "tested_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
+    "tested_tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
   },
   {
     "branch": "task-1407/gate-merge-wait-and-unread",
@@ -2478,7 +2478,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2492,14 +2492,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+          "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "91959bafe2",
+          "commit": "git:91959bafe2",
           "date": "2026-09-23T05:34:07Z",
           "premerge_ci": {
             "by_event": {},
@@ -2512,13 +2512,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2536,14 +2536,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 218.90s (0:03:38)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
+    "head_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126937499,
     "status": "fixed",
-    "tested_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
-    "tested_tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+    "tested_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
+    "tested_tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
   },
   {
     "branch": "task-1407/gate-merge-wait-and-unread",
@@ -2560,7 +2560,7 @@
         "why": "то же"
       },
       "commits": [
-        "4a1152c0"
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2574,14 +2574,14 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+          "tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
         }
       ],
       "message": "assert False",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2597,13 +2597,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           }
         ],
         "last_changed": {
-          "commit": "7d57cfa84e",
+          "commit": "git:7d57cfa84e",
           "date": "2026-09-25T10:37:44Z",
           "premerge_ci": {
             "by_event": {
@@ -2621,14 +2621,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 218.90s (0:03:38)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
+    "head_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36126937499,
     "status": "fixed",
-    "tested_sha": "b1a1efe34959536479cf60f8bc086d7753c36601",
-    "tested_tree": "60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
+    "tested_sha": "git:b1a1efe34959536479cf60f8bc086d7753c36601",
+    "tested_tree": "git:60ac76bb84256a9e07ca1c238c21da9af4a4cc6c"
   },
   {
     "branch": "task-1414/deep-daily-cap",
@@ -2640,9 +2640,9 @@
         "why": "поломка develop 25.09: 8 прогонов подряд на 6 деревьях, локально красные на каждом"
       },
       "commits": [
-        "c8df4bba",
-        "57e0e378",
-        "4a1152c0"
+        "git:c8df4bba",
+        "git:57e0e378",
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2656,7 +2656,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
           "passed": 0,
           "runs": 1,
-          "tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+          "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
         }
       ],
       "message": "assert False",
@@ -2664,14 +2664,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 200.04s (0:03:20)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "549e45c27de3b3122fc621ab419477af7e980994",
+    "head_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
     "nodeid": "tests/test_review_dispatch.py::test_an_uncounted_report_is_not_a_delta_base[self_reviewed]",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36133349256,
     "status": "fixed",
-    "tested_sha": "549e45c27de3b3122fc621ab419477af7e980994",
-    "tested_tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+    "tested_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
+    "tested_tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
   },
   {
     "branch": "task-1414/deep-daily-cap",
@@ -2683,9 +2683,9 @@
         "why": "то же"
       },
       "commits": [
-        "c8df4bba",
-        "57e0e378",
-        "4a1152c0"
+        "git:c8df4bba",
+        "git:57e0e378",
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2699,7 +2699,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
           "passed": 0,
           "runs": 3,
-          "tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+          "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
         }
       ],
       "message": "assert False",
@@ -2707,14 +2707,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 200.04s (0:03:20)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "549e45c27de3b3122fc621ab419477af7e980994",
+    "head_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_is_previous_generation_when_its_review_is_recorded",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36133349256,
     "status": "fixed",
-    "tested_sha": "549e45c27de3b3122fc621ab419477af7e980994",
-    "tested_tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+    "tested_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
+    "tested_tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
   },
   {
     "branch": "task-1414/deep-daily-cap",
@@ -2726,9 +2726,9 @@
         "why": "то же"
       },
       "commits": [
-        "c8df4bba",
-        "57e0e378",
-        "4a1152c0"
+        "git:c8df4bba",
+        "git:57e0e378",
+        "git:4a1152c0"
       ],
       "failed_in_attempt": 3,
       "fixed_by": null,
@@ -2742,7 +2742,7 @@
           "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
           "passed": 0,
           "runs": 3,
-          "tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+          "tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
         }
       ],
       "message": "assert False",
@@ -2750,14 +2750,14 @@
       "summary_line": "3 failed, 4326 passed, 1 skipped, 3 warnings in 200.04s (0:03:20)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "549e45c27de3b3122fc621ab419477af7e980994",
+    "head_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
     "nodeid": "tests/test_review_dispatch.py::test_delta_base_skips_generation_without_recorded_review",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36133349256,
     "status": "fixed",
-    "tested_sha": "549e45c27de3b3122fc621ab419477af7e980994",
-    "tested_tree": "3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
+    "tested_sha": "git:549e45c27de3b3122fc621ab419477af7e980994",
+    "tested_tree": "git:3dc4c6e41374d1bb15352f50e82ef3ffa5e25b10"
   },
   {
     "branch": "task-1405/review-on-green-ci",
@@ -2774,7 +2774,7 @@
         "why": "красный на дереве падения, поправлен автором"
       },
       "commits": [
-        "5e8ed381"
+        "git:5e8ed381"
       ],
       "failed_in_attempt": 1,
       "fixed_by": null,
@@ -2788,14 +2788,14 @@
           "nodeid": "tests/test_review_evidence.py::test_the_authors_claim_survives_the_dispatch_note",
           "passed": 0,
           "runs": 3,
-          "tree": "0b00dce0a5b09c7f4f3a0f5a7dd336941958a6b9"
+          "tree": "git:0b00dce0a5b09c7f4f3a0f5a7dd336941958a6b9"
         }
       ],
       "message": "assert 0 == 1",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "f39eae579a",
+          "commit": "git:f39eae579a",
           "date": "2026-09-24T19:53:16Z",
           "premerge_ci": {
             "by_event": {
@@ -2811,23 +2811,23 @@
         },
         "changed_after_failure": [
           {
-            "commit": "7adf719832",
+            "commit": "git:7adf719832",
             "date": "2026-09-26T09:54:46Z",
             "task": 1405
           },
           {
-            "commit": "4596fa9c5a",
+            "commit": "git:4596fa9c5a",
             "date": "2026-10-11T21:54:22Z",
             "task": 1670
           },
           {
-            "commit": "49a72f952f",
+            "commit": "git:49a72f952f",
             "date": "2026-10-13T14:49:30Z",
             "task": 1687
           }
         ],
         "last_changed": {
-          "commit": "f39eae579a",
+          "commit": "git:f39eae579a",
           "date": "2026-09-24T19:53:16Z",
           "premerge_ci": {
             "by_event": {
@@ -2845,14 +2845,14 @@
       "summary_line": "1 failed, 4396 passed, 1 skipped, 3 warnings in 223.21s (0:03:43)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "0a59096cf5999c2fd495716bff500a7371457bb1",
+    "head_sha": "git:0a59096cf5999c2fd495716bff500a7371457bb1",
     "nodeid": "tests/test_review_evidence.py::test_the_authors_claim_survives_the_dispatch_note",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36215317762,
     "status": "fixed",
-    "tested_sha": "0a59096cf5999c2fd495716bff500a7371457bb1",
-    "tested_tree": "0b00dce0a5b09c7f4f3a0f5a7dd336941958a6b9"
+    "tested_sha": "git:0a59096cf5999c2fd495716bff500a7371457bb1",
+    "tested_tree": "git:0b00dce0a5b09c7f4f3a0f5a7dd336941958a6b9"
   },
   {
     "branch": "task-913/red-test-gate",
@@ -2869,7 +2869,7 @@
         "why": "новый шаг CI без цели make"
       },
       "commits": [
-        "b7537036"
+        "git:b7537036"
       ],
       "failed_in_attempt": 5,
       "fixed_by": null,
@@ -2883,14 +2883,14 @@
           "nodeid": "tests/test_local_checks_match_ci.py::test_a_new_uncovered_step_breaks_the_build",
           "passed": 0,
           "runs": 3,
-          "tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+          "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
         }
       ],
       "message": "assert 2 == 1",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "07654213f2",
+          "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
           "premerge_ci": {
             "by_event": {
@@ -2905,7 +2905,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "14a112fcd0",
+          "commit": "git:14a112fcd0",
           "date": "2026-09-24T04:09:16Z",
           "premerge_ci": {
             "by_event": {
@@ -2922,14 +2922,14 @@
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
+    "head_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
     "nodeid": "tests/test_local_checks_match_ci.py::test_a_new_uncovered_step_breaks_the_build",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36479851980,
     "status": "fixed",
-    "tested_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
-    "tested_tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+    "tested_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
+    "tested_tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
   },
   {
     "branch": "task-913/red-test-gate",
@@ -2946,7 +2946,7 @@
         "why": "то же"
       },
       "commits": [
-        "b7537036"
+        "git:b7537036"
       ],
       "failed_in_attempt": 5,
       "fixed_by": null,
@@ -2960,14 +2960,14 @@
           "nodeid": "tests/test_local_checks_match_ci.py::test_every_ci_static_check_has_a_make_target",
           "passed": 0,
           "runs": 3,
-          "tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+          "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
         }
       ],
       "message": "assert [\"шаг 'Red-te...S с причиной\"] == []",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "07654213f2",
+          "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
           "premerge_ci": {
             "by_event": {
@@ -2982,7 +2982,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "07654213f2",
+          "commit": "git:07654213f2",
           "date": "2026-08-30T20:23:49Z",
           "premerge_ci": {
             "by_event": {
@@ -2999,14 +2999,14 @@
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
+    "head_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
     "nodeid": "tests/test_local_checks_match_ci.py::test_every_ci_static_check_has_a_make_target",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36479851980,
     "status": "fixed",
-    "tested_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
-    "tested_tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+    "tested_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
+    "tested_tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
   },
   {
     "branch": "task-913/red-test-gate",
@@ -3034,14 +3034,14 @@
           "nodeid": "tests/test_mcp_catalog_budget.py::test_description_chars_stay_under_freeze",
           "passed": 0,
           "runs": 10,
-          "tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+          "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
         }
       ],
       "message": "AssertionError: description_chars: the catalog is 36491, over the working freeze 36383 by 109. This is the limit that binds — the 'budgets' ceiling carries a percentage headroom, catches slow drift an",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "1019c7dc19",
+          "commit": "git:1019c7dc19",
           "date": "2026-08-28T08:47:36Z",
           "premerge_ci": {
             "by_event": {
@@ -3056,7 +3056,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "19df910efb",
+          "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
           "premerge_ci": {
             "by_event": {
@@ -3073,14 +3073,14 @@
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
+    "head_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
     "nodeid": "tests/test_mcp_catalog_budget.py::test_description_chars_stay_under_freeze",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36479851980,
     "status": "unconfirmed",
-    "tested_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
-    "tested_tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+    "tested_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
+    "tested_tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
   },
   {
     "branch": "task-913/red-test-gate",
@@ -3108,14 +3108,14 @@
           "nodeid": "tests/test_mcp_catalog_budget.py::test_the_report_leads_with_the_limit_that_binds",
           "passed": 0,
           "runs": 10,
-          "tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+          "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
         }
       ],
       "message": "AssertionError: the report must print the live room under the freeze for description_chars",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "19df910efb",
+          "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
           "premerge_ci": {
             "by_event": {
@@ -3130,7 +3130,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "19df910efb",
+          "commit": "git:19df910efb",
           "date": "2026-08-30T16:06:50Z",
           "premerge_ci": {
             "by_event": {
@@ -3147,14 +3147,14 @@
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
+    "head_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
     "nodeid": "tests/test_mcp_catalog_budget.py::test_the_report_leads_with_the_limit_that_binds",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36479851980,
     "status": "unconfirmed",
-    "tested_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
-    "tested_tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+    "tested_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
+    "tested_tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
   },
   {
     "branch": "task-913/red-test-gate",
@@ -3171,7 +3171,7 @@
         "why": "новый ключ политики без образца значения"
       },
       "commits": [
-        "b7537036"
+        "git:b7537036"
       ],
       "failed_in_attempt": 5,
       "fixed_by": null,
@@ -3185,14 +3185,14 @@
           "nodeid": "tests/test_web.py::test_saving_the_project_form_keeps_unknown_policy_keys",
           "passed": 0,
           "runs": 3,
-          "tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+          "tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
         }
       ],
       "message": "AssertionError: дайте образец значения для ['bug_red_test']",
       "reason": "test file changed before the next green run of the branch",
       "source": {
         "added": {
-          "commit": "08d8ec15ee",
+          "commit": "git:08d8ec15ee",
           "date": "2026-09-23T13:32:49Z",
           "premerge_ci": {
             "by_event": {
@@ -3208,13 +3208,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "5d6db80f9e",
+            "commit": "git:5d6db80f9e",
             "date": "2026-10-12T11:07:13Z",
             "task": 1677
           }
         ],
         "last_changed": {
-          "commit": "c1dc9f55cb",
+          "commit": "git:c1dc9f55cb",
           "date": "2026-09-27T18:58:55Z",
           "premerge_ci": {
             "by_event": {
@@ -3232,14 +3232,14 @@
       "summary_line": "5 failed, 4679 passed, 1 skipped, 3 warnings in 241.30s (0:04:01)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
+    "head_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
     "nodeid": "tests/test_web.py::test_saving_the_project_form_keeps_unknown_policy_keys",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 36479851980,
     "status": "fixed",
-    "tested_sha": "8212d40e3422894b0005866ec894543029d7dd2b",
-    "tested_tree": "9200277377f5a8e44c41231744c5b6741e9b4a03"
+    "tested_sha": "git:8212d40e3422894b0005866ec894543029d7dd2b",
+    "tested_tree": "git:9200277377f5a8e44c41231744c5b6741e9b4a03"
   },
   {
     "branch": "task-1590/predeploy-backup",
@@ -3269,7 +3269,7 @@
           "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
           "passed": 40,
           "runs": 40,
-          "tree": "1966da8454bc036bc9739cef6c84d65ecc369d42"
+          "tree": "git:1966da8454bc036bc9739cef6c84d65ecc369d42"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 1966da8454bc> pytest tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently -q -p repeatplug -p no:cacheprovider",
@@ -3280,7 +3280,7 @@
           "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
           "passed": 40,
           "runs": 40,
-          "tree": "1966da8454bc036bc9739cef6c84d65ecc369d42"
+          "tree": "git:1966da8454bc036bc9739cef6c84d65ecc369d42"
         }
       ],
       "message": "AssertionError: остановка продления маркер не снимает",
@@ -3303,7 +3303,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3319,18 +3319,18 @@
         },
         "changed_after_failure": [
           {
-            "commit": "13dd461659",
+            "commit": "git:13dd461659",
             "date": "2026-10-06T05:53:27Z",
             "task": 1595
           },
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3348,14 +3348,14 @@
       "summary_line": "1 failed, 5046 passed, 1 skipped, 4 warnings in 238.04s (0:03:58)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "5222714d52b43f50f4da628946c46593488f3b30",
+    "head_sha": "git:5222714d52b43f50f4da628946c46593488f3b30",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37362288795,
     "status": "confirmed",
-    "tested_sha": "5222714d52b43f50f4da628946c46593488f3b30",
-    "tested_tree": "1966da8454bc036bc9739cef6c84d65ecc369d42"
+    "tested_sha": "git:5222714d52b43f50f4da628946c46593488f3b30",
+    "tested_tree": "git:1966da8454bc036bc9739cef6c84d65ecc369d42"
   },
   {
     "branch": "task-1591/release-artifacts-check",
@@ -3383,7 +3383,7 @@
           "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
           "passed": 38,
           "runs": 40,
-          "tree": "a820ae609ac106090350b2e42b3c5c069147cea4"
+          "tree": "git:a820ae609ac106090350b2e42b3c5c069147cea4"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree a820ae609ac1> pytest tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker -q -p repeatplug -p no:cacheprovider",
@@ -3394,7 +3394,7 @@
           "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
           "passed": 38,
           "runs": 40,
-          "tree": "a820ae609ac106090350b2e42b3c5c069147cea4"
+          "tree": "git:a820ae609ac106090350b2e42b3c5c069147cea4"
         }
       ],
       "message": "AssertionError: ждущий acquire пережил деплой",
@@ -3422,7 +3422,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3438,7 +3438,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3456,14 +3456,14 @@
       "summary_line": "1 failed, 5053 passed, 1 skipped, 4 warnings in 303.40s (0:05:03)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "07e2b98fee60a3d9b45e0ee304ae4ed26dc4318d",
+    "head_sha": "git:07e2b98fee60a3d9b45e0ee304ae4ed26dc4318d",
     "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37375907895,
     "status": "confirmed",
-    "tested_sha": "58a492df6fff030e659e487115ce53778ecc9575",
-    "tested_tree": "a820ae609ac106090350b2e42b3c5c069147cea4"
+    "tested_sha": "git:58a492df6fff030e659e487115ce53778ecc9575",
+    "tested_tree": "git:a820ae609ac106090350b2e42b3c5c069147cea4"
   },
   {
     "branch": "develop",
@@ -3492,7 +3492,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3508,7 +3508,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3526,14 +3526,14 @@
       "summary_line": "1 failed, 5055 passed, 1 skipped, 4 warnings in 304.20s (0:05:04)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "647e9bf2a095a8c8e5b121052d61f70226ffb2d0",
+    "head_sha": "git:647e9bf2a095a8c8e5b121052d61f70226ffb2d0",
     "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37417217015,
     "status": "confirmed",
-    "tested_sha": "9149fa2d7bb50b713cc1a134117a85fc1b8e72a7",
-    "tested_tree": "c01023456bde9ee4fc995c5a17384f2dc96281ce"
+    "tested_sha": "git:9149fa2d7bb50b713cc1a134117a85fc1b8e72a7",
+    "tested_tree": "git:c01023456bde9ee4fc995c5a17384f2dc96281ce"
   },
   {
     "branch": "develop",
@@ -3562,7 +3562,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3578,7 +3578,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3596,14 +3596,14 @@
       "summary_line": "1 failed, 5055 passed, 1 skipped, 4 warnings in 299.14s (0:04:59)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "4da7711a8a58edd36a2e0ab79513f47eac7a2bc8",
+    "head_sha": "git:4da7711a8a58edd36a2e0ab79513f47eac7a2bc8",
     "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37417835760,
     "status": "confirmed",
-    "tested_sha": "b3b703f5dfede1aab8525d43e9eba6e598b2b433",
-    "tested_tree": "c01023456bde9ee4fc995c5a17384f2dc96281ce"
+    "tested_sha": "git:b3b703f5dfede1aab8525d43e9eba6e598b2b433",
+    "tested_tree": "git:c01023456bde9ee4fc995c5a17384f2dc96281ce"
   },
   {
     "branch": "develop",
@@ -3634,7 +3634,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3650,13 +3650,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "13dd461659",
+          "commit": "git:13dd461659",
           "date": "2026-10-06T05:53:27Z",
           "premerge_ci": {
             "by_event": {
@@ -3674,14 +3674,14 @@
       "summary_line": "1 failed, 5087 passed, 1 skipped, 4 warnings in 189.90s (0:03:09)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "a5282955092a31db74b86e3b13c8693e7be7721f",
+    "head_sha": "git:a5282955092a31db74b86e3b13c8693e7be7721f",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37434457494,
     "status": "confirmed",
-    "tested_sha": "3fa23e89743f0cda12fc057e5b653015b6971d05",
-    "tested_tree": "42dccc69d90a2c5dda887a3a30921d03bc21d9b8"
+    "tested_sha": "git:3fa23e89743f0cda12fc057e5b653015b6971d05",
+    "tested_tree": "git:42dccc69d90a2c5dda887a3a30921d03bc21d9b8"
   },
   {
     "branch": "task-1598/promt-lokalnogo-revyuera-nazyvaet-ego-re",
@@ -3712,7 +3712,7 @@
           "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
           "passed": 40,
           "runs": 40,
-          "tree": "829580a5c4675421feca13e9035f0c0684ead2a1"
+          "tree": "git:829580a5c4675421feca13e9035f0c0684ead2a1"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 829580a5c467> pytest tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push -q -p repeatplug -p no:cacheprovider",
@@ -3723,7 +3723,7 @@
           "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
           "passed": 40,
           "runs": 40,
-          "tree": "829580a5c4675421feca13e9035f0c0684ead2a1"
+          "tree": "git:829580a5c4675421feca13e9035f0c0684ead2a1"
         }
       ],
       "message": "AssertionError: отказ аренды — голова уехала, повтор следующим циклом, а не «нет прав»",
@@ -3736,7 +3736,7 @@
       ],
       "source": {
         "added": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -3752,13 +3752,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "315f45feaa",
+            "commit": "git:315f45feaa",
             "date": "2026-10-15T04:58:53Z",
             "task": 1684
           }
         ],
         "last_changed": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -3776,14 +3776,14 @@
       "summary_line": "1 failed, 5085 passed, 1 skipped, 4 warnings in 302.19s (0:05:02)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ba6ab11c16cd1fadfae5ee66017f0bfc6f7a5839",
+    "head_sha": "git:ba6ab11c16cd1fadfae5ee66017f0bfc6f7a5839",
     "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37438529641,
     "status": "confirmed",
-    "tested_sha": "ba6ab11c16cd1fadfae5ee66017f0bfc6f7a5839",
-    "tested_tree": "829580a5c4675421feca13e9035f0c0684ead2a1"
+    "tested_sha": "git:ba6ab11c16cd1fadfae5ee66017f0bfc6f7a5839",
+    "tested_tree": "git:829580a5c4675421feca13e9035f0c0684ead2a1"
   },
   {
     "branch": "main",
@@ -3814,7 +3814,7 @@
       ],
       "source": {
         "added": {
-          "commit": "da8e3bebfb",
+          "commit": "git:da8e3bebfb",
           "date": "2026-10-05T15:12:58Z",
           "premerge_ci": {
             "by_event": {},
@@ -3827,13 +3827,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "5f398a95c5",
+          "commit": "git:5f398a95c5",
           "date": "2026-10-06T06:00:14Z",
           "premerge_ci": {
             "by_event": {},
@@ -3848,14 +3848,14 @@
       "summary_line": "1 failed, 5280 passed, 1 skipped, 4 warnings in 341.81s (0:05:41)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "dab592aea52d4f2769012ba1fa206861e23226cf",
+    "head_sha": "git:dab592aea52d4f2769012ba1fa206861e23226cf",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37495761804,
     "status": "confirmed",
-    "tested_sha": "dab592aea52d4f2769012ba1fa206861e23226cf",
-    "tested_tree": "b3d3650ed68139a506589d6e96746a2c7b75821f"
+    "tested_sha": "git:dab592aea52d4f2769012ba1fa206861e23226cf",
+    "tested_tree": "git:b3d3650ed68139a506589d6e96746a2c7b75821f"
   },
   {
     "branch": "develop",
@@ -3883,7 +3883,7 @@
           "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
           "passed": 40,
           "runs": 40,
-          "tree": "44b99d672c8474a5481b5faf7fc752bf428f6f32"
+          "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 44b99d672c84> pytest tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker -q -p repeatplug -p no:cacheprovider",
@@ -3894,7 +3894,7 @@
           "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
           "passed": 40,
           "runs": 40,
-          "tree": "44b99d672c8474a5481b5faf7fc752bf428f6f32"
+          "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
         },
         {
           "command": "REPS=150 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 44b99d672c84> pytest tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker -q -p repeatplug -p no:cacheprovider",
@@ -3905,7 +3905,7 @@
           "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
           "passed": 150,
           "runs": 150,
-          "tree": "44b99d672c8474a5481b5faf7fc752bf428f6f32"
+          "tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
         }
       ],
       "message": "subprocess.TimeoutExpired: Command '['bash', '/home/runner/work/haiplane/haiplane/deploy/review-drain.sh', 'acquire']' timed out after 10 seconds",
@@ -3923,7 +3923,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -3939,7 +3939,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "13dd461659",
+          "commit": "git:13dd461659",
           "date": "2026-10-06T05:53:27Z",
           "premerge_ci": {
             "by_event": {
@@ -3957,14 +3957,14 @@
       "summary_line": "1 failed, 5373 passed, 2 skipped, 4 warnings in 322.51s (0:05:22)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "35591730b164163855a0e89f5e3ad92349166a71",
+    "head_sha": "git:35591730b164163855a0e89f5e3ad92349166a71",
     "nodeid": "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37539128383,
     "status": "confirmed",
-    "tested_sha": "8419a629b69a2de5768344ae251465fc556625cc",
-    "tested_tree": "44b99d672c8474a5481b5faf7fc752bf428f6f32"
+    "tested_sha": "git:8419a629b69a2de5768344ae251465fc556625cc",
+    "tested_tree": "git:44b99d672c8474a5481b5faf7fc752bf428f6f32"
   },
   {
     "branch": "main",
@@ -4000,7 +4000,7 @@
       ],
       "source": {
         "added": {
-          "commit": "da8e3bebfb",
+          "commit": "git:da8e3bebfb",
           "date": "2026-10-05T15:12:58Z",
           "premerge_ci": {
             "by_event": {},
@@ -4013,13 +4013,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "5f398a95c5",
+          "commit": "git:5f398a95c5",
           "date": "2026-10-06T06:00:14Z",
           "premerge_ci": {
             "by_event": {},
@@ -4034,14 +4034,14 @@
       "summary_line": "1 failed, 5389 passed, 2 skipped, 4 warnings in 351.05s (0:05:51)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ec066f34b91d4c0063d2549bb7f0f068f0b89af4",
+    "head_sha": "git:ec066f34b91d4c0063d2549bb7f0f068f0b89af4",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37582340752,
     "status": "confirmed",
-    "tested_sha": "ce9acda784c74fbf5fa7524def29bc6551d7516c",
-    "tested_tree": "1b57de9853110db2baf8f56690f9696eb6e78ddc"
+    "tested_sha": "git:ce9acda784c74fbf5fa7524def29bc6551d7516c",
+    "tested_tree": "git:1b57de9853110db2baf8f56690f9696eb6e78ddc"
   },
   {
     "branch": "develop",
@@ -4082,7 +4082,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -4098,13 +4098,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "13dd461659",
+          "commit": "git:13dd461659",
           "date": "2026-10-06T05:53:27Z",
           "premerge_ci": {
             "by_event": {
@@ -4122,14 +4122,14 @@
       "summary_line": "1 failed, 5405 passed, 2 skipped, 4 warnings in 347.69s (0:05:47)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "19071b458c319d38e8ace42ec35bde12b1cf8c99",
+    "head_sha": "git:19071b458c319d38e8ace42ec35bde12b1cf8c99",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37582475944,
     "status": "confirmed",
-    "tested_sha": "ee0444025cf2f57f556ec6842d8657fb10e415e0",
-    "tested_tree": "5659890b66fad981049881d4445fcef4e66c23d9"
+    "tested_sha": "git:ee0444025cf2f57f556ec6842d8657fb10e415e0",
+    "tested_tree": "git:5659890b66fad981049881d4445fcef4e66c23d9"
   },
   {
     "branch": "task-1610/ruchnoe-odobrenie-ne-opiraetsya-na-ustar",
@@ -4160,7 +4160,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -4176,13 +4176,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "ea5a72a474",
+            "commit": "git:ea5a72a474",
             "date": "2026-10-07T20:48:41Z",
             "task": 1627
           }
         ],
         "last_changed": {
-          "commit": "13dd461659",
+          "commit": "git:13dd461659",
           "date": "2026-10-06T05:53:27Z",
           "premerge_ci": {
             "by_event": {
@@ -4200,14 +4200,14 @@
       "summary_line": "1 failed, 5399 passed, 2 skipped, 4 warnings in 348.46s (0:05:48)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1679a87f25476de52940d944c70e204dd7a5e138",
+    "head_sha": "git:1679a87f25476de52940d944c70e204dd7a5e138",
     "nodeid": "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37668027818,
     "status": "confirmed",
-    "tested_sha": "1679a87f25476de52940d944c70e204dd7a5e138",
-    "tested_tree": "5ba456be0b33e6687de9a59fcddb49f4252d563c"
+    "tested_sha": "git:1679a87f25476de52940d944c70e204dd7a5e138",
+    "tested_tree": "git:5ba456be0b33e6687de9a59fcddb49f4252d563c"
   },
   {
     "branch": "task-1650/hab-ispolnyaet-kod-iz-vetki-zadachi-pri",
@@ -4235,7 +4235,7 @@
           "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
           "passed": 10,
           "runs": 10,
-          "tree": "9917b7d4728f09a280a0a2cf5754468dba3170da"
+          "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
@@ -4246,7 +4246,7 @@
           "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
           "passed": 40,
           "runs": 40,
-          "tree": "9917b7d4728f09a280a0a2cf5754468dba3170da"
+          "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
@@ -4257,7 +4257,7 @@
           "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
           "passed": 40,
           "runs": 40,
-          "tree": "9917b7d4728f09a280a0a2cf5754468dba3170da"
+          "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
         },
         {
           "command": "REPS=400 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 9917b7d4728f> pytest tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown -q -p repeatplug -p no:cacheprovider",
@@ -4268,14 +4268,14 @@
           "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
           "passed": 400,
           "runs": 400,
-          "tree": "9917b7d4728f09a280a0a2cf5754468dba3170da"
+          "tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
         }
       ],
       "message": "TimeoutError",
       "passes_on_same_tree": [],
       "source": {
         "added": {
-          "commit": "a6e29e4410",
+          "commit": "git:a6e29e4410",
           "date": "2026-10-09T13:30:57Z",
           "premerge_ci": null,
           "subject": "fix(hub): analyse AC locator files in a bounded worker process (#1650 round 3)",
@@ -4283,13 +4283,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "29a78cc1d8",
+            "commit": "git:29a78cc1d8",
             "date": "2026-10-09T23:59:48Z",
             "task": 1650
           }
         ],
         "last_changed": {
-          "commit": "a6e29e4410",
+          "commit": "git:a6e29e4410",
           "date": "2026-10-09T13:30:57Z",
           "premerge_ci": null,
           "subject": "fix(hub): analyse AC locator files in a bounded worker process (#1650 round 3)",
@@ -4299,14 +4299,14 @@
       "summary_line": "1 failed, 5582 passed, 2 skipped, 5 warnings in 290.28s (0:04:50)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "0a31a2a2f56ef7c99e90ed4a9f4167f428781395",
+    "head_sha": "git:0a31a2a2f56ef7c99e90ed4a9f4167f428781395",
     "nodeid": "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 37959789361,
     "status": "confirmed",
-    "tested_sha": "0a31a2a2f56ef7c99e90ed4a9f4167f428781395",
-    "tested_tree": "9917b7d4728f09a280a0a2cf5754468dba3170da"
+    "tested_sha": "git:0a31a2a2f56ef7c99e90ed4a9f4167f428781395",
+    "tested_tree": "git:9917b7d4728f09a280a0a2cf5754468dba3170da"
   },
   {
     "branch": "task-1651/neudachnoe-perechislenie-dereva-vetki-ke",
@@ -4345,7 +4345,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -4361,7 +4361,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -4379,14 +4379,14 @@
       "summary_line": "1 failed, 5747 passed, 2 skipped, 4 warnings in 350.55s (0:05:50)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "d18322b2e43cc3d92f3cc54d363c530b25619890",
+    "head_sha": "git:d18322b2e43cc3d92f3cc54d363c530b25619890",
     "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38038268501,
     "status": "confirmed",
-    "tested_sha": "2ae5a91590559b0b7c7841ce5fc0a1904e8e4c75",
-    "tested_tree": "22f3a85578a9201aac99021db903da621aa45bd9"
+    "tested_sha": "git:2ae5a91590559b0b7c7841ce5fc0a1904e8e4c75",
+    "tested_tree": "git:22f3a85578a9201aac99021db903da621aa45bd9"
   },
   {
     "branch": "task-1221/versionirovat-nabor-kanareek-i-kontrakt",
@@ -4409,7 +4409,7 @@
           "nodeid": "tests/test_agent_eval_contract.py::test_critical_approve_with_error_is_quality_failed",
           "passed": 0,
           "runs": 10,
-          "tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+          "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
         }
       ],
       "message": "AssertionError: assert 'infrastructure_error' == 'quality_failed'",
@@ -4417,14 +4417,14 @@
       "summary_line": "3 failed, 5792 passed, 2 skipped, 4 warnings in 384.90s (0:06:24)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "991a3c1115630a76369eaf2c0abc8139d1761cfb",
+    "head_sha": "git:991a3c1115630a76369eaf2c0abc8139d1761cfb",
     "nodeid": "tests/test_agent_eval_contract.py::test_critical_approve_with_error_is_quality_failed",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38049486764,
     "status": "unconfirmed",
-    "tested_sha": "339262fa0124a50e9db2dcbe667c27c01118a8e6",
-    "tested_tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+    "tested_sha": "git:339262fa0124a50e9db2dcbe667c27c01118a8e6",
+    "tested_tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
   },
   {
     "branch": "task-1221/versionirovat-nabor-kanareek-i-kontrakt",
@@ -4447,7 +4447,7 @@
           "nodeid": "tests/test_agent_eval_contract.py::test_duplicate_with_critical_approve_is_quality_failed",
           "passed": 0,
           "runs": 10,
-          "tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+          "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
         }
       ],
       "message": "AssertionError: assert 'incomplete' == 'quality_failed'",
@@ -4455,14 +4455,14 @@
       "summary_line": "3 failed, 5792 passed, 2 skipped, 4 warnings in 384.90s (0:06:24)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "991a3c1115630a76369eaf2c0abc8139d1761cfb",
+    "head_sha": "git:991a3c1115630a76369eaf2c0abc8139d1761cfb",
     "nodeid": "tests/test_agent_eval_contract.py::test_duplicate_with_critical_approve_is_quality_failed",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38049486764,
     "status": "unconfirmed",
-    "tested_sha": "339262fa0124a50e9db2dcbe667c27c01118a8e6",
-    "tested_tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+    "tested_sha": "git:339262fa0124a50e9db2dcbe667c27c01118a8e6",
+    "tested_tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
   },
   {
     "branch": "task-1221/versionirovat-nabor-kanareek-i-kontrakt",
@@ -4485,7 +4485,7 @@
           "nodeid": "tests/test_agent_eval_contract.py::test_validate_rejects_outcome_downgrade_to_infrastructure",
           "passed": 0,
           "runs": 10,
-          "tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+          "tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
         }
       ],
       "message": "AssertionError: infrastructure_error",
@@ -4493,14 +4493,14 @@
       "summary_line": "3 failed, 5792 passed, 2 skipped, 4 warnings in 384.90s (0:06:24)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "991a3c1115630a76369eaf2c0abc8139d1761cfb",
+    "head_sha": "git:991a3c1115630a76369eaf2c0abc8139d1761cfb",
     "nodeid": "tests/test_agent_eval_contract.py::test_validate_rejects_outcome_downgrade_to_infrastructure",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38049486764,
     "status": "unconfirmed",
-    "tested_sha": "339262fa0124a50e9db2dcbe667c27c01118a8e6",
-    "tested_tree": "65c81e2113eefb03bf5cd55388277598c41e328a"
+    "tested_sha": "git:339262fa0124a50e9db2dcbe667c27c01118a8e6",
+    "tested_tree": "git:65c81e2113eefb03bf5cd55388277598c41e328a"
   },
   {
     "branch": "task-1666/zavisshii-test-derzhit-ci-do-6-chasov-i",
@@ -4530,7 +4530,7 @@
           "nodeid": "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate",
           "passed": 40,
           "runs": 40,
-          "tree": "7137ddb596b04c904991aca7c8e17ae2eaff0730"
+          "tree": "git:7137ddb596b04c904991aca7c8e17ae2eaff0730"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 7137ddb596b0> pytest tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate -q -p repeatplug -p no:cacheprovider",
@@ -4541,7 +4541,7 @@
           "nodeid": "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate",
           "passed": 40,
           "runs": 40,
-          "tree": "7137ddb596b04c904991aca7c8e17ae2eaff0730"
+          "tree": "git:7137ddb596b04c904991aca7c8e17ae2eaff0730"
         }
       ],
       "message": "Failed: Timeout (>300.0s) from pytest-timeout.",
@@ -4554,7 +4554,7 @@
       ],
       "source": {
         "added": {
-          "commit": "a90881bac9",
+          "commit": "git:a90881bac9",
           "date": "2026-08-23T20:54:09Z",
           "premerge_ci": null,
           "subject": "feat: read HAIPLANE_ env with OPENCLAW_ fallback",
@@ -4562,13 +4562,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "a9e1804a48",
+            "commit": "git:a9e1804a48",
             "date": "2026-10-10T22:01:50Z",
             "task": 1667
           }
         ],
         "last_changed": {
-          "commit": "771f889437",
+          "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
           "premerge_ci": null,
           "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
@@ -4578,14 +4578,14 @@
       "summary_line": "1 failed, 5844 passed, 2 skipped, 4 warnings in 411.37s (0:06:51)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "ede7c9efc4677304ea96d3e08ab0de402d543c03",
+    "head_sha": "git:ede7c9efc4677304ea96d3e08ab0de402d543c03",
     "nodeid": "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38057528563,
     "status": "confirmed",
-    "tested_sha": "ede7c9efc4677304ea96d3e08ab0de402d543c03",
-    "tested_tree": "7137ddb596b04c904991aca7c8e17ae2eaff0730"
+    "tested_sha": "git:ede7c9efc4677304ea96d3e08ab0de402d543c03",
+    "tested_tree": "git:7137ddb596b04c904991aca7c8e17ae2eaff0730"
   },
   {
     "branch": "task-1667/dochernii-protsess-haba-posle-testclient",
@@ -4613,14 +4613,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "4d05d0042be0d1baf8ebc9737dd94362f3f09891"
+          "tree": "git:4d05d0042be0d1baf8ebc9737dd94362f3f09891"
         }
       ],
       "message": "AssertionError: tests/test_app_shutdown.py: 1 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -4628,7 +4628,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -4638,14 +4638,14 @@
       "summary_line": "1 failed, 5858 passed, 2 skipped, 4 warnings in 313.32s (0:05:13)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "f14e5a4fb597efa897937f7e1058a3081112c884",
+    "head_sha": "git:f14e5a4fb597efa897937f7e1058a3081112c884",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38062226962,
     "status": "unconfirmed",
-    "tested_sha": "f14e5a4fb597efa897937f7e1058a3081112c884",
-    "tested_tree": "4d05d0042be0d1baf8ebc9737dd94362f3f09891"
+    "tested_sha": "git:f14e5a4fb597efa897937f7e1058a3081112c884",
+    "tested_tree": "git:4d05d0042be0d1baf8ebc9737dd94362f3f09891"
   },
   {
     "branch": "develop",
@@ -4682,7 +4682,7 @@
       ],
       "source": {
         "added": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -4698,13 +4698,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "315f45feaa",
+            "commit": "git:315f45feaa",
             "date": "2026-10-15T04:58:53Z",
             "task": 1684
           }
         ],
         "last_changed": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -4722,14 +4722,14 @@
       "summary_line": "1 failed, 5912 passed, 2 skipped, 4 warnings in 408.39s (0:06:48)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "74716ae230bfcb2f57f016e31140ac6b340a6e1d",
+    "head_sha": "git:74716ae230bfcb2f57f016e31140ac6b340a6e1d",
     "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38083616982,
     "status": "confirmed",
-    "tested_sha": "30b1d563eb849fcb1adb574370d5e45c8ebd6e21",
-    "tested_tree": "a8fde52fd3397549bb62aa506add4b9f57fa2c6a"
+    "tested_sha": "git:30b1d563eb849fcb1adb574370d5e45c8ebd6e21",
+    "tested_tree": "git:a8fde52fd3397549bb62aa506add4b9f57fa2c6a"
   },
   {
     "branch": "task-1667/dochernii-protsess-haba-posle-testclient",
@@ -4757,7 +4757,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 10,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4768,7 +4768,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4779,7 +4779,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4790,14 +4790,14 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         }
       ],
       "message": "RuntimeError: StreamableHTTPSessionManager .run() can only be called once per instance. Create a new instance if you need to run again.",
       "passes_on_same_tree": [],
       "source": {
         "added": {
-          "commit": "6fd02b0552",
+          "commit": "git:6fd02b0552",
           "date": "2026-06-05T05:33:12Z",
           "premerge_ci": {
             "by_event": {},
@@ -4810,7 +4810,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "771f889437",
+          "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
           "premerge_ci": null,
           "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
@@ -4820,14 +4820,14 @@
       "summary_line": "1 failed, 5936 passed, 2 skipped, 4 warnings in 409.87s (0:06:49)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "e3db1d85e59ada25f4999327f95881029f995911",
+    "head_sha": "git:e3db1d85e59ada25f4999327f95881029f995911",
     "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38084751439,
     "status": "confirmed",
-    "tested_sha": "f88b54a056ac2bca67ab1d8e6d0fd782da5902fb",
-    "tested_tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+    "tested_sha": "git:f88b54a056ac2bca67ab1d8e6d0fd782da5902fb",
+    "tested_tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
   },
   {
     "branch": "task-1667/dochernii-protsess-haba-posle-testclient",
@@ -4855,7 +4855,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 10,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4866,7 +4866,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4877,7 +4877,7 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         },
         {
           "command": "REPS=1 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree 71864a0e8836> pytest tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path -q -p repeatplug -p no:cacheprovider",
@@ -4888,14 +4888,14 @@
           "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
           "passed": 1,
           "runs": 1,
-          "tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+          "tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
         }
       ],
       "message": "RuntimeError: StreamableHTTPSessionManager .run() can only be called once per instance. Create a new instance if you need to run again.",
       "passes_on_same_tree": [],
       "source": {
         "added": {
-          "commit": "6fd02b0552",
+          "commit": "git:6fd02b0552",
           "date": "2026-06-05T05:33:12Z",
           "premerge_ci": {
             "by_event": {},
@@ -4908,7 +4908,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "771f889437",
+          "commit": "git:771f889437",
           "date": "2026-08-24T11:09:48Z",
           "premerge_ci": null,
           "subject": "test(rebrand): Wave 5 — легаси-ассерты удалены или перевёрнуты",
@@ -4918,14 +4918,14 @@
       "summary_line": "1 failed, 5936 passed, 2 skipped, 4 warnings in 237.38s (0:03:57)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "e3db1d85e59ada25f4999327f95881029f995911",
+    "head_sha": "git:e3db1d85e59ada25f4999327f95881029f995911",
     "nodeid": "tests/test_mcp_transport.py::test_mcp_endpoint_requires_bearer_at_public_path",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38084762788,
     "status": "confirmed",
-    "tested_sha": "e3db1d85e59ada25f4999327f95881029f995911",
-    "tested_tree": "71864a0e883662712d5bca8cde58e12c6cca97a1"
+    "tested_sha": "git:e3db1d85e59ada25f4999327f95881029f995911",
+    "tested_tree": "git:71864a0e883662712d5bca8cde58e12c6cca97a1"
   },
   {
     "branch": "task-1223/podnimat-odnorazovyi-hub-dlya-eval-i-sob",
@@ -4953,14 +4953,14 @@
           "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
           "passed": 0,
           "runs": 10,
-          "tree": "bf618dac4ad38a51687c68444fa4cf784f6c5817"
+          "tree": "git:bf618dac4ad38a51687c68444fa4cf784f6c5817"
         }
       ],
       "message": "AssertionError: tests/test_agent_eval_sandbox.py: 1 вхожд.",
       "reason": "no pass on the same tested tree; code changed or no later green run",
       "source": {
         "added": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -4968,7 +4968,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "ac9dd151f1",
+          "commit": "git:ac9dd151f1",
           "date": "2026-08-24T11:09:08Z",
           "premerge_ci": null,
           "subject": "feat(rebrand): Wave 5 — hub code drops every legacy-name constant and fallback",
@@ -4978,14 +4978,14 @@
       "summary_line": "1 failed, 5903 passed, 2 skipped, 4 warnings in 243.99s (0:04:03)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "f052fc345e6644616ea03f04ede454c4fe806191",
+    "head_sha": "git:f052fc345e6644616ea03f04ede454c4fe806191",
     "nodeid": "tests/test_no_legacy_name.py::test_head_contains_no_legacy_name",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38084829102,
     "status": "unconfirmed",
-    "tested_sha": "f052fc345e6644616ea03f04ede454c4fe806191",
-    "tested_tree": "bf618dac4ad38a51687c68444fa4cf784f6c5817"
+    "tested_sha": "git:f052fc345e6644616ea03f04ede454c4fe806191",
+    "tested_tree": "git:bf618dac4ad38a51687c68444fa4cf784f6c5817"
   },
   {
     "branch": "task-1673/archive-needs-reason",
@@ -5019,7 +5019,7 @@
       ],
       "source": {
         "added": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -5035,7 +5035,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "404f1986f1",
+          "commit": "git:404f1986f1",
           "date": "2026-10-05T14:55:25Z",
           "premerge_ci": {
             "by_event": {
@@ -5053,14 +5053,14 @@
       "summary_line": "1 failed, 6051 passed, 2 skipped, 4 warnings in 353.48s (0:05:53)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "9ac3103666346785b03ad7236975fe94bf93468e",
+    "head_sha": "git:9ac3103666346785b03ad7236975fe94bf93468e",
     "nodeid": "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38181418208,
     "status": "confirmed",
-    "tested_sha": "271e5339e601104ca036a412f9673f86c2ba9027",
-    "tested_tree": "8b7ef403d013d1fe91183092e1a51d7e9a8ebacb"
+    "tested_sha": "git:271e5339e601104ca036a412f9673f86c2ba9027",
+    "tested_tree": "git:8b7ef403d013d1fe91183092e1a51d7e9a8ebacb"
   },
   {
     "branch": "main",
@@ -5097,7 +5097,7 @@
       ],
       "source": {
         "added": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -5113,13 +5113,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "315f45feaa",
+            "commit": "git:315f45feaa",
             "date": "2026-10-15T04:58:53Z",
             "task": 1684
           }
         ],
         "last_changed": {
-          "commit": "344e053b16",
+          "commit": "git:344e053b16",
           "date": "2026-09-27T07:34:16Z",
           "premerge_ci": {
             "by_event": {
@@ -5137,14 +5137,14 @@
       "summary_line": "1 failed, 6117 passed, 2 skipped, 4 warnings in 465.19s (0:07:45)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "0affd1a68de96dc76895d89d56569ff83ddfcbd4",
+    "head_sha": "git:0affd1a68de96dc76895d89d56569ff83ddfcbd4",
     "nodeid": "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38241673074,
     "status": "confirmed",
-    "tested_sha": "573a671a9527d910d011100eb015a6a8e4bd6c61",
-    "tested_tree": "9a04b8c43d4f9fba349276b7f338d9e8bf06bd41"
+    "tested_sha": "git:573a671a9527d910d011100eb015a6a8e4bd6c61",
+    "tested_tree": "git:9a04b8c43d4f9fba349276b7f338d9e8bf06bd41"
   },
   {
     "branch": "task-1681/flaky-local-prompt",
@@ -5162,14 +5162,14 @@
       "source_of_nodeid": "карточка #1685 (заметка стюарда 12.10); журнал job даёт только 'validation=fail', подробностей и артефакта (hub-ci-results) нет",
       "test_file_in_run_diff": false
     },
-    "head_sha": "1085dd6aca3dab8d95050816ba63798cde47561a",
+    "head_sha": "git:1085dd6aca3dab8d95050816ba63798cde47561a",
     "nodeid": "tests/test_red_test_gate.py::test_baseline_step_runs_branch_tests_on_merge_base",
     "pytest_outcome": "failed_in_validation_step",
     "run_attempt": 1,
     "run_id": 38269508400,
     "status": "confirmed",
-    "tested_sha": "5e6ebf098862a840d7be37a55d5978d88f5168e8",
-    "tested_tree": "7b0f94928d842ea030e9b67a14683f2c4a4b7f01"
+    "tested_sha": "git:5e6ebf098862a840d7be37a55d5978d88f5168e8",
+    "tested_tree": "git:7b0f94928d842ea030e9b67a14683f2c4a4b7f01"
   },
   {
     "branch": "task-1691/snizit-do-porogov-slozhnosti-funktsii-ch",
@@ -5197,14 +5197,14 @@
           "nodeid": "tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline",
           "passed": 10,
           "runs": 10,
-          "tree": "94460dd923d97ae66176fa55164733c0c640a480"
+          "tree": "git:94460dd923d97ae66176fa55164733c0c640a480"
         }
       ],
       "message": "AssertionError: ответ mcp_prepare_apply_all_append разошёлся с эталоном",
       "passes_on_same_tree": [],
       "source": {
         "added": {
-          "commit": "e193b62db4",
+          "commit": "git:e193b62db4",
           "date": "2026-10-14T04:31:53Z",
           "premerge_ci": {
             "by_event": {},
@@ -5217,13 +5217,13 @@
         },
         "changed_after_failure": [
           {
-            "commit": "8a836b14cb",
+            "commit": "git:8a836b14cb",
             "date": "2026-10-14T17:51:06Z",
             "task": 1691
           }
         ],
         "last_changed": {
-          "commit": "e193b62db4",
+          "commit": "git:e193b62db4",
           "date": "2026-10-14T04:31:53Z",
           "premerge_ci": {
             "by_event": {},
@@ -5238,14 +5238,14 @@
       "summary_line": "1 failed, 6274 passed, 2 skipped, 4 warnings in 513.38s (0:08:33)",
       "test_file_in_run_diff": true
     },
-    "head_sha": "3465fd1e4a184c90781f45fa4494f881a640597d",
+    "head_sha": "git:3465fd1e4a184c90781f45fa4494f881a640597d",
     "nodeid": "tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38514094063,
     "status": "confirmed",
-    "tested_sha": "3465fd1e4a184c90781f45fa4494f881a640597d",
-    "tested_tree": "94460dd923d97ae66176fa55164733c0c640a480"
+    "tested_sha": "git:3465fd1e4a184c90781f45fa4494f881a640597d",
+    "tested_tree": "git:94460dd923d97ae66176fa55164733c0c640a480"
   },
   {
     "branch": "task-1680/huk-dezhurit-po-yaschiku-rabochei-roli-s",
@@ -5273,7 +5273,7 @@
           "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
           "passed": 10,
           "runs": 10,
-          "tree": "ae10d3b67bfdd11f113eca749e451f14f8070c76"
+          "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
@@ -5284,7 +5284,7 @@
           "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
           "passed": 40,
           "runs": 40,
-          "tree": "ae10d3b67bfdd11f113eca749e451f14f8070c76"
+          "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
         },
         {
           "command": "REPS=40 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
@@ -5295,7 +5295,7 @@
           "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
           "passed": 40,
           "runs": 40,
-          "tree": "ae10d3b67bfdd11f113eca749e451f14f8070c76"
+          "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
         },
         {
           "command": "REPS=120 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree ae10d3b67bfd> pytest tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop -q -p repeatplug -p no:cacheprovider",
@@ -5306,14 +5306,14 @@
           "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
           "passed": 120,
           "runs": 120,
-          "tree": "ae10d3b67bfdd11f113eca749e451f14f8070c76"
+          "tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
         }
       ],
       "message": "assert 2 >= 3",
       "passes_on_same_tree": [],
       "source": {
         "added": {
-          "commit": "d195106aff",
+          "commit": "git:d195106aff",
           "date": "2026-10-09T16:23:23Z",
           "premerge_ci": {
             "by_event": {
@@ -5329,7 +5329,7 @@
         },
         "changed_after_failure": [],
         "last_changed": {
-          "commit": "d195106aff",
+          "commit": "git:d195106aff",
           "date": "2026-10-09T16:23:23Z",
           "premerge_ci": {
             "by_event": {
@@ -5347,13 +5347,13 @@
       "summary_line": "1 failed, 6288 passed, 2 skipped, 5 warnings in 401.31s (0:06:41)",
       "test_file_in_run_diff": false
     },
-    "head_sha": "c60f155239235b2950fa53326db6898166583f9c",
+    "head_sha": "git:c60f155239235b2950fa53326db6898166583f9c",
     "nodeid": "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop",
     "pytest_outcome": "failed",
     "run_attempt": 1,
     "run_id": 38514112670,
     "status": "confirmed",
-    "tested_sha": "c60f155239235b2950fa53326db6898166583f9c",
-    "tested_tree": "ae10d3b67bfdd11f113eca749e451f14f8070c76"
+    "tested_sha": "git:c60f155239235b2950fa53326db6898166583f9c",
+    "tested_tree": "git:ae10d3b67bfdd11f113eca749e451f14f8070c76"
   }
 ]

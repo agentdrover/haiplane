@@ -69,6 +69,34 @@ ROW_KEYS = (
 )
 
 
+GIT_TAG = "git:"
+HASH_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
+def tag_hashes(value):
+    """Хеши git пишутся как «git:<hex>»: detect-secrets читает кавычки с одним
+    hex как High Entropy String и красит Secret scan на публичных SHA. Менять
+    scripts/secret_scan.py ради данных нельзя (это ci_script под ci_integrity),
+    поэтому формат данных иной; load_manual возвращает чистые хеши."""
+    if isinstance(value, str):
+        return GIT_TAG + value if HASH_RE.fullmatch(value) else value
+    if isinstance(value, list):
+        return [tag_hashes(item) for item in value]
+    if isinstance(value, dict):
+        return {key: tag_hashes(item) for key, item in value.items()}
+    return value
+
+
+def untag_hashes(value):
+    if isinstance(value, str):
+        return value[len(GIT_TAG) :] if value.startswith(GIT_TAG) else value
+    if isinstance(value, list):
+        return [untag_hashes(item) for item in value]
+    if isinstance(value, dict):
+        return {key: untag_hashes(item) for key, item in value.items()}
+    return value
+
+
 class MissingResource(Exception):
     """Журнал или объект недоступен (404/410): отмечается, не выбрасывается."""
 
@@ -729,7 +757,7 @@ def step_breakdown(gh: Gh, runs: dict[int, dict]) -> str:
 def load_manual(path: str | None) -> dict:
     if not path:
         return {}
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return untag_hashes(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -762,7 +790,10 @@ def main(argv: list[str] | None = None) -> int:
     gh = Gh(args.cache_dir)
     runs = collect_runs(gh, args.since, args.until)
     rows = census_rows(gh, runs, load_manual(args.manual), repo_dir)
-    text = json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    text = (
+        json.dumps(tag_hashes(rows), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    )
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
     print(f"runs={len(runs)} rows={len(rows)} api_calls={gh.calls}", file=sys.stderr)
