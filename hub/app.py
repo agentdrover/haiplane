@@ -182,6 +182,7 @@ from hub.services.diagnostics import (
 )
 from hub.services.ac_tests import run_ac_tests
 from hub.services.ci_report import settle_ci_run_report, store_ci_run_report
+from hub.services.ci_timing import CIRunTimingSubmit, store_ci_run_timing
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.review_brief import build_review_brief, reviewer_harness_skill
@@ -3112,6 +3113,33 @@ async def api_ci_run_report(
     # outside the transaction (it downloads), and written in a short one.
     result = await settle_ci_run_report(db, task_id, stored)
     return CIRunReportResult(**result)
+
+
+@app.post("/api/tasks/{task_id}/ci-run-timing")
+async def api_ci_run_timing(
+    task_id: int,
+    body: CIRunTimingSubmit,
+    request: Request,
+    identity=Depends(require_permission("tasks.ci_report")),
+):
+    """Keep how long one finished CI attempt took (#1700): statistics, no gate.
+
+    Same key, scope check and one write transaction as ``ci-run-report``; a
+    refusal here never touches the report.
+    """
+    db = _db(request)
+    async with write_transaction(db):
+        project_row = await repo.resolve_bound_project(db, task_id)
+        slug = str(dict(project_row)["slug"]) if project_row is not None else "default"
+        await _enforce_ci_scope(db, identity, slug, entrance="ci_report")
+        try:
+            return await store_ci_run_timing(
+                db, task_id, body, reported_by=identity.username
+            )
+        except LookupError:
+            raise HTTPException(404, "task not found") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
 
 
 @app.get("/api/tasks/{task_id}/steward-evidence")

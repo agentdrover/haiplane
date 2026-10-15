@@ -65,6 +65,7 @@ MODEL_INDEPENDENT: tuple[str, ...] = (
     "validation_run_lines",
     "review_model_cascade",
     "steward_shadow",
+    "ci_minutes",
     "review_economy.deep_cap",
     "review_economy.small_delta",
     "review_economy.escapes",
