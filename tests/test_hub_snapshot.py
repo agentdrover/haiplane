@@ -235,13 +235,13 @@ def _systemctl_stub(world, props):
 def _tree(world):
     root = world.root / "sysroot"
     files = {
-        "etc/haiplane/hub.env": "HAIPLANE_HUB_DB=/db\nTOKEN=hub-secret-token\n",
+        "etc/haiplane/hub.env": "HAIPLANE_HUB_DB=/db\nTOKEN=hub-secret-token\n",  # pragma: allowlist secret
         "etc/systemd/system/haiplane-hub.service": "[Service]\n",
         "etc/systemd/system/haiplane-hub.service.d/10.conf": "[Service]\nNice=1\n",
         "etc/georoute/a.conf": "route-a\n",
         "etc/georoute/sub/b.conf": "route-b\n",
         "etc/fail2ban/jail.local": "[DEFAULT]\n",
-        "etc/other-secret": "TOP-SECRET-OUTSIDE\n",
+        "etc/other-secret": "TOP-SECRET-OUTSIDE\n",  # pragma: allowlist secret
     }
     for rel, text in files.items():
         target = root / rel
