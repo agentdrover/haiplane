@@ -4658,13 +4658,14 @@ async def test_git_ops_update_by_push_never_overwrites_a_racing_push(
     ops._conflicting_texts = racing  # type: ignore[method-assign]
     raced = None
     try:
-        outcome, _ = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+        outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
         raced = _gv_git(other, "rev-parse", "HEAD")
     finally:
         ops._conflicting_texts = real  # type: ignore[method-assign]
 
     assert outcome is BranchUpdateOutcome.head_moved, (
-        "отказ аренды — голова уехала, повтор следующим циклом, а не «нет прав»"
+        f"отказ аренды — голова уехала, повтор следующим циклом, а не «нет прав»: "
+        f"{outcome.value}: {detail}"
     )
     assert _gv_git(bare, "rev-parse", "task-1/x") == raced, "чужой пуш цел"
 
@@ -4685,6 +4686,60 @@ async def test_git_ops_update_by_push_never_overwrites_a_racing_push(
             "refused",
         ),
         (1, " ! [rejected]        HEAD -> task-1/x (stale info)", "head_moved"),
+        # Снято настоящим git (2.44) при отказе аренды: в строке стоит имя
+        # временной ветки ``task-N/gate-update-<8 hex sha>``. sha с «403» внутри
+        # (3 из 4096 имён на позицию) читался как HTTP 403 → refused вместо
+        # head_moved: так упали main 12.10 и develop 10.10.
+        (
+            1,
+            " ! [rejected]        task-1/gate-update-1403abcd -> task-1/x (stale info)",
+            "head_moved",
+        ),
+        (
+            1,
+            " ! [rejected]        task-1/gate-update-403abcde -> task-1/x (stale info)",
+            "head_moved",
+        ),
+        (
+            1,
+            " ! [rejected]        task-1/gate-update-abcde403 -> task-1/x (stale info)",
+            "head_moved",
+        ),
+        # Настоящий код ответа сервера остаётся отказом прав.
+        (
+            1,
+            "fatal: unable to access 'https://x/': The requested URL returned error: 403",
+            "refused",
+        ),
+        (1, "remote: HTTP 403 Forbidden", "refused"),
+        # Имя ветки, путь и URL — не диагностика: слова из них не отказ прав.
+        *[
+            (
+                1,
+                f" ! [rejected]        HEAD -> task-1/{word} (stale info)",
+                "head_moved",
+            )
+            for word in ("protected", "permission", "denied", "declined", "403")
+        ],
+        (
+            1,
+            "To /srv/403/repo.git\n"
+            " ! [rejected]        HEAD -> task-1/x (fetch first)\n"
+            "error: failed to push some refs to '/srv/403/repo.git'",
+            "head_moved",
+        ),
+        (
+            1,
+            "fatal: unable to access 'https://h/protected/403/denied.git/': "
+            "Could not resolve host: h",
+            "unavailable",
+        ),
+        (
+            128,
+            "fatal: '/srv/protected/403/repo.git' does not appear to be a git "
+            "repository\nfatal: Could not read from remote repository.",
+            "unavailable",
+        ),
     ],
 )
 async def test_git_ops_update_by_push_classifies_push_failures(

@@ -543,3 +543,33 @@ async def test_a_merge_failure_that_is_not_a_conflict_does_not_claim_one(
     )
     assert "identity unknown" in detail, "вывод git — единственный, кто знает причину"
     assert "rc=128" in detail
+
+
+async def test_a_protected_word_in_a_path_is_not_a_protected_base(
+    repo_pair, monkeypatch
+):
+    """#1684: слово из пути или URL — не защита базы.
+
+    Раньше по всему stderr искалось «protected»/«denied»: отказ push из-за
+    пути ``/srv/protected/…`` объявлял базу закрытой, и человек шёл снимать
+    защиту, которой нет.
+    """
+    from hub.integrations import git_ops as git_ops_mod
+
+    bare, work = repo_pair
+
+    async def refused(*args, **kwargs):
+        return 1, (
+            "fatal: '/srv/protected/denied.git' does not appear to be a git "
+            "repository\nfatal: Could not read from remote repository."
+        )
+
+    monkeypatch.setattr(git_ops_mod, "_push_tree_head", refused)
+
+    ok, detail = await GitOpsIntegration(forge=_forge()).merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok is False
+    assert "закрыта от прямого push" not in detail
+    assert "не прошёл" in detail

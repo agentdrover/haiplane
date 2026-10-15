@@ -90,6 +90,20 @@ def shadow_mode(monkeypatch):
     monkeypatch.setattr(config, "CURSOR_API_KEY", "cursor-key")
 
 
+@pytest.fixture(autouse=True)
+def ci_is_not_the_subject(monkeypatch):
+    """#1695: эти сценарии не про CI — читатель ожидания CI здесь «не ждёт».
+
+    Ожидание проверяется в tests/test_steward_ci_wait.py на настоящих таблицах.
+    """
+    from hub.services import steward_ci_wait
+
+    async def _not_waiting(_db, _task):
+        return steward_ci_wait.NOT_WAITING
+
+    monkeypatch.setattr(steward_ci_wait, "ci_wait_view", _not_waiting)
+
+
 async def _project(db: aiosqlite.Connection, slug: str) -> int:
     project_id = await repo.create_project(
         db, slug=slug, name=slug, workspace_path="", status="active"

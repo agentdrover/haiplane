@@ -41,6 +41,21 @@ from hub.services.steward_judgement import (
 )
 from tests.test_steward_shadow import _project, _task
 
+
+@pytest.fixture(autouse=True)
+def ci_is_not_the_subject(monkeypatch):
+    """#1695: эти сценарии не про CI — читатель ожидания CI здесь «не ждёт».
+
+    Ожидание проверяется в tests/test_steward_ci_wait.py на настоящих таблицах.
+    """
+    from hub.services import steward_ci_wait
+
+    async def _not_waiting(_db, _task):
+        return steward_ci_wait.NOT_WAITING
+
+    monkeypatch.setattr(steward_ci_wait, "ci_wait_view", _not_waiting)
+
+
 _GROUND = {"source": "ci_pinned_sha", "detail": "ci_run 1234 success on sha abc123"}
 
 _STEWARD = TokenIdentity("steward-bot", "steward", principal_id=42)

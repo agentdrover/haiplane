@@ -238,9 +238,15 @@ def test_waits_for_running_jobs_then_gives_up(spool, bin_dir) -> None:
 
 def test_no_active_jobs_or_no_spool_is_immediate(spool, bin_dir, tmp_path) -> None:
     """AC-2: пусто — ok сразу; нет spool, чужой маркер, занятый замок — exit 0."""
-    started = time.monotonic()
+    # #1684: «ждать нечего» проверяется поведением, а не стеной: подменённый
+    # ``sleep`` пишет каждый свой вызов в журнал. Скрипт спит только в ожидании
+    # (пауза опроса, чужой маркер); на пустой очереди вызова быть не должно.
+    sleeps = tmp_path / "sleeps.log"
+    fake_sleep = bin_dir / "sleep"
+    fake_sleep.write_text(f'#!/bin/sh\necho "$@" >> {shlex.quote(str(sleeps))}\n')
+    fake_sleep.chmod(0o755)
     done = _run(["acquire"], spool, bin_dir, DRAIN_BUDGET_SECONDS="30")
-    assert time.monotonic() - started < 3, "без заданий ждать нечего"
+    assert not sleeps.exists(), f"без заданий ждать нечего: {sleeps.read_text()}"
     assert done.returncode == 0 and "drain ok" in done.stdout, done.stdout
     lock = spool / ".drain.lock"
     assert lock.exists() and lock.stat().st_mode & 0o777 == 0o660
