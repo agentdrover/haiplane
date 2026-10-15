@@ -726,3 +726,37 @@ async def test_a_resubmission_inside_the_tick_does_not_merge(
         await poller._deliver_approved_review(db, snapshot)  # the step itself
     git.merge_pr.assert_not_called()
     assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    # A human returned the work to rework after the snapshot: the window is closed.
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+    assert await repo.close_review_verdict_window(db, task_id) == 1
+    await db.commit()
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        patch("hub.poller._record_merge_and_tidy", new_callable=AsyncMock),
+    ):
+        await poller._deliver_approved_review(db, snapshot)
+    git.merge_pr.assert_not_called()
+
+    # Replaced while the CI probe was running: the read is the LAST step before merge.
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+
+    async def _ci_then_replacement(*_a, **_k):
+        from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
+        await db.execute(
+            "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?",
+            (task_id,),
+        )
+        await db.commit()
+        return CIProbeResult(CIProbeOutcome.passed, "checks_pass")
+
+    git.check_pr_ci = _ci_then_replacement
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        patch("hub.poller._record_merge_and_tidy", new_callable=AsyncMock),
+    ):
+        await poller._deliver_approved_review(db, snapshot)
+    git.merge_pr.assert_not_called()

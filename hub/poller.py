@@ -600,9 +600,10 @@ async def _approval_still_current(db, task: dict) -> bool:
     """
     row = await repo.get_task(db, task["id"])
     live = dict(row) if row is not None else {}
-    current = (
-        live.get("review_verdict") == "approved"
-        and live.get("review_verdict_generation") == live.get("submission_generation")
+    # The canonical predicate, which also knows the window a human closed (#1286).
+    current = bool(
+        live
+        and services.review_approved_for_current_submission(live)
         and live.get("submission_generation") == task.get("submission_generation")
     )
     if not current:
@@ -612,8 +613,6 @@ async def _approval_still_current(db, task: dict) -> bool:
 
 async def _deliver_approved_review(db, task: dict) -> None:
     """An approved verdict is not delivery (#363): merge first, complete after."""
-    if not await _approval_still_current(db, task):
-        return
     pr_num = task.get("pr_number")
     merged = False
     if pr_num:
@@ -679,6 +678,11 @@ async def _deliver_approved_review(db, task: dict) -> None:
             # grows for the lifetime of the process — and how the NEXT hold on
             # this task would be silently swallowed as a repeat of this one.
             _pair_delivery_waits.pop(task["id"], None)
+            # The last read before the irreversible step: the CI and stacking
+            # probes above are network calls, and a replacement, a return to
+            # work or a resubmission may land while they run (#1706).
+            if not await _approval_still_current(db, task):
+                return
             merged = await plugins.git_ops.merge_pr(
                 pr_num,
                 task["id"],
