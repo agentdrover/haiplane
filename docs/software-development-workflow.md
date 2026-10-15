@@ -13,7 +13,7 @@ Haiplane Hub должен быть общей контрольной плоск�
 - **Hub repo**: этот репозиторий, где живет сервер хаба, Web UI, REST API, CLI и MCP.
 - **Workspace repo**: рабочий git-репозиторий продукта, с которым будут работать агенты. Он задается через `HAIPLANE_WORKSPACE_REPO`.
 
-Все люди и агенты должны видеть один и тот же хаб. Cursor подключается к MCP-поверхности хаба, а хаб уже обращается к REST API, базе, dispatch, git, GitHub, notes и transcripts через плагины.
+Все люди и агенты должны видеть один и тот же хаб. Cursor подключается к MCP-поверхности хаба, а хаб уже обращается к REST API, базе, dispatch, git, GitHub и transcripts через плагины.
 
 ## Роли
 
@@ -371,7 +371,7 @@ Git-политика path B (локальный clone vs server workspace, push/
 
 После спорных решений:
 
-- сохранить короткое архитектурное или процессное решение в notes, чтобы `hub_list_decisions` возвращал контекст будущим агентам.
+- записать короткое архитектурное или процессное решение в ленту задачи (`kind=decision`; `decide` пишет её сам), чтобы `hub_list_decisions` возвращал контекст будущим агентам. Флаг `record_decision` устарел и ничего не делает; рабочая память агентов и handoff — служба n4l (#1505).
 
 ## Минимальные правила для агентов в Cursor
 
@@ -393,7 +393,7 @@ Git-политика path B (локальный clone vs server workspace, push/
 - `start` требует план.
 - `needs_info`, `needs_decision`, `pending_report`, stale и drafts агрегируются в Inbox/dashboard.
 - Poller умеет переводить задачи через running, ci_check, review, fix_requested, needs_decision и completed.
-- Интеграции optional: без dispatch/git/GitHub/notes/transcripts хаб остается пригодным для CRUD и ручного контроля.
+- Интеграции optional: без dispatch/git/GitHub/transcripts хаб остается пригодным для CRUD и ручного контроля.
 
 ## Рекомендуемые следующие улучшения
 

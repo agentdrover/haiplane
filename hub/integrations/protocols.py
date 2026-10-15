@@ -1034,21 +1034,6 @@ class GitHubPlugin(Protocol):
 
 
 @runtime_checkable
-class NotesPlugin(Protocol):
-    async def recent_decisions(
-        self, space_id: str | None = None, limit: int = 10
-    ) -> list[dict[str, Any]]: ...
-
-    async def save_decision(
-        self,
-        task_id: int,
-        action: str,
-        summary: str,
-        context: str = "",
-    ) -> dict[str, Any] | None: ...
-
-
-@runtime_checkable
 class VastPlugin(Protocol):
     async def has_active_vast_tasks(self, db: aiosqlite.Connection) -> bool: ...
     async def vast_up(self) -> dict[str, Any]: ...
