@@ -10,7 +10,9 @@ chat-pair.md rev. 4 указано в docstring каждого теста.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -44,13 +46,52 @@ def _clean_limiters():
     """Лимитеры живут в памяти процесса — тесты не должны видеть чужие попытки."""
     cp.chat_pair_limiter._buckets.clear()
     login_limiter._buckets.clear()
+    cp._unknown_audit_seen.clear()
     yield
     cp.chat_pair_limiter._buckets.clear()
     login_limiter._buckets.clear()
+    cp._unknown_audit_seen.clear()
+
+
+class _AuditProbe:
+    """Счётчик фоновых записей аудита об отказах обмена (#1694).
+
+    Запись идёт после ответа, и клиент может вернуться раньше неё. Ждать «пока
+    число записей перестанет меняться» нельзя — это стена по времени. Вместо
+    этого тест считает отказы, на которые ждёт запись (``expected``), а обёртка
+    над фоновой задачей считает завершённые (``finished``) и будит ожидающего.
+    """
+
+    def __init__(self) -> None:
+        self.expected = 0
+        self.finished = 0
+        self.changed = asyncio.Event()
+
+    async def settled(self, deadline: float = 10.0) -> None:
+        """Дождаться всех ожидаемых записей; deadline — только страховка."""
+        while self.finished < self.expected:
+            self.changed.clear()
+            await asyncio.wait_for(self.changed.wait(), deadline)
 
 
 @pytest.fixture
-async def hub(client, db, monkeypatch):
+def audit_probe(monkeypatch):
+    probe = _AuditProbe()
+    real = cp.audit_redeem_refusal_detached
+
+    async def _counted(*args, **kwargs):
+        try:
+            return await real(*args, **kwargs)
+        finally:
+            probe.finished += 1
+            probe.changed.set()
+
+    monkeypatch.setattr(cp, "audit_redeem_refusal_detached", _counted)
+    return probe
+
+
+@pytest.fixture
+async def hub(client, db, monkeypatch, audit_probe):
     """Хаб с включённым auth: human-принципал, admin-принципал, агентский токен."""
     monkeypatch.setattr(
         config, "HUB_TOKENS", {AGENT_TOKEN: TokenIdentity("bot", "agent")}
@@ -69,6 +110,7 @@ async def hub(client, db, monkeypatch):
     return SimpleNamespace(
         client=client,
         db=db,
+        audit_probe=audit_probe,
         human_id=human["id"],
         human_token=human_key["plaintext_key"],
         human_auth={"Authorization": f"Bearer {human_key['plaintext_key']}"},
@@ -1760,3 +1802,390 @@ async def test_implementer_block_without_ready_task_carries_no_skip_reasons(
         assert not re.search(rf"#{hidden_id}\b", text), hidden_id
         assert not re.search(rf"#{hidden_id}\b", structured), hidden_id
     assert "propushhennaja" not in text + structured
+
+
+# ---------------------------------------------------------------------------
+# #1694: причина отказа обмена — в закрытый аудит; свой срок кода ревьюера
+# ---------------------------------------------------------------------------
+
+
+async def _post_redeem(hub, code: str, ip: str = CALLER_IP):
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip(ip)
+    )
+    if resp.status_code == 401:
+        hub.audit_probe.expected += 1
+    return resp
+
+
+async def _asgi_redeem(code: str, ip: str, sent: asyncio.Event) -> int:
+    """Обмен напрямую через ASGI; ``sent`` взводится, когда ушёл последний кусок.
+
+    Клиент httpx ждёт конца приложения, включая фоновые задачи, и поэтому
+    скрыл бы задержку записи в аудит. Вызов возвращается, только когда
+    приложение закончило фон, — тест держит его заблокированным и смотрит на
+    ``sent``, а не на часы.
+    """
+    from hub.app import app
+
+    payload = json.dumps({"code": code}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/auth/chat-pair/redeem",
+        "raw_path": b"/api/auth/chat-pair/redeem",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+            (b"x-forwarded-for", ip.encode()),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+    delivered = False
+    never = asyncio.Event()
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await never.wait()
+        return {"type": "http.disconnect"}
+
+    status = 0
+
+    async def send(message):
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = message["status"]
+        elif message["type"] == "http.response.body" and not message.get("more_body"):
+            sent.set()
+
+    await app(scope, receive, send)
+    return status
+
+
+async def _refusals(hub) -> list[dict]:
+    """Записи об отказах в порядке записи; detail разобран.
+
+    Запись идёт фоном после ответа (#1694), поэтому сначала ждём ровно те
+    записи, на которые тест заявил отказы (по событию, а не по часам).
+    """
+    await hub.audit_probe.settled()
+    rows = await _rows(
+        hub.db,
+        "SELECT * FROM admin_audit_log WHERE action = 'chat_pair_redeem_refused' "
+        "ORDER BY id",
+    )
+    for row in rows:
+        row["info"] = json.loads(row["detail"])
+    return rows
+
+
+async def _age_code(hub, code: str, seconds: int) -> None:
+    """Сдвинуть все метки строки кода назад: «сейчас» стало на seconds позже."""
+    await hub.db.execute(
+        "UPDATE chat_pair_codes SET expires_at = datetime(expires_at, ?), "
+        "redeemed_at = CASE WHEN redeemed_at IS NULL THEN NULL "
+        "ELSE datetime(redeemed_at, ?) END WHERE code_hash = ?",
+        (
+            f"-{seconds} seconds",
+            f"-{seconds} seconds",
+            cp.hash_pair_code(cp.normalize_pair_code(code)),
+        ),
+    )
+    await hub.db.commit()
+
+
+async def _reviewer_code(
+    hub, title: str, *, principal_id: int | None = None
+) -> tuple[int, str]:
+    task_id = await _in_review(hub, title)
+    code, _ttl = await cp.issue_code(
+        hub.db,
+        principal_id or hub.human_id,
+        kind="reviewer",
+        bound_task_id=task_id,
+        bound_generation=1,
+    )
+    return task_id, code
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_code_has_its_own_ttl(hub, monkeypatch):
+    """AC-1 (#1694): у кода ревьюера свой срок; прочие виды — прежние 300 с.
+
+    «Сейчас» сдвигается сдвигом меток строки: срок, записанный при выдаче,
+    остаётся тем, что выдал код, — по нему и судит обмен.
+    """
+    assert config.CHAT_PAIR_REVIEWER_CODE_SECONDS == 3600
+    t1, early = await _reviewer_code(hub, "обмен в срок")
+    t2, late = await _reviewer_code(hub, "обмен после срока")
+    intake = await _start(hub)
+    monkeypatch.setattr(config, "CHAT_PAIR_REVIEWER_CODE_SECONDS", 600)
+    t3, short = await _reviewer_code(hub, "короткий срок по настройке")
+
+    # Срок — это записанная при выдаче разница, а не секунда до границы: точность
+    # SQLite — секунды, и проверка «на T+3599» зависела бы от скорости машины.
+    async def _term(code: str) -> int:
+        row = await _rows(
+            hub.db,
+            "SELECT CAST(strftime('%s', expires_at) AS INTEGER) - "
+            "CAST(strftime('%s', created_at) AS INTEGER) AS term "
+            "FROM chat_pair_codes WHERE code_hash = ?",
+            (cp.hash_pair_code(cp.normalize_pair_code(code)),),
+        )
+        return row[0]["term"]
+
+    assert await _term(early) == 3600
+    assert await _term(late) == 3600
+    assert await _term(intake) == 300
+    assert await _term(short) == 600
+
+    await _age_code(hub, early, 3500)
+    await _age_code(hub, late, 3700)
+    await _age_code(hub, intake, 400)
+    await _age_code(hub, short, 700)
+
+    assert (await _post_redeem(hub, early)).status_code == 200
+    answers = [
+        await _post_redeem(hub, c, f"198.51.100.{i}")
+        for i, c in enumerate((late, intake, short), start=10)
+    ]
+    assert [r.status_code for r in answers] == [401, 401, 401]
+    assert {r.json()["detail"]["reason"] for r in answers} == {"chat_pair_invalid"}
+
+    by_task = {
+        r["info"]["bound_task_id"]: r["info"]["reason"] for r in await _refusals(hub)
+    }
+    assert by_task[t2] == "expired"
+    assert by_task[t3] == "expired"
+    assert t1 not in by_task
+    intake_rows = [r for r in await _refusals(hub) if r["info"]["kind"] == "intake"]
+    assert [r["info"]["reason"] for r in intake_rows] == ["expired"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_redeem_is_explained_only_in_the_admin_audit(
+    hub, caplog, monkeypatch
+):
+    """AC-2 (#1694): одна запись на отказ с причиной; ответ один и тот же."""
+    caplog.set_level("INFO")
+    _t, spent = await _reviewer_code(hub, "потрачен")
+    assert (await _post_redeem(hub, spent)).status_code == 200
+    _t, expired = await _reviewer_code(hub, "просрочен")
+    await _age_code(hub, expired, 3601)
+    _t, both = await _reviewer_code(hub, "потрачен и просрочен")
+    assert (await _post_redeem(hub, both)).status_code == 200
+    await _age_code(hub, both, 3601)
+    t_run, not_review = await _reviewer_code(hub, "ушёл из review")
+    await hub.db.execute("UPDATE tasks SET status='running' WHERE id=?", (t_run,))
+    t_gen, old_gen = await _reviewer_code(hub, "прошлое поколение")
+    await hub.db.execute(
+        "UPDATE tasks SET submission_generation=2 WHERE id=?", (t_gen,)
+    )
+    ghost = await admin_svc.create_principal(
+        db=hub.db, kind="human", username="ghost", role_slug="operator"
+    )
+    _t, inactive = await _reviewer_code(
+        hub, "принципал выключен", principal_id=ghost["id"]
+    )
+    await hub.db.execute(
+        "UPDATE principals SET status='disabled' WHERE id=?", (ghost["id"],)
+    )
+    await hub.db.commit()
+
+    codes = [spent, expired, both, not_review, old_gen, inactive, "ZZZZZZZZ"]
+    answers = [
+        await _post_redeem(hub, c, f"198.51.100.{i}")
+        for i, c in enumerate(codes, start=20)
+    ]
+    assert {r.status_code for r in answers} == {401}
+    assert len({json.dumps(r.json(), sort_keys=True) for r in answers}) == 1
+    assert answers[0].json()["detail"]["reason"] == "chat_pair_invalid"
+
+    refusals = await _refusals(hub)
+    assert [r["info"]["reason"] for r in refusals] == [
+        "spent",
+        "expired",
+        "spent",
+        "task_not_in_review",
+        "generation_mismatch",
+        "principal_inactive",
+        "unknown",
+    ]
+    assert refusals[3]["info"]["kind"] == "reviewer"
+    assert refusals[3]["info"]["bound_task_id"] == t_run
+    assert refusals[4]["info"]["bound_generation"] == 1
+
+    everything = (
+        json.dumps(
+            await _rows(hub.db, "SELECT * FROM admin_audit_log")
+            + await _rows(hub.db, "SELECT * FROM activity_log")
+            + await _rows(hub.db, "SELECT * FROM events"),
+            ensure_ascii=False,
+            default=str,
+        )
+        + caplog.text
+    )
+    for code in codes[:-1]:
+        assert cp.normalize_pair_code(code) not in everything
+        assert cp.hash_pair_code(cp.normalize_pair_code(code)) not in everything
+    assert "198.51.100." not in everything
+    assert CALLER_IP not in everything
+
+    # Ответ уходит, пока запись в аудит ещё заблокирована: время не называет
+    # причину. Синхронизация событиями, без стен по времени.
+    real_write = admin_svc.write_audit
+    gate = {"open": asyncio.Event()}
+
+    async def _gated_write(*args, **kwargs):
+        await gate["open"].wait()
+        return await real_write(*args, **kwargs)
+
+    monkeypatch.setattr(admin_svc, "write_audit", _gated_write)
+    _t, fresh = await _reviewer_code(hub, "задержка аудита")
+    await _age_code(hub, fresh, 3601)
+    count_sql = (
+        "SELECT COUNT(*) AS n FROM admin_audit_log "
+        "WHERE action = 'chat_pair_redeem_refused'"
+    )
+    before = (await _rows(hub.db, count_sql))[0]["n"]
+    for i, candidate in enumerate((fresh, spent, "YYYYYYYY"), start=80):
+        gate["open"] = asyncio.Event()
+        sent = asyncio.Event()
+        hub.audit_probe.expected += 1
+        call = asyncio.create_task(_asgi_redeem(candidate, f"198.51.100.{i}", sent))
+        await asyncio.wait_for(sent.wait(), 10)
+        assert not call.done(), "приложение не ждало запись аудита после ответа"
+        assert (await _rows(hub.db, count_sql))[0]["n"] == before + (i - 80)
+        gate["open"].set()
+        assert await asyncio.wait_for(call, 10) == 401
+    monkeypatch.setattr(admin_svc, "write_audit", real_write)
+    assert len(await _refusals(hub)) == before + 3
+
+    # Читает только admin.audit.read: ни лента, ни прочие ключи записи не видят.
+    assert (
+        await hub.client.get("/api/admin/audit", headers=hub.admin_auth)
+    ).status_code == 200
+    watcher = await admin_svc.create_principal(
+        db=hub.db, kind="agent", username="eye", role_slug="watcher"
+    )
+    watcher_key = await admin_svc.create_api_key(hub.db, watcher["id"], name="eye")
+    reviewer = await _reviewer_session(hub, await _in_review(hub, "сессия ревьюера"))
+    for auth in (
+        hub.human_auth,
+        hub.agent_auth,
+        {"Authorization": f"Bearer {watcher_key['plaintext_key']}"},
+        reviewer,
+        await _session(hub),
+    ):
+        resp = await hub.client.get("/api/admin/audit", headers=auth)
+        assert resp.status_code in (401, 403), resp.text
+        assert "chat_pair_redeem_refused" not in resp.text
+    feed = await hub.client.get("/api/events", headers=hub.human_auth)
+    assert "chat_pair_redeem_refused" not in feed.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_code_refusals_are_thinned_in_the_audit(hub, monkeypatch):
+    """AC-3 (#1694): unknown — не чаще раза в 60 с на адрес; лимитер прежний."""
+    now = [1000.0]
+    monkeypatch.setattr(cp, "_clock", lambda: now[0])
+    monkeypatch.setattr(config, "CHAT_PAIR_REDEEM_MAX", 1000)
+
+    written = []
+    plan = [
+        (0, "203.0.113.1"),
+        (10, "203.0.113.1"),
+        (30, "203.0.113.1"),
+        (30, "203.0.113.2"),
+        (91, "203.0.113.1"),
+    ]
+    for at, ip in plan:
+        now[0] = 1000.0 + at
+        resp = await _post_redeem(hub, "ZZZZZZZZ", ip)
+        assert resp.status_code == 401
+        written.append(len(await _refusals(hub)))
+    assert written == [1, 1, 1, 2, 3]
+    assert {r["info"]["reason"] for r in await _refusals(hub)} == {"unknown"}
+
+    # Стандартный лимитер: десять отказов, одиннадцатый — 429, как прежде.
+    monkeypatch.setattr(cp, "_clock", time.monotonic)
+    monkeypatch.setattr(config, "CHAT_PAIR_REDEEM_MAX", 10)
+    cp.chat_pair_limiter._buckets.clear()
+    for _ in range(10):
+        assert (await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.9")).status_code == 401
+    blocked = await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.9")
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"]["reason"] == "chat_pair_rate_limited"
+
+    # Счётчик прореживания ограничен: поток новых адресов не растит память.
+    cp._unknown_audit_seen.clear()
+    for n in range(cp.UNKNOWN_AUDIT_CAPACITY + 50):
+        cp.unknown_refusal_audit_due(f"10.1.{n // 250}.{n % 250}")
+    assert len(cp._unknown_audit_seen) == cp.UNKNOWN_AUDIT_CAPACITY
+    assert cp.unknown_refusal_audit_due("10.9.9.9") is False
+    # Старые записи уходят с головы, и место освобождается.
+    monkeypatch.setattr(cp, "_clock", lambda: time.monotonic() + 61)
+    assert cp.unknown_refusal_audit_due("10.9.9.9") is True
+    assert len(cp._unknown_audit_seen) == 1
+    # Лимитер 429 от счётчика не зависит.
+    cp.chat_pair_limiter._buckets.clear()
+    for _ in range(10):
+        assert (await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.10")).status_code == 401
+    assert (await _post_redeem(hub, "ZZZZZZZZ", "192.0.2.10")).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_reviewer_codes_are_kept_a_day_for_diagnosis_then_purged(hub):
+    """AC-4 (#1694): коды ревьюера живут в таблице сутки, intake — как прежде."""
+    _t, expired = await _reviewer_code(hub, "просрочен для диагноза")
+    _t, spent = await _reviewer_code(hub, "потрачен для диагноза")
+    assert (await _post_redeem(hub, spent)).status_code == 200
+    intake = await _start(hub)
+    await _age_code(hub, expired, 3600 + 120)
+    await _age_code(hub, spent, 120)
+    await _age_code(hub, intake, 300 + 120)
+
+    await cp.purge_expired(hub.db)
+    present = {
+        r["code_hash"]
+        for r in await _rows(hub.db, "SELECT code_hash FROM chat_pair_codes")
+    }
+    h = lambda c: cp.hash_pair_code(cp.normalize_pair_code(c))  # noqa: E731
+    assert h(expired) in present and h(spent) in present
+    assert h(intake) not in present
+
+    answers = [
+        await _post_redeem(hub, c, f"198.51.100.{i}")
+        for i, c in enumerate((expired, spent, intake), start=40)
+    ]
+    assert {r.status_code for r in answers} == {401}
+    assert [r["info"]["reason"] for r in await _refusals(hub)] == [
+        "expired",
+        "spent",
+        "unknown",
+    ]
+
+    await _age_code(hub, expired, 25 * 3600)
+    await _age_code(hub, spent, 25 * 3600)
+    await cp.purge_expired(hub.db)
+    left = await _rows(hub.db, "SELECT code_hash FROM chat_pair_codes")
+    assert h(expired) not in {r["code_hash"] for r in left}
+    assert h(spent) not in {r["code_hash"] for r in left}
+    later = [
+        await _post_redeem(hub, c, f"198.51.100.{i}")
+        for i, c in enumerate((expired, spent), start=60)
+    ]
+    assert {r.status_code for r in later} == {401}
+    assert [r["info"]["reason"] for r in (await _refusals(hub))[3:]] == [
+        "unknown",
+        "unknown",
+    ]
