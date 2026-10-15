@@ -662,6 +662,53 @@ async def test_broken_front_matter_leaves_the_active_seed_version_alone(
     assert await _served(db, "zz-good") == good, "остальные файлы засеяны"
 
 
+@pytest.mark.parametrize("failure", ["permission", "vanished"])
+async def test_an_unreadable_skill_file_does_not_stop_the_seed(
+    db: aiosqlite.Connection, skills_tree: Path, caplog, monkeypatch, failure: str
+):
+    """PermissionError и файл, исчезнувший после glob, пропускают один файл."""
+    _write_skill(skills_tree, "zz-unreadable")
+    good = _write_skill(skills_tree, "zz-fine")
+    await _install(db, "zz-unreadable", [(1, OLD_TEXT, "active", "seed", "seed")])
+    await _install(db, "zz-fine", [])
+    before = await _versions(db, "zz-unreadable")
+    real = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self.parent.name == "zz-unreadable":
+            if failure == "permission":
+                raise PermissionError(13, "denied")
+            raise FileNotFoundError(2, "gone")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with caplog.at_level(logging.WARNING, logger="hub.skill_files"):
+        await seed_default_skills(db)
+
+    assert await _versions(db, "zz-unreadable") == before
+    assert any("zz-unreadable" in r.getMessage() for r in caplog.records)
+    assert await _served(db, "zz-fine") == good
+
+
+def test_each_skill_file_is_read_once(skills_tree: Path, monkeypatch):
+    """Валидируется и засевается один и тот же прочитанный текст."""
+    for name in ("zz-a", "zz-b"):
+        _write_skill(skills_tree, name)
+    reads: list[str] = []
+    real = Path.read_bytes
+
+    def counting(self: Path) -> bytes:
+        reads.append(self.parent.name)
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    assert [f.name for f in skill_files.load_skill_files(skills_tree)] == [
+        "zz-a",
+        "zz-b",
+    ]
+    assert sorted(reads) == ["zz-a", "zz-b"]
+
+
 def test_every_skill_file_in_the_repository_is_valid():
     assert skill_files.skill_file_problems(REPO / "skills") == []
     # Исключение без front-matter — только выгрузка прода как есть.

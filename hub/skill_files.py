@@ -74,32 +74,48 @@ def _front_matter(text: str) -> dict[str, object] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def skill_file_problems(root: Path) -> list[str]:
-    """Что не так с файлами под ``root``; пустой список — всё в порядке."""
-    problems: list[str] = []
-    for path in sorted(root.glob("*/SKILL.md")):
-        directory = path.parent.name
-        label = f"{path.parent.parent.name}/{directory}/SKILL.md"
-        if directory in CODE_SEEDED_SKILLS:
-            problems.append(f"{label}: навык засевается из кода, второй источник")
-            continue
-        try:
-            text = path.read_bytes().decode("utf-8")
-        except UnicodeDecodeError:
-            problems.append(f"{label}: не UTF-8")
-            continue
-        if directory in LEGACY_NO_FRONT_MATTER:
-            continue
+def _inspect(path: Path) -> tuple[SkillFile | None, str | None]:
+    """Один файл: прочитан один раз, этот же текст проверяется и засевается.
+
+    Возвращает (навык, None) или (None, проблема).
+    """
+    directory = path.parent.name
+    label = f"{path.parent.parent.name}/{directory}/SKILL.md"
+    if directory in CODE_SEEDED_SKILLS:
+        return None, f"{label}: навык засевается из кода, второй источник"
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        return None, f"{label}: не UTF-8"
+    except OSError as exc:
+        return None, f"{label}: не прочитан ({type(exc).__name__})"
+    if directory not in LEGACY_NO_FRONT_MATTER:
         fields = _front_matter(text)
         if fields is None:
-            problems.append(f"{label}: front-matter отсутствует или не разбирается")
-            continue
+            return None, f"{label}: front-matter отсутствует или не разбирается"
         if fields.get("name") != directory:
-            problems.append(f"{label}: name не совпадает с каталогом {directory!r}")
+            return None, f"{label}: name не совпадает с каталогом {directory!r}"
         description = fields.get("description")
         if not isinstance(description, str) or not description.strip():
-            problems.append(f"{label}: description не непустая строка")
-    return problems
+            return None, f"{label}: description не непустая строка"
+    skill = SkillFile(
+        name=directory, kind="skill", content=text, tags=_TAGS.get(directory, "[]")
+    )
+    return skill, None
+
+
+def _skill_paths(root: Path) -> list[Path]:
+    try:
+        return sorted(root.glob("*/SKILL.md"))
+    except OSError:
+        logger.warning("skills directory %s is not listable", root)
+        return []
+
+
+def skill_file_problems(root: Path) -> list[str]:
+    """Что не так с файлами под ``root``; пустой список — всё в порядке."""
+    inspected = (_inspect(path) for path in _skill_paths(root))
+    return [problem for _, problem in inspected if problem is not None]
 
 
 def load_skill_files(root: Path | None = None) -> list[SkillFile]:
@@ -109,21 +125,11 @@ def load_skill_files(root: Path | None = None) -> list[SkillFile]:
     if root is None:
         logger.warning("skills directory not found, file seeding skipped")
         return []
-    problems = skill_file_problems(root)
-    bad = {p.split("/")[1] for p in problems}
-    for problem in problems:
-        logger.warning("skill file skipped: %s", problem)
     loaded = []
-    for path in sorted(root.glob("*/SKILL.md")):
-        name = path.parent.name
-        if name in bad:
-            continue
-        loaded.append(
-            SkillFile(
-                name=name,
-                kind="skill",
-                content=path.read_bytes().decode("utf-8"),
-                tags=_TAGS.get(name, "[]"),
-            )
-        )
+    for path in _skill_paths(root):
+        skill, problem = _inspect(path)
+        if problem is not None:
+            logger.warning("skill file skipped: %s", problem)
+        elif skill is not None:
+            loaded.append(skill)
     return loaded
