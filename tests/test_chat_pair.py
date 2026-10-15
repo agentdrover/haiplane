@@ -53,8 +53,45 @@ def _clean_limiters():
     cp._unknown_audit_seen.clear()
 
 
+class _AuditProbe:
+    """Счётчик фоновых записей аудита об отказах обмена (#1694).
+
+    Запись идёт после ответа, и клиент может вернуться раньше неё. Ждать «пока
+    число записей перестанет меняться» нельзя — это стена по времени. Вместо
+    этого тест считает отказы, на которые ждёт запись (``expected``), а обёртка
+    над фоновой задачей считает завершённые (``finished``) и будит ожидающего.
+    """
+
+    def __init__(self) -> None:
+        self.expected = 0
+        self.finished = 0
+        self.changed = asyncio.Event()
+
+    async def settled(self, deadline: float = 10.0) -> None:
+        """Дождаться всех ожидаемых записей; deadline — только страховка."""
+        while self.finished < self.expected:
+            self.changed.clear()
+            await asyncio.wait_for(self.changed.wait(), deadline)
+
+
 @pytest.fixture
-async def hub(client, db, monkeypatch):
+def audit_probe(monkeypatch):
+    probe = _AuditProbe()
+    real = cp.audit_redeem_refusal_detached
+
+    async def _counted(*args, **kwargs):
+        try:
+            return await real(*args, **kwargs)
+        finally:
+            probe.finished += 1
+            probe.changed.set()
+
+    monkeypatch.setattr(cp, "audit_redeem_refusal_detached", _counted)
+    return probe
+
+
+@pytest.fixture
+async def hub(client, db, monkeypatch, audit_probe):
     """Хаб с включённым auth: human-принципал, admin-принципал, агентский токен."""
     monkeypatch.setattr(
         config, "HUB_TOKENS", {AGENT_TOKEN: TokenIdentity("bot", "agent")}
@@ -73,6 +110,7 @@ async def hub(client, db, monkeypatch):
     return SimpleNamespace(
         client=client,
         db=db,
+        audit_probe=audit_probe,
         human_id=human["id"],
         human_token=human_key["plaintext_key"],
         human_auth={"Authorization": f"Bearer {human_key['plaintext_key']}"},
@@ -1772,20 +1810,22 @@ async def test_implementer_block_without_ready_task_carries_no_skip_reasons(
 
 
 async def _post_redeem(hub, code: str, ip: str = CALLER_IP):
-    return await hub.client.post(
+    resp = await hub.client.post(
         "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip(ip)
     )
+    if resp.status_code == 401:
+        hub.audit_probe.expected += 1
+    return resp
 
 
-async def _asgi_redeem(code: str, ip: str) -> tuple[int, float]:
-    """Обмен напрямую через ASGI: (статус, секунды до отправки ответа).
+async def _asgi_redeem(code: str, ip: str, sent: asyncio.Event) -> int:
+    """Обмен напрямую через ASGI; ``sent`` взводится, когда ушёл последний кусок.
 
     Клиент httpx ждёт конца приложения, включая фоновые задачи, и поэтому
-    скрыл бы задержку записи в аудит; здесь время берётся в момент отправки
-    последнего куска ответа.
+    скрыл бы задержку записи в аудит. Вызов возвращается, только когда
+    приложение закончило фон, — тест держит его заблокированным и смотрит на
+    ``sent``, а не на часы.
     """
-    import asyncio
-
     from hub.app import app
 
     payload = json.dumps({"code": code}).encode()
@@ -1819,35 +1859,25 @@ async def _asgi_redeem(code: str, ip: str) -> tuple[int, float]:
         return {"type": "http.disconnect"}
 
     status = 0
-    answered_at = 0.0
-    started = time.monotonic()
 
     async def send(message):
-        nonlocal status, answered_at
+        nonlocal status
         if message["type"] == "http.response.start":
             status = message["status"]
         elif message["type"] == "http.response.body" and not message.get("more_body"):
-            answered_at = time.monotonic() - started
+            sent.set()
 
     await app(scope, receive, send)
-    return status, answered_at
+    return status
 
 
 async def _refusals(hub) -> list[dict]:
     """Записи об отказах в порядке записи; detail разобран.
 
-    Запись идёт фоном после ответа (#1694) и клиент может вернуться раньше
-    неё, поэтому сперва ждём, пока число записей перестанет меняться.
+    Запись идёт фоном после ответа (#1694), поэтому сначала ждём ровно те
+    записи, на которые тест заявил отказы (по событию, а не по часам).
     """
-    count_sql = (
-        "SELECT COUNT(*) AS n FROM admin_audit_log "
-        "WHERE action = 'chat_pair_redeem_refused'"
-    )
-    stable, last = 0, -1
-    while stable < 5:
-        await asyncio.sleep(0.02)
-        now = (await _rows(hub.db, count_sql))[0]["n"]
-        stable, last = (stable + 1, last) if now == last else (0, now)
+    await hub.audit_probe.settled()
     rows = await _rows(
         hub.db,
         "SELECT * FROM admin_audit_log WHERE action = 'chat_pair_redeem_refused' "
@@ -1901,10 +1931,27 @@ async def test_a_reviewer_code_has_its_own_ttl(hub, monkeypatch):
     monkeypatch.setattr(config, "CHAT_PAIR_REVIEWER_CODE_SECONDS", 600)
     t3, short = await _reviewer_code(hub, "короткий срок по настройке")
 
-    await _age_code(hub, early, 3599)
-    await _age_code(hub, late, 3601)
-    await _age_code(hub, intake, 301)
-    await _age_code(hub, short, 601)
+    # Срок — это записанная при выдаче разница, а не секунда до границы: точность
+    # SQLite — секунды, и проверка «на T+3599» зависела бы от скорости машины.
+    async def _term(code: str) -> int:
+        row = await _rows(
+            hub.db,
+            "SELECT CAST(strftime('%s', expires_at) AS INTEGER) - "
+            "CAST(strftime('%s', created_at) AS INTEGER) AS term "
+            "FROM chat_pair_codes WHERE code_hash = ?",
+            (cp.hash_pair_code(cp.normalize_pair_code(code)),),
+        )
+        return row[0]["term"]
+
+    assert await _term(early) == 3600
+    assert await _term(late) == 3600
+    assert await _term(intake) == 300
+    assert await _term(short) == 600
+
+    await _age_code(hub, early, 3500)
+    await _age_code(hub, late, 3700)
+    await _age_code(hub, intake, 400)
+    await _age_code(hub, short, 700)
 
     assert (await _post_redeem(hub, early)).status_code == 200
     answers = [
@@ -1993,21 +2040,33 @@ async def test_a_refused_redeem_is_explained_only_in_the_admin_audit(
     assert "198.51.100." not in everything
     assert CALLER_IP not in everything
 
-    # Время ответа не называет причину: запись в аудит идёт после ответа.
+    # Ответ уходит, пока запись в аудит ещё заблокирована: время не называет
+    # причину. Синхронизация событиями, без стен по времени.
     real_write = admin_svc.write_audit
+    gate = {"open": asyncio.Event()}
 
-    async def _slow_write(*args, **kwargs):
-        await asyncio.sleep(0.2)
+    async def _gated_write(*args, **kwargs):
+        await gate["open"].wait()
         return await real_write(*args, **kwargs)
 
-    monkeypatch.setattr(admin_svc, "write_audit", _slow_write)
-    before = len(await _refusals(hub))
+    monkeypatch.setattr(admin_svc, "write_audit", _gated_write)
     _t, fresh = await _reviewer_code(hub, "задержка аудита")
     await _age_code(hub, fresh, 3601)
+    count_sql = (
+        "SELECT COUNT(*) AS n FROM admin_audit_log "
+        "WHERE action = 'chat_pair_redeem_refused'"
+    )
+    before = (await _rows(hub.db, count_sql))[0]["n"]
     for i, candidate in enumerate((fresh, spent, "YYYYYYYY"), start=80):
-        status, took = await _asgi_redeem(candidate, f"198.51.100.{i}")
-        assert status == 401
-        assert took < 0.1, f"ответ ждал запись аудита: {took:.3f} с"
+        gate["open"] = asyncio.Event()
+        sent = asyncio.Event()
+        hub.audit_probe.expected += 1
+        call = asyncio.create_task(_asgi_redeem(candidate, f"198.51.100.{i}", sent))
+        await asyncio.wait_for(sent.wait(), 10)
+        assert not call.done(), "приложение не ждало запись аудита после ответа"
+        assert (await _rows(hub.db, count_sql))[0]["n"] == before + (i - 80)
+        gate["open"].set()
+        assert await asyncio.wait_for(call, 10) == 401
     monkeypatch.setattr(admin_svc, "write_audit", real_write)
     assert len(await _refusals(hub)) == before + 3
 
