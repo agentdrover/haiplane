@@ -100,3 +100,58 @@ def test_m1_probability_uses_the_budgeted_repeat_count() -> None:
     k = 240  # 120 s / 0.5 s
     assert f"| {k} | {1 - (1 - 0.002) ** k:.3f} |" in table
     assert "n/a (p=0)" in table and "mean over 1 not reproduced" in table
+
+
+class _Proc:
+    def __init__(self, rc: int = 0, out: str = "", err: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def _fake_gh(monkeypatch, help_text: str, replies: list[_Proc]) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[-1] == "--help":
+            return _Proc(out=help_text)
+        return replies.pop(0)
+
+    monkeypatch.setattr(fc.subprocess, "run", run)
+    return calls
+
+
+def test_logs_request_carries_the_escape_flag_only_when_gh_knows_it(
+    monkeypatch, tmp_path
+) -> None:
+    calls = _fake_gh(monkeypatch, "  --allow-escape-sequences  x", [_Proc(out="log")])
+    fc.Gh(tmp_path / "new").get("actions/jobs/1/logs")
+    assert calls[-1][-1] == "--allow-escape-sequences"
+
+    calls = _fake_gh(monkeypatch, "  --jq  x", [_Proc(out="log"), _Proc(out="{}")])
+    gh = fc.Gh(tmp_path / "old")
+    gh.get("actions/jobs/1/logs")
+    gh.get("actions/runs/2")
+    assert "--allow-escape-sequences" not in calls[-2] + calls[-1]
+
+
+def test_escape_sequence_refusal_is_retried_with_the_flag_or_named(
+    monkeypatch, tmp_path
+) -> None:
+    refusal = _Proc(
+        1,
+        "",
+        "the response contains terminal escape sequences; pass --allow-escape-sequences",
+    )
+    calls = _fake_gh(
+        monkeypatch, "no flag listed", [refusal, _Proc(out="\x1b[36;1mok\x1b[0m")]
+    )
+    assert fc.Gh(tmp_path / "a").get("actions/jobs/1/logs") == "ok", "ANSI снят"
+    assert calls[-1][-1] == "--allow-escape-sequences"
+
+    _fake_gh(monkeypatch, "no flag listed", [refusal, refusal])
+    try:
+        fc.Gh(tmp_path / "b").get("actions/jobs/1/logs")
+    except RuntimeError as err:
+        assert "обновите gh" in str(err)
+    else:
+        raise AssertionError("пустой результат вместо ошибки")

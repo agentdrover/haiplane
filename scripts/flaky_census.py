@@ -134,6 +134,16 @@ class MissingResource(Exception):
     """Журнал или объект недоступен (404/410): отмечается, не выбрасывается."""
 
 
+ESCAPE_FLAG = "--allow-escape-sequences"
+ESCAPE_HINT = "escape sequences"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def strip_escapes(text: str) -> str:
+    """Одинаково для любой версии gh: ни токенов, ни сырого ANSI в кэше и в данных."""
+    return ANSI_RE.sub("", text)
+
+
 class Gh:
     """Тонкая обёртка над `gh api` (GET) с файловым кэшем ответов."""
 
@@ -141,9 +151,37 @@ class Gh:
         self.cache_dir = cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.calls = 0
+        self.escape_flag: bool | None = None
 
     def _slot(self, path: str) -> Path:
         return self.cache_dir / (hashlib.sha1(path.encode()).hexdigest() + ".cache")
+
+    def supports_escape_flag(self) -> bool:
+        """gh >= 2.102 отказывается печатать журнал job с управляющими
+        последовательностями без --allow-escape-sequences; старый gh флага не знает.
+        Поддержка определяется один раз по `gh api --help`."""
+        if self.escape_flag is None:
+            help_text = subprocess.run(
+                ["gh", "api", "--help"], capture_output=True, text=True
+            )
+            self.escape_flag = ESCAPE_FLAG in help_text.stdout + help_text.stderr
+        return self.escape_flag
+
+    def _argv(self, path: str, with_flag: bool) -> list[str]:
+        argv = ["gh", "api", f"repos/{REPO}/{path}"]
+        return argv + [ESCAPE_FLAG] if with_flag else argv
+
+    def _run(self, path: str) -> subprocess.CompletedProcess:
+        wants_flag = path.endswith("/logs") and self.supports_escape_flag()
+        proc = subprocess.run(
+            self._argv(path, wants_flag), capture_output=True, text=True
+        )
+        if proc.returncode != 0 and not wants_flag and ESCAPE_HINT in proc.stderr:
+            self.escape_flag = True  # справка флаг не показала, но gh его требует
+            proc = subprocess.run(
+                self._argv(path, True), capture_output=True, text=True
+            )
+        return proc
 
     def get(self, path: str) -> str:
         slot = self._slot(path)
@@ -151,18 +189,22 @@ class Gh:
             body = slot.read_text(encoding="utf-8")
             if body == "\x00MISSING":
                 raise MissingResource(path)
-            return body
+            return strip_escapes(body)
         self.calls += 1
-        proc = subprocess.run(
-            ["gh", "api", f"repos/{REPO}/{path}"], capture_output=True, text=True
-        )
+        proc = self._run(path)
         if proc.returncode != 0:
             if re.search(r"HTTP (404|410)", proc.stderr):
                 slot.write_text("\x00MISSING", encoding="utf-8")
                 raise MissingResource(path)
-            raise RuntimeError(f"gh api {path}: {proc.stderr.strip()[:300]}")
-        slot.write_text(proc.stdout, encoding="utf-8")
-        return proc.stdout
+            hint = (
+                f" (gh {ESCAPE_FLAG} не помог или не поддерживается: обновите gh)"
+                if ESCAPE_HINT in proc.stderr
+                else ""
+            )
+            raise RuntimeError(f"gh api {path}: {proc.stderr.strip()[:300]}{hint}")
+        body = strip_escapes(proc.stdout)
+        slot.write_text(body, encoding="utf-8")
+        return body
 
     def json(self, path: str):
         return json.loads(self.get(path))
