@@ -906,16 +906,20 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def _verdict_block(task_id: int) -> str:
-    """#1697: the "Для вердикта" text; a role without the right gets one line.
+def _verdict_block(task_id: int, generation: int | None = None) -> tuple[str, bool]:
+    """#1697: ``(the "Для вердикта" text, answered)``; a refused role gets one line.
+
+    ``generation`` pins the evidence to the brief just read, so a resubmission
+    between the two requests cannot mix two generations.
 
     Own request instead of ``_api``: that one exits the process on any HTTP
     error, and a refusal here must not cost the reader the brief.
     """
     from hub.services import verdict_evidence
 
+    query = "" if generation is None else f"?generation={int(generation)}"
     url = urllib.parse.urljoin(
-        f"{_validated_hub_base_url()}/", f"api/tasks/{task_id}/verdict-evidence"
+        f"{_validated_hub_base_url()}/", f"api/tasks/{task_id}/verdict-evidence{query}"
     )
     req = urllib.request.Request(url, method="GET")
     if HUB_TOKEN:
@@ -923,19 +927,20 @@ def _verdict_block(task_id: int) -> str:
     try:
         # URL is built from _validated_hub_base_url(), as in _api.
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
-            return verdict_evidence.format_block(json.loads(resp.read().decode()))
+            return verdict_evidence.format_block(json.loads(resp.read().decode())), True
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
-            return verdict_evidence.ROLE_REFUSED_LINE
-        return f"Для вердикта: доказательства не получены (HTTP {exc.code})"
+            return verdict_evidence.ROLE_REFUSED_LINE, False
+        return f"Для вердикта: доказательства не получены (HTTP {exc.code})", False
     except (urllib.error.URLError, ValueError) as exc:
-        return f"Для вердикта: доказательства не получены ({exc})"
+        return f"Для вердикта: доказательства не получены ({exc})", False
 
 
 def cmd_verdict_evidence(args: argparse.Namespace) -> int:
     """#1697: the verdict evidence block of the task, as text."""
-    print(_verdict_block(args.task_id))
-    return 0
+    text, answered = _verdict_block(args.task_id)
+    print(text)
+    return 0 if answered else 1
 
 
 def cmd_review_brief(args: argparse.Namespace) -> int:
@@ -943,7 +948,10 @@ def cmd_review_brief(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
     _print_verdict_route(result)
     _print_ci_integrity(result)
-    print(_verdict_block(args.task_id), file=sys.stderr)
+    print(
+        _verdict_block(args.task_id, result.get("submission_generation"))[0],
+        file=sys.stderr,
+    )
     if getattr(args, "full", False):
         _print_json(result)
         return 0

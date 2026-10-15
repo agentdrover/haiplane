@@ -314,7 +314,10 @@ def _brief_stub() -> dict:
 
 
 async def _mcp_text(hub, task_id: int, *, refused: bool = False) -> str:
+    asked: list[str] = []
+
     async def fake(path: str, **_kw):
+        asked.append(path)
         if path.endswith("/review-brief"):
             return _brief_stub()
         if refused:
@@ -325,6 +328,8 @@ async def _mcp_text(hub, task_id: int, *, refused: bool = False) -> str:
 
     with patch.object(mcp_server, "_api_get", AsyncMock(side_effect=fake)):
         out = await hub_get_review_brief(task_id, section="full")
+    # The evidence is pinned to the generation of the brief just read.
+    assert asked[-1].endswith("verdict-evidence?generation=2"), asked
     return json.loads(out.content[0].text)["message"]
 
 
@@ -389,13 +394,22 @@ async def test_brief_text_and_cli_show_verdict_block(hub):
 
     forbidden = urllib.error.HTTPError("u", 403, "no", {}, None)  # type: ignore[arg-type]
     with patch.object(cli.urllib.request, "urlopen", side_effect=forbidden):
-        assert "доступны этой роли" in cli._verdict_block(task_id)
+        assert cli._verdict_block(task_id) == (
+            verdict_evidence.ROLE_REFUSED_LINE,
+            False,
+        )
+
+    with (
+        patch.object(cli.urllib.request, "urlopen", side_effect=forbidden),
+        patch("sys.stdout", new=StringIO()),
+    ):
+        assert cli.cmd_verdict_evidence(argparse.Namespace(task_id=task_id)) == 1
 
     # review-brief печатает блок рядом с брифом.
     err = StringIO()
     with (
         patch.object(cli, "_api", MagicMock(return_value=_brief_stub())),
-        patch.object(cli, "_verdict_block", MagicMock(return_value="БЛОК")),
+        patch.object(cli, "_verdict_block", MagicMock(return_value=("БЛОК", True))),
         patch("sys.stdout", new=StringIO()),
         patch("sys.stderr", new=err),
     ):

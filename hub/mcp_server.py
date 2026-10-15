@@ -2964,7 +2964,11 @@ async def hub_get_review_brief(
     except HubApiError as exc:
         return _error_result(exc)
     # #1697: the verdict block rides on the projection and the full text only.
-    block = "" if section not in ("", "full") else await _verdict_block(task_id)
+    block = (
+        ""
+        if section not in ("", "full")
+        else await _verdict_block(task_id, brief.get("submission_generation"))
+    )
     if section == "full":
         return _full_brief_result(brief, block)
     # The funnel adds unknown_arguments afterwards; fit against that shape (#1682).
@@ -2979,10 +2983,15 @@ async def hub_get_review_brief(
     return verdict_evidence.append_to_result(result, block) if block else result
 
 
-async def _verdict_block(task_id: int) -> str:
-    """#1697: the "Для вердикта" text; a refused role is told so in one line."""
+async def _verdict_block(task_id: int, generation: int | None) -> str:
+    """#1697: the "Для вердикта" text; a refused role is told so in one line.
+
+    Pinned to the generation of the brief just read: a resubmission between the
+    two requests must not mix two generations in one answer.
+    """
+    query = "" if generation is None else f"?generation={int(generation)}"
     try:
-        evidence = await _api_get(f"/api/tasks/{task_id}/verdict-evidence")
+        evidence = await _api_get(f"/api/tasks/{task_id}/verdict-evidence{query}")
     except HubApiError as exc:
         payload = exc.payload
         if payload.get("reason") == "permission_denied" or (

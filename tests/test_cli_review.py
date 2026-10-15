@@ -44,7 +44,7 @@ def test_cmd_review_brief() -> None:
     args = argparse.Namespace(task_id=42)
     with (
         patch.object(cli, "_api", mock_api),
-        patch.object(cli, "_verdict_block", MagicMock(return_value="блок")),
+        patch.object(cli, "_verdict_block", MagicMock(return_value=("блок", True))),
         patch("sys.stdout", new=StringIO()),
         patch("sys.stderr", new=StringIO()),
     ):
