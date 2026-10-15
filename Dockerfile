@@ -24,6 +24,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY hub ./hub
 COPY scripts ./scripts
+COPY skills ./skills
 RUN uv sync --frozen --no-dev
 
 COPY deploy/docker/entrypoint.sh /entrypoint.sh

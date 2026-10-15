@@ -445,3 +445,322 @@ async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
         assert [d["content"] for d in drafts] == [text], (
             f"{label}: the new text waits as exactly one draft"
         )
+
+
+# --- #1701: навыки из файлов skills/<name>/SKILL.md --------------------------
+
+import hashlib  # noqa: E402
+import logging  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import zipfile  # noqa: E402
+
+import pytest  # noqa: E402
+
+from hub import skill_files  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _write_skill(root: Path, name: str, body: str = "тело", **front) -> str:
+    fields = {"name": name, "description": f"описание {name}", **front}
+    text = "---\n" + "".join(f"{k}: {v}\n" for k, v in fields.items()) + "---\n" + body
+    (root / name).mkdir(parents=True, exist_ok=True)
+    (root / name / "SKILL.md").write_bytes(text.encode("utf-8"))
+    return text
+
+
+@pytest.fixture
+def skills_tree(tmp_path, monkeypatch) -> Path:
+    root = tmp_path / "skills"
+    root.mkdir()
+    monkeypatch.setattr(skill_files, "skills_root", lambda: root)
+    return root
+
+
+async def test_skills_are_seeded_from_files_once(
+    db: aiosqlite.Connection, skills_tree: Path
+):
+    """AC-1: пустая база, два старта — навыки активны с текстом файлов."""
+    texts = {n: _write_skill(skills_tree, n) for n in ("zz-one", "zz-two")}
+    await seed_default_skills(db)
+    first = {n: await _versions(db, n) for n in texts}
+    await seed_default_skills(db)
+    second = {n: await _versions(db, n) for n in texts}
+
+    for name, text in texts.items():
+        assert [(v["version"], v["status"], v["content"]) for v in first[name]] == [
+            (1, "active", text)
+        ]
+        assert first[name][0]["created_by"] == "seed"
+    assert second == first, "второй старт ничего не меняет"
+
+    # И настоящее дерево репозитория: каждый его файл засеян как лежит.
+    real_root = REPO / "skills"
+    loaded = skill_files.load_skill_files(real_root)
+    names = {f.name for f in loaded}
+    assert {
+        "hub-task-prep",
+        "hub-development",
+        "hub-testing",
+        "project-context",
+    } <= names
+    assert "local-executor-hub-repo" in names
+    assert not names & skill_files.CODE_SEEDED_SKILLS
+
+
+async def test_real_skill_files_are_seeded_into_an_empty_library(
+    db: aiosqlite.Connection,
+):
+    await seed_default_skills(db)
+    for f in skill_files.load_skill_files(REPO / "skills"):
+        assert await _served(db, f.name) == f.content, f.name
+
+
+async def test_seed_skill_is_promoted_from_a_changed_file(
+    db: aiosqlite.Connection, skills_tree: Path
+):
+    """AC-2: активный seed со старым текстом — в обоих видах — заменяется."""
+    text = _write_skill(skills_tree, "zz-promote")
+    for label, activated_by in (("seed", "seed"), ("legacy row", "")):
+        await _install(
+            db, "zz-promote", [(1, OLD_TEXT, "active", "seed", activated_by)]
+        )
+        await seed_default_skills(db)
+        assert await _served(db, "zz-promote") == text, label
+        versions = await _versions(db, "zz-promote")
+        assert [(v["version"], v["status"]) for v in versions] == [
+            (1, "draft"),
+            (2, "active"),
+        ], label
+        assert (
+            versions[1]["created_by"] == "seed"
+            and versions[1]["activated_by"] == "seed"
+        )
+
+
+async def test_a_human_published_skill_is_not_overwritten_by_a_file(
+    db: aiosqlite.Connection, skills_tree: Path, caplog
+):
+    """AC-3: активная версия человека цела, файл лежит черновиком, есть warning."""
+    text = _write_skill(skills_tree, "zz-human")
+    await _install(db, "zz-human", [(1, OLD_TEXT, "active", "denis", "denis")])
+    with caplog.at_level(logging.WARNING, logger="hub.db"):
+        await seed_default_skills(db)
+        await seed_default_skills(db)
+
+    assert await _served(db, "zz-human") == OLD_TEXT
+    versions = await _versions(db, "zz-human")
+    assert [(v["version"], v["status"], v["content"]) for v in versions] == [
+        (1, "active", OLD_TEXT),
+        (2, "draft", text),
+    ]
+    warned = [r for r in caplog.records if "zz-human" in r.getMessage()]
+    assert len(warned) == 1, "предупреждение с именем навыка, один раз"
+
+
+async def test_freshness_is_by_hash_not_by_version_number(
+    db: aiosqlite.Connection, skills_tree: Path
+):
+    """AC-4: откат файла выбирает версию по хешу, а не по большему номеру."""
+    old = _write_skill(skills_tree, "zz-revert", body="старое")
+    new = old.replace("старое", "новое")
+    assert skill_files.text_hash(old) != skill_files.text_hash(new)
+    # Файл откатили на старое; база помнит новое под большим номером.
+    await _install(
+        db,
+        "zz-revert",
+        [
+            (1, old, "draft", "seed", ""),
+            (5, new, "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    assert await _served(db, "zz-revert") == old
+    assert [(v["version"], v["status"]) for v in await _versions(db, "zz-revert")] == [
+        (1, "active"),
+        (5, "draft"),
+    ], "новой версии не заведено: нужный текст уже был"
+
+    # Черновик человека с большим номером не мешает: активная seed-версия
+    # со старым текстом всё равно заменяется, номер берётся после черновика.
+    await _install(
+        db,
+        "zz-revert",
+        [
+            (1, OLD_TEXT, "active", "seed", "seed"),
+            (7, "черновик человека", "draft", "denis", ""),
+        ],
+    )
+    await seed_default_skills(db)
+    assert await _served(db, "zz-revert") == old
+    assert max(v["version"] for v in await _versions(db, "zz-revert")) == 8
+
+
+def test_a_skill_file_without_a_matching_name_fails(tmp_path):
+    """AC-6: проверка красная и называет файл."""
+    root = tmp_path / "skills"
+    _write_skill(root, "good-one")
+    (root / "no-name").mkdir()
+    (root / "no-name" / "SKILL.md").write_text("---\ndescription: d\n---\nx\n")
+    _write_skill(root, "wrong-dir")
+    (root / "wrong-dir" / "SKILL.md").write_text(
+        "---\nname: other\ndescription: d\n---\nx\n"
+    )
+    (root / "no-desc").mkdir()
+    (root / "no-desc" / "SKILL.md").write_text("---\nname: no-desc\n---\nx\n")
+    (root / "bare").mkdir()
+    (root / "bare" / "SKILL.md").write_text("# без front-matter\n")
+    _write_skill(root, "executor-pair-discipline")
+
+    problems = skill_files.skill_file_problems(root)
+    joined = "\n".join(problems)
+    for name in ("no-name", "wrong-dir", "no-desc", "bare", "executor-pair-discipline"):
+        assert f"/{name}/SKILL.md" in joined, name
+    assert "good-one" not in joined
+    assert [f.name for f in skill_files.load_skill_files(root)] == ["good-one"]
+
+
+def test_every_skill_file_in_the_repository_is_valid():
+    assert skill_files.skill_file_problems(REPO / "skills") == []
+    # Исключение без front-matter — только выгрузка прода как есть.
+    assert skill_files.LEGACY_NO_FRONT_MATTER == {"local-executor-hub-repo"}
+
+
+#: Хеши активных навыков прода на 15.10.2026 (выгрузка GET /api/skills/{name}).
+PROD_ACTIVE = {
+    "local-executor-hub-repo": (
+        "1d1da7a5867cde77bc91dcb59cf78e85fdcf2cea6c5198ffc3a98478a91b5e37",  # pragma: allowlist secret
+        4,
+        "pda_claude",
+        "admin",
+    ),
+    "hub-review-report-reading": (
+        "d875e35d38027e5fe6c97e68e8cfc3f5efabfa37180367d450504ffdefe4a474",  # pragma: allowlist secret
+        2,
+        "admin",
+        "admin",
+    ),
+    "hub-submit-task": (
+        "5bba46c231528b9b90a7835630df241d102e060703d0be86627e0c44cc75a041",  # pragma: allowlist secret
+        5,
+        "admin",
+        "admin",
+    ),
+    "executor-pair-discipline": (
+        "6453bf6dbe61d6c4dbbdc7667ea15f7a125f41c6a5579c0114c7a8fd8bfd35ca",  # pragma: allowlist secret
+        5,
+        "seed",
+        "admin",
+    ),
+    "machine-review-cycle": (
+        "399a4429d456525ec98356e8c2e4c8237c9c24bc0b58b77c18be013373b237fa",  # pragma: allowlist secret
+        5,
+        "seed",
+        "seed",
+    ),
+}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+async def test_first_rollout_leaves_every_active_prod_skill_untouched(
+    db: aiosqlite.Connection,
+):
+    """Главное требование выката: хеши совпали с базой — ни версии, ни черновика."""
+    sources = {
+        "local-executor-hub-repo": (REPO / "skills/local-executor-hub-repo/SKILL.md"),
+        "hub-review-report-reading": REPO / "skills/hub-review-report-reading/SKILL.md",
+        "hub-submit-task": REPO / "skills/hub-submit-task/SKILL.md",
+    }
+    texts = {n: p.read_bytes().decode("utf-8") for n, p in sources.items()}
+    texts["executor-pair-discipline"] = EXECUTOR_PAIR_DISCIPLINE_SKILL
+    texts["machine-review-cycle"] = MACHINE_REVIEW_CYCLE_SKILL
+    for name, (digest, version, created_by, activated_by) in PROD_ACTIVE.items():
+        assert _sha(texts[name]) == digest, f"{name}: текст разошёлся с базой прода"
+        await _install(
+            db, name, [(version, texts[name], "active", created_by, activated_by)]
+        )
+    # multi-agent-review в проде правил человек (v10): активная версия не наша.
+    # Её черновик из кода уже лежит рядом и сегодня, до этой задачи.
+    from hub.db import MULTI_AGENT_REVIEW_SKILL
+
+    mar = [
+        (10, "текст v10, правка admin", "active", "admin", "admin"),
+        (11, MULTI_AGENT_REVIEW_SKILL, "draft", "seed", ""),
+    ]
+    await _install(db, "multi-agent-review", mar)
+
+    names = [*PROD_ACTIVE, "multi-agent-review"]
+    before = {n: await _versions(db, n) for n in names}
+    await seed_default_skills(db)
+    await seed_default_skills(db)
+    after = {n: await _versions(db, n) for n in names}
+
+    assert after == before
+
+
+async def test_a_code_seeded_name_never_comes_from_a_file(
+    db: aiosqlite.Connection, skills_tree: Path
+):
+    """Два источника недопустимы: файл с именем кодового навыка не засевается."""
+    _write_skill(skills_tree, "executor-pair-discipline", body="из файла")
+    await _install(db, "executor-pair-discipline", [])
+    await seed_default_skills(db)
+    assert (
+        await _served(db, "executor-pair-discipline") == EXECUTOR_PAIR_DISCIPLINE_SKILL
+    )
+
+
+def test_skills_are_seeded_from_the_built_wheel(tmp_path):
+    """AC-5: wheel собран, старт вне checkout засевает навыки из пакета."""
+    out = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(out), str(REPO)],
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    wheel = next(out.glob("*.whl"))
+    site = tmp_path / "site"
+    with zipfile.ZipFile(wheel) as zf:
+        zf.extractall(site)
+    assert (site / "hub" / "_skills" / "hub-task-prep" / "SKILL.md").is_file()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    script = (
+        "import asyncio, sys, hub\n"
+        "from pathlib import Path\n"
+        f"assert Path(hub.__file__).resolve().is_relative_to(Path({str(site)!r}).resolve()), hub.__file__\n"
+        "import aiosqlite\n"
+        "from hub.db import _SCHEMA, _migrate, seed_default_skills\n"
+        "async def main():\n"
+        "    db = await aiosqlite.connect(':memory:')\n"
+        "    db.row_factory = aiosqlite.Row\n"
+        "    await db.executescript(_SCHEMA)\n"
+        "    await _migrate(db)\n"
+        "    await seed_default_skills(db)\n"
+        "    cur = await db.execute(\"SELECT name FROM skills WHERE status='active'\")\n"
+        "    print(sorted(r[0] for r in await cur.fetchall()))\n"
+        "asyncio.run(main())\n"
+    )
+    env = {"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"}
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=elsewhere,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    names = eval(proc.stdout.strip().splitlines()[-1])
+    assert {
+        "hub-task-prep",
+        "hub-development",
+        "hub-testing",
+        "project-context",
+    } <= set(names)
