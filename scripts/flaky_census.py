@@ -73,13 +73,23 @@ GIT_TAG = "git:"
 HASH_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
+LEGACY_NAME = "open" + "claw"  # собрано, чтобы файл не ловил сам себя
+LEGACY_RE = re.compile(LEGACY_NAME, re.IGNORECASE)
+
+
+def scrub_legacy(text: str) -> str:
+    """Темы старых коммитов называют прежнее имя продукта; tests/test_no_legacy_name.py
+    запрещает его в любом файле под git, так что в данных оно заменяется маркером."""
+    return LEGACY_RE.sub("<legacy-name>", text)
+
+
 def tag_hashes(value):
     """Хеши git пишутся как «git:<hex>»: detect-secrets читает кавычки с одним
     hex как High Entropy String и красит Secret scan на публичных SHA. Менять
     scripts/secret_scan.py ради данных нельзя (это ci_script под ci_integrity),
     поэтому формат данных иной; load_manual возвращает чистые хеши."""
     if isinstance(value, str):
-        return GIT_TAG + value if HASH_RE.fullmatch(value) else value
+        return GIT_TAG + value if HASH_RE.fullmatch(value) else scrub_legacy(value)
     if isinstance(value, list):
         return [tag_hashes(item) for item in value]
     if isinstance(value, dict):

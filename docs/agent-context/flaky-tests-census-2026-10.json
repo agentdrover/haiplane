@@ -4557,7 +4557,7 @@
           "commit": "git:a90881bac9",
           "date": "2026-08-23T20:54:09Z",
           "premerge_ci": null,
-          "subject": "feat: read HAIPLANE_ env with OPENCLAW_ fallback",
+          "subject": "feat: read HAIPLANE_ env with <legacy-name>_ fallback",
           "task": null
         },
         "changed_after_failure": [
