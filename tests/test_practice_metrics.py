@@ -3700,10 +3700,38 @@ async def test_ci_minutes_per_task_and_class(db: aiosqlite.Connection):
     section = (await practice_metrics(db, since_days=30))["ci_minutes"]
     assert section["attempts"] == {"received": 6, "timed": 5, "unknown_duration": 1}
     assert section["by_task"] == [
-        {"task_id": a, "attempts": 2, "unknown_attempts": 0, "runner_minutes": 30.0},
-        {"task_id": b, "attempts": 1, "unknown_attempts": 0, "runner_minutes": 20.0},
-        {"task_id": e, "attempts": 1, "unknown_attempts": 0, "runner_minutes": 6.0},
-        {"task_id": c, "attempts": 2, "unknown_attempts": 1, "runner_minutes": 6.0},
+        {
+            "task_id": a,
+            "attempts": 2,
+            "unknown_attempts": 0,
+            "runner_minutes": 30.0,
+            "partial": False,
+            "measured_attempts": 2,
+        },
+        {
+            "task_id": b,
+            "attempts": 1,
+            "unknown_attempts": 0,
+            "runner_minutes": 20.0,
+            "partial": False,
+            "measured_attempts": 1,
+        },
+        {
+            "task_id": e,
+            "attempts": 1,
+            "unknown_attempts": 0,
+            "runner_minutes": 6.0,
+            "partial": False,
+            "measured_attempts": 1,
+        },
+        {
+            "task_id": c,
+            "attempts": 2,
+            "unknown_attempts": 1,
+            "runner_minutes": 6.0,
+            "partial": True,
+            "measured_attempts": 1,
+        },
     ]
     assert section["by_class"] == [
         {
@@ -3731,3 +3759,29 @@ async def test_ci_minutes_per_task_and_class(db: aiosqlite.Connection):
     missing = section["missing_among_received_ci_reports"]
     assert (missing["received_ci_reports"], missing["without_timing"]) == (2, 1)
     assert "полученных отчётов" in missing["note"]
+
+
+async def test_a_task_with_no_measured_attempt_has_no_minutes_not_zero(
+    db: aiosqlite.Connection,
+):
+    """#1700 review: unknown is null; a mixed sum says it is partial."""
+    from hub.services.ci_timing import store_ci_run_timing
+
+    blind = await _classed(db, "blind", "feature", "M", "R2")
+    mixed = await _classed(db, "mixed", "feature", "M", "R2")
+    for task_id, body in (
+        (blind, _attempt("1", None)),
+        (blind, _attempt("2", None)),
+        (mixed, _attempt("3", None)),
+        (mixed, _attempt("4", 600)),
+    ):
+        await store_ci_run_timing(db, task_id, body, reported_by="ci")
+    await db.commit()
+    rows = {
+        r["task_id"]: r
+        for r in (await practice_metrics(db, since_days=30))["ci_minutes"]["by_task"]
+    }
+    assert rows[blind]["runner_minutes"] is None
+    assert (rows[blind]["partial"], rows[blind]["measured_attempts"]) == (False, 0)
+    assert rows[mixed]["runner_minutes"] == 10.0
+    assert (rows[mixed]["partial"], rows[mixed]["measured_attempts"]) == (True, 1)

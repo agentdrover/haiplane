@@ -519,6 +519,11 @@ def send_timing(
     reason = ""
     try:
         jobs = api.list_jobs(repository, facts["run_id"], facts["run_attempt"])
+        if len(jobs) > MAX_TIMED_JOBS:
+            # A body cut to the first jobs would state a smaller sum as measured.
+            reason = f"{len(jobs)} jobs, the limit is {MAX_TIMED_JOBS}"
+            jobs = None
+            log(f"timing_unavailable — {reason}")
     except (Refused, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         reason = f"jobs unreadable: {exc}"
         log(f"timing_unavailable — {reason}")

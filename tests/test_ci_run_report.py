@@ -1338,6 +1338,12 @@ async def test_a_retried_attempt_is_counted_once(ci_runner_hub):
     metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
     assert metrics["by_task"][0]["runner_minutes"] == 15.0
 
+    # Nor does a resend that says state=ok but carries no jobs (#1700 review).
+    blank = _timing_body("5001", "1", jobs=[])
+    assert (await _post_timing(hub.client, hub.ci, task_id, blank)).status_code == 200
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    assert metrics["by_task"][0]["runner_minutes"] == 15.0
+
 
 async def test_ci_run_timing_is_scoped_like_the_ci_report(ci_runner_hub, scoped_ci_key):
     """AC-5: a key without the task's project is refused, ci_reader/auditor too."""

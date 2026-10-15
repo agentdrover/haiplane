@@ -1559,3 +1559,25 @@ def test_timing_is_only_for_task_branches_with_an_event_time(trusted, tmp_path):
         posts: list = []
         _run(trusted, tmp_path, event, _TimedApi(blob, jobs=_jobs()), posts)
         assert _timing(posts) == []
+
+
+def test_more_jobs_than_the_body_carries_is_unavailable_not_a_smaller_sum(
+    trusted, tmp_path
+):
+    """#1700 review: 101 jobs are never reported as the first 50."""
+    many = [
+        {
+            "name": f"j{i}",
+            "started_at": "2026-10-15T10:00:00Z",
+            "completed_at": "2026-10-15T10:01:00Z",
+            "conclusion": "success",
+            "steps": [],
+        }
+        for i in range(101)
+    ]
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    posts: list = []
+    _run(trusted, tmp_path, _finished(), _TimedApi(blob, jobs=many), posts)
+    (body,) = _timing(posts)
+    assert body["state"] == "timing_unavailable" and body["jobs"] == []
+    assert "101 jobs" in body["reason"]

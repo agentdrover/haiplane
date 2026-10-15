@@ -127,7 +127,8 @@ async def store_ci_run_timing(
         "runner_seconds=excluded.runner_seconds, "
         "steps_seconds=excluded.steps_seconds, reported_by=excluded.reported_by, "
         "received_at=datetime('now') "
-        "WHERE excluded.state = 'ok' OR ci_attempt_timings.state != 'ok'",
+        "WHERE excluded.runner_seconds IS NOT NULL "
+        "OR ci_attempt_timings.runner_seconds IS NULL",
         (
             task_id,
             body.run_id,
@@ -163,14 +164,14 @@ def _task_totals(rows: list[Any]) -> dict[int, dict[str, Any]]:
                 "task_id": row["task_id"],
                 "attempts": 0,
                 "unknown_attempts": 0,
-                "seconds": 0.0,
+                "seconds": None,
             },
         )
         item["attempts"] += 1
         if row["runner_seconds"] is None:
             item["unknown_attempts"] += 1
         else:
-            item["seconds"] += row["runner_seconds"]
+            item["seconds"] = (item["seconds"] or 0.0) + row["runner_seconds"]
     return tasks
 
 
@@ -239,7 +240,9 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
         params,
     )
     tasks = _task_totals(rows)
-    ranked = sorted(tasks.values(), key=lambda i: (-i["seconds"], i["task_id"]))
+    ranked = sorted(
+        tasks.values(), key=lambda i: (-(i["seconds"] or 0.0), i["task_id"])
+    )
     unknown = sum(1 for r in rows if r["runner_seconds"] is None)
     return {
         "window_by": "completed_at (время завершения из события)",
@@ -253,7 +256,13 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
                 "task_id": i["task_id"],
                 "attempts": i["attempts"],
                 "unknown_attempts": i["unknown_attempts"],
-                "runner_minutes": _minutes(i["seconds"]),
+                # None: no attempt of the task was measured (never 0.0).
+                "runner_minutes": None
+                if i["seconds"] is None
+                else _minutes(i["seconds"]),
+                # True: the sum leaves out attempts whose duration is unknown.
+                "partial": i["seconds"] is not None and i["unknown_attempts"] > 0,
+                "measured_attempts": i["attempts"] - i["unknown_attempts"],
             }
             for i in ranked[:BY_TASK_LIMIT]
         ],
