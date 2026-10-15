@@ -1267,3 +1267,112 @@ async def test_the_audit_key_files_only_plain_parentless_drafts(ci_runner_hub):
     assert stopped.status_code == 403
     assert stopped.json()["detail"]["reason"] == "ci_key_scope_project_inactive"
     assert await count() == before + 1
+
+
+# ---- #1700: the timing of a finished attempt --------------------------------
+
+
+def _timing_body(
+    run_id: str = "5001", attempt: str = "1", *, minutes: int = 10, **over
+):
+    """The body the trusted workflow sends; GitHub's own times, no clock."""
+    body = {
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "head_sha": "sha-pinned",
+        "event": "pull_request",
+        "conclusion": "success",
+        "completed_at": "2026-10-15T12:30:00Z",
+        "state": "ok",
+        "jobs": [
+            {
+                "name": "Ruff and pytest",
+                "conclusion": "success",
+                "started_at": "2026-10-15T12:00:00Z",
+                "completed_at": f"2026-10-15T12:{minutes:02d}:00Z",
+                "steps": [{"key": "test", "conclusion": "success", "seconds": 60.0}],
+            }
+        ],
+    }
+    body.update(over)
+    return body
+
+
+async def _post_timing(client, headers, task_id: int, body: dict):
+    return await client.post(
+        f"/api/tasks/{task_id}/ci-run-timing", json=body, headers=headers
+    )
+
+
+async def test_a_retried_attempt_is_counted_once(ci_runner_hub):
+    """AC-4: a resend is one row; a rerun is a second; the sum has each once."""
+    from hub.services.metrics_scope import Scope
+    from hub.services.ci_timing import ci_minutes_metrics
+
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    first = _timing_body("5001", "1", minutes=10)
+    for _ in range(2):  # the same attempt posted again
+        resp = await _post_timing(hub.client, hub.ci, task_id, first)
+        assert resp.status_code == 200, resp.text
+    rerun = await _post_timing(
+        hub.client, hub.ci, task_id, _timing_body("5001", "2", minutes=5)
+    )
+    assert rerun.status_code == 200, rerun.text
+
+    rows = await hub.db.execute_fetchall(
+        "SELECT run_attempt FROM ci_attempt_timings WHERE task_id = ? ORDER BY 1",
+        (task_id,),
+    )
+    assert [r[0] for r in rows] == ["1", "2"], "one row per (task, run, attempt)"
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    (task,) = metrics["by_task"]
+    assert task["runner_minutes"] == 15.0, "10 + 5 minutes, each attempt once"
+    assert task["attempts"] == 2
+
+    # A degraded resend does not erase timing that was read.
+    degraded = _timing_body("5001", "1", state="timing_unavailable", jobs=[])
+    assert (
+        await _post_timing(hub.client, hub.ci, task_id, degraded)
+    ).status_code == 200
+    metrics = await ci_minutes_metrics(hub.db, Scope.relative(30))
+    assert metrics["by_task"][0]["runner_minutes"] == 15.0
+
+
+async def test_ci_run_timing_is_scoped_like_the_ci_report(ci_runner_hub, scoped_ci_key):
+    """AC-5: a key without the task's project is refused, ci_reader/auditor too."""
+    hub = ci_runner_hub
+    db = hub.db
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    mine = await _project_task(db, "audit-in")
+    foreign = await _task(db, generation=1, sha="sha-pinned")
+    scoped = await scoped_ci_key('["project:audit-in"]')
+
+    ok = await _post_timing(hub.client, scoped, mine, _timing_body())
+    assert ok.status_code == 200, ok.text
+    refused = await _post_timing(hub.client, scoped, foreign, _timing_body())
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["reason"] == "ci_report_out_of_scope"
+    for role in ("ci_reader", "ci_auditor"):
+        key = await _role_key(hub, role, '["project:audit-in"]', f"timing-{role}")
+        resp = await _post_timing(hub.client, key, mine, _timing_body("5002"))
+        assert resp.status_code == 403, (role, resp.text[:200])
+    # A human key is not the CI reporter either.
+    human = await _post_timing(hub.client, hub.human, mine, _timing_body("5003"))
+    assert human.status_code == 403, human.text
+    rows = await db.execute_fetchall(
+        "SELECT task_id, run_id FROM ci_attempt_timings ORDER BY id"
+    )
+    assert [tuple(r) for r in rows] == [(mine, "5001")], "only the allowed post wrote"
+
+    # The timing route is in the bound key's allowlist, and a bad time is a 400.
+    from hub.auth import ci_scoped_route_allowed
+
+    assert ci_scoped_route_allowed("POST", f"/api/tasks/{mine}/ci-run-timing")
+    bad = await _post_timing(
+        hub.client, hub.ci, foreign, _timing_body(completed_at="yesterday")
+    )
+    assert bad.status_code == 400, bad.text
+    gone = await _post_timing(hub.client, hub.ci, 999999, _timing_body())
+    assert gone.status_code == 404, gone.text

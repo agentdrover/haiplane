@@ -1399,3 +1399,163 @@ def test_audit_drafts_are_filed_for_pushes_to_develop_only(trusted, tmp_path):
             assert token == "audit-key", "drafts use the audit key, not the report key"
             assert body["client_request_id"] == "pip-audit:PYSEC-1"
             assert body["source"] == "agent"
+
+
+# ---- #1700: the timing of every finished attempt of a task branch ------------
+
+
+def _step(name, seconds, conclusion="success"):
+    """One GitHub step record that lasted ``seconds`` (fixed times, no clock)."""
+    return {
+        "name": name,
+        "conclusion": conclusion,
+        "started_at": "2026-10-15T10:00:00Z",
+        "completed_at": f"2026-10-15T10:{seconds // 60:02d}:{seconds % 60:02d}Z",
+    }
+
+
+def _jobs() -> list[dict]:
+    return [
+        {
+            "name": "Ruff and pytest",
+            "conclusion": "success",
+            "started_at": "2026-10-15T10:00:00Z",
+            "completed_at": "2026-10-15T10:29:00Z",
+            "steps": [
+                _step("Lint", 40),
+                _step("Test", 540),
+                _step("Mutations of changed functions (warning only)", 600),
+                _step("Red-test baseline on merge-base (data only)", 90, "skipped"),
+                _step("Collect AC test and validation results for the Hub", 545),
+            ],
+        },
+        {
+            "name": "Compose cold start",
+            "conclusion": "skipped",
+            "started_at": "2026-10-15T10:00:00Z",
+            "completed_at": "2026-10-15T10:00:00Z",
+            "steps": [],
+        },
+    ]
+
+
+class _TimedApi(_FakeApi):
+    def __init__(self, blob, *, jobs=None, jobs_error=None, **kw):
+        super().__init__(blob, **kw)
+        self.jobs = jobs
+        self.jobs_error = jobs_error
+
+    def list_jobs(self, repository, run_id, attempt):
+        self.calls.append(("jobs", repository, run_id, attempt))
+        if self.jobs_error is not None:
+            raise self.jobs_error
+        return self.jobs
+
+
+def _finished(**over) -> dict:
+    return _event(updated_at="2026-10-15T10:31:12Z", **over)
+
+
+def _timing(posts) -> list[dict]:
+    return [p[2] for p in posts if p[0].endswith("/ci-run-timing")]
+
+
+def test_timing_is_sent_with_job_and_step_durations(trusted, tmp_path):
+    """AC-1: run, attempt, event time, job times and the named steps' seconds."""
+    posts: list = []
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    _run(trusted, tmp_path, _finished(), _TimedApi(blob, jobs=_jobs()), posts)
+    (body,) = _timing(posts)
+    assert [p[0] for p in posts if p[2] is body] == [
+        "https://hub.example/api/tasks/1686/ci-run-timing"
+    ]
+    assert (body["run_id"], body["run_attempt"], body["head_sha"]) == ("9001", "2", SHA)
+    assert body["completed_at"] == "2026-10-15T10:31:12Z", "the time of the event"
+    assert body["state"] == "ok" and body["conclusion"] == "success"
+    main, other = body["jobs"]
+    assert (main["name"], main["started_at"], main["completed_at"]) == (
+        "Ruff and pytest",
+        "2026-10-15T10:00:00Z",
+        "2026-10-15T10:29:00Z",
+    )
+    assert [(s["key"], s["seconds"], s["conclusion"]) for s in main["steps"]] == [
+        ("test", 540.0, "success"),
+        ("mutations", 600.0, "success"),
+        ("baseline", None, "skipped"),
+        ("ac_collect", 545.0, "success"),
+    ], "Lint is not a named step; a skipped step has no duration"
+    assert other["steps"] == [] and other["conclusion"] == "skipped"
+    assert len([p for p in posts if p[0].endswith("/ci-run-report")]) == 1
+
+
+class _Boom(_TimedApi):
+    def download(self, url):
+        raise OSError("storage is down")
+
+
+def test_timing_is_sent_without_a_usable_artifact(trusted, tmp_path, capsys):
+    """AC-2: no artifact, a broken ZIP and a failed download each still time the run."""
+    import shutil
+
+    good = _zip({"results.json": json.dumps(_results()).encode()})
+    cases = {
+        "cancelled before upload": _TimedApi(good, jobs=_jobs(), artifacts=[]),
+        "a broken archive": _TimedApi(b"this is not a zip", jobs=_jobs()),
+        "a failed download": _Boom(good, jobs=_jobs()),
+    }
+    for label, api in cases.items():
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+        posts: list = []
+        assert (
+            _run(trusted, tmp_path, _finished(conclusion="cancelled"), api, posts) == 0
+        )
+        timing = _timing(posts)
+        assert len(timing) == 1, label
+        assert timing[0]["state"] == "ok" and timing[0]["conclusion"] == "cancelled"
+        assert len(timing[0]["jobs"]) == 2, label
+        assert not [p for p in posts if p[0].endswith("/ci-run-report")], (
+            label,
+            "the rules for accepting a CI report did not change",
+        )
+        shown = capsys.readouterr().out
+        assert "not reporting this run" in shown or "reporting nothing" in shown, label
+
+
+def test_timing_unavailable_when_jobs_cannot_be_read(trusted, tmp_path, capsys):
+    """AC-3: a failed jobs request, or no jobs at all, still reports the finish."""
+    import urllib.error
+
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    posts: list = []
+    down = _TimedApi(blob, jobs_error=urllib.error.URLError("rate limited"))
+    assert _run(trusted, tmp_path, _finished(), down, posts) == 0
+    (body,) = _timing(posts)
+    assert body["state"] == "timing_unavailable" and body["jobs"] == []
+    assert "rate limited" in body["reason"]
+    assert body["completed_at"] == "2026-10-15T10:31:12Z"
+    assert "timing_unavailable" in capsys.readouterr().out
+    assert len([p for p in posts if p[0].endswith("/ci-run-report")]) == 1, (
+        "the CI report goes as before"
+    )
+
+    import shutil
+
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+    posts = []
+    queued = _TimedApi(blob, jobs=[])
+    assert (
+        _run(trusted, tmp_path, _finished(conclusion="cancelled"), queued, posts) == 0
+    )
+    (body,) = _timing(posts)
+    assert body["state"] == "ok" and body["jobs"] == []
+
+
+def test_timing_is_only_for_task_branches_with_an_event_time(trusted, tmp_path):
+    blob = _zip({"results.json": json.dumps(_results()).encode()})
+    for event in (
+        _finished(head_branch="develop"),
+        _event(),  # no updated_at in the event
+    ):
+        posts: list = []
+        _run(trusted, tmp_path, event, _TimedApi(blob, jobs=_jobs()), posts)
+        assert _timing(posts) == []

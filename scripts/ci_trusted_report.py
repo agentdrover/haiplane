@@ -51,6 +51,17 @@ MAX_UNPACKED_BYTES = 20 * 1024 * 1024
 MAX_RESULTS_BYTES = 2 * 1024 * 1024
 RESULTS_SCHEMA = 1
 TASK_BRANCH = re.compile(r"^task-(\d+)/")
+# #1700: the steps whose minutes the hub names, by the step name in ci.yml. A
+# renamed step shows up as a missing key in the hub, never as a wrong one.
+TIMING_STEPS = {
+    "Test": "test",
+    "Mutations of changed functions (warning only)": "mutations",
+    "Red-test baseline on merge-base (data only)": "baseline",
+    "Collect AC test and validation results for the Hub": "ac_collect",
+}
+MAX_JOBS_PAGES = 5
+MAX_JOBS_BYTES = 2 * 1024 * 1024
+MAX_TIMED_JOBS = 50
 
 AC_STATUSES = frozenset({"pass", "fail", "not_found"})
 CHECK_STATUSES = frozenset({"pass", "fail", "skipped"})
@@ -119,6 +130,7 @@ def run_facts(event: dict, repository: str) -> dict[str, str]:
         "run_conclusion": str(run.get("conclusion") or ""),
         "head_sha": str(run.get("head_sha") or ""),
         "head_branch": str(run.get("head_branch") or ""),
+        "updated_at": str(run.get("updated_at") or ""),
     }
     for name in ("run_id", "run_attempt", "head_sha"):
         if not facts[name]:
@@ -371,6 +383,25 @@ class GitHubApi:
         with opener.open(self._request(url), timeout=30) as resp:  # nosec B310 - GitHub API
             return json.load(resp)
 
+    def list_jobs(self, repository: str, run_id: str, attempt: str) -> list[dict]:
+        """Every job of one attempt, or an exception when the list is not whole."""
+        jobs: list[dict] = []
+        opener = urllib.request.build_opener()
+        for page in range(1, MAX_JOBS_PAGES + 1):
+            url = (
+                f"{self.api}/repos/{repository}/actions/runs/{run_id}"
+                f"/attempts/{attempt}/jobs?per_page=100&page={page}"
+            )
+            with opener.open(self._request(url), timeout=30) as resp:  # nosec B310 - GitHub API
+                raw = resp.read(MAX_JOBS_BYTES + 1)
+            if len(raw) > MAX_JOBS_BYTES:
+                raise Refused("the jobs answer is larger than 2 MB")
+            doc = json.loads(raw.decode("utf-8"))
+            jobs += [j for j in doc.get("jobs") or [] if isinstance(j, dict)]
+            if len(jobs) >= int(doc.get("total_count") or 0):
+                return jobs
+        raise Refused(f"more than {MAX_JOBS_PAGES * 100} jobs: the list is not whole")
+
     def download(self, url: str) -> bytes:
         opener = urllib.request.build_opener(_DropAuthOnRedirect)
         with opener.open(self._request(url), timeout=60) as resp:  # nosec B310 - GitHub API
@@ -398,6 +429,109 @@ def hub_post(url: str, token: str, payload: dict) -> dict | None:
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         log(f"hub unreachable: {exc}")
     return None
+
+
+# ---- the timing (#1700) -----------------------------------------------------
+
+
+def _clip(value: Any, limit: int) -> str:
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def _seconds(started: Any, completed: Any) -> float | None:
+    """Whole-job or whole-step seconds from GitHub's two times, or None."""
+    from datetime import datetime
+
+    try:
+        begin = datetime.fromisoformat(str(started))
+        end = datetime.fromisoformat(str(completed))
+    except ValueError:
+        return None
+    return max(0.0, (end - begin).total_seconds())
+
+
+def _timed_step(step: dict) -> dict | None:
+    key = (
+        TIMING_STEPS.get(step.get("name"))
+        if isinstance(step.get("name"), str)
+        else None
+    )
+    if key is None:
+        return None
+    conclusion = _clip(step.get("conclusion"), 40)
+    seconds = None
+    if conclusion != "skipped":
+        seconds = _seconds(step.get("started_at"), step.get("completed_at"))
+    return {
+        "key": key,
+        "name": _clip(step.get("name"), 200),
+        "conclusion": conclusion,
+        "seconds": seconds,
+    }
+
+
+def _timed_job(job: dict) -> dict:
+    steps = [_timed_step(s) for s in job.get("steps") or [] if isinstance(s, dict)]
+    return {
+        "name": _clip(job.get("name"), 200),
+        "conclusion": _clip(job.get("conclusion"), 40),
+        "started_at": _clip(job.get("started_at"), 40) or None,
+        "completed_at": _clip(job.get("completed_at"), 40) or None,
+        "steps": [s for s in steps if s is not None][:20],
+    }
+
+
+def timing_body(
+    facts: dict[str, str], jobs: list[dict] | None, reason: str = ""
+) -> dict:
+    """The timing of the finished attempt, from the event plus GitHub's jobs."""
+    body: dict[str, Any] = {
+        "run_id": facts["run_id"],
+        "run_attempt": facts["run_attempt"],
+        "head_sha": facts["head_sha"],
+        "event": facts["event"],
+        "conclusion": facts["run_conclusion"],
+        "completed_at": facts["updated_at"],
+        "state": "ok" if jobs is not None else "timing_unavailable",
+        "reason": reason[:500],
+        "jobs": [_timed_job(j) for j in (jobs or [])[:MAX_TIMED_JOBS]],
+    }
+    return body
+
+
+def send_timing(
+    facts: dict[str, str],
+    api: GitHubApi | Any,
+    repository: str,
+    base: str,
+    token: str,
+    post: HubPost,
+) -> None:
+    """Report what the attempt cost; independent of the artifact and its verdict."""
+    match = TASK_BRANCH.match(facts["head_branch"])
+    if match is None:
+        log(f"branch {facts['head_branch']!r} is not task-N/... — no timing")
+        return
+    if not facts["updated_at"]:
+        log("the event carries no completion time — no timing")
+        return
+    jobs: list[dict] | None = None
+    reason = ""
+    try:
+        jobs = api.list_jobs(repository, facts["run_id"], facts["run_attempt"])
+    except (Refused, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        reason = f"jobs unreadable: {exc}"
+        log(f"timing_unavailable — {reason}")
+    task_id = int(match.group(1))
+    result = post(
+        f"{base}/api/tasks/{task_id}/ci-run-timing",
+        token,
+        timing_body(facts, jobs, reason),
+    )
+    shown = "not delivered" if result is None else f"stored={result.get('stored')}"
+    log(
+        f"timing of task #{task_id} run {facts['run_id']}/{facts['run_attempt']}: {shown}"
+    )
 
 
 # ---- the two reports --------------------------------------------------------
@@ -485,25 +619,17 @@ def _independently(step: Callable[[], None]) -> None:
         log(f"not reporting this part: {exc}")
 
 
-def run(
-    event: dict,
+def _report_artifact(
+    facts: dict[str, str],
     environ: dict[str, str],
     api: GitHubApi | Any,
-    post: HubPost = hub_post,
-) -> int:
-    """Report one finished CI run. Always 0: a refusal is logged, never red."""
-    repository = environ.get("GITHUB_REPOSITORY", "")
-    server = environ.get("GITHUB_SERVER_URL") or "https://github.com"
-    try:
-        facts = run_facts(event, repository)
-    except Refused as exc:
-        log(f"not reporting this run: {exc}")
-        return 0
-    base = (environ.get("HAIPLANE_HUB_URL") or "").rstrip("/")
-    token = environ.get("HAIPLANE_HUB_CI_TOKEN") or ""
-    if not base or not token:
-        log("hub URL or report key not configured — reporting nothing (unknown)")
-        return 0
+    post: HubPost,
+    base: str,
+    token: str,
+    repository: str,
+    server: str,
+) -> None:
+    """The CI report and the audit drafts: everything that needs the artifact."""
     try:
         target = download_dir(
             environ.get("RUNNER_TEMP", ""), environ.get("GITHUB_WORKSPACE", "")
@@ -528,6 +654,37 @@ def run(
         log(f"not reporting this run: {exc}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         log(f"GitHub or the disk failed ({exc}) — reporting nothing (unknown)")
+
+
+def run(
+    event: dict,
+    environ: dict[str, str],
+    api: GitHubApi | Any,
+    post: HubPost = hub_post,
+) -> int:
+    """Report one finished CI run. Always 0: a refusal is logged, never red."""
+    repository = environ.get("GITHUB_REPOSITORY", "")
+    server = environ.get("GITHUB_SERVER_URL") or "https://github.com"
+    try:
+        facts = run_facts(event, repository)
+    except Refused as exc:
+        log(f"not reporting this run: {exc}")
+        return 0
+    base = (environ.get("HAIPLANE_HUB_URL") or "").rstrip("/")
+    token = environ.get("HAIPLANE_HUB_CI_TOKEN") or ""
+    if not base or not token:
+        log("hub URL or report key not configured — reporting nothing (unknown)")
+        return 0
+    _independently(
+        lambda: _report_artifact(
+            facts, environ, api, post, base, token, repository, server
+        )
+    )
+    # #1700: after the report, and outside everything the artifact can refuse.
+    try:
+        send_timing(facts, api, repository, base, token, post)
+    except Exception as exc:  # noqa: BLE001 - statistics must never fail the job
+        log(f"timing not sent: {exc}")
     return 0
 
 
