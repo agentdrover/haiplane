@@ -479,3 +479,42 @@ def test_tmpfs_detection_wants_the_exact_mount_point(tmp_path):
     )
     snap.MOUNTINFO = str(tmp_path / "absent")
     assert snap._is_tmpfs(str(work)) is False
+
+
+def test_an_unreadable_directory_is_never_an_empty_one(world, capsys, monkeypatch):
+    root = _tree(world)
+    assert run(world, "daily", capsys)[0] == 0
+    good = published(world, "conf-*")
+    world.clock.tick()
+
+    real_scandir = os.scandir
+
+    def denied(path="."):
+        if str(path).endswith("etc/georoute"):
+            raise PermissionError(errno.EACCES, "denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", denied)
+    # required: nothing is published, the good copies stay, the journal names the reason
+    assert run(world, "daily", capsys) == (
+        1,
+        "failed kind=daily reason=required_unusable",
+    )
+    assert published(world, "conf-*") == good
+    assert list(world.state.glob("*.tmp")) == []
+
+    # optional: the path is skipped with a reason, and it is NOT archived as an empty dir
+    (world.root / "paths.conf").write_text(
+        "required /etc/fail2ban/jail.local\noptional /etc/georoute\n"
+    )
+    rc, line = run(world, "daily", capsys)
+    assert rc == 0 and line.endswith("unreadable=etc/georoute"), line
+    (newest,) = [n for n in published(world, "conf-*.tar.age") if n not in good]
+    with tarfile.open(
+        fileobj=io.BytesIO(decrypt(world.identity, world.state / newest))
+    ) as tar:
+        assert "etc/georoute" not in tar.getnames()
+        manifest = json.loads(tar.extractfile("MANIFEST.json").read())
+    assert manifest["empty_dirs"] == []
+    assert {"path": "etc/georoute", "reason": "unreadable"} in manifest["skipped"]
+    assert root.exists()

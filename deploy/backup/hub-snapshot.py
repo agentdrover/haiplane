@@ -87,6 +87,7 @@ class Config(object):
         self.db = e.get("SNAP_DB") or ""
         self.group = e.get("SNAP_GROUP", "haiplane-backup")
         self.require_tmpfs = e.get("SNAP_REQUIRE_TMPFS", "1") != "0"
+        self.notes = []  # extra words for the journal line
         self.lock_wait = float(e.get("SNAP_LOCK_WAIT") or 120)
 
 
@@ -521,6 +522,10 @@ def _inside(target, roots):
     return any(target == r or target.startswith(r + os.sep) for r in roots)
 
 
+def _raise(error):
+    raise error
+
+
 def _walk(cfg, entries):
     """(files, links, skipped, empty_dirs) under the allowlist.
 
@@ -538,14 +543,25 @@ def _walk(cfg, entries):
         found = []
         is_dir = os.path.isdir(host) and not os.path.islink(host)
         if is_dir:
-            for top, dirs, names in os.walk(host):
-                dirs.sort()
-                found.extend(os.path.join(top, n) for n in sorted(names))
-                found.extend(
-                    os.path.join(top, d)
-                    for d in dirs
-                    if os.path.islink(os.path.join(top, d))
+            try:
+                for top, dirs, names in os.walk(host, onerror=_raise):
+                    dirs.sort()
+                    found.extend(os.path.join(top, n) for n in sorted(names))
+                    found.extend(
+                        os.path.join(top, d)
+                        for d in dirs
+                        if os.path.islink(os.path.join(top, d))
+                    )
+            except OSError:
+                # not read is not empty: never recorded as an empty directory
+                if required:
+                    raise Fail("required_unusable")
+                arc = _arcname(
+                    os.path.relpath(host, cfg.root) if cfg.root != "/" else host
                 )
+                skipped.append({"path": arc, "reason": "unreadable"})
+                cfg.notes.append("unreadable=%s" % arc)
+                continue
         else:
             found.append(host)
         usable = 0
@@ -697,6 +713,8 @@ def main(argv, env=None):
     try:
         name, size = _execute(cfg, kind)
         line, rc = "ok kind=%s name=%s bytes=%d" % (kind, name, size), 0
+        for note in cfg.notes:
+            line += " " + note
     except Skip as exc:
         line, rc = "skipped kind=%s reason=%s" % (kind, exc.code), 0
     except Fail as exc:
