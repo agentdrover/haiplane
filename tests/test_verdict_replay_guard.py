@@ -614,10 +614,11 @@ def _browser_post(page: str, **typed: str) -> dict[str, str]:
 async def test_the_form_never_sends_a_replacement_unless_asked(
     client: AsyncClient, db: aiosqlite.Connection, hdr: dict
 ):
+    # Client-driven review: the first verdict through the rendered form.
     task_id = await _in_review(client, hdr)
-    # A reviewer agent writes the first verdict through the rendered form.
     page = (await client.get(f"/tasks/{task_id}", headers=hdr["rev"])).text
     assert 'name="supersedes_revision"' not in page
+    assert "--supersedes-revision" in page, "the card says where a replacement goes"
     first = await client.post(
         f"/tasks/{task_id}/web-review-verdict",
         data=_browser_post(page, verdict="changes_requested", comments=CR_COMMENTS),
@@ -626,41 +627,32 @@ async def test_the_form_never_sends_a_replacement_unless_asked(
     )
     assert first.status_code == 303 and "review_error" not in first.headers["location"]
     assert (await _snapshot(db, task_id))["revision"] == 1
+    gone = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
+    assert 'id="review-verdict-form"' not in gone, "the task left review: no form"
 
-    # With a verdict standing the human's page offers the replacement as a box
-    # (the card shows the form while the task is in review: headless review).
-    await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
-    await db.commit()
-    page = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
-    assert 'type="checkbox" name="supersedes_revision" value="1"' in page
+    # The form is shown only while a client-driven review is open, and the first
+    # verdict closes it, so the replacement box can never be on screen with a
+    # verdict standing: replacement is the CLI/REST act the card names. The web
+    # handler still honours the field (a script posting what the box would send).
     before = await _snapshot(db, task_id)
-    unchecked = await client.post(
+    fields = {"verdict": "approved", "comments": "ок", "expected_generation": "1"}
+    refused = await client.post(
         f"/tasks/{task_id}/web-review-verdict",
-        data=_browser_post(page, verdict="approved", comments="ок"),
+        data=fields,
         headers=hdr["human"],
         follow_redirects=False,
     )
-    assert "review_error" in unchecked.headers["location"], unchecked.headers
+    assert "review_error" in refused.headers["location"], refused.headers
     assert await _snapshot(db, task_id) == before
-    checked = await client.post(
+    replaced = await client.post(
         f"/tasks/{task_id}/web-review-verdict",
-        data=_browser_post(
-            page, verdict="approved", comments="ок", supersedes_revision="1"
-        ),
+        data={**fields, "supersedes_revision": "1"},
         headers=hdr["human"],
         follow_redirects=False,
     )
-    assert "review_error" not in checked.headers["location"], checked.headers
+    assert "review_error" not in replaced.headers["location"], replaced.headers
     after = await _snapshot(db, task_id)
     assert after["verdict"] == "approved" and after["revision"] == 2
-
-    # After a resubmission the new generation has no verdict: no box again.
-    await repo.bump_submission_generation(db, task_id)
-    await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
-    await db.commit()
-    page = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
-    assert 'name="expected_generation" value="2"' in page
-    assert 'name="supersedes_revision"' not in page
 
 
 # ---- the poller and a resubmission inside the tick ---------------------------
@@ -760,3 +752,128 @@ async def test_a_resubmission_inside_the_tick_does_not_merge(
     ):
         await poller._deliver_approved_review(db, snapshot)
     git.merge_pr.assert_not_called()
+
+
+# ---- the shared delivery gate re-reads the approval before it merges ---------
+
+
+class _ChangingSpy:
+    """A merge double whose CI probe lets the world move while it runs."""
+
+    def __init__(
+        self, db: aiosqlite.Connection, task_id: int, change: str, ci="passed"
+    ):
+        from tests.test_accept_without_delivery import _MergeSpy
+
+        self.inner = _MergeSpy(ci=ci)
+        self.db, self.task_id, self.change = db, task_id, change
+
+    async def check_pr_ci(self, *args, **kwargs):
+        if self.change == "replaced":
+            await self.db.execute(
+                "UPDATE tasks SET review_verdict='changes_requested', "
+                "review_verdict_revision=review_verdict_revision+1 WHERE id=?",
+                (self.task_id,),
+            )
+        elif self.change == "resubmitted":
+            await repo.bump_submission_generation(self.db, self.task_id)
+        elif self.change == "returned":
+            await repo.close_review_verdict_window(self.db, self.task_id)
+        await self.db.commit()
+        return await self.inner.check_pr_ci(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+@pytest.mark.parametrize("change", ["replaced", "resubmitted", "returned"])
+@pytest.mark.parametrize("path", ["pair_gate", "manual_delivery"])
+async def test_the_gate_does_not_merge_on_a_stale_approval(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, path: str, change: str
+):
+    from hub.services import orchestration
+    from tests.test_accept_without_delivery import (
+        _approved_task,
+        _decide_deliver,
+        _install,
+    )
+
+    task_id = await _approved_task(client, db, title=f"{path}-{change}", pr=950)
+    spy = _ChangingSpy(db, task_id, change)
+    _install(monkeypatch, spy)
+    if path == "pair_gate":
+        snapshot = dict(await repo.get_task(db, task_id))
+        ok, detail = await orchestration.merge_before_completion(db, snapshot)
+        assert not ok and detail.startswith(orchestration.APPROVAL_CHANGED_PREFIX)
+    else:
+        await _decide_deliver(client, task_id)
+    assert spy.inner.merged == [], "no merge on an approval that no longer stands"
+    assert not await repo.pipeline_merge_recorded(db, task_id, 950)
+
+
+async def test_the_gate_still_merges_when_nothing_moved(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    from hub.services import orchestration
+    from tests.test_accept_without_delivery import _approved_task, _install
+
+    task_id = await _approved_task(client, db, title="control", pr=951)
+    spy = _ChangingSpy(db, task_id, "nothing")
+    _install(monkeypatch, spy)
+    ok, _ = await orchestration.merge_before_completion(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert ok and spy.inner.merged == [951]
+
+
+# ---- the headless conveyor writes no outcome on a stale approval ---------------
+
+
+@pytest.mark.parametrize("probe", ["ci_failed", "merge_refused", "stacked"])
+async def test_a_stale_approval_leaves_no_approved_outcome(
+    db: aiosqlite.Connection, probe: str, monkeypatch
+):
+    from hub import poller
+
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+
+    async def _replace() -> None:
+        await db.execute(
+            "UPDATE tasks SET review_verdict='changes_requested' WHERE id=?",
+            (task_id,),
+        )
+        await db.commit()
+
+    from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
+    if probe == "ci_failed":
+
+        async def _ci(*_a, **_k):
+            await _replace()
+            return CIProbeResult(CIProbeOutcome.failed, "red")
+
+        git.check_pr_ci = _ci
+    elif probe == "stacked":
+
+        async def _stacking(*_a, **_k):
+            await _replace()
+            return "stack_unresolvable: the order cannot be named"
+
+        monkeypatch.setattr(poller.services, "stacking_gate_step", _stacking)
+    else:
+
+        async def _merge(*_a, **_k):
+            await _replace()
+            return False
+
+        git.merge_pr = _merge
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(db, snapshot)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "no needs_decision over a verdict that is gone"
+    texts = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "Ревью одобрено" not in texts and "CI failed" not in texts
+    assert "Доставка остановлена" not in texts

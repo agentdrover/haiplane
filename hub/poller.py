@@ -648,6 +648,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
                 return
             if stacked:
+                if not await _approval_still_current(db, task):
+                    return  # the probes took time; the approval did not outlive them
                 await repo.add_task_update(
                     db,
                     task["id"],
@@ -701,6 +703,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 # that counts for every project (#534).
                 await _record_merge_and_tidy(db, task, pr_num, mctx)
         elif ci.outcome == CIProbeOutcome.failed:
+            if not await _approval_still_current(db, task):
+                return
             log.warning(
                 "Poll: task #%d CI failed on PR #%d",
                 task["id"],
@@ -732,6 +736,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
         # status is supposed to rule out. Pending probes
         # already `continue` above and retry; reaching here
         # without a merge means a human has to look.
+        if not await _approval_still_current(db, task):
+            return  # "Ревью одобрено" is no longer true: write nothing (#1706)
         reason = "ci_failed" if ci.outcome == CIProbeOutcome.failed else "merge_failed"
         await repo.add_task_update(
             db,
@@ -760,6 +766,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
         await services.maybe_destroy_vast(db, task)
         return
     if not merged and not pr_num:
+        if not await _approval_still_current(db, task):
+            return
         log.info("Poll: task #%d approved (no PR)", task["id"])
     # Converge on the same gate-checked completion used by
     # pair done reports (#309): the verdict recorded above

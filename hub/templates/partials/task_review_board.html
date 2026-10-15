@@ -736,6 +736,7 @@
         {% if task.result_kind != 'state' and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
         <label class="task-action-label"><input type="checkbox" name="supersedes_revision" value="{{ task.review_verdict_revision }}"> Заменить стоящий вердикт ({{ task.review_verdict.value if task.review_verdict.value is defined else task.review_verdict }}, ревизия {{ task.review_verdict_revision }})</label>
         {% endif %}
+        {% if task.result_kind != 'state' %}<p class="task-action-help" id="review-replace-help">Форма пишет первый вердикт по сдаче. Заменить уже поставленный вердикт — через CLI (<code>oc-hub review-verdict {{ task.id }} &lt;вердикт&gt; --expected-generation {{ task.submission_generation }} --supersedes-revision {{ task.review_verdict_revision }}</code>) или REST (<code>supersedes_revision</code>); галочка ниже есть только пока задача остаётся в review.</p>{% endif %}
         <label class="task-action-label" for="review-comments">Review comments</label>
         <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
         <label class="task-action-label" for="review-findings">Findings</label>

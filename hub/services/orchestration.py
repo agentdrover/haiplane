@@ -3819,6 +3819,9 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
 # there are no new commits, so hub_submit_for_review would stale the verdict
 # (#612) and recreate the one-way door #1030 closed.
 PR_DRAFT_PREFIX = "pr_draft"
+# #1706: одобрение, с которым доставка началась, к моменту мержа уже не действует
+# (вердикт заменён, работа возвращена или пересдана, пока шли пробы CI и стопки).
+APPROVAL_CHANGED_PREFIX = "approval_changed"
 # #1186: the base of a stack is not a decision to make — it merges on its own
 # schedule and this delivery becomes possible the moment it does. Same class as
 # a pending CI: come back next cycle. The unknown sits here too, but only the
@@ -3907,6 +3910,7 @@ TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.unavailable.value}",
     f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
+    APPROVAL_CHANGED_PREFIX,
     STACKED_BASE_PREFIX,
     STACK_UNKNOWN_PREFIX,
     # #1233: база слита в ветку и запушена, конфликта больше нет — доставка
@@ -4766,6 +4770,34 @@ async def _record_branch_update(
     )
 
 
+async def _approval_changed_since(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str:
+    """A reason when the approval the caller handed in no longer stands, else ''.
+
+    Only a task that WAS approved on its current submission is held to it: the
+    gate also serves callers that deliver without a verdict (the human's
+    pr_disposition path checks the verdict itself, before the gate). The read
+    is fresh and uses the canonical predicate, which knows the window a human
+    closed (#1286), and the generation must be the one the caller read.
+    """
+    if not review_approved_for_current_submission(task):
+        return ""
+    row = await repo.get_task(db, int(task["id"]))
+    live = dict(row) if row is not None else {}
+    if (
+        live
+        and review_approved_for_current_submission(live)
+        and live.get("submission_generation") == task.get("submission_generation")
+    ):
+        return ""
+    return (
+        f"{APPROVAL_CHANGED_PREFIX}: одобрение, с которым началась доставка, "
+        "уже не действует (вердикт заменён, работа возвращена или пересдана) — "
+        "PR не влит"
+    )
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4860,6 +4892,14 @@ async def merge_before_completion(
                     f"{PR_DRAFT_PREFIX}: GitHub PR ещё черновик — хаб не смог "
                     "пометить его ready"
                 )
+
+        # #1706: the last read before the irreversible step. CI, stacking and
+        # base probes are network calls; a replacement of the verdict, a return
+        # to work or a resubmission may land while they run, and the merge below
+        # would deliver on the snapshot's word.
+        changed = await _approval_changed_since(db, task)
+        if changed:
+            return False, changed
 
         decided, merge_detail = await _gate_merge_step(db, task, ctx)
         key = (int(task_id), int(pr_num))
