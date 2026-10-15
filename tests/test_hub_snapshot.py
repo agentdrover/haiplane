@@ -247,6 +247,7 @@ def _tree(world):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+    (root / "etc/networkd.conf.d").mkdir(parents=True)
     os.symlink("../other-secret", root / "etc/georoute/leak")
     os.symlink("a.conf", root / "etc/georoute/alias")
     props = "\n".join(
@@ -258,7 +259,8 @@ def _tree(world):
         ]
     )
     (world.root / "paths.conf").write_text(
-        "unit haiplane-hub\nrequired /etc/georoute\nrequired /etc/fail2ban/jail.local\n"
+        "unit haiplane-hub\nrequired /etc/georoute\nrequired /etc/networkd.conf.d\n"
+        "required /etc/fail2ban/jail.local\n"
         "optional /etc/runner\n# comment\n"
     )
     world.env.update(
@@ -293,8 +295,12 @@ def test_daily_archive_is_exactly_the_allowlist(world, capsys):
             "etc/georoute/sub/b.conf",
             "etc/georoute/alias",
             "etc/fail2ban/jail.local",
+            "etc/networkd.conf.d",
         ]
     )
+    # an existing empty required directory is a legal state: in the tar and in the manifest
+    with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+        assert tar.getmember("etc/networkd.conf.d").isdir()
     # the stranger next to the allowlist and the target of the outside link never get in
     assert b"TOP-SECRET-OUTSIDE" not in plain and b"other-secret" not in plain
     manifest = json.loads(manifest_bytes)
@@ -303,6 +309,9 @@ def test_daily_archive_is_exactly_the_allowlist(world, capsys):
     }
     assert manifest["skipped"] == [
         {"path": "etc/georoute/leak", "reason": "symlink_outside_allowlist"}
+    ]
+    assert manifest["empty_dirs"] == [
+        {"path": "etc/networkd.conf.d", "note": "empty directory"}
     ]
     meta = meta_of(world, data.name)
     assert meta["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
@@ -315,6 +324,16 @@ def test_daily_archive_is_exactly_the_allowlist(world, capsys):
     assert (rc, line) == (1, "failed kind=daily reason=required_missing")
     assert published(world, "conf-*") == before
     assert list(world.state.glob("*.tmp")) == []
+
+    # a required FILE that cannot be archived (a link out of the allowlist) is refused too,
+    # with its own code
+    os.symlink("../other-secret", root / "etc/fail2ban/jail.local")
+    world.clock.tick()
+    assert run(world, "daily", capsys) == (
+        1,
+        "failed kind=daily reason=required_unusable",
+    )
+    assert published(world, "conf-*") == before
 
 
 def test_no_publish_on_enospc_or_mid_deploy(world, capsys, monkeypatch):

@@ -522,9 +522,13 @@ def _inside(target, roots):
 
 
 def _walk(cfg, entries):
-    """(files, links, skipped) under the allowlist; links are never followed out of it."""
+    """(files, links, skipped, empty_dirs) under the allowlist.
+
+    Links are never followed out of it. A listed directory that yields nothing is
+    a legal state (an empty drop-in directory): it is recorded, not refused. Only a
+    missing path, or a required FILE that cannot be archived, refuses the run."""
     roots = [os.path.realpath(_host(cfg, p)) for p, _ in entries]
-    files, links, skipped, seen = [], [], [], set()
+    files, links, skipped, empty_dirs, seen = [], [], [], [], set()
     for path, required in entries:
         host = _host(cfg, path)
         if not os.path.lexists(host):
@@ -532,7 +536,8 @@ def _walk(cfg, entries):
                 raise Fail("required_missing")
             continue
         found = []
-        if os.path.isdir(host) and not os.path.islink(host):
+        is_dir = os.path.isdir(host) and not os.path.islink(host)
+        if is_dir:
             for top, dirs, names in os.walk(host):
                 dirs.sort()
                 found.extend(os.path.join(top, n) for n in sorted(names))
@@ -565,9 +570,18 @@ def _walk(cfg, entries):
                 usable += 1
             else:
                 skipped.append({"path": arc, "reason": "not_a_regular_file"})
-        if required and not usable:
+        if not usable and is_dir:
+            empty_dirs.append(
+                (
+                    _arcname(
+                        os.path.relpath(host, cfg.root) if cfg.root != "/" else host
+                    ),
+                    host,
+                )
+            )
+        elif required and not usable:
             raise Fail("required_unusable")
-    return files, links, skipped
+    return files, links, skipped, empty_dirs
 
 
 class _Hashing(object):
@@ -600,13 +614,14 @@ def _add_file(tar, arc, host):
     }
 
 
-def _write_archive(tar, files, links, skipped, stamp, box):
+def _write_archive(tar, files, links, skipped, empty_dirs, stamp, box):
     manifest = {
         "version": 1,
         "created": stamp,
         "files": [],
         "links": [],
         "skipped": skipped,
+        "empty_dirs": [],
     }
     for arc, host in files:
         manifest["files"].append(_add_file(tar, arc, host))
@@ -615,6 +630,13 @@ def _write_archive(tar, files, links, skipped, stamp, box):
         info.type, info.linkname = tarfile.SYMTYPE, os.readlink(host)
         tar.addfile(info)
         manifest["links"].append({"path": arc, "target": info.linkname})
+    for arc, host in empty_dirs:
+        st = os.stat(host)
+        info = tarfile.TarInfo(arc)
+        info.type, info.mtime = tarfile.DIRTYPE, int(st.st_mtime)
+        info.mode, info.uid, info.gid = st.st_mode & 0o7777, st.st_uid, st.st_gid
+        tar.addfile(info)
+        manifest["empty_dirs"].append({"path": arc, "note": "empty directory"})
     blob = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
     info = tarfile.TarInfo(MANIFEST_NAME)
     info.size, info.mode, info.mtime = len(blob), 0o600, int(_utcnow().timestamp())
@@ -625,14 +647,14 @@ def _write_archive(tar, files, links, skipped, stamp, box):
 def run_daily(cfg):
     _recipient_ready(cfg)
     entries = _expand(cfg, _parse_paths(cfg))
-    files, links, skipped = _walk(cfg, entries)
+    files, links, skipped, empty_dirs = _walk(cfg, entries)
     stamp = _stamp(_utcnow())
     tmp_data = os.path.join(cfg.state, "conf-%s.tar.age.tmp" % stamp)
     box = {}
 
     def produce(stdin):
         tar = tarfile.open(fileobj=stdin, mode="w|", format=tarfile.PAX_FORMAT)
-        _write_archive(tar, files, links, skipped, stamp, box)
+        _write_archive(tar, files, links, skipped, empty_dirs, stamp, box)
         tar.close()
 
     _encrypt(cfg, tmp_data, produce)

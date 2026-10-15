@@ -101,14 +101,34 @@ sha256 с manifest и положить файлы на место вручную
 
 Строки `unit NAME`, `optional-unit NAME`, `required PATH`, `optional PATH`. Для `unit`
 берутся файл юнита, его drop-in и `EnvironmentFiles` (по `systemctl show`). Отсутствие
-обязательного пути — отказ снимка, в журнал уходит код `required_missing`.
+обязательного пути — отказ снимка, в журнал уходит код `required_missing`. Существующий
+пустой каталог (даже обязательный) — допустимое состояние: он попадает в tar как запись
+каталога, а в manifest — в `empty_dirs` с пометкой `empty directory`. Обязательный *файл*,
+который нельзя архивировать (симлинк наружу allowlist, не обычный файл), — отказ
+`required_unusable`.
 
 ## Журнал
 
 Каждый запуск пишет в journald одну строку: `ok kind=... name=... bytes=...`,
-`skipped kind=... reason=lock_busy` или `failed kind=... reason=<код>`. Коды: `enospc`,
-`mid_deploy`, `age`, `age_missing`, `no_recipient`, `no_deploy_sha`, `no_migrations`,
-`integrity`, `work_not_tmpfs`, `required_missing`, `io_error`. Вывода инструментов и путей
+`skipped kind=... reason=lock_busy` или `failed kind=... reason=<код>`. Коды `failed`:
+
+| Код | Причина |
+|---|---|
+| `enospc` | не хватило места (tmpfs или диск), ничего не опубликовано |
+| `mid_deploy` | `.deploy-sha` изменился во время снимка |
+| `age`, `age_missing` | age завершился с ошибкой / не найден |
+| `no_recipient` | нет файла получателя |
+| `no_deploy_sha`, `bad_deploy_sha` | нет или неверный `.deploy-sha` |
+| `no_db`, `no_db_path` | файл базы / её путь из юнита не найден |
+| `no_migrations`, `integrity`, `journal_mode` | копия базы не прошла проверку |
+| `work_not_tmpfs` | рабочий каталог не tmpfs |
+| `no_paths_conf`, `bad_paths_conf` | нет или неверный `paths.conf` |
+| `systemctl`, `unit_missing` | `systemctl show` не ответил / обязательного юнита нет |
+| `required_missing`, `required_unusable` | обязательного пути нет / обязательный файл нельзя архивировать |
+| `name_exists`, `no_group` | имя копии занято / нет группы `haiplane-backup` |
+| `io_error`, `unexpected`, `usage` | прочие ошибки ввода-вывода, неожиданные, неверный вызов |
+
+Код `skipped`: `lock_busy` (другой запуск держит lock дольше 2 мин). Вывода инструментов и путей
 секретов в журнале нет. `journalctl -u haiplane-snapshot-hourly`.
 
 ## Проверка владельцем после установки
