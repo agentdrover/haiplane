@@ -1101,25 +1101,6 @@ class NoopGitHub:
         return []
 
 
-class NoopNotes:
-    async def availability(self) -> dict[str, str]:
-        return {"status": "no_binary", "detail": "notes integration disabled"}
-
-    async def recent_decisions(
-        self, space_id: str | None = None, limit: int = 10
-    ) -> list[dict[str, Any]]:
-        return []
-
-    async def save_decision(
-        self,
-        task_id: int,
-        action: str,
-        summary: str,
-        context: str = "",
-    ) -> dict[str, Any] | None:
-        return None
-
-
 class NoopVast:
     async def has_active_vast_tasks(self, db: aiosqlite.Connection) -> bool:
         return False

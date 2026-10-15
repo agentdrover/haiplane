@@ -11,7 +11,6 @@ from hub.integrations.noop import (
     NoopForge,
     NoopGitHub,
     NoopGitOps,
-    NoopNotes,
     NoopTranscripts,
     NoopVast,
 )
@@ -20,7 +19,6 @@ from hub.integrations.protocols import (
     ForgePlugin,
     GitHubPlugin,
     GitOpsPlugin,
-    NotesPlugin,
     TranscriptsPlugin,
     VastPlugin,
 )
@@ -31,7 +29,6 @@ class PluginRegistry:
     git_ops: GitOpsPlugin
     forge: ForgePlugin
     github: GitHubPlugin
-    notes: NotesPlugin
     vast: VastPlugin
     transcripts: TranscriptsPlugin
 
@@ -40,7 +37,6 @@ class PluginRegistry:
         self.git_ops = NoopGitOps()
         self.forge = NoopForge()
         self.github = NoopGitHub()
-        self.notes = NoopNotes()
         self.vast = NoopVast()
         self.transcripts = NoopTranscripts()
 

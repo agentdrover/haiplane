@@ -31,8 +31,6 @@ DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "haiplane-dev-dispatch" / "jobs"
 DISPATCH_LOGS_DIR = HOME / ".local" / "state" / "haiplane-dev-dispatch" / "logs"
 DISPATCH_BIN = env_get("DISPATCH_BIN", str(HOME / ".local" / "bin" / "hp-dev-dispatch"))
 
-N4L_BIN = env_get("N4L_BIN", str(HOME / ".local" / "bin" / "n4l"))
-N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
 

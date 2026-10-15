@@ -94,3 +94,10 @@
 - Did a new enum value get added without a migration, rendering path, or tests?
 - Did a “small” contract change bypass `hub/models.py` and get hardcoded in a route?
 - Did an adapter change leak implementation assumptions into core services?
+
+### Decision records (#1698)
+
+- Route `GET /api/decisions?project=&limit=` (limit 1..50, default 10), in `hub/decisions_api.py`; reader `hub/services/decisions.list_decisions`. Response `{"decisions": [...], "source": "hub"}`; keys `id, task_id, task_title, project, content, agent, principal_id, author_kind, created_at`, order `created_at DESC, id DESC`.
+- These are task-feed rows with `kind='decision'` WITH ORIGIN, not "owner decisions": `kind` is a free string, so an agent may write one too. Archived tasks and the project (task subtree, descendants inherit it) are filtered in the same query, BEFORE `LIMIT`. Other journals (dispatcher events, steward judgements, review verdicts, approve/reject) are not sources.
+- Access is the same as `GET /api/dashboard` (no permission of its own; the middleware allowlists decide: watcher reads, steward/chat-pair/ci_reader/ci_auditor are refused). Consumers: MCP `hub_list_decisions`, the dashboard (`recent_decisions`, 8) and `hub_project_status`.
+- The CLI link to n4l is gone (`hub/integrations/notes.py`, `N4L_BIN`, `N4L_SPACE`, `NotesPlugin`). `record_decision` is still accepted on REST/CLI/MCP and ignored; `GET /api/integrations/notes` answers 410.

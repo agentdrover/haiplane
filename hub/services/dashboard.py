@@ -22,11 +22,14 @@ from hub.models import (
     TaskProjectRef,
     TaskView,
 )
+from hub.services import decisions as decisions_svc
 from hub.services import inbox_decisions
 from hub.services.lifecycle import row_to_task
 from hub.services.project_policy import clone_branch_state
 
 log = logging.getLogger("hub")
+
+_DASHBOARD_DECISIONS = 8
 
 
 async def project_id_for(db: aiosqlite.Connection, project: str | None) -> int | None:
@@ -56,7 +59,6 @@ async def get_dashboard_data(
     project_id = await project_id_for(db, project)
     commits_t = asyncio.create_task(plugins.github.recent_commits(8))
     prs_t = asyncio.create_task(plugins.github.open_prs())
-    decisions_t = asyncio.create_task(plugins.notes.recent_decisions(limit=8))
 
     active_rows = await repo.list_tasks_by_statuses(
         db,
@@ -99,7 +101,10 @@ async def get_dashboard_data(
 
     commits = await commits_t
     prs = await prs_t
-    decisions = await decisions_t
+    # #1698: записи ленты задач kind=decision, проект и архив — до LIMIT.
+    decisions = await decisions_svc.list_decisions(
+        db, project_id=project_id, limit=_DASHBOARD_DECISIONS
+    )
 
     recent_activity = _parse_activity_rows(activity_rows)
 

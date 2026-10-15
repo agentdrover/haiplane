@@ -892,6 +892,14 @@ def _commit_line(commit: dict[str, Any]) -> str:
     return f"{commit.get('sha', '')} {msg}"
 
 
+def _decision_line(d: dict[str, Any]) -> str:
+    """Запись ленты kind=decision: задача и происхождение (#1698)."""
+    who = d.get("agent") or d.get("author_kind") or ""
+    return f"#{d.get('task_id', '?')} {d.get('task_title', 'Decision')}" + (
+        f" ({who})" if who else ""
+    )
+
+
 def _status_sections(data: dict[str, Any]) -> list[str]:
     """Восемь секций обзора по порядку; начальные переносы входят в заголовки."""
     parts: list[str] = []
@@ -927,7 +935,7 @@ def _status_sections(data: dict[str, Any]) -> list[str]:
     parts += _status_section(
         "\n## Recent Decisions",
         data.get("recent_decisions", []),
-        lambda d: d.get("title", "Decision"),
+        _decision_line,
         5,
     )
     return parts
@@ -3580,18 +3588,16 @@ async def hub_decide_task(
     """Human decision after arbiter review — the Decision Gate.
 
     When a task reaches needs_decision (review ambiguity, cycle limit, arbiter
-    escalation), a human must accept or rework it. This records that decision
-    and can persist it as a reusable record through notes.
+    escalation), a human must accept or rework it. This records that decision.
 
-    decision_summary is always written to the task log, so the reasoning
-    survives without a notes backend; notes are optional and never block.
+    decision_summary is always written to the task log.
 
     Args:
         task_id: The needs_decision task ID
         action: 'accept' to complete, 'rework' to send back for fixes
         instructions: When action='rework', what needs to be fixed
         decision_summary: Short reason (recorded in task updates)
-        record_decision: Also persist through the notes integration
+        record_decision: Deprecated, ignored: the decision is always logged
         pr_disposition: On accept — 'deliver'|'abandon'|''. 'deliver' merges
             under the gate's own conditions or refuses naming the unmet one:
             a decision cannot stand in for a gate (#1037).
@@ -5040,44 +5046,24 @@ async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
 
 @mcp.tool()
 async def hub_list_decisions(limit: int = 10) -> CallToolResult:
-    """List recent architectural/development decisions from notesforllm.
+    """List recent decision records from task feeds, with origin.
 
     Args:
-        limit: Max decisions to return
+        limit: 1..50
     """
-    data = await _api_get("/api/dashboard")
-    decisions = data.get("recent_decisions", [])
+    limit = max(1, min(int(limit), 50))
+    data = await _api_get(f"/api/decisions?limit={limit}")
+    decisions = data.get("decisions", [])
     if not decisions:
-        # Distinguish "no decisions" from "integration broken" (#251).
-        health = await _api_get("/api/integrations/notes")
-        available = health.get("status") == "available"
-        if available:
-            message = "No decisions recorded."
-        else:
-            message = (
-                "Notes integration unavailable "
-                f"({health.get('status')}): {health.get('detail', '')}"
-            )
         return structured_echo_result(
-            message,
-            decisions=[],
-            notes_available=available,
-            notes_status=health.get("status"),
-            notes_detail=health.get("detail", ""),
+            "No decisions recorded.", decisions=[], source="hub"
         )
     lines = []
-    for d in decisions[:limit]:
-        title = d.get("title", "Decision")
-        content = d.get("content", d.get("decision", ""))
-        lines.append(f"- {title}")
-        if content:
-            lines.append(f"  {content[:200]}")
-    return structured_echo_result(
-        "\n".join(lines),
-        decisions=decisions[:limit],
-        notes_available=True,
-        notes_status="available",
-    )
+    for d in decisions:
+        lines.append(f"- #{d.get('task_id')} {d.get('task_title', 'Decision')}")
+        if d.get("content"):
+            lines.append(f"  {d['content'][:200]}")
+    return structured_echo_result("\n".join(lines), decisions=decisions, source="hub")
 
 
 # ---------------------------------------------------------------------------
