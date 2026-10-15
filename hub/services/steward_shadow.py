@@ -61,6 +61,7 @@ from hub.services.steward_dispatch import (
     close_run,
     configured_mode,
     hold_start_for_review,
+    note_ci_after_start,
     steward_mode,
 )
 
@@ -1047,6 +1048,7 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     )
     await db.commit()
     log.info("steward run started: task #%s gen %s", task_id, generation)
+    await note_ci_after_start(db, order, dict(task_row))
     return True
 
 

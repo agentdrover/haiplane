@@ -656,12 +656,16 @@ async def _nothing_new_since(
 class ReviewGate:
     """Ответ стража ожидания отчёта: ждать (``blocker``) или заказывать.
 
+    ``ci_note`` (#1695) — окно кончилось, а CI сдачи всё ещё не подтверждён:
+    вызывающий пишет одну строку в ленту и судит.
+
     ``because`` — что назвать в ленте, когда заказ идёт НЕ на готовом отчёте:
     окончательный исход ревью или «ждали отчёт N мин». Пусто — отчёт есть.
     """
 
     blocker: str = ""
     because: str = ""
+    ci_note: str = ""  # #1695: судим, не дождавшись подтверждённого CI
 
 
 def _waited_minutes(since: datetime | None, deferred_at: str) -> tuple[int, bool]:
@@ -724,6 +728,51 @@ async def review_wait_gate(
     from hub.services.review_evidence import review_wait_view
 
     wait = await review_wait_view(db, task)
+    gate = await _review_report_gate(db, task, wait)
+    if gate.blocker:
+        return gate
+    return await _ci_wait_gate(db, task, wait.since, gate)
+
+
+async def _ci_wait_gate(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    since: datetime | None,
+    gate: ReviewGate,
+) -> ReviewGate:
+    """#1695: отчёт ревью не держит — держит ли CI. Окно то же, без нового.
+
+    Судья, стартовавший при неполном CI, выносит escalate ci_pinned_sha
+    absent, а суждение на поколение одно (#1022): поздний verified его не
+    исправит. Ждём до STEWARD_REVIEW_WAIT_MAX от сдачи, как ждём отчёт ревью.
+    """
+    from hub.services.steward_ci_wait import ci_wait_view
+
+    ci = await ci_wait_view(db, task)
+    if not ci.waiting:
+        return gate
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    stamp = "" if since else await _first_deferral_stamp(db, task_id, generation)
+    waited, unreadable = _waited_minutes(since, stamp)
+    if not unreadable and waited < config.STEWARD_REVIEW_WAIT_MAX:
+        return ReviewGate(
+            blocker=f"CI этой сдачи ещё не подтверждён ({ci.state}) — судья "
+            "прочитал бы неполные данные и эскалировал, а суждение на поколение "
+            "одно; заказ ждёт отчёта CI",
+            because=gate.because,
+        )
+    note = (
+        f"стюард судит без подтверждённого CI: ждали {waited} мин "
+        f"(потолок {config.STEWARD_REVIEW_WAIT_MAX}), состояние: {ci.state}"
+    )
+    return ReviewGate(because=gate.because or note, ci_note=note)
+
+
+async def _review_report_gate(
+    db: aiosqlite.Connection, task: dict[str, Any], wait: Any
+) -> ReviewGate:
+    """Часть стража про отчёт машинного ревью (#1289, #1600)."""
     if wait.pending:
         task_id = int(task["id"])
         generation = int(task.get("submission_generation") or 0)
@@ -789,6 +838,32 @@ async def _defer(
     await db.commit()
 
 
+async def _note_ci(
+    db: aiosqlite.Connection, task_id: int, generation: int, gate: ReviewGate
+) -> None:
+    """Окно ожидания CI вышло — одна строка в ленте на поколение (#1695)."""
+    if gate.ci_note:
+        from hub.services.steward_ci_wait import note_judged_without_ci
+
+        await note_judged_without_ci(db, task_id, generation, gate.ci_note)
+
+
+async def note_ci_after_start(
+    db: aiosqlite.Connection, order: dict[str, Any], task: dict[str, Any]
+) -> None:
+    """Судья стартовал — если без подтверждённого CI, строка в ленте (#1695)."""
+    if order.get("kind", KIND_VERDICT) != KIND_VERDICT:
+        return
+    note = str(order.get("ci_note") or "")
+    if not note:
+        return
+    from hub.services.steward_ci_wait import note_judged_without_ci
+
+    await note_judged_without_ci(
+        db, int(order["task_id"]), int(order["generation"]), note
+    )
+
+
 async def hold_start_for_review(
     db: aiosqlite.Connection, order: dict[str, Any], task: dict[str, Any]
 ) -> bool:
@@ -810,6 +885,10 @@ async def hold_start_for_review(
         return False
     gate = await review_wait_gate(db, task)
     if not gate.blocker:
+        # Основание запускать без CI запоминается ДО обращения к провайдера:
+        # CI мог подтвердиться, пока шёл вызов, а аудит должен назвать то,
+        # что видел судья на старте (#1695).
+        order["ci_note"] = gate.ci_note
         return False
     await _defer(db, int(order["task_id"]), int(order["generation"]), gate.blocker)
     await _push_start_deadline(db, int(order["id"]))
@@ -829,15 +908,22 @@ async def _push_start_deadline(db: aiosqlite.Connection, run_id: int) -> None:
 EVENT_WINDOW_RENEWED = "steward_run_window_renewed"
 
 
-async def _waited_for_review(db: aiosqlite.Connection, run: dict[str, Any]) -> bool:
-    """Слот этой сдачи уже откладывался из-за ревью (есть запись об отсрочке)."""
+async def _waited_for_review(
+    db: aiosqlite.Connection, run: dict[str, Any]
+) -> str | None:
+    """Слот этой сдачи уже откладывался (есть запись об отсрочке): её причина.
+
+    None — не откладывался. Причина нужна, чтобы продление окна называло то,
+    чего ждали: отчёт ревью или подтверждённый CI (#1695).
+    """
     rows = await fetchall(
         db,
-        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "SELECT json_extract(payload, '$.detail') AS detail FROM events "
+        "WHERE task_id=? AND kind=? "
         "AND json_extract(payload, '$.generation')=? LIMIT 1",
         (run["task_id"], EVENT_DEFERRED, run["generation"]),
     )
-    return bool(rows)
+    return str(dict(rows[0]).get("detail") or "") if rows else None
 
 
 async def _renew_once(
@@ -890,11 +976,20 @@ async def _waits_for_review(
         return False
     gate = await review_wait_gate(db, task)
     if gate.blocker:
+        # Отсрочка записывается и здесь (#1695): без неё слот, просроченный до
+        # первого тика старта, по окончании ожидания не знал бы, что ждал.
+        await _defer(db, int(run["task_id"]), int(run["generation"]), gate.blocker)
         await _push_start_deadline(db, int(run["id"]))
         return True
-    if not await _waited_for_review(db, run):
+    waited_for = await _waited_for_review(db, run)
+    if waited_for is None:
         return False
-    return await _renew_once(db, run, gate.because or "отчёт ревью получен")
+    ready = (
+        "ожидание CI кончилось: CI подтверждён или проверка окончательна"
+        if waited_for.startswith("CI")
+        else "отчёт ревью получен"
+    )
+    return await _renew_once(db, run, gate.because or ready)
 
 
 async def order_due_runs(db: aiosqlite.Connection) -> int:
@@ -935,6 +1030,7 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
             continue
         if await order_run(db, task_id, generation, why=gate.because) is not None:
             ordered += 1
+            await _note_ci(db, task_id, generation, gate)
     return ordered
 
 
