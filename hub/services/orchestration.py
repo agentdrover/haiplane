@@ -4344,6 +4344,19 @@ class MergeStep(enum.Enum):
     APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
 
 
+def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    """Предикат одобрения над свежей строкой, привязанный к сдаче снимка (#1706).
+
+    Операция, начатая на сдаче N, не продолжается, если живая сдача уже N+1:
+    проверки (CI, стопка) относились к коду N, а одобрение N+1 — к другому коду.
+    Снимок без номера сдачи (синтетический) на сдачу не привязывается.
+    """
+    generation = snapshot.get("submission_generation")
+    if generation is not None and fresh.get("submission_generation") != generation:
+        return False
+    return not completion_requires_review(fresh)
+
+
 async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
     """Действует ли одобрение ПРЯМО СЕЙЧАС: свежее чтение, канонический предикат.
 
@@ -4353,7 +4366,7 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
     (#1286). Снимок вызывающего не читается вовсе: его возраст и есть дефект.
     """
     row = await repo.get_task(db, int(task["id"]))
-    return row is not None and not completion_requires_review(dict(row))
+    return row is not None and _approval_holds(dict(row), task)
 
 
 async def merge_if_approval_stands(
@@ -4375,7 +4388,7 @@ async def merge_if_approval_stands(
     while True:
         row = await repo.get_task(db, key[0])
         # --- ниже до регистрации Future нет ни одного await ---
-        if row is None or completion_requires_review(dict(row)):
+        if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""
         if key not in _gate_merges:
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
@@ -5671,7 +5684,10 @@ async def _complete_without_review(
     # WITHOUT bumping the generation — no new work is being submitted,
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
-    if not await _write_completed(db, task, exit_code, result_text):
+    pr_delivered = bool(task.get("pr_number") and not task.get("job_id"))
+    if not await _write_completed(
+        db, task, exit_code, result_text, delivered=pr_delivered
+    ):
         await _note_approval_gone(db, task)
         return "running"
     return "completed"
@@ -5682,8 +5698,15 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
+    *,
+    delivered: bool = False,
 ) -> bool:
     """The write of ``completed`` after a done report, with its validation gate.
+
+    ``delivered`` — the PR was merged on this route: that is a fact, and the
+    completion records it whatever the verdict is now (the merge point checked
+    the approval at the moment of the merge). Without a merge the approval is
+    asked again here.
 
     #1706: the approval is read inside the same write transaction as the
     ``completed`` it authorises. ``False`` — it is gone (a replacement, a
@@ -5698,7 +5721,7 @@ async def _write_completed(
     """
     task_id = task["id"]
     async with write_transaction(db):
-        if not await approval_stands(db, task):
+        if not delivered and not await approval_stands(db, task):
             return False
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate

@@ -756,7 +756,7 @@ async def test_a_resubmission_inside_the_tick_does_not_merge(
 
 # ---- ONE merge point: every network probe x every path x every change --------
 
-_CHANGES = ["replaced", "resubmitted", "returned"]
+_CHANGES = ["replaced", "resubmitted", "returned", "reapproved"]
 _OUTCOME_PHRASES = ("Ревью одобрено", "Доставлено хабом", "Доставка отложена")
 
 
@@ -770,6 +770,14 @@ async def _fire(db: aiosqlite.Connection, task_id: int, change: str) -> None:
         )
     elif change == "resubmitted":
         await repo.bump_submission_generation(db, task_id)
+    elif change == "reapproved":
+        # N -> N+1 and a NEW approval of N+1: this flow was started on N.
+        await repo.bump_submission_generation(db, task_id)
+        await db.execute(
+            "UPDATE tasks SET review_verdict='approved', "
+            "review_verdict_generation=submission_generation WHERE id=?",
+            (task_id,),
+        )
     else:
         await repo.close_review_verdict_window(db, task_id)
     await db.commit()
@@ -828,6 +836,8 @@ async def test_no_merge_and_no_outcome_on_any_gate_path(
         _report_done,
     )
 
+    if path == "deferred_completion" and change == "reapproved":
+        pytest.skip("the deferred completion starts after the change: it reads N+1")
     method, _, answer = probe.partition(":")
     git = _git(CIProbeOutcome[answer or "passed"], merged=True)
     task_id = await _approved_pair_task(db)
@@ -1112,6 +1122,8 @@ async def test_a_task_without_a_pr_is_not_completed_on_a_gone_approval(
     db: aiosqlite.Connection, change: str
 ):
     """No PR, no merge point: the deferred completion itself must look again."""
+    if change == "reapproved":
+        pytest.skip("the deferred completion starts after the change: it reads N+1")
     from hub.services import orchestration
     from tests.test_pair_merge_gate import _approved_pair_task, _git
 
@@ -1207,3 +1219,125 @@ async def test_the_outcome_check_and_write_hold_one_write_lock(db_dsn, db):
     finally:
         await other.close()
     assert stands and locked == [True], "the other connection was held off"
+
+
+async def test_a_merge_is_recorded_even_when_the_approval_went_after_it(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 5: the merge is a fact; the line must not claim an approval."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+    )
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    async def merged_then_replaced(*_a, **_k):
+        await _fire(db, task_id, "replaced")
+        return True
+
+    git.merge_pr = AsyncMock(side_effect=merged_then_replaced)
+    await _drain_pair_delivery(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "влит по одобренному ревью" not in feed
+    assert "одобрение уже не действует" in feed
+
+
+async def test_no_fix_is_bought_for_a_verdict_that_was_replaced(
+    db: aiosqlite.Connection,
+):
+    from hub import poller
+
+    task_id = await _headless_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "Review verdict: CHANGES_REQUESTED\nfix it"
+    )
+    await db.execute(
+        "UPDATE tasks SET review_verdict='changes_requested', "
+        "review_verdict_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    snapshot = dict(await repo.get_task(db, task_id))
+    real = poller._resolve_review_verdict
+
+    async def replaced_meanwhile(db_, task_, updates_):
+        verdict = await real(db_, task_, updates_)
+        await db_.execute(
+            "UPDATE tasks SET review_verdict='approved' WHERE id=?", (task_id,)
+        )
+        await db_.commit()
+        return verdict
+
+    plugins.dispatch = _job()
+    fixes: list[str] = []
+
+    async def fix(_db, _task, text):
+        fixes.append(text)
+
+    with (
+        patch.object(poller, "_resolve_review_verdict", replaced_meanwhile),
+        patch.object(poller.services, "dispatch_fix", fix),
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+    ):
+        await poller._review_task_tick(db, snapshot, {"status": "completed"})
+    assert fixes == []
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+@pytest.mark.parametrize(
+    "probe",
+    ["ci_passed", "ci_failed", "stacking_clear", "stacking_blocks", "merge_refused"],
+)
+async def test_no_merge_and_no_outcome_on_the_headless_path(
+    db: aiosqlite.Connection, monkeypatch, probe: str, change: str
+):
+    """The matrix's fourth route: the headless conveyor, every probe, every change."""
+    from hub import poller
+    from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+
+    async def ci(*_a, **_k):
+        if probe.startswith("ci_"):
+            await _fire(db, task_id, change)
+        outcome = (
+            CIProbeOutcome.failed if probe == "ci_failed" else CIProbeOutcome.passed
+        )
+        return CIProbeResult(outcome, "probe")
+
+    async def stacking(*_a, **_k):
+        if probe.startswith("stacking"):
+            await _fire(db, task_id, change)
+        return (
+            "stack_unresolvable: nobody delivers the base"
+            if probe == "stacking_blocks"
+            else ""
+        )
+
+    async def merge(*_a, **_k):
+        await _fire(db, task_id, change)
+        return False
+
+    git.check_pr_ci = ci
+    monkeypatch.setattr(poller.services, "stacking_gate_step", stacking)
+    if probe == "merge_refused":
+        git.merge_pr = merge
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(db, snapshot)
+    if probe != "merge_refused":
+        assert git.merge_pr.await_count == 0, "the forge was never asked to merge"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "no needs_decision, no completed"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    for phrase in (*_OUTCOME_PHRASES, "Доставка остановлена", "CI failed"):
+        assert phrase not in feed, f"{phrase!r} written over an approval that was gone"

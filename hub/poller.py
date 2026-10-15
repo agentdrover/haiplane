@@ -631,7 +631,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 # Said once, not once per sweep — the same dedup the pair
                 # path uses, for the same reason: a line every thirty
                 # seconds is how a real signal gets muted (#534).
-                await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
+                await _note_pair_delivery_wait(db, task, pr_num, stacked)
                 return
             if stacked:
                 written, _ = await services.record_delivery_outcome(
@@ -804,6 +804,9 @@ async def _review_task_tick(db, task: dict, job: dict) -> None:
         # The text of the verdict is read with it: a replacement between the two
         # reads would send the executor yesterday's APPROVED (#1706).
         updates_list = [dict(u) for u in await repo.get_task_updates(db, task["id"])]
+        row = await repo.get_task(db, task["id"])
+        if row is None or dict(row).get("review_verdict") != "changes_requested":
+            return  # replaced since: a fix for a verdict that is gone is not bought
         await _request_review_fixes(db, task, updates_list)
     elif verdict in (SCANNED_APPROVAL_DEFERRED, VERDICT_NOT_WRITTEN):
         return  # routed to a human with the quoted line / write refused (#1706)
@@ -2014,7 +2017,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
         # chore the very next pass might make unnecessary — the same
         # reasoning as an unreadable recorded-PR state, so it gets the same
         # treatment: a transient wait, not a terminal refusal.
-        await _note_pair_delivery_wait(db, task_id, pr_num, delivery_pr.reason)
+        await _note_pair_delivery_wait(db, task, pr_num, delivery_pr.reason)
         return
     if delivery_pr.unusable:
         # #959: closed, the search for a replacement ANSWERED "none" —
@@ -2038,7 +2041,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
         if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
             await _note_pair_delivery_wait(
                 db,
-                task_id,
+                task,
                 pr_num,
                 detail,
                 hint=(
@@ -2074,7 +2077,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
                     # instead, exactly like the transient branch.
                     await _note_pair_delivery_wait(
                         db,
-                        task_id,
+                        task,
                         pr_num,
                         detail,
                         hint=services.RESUBMIT_AFTER_FIX_HINT,
@@ -2129,13 +2132,22 @@ async def _deliver_pair_task(db, task: dict) -> None:
 
     # Said out loud, because a completed task with no done report otherwise
     # reads as a lost record rather than as work the hub carried home (AC-5).
+    # #1706: the merge is a fact and is recorded; what the line may CLAIM about
+    # the approval depends on whether it still stands.
+    claim = (
+        "влит по одобренному ревью. Условия доставки были выполнены целиком, "
+        "ждать было нечего."
+        if await services.approval_stands(db, task)
+        else "влит, но к моменту записи одобрение уже не действует (вердикт "
+        "заменён, работа возвращена или пересдана): влитый PR остаётся в базовой "
+        "ветке, решение по задаче — за человеком."
+    )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Доставлено хабом без отчёта агента: PR #{pr_num} влит по одобренному "
-        "ревью. Условия доставки были выполнены целиком, ждать было нечего. "
+        f"Доставлено хабом без отчёта агента: PR #{pr_num} {claim} "
         "Отчёт агента, если он придёт, ляжет сюда же рассказом о работе.",
     )
     # Completion WITHOUT bumping the generation: no new work is being
@@ -2169,7 +2181,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
 
 
 async def _note_pair_delivery_wait(
-    db, task_id: int, pr_num, detail: str, *, hint: str = "", resolver_note: str = ""
+    db, task: dict, pr_num, detail: str, *, hint: str = "", resolver_note: str = ""
 ) -> None:
     """Say once that delivery is waiting, and then be quiet (#534).
 
@@ -2199,6 +2211,7 @@ async def _note_pair_delivery_wait(
     closes every path that skipped it.
     """
     key = f"{resolver_note}\x1f{detail}"
+    task_id = int(task["id"])
 
     async def _write() -> None:
         if _pair_delivery_waits.get(task_id) != key:
@@ -2215,10 +2228,7 @@ async def _note_pair_delivery_wait(
 
     # #1706: "delivery postponed" says the work is approved and will be
     # delivered; the one outcome writer checks that it still is.
-    row = await repo.get_task(db, task_id)
-    await services.record_delivery_outcome(
-        db, dict(row) if row else {"id": task_id, "pr_number": pr_num}, _write
-    )
+    await services.record_delivery_outcome(db, task, _write)
     await db.commit()
 
 
