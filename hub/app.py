@@ -29,7 +29,6 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hub import brand, config, models, services, skill_publish
@@ -129,8 +128,6 @@ from hub.actionable_errors import (
     agent_create_forbidden_detail,
     chat_pair_agent_missing_detail,
     chat_pair_auth_required_detail,
-    chat_pair_invalid_detail,
-    chat_pair_rate_limited_detail,
     chat_pair_run_forbidden_detail,
     chat_pair_task_not_open_detail,
     human_only_gate_detail,
@@ -141,7 +138,6 @@ from hub.auth import (
     CSRF_FIELD_NAME,
     CSRF_HEADER_NAME,
     _extract_bearer,
-    client_ip,
     cookie_csrf_ok,
     csrf_exempt_transport,
     current_identity,
@@ -162,7 +158,6 @@ from hub.mcp_catalog import (
     load_budget,
     load_measured,
 )
-from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import policy_change, project_policy
@@ -765,43 +760,7 @@ async def api_chat_pair_redeem(
     unknown/spent/expired, and a code that is gone the moment it is spent.
     """
     _guard_chat_pair_enabled()
-    caller = client_ip(request)
-    if chat_pair.redeem_limit_reached(caller):
-        raise HTTPException(429, detail=chat_pair_rate_limited_detail())
-
-    session, refusal = await chat_pair.redeem_code_explained(_db(request), body.code)
-    if session is None:
-        chat_pair.record_redeem_attempt(caller)
-        return JSONResponse(
-            status_code=401,
-            content={"detail": chat_pair_invalid_detail()},
-            background=BackgroundTask(
-                chat_pair.audit_redeem_refusal_detached, request.app, caller, refusal
-            ),
-        )
-
-    await admin_svc.write_audit(
-        _db(request),
-        actor_id=session["principal_id"],
-        action="chat_pair_redeem",
-        target_type="chat_pair",
-        target_id=str(session["principal_id"]),
-        summary="pairing code redeemed for a chat session",
-    )
-    return ChatPairRedeemed(
-        token=session["token"],
-        expires_at=session["expires_at"],
-        username=session["username"],
-        role="agent" if session.get("kind") == "implementer" else "human",
-        base_url=hub_base_url(),
-        permissions=sorted(
-            config.CHAT_PAIR_IMPLEMENTER_PERMS
-            if session.get("kind") == "implementer"
-            else config.CHAT_PAIR_PERMS
-        ),
-        kind=session.get("kind") or "intake",
-        bound_task_id=session.get("bound_task_id"),
-    )
+    return await chat_pair.redeem_for_request(request, body.code)
 
 
 @app.post("/api/auth/chat-pair/revoke", response_model=ChatPairRevoked)

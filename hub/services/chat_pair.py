@@ -609,6 +609,72 @@ async def redeem_code_explained(
     return session, None
 
 
+async def redeem_for_request(request: Any, raw_code: str) -> Any:
+    """The body of ``POST /api/auth/chat-pair/redeem`` (moved out of app.py).
+
+    The only unauthenticated write in the hub, and every guard here exists
+    because of that: a limiter of its own (not the login one — a shared bucket
+    would lock the operator out of /login), one indistinguishable refusal for
+    unknown/spent/expired, and a code that is gone the moment it is spent.
+
+    A refusal is the same 401 whatever the reason; the reason goes to the
+    closed audit AFTER the answer is sent (#1694), because inline the response
+    time would name it.
+    """
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    from starlette.background import BackgroundTask
+
+    from hub.actionable_errors import (
+        chat_pair_invalid_detail,
+        chat_pair_rate_limited_detail,
+    )
+    from hub.auth import client_ip
+    from hub.hub_instance import hub_base_url
+    from hub.models import ChatPairRedeemed
+    from hub.services import admin as admin_svc
+
+    caller = client_ip(request)
+    if redeem_limit_reached(caller):
+        raise HTTPException(429, detail=chat_pair_rate_limited_detail())
+
+    db = getattr(request.state, "db", None) or request.app.state.db
+    session, refusal = await redeem_code_explained(db, raw_code)
+    if session is None:
+        record_redeem_attempt(caller)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": chat_pair_invalid_detail()},
+            background=BackgroundTask(
+                audit_redeem_refusal_detached, request.app, caller, refusal
+            ),
+        )
+
+    await admin_svc.write_audit(
+        db,
+        actor_id=session["principal_id"],
+        action="chat_pair_redeem",
+        target_type="chat_pair",
+        target_id=str(session["principal_id"]),
+        summary="pairing code redeemed for a chat session",
+    )
+    implementer = session.get("kind") == "implementer"
+    return ChatPairRedeemed(
+        token=session["token"],
+        expires_at=session["expires_at"],
+        username=session["username"],
+        role="agent" if implementer else "human",
+        base_url=hub_base_url(),
+        permissions=sorted(
+            config.CHAT_PAIR_IMPLEMENTER_PERMS
+            if implementer
+            else config.CHAT_PAIR_PERMS
+        ),
+        kind=session.get("kind") or "intake",
+        bound_task_id=session.get("bound_task_id"),
+    )
+
+
 async def ordered_skill_of_session(
     db: aiosqlite.Connection, token: str, task_id: int
 ) -> dict[str, Any] | None:
