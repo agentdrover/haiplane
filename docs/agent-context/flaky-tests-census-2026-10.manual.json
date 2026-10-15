@@ -282,6 +282,18 @@
    "task": "#1627"
   }
  },
+ "loaded_seconds_per_repeat": {
+  "tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate": 5.167,
+  "tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push": 2.566,
+  "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row": 0.408,
+  "tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop": 1.387,
+  "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret": 0.466,
+  "tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown": 0.21,
+  "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code": 5.898,
+  "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker": 0.65,
+  "tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker": 0.517,
+  "tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently": 3.844
+ },
  "local_runs": [
   {
    "command": "REPS=10 PYTHONPATH=<plugin repeatplug> uv run --directory <git worktree of tree b8f9f259ec9b> pytest tests/test_no_legacy_name.py::test_head_contains_no_legacy_name -q -p repeatplug -p no:cacheprovider",
@@ -1119,6 +1131,12 @@
    "runs": 100,
    "tree": "git:c8fe20902b42237f3bf3433138aede4741587319"
   }
+ ],
+ "m1_reproduced": [
+  "tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row",
+  "tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret",
+  "tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code",
+  "tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker"
  ],
  "note": "Ручные входы переписи: локальные повторы (команда и нагрузка записаны), класс причины, фиксы, строки вне ci.yml."
 }

@@ -917,6 +917,47 @@ def step_breakdown(gh: Gh, runs: dict[int, dict]) -> str:
     )
 
 
+M1_BUDGET_SECONDS = 120
+M1_MAX_REPEATS = 400
+
+
+def m1_table(rows: list[dict], manual: dict) -> str:
+    """Таблица мер M1: K = min(400, 120 с / длительность повтора под нагрузкой),
+    P(detect) = 1 - (1 - p)^K, p = падения/выполнения из ci_rate. Все числа
+    документа берутся отсюда, а не набираются руками."""
+    secs = manual.get("loaded_seconds_per_repeat", {})
+    reproduced = set(manual.get("m1_reproduced", []))
+    lines = [
+        "| nodeid | failures/executions (p) | s per repeat (loaded) | K | P(detect) | reproduced locally |",
+        "|---|---|---|---|---|---|",
+    ]
+    probs: dict[bool, list[float]] = {True: [], False: []}
+    seen: set[str] = set()
+    for row in rows:
+        rate = row["evidence"].get("ci_rate")
+        nodeid = row["nodeid"]
+        if not rate or nodeid in seen or nodeid not in secs:
+            continue
+        seen.add(nodeid)
+        p = rate["failures"] / rate["executions"] if rate["executions"] else 0.0
+        k = min(M1_MAX_REPEATS, int(M1_BUDGET_SECONDS / secs[nodeid]))
+        prob = 1 - (1 - p) ** k
+        repro = nodeid in reproduced
+        if p > 0:
+            probs[repro].append(prob)
+        shown = f"{prob:.3f}" if p > 0 else "n/a (p=0)"
+        lines.append(
+            f"| {nodeid} | {rate['failures']}/{rate['executions']} ({p * 100:.2f}%) | {secs[nodeid]} | {k} | {shown} | {'yes' if repro else 'no'} |"
+        )
+    rest, every = probs[False], probs[False] + probs[True]
+    lines.append("")
+    lines.append(
+        f"mean over {len(rest)} not reproduced with p>0: {sum(rest) / len(rest):.3f}; "
+        f"mean over all {len(every)} with p>0: {sum(every) / len(every):.3f}"
+    )
+    return "\n".join(lines)
+
+
 def load_manual(path: str | None) -> dict:
     if not path:
         return {}
@@ -941,6 +982,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--markdown", action="store_true", help="напечатать таблицу для .md"
     )
     parser.add_argument(
+        "--m1", action="store_true", help="напечатать таблицу P(detect) для меры M1"
+    )
+    parser.add_argument(
         "--summary", action="store_true", help="напечатать сводку и числа по гипотезе"
     )
     return parser.parse_args(argv)
@@ -962,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"runs={len(runs)} rows={len(rows)} api_calls={gh.calls}", file=sys.stderr)
     if args.markdown:
         print(render_markdown(rows))
+    elif args.m1:
+        print(m1_table(rows, load_manual(args.manual)))
     elif args.summary:
         print(f"runs={len(runs)}; {step_breakdown(gh, runs)}")
         print(summarize(rows))

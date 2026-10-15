@@ -171,7 +171,24 @@ def _rep_step(request):
 - Этап: шаг после Test в прогонах `workflow_dispatch` и первом PR-прогоне task-ветки (то же условие, что у мутаций и baseline, ci.yml шаг «Decide whether mutations…»).
 - Что делает: берёт тест-функции, добавленные или изменённые диффом (механика `scripts/red_test_baseline.py` и `scripts/mutation_changed.py`), и гоняет каждую K раз в одном процессе (плагин повтора) при фоновой нагрузке на все ядра; K = min(400, 120 с / длительность повтора под нагрузкой); итого не больше 8 минут. Падение даёт красный шаг с nodeid и числом падений.
 - (а) Проверено опытом: dead_parent (4/80), limit_not_cut (4/480), queued_local_run (1/80), probe_leaks (3/480). Всего 4 из 17 кандидатов. `test_mcp_transport` в охват не входит: он повтор-небезопасен (9 из 10 повторов в процессе падают) и исключается маркером `no_repeat`, поэтому его CI-падения остаются **без меры** (пробел; нужна отдельная задача на изоляцию одноразовых объектов модулей или запуск файла отдельным процессом, как уже делает validation_commands) (воспроизведение — раздел «Опыты»).
-- (б) Ожидаемое покрытие остальных при K по формуле выше, допущение — частота падения на выполнение равна оценке за окно: marker_renewed 0,26 (K=31 при 3,8 с на повтор), signal 0,36, git race 0,14, egress 0,25, queued_local 0,02 (K=20), brand 0,01 (K=23); для `test_locator_worker` и `test_api_context` оценка частоты после мержа нулевая (оба упали только до мержа), покрытие n/a. Среднее по шести невоспроизведённым случаям с оценкой около 0,17, по девяти с оценкой с воспроизведёнными (dead_parent 0,83, limit 0,33, probe_leaks 0,15) около 0,25 (при K=400 и частоте locator 0). Оговорки: оценки частоты берутся из CI, а нагрузка опыта слабее CI; вероятность обнаружения на тесте без воспроизведения может быть ниже в разы.
+- (б) Ожидаемое покрытие: P(detect) = 1 − (1 − p)^K, где p = падения/выполнения из `ci_rate` JSON, K = min(400, 120 с / длительность повтора под нагрузкой). Таблица и средние печатаются командой `flaky_census.py <аргументы> --m1` из текущего JSON и `loaded_seconds_per_repeat` в `.manual.json`, руками не набираются. Для limit_not_cut K=294 (0,408 с на повтор), для probe_leaks K=257 (0,466 с); при фиксированном K=400 было бы 0,419 и 0,227 соответственно, но в бюджет 120 с они не укладываются. У `test_locator_worker` и `test_api_context` частота после мержа нулевая (оба упали только до мержа): оценки нет.
+
+| nodeid | failures/executions (p) | s per repeat (loaded) | K | P(detect) | reproduced locally |
+|---|---|---|---|---|---|
+| tests/test_lifecycle.py::test_a_probe_never_leaks_its_secret | 1/1557 (0.06%) | 0.466 | 257 | 0.152 | yes |
+| tests/test_delivery_gate.py::test_the_limit_does_not_cut_off_the_oldest_live_row | 2/1472 (0.14%) | 0.408 | 294 | 0.329 | yes |
+| tests/test_review_dispatch.py::test_the_queued_local_run_starts_with_a_live_access_code | 1/1279 (0.08%) | 5.898 | 20 | 0.016 | yes |
+| tests/test_review_drain.py::test_the_marker_is_renewed_beyond_its_ttl_independently | 5/521 (0.96%) | 3.844 | 31 | 0.258 | no |
+| tests/test_review_drain.py::test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker | 5/521 (0.96%) | 0.65 | 184 | 0.830 | yes |
+| tests/test_delivery_gate.py::test_git_ops_update_by_push_never_overwrites_a_racing_push | 3/951 (0.32%) | 2.566 | 46 | 0.135 | no |
+| tests/test_review_drain.py::test_a_signal_during_the_wait_removes_only_our_marker | 1/521 (0.19%) | 0.517 | 232 | 0.360 | no |
+| tests/test_locator_worker.py::test_a_crashing_or_garbling_worker_makes_every_locator_unknown | 0/287 (0.00%) | 0.21 | 400 | n/a (p=0) | no |
+| tests/test_brand.py::test_legacy_only_tokens_do_not_authenticate | 1/2121 (0.05%) | 5.167 | 23 | 0.011 | no |
+| tests/test_egress_watch.py::test_probe_is_bounded_and_never_blocks_the_loop | 1/300 (0.33%) | 1.387 | 86 | 0.250 | no |
+
+mean over 5 not reproduced with p>0: 0.203; mean over all 9 with p>0: 0.260
+
+Средние: по пяти невоспроизведённым случаям с p>0 — 0,203; по всем девяти с p>0 — 0,260. Оговорки: частота берётся из CI, а нагрузка опыта слабее CI; вероятность на тесте без воспроизведения может быть ниже в разы.
 - Ложные срабатывания: тесты, непригодные к повтору в процессе (`test_mcp_transport` падает при втором запуске); нужен маркер `no_repeat` с реестром исключений. В опыте 1 из 15 протестированных повтором nodeid (7%) повтор-небезопасен. Красный по дрейфу нагрузки в слабом раннере ожидается редко: тест красный в повторе означает реальную недетерминированность или нехватку устойчивости к нагрузке.
 - Цена: +2 мин в среднем на прогон с изменёнными тестами (потолок 8 мин) на 427 + 523 прогонах за 60 дней, то есть до 1 900–7 600 минут за период; деньги 0 (публичный репозиторий), задержка сдачи.
 - Черновик AC: (1) тест, добавленный в дифф и падающий в 1 из 50 повторов, роняет шаг и называет nodeid; (2) тест без изменений в диффе не повторяется; (3) повтор-небезопасные тесты исключаются маркером `no_repeat` (начальный список: `test_mcp_transport`), и шаг называет исключённые; (4) шаг укладывается в 8 минут на 5 изменённых тестах; (5) красный шаг входит в отчёт CI хабу отдельным полем и блокирует сдачу при `ci_before_submit=require`.

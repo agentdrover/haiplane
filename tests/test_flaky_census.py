@@ -85,3 +85,18 @@ def test_pre_merge_window_ends_at_the_merge_date_and_uses_the_task_branch() -> N
 def test_source_is_unknown_when_history_has_no_such_test(monkeypatch) -> None:
     monkeypatch.setattr(fc, "commit_lines", lambda *args: [])
     assert "source unknown" in fc.source_of(NODE, Path("."))["reason"]
+
+
+def test_m1_probability_uses_the_budgeted_repeat_count() -> None:
+    rows = [
+        {"nodeid": NODE, "evidence": {"ci_rate": {"failures": 2, "executions": 1000}}},
+        {
+            "nodeid": NODE + "2",
+            "evidence": {"ci_rate": {"failures": 0, "executions": 50}},
+        },
+    ]
+    manual = {"loaded_seconds_per_repeat": {NODE: 0.5, NODE + "2": 0.1}}
+    table = fc.m1_table(rows, manual)
+    k = 240  # 120 s / 0.5 s
+    assert f"| {k} | {1 - (1 - 0.002) ** k:.3f} |" in table
+    assert "n/a (p=0)" in table and "mean over 1 not reproduced" in table
