@@ -12,7 +12,7 @@ _SPEC = importlib.util.spec_from_file_location(
 fc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fc)
 
-SHA = "573a671a9527d910d011100eb015a6a8e4bd6c61"
+SHA = "ab12" * 10  # 40 hex, not a literal: detect-secrets reads quoted hex
 NODE = "tests/test_x.py::test_a"
 
 
