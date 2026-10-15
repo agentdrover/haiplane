@@ -402,6 +402,9 @@ async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
 # verdict and not "nothing found" — both of those have their own handling, and
 # collapsing this into either would either deliver the work or hide why it stopped.
 SCANNED_APPROVAL_DEFERRED = "scanned_approval_deferred"
+# #1706: a scanned verdict the write refused (resubmitted, or one already
+# stands). The task is left as it is; the next tick judges what is live.
+VERDICT_NOT_WRITTEN = "verdict_not_written"
 
 
 async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> str:
@@ -422,10 +425,8 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
             task["id"],
             persisted,
         )
-        # Canonical verdict state (#305): bind the verdict to the
-        # current submission generation so a later resubmission
-        # invalidates this approval.
-        await repo.record_review_verdict(db, task["id"], persisted)
+        # #1706: the verdict is already bound and already stored with its
+        # findings and revision; writing it again wiped the findings.
         return str(persisted)
 
     scanned = services.extract_review_verdict(
@@ -445,8 +446,24 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
         return SCANNED_APPROVAL_DEFERRED
 
     # changes_requested keeps working: it returns work to its author instead of
-    # opening delivery, so a false positive costs a round, not a merge.
-    await repo.record_review_verdict(db, task["id"], scanned.verdict)
+    # opening delivery, so a false positive costs a round, not a merge. #1706:
+    # only for the generation this tick read, and only where no verdict stands —
+    # the write is conditional in SQL and its result is checked: a verdict that
+    # was not written is not a verdict this tick may act on.
+    written = await repo.record_review_verdict(
+        db,
+        task["id"],
+        scanned.verdict,
+        expected_generation=int(task.get("submission_generation") or 0),
+    )
+    if not written:
+        log.warning(
+            "Poll: task #%d scanned %s not recorded: the generation moved or a "
+            "verdict already stands",
+            task["id"],
+            scanned.verdict,
+        )
+        return VERDICT_NOT_WRITTEN
     return scanned.verdict
 
 
@@ -795,8 +812,8 @@ async def _review_task_tick(db, task: dict, job: dict) -> None:
         await _deliver_approved_review(db, task)
     elif verdict == "changes_requested":
         await _request_review_fixes(db, task, updates_list)
-    elif verdict == SCANNED_APPROVAL_DEFERRED:
-        return  # already routed to a human, with the matched line quoted
+    elif verdict in (SCANNED_APPROVAL_DEFERRED, VERDICT_NOT_WRITTEN):
+        return  # routed to a human with the quoted line / write refused (#1706)
     else:
         await _mark_no_clear_verdict(db, task)
 

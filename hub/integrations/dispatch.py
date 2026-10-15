@@ -132,6 +132,7 @@ class DispatchIntegration:
         pr_number: int | None = None,
         breadcrumb: str = "",
         pr_url: str = "",
+        generation: int | None = None,
     ) -> str:
         # Готовый адрес приходит снаружи (#1119). Раньше он собирался здесь из
         # литерала github.com и глобального REPO_NAME — то есть сборщик текста
@@ -141,6 +142,13 @@ class DispatchIntegration:
         branch_note = f"\nВетка разработчика: `{branch}`\n" if branch else ""
         pr_note = f"PR: {pr_url}\n" if pr_url else ""
         breadcrumb_note = f"Иерархия: {breadcrumb}\n" if breadcrumb else ""
+        # #1706: вердикт называет сдачу, которую изучали; поколение берётся из
+        # брифа, и CLI само его не подставляет.
+        gen = (
+            str(generation)
+            if generation is not None
+            else f"<submission_generation из oc-hub review-brief {task_id}>"
+        )
         return (
             f"ЗАДАНИЕ: Code review задачи #{task_id}: {title}\n\n"
             f"{breadcrumb_note}"
@@ -158,11 +166,14 @@ class DispatchIntegration:
             "4. Для каждого замечания укажи severity (high/medium/low) и обоснование\n"
             "5. ОБЯЗАТЕЛЬНО запиши вердикт СТРУКТУРИРОВАННОЙ командой (#326):\n"
             f"   oc-hub review-verdict {task_id} approved --agent code-reviewer "
-            '--comments "<краткий отчёт>"\n'
+            f'--expected-generation {gen} --comments "<краткий отчёт>"\n'
             "   ИЛИ\n"
             f"   oc-hub review-verdict {task_id} changes_requested --agent code-reviewer "
-            '--comments "<краткий отчёт>" '
+            f'--expected-generation {gen} --comments "<краткий отчёт>" '
             '--findings-json \'[{"id":1,"severity":"high","message":"..."}]\'\n\n'
+            "Без --expected-generation вердикт не принимается: возьмите поколение из "
+            f"`oc-hub review-brief {task_id}` (submission_generation). Стоящий "
+            "вердикт заменяет только человек.\n\n"
             "ВАЖНО: Если основная задача выполнена корректно — approved, "
             "даже если есть мелкие недочёты (low severity). "
             "changes_requested — только для высокоприоритетных проблем (high), "

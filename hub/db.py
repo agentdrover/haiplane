@@ -2947,6 +2947,24 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN ci_integrity_explanation TEXT "
         "NOT NULL DEFAULT ''",
     ),
+    (
+        # #1706: ревизия вердикта — сколько раз на задачу писали вердикт. Растёт
+        # при КАЖДОЙ записи любым писателем (REST, web, стюард, автопилот,
+        # поллер); замена стоящего вердикта сверяет её в условии UPDATE.
+        # 0 — вердикта не было или он записан до колонки.
+        "add_tasks_review_verdict_revision",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_revision INTEGER "
+        "NOT NULL DEFAULT 0",
+    ),
+    (
+        # #1706: отпечаток запроса, которым записан стоящий вердикт (вид,
+        # находки, комментарий). По нему повтор того же запроса отличим от
+        # другого: комментарий живёт только в ленте, а находки хранятся уже с
+        # проставленными номерами follow-up задач. '' — вердикт записан
+        # поллером или до колонки: повтор такого не узнаётся и получает 409.
+        "add_tasks_review_verdict_digest",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_digest TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

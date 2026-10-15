@@ -6248,6 +6248,7 @@ async def dispatch_review(
         pr_number=pr_number,
         breadcrumb=breadcrumb,
         pr_url=pr_link,
+        generation=int(task.get("submission_generation") or 0) or None,
     )
     result = await plugins.dispatch.submit_task(
         message,

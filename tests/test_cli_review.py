@@ -63,6 +63,7 @@ def test_cmd_review_verdict_with_findings() -> None:
         comments="see findings",
         agent="reviewer",
         findings_json=json.dumps(findings),
+        expected_generation=3,  # #1706: the brief's generation, never filled in by the CLI
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_review_verdict(args)
@@ -75,6 +76,7 @@ def test_cmd_review_verdict_with_findings() -> None:
             "comments": "see findings",
             "agent": "reviewer",
             "findings": findings,
+            "expected_generation": 3,
         },
     )
 
@@ -94,6 +96,7 @@ def test_cmd_review_verdict_forwards_auto_draft_flag() -> None:
         agent="reviewer",
         findings_json=json.dumps(findings),
         create_tasks_for_out_of_scope=True,
+        expected_generation=3,
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_review_verdict(args)
@@ -106,6 +109,7 @@ def test_cmd_review_verdict_forwards_auto_draft_flag() -> None:
             "agent": "reviewer",
             "findings": findings,
             "create_tasks_for_out_of_scope": True,
+            "expected_generation": 3,
         },
     )
 

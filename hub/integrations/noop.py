@@ -66,6 +66,7 @@ class NoopDispatch:
         pr_number: int | None = None,
         breadcrumb: str = "",
         pr_url: str = "",
+        generation: int | None = None,
     ) -> str:
         return f"[noop] review #{task_id}: {title}"
 

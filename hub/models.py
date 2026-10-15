@@ -1347,7 +1347,11 @@ class TaskReviewVerdict(BaseModel):
     # запись вердикта и завершение условны по нему, расхождение — 409 без
     # записей. У commit-задачи не читается (там вердикт и так пишется на
     # текущее поколение, а стюард передаёт своё отдельным аргументом #1601).
+    # #1706: теперь читается и там: название поколения проверяется в записи.
     expected_generation: int | None = None
+    # #1706: замена стоящего вердикта commit-задачи — только человеком и только
+    # с ревизией, которую он видел; без поля стоящий вердикт не заменяется.
+    supersedes_revision: int | None = Field(None, ge=0)
 
 
 class LatestReview(BaseModel):
@@ -1928,6 +1932,8 @@ class ReviewBrief(BaseModel):
     status: TaskStatus
     description: str = ""
     project: TaskProjectRef | None = None
+    # #1706: ревизия стоящего вердикта; замена человеком называет её.
+    review_verdict_revision: int = 0
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     # #506: per verifiable_by=test AC, whether its locator resolves to a real test.
     locator_resolution: list[ACLocatorResolution] = Field(default_factory=list)
@@ -3180,6 +3186,8 @@ class TaskView(BaseModel):
     submission_model: str = ""
     review_verdict: ReviewVerdict | None = None
     review_verdict_generation: int | None = None
+    # #1706: сколько раз на задачу писали вердикт; замена называет её.
+    review_verdict_revision: int = 0
     review_approved_current: bool = False
     latest_review: LatestReview | None = None
     branch: str | None = None
