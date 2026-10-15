@@ -316,8 +316,8 @@
             <ul class="item-list">
                 {% for d in data.recent_decisions[:5] %}
                 <li>
-                    <strong>{{ d.title if d.title else 'Decision' }}</strong>
-                    <div class="meta">{{ (d.content or d.decision or '')[:80] }}</div>
+                    <strong>#{{ d.task_id }} {{ d.task_title if d.task_title else 'Decision' }}</strong>
+                    <div class="meta">{{ (d.content or '')[:80] }} — {{ d.agent }} ({{ d.author_kind }}{% if d.principal_id %} #{{ d.principal_id }}{% endif %})</div>
                 </li>
                 {% endfor %}
             </ul>

@@ -24,7 +24,6 @@ hub/
 │   ├── dispatch.py     # oc-dev-dispatch integration
 │   ├── git_ops.py      # Git + GitHub operations
 │   ├── github.py       # GitHub API (commits, PRs)
-│   ├── notes.py        # notesforllm bridge
 │   ├── vast.py         # Vast.ai management
 │   └── transcripts.py  # Agent transcript reader
 ├── templates/          # Jinja2 templates
@@ -41,7 +40,6 @@ Hub uses a plugin architecture for external integrations. Each integration imple
 - `DispatchPlugin` — task dispatch via `oc-dev-dispatch`
 - `GitOpsPlugin` — git branch/PR/merge via local git + `gh` CLI
 - `GitHubPlugin` — commits/PRs via `gh` CLI
-- `NotesPlugin` — decisions via `n4l` CLI
 - `VastPlugin` — GPU instance management via `vast-haiplane`
 - `TranscriptsPlugin` — agent transcript viewer
 

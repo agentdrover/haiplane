@@ -260,7 +260,6 @@ async def test_server_configure_replaces_every_outward_path(monkeypatch):
         "git_ops",
         "forge",
         "github",
-        "notes",
         "vast",
         "transcripts",
     ):

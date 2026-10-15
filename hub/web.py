@@ -3253,7 +3253,6 @@ async def web_decide_task(
     action: str = Form("accept"),
     instructions: str = Form(""),
     decision_summary: str = Form(""),
-    record_decision: bool = Form(False),
     # #1333: without this field an acceptance in the UI could only ever be
     # the undelivering one — MCP and REST took pr_disposition (#1037), the
     # form did not. Empty stays legal and is still recorded (#897).
@@ -3271,7 +3270,6 @@ async def web_decide_task(
             action=action,
             instructions=instructions,
             decision_summary=decision_summary,
-            record_decision=record_decision,
             pr_disposition=pr_disposition.strip(),
         )
     except ValidationError as exc:

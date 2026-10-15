@@ -2805,7 +2805,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--record-decision",
         dest="record_decision",
         action="store_true",
-        help="Also persist the decision through the notes integration",
+        help="Устарел: решение всегда пишется в ленту задачи",
     )
     p_decide.set_defaults(func=cmd_decide)
 

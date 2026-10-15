@@ -2746,34 +2746,38 @@ async def test_hub_list_tasks_paged_envelope(mock_api_get: AsyncMock) -> None:
     assert "after_id=0" in called and "mode=summary" in called
 
 
-async def test_hub_list_decisions_reports_unavailable_integration(
+async def test_hub_list_decisions_empty_has_the_same_shape(
     mock_api_get: AsyncMock,
 ) -> None:
-    # AC-1 (#251): empty because broken != empty because none exist.
-    mock_api_get.side_effect = [
-        {"recent_decisions": []},
-        {"status": "no_binary", "detail": "n4l binary not found at /x/n4l"},
-    ]
+    # #1698: один ответ {decisions, source: hub} и для пустого случая.
+    mock_api_get.return_value = {"decisions": [], "source": "hub"}
     out = await hub_list_decisions()
     structured = _mcp_structured(out)
-    assert structured["notes_available"] is False
-    assert structured["notes_status"] == "no_binary"
-    text = json.loads(_mcp_text(out))["message"]
-    assert "Notes integration unavailable" in text
-    assert "n4l binary not found" in text
-
-
-async def test_hub_list_decisions_empty_but_available(
-    mock_api_get: AsyncMock,
-) -> None:
-    mock_api_get.side_effect = [
-        {"recent_decisions": []},
-        {"status": "available", "detail": "space=abc"},
-    ]
-    out = await hub_list_decisions()
-    structured = _mcp_structured(out)
-    assert structured["notes_available"] is True
+    assert structured["decisions"] == []
+    assert structured["source"] == "hub"
+    assert "notes_available" not in structured
     assert json.loads(_mcp_text(out))["message"] == "No decisions recorded."
+    mock_api_get.assert_awaited_once_with("/api/decisions?limit=10")
+
+
+async def test_hub_list_decisions_filled_and_limit_clamped(
+    mock_api_get: AsyncMock,
+) -> None:
+    row = {
+        "id": 5,
+        "task_id": 9,
+        "task_title": "Задача",
+        "content": "Decision: ok",
+        "agent": "human",
+        "author_kind": "principal",
+    }
+    mock_api_get.return_value = {"decisions": [row], "source": "hub"}
+    out = await hub_list_decisions(limit=500)
+    structured = _mcp_structured(out)
+    assert structured["decisions"] == [row]
+    assert structured["source"] == "hub"
+    assert "#9 Задача" in _mcp_text(out)
+    mock_api_get.assert_awaited_once_with("/api/decisions?limit=50")
 
 
 async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:

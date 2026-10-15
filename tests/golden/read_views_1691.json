@@ -828,25 +828,60 @@
     ],
     "recent_decisions": [
      {
-      "title": "Решение 0"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 0",
+      "id": 0,
+      "task_id": 20,
+      "task_title": "Решение 0"
      },
      {
-      "title": "Решение 1"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 1",
+      "id": 1,
+      "task_id": 21,
+      "task_title": "Решение 1"
      },
      {
-      "title": "Решение 2"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 2",
+      "id": 2,
+      "task_id": 22,
+      "task_title": "Решение 2"
      },
      {
-      "title": "Решение 3"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 3",
+      "id": 3,
+      "task_id": 23,
+      "task_title": "Решение 3"
      },
      {
-      "title": "Решение 4"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 4",
+      "id": 4,
+      "task_id": 24,
+      "task_title": "Решение 4"
      },
      {
-      "title": "Решение 5"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 5",
+      "id": 5,
+      "task_id": 25,
+      "task_title": "Решение 5"
      },
      {
-      "title": "Решение 6"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 6",
+      "id": 6,
+      "task_id": 26,
+      "task_title": "Решение 6"
      },
      {}
     ],
@@ -896,7 +931,7 @@
    "schema_version": "1",
    "server_id": "host-1"
   },
-  "text": "{\"message\": \"## Drafts (need approval)\\n- #1 [draft] (auto) Задача 1\\n- #2 [draft] (auto) [agent:] Задача 2\\n\\n## Needs Info (agent asked a question)\\n- #3 [needs_info] (auto) Задача 3\\n\\n## Under Review\\n- #4 [review] (auto) Задача 4 (review cycle 1)\\n- #5 [review] (auto) Задача 5 (review cycle 3)\\n\\n## Needs Decision (arbiter report ready)\\n- #6 [needs_decision] (auto) Задача 6 — ARBITER REPORT READY, human must decide\\n\\n## Active Tasks (open / running)\\n- #7 [running] (auto) Задача 7\\n- #8 [open] (auto) Задача 8\\n\\n## Open PRs\\n- #11 PR (task-7/x)\\n- #12 PR2 ()\\n\\n## Recent Commits\\n- abc0 сообщение 0\\n- abc1 сообщение 1\\n- abc2 сообщение 2\\n- abc3 сообщение 3\\n- abc4 сообщение 4\\n\\n## Recent Decisions\\n- Решение 0\\n- Решение 1\\n- Решение 2\\n- Решение 3\\n- Решение 4\\n\\n## Next Task (orchestrator queue, shadow) — default\\nследующая #7\\n- #9 зависит\\n- #10 \\n\\n## Next Task (orchestrator queue, shadow) — other\\n\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"}"
+  "text": "{\"message\": \"## Drafts (need approval)\\n- #1 [draft] (auto) Задача 1\\n- #2 [draft] (auto) [agent:] Задача 2\\n\\n## Needs Info (agent asked a question)\\n- #3 [needs_info] (auto) Задача 3\\n\\n## Under Review\\n- #4 [review] (auto) Задача 4 (review cycle 1)\\n- #5 [review] (auto) Задача 5 (review cycle 3)\\n\\n## Needs Decision (arbiter report ready)\\n- #6 [needs_decision] (auto) Задача 6 — ARBITER REPORT READY, human must decide\\n\\n## Active Tasks (open / running)\\n- #7 [running] (auto) Задача 7\\n- #8 [open] (auto) Задача 8\\n\\n## Open PRs\\n- #11 PR (task-7/x)\\n- #12 PR2 ()\\n\\n## Recent Commits\\n- abc0 сообщение 0\\n- abc1 сообщение 1\\n- abc2 сообщение 2\\n- abc3 сообщение 3\\n- abc4 сообщение 4\\n\\n## Recent Decisions\\n- #20 Решение 0 (human, hub)\\n- #21 Решение 1 (human, hub)\\n- #22 Решение 2 (human, hub)\\n- #23 Решение 3 (human, hub)\\n- #24 Решение 4 (human, hub)\\n\\n## Next Task (orchestrator queue, shadow) — default\\nследующая #7\\n- #9 зависит\\n- #10 \\n\\n## Next Task (orchestrator queue, shadow) — other\\n\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"}"
  },
  "mcp_status_filled_queue_error": {
   "structured": {
@@ -1002,25 +1037,60 @@
     ],
     "recent_decisions": [
      {
-      "title": "Решение 0"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 0",
+      "id": 0,
+      "task_id": 20,
+      "task_title": "Решение 0"
      },
      {
-      "title": "Решение 1"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 1",
+      "id": 1,
+      "task_id": 21,
+      "task_title": "Решение 1"
      },
      {
-      "title": "Решение 2"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 2",
+      "id": 2,
+      "task_id": 22,
+      "task_title": "Решение 2"
      },
      {
-      "title": "Решение 3"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 3",
+      "id": 3,
+      "task_id": 23,
+      "task_title": "Решение 3"
      },
      {
-      "title": "Решение 4"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 4",
+      "id": 4,
+      "task_id": 24,
+      "task_title": "Решение 4"
      },
      {
-      "title": "Решение 5"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 5",
+      "id": 5,
+      "task_id": 25,
+      "task_title": "Решение 5"
      },
      {
-      "title": "Решение 6"
+      "agent": "human",
+      "author_kind": "hub",
+      "content": "запись 6",
+      "id": 6,
+      "task_id": 26,
+      "task_title": "Решение 6"
      },
      {}
     ],
@@ -1051,7 +1121,7 @@
    "schema_version": "1",
    "server_id": "host-1"
   },
-  "text": "{\"message\": \"## Drafts (need approval)\\n- #1 [draft] (auto) Задача 1\\n- #2 [draft] (auto) [agent:] Задача 2\\n\\n## Needs Info (agent asked a question)\\n- #3 [needs_info] (auto) Задача 3\\n\\n## Under Review\\n- #4 [review] (auto) Задача 4 (review cycle 1)\\n- #5 [review] (auto) Задача 5 (review cycle 3)\\n\\n## Needs Decision (arbiter report ready)\\n- #6 [needs_decision] (auto) Задача 6 — ARBITER REPORT READY, human must decide\\n\\n## Active Tasks (open / running)\\n- #7 [running] (auto) Задача 7\\n- #8 [open] (auto) Задача 8\\n\\n## Open PRs\\n- #11 PR (task-7/x)\\n- #12 PR2 ()\\n\\n## Recent Commits\\n- abc0 сообщение 0\\n- abc1 сообщение 1\\n- abc2 сообщение 2\\n- abc3 сообщение 3\\n- abc4 сообщение 4\\n\\n## Recent Decisions\\n- Решение 0\\n- Решение 1\\n- Решение 2\\n- Решение 3\\n- Решение 4\\n\\n## Next Task: не удалось прочитать очередь — ValueError: плохой ответ\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"}"
+  "text": "{\"message\": \"## Drafts (need approval)\\n- #1 [draft] (auto) Задача 1\\n- #2 [draft] (auto) [agent:] Задача 2\\n\\n## Needs Info (agent asked a question)\\n- #3 [needs_info] (auto) Задача 3\\n\\n## Under Review\\n- #4 [review] (auto) Задача 4 (review cycle 1)\\n- #5 [review] (auto) Задача 5 (review cycle 3)\\n\\n## Needs Decision (arbiter report ready)\\n- #6 [needs_decision] (auto) Задача 6 — ARBITER REPORT READY, human must decide\\n\\n## Active Tasks (open / running)\\n- #7 [running] (auto) Задача 7\\n- #8 [open] (auto) Задача 8\\n\\n## Open PRs\\n- #11 PR (task-7/x)\\n- #12 PR2 ()\\n\\n## Recent Commits\\n- abc0 сообщение 0\\n- abc1 сообщение 1\\n- abc2 сообщение 2\\n- abc3 сообщение 3\\n- abc4 сообщение 4\\n\\n## Recent Decisions\\n- #20 Решение 0 (human, hub)\\n- #21 Решение 1 (human, hub)\\n- #22 Решение 2 (human, hub)\\n- #23 Решение 3 (human, hub)\\n- #24 Решение 4 (human, hub)\\n\\n## Next Task: не удалось прочитать очередь — ValueError: плохой ответ\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"}"
  },
  "mcp_status_queue_not_dict": {
   "structured": {
