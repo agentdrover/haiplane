@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -76,6 +77,11 @@ REASON_ALREADY_RUNNING = "по задаче уже идёт прогон исп�
 REASON_NO_ACTING_AGENT = "нет агента chat-pair"
 REASON_CREATE_REFUSED = "провайдер отказал в создании агента"
 REASON_CREATE_EXHAUSTED = "создание агента не удалось за все попытки"
+#: Запас кода implementer сверх одного вызова провайдера, с (#1769).
+CODE_MARGIN_S = 30.0
+REASON_CODE_EXPIRING = (
+    "код implementer истечёт до конца заказа: агент получил бы просроченный код"
+)
 REASON_ANSWER_LOST = "ответ на создание агента не дошёл"
 REASON_ANSWER_BLIND = (
     "ответ на создание агента не дошёл, и спросить провайдера не удалось — "
@@ -359,11 +365,72 @@ def _params_refused(
     )
 
 
+def _clock() -> float:
+    """Монотонные секунды; отдельной функцией — чтобы тест подменял часы."""
+    return time.monotonic()
+
+
+@dataclass
+class _Sending:
+    """Состояние отправки заказа: что уходило провайдеру и сколько жив код."""
+
+    want: list[cursor_cloud.ModelParam]
+    code_until: float
+    sent: list[cursor_cloud.ModelParam]
+    dropped: list[cursor_cloud.ModelParam]
+    dropped_refusal: cursor_cloud.Refusal | None = None
+
+    def code_lasts(self) -> bool:
+        """Код доживёт до конца заказа с запасом (#1769): иначе агент получит
+        просроченный код, а хаб вернёт launched=True."""
+        need = cursor_cloud.CREATE_TIMEOUT_S + CODE_MARGIN_S
+        return self.code_until - _clock() >= need
+
+
+async def _send(
+    marker: str, order: dict[str, Any], st: _Sending
+) -> tuple[dict[str, Any] | None, cursor_cloud.Refusal | None, bool]:
+    """Один заказ провайдеру, при отказе params — ещё один без них (#1769).
+
+    Третье значение — ``True``: код не доживёт, провайдеру ничего не ушло.
+    """
+    if not st.code_lasts():
+        return None, None, True
+    st.sent = list(st.want)
+    created, refusal = await cursor_cloud.create_agent_attempt(
+        name=marker, **order, model_params=st.sent
+    )
+    if (created or {}).get("agent") or not _params_refused(st.sent, refusal):
+        return created, refusal, False
+    st.dropped, st.dropped_refusal, st.want = st.sent, refusal, []
+    if not st.code_lasts():
+        st.sent = []
+        return None, None, True
+    st.sent = []
+    created, refusal = await cursor_cloud.create_agent_attempt(
+        name=marker, **order, model_params=[]
+    )
+    return created, refusal, False
+
+
+async def _code_left_s(db: aiosqlite.Connection, row_id: int) -> float:
+    """Сколько секунд ещё жив код брони: он выписан вместе со строкой прогона."""
+    cur = await db.execute("SELECT started_at FROM executor_runs WHERE id=?", (row_id,))
+    row = await cur.fetchone()
+    try:
+        at = datetime.fromisoformat(str(row[0] if row else "")).replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return float(config.CHAT_PAIR_CODE_SECONDS)
+    age = (datetime.now(UTC) - at).total_seconds()
+    return config.CHAT_PAIR_CODE_SECONDS - max(0.0, age)
+
+
 async def _create(
     task_id: int,
     generation: int,
     order: dict[str, Any],
     params: list[cursor_cloud.ModelParam] | None = None,
+    code_left_s: float = float("inf"),
 ) -> _Created:
     """Заказать агента с повторами.
 
@@ -373,27 +440,23 @@ async def _create(
 
     ``params`` (#1769): 400 не по лимиту на заказ с ними — ровно один заказ
     без них на весь заказ; отвергнутый заказ агента не создаёт. Дальше params
-    не возвращаются.
+    не возвращаются. ``code_left_s`` — сколько ещё жив код implementer: перед
+    каждой отправкой остаток проверяется, не хватает — заказа нет.
     """
     limit = max(1, config.EXECUTOR_LAUNCH_MAX_ATTEMPTS)
     last = ""
-    sent = list(params or [])
-    dropped: list[cursor_cloud.ModelParam] = []
-    dropped_refusal: cursor_cloud.Refusal | None = None
+    st = _Sending(list(params or []), _clock() + code_left_s, [], [])
 
     def _out(agent_id: str, run_id: str, failed: str) -> _Created:
-        return _Created(agent_id, run_id, failed, sent, dropped, dropped_refusal)
+        return _Created(
+            agent_id, run_id, failed, st.sent, st.dropped, st.dropped_refusal
+        )
 
     for attempt in range(1, limit + 1):
         marker = cursor_cloud.agent_marker(AGENT_KIND, task_id, generation, attempt)
-        created, refusal = await cursor_cloud.create_agent_attempt(
-            name=marker, **order, model_params=sent
-        )
-        if not (created or {}).get("agent") and _params_refused(sent, refusal):
-            dropped, dropped_refusal, sent = sent, refusal, []
-            created, refusal = await cursor_cloud.create_agent_attempt(
-                name=marker, **order, model_params=[]
-            )
+        created, refusal, expired = await _send(marker, order, st)
+        if expired:
+            return _out("", "", REASON_CODE_EXPIRING)
         agent = (created or {}).get("agent") or {}
         run = (created or {}).get("run") or {}
         if agent.get("id"):
@@ -616,21 +679,22 @@ async def _order(
         generation,
         order,
         cursor_cloud.parse_model_params(config.EXECUTOR_MODEL_PARAMS),
+        await _code_left_s(db, row_id),
     )
     agent_id, run_id, failed = made.agent_id, made.run_id, made.failed
     if failed:
         if failed.startswith(REASON_ANSWER_BLIND):
             # Бронь остаётся: второй запуск купил бы второго агента вслепую.
             await repo.update_executor_run(db, row_id, reason=failed)
-            # Возможный живой агент заказан этим вариантом (#1769).
-            await repo.set_executor_run_model(
-                db, row_id, cursor_cloud.model_variant(model, made.sent)
-            )
         else:
             # Бронь закрывается: следующий запуск не упрётся в «уже идёт».
             await repo.update_executor_run(
                 db, row_id, outcome=OUTCOME_FAILED, reason=failed, finish=True
             )
+        # Вариант, ушедший провайдеру, остаётся в строке и при отказе (#1769).
+        await repo.set_executor_run_model(
+            db, row_id, cursor_cloud.model_variant(model, made.sent)
+        )
         await repo.add_task_update(
             db, task_id, "hub", "alert", f"Исполнитель НЕ запущен: {failed}."
         )
