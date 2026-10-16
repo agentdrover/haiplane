@@ -38,8 +38,15 @@ def _text(path: Path) -> str:
 
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace so a prose line-wrap cannot break a substring check."""
-    return " ".join(text.split())
+    """Collapse whitespace and strip markdown emphasis markers.
+
+    A line-wrap must not break a substring check, and neither must bold/italic
+    markup: the original false claim was literally ``rulesets **недоступны**``
+    (bold only around the second word), which a plain ``rulesets недоступны``
+    substring check does not match with the ``**`` still in place — found by
+    the Codex critic on f8710589.
+    """
+    return " ".join(text.replace("**", "").replace("*", "").split())
 
 
 def _normalized(path: Path) -> str:
@@ -47,13 +54,24 @@ def _normalized(path: Path) -> str:
 
 
 def test_invariant_names_the_gate_and_its_bypass() -> None:
+    """Checks exclusivity wording, not just keyword presence.
+
+    A prior version of this test only checked that "haiplane-gate" and
+    "GitHub Actions" appear somewhere in the text — an edit that widened the
+    bypass to every writer, or accepted status checks from any application,
+    would still pass as long as those two words stayed in the doc elsewhere.
+    Found by the Codex critic on f8710589. Each assertion below now anchors
+    on the word that makes the claim exclusive ("единственная" / "только"),
+    not just on the named actor.
+    """
     text = _normalized(INVARIANTS)
     assert "Личность вливания" in text
     assert "haiplane-gate" in text
     assert "only the gate updates integration branches" in text
+    assert "Она единственная в обходе ruleset «only the gate updates" in text
     assert "В обходе ruleset «green CI before merge» нет никого" in text
     assert "Ruff and pytest" in text
-    assert "GitHub Actions" in text
+    assert "принимается только от GitHub Actions" in text
 
 
 def test_invariant_names_executors_drift_guard_and_rotation() -> None:
@@ -90,6 +108,11 @@ FORBIDDEN_SUBSTRINGS: list[str] = [
     "rulesets недоступны",
     "rulesets are unavailable",
     "PAT хаба read-only",
+    # AC-3's own wording is "«токен хаба … только на чтение»" (ellipsis =
+    # a wildcard claim family), not just the two phrasings above — missing
+    # found by the Codex critic on f8710589 (injecting this exact phrase
+    # into each AC-3 file produced no offenders).
+    "токен хаба только на чтение",
 ]
 
 # Kept only for the ids of the main guard test's failure message / parametrize
