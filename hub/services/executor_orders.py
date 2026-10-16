@@ -937,20 +937,18 @@ async def ack_order(
     }
 
 
-#: Токен начинается с начала строки или после разделителя, а не внутри слова:
-#: «task-refactoring-…» содержит «sk-refact…», но это слово, а не ключ.
-_START = r"(?<![A-Za-z0-9])"
+#: Только у ``sk-`` есть граница: оно короткое и встречается внутри обычных слов
+#: («task-refactoring-…» содержит «sk-refact…»). Остальные шаблоны либо
+#: уникальны по префиксу (``ahcp_``, ``ghp_``), либо несут ``=``/``:`` и
+#: значение; приставленная впереди буква их не обезвреживает («mypassword=…»,
+#: «xghp_…» — всё ещё секрет).
 _SECRET_SHAPES: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(
-        _START + r"(?:ahcp_|ochk_|ghp_|github_pat_|sk-[A-Za-z0-9]{8})", re.IGNORECASE
-    ),
+    re.compile(r"ahcp_|ochk_|ghp_|github_pat_", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{8}", re.IGNORECASE),
     re.compile(r"\bAH-?[0-9A-HJKMNP-TV-Z]{8}\b", re.IGNORECASE),
-    re.compile(_START + r"bearer\s+\S{8,}", re.IGNORECASE),
+    re.compile(r"bearer\s+\S{8,}", re.IGNORECASE),
     re.compile(r"-----BEGIN"),
-    re.compile(
-        _START + r"(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}",
-        re.IGNORECASE,
-    ),
+    re.compile(r"(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}", re.I),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{32,}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
