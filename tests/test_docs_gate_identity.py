@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVARIANTS = REPO_ROOT / "docs" / "agent-context" / "invariants.md"
 
@@ -109,21 +111,69 @@ def test_bypass_wording_names_pr_and_ci_requirements() -> None:
     assert "Nothing needs to bypass anything." not in release
 
 
-def test_guard_names_file_and_phrase_on_regression(tmp_path: Path) -> None:
-    """Mutation check for AC-5: a reintroduced false phrase is named, not swallowed."""
-    target = REPO_ROOT / "hub" / "integrations" / "forge" / "github.py"
+# AC-3 lists six files; mutating each the same way in-place (not just
+# appending, which would be invalid at random offsets in .py files) keeps the
+# fixture syntactically valid. `find` is an existing substring in a comment or
+# docstring of that file; `replace` reintroduces the forbidden phrase in it.
+_INPLACE_MUTATIONS: dict[Path, tuple[str, str]] = {
+    REPO_ROOT / "deploy" / "CD.md": (
+        "токен хаба пишет при мерже",
+        "PAT только на чтение",
+    ),
+    REPO_ROOT / "docs" / "workspace-safety-policy.md": (
+        "Серверная защита теперь есть",
+        "Branch protection недоступна",
+    ),
+    REPO_ROOT / "docs" / "hub-workflows-map.html": (
+        "серверная сторона не могла отказать",
+        "rulesets недоступны",
+    ),
+    REPO_ROOT / "hub" / "services" / "drift_guard.py": (
+        "rulesets were unavailable",
+        "rulesets are unavailable",
+    ),
+    REPO_ROOT / "hub" / "integrations" / "forge" / "github.py": (
+        "сам токен хаба умеет и писать",
+        "PAT хаба read-only (мутация теста)",
+    ),
+    REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md": (
+        "в его обходе больше нет никого",
+        "rulesets недоступны",
+    ),
+}
+
+# One representative (file, phrase) per AC-3 file — matches FORBIDDEN_PHRASES'
+# first entry for each path, so the assertion below names the same pair.
+_AC3_FILES = list(dict.fromkeys(path for path, _ in FORBIDDEN_PHRASES))
+_AC3_REPRESENTATIVE: list[tuple[Path, str]] = [
+    next((path, phrase) for path, phrase in FORBIDDEN_PHRASES if path == target)
+    for target in _AC3_FILES
+]
+assert set(_AC3_FILES) == set(_INPLACE_MUTATIONS), (
+    "every AC-3 file in FORBIDDEN_PHRASES needs a mutation fixture, and vice versa"
+)
+
+
+@pytest.mark.parametrize(
+    "target,phrase",
+    _AC3_REPRESENTATIVE,
+    ids=[str(path.relative_to(REPO_ROOT)) for path, _ in _AC3_REPRESENTATIVE],
+)
+def test_guard_names_file_and_phrase_on_regression(target: Path, phrase: str) -> None:
+    """Mutation check for AC-5: a reintroduced false phrase is named, not swallowed,
+    for every file listed in AC-3 — not just one of the six."""
+    find, replace = _INPLACE_MUTATIONS[target]
+    assert phrase in replace, f"fixture for {target} does not reintroduce {phrase!r}"
     original = _text(target)
-    mutated = original.replace(
-        "сам токен хаба умеет и писать", "PAT хаба read-only (мутация теста)"
-    )
-    assert mutated != original, "fixture text to mutate was not found in github.py"
+    assert find in original, f"mutation fixture stale for {target}: {find!r} not found"
+    mutated = original.replace(find, replace, 1)
     target.write_text(mutated, encoding="utf-8")
     try:
         offenders = [
-            f"{path.relative_to(REPO_ROOT)}: {phrase!r}"
-            for path, phrase in FORBIDDEN_PHRASES
-            if phrase in _text(path)
+            f"{path.relative_to(REPO_ROOT)}: {found_phrase!r}"
+            for path, found_phrase in FORBIDDEN_PHRASES
+            if found_phrase in _text(path)
         ]
-        assert offenders == [f"{target.relative_to(REPO_ROOT)}: 'PAT хаба read-only'"]
+        assert offenders == [f"{target.relative_to(REPO_ROOT)}: {phrase!r}"]
     finally:
         target.write_text(original, encoding="utf-8")
