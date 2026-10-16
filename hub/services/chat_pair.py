@@ -28,6 +28,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final
 
 import aiosqlite
@@ -974,3 +975,26 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     removed = int(codes.rowcount or 0) + int(sessions.rowcount or 0)
     await db.commit()
     return removed
+
+
+def render_agent_prompt(code: str, base_url: str) -> str:
+    """Instruction pasted into a cloud chat with the code (#1715).
+
+    One source for the text: ``chat_pair_prompt.txt``. Plain text, so no
+    autoescape (only .html templates are escaped) — the code and base_url come from the hub itself, and HTML
+    escaping would corrupt a curl line the agent has to run verbatim.
+    """
+    from jinja2 import (
+        Environment,
+        FileSystemLoader,
+        StrictUndefined,
+        select_autoescape,
+    )
+
+    env = Environment(
+        loader=FileSystemLoader(str(Path(__file__).parent.parent / "templates")),
+        autoescape=select_autoescape(enabled_extensions=("html",)),
+        undefined=StrictUndefined,
+        keep_trailing_newline=False,
+    )
+    return env.get_template("chat_pair_prompt.txt").render(code=code, base_url=base_url)
