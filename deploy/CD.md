@@ -338,10 +338,11 @@ CI остаётся финальной защитой: проверка её н�
 `pull_request` ruleset 21764773 «green CI before merge» пропускало такой мерж
 только потому, что у роли **Write** в bypass стоял режим *Always allow*. Этот
 же обход был открыт любому писателю: с ним можно было пушить в main и develop
-мимо PR и CI. Так было до 16.10.2026: этот обход снят и заменён ruleset
-«only the gate updates integration branches», где обход — только учётка
-`haiplane-gate` (подробности — `docs/agent-context/invariants.md`,
-«Личность вливания», #1708).
+мимо PR и CI. Так было до 07.10.2026: роль Write убрали из bypass без замены
+(#1426) — обхода у этого ruleset не осталось вовсе, ни для кого. Отдельно и
+позже, 16.10.2026, добавился новый ruleset «only the gate updates integration
+branches», где обход — только учётка `haiplane-gate` (подробности —
+`docs/agent-context/invariants.md`, «Личность вливания», #1708).
 
 Теперь возврат идёт как обычная доставка:
 

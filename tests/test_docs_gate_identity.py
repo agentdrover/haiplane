@@ -18,6 +18,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVARIANTS = REPO_ROOT / "docs" / "agent-context" / "invariants.md"
 
+# Two separate events, not one: the Write-role bypass on "green CI before
+# merge" was removed on 07.10.2026 (#1426); the new "only the gate updates
+# integration branches" ruleset was added later and separately, on
+# 16.10.2026 (#1708). Review on 218ae4c8 found these dates conflated into a
+# single event in all six locations below.
+DATE_SEPARATION_FILES: list[Path] = [
+    INVARIANTS,
+    REPO_ROOT / "docs" / "workspace-safety-policy.md",
+    REPO_ROOT / "docs" / "hub-workflows-map.html",
+    REPO_ROOT / "deploy" / "CD.md",
+    REPO_ROOT / "hub" / "integrations" / "git_ops.py",
+    REPO_ROOT / "hub" / "services" / "release.py",
+]
+
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -106,6 +120,25 @@ def _forbidden_offenders(overrides: dict[Path, str] | None = None) -> list[str]:
 def test_no_false_gate_claims_remain() -> None:
     offenders = _forbidden_offenders()
     assert not offenders, "false gate-identity claim(s) found: " + "; ".join(offenders)
+
+
+def test_write_bypass_removal_and_gate_ruleset_dated_separately() -> None:
+    """Each of the six named spots must name 07.10 and 16.10 as two events.
+
+    A missing date here means the text collapsed the Write-role bypass
+    removal (07.10.2026, #1426) and the new gate-identity ruleset addition
+    (16.10.2026, #1708) back into a single dated event — the regression
+    found by review on 218ae4c8.
+    """
+    for path in DATE_SEPARATION_FILES:
+        text = _normalized(path)
+        rel = path.relative_to(REPO_ROOT)
+        assert "07.10.2026" in text, (
+            f"{rel}: missing Write-bypass-removal date 07.10.2026"
+        )
+        assert "16.10.2026" in text, (
+            f"{rel}: missing gate-ruleset-addition date 16.10.2026"
+        )
 
 
 def test_merge_branches_mention_is_marked_historical() -> None:

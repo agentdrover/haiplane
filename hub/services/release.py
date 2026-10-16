@@ -603,13 +603,15 @@ async def _return_the_release(
     Until #1426 the return was a direct branch merge (``POST /merges``). A
     merge with no PR passes the ruleset's pull_request rule only by bypass,
     and the bypass was the Write role's — every writer's, not only the hub's.
-    That was true before 16.10.2026 (#1708); since then the only bypass left
-    on main/develop is the gate's own identity (``haiplane-gate``) on a
-    narrower ruleset — see ``docs/agent-context/invariants.md``, «Личность
-    вливания». Now the return is a PR like any other delivery: opened here,
-    the moment the release lands, and merged by ``_merge_pending_return`` on
-    a later cycle once its CI is green. Nothing needs to bypass the PR/CI
-    requirements.
+    That was true before 07.10.2026, when the Write role was dropped from
+    the bypass with no replacement (#1426) — the ruleset was left with no
+    bypass at all. Separately and later, on 16.10.2026 (#1708), a narrower
+    ruleset was added whose only bypass is the gate's own identity
+    (``haiplane-gate``), and only on that ruleset's update rule — see
+    ``docs/agent-context/invariants.md``, «Личность вливания». Now the return
+    is a PR like any other delivery: opened here, the moment the release
+    lands, and merged by ``_merge_pending_return`` on a later cycle once its
+    CI is green. Nothing needs to bypass the PR/CI requirements.
 
     Reported next to the release, never instead of it. The release happened —
     the code is in production — and a failure here is a separate named cause,

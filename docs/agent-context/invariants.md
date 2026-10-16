@@ -163,9 +163,16 @@ These are the rules most likely to be broken by “small” changes.
   «integration branches are permanent» (`deletion`, `non_fast_forward`),
   обхода не имеет вовсе.
 - Исполнители — App на k8, Cursor, `gh` на Mac и любой другой писатель —
-  работают без обхода: ни один из трёх ruleset не пускает их напрямую в
-  `main`/`develop`. Это сузило обход, до 16.10.2026 открытый роли Write
-  целиком (#1426).
+  работают без обхода. Прямой пуш в `main`/`develop` запрещён совокупностью
+  двух правил, а не каждым из трёх ruleset по отдельности: `pull_request`
+  ruleset «green CI before merge» (обхода нет ни у кого) и `update` ruleset
+  «only the gate updates integration branches» (обход только у
+  `haiplane-gate`). Третий ruleset, «integration branches are permanent»,
+  запрещает только `deletion` и `non_fast_forward` и САМ ПО СЕБЕ fast-forward
+  push разрешает. Это два отдельных события: обход роли Write на ruleset
+  «green CI before merge» снят 07.10.2026 (#1426), а ruleset «only the gate
+  updates integration branches» (id 25216047, названный выше) добавлен позже,
+  16.10.2026.
 - Drift-guard (`hub/services/drift_guard.py`, #534) сверяет SHA коммита,
   произведшего merge, а не актора пуша: смена личности гейта сама по себе
   не требует правки guard.
