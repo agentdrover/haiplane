@@ -469,7 +469,14 @@ def failed_attempt(gh: Gh, base: dict, number: int) -> dict:
         except MissingResource:
             # each failed part with no log stays visible (see rows_for_attempt)
             rec["log_unavailable"].append(job["name"])
-    rec["incomplete"] = rec["incomplete"] or bool(rec["log_unavailable"])
+    # Each log is judged BEFORE the merge: a failed part whose log names no
+    # failed test (collection error, crash) leaves its tests unrun, exactly as
+    # the single old job did, so the attempt is out of the denominator.
+    rec["incomplete"] = (
+        rec["incomplete"]
+        or bool(rec["log_unavailable"])
+        or any(not parsed_log["nodeids"] for parsed_log in logs)
+    )
     parsed = merge_logs(logs) if logs else None
     if parsed is None:
         rec["log"] = "unavailable"

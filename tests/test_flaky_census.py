@@ -369,13 +369,49 @@ def test_an_attempt_with_a_part_that_never_ran_is_not_a_denominator(
     assert rec["test_step"] == "failure"
     pool = [fc.attempt_record({**_BASE, "run_attempt": 1}, fc.pool_failed(rec))]
     assert pool[0]["failed"] is None
-    blobs = _Blobs({SHA: "def test_a():\n pass\n"})
+    # test_b really exists in the tree, so only the attempt's state can keep it out
+    blobs = _Blobs({SHA: "def test_a():\n pass\n\ndef test_b():\n pass\n"})
+    other = "tests/test_x.py::test_b"
+
+    def counted(failed) -> int:
+        record = fc.attempt_record({**_BASE, "run_attempt": 1}, failed)
+        return fc.count_executions(
+            [{**record, "head_sha": SHA}],
+            blobs,
+            other,
+            "2026-01-01T00:00:00Z",
+            None,
+            None,
+        )["executions"]
+
+    assert counted(fc.pool_failed(fc.failed_attempt(complete, _BASE, 1))) == 1
+    assert counted(fc.pool_failed(rec)) == 0, "a part that did not run is not counted"
+
+
+_LOG_CRASH = f"x git log -1 --format=%H\n{SHA}\n=== 1 error in 0.10s ===\n"
+
+
+def test_a_crashed_part_without_nodeids_keeps_the_attempt_out_of_the_denominator(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(fc, "pr_base", lambda run: "")
+    jobs = _parts("failure", "failure", "success")
+    both = _FakeGh(jobs, {11: _LOG_FAILED, 12: _LOG_CRASH})
+    rec = fc.failed_attempt(both, _BASE, 1)
+    assert rec["nodeids"] == [NODE], "the failure that was parsed is kept"
+    assert rec["incomplete"] is True
+    assert fc.pool_failed(rec) is None
+    blobs = _Blobs({SHA: "def test_a():\n pass\n\ndef test_b():\n pass\n"})
+    record = fc.attempt_record({**_BASE, "run_attempt": 1}, fc.pool_failed(rec))
     got = fc.count_executions(
-        [{**pool[0], "head_sha": SHA}],
+        [{**record, "head_sha": SHA}],
         blobs,
         "tests/test_x.py::test_b",
         "2026-01-01T00:00:00Z",
         None,
         None,
     )
-    assert got["executions"] == 0, "a test of the part that did not run is not counted"
+    assert got["executions"] == 0
+    # two ordinary failures: the attempt stays proven
+    fine = _FakeGh(jobs, {11: _LOG_FAILED, 12: _LOG_FAILED})
+    assert fc.pool_failed(fc.failed_attempt(fine, _BASE, 1)) == {NODE}
