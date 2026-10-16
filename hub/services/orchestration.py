@@ -58,7 +58,7 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import base_merge, watch_notices, workflow_seed
+from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
 from hub.services.ci_timing import ci_minutes_metrics
 from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
@@ -3363,6 +3363,10 @@ async def _approved_code_check(
                 ),
             )
             await db.commit()
+            # The pass now stands on this head. A side key, not ``submission_sha``:
+            # the CI/stacking steps below read the snapshot's pin as "what the
+            # author submitted" and must keep reading it so.
+            task["_checked_sha"] = current_tip
             return "", (
                 f"Мерж базы в ветку: одобренный коммит {pinned[:12]} сменился "
                 f"на {current_tip[:12]}, но {why}. Вердикт остаётся текущим, "
@@ -3849,6 +3853,8 @@ APPROVAL_CHANGED_PREFIX = "approval_changed"
 # #1706: у одобренной сдачи не закреплён коммит — слить «ту самую голову» нечем.
 # Тоже явный исход, не ожидание.
 APPROVAL_UNPINNED_PREFIX = "approval_unpinned"
+# #1706: голова, на которой этот проход смотрел CI, к мержу уже не закреплённая.
+APPROVAL_HEAD_MOVED_PREFIX = "approval_head_moved"
 # #1186: the base of a stack is not a decision to make — it merges on its own
 # schedule and this delivery becomes possible the moment it does. Same class as
 # a pending CI: come back next cycle. The unknown sits here too, but only the
@@ -4374,6 +4380,7 @@ class MergeStep(enum.Enum):
     IN_FLIGHT = "in_flight"  # соседний путь ещё вливает, ждать больше нельзя (#1407)
     APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
     UNPINNED = "unpinned"  # коммит одобренной сдачи не закреплён — форж не вызывался
+    HEAD_MOVED = "head_moved"  # закрепление ушло с головы, на которой смотрели проверки
 
 
 def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
@@ -4402,7 +4409,11 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
 
 
 async def merge_if_approval_stands(
-    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    *,
+    checked_sha: str | None = None,
 ) -> tuple[MergeStep, str]:
     """ЕДИНСТВЕННЫЙ вызов форжа для мержа PR задачи (#1706).
 
@@ -4415,6 +4426,12 @@ async def merge_if_approval_stands(
     Порядок #1398 сохранён: уже идущий мерж ждут, а не повторяют. Ожидание — это
     ``await``, поэтому после него проверка делается ЗАНОВО: за минуту ожидания
     одобрение могло уйти.
+
+    ``checked_sha`` — голова, на которой ЭТОТ проход смотрел CI, стопку и свежесть
+    базы. Мерж привязывается к ней, а не к закреплению, прочитанному из базы к
+    моменту вызова: соседний проход мог перезакрепить голову и получить на ней
+    красный CI, и тогда зелёный CI этого прохода относится не к тому, что ляжет в
+    базу. Закрепление сменилось — отказ без вызова форжа (``HEAD_MOVED``).
     """
     key = (int(task["id"]), int(task["pr_number"]))
     while True:
@@ -4423,6 +4440,8 @@ async def merge_if_approval_stands(
         if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""
         pinned = (dict(row).get("submission_sha") or "").strip()
+        if checked_sha is not None and pinned != checked_sha.strip():
+            return MergeStep.HEAD_MOVED, ""
         if not pinned and dict(row).get("auto_review"):
             return MergeStep.UNPINNED, ""
         # A task that opted out of review (auto_review=False) has no approved head
@@ -4462,54 +4481,6 @@ async def _nothing() -> None:
     """Пустая запись: исход, которому нечего писать, кроме объяснения."""
 
 
-async def _note_approval_gone(
-    db: aiosqlite.Connection, task: dict[str, Any], *, merged: bool = False
-) -> None:
-    """Сказать один раз, что одобрения больше нет, и не обещать вернуться.
-
-    ``merged`` — PR уже влит (мерж записан как факт): задача при этом не
-    завершается, потому что завершение утверждает «одобренная работа доставлена».
-    """
-    if merged:
-        text = (
-            f"PR #{task.get('pr_number')} влит, но одобрение, с которым началась "
-            "доставка, к этому моменту уже не действует (вердикт заменён, работа "
-            "возвращена в доработку или пересдана): задача НЕ завершена. Влитый PR "
-            "остаётся в базовой ветке; что дальше, решает человек по текущему "
-            "вердикту на карточке."
-        )
-    else:
-        text = (
-            f"Доставка PR #{task.get('pr_number')} не выполнена: одобрение, с "
-            "которым она началась, больше не действует (вердикт заменён, работа "
-            "возвращена в доработку или пересдана). Что дальше, определяет "
-            "текущий вердикт на карточке; хаб к этой доставке сам не вернётся."
-        )
-    updates = await repo.get_task_updates(db, int(task["id"]))
-    if updates and (dict(updates[-1]).get("content") or "") == text:
-        return
-    await repo.add_task_update(db, int(task["id"]), "hub", "status", text)
-    await db.commit()
-
-
-async def note_delivery_unpinned(
-    db: aiosqlite.Connection, task: dict[str, Any]
-) -> None:
-    """Явный исход: merge не привязан к одобренной голове, форж не вызывался (#1706)."""
-    text = (
-        f"Доставка PR #{task.get('pr_number')} не выполнена: у одобренной сдачи не "
-        "закреплён коммит, а хаб вливает PR только на ту голову, которая была "
-        "одобрена (gh pr merge --match-head-commit). Форж не вызывался. Пересдайте "
-        "работу, чтобы коммит закрепился, или решите по задаче вручную; хаб к этой "
-        "доставке сам не вернётся."
-    )
-    updates = await repo.get_task_updates(db, int(task["id"]))
-    if updates and (dict(updates[-1]).get("content") or "") == text:
-        return
-    await repo.add_task_update(db, int(task["id"]), "hub", "alert", text)
-    await db.commit()
-
-
 async def record_delivery_outcome(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -4532,7 +4503,7 @@ async def record_delivery_outcome(
         stands = await approval_stands(db, task)
         result = await write() if stands else fallback
     if not stands:
-        await _note_approval_gone(db, task, merged=merged)
+        await delivery_notes.note_approval_gone(db, task, merged=merged)
     return stands, result
 
 
@@ -4549,7 +4520,12 @@ async def _gate_merge_step(
     разрешается однозначно. Оба вопроса задаются ТОЛЬКО после отказа мержа:
     у зелёной доставки нет причины за них платить.
     """
-    step, merge_detail = await merge_if_approval_stands(db, task, ctx)
+    step, merge_detail = await merge_if_approval_stands(
+        db,
+        task,
+        ctx,
+        checked_sha=(task.get("_checked_sha") or task.get("submission_sha") or ""),
+    )
     key = (int(task["id"]), int(task["pr_number"]))
     if step is MergeStep.ALREADY:
         return (True, "already delivered"), ""
@@ -4567,6 +4543,12 @@ async def _gate_merge_step(
             False,
             f"{APPROVAL_CHANGED_PREFIX}: одобрение, с которым началась доставка, "
             "уже не действует — PR не влит",
+        ), ""
+    if step is MergeStep.HEAD_MOVED:
+        return (
+            False,
+            f"{APPROVAL_HEAD_MOVED_PREFIX}: закрепление сдачи ушло с головы, на "
+            "которой этот проход смотрел CI и стопку — форж не вызывался",
         ), ""
     if step is MergeStep.UNPINNED:
         return (
@@ -5589,7 +5571,12 @@ async def _record_gate_refusal(
         return "running"
     if detail.startswith(APPROVAL_UNPINNED_PREFIX):
         await record_delivery_outcome(
-            db, task, partial(note_delivery_unpinned, db, task)
+            db, task, partial(delivery_notes.note_delivery_unpinned, db, task)
+        )
+        return "running"
+    if detail.startswith(APPROVAL_HEAD_MOVED_PREFIX):
+        await record_delivery_outcome(
+            db, task, partial(delivery_notes.note_delivery_head_moved, db, task)
         )
         return "running"
 
@@ -5772,7 +5759,7 @@ async def _complete_without_review(
     # this completion (#306).
     pr_delivered = bool(task.get("pr_number"))
     if not await _write_completed(db, task, exit_code, result_text):
-        await _note_approval_gone(db, task, merged=pr_delivered)
+        await delivery_notes.note_approval_gone(db, task, merged=pr_delivered)
         return "running"
     return "completed"
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
@@ -6191,6 +6192,7 @@ async def deliver_on_disposition(
     from hub.services.orchestration import (
         GATE_RECORD_PENDING_PREFIX,
         merge_before_completion,
+        record_delivery_outcome,
         resolve_delivery_pr,
         review_approved_for_current_submission,
     )
@@ -6233,15 +6235,23 @@ async def deliver_on_disposition(
         if not ok and reason.startswith(GATE_RECORD_PENDING_PREFIX):
             ok = await _name_the_owed_record(db, task_id, reason)
     if ok:
-        await repo.add_task_update(
+        # #1706: the merge is a fact; the sentence "approved review" is true
+        # only while the approval stands, and the one outcome writer asks.
+        await record_delivery_outcome(
             db,
-            task_id,
-            "hub",
-            "status",
-            f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
-            f"PR #{task['pr_number']} влит теми же условиями, что применяет "
-            "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
-            "(#1037).",
+            task,
+            partial(
+                repo.add_task_update,
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
+                f"PR #{task['pr_number']} влит теми же условиями, что применяет "
+                "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
+                "(#1037).",
+            ),
+            merged=True,
         )
     elif delivery_pr.unusable and delivery_pr.search_unanswered:
         # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): the

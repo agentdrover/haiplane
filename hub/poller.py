@@ -17,7 +17,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
-from hub.services import delivery_writes, watch_notices
+from hub.services import delivery_notes, delivery_writes, watch_notices
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
@@ -593,6 +593,14 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
     )
 
 
+async def _with_live_approval(db, task: dict) -> dict:
+    """The task with the approval of the LIVE row (the tick's snapshot may predate it)."""
+    live = await repo.get_task(db, task["id"])
+    if live is None:
+        return task
+    return {**task, **{k: dict(live)[k] for k in services.APPROVAL_FIELDS}}
+
+
 async def _explicit_outcome(db, task: dict, what: str) -> bool:
     """The refusals that are final (#1706): the approval is gone, or no commit is pinned.
 
@@ -601,9 +609,13 @@ async def _explicit_outcome(db, task: dict, what: str) -> bool:
     """
     if what.startswith((services.APPROVAL_CHANGED_PREFIX, "approval_gone")):
         await services.record_delivery_outcome(db, task, _nothing_to_write)
+    elif what.startswith((services.APPROVAL_HEAD_MOVED_PREFIX, "head_moved")):
+        await services.record_delivery_outcome(
+            db, task, partial(delivery_notes.note_delivery_head_moved, db, task)
+        )
     elif what.startswith((services.APPROVAL_UNPINNED_PREFIX, "unpinned")):
         await services.record_delivery_outcome(
-            db, task, partial(services.note_delivery_unpinned, db, task)
+            db, task, partial(delivery_notes.note_delivery_unpinned, db, task)
         )
     else:
         return False
@@ -616,6 +628,12 @@ async def _nothing_to_write() -> None:
 
 async def _deliver_approved_review(db, task: dict) -> None:
     """An approved verdict is not delivery (#363): merge first, complete after."""
+    # #1706: the tick's snapshot may predate the verdict this delivery is made
+    # for (the verdict was resolved from the live row). The approval used is the
+    # live one, read here; the merge point and the write of ``completed`` ask it
+    # again themselves. Passing the snapshot on would show the post-merge
+    # transition "no verdict" and open a new submission over a merged branch.
+    task = await _with_live_approval(db, task)
     pr_num = task.get("pr_number")
     merged = False
     if pr_num:
@@ -671,7 +689,9 @@ async def _deliver_approved_review(db, task: dict) -> None:
             # merge registered with no await between the two; the probes above
             # are network calls and a replacement, a return to work or a
             # resubmission may land while they run.
-            step, _detail = await services.merge_if_approval_stands(db, task, mctx)
+            step, _detail = await services.merge_if_approval_stands(
+                db, task, mctx, checked_sha=(task.get("submission_sha") or "")
+            )
             if await _explicit_outcome(db, task, step.value):
                 return
             if step is services.MergeStep.IN_FLIGHT:

@@ -1807,3 +1807,104 @@ async def test_a_replacement_while_the_headless_merge_is_tidied_opens_no_new_sub
         (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
     )
     assert "НЕ завершена" in feed
+
+
+# ---- round 6: the merge stands on the head THIS pass checked --------------------
+
+
+@pytest.mark.parametrize("path", ["gate", "done_report"])
+async def test_the_merge_is_bound_to_the_head_this_pass_checked(
+    db: aiosqlite.Connection, path: str
+):
+    """Codex round 6 (P1): a neighbour re-pins B->C while this pass saw green CI on B."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    real = git.check_pr_ci
+
+    async def ci_then_repin(*args, **kwargs):
+        result = await real(*args, **kwargs)  # green on the head THIS pass looked at
+        await db.execute(
+            "UPDATE tasks SET submission_sha=? WHERE id=?", ("c" * 40, task_id)
+        )
+        await db.commit()
+        return result
+
+    git.check_pr_ci = ci_then_repin
+    if path == "gate":
+        ok, detail = await orchestration.merge_before_completion(
+            db, dict(await repo.get_task(db, task_id))
+        )
+        assert not ok and detail.startswith(orchestration.APPROVAL_HEAD_MOVED_PREFIX)
+    else:
+        await _report_done(db, task_id)
+        feed = " ".join(
+            (dict(u).get("content") or "")
+            for u in await repo.get_task_updates(db, task_id)
+        )
+        assert "закрепление одобренной сдачи ушло" in feed
+    assert git.merge_pr.await_count == 0, "the forge was never called"
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_a_human_delivery_does_not_claim_an_approval_that_went_during_the_merge(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 6 (P2): the success line of /decide deliver says "approved review"."""
+    from tests.test_accept_without_delivery import (
+        _approved_task,
+        _decide_deliver,
+        _install,
+        _MergeSpy,
+    )
+
+    task_id = await _approved_task(client, db, title="manual-race", pr=956)
+
+    class Replacing(_MergeSpy):
+        async def merge_pr(self, *args, **kwargs):
+            await _fire(db, task_id, "replaced")
+            return await super().merge_pr(*args, **kwargs)
+
+    spy = Replacing()
+    _install(monkeypatch, spy)
+    await _decide_deliver(client, task_id)
+    assert spy.merged == [956], "the merge happened"
+    assert await repo.pipeline_merge_recorded(db, task_id, 956), "and is a fact"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "одобренное ревью, неизменившийся" not in feed
+    assert "одобрение" in feed and "не действует" in feed
+
+
+async def test_a_tick_with_a_stale_snapshot_does_not_open_a_submission_after_merging(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 6 (P2): the snapshot has no verdict; the live row is APPROVED."""
+    from hub import poller
+
+    task_id, git = await _mergeable_review_task(db)
+    await db.execute(
+        "UPDATE tasks SET review_verdict=NULL, review_verdict_generation=NULL "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    stale = dict(await repo.get_task(db, task_id))  # what the tick read: no verdict
+    await db.execute(
+        "UPDATE tasks SET review_verdict='approved', "
+        "review_verdict_generation=submission_generation WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    fixes = AsyncMock()
+    monkeypatch.setattr(poller.services, "dispatch_fix", fixes)
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(db, stale)
+    row = dict(await repo.get_task(db, task_id))
+    assert git.merge_pr.await_count == 1
+    assert row["submission_generation"] == 1, "no new submission over a merged branch"
+    assert row["status"] != "needs_decision" and fixes.await_count == 0
