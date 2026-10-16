@@ -387,27 +387,6 @@ class _Sending:
         return self.code_until - _clock() >= need
 
 
-async def _post(
-    marker: str, order: dict[str, Any], params: list[cursor_cloud.ModelParam]
-) -> tuple[dict[str, Any] | None, cursor_cloud.Refusal | None]:
-    """Вызов провайдера под общим сроком (#1769).
-
-    ``CREATE_TIMEOUT_S`` у httpx ограничивает каждую сетевую операцию, а не
-    вызов целиком: без общего срока проверка остатка кода опиралась бы на
-    предел, которого нет. Срок вышел — исход неизвестен (как обрыв): дальше
-    сверка по имени, а не повтор.
-    """
-    try:
-        return await asyncio.wait_for(
-            cursor_cloud.create_agent_attempt(
-                name=marker, **order, model_params=params
-            ),
-            timeout=cursor_cloud.CREATE_TIMEOUT_S,
-        )
-    except TimeoutError:
-        return None, cursor_cloud.Refusal(status=0, detail="общий срок вызова")
-
-
 async def _send(
     marker: str, order: dict[str, Any], st: _Sending
 ) -> tuple[dict[str, Any] | None, cursor_cloud.Refusal | None, bool]:
@@ -419,14 +398,18 @@ async def _send(
     if not st.code_lasts():
         return None, None, True
     st.sent = list(st.want)
-    created, refusal = await _post(marker, order, st.sent)
+    created, refusal = await cursor_cloud.create_agent_attempt(
+        name=marker, **order, model_params=st.sent
+    )
     if (created or {}).get("agent") or not _params_refused(st.sent, refusal):
         return created, refusal, False
     st.dropped, st.dropped_refusal, st.want = st.sent, refusal, []
     if not st.code_lasts():
         return None, None, True
     st.sent = []
-    created, refusal = await _post(marker, order, [])
+    created, refusal = await cursor_cloud.create_agent_attempt(
+        name=marker, **order, model_params=[]
+    )
     return created, refusal, False
 
 

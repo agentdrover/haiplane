@@ -137,27 +137,30 @@ async def test_expiry_after_the_rejected_order_keeps_the_params_variant(
     assert await _last_model(db, task_id) == f"{_EXEC_MODEL} {_VARIANT_RAW}"
 
 
-async def test_the_order_call_has_a_total_deadline(db, monkeypatch):
-    """Находка Codex P2: зависший вызов обрывается общим сроком, исход
-    сверяется по имени, а не считается успехом."""
+async def test_a_slow_create_is_awaited_not_cut_off(db, monkeypatch):
+    """Находка Codex P1 круга 3: медленный успешный create дожидается — один
+    агент, без ложной потери ответа и без сверки; второй запуск отказан."""
     import asyncio
 
     _launch_config(monkeypatch)
     monkeypatch.setattr(cursor_cloud, "CREATE_TIMEOUT_S", 0.05)
-    seen: list[str] = []
+    calls: list[dict] = []
 
-    async def _hang(**kw):
-        await asyncio.sleep(5)
+    async def _slow(**kw):
+        calls.append(kw)
+        await asyncio.sleep(0.2)
+        return _CREATED, None
 
-    async def _empty(name, pages=3):
-        seen.append(name)
-        return cursor_cloud.Reconciliation("", "", True)
+    async def _no_lookup(_name, pages=3):
+        raise AssertionError("сверка по имени не нужна: ответ дождались")
 
-    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _hang)
-    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _empty)
-    project, _ = await _launch_project(db, slug="exec-total-deadline")
-    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _slow)
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _no_lookup)
+    project, _ = await _launch_project(db, slug="exec-slow-create")
+    human = await _human(db)
+    first = await el.launch_executor(db, project, issuer_principal_id=human)
+    second = await el.launch_executor(db, project, issuer_principal_id=human)
 
-    assert not result.launched
-    assert result.reason.startswith(el.REASON_ANSWER_LOST), result
-    assert len(seen) == 1
+    assert first.launched, first
+    assert not second.launched
+    assert len(calls) == 1
