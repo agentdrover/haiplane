@@ -18,8 +18,24 @@
 
 {% if code %}
 <div class="task-action-stack">
-    <p class="chat-pair-code" style="font-size:1.7rem;letter-spacing:.14em"><strong>{{ code }}</strong></p>
+    <p class="chat-pair-code" style="font-size:1.7rem;letter-spacing:.14em"><strong id="chat-pair-code-text">{{ code }}</strong></p>
     <p class="muted">Показывается один раз, действует {{ code_ttl_minutes }} мин.</p>
+</div>
+
+{# #1715: кнопки копирования — вне форм и type="button": нажатие не шлёт POST
+   и не выдаёт новый код. #}
+<div class="task-action-stack">
+    <button class="btn task-action-btn" type="button" data-copy-source="chat-pair-code-text">Скопировать код</button>
+    <p class="muted" data-copy-status="chat-pair-code-text" role="status" aria-live="polite"></p>
+</div>
+
+<div class="task-action-stack">
+    <h2>Инструкция для агента</h2>
+    <p class="muted">Вставьте её в чат целиком: код уже подставлен, агент сам обменяет его и поставит задачу.</p>
+    <textarea id="chat-pair-prompt-text" readonly rows="14" style="width:100%;font-family:monospace;font-size:.85rem">{{ agent_prompt }}</textarea>
+    <button class="btn btn-primary task-action-btn" type="button" data-copy-source="chat-pair-prompt-text">Скопировать инструкцию</button>
+    <p class="muted" data-copy-status="chat-pair-prompt-text" role="status" aria-live="polite"></p>
+    <p class="muted">Не обновляйте эту страницу: браузер предложит повторную отправку и выдаст новый код, а прежний сгорит.</p>
 </div>
 {% endif %}
 
@@ -44,4 +60,41 @@
     невыданный, поэтому подсмотренный через плечо код умирает вместе с запросом
     следующего.
 </p>
+
+{% if code %}
+<script>
+(function () {
+    function selectText(el) {
+        if (el.select) {
+            el.focus();
+            el.select();
+            if (el.setSelectionRange) { el.setSelectionRange(0, el.value.length); }
+            return;
+        }
+        var range = document.createRange();
+        range.selectNodeContents(el);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+    }
+    function textOf(el) { return el.select ? el.value : el.textContent; }
+    document.querySelectorAll("[data-copy-source]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            var src = document.getElementById(btn.getAttribute("data-copy-source"));
+            var status = document.querySelector('[data-copy-status="' + src.id + '"]');
+            function fallback() {
+                selectText(src);
+                status.textContent = "Не удалось скопировать само: текст выделен, нажмите ⌘C (Ctrl+C) или удерживайте выделение и выберите «Копировать».";
+            }
+            if (!(navigator.clipboard && navigator.clipboard.writeText)) { fallback(); return; }
+            var done;
+            try { done = navigator.clipboard.writeText(textOf(src)); } catch (e) { fallback(); return; }
+            Promise.resolve(done).then(function () {
+                status.textContent = "Скопировано";
+            }, fallback);
+        });
+    });
+})();
+</script>
+{% endif %}
 {% endblock %}

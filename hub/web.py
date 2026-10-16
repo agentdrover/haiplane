@@ -43,6 +43,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.csrf import CSRF_FIELD_NAME
+from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
@@ -448,9 +449,15 @@ async def _chat_pair_page(
             "live_sessions": live,
             "code_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
             "csrf_token": csrf_token,
+            "agent_prompt": (
+                chat_pair_svc.render_agent_prompt(code, hub_base_url()) if code else ""
+            ),
         },
         status_code=status_code,
     )
+    # #1715: the page carries a one-time code (twice); keep it out of caches.
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     response.set_cookie(
         key=CSRF_COOKIE_NAME,
         value=csrf_token,
