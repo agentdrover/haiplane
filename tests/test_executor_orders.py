@@ -46,6 +46,8 @@ AGENT_TOKEN = "agent-token-1712"  # pragma: allowlist secret
 FAKE_SESSION_TOKEN = (
     "ahcp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg"  # pragma: allowlist secret
 )
+FAKE_DOTTED = "Q7m9R2t8V4x6Z1b3.N5p0S8u2W9y4A6c1"  # pragma: allowlist secret
+FAKE_DASHED = "h8v3q9m2n7w4r6t1-k5z0p2s9u8x4y6b3"  # pragma: allowlist secret
 FAKE_KEY_TAIL = "ochk_AbCdEfGhIjKlMnOpQrStUvWxYz01234567"  # pragma: allowlist secret
 HUB_URL = "https://hub.example.test"
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "executor_host_decrypt.py"
@@ -1523,8 +1525,8 @@ async def _notes_part(world, order: dict, task_id: int):
     for body in (
         {"branch": FAKE_SESSION_TOKEN},
         # Обходы эвристики: части короче 32, «хеш» без предела длины, чужая ветка.
-        {"branch": "Q7m9R2t8V4x6Z1b3.N5p0S8u2W9y4A6c1"},
-        {"branch": "h8v3q9m2n7w4r6t1-k5z0p2s9u8x4y6b3"},
+        {"branch": FAKE_DOTTED},
+        {"branch": FAKE_DASHED},
         {"sha": "a1b2c3d4" * 20},
         {"sha": "A1B2C3D"},
         {"branch": f"task-{task_id + 1000}/rescue-5"},
