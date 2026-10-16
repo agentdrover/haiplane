@@ -665,6 +665,7 @@ async def _web_issue(hub) -> tuple[str, str]:
         headers={"Accept": "text/html"},
     )
     assert issued.status_code == 200, issued.text
+    assert issued.headers.get("cache-control") == "no-store"
     return issued.text, csrf
 
 
@@ -731,6 +732,7 @@ async def test_no_prompt_without_a_code(hub):
     hub.client.cookies.set(config.HUB_COOKIE_NAME, session_token)
     page = await hub.client.get("/chat-pair", headers={"Accept": "text/html"})
     assert page.status_code == 200, page.text
+    assert page.headers.get("cache-control") == "no-store"
     for needle in (
         "AH-",
         "chat-pair-code-text",

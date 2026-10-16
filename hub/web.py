@@ -454,6 +454,9 @@ async def _chat_pair_page(
         },
         status_code=status_code,
     )
+    # #1715: the page carries a one-time code (twice); keep it out of caches.
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     response.set_cookie(
         key=CSRF_COOKIE_NAME,
         value=csrf_token,
