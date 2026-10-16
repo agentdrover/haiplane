@@ -110,3 +110,54 @@ async def test_a_failed_order_records_the_variant_it_sent(db, monkeypatch):
         await el.launch_executor(db, project, issuer_principal_id=human)
     ).launched
     assert await _last_model(db, task_id) == variant
+
+
+async def test_expiry_after_the_rejected_order_keeps_the_params_variant(
+    db, monkeypatch
+):
+    """Находка Codex P2: голый заказ не ушёл (код истекает) — в строке вариант
+    с params, который был отправлен."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", _VARIANT_RAW)
+    now = [1000.0]
+    monkeypatch.setattr(el, "_clock", lambda: now[0])
+    calls = _creator(monkeypatch, [cursor_cloud.Refusal(status=400), _CREATED])
+    real = cursor_cloud.create_agent_attempt
+
+    async def _slow(**kw):
+        now[0] += 200
+        return await real(**kw)
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _slow)
+    project, task_id = await _launch_project(db, slug="exec-expire-after-400")
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.reason.startswith(el.REASON_CODE_EXPIRING), result
+    assert len(calls) == 1
+    assert await _last_model(db, task_id) == f"{_EXEC_MODEL} {_VARIANT_RAW}"
+
+
+async def test_the_order_call_has_a_total_deadline(db, monkeypatch):
+    """Находка Codex P2: зависший вызов обрывается общим сроком, исход
+    сверяется по имени, а не считается успехом."""
+    import asyncio
+
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(cursor_cloud, "CREATE_TIMEOUT_S", 0.05)
+    seen: list[str] = []
+
+    async def _hang(**kw):
+        await asyncio.sleep(5)
+
+    async def _empty(name, pages=3):
+        seen.append(name)
+        return cursor_cloud.Reconciliation("", "", True)
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _hang)
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _empty)
+    project, _ = await _launch_project(db, slug="exec-total-deadline")
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_ANSWER_LOST), result
+    assert len(seen) == 1
