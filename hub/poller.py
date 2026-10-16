@@ -593,6 +593,23 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
     )
 
 
+async def _explicit_outcome(db, task: dict, what: str) -> bool:
+    """The refusals that are final (#1706): the approval is gone, or no commit is pinned.
+
+    ``what`` is a ``MergeStep`` value or a gate detail. True — the outcome was
+    written through the one writer and the caller stops; neither is a wait.
+    """
+    if what.startswith((services.APPROVAL_CHANGED_PREFIX, "approval_gone")):
+        await services.record_delivery_outcome(db, task, _nothing_to_write)
+    elif what.startswith((services.APPROVAL_UNPINNED_PREFIX, "unpinned")):
+        await services.record_delivery_outcome(
+            db, task, partial(services.note_delivery_unpinned, db, task)
+        )
+    else:
+        return False
+    return True
+
+
 async def _nothing_to_write() -> None:
     """An outcome with nothing to write: only the approval is (re)checked."""
 
@@ -655,8 +672,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
             # are network calls and a replacement, a return to work or a
             # resubmission may land while they run.
             step, _detail = await services.merge_if_approval_stands(db, task, mctx)
-            if step is services.MergeStep.APPROVAL_GONE:
-                await services.record_delivery_outcome(db, task, _nothing_to_write)
+            if await _explicit_outcome(db, task, step.value):
                 return
             if step is services.MergeStep.IN_FLIGHT:
                 return  # a neighbour path is merging this PR: next sweep looks again
@@ -2028,11 +2044,8 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
-    if not ok and detail.startswith(services.APPROVAL_CHANGED_PREFIX):
-        # An explicit outcome, not a wait: the approval is gone and the sweep
-        # does not come back to this delivery (#1706).
-        await services.record_delivery_outcome(db, task, _nothing_to_write)
-        return
+    if not ok and await _explicit_outcome(db, task, detail):
+        return  # an outcome, not a wait: the sweep does not come back (#1706)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
@@ -2130,24 +2143,24 @@ async def _deliver_pair_task(db, task: dict) -> None:
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         log.warning("release PR not prepared for #%s: %s", task_id, exc)
 
+    # #1706: the merge is a fact and the ledger holds it (pipeline_merges);
+    # ``completed`` says "approved work was delivered", so it is written only
+    # while the approved submission is still the current one. Otherwise one
+    # explicit outcome, and the task is left to the human.
+    stands, _ = await services.record_delivery_outcome(
+        db, task, _nothing_to_write, merged=True
+    )
+    if not stands:
+        return
     # Said out loud, because a completed task with no done report otherwise
     # reads as a lost record rather than as work the hub carried home (AC-5).
-    # #1706: the merge is a fact and is recorded; what the line may CLAIM about
-    # the approval depends on whether it still stands.
-    claim = (
-        "влит по одобренному ревью. Условия доставки были выполнены целиком, "
-        "ждать было нечего."
-        if await services.approval_stands(db, task)
-        else "влит, но к моменту записи одобрение уже не действует (вердикт "
-        "заменён, работа возвращена или пересдана): влитый PR остаётся в базовой "
-        "ветке, решение по задаче — за человеком."
-    )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Доставлено хабом без отчёта агента: PR #{pr_num} {claim} "
+        f"Доставлено хабом без отчёта агента: PR #{pr_num} влит по одобренному "
+        "ревью. Условия доставки были выполнены целиком, ждать было нечего. "
         "Отчёт агента, если он придёт, ляжет сюда же рассказом о работе.",
     )
     # Completion WITHOUT bumping the generation: no new work is being

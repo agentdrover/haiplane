@@ -837,6 +837,7 @@ class NoopGitOps:
             repo=repo,
             gh_repo=gh_repo,
             delete_branch=delete_branch,
+            expected_head_sha=expected_head_sha,
         )
         return (ok, "" if ok else "git_ops не настроен")
 

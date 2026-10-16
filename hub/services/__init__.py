@@ -143,6 +143,7 @@ from hub.services.lifecycle import (
 )
 from hub.services.orchestration import (
     APPROVAL_CHANGED_PREFIX,
+    APPROVAL_UNPINNED_PREFIX,
     CI_BUDGET_GATE_PREFIXES,
     PR_DRAFT_PREFIX,
     STACK_UNKNOWN_PREFIX,
@@ -171,6 +172,7 @@ from hub.services.orchestration import (
     approval_stands,
     merge_before_completion,
     merge_if_approval_stands,
+    note_delivery_unpinned,
     record_delivery_outcome,
     stacking_gate_step,
     request_missing_ci_run,
@@ -201,6 +203,7 @@ __all__ = [
     "MESSAGE_EVENT_KIND",
     "ProjectBindError",
     "APPROVAL_CHANGED_PREFIX",
+    "APPROVAL_UNPINNED_PREFIX",
     "CI_BUDGET_GATE_PREFIXES",
     "PR_DRAFT_PREFIX",
     "STACK_UNKNOWN_PREFIX",
@@ -312,6 +315,7 @@ __all__ = [
     "approval_stands",
     "merge_before_completion",
     "merge_if_approval_stands",
+    "note_delivery_unpinned",
     "record_delivery_outcome",
     "DeliveryPR",
     "pr_for_delivery",

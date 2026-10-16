@@ -728,15 +728,13 @@
         {# #1647: вердикт по задаче-состоянию привязан к поколению сдачи, которое
            показано на этой странице; расхождение — 409 без записей. #}
         {# #1706: то же у commit-задачи — вердикт о сдаче, показанной здесь.
-           Замена стоящего вердикта — отдельное действие человека: поле
-           supersedes_revision уходит ТОЛЬКО с отмеченной галочкой. Скрытое
-           поле отправлялось бы всегда, и первая запись ревьюера получала бы
+           Замена стоящего вердикта — отдельное действие человека и отдельная
+           форма (partials/task_verdict_replace.html): поле supersedes_revision
+           в эту форму не кладётся, иначе первая запись ревьюера получала бы
            отказ «замена — только человеком». #}
         <input type="hidden" name="expected_generation" value="{{ task.submission_generation }}">
-        {% if task.result_kind != 'state' and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
-        <label class="task-action-label"><input type="checkbox" name="supersedes_revision" value="{{ task.review_verdict_revision }}"> Заменить стоящий вердикт ({{ task.review_verdict.value if task.review_verdict.value is defined else task.review_verdict }}, ревизия {{ task.review_verdict_revision }})</label>
-        {% endif %}
-        {% if task.result_kind != 'state' %}<p class="task-action-help" id="review-replace-help">Форма пишет первый вердикт по сдаче. Заменить уже поставленный вердикт — через CLI (<code>oc-hub review-verdict {{ task.id }} &lt;вердикт&gt; --expected-generation {{ task.submission_generation }} --supersedes-revision {{ task.review_verdict_revision }}</code>) или REST (<code>supersedes_revision</code>); галочка ниже есть только пока задача остаётся в review.</p>{% endif %}
+
+        {% if task.result_kind != 'state' %}<p class="task-action-help" id="review-replace-help">Форма пишет первый вердикт по сдаче. Заменить уже поставленный вердикт может человек: форма «Заменить вердикт» на карточке (она есть и в running), CLI (<code>oc-hub review-verdict {{ task.id }} &lt;вердикт&gt; --expected-generation {{ task.submission_generation }} --supersedes-revision {{ task.review_verdict_revision }}</code>) или REST (<code>supersedes_revision</code>).</p>{% endif %}
         <label class="task-action-label" for="review-comments">Review comments</label>
         <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
         <label class="task-action-label" for="review-findings">Findings</label>

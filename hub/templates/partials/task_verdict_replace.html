@@ -1,0 +1,26 @@
+{# #1706: замена стоящего вердикта commit-задачи — отдельное действие человека.
+   Форма видна, пока на ЖИВОЕ поколение стоит вердикт, и в review, и в running:
+   первый вердикт client-driven ревью уводит задачу в running, и форма первого
+   вердикта к этому моменту уже исчезла. Поле supersedes_revision — ревизия,
+   которую человек видит на карточке: устаревшая страница получает 409. #}
+<section class="task-content-card task-verdict-replace">
+    <div class="task-card-header">
+        <h2>Заменить вердикт</h2>
+        <span class="task-card-header-meta">стоит {{ task.review_verdict.value }}, ревизия {{ task.review_verdict_revision }}; замена — только человеком</span>
+    </div>
+    <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack" id="review-replace-form">
+      {{ csrf_field() }}
+        <input type="hidden" name="expected_generation" value="{{ task.submission_generation }}">
+        <input type="hidden" name="supersedes_revision" value="{{ task.review_verdict_revision }}">
+        <label class="task-action-label" for="replace-verdict">Новый вердикт</label>
+        <select id="replace-verdict" name="verdict" class="task-action-control">
+            <option value="approved">approved</option>
+            <option value="changes_requested">changes_requested</option>
+        </select>
+        <label class="task-action-label" for="replace-comments">Review comments</label>
+        <textarea id="replace-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Почему прежний вердикт заменяется..."></textarea>
+        <label class="task-action-label" for="replace-findings">Findings</label>
+        <textarea id="replace-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: ..."></textarea>
+        <button type="submit" class="btn btn-primary">Заменить вердикт</button>
+    </form>
+</section>

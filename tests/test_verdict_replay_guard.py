@@ -305,7 +305,7 @@ async def _headless_review_task(db: aiosqlite.Connection) -> int:
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(db, task_id, review_job_id="rev-1")
+    await repo.update_task(db, task_id, review_job_id="rev-1", submission_sha="a" * 40)
     await repo.bump_submission_generation(db, task_id)
     await db.commit()
     return task_id
@@ -1221,10 +1221,14 @@ async def test_the_outcome_check_and_write_hold_one_write_lock(db_dsn, db):
     assert stands and locked == [True], "the other connection was held off"
 
 
-async def test_a_merge_is_recorded_even_when_the_approval_went_after_it(
+async def test_a_merge_is_a_fact_but_completed_needs_the_approval(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """Codex round 5: the merge is a fact; the line must not claim an approval."""
+    """Codex round 5/6: a merge under an approval that went right after it.
+
+    The merge is recorded in the ledger; ``completed`` says "approved work was
+    delivered" and is not written; ONE explicit outcome names what happened.
+    """
     from hub.integrations.protocols import CIProbeOutcome
     from tests.test_pair_merge_gate import (
         _approved_pair_task,
@@ -1241,12 +1245,15 @@ async def test_a_merge_is_recorded_even_when_the_approval_went_after_it(
 
     git.merge_pr = AsyncMock(side_effect=merged_then_replaced)
     await _drain_pair_delivery(db)
-    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
-    feed = " ".join(
-        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
-    )
-    assert "влит по одобренному ревью" not in feed
-    assert "одобрение уже не действует" in feed
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+    assert await repo.pipeline_merge_recorded(db, task_id, 77), "the merge is a fact"
+    notes = [
+        (dict(u).get("content") or "")
+        for u in await repo.get_task_updates(db, task_id)
+        if "влит, но одобрение" in (dict(u).get("content") or "")
+    ]
+    assert len(notes) == 1 and "НЕ завершена" in notes[0]
+    assert "влит по одобренному ревью" not in " ".join(notes)
 
 
 async def test_no_fix_is_bought_for_a_verdict_that_was_replaced(
@@ -1341,3 +1348,257 @@ async def test_no_merge_and_no_outcome_on_the_headless_path(
     )
     for phrase in (*_OUTCOME_PHRASES, "Доставка остановлена", "CI failed"):
         assert phrase not in feed, f"{phrase!r} written over an approval that was gone"
+
+
+# ---- the merge is bound to the approved head (gh pr merge --match-head-commit) ----
+
+
+def _head_bound_forge(git, db: aiosqlite.Connection, task_id: int, *, move: bool):
+    """A forge double that behaves like --match-head-commit.
+
+    ``move`` — while the merge call is running the branch is pushed and the work
+    resubmitted: the head is no longer the approved one, so the forge refuses.
+    """
+    calls: list[str] = []
+
+    async def merge(*_a, expected_head_sha="", **_k):
+        calls.append(expected_head_sha)
+        if move:
+            await _fire(db, task_id, "resubmitted")
+            await db.execute(
+                "UPDATE tasks SET submission_sha='b'*40 WHERE id=?", (task_id,)
+            )
+            await db.commit()
+        return expected_head_sha == "a" * 40 and not move
+
+    git.merge_pr = AsyncMock(side_effect=merge)
+    return calls
+
+
+async def test_a_resubmission_during_the_merge_is_refused_by_the_forge_on_the_old_head(
+    db: aiosqlite.Connection,
+):
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+    )
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    calls = _head_bound_forge(git, db, task_id, move=True)
+    await _drain_pair_delivery(db)
+    assert calls == ["a" * 40], "the forge got the head that was approved"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] != "completed", "no completed for a delivery that failed"
+    assert not await repo.pipeline_merge_recorded(db, task_id, 77)
+
+
+async def test_the_forge_always_gets_the_approved_head(db: aiosqlite.Connection):
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+    )
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    calls = _head_bound_forge(git, db, task_id, move=False)
+    await _drain_pair_delivery(db)
+    assert calls == ["a" * 40]
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+@pytest.mark.parametrize("path", ["pair_sweep", "done_report", "headless", "manual"])
+async def test_an_unpinned_submission_gets_no_forge_call(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, path: str
+):
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+        _report_done,
+    )
+
+    if path == "headless":
+        from hub import poller
+
+        task_id, git = await _mergeable_review_task(db)
+        await db.execute("UPDATE tasks SET submission_sha='' WHERE id=?", (task_id,))
+        await db.commit()
+        snapshot = dict(await repo.get_task(db, task_id))
+        with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+            await poller._deliver_approved_review(db, snapshot)
+    elif path == "manual":
+        from tests.test_accept_without_delivery import (
+            _approved_task,
+            _decide_deliver,
+            _install,
+            _MergeSpy,
+        )
+
+        task_id = await _approved_task(client, db, title="unpinned", pr=950)
+        await db.execute("UPDATE tasks SET submission_sha='' WHERE id=?", (task_id,))
+        await db.commit()
+        spy = _MergeSpy()
+        _install(monkeypatch, spy)
+        await _decide_deliver(client, task_id)
+        git = None
+        assert spy.heads == [] and spy.merged == []
+    else:
+        git = _git(CIProbeOutcome.passed, merged=True)
+        task_id = await _approved_pair_task(db, pin=False)
+        if path == "pair_sweep":
+            await _drain_pair_delivery(db)
+        else:
+            await _report_done(db, task_id)
+    if git is not None:
+        assert git.merge_pr.await_count == 0, "the forge was never called"
+    if path != "manual":  # a human's accept completes the task without delivery
+        assert dict(await repo.get_task(db, task_id))["status"] not in (
+            "completed",
+            "needs_decision",
+        )
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "Ревью одобрено" not in feed
+
+
+async def test_an_old_done_report_after_a_reapproved_resubmission_does_not_merge(
+    db: aiosqlite.Connection,
+):
+    """P2: the deferred completion remembers the generation of ITS done report."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    generation = dict(await repo.get_task(db, task_id))["submission_generation"]
+    await _fire(db, task_id, "reapproved")  # N+1, approved again
+    await db.execute("UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,))
+    await db.commit()
+    await orchestration.run_deferred_completions(
+        db,
+        [
+            {
+                "task_id": task_id,
+                "exit_code": None,
+                "result_text": "old done",
+                "generation": generation,
+            }
+        ],
+    )
+    assert git.merge_pr.await_count == 0
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_the_replace_form_is_there_in_running_without_faking_a_status(
+    client: AsyncClient, db: aiosqlite.Connection, hdr: dict
+):
+    """P2: the first client-driven verdict moves the task to running; the form stays."""
+    task_id = await _in_review(client, hdr)
+    page = (await client.get(f"/tasks/{task_id}", headers=hdr["rev"])).text
+    assert 'id="review-replace-form"' not in page, "nothing to replace yet"
+    first = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data=_browser_post(page, verdict="changes_requested", comments=CR_COMMENTS),
+        headers=hdr["rev"],
+        follow_redirects=False,
+    )
+    assert first.status_code == 303 and "review_error" not in first.headers["location"]
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "running", "the real flow, no UPDATE of the status"
+
+    page = (await client.get(f"/tasks/{task_id}", headers=hdr["human"])).text
+    assert 'id="review-replace-form"' in page
+    form = _replace_form_fields(page)
+    assert form["supersedes_revision"] == "1" and form["expected_generation"] == "1"
+    before = await _snapshot(db, task_id)
+    done = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={**form, "verdict": "approved", "comments": "ок, замена"},
+        headers=hdr["human"],
+        follow_redirects=False,
+    )
+    assert "review_error" not in done.headers["location"], done.headers
+    after = await _snapshot(db, task_id)
+    assert (
+        after["verdict"] == "approved" and after["revision"] == before["revision"] + 1
+    )
+
+    stale = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={**form, "verdict": "changes_requested", "comments": "поздно"},
+        headers=hdr["human"],
+        follow_redirects=False,
+    )
+    assert "review_error" in stale.headers["location"], "the page was stale"
+
+
+def _replace_form_fields(page: str) -> dict[str, str]:
+    import re
+
+    form = re.search(r'<form[^>]*id="review-replace-form".*?</form>', page, re.S).group(
+        0
+    )
+    out: dict[str, str] = {}
+    for tag in re.findall(r"<input[^>]*>", form):
+        name = re.search(r'name="([^"]+)"', tag)
+        value = re.search(r'value="([^"]*)"', tag)
+        if name and "csrf" not in name.group(1).lower() and 'type="hidden"' in tag:
+            out[name.group(1)] = value.group(1) if value else ""
+    return out
+
+
+async def test_the_real_done_report_remembers_its_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2 through the real flow: done at N, resubmitted+re-approved before completion."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import lifecycle
+    from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    real = lifecycle.run_deferred_completions
+
+    async def late(db_, pending):
+        await _fire(db_, task_id, "reapproved")
+        await db_.execute(
+            "UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,)
+        )
+        await db_.commit()
+        await real(db_, pending)
+
+    monkeypatch.setattr(lifecycle, "run_deferred_completions", late)
+    await _report_done(db, task_id)
+    assert git.merge_pr.await_count == 0
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_a_done_report_does_not_complete_after_a_merge_under_a_gone_approval(
+    db: aiosqlite.Connection,
+):
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    async def merged_then_replaced(*_a, **_k):
+        await _fire(db, task_id, "replaced")
+        return True
+
+    git.merge_pr = AsyncMock(side_effect=merged_then_replaced)
+    await _report_done(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+    assert await repo.pipeline_merge_recorded(db, task_id, 77), "the merge is a fact"
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "НЕ завершена" in feed

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import contextlib
 import enum
 import functools
@@ -3827,6 +3828,9 @@ PR_DRAFT_PREFIX = "pr_draft"
 # Это ЯВНЫЙ исход, не ожидание: он не входит в TRANSIENT_GATE_PREFIXES, потому что
 # хаб к такой доставке сам не вернётся — дальше решает текущий вердикт.
 APPROVAL_CHANGED_PREFIX = "approval_changed"
+# #1706: у одобренной сдачи не закреплён коммит — слить «ту самую голову» нечем.
+# Тоже явный исход, не ожидание.
+APPROVAL_UNPINNED_PREFIX = "approval_unpinned"
 # #1186: the base of a stack is not a decision to make — it merges on its own
 # schedule and this delivery becomes possible the moment it does. Same class as
 # a pending CI: come back next cycle. The unknown sits here too, but only the
@@ -4342,6 +4346,7 @@ class MergeStep(enum.Enum):
     ALREADY = "already"  # гейт уже влил этот PR в этом процессе (#1398)
     IN_FLIGHT = "in_flight"  # соседний путь ещё вливает, ждать больше нельзя (#1407)
     APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
+    UNPINNED = "unpinned"  # коммит одобренной сдачи не закреплён — форж не вызывался
 
 
 def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
@@ -4390,6 +4395,9 @@ async def merge_if_approval_stands(
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""
+        pinned = (dict(row).get("submission_sha") or "").strip()
+        if not pinned:
+            return MergeStep.UNPINNED, ""
         if key not in _gate_merges:
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             _gate_merges[key] = fut
@@ -4409,6 +4417,10 @@ async def merge_if_approval_stands(
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
             forge=ctx.get("forge", ""),
+            # The commit the approval was given to: the forge merges only if
+            # the head is still THIS one (gh pr merge --match-head-commit), so
+            # a push or a resubmission during the call cannot ride in (#1706).
+            expected_head_sha=pinned,
         )
     finally:
         fut.set_result(merged)
@@ -4421,18 +4433,51 @@ async def _nothing() -> None:
     """Пустая запись: исход, которому нечего писать, кроме объяснения."""
 
 
-async def _note_approval_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
-    """Сказать один раз, что одобрения больше нет, и не обещать вернуться."""
-    text = (
-        f"Доставка PR #{task.get('pr_number')} не выполнена: одобрение, с которым "
-        "она началась, больше не действует (вердикт заменён, работа возвращена в "
-        "доработку или пересдана). Что дальше, определяет текущий вердикт на "
-        "карточке; хаб к этой доставке сам не вернётся."
-    )
+async def _note_approval_gone(
+    db: aiosqlite.Connection, task: dict[str, Any], *, merged: bool = False
+) -> None:
+    """Сказать один раз, что одобрения больше нет, и не обещать вернуться.
+
+    ``merged`` — PR уже влит (мерж записан как факт): задача при этом не
+    завершается, потому что завершение утверждает «одобренная работа доставлена».
+    """
+    if merged:
+        text = (
+            f"PR #{task.get('pr_number')} влит, но одобрение, с которым началась "
+            "доставка, к этому моменту уже не действует (вердикт заменён, работа "
+            "возвращена в доработку или пересдана): задача НЕ завершена. Влитый PR "
+            "остаётся в базовой ветке; что дальше, решает человек по текущему "
+            "вердикту на карточке."
+        )
+    else:
+        text = (
+            f"Доставка PR #{task.get('pr_number')} не выполнена: одобрение, с "
+            "которым она началась, больше не действует (вердикт заменён, работа "
+            "возвращена в доработку или пересдана). Что дальше, определяет "
+            "текущий вердикт на карточке; хаб к этой доставке сам не вернётся."
+        )
     updates = await repo.get_task_updates(db, int(task["id"]))
     if updates and (dict(updates[-1]).get("content") or "") == text:
         return
     await repo.add_task_update(db, int(task["id"]), "hub", "status", text)
+    await db.commit()
+
+
+async def note_delivery_unpinned(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> None:
+    """Явный исход: merge не привязан к одобренной голове, форж не вызывался (#1706)."""
+    text = (
+        f"Доставка PR #{task.get('pr_number')} не выполнена: у одобренной сдачи не "
+        "закреплён коммит, а хаб вливает PR только на ту голову, которая была "
+        "одобрена (gh pr merge --match-head-commit). Форж не вызывался. Пересдайте "
+        "работу, чтобы коммит закрепился, или решите по задаче вручную; хаб к этой "
+        "доставке сам не вернётся."
+    )
+    updates = await repo.get_task_updates(db, int(task["id"]))
+    if updates and (dict(updates[-1]).get("content") or "") == text:
+        return
+    await repo.add_task_update(db, int(task["id"]), "hub", "alert", text)
     await db.commit()
 
 
@@ -4442,6 +4487,7 @@ async def record_delivery_outcome(
     write: Callable[[], Awaitable[Any]],
     *,
     fallback: Any = None,
+    merged: bool = False,
 ) -> tuple[bool, Any]:
     """ЕДИНСТВЕННОЕ место, где пишется исход доставки (#1706).
 
@@ -4457,7 +4503,7 @@ async def record_delivery_outcome(
         stands = await approval_stands(db, task)
         result = await write() if stands else fallback
     if not stands:
-        await _note_approval_gone(db, task)
+        await _note_approval_gone(db, task, merged=merged)
     return stands, result
 
 
@@ -4492,6 +4538,12 @@ async def _gate_merge_step(
             False,
             f"{APPROVAL_CHANGED_PREFIX}: одобрение, с которым началась доставка, "
             "уже не действует — PR не влит",
+        ), ""
+    if step is MergeStep.UNPINNED:
+        return (
+            False,
+            f"{APPROVAL_UNPINNED_PREFIX}: у одобренной сдачи не закреплён коммит — "
+            "хаб не вливает PR, не привязав мерж к одобренной голове",
         ), ""
     if step is MergeStep.REFUSED:
         return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
@@ -5506,6 +5558,11 @@ async def _record_gate_refusal(
     if detail.startswith(APPROVAL_CHANGED_PREFIX):
         await record_delivery_outcome(db, task, _nothing, fallback=None)
         return "running"
+    if detail.startswith(APPROVAL_UNPINNED_PREFIX):
+        await record_delivery_outcome(
+            db, task, partial(note_delivery_unpinned, db, task)
+        )
+        return "running"
 
     async def write() -> str:
         return await _write_gate_refusal(db, task, detail, delivery_pr)
@@ -5684,11 +5741,9 @@ async def _complete_without_review(
     # WITHOUT bumping the generation — no new work is being submitted,
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
-    pr_delivered = bool(task.get("pr_number") and not task.get("job_id"))
-    if not await _write_completed(
-        db, task, exit_code, result_text, delivered=pr_delivered
-    ):
-        await _note_approval_gone(db, task)
+    pr_delivered = bool(task.get("pr_number"))
+    if not await _write_completed(db, task, exit_code, result_text):
+        await _note_approval_gone(db, task, merged=pr_delivered)
         return "running"
     return "completed"
 
@@ -5698,15 +5753,13 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-    *,
-    delivered: bool = False,
 ) -> bool:
     """The write of ``completed`` after a done report, with its validation gate.
 
-    ``delivered`` — the PR was merged on this route: that is a fact, and the
-    completion records it whatever the verdict is now (the merge point checked
-    the approval at the moment of the merge). Without a merge the approval is
-    asked again here.
+    The approval of the CURRENT submission is asked again here in every case
+    (#1706): ``completed`` says "approved work was delivered", and a merge made
+    under an approval that is gone by now is recorded as a fact (the merge
+    ledger), never as that. ``delivered`` only picks the words of the note.
 
     #1706: the approval is read inside the same write transaction as the
     ``completed`` it authorises. ``False`` — it is gone (a replacement, a
@@ -5721,7 +5774,7 @@ async def _write_completed(
     """
     task_id = task["id"]
     async with write_transaction(db):
-        if not delivered and not await approval_stands(db, task):
+        if not await approval_stands(db, task):
             return False
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
@@ -6160,9 +6213,12 @@ async def run_deferred_completions(
             if row is None or dict(row)["status"] not in ("running", "claimed"):
                 continue
             task = dict(row)
-            # #1706: the done report was committed while the task was approved;
-            # a replacement or a return to work since then cancels the
-            # completion — it is not a delivery the hub may finish on its own.
+            if item.get("generation") is not None:
+                # The row is read afresh, so comparing it with itself proves
+                # nothing: the snapshot carries the generation of the done
+                # report, and a resubmission (even one re-approved) since then
+                # cancels this completion (#1706).
+                task = {**task, "submission_generation": item["generation"]}
             stands, _ = await record_delivery_outcome(db, task, _nothing)
             if not stands:
                 continue
@@ -6252,7 +6308,15 @@ async def transition_after_agent_done(
             # держало лок базы на время вызова форжа. Завершение идёт после
             # коммита — run_deferred_completions.
             deferred.append(
-                {"task_id": task_id, "exit_code": exit_code, "result_text": result_text}
+                {
+                    "task_id": task_id,
+                    "exit_code": exit_code,
+                    "result_text": result_text,
+                    # #1706: the submission this done report belongs to; the
+                    # completion later is checked against IT, not against
+                    # whatever the row says by then.
+                    "generation": task.get("submission_generation"),
+                }
             )
             return DEFERRED_COMPLETION
         return await _complete_without_review(
