@@ -286,17 +286,10 @@ jobs:
       # passed).
       - name: Tests outcome of the three parts
         id: tests
-        if: ${{ always() && (cancelled() || !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success')) }}
+        if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
         env:
           PARTS_RESULT: ${{ needs.pytest.result }}
-          RUN_CANCELLED: ${{ cancelled() }}
         run: |
-          # The parts may have passed before the run was cancelled; the steps
-          # of this job that wait for success() (lint, types) were skipped.
-          if [ "$RUN_CANCELLED" = "true" ]; then
-            echo "::error::the run was cancelled: lint and the other checks did not finish"
-            exit 1
-          fi
           if [ "$PARTS_RESULT" = "success" ]; then
             echo "the three test parts passed"
             exit 0
@@ -512,6 +505,17 @@ jobs:
       # зовёт и `make security` — определение одно, разъехаться нечему.
       - name: Secret scan
         run: uv run python scripts/secret_scan.py
+
+      # #1767: job test runs on `always()` so that it exists on a cancelled run,
+      # but the steps with an implicit success() (Lint, Types, the scans) are
+      # skipped then, and the tests step may already have passed. This LAST step
+      # turns any cancellation, at whatever point it came, into a red job.
+      # Status functions are allowed only in `if`, not in `env`.
+      - name: Fail a cancelled run
+        if: ${{ cancelled() }}
+        run: |
+          echo "::error::the run was cancelled before every check finished"
+          exit 1
 
   # #1358: холодный старт из docker-compose.yml (#944, #1336) не проверял ни
   # один шаг — ни сборку образа, ни /healthz, ни старт без демо-сида. Ревью

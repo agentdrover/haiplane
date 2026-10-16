@@ -390,13 +390,7 @@ _EXPR = {
 }
 
 
-def _holds(
-    condition: str,
-    skip: str,
-    result: str,
-    previous_ok: bool = True,
-    cancelled: bool = False,
-) -> bool:
+def _holds(condition: str, skip: str, result: str, previous_ok: bool = True) -> bool:
     """Evaluate the small `${{ ... }}` conditions of these jobs.
 
     Only the grammar the jobs use is accepted: the two `needs` values, string
@@ -413,40 +407,30 @@ def _holds(
     for name, var in _EXPR.items():
         code = code.replace(name, var)
     has_status = "always()" in code
-    code = code.replace("always()", " True ").replace("cancelled()", " cancelled ")
+    code = code.replace("always()", " True ")
     code = code.replace("&&", " and ").replace("||", " or ")
     code = re.sub(r"!(?!=)", " not ", code)
     leftover = re.sub(
-        r"'[^']*'|\b(?:skip|result|and|or|not|True|cancelled)\b|==|!=|[()\s]", "", code
+        r"'[^']*'|\b(?:skip|result|and|or|not|True)\b|==|!=|[()\s]", "", code
     )
     assert leftover == "", f"unexpected syntax {leftover!r} in {condition!r}"
-    value = bool(
-        eval(
-            code,
-            {"__builtins__": {}},
-            {"skip": skip, "result": result, "cancelled": cancelled},
-        )
-    )  # noqa: S307  # nosec B307
+    value = bool(eval(code, {"__builtins__": {}}, {"skip": skip, "result": result}))  # noqa: S307  # nosec B307
     return value if has_status else (previous_ok and value)
 
 
 def _aggregator_rc(
-    result: str, skip: str, previous_ok: bool = True, cancelled: bool = False
+    result: str, skip: str, previous_ok: bool = True
 ) -> tuple[str, int | None, str]:
     """(outcome, return code, output) of step `tests` of job test for these needs."""
     import subprocess
 
     step = _steps()["tests"]
-    if not _holds(step["if"], skip, result, previous_ok, cancelled):
+    if not _holds(step["if"], skip, result, previous_ok):
         return "skipped", None, ""
     env = {"PATH": __import__("os").environ["PATH"]}
     for key, value in step["env"].items():
-        known = {
-            "PARTS_RESULT": ("${{ needs.pytest.result }}", result),
-            "RUN_CANCELLED": ("${{ cancelled() }}", str(cancelled).lower()),
-        }
-        assert key in known and value == known[key][0], (key, value)
-        env[key] = known[key][1]
+        assert value == "${{ needs.pytest.result }}", (key, value)
+        env[key] = result
     done = subprocess.run(
         ["bash", "-c", step["run"]], env=env, capture_output=True, text=True
     )
@@ -500,21 +484,24 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         has_artifact = any("upload-artifact" in u for u in uses)
         assert has_report is has_artifact is (name == "test"), name
 
+    # The last step of job test: any cancellation, even after the aggregator
+    # passed, ends the job red (the steps with implicit success() are skipped).
+    import subprocess
+
+    last = test["steps"][-1]
+    assert last["name"] == "Fail a cancelled run"
+    assert last["if"] == "${{ cancelled() }}"
+    assert subprocess.run(["bash", "-c", last["run"]], capture_output=True).returncode
+
     # The aggregator: every outcome of the parts, with and without dedup.
-    for skip, result, previous_ok, cancelled in itertools.product(
+    for skip, result, previous_ok in itertools.product(
         ("", "false", "true"),
         ("success", "failure", "cancelled", "skipped"),
         (True, False),  # False: an earlier step (Lint, install) failed
-        (False, True),  # True: the run was cancelled (steps after Lint skipped)
     ):
-        outcome, rc, out = _aggregator_rc(result, skip, previous_ok, cancelled)
-        label = (skip, result, previous_ok, cancelled, out)
-        if cancelled:
-            # never green and never skipped, even when the parts passed and
-            # even when the tree dedup would have skipped the step
-            assert outcome == "ran" and rc not in (0, None), label
-            assert "cancelled" in out, label
-        elif result == "success" and skip == "true":
+        outcome, rc, out = _aggregator_rc(result, skip, previous_ok)
+        label = (skip, result, previous_ok, out)
+        if result == "success" and skip == "true":
             assert outcome == "skipped", label  # the tree was already green
         elif result == "success":
             assert (outcome, rc) == ("ran", 0), label
@@ -544,3 +531,33 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         text = conftest.read_text(encoding="utf-8")
         for hook in ("pytest_collection_modifyitems", "pytest_collection_finish"):
             assert hook not in text, f"{conftest}: {hook}"
+
+
+_STATUS_FUNCTION = __import__("re").compile(
+    r"\b(?:success|failure|cancelled|always)\(\)"
+)
+
+
+def _status_calls_outside_if(node, path="") -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            where = f"{path}/{key}"
+            if key == "if":
+                continue  # the only place a status function is allowed
+            found += _status_calls_outside_if(value, where)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found += _status_calls_outside_if(value, f"{path}[{i}]")
+    elif isinstance(node, str) and _STATUS_FUNCTION.search(node):
+        found.append(path)
+    return found
+
+
+def test_status_functions_are_used_only_in_if_conditions() -> None:
+    """#1767: GitHub rejects success()/failure()/cancelled()/always() in `env`,
+    `run`, `with` and the like (actionlint: "calling function ... is not allowed
+    here"). The workflow is walked as YAML, not grepped."""
+    assert _status_calls_outside_if(_doc()) == []
+    probe = {"jobs": {"j": {"steps": [{"env": {"X": "${{ cancelled() }}"}}]}}}
+    assert _status_calls_outside_if(probe) == ["/jobs/j/steps[0]/env/X"]

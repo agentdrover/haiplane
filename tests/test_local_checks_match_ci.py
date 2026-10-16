@@ -34,6 +34,7 @@ EXCEPTIONS: dict[str, str] = {
     "Install age and openssh-server (backup tests)": (
         "подготовка окружения для тестов копий (#1707), не проверка"
     ),
+    "Fail a cancelled run": ("красит отменённый прогон, локально отмены нет — #1767"),
     "Tests outcome of the three parts": (
         "итог трёх частей набора из job pytest, сам тесты не гоняет — #1767; "
         "части покрыты тестом test_a_test_part_is_what_make_test_runs"

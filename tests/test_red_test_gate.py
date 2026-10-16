@@ -726,8 +726,8 @@ def _treedup_reuses_a_pr_run_whose_mutations_were_skipped(tmp_path: Path) -> Non
         assert "continue-on-error" not in step, "красный Test обязан краснить прогон"
     assert part["if"] == "${{ needs.treedup.outputs.skip != 'true' }}"
     assert judge["if"] == (
-        "${{ always() && (cancelled() || !(needs.treedup.outputs.skip == 'true' "
-        "&& needs.pytest.result == 'success')) }}"
+        "${{ always() && !(needs.treedup.outputs.skip == 'true' "
+        "&& needs.pytest.result == 'success') }}"
     )
     assert treedup["if"] == "${{ github.event_name == 'push' }}"
 
