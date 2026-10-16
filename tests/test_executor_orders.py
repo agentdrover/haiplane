@@ -179,7 +179,9 @@ async def _task(world, title: str = "задача на слот", status: str = 
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(world.db, task_id, project_id=world.pid)
+    await repo.update_task(
+        world.db, task_id, project_id=world.pid, branch=f"task-{task_id}/work"
+    )
     await world.db.commit()
     return task_id
 
@@ -1353,7 +1355,7 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     payload = {
         "outcome": "submitted",
         "sha": sha,
-        "branch": "task-1/x",
+        "branch": f"task-{task_id}/work",
         "note": "всё хорошо",
     }
     status_before = (await repo.get_task(world.db, task_id))["status"]
@@ -1372,7 +1374,7 @@ async def test_host_reports_run_outcome_to_the_feed(world):
         if "Итог прогона" in u["content"]
     ]
     assert len(feed) == 1
-    assert sha in feed[0]["content"] and "task-1/x" in feed[0]["content"]
+    assert sha in feed[0]["content"] and f"task-{task_id}/work" in feed[0]["content"]
     assert "submitted" in feed[0]["content"] and "k8" in feed[0]["content"]
     assert feed[0]["agent"] == "executor-host-k8"
     assert (await repo.get_task(world.db, task_id))["status"] == status_before
@@ -1512,6 +1514,15 @@ async def _notes_part(world, order: dict, task_id: int):
     raw = code.removeprefix("AH-")
     for body in (
         {"branch": FAKE_SESSION_TOKEN},
+        # Обходы эвристики: части короче 32, «хеш» без предела длины, чужая ветка.
+        {"branch": "Q7m9R2t8V4x6Z1b3.N5p0S8u2W9y4A6c1"},
+        {"branch": "h8v3q9m2n7w4r6t1-k5z0p2s9u8x4y6b3"},
+        {"sha": "a1b2c3d4" * 20},
+        {"sha": "A1B2C3D"},
+        {"branch": f"task-{task_id + 1000}/rescue-5"},
+        {"branch": f"task-{task_id}/rescue-5x"},
+        {"branch": f"task-{task_id}/rescue-"},
+        {"branch": f"task-{task_id}/other"},
         {"branch": "task-1712/" + "q" * 40},
         {"branch": "task-1712/" + "Xy" * 20},
         {"sha": "q" * 40},
@@ -1563,7 +1574,7 @@ async def _notes_part(world, order: dict, task_id: int):
     # Обычная ветка с длинным слагом и хеш коммита проходят.
     ok = await post(
         note="a" * 500,
-        branch="task-1712/hab-vydaet-kod-ispolnitelya-slotu-k8-zap",
+        branch=f"task-{task_id}/work",
         sha="0123456789abcdef0123456789abcdef01234567",  # pragma: allowlist secret
     )
     assert ok.status_code == 200, ok.text
@@ -1592,7 +1603,9 @@ async def _rescued_part(world):
         token = {"Authorization": f"Bearer {redeemed.json()['token']}"}
         posted = await world.client.post(
             f"/api/executor-hosts/k9/orders/{got['id']}/report",
-            json={"outcome": outcome},
+            json={"outcome": outcome, "branch": f"task-{task_id}/rescue-20261016"}
+            if outcome == "rescued"
+            else {"outcome": outcome},
             headers=world.k9_auth,
         )
         assert posted.status_code == 200, posted.text

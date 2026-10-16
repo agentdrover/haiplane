@@ -945,23 +945,9 @@ _SECRET_SHAPES: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}", re.I),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{32,}")
-_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-#: Слово слага ветки (``task-N/<slug>``) короткое; у токена разрывов нет.
-_SLUG_WORD_MAX = 20
-
-
-def _looks_like_token(run: str) -> bool:
-    """Длинная строка, которую не объяснить ни хешем коммита, ни слагом ветки."""
-    if _HEX.match(run):
-        return False
-    if _SLUG.fullmatch(run):
-        return max(len(word) for word in run.split("-")) > _SLUG_WORD_MAX
-    return True
-
-
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
-_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
-_BRANCH = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")
+_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+_RESCUE_NUMBER = re.compile(r"^[0-9]{1,20}$")
 
 
 def note_refusal(note: str) -> str:
@@ -1017,20 +1003,33 @@ def _check_report_fields(outcome: str, sha: str, branch: str, note: str) -> None
     if outcome not in REPORT_OUTCOMES:
         raise HostError(422, f"outcome: один из {', '.join(REPORT_OUTCOMES)}")
     if sha and not _SHA.match(sha):
-        raise HostError(422, "sha: от 7 до 64 шестнадцатеричных символов")
-    if branch and not _BRANCH.match(branch):
-        raise HostError(422, "branch: недопустимое имя ветки")
+        raise HostError(422, "sha: от 7 до 40 строчных шестнадцатеричных символов")
     why = note_refusal(note)
     if why:
         raise HostError(422, why)
-    # Ветка и sha — не заметка, но тоже строки в ленте: токен сессии или ключа
-    # в имени ветки — тот же секрет в той же ленте. Длинная строка, не похожая на слаг
-    # ветки (у слага слова короткие, у токена разрывов нет), — тоже отказ.
-    for field in (branch, sha):
-        if any(shape.search(field) for shape in _SECRET_SHAPES):
-            raise HostError(422, "branch/sha: похоже на токен или ключ")
-        if any(_looks_like_token(run) for run in _LONG_TOKEN.findall(field)):
-            raise HostError(422, "branch/sha: длинная строка похожа на токен")
+
+
+async def _branch_refusal(
+    db: aiosqlite.Connection, order: dict[str, Any], branch: str
+) -> str:
+    """Почему ветку нельзя записать в ленту; пусто — можно.
+
+    Белый список, а не эвристика: ветка — это ветка ЭТОЙ задачи (``tasks.branch``)
+    или ``task-<id задачи>/rescue-<цифры>``. Любая другая строка — не ветка, а
+    свободный текст в ленте, и угадывать по виду, секрет она или нет, нельзя:
+    токен не обязан выглядеть как токен.
+    """
+    if not branch:
+        return ""
+    task_id = int(order["task_id"])
+    row = await repo.get_task(db, task_id)
+    own = str(dict(row).get("branch") or "") if row is not None else ""
+    if own and branch == own:
+        return ""
+    prefix = f"task-{task_id}/rescue-"
+    if branch.startswith(prefix) and _RESCUE_NUMBER.match(branch[len(prefix) :]):
+        return ""
+    return f"branch: только ветка задачи ({own or 'не названа'}) или {prefix}<цифры>"
 
 
 async def report_outcome(
@@ -1058,6 +1057,9 @@ async def report_outcome(
             raise HostError(403, "заказ не принадлежит этому хосту")
         if not order["delivered_at"]:
             raise HostError(409, "заказ ещё не выдан хосту: итогу прогона рано")
+        refusal = await _branch_refusal(db, order, branch)
+        if refusal:
+            raise HostError(422, refusal)
         if await _fields_hold_the_code(db, order, note, branch, sha):
             raise HostError(422, "в полях итога код этого заказа")
         if order["report_outcome"]:

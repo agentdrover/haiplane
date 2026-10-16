@@ -126,8 +126,7 @@ Host key (`slot_runner`), exactly three routes of its OWN host:
   `note` ≤ 500 chars without codes or tokens (422), never changes the task status;
   works on a closed order. `failed`/`rescued` also CLOSE the order (the run ended
   without a submission: unspent code burnt, run aborted, slot free); `submitted`
-  does not (the landed submission closes it). `branch`/`sha` get the same secret
-  checks as `note` (a long string that is not a branch slug or a commit hash is 422).
+  does not (the landed submission closes it). `branch` is a WHITELIST: the task's own `tasks.branch` or `task-<order task id>/rescue-<digits>`, anything else is 422; `sha` is `^[0-9a-f]{7,40}$`; `note` has the secret and long-token checks (no heuristics on branch/sha).
 
 Host contract: decrypt `code_ciphertext` (RSA-OAEP, SHA-256 in OAEP and MGF1, no
 label, base64url without padding — reference `scripts/executor_host_decrypt.py`),
