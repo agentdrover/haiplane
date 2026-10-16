@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,10 +13,14 @@ import pytest
 from tests.backup_support import (
     BACKUP_DIR,
     DROPIN,
+    HUB_NAME,
     HOME_DIR,
     INSTALL,
     LIB_DIR,
+    PATHS_CONF,
+    SHARED,
     STATE_DIR,
+    SharedLock,
     as_backup,
     as_root,
     installed_state,
@@ -24,6 +29,7 @@ from tests.backup_support import (
     shared_keys,
     sshd_path,
     must_have,
+    write_sites,
 )
 
 
@@ -180,6 +186,318 @@ def test_install_is_idempotent_and_least_privilege():
         "hub-snapshot.py hourly" in hourly_service
         and "hub-snapshot.py daily" in unit("haiplane-snapshot-daily.service")
     )
+
+
+def _paths_lines() -> list[str]:
+    return as_root(["cat", PATHS_CONF], text=True).stdout.splitlines()
+
+
+def test_nginx_site_is_found_by_server_name(tmp_path):
+    need_root_host()
+    sites = tmp_path / "sites"
+    with SharedLock() as host:
+        try:
+            write_sites(sites)
+            as_root(["rm", "-f", PATHS_CONF])
+            done = run_install(["--sites-dir", str(sites)], held=host)
+            assert done.returncode == 0, done.stdout + done.stderr
+            lines = _paths_lines()
+            # exactly the file whose server_name lists the host: not a name that merely contains it
+            assert "required %s/%s" % (sites, HUB_NAME) in lines
+            assert [x for x in lines if str(sites) in x] == [
+                "required %s/%s" % (sites, HUB_NAME)
+            ]
+            assert "required /etc/" + HUB_NAME in lines
+            assert "optional /etc/haiplane-backup" in lines
+            assert "required /etc/nginx/sites-available/agenthai.ru" not in lines
+
+            # another host name picks another file
+            as_root(["rm", "-f", PATHS_CONF])
+            done = run_install(
+                ["--sites-dir", str(sites), "--site-host", "haiplane.com"], held=host
+            )
+            assert done.returncode == 0, done.stderr
+            assert "required %s/haiplane" % sites in _paths_lines()
+
+            # no file, or two files: refused before any change
+            for name, files in (
+                ("none", {"haiplane": "server {\n    server_name haiplane.com;\n}\n"}),
+                (
+                    "two",
+                    {
+                        "a": "server {\n    server_name agenthai.ru;\n}\n",
+                        "b": "server {\n    server_name x.example agenthai.ru;\n}\n",
+                    },
+                ),
+            ):
+                write_sites(sites, files)
+                as_root(["rm", "-f", PATHS_CONF])
+                before = installed_state()
+                done = run_install(["--sites-dir", str(sites)], held=host)
+                assert done.returncode != 0, name
+                assert "nothing was changed" in done.stderr, (name, done.stderr)
+                assert installed_state() == before, name
+                if name == "two":
+                    assert (
+                        str(sites / "a") in done.stderr
+                        and str(sites / "b") in done.stderr
+                    )
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+def test_nginx_site_search_reads_directives_links_and_explicit_path(tmp_path):
+    need_root_host()
+    nginx = tmp_path / "nginx"
+    sites = nginx / "sites-available"
+    real_dir = nginx / "real"
+    outside = tmp_path / "outside"
+    site_text = "server {\n    server_name agenthai.ru;\n}\n"
+
+    def prepare(files, links=()):
+        write_sites(sites, files)
+        for directory in (real_dir, outside):
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True)
+        (real_dir / "site").write_text(site_text)
+        (outside / "site").write_text(site_text)
+        for name, target in links:
+            (sites / name).symlink_to(target)
+
+    def attempt(host, extra=()):
+        as_root(["rm", "-f", PATHS_CONF])
+        before = installed_state()
+        done = run_install(["--sites-dir", str(sites), *extra], held=host)
+        if done.returncode != 0:
+            assert "nothing was changed" in done.stderr, done.stderr
+            assert installed_state() == before
+        return done
+
+    with SharedLock() as host:
+        try:
+            # a name in a comment is not a name
+            prepare(
+                {"c": "server {\n    server_name other.example # agenthai.ru ;\n}\n"}
+            )
+            assert attempt(host).returncode != 0
+            # a directive over several lines, and one right after '{'
+            prepare(
+                {
+                    "m": "server {\n  server_name\n    x.example\n    agenthai.ru\n  ;\n}\n"
+                }
+            )
+            assert attempt(host).returncode == 0
+            assert "required %s/m" % sites in _paths_lines()
+            prepare({"b": "server {server_name agenthai.ru;}\n"})
+            assert attempt(host).returncode == 0
+            assert "required %s/b" % sites in _paths_lines()
+
+            # a link: the real file goes into the allowlist; a link out of nginx's tree is refused
+            prepare({}, links=[("link", real_dir / "site")])
+            assert attempt(host).returncode == 0
+            assert "required %s" % os.path.realpath(real_dir / "site") in _paths_lines()
+            assert not [x for x in _paths_lines() if x.endswith("/link")]
+            prepare({}, links=[("link", outside / "site")])
+            done = attempt(host)
+            assert done.returncode != 0 and "outside" in done.stderr
+
+            # --nginx-site replaces the search and must be an existing regular file
+            prepare({})
+            assert attempt(host).returncode != 0
+            for bad in (str(sites / "absent"), str(sites)):
+                assert attempt(host, ["--nginx-site", bad]).returncode != 0, bad
+            done = attempt(host, ["--nginx-site", str(real_dir / "site")])
+            assert done.returncode == 0, done.stderr
+            assert "required %s" % (real_dir / "site") in _paths_lines()
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+def test_relative_nginx_paths_reach_paths_conf_as_absolute_ones(tmp_path):
+    need_root_host()
+    from tests.backup_support import load_snapshot
+
+    site_text = "server {\n    server_name agenthai.ru;\n}\n"
+    (tmp_path / "rel").mkdir()
+    (tmp_path / "rel" / "hub.conf").write_text(site_text)
+    write_sites(tmp_path / "rel" / "sites-available", {"hub": site_text})
+    snap = load_snapshot()
+    with SharedLock() as host:
+        try:
+            for extra, expected, cwd in (
+                (
+                    ["--nginx-site", "./hub.conf", "--sites-dir", "sites-available"],
+                    tmp_path / "rel" / "hub.conf",
+                    tmp_path / "rel",
+                ),
+                (
+                    ["--sites-dir", "rel/sites-available"],
+                    tmp_path / "rel/sites-available/hub",
+                    tmp_path,
+                ),
+            ):
+                as_root(["rm", "-f", PATHS_CONF])
+                done = run_install(extra, held=host, cwd=cwd)
+                assert done.returncode == 0, (extra, done.stderr)
+                want = "required %s" % os.path.realpath(expected)
+                assert want in _paths_lines(), (extra, _paths_lines())
+                # the file the daily run reads: every entry must be an absolute path
+                conf = tmp_path / "paths.conf"
+                conf.write_text("\n".join(_paths_lines()) + "\n")
+                cfg = snap.Config({"SNAP_PATHS_CONF": str(conf)})
+                assert snap._parse_paths(cfg), extra
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+def test_a_sites_directory_that_is_a_link_cannot_move_the_boundary(tmp_path):
+    need_root_host()
+    nginx, srv = tmp_path / "nginx", tmp_path / "srv"
+    nginx.mkdir()
+    (srv / "sites").mkdir(parents=True)
+    (srv / "private.env").write_text("server {\n    server_name agenthai.ru;\n}\n")
+    (srv / "sites" / "hub").symlink_to("../private.env")
+    (nginx / "sites-available").symlink_to(srv / "sites")
+    with SharedLock() as host:
+        try:
+            as_root(["rm", "-f", PATHS_CONF])
+            before = installed_state()
+            done = run_install(
+                ["--sites-dir", str(nginx / "sites-available")], held=host
+            )
+            assert done.returncode != 0
+            assert "nothing was changed" in done.stderr and "outside" in done.stderr
+            assert installed_state() == before
+            assert not [x for x in _paths_lines() if "private.env" in x]
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+def test_nginx_site_outside_the_nginx_tree_is_refused(tmp_path):
+    need_root_host()
+    nginx, srv = tmp_path / "nginx", tmp_path / "srv"
+    sites = write_sites(nginx / "sites-available", {})
+    srv.mkdir()
+    (srv / "private.env").write_text("server {\n    server_name agenthai.ru;\n}\n")
+    (nginx / "via").symlink_to(
+        srv
+    )  # a directory inside nginx's tree that leads out of it
+    with SharedLock() as host:
+        try:
+            for name, path in (
+                ("outside file", srv / "private.env"),
+                ("parent is a link", nginx / "via" / "private.env"),
+            ):
+                as_root(["rm", "-f", PATHS_CONF])
+                before = installed_state()
+                done = run_install(
+                    ["--sites-dir", str(sites), "--nginx-site", str(path)], held=host
+                )
+                assert done.returncode != 0, name
+                assert "outside" in done.stderr and "nothing was changed" in done.stderr
+                assert installed_state() == before, name
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+# paths.conf as the installer of origin/develop wrote it
+OLD_PATHS_CONF = """# Allowlist of the daily settings archive (#1707). Nothing outside it is read.
+unit haiplane-hub
+required /etc/georoute
+required /etc/systemd/networkd.conf.d
+required /etc/fail2ban/jail.local
+required /etc/nginx/sites-available/agenthai.ru
+# optional-unit haiplane-hub-poller
+# optional /etc/haiplane-review-runner
+"""
+
+
+def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
+    need_root_host()
+    from tests.backup_support import decrypt, load_snapshot
+
+    sites = tmp_path / "sites"
+    with SharedLock() as host:
+        try:
+            write_sites(sites)
+            as_root(["install", "-d", "-m", "0755", "/etc/haiplane-backup"], check=True)
+            as_root(["tee", PATHS_CONF], input=OLD_PATHS_CONF, text=True, check=True)
+            done = run_install(["--sites-dir", str(sites)], held=host)
+            assert done.returncode == 0, done.stdout + done.stderr
+            assert _paths_lines() == OLD_PATHS_CONF.splitlines(), "not rewritten"
+            site = "%s/%s" % (sites, HUB_NAME)
+            warned = done.stderr
+            assert (
+                "required /etc/nginx/sites-available/agenthai.ru does not exist"
+                in warned.replace("required path ", "required ")
+            )
+            assert "replace the entry with 'required %s'" % site in warned
+            missing = [
+                line.split("default entry: ", 1)[1]
+                for line in warned.splitlines()
+                if "lacks the default entry: " in line
+            ]
+            assert missing == [
+                "required " + site,
+                "required /etc/" + HUB_NAME,
+                "optional /etc/haiplane-backup",
+            ]
+            recipient = as_root(["cat", "/etc/haiplane-backup/recipient.txt"]).stdout
+
+            # the owner's correction by the README: replace the old entry, add the missing ones
+            corrected = (
+                OLD_PATHS_CONF.replace(
+                    "required /etc/nginx/sites-available/agenthai.ru\n", ""
+                )
+                + "\n".join(missing)
+                + "\n"
+            )
+            root = tmp_path / "sysroot"
+            for rel, text in {
+                "etc/georoute/a.conf": "r\n",
+                "etc/fail2ban/jail.local": "[DEFAULT]\n",
+                "etc/%s/%s.env" % (HUB_NAME, HUB_NAME): "HAIPLANE_HUB_DB=/db\n",
+                "etc/systemd/system/haiplane-hub.service": "[Service]\n",
+                site.lstrip("/"): "server {\n    server_name agenthai.ru;\n}\n",
+                "etc/haiplane-backup/paths.conf": corrected,
+            }.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            (root / "etc/systemd/networkd.conf.d").mkdir(parents=True)
+            (root / "etc/haiplane-backup/recipient.txt").write_bytes(recipient)
+            systemctl = tmp_path / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\necho FragmentPath=/etc/systemd/system/haiplane-hub.service\n"
+            )
+            systemctl.chmod(0o755)
+            (tmp_path / "state").mkdir()
+            env = {
+                "SNAP_ROOT": str(root),
+                "SNAP_PATHS_CONF": str(root / "etc/haiplane-backup/paths.conf"),
+                "SNAP_RECIPIENT_FILE": str(root / "etc/haiplane-backup/recipient.txt"),
+                "SNAP_STATE_DIR": str(tmp_path / "state"),
+                "SNAP_WORK_DIR": str(tmp_path / "state" / "work"),
+                "SNAP_SYSTEMCTL": str(systemctl),
+                "SNAP_GROUP": "",
+                "SNAP_REQUIRE_TMPFS": "0",
+            }
+            import io
+            import tarfile
+
+            snap = load_snapshot()
+            # the old entry alone leaves the archive without the site: daily refuses
+            old = dict(env, SNAP_PATHS_CONF=str(tmp_path / "old.conf"))
+            (tmp_path / "old.conf").write_text(OLD_PATHS_CONF)
+            assert snap.main(["hub-snapshot.py", "daily"], old) == 1
+            assert snap.main(["hub-snapshot.py", "daily"], env) == 0
+            (data,) = (tmp_path / "state").glob("conf-*.tar.age")
+            plain = decrypt(SHARED / "identity.txt", data)
+            with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+                names = set(tar.getnames())
+            assert "etc/haiplane-backup/paths.conf" in names
+            assert "etc/haiplane-backup/recipient.txt" in names
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
 
 
 def test_ci_installs_the_tools_and_forbids_skips():
