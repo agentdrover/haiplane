@@ -56,9 +56,16 @@ def test_ci_and_pytest_have_explicit_time_limits() -> None:
     wf = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     job = wf["jobs"]["test"]
     assert job["timeout-minutes"] == 90
+    # #1767: the suite runs in the three parts of job `pytest`; each part keeps
+    # the 25 min ceiling of the old Test step, and the job around them has one.
+    part_job = wf["jobs"]["pytest"]
+    assert part_job["timeout-minutes"] == 40
+    part_steps = {s.get("name"): s for s in part_job["steps"]}
+    assert part_steps["Test"]["timeout-minutes"] == 25
+    # AC-3: the CI log carries the slowest tests of every part
+    assert "--durations=30" in part_steps["Test"]["run"]
     steps = {s.get("name"): s for s in job["steps"]}
-    assert steps["Test"]["timeout-minutes"] == 25
-    assert "--durations=30" in steps["Test"]["run"]  # AC-3: the CI log carries them
+    assert "Test" not in steps, "job test must not run the suite a second time"
     assert (
         steps["Collect AC test and validation results for the Hub"]["timeout-minutes"]
         == 20

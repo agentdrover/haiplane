@@ -32,57 +32,21 @@ permissions:
   actions: read
 
 jobs:
-  test:
-    name: Ruff and pytest
+  # #1767: the dedup decision lives in a job of its own so that the parts of
+  # the suite can wait for it and `test` can read it. Same code as before: the
+  # step is moved, not rewritten.
+  treedup:
+    name: Detect tree already tested
     runs-on: ubuntu-latest
-    # #1666: 90 min = 70 min of explicit step ceilings (Test 25 + mutations 15 +
-    # baseline 10 + report 20) plus headroom for the steps that have no ceiling
-    # of their own (install, lint, type check, scans).
-    timeout-minutes: 90
-    # #1707: the backup tests install a real user and an sshd drop-in on this
-    # disposable runner. With this variable a missing tool or missing root is a
-    # red test, not a skip (tests/backup_support.py::must_have). Job level on
-    # purpose: the AC collector below runs the same tests and must not see a skip.
-    env:
-      CI_REQUIRE_ROOT_TESTS: "1"
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.treedup.outputs.skip }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # #833: the surface parity check diffs against the base branch, and
-          # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
-
-      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
-      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
-      # lock revision, so a floating version would rewrite uv.lock under us. The
-      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.12.18"
-          enable-cache: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # #1707: tests/test_backup_install.py and tests/test_snapshot_serve.py run
-      # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
-      # encrypts with real age. No continue-on-error and no `|| true`: if a tool
-      # is missing this step is red, the tests are never skipped.
-      - name: Install age and openssh-server (backup tests)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
-          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
-          sudo -n true
-
-      - name: Install dependencies
-        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
-        run: uv sync --locked --dev
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -134,6 +98,141 @@ jobs:
             echo "tree not seen before — running pytest: $tree"
           fi
 
+  # #1767: the full suite as three parallel parts. Measured (#1700, 39 attempts):
+  # the Test step took 8.4 min of a 16.4 min run; the runner has 4 cores, the
+  # time is spread evenly, so speeding up single tests gains little, while the
+  # repository is public and parallel jobs cost nothing.
+  #
+  # This job runs the code of the branch, so it holds no environment, no secret
+  # and no report key (#1686). It reports nothing: the artifact, the AC
+  # collection and the report to the hub stay in job `test`.
+  #
+  # The split is a plugin loaded by this command only (-p scripts.pytest_shard),
+  # never a hook in tests/conftest.py: a collection hook in a conftest turns the
+  # AC locators under tests/ into "unknown". Every step carries the dedup
+  # condition, so a skipped suite installs nothing; the job still ends
+  # "success", which is what job `test` reads together with the dedup output.
+  pytest:
+    name: Tests part ${{ matrix.shard }}/3
+    needs: treedup
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    # Same as in job test: a missing tool or root is a red test, not a skip.
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The same uv version as everywhere (#1620), asserted by
+      # tests/test_ci_workflow_contract.py.
+      - name: Install uv
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # #1707: see the same step in job test; no `|| true`.
+      - name: Install age and openssh-server (backup tests)
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
+
+      - name: Install dependencies
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        run: uv sync --locked --dev
+
+      # -n auto распараллеливает прогон по ядрам раннера. Не в addopts: тот же
+      # флаг достался бы шагу "Report AC tests", а его парсер ждёт nodeid
+      # первым токеном строки `-v` — xdist ставит там `[gw0]`, и каждый AC
+      # ушёл бы в not_found. Прогон AC остаётся последовательным.
+      # Имя шага "Test" осталось прежним: по нему сборщик времени называет
+      # минуты тестов (scripts/ci_trusted_report.py, TIMING_STEPS), и три
+      # части складываются в один ключ.
+      - name: Test
+        id: shard
+        if: ${{ needs.treedup.outputs.skip != 'true' }}
+        # #1666: a hung test must not hold the run for the 360 min default;
+        # pytest-timeout (300 s per test) names the test well before this.
+        timeout-minutes: 25
+        run: HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 uv run pytest -p scripts.pytest_shard -q -n auto --durations=30
+
+  test:
+    name: Ruff and pytest
+    # #1767: the one required check, the one place that collects the AC and
+    # sends the artifact. It runs after the dedup decision and the three parts
+    # whatever their outcome, and judges them in the step `tests` below.
+    needs: [treedup, pytest]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    # #1666: 90 min = 45 min of explicit step ceilings (mutations 15 + baseline
+    # 10 + report 20) plus headroom for the steps that have no ceiling of their
+    # own (install, lint, type check, scans). #1767: the 25 min of the Test step
+    # moved to job `pytest`; the ceiling of THIS job stays as it was.
+    timeout-minutes: 90
+    # #1707: the backup tests install a real user and an sshd drop-in on this
+    # disposable runner. With this variable a missing tool or missing root is a
+    # red test, not a skip (tests/backup_support.py::must_have). Job level on
+    # purpose: the AC collector below runs the same tests and must not see a skip.
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # #833: the surface parity check diffs against the base branch, and
+          # merge-base needs history that a depth-1 checkout does not have.
+          fetch-depth: 0
+
+      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
+      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
+      # lock revision, so a floating version would rewrite uv.lock under us. The
+      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # #1707: tests/test_backup_install.py and tests/test_snapshot_serve.py run
+      # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
+      # encrypts with real age. No continue-on-error and no `|| true`: if a tool
+      # is missing this step is red, the tests are never skipped.
+      - name: Install age and openssh-server (backup tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
+
+      - name: Install dependencies
+        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
+        run: uv sync --locked --dev
+
       # #875: these steps get ids so their outcomes can be REPORTED to the
       # hub. The reviewer was paying model prices to rediscover defects ruff
       # and mypy had proven absent minutes earlier, because the result stopped
@@ -171,17 +270,28 @@ jobs:
         id: types
         run: uv run mypy hub
 
-      # -n auto распараллеливает прогон по ядрам раннера. Не в addopts: тот же
-      # флаг достался бы шагу "Report AC tests" ниже, а его парсер ждёт nodeid
-      # первым токеном строки `-v` — xdist ставит там `[gw0]`, и каждый AC
-      # ушёл бы в not_found. Прогон AC остаётся последовательным.
-      - name: Test
+      # #1767: the suite itself runs in job `pytest` (three parts in parallel).
+      # THIS step is the only place that turns the three results into one
+      # outcome, and `steps.tests.outcome` below keeps meaning "the suite
+      # passed". It reads `needs.pytest.result`, which GitHub folds from EVERY
+      # matrix leg (failure if one failed, cancelled if one was cancelled), not
+      # an output of the matrix, which carries the value of one leg at random.
+      # It is skipped ONLY when the tree was already green (job treedup) AND the
+      # parts finished without a failure; in every other case it runs and is
+      # red unless the parts succeeded. Not `always()`: a red earlier step of
+      # this job has already made the job red, as for the old Test step.
+      - name: Tests outcome of the three parts
         id: tests
-        if: ${{ steps.treedup.outputs.skip != 'true' }}
-        # #1666: a hung test must not hold the run for the 360 min default;
-        # pytest-timeout (300 s per test) names the test well before this.
-        timeout-minutes: 25
-        run: uv run pytest -q -n auto --durations=30
+        if: ${{ !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
+        env:
+          PARTS_RESULT: ${{ needs.pytest.result }}
+        run: |
+          if [ "$PARTS_RESULT" = "success" ]; then
+            echo "the three test parts passed"
+            exit 0
+          fi
+          echo "::error::the test parts did not pass: result is '${PARTS_RESULT:-unknown}'"
+          exit 1
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
       # grew to its current size because nothing was watching. The check
