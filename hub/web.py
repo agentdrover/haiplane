@@ -56,6 +56,7 @@ from hub.services.lifecycle import DELIVER_DISPOSITION, REGISTRY_REFUSAL_PREFIX
 from hub.services.review_evidence import inflight_view
 from hub.services import verdict_evidence
 from hub.version import get_app_version
+from hub.web_executor_slot import card_hosts
 from hub.models import (
     DeliveryAcknowledgement,
     DEFAULT_FORGE,
@@ -1318,7 +1319,10 @@ async def web_executor_repair(
 
 @router.post("/projects/{slug}/web-executor-launch")
 async def web_executor_launch(
-    slug: str, request: Request, csrf_token: str = Form(default="")
+    slug: str,
+    request: Request,
+    csrf_token: str = Form(default=""),
+    target: str = Form(default="cloud"),
 ):
     """Кнопка «запустить исполнителя» (#1412): тот же сервис, что у REST."""
     from hub.services.executor_launch import launch_executor
@@ -1339,7 +1343,7 @@ async def web_executor_launch(
     if project is None:
         return _projects_error_redirect("project not found")
     result = await launch_executor(
-        db, project, issuer_principal_id=int(identity.principal_id)
+        db, project, issuer_principal_id=int(identity.principal_id), target=target
     )
     if not result.launched:
         return _projects_error_redirect(
@@ -2893,6 +2897,10 @@ async def _web_task_detail_page(
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
             "merge_offered": merge_offered,
+            # #1712: хосты, на которые карточка open-задачи предлагает запуск.
+            "slot_hosts": await card_hosts(db, task_id)
+            if task.status.value == "open"
+            else [],
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,

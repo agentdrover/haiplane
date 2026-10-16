@@ -265,6 +265,9 @@ def _template_to_regex(template: str) -> re.Pattern[str]:
             name = seg[1:-1]
             if name == "task_id":
                 parts.append("(?P<task_id>[^/]+)")
+            elif name == "name" and "executor-hosts" in template:
+                # #1712: the host named in the path is compared to the key's own.
+                parts.append("(?P<name>[^/]+)")
             else:
                 parts.append("[^/]+")
         else:
@@ -465,6 +468,66 @@ def ci_key_route_allowed(
     return any(
         probe == allowed_method and pattern.match(path)
         for allowed_method, pattern in allowed
+    )
+
+
+# ---------------------------------------------------------------------------
+# Executor host key (#1712)
+# ---------------------------------------------------------------------------
+#
+# A host (k8) takes its orders, confirms them and reports the outcome of the
+# run, and does nothing else: the key lives on a machine that also runs the
+# executor's own tooling. The route must name the host of the principal — a
+# key of one host does not reach the orders of another — and the handlers check
+# the same thing against the database, because here only the path is known.
+SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/executor-hosts/{name}/orders"),
+    ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
+    ("POST", "/api/executor-hosts/{name}/orders/{order_id}/report"),
+)
+#: ``executor-host-<name>`` — the username of the principal a host registration
+#: creates; the gate compares the path to it without touching the database.
+SLOT_RUNNER_USER_PREFIX: Final[str] = "executor-host-"
+_SLOT_RUNNER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in SLOT_RUNNER_ALLOWLIST
+)
+
+
+def slot_runner_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a host key may reach ``(method, path)`` (#1712)."""
+    if identity is None or not identity.is_slot_runner:
+        return False
+    if not identity.username.startswith(SLOT_RUNNER_USER_PREFIX):
+        return False
+    host = identity.username[len(SLOT_RUNNER_USER_PREFIX) :]
+    probe = "GET" if method == "HEAD" else method
+    for allowed_method, pattern in _SLOT_RUNNER_ALLOWED:
+        found = pattern.match(path)
+        if probe == allowed_method and found and found.group("name") == host:
+            return True
+    return False
+
+
+def _slot_runner_forbidden(method: str, path: str) -> Response:
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {
+                "detail": {
+                    "reason": "slot_runner_route_forbidden",
+                    "actor_hint": "human",
+                    "message": (
+                        f"{method} {path}: ключ хоста исполнителя читает заказы "
+                        "своего хоста, подтверждает их и сообщает итог прогона, "
+                        "больше ничего."
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
     )
 
 
@@ -876,6 +939,10 @@ async def _role_gate(
         request.method, path, identity
     ):
         return _ci_scoped_forbidden(request.method, path)
+    if identity.is_slot_runner and not slot_runner_route_allowed(
+        request.method, path, identity
+    ):
+        return _slot_runner_forbidden(request.method, path)
     return None
 
 

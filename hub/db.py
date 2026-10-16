@@ -2995,6 +2995,84 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, run_id, run_attempt)
         )""",
     ),
+    (
+        # #1712: реестр хостов, которым хаб выдаёт код исполнителя сам. Один
+        # хост — один сервисный принципал роли slot_runner и один открытый
+        # ключ RSA (PEM SPKI), которым шифруется код. enabled=0 — хост
+        # отключён человеком: его ключ отозван, коды сожжены.
+        "create_executor_hosts",
+        """CREATE TABLE IF NOT EXISTS executor_hosts (
+            name           TEXT PRIMARY KEY,
+            principal_id   INTEGER NOT NULL REFERENCES principals(id),
+            public_key_pem TEXT    NOT NULL,
+            enabled        INTEGER NOT NULL DEFAULT 1,
+            created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+            created_by     INTEGER REFERENCES principals(id),
+            disabled_at    TEXT,
+            disabled_by    INTEGER REFERENCES principals(id)
+        )""",
+    ),
+    (
+        # #1712: канал прогона, имя слота и кто нажал запуск. У строк до
+        # миграции канал cloud — единственный, который существовал.
+        "add_executor_runs_channel",
+        "ALTER TABLE executor_runs ADD COLUMN channel TEXT NOT NULL DEFAULT 'cloud'",
+    ),
+    (
+        "add_executor_runs_slot",
+        "ALTER TABLE executor_runs ADD COLUMN slot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_executor_runs_launched_by",
+        "ALTER TABLE executor_runs ADD COLUMN launched_by INTEGER",
+    ),
+    (
+        # #1712: заказ хосту = бронь слота от выпуска кода до закрытия.
+        # state: pending -> delivered -> redeemed -> closed. Открытый код в
+        # таблице не хранится: code_ciphertext — RSA-OAEP на ключ хоста, а
+        # после закрытия очищается. pair_code_id — строка chat_pair_codes,
+        # которую закрытие сжигает, пока код не потрачен.
+        "create_executor_orders",
+        """CREATE TABLE IF NOT EXISTS executor_orders (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            host            TEXT    NOT NULL REFERENCES executor_hosts(name),
+            task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation      INTEGER NOT NULL,
+            executor_run_id INTEGER NOT NULL
+                            REFERENCES executor_runs(id) ON DELETE CASCADE,
+            pair_code_id    INTEGER,
+            code_ciphertext TEXT    NOT NULL DEFAULT '',
+            order_text      TEXT    NOT NULL DEFAULT '',
+            state           TEXT    NOT NULL DEFAULT 'pending'
+                            CHECK (state IN
+                                   ('pending', 'delivered', 'redeemed', 'closed')),
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            expires_at      TEXT    NOT NULL,
+            delivered_at    TEXT,
+            redeemed_at     TEXT,
+            closed_at       TEXT,
+            close_reason    TEXT    NOT NULL DEFAULT '',
+            ack_result      TEXT    NOT NULL DEFAULT '',
+            acked_at        TEXT,
+            report_outcome  TEXT    NOT NULL DEFAULT '',
+            report_sha      TEXT    NOT NULL DEFAULT '',
+            report_branch   TEXT    NOT NULL DEFAULT '',
+            report_note     TEXT    NOT NULL DEFAULT '',
+            reported_at     TEXT
+        )""",
+    ),
+    (
+        # #1712: одна задача на слот ЗДЕСЬ, а не в проверке перед вставкой —
+        # два нажатия с двух соединений не пройдут оба.
+        "idx_executor_orders_one_open_per_host",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_orders_one_open_per_host "
+        "ON executor_orders(host) WHERE state <> 'closed'",
+    ),
+    (
+        "idx_executor_orders_task",
+        "CREATE INDEX IF NOT EXISTS idx_executor_orders_task "
+        "ON executor_orders(task_id)",
+    ),
 ]
 
 
@@ -3899,6 +3977,17 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "CI Auditor",
         "Заводит черновики аудита зависимостей (pip-audit:<id>) в своём проекте",
         ("tasks.create",),
+    ),
+    (
+        # #1712: ключ хоста исполнителя (k8). Три маршрута своего хоста —
+        # заказы, ack, итог прогона; их держит allowlist в hub/auth.py, а не
+        # права. Прав у роли нет НАРОЧНО: пустой набор у DB-принципала читался
+        # бы как «права по умолчанию агента», поэтому has_permission роли
+        # slot_runner отказывает сам и не смотрит на набор.
+        "slot_runner",
+        "Slot Runner",
+        "Хост исполнителя: забирает свои заказы, подтверждает, сообщает итог",
+        (),
     ),
 )
 

@@ -1730,6 +1730,18 @@ async def _sweep_executor_slots(db) -> None:
         log.exception("executor slot sweep failed")
 
 
+async def _sweep_executor_orders(db) -> None:
+    # #1712: заказ хосту, чей код не выкуплен к сроку, чья сессия умерла или
+    # чья задача сдана, закрывается с сожжением непотраченного кода — слот
+    # свободен без человека. Гонка с выкупом кода решается условным UPDATE.
+    try:
+        from hub.services.executor_orders import sweep_executor_orders
+
+        await sweep_executor_orders(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("executor order sweep failed")
+
+
 async def _sweep_ci_trust(db) -> None:
     # #1687: a CI report is worth what GitHub confirms. Retries the reports
     # GitHub could not be asked about (every 5 minutes, up to 6 hours) and
@@ -2507,6 +2519,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("steward_runs", _sweep_steward_runs),
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
+    Sweep("executor_orders", _sweep_executor_orders),
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),

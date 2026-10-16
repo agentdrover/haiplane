@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
+from hub.cli_executor_host import add_executor_host_parsers
 from hub.models import (
     DEFAULT_FORGE,
     FORGES,
@@ -3268,6 +3269,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_next.set_defaults(func=cmd_next_task)
 
     _add_executor_stop_parser(sub)
+    add_executor_host_parsers(sub)
 
     p_slots = sub.add_parser(
         "slots", help="Executor channels and slots: which task, since when (#1434)"
