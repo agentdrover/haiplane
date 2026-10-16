@@ -390,12 +390,14 @@ _EXPR = {
 }
 
 
-def _holds(condition: str, skip: str, result: str) -> bool:
+def _holds(condition: str, skip: str, result: str, previous_ok: bool = True) -> bool:
     """Evaluate the small `${{ ... }}` conditions of these jobs.
 
     Only the grammar the jobs use is accepted: the two `needs` values, string
     literals, ==, !=, &&, ||, !, parentheses. Anything else fails the test
-    instead of being guessed.
+    instead of being guessed. Like GitHub, a condition with no status function
+    (`always()`) gets an implicit `success()`: it holds only if the previous
+    steps of the job succeeded (`previous_ok`).
     """
     import re
 
@@ -404,19 +406,26 @@ def _holds(condition: str, skip: str, result: str) -> bool:
     code = text[3:-2]
     for name, var in _EXPR.items():
         code = code.replace(name, var)
+    has_status = "always()" in code
+    code = code.replace("always()", " True ")
     code = code.replace("&&", " and ").replace("||", " or ")
     code = re.sub(r"!(?!=)", " not ", code)
-    leftover = re.sub(r"'[^']*'|\b(?:skip|result|and|or|not)\b|==|!=|[()\s]", "", code)
+    leftover = re.sub(
+        r"'[^']*'|\b(?:skip|result|and|or|not|True)\b|==|!=|[()\s]", "", code
+    )
     assert leftover == "", f"unexpected syntax {leftover!r} in {condition!r}"
-    return bool(eval(code, {"__builtins__": {}}, {"skip": skip, "result": result}))  # noqa: S307  # nosec B307
+    value = bool(eval(code, {"__builtins__": {}}, {"skip": skip, "result": result}))  # noqa: S307  # nosec B307
+    return value if has_status else (previous_ok and value)
 
 
-def _aggregator_rc(result: str, skip: str) -> tuple[str, int | None, str]:
+def _aggregator_rc(
+    result: str, skip: str, previous_ok: bool = True
+) -> tuple[str, int | None, str]:
     """(outcome, return code, output) of step `tests` of job test for these needs."""
     import subprocess
 
     step = _steps()["tests"]
-    if not _holds(step["if"], skip, result):
+    if not _holds(step["if"], skip, result, previous_ok):
         return "skipped", None, ""
     env = {"PATH": __import__("os").environ["PATH"]}
     for key, value in step["env"].items():
@@ -430,6 +439,7 @@ def _aggregator_rc(result: str, skip: str) -> tuple[str, int | None, str]:
 
 def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     """AC-3: the job layout, the aggregator table, the reused full-suite line."""
+    import itertools
     import json
 
     doc = _doc()
@@ -461,7 +471,10 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     test = jobs["test"]
     assert test["name"] == "Ruff and pytest"
     assert test["needs"] == ["treedup", "pytest"]
-    assert test["if"] == "${{ always() && !cancelled() }}"
+    # A cancelled run must still run job test (and end red): `!cancelled()`
+    # would skip it, and a skipped required check can count as passed.
+    assert test["if"] == "${{ always() }}"
+    assert "!cancelled()" not in test["if"] and "always()" in test["if"]
     assert jobs["deploy"]["needs"] == "test"
 
     # The artifact and the AC collection live in job test and nowhere else.
@@ -472,18 +485,21 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         assert has_report is has_artifact is (name == "test"), name
 
     # The aggregator: every outcome of the parts, with and without dedup.
-    for skip in ("", "false", "true"):
-        for result in ("success", "failure", "cancelled", "skipped"):
-            outcome, rc, out = _aggregator_rc(result, skip)
-            label = (skip, result, out)
-            if result == "success" and skip == "true":
-                assert outcome == "skipped", label  # the tree was already green
-            elif result == "success":
-                assert (outcome, rc) == ("ran", 0), label
-            else:
-                # a failed, cancelled or skipped part is never green or skipped
-                assert outcome == "ran" and rc not in (0, None), label
-                assert result in out, label  # and the outcome is named
+    for skip, result, previous_ok in itertools.product(
+        ("", "false", "true"),
+        ("success", "failure", "cancelled", "skipped"),
+        (True, False),  # False: an earlier step (Lint, install) failed
+    ):
+        outcome, rc, out = _aggregator_rc(result, skip, previous_ok)
+        label = (skip, result, previous_ok, out)
+        if result == "success" and skip == "true":
+            assert outcome == "skipped", label  # the tree was already green
+        elif result == "success":
+            assert (outcome, rc) == ("ran", 0), label
+        else:
+            # a failed, cancelled or skipped part is never green or skipped
+            assert outcome == "ran" and rc not in (0, None), label
+            assert result in out, label  # and the outcome is named
 
     # The full-suite line: the reporter keeps it byte for byte, the step it
     # points at is the aggregator, and every part runs exactly that command

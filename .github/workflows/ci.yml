@@ -181,7 +181,7 @@ jobs:
     # sends the artifact. It runs after the dedup decision and the three parts
     # whatever their outcome, and judges them in the step `tests` below.
     needs: [treedup, pytest]
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     # #1666: 90 min = 45 min of explicit step ceilings (mutations 15 + baseline
     # 10 + report 20) plus headroom for the steps that have no ceiling of their
@@ -278,11 +278,15 @@ jobs:
       # an output of the matrix, which carries the value of one leg at random.
       # It is skipped ONLY when the tree was already green (job treedup) AND the
       # parts finished without a failure; in every other case it runs and is
-      # red unless the parts succeeded. Not `always()`: a red earlier step of
-      # this job has already made the job red, as for the old Test step.
+      # red unless the parts succeeded. `always()` is explicit: without a status
+      # function GitHub adds `success()`, and a red earlier step (Lint, install)
+      # would turn this step into "skipped" instead of red. The job `if` is
+      # `always()` WITHOUT `!cancelled()`: a cancelled run must still run this
+      # job and end red, not be skipped (a skipped required check can count as
+      # passed).
       - name: Tests outcome of the three parts
         id: tests
-        if: ${{ !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
+        if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
         env:
           PARTS_RESULT: ${{ needs.pytest.result }}
         run: |
