@@ -344,6 +344,29 @@ def test_relative_nginx_paths_reach_paths_conf_as_absolute_ones(tmp_path):
             as_root(["rm", "-f", PATHS_CONF])
 
 
+def test_a_sites_directory_that_is_a_link_cannot_move_the_boundary(tmp_path):
+    need_root_host()
+    nginx, srv = tmp_path / "nginx", tmp_path / "srv"
+    nginx.mkdir()
+    (srv / "sites").mkdir(parents=True)
+    (srv / "private.env").write_text("server {\n    server_name agenthai.ru;\n}\n")
+    (srv / "sites" / "hub").symlink_to("../private.env")
+    (nginx / "sites-available").symlink_to(srv / "sites")
+    with SharedLock() as host:
+        try:
+            as_root(["rm", "-f", PATHS_CONF])
+            before = installed_state()
+            done = run_install(
+                ["--sites-dir", str(nginx / "sites-available")], held=host
+            )
+            assert done.returncode != 0
+            assert "nothing was changed" in done.stderr and "outside" in done.stderr
+            assert installed_state() == before
+            assert not [x for x in _paths_lines() if "private.env" in x]
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
 # paths.conf as the installer of origin/develop wrote it
 OLD_PATHS_CONF = """# Allowlist of the daily settings archive (#1707). Nothing outside it is read.
 unit haiplane-hub

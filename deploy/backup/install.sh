@@ -117,8 +117,14 @@ done
 # are cut, the file is split at ';' (so a directive may span lines or follow a '{').
 # `include` is not followed. --nginx-site PATH replaces the search.
 # Paths go into paths.conf, which wants absolute ones: everything is canonical from here.
+# nginx's tree is the parent of the directory AS GIVEN: a sites directory that is itself a
+# link must not move the boundary outwards.
+NGINX_ROOT=$(readlink -f "$(dirname "${SITES_DIR%/}")")
 SITES_DIR=$(readlink -f "$SITES_DIR")
-NGINX_ROOT=$(readlink -f "$(dirname "$SITES_DIR")")
+case "$SITES_DIR" in
+    "$NGINX_ROOT"/*) ;;
+    *) die "the sites directory is a link to $SITES_DIR, outside $NGINX_ROOT; nothing was changed" ;;
+esac
 server_names() {
     sed 's/#.*//' "$1" | tr '\n\t' '  ' | tr ';' '\n' | sed 's/^/ /' |
         sed -n 's/^.*[[:space:]{}]server_name[[:space:]][[:space:]]*//p'
