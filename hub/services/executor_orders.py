@@ -1021,6 +1021,10 @@ async def _branch_refusal(
     """
     if not branch:
         return ""
+    if any(shape.search(branch) for shape in _SECRET_SHAPES):
+        # Слаг ветки задаёт вызывающий pair-start: хранимая ветка тоже может
+        # быть секретом по виду, и в ленту она не пойдёт.
+        return "branch: похоже на токен или ключ"
     task_id = int(order["task_id"])
     row = await repo.get_task(db, task_id)
     own = str(dict(row).get("branch") or "") if row is not None else ""
@@ -1057,11 +1061,6 @@ async def report_outcome(
             raise HostError(403, "заказ не принадлежит этому хосту")
         if not order["delivered_at"]:
             raise HostError(409, "заказ ещё не выдан хосту: итогу прогона рано")
-        refusal = await _branch_refusal(db, order, branch)
-        if refusal:
-            raise HostError(422, refusal)
-        if await _fields_hold_the_code(db, order, note, branch, sha):
-            raise HostError(422, "в полях итога код этого заказа")
         if order["report_outcome"]:
             same = (
                 order["report_outcome"],
@@ -1078,6 +1077,11 @@ async def report_outcome(
                     f"итог по заказу уже записан: {order['report_outcome']}",
                 )
             return {"id": order["id"], "outcome": outcome, "duplicate": True}
+        refusal = await _branch_refusal(db, order, branch)
+        if refusal:
+            raise HostError(422, refusal)
+        if await _fields_hold_the_code(db, order, note, branch, sha):
+            raise HostError(422, "в полях итога код этого заказа")
         await db.execute(
             "UPDATE executor_orders SET report_outcome = ?, report_sha = ?, "
             "report_branch = ?, report_note = ?, reported_at = datetime('now') "

@@ -1365,6 +1365,14 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     assert first.json()["duplicate"] is False
     again = await world.client.post(url, json=payload, headers=world.k8_auth)
     assert again.status_code == 200 and again.json()["duplicate"] is True
+    # Ветку задачи потом сменили (возврат и новый pair-start): повтор того же итога
+    # по-прежнему идемпотентен, а не 422 по белому списку.
+    await repo.update_task(world.db, task_id, branch=f"task-{task_id}/renamed")
+    await world.db.commit()
+    renamed = await world.client.post(url, json=payload, headers=world.k8_auth)
+    assert renamed.status_code == 200 and renamed.json()["duplicate"] is True
+    await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
+    await world.db.commit()
 
     feed = [
         u
@@ -1571,6 +1579,13 @@ async def _notes_part(world, order: dict, task_id: int):
         if "Итог прогона" in u["content"]
     ]
     assert feed == []
+    # Ветка задачи по виду секрет (слаг задаёт вызывающий pair-start): в ленту не идёт.
+    sneaky = f"task-{task_id}/sk-" + "abcdefgh12345678"
+    await repo.update_task(world.db, task_id, branch=sneaky)
+    await world.db.commit()
+    assert (await post(branch=sneaky)).status_code == 422
+    await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
+    await world.db.commit()
     # Обычная ветка с длинным слагом и хеш коммита проходят.
     ok = await post(
         note="a" * 500,
