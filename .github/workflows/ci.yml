@@ -247,6 +247,9 @@ jobs:
       CI_REQUIRE_ROOT_TESTS: "1"
 
     steps:
+      - name: Break the setup (temporary, #1785 AC-3b)
+        run: exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
