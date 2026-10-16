@@ -17,9 +17,9 @@ A violation stays possible; it stops being invisible.
 THREE OUTCOMES, NOT TWO. "No drift" and "could not check" are different
 answers and are never collapsed. On production the ``default`` project — the
 hub's own repository — has an empty ``repo``, a ``workspace_path`` that does
-not exist, and a fallback clone with no remote at all; ``gh`` is not
-installed either. A guard that reported "clean" there would be reporting on
-nothing while the milestone read as delivered.
+not exist, and a fallback clone with no remote at all. A guard that reported
+"clean" there would be reporting on nothing while the milestone read as
+delivered.
 
 WHAT COUNTS AS EXPECTED. The hub merges through ``gh pr merge --squash``, so
 its own merges land on the base as ordinary non-merge commits — the same

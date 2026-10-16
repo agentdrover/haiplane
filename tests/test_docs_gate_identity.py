@@ -54,31 +54,39 @@ def test_invariant_names_executors_drift_guard_and_rotation() -> None:
     assert "gh auth switch" in text
 
 
-# (path, forbidden substring) — each pair is a claim retired by #1708.
+# AC-3 names these six files and says NONE of them may carry ANY of the six
+# retired claims below — not "this file may carry only its originally-cited
+# phrase". So the check is a full cross product: every file against every
+# phrase, not a fixed list of (file, phrase) pairs (a fixed-pair list missed
+# e.g. "PAT хаба read-only" reappearing in deploy/CD.md, since that pairing
+# was never listed — found by review on eebc0180).
+AC3_FILES: list[Path] = [
+    REPO_ROOT / "deploy" / "CD.md",
+    REPO_ROOT / "docs" / "workspace-safety-policy.md",
+    REPO_ROOT / "docs" / "hub-workflows-map.html",
+    REPO_ROOT / "hub" / "services" / "drift_guard.py",
+    REPO_ROOT / "hub" / "integrations" / "forge" / "github.py",
+    REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md",
+]
+
+FORBIDDEN_SUBSTRINGS: list[str] = [
+    "PAT только на чтение",
+    "(токен только на чтение)",
+    "Branch protection недоступна",
+    "rulesets недоступны",
+    "rulesets are unavailable",
+    "PAT хаба read-only",
+]
+
+# Kept only for the ids of the main guard test's failure message / parametrize
+# below: the full cross product of AC3_FILES x FORBIDDEN_SUBSTRINGS.
 FORBIDDEN_PHRASES: list[tuple[Path, str]] = [
-    (REPO_ROOT / "deploy" / "CD.md", "PAT только на чтение"),
-    (REPO_ROOT / "deploy" / "CD.md", "(токен только на чтение)"),
-    (
-        REPO_ROOT / "docs" / "workspace-safety-policy.md",
-        "Branch protection недоступна",
-    ),
-    (REPO_ROOT / "docs" / "workspace-safety-policy.md", "rulesets недоступны"),
-    (REPO_ROOT / "docs" / "hub-workflows-map.html", "rulesets недоступны"),
-    (REPO_ROOT / "hub" / "services" / "drift_guard.py", "rulesets are unavailable"),
-    (REPO_ROOT / "hub" / "integrations" / "forge" / "github.py", "PAT хаба read-only"),
-    (
-        REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md",
-        "rulesets недоступны",
-    ),
-    (
-        REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md",
-        "rulesets are unavailable",
-    ),
+    (path, phrase) for path in AC3_FILES for phrase in FORBIDDEN_SUBSTRINGS
 ]
 
 
 def _forbidden_offenders(overrides: dict[Path, str] | None = None) -> list[str]:
-    """Shared guard check: one list of forbidden claims, read normalized.
+    """Shared guard check: every AC-3 file against every forbidden claim.
 
     ``overrides`` lets a caller substitute an in-memory text for a path
     instead of the file on disk — used by the mutation test below so no
@@ -87,10 +95,11 @@ def _forbidden_offenders(overrides: dict[Path, str] | None = None) -> list[str]:
     """
     overrides = overrides or {}
     offenders = []
-    for path, phrase in FORBIDDEN_PHRASES:
+    for path in AC3_FILES:
         text = _normalize(overrides[path]) if path in overrides else _normalized(path)
-        if phrase in text:
-            offenders.append(f"{path.relative_to(REPO_ROOT)}: {phrase!r}")
+        for phrase in FORBIDDEN_SUBSTRINGS:
+            if phrase in text:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {phrase!r}")
     return offenders
 
 
@@ -128,24 +137,18 @@ def test_bypass_wording_names_pr_and_ci_requirements() -> None:
     assert "Nothing needs to bypass anything." not in release
 
 
-# One representative (file, phrase) per AC-3 file, in FORBIDDEN_PHRASES' own
-# order, so every file named by AC-3 gets a mutation case — not just one of
-# the six.
-_AC3_FILES = list(dict.fromkeys(path for path, _ in FORBIDDEN_PHRASES))
-_AC3_REPRESENTATIVE: list[tuple[Path, str]] = [
-    next((path, phrase) for path, phrase in FORBIDDEN_PHRASES if path == target)
-    for target in _AC3_FILES
-]
-
-
 @pytest.mark.parametrize(
     "target,phrase",
-    _AC3_REPRESENTATIVE,
-    ids=[str(path.relative_to(REPO_ROOT)) for path, _ in _AC3_REPRESENTATIVE],
+    FORBIDDEN_PHRASES,
+    ids=[
+        f"{path.relative_to(REPO_ROOT)}::{phrase}" for path, phrase in FORBIDDEN_PHRASES
+    ],
 )
 def test_guard_names_file_and_phrase_on_regression(target: Path, phrase: str) -> None:
     """Mutation check for AC-5: a reintroduced false phrase is named, not swallowed,
-    for every file listed in AC-3 — not just one of the six.
+    for every (file, phrase) pair AC-3 covers — the full cross product of the
+    six files and the six retired claims, not just the pairing each phrase
+    happened to start in.
 
     The mutated text lives only in a local variable, never written to the
     file on disk: writing into the real checkout would be visible to
