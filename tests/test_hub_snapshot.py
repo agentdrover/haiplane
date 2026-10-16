@@ -254,7 +254,9 @@ def _tree(world):
         [
             "FragmentPath=/etc/systemd/system/haiplane-hub.service",
             "DropInPaths=/etc/systemd/system/haiplane-hub.service.d/10.conf",
-            "EnvironmentFiles=/etc/haiplane/hub.env (ignore_errors=no) /etc/haiplane/absent.env (ignore_errors=yes)",
+            # systemd prints one EnvironmentFiles= line per file
+            "EnvironmentFiles=/etc/haiplane/hub.env (ignore_errors=no)",
+            "EnvironmentFiles=/etc/haiplane/absent.env (ignore_errors=yes)",
             "Environment=",
         ]
     )
@@ -440,6 +442,120 @@ def test_database_path_comes_from_the_unit_and_files_override(world, capsys):
     )
     world.clock.tick()
     assert run(world, "hourly", capsys) == (1, "failed kind=hourly reason=no_db_path")
+
+
+def _unit_world(world, first_text, second_text, first_path="etc/hub/first.env"):
+    """Two EnvironmentFiles printed the way systemd prints them (a line per file)."""
+    root = world.root / "unitroot"
+    files = {
+        first_path: first_text,
+        "etc/hub/secrets.env": second_text,
+        "etc/systemd/system/haiplane-hub.service": "[Service]\n",
+        "etc/systemd/system/haiplane-hub.service.d/10.conf": "[Service]\nNice=1\n",
+        "etc/systemd/system/haiplane-hub.service.d/20.conf": "[Service]\nNice=2\n",
+    }
+    for rel, text in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    props = "\n".join(
+        [
+            "FragmentPath=/etc/systemd/system/haiplane-hub.service",
+            "DropInPaths=/etc/systemd/system/haiplane-hub.service.d/10.conf "
+            "/etc/systemd/system/haiplane-hub.service.d/20.conf",
+            "EnvironmentFiles=/%s (ignore_errors=no)" % first_path,
+            "EnvironmentFiles=/etc/hub/secrets.env (ignore_errors=yes)",
+            "Environment=LANG=C PORT=8080 NAME=hub",
+        ]
+    )
+    (world.root / "paths.conf").write_text("unit haiplane-hub\n")
+    world.env.update(
+        SNAP_ROOT=str(root),
+        SNAP_DB="",
+        SNAP_PATHS_CONF=str(world.root / "paths.conf"),
+        SNAP_SYSTEMCTL=_systemctl_stub(world, props),
+    )
+
+
+def test_every_environment_file_of_the_unit_is_read(world, capsys):
+    _unit_world(
+        world,
+        "HAIPLANE_HUB_DB=%s\n" % world.db,
+        "TOKEN=hub-secret-token\n",  # pragma: allowlist secret
+    )
+    rc, line = run(world, "hourly", capsys)
+    assert rc == 0, line
+    assert published(world, "hub-*.db.age"), "the database path of the first file"
+
+    world.clock.tick()
+    rc, line = run(world, "daily", capsys)
+    assert rc == 0, line
+    (data,) = world.state.glob("conf-*.tar.age")
+    plain = decrypt(world.identity, data)
+    with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+        names = set(tar.getnames())
+        manifest = json.loads(tar.extractfile("MANIFEST.json").read())
+    expected = {
+        "etc/hub/first.env",
+        "etc/hub/secrets.env",
+        "etc/systemd/system/haiplane-hub.service.d/10.conf",
+        "etc/systemd/system/haiplane-hub.service.d/20.conf",
+    }
+    assert expected <= names
+    assert expected <= {f["path"] for f in manifest["files"]}
+
+
+def test_environment_file_path_may_contain_spaces(world, capsys):
+    spaced = "etc/hub config/base.env"
+    _unit_world(world, "HAIPLANE_HUB_DB=%s\n" % world.db, "A=1\n", first_path=spaced)
+    rc, line = run(world, "hourly", capsys)
+    assert rc == 0, line
+    world.clock.tick()
+    rc, line = run(world, "daily", capsys)
+    assert rc == 0, line
+    (data,) = world.state.glob("conf-*.tar.age")
+    with tarfile.open(fileobj=io.BytesIO(decrypt(world.identity, data))) as tar:
+        assert spaced in tar.getnames()
+
+
+def test_later_environment_file_overrides_and_snap_db_wins(world, capsys):
+    other = world.root / "other.db"
+    keeper, ghost = make_hub_db(other, rows=("only-in-other",))
+    try:
+        # the later file is soft and absent: the earlier one still decides
+        _unit_world(world, "HAIPLANE_HUB_DB=%s\n" % other, "")
+        (world.root / "unitroot/etc/hub/secrets.env").unlink()
+        rc, line = run(world, "hourly", capsys)
+        assert rc == 0, line
+        for leftover in world.state.glob("hub-*"):
+            leftover.unlink()
+        world.clock.tick()
+        _unit_world(
+            world,
+            "HAIPLANE_HUB_DB=/nowhere/first.db\n",
+            "HAIPLANE_HUB_DB=%s\n" % other,
+        )
+        rc, line = run(world, "hourly", capsys)
+        assert rc == 0, line
+        (data,) = world.state.glob("hub-*.db.age")
+        copy = world.root / "copy.db"
+        copy.write_bytes(decrypt(world.identity, data))
+        rows = [r[0] for r in sqlite3.connect(copy).execute("SELECT body FROM notes")]
+        assert rows == ["only-in-other"], "the second file wins"
+
+        # SNAP_DB beats the unit
+        world.clock.tick()
+        rc, line = run(world, "hourly", capsys, SNAP_DB=str(world.db))
+        assert rc == 0, line
+        newest = sorted(world.state.glob("hub-*.db.age"))[-1]
+        copy.write_bytes(decrypt(world.identity, newest))
+        rows = sorted(
+            r[0] for r in sqlite3.connect(copy).execute("SELECT body FROM notes")
+        )
+        assert rows == ["committed-1", "committed-2"]
+    finally:
+        ghost.close()
+        keeper.close()
 
 
 def test_missing_recipient_publishes_nothing(world, capsys):
