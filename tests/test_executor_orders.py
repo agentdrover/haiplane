@@ -41,6 +41,12 @@ from hub.services import executor_orders as orders
 from hub.services.executor_dispatch import poll_executor_runs
 
 AGENT_TOKEN = "agent-token-1712"  # pragma: allowlist secret
+# Look like a session token and an API key by prefix only: the report filter must
+# refuse them, and the secret scan must not take the fixtures for real ones.
+FAKE_SESSION_TOKEN = (
+    "ahcp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg"  # pragma: allowlist secret
+)
+FAKE_KEY_TAIL = "ochk_AbCdEfGhIjKlMnOpQrStUvWxYz01234567"  # pragma: allowlist secret
 HUB_URL = "https://hub.example.test"
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "executor_host_decrypt.py"
 
@@ -1297,7 +1303,7 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     order = (await _orders(world)).json()["orders"][0]
     k9_order = (await _orders(world, "k9")).json()["orders"][0]
     url = f"/api/executor-hosts/k8/orders/{order['id']}/report"
-    sha = "0123456789abcdef0123456789abcdef01234567"
+    sha = "0123456789abcdef0123456789abcdef01234567"  # pragma: allowlist secret
     payload = {
         "outcome": "submitted",
         "sha": sha,
@@ -1427,8 +1433,8 @@ async def _notes_part(world, order: dict, task_id: int):
 
     raw = code.removeprefix("AH-")
     for body in (
-        {"branch": "ahcp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg"},
-        {"branch": "task-1/ochk_AbCdEfGhIjKlMnOpQrStUvWxYz01234567"},
+        {"branch": FAKE_SESSION_TOKEN},
+        {"branch": "task-1/" + FAKE_KEY_TAIL},
         {"branch": raw},
         {"branch": raw.lower()},
         {"sha": raw.lower()},
@@ -1457,7 +1463,7 @@ async def _notes_part(world, order: dict, task_id: int):
         "Authorization: Bearer abcdefghijkl",
         "token=supersecretvalue",
         "x" * 501,
-        "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+        "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",  # pragma: allowlist secret
     ):
         refused = await post(note=note)
         assert refused.status_code == 422, note
