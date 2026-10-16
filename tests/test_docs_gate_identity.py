@@ -23,9 +23,13 @@ def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _normalized(path: Path) -> str:
+def _normalize(text: str) -> str:
     """Collapse whitespace so a prose line-wrap cannot break a substring check."""
-    return " ".join(_text(path).split())
+    return " ".join(text.split())
+
+
+def _normalized(path: Path) -> str:
+    return _normalize(_text(path))
 
 
 def test_invariant_names_the_gate_and_its_bypass() -> None:
@@ -73,12 +77,25 @@ FORBIDDEN_PHRASES: list[tuple[Path, str]] = [
 ]
 
 
+def _forbidden_offenders(overrides: dict[Path, str] | None = None) -> list[str]:
+    """Shared guard check: one list of forbidden claims, read normalized.
+
+    ``overrides`` lets a caller substitute an in-memory text for a path
+    instead of the file on disk — used by the mutation test below so no
+    test ever writes into the shared checkout (which would be visible to
+    sibling workers under ``pytest -n auto``).
+    """
+    overrides = overrides or {}
+    offenders = []
+    for path, phrase in FORBIDDEN_PHRASES:
+        text = _normalize(overrides[path]) if path in overrides else _normalized(path)
+        if phrase in text:
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {phrase!r}")
+    return offenders
+
+
 def test_no_false_gate_claims_remain() -> None:
-    offenders = [
-        f"{path.relative_to(REPO_ROOT)}: {phrase!r}"
-        for path, phrase in FORBIDDEN_PHRASES
-        if phrase in _text(path)
-    ]
+    offenders = _forbidden_offenders()
     assert not offenders, "false gate-identity claim(s) found: " + "; ".join(offenders)
 
 
@@ -111,47 +128,14 @@ def test_bypass_wording_names_pr_and_ci_requirements() -> None:
     assert "Nothing needs to bypass anything." not in release
 
 
-# AC-3 lists six files; mutating each the same way in-place (not just
-# appending, which would be invalid at random offsets in .py files) keeps the
-# fixture syntactically valid. `find` is an existing substring in a comment or
-# docstring of that file; `replace` reintroduces the forbidden phrase in it.
-_INPLACE_MUTATIONS: dict[Path, tuple[str, str]] = {
-    REPO_ROOT / "deploy" / "CD.md": (
-        "токен хаба пишет при мерже",
-        "PAT только на чтение",
-    ),
-    REPO_ROOT / "docs" / "workspace-safety-policy.md": (
-        "Серверная защита теперь есть",
-        "Branch protection недоступна",
-    ),
-    REPO_ROOT / "docs" / "hub-workflows-map.html": (
-        "серверная сторона не могла отказать",
-        "rulesets недоступны",
-    ),
-    REPO_ROOT / "hub" / "services" / "drift_guard.py": (
-        "rulesets were unavailable",
-        "rulesets are unavailable",
-    ),
-    REPO_ROOT / "hub" / "integrations" / "forge" / "github.py": (
-        "сам токен хаба умеет и писать",
-        "PAT хаба read-only (мутация теста)",
-    ),
-    REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md": (
-        "в его обходе больше нет никого",
-        "rulesets недоступны",
-    ),
-}
-
-# One representative (file, phrase) per AC-3 file — matches FORBIDDEN_PHRASES'
-# first entry for each path, so the assertion below names the same pair.
+# One representative (file, phrase) per AC-3 file, in FORBIDDEN_PHRASES' own
+# order, so every file named by AC-3 gets a mutation case — not just one of
+# the six.
 _AC3_FILES = list(dict.fromkeys(path for path, _ in FORBIDDEN_PHRASES))
 _AC3_REPRESENTATIVE: list[tuple[Path, str]] = [
     next((path, phrase) for path, phrase in FORBIDDEN_PHRASES if path == target)
     for target in _AC3_FILES
 ]
-assert set(_AC3_FILES) == set(_INPLACE_MUTATIONS), (
-    "every AC-3 file in FORBIDDEN_PHRASES needs a mutation fixture, and vice versa"
-)
 
 
 @pytest.mark.parametrize(
@@ -161,19 +145,17 @@ assert set(_AC3_FILES) == set(_INPLACE_MUTATIONS), (
 )
 def test_guard_names_file_and_phrase_on_regression(target: Path, phrase: str) -> None:
     """Mutation check for AC-5: a reintroduced false phrase is named, not swallowed,
-    for every file listed in AC-3 — not just one of the six."""
-    find, replace = _INPLACE_MUTATIONS[target]
-    assert phrase in replace, f"fixture for {target} does not reintroduce {phrase!r}"
+    for every file listed in AC-3 — not just one of the six.
+
+    The mutated text lives only in a local variable, never written to the
+    file on disk: writing into the real checkout would be visible to
+    sibling workers under ``pytest -n auto``. The same ``_forbidden_offenders``
+    helper that the main guard test (``test_no_false_gate_claims_remain``)
+    calls is reused here via its ``overrides`` argument, so this test proves
+    the guard catches a regression instead of re-implementing its own search
+    with a separate, driftable set of anchors.
+    """
     original = _text(target)
-    assert find in original, f"mutation fixture stale for {target}: {find!r} not found"
-    mutated = original.replace(find, replace, 1)
-    target.write_text(mutated, encoding="utf-8")
-    try:
-        offenders = [
-            f"{path.relative_to(REPO_ROOT)}: {found_phrase!r}"
-            for path, found_phrase in FORBIDDEN_PHRASES
-            if found_phrase in _text(path)
-        ]
-        assert offenders == [f"{target.relative_to(REPO_ROOT)}: {phrase!r}"]
-    finally:
-        target.write_text(original, encoding="utf-8")
+    mutated = f"{original}\n<!-- regression check: {phrase} -->\n"
+    offenders = _forbidden_offenders({target: mutated})
+    assert offenders == [f"{target.relative_to(REPO_ROOT)}: {phrase!r}"]

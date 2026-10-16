@@ -169,8 +169,15 @@ These are the rules most likely to be broken by “small” changes.
 - Drift-guard (`hub/services/drift_guard.py`, #534) сверяет SHA коммита,
   произведшего merge, а не актора пуша: смена личности гейта сама по себе
   не требует правки guard.
-- Токен гейта ротируется раз в 90 дней; откат при проблеме — `gh auth
-  switch` на прежнюю учётку.
+- Токен гейта ротируется раз в 90 дней. Откат одним `gh auth switch` на
+  прежнюю учётку сам по себе вливания не восстанавливает: в обходе ruleset
+  «only the gate updates integration branches» состоит только учётка
+  `haiplane-gate`, и переключённая локальная учётка там не значится — её
+  пуш или мерж в `main`/`develop` тот же ruleset отклонит. Порядок отката:
+  либо выключить ruleset 25216047 («only the gate updates integration
+  branches»), а затем переключить `gh auth` на прежнюю учётку, либо
+  восстановить рабочие credentials самой `haiplane-gate` без смены личности
+  вовсе.
 - Подтверждено пробами П0–П10 на `agentdrover/haiplane-w4-probe` и выкаткой
   на `agentdrover/haiplane`, обе 16.10.2026.
 - Пересмотреть при смене личности гейта (App гейта вместо учётки) или при
