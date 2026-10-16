@@ -139,6 +139,26 @@ ssh haiplane-backup@HOST id                     # отказ, rc 2
 sftp haiplane-backup@HOST                       # отказ
 ```
 
+## Обновление действующей установки (#1711)
+
+`install.sh` по-прежнему не перезаписывает `paths.conf`: он печатает в stderr, чего в нём
+нет. Сайт nginx хаба установщик ищет сам: это единственный файл в
+`/etc/nginx/sites-available`, где в `server_name` есть хост (`--site-host`, по умолчанию
+`agenthai.ru`; каталог — `--sites-dir`). Нет файла или их больше одного — установка
+останавливается до любых изменений.
+
+1. Запустить `sudo sh deploy/backup/install.sh` с теми же ключами. Заменить в
+   `/etc/haiplane-backup/paths.conf` старую запись nginx на названный в предупреждении сайт
+   (`required /etc/nginx/sites-available/openclaw-hub`) и дописать недостающие записи из
+   предупреждений (`required /etc/openclaw-hub`, `optional /etc/haiplane-backup`).
+2. Убрать временный обход: `sudo rm /etc/systemd/system/haiplane-snapshot-hourly.service.d/10-db.conf`,
+   `sudo systemctl daemon-reload`, `systemctl show -p Environment haiplane-snapshot-hourly.service`
+   (в выводе нет `SNAP_DB`), затем `sudo systemctl start haiplane-snapshot-hourly.service` —
+   в журнале `ok kind=hourly`.
+3. `sudo systemctl start haiplane-snapshot-daily.service`, расшифровать новый архив
+   (`age -d -i identity.txt conf-*.tar.age | tar -t`): в нём есть
+   `etc/openclaw-hub/openclaw-hub.env` и `etc/haiplane-backup/paths.conf`.
+
 ## Откат установки
 
 ```sh

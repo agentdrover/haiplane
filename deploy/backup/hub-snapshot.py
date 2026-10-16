@@ -338,6 +338,9 @@ def _unit_props(cfg, unit):
     props = {}
     for line in proc.stdout.splitlines():
         key, _, value = line.partition("=")
+        if key == "EnvironmentFiles" and key in props:
+            # systemd prints one line per file; the order is the order it loads them in
+            value = props[key] + " " + value if value else props[key]
         props[key] = value
     return props
 

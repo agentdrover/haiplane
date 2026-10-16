@@ -15,7 +15,10 @@ from tests.backup_support import (
     HOME_DIR,
     INSTALL,
     LIB_DIR,
+    PATHS_CONF,
+    SHARED,
     STATE_DIR,
+    SharedLock,
     as_backup,
     as_root,
     installed_state,
@@ -24,6 +27,7 @@ from tests.backup_support import (
     shared_keys,
     sshd_path,
     must_have,
+    write_sites,
 )
 
 
@@ -180,6 +184,163 @@ def test_install_is_idempotent_and_least_privilege():
         "hub-snapshot.py hourly" in hourly_service
         and "hub-snapshot.py daily" in unit("haiplane-snapshot-daily.service")
     )
+
+
+def _paths_lines() -> list[str]:
+    return as_root(["cat", PATHS_CONF], text=True).stdout.splitlines()
+
+
+def test_nginx_site_is_found_by_server_name(tmp_path):
+    need_root_host()
+    sites = tmp_path / "sites"
+    with SharedLock() as host:
+        try:
+            write_sites(sites)
+            as_root(["rm", "-f", PATHS_CONF])
+            done = run_install(["--sites-dir", str(sites)], held=host)
+            assert done.returncode == 0, done.stdout + done.stderr
+            lines = _paths_lines()
+            # exactly the file whose server_name lists the host: not a name that merely contains it
+            assert "required %s/openclaw-hub" % sites in lines
+            assert [x for x in lines if str(sites) in x] == [
+                "required %s/openclaw-hub" % sites
+            ]
+            assert "required /etc/openclaw-hub" in lines
+            assert "optional /etc/haiplane-backup" in lines
+            assert "required /etc/nginx/sites-available/agenthai.ru" not in lines
+
+            # another host name picks another file
+            as_root(["rm", "-f", PATHS_CONF])
+            done = run_install(
+                ["--sites-dir", str(sites), "--site-host", "haiplane.com"], held=host
+            )
+            assert done.returncode == 0, done.stderr
+            assert "required %s/haiplane" % sites in _paths_lines()
+
+            # no file, or two files: refused before any change
+            for name, files in (
+                ("none", {"haiplane": "server {\n    server_name haiplane.com;\n}\n"}),
+                (
+                    "two",
+                    {
+                        "a": "server {\n    server_name agenthai.ru;\n}\n",
+                        "b": "server {\n    server_name x.example agenthai.ru;\n}\n",
+                    },
+                ),
+            ):
+                write_sites(sites, files)
+                as_root(["rm", "-f", PATHS_CONF])
+                before = installed_state()
+                done = run_install(["--sites-dir", str(sites)], held=host)
+                assert done.returncode != 0, name
+                assert "nothing was changed" in done.stderr, (name, done.stderr)
+                assert installed_state() == before, name
+                if name == "two":
+                    assert (
+                        str(sites / "a") in done.stderr
+                        and str(sites / "b") in done.stderr
+                    )
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+# paths.conf as the installer of origin/develop wrote it
+OLD_PATHS_CONF = """# Allowlist of the daily settings archive (#1707). Nothing outside it is read.
+unit haiplane-hub
+required /etc/georoute
+required /etc/systemd/networkd.conf.d
+required /etc/fail2ban/jail.local
+required /etc/nginx/sites-available/agenthai.ru
+# optional-unit haiplane-hub-poller
+# optional /etc/haiplane-review-runner
+"""
+
+
+def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
+    need_root_host()
+    from tests.backup_support import decrypt, load_snapshot
+
+    sites = tmp_path / "sites"
+    with SharedLock() as host:
+        try:
+            write_sites(sites)
+            as_root(["tee", PATHS_CONF], input=OLD_PATHS_CONF, text=True)
+            done = run_install(["--sites-dir", str(sites)], held=host)
+            assert done.returncode == 0, done.stdout + done.stderr
+            assert _paths_lines() == OLD_PATHS_CONF.splitlines(), "not rewritten"
+            site = "%s/openclaw-hub" % sites
+            warned = done.stderr
+            assert (
+                "required /etc/nginx/sites-available/agenthai.ru does not exist"
+                in warned.replace("required path ", "required ")
+            )
+            assert "replace the entry with 'required %s'" % site in warned
+            missing = [
+                line.split("default entry: ", 1)[1]
+                for line in warned.splitlines()
+                if "lacks the default entry: " in line
+            ]
+            assert missing == [
+                "required " + site,
+                "required /etc/openclaw-hub",
+                "optional /etc/haiplane-backup",
+            ]
+            recipient = as_root(["cat", "/etc/haiplane-backup/recipient.txt"]).stdout
+
+            # the owner's correction by the README: replace the old entry, add the missing ones
+            corrected = (
+                OLD_PATHS_CONF.replace(
+                    "required /etc/nginx/sites-available/agenthai.ru\n", ""
+                )
+                + "\n".join(missing)
+                + "\n"
+            )
+            root = tmp_path / "sysroot"
+            for rel, text in {
+                "etc/georoute/a.conf": "r\n",
+                "etc/fail2ban/jail.local": "[DEFAULT]\n",
+                "etc/openclaw-hub/openclaw-hub.env": "HAIPLANE_HUB_DB=/db\n",
+                "etc/systemd/system/haiplane-hub.service": "[Service]\n",
+                site.lstrip("/"): "server {\n    server_name agenthai.ru;\n}\n",
+                "etc/haiplane-backup/paths.conf": corrected,
+            }.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            (root / "etc/systemd/networkd.conf.d").mkdir(parents=True)
+            (root / "etc/haiplane-backup/recipient.txt").write_bytes(recipient)
+            systemctl = tmp_path / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\necho FragmentPath=/etc/systemd/system/haiplane-hub.service\n"
+            )
+            systemctl.chmod(0o755)
+            (tmp_path / "state").mkdir()
+            env = {
+                "SNAP_ROOT": str(root),
+                "SNAP_PATHS_CONF": str(root / "etc/haiplane-backup/paths.conf"),
+                "SNAP_RECIPIENT_FILE": str(root / "etc/haiplane-backup/recipient.txt"),
+                "SNAP_STATE_DIR": str(tmp_path / "state"),
+                "SNAP_WORK_DIR": str(tmp_path / "state" / "work"),
+                "SNAP_SYSTEMCTL": str(systemctl),
+                "SNAP_GROUP": "",
+                "SNAP_REQUIRE_TMPFS": "0",
+            }
+            import io
+            import tarfile
+
+            snap = load_snapshot()
+            # the old entry alone leaves the archive without the site: daily refuses
+            old = dict(env, SNAP_PATHS_CONF=str(tmp_path / "old.conf"))
+            (tmp_path / "old.conf").write_text(OLD_PATHS_CONF)
+            assert snap.main(["hub-snapshot.py", "daily"], old) == 1
+            assert snap.main(["hub-snapshot.py", "daily"], env) == 0
+            (data,) = (tmp_path / "state").glob("conf-*.tar.age")
+            plain = decrypt(SHARED / "identity.txt", data)
+            with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+                names = set(tar.getnames())
+            assert "etc/haiplane-backup/paths.conf" in names
+            assert "etc/haiplane-backup/recipient.txt" in names
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
 
 
 def test_ci_installs_the_tools_and_forbids_skips():

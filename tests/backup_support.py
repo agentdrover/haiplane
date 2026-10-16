@@ -120,6 +120,24 @@ STATE_DIR = "/var/lib/haiplane-backup"
 LIB_DIR = "/usr/local/lib/haiplane-backup"
 DROPIN = "/etc/ssh/sshd_config.d/60-haiplane-backup.conf"
 SHARED = Path(tempfile.gettempdir()) / "haiplane-backup-test-material"
+PATHS_CONF = "/etc/haiplane-backup/paths.conf"
+SITE_HOST = "agenthai.ru"
+# the nginx sites of the hub host: the installer finds its site by server_name, so
+# every installer run needs a directory with exactly one such file (#1711)
+DEFAULT_SITES = {
+    "openclaw-hub": "server {\n    listen 443;\n    server_name agenthai.ru www.agenthai.ru;\n}\n",
+    "haiplane": "server {\n    server_name haiplane.com;\n}\n",
+    "hc.haiplane.com": "server {\n    server_name hc.haiplane.com notagenthai.ru.example;\n}\n",
+}
+
+
+def write_sites(directory: Path, sites: dict[str, str] | None = None) -> Path:
+    """A throwaway sites-available directory with exactly the given files."""
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True)
+    for name, text in (DEFAULT_SITES if sites is None else sites).items():
+        (directory / name).write_text(text)
+    return directory
 
 
 def root_prefix() -> list[str]:
@@ -225,9 +243,12 @@ def run_install(
     ):
         as_root(["usermod", "-L", "haiplane-backup"], check=True)
     keys = shared_keys()
+    sites = write_sites(SHARED / "nginx-sites")
     args = [
         "sh",
         str(INSTALL),
+        "--sites-dir",
+        str(sites),
         "--ssh-pubkey-file",
         str(keys["pub"]),
         "--age-recipient-file",

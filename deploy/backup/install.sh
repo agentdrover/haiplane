@@ -7,6 +7,10 @@
 #
 # --ssh-pubkey[-file]      public ssh key of the machine that fetches the copies
 # --age-recipient[-file]   public age recipient: the private key stays at home
+# --site-host HOST         the nginx site of the hub is the one file in the sites
+#                          directory whose server_name lists HOST (default agenthai.ru);
+#                          no such file, or more than one, stops the install before any change
+# --sites-dir DIR          that directory (default /etc/nginx/sites-available)
 # --no-services            do not touch systemd and do not reload sshd (a host
 #                          without a running systemd, e.g. a CI container)
 # Keys are arguments or files; no key is kept in the repository. Without a key
@@ -39,6 +43,8 @@ die() {
 SSH_KEY=
 RECIPIENT=
 SERVICES=1
+SITE_HOST=agenthai.ru
+SITES_DIR=/etc/nginx/sites-available
 
 # Reads the first value line of a file (not empty, not a comment).
 first_line() {
@@ -55,6 +61,8 @@ while [ $# -gt 0 ]; do
         --age-recipient-file) [ $# -ge 2 ] || die "--age-recipient-file needs a path" 2
             [ -r "$2" ] || die "cannot read $2" 2
             RECIPIENT=$(sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$2"); shift 2 ;;
+        --site-host) [ $# -ge 2 ] || die "--site-host needs a value" 2; SITE_HOST=$2; shift 2 ;;
+        --sites-dir) [ $# -ge 2 ] || die "--sites-dir needs a path" 2; SITES_DIR=$2; shift 2 ;;
         --no-services) SERVICES=0; shift ;;
         *) die "unknown argument: $1" 2 ;;
     esac
@@ -100,6 +108,24 @@ SSHD=$(command -v sshd 2>/dev/null || true)
 for f in hub-snapshot.py snapshot-serve.sh; do
     [ -f "$SRC_DIR/$f" ] || die "missing $SRC_DIR/$f"
 done
+
+# ---- the nginx site of the hub: found by server_name, before anything is touched ----
+# A file counts when a server_name directive lists SITE_HOST as a whole name.
+SITE_FILES=
+SITE_COUNT=0
+for site in "$SITES_DIR"/*; do
+    [ -f "$site" ] || continue
+    if sed -n 's/^[[:space:]]*server_name[[:space:]][[:space:]]*\([^;]*\);.*/\1/p' "$site" |
+        tr -s ' \t' '\n\n' | grep -qxF -- "$SITE_HOST"; then
+        SITE_FILES="$SITE_FILES $site"
+        SITE_COUNT=$((SITE_COUNT + 1))
+    fi
+done
+case "$SITE_COUNT" in
+    1) SITE_FILE=${SITE_FILES# } ;;
+    0) die "no nginx site in $SITES_DIR has server_name $SITE_HOST (--site-host / --sites-dir); nothing was changed" ;;
+    *) die "$SITE_COUNT nginx sites in $SITES_DIR have server_name $SITE_HOST:$SITE_FILES; nothing was changed" ;;
+esac
 
 AUTH_KEYS=$HOME_DIR/.ssh/authorized_keys
 # An earlier installed key is kept; its options are rebuilt below.
@@ -163,8 +189,15 @@ fi
 
 
 # What the archive may contain. Written once; the owner edits it afterwards.
+DEFAULT_ENTRIES="unit haiplane-hub
+required /etc/georoute
+required /etc/systemd/networkd.conf.d
+required /etc/fail2ban/jail.local
+required $SITE_FILE
+required /etc/openclaw-hub
+optional /etc/haiplane-backup"
 if [ ! -f "$ETC_DIR/paths.conf" ]; then
-    cat >"$TMP/paths.conf" <<'EOF'
+    cat >"$TMP/paths.conf" <<EOF
 # Allowlist of the daily settings archive (#1707). Nothing outside it is read.
 #   unit NAME            unit file, its drop-ins and its EnvironmentFiles (required)
 #   optional-unit NAME   the same, skipped when the unit does not exist
@@ -172,15 +205,27 @@ if [ ! -f "$ETC_DIR/paths.conf" ]; then
 #   optional PATH        file or directory; missing = skipped
 # Symlinks are never followed out of the allowlist. TLS keys are not listed on
 # purpose: after a restore the certificate is issued again (certbot).
-unit haiplane-hub
-required /etc/georoute
-required /etc/systemd/networkd.conf.d
-required /etc/fail2ban/jail.local
-required /etc/nginx/sites-available/agenthai.ru
+$DEFAULT_ENTRIES
 # optional-unit haiplane-hub-poller
 # optional /etc/haiplane-review-runner
 EOF
     put_file "$ETC_DIR/paths.conf" 0644 "$TMP/paths.conf"
+else
+    # An existing paths.conf is the owner's: it is never rewritten. What differs from
+    # the defaults is only reported (stderr), so the owner can correct it by hand.
+    printf '%s\n' "$DEFAULT_ENTRIES" | while IFS= read -r entry; do
+        grep -qxF -- "$entry" "$ETC_DIR/paths.conf" ||
+            echo "warning: $ETC_DIR/paths.conf lacks the default entry: $entry" >&2
+    done
+    while read -r kind value; do
+        [ "$kind" = required ] || continue
+        [ -e "$value" ] && continue
+        case "$value" in
+            "$SITES_DIR"/* | */sites-available/*)
+                echo "warning: $ETC_DIR/paths.conf: required path $value does not exist; the site of $SITE_HOST is $SITE_FILE: replace the entry with 'required $SITE_FILE'" >&2 ;;
+            *) echo "warning: $ETC_DIR/paths.conf: required path $value does not exist on this machine" >&2 ;;
+        esac
+    done <"$ETC_DIR/paths.conf"
 fi
 
 # ---- sshd ---------------------------------------------------------------------
