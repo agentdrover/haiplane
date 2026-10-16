@@ -184,13 +184,22 @@ def _addopts_tokens(addopts: object) -> list[str]:
 
 
 def test_the_ci_test_step_runs_pytest_in_parallel() -> None:
-    run = _step_by_id("tests").get("run", "")
+    # #1767: the suite runs in the step of each part (job `pytest`); the step
+    # `tests` of job `test` only judges the result of the parts.
+    run = _step_by_id("shard").get("run", "")
     tokens = _split(run)
-    assert "pytest" in tokens, f"шаг tests больше не гоняет pytest: {run!r}"
+    assert "pytest" in tokens, f"шаг части больше не гоняет pytest: {run!r}"
     assert _carries_parallel_flag(tokens), (
-        f"шаг tests потерял флаг параллельности: {run!r}. Порядок и написание "
+        f"шаг части потерял флаг параллельности: {run!r}. Порядок и написание "
         "флага роли не играют — проверяются токены, а не подстрока."
     )
+    # The part is a parallel run INSIDE the part: the split plugin is loaded by
+    # this command and the xdist flag follows it (pytest's own arguments).
+    argv = _pytest_argv(tokens)
+    assert argv[:2] == ["-p", "scripts.pytest_shard"], argv
+    # The step that judges the parts never runs pytest itself: a second run of
+    # the suite in job `test` would undo what the split gained.
+    assert "pytest" not in _split(_step_by_id("tests").get("run", ""))
 
 
 def test_the_make_target_runs_pytest_in_parallel() -> None:

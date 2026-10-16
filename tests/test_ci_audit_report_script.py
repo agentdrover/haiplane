@@ -99,7 +99,16 @@ def test_the_audit_step_cannot_block_delivery():
         steps["Upload results for the trusted report"].get("continue-on-error") is True
     )
 
-    for blocking in ("Lint", "Test", "Secret scan", "Static security scan"):
+    # #1767: the suite runs in the parts of job `pytest`; the step of job `test`
+    # that judges their result is the one named below.
+    parts = {s["name"]: s for s in workflow["jobs"]["pytest"]["steps"]}
+    assert not parts["Test"].get("continue-on-error"), "a test part must fail the run"
+    for blocking in (
+        "Lint",
+        "Tests outcome of the three parts",
+        "Secret scan",
+        "Static security scan",
+    ):
         assert not steps[blocking].get("continue-on-error"), (
             f"{blocking} judges this PR's own code and must still fail the job"
         )
