@@ -1038,7 +1038,30 @@ async def return_task_to_open(
     return True
 
 
-async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[int]:
+async def _release_atomically(
+    db: aiosqlite.Connection, task_id: int, **kwargs: Any
+) -> bool:
+    """``return_task_to_open`` целиком или никак — и в чужой транзакции тоже.
+
+    ``write_transaction`` во вложенном вызове ничего не откатывает (владелец
+    снаружи); SAVEPOINT откатывает именно эту задачу, а владелец потом коммитит
+    остальное (#1712).
+    """
+    async with write_transaction(db):
+        await db.execute("SAVEPOINT reaper_release")
+        try:
+            freed = await return_task_to_open(db, task_id, **kwargs)
+        except BaseException:
+            await db.execute("ROLLBACK TO reaper_release")
+            await db.execute("RELEASE reaper_release")
+            raise
+        await db.execute("RELEASE reaper_release")
+        return freed
+
+
+async def release_expired_implementer_tasks(
+    db: aiosqlite.Connection, failed: set[int] | None = None
+) -> list[int]:
     """Return bound pair tasks to open when their implementer session is dead.
 
     Intake TTL is unchanged (#983 out of scope). A live token must not trip
@@ -1080,18 +1103,19 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
         # must not leave half of it behind — nor an open write transaction that
         # the next pass would commit as if it were its own.
         try:
-            async with write_transaction(db):
-                freed = await return_task_to_open(
-                    db,
-                    task_id,
-                    from_status=from_status,
-                    note="Implementer pairing session expired; task returned to open.",
-                    event_kind="chat_pair_implementer_expired",
-                    # #1712: a task another agent holds now is not this session's.
-                    holders=frozenset(principals),
-                )
+            freed = await _release_atomically(
+                db,
+                task_id,
+                from_status=from_status,
+                note="Implementer pairing session expired; task returned to open.",
+                event_kind="chat_pair_implementer_expired",
+                # #1712: a task another agent holds now is not this session's.
+                holders=frozenset(principals),
+            )
         except Exception:  # noqa: BLE001 - one task must not stop the others
             log.exception("Chat-pair reaper: releasing task #%d failed", task_id)
+            if failed is not None:
+                failed.add(task_id)  # its dead sessions are the retry evidence
             continue
         if freed:
             released.append(task_id)
@@ -1112,7 +1136,8 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     Dead implementer sessions unstick their bound pair task first (#983),
     otherwise purge would delete the only row that still named the task.
     """
-    await release_expired_implementer_tasks(db)
+    unreleased: set[int] = set()
+    await release_expired_implementer_tasks(db, unreleased)
     hours = int(config.CHAT_PAIR_SPENT_RETENTION_HOURS)
     # Reviewer rows stay a window past their end (#1694): a refused redeem is
     # explained by looking the row up, and a row dropped the minute it expired
@@ -1125,9 +1150,14 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
         "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))))",
         (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
     )
+    # A task whose release just failed keeps its dead sessions: they are the
+    # only thing the next pass can find it by (#1712).
+    keep = ", ".join("?" for _ in unreleased)
     sessions = await db.execute(
-        "DELETE FROM chat_pair_sessions WHERE expires_at < datetime('now') "
-        "OR revoked_at IS NOT NULL"
+        "DELETE FROM chat_pair_sessions WHERE (expires_at < datetime('now') "  # nosec B608 - placeholders only
+        "OR revoked_at IS NOT NULL)"
+        + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
+        tuple(sorted(unreleased)),
     )
     removed = int(codes.rowcount or 0) + int(sessions.rowcount or 0)
     await db.commit()

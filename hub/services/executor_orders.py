@@ -1012,6 +1012,27 @@ async def _fields_hold_the_code(
     return False
 
 
+def _check_report_fields(outcome: str, sha: str, branch: str, note: str) -> None:
+    """Поля итога прогона до всякой записи: форма и секреты (422)."""
+    if outcome not in REPORT_OUTCOMES:
+        raise HostError(422, f"outcome: один из {', '.join(REPORT_OUTCOMES)}")
+    if sha and not _SHA.match(sha):
+        raise HostError(422, "sha: от 7 до 64 шестнадцатеричных символов")
+    if branch and not _BRANCH.match(branch):
+        raise HostError(422, "branch: недопустимое имя ветки")
+    why = note_refusal(note)
+    if why:
+        raise HostError(422, why)
+    # Ветка и sha — не заметка, но тоже строки в ленте: токен сессии или ключа
+    # в имени ветки — тот же секрет в той же ленте. Длинная строка, не похожая на слаг
+    # ветки (у слага слова короткие, у токена разрывов нет), — тоже отказ.
+    for field in (branch, sha):
+        if any(shape.search(field) for shape in _SECRET_SHAPES):
+            raise HostError(422, "branch/sha: похоже на токен или ключ")
+        if any(_looks_like_token(run) for run in _LONG_TOKEN.findall(field)):
+            raise HostError(422, "branch/sha: длинная строка похожа на токен")
+
+
 async def report_outcome(
     db: aiosqlite.Connection,
     host: str,
@@ -1030,23 +1051,7 @@ async def report_outcome(
     Работает и на закрытом заказе: сдача закрывает его раньше, чем хост
     успевает сказать, чем кончился прогон.
     """
-    if outcome not in REPORT_OUTCOMES:
-        raise HostError(422, f"outcome: один из {', '.join(REPORT_OUTCOMES)}")
-    if sha and not _SHA.match(sha):
-        raise HostError(422, "sha: от 7 до 64 шестнадцатеричных символов")
-    if branch and not _BRANCH.match(branch):
-        raise HostError(422, "branch: недопустимое имя ветки")
-    why = note_refusal(note)
-    if why:
-        raise HostError(422, why)
-    # Ветка и sha — не заметка, но тоже строки в ленте: токен сессии или ключа
-    # в имени ветки — тот же секрет в той же ленте. Длинная строка, не похожая на слаг
-    # ветки (у слага слова короткие, у токена разрывов нет), — тоже отказ.
-    for field in (branch, sha):
-        if any(shape.search(field) for shape in _SECRET_SHAPES):
-            raise HostError(422, "branch/sha: похоже на токен или ключ")
-        if any(_looks_like_token(run) for run in _LONG_TOKEN.findall(field)):
-            raise HostError(422, "branch/sha: длинная строка похожа на токен")
+    _check_report_fields(outcome, sha, branch, note)
     async with write_transaction(db):
         order = await _own_order(db, host, order_id)
         if order is None:
@@ -1099,5 +1104,12 @@ async def report_outcome(
             # Прогон на хосте кончился без сдачи: бронь не ждёт конца сессии
             # (решение владельца 16.10). Сдача (submitted) заказ не закрывает —
             # его закрывает сама сдача.
+            # Хост сообщил, что прогон кончился: сессия этого прогона больше не
+            # исполнитель, и пока она жива, слот нельзя отдавать второму.
+            await db.execute(
+                "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+                "WHERE executor_run_id = ? AND revoked_at IS NULL",
+                (int(order["executor_run_id"]),),
+            )
             await close_order(db, order, f"reported_{outcome}", RUN_OUTCOME_ABORTED)
     return {"id": order["id"], "outcome": outcome, "duplicate": False}

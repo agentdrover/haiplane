@@ -863,6 +863,22 @@ async def _reaper_failure_part(world, monkeypatch):
     await world.db.commit()
     assert (await repo.get_task(world.db, task_id))["status"] == "running"
     assert (await _order_row(world, alive["order"]["id"]))["state"] == "redeemed"
+    # Очистка не уносит улики неудавшегося возврата: мёртвая сессия остаётся.
+    with monkeypatch.context() as patch:
+        patch.setattr(orders, "close_for_released_task", _boom)
+        await cp.purge_expired(world.db)
+    assert await _rows(
+        world.db,
+        "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ?",
+        (task_id,),
+    )
+    # Внутри чужой транзакции сбой откатывает именно эту задачу (SAVEPOINT).
+    await world.db.execute("UPDATE tasks SET title = title WHERE id = ?", (task_id,))
+    with monkeypatch.context() as patch:
+        patch.setattr(orders, "close_for_released_task", _boom)
+        assert await cp.release_expired_implementer_tasks(world.db) == []
+    await world.db.commit()
+    assert (await repo.get_task(world.db, task_id))["status"] == "running"
     # Следующий проход без сбоя доводит то же самое до конца.
     assert await cp.release_expired_implementer_tasks(world.db) == [task_id]
     await world.db.commit()
@@ -1571,6 +1587,9 @@ async def _rescued_part(world):
         task_id = await _task(world, f"итог {outcome}")
         assert (await _launch(world, task_id, "k9")).status_code == 200
         got = (await _orders(world, "k9")).json()["orders"][0]
+        redeemed = await _redeem(world, _code_of(world, got, "k9"))
+        assert redeemed.status_code == 200
+        token = {"Authorization": f"Bearer {redeemed.json()['token']}"}
         posted = await world.client.post(
             f"/api/executor-hosts/k9/orders/{got['id']}/report",
             json={"outcome": outcome},
@@ -1581,6 +1600,10 @@ async def _rescued_part(world):
         assert (row["state"] == "closed") is closes, (outcome, row["state"])
         if closes:
             assert row["close_reason"] == "reported_rescued"
+            # Живая сессия закрытого прогона отозвана: слот не пересечётся с ней.
+            assert (
+                await world.client.get(f"/api/tasks/{task_id}", headers=token)
+            ).status_code == 401
             assert row["code_ciphertext"] == ""
             run = (
                 await _rows(
