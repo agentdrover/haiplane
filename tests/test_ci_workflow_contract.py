@@ -527,7 +527,7 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         assert has_report is (name == "test"), name
         expected = {
             "test": ["hub-ci-results-${{ github.run_attempt }}"],
-            "evidence": ["hub-ci-evidence-${{ github.run_attempt }}"],
+            "evidence": ["hub-ci-evidence"],
         }.get(name, [])
         assert uploads == expected, name
 
@@ -613,7 +613,7 @@ def test_status_functions_are_used_only_in_if_conditions() -> None:
 MUTATIONS_STEP = "Mutations of changed functions (warning only)"
 BASELINE_STEP = "Red-test baseline on merge-base (data only)"
 EVIDENCE_GATE = "needs.treedup.outputs.evidence_run == 'true'"
-EVIDENCE_ARTIFACT = "hub-ci-evidence-${{ github.run_attempt }}"
+EVIDENCE_ARTIFACT = "hub-ci-evidence"
 
 
 def _same_setup(left: dict, right: dict) -> bool:
@@ -673,6 +673,8 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
         s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
     )
     assert upload["with"]["name"] == EVIDENCE_ARTIFACT
+    assert "run_attempt" not in upload["with"]["name"], "partial reruns find it"
+    assert upload["with"]["overwrite"] is True
     assert not upload["with"]["name"].startswith("hub-ci-results-")
     assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
     assert upload["continue-on-error"] is True
