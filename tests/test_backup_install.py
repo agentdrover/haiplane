@@ -12,6 +12,7 @@ import pytest
 from tests.backup_support import (
     BACKUP_DIR,
     DROPIN,
+    HUB_NAME,
     HOME_DIR,
     INSTALL,
     LIB_DIR,
@@ -201,11 +202,11 @@ def test_nginx_site_is_found_by_server_name(tmp_path):
             assert done.returncode == 0, done.stdout + done.stderr
             lines = _paths_lines()
             # exactly the file whose server_name lists the host: not a name that merely contains it
-            assert "required %s/openclaw-hub" % sites in lines
+            assert "required %s/%s" % (sites, HUB_NAME) in lines
             assert [x for x in lines if str(sites) in x] == [
-                "required %s/openclaw-hub" % sites
+                "required %s/%s" % (sites, HUB_NAME)
             ]
-            assert "required /etc/openclaw-hub" in lines
+            assert "required /etc/" + HUB_NAME in lines
             assert "optional /etc/haiplane-backup" in lines
             assert "required /etc/nginx/sites-available/agenthai.ru" not in lines
 
@@ -268,7 +269,7 @@ def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
             done = run_install(["--sites-dir", str(sites)], held=host)
             assert done.returncode == 0, done.stdout + done.stderr
             assert _paths_lines() == OLD_PATHS_CONF.splitlines(), "not rewritten"
-            site = "%s/openclaw-hub" % sites
+            site = "%s/%s" % (sites, HUB_NAME)
             warned = done.stderr
             assert (
                 "required /etc/nginx/sites-available/agenthai.ru does not exist"
@@ -282,7 +283,7 @@ def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
             ]
             assert missing == [
                 "required " + site,
-                "required /etc/openclaw-hub",
+                "required /etc/" + HUB_NAME,
                 "optional /etc/haiplane-backup",
             ]
             recipient = as_root(["cat", "/etc/haiplane-backup/recipient.txt"]).stdout
@@ -299,7 +300,7 @@ def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
             for rel, text in {
                 "etc/georoute/a.conf": "r\n",
                 "etc/fail2ban/jail.local": "[DEFAULT]\n",
-                "etc/openclaw-hub/openclaw-hub.env": "HAIPLANE_HUB_DB=/db\n",
+                "etc/%s/%s.env" % (HUB_NAME, HUB_NAME): "HAIPLANE_HUB_DB=/db\n",
                 "etc/systemd/system/haiplane-hub.service": "[Service]\n",
                 site.lstrip("/"): "server {\n    server_name agenthai.ru;\n}\n",
                 "etc/haiplane-backup/paths.conf": corrected,

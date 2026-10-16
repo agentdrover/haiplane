@@ -448,7 +448,7 @@ def _unit_world(world, first_text, second_text):
     """Two EnvironmentFiles printed the way systemd prints them (a line per file)."""
     root = world.root / "unitroot"
     files = {
-        "etc/hub/openclaw-hub.env": first_text,
+        "etc/hub/first.env": first_text,
         "etc/hub/secrets.env": second_text,
         "etc/systemd/system/haiplane-hub.service": "[Service]\n",
         "etc/systemd/system/haiplane-hub.service.d/10.conf": "[Service]\nNice=1\n",
@@ -463,7 +463,7 @@ def _unit_world(world, first_text, second_text):
             "FragmentPath=/etc/systemd/system/haiplane-hub.service",
             "DropInPaths=/etc/systemd/system/haiplane-hub.service.d/10.conf "
             "/etc/systemd/system/haiplane-hub.service.d/20.conf",
-            "EnvironmentFiles=/etc/hub/openclaw-hub.env (ignore_errors=no)",
+            "EnvironmentFiles=/etc/hub/first.env (ignore_errors=no)",
             "EnvironmentFiles=/etc/hub/secrets.env (ignore_errors=yes)",
             "Environment=LANG=C PORT=8080 NAME=hub",
         ]
@@ -496,7 +496,7 @@ def test_every_environment_file_of_the_unit_is_read(world, capsys):
         names = set(tar.getnames())
         manifest = json.loads(tar.extractfile("MANIFEST.json").read())
     expected = {
-        "etc/hub/openclaw-hub.env",
+        "etc/hub/first.env",
         "etc/hub/secrets.env",
         "etc/systemd/system/haiplane-hub.service.d/10.conf",
         "etc/systemd/system/haiplane-hub.service.d/20.conf",

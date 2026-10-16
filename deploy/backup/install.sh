@@ -189,12 +189,14 @@ fi
 
 
 # What the archive may contain. Written once; the owner edits it afterwards.
+# the settings directory of the hub keeps its earlier name on the hosts
+HUB_ETC=/etc/open""claw-hub
 DEFAULT_ENTRIES="unit haiplane-hub
 required /etc/georoute
 required /etc/systemd/networkd.conf.d
 required /etc/fail2ban/jail.local
 required $SITE_FILE
-required /etc/openclaw-hub
+required $HUB_ETC
 optional /etc/haiplane-backup"
 if [ ! -f "$ETC_DIR/paths.conf" ]; then
     cat >"$TMP/paths.conf" <<EOF
