@@ -652,6 +652,120 @@ async def test_web_pair_form_issues_code(hub):
     assert as_agent.status_code in (303, 403), as_agent.text
 
 
+async def _web_issue(hub) -> tuple[str, str]:
+    """Войти человеком, взять страницу и POST web-start: (html, csrf)."""
+    session_token = await admin_svc.create_browser_session(hub.db, hub.human_id)
+    hub.client.cookies.set(config.HUB_COOKIE_NAME, session_token)
+    page = await hub.client.get("/chat-pair", headers={"Accept": "text/html"})
+    csrf = page.cookies.get(CSRF_COOKIE_NAME)
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    issued = await hub.client.post(
+        "/chat-pair/web-start",
+        data={"csrf_token": csrf},
+        headers={"Accept": "text/html"},
+    )
+    assert issued.status_code == 200, issued.text
+    assert issued.headers.get("cache-control") == "no-store"
+    return issued.text, csrf
+
+
+def _textarea_text(html_text: str) -> str:
+    import html as html_lib
+    import re
+
+    match = re.search(
+        r'<textarea[^>]*id="chat-pair-prompt-text"[^>]*>(.*?)</textarea>',
+        html_text,
+        re.S,
+    )
+    assert match, "textarea с инструкцией не найдена"
+    return html_lib.unescape(match.group(1))
+
+
+@pytest.mark.asyncio
+async def test_issued_code_page_offers_code_and_agent_prompt(hub, monkeypatch):
+    """AC-1 (#1715): код, кнопка кода, textarea с инструкцией, кнопка инструкции."""
+    import re
+    from html.parser import HTMLParser
+
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example.test")
+    html_text, _ = await _web_issue(hub)
+
+    code = re.search(r"AH-[A-Z0-9]+", html_text).group(0)
+    assert html_text.count(f">{code}<") == 1
+
+    prompt = _textarea_text(html_text)
+    assert "https://hub.example.test/api/auth/chat-pair/redeem" in prompt
+    assert f'{{"code":"{code}"}}' in prompt
+    assert prompt.count(code) == 2  # строка «Код:» и curl
+
+    class Buttons(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.depth_form = 0
+            self.copy_buttons: list[tuple[dict, int]] = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form":
+                self.depth_form += 1
+            if tag == "button" and "data-copy-source" in attrs:
+                self.copy_buttons.append((attrs, self.depth_form))
+
+        def handle_endtag(self, tag):
+            if tag == "form":
+                self.depth_form -= 1
+
+    parser = Buttons()
+    parser.feed(html_text)
+    sources = {a["data-copy-source"] for a, _ in parser.copy_buttons}
+    assert sources == {"chat-pair-code-text", "chat-pair-prompt-text"}
+    for attrs, in_form in parser.copy_buttons:
+        assert attrs.get("type") == "button"
+        assert in_form == 0
+
+
+@pytest.mark.asyncio
+async def test_no_prompt_without_a_code(hub):
+    """AC-2 (#1715): GET страницы не содержит ни кода, ни инструкции, ни кнопок."""
+    session_token = await admin_svc.create_browser_session(hub.db, hub.human_id)
+    hub.client.cookies.set(config.HUB_COOKIE_NAME, session_token)
+    page = await hub.client.get("/chat-pair", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    assert page.headers.get("cache-control") == "no-store"
+    for needle in (
+        "AH-",
+        "chat-pair-code-text",
+        "chat-pair-prompt-text",
+        "data-copy-source",
+        "Инструкция для агента",
+        "Скопировать",
+        "clipboard",
+    ):
+        assert needle not in page.text, needle
+
+
+def test_agent_prompt_states_the_route_and_the_rules():
+    """AC-3 (#1715): маршрут, whoami, постановка, четыре правила, без секретов."""
+    prompt = cp.render_agent_prompt("AH-7K2M9QRS", "https://hub.example.test")
+
+    assert "https://hub.example.test/api/auth/chat-pair/redeem" in prompt
+    assert "/api/whoami" in prompt
+    assert "/api/tasks" in prompt
+    assert "AH-7K2M9QRS" in prompt
+    # четыре правила
+    assert "Токен не печатай" in prompt
+    assert "run_immediately" in prompt and "chat_pair_run_forbidden" in prompt
+    assert "chat_pair_gate_forbidden" in prompt and "границу канала" in prompt
+    assert "401 chat_pair_invalid" in prompt
+    # ни токена, ни пути сервера: только base_url и код
+    assert "Bearer <token>" in prompt
+    for forbidden in ("/var/lib", "/home/", "/etc/", "HAIPLANE_HUB_TOKEN", "sk-"):
+        assert forbidden not in prompt
+    stripped = prompt.replace("https://hub.example.test", "").replace("AH-7K2M9QRS", "")
+    assert "hub.example.test" not in stripped
+
+
 @pytest.mark.asyncio
 async def test_open_mode_refuses_chat_pair(client, db, monkeypatch):
     """AC-20 (спека AC-13): без auth канала личности не существует."""
