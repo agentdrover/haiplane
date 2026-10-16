@@ -1771,3 +1771,39 @@ async def test_the_repin_leaves_a_newer_submissions_pin_alone(
     row = dict(await repo.get_task(db, task_id))
     assert row["submission_sha"] == "z" * 40, "the newer submission keeps its pin"
     assert not db.in_transaction, "the short write is committed before the network"
+
+
+@pytest.mark.parametrize("change", ["replaced", "returned"])
+async def test_a_replacement_while_the_headless_merge_is_tidied_opens_no_new_submission(
+    db: aiosqlite.Connection, monkeypatch, change: str
+):
+    """Machine review 948 (high): the post-merge transition must not read the live verdict."""
+    from hub import poller
+
+    task_id, git = await _mergeable_review_task(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+    generation = snapshot["submission_generation"]
+
+    real_tidy = poller._record_merge_and_tidy
+
+    async def tidy(*args, **kwargs):
+        await real_tidy(*args, **kwargs)  # the merge is recorded, as in production
+        await _fire(db, task_id, change)  # then the world moves, before completion
+
+    monkeypatch.setattr(poller, "_record_merge_and_tidy", tidy)
+    fixes: list[str] = []
+    monkeypatch.setattr(
+        poller.services,
+        "dispatch_fix",
+        AsyncMock(side_effect=lambda *a, **k: fixes.append("fix")),
+    )
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(db, snapshot)
+    row = dict(await repo.get_task(db, task_id))
+    assert git.merge_pr.await_count == 1
+    assert row["submission_generation"] == generation, "no new submission was opened"
+    assert row["status"] != "completed" and fixes == []
+    feed = " ".join(
+        (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "НЕ завершена" in feed

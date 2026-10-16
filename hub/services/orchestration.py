@@ -4356,6 +4356,15 @@ async def _gate_merge_outcome(key: tuple[int, int]) -> GateMergeSeen:
     return GateMergeSeen.MERGED if merged else GateMergeSeen.ABSENT
 
 
+#: The columns the review gate (``completion_requires_review``) reads.
+APPROVAL_FIELDS = (
+    "review_verdict",
+    "review_verdict_generation",
+    "review_verdict_closed_generation",
+    "submission_generation",
+)
+
+
 class MergeStep(enum.Enum):
     """Чем кончилась попытка мержа в единственной точке вызова форжа (#1706)."""
 
@@ -6285,7 +6294,12 @@ async def transition_after_agent_done(
         # anything here opens a transaction (pair mode arrives with this done).
         from hub.services.lifecycle import prepare_ci_standing
 
-        task = await prepare_ci_standing(db, task)
+        # prepare_ci_standing returns a FRESH row; the approval the caller acted
+        # under is kept, or a verdict replaced during that call would turn a
+        # delivered task into a new submission (#1706). The write of
+        # ``completed`` asks the live row itself.
+        approval = {k: task.get(k) for k in APPROVAL_FIELDS}
+        task = {**await prepare_ci_standing(db, task), **approval}
     task_id = task["id"]
     branch = task.get("branch")
     if has_done and automation_not_applicable(task):

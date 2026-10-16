@@ -732,6 +732,12 @@ async def _deliver_approved_review(db, task: dict) -> None:
     # transition completes without bumping the generation.
     refreshed_row = await repo.get_task(db, task["id"])
     refreshed = dict(refreshed_row) if refreshed_row else task
+    # #1706: the transition decides "does this need a review?" from the row it is
+    # given. A verdict replaced while the merge was being tidied would read as
+    # "yes" and open a NEW submission (and a fix) over a branch that is already
+    # in the base. It gets the approval the merge was made under; the write of
+    # ``completed`` asks the live row itself, atomically, and says so if it is gone.
+    refreshed = {**refreshed, **{k: task.get(k) for k in services.APPROVAL_FIELDS}}
     await services.transition_after_agent_done(db, refreshed, has_done=True)
     await db.commit()
     log.info("Poll: task #%d review → approved", task["id"])

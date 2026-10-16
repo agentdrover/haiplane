@@ -143,6 +143,7 @@ from hub.services.lifecycle import (
 )
 from hub.services.orchestration import (
     APPROVAL_CHANGED_PREFIX,
+    APPROVAL_FIELDS,
     APPROVAL_UNPINNED_PREFIX,
     CI_BUDGET_GATE_PREFIXES,
     PR_DRAFT_PREFIX,
@@ -203,6 +204,7 @@ __all__ = [
     "MESSAGE_EVENT_KIND",
     "ProjectBindError",
     "APPROVAL_CHANGED_PREFIX",
+    "APPROVAL_FIELDS",
     "APPROVAL_UNPINNED_PREFIX",
     "CI_BUDGET_GATE_PREFIXES",
     "PR_DRAFT_PREFIX",
