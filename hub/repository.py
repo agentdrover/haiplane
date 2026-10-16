@@ -6887,6 +6887,15 @@ async def set_executor_run_starting_ref(
     )
 
 
+async def set_executor_run_model(db: aiosqlite.Connection, row_id: int, model: str) -> None:
+    """Записать вариант модели, фактически отправленный провайдеру (#1769).
+
+    Бронь пишет голую модель ДО заказа; после заказа строка называет вариант
+    с params (или голую модель после сброса). Коммит — за вызывающим.
+    """
+    await db.execute("UPDATE executor_runs SET model=? WHERE id=?", (model, row_id))
+
+
 async def wait_for_executor_cost(
     db: aiosqlite.Connection, row_id: int, minutes: int
 ) -> bool:
