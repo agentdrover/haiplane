@@ -444,11 +444,11 @@ def test_database_path_comes_from_the_unit_and_files_override(world, capsys):
     assert run(world, "hourly", capsys) == (1, "failed kind=hourly reason=no_db_path")
 
 
-def _unit_world(world, first_text, second_text):
+def _unit_world(world, first_text, second_text, first_path="etc/hub/first.env"):
     """Two EnvironmentFiles printed the way systemd prints them (a line per file)."""
     root = world.root / "unitroot"
     files = {
-        "etc/hub/first.env": first_text,
+        first_path: first_text,
         "etc/hub/secrets.env": second_text,
         "etc/systemd/system/haiplane-hub.service": "[Service]\n",
         "etc/systemd/system/haiplane-hub.service.d/10.conf": "[Service]\nNice=1\n",
@@ -463,7 +463,7 @@ def _unit_world(world, first_text, second_text):
             "FragmentPath=/etc/systemd/system/haiplane-hub.service",
             "DropInPaths=/etc/systemd/system/haiplane-hub.service.d/10.conf "
             "/etc/systemd/system/haiplane-hub.service.d/20.conf",
-            "EnvironmentFiles=/etc/hub/first.env (ignore_errors=no)",
+            "EnvironmentFiles=/%s (ignore_errors=no)" % first_path,
             "EnvironmentFiles=/etc/hub/secrets.env (ignore_errors=yes)",
             "Environment=LANG=C PORT=8080 NAME=hub",
         ]
@@ -503,6 +503,19 @@ def test_every_environment_file_of_the_unit_is_read(world, capsys):
     }
     assert expected <= names
     assert expected <= {f["path"] for f in manifest["files"]}
+
+
+def test_environment_file_path_may_contain_spaces(world, capsys):
+    spaced = "etc/hub config/base.env"
+    _unit_world(world, "HAIPLANE_HUB_DB=%s\n" % world.db, "A=1\n", first_path=spaced)
+    rc, line = run(world, "hourly", capsys)
+    assert rc == 0, line
+    world.clock.tick()
+    rc, line = run(world, "daily", capsys)
+    assert rc == 0, line
+    (data,) = world.state.glob("conf-*.tar.age")
+    with tarfile.open(fileobj=io.BytesIO(decrypt(world.identity, data))) as tar:
+        assert spaced in tar.getnames()
 
 
 def test_later_environment_file_overrides_and_snap_db_wins(world, capsys):

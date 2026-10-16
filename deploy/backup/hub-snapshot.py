@@ -45,7 +45,8 @@ HOURLY_KEEP = 3
 DAILY_KEEP = 2
 MANIFEST_NAME = "MANIFEST.json"
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-ENV_FILE_RE = re.compile(r"(\S+) \(ignore_errors=(yes|no)\)")
+# one EnvironmentFiles= line per file: the path is everything before the last suffix
+ENV_FILE_RE = re.compile(r"^(.+) \(ignore_errors=(yes|no)\)\s*$")
 
 KINDS = {
     "hourly": {"prefix": "hub", "suffix": ".db.age", "keep": HOURLY_KEEP},
@@ -340,16 +341,17 @@ def _unit_props(cfg, unit):
         key, _, value = line.partition("=")
         if key == "EnvironmentFiles" and key in props:
             # systemd prints one line per file; the order is the order it loads them in
-            value = props[key] + " " + value if value else props[key]
+            value = "\n".join(v for v in (props[key], value) if v)
         props[key] = value
     return props
 
 
 def _env_files(props):
-    return [
-        (m.group(1).lstrip("-"), m.group(2) == "yes")
-        for m in ENV_FILE_RE.finditer(props.get("EnvironmentFiles", ""))
-    ]
+    matches = (
+        ENV_FILE_RE.match(line)
+        for line in props.get("EnvironmentFiles", "").split("\n")
+    )
+    return [(m.group(1).lstrip("-"), m.group(2) == "yes") for m in matches if m]
 
 
 def _env_assignments(text):

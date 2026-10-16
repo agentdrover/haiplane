@@ -11,6 +11,7 @@
 #                          directory whose server_name lists HOST (default agenthai.ru);
 #                          no such file, or more than one, stops the install before any change
 # --sites-dir DIR          that directory (default /etc/nginx/sites-available)
+# --nginx-site PATH        use this file as the nginx site, no search (it must exist)
 # --no-services            do not touch systemd and do not reload sshd (a host
 #                          without a running systemd, e.g. a CI container)
 # Keys are arguments or files; no key is kept in the repository. Without a key
@@ -45,6 +46,7 @@ RECIPIENT=
 SERVICES=1
 SITE_HOST=agenthai.ru
 SITES_DIR=/etc/nginx/sites-available
+NGINX_SITE=
 
 # Reads the first value line of a file (not empty, not a comment).
 first_line() {
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
             RECIPIENT=$(sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$2"); shift 2 ;;
         --site-host) [ $# -ge 2 ] || die "--site-host needs a value" 2; SITE_HOST=$2; shift 2 ;;
         --sites-dir) [ $# -ge 2 ] || die "--sites-dir needs a path" 2; SITES_DIR=$2; shift 2 ;;
+        --nginx-site) [ $# -ge 2 ] || die "--nginx-site needs a path" 2; NGINX_SITE=$2; shift 2 ;;
         --no-services) SERVICES=0; shift ;;
         *) die "unknown argument: $1" 2 ;;
     esac
@@ -110,22 +113,42 @@ for f in hub-snapshot.py snapshot-serve.sh; do
 done
 
 # ---- the nginx site of the hub: found by server_name, before anything is touched ----
-# A file counts when a server_name directive lists SITE_HOST as a whole name.
-SITE_FILES=
-SITE_COUNT=0
-for site in "$SITES_DIR"/*; do
-    [ -f "$site" ] || continue
-    if sed -n 's/^[[:space:]]*server_name[[:space:]][[:space:]]*\([^;]*\);.*/\1/p' "$site" |
-        tr -s ' \t' '\n\n' | grep -qxF -- "$SITE_HOST"; then
-        SITE_FILES="$SITE_FILES $site"
-        SITE_COUNT=$((SITE_COUNT + 1))
-    fi
-done
-case "$SITE_COUNT" in
-    1) SITE_FILE=${SITE_FILES# } ;;
-    0) die "no nginx site in $SITES_DIR has server_name $SITE_HOST (--site-host / --sites-dir); nothing was changed" ;;
-    *) die "$SITE_COUNT nginx sites in $SITES_DIR have server_name $SITE_HOST:$SITE_FILES; nothing was changed" ;;
-esac
+# A file counts when a server_name directive lists SITE_HOST as a whole name. Comments
+# are cut, the file is split at ';' (so a directive may span lines or follow a '{').
+# `include` is not followed. --nginx-site PATH replaces the search.
+NGINX_ROOT=$(readlink -f "$(dirname "$SITES_DIR")")
+server_names() {
+    sed 's/#.*//' "$1" | tr '\n\t' '  ' | tr ';' '\n' | sed 's/^/ /' |
+        sed -n 's/^.*[[:space:]{}]server_name[[:space:]][[:space:]]*//p'
+}
+if [ -n "$NGINX_SITE" ]; then
+    [ -f "$NGINX_SITE" ] || die "--nginx-site $NGINX_SITE is not an existing regular file; nothing was changed"
+    SITE_FILE=$NGINX_SITE
+else
+    SITE_FILES=
+    SITE_COUNT=0
+    for site in "$SITES_DIR"/*; do
+        [ -f "$site" ] || continue
+        if server_names "$site" | tr -s ' ' '\n' | grep -qxF -- "$SITE_HOST"; then
+            SITE_FILES="$SITE_FILES $site"
+            SITE_COUNT=$((SITE_COUNT + 1))
+        fi
+    done
+    case "$SITE_COUNT" in
+        1) SITE_FILE=${SITE_FILES# } ;;
+        0) die "no nginx site in $SITES_DIR has server_name $SITE_HOST (--site-host / --sites-dir / --nginx-site); nothing was changed" ;;
+        *) die "$SITE_COUNT nginx sites in $SITES_DIR have server_name $SITE_HOST:$SITE_FILES (use --nginx-site PATH); nothing was changed" ;;
+    esac
+fi
+# The archive refuses a link: the allowlist gets the real file, and only inside nginx's tree.
+if [ -L "$SITE_FILE" ]; then
+    REAL_SITE=$(readlink -f "$SITE_FILE")
+    case "$REAL_SITE" in
+        "$NGINX_ROOT"/*) [ -f "$REAL_SITE" ] || die "the link $SITE_FILE does not lead to a regular file; nothing was changed"
+            SITE_FILE=$REAL_SITE ;;
+        *) die "the nginx site $SITE_FILE is a link to $REAL_SITE, outside $NGINX_ROOT; nothing was changed" ;;
+    esac
+fi
 
 AUTH_KEYS=$HOME_DIR/.ssh/authorized_keys
 # An earlier installed key is kept; its options are rebuilt below.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -245,6 +246,73 @@ def test_nginx_site_is_found_by_server_name(tmp_path):
             as_root(["rm", "-f", PATHS_CONF])
 
 
+def test_nginx_site_search_reads_directives_links_and_explicit_path(tmp_path):
+    need_root_host()
+    nginx = tmp_path / "nginx"
+    sites = nginx / "sites-available"
+    real_dir = nginx / "real"
+    outside = tmp_path / "outside"
+    site_text = "server {\n    server_name agenthai.ru;\n}\n"
+
+    def prepare(files, links=()):
+        write_sites(sites, files)
+        for directory in (real_dir, outside):
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True)
+        (real_dir / "site").write_text(site_text)
+        (outside / "site").write_text(site_text)
+        for name, target in links:
+            (sites / name).symlink_to(target)
+
+    def attempt(host, extra=()):
+        as_root(["rm", "-f", PATHS_CONF])
+        before = installed_state()
+        done = run_install(["--sites-dir", str(sites), *extra], held=host)
+        if done.returncode != 0:
+            assert "nothing was changed" in done.stderr, done.stderr
+            assert installed_state() == before
+        return done
+
+    with SharedLock() as host:
+        try:
+            # a name in a comment is not a name
+            prepare(
+                {"c": "server {\n    server_name other.example # agenthai.ru ;\n}\n"}
+            )
+            assert attempt(host).returncode != 0
+            # a directive over several lines, and one right after '{'
+            prepare(
+                {
+                    "m": "server {\n  server_name\n    x.example\n    agenthai.ru\n  ;\n}\n"
+                }
+            )
+            assert attempt(host).returncode == 0
+            assert "required %s/m" % sites in _paths_lines()
+            prepare({"b": "server {server_name agenthai.ru;}\n"})
+            assert attempt(host).returncode == 0
+            assert "required %s/b" % sites in _paths_lines()
+
+            # a link: the real file goes into the allowlist; a link out of nginx's tree is refused
+            prepare({}, links=[("link", real_dir / "site")])
+            assert attempt(host).returncode == 0
+            assert "required %s" % os.path.realpath(real_dir / "site") in _paths_lines()
+            assert not [x for x in _paths_lines() if x.endswith("/link")]
+            prepare({}, links=[("link", outside / "site")])
+            done = attempt(host)
+            assert done.returncode != 0 and "outside" in done.stderr
+
+            # --nginx-site replaces the search and must be an existing regular file
+            prepare({})
+            assert attempt(host).returncode != 0
+            for bad in (str(sites / "absent"), str(sites)):
+                assert attempt(host, ["--nginx-site", bad]).returncode != 0, bad
+            done = attempt(host, ["--nginx-site", str(real_dir / "site")])
+            assert done.returncode == 0, done.stderr
+            assert "required %s" % (real_dir / "site") in _paths_lines()
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
 # paths.conf as the installer of origin/develop wrote it
 OLD_PATHS_CONF = """# Allowlist of the daily settings archive (#1707). Nothing outside it is read.
 unit haiplane-hub
@@ -265,7 +333,8 @@ def test_reinstall_keeps_paths_conf_and_names_missing_defaults(tmp_path):
     with SharedLock() as host:
         try:
             write_sites(sites)
-            as_root(["tee", PATHS_CONF], input=OLD_PATHS_CONF, text=True)
+            as_root(["install", "-d", "-m", "0755", "/etc/haiplane-backup"], check=True)
+            as_root(["tee", PATHS_CONF], input=OLD_PATHS_CONF, text=True, check=True)
             done = run_install(["--sites-dir", str(sites)], held=host)
             assert done.returncode == 0, done.stdout + done.stderr
             assert _paths_lines() == OLD_PATHS_CONF.splitlines(), "not rewritten"
