@@ -39,6 +39,12 @@ jobs:
     # baseline 10 + report 20) plus headroom for the steps that have no ceiling
     # of their own (install, lint, type check, scans).
     timeout-minutes: 90
+    # #1707: the backup tests install a real user and an sshd drop-in on this
+    # disposable runner. With this variable a missing tool or missing root is a
+    # red test, not a skip (tests/backup_support.py::must_have). Job level on
+    # purpose: the AC collector below runs the same tests and must not see a skip.
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
 
     steps:
       - name: Checkout
@@ -62,6 +68,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # #1707: tests/test_backup_install.py and tests/test_snapshot_serve.py run
+      # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
+      # encrypts with real age. No continue-on-error and no `|| true`: if a tool
+      # is missing this step is red, the tests are never skipped.
+      - name: Install age and openssh-server (backup tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
 
       - name: Install dependencies
         # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
