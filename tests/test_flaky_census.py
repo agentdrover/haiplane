@@ -280,3 +280,102 @@ def test_the_names_the_census_searches_for_are_the_names_in_ci_yml() -> None:
     assert fc.TEST_STEP_NAME not in [
         s.get("name") for s in doc["jobs"]["test"]["steps"]
     ]
+
+
+# ---- #1767 (round 2): complete parts, per-part logs, the denominator ----------
+
+
+def _named(*specs: tuple[str, str]) -> list[dict]:
+    """Job-ы частей: (имя, исход Test)."""
+    return [
+        _job(20 + i, name, fc.TEST_STEP_NAME, c) for i, (name, c) in enumerate(specs)
+    ]
+
+
+def test_an_incomplete_set_of_parts_is_unknown_unless_one_failed() -> None:
+    p1, p2, p3 = "Tests part 1/3", "Tests part 2/3", "Tests part 3/3"
+    ok = "success"
+    assert fc.test_step_state(_named((p1, ok), (p2, ok), (p3, ok))) == "success"
+    # one green part of three proves nothing about the other two
+    assert fc.test_step_state(_named((p1, ok))) == "no_step"
+    assert fc.test_step_state(_named((p1, ok), (p3, ok))) == "no_step"
+    assert fc.test_step_state(_named((p1, ok), (p1, ok), (p2, ok))) == "no_step"
+    assert fc.test_step_state(_named((p1, ok), ("Tests part 2/4", ok))) == "no_step"
+    assert fc.test_step_state(_named((p1, ok), ("Tests part x", ok))) == "no_step"
+    # a failure is known even when the set is incomplete
+    assert fc.test_step_state(_named((p1, "failure"))) == "failure"
+    assert fc.test_step_state(_named((p1, ok), (p3, "failure"))) == "failure"
+    gh = _FakeGh(_named((p1, ok)))
+    assert fc.green_attempts(gh, {"id": 9, "run_attempt": 1}) == []
+
+
+def test_the_part_count_is_the_matrix_of_ci_yml() -> None:
+    import re
+
+    import yaml
+
+    doc = yaml.safe_load(
+        (
+            Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+        ).read_text()
+    )
+    part = doc["jobs"]["pytest"]
+    total = len(part["strategy"]["matrix"]["shard"])
+    assert re.search(rf"/{total}$", part["name"]), (part["name"], total)
+    names = [
+        part["name"].replace("${{ matrix.shard }}", str(i)) for i in range(1, total + 1)
+    ]
+    ok = [_job(30 + i, n, fc.TEST_STEP_NAME) for i, n in enumerate(names)]
+    assert fc.test_step_state(ok) == "success"
+    assert fc.test_step_state(ok[:-1]) == "no_step"
+
+
+class _GoneGh(_FakeGh):
+    def get(self, path: str, *args, **kwargs) -> str:
+        if int(path.split("/")[2]) in self.gone:
+            raise fc.MissingResource(path)
+        return super().get(path, *args, **kwargs)
+
+
+def test_a_failed_part_without_a_log_stays_visible(monkeypatch) -> None:
+    monkeypatch.setattr(fc, "pr_base", lambda run: "")
+    gh = _GoneGh(_parts("failure", "failure", "success"), {11: _LOG_FAILED})
+    gh.gone = {12}
+    rec = fc.failed_attempt(gh, _BASE, 1)
+    assert rec["log"] == "ok" and rec["nodeids"] == [NODE]
+    assert rec["log_unavailable"] == ["Tests part 2/3"]
+    assert rec["incomplete"] is True
+    monkeypatch.setattr(fc, "tree_of", lambda *a, **k: None)
+    monkeypatch.setattr(fc, "diff_files", lambda *a, **k: None)
+    monkeypatch.setattr(fc, "attach_context", lambda *a, **k: None)
+    monkeypatch.setattr(fc, "classify", lambda *a, **k: ("unconfirmed", {}))
+    rows = fc.rows_for_attempt(gh, rec, (), Path("."))
+    statuses = [(r["nodeid"], r["status"]) for r in rows]
+    assert statuses == [(NODE, "unconfirmed"), (None, "log_unavailable")]
+    assert rows[1]["evidence"]["part"] == "Tests part 2/3"
+    assert rows[1]["pytest_outcome"] == "unknown"
+
+
+def test_an_attempt_with_a_part_that_never_ran_is_not_a_denominator(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(fc, "pr_base", lambda run: "")
+    complete = _FakeGh(_parts("failure", "success", "success"), {11: _LOG_FAILED})
+    assert fc.pool_failed(fc.failed_attempt(complete, _BASE, 1)) == {NODE}
+    # part 2 never reached Test (skipped): its tests were not run
+    jobs = _parts("failure", "skipped", "success")
+    partial = _FakeGh(jobs, {11: _LOG_FAILED})
+    rec = fc.failed_attempt(partial, _BASE, 1)
+    assert rec["test_step"] == "failure"
+    pool = [fc.attempt_record({**_BASE, "run_attempt": 1}, fc.pool_failed(rec))]
+    assert pool[0]["failed"] is None
+    blobs = _Blobs({SHA: "def test_a():\n pass\n"})
+    got = fc.count_executions(
+        [{**pool[0], "head_sha": SHA}],
+        blobs,
+        "tests/test_x.py::test_b",
+        "2026-01-01T00:00:00Z",
+        None,
+        None,
+    )
+    assert got["executions"] == 0, "a test of the part that did not run is not counted"

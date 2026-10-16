@@ -267,6 +267,26 @@ def test_jobs(gh: Gh, run_id: int, attempt: int) -> list[dict]:
     return [j for j in jobs if TEST_JOB_HINT in j["name"].lower()][:1]
 
 
+_PART_RE = re.compile(r"^" + re.escape(PART_JOB_PREFIX) + r"(\d+)/(\d+)$")
+
+
+def parts_complete(jobs: list[dict]) -> bool:
+    """Все ли части 1..N на месте. Старый job (без "N/M" в имени) — одна часть.
+
+    N берётся из имени и должно быть одним у всех; повтор номера или дыра — не полный набор.
+    """
+    if not any(j["name"].startswith(PART_JOB_PREFIX) for j in jobs):
+        return len(jobs) == 1
+    found = [_PART_RE.match(j["name"]) for j in jobs]
+    if not all(found):
+        return False
+    numbers = [(int(m.group(1)), int(m.group(2))) for m in found if m]
+    totals = {n for _, n in numbers}
+    if len(totals) != 1:
+        return False
+    return sorted(i for i, _ in numbers) == list(range(1, totals.pop() + 1))
+
+
 def test_step_state(jobs: list[dict]) -> str:
     """Итог шага Test по всем job набора.
 
@@ -282,9 +302,21 @@ def test_step_state(jobs: list[dict]) -> str:
         states.append(None if step is None else (step["conclusion"] or "unknown"))
     if "failure" in states:
         return "failure"
-    if None in states:
+    if None in states or not parts_complete(jobs):
+        # a part that never ran proves nothing about its tests (#1767)
         return "no_step"
     return next((s for s in states if s != "success"), "success") or "unknown"
+
+
+def attempt_proven(jobs: list[dict]) -> bool:
+    """Все части на месте и в каждой Test дошёл до success или failure."""
+    if not jobs or not parts_complete(jobs):
+        return False
+    for job in jobs:
+        step = next((s for s in job["steps"] if s["name"] == TEST_STEP_NAME), None)
+        if step is None or step["conclusion"] not in {"success", "failure"}:
+            return False
+    return True
 
 
 def failed_test_jobs(jobs: list[dict]) -> list[dict]:
@@ -429,11 +461,15 @@ def failed_attempt(gh: Gh, base: dict, number: int) -> dict:
     if rec["test_step"] != "failure":
         return rec
     logs = []
+    rec["log_unavailable"] = []
+    rec["incomplete"] = not attempt_proven(jobs)
     for job in failed_test_jobs(jobs):
         try:
             logs.append(parse_log(gh.get(f"actions/jobs/{job['id']}/logs")))
         except MissingResource:
-            continue
+            # each failed part with no log stays visible (see rows_for_attempt)
+            rec["log_unavailable"].append(job["name"])
+    rec["incomplete"] = rec["incomplete"] or bool(rec["log_unavailable"])
     parsed = merge_logs(logs) if logs else None
     if parsed is None:
         rec["log"] = "unavailable"
@@ -867,11 +903,24 @@ def rows_for_attempt(gh: Gh, rec: dict, ctx: tuple, repo_dir: Path) -> list[dict
         )
         attach_context(evidence, rec, nodeid, ctx, status)
         rows.append(row_for(rec, nodeid, tree, status, evidence))
+    for name in rec.get("log_unavailable", []) if rec["log"] == "ok" else []:
+        # a failed part whose log is gone: its failures are unknown, and that
+        # is said in a row of its own instead of being dropped (#1767)
+        reason = {"reason": "job log returned 404/410", "part": name}
+        unknown = {**rec, "log": "unavailable"}
+        rows.append(row_for(unknown, None, tree, "log_unavailable", reason))
     return rows
 
 
 def pool_failed(rec: dict) -> set[str] | None:
     """nodeid, упавшие в attempt, где Test выполнялся; None — выполнение не доказано."""
+    if rec.get("incomplete"):
+        # #1767: a part that did not reach Test (or whose log is gone) leaves its
+        # tests unrun or unknown. Counting the attempt would give every test of
+        # that part executions=1, failures=0, so the whole attempt is left out
+        # of the denominator. Counting only the failed parts' tests would be
+        # more exact, but the job log names no test that did not fail.
+        return None
     if rec["test_step"] == "success":
         return set()
     if rec["test_step"] == "failure" and rec["nodeids"]:
