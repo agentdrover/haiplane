@@ -3345,6 +3345,11 @@ async def _approved_code_check(
             return waiting, ""
         kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
         if kept:
+            # The head this check compared is the head the merge must be bound
+            # to (gh pr merge --match-head-commit): re-pin it, as the gate's own
+            # automerge does (#1706). Not re-read: a push after this line is
+            # exactly what the bound merge refuses.
+            await repo.update_task(db, task["id"], submission_sha=current_tip)
             return "", (
                 f"Мерж базы в ветку: одобренный коммит {pinned[:12]} сменился "
                 f"на {current_tip[:12]}, но {why}. Вердикт остаётся текущим, "
@@ -4396,8 +4401,10 @@ async def merge_if_approval_stands(
         if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""
         pinned = (dict(row).get("submission_sha") or "").strip()
-        if not pinned:
+        if not pinned and dict(row).get("auto_review"):
             return MergeStep.UNPINNED, ""
+        # A task that opted out of review (auto_review=False) has no approved head
+        # to bind to; for it the merge stays what it was before #1706.
         if key not in _gate_merges:
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             _gate_merges[key] = fut
@@ -6196,6 +6203,19 @@ async def defer_completions() -> AsyncIterator[list[dict[str, Any]]]:
         _deferred_completions.reset(token)
 
 
+def _as_of_the_done_report(
+    task: dict[str, Any], item: dict[str, Any]
+) -> dict[str, Any]:
+    """The task with the generation its done report belongs to (#1706).
+
+    A row read afresh compared with itself proves nothing: a resubmission, even
+    a re-approved one, since the done report cancels its completion.
+    """
+    if item.get("generation") is None:
+        return task
+    return {**task, "submission_generation": item["generation"]}
+
+
 async def run_deferred_completions(
     db: aiosqlite.Connection, pending: list[dict[str, Any]]
 ) -> None:
@@ -6212,13 +6232,7 @@ async def run_deferred_completions(
             row = await repo.get_task(db, item["task_id"])
             if row is None or dict(row)["status"] not in ("running", "claimed"):
                 continue
-            task = dict(row)
-            if item.get("generation") is not None:
-                # The row is read afresh, so comparing it with itself proves
-                # nothing: the snapshot carries the generation of the done
-                # report, and a resubmission (even one re-approved) since then
-                # cancels this completion (#1706).
-                task = {**task, "submission_generation": item["generation"]}
+            task = _as_of_the_done_report(dict(row), item)
             stands, _ = await record_delivery_outcome(db, task, _nothing)
             if not stands:
                 continue
@@ -6228,7 +6242,10 @@ async def run_deferred_completions(
                 # validation gate again of the database.
                 from hub.services.lifecycle import prepare_ci_standing
 
-                task = await prepare_ci_standing(db, task)
+                # It returns a FRESH row: the done report's generation is put
+                # back, or a resubmission during this call would be completed
+                # with the old report's text (#1706).
+                task = _as_of_the_done_report(await prepare_ci_standing(db, task), item)
             await _complete_without_review(
                 db,
                 task,

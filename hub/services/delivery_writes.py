@@ -123,3 +123,32 @@ async def hand_pair_to_human(
     log.info(
         "Poll: task #%d → needs_decision: merge gate refused (%s)", task_id, detail
     )
+
+
+async def complete_delivered(
+    db: aiosqlite.Connection, task_id: int, pr_num: Any
+) -> None:
+    """pair-свип: PR влит, одобрение действует — завершить задачу (#306, #1706)."""
+    # Said out loud, because a completed task with no done report otherwise
+    # reads as a lost record rather than as work the hub carried home (AC-5).
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Доставлено хабом без отчёта агента: PR #{pr_num} влит по одобренному "
+        "ревью. Условия доставки были выполнены целиком, ждать было нечего. "
+        "Отчёт агента, если он придёт, ляжет сюда же рассказом о работе.",
+    )
+    # Completion WITHOUT bumping the generation: no new work is being
+    # submitted, and a bump would invalidate the very approval that authorises
+    # this delivery (#306).
+    await repo.update_task(db, task_id, status="completed")
+    await repo.insert_event(
+        db,
+        kind="task_completed",
+        task_id=task_id,
+        actor="hub",
+        payload={"via": "poller_delivery"},
+    )
+    await db.commit()

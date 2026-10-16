@@ -2145,36 +2145,23 @@ async def _deliver_pair_task(db, task: dict) -> None:
 
     # #1706: the merge is a fact and the ledger holds it (pipeline_merges);
     # ``completed`` says "approved work was delivered", so it is written only
-    # while the approved submission is still the current one. Otherwise one
-    # explicit outcome, and the task is left to the human.
+    # while the approved submission is still the current one, and the check
+    # shares one write transaction with the write. Otherwise one explicit
+    # outcome, and the task is left to the human.
     stands, _ = await services.record_delivery_outcome(
-        db, task, _nothing_to_write, merged=True
+        db,
+        task,
+        partial(delivery_writes.complete_delivered, db, task_id, pr_num),
+        merged=True,
     )
     if not stands:
         return
-    # Said out loud, because a completed task with no done report otherwise
-    # reads as a lost record rather than as work the hub carried home (AC-5).
-    await repo.add_task_update(
-        db,
-        task_id,
-        "hub",
-        "status",
-        f"Доставлено хабом без отчёта агента: PR #{pr_num} влит по одобренному "
-        "ревью. Условия доставки были выполнены целиком, ждать было нечего. "
-        "Отчёт агента, если он придёт, ляжет сюда же рассказом о работе.",
-    )
-    # Completion WITHOUT bumping the generation: no new work is being
-    # submitted, and a bump would invalidate the very approval that authorises
-    # this delivery (#306).
-    await repo.update_task(db, task_id, status="completed")
-    await repo.insert_event(
-        db,
-        kind="task_completed",
-        task_id=task_id,
-        actor="hub",
-        payload={"via": "poller_delivery"},
-    )
-    await db.commit()
+    await _roll_up_parent_after_delivery(db, task_id)
+    log.info("Poll: task #%d delivered and completed without a done report", task_id)
+
+
+async def _roll_up_parent_after_delivery(db, task_id: int) -> None:
+    """Свёртка родителя после доставки поллером (#1437)."""
     # #1437: свёртка родителя, как на done-пути. Без неё фича, последнюю
     # подзадачу которой доставил поллер, ждала перезапуска хаба
     # (repair_stale_parent_completions), а её зависимые — вместе с ней.
@@ -2190,7 +2177,6 @@ async def _deliver_pair_task(db, task: dict) -> None:
     except Exception:  # noqa: BLE001 - the parent_rollup sweep closes it
         await db.rollback()
         log.exception("Poll: parent rollup after #%d failed — sweep retries", task_id)
-    log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
 
 async def _note_pair_delivery_wait(

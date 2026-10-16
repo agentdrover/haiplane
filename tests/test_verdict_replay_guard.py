@@ -1602,3 +1602,134 @@ async def test_a_done_report_does_not_complete_after_a_merge_under_a_gone_approv
         (dict(u).get("content") or "") for u in await repo.get_task_updates(db, task_id)
     )
     assert "НЕ завершена" in feed
+
+
+async def test_the_pair_completion_is_written_inside_the_outcome_writer(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 7 (P1): the check and ``completed`` are one transaction.
+
+    The writer is the only place that holds the check and the write under one
+    write lock (test_the_outcome_check_and_write_hold_one_write_lock), so the
+    completion must be written FROM it, not after it.
+    """
+    from hub import services
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import delivery_writes
+    from tests.test_pair_merge_gate import (
+        _approved_pair_task,
+        _drain_pair_delivery,
+        _git,
+    )
+
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    inside = {"now": False}
+    seen: list[bool] = []
+    real_writer = services.record_delivery_outcome
+    real_complete = delivery_writes.complete_delivered
+
+    async def writer(*args, **kwargs):
+        inside["now"] = True
+        try:
+            return await real_writer(*args, **kwargs)
+        finally:
+            inside["now"] = False
+
+    async def complete(*args, **kwargs):
+        seen.append(inside["now"])
+        await real_complete(*args, **kwargs)
+
+    monkeypatch.setattr(services, "record_delivery_outcome", writer)
+    monkeypatch.setattr(delivery_writes, "complete_delivered", complete)
+    await _drain_pair_delivery(db)
+    assert seen == [True], "completed was written outside the outcome writer"
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_a_resubmission_during_ci_standing_does_not_complete_the_old_done(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 7 (P2): ``prepare_ci_standing`` returns a fresh row."""
+    from hub import config
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import lifecycle, orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    generation = dict(await repo.get_task(db, task_id))["submission_generation"]
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+
+    async def standing(db_, task_):
+        await _fire(db_, task_id, "reapproved")
+        await db_.execute(
+            "UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,)
+        )
+        await db_.commit()
+        return dict(await repo.get_task(db_, task_id))  # fresh: N+1
+
+    monkeypatch.setattr(lifecycle, "prepare_ci_standing", standing)
+    await orchestration.run_deferred_completions(
+        db,
+        [
+            {
+                "task_id": task_id,
+                "exit_code": None,
+                "result_text": "old done",
+                "generation": generation,
+            }
+        ],
+    )
+    assert git.merge_pr.await_count == 0
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_a_task_that_opted_out_of_review_is_merged_without_a_pin(
+    db: aiosqlite.Connection,
+):
+    """Codex round 7 (P2): auto_review=False has no approved head to bind to."""
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    git = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db, pin=False)
+    await db.execute(
+        "UPDATE tasks SET auto_review=0, submission_sha='' WHERE id=?", (task_id,)
+    )
+    await db.commit()
+    ok, _ = await orchestration.merge_before_completion(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert ok and git.merge_pr.await_count == 1
+
+
+async def test_the_merge_after_a_base_update_is_bound_to_the_head_that_was_compared(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 7 (P2): the pin moves with a verdict-keeping base merge."""
+    from hub.services import lifecycle, orchestration
+    from tests.test_accept_without_delivery import _approved_task, _install, _MergeSpy
+
+    task_id = await _approved_task(client, db, title="base-moved", pr=953)
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+
+    async def tip(*_a, **_k):
+        return "n" * 40, ""
+
+    async def kept(*_a, **_k):
+        return True, "авторская правка та же"
+
+    async def no_wait(*_a, **_k):
+        return ""
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", tip)
+    monkeypatch.setattr(orchestration, "base_merge_kept_the_verdict", kept)
+    monkeypatch.setattr(orchestration, "_gate_update_base", no_wait)
+    ok, _ = await orchestration.merge_before_completion(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert ok and spy.heads == ["n" * 40], "bound to the head the check compared"
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == "n" * 40
