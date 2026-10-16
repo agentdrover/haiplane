@@ -728,7 +728,7 @@
   </tbody>
 </table>
 <div class="card">
-  <p><strong>Почему «заметить» вместо «запретить».</strong> Репозиторий приватный на бесплатном плане GitHub: branch protection и rulesets недоступны, серверная сторона не может отказать в прямом пуше в main/develop, а клиентский хук обходится через <code>--no-verify</code>. Drift guard — сознательная замена невозможного «предотвратить» на достижимое «заметить».</p>
+  <p><strong>Почему «заметить», а не только «запретить».</strong> Ruleset'ы на agentdrover/haiplane существуют как минимум с 25.09.2026: «green CI before merge» и «integration branches are permanent» (без обхода). До 07.10.2026 обход «green CI before merge» был открыт роли Write целиком (Always allow) — этим обходом мог воспользоваться любой писатель и залить код в main/develop мимо PR и зелёного CI. 07.10.2026 роль Write убрали из этого bypass без замены — у ruleset обхода не осталось вовсе, ни для кого. Это два отдельных события: позже и отдельно, 16.10.2026, добавился третий ruleset и сменилась личность обхода (личность гейта — <code>docs/agent-context/invariants.md</code>, «Личность вливания») — новый ruleset «only the gate updates integration branches» несёт обход только для учётки haiplane-gate, и этот обход — только на правиле update, а не на pull_request/required_status_checks. Прямой пуш в main/develop, минуя PR и зелёный CI, отказывается всем без исключения, включая гейт. Клиентский хук всё ещё обходится через <code>--no-verify</code>, а у проектов хаба без rulesets серверной защиты по-прежнему нет вообще — для них Drift guard остаётся сознательной заменой невозможного «предотвратить» на достижимое «заметить».</p>
 </div>
 
 <h2 id="w14">W14 · Иерархия, rollup и жизненный цикл записи</h2>
