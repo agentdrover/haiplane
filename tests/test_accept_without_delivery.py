@@ -518,6 +518,7 @@ class _MergeSpy:
         self.ci = ci
         self.merges = merges
         self.merged: list[int] = []
+        self.heads: list[str] = []  # expected_head_sha of every forge call (#1706)
 
     async def check_pr_ci(self, pr_number, repo=None, gh_repo=None, forge: str = ""):
         from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
@@ -528,8 +529,16 @@ class _MergeSpy:
         return CIProbeResult(outcome=outcome, reason=f"probe says {self.ci}")
 
     async def merge_pr(
-        self, pr_number, task_id, title, repo=None, gh_repo=None, forge: str = ""
+        self,
+        pr_number,
+        task_id,
+        title,
+        repo=None,
+        gh_repo=None,
+        forge: str = "",
+        expected_head_sha: str = "",
     ):
+        self.heads.append(expected_head_sha)
         if not self.merges:
             return False
         self.merged.append(int(pr_number))
@@ -544,11 +553,19 @@ class _MergeSpy:
         gh_repo=None,
         delete_branch=True,
         forge: str = "",
+        expected_head_sha: str = "",
     ):
         # #1116: гейт спрашивает причину отказа, а не только факт. Дублёр
         # отвечает согласованно со своим merge_pr — иначе он рассказывал бы
         # о доставке две разные истории.
-        ok = await self.merge_pr(pr_number, task_id, title, repo=repo, gh_repo=gh_repo)
+        ok = await self.merge_pr(
+            pr_number,
+            task_id,
+            title,
+            repo=repo,
+            gh_repo=gh_repo,
+            expected_head_sha=expected_head_sha,
+        )
         return (ok, "" if ok else "")
 
     async def merge_commit_sha(

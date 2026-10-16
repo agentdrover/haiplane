@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import aiosqlite
 
 from hub import config
+from hub.repository_verdict import write_review_verdict
 from hub.db import (
     inserted_id,
     write_transaction,
@@ -3151,52 +3152,28 @@ async def record_review_verdict(
     self_approved: bool = False,
     expected_generation: int | None = None,
     claim: tuple[int, str] | None = None,
+    supersedes_revision: int | None = None,
+    digest: str = "",
 ) -> bool:
-    """Persist a review verdict bound to the CURRENT submission generation.
+    """Persist a review verdict bound to the CURRENT submission generation (#305).
 
-    ``expected_generation`` (#1601): запись условна В SQL — только если живое
-    поколение равно названному И на него ещё нет вердикта. Возвращает, была
-    ли запись; без ожидания поведение прежнее (всегда True).
-
-    The binding is done in SQL (``review_verdict_generation = submission_generation``)
-    so the verdict can never be attached to a generation the caller read
-    before a concurrent resubmission bumped it. ``findings_json`` replaces
-    the stored findings wholesale: findings belong to their verdict, so a
-    verdict without findings clears the previous list (#308).
-    ``self_approved`` marks verdicts accepted only via the
-    ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
-    to the verdict, so every new verdict overwrites the flag.
-    ``review_verdict_closed_generation`` is cleared for the same reason
-    (#1286): a window closed by a human decision belonged to the PREVIOUS
-    verdict, and a new verdict opens its own.
+    Conditional in SQL (#1601, #1706): see ``hub.repository_verdict`` — a verdict
+    lands only where none stands on the live generation, or replaces the
+    revision named in ``supersedes_revision``. Returns whether it was written.
+    Findings belong to their verdict and are replaced wholesale (#308);
+    ``self_approved`` (#434) and the closed window (#1286) likewise.
     """
-    guard = ""
-    params: list[Any] = [verdict, findings_json, 1 if self_approved else 0, task_id]
-    if expected_generation is not None:
-        guard = (
-            " AND submission_generation=? AND NOT (COALESCE(review_verdict,'')!='' "
-            "AND review_verdict_generation=submission_generation)"
-        )
-        params.append(expected_generation)
-    if claim is not None:
-        # #1601: применение стюарда пишет вердикт, только пока ЕГО метка цела —
-        # суждение всё ещё applying с тем же временем занятия. Переведённое в
-        # escalated (прерванное) применение вердикта не пишет.
-        guard += (
-            " AND EXISTS (SELECT 1 FROM steward_judgements sj WHERE sj.id=? "
-            "AND sj.advisor_outcome='applying' AND sj.advisor_claimed_at=?)"
-        )
-        params.extend([claim[0], claim[1]])
-    cursor = await db.execute(
-        "UPDATE tasks SET review_verdict=?, "  # nosec B608 - guard is a constant
-        "review_verdict_generation=submission_generation, "
-        "review_findings=?, "
-        "review_self_approved=?, "
-        "review_verdict_closed_generation=NULL, "
-        "updated_at=datetime('now') WHERE id=?" + guard,
-        tuple(params),
+    return await write_review_verdict(
+        db,
+        task_id,
+        verdict,
+        findings_json=findings_json,
+        self_approved=self_approved,
+        expected_generation=expected_generation,
+        claim=claim,
+        supersedes_revision=supersedes_revision,
+        digest=digest,
     )
-    return (cursor.rowcount or 0) > 0
 
 
 async def close_review_verdict_window(

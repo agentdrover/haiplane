@@ -1048,7 +1048,13 @@ def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
     return {
         "task_id": packet.task_id,
         "generation": packet.generation,
-        "brief": packet.brief.model_dump(mode="json") if packet.brief else None,
+        # #1706: the revision is for whoever may REPLACE a verdict; the steward
+        # only ever writes the first one, so the packet keeps its old shape.
+        "brief": (
+            packet.brief.model_dump(mode="json", exclude={"review_verdict_revision"})
+            if packet.brief
+            else None
+        ),
         "facts": {
             source: {
                 "source": fact.source,

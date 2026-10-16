@@ -104,6 +104,7 @@ class _PinnedGitOps(NoopGitOps):
         gh_repo=None,
         delete_branch=True,
         forge: str = "",
+        expected_head_sha: str = "",
     ):
         return True
 

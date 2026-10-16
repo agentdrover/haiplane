@@ -96,6 +96,14 @@ These are the rules most likely to be broken by “small” changes.
 - If required DoR checks fail and `force` is not set, approval must fail with HTTP 422.
 - If concurrent approval loses the race, the caller should see HTTP 409, not silent success.
 
+### Verdict of a commit task is not replaced silently (#1706)
+
+- ONE writer: `hub/repository_verdict.write_review_verdict` (behind `repository.record_review_verdict`). Every condition is in the UPDATE: the live generation equals the named one; no verdict stands on it, or `review_verdict_revision` equals `supersedes_revision` and the #1286 window is not closed. `review_verdict_revision` grows on every write by every writer (REST, web, steward, autopilot, poller).
+- Before the write, `hub/services/verdict_guard.decide` gives the readable answer: first write / repeat (same kind + findings + comments, by `tasks.review_verdict_digest`: 200, no write, no feed line, no follow-up drafts) / 409 naming kind, revision, time, author and `supersedes_revision=R` / replacement. Replacement needs an authenticated human, `expected_generation` and the current revision; the feed says "вердикт заменён: было X (ревизия R), стало Y". Automation (steward, autopilot) has only the first write; a closed window answers 409 "нужна новая сдача".
+- The studied generation: `expected_generation` is in the body (REST, CLI `--expected-generation`, MCP `hub_submit_review`, web hidden field) and comes from the review brief; the CLI never fills it in. A write without it is accepted but answered with a warning.
+- The poller does not rewrite a stored verdict; a scanned CHANGES_REQUESTED is written only for the generation the tick read and only where no verdict stands, and its result is checked.
+- Known boundary: follow-up drafts are created before the write transaction (`create_task` commits on its own), so two concurrent identical first writes may leave one idempotent (marker-reused) draft; the verdict itself is atomic.
+
 ## Structured Form Invariants
 
 - Structured fields are stored on the `tasks` row except acceptance criteria, which live in a separate table.

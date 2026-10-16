@@ -39,6 +39,15 @@
   submission, severity high/medium/low, message, optional file/line and
   recommendation). Free-text status updates are not a verdict — the server
   ignores them for gate purposes.
+- Name the submission you studied (#1706): pass `expected_generation` to
+  `hub_submit_review` (CLI: `oc-hub review-verdict <id> <verdict>
+  --expected-generation <N>`), where N is the `submission_generation` of the
+  brief you read — never a value read later. A different live generation is a
+  409 and nothing is written. A verdict that already stands on the submission
+  is not replaced: the same request again is a no-op, a different one is a 409
+  naming the revision, and only a human replaces it (`supersedes_revision`).
+  Without the generation the hub warns that it cannot tell which submission
+  you judged.
 - Your output is the verdict. Do not approve or merge PRs, do not call
   `hub_report_done`, and never try to decide a task — the decision gate is the
   human's (REST `POST /api/tasks/{id}/decide`, not in your tool list). Never review your own implementation work.
