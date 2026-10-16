@@ -31,6 +31,9 @@ EXCEPTIONS: dict[str, str] = {
     "Install uv": "подготовка окружения, не проверка",
     "Set up Python": "подготовка окружения, не проверка",
     "Install dependencies": "подготовка окружения, не проверка",
+    "Install age and openssh-server (backup tests)": (
+        "подготовка окружения для тестов копий (#1707), не проверка"
+    ),
     "Detect tree already tested (skip pytest on exact dedup)": (
         "оптимизация прогона, не проверка — #1077"
     ),
