@@ -3722,7 +3722,9 @@ _ALL_DOORS = [
 
 
 async def _last_model(db: aiosqlite.Connection, task_id: int) -> str:
-    return str([dict(r) for r in await repo.list_executor_runs(db, task_id)][-1]["model"])
+    return str(
+        [dict(r) for r in await repo.list_executor_runs(db, task_id)][-1]["model"]
+    )
 
 
 async def test_executor_params_reach_every_order_door(db, monkeypatch):

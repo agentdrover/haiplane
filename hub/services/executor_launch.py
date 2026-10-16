@@ -414,7 +414,9 @@ async def _create(
             return _out("", "", f"{REASON_CREATE_REFUSED}: {last}")
         if attempt < limit:
             await asyncio.sleep(config.EXECUTOR_LAUNCH_PAUSE_S)
-    return _out("", "", f"{REASON_CREATE_EXHAUSTED}: {limit} попыток, последний отказ {last}")
+    return _out(
+        "", "", f"{REASON_CREATE_EXHAUSTED}: {limit} попыток, последний отказ {last}"
+    )
 
 
 async def _note_sent_variant(
