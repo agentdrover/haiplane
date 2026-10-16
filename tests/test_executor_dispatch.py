@@ -3750,7 +3750,7 @@ async def test_empty_executor_params_send_bare_model(db, monkeypatch):
         calls = _creator(monkeypatch, [_CREATED])
         task_id, run = await door(db, human)
         assert (await run()).launched, door.__name__
-        assert "model_params" not in calls[0], door.__name__
+        assert not calls[0].get("model_params"), door.__name__
         assert await _last_model(db, task_id) == _EXEC_MODEL
 
 
@@ -3777,7 +3777,7 @@ async def test_rejected_executor_params_retry_bare_once(db, monkeypatch):
     project, task_id = await _launch_project(db, slug="exec-params-drop")
     result = await el.launch_executor(db, project, issuer_principal_id=human)
     assert result.launched, result
-    assert [("model_params" in c) for c in calls] == [True, False, False]
+    assert [bool(c.get("model_params")) for c in calls] == [True, False, False]
     assert calls[0]["name"] == calls[1]["name"], "голый заказ — та же попытка"
     alerts = await _alerts_of(db, task_id)
     assert len(alerts) == 1 and _VARIANT_RAW in alerts[0], alerts

@@ -383,14 +383,13 @@ async def _create(
 
     for attempt in range(1, limit + 1):
         marker = cursor_cloud.agent_marker(AGENT_KIND, task_id, generation, attempt)
-        extra = {"model_params": sent} if sent else {}
         created, refusal = await cursor_cloud.create_agent_attempt(
-            name=marker, **order, **extra
+            name=marker, **order, model_params=sent
         )
         if not (created or {}).get("agent") and _params_refused(sent, refusal):
             dropped, dropped_refusal, sent = sent, refusal, []
             created, refusal = await cursor_cloud.create_agent_attempt(
-                name=marker, **order
+                name=marker, **order, model_params=[]
             )
         agent = (created or {}).get("agent") or {}
         run = (created or {}).get("run") or {}
