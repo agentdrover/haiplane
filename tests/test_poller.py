@@ -195,7 +195,10 @@ async def _make_review_task(db, *, review_job_id="rev-1", generation=1) -> int:
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(db, task_id, review_job_id=review_job_id)
+    # #1706: a merge is bound to the approved head, so the submission pins one.
+    await repo.update_task(
+        db, task_id, review_job_id=review_job_id, submission_sha="a" * 40
+    )
     for _ in range(generation):
         await repo.bump_submission_generation(db, task_id)
     await db.commit()

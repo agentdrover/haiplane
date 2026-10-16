@@ -570,6 +570,13 @@ async def web(client, db, monkeypatch):
             "UPDATE tasks SET status = ? WHERE id = ?", (status.value, task_id)
         )
         ids[status.value] = task_id
+    # #1706: a running task with a verdict standing shows the "replace" form.
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 1, review_verdict = "
+        "'changes_requested', review_verdict_generation = 1, "
+        "review_verdict_revision = 1 WHERE id = ?",
+        (ids["running"],),
+    )
     archived = ids["completed"]
     await db.execute("UPDATE tasks SET archived = 1 WHERE id = ?", (archived,))
     await db.commit()

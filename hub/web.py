@@ -3492,12 +3492,12 @@ def _review_form_error(
     )
 
 
-def _is_state_verdict_refusal(exc: HTTPException) -> bool:
-    """403/409 вердикта по задаче-состоянию (#1647) показываются в форме."""
+def _is_verdict_refusal(exc: HTTPException) -> bool:
+    """403/409 вердикта показываются в форме: задача-состояние (#1647), стоящий вердикт (#1706)."""
     detail = exc.detail
     return (
         isinstance(detail, dict)
-        and str(detail.get("reason") or "").startswith("state_")
+        and str(detail.get("reason") or "").startswith(("state_", "verdict_"))
         and exc.status_code in (403, 409)
     )
 
@@ -3511,6 +3511,7 @@ async def web_review_verdict(
     findings_text: str = Form(""),
     acknowledge_repeat: str = Form(""),
     expected_generation: str = Form(""),
+    supersedes_revision: str = Form(""),
 ):
     """Submit a review verdict from the task card panel (#321).
 
@@ -3559,6 +3560,12 @@ async def web_review_verdict(
                 if expected_generation.strip().isdigit()
                 else None
             ),
+            # #1706: ревизия стоящего вердикта, которую человек видел на карточке.
+            supersedes_revision=(
+                int(supersedes_revision)
+                if supersedes_revision.strip().isdigit()
+                else None
+            ),
         )
     except ValidationError as exc:
         errors = exc.errors()
@@ -3577,7 +3584,7 @@ async def web_review_verdict(
             human_caller=identity.is_human,
         )
     except HTTPException as exc:
-        if exc.status_code != 422 and not _is_state_verdict_refusal(exc):
+        if exc.status_code != 422 and not _is_verdict_refusal(exc):
             raise
         # #1648: отказ по поколению (409) htmx-форма получает со своим кодом, а
         # не 422: устаревшая форма — конфликт состояния, не ошибка ввода.

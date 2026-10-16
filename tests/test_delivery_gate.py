@@ -4353,10 +4353,9 @@ async def test_a_slow_gate_merge_is_not_merged_twice(
     monkeypatch.setattr(orchestration, "GATE_MERGE_WAIT_SECONDS", 0.05)
 
     task = dict(await repo.get_task(db, task_id))
-    first = asyncio.create_task(
-        orchestration._registered_gate_merge((task_id, 77), task, {})
-    )
-    await asyncio.sleep(0)
+    first = asyncio.create_task(orchestration.merge_if_approval_stands(db, task, {}))
+    while not calls:  # #1706: the merge point reads the task first (one DB hop)
+        await asyncio.sleep(0.01)
     assert calls == [77], "первый путь уже в форже"
 
     await _report_done(db, task_id)
@@ -4370,7 +4369,8 @@ async def test_a_slow_gate_merge_is_not_merged_twice(
     assert "merge_failed" not in feed
 
     release.set()
-    assert await first == (True, "")
+    # #1706: the single merge point answers with a step, not a bool.
+    assert await first == (orchestration.MergeStep.MERGED, "")
 
 
 @pytest.mark.parametrize(

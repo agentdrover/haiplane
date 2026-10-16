@@ -24,7 +24,7 @@ from hub.models import TaskCreate, TaskReviewVerdict, TaskUpdateCreate
 
 
 async def _approved_pair_task(
-    db: aiosqlite.Connection, *, pr_number: int | None = 77
+    db: aiosqlite.Connection, *, pr_number: int | None = 77, pin: bool = True
 ) -> int:
     """A pair task that walked the real path: start → submit → APPROVED."""
     tv = await services.create_task(db, TaskCreate(title="Deliver me"))
@@ -35,6 +35,11 @@ async def _approved_pair_task(
         await repo.update_task(db, tv.id, pr_number=pr_number)
         await db.commit()
     await services.submit_for_review(db, tv.id)
+    # #1706: the merge is bound to the approved head, so the submission pins one.
+    pinned = (dict(await repo.get_task(db, tv.id)).get("submission_sha") or "").strip()
+    if pin and not pinned:
+        await repo.update_task(db, tv.id, submission_sha="a" * 40)
+        await db.commit()
     await services.record_review_verdict(
         db, tv.id, TaskReviewVerdict(verdict="approved", agent="reviewer")
     )
@@ -230,6 +235,8 @@ async def test_submission_discovers_the_pr_for_the_branch(db):
     await db.commit()
     await services.pair_start_task(db, tv.id, caller="dev")
     await services.submit_for_review(db, tv.id)
+    await repo.update_task(db, tv.id, submission_sha="a" * 40)  # #1706: head to bind to
+    await db.commit()
 
     task = dict(await repo.get_task(db, tv.id))
     assert task["pr_number"] == 238, (
@@ -430,25 +437,23 @@ async def test_an_unresolvable_tip_delivers_with_a_visible_note(db, monkeypatch)
     assert "pinned0commi" in note, "and say which commit was approved"
 
 
-async def test_a_task_without_a_pin_delivers_as_before(db, monkeypatch):
-    # AC-4 (#612): tasks submitted before #572, or ones whose pin could not be
-    # taken, must keep working. A new check that retroactively blocks old work
-    # is a new outage, not a new guarantee.
+async def test_a_task_without_a_pin_is_not_delivered_blind(db, monkeypatch):
+    # AC-4 (#612) said "delivers as before"; #1706 reverses it on purpose: the
+    # merge is bound to the approved head (gh pr merge --match-head-commit), and
+    # a submission with no pinned commit has no head to bind to. The forge is not
+    # called, and the refusal is an explicit outcome, not a wait.
     g = _git_seeing(monkeypatch, "")  # head_sha returns nothing → nothing was pinned
-    task_id = await _approved_pair_task(db)
+    task_id = await _approved_pair_task(db, pin=False)
     assert dict(await repo.get_task(db, task_id))["submission_sha"] == ""
 
     await _report_done(db, task_id)
 
     task = dict(await repo.get_task(db, task_id))
-    assert task["status"] == "completed"
-    assert g.merge_pr.await_count == 1
+    assert task["status"] != "completed"
+    assert g.merge_pr.await_count == 0, "the forge was never called"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     note = " ".join(u.get("content") or "" for u in updates)
-    assert "Сверка кода с одобрением НЕ проводилась" in note, (
-        "say that nothing was compared"
-    )
-    assert "не был закреплён" in note, "and why"
+    assert "не закреплён коммит" in note and "--match-head-commit" in note
 
 
 # ---------------------------------------------------------------------------

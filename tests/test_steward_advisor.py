@@ -1418,8 +1418,21 @@ async def test_the_verdict_write_is_conditional_in_sql(db: aiosqlite.Connection)
         await repo.record_review_verdict(db, task_id, "approved", expected_generation=1)
         is False
     )
-    assert await repo.record_review_verdict(db, task_id, "approved") is True, (
-        "без ожидания поведение прежнее — человек пишет поверх"
+    # #1706: без названного поколения запись тоже не перезаписывает стоящий
+    # вердикт (раньше «человек пишет поверх» — это и была дыра #1699); поверх
+    # пишет только замена с названной ревизией.
+    assert await repo.record_review_verdict(db, task_id, "approved") is False
+    assert (
+        await repo.record_review_verdict(
+            db, task_id, "changes_requested", supersedes_revision=0
+        )
+        is False
+    ), "ревизия устарела: стоящий вердикт уже имеет ревизию 1"
+    assert (
+        await repo.record_review_verdict(
+            db, task_id, "changes_requested", supersedes_revision=1
+        )
+        is True
     )
 
 

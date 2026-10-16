@@ -66,6 +66,7 @@ class NoopDispatch:
         pr_number: int | None = None,
         breadcrumb: str = "",
         pr_url: str = "",
+        generation: int | None = None,
     ) -> str:
         return f"[noop] review #{task_id}: {title}"
 
@@ -836,6 +837,7 @@ class NoopGitOps:
             repo=repo,
             gh_repo=gh_repo,
             delete_branch=delete_branch,
+            expected_head_sha=expected_head_sha,
         )
         return (ok, "" if ok else "git_ops не настроен")
 

@@ -748,6 +748,7 @@ async def build_review_brief(
         call_sites=call_sites_section,
         review_cycle=task_view.review_cycle,
         submission_generation=task_view.submission_generation,
+        review_verdict_revision=task_view.review_verdict_revision,
         latest_submission_summary=latest_submission_summary,
         latest_review=task_view.latest_review,
         machine_review=machine_review,

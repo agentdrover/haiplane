@@ -286,6 +286,7 @@ class DispatchPlugin(Protocol):
         pr_number: int | None = None,
         breadcrumb: str = "",
         pr_url: str = "",
+        generation: int | None = None,
     ) -> str: ...
 
     def build_fix_message(
