@@ -318,20 +318,26 @@ def test_relative_nginx_paths_reach_paths_conf_as_absolute_ones(tmp_path):
     from tests.backup_support import load_snapshot
 
     site_text = "server {\n    server_name agenthai.ru;\n}\n"
-    (tmp_path / "hub.conf").write_text(site_text)
+    (tmp_path / "rel").mkdir()
+    (tmp_path / "rel" / "hub.conf").write_text(site_text)
     write_sites(tmp_path / "rel" / "sites-available", {"hub": site_text})
     snap = load_snapshot()
     with SharedLock() as host:
         try:
-            for extra, expected in (
-                (["--nginx-site", "./hub.conf"], tmp_path / "hub.conf"),
+            for extra, expected, cwd in (
+                (
+                    ["--nginx-site", "./hub.conf", "--sites-dir", "sites-available"],
+                    tmp_path / "rel" / "hub.conf",
+                    tmp_path / "rel",
+                ),
                 (
                     ["--sites-dir", "rel/sites-available"],
                     tmp_path / "rel/sites-available/hub",
+                    tmp_path,
                 ),
             ):
                 as_root(["rm", "-f", PATHS_CONF])
-                done = run_install(extra, held=host, cwd=tmp_path)
+                done = run_install(extra, held=host, cwd=cwd)
                 assert done.returncode == 0, (extra, done.stderr)
                 want = "required %s" % os.path.realpath(expected)
                 assert want in _paths_lines(), (extra, _paths_lines())
@@ -363,6 +369,33 @@ def test_a_sites_directory_that_is_a_link_cannot_move_the_boundary(tmp_path):
             assert "nothing was changed" in done.stderr and "outside" in done.stderr
             assert installed_state() == before
             assert not [x for x in _paths_lines() if "private.env" in x]
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
+def test_nginx_site_outside_the_nginx_tree_is_refused(tmp_path):
+    need_root_host()
+    nginx, srv = tmp_path / "nginx", tmp_path / "srv"
+    sites = write_sites(nginx / "sites-available", {})
+    srv.mkdir()
+    (srv / "private.env").write_text("server {\n    server_name agenthai.ru;\n}\n")
+    (nginx / "via").symlink_to(
+        srv
+    )  # a directory inside nginx's tree that leads out of it
+    with SharedLock() as host:
+        try:
+            for name, path in (
+                ("outside file", srv / "private.env"),
+                ("parent is a link", nginx / "via" / "private.env"),
+            ):
+                as_root(["rm", "-f", PATHS_CONF])
+                before = installed_state()
+                done = run_install(
+                    ["--sites-dir", str(sites), "--nginx-site", str(path)], held=host
+                )
+                assert done.returncode != 0, name
+                assert "outside" in done.stderr and "nothing was changed" in done.stderr
+                assert installed_state() == before, name
         finally:
             as_root(["rm", "-f", PATHS_CONF])
 

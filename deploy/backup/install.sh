@@ -148,16 +148,15 @@ else
         *) die "$SITE_COUNT nginx sites in $SITES_DIR have server_name $SITE_HOST:$SITE_FILES (use --nginx-site PATH); nothing was changed" ;;
     esac
 fi
-# The archive refuses a link: the allowlist gets the real file, and only inside nginx's tree.
-if [ -L "$SITE_FILE" ]; then
-    REAL_SITE=$(readlink -f "$SITE_FILE")
-    case "$REAL_SITE" in
-        "$NGINX_ROOT"/*) [ -f "$REAL_SITE" ] || die "the link $SITE_FILE does not lead to a regular file; nothing was changed"
-            SITE_FILE=$REAL_SITE ;;
-        *) die "the nginx site $SITE_FILE is a link to $REAL_SITE, outside $NGINX_ROOT; nothing was changed" ;;
-    esac
-fi
-SITE_FILE=$(readlink -f "$SITE_FILE")
+# The archive refuses a link: the allowlist gets the real file. One check for every source
+# (search, --nginx-site, link): the real file must be a regular file inside nginx's tree.
+REAL_SITE=$(readlink -f "$SITE_FILE")
+case "$REAL_SITE" in
+    "$NGINX_ROOT"/*) ;;
+    *) die "the nginx site $SITE_FILE resolves to $REAL_SITE, outside $NGINX_ROOT; nothing was changed" ;;
+esac
+[ -f "$REAL_SITE" ] || die "the nginx site $SITE_FILE does not lead to a regular file; nothing was changed"
+SITE_FILE=$REAL_SITE
 
 AUTH_KEYS=$HOME_DIR/.ssh/authorized_keys
 # An earlier installed key is kept; its options are rebuilt below.
