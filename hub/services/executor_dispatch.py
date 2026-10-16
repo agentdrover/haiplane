@@ -983,8 +983,14 @@ async def poll_executor_runs(db: aiosqlite.Connection) -> int:
 
     Возвращает число опрошенных строк. Коммит — здесь, один на проход.
     """
+    # #1712: опрос провайдера — только облачные прогоны. Прогон слота не имеет
+    # агента у провайдера, и «нечего опрашивать» закрыло бы его как брошенную
+    # бронь, пока хост ещё работает.
     rows = [
-        dict(r) for r in await repo.list_executor_runs_in_outcome(db, OUTCOME_RUNNING)
+        dict(r)
+        for r in await repo.list_executor_runs_in_outcome(
+            db, OUTCOME_RUNNING, channel="cloud"
+        )
     ]
     for row in rows:
         await _poll_one(db, row)
@@ -1720,7 +1726,9 @@ async def executor_run_metrics(
         "COALESCE(SUM(CASE WHEN cents IS NULL THEN 1 ELSE 0 END), 0) "
         "AS runs_without_cents, "
         "COALESCE(SUM(CASE WHEN outcome=? THEN 1 ELSE 0 END), 0) AS runs_running "
-        f"FROM executor_runs WHERE {where}",  # nosec B608 - constant fragment
+        # #1712: стоимость — счёт облачного провайдера; у прогона слота цены нет
+        # по построению, и «без цены» он не значит.
+        f"FROM executor_runs WHERE channel = 'cloud' AND {where}",  # nosec B608 - constant fragment
         (OUTCOME_RUNNING, *params),
     )
     out = dict(rows[0])
