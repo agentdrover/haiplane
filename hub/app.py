@@ -194,6 +194,12 @@ from hub.services.tree_output import (
 from hub.poller import start_poller
 from hub.decisions_api import router as decisions_router
 from hub.verdict_evidence_api import router as verdict_evidence_router
+from hub.web_executor_slot import router as executor_slot_web_router
+from hub.executor_host_api import (
+    launch_request,
+    refuse_registered_slot,
+    router as executor_host_router,
+)
 from hub.web import router as web_router
 
 logging.basicConfig(
@@ -538,6 +544,8 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
+app.include_router(executor_host_router)
+app.include_router(executor_slot_web_router)
 
 
 def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:
@@ -708,6 +716,7 @@ async def api_chat_pair_start(request: Request) -> ChatPairStartView:
     _guard_chat_pair_enabled()
     principal_id = await _chat_pair_issuer(request)
     payload = await _chat_pair_start_payload(request)
+    await refuse_registered_slot(_db(request), payload.channel, payload.slot)
     bound_task_id: int | None = None
     if payload.kind == "implementer":
         if payload.task_id is None:
@@ -1355,7 +1364,14 @@ async def api_executor_launch(
     project = await repo.get_project_by_slug(db, slug)
     if project is None:
         raise HTTPException(404, detail=f"project {slug!r} not found")
-    result = await launch_executor(db, project, issuer_principal_id=int(issuer))
+    wanted = await launch_request(request)
+    result = await launch_executor(
+        db,
+        project,
+        issuer_principal_id=int(issuer),
+        target=wanted.target,
+        task_id=wanted.task_id,
+    )
     if not result.launched:
         raise HTTPException(
             409, detail={"reason": result.reason, "task_id": result.task_id}
@@ -1365,6 +1381,9 @@ async def api_executor_launch(
         "agent_id": result.agent_id,
         "run_id": result.run_id,
         "row_id": result.row_id,
+        # #1712: запуск на слот — заказ хосту; кода в ответе нет и быть не может.
+        "order_id": result.order_id,
+        "host": result.host,
     }
 
 

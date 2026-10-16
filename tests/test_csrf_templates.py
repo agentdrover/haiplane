@@ -623,6 +623,15 @@ async def _cheap_state(client, db, bearer, ids: dict[str, int]) -> list[str]:
         "UPDATE projects SET gate_policy = ? WHERE id = ?",
         (_json.dumps({"executor_launch": "manual"}), base.json()["id"]),
     )
+    # #1712: the card of an open task offers "run on <host>" for an enabled host.
+    host = await admin_svc.create_principal(
+        db, kind="service", username="executor-host-k8", role_slug="slot_runner"
+    )
+    await db.execute(
+        "INSERT INTO executor_hosts (name, principal_id, public_key_pem) "
+        "VALUES ('k8', ?, 'shown-only')",
+        (host["id"],),
+    )
     for name in ("csrf-disabled", "csrf-locked"):
         for kind in ("human", "agent"):
             row = await admin_svc.create_principal(

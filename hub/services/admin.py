@@ -86,13 +86,17 @@ async def write_audit(
     target_id: str = "",
     summary: str,
     detail: str | None = None,
+    commit: bool = True,
 ) -> None:
+    """Append an audit row. ``commit=False`` leaves it to the caller's
+    transaction (#1712): a row written inside a unit of work must roll back with it."""
     await db.execute(
         "INSERT INTO admin_audit_log (actor_principal_id, action, target_type, target_id, summary, detail) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (actor_id, action, target_type, target_id, summary, detail),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def list_audit(
@@ -125,6 +129,7 @@ async def create_principal(
     created_by: int | None = None,
     password: str | None = None,
     role_slug: str | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     cursor = await db.execute(
         "INSERT INTO principals (kind, username, display_name, email, notes, created_by) "
@@ -150,7 +155,8 @@ async def create_principal(
                 (principal_id, role_rows[0][0], created_by),
             )
 
-    await db.commit()
+    if commit:
+        await db.commit()
     return await get_principal(db, principal_id)  # type: ignore[return-value]
 
 
@@ -220,7 +226,7 @@ async def update_principal(
 
 
 async def disable_principal(
-    db: aiosqlite.Connection, principal_id: int
+    db: aiosqlite.Connection, principal_id: int, *, commit: bool = True
 ) -> dict[str, Any] | None:
     p = await get_principal(db, principal_id)
     if not p:
@@ -234,7 +240,8 @@ async def disable_principal(
     )
     await _revoke_all_sessions(db, principal_id)
     await _revoke_all_keys(db, principal_id)
-    await db.commit()
+    if commit:
+        await db.commit()
     return await get_principal(db, principal_id)
 
 
@@ -306,6 +313,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
     #   steward, watcher                   -> steward / watcher
     #   ci_reader, ci_auditor              -> themselves (#1686): the legacy role
     #                                         IS the confinement, as for watcher
+    #   slot_runner                        -> itself (#1712), same reason
     #   operator, developer, viewer        -> human
     #   reviewer_agent, agent, ci_runner   -> agent
     # ci_runner sits above viewer on purpose: a CI key that also holds a viewer
@@ -313,6 +321,12 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
     # (service, agent) or a missing principal -> agent, never human (#1639).
     slugs = await _get_principal_role_slugs(db, principal_id)
     for priority in (
+        # #1712: a host key is itself and FIRST. Any role added next to it would
+        # otherwise win the order below and lift the key out of its three-route
+        # allowlist (admin + slot_runner read as admin). The allowlist also needs
+        # the principal to BE a registered host, so the role on any other
+        # principal confines it to nothing at all.
+        "slot_runner",
         "super_admin",
         "admin",
         "security_admin",
@@ -330,7 +344,13 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         if priority in slugs:
             if priority in ("super_admin", "admin", "security_admin"):
                 return "admin"
-            if priority in ("steward", "watcher", "ci_reader", "ci_auditor"):
+            if priority in (
+                "steward",
+                "watcher",
+                "ci_reader",
+                "ci_auditor",
+                "slot_runner",
+            ):
                 return priority
             if priority in ("operator", "developer", "viewer"):
                 return "human"
@@ -469,6 +489,7 @@ async def create_api_key(
     expires_days: int | None = None,
     created_by: int | None = None,
     projects: list[str] | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     scopes = await _scope_entries(db, projects)
     plaintext, prefix, key_hash = generate_api_key()
@@ -492,7 +513,8 @@ async def create_api_key(
         ),
     )
     key_id = cursor.lastrowid
-    await db.commit()
+    if commit:
+        await db.commit()
 
     return {
         "id": key_id,

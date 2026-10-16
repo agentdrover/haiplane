@@ -650,6 +650,15 @@
                   {{ csrf_field() }}
                     <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
+                {#- #1712: хаб сам выдаёт код слоту хоста; человек код не видит. -#}
+                {%- for slot_host in slot_hosts %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-slot" class="task-action-stack task-action-stack--separated">
+                  {{ csrf_field() }}
+                    <input type="hidden" name="host" value="{{ slot_host }}">
+                    <button class="btn btn-primary task-action-btn" type="submit"
+                            onclick="return confirm('Запустить исполнителя на слоте {{ slot_host }} для задачи #{{ task.id }}? Хаб сам передаст код хосту.')">Запустить на {{ slot_host }}</button>
+                </form>
+                {%- endfor %}
 
                 {% elif task.status.value == 'needs_info' %}
                 <div class="task-action-state task-action-state--warning">Answer Required</div>

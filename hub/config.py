@@ -863,6 +863,10 @@ class TokenIdentity:
 
     @property
     def is_admin(self) -> bool:
+        if self.is_slot_runner:
+            # Stored permissions of an extra role must not make a host key an
+            # admin (#1712): the key is confined by its role, not by luck.
+            return False
         if self.role in ("admin", "super_admin"):
             return True
         return "admin.read" in self.permissions
@@ -886,6 +890,11 @@ class TokenIdentity:
         return self.role == "ci_auditor"
 
     @property
+    def is_slot_runner(self) -> bool:
+        """The key of an executor host (#1712): three routes of its own host."""
+        return self.role == "slot_runner"
+
+    @property
     def is_scoped_ci(self) -> bool:
         """A CI key bound to projects (#1644): confined to the CI routes.
 
@@ -906,6 +915,7 @@ class TokenIdentity:
             or self.is_watcher
             or self.is_ci_reader
             or self.is_ci_auditor
+            or self.is_slot_runner
         ):
             return False
         if self.role in ("human", "admin", "super_admin"):
@@ -914,7 +924,9 @@ class TokenIdentity:
 
     @property
     def is_agent(self) -> bool:
-        if self.is_steward or self.is_watcher:
+        # A host key is a machine, but NOT an agent (#1712): "not human and has
+        # a principal" would otherwise read a service principal as one.
+        if self.is_steward or self.is_watcher or self.is_slot_runner:
             return False
         if self.role == "agent":
             return True
@@ -923,6 +935,11 @@ class TokenIdentity:
     def has_permission(self, perm: str) -> bool:
         if self.role == "super_admin":
             return True
+        if self.is_slot_runner:
+            # No verb at all (#1712): neither the stored set nor the agent
+            # defaults below may widen a host key. The route allowlist in
+            # hub/auth.py is the gate; this is the ceiling behind it.
+            return False
         if self.is_ci_reader or self.is_ci_auditor:
             # Never widened by a stored permission set (#1686), as for a watcher.
             allowed = CI_READER_PERMS if self.is_ci_reader else CI_AUDITOR_PERMS
