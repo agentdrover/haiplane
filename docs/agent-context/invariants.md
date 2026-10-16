@@ -149,3 +149,29 @@ These are the rules most likely to be broken by “small” changes.
   Threat model and residual risk: test code of a branch IS branch code, and a verified run (#1687) still executes it. An author who forges results with ordinary code that shows none of these signs is not caught by the scan; that remainder is the review of the diff. The CI token is out of the branch's reach (#1686), the hub checks the run, attempt and artifact on GitHub (#1687), and this scan adds the visible signs of tampering with the inputs of CI. The `GITHUB_TOKEN` of a same-repo branch is bounded by repository settings and rulesets, outside this check and outside the YAML; executors can push to the repository anyway.
 - Steward watch notices (#1679): `watch_notices.notify_steward(db, reason, task_id|project_id, source_key, source_event_id)` writes a role message `steward@<slug>` (kind `note`, from `hub`, body JSON v1 with closed fields) IN THE TRANSACTION of the source event, behind a SAVEPOINT: a failure rolls back only its own key and message, emits `watch_notice_failed` and never raises, so the transition goes on. It does no commit and no network. Five reasons (`gate_policy.steward_watch`, absent = all five, `[]` = off, read at the moment of the event, never replayed): `needs_decision`, `machine_review`, `release`, `base_branch_red`, `stale`. Dedup is the lifetime key table `watch_notices(key UNIQUE)` with namespaced keys (`needs_decision:<event>`, `machine_review:<review>`, `release:<event>`, `base_branch_red:<project>:<sha>`, `stale:<task>:<status>:<rung>`, `stale_draft:<update>`); keys are never pruned by age. Every `needs_decision` event goes through `watch_notices.emit_needs_decision` (a test walks the sources and fails on a direct `insert_event(kind="needs_decision")`).
 - Done report transaction (#1690, #1687, #1688): `lifecycle.add_update` is a thin caller; its stages live in `hub/services/task_updates.py`. Order: `_task_with_current_ci` (`prepare_ci_standing`, the only network read, sets `PREPARED_CI_SHA`) -> `normalize_done_report` (poller-delivered done becomes `status` #971; `refuse_done_report` #1647; `_validate_done_report`) -> `undelivered_advisory` (#498, advisory, never raises) -> `apply_update`, the ONE owner of the transaction (`defer_completions`, `write_transaction`, SAVEPOINT `done_flow`, `except BaseException` with ROLLBACK TO + RELEASE). Inside it the task is read again (`_task_inside_transaction`, keeps `PREPARED_CI_SHA`) and the done gate decides again through `ci_trust.recheck_in_transaction` (`_done_validation_gate`); the scan and the CI standing are read BEFORE the transaction, the standing is rechecked inside it, as for the verdict (#1688). Extracted stages add no `commit`; the existing `log_activity(commit=True)` ends the transaction where it always did. Deferred delivery runs after the commit (`finish_update`) and its failure does not roll back the accepted done row. Race test: `tests/test_ci_trust.py::test_a_change_between_prepare_and_the_transaction_is_judged_inside_it`.
+
+## Личность вливания (#1708)
+
+- `main`/`develop` меняет только личность гейта — пишущая `gh`-учётка на
+  проде, сейчас `haiplane-gate` (до неё были `mrPDA`, затем личная учётка
+  владельца). Она единственная в обходе ruleset «only the gate updates
+  integration branches» (`update` на `main`/`develop`). В обходе ruleset
+  «green CI before merge»
+  нет никого: его правила (`pull_request` + `required_status_checks`) не
+  имеют bypass-актора, и PR обязателен для всех без исключения, а статус
+  «Ruff and pytest» принимается только от GitHub Actions. Третий ruleset,
+  «integration branches are permanent» (`deletion`, `non_fast_forward`),
+  обхода не имеет вовсе.
+- Исполнители — App на k8, Cursor, `gh` на Mac и любой другой писатель —
+  работают без обхода: ни один из трёх ruleset не пускает их напрямую в
+  `main`/`develop`. Это сузило обход, до 16.10.2026 открытый роли Write
+  целиком (#1426).
+- Drift-guard (`hub/services/drift_guard.py`, #534) сверяет SHA коммита,
+  произведшего merge, а не актора пуша: смена личности гейта сама по себе
+  не требует правки guard.
+- Токен гейта ротируется раз в 90 дней; откат при проблеме — `gh auth
+  switch` на прежнюю учётку.
+- Подтверждено пробами П0–П10 на `agentdrover/haiplane-w4-probe` и выкаткой
+  на `agentdrover/haiplane`, обе 16.10.2026.
+- Пересмотреть при смене личности гейта (App гейта вместо учётки) или при
+  изменении состава/обхода этих трёх ruleset.

@@ -542,10 +542,12 @@ develop действуют два ruleset:
 | green CI before merge | 21764773 | `pull_request` — изменения только через PR; `required_status_checks` — проверки зелёные | роль **Write**, режим **Always allow** (totalCount=1) |
 | integration branches are permanent | 21764736 | `deletion` — ветку нельзя удалить; `non_fast_forward` — историю нельзя перезаписать | пуст |
 
-Обход первого ruleset хаб использует сам: возврат main→develop после релиза
-идёт серверным слиянием `POST /repos/{repo}/merges` без PR
-(`hub/integrations/forge/github.py`, `merge_branches`, строки ~1092–1125).
-Поэтому просто убрать обход нельзя, сначала нужна замена этому пути.
+**Исторически** (до #1426, до 16.10.2026) обход первого ruleset хаб
+использовал сам: возврат main→develop после релиза шёл серверным слиянием
+`POST /repos/{repo}/merges` без PR (`hub/integrations/forge/github.py`,
+`merge_branches`, строки ~1092–1125). Этот путь заменён (#1426): теперь
+возврат идёт PR-ом (`deploy/CD.md`, «Возврат main в develop после релиза»),
+а `merge_branches` в этом файле больше нет.
 
 Первая запись этого раздела от 25.09 («Bypass list пуст в обоих») была
 неверной: её опровергли ревью через GraphQL и скриншот владельца.
@@ -574,6 +576,13 @@ develop действуют два ruleset:
 
 Задача #1426 (сужение обхода) остаётся: обход по роли Write по-прежнему
 открыт людям с этой ролью и нужен хабу для возврата main→develop.
+
+**Обновление 16.10.2026 (#1708).** #1426 выполнена: возврат main→develop
+идёт PR-ом (см. выше), и обход роли Write на ruleset «green CI before
+merge» снят — в его обходе больше нет никого. На agentdrover/haiplane
+действуют три ruleset и личность гейта — `docs/agent-context/invariants.md`,
+«Личность вливания». Наблюдение выше (25.09.2026) — исторический снимок
+настроек ДО этих изменений, он больше не описывает текущий обход.
 
 ### Почему не dry-run
 

@@ -1,12 +1,18 @@
 """Detect commits that reached a base branch outside the merge pipeline (#534).
 
-The repository is private on GitHub's free plan, so branch protection and
-rulesets are unavailable: nothing on the server can refuse a direct push to
-``main`` or ``develop``. The client-side pre-push hook is bypassed by
-``--no-verify`` and absent from clones without ``core.hooksPath``.
+Written for a repository with no server-side protection at all: on GitHub's
+free plan branch protection and rulesets were unavailable, so nothing on the
+server could refuse a direct push to ``main`` or ``develop``. Since
+16.10.2026 ``agentdrover/haiplane`` itself runs three rulesets that DO refuse
+an unapproved direct push server-side (gate identity and bypass —
+``docs/agent-context/invariants.md``, «Личность вливания», #1708), but this
+guard stays generic: other hub-managed projects may still have none. The
+client-side pre-push hook is bypassed by ``--no-verify`` and absent from
+clones without ``core.hooksPath``, on any project.
 
-So this replaces the impossible "prevent" with the achievable "notice". A
-violation stays possible; it stops being invisible.
+So this replaces the impossible "prevent" with the achievable "notice" where
+prevention is still absent, and keeps noticing even where it is now present.
+A violation stays possible; it stops being invisible.
 
 THREE OUTCOMES, NOT TWO. "No drift" and "could not check" are different
 answers and are never collapsed. On production the ``default`` project — the

@@ -3754,8 +3754,13 @@ class GitOpsIntegration:
         Replaces the direct branch merge of #969 (#1426). That merge went
         through ``POST /merges`` with no PR, and the ruleset's pull_request
         rule let it through only because the Write role could bypass it — a
-        bypass every writer had, not only the hub. As a PR merged at green
-        CI the return needs no bypass at all.
+        bypass every writer had, not only the hub. That was true before
+        16.10.2026 (#1708); since then the only bypass left on main/develop
+        is the gate's own identity (``haiplane-gate``) on a narrower
+        ruleset, not on ``pull_request``/``required_status_checks`` — see
+        ``docs/agent-context/invariants.md``, «Личность вливания». As a PR
+        merged at green CI the return needs no bypass of the PR/CI
+        requirements.
 
         Two things differ from a task merge, and both are load-bearing:
 
