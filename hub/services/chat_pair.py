@@ -37,7 +37,7 @@ from hub import config
 from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 
 log = logging.getLogger("hub.services.chat_pair")
 
@@ -1075,18 +1075,27 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
         )
         principals.add(int(row["principal_id"]))
     for task_id, (from_status, principals) in pending.items():
-        if await return_task_to_open(
-            db,
-            task_id,
-            from_status=from_status,
-            note="Implementer pairing session expired; task returned to open.",
-            event_kind="chat_pair_implementer_expired",
-            # #1712: a task another agent holds now is not this dead session's.
-            holders=frozenset(principals),
-        ):
+        # One transaction per task, rolled back as a whole (#1712): the release
+        # also closes the host order of the run, and a failure between the two
+        # must not leave half of it behind — nor an open write transaction that
+        # the next pass would commit as if it were its own.
+        try:
+            async with write_transaction(db):
+                freed = await return_task_to_open(
+                    db,
+                    task_id,
+                    from_status=from_status,
+                    note="Implementer pairing session expired; task returned to open.",
+                    event_kind="chat_pair_implementer_expired",
+                    # #1712: a task another agent holds now is not this session's.
+                    holders=frozenset(principals),
+                )
+        except Exception:  # noqa: BLE001 - one task must not stop the others
+            log.exception("Chat-pair reaper: releasing task #%d failed", task_id)
+            continue
+        if freed:
             released.append(task_id)
     if released:
-        await db.commit()
         log.info(
             "Chat-pair reaper: released %d implementer-bound task(s) to open",
             len(released),

@@ -642,7 +642,7 @@ async def _order_text(
 async def _code_row(db: aiosqlite.Connection, code: str) -> dict[str, Any]:
     rows = await fetchall(
         db,
-        "SELECT id, expires_at FROM chat_pair_codes WHERE code_hash = ?",
+        "SELECT id, expires_at, code_hash FROM chat_pair_codes WHERE code_hash = ?",
         (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(code)),),
     )
     return dict(rows[0])
@@ -787,8 +787,8 @@ async def _issue(
     del code
     cursor = await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
-        "pair_code_id, code_ciphertext, order_text, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "pair_code_id, code_ciphertext, order_text, expires_at, code_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host["name"],
             task_id,
@@ -798,6 +798,7 @@ async def _issue(
             sealed,
             text,
             stored["expires_at"],
+            stored["code_hash"],
         ),
     )
     order_id = int(cursor.lastrowid or 0)
@@ -944,6 +945,20 @@ _SECRET_SHAPES: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}", re.I),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{32,}")
+_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+#: Слово слага ветки (``task-N/<slug>``) короткое; у токена разрывов нет.
+_SLUG_WORD_MAX = 20
+
+
+def _looks_like_token(run: str) -> bool:
+    """Длинная строка, которую не объяснить ни хешем коммита, ни слагом ветки."""
+    if _HEX.match(run):
+        return False
+    if _SLUG.fullmatch(run):
+        return max(len(word) for word in run.split("-")) > _SLUG_WORD_MAX
+    return True
+
+
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")
@@ -977,8 +992,12 @@ async def _fields_hold_the_code(
     rows = await fetchall(
         db,
         "SELECT code_hash FROM chat_pair_codes WHERE id = ? "
-        "OR (channel = 'slot' AND slot = ? AND redeemed_at IS NULL)",
-        (int(order["pair_code_id"] or 0), order["host"]),
+        "OR (channel = 'slot' AND slot = ? AND redeemed_at IS NULL) "
+        # Хеши КАЖДОГО заказа хоста: сожжённый код (строки в chat_pair_codes уже
+        # нет) узнаётся по хешу заказа, а не пропускается в ленту без префикса.
+        "UNION SELECT code_hash FROM executor_orders "
+        "WHERE host = ? AND code_hash <> ''",
+        (int(order["pair_code_id"] or 0), order["host"], order["host"]),
     )
     wanted = {str(r[0]) for r in rows}
     if not wanted:
@@ -1021,9 +1040,13 @@ async def report_outcome(
     if why:
         raise HostError(422, why)
     # Ветка и sha — не заметка, но тоже строки в ленте: токен сессии или ключа
-    # в имени ветки — тот же секрет в той же ленте.
-    if any(shape.search(f) for shape in _SECRET_SHAPES for f in (branch, sha)):
-        raise HostError(422, "branch/sha: похоже на токен или ключ")
+    # в имени ветки — тот же секрет в той же ленте. Длинная строка, не похожая на слаг
+    # ветки (у слага слова короткие, у токена разрывов нет), — тоже отказ.
+    for field in (branch, sha):
+        if any(shape.search(field) for shape in _SECRET_SHAPES):
+            raise HostError(422, "branch/sha: похоже на токен или ключ")
+        if any(_looks_like_token(run) for run in _LONG_TOKEN.findall(field)):
+            raise HostError(422, "branch/sha: длинная строка похожа на токен")
     async with write_transaction(db):
         order = await _own_order(db, host, order_id)
         if order is None:
@@ -1072,4 +1095,9 @@ async def report_outcome(
             principal_id=principal_id,
             author_kind="principal",
         )
+        if outcome in ("failed", "rescued"):
+            # Прогон на хосте кончился без сдачи: бронь не ждёт конца сессии
+            # (решение владельца 16.10). Сдача (submitted) заказ не закрывает —
+            # его закрывает сама сдача.
+            await close_order(db, order, f"reported_{outcome}", RUN_OUTCOME_ABORTED)
     return {"id": order["id"], "outcome": outcome, "duplicate": False}

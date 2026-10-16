@@ -708,7 +708,7 @@ async def _burnt(world, order: dict, code: str) -> None:
     assert (await _redeem(world, code)).status_code == 401
 
 
-async def test_any_close_burns_the_code(world):
+async def test_any_close_burns_the_code(world, monkeypatch):
     """AC-5: истечение, redeem_failed, redeem_lost, смерть сессии; гонка — один исход."""
     # (1) ack redeem_failed: заказ закрыт, код сожжён, прогон aborted, задача open.
     t1 = await _task(world, "failed")
@@ -835,9 +835,39 @@ async def test_any_close_burns_the_code(world):
         headers=world.k8_auth,
     )
     assert freed.status_code == 200
+    await _reaper_failure_part(world, monkeypatch)
     # Слот свободен для следующего.
     assert (await _launch(world, await _task(world, "следующая"))).status_code == 200
     await _expiry_race_part(world)
+
+
+async def _reaper_failure_part(world, monkeypatch):
+    """AC-5: сбой reaper'а посреди возврата откатывает ВСЁ и не оставляет транзакцию."""
+    task_id = await _task(world, "сбой reaper")
+    alive = await _launch_redeem(world, task_id)
+    await _claim_and_start(world, task_id, alive["session"])
+    await world.db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
+        "WHERE bound_task_id = ?",
+        (task_id,),
+    )
+    await world.db.commit()
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("закрытие заказа упало")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orders, "close_for_released_task", _boom)
+        assert await cp.release_expired_implementer_tasks(world.db) == []
+    assert not world.db.in_transaction  # ничего не осталось открытым
+    await world.db.commit()
+    assert (await repo.get_task(world.db, task_id))["status"] == "running"
+    assert (await _order_row(world, alive["order"]["id"]))["state"] == "redeemed"
+    # Следующий проход без сбоя доводит то же самое до конца.
+    assert await cp.release_expired_implementer_tasks(world.db) == [task_id]
+    await world.db.commit()
+    assert (await repo.get_task(world.db, task_id))["status"] == "open"
+    assert (await _order_row(world, alive["order"]["id"]))["state"] == "closed"
 
 
 async def _expiry_race_part(world):
@@ -1408,6 +1438,38 @@ async def _other_order_code_part(world):
             headers=world.k8_auth,
         )
         assert leaked.status_code == 422, body
+    # Сожжённый код (заказ закрыт настоящим ack redeem_failed, строки кода нет)
+    # фильтр итога всё равно узнаёт — по хешу, оставшемуся в заказе.
+    await world.db.execute(
+        "UPDATE executor_orders SET state = 'closed' WHERE host = 'k8' "
+        "AND state <> 'closed'"
+    )
+    await world.db.commit()
+    burnt_task = await _task(world, "сожжённый")
+    assert (await _launch(world, burnt_task, "k8")).status_code == 200
+    burnt_order = (await _orders(world, "k8")).json()["orders"][0]
+    burnt = _code_of(world, burnt_order).removeprefix("AH-")
+    failed = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{burnt_order['id']}/ack",
+        json={"result": "redeem_failed"},
+        headers=world.k8_auth,
+    )
+    assert failed.status_code == 200
+    assert (
+        await _rows(
+            world.db,
+            "SELECT 1 FROM chat_pair_codes WHERE id = ?",
+            ((await _order_row(world, burnt_order["id"]))["pair_code_id"],),
+        )
+        == []
+    )
+    for body in ({"note": burnt}, {"branch": burnt}, {"note": burnt.lower() + "z"}):
+        again = await world.client.post(
+            f"/api/executor-hosts/k8/orders/{burnt_order['id']}/report",
+            json={"outcome": "failed", **body},
+            headers=world.k8_auth,
+        )
+        assert again.status_code == 422, body
     clean = await world.client.post(
         f"/api/executor-hosts/k8/orders/{old_order['id']}/report",
         json={"outcome": "failed", "note": "без кода"},
@@ -1434,6 +1496,10 @@ async def _notes_part(world, order: dict, task_id: int):
     raw = code.removeprefix("AH-")
     for body in (
         {"branch": FAKE_SESSION_TOKEN},
+        {"branch": "task-1712/" + "q" * 40},
+        {"branch": "task-1712/" + "Xy" * 20},
+        {"sha": "q" * 40},
+        {"branch": "task-1712/ok", "sha": "z" * 33},
         {"branch": "task-1/" + FAKE_KEY_TAIL},
         {"branch": raw},
         {"branch": raw.lower()},
@@ -1478,8 +1544,57 @@ async def _notes_part(world, order: dict, task_id: int):
         if "Итог прогона" in u["content"]
     ]
     assert feed == []
-    ok = await post(note="a" * 500)
-    assert ok.status_code == 200
+    # Обычная ветка с длинным слагом и хеш коммита проходят.
+    ok = await post(
+        note="a" * 500,
+        branch="task-1712/hab-vydaet-kod-ispolnitelya-slotu-k8-zap",
+        sha="0123456789abcdef0123456789abcdef01234567",  # pragma: allowlist secret
+    )
+    assert ok.status_code == 200, ok.text
+    # failed закрывает заказ и освобождает слот, непотраченный код сожжён.
+    closed = await _order_row(world, order["id"])
+    assert closed["state"] == "closed" and closed["close_reason"] == "reported_failed"
+    assert (
+        await _launch(world, await _task(world, "после failed"), "k9")
+    ).status_code == 200
+    await _rescued_part(world)
+
+
+async def _rescued_part(world):
+    """AC-11: rescued закрывает так же, submitted — нет (закрывает сама сдача)."""
+    await world.db.execute(
+        "UPDATE executor_orders SET state = 'closed' WHERE host = 'k9' "
+        "AND state <> 'closed'"
+    )
+    await world.db.commit()
+    for outcome, closes in (("rescued", True), ("submitted", False)):
+        task_id = await _task(world, f"итог {outcome}")
+        assert (await _launch(world, task_id, "k9")).status_code == 200
+        got = (await _orders(world, "k9")).json()["orders"][0]
+        posted = await world.client.post(
+            f"/api/executor-hosts/k9/orders/{got['id']}/report",
+            json={"outcome": outcome},
+            headers=world.k9_auth,
+        )
+        assert posted.status_code == 200, posted.text
+        row = await _order_row(world, got["id"])
+        assert (row["state"] == "closed") is closes, (outcome, row["state"])
+        if closes:
+            assert row["close_reason"] == "reported_rescued"
+            assert row["code_ciphertext"] == ""
+            run = (
+                await _rows(
+                    world.db,
+                    "SELECT outcome FROM executor_runs WHERE id=?",
+                    (got["executor_run_id"],),
+                )
+            )[0]
+            assert run["outcome"] == "aborted"
+        await world.db.execute(
+            "UPDATE executor_orders SET state = 'closed' WHERE host = 'k9' "
+            "AND state <> 'closed'"
+        )
+        await world.db.commit()
 
 
 # ---------------------------------------------------------------------------

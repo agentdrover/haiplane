@@ -3069,6 +3069,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON executor_orders(host) WHERE state <> 'closed'",
     ),
     (
+        # #1712: хеш кода заказа (как в chat_pair_codes) остаётся и после
+        # сожжения кода: фильтр итога прогона узнаёт по нему код закрытого
+        # заказа, строки которого в chat_pair_codes уже нет.
+        "add_executor_orders_code_hash",
+        "ALTER TABLE executor_orders ADD COLUMN code_hash TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         "idx_executor_orders_task",
         "CREATE INDEX IF NOT EXISTS idx_executor_orders_task "
         "ON executor_orders(task_id)",
