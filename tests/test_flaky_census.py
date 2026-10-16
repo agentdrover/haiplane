@@ -155,3 +155,128 @@ def test_escape_sequence_refusal_is_retried_with_the_flag_or_named(
         assert "обновите gh" in str(err)
     else:
         raise AssertionError("пустой результат вместо ошибки")
+
+
+# ---- #1767: the suite runs in the jobs "Tests part N/3" -----------------------
+
+_LOG_FAILED = (
+    f"x git log -1 --format=%H\n{SHA}\n"
+    f"gw0 FAILED {NODE} - boom\n"
+    "=== 1 failed, 5 passed in 1.00s ===\n"
+)
+
+
+class _FakeGh:
+    """Отвечает на jobs попытки и на журналы job-ов."""
+
+    def __init__(self, jobs: list[dict], logs: dict[int, str] | None = None) -> None:
+        self.jobs = jobs
+        self.logs = logs or {}
+        self.read: list[int] = []
+
+    def json(self, path: str) -> dict:
+        assert path.endswith("/jobs?per_page=100"), path
+        return {"jobs": self.jobs}
+
+    def get(self, path: str, *args, **kwargs) -> str:
+        job_id = int(path.split("/")[2])
+        self.read.append(job_id)
+        return self.logs[job_id]
+
+
+def _job(job_id: int, name: str, step: str | None, conclusion: str | None = "success"):
+    steps = [{"name": "Checkout", "conclusion": "success"}]
+    if step is not None:
+        steps.append({"name": step, "conclusion": conclusion})
+    return {"id": job_id, "name": name, "steps": steps}
+
+
+_BASE = {
+    "id": 9,
+    "event": "push",
+    "head_branch": "develop",
+    "head_sha": SHA,
+    "created_at": "2026-10-16T00:00:00Z",
+    "conclusion": "failure",
+    "pull_request_base": None,
+}
+
+
+def _parts(*conclusions: str) -> list[dict]:
+    jobs = [_job(1, "Ruff and pytest", None)]
+    for i, c in enumerate(conclusions, 1):
+        jobs.append(_job(10 + i, f"Tests part {i}/3", fc.TEST_STEP_NAME, c))
+    return jobs
+
+
+def test_one_failed_part_fails_the_attempt_and_its_log_is_read(monkeypatch) -> None:
+    monkeypatch.setattr(fc, "pr_base", lambda run: "")
+    gh = _FakeGh(_parts("success", "failure", "success"), {12: _LOG_FAILED})
+    jobs = fc.test_jobs(gh, 9, 1)
+    assert [j["id"] for j in jobs] == [11, 12, 13]
+    assert fc.test_step_state(jobs) == "failure"
+    rec = fc.failed_attempt(gh, _BASE, 1)
+    assert rec["test_step"] == "failure" and rec["log"] == "ok"
+    assert rec["nodeids"] == [NODE]
+    assert gh.read == [12], "only the failed part's log is read"
+    # several failed parts: each one's log is read
+    gh = _FakeGh(
+        _parts("failure", "failure", "success"), {11: _LOG_FAILED, 12: _LOG_FAILED}
+    )
+    fc.failed_attempt(gh, _BASE, 1)
+    assert gh.read == [11, 12]
+
+
+def test_an_attempt_is_green_only_when_every_part_is_green() -> None:
+    def state(*conclusions: str) -> str:
+        return fc.test_step_state(fc.test_jobs(_FakeGh(_parts(*conclusions)), 9, 1))
+
+    assert state("success", "success", "success") == "success"
+    assert state("success", "success", "skipped") == "skipped"
+    assert state("success", "success", "failure") == "failure"
+    gh = _FakeGh(_parts("success", "success", "success"))
+    run = {"id": 9, "run_attempt": 1}
+    assert fc.green_attempts(gh, run) == [1]
+    gh = _FakeGh(_parts("success", "cancelled", "success"))
+    assert fc.green_attempts(gh, run) == []
+
+
+def test_missing_parts_or_a_missing_test_step_is_unknown_not_clean() -> None:
+    # no parts and no old job: nothing is known
+    assert fc.test_step_state(fc.test_jobs(_FakeGh([_job(1, "Lint", None)]), 9, 1)) == (
+        "no_job"
+    )
+    # the new job without its Test step, whether alone or next to green parts
+    only_new = _FakeGh(_parts("success")[:1])  # just "Ruff and pytest", no Test
+    assert fc.test_step_state(fc.test_jobs(only_new, 9, 1)) == "no_step"
+    jobs = [
+        _job(11, "Tests part 1/3", fc.TEST_STEP_NAME),
+        _job(12, "Tests part 2/3", None),
+    ]
+    assert fc.test_step_state(jobs) == "no_step"
+
+
+def test_a_run_before_the_split_is_still_read() -> None:
+    old = [_job(5, "Ruff and pytest", fc.TEST_STEP_NAME, "failure")]
+    gh = _FakeGh(old, {5: _LOG_FAILED})
+    assert fc.test_step_state(fc.test_jobs(gh, 9, 1)) == "failure"
+    ok = _FakeGh([_job(5, "Ruff and pytest", fc.TEST_STEP_NAME)])
+    assert fc.green_attempts(ok, {"id": 9, "run_attempt": 1}) == [1]
+
+
+def test_the_names_the_census_searches_for_are_the_names_in_ci_yml() -> None:
+    import yaml
+
+    doc = yaml.safe_load(
+        (
+            Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+        ).read_text()
+    )
+    part = doc["jobs"]["pytest"]
+    assert part["name"].startswith(fc.PART_JOB_PREFIX), part["name"]
+    assert fc.TEST_STEP_NAME in [s["name"] for s in part["steps"]]
+    # the pre-split layout is gone from the workflow, so nothing else may match
+    assert fc.PART_JOB_PREFIX not in doc["jobs"]["test"]["name"]
+    assert fc.TEST_STEP_NAME not in [
+        s.get("name") for s in doc["jobs"]["test"]["steps"]
+    ]
