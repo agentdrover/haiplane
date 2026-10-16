@@ -41,8 +41,50 @@ jobs:
     timeout-minutes: 10
     outputs:
       skip: ${{ steps.treedup.outputs.skip }}
+      # #1785: whether the evidence (mutations, red-test baseline) is expected
+      # in THIS run. Decided once, here, and read by job `evidence` (to run) and
+      # by job `test` (to know what a missing file means).
+      evidence_run: ${{ steps.evidence.outputs.run }}
 
     steps:
+      # #1606: мутации (~9,5 мин) и baseline (~2-3 мин) считаются там, где их
+      # результат будет прочитан, а не на каждом обновлении ветки. Решение
+      # принимается по СОБЫТИЮ GitHub, которое CI знает сам, без доверия к
+      # хабу: ручной прогон исполнителя ДО сдачи (workflow_dispatch) и первый
+      # прогон PR (opened/reopened) task-ветки. Обновление ветки (synchronize —
+      # гейт подтянул базу или автор дописал коммит) и не-task PR (релизный
+      # develop→main, возврат main→develop, dependabot/*) их не считают;
+      # Test, AC и validation идут как раньше. Ветка и база — через env, а не
+      # подстановкой в тело: имя ветки приходит снаружи.
+      # #1785: the step moved here from job `test` (same case, same answers). It
+      # is the FIRST step and needs nothing from the checkout, so no failure of
+      # a later step can leave the output empty.
+      - name: Decide whether mutations and baseline are worth their minutes
+        id: evidence
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          case "$EVENT_NAME:$EVENT_ACTION:$HEAD_REF" in
+            workflow_dispatch:*:task-* | pull_request:opened:task-* | pull_request:reopened:task-*)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: running ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF)"
+              ;;
+            push:*)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped (push: the branch is the base, the diff is empty)"
+              ;;
+            pull_request:synchronize:task-*)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped (synchronize: a branch update; they come from the manual run before submission or from opened)"
+              ;;
+            *)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "mutations/baseline: skipped ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF: not a task branch run they are for)"
+              ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -98,7 +140,7 @@ jobs:
             echo "tree not seen before — running pytest: $tree"
           fi
 
-  # #1767: the full suite as three parallel parts. Measured (#1700, 39 attempts):
+  # #1767: the full suite as parallel parts. Measured (#1700, 39 attempts):
   # the Test step took 8.4 min of a 16.4 min run; the runner has 4 cores, the
   # time is spread evenly, so speeding up single tests gains little, while the
   # repository is public and parallel jobs cost nothing.
@@ -113,14 +155,16 @@ jobs:
   # condition, so a skipped suite installs nothing; the job still ends
   # "success", which is what job `test` reads together with the dedup output.
   pytest:
-    name: Tests part ${{ matrix.shard }}/3
+    name: Tests part ${{ matrix.shard }}/${{ strategy.job-total }}
     needs: treedup
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        # #1785: the number of parts is set HERE and nowhere else; the job name
+        # and the command read it from strategy.job-total.
+        shard: [1, 2, 3, 4]
     # Same as in job test: a missing tool or root is a red test, not a skip.
     env:
       CI_REQUIRE_ROOT_TESTS: "1"
@@ -165,28 +209,146 @@ jobs:
       # первым токеном строки `-v` — xdist ставит там `[gw0]`, и каждый AC
       # ушёл бы в not_found. Прогон AC остаётся последовательным.
       # Имя шага "Test" осталось прежним: по нему сборщик времени называет
-      # минуты тестов (scripts/ci_trusted_report.py, TIMING_STEPS), и три
-      # части складываются в один ключ.
+      # минуты тестов (scripts/ci_trusted_report.py, TIMING_STEPS), и части
+      # складываются в один ключ.
       - name: Test
         id: shard
         if: ${{ needs.treedup.outputs.skip != 'true' }}
         # #1666: a hung test must not hold the run for the 360 min default;
         # pytest-timeout (300 s per test) names the test well before this.
         timeout-minutes: 25
-        run: HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 uv run pytest -p scripts.pytest_shard -q -n auto --durations=30
+        run: HAIPLANE_TEST_SHARD=${{ matrix.shard }}/${{ strategy.job-total }} uv run pytest -p scripts.pytest_shard -q -n auto --durations=30
+
+  # #1785: the mutations and the red-test baseline do not depend on the outcome
+  # of the parts (the script runs the changed files' tests itself, after a green
+  # baseline of its own), so they run NEXT to the parts instead of after them.
+  # Measured on #1767 (0545c6ac, d674d0d5): 552 s + 78 s sequentially after the
+  # parts.
+  #
+  # `continue-on-error` at the JOB level: a red evidence job must not make the
+  # workflow red (ci_trust requires run_conclusion=success). The job holds no
+  # environment, no secret and no report key (#1686): it runs the branch's code.
+  # Its files travel to job `test` in an intermediate artifact whose name does
+  # NOT start with `hub-ci-results-`: the trusted report reads only that prefix
+  # (scripts/ci_trusted_report.py), and the files reach it through the AC
+  # collection of job `test`, as before.
+  #
+  # Whether the evidence is EXPECTED is decided once, in job treedup. A run that
+  # does not expect it skips this job entirely (nothing is installed).
+  evidence:
+    name: Mutations and red-test baseline
+    needs: treedup
+    if: ${{ needs.treedup.outputs.evidence_run == 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Same as in job test: a missing tool or root is a red test, not a skip.
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The mutations and the baseline diff against the base branch, and
+          # merge-base needs history that a depth-1 checkout does not have.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # #1707: see the same step in job test; no `|| true`.
+      - name: Install age and openssh-server (backup tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
+      # test does not fail on broken behaviour", and the reviewer named the
+      # surviving mutation himself in 33. The script mutates ONLY the Python
+      # functions this PR changed, runs the tests that reference their files,
+      # and names every survivor. It observes a green baseline by rc first: a
+      # red one is reported as "the series did not run", never as "no
+      # survivors". Warning only, like Surface parity: the script exits 0,
+      # continue-on-error keeps a crash out of the delivery gate, and the
+      # timeout caps the cost (outcome revisit condition: 10 minutes).
+      # The base is the PR base, develop for a manual run (as for the baseline).
+      - name: Mutations of changed functions (warning only)
+        id: mutations
+        if: ${{ needs.treedup.outputs.evidence_run == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          uv run python scripts/mutation_changed.py \
+            --base "origin/${{ github.base_ref || 'develop' }}" \
+            --budget-seconds 540 \
+            --json-out mutation-report.json
+
+      # #913: the red-test gate for bugs needs proof that the AC test failed
+      # BEFORE the fix, and the hub accepts CI reports only about the pinned
+      # commit. So the proof travels in that same report: the branch's changed
+      # tests/** are laid over the merge-base code in a separate worktree and
+      # run with junitxml — failed (assert) / passed / error (collection,
+      # ImportError, fixture). A test failing on the base is DATA, not an
+      # error: the script always exits 0 and continue-on-error keeps a crash
+      # out of the delivery gate. task-* branches only (PR and manual runs);
+      # the base is the PR base, develop for a manual run.
+      - name: Red-test baseline on merge-base (data only)
+        id: baseline
+        # !cancelled(): the proof is about the base, not about the mutations
+        # step above.
+        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          uv run python scripts/red_test_baseline.py \
+            --base "origin/${{ github.base_ref || 'develop' }}" \
+            --json-out red-test-baseline.json
+
+      # The hand-over to job test: whatever files exist, even after a red step.
+      # No files at all ⇒ no artifact (ignore), and job test reports the
+      # missing file as an error with its cause.
+      - name: Upload the evidence files for job test
+        if: ${{ always() && needs.treedup.outputs.evidence_run == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-evidence-${{ github.run_attempt }}
+          path: |
+            mutation-report.json
+            red-test-baseline.json
+          if-no-files-found: ignore
+          retention-days: 1
 
   test:
     name: Ruff and pytest
     # #1767: the one required check, the one place that collects the AC and
-    # sends the artifact. It runs after the dedup decision and the three parts
-    # whatever their outcome, and judges them in the step `tests` below.
-    needs: [treedup, pytest]
+    # sends the artifact. It runs after the dedup decision, the parts and the
+    # evidence whatever their outcome, and judges the parts in the step `tests`
+    # below. #1785: it waits for job `evidence` only to download its files; the
+    # outcome of that job is read nowhere (it is continue-on-error and a
+    # missing file is reported as an error by the collector).
+    needs: [treedup, pytest, evidence]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    # #1666: 90 min = 45 min of explicit step ceilings (mutations 15 + baseline
-    # 10 + report 20) plus headroom for the steps that have no ceiling of their
-    # own (install, lint, type check, scans). #1767: the 25 min of the Test step
-    # moved to job `pytest`; the ceiling of THIS job stays as it was.
+    # #1666: 90 min = explicit step ceilings plus headroom for the steps that
+    # have no ceiling of their own (install, lint, type check, scans). #1767:
+    # the 25 min of the Test step moved to job `pytest`; #1785: the mutations
+    # (15 min) and the baseline (10 min) moved to job `evidence`. The ceiling of
+    # THIS job stays as it was.
     timeout-minutes: 90
     # #1707: the backup tests install a real user and an sshd drop-in on this
     # disposable runner. With this variable a missing tool or missing root is a
@@ -270,8 +432,8 @@ jobs:
         id: types
         run: uv run mypy hub
 
-      # #1767: the suite itself runs in job `pytest` (three parts in parallel).
-      # THIS step is the only place that turns the three results into one
+      # #1767: the suite itself runs in job `pytest` (the parts in parallel).
+      # THIS step is the only place that turns the results of the parts into one
       # outcome, and `steps.tests.outcome` below keeps meaning "the suite
       # passed". It reads `needs.pytest.result`, which GitHub folds from EVERY
       # matrix leg (failure if one failed, cancelled if one was cancelled), not
@@ -284,14 +446,14 @@ jobs:
       # `always()` WITHOUT `!cancelled()`: a cancelled run must still run this
       # job and end red, not be skipped (a skipped required check can count as
       # passed).
-      - name: Tests outcome of the three parts
+      - name: Tests outcome of the parts
         id: tests
         if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
         env:
           PARTS_RESULT: ${{ needs.pytest.result }}
         run: |
           if [ "$PARTS_RESULT" = "success" ]; then
-            echo "the three test parts passed"
+            echo "the test parts passed"
             exit 0
           fi
           echo "::error::the test parts did not pass: result is '${PARTS_RESULT:-unknown}'"
@@ -325,88 +487,6 @@ jobs:
           uv run python scripts/surface_parity.py \
             --base "origin/${{ github.base_ref }}"
 
-      # #1606: мутации (~9,5 мин) и baseline (~2-3 мин) считаются там, где их
-      # результат будет прочитан, а не на каждом обновлении ветки. Решение
-      # принимается по СОБЫТИЮ GitHub, которое CI знает сам, без доверия к
-      # хабу: ручной прогон исполнителя ДО сдачи (workflow_dispatch) и первый
-      # прогон PR (opened/reopened) task-ветки. Обновление ветки (synchronize —
-      # гейт подтянул базу или автор дописал коммит) и не-task PR (релизный
-      # develop→main, возврат main→develop, dependabot/*) их не считают;
-      # Test, AC и validation идут как раньше. Ветка и база — через env, а не
-      # подстановкой в тело: имя ветки приходит снаружи.
-      - name: Decide whether mutations and baseline are worth their minutes
-        id: evidence
-        # !cancelled(): a red Test or an earlier check must not skip this step
-        # and with it the baseline, whose own condition already says !cancelled().
-        if: ${{ !cancelled() }}
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action }}
-          HEAD_REF: ${{ github.head_ref || github.ref_name }}
-        run: |
-          case "$EVENT_NAME:$EVENT_ACTION:$HEAD_REF" in
-            workflow_dispatch:*:task-* | pull_request:opened:task-* | pull_request:reopened:task-*)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              echo "mutations/baseline: running ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF)"
-              ;;
-            push:*)
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "mutations/baseline: skipped (push: the branch is the base, the diff is empty)"
-              ;;
-            pull_request:synchronize:task-*)
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "mutations/baseline: skipped (synchronize: a branch update; they come from the manual run before submission or from opened)"
-              ;;
-            *)
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "mutations/baseline: skipped ($EVENT_NAME ${EVENT_ACTION:-manual} on $HEAD_REF: not a task branch run they are for)"
-              ;;
-          esac
-
-      # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
-      # test does not fail on broken behaviour", and the reviewer named the
-      # surviving mutation himself in 33. The script mutates ONLY the Python
-      # functions this PR changed, runs the tests that reference their files,
-      # and names every survivor. It observes a green baseline by rc first: a
-      # red one is reported as "the series did not run", never as "no
-      # survivors". Warning only, like Surface parity: the script exits 0,
-      # continue-on-error keeps a crash out of the delivery gate, and the
-      # timeout caps the cost (outcome revisit condition: 10 minutes).
-      # #1606: runs only where the "evidence" step above says so; the base is the
-      # PR base, develop for a manual run (as for the baseline below).
-      - name: Mutations of changed functions (warning only)
-        id: mutations
-        if: ${{ steps.evidence.outputs.run == 'true' }}
-        continue-on-error: true
-        timeout-minutes: 15
-        run: |
-          uv run python scripts/mutation_changed.py \
-            --base "origin/${{ github.base_ref || 'develop' }}" \
-            --budget-seconds 540 \
-            --json-out mutation-report.json
-
-      # #913: the red-test gate for bugs needs proof that the AC test failed
-      # BEFORE the fix, and the hub accepts CI reports only about the pinned
-      # commit. So the proof travels in that same report: the branch's changed
-      # tests/** are laid over the merge-base code in a separate worktree and
-      # run with junitxml — failed (assert) / passed / error (collection,
-      # ImportError, fixture). A test failing on the base is DATA, not an
-      # error: the script always exits 0 and continue-on-error keeps a crash
-      # out of the delivery gate. task-* branches only (PR and manual runs);
-      # the base is the PR base, develop for a manual run.
-      - name: Red-test baseline on merge-base (data only)
-        id: baseline
-        # !cancelled(): the proof is about the base, not about this commit's
-        # own Test step — a red suite must not also erase the baseline.
-        # #1606: the same decision as for the mutations (task-* is part of it).
-        if: ${{ !cancelled() && steps.evidence.outputs.run == 'true' }}
-        continue-on-error: true
-        timeout-minutes: 10
-        run: |
-          uv run python scripts/red_test_baseline.py \
-            --base "origin/${{ github.base_ref || 'develop' }}" \
-            --json-out red-test-baseline.json
-
       # #546: the hub has no test runner by design, so the evidence for its two
       # SDD gates is produced here and reported back. Placed AFTER the main test
       # step and marked continue-on-error on purpose: the delivery gate
@@ -428,6 +508,20 @@ jobs:
       # hub-ci-results/, uploaded below as an artifact. The report itself is
       # sent by .github/workflows/ci-report.yml, which GitHub runs from the
       # default branch after this workflow completes.
+      # #1785: the evidence files of job `evidence`. `!cancelled()`, not the
+      # implicit success(): a red Lint or Tests step must not skip the download,
+      # the proof is about the base and the mutations, not about this job.
+      # A missing artifact (job evidence failed to prepare, nothing written) is a
+      # failed download here — it does not stop the job, and the collector turns
+      # the missing file into an explicit error because evidence-run is true.
+      - name: Download the evidence files of job evidence
+        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-ci-evidence-${{ github.run_attempt }}
+          path: .
+
       - name: Collect AC test and validation results for the Hub
         if: ${{ always() }}
         continue-on-error: true
@@ -446,10 +540,10 @@ jobs:
           mutations-file: mutation-report.json
           # #913: its own key too — evidence for the red-test gate on bugs.
           baseline-file: red-test-baseline.json
-          # #1606: what each step DID, so the reporter can tell "did not run"
-          # (no key sent) from "ran and left no file" (an explicit error).
-          mutations-outcome: ${{ steps.mutations.outcome }}
-          baseline-outcome: ${{ steps.baseline.outcome }}
+          # #1606/#1785: whether the evidence was EXPECTED in this run (decided
+          # in job treedup), so the reporter can tell "not expected" (no key
+          # sent) from "expected and no file" (an explicit error).
+          evidence-run: ${{ needs.treedup.outputs.evidence_run }}
           event-action: ${{ github.event.action }}
           # A step that never ran reports its outcome as '' and is dropped by
           # the reporter — silence, not a pass (#875).

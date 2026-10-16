@@ -1,9 +1,9 @@
-"""#1767: the suite runs as three parts; together they are the suite, once.
+"""#1767: the suite runs as parts; together they are the suite, once.
 
 The plugin is ``scripts/pytest_shard.py``. These tests execute a REAL isolated
 suite in a temporary directory (pytester) and never run the repository's own
-suite recursively: for ``tests/`` itself only ``--collect-only`` of the three
-parts is run.
+suite recursively: for ``tests/`` itself only ``--collect-only`` of the parts is
+run (their number is the matrix of ci.yml, #1785).
 """
 
 from __future__ import annotations
@@ -141,8 +141,15 @@ def test_three_shards_cover_a_suite_exactly_once_under_xdist(
     assert len(everything) == len(set(everything)), "a test ran in two parts"
     assert set(everything) == expected, expected.symmetric_difference(everything)
 
-    # The real tests/: only collection, the three parts against the whole.
-    runs = {spec: _collect_tests_dir(spec) for spec in (None, "1/3", "2/3", "3/3")}
+
+def assert_parts_of_tests_dir_are_the_whole(total: int) -> None:
+    """The real tests/: only collection, the ``total`` parts against the whole.
+
+    #1785: ``total`` is the number of parts in ci.yml, not a constant here; the
+    contract test of the workflow (AC-4) calls this with the matrix length.
+    """
+    specs = [None, *[f"{i}/{total}" for i in range(1, total + 1)]]
+    runs = {spec: _collect_tests_dir(spec) for spec in specs}
     listings = {}
     for spec, proc in runs.items():
         out, _ = proc.communicate(timeout=300)
@@ -150,6 +157,7 @@ def test_three_shards_cover_a_suite_exactly_once_under_xdist(
         listings[spec] = _collected(out)
     whole = listings.pop(None)
     assert len(whole) > 1000, "the collection of tests/ looks empty"
+    assert len(listings) == total
     parts = [n for lst in listings.values() for n in lst]
     assert all(listings.values()), "a part of tests/ is empty"
     assert len(parts) == len(set(parts)), "a test of tests/ is in two parts"

@@ -43,8 +43,7 @@ def _clean_prefixed_env(monkeypatch):
         "HUB_CI_CHECKS",
         "HUB_CI_MUTATIONS",
         "HUB_CI_BASELINE",
-        "HUB_CI_MUTATIONS_OUTCOME",
-        "HUB_CI_BASELINE_OUTCOME",
+        "HUB_CI_EVIDENCE_RUN",
         "HUB_CI_EVENT_ACTION",
     ):
         monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
@@ -454,7 +453,7 @@ def test_the_workflow_hands_the_reporter_what_it_ran():
     assert declared, "the reporter is told nothing about what this job ran"
 
     # #1767: the full-suite line is the one SYNTHETIC record: the suite runs in
-    # three parts of job `pytest`, and the step `tests` of this job turns their
+    # the parts of job `pytest` (their number is the matrix of ci.yml, #1785), and the step `tests` of this job turns their
     # result into one outcome. The line stays byte for byte what the validation
     # commands of task cards say (the reporter matches by equality), the step it
     # points at is that aggregator, and every part runs exactly this command
@@ -466,14 +465,14 @@ def test_the_workflow_hands_the_reporter_what_it_ran():
     assert "pytest" not in aggregator["run"], "the aggregator runs nothing itself"
     assert aggregator["run"].strip() != full_suite
     part = by_id["shard"]
+    shard_env = "HAIPLANE_TEST_SHARD=${{ matrix.shard }}/${{ strategy.job-total }} "
     assert part["run"].strip() == (
-        "HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 uv run pytest "
-        "-p scripts.pytest_shard -q -n auto --durations=30"
+        shard_env + "uv run pytest -p scripts.pytest_shard -q -n auto --durations=30"
     )
     assert (
         part["run"]
         .strip()
-        .removeprefix("HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 ")
+        .removeprefix(shard_env)
         .replace(" -p scripts.pytest_shard", "")
         == full_suite
     )
@@ -712,26 +711,35 @@ def test_a_long_survivor_list_is_trimmed_and_says_so(script):
     assert all(s["line"] is not None for s in trimmed["survivors"])
 
 
-def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
-    """#1270 AC-3 (static half): warning step, PR only, its JSON reaches the reporter."""
+def test_ci_workflow_runs_mutations_beside_the_tests_and_cannot_fail_the_job():
+    """#1270 AC-3 (static half): warning step, PR only, its JSON reaches the reporter.
+
+    #1785: the step lives in job `evidence`, next to the parts of the suite; the
+    reporter stays in job `test`, and the file travels between them.
+    """
     import yaml
 
     workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
-    steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []]
-    names = [s.get("id") or s.get("name") for s in steps]
-    mutation = next(s for s in steps if s.get("id") == "mutations")
+    evidence = doc["jobs"]["evidence"]
+    mutation = next(s for s in evidence["steps"] if s.get("id") == "mutations")
 
+    assert evidence["continue-on-error"] is True
     assert mutation["continue-on-error"] is True
-    assert "steps.evidence.outputs.run" in mutation["if"], "#1606: decided by event"
+    assert "needs.treedup.outputs.evidence_run" in mutation["if"], "#1606: by event"
     assert "timeout-minutes" in mutation
     assert "scripts/mutation_changed.py" in mutation["run"]
-    assert names.index("mutations") > names.index("tests")
+    assert not [s for s in doc["jobs"]["test"]["steps"] if s.get("id") == "mutations"]
 
-    reporter = next(s for s in steps if "hub-ci-report" in str(s.get("uses", "")))
-    assert names.index("mutations") < steps.index(reporter)
+    reporter = next(
+        s for s in doc["jobs"]["test"]["steps"] if "hub-ci-report" in str(s.get("uses"))
+    )
     json_out = re.search(r"--json-out\s+(\S+)", mutation["run"]).group(1)
     assert reporter["with"]["mutations-file"] == json_out.strip("\"'")
+    upload = next(
+        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
+    )
+    assert json_out in upload["with"]["path"].split()
 
 
 # ---- #913: the red-test baseline travels under its own key --------------------
@@ -913,7 +921,7 @@ def _provenance_env(monkeypatch):
 def test_evidence_keys_distinguish_skipped_failed_and_present(
     script, monkeypatch, tmp_path
 ):
-    """AC-3: a step that did not run sends no key; one that ran says what happened."""
+    """AC-3: not expected sends no key; expected says what happened (#1785)."""
     _provenance_env(monkeypatch)
     valid = tmp_path / "ok.json"
     valid.write_text(json.dumps({"state": "ran", "survivors": []}))
@@ -921,28 +929,28 @@ def test_evidence_keys_distinguish_skipped_failed_and_present(
     broken.write_text("{not json")
     absent = tmp_path / "absent.json"
 
-    def run(kind: str, outcome: str, path) -> dict:
+    def run(kind: str, expected: str, path) -> dict:
         monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
-        monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", outcome)
+        monkeypatch.setenv("HAIPLANE_HUB_CI_EVIDENCE_RUN", expected)
         return _capture_payload(script, monkeypatch)
 
     for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
-        # skipped: the key is absent — not {} and not an error.
-        assert key not in run(kind, "skipped", absent)
-        assert key not in run(kind, "skipped", valid), "a skipped step sends nothing"
+        # not expected: the key is absent — not {} and not an error.
+        assert key not in run(kind, "false", absent)
+        assert key not in run(kind, "false", valid), "a skipped run sends nothing"
 
-        # ran, but no file (timeout before the write): an explicit error.
-        timed_out = run(kind, "cancelled", absent)[key]
+        # expected, but no file (the job fell over before the write): an error.
+        timed_out = run(kind, "true", absent)[key]
         assert timed_out["state"] == "error"
         assert timed_out["reason"], "the cause must be named"
         assert "provenance" in timed_out
 
-        # ran, file is broken: an explicit error too.
-        garbage = run(kind, "failure", broken)[key]
+        # expected, file is broken: an explicit error too.
+        garbage = run(kind, "true", broken)[key]
         assert garbage["state"] == "error" and garbage["reason"]
 
-        # ran, file is valid: the data, plus where it came from.
-        good = run(kind, "success", valid)[key]
+        # expected, file is valid: the data, plus where it came from.
+        good = run(kind, "true", valid)[key]
         assert good["state"] == "ran"
         assert good["provenance"]["run_id"] == "4242"
         assert good["provenance"]["run_url"] == (
@@ -951,7 +959,7 @@ def test_evidence_keys_distinguish_skipped_failed_and_present(
         assert good["provenance"]["event"] == "pull_request.opened"
         assert good["provenance"]["at"], "a time must be stated"
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
-        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+        monkeypatch.delenv("HAIPLANE_HUB_CI_EVIDENCE_RUN")
 
 
 def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
@@ -964,13 +972,13 @@ def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
             path = tmp_path / f"{key}.json"
             path.write_text(json.dumps(content))
             monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
-            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", "success")
+            monkeypatch.setenv("HAIPLANE_HUB_CI_EVIDENCE_RUN", "true")
             block = _capture_payload(script, monkeypatch)[key]
             assert block["state"] == "error", (key, content)
             assert block["reason"] and "unexpected" not in block
             assert block["provenance"]["run_id"] == "4242"
-        # Without a stated outcome (an old caller) foreign content sends nothing.
-        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+        # Without a stated decision (an old caller) foreign content sends nothing.
+        monkeypatch.delenv("HAIPLANE_HUB_CI_EVIDENCE_RUN")
         assert key not in _capture_payload(script, monkeypatch)
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
 

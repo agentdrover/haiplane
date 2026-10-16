@@ -95,7 +95,7 @@ def _decide(
     import os
     import subprocess
 
-    step = _steps()["evidence"]
+    step = _steps("treedup")["evidence"]
     out = tmp_path / "github_output"
     out.write_text("")
     env = {
@@ -158,8 +158,10 @@ def test_mutations_and_baseline_skip_branch_sync_and_non_task_prs(tmp_path) -> N
             assert len(lines) == 1, f"the reason is ONE line: {label} {log!r}"
             assert "skipped" in lines[0] and fragment in lines[0], (label, lines)
 
-    steps = _steps()
-    gate = "steps.evidence.outputs.run == 'true'"
+    # #1785: the two steps live in job `evidence`, gated by the decision of job
+    # treedup (the same answers, moved).
+    steps = _steps("evidence")
+    gate = "needs.treedup.outputs.evidence_run == 'true'"
     assert gate in steps["mutations"]["if"]
     assert gate in steps["baseline"]["if"]
     assert "github.event_name == 'pull_request'" not in steps["mutations"]["if"]
@@ -174,14 +176,15 @@ def test_mutations_and_baseline_skip_branch_sync_and_non_task_prs(tmp_path) -> N
         "${{ github.base_ref || 'develop' }}", "workflow_dispatch", "", "t", ""
     ) == ("develop")
 
-    # The reporter learns what each step did, so absent ≠ failed.
+    # The reporter learns whether the evidence was EXPECTED, so absent is not
+    # the same as failed (#1785: the decision, not the outcome of a step).
     sent = next(
         s
         for s in _doc()["jobs"]["test"]["steps"]
         if "hub-ci-report" in str(s.get("uses"))
     )["with"]
-    assert sent["mutations-outcome"] == "${{ steps.mutations.outcome }}"
-    assert sent["baseline-outcome"] == "${{ steps.baseline.outcome }}"
+    assert sent["evidence-run"] == "${{ needs.treedup.outputs.evidence_run }}"
+    assert "mutations-outcome" not in sent and "baseline-outcome" not in sent
     assert sent["event-action"] == "${{ github.event.action }}"
 
     # What must NOT change: the deploy dependency and the tree-dedup scope.
@@ -190,11 +193,16 @@ def test_mutations_and_baseline_skip_branch_sync_and_non_task_prs(tmp_path) -> N
 
 
 def test_evidence_decision_survives_a_red_earlier_step() -> None:
-    """#1606: a red Test must not skip `evidence` and, through it, the baseline."""
-    steps = _steps()
-    assert steps["evidence"]["if"] == "${{ !cancelled() }}"
-    assert "!cancelled()" in steps["baseline"]["if"]
-    # With the earlier step red, the decision step still runs and says yes.
+    """#1606: nothing may skip the decision; a red mutation step must not skip the baseline.
+
+    #1785: the decision is the FIRST step of job treedup and carries no `if`, so
+    no failing step can leave its output empty; the baseline keeps `!cancelled()`
+    because the mutation step before it may end red.
+    """
+    treedup_steps = _doc()["jobs"]["treedup"]["steps"]
+    assert treedup_steps[0]["id"] == "evidence"
+    assert "if" not in treedup_steps[0]
+    assert "!cancelled()" in _steps("evidence")["baseline"]["if"]
     ran, _log = _decide(
         Path(__import__("tempfile").mkdtemp()),
         event="pull_request",
@@ -377,27 +385,39 @@ def test_the_timing_read_stays_a_read_of_the_github_api() -> None:
     ], "the timing rides the existing step"
 
 
-# ---- #1767: the suite runs as three parts, one job reports ----------------------
+# ---- #1767: the suite runs as parts, one job reports ----------------------
 
 FULL_SUITE = "uv run pytest -q -n auto --durations=30"
+# #1785: the number of parts is the matrix of ci.yml and is read back through
+# strategy.job-total; no digit is written here.
+SHARD_ENV = "HAIPLANE_TEST_SHARD=${{ matrix.shard }}/${{ strategy.job-total }} "
 PART_COMMAND = (
-    "HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 uv run pytest "
-    "-p scripts.pytest_shard -q -n auto --durations=30"
+    SHARD_ENV + "uv run pytest -p scripts.pytest_shard -q -n auto --durations=30"
 )
 _EXPR = {
     "needs.treedup.outputs.skip": "skip",
+    "needs.treedup.outputs.evidence_run": "evid",
     "needs.pytest.result": "result",
 }
 
 
-def _holds(condition: str, skip: str, result: str, previous_ok: bool = True) -> bool:
+def _holds(
+    condition: str,
+    skip: str,
+    result: str,
+    previous_ok: bool = True,
+    evidence_run: str = "",
+    cancelled: bool = False,
+) -> bool:
     """Evaluate the small `${{ ... }}` conditions of these jobs.
 
-    Only the grammar the jobs use is accepted: the two `needs` values, string
-    literals, ==, !=, &&, ||, !, parentheses. Anything else fails the test
-    instead of being guessed. Like GitHub, a condition with no status function
-    (`always()`) gets an implicit `success()`: it holds only if the previous
-    steps of the job succeeded (`previous_ok`).
+    Only the grammar the jobs use is accepted: the three `needs` values, string
+    literals, ==, !=, &&, ||, !, parentheses and the status functions always()
+    and cancelled(). Anything else fails the test instead of being guessed
+    (so a condition that reads the outcome of another job cannot pass
+    unnoticed). Like GitHub, a condition with no status function gets an
+    implicit `success()`: it holds only if the previous steps of the job
+    succeeded (`previous_ok`).
     """
     import re
 
@@ -406,15 +426,28 @@ def _holds(condition: str, skip: str, result: str, previous_ok: bool = True) -> 
     code = text[3:-2]
     for name, var in _EXPR.items():
         code = code.replace(name, var)
-    has_status = "always()" in code
-    code = code.replace("always()", " True ")
+    has_status = "always()" in code or "cancelled()" in code
+    code = code.replace("always()", " True ").replace("cancelled()", " cancelled ")
     code = code.replace("&&", " and ").replace("||", " or ")
     code = re.sub(r"!(?!=)", " not ", code)
     leftover = re.sub(
-        r"'[^']*'|\b(?:skip|result|and|or|not|True)\b|==|!=|[()\s]", "", code
+        r"'[^']*'|\b(?:skip|result|evid|cancelled|and|or|not|True)\b|==|!=|[()\s]",
+        "",
+        code,
     )
     assert leftover == "", f"unexpected syntax {leftover!r} in {condition!r}"
-    value = bool(eval(code, {"__builtins__": {}}, {"skip": skip, "result": result}))  # noqa: S307  # nosec B307
+    value = bool(
+        eval(
+            code,
+            {"__builtins__": {}},
+            {
+                "skip": skip,
+                "result": result,
+                "evid": evidence_run,
+                "cancelled": cancelled,
+            },
+        )
+    )  # noqa: S307  # nosec B307
     return value if has_status else (previous_ok and value)
 
 
@@ -448,14 +481,18 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     # treedup: the decision, no matrix; its answer is the job's output.
     treedup = jobs["treedup"]
     assert "strategy" not in treedup
-    assert treedup["outputs"] == {"skip": "${{ steps.treedup.outputs.skip }}"}
+    assert treedup["outputs"] == {
+        "skip": "${{ steps.treedup.outputs.skip }}",
+        "evidence_run": "${{ steps.evidence.outputs.run }}",
+    }
 
     # pytest: three parts, none of which may hide another's failure, and none
     # of which holds anything the branch's code could use to forge a report.
     part = jobs["pytest"]
     assert part["needs"] == "treedup"
     assert part["strategy"]["fail-fast"] is False
-    assert part["strategy"]["matrix"] == {"shard": [1, 2, 3]}
+    total = len(part["strategy"]["matrix"]["shard"])
+    assert part["strategy"]["matrix"] == {"shard": list(range(1, total + 1))}
     assert "environment" not in part
     assert "secrets." not in json.dumps(part), "job pytest holds no secret"
     for step in part["steps"]:
@@ -470,19 +507,29 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     # test: the single required check, after both, whatever their outcome.
     test = jobs["test"]
     assert test["name"] == "Ruff and pytest"
-    assert test["needs"] == ["treedup", "pytest"]
+    assert test["needs"] == ["treedup", "pytest", "evidence"]
     # A cancelled run must still run job test (and end red): `!cancelled()`
     # would skip it, and a skipped required check can count as passed.
     assert test["if"] == "${{ always() }}"
     assert "!cancelled()" not in test["if"] and "always()" in test["if"]
     assert jobs["deploy"]["needs"] == "test"
 
-    # The artifact and the AC collection live in job test and nowhere else.
+    # The report artifact and the AC collection live in job test and nowhere
+    # else; job evidence uploads its own intermediate artifact (#1785).
     for name, job in jobs.items():
-        uses = [str(s.get("uses")) for s in job["steps"] if "uses" in s]
-        has_report = any("hub-ci-report" in u for u in uses)
-        has_artifact = any("upload-artifact" in u for u in uses)
-        assert has_report is has_artifact is (name == "test"), name
+        steps = job["steps"]
+        uploads = [
+            str(s["with"]["name"])
+            for s in steps
+            if "upload-artifact" in str(s.get("uses"))
+        ]
+        has_report = any("hub-ci-report" in str(s.get("uses")) for s in steps)
+        assert has_report is (name == "test"), name
+        expected = {
+            "test": ["hub-ci-results-${{ github.run_attempt }}"],
+            "evidence": ["hub-ci-evidence-${{ github.run_attempt }}"],
+        }.get(name, [])
+        assert uploads == expected, name
 
     # The last step of job test: any cancellation, even after the aggregator
     # passed, ends the job red (the steps with implicit success() are skipped).
@@ -519,12 +566,10 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     part_run = next(s for s in part["steps"] if s.get("id") == "shard")["run"].strip()
     assert part_run == PART_COMMAND
     assert (
-        part_run.removeprefix("HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 ").replace(
-            " -p scripts.pytest_shard", ""
-        )
+        part_run.removeprefix(SHARD_ENV).replace(" -p scripts.pytest_shard", "")
         == FULL_SUITE
     )
-    assert "pytest" not in _step("test", "Tests outcome of the three parts")["run"]
+    assert "pytest" not in _step("test", "Tests outcome of the parts")["run"]
 
     # No new collection hook where the AC locators would be read as unknown.
     for conftest in (ROOT / "tests").rglob("conftest.py"):
@@ -561,3 +606,282 @@ def test_status_functions_are_used_only_in_if_conditions() -> None:
     assert _status_calls_outside_if(_doc()) == []
     probe = {"jobs": {"j": {"steps": [{"env": {"X": "${{ cancelled() }}"}}]}}}
     assert _status_calls_outside_if(probe) == ["/jobs/j/steps[0]/env/X"]
+
+
+# ---- #1785: the evidence runs beside the parts ---------------------------------
+
+MUTATIONS_STEP = "Mutations of changed functions (warning only)"
+BASELINE_STEP = "Red-test baseline on merge-base (data only)"
+EVIDENCE_GATE = "needs.treedup.outputs.evidence_run == 'true'"
+EVIDENCE_ARTIFACT = "hub-ci-evidence-${{ github.run_attempt }}"
+
+
+def _same_setup(left: dict, right: dict) -> bool:
+    return all(left.get(k) == right.get(k) for k in ("uses", "with", "run", "if"))
+
+
+def test_mutations_and_baseline_run_beside_the_parts() -> None:
+    """AC-1: the layout of job `evidence`, its hand-over, and what job test lost."""
+    import json
+    import re
+
+    doc = _doc()
+    jobs = doc["jobs"]
+    treedup, evidence, test = jobs["treedup"], jobs["evidence"], jobs["test"]
+
+    # The decision is made once, in treedup.
+    assert treedup["outputs"]["evidence_run"] == "${{ steps.evidence.outputs.run }}"
+
+    # Job evidence: after treedup only, red without consequence, nothing to forge
+    # a report with.
+    assert evidence["name"] == "Mutations and red-test baseline"
+    assert evidence["needs"] == "treedup"
+    assert evidence["continue-on-error"] is True
+    assert "environment" not in evidence
+    dumped = json.dumps(evidence)
+    assert "secrets." not in dumped and "HAIPLANE_HUB" not in dumped
+    assert "hub-ci-report" not in dumped and "hub-read-token" not in dumped
+    assert evidence["env"] == test["env"] == {"CI_REQUIRE_ROOT_TESTS": "1"}
+
+    # The environment is that of job test: the same steps, byte for byte.
+    by_name = {s["name"]: s for s in test["steps"]}
+    own = {s["name"]: s for s in evidence["steps"]}
+    for name in (
+        "Checkout",
+        "Install uv",
+        "Set up Python",
+        "Install age and openssh-server (backup tests)",
+        "Install dependencies",
+    ):
+        assert _same_setup(own[name], by_name[name]), name
+    assert own["Checkout"]["with"] == {"fetch-depth": 0}
+
+    # The two steps: names, ceilings, budget and the gate are as before.
+    mutations, baseline = own[MUTATIONS_STEP], own[BASELINE_STEP]
+    assert (mutations["id"], baseline["id"]) == ("mutations", "baseline")
+    assert mutations["continue-on-error"] is baseline["continue-on-error"] is True
+    assert mutations["timeout-minutes"] == 15 and baseline["timeout-minutes"] == 10
+    assert "--budget-seconds 540" in mutations["run"]
+    assert "--json-out mutation-report.json" in mutations["run"]
+    assert "--json-out red-test-baseline.json" in baseline["run"]
+    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " }}"
+    assert baseline["if"] == "${{ !cancelled() && " + EVIDENCE_GATE + " }}"
+
+    # The hand-over: whatever files exist, after a red step too, outside the
+    # prefix the trusted report reads.
+    upload = next(
+        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
+    )
+    assert upload["with"]["name"] == EVIDENCE_ARTIFACT
+    assert not upload["with"]["name"].startswith("hub-ci-results-")
+    assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
+    assert upload["continue-on-error"] is True
+    assert upload["with"]["if-no-files-found"] == "ignore"
+    assert upload["with"]["retention-days"] == 1
+    assert upload["with"]["path"].split() == [
+        "mutation-report.json",
+        "red-test-baseline.json",
+    ]
+    assert upload is evidence["steps"][-1]
+    assert "hub-ci-results-" in json.dumps(test) and "hub-ci-results-" not in dumped
+
+    # Job test: waits for the evidence, has none of its steps, and reads nothing
+    # from it except the downloaded files.
+    assert test["needs"] == ["treedup", "pytest", "evidence"]
+    assert test["if"] == "${{ always() }}"
+    ids = {s.get("id") for s in test["steps"]}
+    assert not ids & {"evidence", "mutations", "baseline"}
+    assert MUTATIONS_STEP not in by_name and BASELINE_STEP not in by_name
+    text = json.dumps(test)
+    assert not re.search(r"steps\.(mutations|baseline|evidence)\b", text)
+    assert "needs.evidence" not in text, "the outcome of job evidence is read nowhere"
+
+    names = [s["name"] for s in test["steps"]]
+    download = by_name["Download the evidence files of job evidence"]
+    assert "download-artifact" in download["uses"]
+    assert download["if"] == "${{ !cancelled() && " + EVIDENCE_GATE + " }}"
+    assert download["continue-on-error"] is True
+    assert download["with"]["name"] == upload["with"]["name"] == EVIDENCE_ARTIFACT
+    assert download["with"]["path"] == "."
+    collect = "Collect AC test and validation results for the Hub"
+    assert names.index(download["name"]) < names.index(collect)
+    assert names[-1] == "Fail a cancelled run", "the last step stays the last"
+
+
+def _run_reporter_as_the_action_does(
+    tmp_path: Path, *, evidence_run: str, mutations: bool, baseline: bool
+) -> dict:
+    """Run ci.yml's collect step: its `with` -> the action's env -> the script.
+
+    Nothing is filled in by hand: the inputs are what ci.yml passes (with its
+    expressions evaluated), the env is what action.yml builds from them, the
+    shell is the action's own `run`, and the answer is the results.json the
+    script writes. The hub is a local server that serves one task card.
+    """
+    import http.server
+    import json
+    import os
+    import re
+    import subprocess
+    import sys
+    import threading
+
+    class Hub(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            body = json.dumps(
+                {"id": 1785, "acceptance_criteria": [], "validation_commands": []}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    work = tmp_path / "workspace"
+    work.mkdir()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    server_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        step = next(
+            s
+            for s in _doc()["jobs"]["test"]["steps"]
+            if "hub-ci-report" in str(s.get("uses"))
+        )
+        action = __import__("yaml").safe_load(
+            (ROOT / ".github/actions/hub-ci-report/action.yml").read_text()
+        )
+
+        def value(raw: object) -> str:
+            text = str(raw)
+            text = text.replace(
+                "${{ needs.treedup.outputs.evidence_run }}", evidence_run
+            )
+            text = text.replace("${{ github.event.action }}", "opened")
+            text = re.sub(r"\$\{\{ steps\.\w+\.outcome \}\}", "success", text)
+            text = text.replace("${{ secrets.HAIPLANE_HUB_URL }}", server_url)
+            text = text.replace("${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}", "reader")
+            text = text.replace(
+                "${{ github.event.pull_request.head.sha || github.sha }}", "sha-head"
+            )
+            assert "${{" not in text, f"unevaluated expression: {text!r}"
+            return text
+
+        inputs = {k: str(v.get("default", "")) for k, v in action["inputs"].items()}
+        inputs.update({k: value(v) for k, v in step["with"].items()})
+
+        run_step = action["runs"]["steps"][0]
+        env = {"PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"}
+        for key, raw in run_step["env"].items():
+            match = re.fullmatch(r"\$\{\{ inputs\.([\w-]+) \}\}", str(raw))
+            assert match, (key, raw)
+            env[key] = inputs[match.group(1)]
+        env.update(
+            GITHUB_ACTION_PATH=str(ROOT / ".github/actions/hub-ci-report"),
+            GITHUB_HEAD_REF="task-1785/x",
+            GITHUB_EVENT_NAME="workflow_dispatch",
+            GITHUB_RUN_ID="7",
+            GITHUB_REPOSITORY="o/r",
+            NO_PROXY="127.0.0.1",
+        )
+        # The files the download step would leave in the workspace.
+        files = {
+            inputs["mutations-file"]: {"state": "ran", "survived": 0, "survivors": []},
+            inputs["baseline-file"]: {"state": "ran", "merge_base": "m", "tests": {}},
+        }
+        for (name, content), present in zip(files.items(), (mutations, baseline)):
+            if present:
+                (work / name).write_text(json.dumps(content))
+        done = subprocess.run(
+            ["bash", "-c", run_step["run"]],
+            cwd=work,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        results = work / inputs["results-dir"] / "results.json"
+        assert results.exists(), done.stdout + done.stderr
+        return json.loads(results.read_text())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_evidence_reaches_the_report_only_when_it_ran(tmp_path) -> None:
+    """AC-2: the table, through the real path workflow -> action -> reporter."""
+    import itertools
+
+    download = _step("test", "Download the evidence files of job evidence")["if"]
+    table = itertools.product(
+        ("true", "false"),  # the decision of treedup
+        (True, False),  # mutation-report.json is in the workspace
+        (True, False),  # red-test-baseline.json is in the workspace
+        ("success", "failure"),  # the result of job evidence
+        (True, False),  # an earlier step of job test failed
+    )
+    for run, mut, base, job_result, previous_failed in table:
+        label = (run, mut, base, job_result, previous_failed)
+        # The `if` of the download step, translated like GitHub does (implicit
+        # success() only without a status function). The result of job evidence
+        # cannot enter it: the evaluator rejects every name it does not know.
+        fetched = _holds(
+            download, "", "", previous_ok=not previous_failed, evidence_run=run
+        )
+        assert fetched is (run == "true"), label  # also after a red step
+        cancelled = _holds(
+            download,
+            "",
+            "",
+            previous_ok=not previous_failed,
+            evidence_run=run,
+            cancelled=True,
+        )
+        assert cancelled is False, label
+
+        case = tmp_path / "-".join(map(str, label))
+        case.mkdir()
+        results = _run_reporter_as_the_action_does(
+            case, evidence_run=run, mutations=mut, baseline=base
+        )
+        for key, present in (("mutations", mut), ("baseline", base)):
+            block = results.get(key)
+            if run == "false":
+                assert key not in results, label  # not expected: no key at all
+            elif present:
+                assert block and block["state"] == "ran", label  # the file's data
+                assert block["provenance"]["run_id"] == "7", label
+            else:
+                # expected and no file: an error that names the cause, never an
+                # absent key and never "no survivors"
+                assert block and block["state"] == "error", label
+                assert block["reason"] and "survivors" not in block, label
+
+
+def test_the_number_of_parts_is_set_once_by_the_matrix() -> None:
+    """AC-4: [1..N], N >= 4, read back through strategy.job-total; the real tests/ split."""
+    import re
+
+    from tests.test_pytest_shard import assert_parts_of_tests_dir_are_the_whole
+
+    doc = _doc()
+    part = doc["jobs"]["pytest"]
+    shards = part["strategy"]["matrix"]["shard"]
+    total = len(shards)
+    assert shards == list(range(1, total + 1)) and total >= 4, shards
+    assert part["name"] == "Tests part ${{ matrix.shard }}/${{ strategy.job-total }}"
+    run = next(s for s in part["steps"] if s.get("id") == "shard")["run"].strip()
+    assert run == PART_COMMAND
+
+    # No number of parts anywhere else: no `/<digit>` after the shard, no
+    # `part N/<digit>` in a name, and the aggregator's name has no digit.
+    text = _text()
+    assert not re.search(r"matrix\.shard\s*\}\}\s*/\s*\d", text)
+    assert not re.search(r"[Pp]arts?\s+\d+\s*/\s*\d+", text)
+    assert not re.search(r"\d", _step("test", "Tests outcome of the parts")["name"])
+
+    assert_parts_of_tests_dir_are_the_whole(total)
