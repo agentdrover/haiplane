@@ -22,15 +22,71 @@ INVARIANTS = REPO_ROOT / "docs" / "agent-context" / "invariants.md"
 # merge" was removed on 07.10.2026 (#1426); the new "only the gate updates
 # integration branches" ruleset was added later and separately, on
 # 16.10.2026 (#1708). Review on 218ae4c8 found these dates conflated into a
-# single event in all six locations below.
-DATE_SEPARATION_FILES: list[Path] = [
-    INVARIANTS,
-    REPO_ROOT / "docs" / "workspace-safety-policy.md",
-    REPO_ROOT / "docs" / "hub-workflows-map.html",
-    REPO_ROOT / "deploy" / "CD.md",
-    REPO_ROOT / "hub" / "integrations" / "git_ops.py",
-    REPO_ROOT / "hub" / "services" / "release.py",
-]
+# single event; review on 0021fa3e found that checking only "both dates
+# appear somewhere in the file" let a place attach the WRONG date to an
+# event (deploy/CD.md:364 dated the no-bypass state 16.10 instead of 07.10;
+# the spec file was missing from this check entirely). So each entry below
+# is a (file, exact phrase pairs) map: every pair's two phrases must both be
+# present, each anchoring its own date to its own event at that one place in
+# the text — not just "both date strings occur somewhere in the file".
+DATE_PLACES: dict[Path, list[tuple[str, str]]] = {
+    INVARIANTS: [
+        (
+            "ruleset «green CI before merge» снят 07.10.2026 (#1426)",
+            "ruleset «only the gate updates integration branches» (id "
+            "25216047, названный выше) добавлен позже, 16.10.2026.",
+        ),
+    ],
+    REPO_ROOT / "docs" / "workspace-safety-policy.md": [
+        (
+            "07.10.2026 роль Write убрали из bypass «green CI before merge» без замены",
+            "16.10.2026, позже и отдельно от снятия роли Write 07.10.2026, "
+            "на `agentdrover/haiplane` добавился третий ruleset",
+        ),
+    ],
+    REPO_ROOT / "docs" / "hub-workflows-map.html": [
+        (
+            "07.10.2026 роль Write убрали из этого bypass без замены",
+            "16.10.2026, добавился третий ruleset",
+        ),
+    ],
+    REPO_ROOT / "deploy" / "CD.md": [
+        (
+            "до 07.10.2026: роль Write убрали из bypass без замены (#1426)",
+            "позже, 16.10.2026, добавился новый ruleset «only the gate "
+            "updates integration",
+        ),
+        (
+            "с 07.10.2026 не имеет обхода вовсе (роль Write убрали из bypass, #1426)",
+            "Отдельно, 16.10.2026, добавился ruleset «only the gate "
+            "updates integration",
+        ),
+    ],
+    REPO_ROOT / "hub" / "integrations" / "git_ops.py": [
+        (
+            "before 07.10.2026, when the Write role was dropped from the bypass",
+            "on 16.10.2026 (#1708), a narrower ruleset was added",
+        ),
+    ],
+    REPO_ROOT / "hub" / "services" / "release.py": [
+        (
+            "before 07.10.2026, when the Write role was dropped from the bypass",
+            "on 16.10.2026 (#1708), a narrower ruleset was added",
+        ),
+    ],
+    REPO_ROOT / "docs" / "specs" / "orchestrator-executor-environment.md": [
+        (
+            "до #1426, до 07.10.2026) обход первого ruleset хаб использовал сам",
+            "Отдельно, 16.10.2026, добавился новый ruleset 25216047 "
+            "«only the gate updates in",
+        ),
+        (
+            "#1426 выполнена 07.10.2026: возврат main→develop идёт PR-ом",
+            "Отдельно, 16.10.2026, добавился новый ruleset 25216047 "
+            "«only the gate updates in",
+        ),
+    ],
+}
 
 
 def _text(path: Path) -> str:
@@ -146,22 +202,30 @@ def test_no_false_gate_claims_remain() -> None:
 
 
 def test_write_bypass_removal_and_gate_ruleset_dated_separately() -> None:
-    """Each of the six named spots must name 07.10 and 16.10 as two events.
+    """Each named place must name 07.10 and 16.10 as two separate events.
 
-    A missing date here means the text collapsed the Write-role bypass
-    removal (07.10.2026, #1426) and the new gate-identity ruleset addition
-    (16.10.2026, #1708) back into a single dated event — the regression
-    found by review on 218ae4c8.
+    Checks per PLACE (an exact phrase anchoring each date to its own
+    event), not just that both date strings occur somewhere in the file:
+    that weaker check passed even when review on 0021fa3e found
+    deploy/CD.md:364 attaching 16.10.2026 to the no-PR/CI-bypass state that
+    actually dates from 07.10.2026 (the Write-role bypass removal, #1426;
+    the "only the gate updates integration branches" ruleset 25216047 is
+    the separate, later, 16.10.2026 event). The spec file
+    docs/specs/orchestrator-executor-environment.md carried the same
+    conflation at two places and was missing from this check entirely.
     """
-    for path in DATE_SEPARATION_FILES:
+    for path, places in DATE_PLACES.items():
         text = _normalized(path)
         rel = path.relative_to(REPO_ROOT)
-        assert "07.10.2026" in text, (
-            f"{rel}: missing Write-bypass-removal date 07.10.2026"
-        )
-        assert "16.10.2026" in text, (
-            f"{rel}: missing gate-ruleset-addition date 16.10.2026"
-        )
+        for bypass_removal_phrase, ruleset_addition_phrase in places:
+            assert bypass_removal_phrase in text, (
+                f"{rel}: missing or misdated Write-bypass-removal (07.10.2026) "
+                f"phrase: {bypass_removal_phrase!r}"
+            )
+            assert ruleset_addition_phrase in text, (
+                f"{rel}: missing or misdated gate-ruleset-addition (16.10.2026) "
+                f"phrase: {ruleset_addition_phrase!r}"
+            )
 
 
 def test_merge_branches_mention_is_marked_historical() -> None:

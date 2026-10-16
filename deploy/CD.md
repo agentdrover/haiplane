@@ -361,8 +361,9 @@ branches», где обход — только учётка `haiplane-gate` (п�
    (PR #N) не влит: …». Чинится как обычный PR: правкой в ветке или вручную.
 
 После этого обход требований PR/CI не нужен никому: «green CI before merge»
-с 16.10.2026 не имеет обхода вовсе. Обход учётки `haiplane-gate` на отдельном
-ruleset «only the gate updates integration branches» — это обход личности
+с 07.10.2026 не имеет обхода вовсе (роль Write убрали из bypass, #1426).
+Отдельно, 16.10.2026, добавился ruleset «only the gate updates integration
+branches» с обходом учётки `haiplane-gate` — это обход личности
 (кто вливает в main/develop), а не обход требований PR/CI.
 
 ### Что сделать владельцу — строго в этом порядке
