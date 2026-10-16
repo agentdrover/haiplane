@@ -268,6 +268,14 @@ def test_the_ci_script_list_covers_what_ci_calls():
             )
         )
     assert "scripts/ci_report_to_hub.py" in called, "the reading itself works"
+    # #1767: a script can also be called as a pytest plugin, ``-p scripts.name``,
+    # which the path pattern above does not see.
+    for src in sources:
+        called |= {
+            module.replace(".", "/") + ".py"
+            for module in re.findall(r"-p (scripts\.[A-Za-z0-9_.]+)", src.read_text())
+        }
+    assert "scripts/pytest_shard.py" in called, "the plugin form is read"
     missing = called - ci_integrity.CI_SCRIPTS
     assert not missing, f"CI calls scripts the integrity scan does not watch: {missing}"
     assert all((REPO_ROOT / p).exists() for p in called)

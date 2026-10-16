@@ -89,6 +89,63 @@ def _job_seconds(job: CIJobTiming) -> float | None:
     return max(0.0, (end - start).total_seconds())
 
 
+def wait_seconds(jobs: list[CIJobTiming]) -> float | None:
+    """How long one attempt kept its author waiting (#1767).
+
+    From the start of the first job to the end of the last one, so jobs that run
+    in parallel count once. The sum of runner minutes (``summarize``) is a
+    different number: it is what the attempt cost, this is what it delayed.
+    None unless there is a job and EVERY job has both times: an interval over
+    the jobs that have them would be shorter than the truth, and an unknown
+    wait is never a zero.
+    """
+    if not jobs:
+        return None
+    starts, ends = [], []
+    for job in jobs:
+        start, end = _parse(job.started_at), _parse(job.completed_at)
+        if start is None or end is None:
+            return None
+        starts.append(start)
+        ends.append(end)
+    return max(0.0, (max(ends) - min(starts)).total_seconds())
+
+
+def _stored_wait_seconds(raw: str | None) -> float | None:
+    """``wait_seconds`` of the jobs kept in ``ci_attempt_timings.jobs``."""
+    try:
+        jobs = [CIJobTiming.model_validate(j) for j in json.loads(raw or "[]")]
+    except (ValueError, TypeError):
+        return None
+    return wait_seconds(jobs)
+
+
+def _wait_section(rows: list[Any]) -> dict[str, Any]:
+    """Wait of an attempt (first job start to last job end), apart from minutes.
+
+    Read from the jobs kept with every attempt, so it needs no new column and
+    covers the attempts already stored. Only attempts with a complete
+    measurement take part; the rest are counted as unknown, not as zero.
+    """
+    waits = [
+        w
+        for r in rows
+        if r["runner_seconds"] is not None and r["complete"]
+        for w in [_stored_wait_seconds(r["jobs"])]
+        if w is not None
+    ]
+    return {
+        "note": (
+            "ожидание попытки: от старта первого job до конца последнего, "
+            "параллельные job считаются один раз; не сумма минут раннера"
+        ),
+        "measured_attempts": len(waits),
+        "unknown_attempts": len(rows) - len(waits),
+        "median_minutes": _minutes(statistics.median(waits)) if waits else None,
+        "max_minutes": _minutes(max(waits)) if waits else None,
+    }
+
+
 def summarize(
     body: CIRunTimingSubmit,
 ) -> tuple[float | None, dict[str, float], bool]:
@@ -251,7 +308,8 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
     where, params = scope.where("t.completed_at", task_column="t.task_id")
     rows = await fetchall(
         db,
-        "SELECT t.task_id, t.runner_seconds, t.complete, t.steps_seconds, k.work_type, "  # nosec B608
+        "SELECT t.task_id, t.runner_seconds, t.complete, t.steps_seconds, t.jobs, "  # nosec B608
+        "k.work_type, "
         "k.size, k.risk_class FROM ci_attempt_timings t "
         f"JOIN tasks k ON k.id = t.task_id WHERE {where} ORDER BY t.id",
         params,
@@ -292,5 +350,6 @@ async def ci_minutes_metrics(db: aiosqlite.Connection, scope: Any) -> dict[str, 
         ],
         "by_task_more": max(0, len(ranked) - BY_TASK_LIMIT),
         "by_class": _class_rows(rows),
+        "attempt_wait": _wait_section(rows),
         "missing_among_received_ci_reports": await _missing_among_received(db, scope),
     }

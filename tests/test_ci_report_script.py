@@ -453,6 +453,31 @@ def test_the_workflow_hands_the_reporter_what_it_ran():
             declared[match.group(2).strip()] = match.group(1)
     assert declared, "the reporter is told nothing about what this job ran"
 
+    # #1767: the full-suite line is the one SYNTHETIC record: the suite runs in
+    # three parts of job `pytest`, and the step `tests` of this job turns their
+    # result into one outcome. The line stays byte for byte what the validation
+    # commands of task cards say (the reporter matches by equality), the step it
+    # points at is that aggregator, and every part runs exactly this command
+    # with the split plugin and its own number added. A drift of any of the
+    # three stops the reuse and brings the duplicate run back.
+    full_suite = "uv run pytest -q -n auto --durations=30"
+    assert declared.pop(full_suite) == "tests"
+    aggregator = by_id["tests"]
+    assert "pytest" not in aggregator["run"], "the aggregator runs nothing itself"
+    assert aggregator["run"].strip() != full_suite
+    part = by_id["shard"]
+    assert part["run"].strip() == (
+        "HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 uv run pytest "
+        "-p scripts.pytest_shard -q -n auto --durations=30"
+    )
+    assert (
+        part["run"]
+        .strip()
+        .removeprefix("HAIPLANE_TEST_SHARD=${{ matrix.shard }}/3 ")
+        .replace(" -p scripts.pytest_shard", "")
+        == full_suite
+    )
+
     for command, step_id in declared.items():
         assert step_id in by_id, f"steps.{step_id} names no step in this workflow"
         assert by_id[step_id]["run"].strip() == command, (

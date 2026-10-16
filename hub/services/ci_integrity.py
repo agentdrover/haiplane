@@ -111,6 +111,9 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         "scripts/ci_report_audit_to_hub.py",
         "scripts/ci_trusted_report.py",
         "scripts/mutation_changed.py",
+        # #1767: a plugin loaded by the command of each test part
+        # (``-p scripts.pytest_shard``); changing it can hide tests.
+        "scripts/pytest_shard.py",
         "scripts/red_test_baseline.py",
         "scripts/complexity_budget.py",
         "scripts/file_size_budget.py",
