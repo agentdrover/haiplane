@@ -98,6 +98,9 @@ class LaunchResult:
     agent_id: str = ""
     run_id: str = ""
     row_id: int | None = None
+    #: #1712: заказ хосту и имя хоста — только у запуска на слот.
+    order_id: int | None = None
+    host: str = ""
 
 
 def launch_mode_of(policy: dict) -> str:
@@ -234,6 +237,12 @@ async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
         r = dict(row)
         if r["outcome"] != OUTCOME_RUNNING:
             continue
+        # #1712: прогон слота живёт не по облачному сроку брони. У него нет
+        # агента у провайдера НАРОЧНО: его держит заказ хосту, а закрывает
+        # executor_orders.settle. Объявить его «сорванной бронью» через 450 с
+        # значило бы пустить второго исполнителя на ту же задачу.
+        if r.get("channel", "cloud") == "slot":
+            return f"{REASON_ALREADY_RUNNING} #{task_id} (слот {r.get('slot') or '?'})"
         if not r["agent_id"] and _reservation_abandoned(r):
             # Бронь без агента старше всех попыток заказа: запрос, что её
             # положил, не дожил до ответа провайдера (выкат, падение). Иначе
@@ -557,9 +566,34 @@ async def _order(
 
 
 async def launch_executor(
-    db: aiosqlite.Connection, project: Any, *, issuer_principal_id: int
+    db: aiosqlite.Connection,
+    project: Any,
+    *,
+    issuer_principal_id: int,
+    target: str = "cloud",
+    task_id: int | None = None,
 ) -> LaunchResult:
-    """Запустить исполнителя на задачу из очереди — по нажатию человека."""
+    """Запустить исполнителя по нажатию человека: в облако или на слот хоста.
+
+    ``target`` — ``cloud`` (задача из очереди, как раньше) или
+    ``slot:<имя хоста>`` (#1712): хаб выписывает код слоту сам, ``task_id``
+    называет задачу (без него — голова очереди).
+    """
+    from hub.services import executor_orders
+
+    host = executor_orders.parse_target(target)
+    if target != "cloud" and not host:
+        return _refused(f"{executor_orders.REASON_TARGET}: {target!r}")
+    if host:
+        return await executor_orders.launch_on_slot(
+            db,
+            project,
+            host=host,
+            task_id=task_id,
+            issuer_principal_id=issuer_principal_id,
+        )
+    if task_id is not None:
+        return _refused("task_id задаётся только для запуска на слот", task_id)
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
         return ready

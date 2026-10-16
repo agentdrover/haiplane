@@ -2721,6 +2721,7 @@ async def test_the_sweep_order_is_pinned(db):
         # работа про жизненный цикл облачных прогонов.
         "executor_runs",
         "executor_slots",
+        "executor_orders",
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",

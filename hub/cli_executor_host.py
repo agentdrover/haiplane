@@ -1,0 +1,102 @@
+"""``oc-hub executor-host`` и ``oc-hub executor-launch`` (#1712).
+
+Вынесено из ``hub/cli.py``: у того бюджет размера (#1669). Все команды —
+человеку: хаб не пускает по этим маршрутам ни агента, ни ключ хоста.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+
+def _api(*args: Any, **kwargs: Any) -> Any:
+    # Лениво: hub.cli собирает парсеры при импорте и импортирует этот модуль.
+    from hub.cli import _api as api
+
+    return api(*args, **kwargs)
+
+
+def cmd_executor_host(args: argparse.Namespace) -> int:
+    """add | disable | list — реестр хостов исполнителя."""
+    if args.host_cmd == "list":
+        result = _api("GET", "/api/admin/executor-hosts")
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        for host in result["hosts"]:
+            state = "включён" if host["enabled"] else "отключён"
+            print(f"{host['name']}\t{state}\tprincipal #{host['principal_id']}")
+        return 0
+    name = urllib.parse.quote(args.name, safe="")
+    if args.host_cmd == "disable":
+        _api("POST", f"/api/admin/executor-hosts/{name}/disable")
+        print(f"{args.name}: отключён; ключ отозван, коды сожжены, заказы закрыты.")
+        return 0
+    body = {
+        "name": args.name,
+        "public_key_pem": Path(args.public_key_file).read_text(),
+        "expires_days": args.expires_days,
+    }
+    result = _api("POST", "/api/admin/executor-hosts", body)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Хост {result['name']} заведён (принципал #{result['principal_id']}).")
+    print(f"Ключ API хоста (показан ОДИН раз, срок до {result['key_expires_at']}):")
+    print(result["api_key"])
+    return 0
+
+
+def cmd_executor_launch(args: argparse.Namespace) -> int:
+    """Запустить исполнителя: в облако (голова очереди) или на слот хоста."""
+    body: dict[str, Any] = {"target": args.target}
+    if args.task_id is not None:
+        body["task_id"] = args.task_id
+    slug = urllib.parse.quote(args.slug, safe="")
+    result = _api("POST", f"/api/projects/{slug}/executor-launch", body)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if result.get("order_id"):
+        print(
+            f"#{result['task_id']}: заказ #{result['order_id']} выдан хосту "
+            f"{result['host']}; код хост заберёт сам."
+        )
+    else:
+        print(f"#{result['task_id']}: исполнитель запущен, агент {result['agent_id']}.")
+    return 0
+
+
+def add_executor_host_parsers(sub: Any) -> None:
+    """Подкоманды executor-host и executor-launch; build_parser на потолке."""
+    p_host = sub.add_parser(
+        "executor-host", help="Executor hosts that receive their code from the hub"
+    )
+    host_sub = p_host.add_subparsers(dest="host_cmd", required=True)
+    p_add = host_sub.add_parser("add", help="Register a host (human); key shown once")
+    p_add.add_argument("name", help="host name, e.g. k8")
+    p_add.add_argument(
+        "--public-key-file", required=True, help="RSA-3072 public key, PEM SPKI"
+    )
+    p_add.add_argument("--expires-days", type=int, default=90)
+    p_dis = host_sub.add_parser("disable", help="Disable a host (human)")
+    p_dis.add_argument("name")
+    host_sub.add_parser("list", help="List registered hosts")
+    for each in (p_add, p_host):
+        each.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_host.set_defaults(func=cmd_executor_host)
+
+    p_launch = sub.add_parser(
+        "executor-launch", help="Launch the executor on a task (human)"
+    )
+    p_launch.add_argument("slug", help="project slug")
+    p_launch.add_argument(
+        "--target", default="cloud", help="cloud (default) or slot:<host>"
+    )
+    p_launch.add_argument("--task-id", type=int, default=None)
+    p_launch.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_launch.set_defaults(func=cmd_executor_launch)

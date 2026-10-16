@@ -94,6 +94,47 @@
 - The fact of issue (`executor_run_id`, `skill_version`, `delivered_in_order`,
   `omitted_chars`) is in the detail of the `task_pair_started` activity entry.
 
+### Executor host orders: the hub issues the code to a slot (#1712)
+
+Human-only (a person, CSRF for cookies):
+
+- `POST /api/admin/executor-hosts {name, public_key_pem, expires_days=90}` →
+  host + service principal `executor-host-<name>` (role `slot_runner`) + API key
+  shown ONCE (`api_key`). `public_key_pem`: RSA ≥ 3072, PEM SPKI.
+  `POST /api/admin/executor-hosts/{name}/disable`, `GET /api/admin/executor-hosts`.
+  CLI: `oc-hub executor-host add|disable|list`.
+- `POST /api/projects/{slug}/executor-launch {target: "cloud"|"slot:<host>",
+  task_id?}` (no body = cloud, queue head, as before). `slot:<host>` needs the
+  project in `executor_launch=manual`, an `open` task of that project (`task_id`
+  or the queue head), a free enabled host; answer carries `order_id`, `host`,
+  never the code. Card button «Запустить на <host>» →
+  `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
+
+Host key (`slot_runner`), exactly three routes of its OWN host:
+
+- `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
+  generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
+  every unclosed unredeemed order, repeated until acked or closed (stable `id`,
+  dedupe on it); the first delivery sets `delivered_at`.
+- `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
+  `redeemed` is informational (the hub sees the spend itself) and keeps the
+  booking; the other two close the order, burn the code, abort the run. A repeat
+  with a DIFFERENT result is 409 (the first word of the host stands). Foreign or
+  unknown order: 403. At most 3 concurrent long-polls per host (429).
+- `POST …/orders/{id}/report {outcome: submitted|rescued|failed, sha?, branch?,
+  note?}` — one feed entry per order, repeat is a no-op, a different outcome is 409,
+  `note` ≤ 500 chars without codes or tokens (422), never changes the task status;
+  works on a closed order. `failed`/`rescued` also CLOSE the order (the run ended
+  without a submission: unspent code burnt, run aborted, slot free); `submitted`
+  does not (the landed submission closes it). `branch` is a WHITELIST: the task's own `tasks.branch` or `task-<order task id>/rescue-<digits>`, anything else is 422; `sha` is `^[0-9a-f]{7,40}$`; `note` has the secret and long-token checks (no heuristics on branch/sha).
+
+Host contract: decrypt `code_ciphertext` (RSA-OAEP, SHA-256 in OAEP and MGF1, no
+label, base64url without padding — reference `scripts/executor_host_decrypt.py`),
+put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at the
+unchanged `POST /api/auth/chat-pair/redeem` (session `ahcp_`, `channel=slot`,
+`slot=<host>`, bound to the task and generation), ack, then claim/pair-start with
+`git_mode=remote`. The host key never enters the executor VM.
+
 ## Contract-Smell Checklist
 
 - Does the same concept have different names across API, CLI, MCP, and DB?

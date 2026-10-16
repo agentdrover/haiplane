@@ -37,7 +37,7 @@ from hub import config
 from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 
 log = logging.getLogger("hub.services.chat_pair")
 
@@ -135,8 +135,13 @@ async def issue_code(
     channel: str = "",
     slot: str = "",
     executor_run_id: int | None = None,
+    commit: bool = True,
 ) -> tuple[str, int]:
     """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
+
+    ``commit=False`` (#1712) leaves the transaction to the caller: the host
+    order issues a code, a run row and the order itself as ONE unit, and a
+    commit in the middle would make a failed order leave a live code behind.
 
     Intake and implementer do not kill each other: burn is scoped to the
     same kind (and, for implementer, the same bound task).
@@ -196,7 +201,8 @@ async def issue_code(
             executor_run_id if kind == "implementer" else None,
         ),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return format_pair_code(code), ttl
 
 
@@ -212,8 +218,14 @@ async def issue_run_code(
     *,
     issued_by_principal_id: int | None,
     executor_run_id: int | None = None,
+    channel: str = "cloud",
+    slot: str = "",
+    commit: bool = True,
 ) -> tuple[str, int]:
     """Код implementer, который выписывает сам хаб на прогон исполнителя (#1439).
+
+    ``channel``/``slot`` (#1712): облако по умолчанию, слот хоста — по запуску
+    с целью slot:<имя>. ``commit=False`` оставляет транзакцию вызывающему.
 
     Выписывается от имени агента chat-pair — того принципала, которым сессия
     implementer и так действует, — и привязан к задаче и к поколению сдачи,
@@ -236,12 +248,15 @@ async def issue_run_code(
         kind="implementer",
         bound_task_id=int(task_id),
         bound_generation=int(generation),
-        # #1434: диспетчер хаба запускает облачного исполнителя — канал
-        # известен по построению и ложится в карточку при захвате.
-        channel="cloud",
+        # #1434: диспетчер хаба запускает исполнителя — канал известен по
+        # построению и ложится в карточку при захвате.
+        channel=channel,
+        slot=slot,
         # #1683: код помнит заказ, ради которого выписан; сессия наследует.
         executor_run_id=executor_run_id,
+        commit=False,
     )
+    on_slot = channel == "slot"
     await admin_svc.write_audit(
         db,
         actor_id=issued_by_principal_id,
@@ -251,8 +266,25 @@ async def issue_run_code(
         summary=(
             f"implementer code issued by the hub dispatcher for task #{task_id}, "
             f"generation {generation}, valid {ttl}s"
+            + (f", channel=slot slot={slot} host={slot}" if on_slot else "")
         ),
+        detail=(
+            json.dumps(
+                {
+                    "channel": channel,
+                    "slot": slot,
+                    "host": slot,
+                    "launched_by": issued_by_principal_id,
+                    "generation": int(generation),
+                }
+            )
+            if on_slot
+            else None
+        ),
+        commit=False,
     )
+    if commit:
+        await db.commit()
     return code, ttl
 
 
@@ -481,6 +513,60 @@ async def _reviewer_refusal(
     return None
 
 
+#: #1712: a code of a REGISTERED host is spent only against an open order of an
+#: enabled host. One statement, not a read followed by a write: closing the
+#: order or disabling the host takes the write lock too, so the two are
+#: serialised and the code either goes before them or not at all. A slot name
+#: nobody registered keeps the manual door's old behaviour.
+_SLOT_ORDER_GUARD: Final[str] = (
+    " AND (channel <> 'slot' "
+    "OR NOT EXISTS (SELECT 1 FROM executor_hosts h WHERE h.name = chat_pair_codes.slot) "
+    "OR EXISTS (SELECT 1 FROM executor_hosts h "
+    "JOIN principals p ON p.id = h.principal_id "
+    "JOIN executor_orders o ON o.host = h.name "
+    "WHERE h.name = chat_pair_codes.slot AND h.enabled = 1 AND p.status = 'active' "
+    "AND o.pair_code_id = chat_pair_codes.id "
+    "AND o.state IN ('pending', 'delivered')))"
+)
+
+
+_SPEND_CODE_SQL: Final[str] = (
+    "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "  # nosec B608 - constants
+    "WHERE id = ? AND redeemed_at IS NULL" + _SLOT_ORDER_GUARD
+)
+
+
+async def _slot_order_refusal(
+    db: aiosqlite.Connection, row: dict[str, Any]
+) -> RedeemRefusal | None:
+    """Why a code of a registered host cannot be spent (#1712); None — it can.
+
+    Names the reason for the closed audit only. The atomic check is
+    ``_SLOT_ORDER_GUARD`` in the spend itself; this read exists so the audit
+    can say which of the two it was.
+    """
+    hosts = await fetchall(
+        db,
+        "SELECT h.enabled, p.status FROM executor_hosts h "
+        "JOIN principals p ON p.id = h.principal_id WHERE h.name = ?",
+        (row.get("slot") or "",),
+    )
+    if not hosts:
+        return None
+    host = dict(hosts[0])
+    if not host["enabled"] or host["status"] != "active":
+        return _row_refusal(row, "slot_host_disabled")
+    orders = await fetchall(
+        db,
+        "SELECT 1 FROM executor_orders WHERE pair_code_id = ? "
+        "AND state IN ('pending', 'delivered')",
+        (row["id"],),
+    )
+    if not orders:
+        return _row_refusal(row, "slot_order_closed")
+    return None
+
+
 async def _spend_code(
     db: aiosqlite.Connection,
     row: dict[str, Any],
@@ -491,11 +577,7 @@ async def _spend_code(
 ) -> dict[str, Any] | None:
     """Mark the code spent and mint the session; None if someone spent it first."""
     bound_task_id = row.get("bound_task_id")
-    cursor = await db.execute(
-        "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "
-        "WHERE id = ? AND redeemed_at IS NULL",
-        (row["id"],),
-    )
+    cursor = await db.execute(_SPEND_CODE_SQL, (row["id"],))
     if not cursor.rowcount:
         await db.rollback()
         return None
@@ -521,6 +603,14 @@ async def _spend_code(
             row.get("executor_run_id"),
         ),
     )
+    if row.get("channel") == "slot":
+        # #1712: the order moves with the spend, in the same transaction.
+        await db.execute(
+            "UPDATE executor_orders SET state = 'redeemed', "
+            "redeemed_at = datetime('now') "
+            "WHERE pair_code_id = ? AND state IN ('pending', 'delivered')",
+            (row["id"],),
+        )
     await db.commit()
 
     stored = await fetchall(
@@ -592,6 +682,10 @@ async def redeem_code_explained(
     acting_id: int | None = None
     acting_username = row["username"]
     if kind == "implementer":
+        if row.get("channel") == "slot":
+            refusal = await _slot_order_refusal(db, row)
+            if refusal is not None:
+                return None, refusal
         acting, refusal = await _implementer_refusal(db, row)
         if refusal is not None or acting is None:
             return None, refusal
@@ -874,7 +968,100 @@ async def revoke_sessions(
     return int(cursor.rowcount or 0)
 
 
-async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[int]:
+async def return_task_to_open(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    from_status: str,
+    note: str,
+    event_kind: str,
+    holders: frozenset[int] | None = None,
+) -> bool:
+    """Put a pair task whose implementer is gone back to open; no commit.
+
+    One body for the session reaper and for the host order that closes with
+    its task still held (#1712): two copies of "what returning to open
+    involves" would drift apart. The order of the held session is closed in
+    the same transaction (the reaper's half of the booking).
+
+    The caller decided to release from a read taken OUTSIDE the write lock, and
+    between that read and this write a person can release the claim and another
+    agent take the task. So the write lock is taken first (a statement that
+    matches no row still takes it) and the facts are read again under it: the
+    status, the live-session check, and — when ``holders`` is given — that the
+    task's current holder is one of those principals (an unknown holder counts
+    as the session's, as before). A task somebody else holds now is left alone.
+    """
+    await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
+    rows = await fetchall(
+        db,
+        "SELECT status, implementer_principal_id FROM tasks WHERE id = ?",
+        (int(task_id),),
+    )
+    if not rows or rows[0]["status"] != from_status:
+        return False
+    holder = rows[0]["implementer_principal_id"]
+    if holders is not None and holder is not None and int(holder) not in holders:
+        return False
+    live = await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+        "AND bound_task_id = ? AND revoked_at IS NULL "
+        "AND expires_at > datetime('now')",
+        (int(task_id),),
+    )
+    if live:
+        return False
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=from_status, new_status="open"
+    ):
+        return False
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+    )
+    await repo.add_task_update(db, task_id, "hub", "status", note)
+    await repo.insert_event(
+        db,
+        kind=event_kind,
+        task_id=task_id,
+        actor="hub",
+        payload={"reason": event_kind, "from": from_status},
+    )
+    from hub.services import executor_orders
+
+    await executor_orders.close_for_released_task(db, task_id)
+    return True
+
+
+async def _release_atomically(
+    db: aiosqlite.Connection, task_id: int, **kwargs: Any
+) -> bool:
+    """``return_task_to_open`` целиком или никак — и в чужой транзакции тоже.
+
+    ``write_transaction`` во вложенном вызове ничего не откатывает (владелец
+    снаружи); SAVEPOINT откатывает именно эту задачу, а владелец потом коммитит
+    остальное (#1712).
+    """
+    async with write_transaction(db):
+        await db.execute("SAVEPOINT reaper_release")
+        try:
+            freed = await return_task_to_open(db, task_id, **kwargs)
+        except BaseException:
+            await db.execute("ROLLBACK TO reaper_release")
+            await db.execute("RELEASE reaper_release")
+            raise
+        await db.execute("RELEASE reaper_release")
+        return freed
+
+
+async def release_expired_implementer_tasks(
+    db: aiosqlite.Connection, failed: set[int] | None = None
+) -> list[int]:
     """Return bound pair tasks to open when their implementer session is dead.
 
     Intake TTL is unchanged (#983 out of scope). A live token must not trip
@@ -885,7 +1072,8 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
     """
     rows = await fetchall(
         db,
-        "SELECT s.bound_task_id AS task_id, t.status AS status, t.job_id AS job_id "
+        "SELECT s.bound_task_id AS task_id, t.status AS status, t.job_id AS job_id, "
+        "s.principal_id AS principal_id "
         "FROM chat_pair_sessions s "
         "JOIN tasks t ON t.id = s.bound_task_id "
         "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
@@ -900,45 +1088,38 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
         ")",
     )
     released: list[int] = []
-    seen: set[int] = set()
+    pending: dict[int, tuple[str, set[int]]] = {}
     for raw in rows:
         row = dict(raw)
         if row.get("job_id"):
             continue
-        task_id = int(row["task_id"])
-        if task_id in seen:
+        status, principals = pending.setdefault(
+            int(row["task_id"]), (str(row["status"]), set())
+        )
+        principals.add(int(row["principal_id"]))
+    for task_id, (from_status, principals) in pending.items():
+        # One transaction per task, rolled back as a whole (#1712): the release
+        # also closes the host order of the run, and a failure between the two
+        # must not leave half of it behind — nor an open write transaction that
+        # the next pass would commit as if it were its own.
+        try:
+            freed = await _release_atomically(
+                db,
+                task_id,
+                from_status=from_status,
+                note="Implementer pairing session expired; task returned to open.",
+                event_kind="chat_pair_implementer_expired",
+                # #1712: a task another agent holds now is not this session's.
+                holders=frozenset(principals),
+            )
+        except Exception:  # noqa: BLE001 - one task must not stop the others
+            log.exception("Chat-pair reaper: releasing task #%d failed", task_id)
+            if failed is not None:
+                failed.add(task_id)  # its dead sessions are the retry evidence
             continue
-        seen.add(task_id)
-        from_status = str(row["status"])
-        if not await repo.transition_status_if(
-            db, task_id, expected_from=from_status, new_status="open"
-        ):
-            continue
-        await repo.update_task(
-            db,
-            task_id,
-            claimed_by=None,
-            claim_session_id=None,
-            claimed_at=None,
-            implementer_principal_id=None,
-        )
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "status",
-            "Implementer pairing session expired; task returned to open.",
-        )
-        await repo.insert_event(
-            db,
-            kind="chat_pair_implementer_expired",
-            task_id=task_id,
-            actor="hub",
-            payload={"reason": "chat_pair_implementer_expired", "from": from_status},
-        )
-        released.append(task_id)
+        if freed:
+            released.append(task_id)
     if released:
-        await db.commit()
         log.info(
             "Chat-pair reaper: released %d implementer-bound task(s) to open",
             len(released),
@@ -955,7 +1136,8 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     Dead implementer sessions unstick their bound pair task first (#983),
     otherwise purge would delete the only row that still named the task.
     """
-    await release_expired_implementer_tasks(db)
+    unreleased: set[int] = set()
+    await release_expired_implementer_tasks(db, unreleased)
     hours = int(config.CHAT_PAIR_SPENT_RETENTION_HOURS)
     # Reviewer rows stay a window past their end (#1694): a refused redeem is
     # explained by looking the row up, and a row dropped the minute it expired
@@ -968,9 +1150,14 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
         "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))))",
         (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
     )
+    # A task whose release just failed keeps its dead sessions: they are the
+    # only thing the next pass can find it by (#1712).
+    keep = ", ".join("?" for _ in unreleased)
     sessions = await db.execute(
-        "DELETE FROM chat_pair_sessions WHERE expires_at < datetime('now') "
-        "OR revoked_at IS NOT NULL"
+        "DELETE FROM chat_pair_sessions WHERE (expires_at < datetime('now') "  # nosec B608 - placeholders only
+        "OR revoked_at IS NOT NULL)"
+        + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
+        tuple(sorted(unreleased)),
     )
     removed = int(codes.rowcount or 0) + int(sessions.rowcount or 0)
     await db.commit()

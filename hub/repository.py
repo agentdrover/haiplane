@@ -6698,8 +6698,14 @@ async def create_executor_run(
     model: str,
     token_ceiling: int | None = None,
     cents_ceiling: float | None = None,
+    channel: str = "cloud",
+    slot: str = "",
+    launched_by: int | None = None,
 ) -> int:
     """Записать прогон исполнителя при заказе (#1410). Коммит — за вызывающим.
+
+    ``channel``/``slot``/``launched_by`` (#1712): облако по умолчанию; слот —
+    с именем хоста и принципалом, нажавшим запуск.
 
     Токены и центы не пишутся: их называет только провайдер при опросе, а
     ноль на месте неизвестного выдал бы непрочитанный счёт за бесплатный.
@@ -6713,8 +6719,8 @@ async def create_executor_run(
     cur = await db.execute(
         "INSERT INTO executor_runs "
         "(task_id, submission_generation, agent_id, run_id, model, "
-        "token_ceiling, cents_ceiling) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "token_ceiling, cents_ceiling, channel, slot, launched_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -6723,6 +6729,9 @@ async def create_executor_run(
             model,
             config.EXECUTOR_TOKEN_CEILING if token_ceiling is None else token_ceiling,
             config.EXECUTOR_CENTS_CEILING if cents_ceiling is None else cents_ceiling,
+            channel,
+            slot,
+            launched_by,
         ),
     )
     return inserted_id(cur)
@@ -6780,12 +6789,19 @@ async def list_executor_runs(
 
 
 async def list_executor_runs_in_outcome(
-    db: aiosqlite.Connection, outcome: str
+    db: aiosqlite.Connection, outcome: str, *, channel: str | None = None
 ) -> list[aiosqlite.Row]:
+    """Прогоны в исходе ``outcome``; ``channel`` сужает до облака или слота (#1712)."""
+    if channel is None:
+        return await fetchall(
+            db,
+            "SELECT * FROM executor_runs WHERE outcome=? ORDER BY id",
+            (outcome,),
+        )
     return await fetchall(
         db,
-        "SELECT * FROM executor_runs WHERE outcome=? ORDER BY id",
-        (outcome,),
+        "SELECT * FROM executor_runs WHERE outcome=? AND channel=? ORDER BY id",
+        (outcome, channel),
     )
 
 
