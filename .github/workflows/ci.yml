@@ -286,10 +286,17 @@ jobs:
       # passed).
       - name: Tests outcome of the three parts
         id: tests
-        if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
+        if: ${{ always() && (cancelled() || !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success')) }}
         env:
           PARTS_RESULT: ${{ needs.pytest.result }}
+          RUN_CANCELLED: ${{ cancelled() }}
         run: |
+          # The parts may have passed before the run was cancelled; the steps
+          # of this job that wait for success() (lint, types) were skipped.
+          if [ "$RUN_CANCELLED" = "true" ]; then
+            echo "::error::the run was cancelled: lint and the other checks did not finish"
+            exit 1
+          fi
           if [ "$PARTS_RESULT" = "success" ]; then
             echo "the three test parts passed"
             exit 0
