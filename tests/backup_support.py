@@ -230,6 +230,7 @@ def run_install(
     extra: list[str] | None = None,
     held: SharedLock | None = None,
     lock_account: bool = False,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """Run the real install.sh under the host lock (``held``: the caller already has it).
 
@@ -237,7 +238,7 @@ def run_install(
     which the installer must repair (sshd without PAM refuses such an account)."""
     if held is None:
         with SharedLock() as taken:
-            return run_install(extra, taken, lock_account)
+            return run_install(extra, taken, lock_account, cwd)
     if (
         lock_account
         and as_root(["getent", "passwd", "haiplane-backup"]).returncode == 0
@@ -256,7 +257,7 @@ def run_install(
         str(keys["recipient"]),
         "--no-services",
     ] + (extra or [])
-    return as_root(args, text=True)
+    return as_root(args, text=True, cwd=cwd)
 
 
 def installed_state() -> str:

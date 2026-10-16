@@ -116,6 +116,8 @@ done
 # A file counts when a server_name directive lists SITE_HOST as a whole name. Comments
 # are cut, the file is split at ';' (so a directive may span lines or follow a '{').
 # `include` is not followed. --nginx-site PATH replaces the search.
+# Paths go into paths.conf, which wants absolute ones: everything is canonical from here.
+SITES_DIR=$(readlink -f "$SITES_DIR")
 NGINX_ROOT=$(readlink -f "$(dirname "$SITES_DIR")")
 server_names() {
     sed 's/#.*//' "$1" | tr '\n\t' '  ' | tr ';' '\n' | sed 's/^/ /' |
@@ -149,6 +151,7 @@ if [ -L "$SITE_FILE" ]; then
         *) die "the nginx site $SITE_FILE is a link to $REAL_SITE, outside $NGINX_ROOT; nothing was changed" ;;
     esac
 fi
+SITE_FILE=$(readlink -f "$SITE_FILE")
 
 AUTH_KEYS=$HOME_DIR/.ssh/authorized_keys
 # An earlier installed key is kept; its options are rebuilt below.

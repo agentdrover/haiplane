@@ -313,6 +313,37 @@ def test_nginx_site_search_reads_directives_links_and_explicit_path(tmp_path):
             as_root(["rm", "-f", PATHS_CONF])
 
 
+def test_relative_nginx_paths_reach_paths_conf_as_absolute_ones(tmp_path):
+    need_root_host()
+    from tests.backup_support import load_snapshot
+
+    site_text = "server {\n    server_name agenthai.ru;\n}\n"
+    (tmp_path / "hub.conf").write_text(site_text)
+    write_sites(tmp_path / "rel" / "sites-available", {"hub": site_text})
+    snap = load_snapshot()
+    with SharedLock() as host:
+        try:
+            for extra, expected in (
+                (["--nginx-site", "./hub.conf"], tmp_path / "hub.conf"),
+                (
+                    ["--sites-dir", "rel/sites-available"],
+                    tmp_path / "rel/sites-available/hub",
+                ),
+            ):
+                as_root(["rm", "-f", PATHS_CONF])
+                done = run_install(extra, held=host, cwd=tmp_path)
+                assert done.returncode == 0, (extra, done.stderr)
+                want = "required %s" % os.path.realpath(expected)
+                assert want in _paths_lines(), (extra, _paths_lines())
+                # the file the daily run reads: every entry must be an absolute path
+                conf = tmp_path / "paths.conf"
+                conf.write_text("\n".join(_paths_lines()) + "\n")
+                cfg = snap.Config({"SNAP_PATHS_CONF": str(conf)})
+                assert snap._parse_paths(cfg), extra
+        finally:
+            as_root(["rm", "-f", PATHS_CONF])
+
+
 # paths.conf as the installer of origin/develop wrote it
 OLD_PATHS_CONF = """# Allowlist of the daily settings archive (#1707). Nothing outside it is read.
 unit haiplane-hub
