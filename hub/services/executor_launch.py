@@ -182,8 +182,11 @@ def _reservation_abandoned(row: dict[str, Any]) -> bool:
         at = datetime.fromisoformat(started).replace(tzinfo=UTC)
     except ValueError:
         return False
-    budget = config.EXECUTOR_LAUNCH_MAX_ATTEMPTS * (
-        cursor_cloud.CREATE_TIMEOUT_S + config.EXECUTOR_LAUNCH_PAUSE_S
+    # + один заказ без params (#1769): он идёт сверх попыток.
+    budget = (
+        config.EXECUTOR_LAUNCH_MAX_ATTEMPTS
+        * (cursor_cloud.CREATE_TIMEOUT_S + config.EXECUTOR_LAUNCH_PAUSE_S)
+        + cursor_cloud.CREATE_TIMEOUT_S
     )
     return datetime.now(UTC) - at > timedelta(seconds=budget + 60)
 
@@ -619,6 +622,10 @@ async def _order(
         if failed.startswith(REASON_ANSWER_BLIND):
             # Бронь остаётся: второй запуск купил бы второго агента вслепую.
             await repo.update_executor_run(db, row_id, reason=failed)
+            # Возможный живой агент заказан этим вариантом (#1769).
+            await repo.set_executor_run_model(
+                db, row_id, cursor_cloud.model_variant(model, made.sent)
+            )
         else:
             # Бронь закрывается: следующий запуск не упрётся в «уже идёт».
             await repo.update_executor_run(

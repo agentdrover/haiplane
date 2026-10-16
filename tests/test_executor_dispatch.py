@@ -3824,3 +3824,36 @@ async def test_executor_run_records_the_sent_variant(db, monkeypatch):
     project, task_id = await _launch_project(db, slug="exec-var-adopt")
     assert (await el.launch_executor(db, project, issuer_principal_id=human)).launched
     assert await _last_model(db, task_id) == variant
+
+
+async def test_a_blind_order_keeps_the_sent_variant(db, monkeypatch):
+    """Находка Codex P2: слепой исход бронь держит, модель — отправленный вариант."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", _VARIANT_RAW)
+
+    async def _blind(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _blind)
+    _creator(monkeypatch, [cursor_cloud.Refusal(status=0, detail="ReadTimeout")])
+    project, task_id = await _launch_project(db, slug="exec-var-blind")
+    human = await _human(db)
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert not result.launched
+    assert await _last_model(db, task_id) == f"{_EXEC_MODEL} {_VARIANT_RAW}"
+
+
+def test_the_reservation_term_covers_the_order_without_params(monkeypatch):
+    """Находка Codex P1: заказ без params идёт сверх попыток — бронь живёт дольше."""
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setattr(config, "EXECUTOR_LAUNCH_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(config, "EXECUTOR_LAUNCH_PAUSE_S", 10)
+    timeout = cursor_cloud.CREATE_TIMEOUT_S
+
+    def _age(seconds: float) -> dict:
+        at = datetime.now(UTC) - timedelta(seconds=seconds)
+        return {"started_at": at.replace(tzinfo=None).isoformat()}
+
+    assert not el._reservation_abandoned(_age(timeout + 10 + 60 + 30))
+    assert el._reservation_abandoned(_age(2 * timeout + 10 + 60 + 30))
