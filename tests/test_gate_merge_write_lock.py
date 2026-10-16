@@ -51,6 +51,10 @@ async def _approved_pair_task(db: aiosqlite.Connection, *, pr_number: int = 501)
     await repo.update_task(db, tv.id, pr_number=pr_number)
     await db.commit()
     await services.submit_for_review(db, tv.id)
+    await repo.update_task(
+        db, tv.id, submission_sha="a" * 40
+    )  # #1706: the head the merge is bound to
+    await db.commit()
     await services.record_review_verdict(
         db, tv.id, TaskReviewVerdict(verdict="approved", agent="reviewer")
     )

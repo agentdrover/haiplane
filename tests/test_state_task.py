@@ -591,9 +591,11 @@ async def test_the_web_form_carries_the_generation_and_completes_a_state_task(
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
-async def test_a_commit_task_form_has_no_generation_field(
+async def test_a_commit_task_form_carries_the_generation_only(
     client: AsyncClient, db: aiosqlite.Connection
 ):
+    # #1706: the commit form now names the generation it shows and the revision
+    # of the verdict that stands; the state task's form has no revision field.
     commit_id = await make_state_task(db, result_kind="commit")
     await db.execute(
         "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
@@ -601,7 +603,10 @@ async def test_a_commit_task_form_has_no_generation_field(
     )
     await db.commit()
     page = (await client.get(f"/tasks/{commit_id}")).text
-    assert 'name="expected_generation"' not in page
+    assert 'name="expected_generation" value="1"' in page
+    assert 'name="supersedes_revision"' not in page, (
+        "no verdict stands: nothing to replace"
+    )
 
 
 # --- логи -------------------------------------------------------------------

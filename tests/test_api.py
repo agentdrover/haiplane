@@ -4532,6 +4532,7 @@ async def test_cli_and_mcp_review_verdict_hit_the_guarded_route(
                 agent="r",
                 findings_json="",
                 create_tasks_for_out_of_scope=False,
+                expected_generation=1,  # #1706: CLI без поколения отказывает
             )
         )
     assert calls[0][:2] == ("POST", f"/api/tasks/{task_id}/review-verdict")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
@@ -68,7 +69,7 @@ from hub.services.project_policy import (
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
-from hub.services import finding_outcome
+from hub.services import finding_outcome, verdict_guard
 from hub.services import ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
@@ -819,6 +820,7 @@ def row_to_task(
         submission_model=d.get("submission_model") or "",
         review_verdict=d.get("review_verdict"),
         review_verdict_generation=d.get("review_verdict_generation"),
+        review_verdict_revision=d.get("review_verdict_revision") or 0,
         review_approved_current=review_approved_for_current_submission(d),
         latest_review=latest_review_projection(d),
         waiting_for=d.get("waiting_for") or "",
@@ -4098,6 +4100,15 @@ class VerdictContext:
     # #1602: вердикт записан применением стюарда. Метка ставится САМИМ
     # применением, а не телом запроса, поэтому подделать её именем агента нельзя.
     applied_by_steward: bool = False
+    # #1706: вызов от аутентифицированного человека (REST и web ставят по
+    # личности); только он заменяет стоящий вердикт.
+    human_caller: bool = False
+    # #1706: что решила проверка стоящего вердикта; замену запись называет в ленте.
+    outcome: verdict_guard.Outcome = verdict_guard.Outcome.first
+    replaced: verdict_guard.Standing | None = None
+    # #1706: отпечаток запроса, снятый ДО черновиков follow-up: они проставляют
+    # номера задач в находки тела, а повтор приходит без них.
+    digest: str = ""
 
     body_text: str = ""
     pinned_sha: str = ""
@@ -4426,6 +4437,52 @@ VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
 )
 
 
+_UNPINNED_VERDICT = (
+    "Вердикт записан БЕЗ expected_generation: хаб не может сверить, о какой "
+    "сдаче вы судили, и устаревшее решение к первой записи не отличить. "
+    "Прочитайте бриф (oc-hub review-brief <id> / hub_get_review_brief) и "
+    "передавайте его поколение."
+)
+
+
+def _unpinned_verdict_note(hint: str | None) -> str:
+    """Предупреждение о вердикте без названного поколения (#1706), не подстановка."""
+    return f"{hint}\n{_UNPINNED_VERDICT}" if hint else _UNPINNED_VERDICT
+
+
+async def _standing_verdict_gate(state: VerdictContext) -> TaskView | None:
+    """Стоящий вердикт не заменяется молча (#1706); повтор — ответ без записей.
+
+    Поколение, о котором судили, берётся из аргумента вызова (стюард, автопилот)
+    или из тела (REST, CLI, MCP, web) и дальше едет в запись — условие стоит в
+    самом UPDATE. Решение называет ``verdict_guard``; здесь только то, что
+    принадлежит этому конвейеру: кто автоматика и что отвечать на повтор.
+    """
+    from hub.services.auto_verdict import _POLICY_ACTOR
+
+    if state.expected_generation is None:
+        state.expected_generation = state.body.expected_generation
+    automated = (
+        state.claim is not None
+        or state.applied_by_steward
+        or state.body.agent == _POLICY_ACTOR
+    )
+    state.digest = verdict_guard.verdict_digest(state.body)
+    state.outcome, state.replaced = await verdict_guard.decide(
+        state.db,
+        state.task,
+        state.body,
+        expected_generation=state.expected_generation,
+        automated=automated,
+        human_caller=state.human_caller,
+    )
+    if state.outcome is not verdict_guard.Outcome.repeat:
+        return None
+    row = await repo.get_task(state.db, state.task_id)
+    updates = await repo.get_task_updates(state.db, state.task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
 async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4504,10 +4561,16 @@ async def record_review_verdict(
         claim=claim,
         agent_caller=agent_caller,
         applied_by_steward=applied_by_steward,
+        human_caller=human_caller,
     )
+    if (repeat := await _standing_verdict_gate(state)) is not None:
+        return repeat
     await run_steps(state, VERDICT_STEPS)
 
-    return await _apply_verdict(state)
+    view = await _apply_verdict(state)
+    if state.expected_generation is None:
+        view.lifecycle_hint = _unpinned_verdict_note(view.lifecycle_hint)
+    return view
 
 
 def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
@@ -4594,7 +4657,24 @@ def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
     }
     if state.applied_by_steward:
         payload["source"] = STEWARD_APPLIED_SOURCE
+    if state.replaced is not None and state.outcome is verdict_guard.Outcome.supersede:
+        payload["replaced_revision"] = state.replaced.revision
     return payload
+
+
+async def _note_replacement(state: VerdictContext) -> None:
+    """Замена стоящего вердикта названа в ленте (#1706): было, стало, ревизии."""
+    old = state.replaced
+    if old is None or state.outcome is not verdict_guard.Outcome.supersede:
+        return
+    await repo.add_task_update(
+        state.db,
+        state.task_id,
+        "hub",
+        "status",
+        verdict_guard.replaced_line(old, state.body.verdict.value, old.revision + 1),
+        author_kind="hub",
+    )
 
 
 async def _apply_verdict(state: VerdictContext) -> TaskView:
@@ -4638,16 +4718,15 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             self_approved=self_approved,
             expected_generation=expected_generation,
             claim=claim,
+            supersedes_revision=body.supersedes_revision,
+            digest=state.digest,
         )
         if not written:
-            # #1601: пока считали (пакет, согласие), сдачу пересдали или вердикт
-            # на неё уже поставил человек. Запись не состоялась ни на какое
-            # поколение; транзакция откатывается целиком.
-            raise HTTPException(
-                409,
-                f"вердикт о сдаче {expected_generation} не записан: поколение "
-                "уже другое или вердикт на него уже стоит",
-            )
+            # #1601, #1706: пока считали (пакет, согласие), сдачу пересдали,
+            # вердикт на неё поставил другой писатель или заменили стоящий.
+            # Запись не состоялась ни на какое поколение; транзакция
+            # откатывается целиком.
+            raise verdict_guard.not_written_refusal(task, expected_generation)
         agent, content = _verdict_update_text(state)
         # The verdict is authored by a principal — the endpoint already
         # resolved one to check reviewer independence. Without this it would
@@ -4661,6 +4740,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             principal_id=principal_id,
             author_kind="principal" if principal_id is not None else "anonymous",
         )
+        await _note_replacement(state)
 
         # Client-driven review only (status=review, no review_job_id): hand
         # the task back to the developer so the loop continues — fix findings
@@ -6112,6 +6192,7 @@ async def deliver_on_disposition(
     from hub.services.orchestration import (
         GATE_RECORD_PENDING_PREFIX,
         merge_before_completion,
+        record_delivery_outcome,
         resolve_delivery_pr,
         review_approved_for_current_submission,
     )
@@ -6154,15 +6235,23 @@ async def deliver_on_disposition(
         if not ok and reason.startswith(GATE_RECORD_PENDING_PREFIX):
             ok = await _name_the_owed_record(db, task_id, reason)
     if ok:
-        await repo.add_task_update(
+        # #1706: the merge is a fact; the sentence "approved review" is true
+        # only while the approval stands, and the one outcome writer asks.
+        await record_delivery_outcome(
             db,
-            task_id,
-            "hub",
-            "status",
-            f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
-            f"PR #{task['pr_number']} влит теми же условиями, что применяет "
-            "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
-            "(#1037).",
+            task,
+            partial(
+                repo.add_task_update,
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
+                f"PR #{task['pr_number']} влит теми же условиями, что применяет "
+                "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
+                "(#1037).",
+            ),
+            merged=True,
         )
     elif delivery_pr.unusable and delivery_pr.search_unanswered:
         # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): the

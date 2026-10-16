@@ -3150,8 +3150,7 @@ async def hub_submit_review(
             unlinked out_of_scope findings (default false).
         acknowledge_repeat: A verdict repeating the previous one word for
             word is refused without it (#1057).
-        expected_generation: State task: generation judged (required); only a
-            human approves.
+        expected_generation: Brief's generation; state task requires it, commit task: 409 on mismatch.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -3178,6 +3177,13 @@ async def hub_submit_review(
         f"Review verdict {verdict.upper()} recorded for task #{task_id}"
         f"{findings_note} (status: {task.get('status', '?')})."
     )
+    if expected_generation is None:
+        # #1706: not substituted — a generation read here would be the live
+        # one, not the one the reviewer studied.
+        message += (
+            " WARNING: no expected_generation — the hub cannot tell which "
+            "submission you judged; pass the generation of hub_get_review_brief."
+        )
     return await _task_mutation_response(
         task_id,
         message,

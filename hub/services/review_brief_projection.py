@@ -784,6 +784,16 @@ def _rules_lines(rules: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _verdict_command_line(proj: dict[str, Any]) -> str:
+    """The generation a commit-task verdict must name (#1706), and the revision."""
+    generation = proj["submission_generation"]
+    return (
+        f"Verdict: pass expected_generation={generation} (CLI: --expected-generation "
+        f"{generation}); a verdict that stands is never replaced silently, only by "
+        f"a human with supersedes_revision={proj['review_verdict_revision']}."
+    )
+
+
 def _head_lines(proj: dict[str, Any]) -> list[str]:
     lines = [
         f"Review brief for task #{proj['task_id']}: {proj['title']} "
@@ -806,6 +816,7 @@ def _head_lines(proj: dict[str, Any]) -> list[str]:
     if proj["state_review"]:
         lines.extend(_state_review_lines(proj["state_review"]))
     else:
+        lines.append(_verdict_command_line(proj))
         lines.extend(_diff_lines(proj))
     lines.extend(_rules_lines(proj["catalogue_rules"]))
     lines.extend(_boundary_lines(proj))

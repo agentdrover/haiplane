@@ -84,6 +84,9 @@
 
     <div class="task-detail-layout">
         <main class="task-detail-main">
+            {% if task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
+            {% include "partials/task_verdict_replace.html" %}
+            {% endif %}
             {% if review_board %}
             {% include "partials/task_review_board.html" %}
 

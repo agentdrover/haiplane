@@ -884,7 +884,20 @@ def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
         dest="expected_generation",
         type=int,
         default=None,
-        help="State task (#1647): the submission generation you judge (required)",
+        help=(
+            "The submission generation you judged, from the review brief "
+            "(required: state task #1647, commit task #1706)"
+        ),
+    )
+    parser.add_argument(
+        "--supersedes-revision",
+        dest="supersedes_revision",
+        type=int,
+        default=None,
+        help=(
+            "Human only (#1706): replace the verdict that stands, naming its "
+            "revision from the task card"
+        ),
     )
 
 
@@ -984,8 +997,20 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
         body["findings"] = findings
     if getattr(args, "create_tasks_for_out_of_scope", False):
         body["create_tasks_for_out_of_scope"] = True
-    if getattr(args, "expected_generation", None) is not None:
-        body["expected_generation"] = args.expected_generation
+    if getattr(args, "expected_generation", None) is None:
+        # #1706: the generation is the brief's, never the live one read here —
+        # a CLI that fills it in judges whatever stands now, which is the
+        # stale command this flag exists to stop.
+        print(
+            "--expected-generation is required: read the brief "
+            f"(oc-hub review-brief {args.task_id}) and repeat the command with "
+            "--expected-generation <submission_generation of the brief>",
+            file=sys.stderr,
+        )
+        return 2
+    body["expected_generation"] = args.expected_generation
+    if getattr(args, "supersedes_revision", None) is not None:
+        body["supersedes_revision"] = args.supersedes_revision
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0

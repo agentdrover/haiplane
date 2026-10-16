@@ -755,7 +755,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # Эталон снят на develop 42e3505a (до правки), а не на 7184b67d из карточки:
 # 7184b67d старше #1686-#1688 (ci_run_report.trust, ci_integrity), и бриф на нём
 # уже иного состава. Часы — нормализация created_at/written_at и снятие timings.
-GOLDEN_REST_BRIEF = "29fcb9b1bb11b5c0537107f05260ab82fb572e9f79efe1d16a99160c6fc936c7"  # pragma: allowlist secret
+# #1706: бриф получил поле review_verdict_revision (ревизия стоящего вердикта),
+# эталон переснят осознанно; пакет стюарда и его хеш остались прежними.
+GOLDEN_REST_BRIEF = "5d27a4d92634ee4272db04f9b6dc2275747eb631498554ee2d68de1edd5a384b"  # pragma: allowlist secret
 GOLDEN_STEWARD_PACKET = "0e49d37ec6b654caacb331d17b6215f0293bc07e6771d3aabde5c3737e8abdef"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
@@ -1250,6 +1252,7 @@ _BAD: dict[str, tuple[str, Any]] = {
         [{"category": "c", "check_ref": "t::x", "matched_areas": []}],
     ),
     "submission_generation": ("submission_generation", 9),
+    "review_verdict_revision": ("review_verdict_revision", 9),
     "submission_sha": ("submission_sha", "f" * 40),
     "current_branch_tip": ("current_branch_tip", "e" * 40),
     "sha_check": ("sha_check", "diverged"),
