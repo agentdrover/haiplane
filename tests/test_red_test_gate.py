@@ -714,10 +714,21 @@ def _treedup_reuses_a_pr_run_whose_mutations_were_skipped(tmp_path: Path) -> Non
     import yaml
 
     doc = yaml.safe_load((_ROOT / ".github" / "workflows" / "ci.yml").read_text())
-    steps = {s.get("id"): s for s in doc["jobs"]["test"]["steps"] if s.get("id")}
-    treedup, test = steps["treedup"], steps["tests"]
-    assert "continue-on-error" not in test, "красный Test обязан краснить прогон"
-    assert test["if"] == "${{ steps.treedup.outputs.skip != 'true' }}"
+    # #1767: the decision is the step of job `treedup`; the suite runs in the
+    # parts of job `pytest` (each skipped on the dedup output), and job `test`
+    # judges them in the step `tests`, skipped only when the tree was green AND
+    # the parts did not fail.
+    treedup = next(s for s in doc["jobs"]["treedup"]["steps"] if s.get("id"))
+    assert treedup["id"] == "treedup"
+    part = next(s for s in doc["jobs"]["pytest"]["steps"] if s.get("id") == "shard")
+    judge = next(s for s in doc["jobs"]["test"]["steps"] if s.get("id") == "tests")
+    for step in (part, judge):
+        assert "continue-on-error" not in step, "красный Test обязан краснить прогон"
+    assert part["if"] == "${{ needs.treedup.outputs.skip != 'true' }}"
+    assert judge["if"] == (
+        "${{ always() && !(needs.treedup.outputs.skip == 'true' "
+        "&& needs.pytest.result == 'success') }}"
+    )
     assert treedup["if"] == "${{ github.event_name == 'push' }}"
 
     work = tmp_path / "repo"

@@ -34,8 +34,10 @@ EXCEPTIONS: dict[str, str] = {
     "Install age and openssh-server (backup tests)": (
         "подготовка окружения для тестов копий (#1707), не проверка"
     ),
-    "Detect tree already tested (skip pytest on exact dedup)": (
-        "оптимизация прогона, не проверка — #1077"
+    "Fail a cancelled run": ("красит отменённый прогон, локально отмены нет — #1767"),
+    "Tests outcome of the three parts": (
+        "итог трёх частей набора из job pytest, сам тесты не гоняет — #1767; "
+        "части покрыты тестом test_a_test_part_is_what_make_test_runs"
     ),
     "Surface parity (warning only)": ("только PR и warning-only: exit 0 всегда"),
     "Decide whether mutations and baseline are worth their minutes": (
@@ -216,3 +218,35 @@ def test_exceptions_name_only_real_steps() -> None:
     real_names = {name for name, _ in _ci_test_steps(ci_text)}
     for name in EXCEPTIONS:
         assert name in real_names, name
+
+
+def test_a_test_part_is_what_make_test_runs() -> None:
+    """#1767: the suite moved to the parts of job ``pytest``; they stay ``make test``.
+
+    The job ``test`` parsed above no longer holds the Test step, so the pairing
+    "what CI runs <-> what `make test` runs" is asserted on the part itself: the
+    part is the make recipe plus the split plugin, its number and the durations
+    report, and nothing is dropped from the recipe.
+    """
+    import shlex
+
+    import yaml
+
+    doc = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
+    part = next(s for s in doc["jobs"]["pytest"]["steps"] if s.get("id") == "shard")
+    ci_tokens = shlex.split(part["run"])
+    make_tokens = shlex.split(_target_body(MAKEFILE.read_text().splitlines(), "test"))
+    assert make_tokens[:3] == ["uv", "run", "pytest"], make_tokens
+    assert "pytest" in ci_tokens
+    ci_argv = ci_tokens[ci_tokens.index("pytest") + 1 :]
+    make_argv = make_tokens[make_tokens.index("pytest") + 1 :]
+    assert make_argv, "make test passes no pytest flags any more"
+    for token in make_argv:
+        assert token in ci_argv, f"`make test` runs {token!r}, the CI part does not"
+    # what the part adds is exactly the split, its number and the report
+    assert [t for t in ci_argv if t not in make_argv] == [
+        "-p",
+        "scripts.pytest_shard",
+        "--durations=30",
+    ]
+    assert ci_tokens[0].startswith("HAIPLANE_TEST_SHARD=")
