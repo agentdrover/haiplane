@@ -1529,6 +1529,12 @@ async def _notes_part(world, order: dict, task_id: int):
         {"branch": FAKE_DASHED},
         {"sha": "a1b2c3d4" * 20},
         {"sha": "A1B2C3D"},
+        {"sha": "abcdef1\n"},
+        {"branch": f"task-{task_id}/rescue-5\n"},
+        {"note": "ключ sk-" + "abcdefgh12345678"},
+        {"note": "x-ahcp_ab"},
+        {"note": "x_ahcp_ab"},
+        {"note": "ключ=ghp_" + "abcdefgh12345678"},
         {"branch": f"task-{task_id + 1000}/rescue-5"},
         {"branch": f"task-{task_id}/rescue-5x"},
         {"branch": f"task-{task_id}/rescue-"},
@@ -1588,10 +1594,15 @@ async def _notes_part(world, order: dict, task_id: int):
     assert (await post(branch=sneaky)).status_code == 422
     await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
     await world.db.commit()
+    # Ветка со словом «sk-…» внутри (task-refactoring-…) — обычная ветка, а не
+    # ключ: токен начинается после разделителя, не внутри слова.
+    wordy = "task-refactoring-executor-orders"
+    await repo.update_task(world.db, task_id, branch=wordy)
+    await world.db.commit()
     # Обычная ветка с длинным слагом и хеш коммита проходят.
     ok = await post(
         note="a" * 500,
-        branch=f"task-{task_id}/work",
+        branch=wordy,
         sha="0123456789abcdef0123456789abcdef01234567",  # pragma: allowlist secret
     )
     assert ok.status_code == 200, ok.text

@@ -937,17 +937,25 @@ async def ack_order(
     }
 
 
+#: Токен начинается с начала строки или после разделителя, а не внутри слова:
+#: «task-refactoring-…» содержит «sk-refact…», но это слово, а не ключ.
+_START = r"(?<![A-Za-z0-9])"
 _SECRET_SHAPES: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(r"ahcp_|ochk_|ghp_|github_pat_|sk-[A-Za-z0-9]{8}", re.IGNORECASE),
+    re.compile(
+        _START + r"(?:ahcp_|ochk_|ghp_|github_pat_|sk-[A-Za-z0-9]{8})", re.IGNORECASE
+    ),
     re.compile(r"\bAH-?[0-9A-HJKMNP-TV-Z]{8}\b", re.IGNORECASE),
-    re.compile(r"bearer\s+\S{8,}", re.IGNORECASE),
+    re.compile(_START + r"bearer\s+\S{8,}", re.IGNORECASE),
     re.compile(r"-----BEGIN"),
-    re.compile(r"(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}", re.I),
+    re.compile(
+        _START + r"(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S{6,}",
+        re.IGNORECASE,
+    ),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{32,}")
-_HEX = re.compile(r"^[0-9a-fA-F]+$")
-_SHA = re.compile(r"^[0-9a-f]{7,40}$")
-_RESCUE_NUMBER = re.compile(r"^[0-9]{1,20}$")
+_HEX = re.compile(r"[0-9a-fA-F]+")
+_SHA = re.compile(r"[0-9a-f]{7,40}")
+_RESCUE_NUMBER = re.compile(r"[0-9]{1,20}")
 
 
 def note_refusal(note: str) -> str:
@@ -957,7 +965,7 @@ def note_refusal(note: str) -> str:
     if any(shape.search(note) for shape in _SECRET_SHAPES):
         return "note: похоже на код, токен или ключ — секретам в ленте не место"
     for token in _LONG_TOKEN.findall(note):
-        if not _HEX.match(token):
+        if not _HEX.fullmatch(token):
             return "note: длинная строка похожа на токен"
     return ""
 
@@ -1002,7 +1010,7 @@ def _check_report_fields(outcome: str, sha: str, branch: str, note: str) -> None
     """Поля итога прогона до всякой записи: форма и секреты (422)."""
     if outcome not in REPORT_OUTCOMES:
         raise HostError(422, f"outcome: один из {', '.join(REPORT_OUTCOMES)}")
-    if sha and not _SHA.match(sha):
+    if sha and not _SHA.fullmatch(sha):
         raise HostError(422, "sha: от 7 до 40 строчных шестнадцатеричных символов")
     why = note_refusal(note)
     if why:
@@ -1031,7 +1039,7 @@ async def _branch_refusal(
     if own and branch == own:
         return ""
     prefix = f"task-{task_id}/rescue-"
-    if branch.startswith(prefix) and _RESCUE_NUMBER.match(branch[len(prefix) :]):
+    if branch.startswith(prefix) and _RESCUE_NUMBER.fullmatch(branch[len(prefix) :]):
         return ""
     return f"branch: только ветка задачи ({own or 'не названа'}) или {prefix}<цифры>"
 
