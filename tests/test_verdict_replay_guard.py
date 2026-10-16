@@ -1366,7 +1366,7 @@ def _head_bound_forge(git, db: aiosqlite.Connection, task_id: int, *, move: bool
         if move:
             await _fire(db, task_id, "resubmitted")
             await db.execute(
-                "UPDATE tasks SET submission_sha='b'*40 WHERE id=?", (task_id,)
+                "UPDATE tasks SET submission_sha=? WHERE id=?", ("b" * 40, task_id)
             )
             await db.commit()
         return expected_head_sha == "a" * 40 and not move
@@ -1480,7 +1480,9 @@ async def test_an_old_done_report_after_a_reapproved_resubmission_does_not_merge
     task_id = await _approved_pair_task(db)
     generation = dict(await repo.get_task(db, task_id))["submission_generation"]
     await _fire(db, task_id, "reapproved")  # N+1, approved again
-    await db.execute("UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,))
+    await db.execute(
+        "UPDATE tasks SET submission_sha=? WHERE id=?", ("c" * 40, task_id)
+    )
     await db.commit()
     await orchestration.run_deferred_completions(
         db,
@@ -1570,7 +1572,7 @@ async def test_the_real_done_report_remembers_its_generation(
     async def late(db_, pending):
         await _fire(db_, task_id, "reapproved")
         await db_.execute(
-            "UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,)
+            "UPDATE tasks SET submission_sha=? WHERE id=?", ("c" * 40, task_id)
         )
         await db_.commit()
         await real(db_, pending)
@@ -1664,7 +1666,7 @@ async def test_a_resubmission_during_ci_standing_does_not_complete_the_old_done(
     async def standing(db_, task_):
         await _fire(db_, task_id, "reapproved")
         await db_.execute(
-            "UPDATE tasks SET submission_sha='c'*40 WHERE id=?", (task_id,)
+            "UPDATE tasks SET submission_sha=? WHERE id=?", ("c" * 40, task_id)
         )
         await db_.commit()
         return dict(await repo.get_task(db_, task_id))  # fresh: N+1
@@ -1733,3 +1735,39 @@ async def test_the_merge_after_a_base_update_is_bound_to_the_head_that_was_compa
     )
     assert ok and spy.heads == ["n" * 40], "bound to the head the check compared"
     assert dict(await repo.get_task(db, task_id))["submission_sha"] == "n" * 40
+
+
+async def test_the_repin_leaves_a_newer_submissions_pin_alone(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Codex round 8: the re-pin is conditional on the submission and the old pin."""
+    from hub.services import lifecycle, orchestration
+    from tests.test_accept_without_delivery import _approved_task, _install, _MergeSpy
+
+    task_id = await _approved_task(client, db, title="repin-race", pr=954)
+    _install(monkeypatch, _MergeSpy())
+
+    async def tip(*_a, **_k):
+        return "n" * 40, ""
+
+    async def kept(*_a, **_k):
+        # A newer submission arrives while the comparison runs.
+        await repo.bump_submission_generation(db, task_id)
+        await db.execute(
+            "UPDATE tasks SET submission_sha=? WHERE id=?", ("z" * 40, task_id)
+        )
+        await db.commit()
+        return True, "та же правка"
+
+    async def no_wait(*_a, **_k):
+        return ""
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", tip)
+    monkeypatch.setattr(orchestration, "base_merge_kept_the_verdict", kept)
+    monkeypatch.setattr(orchestration, "_gate_update_base", no_wait)
+    await orchestration.merge_before_completion(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["submission_sha"] == "z" * 40, "the newer submission keeps its pin"
+    assert not db.in_transaction, "the short write is committed before the network"

@@ -3349,7 +3349,20 @@ async def _approved_code_check(
             # to (gh pr merge --match-head-commit): re-pin it, as the gate's own
             # automerge does (#1706). Not re-read: a push after this line is
             # exactly what the bound merge refuses.
-            await repo.update_task(db, task["id"], submission_sha=current_tip)
+            # Conditional on the submission and the old pin, and committed at
+            # once: a newer submission keeps ITS pin, and the write lock is not
+            # held over the network steps that follow.
+            await db.execute(
+                "UPDATE tasks SET submission_sha=?, updated_at=datetime('now') "
+                "WHERE id=? AND submission_generation=? AND submission_sha=?",
+                (
+                    current_tip,
+                    task["id"],
+                    task.get("submission_generation"),
+                    pinned,
+                ),
+            )
+            await db.commit()
             return "", (
                 f"Мерж базы в ветку: одобренный коммит {pinned[:12]} сменился "
                 f"на {current_tip[:12]}, но {why}. Вердикт остаётся текущим, "
