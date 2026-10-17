@@ -1640,7 +1640,7 @@ async def test_the_pair_completion_is_written_inside_the_outcome_writer(
 
     async def complete(*args, **kwargs):
         seen.append(inside["now"])
-        await real_complete(*args, **kwargs)
+        return await real_complete(*args, **kwargs)
 
     monkeypatch.setattr(services, "record_delivery_outcome", writer)
     monkeypatch.setattr(delivery_writes, "complete_delivered", complete)
