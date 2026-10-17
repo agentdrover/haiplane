@@ -68,7 +68,7 @@ def test_manual_runs_buy_checks_not_a_deploy() -> None:
         "существующем коммите родить нечем"
     )
     assert (
-        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in text
+        "github.event_name == 'push' && github.ref == 'refs/heads/main' }}" in text
     ), (
         "deploy обязан требовать push в main: ручной запуск покупает проверки, "
         "а не выкат"
@@ -249,9 +249,9 @@ def test_the_deploy_ships_hashed_lock_exports() -> None:
     doc = _doc()
     deploy = doc["jobs"]["deploy"]
     assert deploy["needs"] == "test"
-    assert (
-        deploy["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    )
+    # #1796: the condition carries its own status check (see the AC-1 test).
+    assert "github.event_name == 'push'" in deploy["if"]
+    assert "github.ref == 'refs/heads/main'" in deploy["if"]
 
     # One uv version everywhere: a floating one rewrites uv.lock under us.
     assert _uv_versions() == {
@@ -887,3 +887,123 @@ def test_the_number_of_parts_is_set_once_by_the_matrix() -> None:
     assert not re.search(r"\d", _step("test", "Tests outcome of the parts")["name"])
 
     assert_parts_of_tests_dir_are_the_whole(total)
+
+
+# ---- #1796: the deploy condition survives a skipped ancestor -------------------
+
+
+def _job_condition_holds(
+    condition: str,
+    job: str,
+    results: dict[str, str],
+    *,
+    event: str,
+    ref: str,
+    cancelled: bool = False,
+) -> bool:
+    """Evaluate a job-level ``if`` the way GitHub does, over the real job graph.
+
+    Supports github.event_name, github.ref, needs.<job>.result, cancelled(),
+    success() and ``!``, ``&&``, ``||``, ``==``, ``!=``. A condition with no
+    status function gets an implicit success(): every transitive ancestor in
+    ``needs`` must have the result "success" (a skipped one makes it false).
+    Unknown names raise instead of being guessed.
+    """
+    import re
+
+    jobs = _doc()["jobs"]
+
+    def ancestors(name: str) -> set[str]:
+        needs = jobs[name].get("needs", [])
+        direct = [needs] if isinstance(needs, str) else list(needs)
+        found = set(direct)
+        for parent in direct:
+            found |= ancestors(parent)
+        return found
+
+    def success() -> bool:
+        return all(results[a] == "success" for a in ancestors(job))
+
+    text = condition.strip()
+    if text.startswith("${{"):
+        assert text.endswith("}}"), condition
+        text = text[3:-2]
+    has_status = bool(re.search(r"\b(?:success|failure|always|cancelled)\(\)", text))
+    names: dict[str, str] = {}
+
+    def literal(match: re.Match[str]) -> str:
+        names[f"s{len(names)}"] = match.group(0)[1:-1]
+        return f"s{len(names) - 1}"
+
+    code = re.sub(r"'[^']*'", literal, text)
+
+    def need(match: re.Match[str]) -> str:
+        names[f"n{len(names)}"] = results[match.group(1)]
+        return f"n{len(names) - 1}"
+
+    code = re.sub(r"needs\.([\w-]+)\.result", need, code)
+    values = {"github.event_name": event, "github.ref": ref}
+    for key, value in values.items():
+        code = code.replace(key, f"v{len(names)}")
+        names[f"v{len(names)}"] = value
+    code = code.replace("success()", " ok ").replace("cancelled()", " was_cancelled ")
+    code = code.replace("&&", " and ").replace("||", " or ")
+    code = re.sub(r"!(?!=)", " not ", code)
+    leftover = re.sub(
+        r"\b(?:s|n|v)\d+\b|\b(?:ok|was_cancelled|and|or|not)\b|==|!=|[()\s]",
+        "",
+        code,
+    )
+    assert leftover == "", f"unexpected syntax {leftover!r} in {condition!r}"
+    scope = {**names, "ok": success(), "was_cancelled": cancelled}
+    value = bool(eval(code, {"__builtins__": {}}, scope))  # noqa: S307  # nosec B307
+    return value if has_status else (success() and value)
+
+
+def _deploy_cases(condition: str) -> dict[str, bool]:
+    ok = {"treedup": "success", "pytest": "success", "evidence": "skipped"}
+    out: dict[str, bool] = {}
+
+    def run(name: str, test: str, event: str, ref: str, cancelled: bool = False):
+        out[name] = _job_condition_holds(
+            condition,
+            "deploy",
+            {**ok, "test": test},
+            event=event,
+            ref=ref,
+            cancelled=cancelled,
+        )
+
+    main = "refs/heads/main"
+    run("push_main_skipped_evidence", "success", "push", main)
+    run("test_failure", "failure", "push", main)
+    run("test_cancelled", "cancelled", "push", main)
+    run("test_skipped", "skipped", "push", main)
+    run("workflow_cancelled", "success", "push", main, cancelled=True)
+    run("push_develop", "success", "push", "refs/heads/develop")
+    run("pull_request", "success", "pull_request", "refs/pull/1/merge")
+    run("workflow_dispatch", "success", "workflow_dispatch", main)
+    return out
+
+
+def test_deploy_runs_when_tests_pass_even_with_a_skipped_ancestor() -> None:
+    """AC-1 (#1796): push в main при test=success выкатывается, хотя предок
+    evidence пропущен; во всех прочих случаях выката нет. Условие — настоящее
+    deploy.if из ci.yml, исходы предков идут через неявный success()."""
+    cases = _deploy_cases(_doc()["jobs"]["deploy"]["if"])
+    assert cases == {
+        "push_main_skipped_evidence": True,
+        "test_failure": False,
+        "test_cancelled": False,
+        "test_skipped": False,
+        "workflow_cancelled": False,
+        "push_develop": False,
+        "pull_request": False,
+        "workflow_dispatch": False,
+    }
+
+
+def test_the_pre_1796_condition_skipped_the_deploy() -> None:
+    """Вычислитель видит дефект: старое условие даёт False в главном случае."""
+    old = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    assert _deploy_cases(old)["push_main_skipped_evidence"] is False
