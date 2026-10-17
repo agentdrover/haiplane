@@ -697,7 +697,7 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
     await _slot_note(db, own)
     # другой принципал, отозванная сессия, нет слота — тоже не доказательство
     negatives = []
-    for tag in ("other", "revoked", "noslot"):
+    for tag in ("other", "revoked", "noslot", "lateclaim"):
         _, t = await _task_with_findings(db, slug=f"rc-p1-{tag}")
         r = await _finished_run_id(db, t)
         await db.execute(
@@ -706,8 +706,8 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
         await _live_run_session(db, t, r, f"p1-{tag}")
         await _hold(db, t, None, session=False, status="running")
         await db.execute(
-            "UPDATE tasks SET claimed_at = datetime('now', '-30 minutes') WHERE id = ?",
-            (t,),
+            "UPDATE tasks SET claimed_at = datetime('now', ?) WHERE id = ?",
+            ("-5 minutes" if tag == "lateclaim" else "-30 minutes", t),
         )
         if tag != "noslot":
             await db.execute(
@@ -773,6 +773,25 @@ async def test_p1_first_pass_reaper_leaves_a_human_claim_after_a_manual_session(
     await db.commit()
     assert await cp.release_expired_implementer_tasks(db) == []
     assert (await _row(db, task_id))["claimed_by"] == "alice"
+
+
+async def test_p1_first_pass_reaper_leaves_a_same_identity_retake(db, monkeypatch):
+    """P1-2 (вариант): новый захват под тем же именем агента, но без доказательства
+    прогона — истёкшая сессия СТАРОГО прогона его не снимает."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-p1-retake-reaper")
+    run_id = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, None, session=False, status="running")
+    acting = await cp.get_acting_agent(db)
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, executor_run_id) VALUES "
+        "(?, 'p1-2b', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), task_id, run_id),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["status"] == "running"
 
 
 async def test_p1_first_pass_reaper_leaves_a_human_claim(db, monkeypatch):
