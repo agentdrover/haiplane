@@ -7,8 +7,8 @@
   человек, а cookie-сессия — только с верным CSRF, какой бы ни был глобальный
   режим (``_human_door``). Агент и ключ хоста сюда не проходят.
 * ``/api/executor-hosts/{name}/orders…`` — то, что хост делает своим ключом
-  роли slot_runner: забрать заказы, подтвердить, сообщить итог. Allowlist в
-  ``hub/auth.py`` пускает ключ ровно на эти три маршрута своего хоста; здесь
+  роли slot_runner: забрать заказы, выкупить код, подтвердить, сообщить итог.
+  Allowlist в ``hub/auth.py`` пускает ключ ровно на эти четыре маршрута своего хоста; здесь
   то же проверяется по базе, потому что middleware знает только путь.
 * параметры запуска исполнителя (``ExecutorLaunchRequest``) — на слот хоста.
 """
@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import current_identity, require_human_or_admin
-from hub.services import executor_orders
+from hub.services import executor_orders, host_redeem
 
 router = APIRouter()
 
@@ -44,6 +44,10 @@ class ExecutorHostCreate(BaseModel):
 
 class ExecutorOrderAck(BaseModel):
     result: str
+
+
+class ExecutorOrderRedeem(BaseModel):
+    code: str
 
 
 class ExecutorOrderReport(BaseModel):
@@ -222,6 +226,24 @@ async def api_executor_host_orders(
         if not _polling[name]:
             del _polling[name]
     return {"host": name, "orders": orders}
+
+
+@router.post("/api/executor-hosts/{name}/orders/{order_id}/redeem")
+async def api_executor_order_redeem(
+    name: str, order_id: int, body: ExecutorOrderRedeem, request: Request
+) -> dict:
+    """Выкуп кода заказа ключом хоста; повтор после потерянного ответа (#1825).
+
+    Первый вызов — токен сессии; повтор в окне, пока токен не предъявлен, —
+    новый токен той же сессии с большей ``token_version``. Тело ответа — секрет.
+    """
+    await _host_caller(request, name)
+    try:
+        return await host_redeem.redeem_for_host(
+            _db(request), name, order_id, body.code
+        )
+    except executor_orders.HostError as exc:
+        raise _as_http(exc) from exc
 
 
 @router.post("/api/executor-hosts/{name}/orders/{order_id}/ack")
