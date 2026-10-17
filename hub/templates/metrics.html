@@ -531,6 +531,23 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
             <td>{% if rd.features_without_completion %}{{ rd.features_without_completion }}{% else %}—{% endif %}</td></tr>
     </tbody>
 </table>
+<p class="muted">Те же утечки по виду причины (cause_kind, #1791): сумма строк
+равна «Утечек в прод, измерено». «пусто» — вид ещё никто не назвал, unknown —
+назван «причина не установлена»; это разные строки. Регрессия — только дефект,
+вид которого назван regression; ссылка на задачу-причину без вида регрессией не
+считается.</p>
+<table class="task-table">
+    <thead><tr><th>Вид причины</th><th>Утечек</th><th>Доля</th></tr></thead>
+    <tbody>
+        {% for r in ed.by_cause_kind %}
+        <tr><td>{{ r.cause_kind }}</td>
+            <td data-metric="escaped_defects.by_cause_kind.{{ r.cause_kind }}">{{ r.defects }}</td>
+            <td>{% if r.share is not none %}{{ (r.share * 100) | round(1) }}%{% else %}—{% endif %}</td></tr>
+        {% endfor %}
+        <tr><td><strong>Регрессии</strong> <span class="muted">(cause_kind=regression)</span></td>
+            <td data-metric="escaped_defects.regressions">{{ ed.regressions }}</td><td></td></tr>
+    </tbody>
+</table>
 <table class="task-table">
     <thead><tr><th>Фича-источник <span class="muted">(реконструкция)</span></th><th>Утечек</th></tr></thead>
     <tbody>
