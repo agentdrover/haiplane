@@ -128,3 +128,35 @@ def test_build_check_leaves_the_imported_module_objects_intact():
     test_server_builds()
     after = (mcp_server.HubApiError, mcp_server.mcp, mcp_server.hub_health)
     assert all(b is a for b, a in zip(before, after, strict=True))
+
+
+async def _post_padded_ping(client, size: int):
+    from hub.app import _mcp_streamable_app
+
+    body = (
+        '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"' + "x" * size + '"}}'
+    )
+    async with _mcp_streamable_app.router.lifespan_context(_mcp_streamable_app):
+        return await client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+            content=body.encode(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_body_between_sdk_default_and_configured_cap_is_accepted(client):
+    """mcp 1.29+ caps bodies at 4 MiB; the hub raises the cap (#1827)."""
+    assert config.MCP_MAX_REQUEST_BODY_BYTES > 5 * 1024 * 1024
+    response = await _post_padded_ping(client, 5 * 1024 * 1024)
+    assert response.status_code != 413
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_mcp_body_over_configured_cap_is_413(client):
+    response = await _post_padded_ping(client, config.MCP_MAX_REQUEST_BODY_BYTES + 1024)
+    assert response.status_code == 413
