@@ -1129,6 +1129,14 @@ async def test_a_revoked_run_session_cannot_take_the_task_as_a_manual_one(
     )
     await db.commit()
     assert await cp.ended_run_session(db, "rev-token", task_id) is True
+    # истёкшая (не отозванная) сессия живого прогона — тоже не ручная
+    await db.execute(
+        "UPDATE chat_pair_sessions SET revoked_at = NULL, "
+        "expires_at = datetime('now', '-1 minute') WHERE token_hash = ?",
+        (cp.hash_pair_code("rev-token"),),
+    )
+    await db.commit()
+    assert await cp.ended_run_session(db, "rev-token", task_id) is True
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException):
