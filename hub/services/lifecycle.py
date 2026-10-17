@@ -1990,6 +1990,7 @@ async def _pair_start_write(
         # доказательство прогона пишется здесь. Из claimed оно уже записано
         # claim'ом; None у ручного старта стирает чужой хвост.
         update_fields["executor_run_id"] = caller_run
+        await chat_pair.bind_claim(db, session_token, task_id, declared_session)
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
@@ -4906,6 +4907,7 @@ async def _claim_write(
     # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
     # чужой прежний executor_run_id у нового держателя не остаётся.
     claim_fields["executor_run_id"] = caller_run
+    await chat_pair.bind_claim(db, session_token, task_id, body.session_id or "")
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when

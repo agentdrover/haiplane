@@ -237,6 +237,11 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
     )
     assert claimed.status_code == 200, claimed.text
     assert (await _row(db, task_id))["executor_run_id"] == run
+    bound = await db.execute_fetchall(
+        "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run,),
+    )
+    assert bound[0][0] == "s-1783", "сессия запомнила свой claim_session_id"
 
     # done из claimed снимает захват и вместе с ним закрывает сессии и слот прогона:
     # доказательство уходит с захватом, и позже закрыть эти остатки было бы нечем.
@@ -697,7 +702,7 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
     await _slot_note(db, own)
     # другой принципал, отозванная сессия, нет слота — тоже не доказательство
     negatives = []
-    for tag in ("other", "revoked", "noslot", "lateclaim"):
+    for tag in ("other", "noslot", "lateclaim", "nullclaim"):
         _, t = await _task_with_findings(db, slug=f"rc-p1-{tag}")
         r = await _finished_run_id(db, t)
         await db.execute(
@@ -709,6 +714,8 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
             "UPDATE tasks SET claimed_at = datetime('now', ?) WHERE id = ?",
             ("-5 minutes" if tag == "lateclaim" else "-30 minutes", t),
         )
+        if tag == "nullclaim":  # pair-start из open: claim не было, часам верить нельзя
+            await db.execute("UPDATE tasks SET claimed_at = NULL WHERE id = ?", (t,))
         if tag != "noslot":
             await db.execute(
                 "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
@@ -720,12 +727,6 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
             await db.execute(
                 "UPDATE tasks SET implementer_principal_id = ? WHERE id = ?",
                 (await _human(db), t),
-            )
-        if tag == "revoked":
-            await db.execute(
-                "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
-                "WHERE bound_task_id = ?",
-                (t,),
             )
         negatives.append(t)
     # та же секунда: слот прогона и ручной claim неразличимы по часам, различает лента
@@ -952,3 +953,49 @@ async def _phase_booking_blocks_a_manual_claim(db, monkeypatch):
         db, task_id, models.TaskClaim(agent="alice", session_id="s-a")
     )
     assert claimed.status.value == "claimed"
+
+
+async def test_p1_reaper_gives_back_only_the_claim_the_session_made(db, monkeypatch):
+    """Сессия запоминает claim_session_id, под которым взяла задачу (bind_claim);
+    независимый захват тем же принципалом под другим session_id её истечением не
+    снимается, а её собственный — снимается."""
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    for tag, claim, expected in (("own", "S1", ["task"]), ("other", "S2", [])):
+        _, task_id = await _task_with_findings(db, slug=f"rc-bind-{tag}")
+        await _hold(db, task_id, None, session=False, status="running")
+        await db.execute(
+            "UPDATE tasks SET claim_session_id = ? WHERE id = ?", (claim, task_id)
+        )
+        await db.execute(
+            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
+            "kind, bound_task_id, bound_generation, claimed_session) VALUES "
+            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, 'S1')",
+            (int(acting["id"]), f"bind-{tag}", task_id),
+        )
+        await db.commit()
+        released = await cp.release_expired_implementer_tasks(db)
+        assert released == ([task_id] if expected else []), tag
+        assert (await _row(db, task_id))["status"] == (
+            "open" if expected else "running"
+        )
+
+
+async def test_p1_bind_claim_records_the_declared_session(db, monkeypatch):
+    """claim и pair-start сессией implementer записывают в неё объявленный session_id."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-bind-rec")
+    acting = await cp.get_acting_agent(db)
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation) VALUES (?, ?, datetime('now', '+1 hour'), "
+        "'implementer', ?, 1)",
+        (int(acting["id"]), cp.hash_pair_code("tok-bind"), task_id),
+    )
+    await db.commit()
+    await cp.bind_claim(db, "tok-bind", task_id, "S-declared")
+    rows = await db.execute_fetchall(
+        "SELECT claimed_session FROM chat_pair_sessions WHERE bound_task_id = ?",
+        (task_id,),
+    )
+    assert rows[0][0] == "S-declared"

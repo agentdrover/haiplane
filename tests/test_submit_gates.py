@@ -1521,9 +1521,15 @@ async def test_same_sha_after_changes_requested_is_refused(
         return ["hub/x.py"]
 
     git.dirty_paths = _dirty
+    from hub.services import orchestration
     from hub.services import resubmission_guard as _rg
 
-    assert await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id))) == ""
+    assert (
+        await _rg.stop_empty_done(
+            db, dict(await repo.get_task(db, task.id)), tail_pending=True
+        )
+        == ""
+    )
     git.dirty_paths = real_dirty
     await repo.update_task(db, task.id, job_id=None, status="running")
     await db.commit()
@@ -1536,7 +1542,36 @@ async def test_same_sha_after_changes_requested_is_refused(
         return 1
 
     git.unpushed_commits = _ahead
-    assert await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id))) == ""
+    # pending_report хвоста конвейера не выполняет: там недокоммиченное не оправдание.
+    assert (
+        await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id)))
+        == "needs_decision"
+    )
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    # проект без workspace_path: git по умолчанию, как у хвоста (repo=None доходит до git)
+    from unittest.mock import AsyncMock
+
+    seen: list = []
+
+    async def _dirty_seen(repo=None):
+        seen.append(repo)
+        return ["a.py"]
+
+    real_ctx = orchestration.project_git_context
+    orchestration.project_git_context = AsyncMock(return_value={"repo": None})
+    real_dirty2, git.dirty_paths = git.dirty_paths, _dirty_seen
+    assert await _rg._uncommitted_work(db, task.id, "b") is True and seen == [None]
+    git.dirty_paths = real_dirty2
+    orchestration.project_git_context = real_ctx
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    assert (
+        await _rg.stop_empty_done(
+            db, dict(await repo.get_task(db, task.id)), tail_pending=True
+        )
+        == ""
+    )
     del git.unpushed_commits
 
     # done через pending_report (поллер не нашёл отчёта) — тот же запрет.

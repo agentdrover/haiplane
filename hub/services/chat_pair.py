@@ -819,6 +819,22 @@ async def ordered_skill_of_session(
     }
 
 
+async def bind_claim(
+    db: aiosqlite.Connection, token: str, task_id: int, declared_session: str
+) -> None:
+    """Сессия implementer запоминает, под каким claim_session_id она взяла задачу.
+
+    Реапер потом отдаёт задачу мёртвой сессии, только если захват — её (#1783):
+    независимый claim тем же принципалом под другим session_id её не наследует.
+    """
+    if token and declared_session:
+        await db.execute(
+            "UPDATE chat_pair_sessions SET claimed_session = ? "
+            "WHERE token_hash = ? AND kind = 'implementer' AND bound_task_id = ?",
+            (declared_session, hash_pair_code(token), int(task_id)),
+        )
+
+
 async def run_of_session(
     db: aiosqlite.Connection, token: str, task_id: int
 ) -> int | None:
@@ -1005,6 +1021,7 @@ async def return_task_to_open(
     event_kind: str,
     holders: frozenset[int] | None = None,
     session_runs: frozenset[int | None] | None = None,
+    session_claims: frozenset[str | None] | None = None,
 ) -> bool:
     """Put a pair task whose implementer is gone back to open; no commit.
 
@@ -1036,6 +1053,11 @@ async def return_task_to_open(
     # после release и уже снятый run_claim чужой сессией не освобождаются.
     if session_runs is not None and rows[0]["executor_run_id"] not in session_runs:
         return False
+    # Сессии, запомнившие свой claim_session_id, отдают только его; None — сессия
+    # до этой записи (прежнее поведение).
+    if session_claims is not None and None not in session_claims:
+        if (rows[0]["claim_session_id"] or None) not in session_claims:
+            return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.
     if (rows[0]["job_id"] or "").strip() or (rows[0]["review_job_id"] or "").strip():
@@ -1136,7 +1158,8 @@ async def release_expired_implementer_tasks(
     rows = await fetchall(
         db,
         "SELECT s.bound_task_id AS task_id, t.status AS status, t.job_id AS job_id, "
-        "s.principal_id AS principal_id, s.executor_run_id AS run_id "
+        "s.principal_id AS principal_id, s.executor_run_id AS run_id, "
+        "s.claimed_session AS claimed_session "
         "FROM chat_pair_sessions s "
         "JOIN tasks t ON t.id = s.bound_task_id "
         "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
@@ -1151,17 +1174,18 @@ async def release_expired_implementer_tasks(
         ")",
     )
     released: list[int] = []
-    pending: dict[int, tuple[str, set[int], set[int | None]]] = {}
+    pending: dict[int, tuple[str, set[int], set[int | None], set[str | None]]] = {}
     for raw in rows:
         row = dict(raw)
         if row.get("job_id"):
             continue
-        status, principals, runs = pending.setdefault(
-            int(row["task_id"]), (str(row["status"]), set(), set())
+        status, principals, runs, claims = pending.setdefault(
+            int(row["task_id"]), (str(row["status"]), set(), set(), set())
         )
         principals.add(int(row["principal_id"]))
         runs.add(row["run_id"])
-    for task_id, (from_status, principals, runs) in pending.items():
+        claims.add(row["claimed_session"])
+    for task_id, (from_status, principals, runs, claims) in pending.items():
         # One transaction per task, rolled back as a whole (#1712): the release
         # also closes the host order of the run, and a failure between the two
         # must not leave half of it behind — nor an open write transaction that
@@ -1176,6 +1200,7 @@ async def release_expired_implementer_tasks(
                 # #1712: a task another agent holds now is not this session's.
                 holders=frozenset(principals),
                 session_runs=frozenset(runs),
+                session_claims=frozenset(claims),
             )
         except Exception:  # noqa: BLE001 - one task must not stop the others
             log.exception("Chat-pair reaper: releasing task #%d failed", task_id)

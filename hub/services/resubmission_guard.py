@@ -53,9 +53,7 @@ async def _uncommitted_work(
     from hub.services.orchestration import project_git_context
 
     ctx = await project_git_context(db, task_id)
-    workspace = ctx.get("repo")
-    if not workspace:
-        return False
+    workspace = ctx.get("repo")  # пусто — общий каталог git по умолчанию, как у хвоста
     if await plugins.git_ops.dirty_paths(repo=workspace):
         return True
     return (
@@ -63,13 +61,16 @@ async def _uncommitted_work(
     )
 
 
-async def stop_empty_done(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+async def stop_empty_done(
+    db: aiosqlite.Connection, task: dict[str, Any], *, tail_pending: bool = False
+) -> str:
     """done-отчёт на коммите поколения с действующим «на доработку».
 
     До бампа поколения и до любой записи. Pair: отказ (422), строка отчёта
     откатывается вместе с done-потоком. Headless: задача уходит в needs_decision
     с названной причиной, возвращается этот статус. Пустая строка — отчёт не
-    пустой.
+    пустой. ``tail_pending`` — вызов из поллера, где git-хвост конвейера ещё
+    впереди и закоммитит то, что лежит в рабочем каталоге.
     """
     from hub.services import lifecycle, watch_notices
 
@@ -89,12 +90,15 @@ async def stop_empty_done(db: aiosqlite.Connection, task: dict[str, Any]) -> str
     if not empty_resubmission_of(task, sha):
         return ""
     task_id = int(task["id"])
-    if task.get("job_id") and await _uncommitted_work(
-        db, task_id, task.get("branch") or ""
+    if (
+        tail_pending
+        and task.get("job_id")
+        and await _uncommitted_work(db, task_id, task.get("branch") or "")
     ):
-        # Headless: правки исполнителя лежат в рабочем каталоге (или в локальных
-        # коммитах), их коммитит и пушит хвост конвейера ПОСЛЕ этого места. Удалённая вершина до него —
-        # прежняя, и это не пустая пересдача (#1783, круг 2).
+        # Правки исполнителя ещё не в удалённой ветке: их коммитит и пушит хвост
+        # конвейера ПОСЛЕ этого места, и это не пустая пересдача. Только там, где
+        # хвост есть: pending_report его не выполняет, и git под write-локом
+        # done-потока не зовётся (#1783, круг 2).
         return ""
     generation = int(task.get("submission_generation") or 0)
     detail = empty_resubmission_detail(task_id=task_id, sha=sha, generation=generation)

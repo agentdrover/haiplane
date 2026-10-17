@@ -6299,7 +6299,7 @@ async def transition_after_agent_done(
         )
         return str(task.get("status") or "")
 
-    if has_done and (halted := await stop_empty_done(db, task)):
+    if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
 
     if has_done and not completion_requires_review(task):

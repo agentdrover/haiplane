@@ -2309,9 +2309,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: прогон хаба, держащий захват (claim/pair-start сессией с
-        # заказом); NULL — ручной захват. Снятие захвата без сессий — только
-        # по этому доказательству (см. services/run_claim.py).
+        # #1783: claim_session_id, под которым сессия взяла задачу (реапер).
+        "add_chat_pair_sessions_claimed_session",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+    ),
+    (
+        # #1783: прогон хаба, держащий захват; NULL — ручной (run_claim.py).
         "add_tasks_executor_run_id",
         "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",
     ),
@@ -2481,10 +2484,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: доказательство для захватов, стоящих при выкате: сессия с
-        # заказом + её слот, записанный не раньше захвата, и после него никто
-        # не брал задачу («Claimed by» новее «канал:»). Остаток: ручной
-        # pair-start из open в ту же секунду. Один раз.
+        # #1783: доказательство для захватов при выкате: сессия с заказом + её
+        # слот не раньше claim, и после него «Claimed by» не было; без claim нет.
         "backfill_tasks_executor_run_id",
         "UPDATE tasks SET executor_run_id = (SELECT s.executor_run_id "
         "FROM chat_pair_sessions s JOIN executor_runs r ON r.id = s.executor_run_id "
@@ -2492,8 +2493,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "AND sl.channel = s.channel AND sl.slot = s.slot "
         "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
         "AND r.task_id = tasks.id AND s.principal_id = tasks.implementer_principal_id "
-        "AND s.revoked_at IS NULL AND (tasks.claimed_at IS NULL "
-        "OR datetime(sl.captured_at) >= datetime(tasks.claimed_at)) "
+        "AND tasks.claimed_at IS NOT NULL "
+        "AND datetime(sl.captured_at) >= datetime(tasks.claimed_at) "
         "AND EXISTS (SELECT 1 FROM task_updates c WHERE c.task_id = tasks.id "
         "AND c.agent = 'hub' AND c.content LIKE 'канал: %') "
         "AND NOT EXISTS (SELECT 1 FROM task_updates m WHERE m.task_id = tasks.id "
