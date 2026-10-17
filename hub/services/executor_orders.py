@@ -908,6 +908,9 @@ async def _own_order(
     return dict(rows[0]) if rows else None
 
 
+_SQLITE_MAX_INT = 2**63 - 1
+
+
 async def read_order_outcome(
     db: aiosqlite.Connection, host: str, order_id: int
 ) -> dict[str, Any] | None:
@@ -916,11 +919,28 @@ async def read_order_outcome(
     Только чтение, без кода, шифротекста, хеша и текста заказа: хост узнаёт,
     сдана ли работа, когда сессия прогона уже отозвана при сдаче.
     """
+    if not 0 <= int(order_id) <= _SQLITE_MAX_INT:
+        return None
     order = await _own_order(db, host, order_id)
     if order is None:
         return None
-    task = await repo.get_task(db, int(order["task_id"]))
+    # Задача могла уйти в новый заказ (этого или другого хоста): её сдача тогда
+    # не итог ЭТОГО заказа, и отдавать её старому заказу нельзя.
+    newer = await fetchall(
+        db,
+        "SELECT 1 FROM executor_orders WHERE task_id = ? AND id > ? LIMIT 1",
+        (int(order["task_id"]), int(order["id"])),
+    )
+    task = None if newer else await repo.get_task(db, int(order["task_id"]))
     row = dict(task) if task is not None else {}
+    branch = str(row.get("branch") or "")
+    if branch and (
+        any(shape.search(branch) for shape in _SECRET_SHAPES)
+        or await _fields_hold_the_code(db, order, branch)
+    ):
+        branch = (
+            ""  # слаг ветки задаёт вызывающий pair-start: секрету в ответе не место
+        )
     return {
         "id": order["id"],
         "host": order["host"],
@@ -928,10 +948,11 @@ async def read_order_outcome(
         "close_reason": order["close_reason"],
         "task_id": order["task_id"],
         "generation": order["generation"],
+        "superseded": bool(newer),
         "task_status": row.get("status"),
         "submission_generation": row.get("submission_generation"),
         "submission_sha": row.get("submission_sha") or "",
-        "branch": row.get("branch") or "",
+        "branch": branch,
         "pr_number": row.get("pr_number"),
         "report_outcome": order["report_outcome"],
     }

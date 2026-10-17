@@ -115,3 +115,42 @@ async def test_order_read_scoped_to_own_host(world, monkeypatch):
     monkeypatch.setattr(executor_host_api, "ORDER_READ_MAX", 3)
     codes = [(await _read(world, "k8", mine)).status_code for _ in range(5)]
     assert 429 in codes and codes[0] == 200
+
+
+async def test_order_read_hides_secrets_stale_runs_and_overflow(world):
+    """Codex P2/P2/P3: секрет в ветке, сдача следующего заказа, id вне диапазона SQLite."""
+    from hub import repository as repo
+
+    task_id = await _task(world, "старый заказ")
+    first = (await _eo._launch(world, task_id, "k8")).json()["order_id"]
+    code = _eo._code_of(
+        world, (await _eo._orders(world, "k8")).json()["orders"][0], "k8"
+    )
+    # Секрет в ветке (слаг задаёт вызывающий pair-start): в ответ не попадает.
+    await repo.update_task(world.db, task_id, branch=f"task-1/{code}")
+    await world.db.commit()
+    got = await _read(world, "k8", first)
+    assert got.status_code == 200 and got.json()["branch"] == ""
+    assert code not in got.text and code.removeprefix("AH-") not in got.text
+    # Заказ закрыт, задача ушла на другой хост: чужая сдача старому заказу не видна.
+    await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
+    await world.db.commit()
+    lost = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{first}/ack",
+        json={"result": "redeem_failed"},
+        headers=world.k8_auth,
+    )
+    assert lost.status_code == 200
+    assert (await _eo._launch(world, task_id, "k9")).status_code == 200
+    await repo.update_task(
+        world.db, task_id, submission_sha="b" * 40, pr_number=9, status="review"
+    )
+    await world.db.commit()
+    old = (await _read(world, "k8", first)).json()
+    assert old["superseded"] is True and old["state"] == "closed"
+    assert old["submission_sha"] == "" and old["pr_number"] is None
+    assert old["task_status"] is None and old["branch"] == ""
+    # id вне диапазона SQLite: тот же 404, а не 500.
+    big = await _read(world, "k8", 2**63)
+    assert big.status_code == 404
+    assert big.json() == (await _read(world, "k8", 999999)).json()

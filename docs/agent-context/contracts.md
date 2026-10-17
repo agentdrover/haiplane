@@ -121,7 +121,7 @@ Host key (`slot_runner`), exactly four routes of its OWN host:
   `submission_sha`, `branch`, `pr_number`, `report_outcome` — no code, ciphertext,
   tokens or order text. After a submission the run's sessions are revoked (#1783),
   so the host checks the submission with THIS read, not with the agent session.
-  Foreign and unknown order: one 404; ≤ 60 reads/min per host (429).
+  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
 - `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
   `redeemed` is informational (the hub sees the spend itself) and keeps the
   booking; the other two close the order, burn the code, abort the run. A repeat
