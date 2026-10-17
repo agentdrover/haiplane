@@ -861,3 +861,48 @@ async def test_a_passport_changed_after_the_gate_does_not_complete(db):
     await db.commit()
     await delivery_writes.complete_delivered(db, ok, 8)
     assert (await _row(db, ok))["status"] == "completed"
+
+
+async def _poller_delivery(db, monkeypatch, *, flip_passport: bool, caplog):
+    """Run the pair sweep once, the first hold_completion passed or not."""
+    from hub import poller
+    from hub.integrations.protocols import CIProbeOutcome
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    rollup = AsyncMock()
+    monkeypatch.setattr(poller, "_roll_up_parent_after_delivery", rollup)
+
+    async def skip_first_gate(db_, tid, *, via, actor):
+        # The first door is passed; the passport changes before the write.
+        if flip_passport:
+            await db_.execute("UPDATE tasks SET found_in='prod' WHERE id=?", (tid,))
+            await db_.commit()
+        return False
+
+    monkeypatch.setattr(poller, "hold_completion", skip_first_gate)
+    with caplog.at_level("INFO", logger="hub"):
+        await poller._sweep_pair_delivery(db)
+    return task_id, rollup, "\n".join(r.getMessage() for r in caplog.records)
+
+
+async def test_a_held_delivery_is_not_logged_as_completed(db, monkeypatch, caplog):
+    """#1800: the sweep's log says what the row says, not what it hoped."""
+    task_id, rollup, log_text = await _poller_delivery(
+        db, monkeypatch, flip_passport=True, caplog=caplog
+    )
+    assert (await _row(db, task_id))["status"] == "needs_decision"
+    assert not await _events(db, task_id, "task_completed")
+    assert "delivered and completed" not in log_text
+    assert "held in needs_decision" in log_text
+    assert "prevention_missing" in log_text
+    assert rollup.await_count == 0
+
+    caplog.clear()
+    ok_id, ok_rollup, ok_log = await _poller_delivery(
+        db, monkeypatch, flip_passport=False, caplog=caplog
+    )
+    assert (await _row(db, ok_id))["status"] == "completed"
+    assert "delivered and completed" in ok_log
+    assert ok_rollup.await_count == 1

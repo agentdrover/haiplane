@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -128,13 +129,16 @@ async def hand_pair_to_human(
 
 async def complete_delivered(
     db: aiosqlite.Connection, task_id: int, pr_num: Any
-) -> None:
-    """pair-свип: PR влит, одобрение действует — завершить задачу (#306, #1706)."""
+) -> bool:
+    """pair-свип: PR влит, одобрение действует — завершить задачу (#306, #1706).
+
+    True — completed записан; False — задача удержана в needs_decision (#1800).
+    """
     # #1791: the gate ran before the merge; the passport may have changed under
     # it. Asked again of the row, in the transaction that would write completed.
     if await hold_completion(db, task_id, via="poller_delivery_write", actor="hub"):
         await db.commit()
-        return
+        return False
     # Said out loud, because a completed task with no done report otherwise
     # reads as a lost record rather than as work the hub carried home (AC-5).
     await repo.add_task_update(
@@ -158,3 +162,20 @@ async def complete_delivered(
         payload={"via": "poller_delivery"},
     )
     await db.commit()
+    return True
+
+
+async def log_held(db: aiosqlite.Connection, task_id: int) -> None:
+    """Лог поллера об удержании: причина из последнего needs_decision (#1800)."""
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT payload FROM events WHERE task_id=? AND kind='needs_decision' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+    )
+    try:
+        why = str(json.loads(rows[0]["payload"]).get("reason") or "unknown")
+    except (IndexError, KeyError, TypeError, ValueError):
+        why = "unknown"
+    log.info("Poll: task #%d delivered, held in needs_decision: %s", task_id, why)
