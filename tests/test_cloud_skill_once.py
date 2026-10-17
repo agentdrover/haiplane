@@ -248,19 +248,17 @@ async def test_pair_start_sends_the_full_skill_unless_its_own_order_carried_the_
         )
     ]
     assert versions[0] != versions[1]
-    # #1783: старая сессия закрытого прогона не берёт задачу поверх живого нового —
-    # новый прогон здесь закончен, чтобы проверялось только решение по заказу.
-    await hub.db.execute(
-        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
-        "WHERE id=?",
-        (second_id,),
+    # #1783: сессия закончившегося прогона задачу уже не берёт (claim/pair-start
+    # отказаны), поэтому решение «чей заказ» проверяется самой связью токена с заказом.
+    from hub.services import chat_pair
+
+    bound = await chat_pair.ordered_skill_of_session(
+        hub.db, old_session["Authorization"].split()[1], task_b
     )
-    await hub.db.commit()
-    resp = await _pair_start(hub, task_b, old_session)
-    assert resp.status_code == 200, resp.text
-    skill = resp.json()["working_rules"]["hub_skill"]
-    assert skill["delivered_in_order"] is False and skill["content"]
-    assert (await _facts(hub.db, task_b))[0]["executor_run_id"] == first_id
+    assert bound is not None and bound["executor_run_id"] == first_id
+    assert bound["skill_version"] == versions[0] != versions[1]
+    refused = await _pair_start(hub, task_b, old_session)
+    assert refused.status_code == 409, refused.text
 
     # (в) ручной implementer без заказа.
     _, task_c = await _launch_project(hub.db, slug="once-2c")

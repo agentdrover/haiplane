@@ -160,6 +160,7 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     # из строки (_spent).
     if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
         return
+    await _release_on_terminal(db, row, run)
     if tokens is None and cents is None:
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
@@ -202,6 +203,25 @@ def _outcome_of(row: dict[str, Any], run: dict[str, Any]) -> str | None:
     return outcome
 
 
+async def _release_on_terminal(
+    db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Провайдер сказал «конец» после сдачи — захват снят сразу (#1783).
+
+    Не после цены, которой провайдер может не назвать до 30 минут, и не после
+    молчания /usage: от учёта денег снятие не зависит.
+    """
+    outcome = _outcome_of(row, run)
+    if outcome == OUTCOME_FINISHED and not await _submission_landed(db, row):
+        return
+    if outcome in (OUTCOME_TAKEN_DOWN, OUTCOME_FINISHED):
+        from hub.services import run_claim
+
+        await run_claim.release_after_run_closed(
+            db, int(row["id"]), why=outcome, run_ended=True
+        )
+
+
 async def _settle(
     db: aiosqlite.Connection,
     row: dict[str, Any],
@@ -213,14 +233,7 @@ async def _settle(
     if outcome == OUTCOME_FINISHED and not await _submission_landed(db, row):
         # #1446: закончился, не сдав своё поколение, — отдельный исход.
         outcome = OUTCOME_FINISHED_WITHOUT_SUBMISSION
-    # #1783: конец прогона после сдачи снимает захват сразу — не после цены,
-    # которой провайдер может не назвать до 30 минут.
-    if outcome in (OUTCOME_TAKEN_DOWN, OUTCOME_FINISHED):
-        from hub.services import run_claim
-
-        await run_claim.release_after_run_closed(
-            db, int(row["id"]), why=outcome, run_ended=True
-        )
+    await _release_on_terminal(db, row, run)
     # Ждать цену — только если её нет ни в ответе, ни в строке: цена,
     # прочитанная опросом во время RUNNING, известна, и конец без cost её не
     # отменяет (COALESCE в update_executor_run её сохранит).

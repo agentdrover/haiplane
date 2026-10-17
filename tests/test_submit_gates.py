@@ -1530,6 +1530,19 @@ async def test_same_sha_after_changes_requested_is_refused(
         )
         == ""
     )
+    # pair-путь: done с локальными исправлениями в worktree тоже доезжает до хвоста
+    await repo.update_task(db, task.id, status="running", job_id=None)
+    await db.commit()
+    git.dirty_paths = _dirty
+    assert (
+        await _rg.stop_empty_done(
+            db, dict(await repo.get_task(db, task.id)), tail_pending=True
+        )
+        == ""
+    )
+    git.dirty_paths = real_dirty
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
     # без ревью (auto_review=0) хвост конвейера не коммитит: недокоммиченное не оправдание
     await db.execute("UPDATE tasks SET auto_review = 0 WHERE id = ?", (task.id,))
     await db.commit()
@@ -1574,7 +1587,9 @@ async def test_same_sha_after_changes_requested_is_refused(
     real_ctx = orchestration.project_git_context
     orchestration.project_git_context = AsyncMock(return_value={"repo": None})
     real_dirty2, git.dirty_paths = git.dirty_paths, _dirty_seen
-    assert await _rg._uncommitted_work(db, task.id, "b") is True and seen == [None]
+    assert await _rg._uncommitted_work(
+        db, dict(await repo.get_task(db, task.id))
+    ) is True and seen == [None]
     git.dirty_paths = real_dirty2
     orchestration.project_git_context = real_ctx
     await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")

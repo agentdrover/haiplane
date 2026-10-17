@@ -1104,3 +1104,86 @@ async def test_the_1732_chain_end_to_end(
         await el.repair_executor(db, task_id, issuer_principal_id=human, issuer="o")
     ).launched
     assert len(calls) == 1
+
+
+async def test_a_revoked_run_session_cannot_take_the_task_as_a_manual_one(
+    client, db, monkeypatch
+):
+    """Запрос прошёл авторизацию, а сессию прогона тем временем отозвали: claim отказан,
+    а не записан как ручной (его никто не смог бы снять)."""
+    from hub.services import run_claim as rc
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-revoked-claim")
+    run = await _new_run(db, task_id, 2)
+    await _live_run_session(db, task_id, run, "rev-1")
+    await db.execute(
+        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') WHERE token_hash = ?",
+        ("rev-1",),
+    )
+    await db.commit()
+    assert await cp.ended_run_session(db, "rev-1", task_id) is False  # хэш не токена
+    await db.execute(
+        "UPDATE chat_pair_sessions SET token_hash = ? WHERE token_hash = 'rev-1'",
+        (cp.hash_pair_code("rev-token"),),
+    )
+    await db.commit()
+    assert await cp.ended_run_session(db, "rev-token", task_id) is True
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException):
+        await rc.refuse_over_live_run(db, task_id, None, "rev-token")
+
+
+async def test_a_slot_is_not_recorded_for_a_claim_already_released(db, monkeypatch):
+    """record_capture по устаревшему снимку (захват прогона уже снят) слот не пишет."""
+    from hub.services import executor_slots
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-slot-race")
+    run = await _new_run(db, task_id, 2)
+    await _live_run_session(db, task_id, run, cp.hash_pair_code("slot-race"))
+    await _hold(db, task_id, None, session=False, status="running")
+    await db.commit()
+    assert (
+        await executor_slots.record_capture(db, task_id, cp.hash_pair_code("slot-race"))
+        == ""
+    )
+    await repo.update_task(db, task_id, executor_run_id=run)
+    await db.commit()
+    assert (
+        await executor_slots.record_capture(db, task_id, cp.hash_pair_code("slot-race"))
+        != ""
+    )
+
+
+async def test_a_silent_usage_does_not_delay_releasing_the_claim(db, monkeypatch):
+    """Провайдер вернул FINISHED, /usage молчит: опрос доходит до снятия захвата."""
+    from hub.integrations import cursor_cloud
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-usage-silent")
+    run = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="a",
+        run_id="r",
+        model="m",
+    )
+    await _hold(db, task_id, run, session=True, live=True, status="review")
+    await repo.update_task(db, task_id, submission_generation=1)
+    await db.commit()
+
+    async def _get_run(agent, run_id):
+        return {"status": "FINISHED"}
+
+    async def _get_usage(agent, run_id):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _get_usage)
+    await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+    await db.commit()
+    after = await _row(db, task_id)
+    assert (after["claimed_by"], after["executor_run_id"]) == (None, None)

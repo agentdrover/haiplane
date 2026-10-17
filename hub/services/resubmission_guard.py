@@ -53,20 +53,31 @@ def empty_resubmission_of(task: dict[str, Any], sha: str) -> bool:
     return (task.get("submission_sha") or "").strip() == sha.strip()
 
 
-async def _uncommitted_work(
-    db: aiosqlite.Connection, task_id: int, branch: str
-) -> bool:
-    """В рабочем каталоге headless-задачи есть то, что хвост ещё закоммитит или запушит."""
-    from hub.integrations.registry import plugins
-    from hub.services.orchestration import project_git_context
+async def _uncommitted_work(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Там, куда смотрит git-хвост done, есть то, что он ещё закоммитит или запушит.
 
-    ctx = await project_git_context(db, task_id)
-    workspace = ctx.get("repo")  # пусто — общий каталог git по умолчанию, как у хвоста
-    if await plugins.git_ops.dirty_paths(repo=workspace):
-        return True
-    return (
-        bool(branch) and await plugins.git_ops.unpushed_commits(branch, workspace) > 0
+    Каталог — тот же, что у ``_route_after_done``: worktree pair-задачи, иначе
+    рабочий каталог проекта (пусто — общий каталог git по умолчанию).
+    """
+    import os
+
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import (
+        project_git_context,
+        worktree_per_task_enabled,
     )
+
+    task_id = int(task["id"])
+    workspace = (await project_git_context(db, task_id)).get("repo")
+    git_repo = workspace
+    if worktree_per_task_enabled() and not task.get("job_id"):
+        wt = plugins.git_ops.worktree_path(task_id, workspace)
+        if wt and os.path.isdir(wt):
+            git_repo = wt
+    if await plugins.git_ops.dirty_paths(repo=git_repo):
+        return True
+    branch = task.get("branch") or ""
+    return bool(branch) and await plugins.git_ops.unpushed_commits(branch, git_repo) > 0
 
 
 async def stop_empty_done(
@@ -107,16 +118,16 @@ async def stop_empty_done(
     task_id = int(task["id"])
     if (
         tail_pending
-        and task.get("job_id")
         and task.get("auto_review")
         and task.get("branch")
         and not review_budget_exhausted(task.get("review_cycle", 0))
-        and await _uncommitted_work(db, task_id, task.get("branch") or "")
+        and await _uncommitted_work(db, task)
     ):
         # Правки исполнителя ещё не в удалённой ветке: их коммитит и пушит хвост
-        # конвейера ПОСЛЕ этого места, и это не пустая пересдача. Только там, где
-        # хвост есть (auto_review, ветка, бюджет кругов не исчерпан): pending_report его не выполняет, и git под write-локом
-        # done-потока не зовётся (#1783, круг 2).
+        # конвейера (``_route_after_done``) ПОСЛЕ этого места, и это не пустая
+        # пересдача. Только там, где хвост есть (auto_review, ветка, бюджет
+        # кругов не исчерпан): pending_report его не выполняет, и git под
+        # write-локом done-потока там не зовётся (#1783, круг 2).
         return ""
     generation = int(task.get("submission_generation") or 0)
     detail = empty_resubmission_detail(task_id=task_id, sha=sha, generation=generation)
