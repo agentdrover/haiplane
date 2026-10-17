@@ -1339,7 +1339,7 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
         "AND t.executor_run_id = chat_pair_sessions.executor_run_id "
         "AND t.id = chat_pair_sessions.bound_task_id "
         "AND t.status IN ('claimed', 'running', 'review', 'fix_requested', "
-        "'needs_decision'))"
+        "'needs_decision', 'ci_check', 'pending_report'))"
         + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
         tuple(sorted(unreleased)),
     )

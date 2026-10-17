@@ -603,6 +603,17 @@ async def _task_refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     not_leaf = await el._not_leaf_refusal(db, task)
     if not_leaf is not None:
         return not_leaf.reason
+    # Живая сессия implementer на задаче (ручной код выкуплен раньше) — второй
+    # исполнитель на той же ветке: заказ не выдаётся, выкуп кода был бы отказан
+    # (#1783, k8), и обе стороны ждали бы друг друга до TTL.
+    if await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+        "AND bound_task_id = ? AND revoked_at IS NULL "
+        "AND expires_at > datetime('now')",
+        (task_id,),
+    ):
+        return f"{el.REASON_ALREADY_RUNNING} #{task_id} (живая сессия implementer)"
     return await el._live_run(db, task_id)
 
 

@@ -1543,6 +1543,17 @@ async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
     order4 = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == fourth]
     assert (await _redeem(w, _code_of(w, order4[0]))).status_code == 200
 
+    # обратный порядок: ручная сессия выкуплена раньше — заказ слоту не выдаётся
+    await _free_host()
+    fifth = await _task(w, "k8: порядок 5")
+    manual5 = await w.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": fifth},
+        headers={**w.human_auth, "x-forwarded-for": "203.0.113.57"},
+    )
+    assert (await _redeem(w, manual5.json()["code"])).status_code == 200
+    assert (await _launch(w, fifth)).status_code == 409
+
 
 async def test_k8_two_connections_redeem_and_claim_leave_one_executor(
     world,  # noqa: F811
@@ -1714,3 +1725,46 @@ async def test_c3_a_done_by_name_does_not_clear_a_session_claim(db, monkeypatch)
         ),
     )
     assert (await _row(db, task_id))["claimed_by"] == config.CHAT_PAIR_AGENT
+
+
+async def test_c3_release_by_name_does_not_free_a_session_claim(db, monkeypatch):
+    """release без session_id не снимает захват, сделанный сессией implementer."""
+    from fastapi import HTTPException
+
+    from hub import models
+    from hub.services import lifecycle
+
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-release-name")
+    await _hold(db, task_id, None, session=False, status="claimed")
+    await db.execute("UPDATE tasks SET claim_nonce = 'rn' WHERE id = ?", (task_id,))
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'rn-s', datetime('now', '+1 hour'), 'implementer', ?, 1, 'rn')",
+        (int(acting["id"]), task_id),
+    )
+    await db.commit()
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.release_task(
+            db, task_id, models.TaskRelease(agent=config.CHAT_PAIR_AGENT)
+        )
+    assert refused.value.status_code == 409
+    await lifecycle.release_task(
+        db,
+        task_id,
+        models.TaskRelease(agent=config.CHAT_PAIR_AGENT, session_id="s-run"),
+    )
+    assert (await _row(db, task_id))["status"] == "open"
+
+
+async def test_c3_a_claim_held_after_done_is_released_in_ci_check(db, monkeypatch):
+    """Доказанный держатель сдал через done (ci_check), прогон кончился: захват снят и там."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-ci-check")
+    run = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, run, session=False, status="ci_check")
+    await cp.purge_expired(db)
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"]) == ("ci_check", None)
