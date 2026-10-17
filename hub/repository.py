@@ -6887,6 +6887,13 @@ async def set_executor_run_starting_ref(
     )
 
 
+async def set_executor_run_model(
+    db: aiosqlite.Connection, row_id: int, model: str
+) -> None:
+    """Вариант модели, фактически ушедший провайдеру (#1769). Коммит — за вызывающим."""
+    await db.execute("UPDATE executor_runs SET model=? WHERE id=?", (model, row_id))
+
+
 async def wait_for_executor_cost(
     db: aiosqlite.Connection, row_id: int, minutes: int
 ) -> bool:
