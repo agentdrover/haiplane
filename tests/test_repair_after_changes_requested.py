@@ -1453,7 +1453,18 @@ async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
     assert redeemed.status_code == 200, redeemed.text
     session = {"Authorization": f"Bearer {redeemed.json()['token']}"}
     for path in ("claim", "pair-start"):
-        assert (await _manual(path, task_id)).status_code == 409, f"after redeem {path}"
+        assert (await _manual(path, task_id)).status_code == 409, (
+            f"after redeem {path}"
+        )  # прошёл облачный срок брони без агента (у слотового прогона агента нет вовсе):
+    # защита живого заказа от этого не слабеет
+    await w.db.execute(
+        "UPDATE executor_runs SET started_at = datetime('now', '-3 hours') "
+        "WHERE task_id = ?",
+        (task_id,),
+    )
+    await w.db.commit()
+    for path in ("claim", "pair-start"):
+        assert (await _manual(path, task_id)).status_code == 409, f"stale {path}"
     await _claim_and_start(w, task_id, session)  # своя сессия берёт
     assert (await _row(w.db, task_id))["status"] == "running"
 
@@ -1553,3 +1564,27 @@ async def test_c3_repair_does_not_return_a_manual_holders_task_from_review(
     assert calls == []
     after = await _row(db, task_id)
     assert (after["status"], after["claimed_by"]) == ("review", "alice")
+
+
+async def test_c3_the_reaper_pairs_the_run_with_the_mark_of_one_session(
+    db, monkeypatch
+):
+    """Две сессии: ручная без метки и сессия закончившегося прогона с меткой N. На задаче
+    метка N и нет доказательства (захват прогона уже снят): пара «прогон, метка» ни
+    одной сессии не совпадает — задача в open не уходит."""
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-pairs")
+    run = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, None, session=False, status="running")
+    await db.execute("UPDATE tasks SET claim_nonce = 'N' WHERE id = ?", (task_id,))
+    for token, run_id, mark in (("pm", None, None), ("pr", run, "N")):
+        await db.execute(
+            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
+            "kind, bound_task_id, bound_generation, executor_run_id, claimed_session) "
+            "VALUES (?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, ?, ?)",
+            (int(acting["id"]), token, task_id, run_id, mark),
+        )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["status"] == "running"

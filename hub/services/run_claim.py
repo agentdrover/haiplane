@@ -167,7 +167,11 @@ async def refuse_over_live_run(
             # держит она, закрывает sweep заказов — ручная передача задачи (человек
             # отпустил, взял другой агент) остаётся возможной.
             continue
-        if not row["agent_id"] and _reservation_abandoned(row):
+        if (
+            row.get("channel", "cloud") != "slot"
+            and not row["agent_id"]
+            and _reservation_abandoned(row)
+        ):
             continue
         raise HTTPException(
             409,

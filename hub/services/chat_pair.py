@@ -1051,7 +1051,7 @@ async def return_task_to_open(
     event_kind: str,
     holders: frozenset[int] | None = None,
     session_runs: frozenset[int | None] | None = None,
-    session_claims: frozenset[str | None] | None = None,
+    session_marks: frozenset[tuple[int | None, str | None]] | None = None,
 ) -> bool:
     """Put a pair task whose implementer is gone back to open; no commit.
 
@@ -1084,11 +1084,13 @@ async def return_task_to_open(
     # после release и уже снятый run_claim чужой сессией не освобождаются.
     if session_runs is not None and rows[0]["executor_run_id"] not in session_runs:
         return False
-    # Сессия отдаёт только тот захват, который сама объявила (bind_claim): без
-    # записи (NULL — не брала, в том числе сессии до этой записи) задачу не трогаем,
-    # а чужой claim_session_id не совпадёт (#1783, круг 3).
-    if session_claims is not None:
-        if rows[0]["claim_nonce"] not in session_claims - {None}:
+    # Сессия отдаёт только тот захват, который сама сделала: ПАРА (прогон, метка
+    # захвата) одной и той же сессии совпадает с задачей. Метка NULL — сессия
+    # задачу не брала (в том числе сессия до этой записи); раздельные множества
+    # прогонов и меток сопоставили бы разные сессии (#1783, круг 3).
+    if session_marks is not None:
+        mark = (rows[0]["executor_run_id"], rows[0]["claim_nonce"])
+        if mark[1] is None or mark not in session_marks:
             return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.
@@ -1206,18 +1208,17 @@ async def release_expired_implementer_tasks(
         ")",
     )
     released: list[int] = []
-    pending: dict[int, tuple[str, set[int], set[int | None], set[str | None]]] = {}
+    pending: dict[int, tuple[str, set[int], set[tuple[int | None, str | None]]]] = {}
     for raw in rows:
         row = dict(raw)
         if row.get("job_id"):
             continue
-        status, principals, runs, claims = pending.setdefault(
-            int(row["task_id"]), (str(row["status"]), set(), set(), set())
+        status, principals, marks = pending.setdefault(
+            int(row["task_id"]), (str(row["status"]), set(), set())
         )
         principals.add(int(row["principal_id"]))
-        runs.add(row["run_id"])
-        claims.add(row["claimed_session"])
-    for task_id, (from_status, principals, runs, claims) in pending.items():
+        marks.add((row["run_id"], row["claimed_session"]))
+    for task_id, (from_status, principals, marks) in pending.items():
         # One transaction per task, rolled back as a whole (#1712): the release
         # also closes the host order of the run, and a failure between the two
         # must not leave half of it behind — nor an open write transaction that
@@ -1231,8 +1232,7 @@ async def release_expired_implementer_tasks(
                 event_kind="chat_pair_implementer_expired",
                 # #1712: a task another agent holds now is not this session's.
                 holders=frozenset(principals),
-                session_runs=frozenset(runs),
-                session_claims=frozenset(claims),
+                session_marks=frozenset(marks),
             )
         except Exception:  # noqa: BLE001 - one task must not stop the others
             log.exception("Chat-pair reaper: releasing task #%d failed", task_id)
