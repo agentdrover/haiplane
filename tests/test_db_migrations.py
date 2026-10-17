@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -1435,5 +1437,121 @@ async def test_watch_notices_table_is_idempotent_and_keys_are_unique():
         assert (first.rowcount, again.rowcount) == (1, 0)
         rows = await conn.execute_fetchall("SELECT key, created_at FROM watch_notices")
         assert [r["key"] for r in rows] == ["k:1"] and rows[0]["created_at"]
+    finally:
+        await conn.close()
+
+
+# --- #1809: перенос списка миграций из hub/db.py -----------------------------
+# Эталоны сняты с кода ДО переноса (первый коммит задачи) и лежат в
+# tests/fixtures. Перенос обязан не изменить ни имя, ни порядок, ни байт SQL.
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _spaced(digest: str) -> str:
+    # The fixture stores sha256 in groups of 8 so that detect-secrets does not
+    # take 323 digests for hex secrets.
+    return " ".join(digest[i : i + 8] for i in range(0, len(digest), 8))
+
+
+def test_migration_list_unchanged_after_move():
+    import hashlib
+
+    import hub.db as db_module
+
+    expected = json.loads((_FIXTURES / "migrations_baseline.json").read_text())
+    actual = [
+        [name, _spaced(hashlib.sha256(sql.encode()).hexdigest())]
+        for name, sql in db_module._MIGRATIONS
+    ]
+    assert len(actual) == len(expected)
+    assert [n for n, _ in actual] == [n for n, _ in expected]
+    assert actual == expected
+
+
+async def _schema_dump(conn: aiosqlite.Connection) -> list[list]:
+    rows = await conn.execute_fetchall(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    )
+    return [list(r) for r in rows]
+
+
+async def test_moved_migrations_are_noop_on_migrated_db():
+    conn = await _make_db()
+    try:
+        # Свежая база новым кодом даёт ту же схему, что дал старый код.
+        expected = json.loads((_FIXTURES / "migrated_schema_baseline.json").read_text())
+        assert await _schema_dump(conn) == expected
+
+        await conn.execute(
+            "INSERT INTO tasks (title, description) VALUES ('control', 'row')"
+        )
+        await conn.commit()
+        applied_before = [
+            list(r)
+            for r in await conn.execute_fetchall(
+                "SELECT name, applied_at FROM _migrations ORDER BY name"
+            )
+        ]
+        data_before = [
+            list(r)
+            for r in await conn.execute_fetchall(
+                "SELECT id, title, description FROM tasks"
+            )
+        ]
+        baseline = json.loads((_FIXTURES / "migrations_baseline.json").read_text())
+        assert {r[0] for r in applied_before} == {n for n, _ in baseline}
+
+        # Повторная инициализация: ни одна миграция не исполняется заново.
+        executed: list[str] = []
+        real_execute = conn.execute
+
+        async def spy(sql, *args, **kwargs):
+            executed.append(sql)
+            return await real_execute(sql, *args, **kwargs)
+
+        conn.execute = spy  # type: ignore[method-assign]
+        try:
+            await _migrate(conn)
+        finally:
+            conn.execute = real_execute  # type: ignore[method-assign]
+        migration_sql = {sql for _, sql in _MIGRATIONS}
+        assert not [s for s in executed if s in migration_sql]
+
+        assert [
+            list(r)
+            for r in await conn.execute_fetchall(
+                "SELECT name, applied_at FROM _migrations ORDER BY name"
+            )
+        ] == applied_before
+        assert await _schema_dump(conn) == expected
+        assert [
+            list(r)
+            for r in await conn.execute_fetchall(
+                "SELECT id, title, description FROM tasks"
+            )
+        ] == data_before
+    finally:
+        await conn.close()
+
+
+async def test_patched_migration_list_is_applied(monkeypatch):
+    import hub.db as db_module
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        marker = (
+            "test_patched_list_marker",
+            "ALTER TABLE tasks ADD COLUMN zz_patched TEXT",
+        )
+        monkeypatch.setattr(db_module, "_MIGRATIONS", [marker])
+        await _migrate(conn)
+        assert "zz_patched" in await _table_columns(conn, "tasks")
+        names = [
+            r[0] for r in await conn.execute_fetchall("SELECT name FROM _migrations")
+        ]
+        assert names == ["test_patched_list_marker"]
     finally:
         await conn.close()

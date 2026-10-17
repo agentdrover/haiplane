@@ -1,0 +1,1294 @@
+[
+[
+"add_source_column",
+"5c470fba b090a65b 502299c5 51e9415f d125fb53 e34d7e90 4ae58cab ee2bbce3"
+],
+[
+"add_assigned_agent_column",
+"cc46b952 153d506c a228a13a 8defab55 94878ea8 5b5d4955 4826aee5 0c58a925"
+],
+[
+"add_rationale_column",
+"7848ee6e 64f9b64b 487282bf 2bf8c6a5 632f2156 11d87164 e9239444 a934eede"
+],
+[
+"add_review_cycle_column",
+"7a2cb118 41c43ad3 2f1fa706 b7d2362f 11240fb4 00928b2d 4fc55bbf 4b21088f"
+],
+[
+"add_auto_review_column",
+"90796b7f d7a44b21 fcedddcf f2583144 afb76a18 b0b58ee3 4baf76a2 787eeb8b"
+],
+[
+"add_review_job_id_column",
+"a6cd4a9c 6e9d2baf 50a7b1cc f9f61af7 13c24ba0 98e62e5e 5676238c df200755"
+],
+[
+"add_branch_column",
+"17d1d748 e2261153 e22ba186 5aa2327f a8aa30d7 034ce109 1b090006 85d6e620"
+],
+[
+"add_pr_number_column",
+"52675121 d2f87bf1 4aed5add 747fa015 daae6df8 46394f3b b2739413 926b5e7f"
+],
+[
+"add_ci_fix_cycle_column",
+"68ebe0c3 cbdb6ad3 8045bb45 d69162cc c6feab8e fe466e48 f36c2e62 a3cb3809"
+],
+[
+"add_task_type_column",
+"fc5b0649 eb91c7c6 6fb3ada5 74108b0b 17901a5c a7d9dac4 f85e1099 d4cc5813"
+],
+[
+"add_parent_id_column",
+"e8f6d163 62fd50ba d4d30578 3745b920 02d5a7ee afd874d3 dc9eccfa 4aa1d29c"
+],
+[
+"add_position_column",
+"b10ff252 bb738c09 31537728 66054d8f cfbdbeb5 3ef71661 d47cbec6 7ed1c462"
+],
+[
+"add_priority_column",
+"71fcadf5 c54c5929 428cc556 9c28264b efa9361b 696d6921 7eaa55df 24ccf7bf"
+],
+[
+"idx_tasks_parent_id",
+"7a00682d 4e014db2 52e3cc8a 256d1966 4eb25a92 d7eb355b 971eac04 18035df7"
+],
+[
+"idx_tasks_status",
+"3e6d31b8 01c91ccd 751eb4c9 f176de33 b6919626 89851977 34d230df faab8bc0"
+],
+[
+"idx_tasks_type_status",
+"97c36c7a 6e2e6b32 a2d62bdd 3333533a daf67540 7e054b37 125edf02 f2031148"
+],
+[
+"idx_task_updates_task_id",
+"a3477780 ce566167 c3a54ee5 ab56e7b0 35c8bddf 69755ac6 e8107544 7f53b72c"
+],
+[
+"add_work_type_column",
+"21ba411b 6bc8519e 4c8cc759 42a27f6d 74095ccc f2e590ab b0751f7c 82e3c928"
+],
+[
+"add_class_of_service_column",
+"d28ae4c9 35944023 4470feb2 0f4f1c66 10b89472 dd00bad6 797607eb d34b062f"
+],
+[
+"add_size_column",
+"ebb3eb94 ef0a3269 bce7b4ba b9d8a0bd 79e5ba2f 7975ff3d 54c41fe8 54155a84"
+],
+[
+"add_wip_tag_column",
+"c75a4331 c06eab8c bff954df 5191489a de8d5794 1b63db10 73000a72 ce30d50b"
+],
+[
+"add_due_date_column",
+"4ae53b0d 15be76fc f662e2e1 6fdc5da0 8d453e93 10585f3c a9610fad b15f5ea8"
+],
+[
+"add_user_story_column",
+"89dd60be 2cab5f1f 46f32288 eaac2d05 96d7c7dd fb1dcb68 6a758eea d5097bba"
+],
+[
+"add_problem_statement_column",
+"4e6fdf64 a7b01e2e 190a532d 80fca7f3 d767c343 bab87f35 5617cf0f 6da5837a"
+],
+[
+"add_business_value_column",
+"51da8820 bc6ca49e dac604dc 18ad7345 e960f0f7 19c85a00 e3265a27 b203c874"
+],
+[
+"add_scope_in_column",
+"1b61f06a 27a8737f 82fbcf4e 08c1100d bde2061c b07915cc 028140ff e451a982"
+],
+[
+"add_scope_out_column",
+"4e744262 2ee18d9f 7f2fc7fd 08258715 572104ed 990cc5ef 25c0e621 fa3a3576"
+],
+[
+"add_affected_areas_column",
+"63b70f89 9489a2a6 f8766abb 264d2f67 da850ad0 61de125a bf42d399 a3123c3b"
+],
+[
+"add_technical_hints_column",
+"4b442f01 031ad513 79851512 5debf299 a6ca4923 4a33d661 48f1c1f1 f1f70ec0"
+],
+[
+"add_constraints_column",
+"d9e80635 bbe4d59b 70df16fd c876f289 cc30ede8 a957b99a 705bf5a8 2d477595"
+],
+[
+"add_assumptions_column",
+"c944eaa7 04d33f89 26b22a98 b59be046 ba730ff2 60478b91 ec21eed9 16ee411a"
+],
+[
+"add_validation_commands_column",
+"54796126 d7dcf883 4c8752ff a429d132 2b5277ad 55a715b7 ed570e93 6a2b41f7"
+],
+[
+"add_out_of_scope_for_review_column",
+"6bd51b81 c3169e77 7425ef07 fc8d3e08 829f7e25 0c3a377d e5a178a2 f7c61db9"
+],
+[
+"add_risks_column",
+"b32e60e2 7f9bde88 3a15c618 897fb839 ab00061b 3b0c40e1 f1760096 47c2bc60"
+],
+[
+"add_readiness_score_column",
+"c1530b53 37344597 316a788e 94d16d79 27cf0343 dabdb21a 4178bcc0 ab16cf16"
+],
+[
+"add_dor_passed_column",
+"b472d176 f46909ac 16a91a4c 85ed4117 31146d34 87f0d060 6c9e3733 573b98c5"
+],
+[
+"add_ready_at_column",
+"fe1a2b57 4e81c2fa 5b0f338b 1017f86d 1288192e 75b314a9 9daf5814 1a83e552"
+],
+[
+"add_started_at_column",
+"2d80c68d 80b9770c 9e6fbdd1 c3a0e59f d9394f12 e6defd4c 00c38773 8915caff"
+],
+[
+"add_completed_at_column",
+"02ba64a3 e65f867a 100ca392 4b02c310 1b66fa40 db690657 73adaaad a64f33b1"
+],
+[
+"create_acceptance_criteria_table",
+"31f9d343 d5f9d37d ec8c7dc3 6d662fdc 816a1038 07a792a0 219eaf6e 6c62d7b9"
+],
+[
+"idx_acceptance_criteria_task_id",
+"5858afda eb018966 c2f6ebb3 665c1f3c 28377417 2e6cb6e1 1e3c3ef2 b1c2b3f0"
+],
+[
+"add_human_owner_column",
+"5c447a9c 83afe7e0 fc6d75f2 e81be5c8 98bf9c7d 01b89ba1 146e2ad5 8bfe7829"
+],
+[
+"add_human_reviewer_column",
+"37e4cf32 d365a373 d1907c9a 732fe664 23147953 0f8c95ed 0b98937b 46b519e2"
+],
+[
+"add_review_checklist_column",
+"f17a838a 5f0d8f8e 71021e5f da5a3bbd e210a457 a4274c37 a6bdf19c ebd93bf9"
+],
+[
+"create_principals_table",
+"4d5381dd 10a13394 efe69dd0 90170126 85c21382 0cdcda1b b782b283 a1c941f4"
+],
+[
+"create_roles_table",
+"8d5da115 8aba7786 d75088ce 11626746 8bdd4aea 3ba6696f 47b1e557 cd441d17"
+],
+[
+"create_principal_roles_table",
+"6bf14598 1b35690e f0965756 a767e161 853ea181 1fb4153b ac378406 d2be5e33"
+],
+[
+"create_role_permissions_table",
+"3a7f6d2b 2fbe5e85 43362293 ef59e4ad 6d22957d d1cc07e9 35773c32 b1b791cc"
+],
+[
+"create_password_credentials_table",
+"3f5e8d9d 9be8b2d3 21a61411 82433fc2 94951f55 e8fb9605 5a946c2a 0fea293a"
+],
+[
+"create_api_keys_table",
+"1520eaba 9e2a140a 0b61acdb fadd4968 260863ca d77ba227 5360dd7a 24f8747e"
+],
+[
+"create_browser_sessions_table",
+"ec54a81c 6e919d96 25d6e892 11f3309a b1215d65 f6885c10 b1156fa6 fd3a8831"
+],
+[
+"create_admin_audit_log_table",
+"af5cb682 ba19e17b 1d6aadcb baf28405 c43b9a64 59bb2b13 c7629177 8d2895e1"
+],
+[
+"idx_principals_kind_status",
+"f4343345 564be12c af63b4ed 79a48c29 77027730 09e82733 d5c10431 37768651"
+],
+[
+"idx_api_keys_principal_id",
+"812ecb83 447daf66 e4db4a2c c9467fed 68252213 ed63af46 74c1d19f 757a4e18"
+],
+[
+"idx_api_keys_prefix",
+"52ab2ca2 69fcbea3 fe701c80 4c3770f1 6a96a473 0ee28640 0f5b5189 ae561e3e"
+],
+[
+"idx_browser_sessions_principal_id",
+"ddc3720a ef9d4c57 36629563 fd4031cd 5bcc52d3 caccec3e 7bb733cc 22f3b4d4"
+],
+[
+"idx_admin_audit_actor",
+"ec2e1df3 da22336a 5cf74801 f92b8136 5910084e e800e6c7 7cd275e9 0f9271b4"
+],
+[
+"idx_admin_audit_target",
+"bf93d29b cd7e3ec9 f8512309 6d4867ef bcafb40b 3073539f be8057a8 ffb38c00"
+],
+[
+"add_tasks_archived_column",
+"86a6f618 3a47299d d881278e 8cee8081 13a52d55 91ce2637 e2d2ec8b 72a85ded"
+],
+[
+"add_prepared_by_column",
+"6d115f5f 8bc90bf1 95789451 895bcb4f 8c5c60e1 f6820d3b 89510de8 87777c66"
+],
+[
+"add_prepared_at_column",
+"fc278690 e4e0443b 39841581 dcb46a0f 75c0b50c a914a3fe 55d2087c ea05e9ee"
+],
+[
+"idx_tasks_archived",
+"8ee80762 0291b630 de8cacee 0117dc22 29ce34ef 11ee4a16 f8cbb6aa 95b3f472"
+],
+[
+"add_claimed_by_column",
+"4a649d76 0d387db8 a30bb843 fcb10f69 c907f483 8e9322af 0a231d52 7b4df83c"
+],
+[
+"add_claim_session_id_column",
+"f49a9a39 26b03c1e ae77d7f6 4c3370ae 841ec35d 867a3dcd 722cac3b 4dc309bf"
+],
+[
+"add_claimed_at_column",
+"b97457f7 e3843bd9 12ba579d 72be8992 cf4ebc2a 3486bf9a 130938df feb23261"
+],
+[
+"add_submission_generation_column",
+"32024db6 8b1cb66c a430d6ca dbb316fd f0673b72 c4e82abd af102241 ee098dd0"
+],
+[
+"add_review_verdict_column",
+"6b1957d7 12311378 f7efa3da 3fe7158f 0f300de1 fc28eef8 7815dac5 b7eb25e9"
+],
+[
+"add_review_verdict_generation_column",
+"4041e528 10e59e7d df570f0f fb796571 52724176 ac4dc39b 4e2c4077 a7151230"
+],
+[
+"add_review_findings_column",
+"37c2909c f0f516bb f82b9755 c07baa5b 17813465 9a809101 64aaa26e 1a25c741"
+],
+[
+"create_projects_table",
+"618e42fc 94650256 be7bcb6d 2176ef2b 82340b27 d7baa659 ce9ad2ed d3da140d"
+],
+[
+"add_tasks_project_id_column",
+"89a77bbf 022ac39c e3f88d64 b164f089 6a48d23c cb751ab1 1d787ea4 626d9fe1"
+],
+[
+"idx_tasks_project_id",
+"29ca53a4 62cc462c 986faa93 f886bcde 1d6203f3 77c45405 b363dace cfc0c64f"
+],
+[
+"add_projects_status_column",
+"f08f1274 989c13ab 188e3620 6e9d1096 c79fe49d f5aa71ff f3f1c1b5 b52e4b3e"
+],
+[
+"add_implementer_principal_id_column",
+"eb440ddd 988c032e 863de9cf 63a59438 53129adb eaf59db1 035bc0fa 94550e43"
+],
+[
+"create_events_table",
+"3946f187 e1152c71 dc23c396 43da4d89 3e56db3a e9e0038a 6d6c466f dee0ad11"
+],
+[
+"idx_events_created_at",
+"333b0532 5d499f45 1af9dca0 1ffe20df 81e26bef 3e0d59ab b775a7d0 52e3cebf"
+],
+[
+"create_skills_table",
+"4a463251 54b6f62f dc1f4d18 7111e8b6 5272f851 45a17d20 95d22995 1d61da77"
+],
+[
+"idx_skills_name_status",
+"9dd6d915 737ec7d1 7cd6186b 5ee9165b da7b7aa5 06fc0398 1a4fd53d 290de28a"
+],
+[
+"add_skills_activated_by_column",
+"b88a1a66 f4e3c3de 3853e565 8c68dd3f ef4a3ac7 2bbf006f 21f46772 137285ac"
+],
+[
+"add_skills_publication_record_column",
+"e8339ccb 22239565 a95906f9 0658cbe1 c9809c0d 38ef318b 53e488b8 44cf3c35"
+],
+[
+"backfill_skills_publication_record",
+"a4a3da90 d2da0214 929afd8d 4f961fea 03991e0d b3da1685 5502d245 6141828d"
+],
+[
+"add_projects_machine_review_column",
+"f6b904b7 a27f2de0 1e99b80d e7f2fd44 f438126f 90cf30b7 bd07141a b6dbb79c"
+],
+[
+"add_tasks_machine_review_override_column",
+"00eebb35 90fce16c 6cb1cf82 f211984a 900f65d1 6ba2ccb9 47752a29 8445cd22"
+],
+[
+"create_machine_reviews_table",
+"1adf4c5b 2012e551 7ca433a3 701b8c8d 344aea7e eaaf3da9 401ba6ea 58e079ab"
+],
+[
+"idx_machine_reviews_task",
+"483f52a1 433382de b0b7b65b 8b5c5bf6 11b90501 6f4ece57 b6960d53 5c05a233"
+],
+[
+"add_projects_provision_status_column",
+"b741e478 f56323ae cb16ae3e 7a6ade30 f7383186 8a54e6ec a66c1049 763d4416"
+],
+[
+"add_projects_provision_detail_column",
+"a7daf50e 8cdacb60 ff74da60 11ae4d0e efc0f163 692536b0 c0796a11 988e450c"
+],
+[
+"add_review_self_approved_column",
+"908d3006 3bef7ca4 3913f737 7bcb866c bf7451df 8107add0 5caedd6f 5c99f80a"
+],
+[
+"add_status_entered_at_column",
+"4411604c 4a4dccee 57d3e389 99321059 7dd88ead 0a544263 a8fc4925 19fcd78d"
+],
+[
+"add_ci_check_started_at_column",
+"c64123ce b55ac9ef 3f911d18 c18048eb 6c5f7e26 ed62952e d1a3260d 9f3e0bbb"
+],
+[
+"add_ci_no_pr_attempts_column",
+"cae9a6e7 74d32983 cf71e96a 9c06f09f 078cffd3 20dc7f38 14937d68 11083994"
+],
+[
+"add_ci_run_requested_sha_column",
+"4d7d0f4a 20a647b9 6258b63f 1d96a5b1 a67821f3 06fdbd85 d8d53185 b5926b3a"
+],
+[
+"backfill_status_entered_at",
+"bdab1aef 004c4c45 fbb058b7 8cb9ad7c 179177f9 512d0ac9 cf327fd4 2fb3775f"
+],
+[
+"add_job_missing_since_column",
+"e8e01ef9 e6c19798 ab6f2790 1cd1ce61 e0da6040 eaef09ca bedfce51 d0f9a936"
+],
+[
+"add_arbiter_generation_column",
+"60b5edaf 00041ad8 da7b6224 035642b4 9d24cc8f 3b3c89c8 c4af4f4b d838d50c"
+],
+[
+"add_arbiter_state_column",
+"e24f094e ac6815b7 ccbe4d9b 63fb9214 10242dad 04dc4169 283217b8 19605fe1"
+],
+[
+"add_arbiter_job_id_column",
+"700047c6 a6e55ef5 e0ffebd4 4826415c a6b73f80 193021fa 4e5405f7 614ee44d"
+],
+[
+"add_arbiter_dispatch_at_column",
+"e9edd86f e31b75ab 3ee76d64 577b79a9 d12e3617 d5b6b986 b193336b 195915ec"
+],
+[
+"create_task_idempotency_keys_table",
+"a21871dc 6d0d9c62 a0007a79 1a4b8595 87dab1c6 7f3b8bd2 702af9a5 9401d313"
+],
+[
+"create_ac_test_results_table",
+"cca452b9 9fffac3e 51abd74f be7e6257 7f9ff6ca c531f31e 160e6bcb d1cca374"
+],
+[
+"add_validation_generation_column",
+"167500b0 48da1162 bdd58493 677dff8d 9cecf12f bae5efd7 09d7dfbb b0307609"
+],
+[
+"add_validation_status_column",
+"e64a4078 54eda3ad f7d2cef3 bfddaee6 f6b2e232 35a03ae4 59d1bda2 911a5da5"
+],
+[
+"add_validation_log_column",
+"25d128dc 209180fa 1a6ff88c b4bf153e c4842ad2 086d7f1b 03b95256 3d461833"
+],
+[
+"add_machine_reviews_incomplete_column",
+"4b21189d ad9c4603 5e5be547 6fe4f0bc a82c6b9b 2b0bb223 c2fb3cec 4106e5c3"
+],
+[
+"add_machine_reviews_unresolved_column",
+"d1060e7a c47ebc4a 5b555362 e36b4979 1ec1b6ed afcfaa91 8c7b1217 28e4f2d9"
+],
+[
+"add_machine_reviews_lost_dimensions_column",
+"ab2abf70 6d6015d8 b8fe2ee8 64fb962b b6ca0f3e ca50b05e 9b74bb9f dc56dfcb"
+],
+[
+"add_machine_reviews_incomplete_reason_column",
+"64820188 935e0f72 ca5576a7 1df0352b ae467c42 b2be6d90 e1291e71 8d26a988"
+],
+[
+"add_task_updates_principal_id",
+"9cabeb07 10b2e10c 3988a111 3c3e937c d33824c4 061a86e8 bcccc09a 86fc8093"
+],
+[
+"add_task_updates_author_kind",
+"cd3bc7b6 a1be85e4 39d02e91 f92d2117 dc3b7e0c 92f881af 4c363a26 dfb63478"
+],
+[
+"add_outcome_metric_column",
+"46a276c9 8cebe494 dc6a6b54 eb400e2e e03ad8fb d5649a6b 2d4610ca 1d798b46"
+],
+[
+"add_outcome_indicator_column",
+"73d7494d 352e1d77 dd4c603b dcae242e 70f931b8 bce3f74f 6be8233b c5b3cf49"
+],
+[
+"add_outcome_deadline_column",
+"fbc85b80 43126a25 c6bf37ea 0d01d1a2 7a34e263 f994aeef 637ad614 8e7ec660"
+],
+[
+"add_outcome_revisit_condition_column",
+"e63b668c 1afc5685 5e0baeac 5cd05872 e2d19ba9 932f8237 4af974b7 ab961f33"
+],
+[
+"add_redesign_decision_column",
+"dc5978e2 130f42ab 9a5944d6 42d94bbe 71569ede 4cddb16f 2064f11b 18cc6916"
+],
+[
+"add_redesign_rationale_column",
+"d2c5d6ed 1a476e9e 1dd6b347 a7ab0cd7 58e4358e d47e69d6 f9fe83fa cacd5f73"
+],
+[
+"add_agent_fit_column",
+"90e58db0 bfefa864 8f73f385 32b63d33 ef19b3bd 2984c0e3 f59bad62 50074baa"
+],
+[
+"normalize_ready_at_format",
+"01d8b3a6 fd0d3fb4 76946fb3 e0b97697 885c616c 80c58517 3d65ef51 5e2fcc1b"
+],
+[
+"add_ac_expectation_source_column",
+"d48e7aa5 7f83485a fd3c50cd 4e349623 ae19db9f 5d952af0 2aea2a44 1f1789cb"
+],
+[
+"create_pipeline_merges",
+"b7898ef1 37952436 50ca6f32 136da8e6 d416d186 79d08d5f 60b1fa8b d2bd795a"
+],
+[
+"add_projects_drift_baseline",
+"f3751147 66e559bd 9effdcb8 360a8740 035e4150 7d0d84bb 431baae3 1ae0f972"
+],
+[
+"add_pipeline_merges_sha",
+"bfd7d8a7 b8c0a32a fb363220 19fc8301 0191ffa0 463c9d06 644294af 37585b3b"
+],
+[
+"add_pipeline_merges_released_pr",
+"c44c042d d14c9575 8d2f21d5 8a36616d e6cb3a79 4be40d8b 4395e113 4c907810"
+],
+[
+"add_pipeline_merges_released_sha",
+"54b15a7a 11a56a64 9736ab3d d589a598 7e483234 7c828953 eb5e0545 8aea84c9"
+],
+[
+"create_base_branch_drift",
+"24b6bfe9 2fd9fad9 56b8b62f 24b39b7f af58d975 93b83510 fdfaa82e 82738665"
+],
+[
+"add_tasks_submission_sha",
+"487136c4 8b986b98 59576b9f c1feb6c9 c3c28964 7b118d0e f0c6cc94 77f3a61a"
+],
+[
+"create_ci_run_reports",
+"abac05f1 303e7421 830a2eb2 8d705ab0 31dbb57b 759814b2 8f0d22d3 46ba5a4b"
+],
+[
+"add_risk_class_column",
+"8cfc4bab 7b68bea0 238ac10d 9dd8912c 979997f2 7afd954c 77f2c81b 7f5bb082"
+],
+[
+"add_risk_class_reasons_column",
+"8ac04b4a f6ca4355 cc2f6156 828e8ece 165cb15b 02e7db81 e05e8d86 a935e246"
+],
+[
+"add_projects_gate_policy",
+"e81b8d58 3307b4ed a9af0177 4f008a5d 8c032e4b f633cf50 623321fd 574077ed"
+],
+[
+"add_projects_forge",
+"f45afd6a 25d6075a 9d1eb967 1f64b1bc fb09ce6b abba2bfd 78d7cf3e f35b84ff"
+],
+[
+"create_autopilot_digests",
+"eab0abe2 822ac3a3 e1dbffd8 49e007d3 c0feefd2 023eb8e2 15966211 7b54e8cf"
+],
+[
+"add_tasks_submission_model",
+"f067a764 3ac646a1 928858b1 a6967fc8 160199a9 393c4b96 603d9689 0cd122f2"
+],
+[
+"create_review_dispatches",
+"6b54cb00 9a326030 5c89b5e2 e7833cca 60edbd3a a3f93e30 8a979a45 2a6c73a2"
+],
+[
+"create_agent_sessions",
+"0ac84d35 27986270 98998125 8ff50d0d a3a6dc2c dc1313d7 5fbd2916 b1667f26"
+],
+[
+"idx_agent_sessions_last_seen",
+"b21f93f3 b739d3de 354d255b ad4248a7 dd4ad43a 97118747 20e81989 0da0cdd6"
+],
+[
+"create_agent_messages",
+"e2d9f0a9 55bcd0db 76300dd4 9edbec07 84e75088 82f4db22 19003d3f ee143883"
+],
+[
+"idx_agent_messages_address",
+"fc433712 2acb3938 ffe720c2 38c3fe84 4a2ae277 22ba665b 87a8256e 00dfb3ef"
+],
+[
+"create_mcp_call_events",
+"37ad3934 77854b78 ec37f045 2915c1c5 a7c9a786 be194007 0117cb7a 9a9d981f"
+],
+[
+"idx_mcp_call_events_window",
+"f0d87933 d4f73a9a a6128182 e06227f6 31b304b6 f49decd4 d0132da3 a7a7ea83"
+],
+[
+"add_review_dispatches_profile",
+"3bbf563a fcabb638 3465cf89 f8dd9b8c 574014f3 100da680 f73b1fc3 2d439c19"
+],
+[
+"add_machine_reviews_provider_tokens",
+"9732e147 1b769c07 5f1e2123 2a6da7bf ff7045b1 de166ead b73ae38c 92246770"
+],
+[
+"add_machine_reviews_profile",
+"854a70ec e595c6cb 8e6565f2 f26131ca 51d688c5 973d400b ac1564ba 7cfad517"
+],
+[
+"create_outcome_answers_table",
+"d3947608 15a5460f 3f86ed30 32cd6fd1 041c19e0 b8b8e68a 5089b6e3 12b4bfe5"
+],
+[
+"idx_outcome_answers_task",
+"c44eee00 7d2df91a cc91cf2d 42ea3434 af6afb8e ae42a038 eb6d1279 c2840c49"
+],
+[
+"create_live_checks",
+"f29ebc41 bdfe7bea 62bac142 9d623d9e fb93f360 16a1821b 1355bdd1 2026398b"
+],
+[
+"idx_live_checks_task",
+"61bd9f84 7b6e9e28 4c2cb563 c88d381c 1a547a21 cba40c28 298984cf 4f6edc94"
+],
+[
+"create_task_dependencies",
+"2fa3c51c 5b99f149 512f636b 86db66cb a1538202 ef49453e 54a72f72 9324fe7c"
+],
+[
+"idx_task_dependencies_task",
+"cdbc3a8c 20e36507 e6f1c299 be8054cc b1c7111f bbfe6b9f e576b71a 1f3ef56c"
+],
+[
+"idx_task_dependencies_depends_on",
+"b52c9001 c159f092 7ac4988e 5f0edfd8 a01313d6 af5fbb6a 58238c31 87dd3629"
+],
+[
+"add_live_checks_deploy_state",
+"d1067532 81c85267 fc3ad132 16cc5811 f4c0ddb6 0c381ef5 6e7a2d5b b817da9d"
+],
+[
+"add_agent_messages_for_session",
+"dd19f4f2 0434273f f2db3d12 9fb7e6ea 97d07245 093d2b31 b513ae15 ee67a99c"
+],
+[
+"create_releases",
+"44193681 1f1aaac7 5b546320 76c86682 09808988 9d569f02 7335174e c235a8bf"
+],
+[
+"idx_releases_project",
+"347b3e52 b06e43ac 05aed273 3c358b5e 02202e1e 2098c6a1 107f2e73 e0cf21f9"
+],
+[
+"add_outcome_answers_hypothesis_snapshot",
+"49a91d5f efb49fa7 13bc23df 76cf36b6 08c6dad2 00cbddfb db8a0ce9 bffe7ea9"
+],
+[
+"create_finding_dispositions",
+"67f2a089 10a9e5a1 6d87af3c d32e5378 ab0b41ac 169db12a 5233535e 094ea6ac"
+],
+[
+"idx_finding_dispositions_unique",
+"c38d265d 631dae63 d8e83f20 bbef777c f393c17b 5f62d015 a1cce2a7 48c5450e"
+],
+[
+"add_finding_uid_to_dispositions",
+"7eeba9c5 860a62bf 266c9b5a 5954aa31 720edf37 b5449537 8a10e444 16da220b"
+],
+[
+"create_category_checks",
+"005eee9a 58725563 d603dd6b 2d778517 ca192f1d bfc55f72 242b771a cec4cf76"
+],
+[
+"idx_category_checks_unique",
+"8d12a5f4 268305e7 47511022 7077c0fc 8021c8df bfbae3d1 a492f7a5 b6ef80b0"
+],
+[
+"add_ci_run_reports_checks",
+"72a16d09 5c28b2fa 37970fc4 395cb822 c0a155e8 dda1eabe 1bc15044 47b92398"
+],
+[
+"add_ci_run_reports_mutations",
+"8b763640 d9858269 540aa33f 31e58268 c399d802 214b868d f597848f d6b88207"
+],
+[
+"add_found_in_column",
+"bdec7db3 808f02f0 26b94c22 9cd31a35 3c68bf8e 14808795 1cf09d65 b00b370a"
+],
+[
+"add_caused_by_task_id_column",
+"8b0786b9 af37b111 6b5ce359 1ee90bb8 00322e17 59353b39 8633cb51 346c7132"
+],
+[
+"add_detected_at_column",
+"25cdee8d 9c2602c6 2d01421f a44f09e1 75063589 0950b507 2ad35728 ee0d6163"
+],
+[
+"add_resolved_at_column",
+"da2f45ff 085e7955 1910b145 557c5b18 95088666 a1198716 f2e0ede5 5224aa7e"
+],
+[
+"idx_tasks_found_in",
+"63e29bfa d870f2b9 02d8f8be 24505da0 14676260 747e2bc2 86cb2586 dcc2fdf4"
+],
+[
+"idx_tasks_caused_by",
+"013f62e3 1519ebfd 19a2da36 e1a8ee48 9a3ffb17 1bb71b84 68aea0a0 28f08c3b"
+],
+[
+"create_delivery_discrepancies",
+"4ea9ff98 bc507494 75b8c06d c2b38180 67f85c05 1e2e4859 160528ac c03d703a"
+],
+[
+"create_submissions",
+"f39e75ec 1e85f06d f2d0b8a9 b3df3e8b d5a534cd 6c299330 7bdaa310 b667b7b9"
+],
+[
+"create_chat_pair_codes",
+"e5e89ec0 b205ecfb 7a5ce777 1d05798f e806f8d8 002dea9b 48d871b2 16230b61"
+],
+[
+"create_chat_pair_sessions",
+"20934a0e 4a0c3afb 9fc26fb2 b92474d5 0d828348 0985ecef 5af14d6b b7206558"
+],
+[
+"idx_chat_pair_codes_principal",
+"a4049cc2 4cf20221 3e9ed382 1d532dfb 5ddbeea0 40b52a93 eace8c11 cf347477"
+],
+[
+"idx_chat_pair_sessions_principal",
+"b9aebad1 c6de0375 9b656b1c bdd254d7 d85b8139 aa1085b8 9ff01a0b 2378ba0a"
+],
+[
+"add_tasks_waiting_for",
+"7564b37b 5c738cf2 b9abc10e 4cc3256e e938bdd3 2f7aa966 87b9f29f 9ec9f57a"
+],
+[
+"add_tasks_waiting_until",
+"a41402c6 56b312b8 f7390921 7af63884 03f92183 84097a8d 2a4065be 73ec10e4"
+],
+[
+"add_tasks_waiting_declared_by",
+"83a084db 2eba3c76 29c837ac 6bfa88c1 091425b6 3703e939 d1ad4ea4 dd7bfe3c"
+],
+[
+"add_machine_reviews_self_reviewed",
+"c28a1b7b 3e40812a 0b3dacd2 4bba14b8 77fba888 7de24d73 a3647e92 98eb32c0"
+],
+[
+"add_tasks_git_mode",
+"b1a58649 e3fd2ff3 a28dfa4c e2309252 adc9cf60 21a637c8 77f45652 052037e1"
+],
+[
+"add_chat_pair_codes_kind",
+"d59bd529 59cf58e1 6f0276cc 6dbce78c 0be22d77 715d12d0 e3c68578 e3ae9fba"
+],
+[
+"add_chat_pair_codes_bound_task_id",
+"d48bd241 1cde92f2 6070e780 7998061b 36117571 f623378b 327e2abf 26e936e5"
+],
+[
+"add_chat_pair_sessions_kind",
+"1aa91ab1 685f657c 3c83d7cb d1c1b809 3d50a4e1 9383d4c4 137f721a 01ec0ab4"
+],
+[
+"add_chat_pair_sessions_bound_task_id",
+"3a7564ca 8eb8bc7e 521b5204 92404ae9 a1586300 ef9d357c 4b2a1849 c033bfcf"
+],
+[
+"add_chat_pair_codes_bound_generation",
+"2a5c6cc8 f1552c31 735ab221 73839955 b71fff71 06e9466a feac5179 1c8b1506"
+],
+[
+"add_chat_pair_sessions_bound_generation",
+"44f246c1 61805a4b 7e7342e4 f5339d88 11cce6c8 3615119f e486c16b 47107c56"
+],
+[
+"add_chat_pair_sessions_acting_principal_id",
+"01c76f24 6e90b9bf b3b3d992 4d137285 713282e7 4c66d7b9 e39ae26c 4b04fed5"
+],
+[
+"add_machine_reviews_principal_id",
+"98498ddc b36e1a8a af2a00c1 f20b6c93 9ba56e16 6787084d d74f7cf4 35bb611f"
+],
+[
+"add_review_dispatches_reviewer_principal_id",
+"28b78839 e6e380a7 c79953ca 5d2e07ad e218c86a e5a3d45f 8623d3c1 8939dea1"
+],
+[
+"add_review_dispatches_provider_tokens",
+"9ae2a51e a4f29047 81a83a2d 30bf64eb ab7914fc ed6a5e2e 2c424416 d14f4d13"
+],
+[
+"add_review_dispatches_channel",
+"12121a4b fac0a540 f6fcad2b 7821300d e1482e5c e006939a b5df3fd6 e9612f51"
+],
+[
+"add_mcp_call_events_unknown_arg_count",
+"fde9ddeb 4808c047 4009ce79 45bd4b5d d95c39a5 e6154b80 b709a61f bd99c5cb"
+],
+[
+"add_ci_fix_charged_generation_column",
+"0bf156ef fb3061da 96b2050c c88cd056 64c335d9 3d8fc40d c4cc9d24 501c30cc"
+],
+[
+"create_steward_judgements",
+"f0e5cb06 6dcdea40 fd84dffa 95e67beb 2ef1a07f a6243b95 8b3f3734 ca100281"
+],
+[
+"idx_steward_judgements_unique",
+"2653505b f46e167c 6504d74f c8a6332e 6a347ea6 5d8308de c1194f37 3a7289ad"
+],
+[
+"add_task_updates_agent_claimed",
+"9735d956 9efe666f b8826dde 2de08f3a ec8265fd 92248cb9 ed6e663b 0ffe5c2b"
+],
+[
+"add_human_queue_reminders",
+"4e755b49 6070d236 c02837cb 38b85a02 7da4fade 5fa4ac33 80376a6b d90ddc33"
+],
+[
+"create_finding_outcomes",
+"02277444 48dd95f6 61c17b30 04b347f2 d2503678 61feb49f 8aef3ce8 90f196bb"
+],
+[
+"idx_finding_outcomes_task",
+"b5711829 69c0490c fefd0c7c 3fa852f2 bf79d54f 1053b107 d8311412 73293aa9"
+],
+[
+"add_finding_outcomes_kind",
+"1ef64408 d99699dd 9e091738 95ae8732 c6d5075f fde1ffd9 99ad1951 cdaf9a69"
+],
+[
+"create_steward_runs",
+"6ad16cf8 cf1e014c 860fcfa3 9734c949 753b9681 7410f0dd a0083c66 0cdc3385"
+],
+[
+"add_steward_runs_agent_id",
+"d788ba73 b62c0f10 b917ab0c cef1eb9e 746c8893 87f40cab 1bc7d751 c0757676"
+],
+[
+"add_steward_runs_run_id",
+"1d4c5e02 f3e5a032 d447f819 f6b6b683 8a1018a0 65eb96c5 389d62ba 7362b7a3"
+],
+[
+"idx_steward_runs_open",
+"cd810e53 4dd7aa55 5eb4ce7c 70756b05 f9b286ac 714fb4ea a1109ac4 2e983811"
+],
+[
+"add_tasks_statement_generation",
+"5a7534fa fc58c121 53b65cce 9a614da5 e2cbd66e dfcc5ed2 18e5a35e e7c503ac"
+],
+[
+"add_tasks_statement_fingerprint",
+"e6080e01 9dfe6cc2 05641044 1a7054f4 3524b45f f2708f21 99a6d88d 17cd3996"
+],
+[
+"add_delivery_acknowledged_at",
+"7d850e88 da877741 096bbafd 0317402f 21382d4d 7749e593 37762fa7 44fb16b5"
+],
+[
+"add_delivery_acknowledged_by",
+"56809d20 96f1dd23 fe6937bd 06b1a533 4892a82b 50b5705c 441324fe e2077568"
+],
+[
+"add_delivery_ack_reason",
+"9c0d7f4b 7b3543cb 8b1d350a 0a073fc1 6ffd7b0c 493e79f0 412fae66 f2ee0f2c"
+],
+[
+"add_delivery_acknowledged_state",
+"6b6632f2 68023940 19fef862 fef49897 44e83123 2aed01a4 db8d422e 4ee8223b"
+],
+[
+"add_delivery_alerted_age_bucket",
+"70a7bbe8 bf9e77a9 3fc15f4b 5de347dd b24bab10 4fe6afb9 4334fe62 f9a7d58b"
+],
+[
+"add_tasks_live_probe",
+"08174ad8 747ce624 122c5aa0 f5ee80af 705df8a5 2e37d86e bc625fe4 0301bc0d"
+],
+[
+"add_review_dispatches_run_status",
+"a0d8883e 80612e57 414ea36c 5e8aa232 b4e38798 10e6ff8a e97dc0bc f9f10875"
+],
+[
+"add_delivery_observed_at",
+"eb3621ba 6c9e914c 2654c6ba f85fd2cc e6450e12 37349920 911004ab 1bacff24"
+],
+[
+"add_delivery_observed_by",
+"d711fe6a 8519524d 7ae39da9 e7319bd8 5e9b59f3 b53a570f 8fcb6a53 74bee7d1"
+],
+[
+"add_delivery_observed_probe",
+"52757f91 023b8e10 44a893d2 4be512df 26247357 5f750921 1661b8c9 4ae99467"
+],
+[
+"add_delivery_observed_evidence",
+"9b7cd66c e21bb224 b86f9f5b 2cc2225a bdbbd1fe 781f25df f3a63276 4a87e54a"
+],
+[
+"add_delivery_observed_sha",
+"1b1d5cf5 af8a819d 6cd6a96a dd8b9002 a2c5c239 3b878b22 e46731d5 fa79517f"
+],
+[
+"add_delivery_observed_state",
+"4c1bf584 758aaeab 1cdff70b 5d05e8e1 a514a65b 92140a65 3ac09116 755e7b6a"
+],
+[
+"backfill_delivery_observed_from_live_checks",
+"4a71048d f90c6813 f6f9671d 7531b5b8 8df6db57 feea90ee 575c6c08 9f195dee"
+],
+[
+"add_review_dispatches_replaces_dispatch_id",
+"6bf59a31 5fd96f28 532e0d67 a9945d8b d07565e3 6bcc7928 0a7c7a0b b708e69f"
+],
+[
+"add_review_dispatches_second_door_reason",
+"3bdfbcd0 cc8e8f41 15984bbf 7eee5ea1 83b0fd1d 86015cd7 360ad7f8 a5f9d801"
+],
+[
+"add_review_verdict_closed_generation_column",
+"5a7f9c97 4925757d 7d9e93df 69e5edb2 f6ca1fcd 00d0035a 79a08630 e23f6fc9"
+],
+[
+"add_tasks_gate_squashed_sha",
+"655db158 71ebf6d1 021ecec9 d7f858d5 0096e0d1 fb1d20e8 8e1ccb9b ec27df3c"
+],
+[
+"add_steward_runs_started_at",
+"0beb51df b7ff05d5 71821ccc 4b3dee44 555ddf2d e4b7e961 fe21fff5 c43ad3dc"
+],
+[
+"add_steward_judgements_tokens_unknown_reason",
+"d5e548e2 ff1944b2 74fa7f4d 6db185e8 6e3bd403 9a50f216 6f3ae60c dbf832cf"
+],
+[
+"add_review_dispatches_only_tests",
+"5cbd6b56 1db2bb55 043e815f d8ea537d 1b384d8b ce7ddff9 aff66bc1 c4a31536"
+],
+[
+"rekey_pipeline_merges_clear",
+"4c77aec7 17dd8af3 832a1186 3df06b1c 73d14ebf 5f619eab 88dee11a de357da9"
+],
+[
+"rekey_pipeline_merges_create",
+"79536993 5b9a1740 94f8d0ad 2540a207 5a06ca0a fdbe0ce4 760fb336 89406a27"
+],
+[
+"rekey_pipeline_merges_copy",
+"66e2a1a8 e07dbd88 e30635c7 045fbfdb 85c7e59c 8fe208f1 9d9e4c2d 6af2112d"
+],
+[
+"rekey_pipeline_merges_sequence",
+"47486062 8c701016 512da25f 7aee5bcc 85aa3d46 f5df30a7 12d3e0b2 5c87c299"
+],
+[
+"rekey_pipeline_merges_drop",
+"2ddf97ba 57721477 4880e828 be6fdc50 c8582203 5195c71e 4d19951f 91bdf304"
+],
+[
+"rekey_pipeline_merges_rename",
+"bb29b4dd 4a1197f1 d8847b01 6b0d0209 44de9970 af84d3a5 fbc13064 13887b53"
+],
+[
+"rekey_pipeline_merges_unique_sha",
+"b2f291e5 ae9aa68b 1f03e42e 23de36d3 dc136bb4 33d8271c ca2884b2 cf34358a"
+],
+[
+"rekey_pipeline_merges_project_pr_index",
+"34bcd87a cc55d41f e91aac25 711d5a84 be624ab8 cecfbc94 2319bd1f 5e1d58ea"
+],
+[
+"create_review_order_claims",
+"27ce3992 8d87d228 21a70f4a 78b15a19 00346cd1 628525c8 3bde451c d8d1dc27"
+],
+[
+"add_machine_reviews_carried_from_review_id",
+"ced6ac39 3c72cd8b 6b68bd4f c22bab8d cc062f4b 347760cc 34adab9a 25b229d0"
+],
+[
+"create_executor_runs",
+"8944d529 988a83b1 c4a8be9d 8fb9fe40 f50f32d5 47c83858 e0db91e2 2c1844c7"
+],
+[
+"idx_executor_runs_outcome",
+"b60d43fe 9b00f503 1b2ba9c7 5f67a06c 83c6b45c c9df49f6 57136769 5520049d"
+],
+[
+"add_executor_runs_cost_wait_since",
+"20eb34a9 9a23a090 5a7a0263 5c718157 b5022ce5 7ffe45b7 2bb32160 511334e8"
+],
+[
+"add_executor_runs_token_ceiling",
+"0d179888 8aefb94a ff9f1f7b 668ec85a a29fe65b 5075605c 46c09987 a4009d5b"
+],
+[
+"add_executor_runs_cents_ceiling",
+"5e791186 66295932 7b639ed7 ca9e3c6f b21832e8 7a836719 a411d583 be1b79c6"
+],
+[
+"add_executor_runs_cancel_intent",
+"036b2c32 ce9c58f0 f4d24b2b 7c082da9 3df9ff69 358b0a45 f8f4e7c5 0ba54026"
+],
+[
+"add_executor_runs_cancel_attempts",
+"7dd972ac f5d50f08 ed585899 a45eadfe 1a66995d 60125aa1 7d61da8b 2f157282"
+],
+[
+"add_executor_runs_cancel_last_at",
+"781d1696 2d2827e5 537eb689 1a80cee7 106d8c7d ec1a1bf1 b8ce6e59 3a3eb15d"
+],
+[
+"add_executor_runs_starting_ref",
+"60eccfba fa94d764 2bf151cb 672a531c eb040661 d4d8bcfd 2c676411 d611cab1"
+],
+[
+"add_executor_runs_ordered_skill_version",
+"5e575e57 8431a987 fc451c34 da3becbe c82ea1d7 eaad069b 22679f02 be0224e8"
+],
+[
+"add_chat_pair_codes_executor_run_id",
+"3f8e50a1 2b300a13 858fad1c e546e04f 4a8ad57d 52b75569 62bdcb63 77a8388c"
+],
+[
+"add_chat_pair_sessions_executor_run_id",
+"4e46f889 2d05567c 4f8daafa 31623e25 e8f3aba5 5a465051 678e2462 0de9ab18"
+],
+[
+"idx_events_kind_project",
+"0416a3e8 d7d60053 7b1d568c d14db123 273edfd1 4ccaa9d9 bc1d0afb e935277c"
+],
+[
+"create_egress_state_table",
+"4380a2f7 d8716dcc 417c5d38 dd737da3 99abea3f d45f349b 2586ad88 a44e49e1"
+],
+[
+"add_review_dispatches_usage_scope",
+"c8fbe582 6a505818 2770bcab 04e52d5e 2c9ed1d2 b5c34b36 8e2eb847 16461efc"
+],
+[
+"add_review_dispatches_usage_checked_at",
+"2e5d52a1 08ed7056 4e9be9b2 753623a4 170f5de5 e4bfa019 990284a8 c6d5a704"
+],
+[
+"add_review_dispatches_profile_assignment",
+"1928968c d8eeceff 56eb7414 786d7ccd d370bab2 438cf3cc 60648dc1 36e821f1"
+],
+[
+"add_review_dispatches_billed_tokens",
+"6a4a8dee 17f28b91 374d2426 eb9497f1 2676aba8 7b3fb133 e95199a8 df0ff4bd"
+],
+[
+"add_review_dispatches_billed_events",
+"0fa06377 5781f1c3 a601cb7c 4f1d76f5 2742c349 54c24468 8e557b79 b68d633d"
+],
+[
+"create_cursor_usage_events",
+"a6438680 11f56a57 126a25d9 7e964bf4 251b6b42 15863b62 0a411a30 01fc27d0"
+],
+[
+"add_releases_backup",
+"5800ca00 2f965fcb 7f742b52 83656a75 532c009c 7793aef6 527409d5 89751f07"
+],
+[
+"add_tasks_release_id",
+"7ce2683a 2c35f166 af9a9fd1 883f4df3 ff3f1132 49949430 4d568aeb 0d3b85c4"
+],
+[
+"idx_tasks_release_id",
+"3398ae56 24ee072c 6c5d53b7 0219b5ea 292e39c7 5c76a1bf 25cff5a4 4d8bf3b7"
+],
+[
+"create_defect_cause_suggestions",
+"4429e446 f4734548 ea0e05ed 8546e84e ecf68790 fa1383f9 ef5a42d0 9c6658cd"
+],
+[
+"add_chat_pair_codes_channel",
+"92fe868d 8fac515a 7e5b2fd1 c674ada8 c63dd938 6c42797c 659696b8 97a34f88"
+],
+[
+"add_chat_pair_codes_slot",
+"99fb3bfe 0b83355a 1ac330e7 a2bc83e6 a03553b9 4c1af31e 956c9b0c 1f3ec8c9"
+],
+[
+"add_chat_pair_sessions_channel",
+"38f5668c de671feb 8dc2c3a4 2913fa0e d7616bcd f4a8cd52 c034008d 1d63d2f6"
+],
+[
+"add_chat_pair_sessions_slot",
+"c6223424 a20ffacd dbf318f3 c047ddc0 cfac2e3b c863f202 b7da78c7 6fd2ced3"
+],
+[
+"create_executor_slots",
+"42d7f33c b9309e56 f17089e9 24c6ebb7 cb125523 d0a5e380 c23b100c 5d80d945"
+],
+[
+"idx_executor_slots_active",
+"dfea0085 3fdef3c8 d47c3860 c5ffa368 4a110112 bfd1aca4 33f0919b 2eccfebc"
+],
+[
+"add_defect_prevention_column",
+"f4b80bc0 0516d482 a180b670 43376319 6d16667b c2e2d9a5 28af77a1 51101a44"
+],
+[
+"add_category_checks_created_at",
+"debe0694 efd8ef9b f0ef5576 102c6e28 f29e0a67 c2d274a4 7c7f7025 b63aa595"
+],
+[
+"backfill_category_checks_created_at",
+"441cc4a0 b93c021d 76c3fee9 9801b0b3 4eb99a77 1b7d3b15 a92d9381 04a3784e"
+],
+[
+"add_ci_run_reports_baseline",
+"040fd1fa 7f2a8fde c9bc2de8 f259d3d0 370f6474 4ad75930 01a57f78 1b793866"
+],
+[
+"create_path_notice_results",
+"8a990bed 5571c2b4 27a0c27f 2309842d d9b89120 1837b4e9 7c1f8bff cf6683c1"
+],
+[
+"add_steward_judgements_judged_id",
+"d421b7ad 8ad15929 3b91caaf b6acee7d 8f2ad841 b068af01 f44f13bd 989db06a"
+],
+[
+"add_steward_judgements_packet_hash",
+"1683b123 ff6786d1 2233969e cdff0f0b 2a28e11c aaa7d190 5fe3c334 6eccdbb1"
+],
+[
+"add_steward_judgements_contour",
+"59aa1dd3 49971b23 c18fa375 0b295fb2 ea2aeb26 48c48f84 593c5a31 8458d435"
+],
+[
+"add_steward_judgements_advisor_outcome",
+"75f7fff9 e27a4931 7122b540 616c063b f825754b f724d1c9 2665bf5f d1bd065e"
+],
+[
+"add_steward_judgements_advisor_claimed_at",
+"fabcef35 6305008f af616906 b897df19 ebd46969 828e11ab e574cbf5 35f02169"
+],
+[
+"add_steward_runs_packet_hash",
+"40f3917e ae02256d c8e07f37 431724bb cbb84346 c5c73475 d08d9a5f 1483b246"
+],
+[
+"create_steward_false_approvals",
+"ab445b5c c2c8d9fe 197c6cf9 dc0fa4d2 9d054678 ed2fcc3d 19266e8b e5596c2a"
+],
+[
+"add_tasks_completed_exit_seq",
+"d36769b3 fbdb7e09 3f5e93dd cfb1bca8 8ae879b4 cad5d86f 0d6a2c6d 7b05e39e"
+],
+[
+"create_trigger_false_approve_human_return",
+"e1bacfad 19651008 d0b5992c 853f1071 3420fb72 7b64b230 37c248f8 9566667e"
+],
+[
+"create_trigger_false_approve_reopened",
+"d5c07478 ec309d22 6ee9652e 58ab0323 bfd3875f c9d9018b c97cd5be 2b1d112d"
+],
+[
+"create_trigger_false_approve_prod_defect_insert",
+"a8da511e 0c82beb0 9b731a66 fa0edab4 2910933f 4a373214 493d2006 2e43b09d"
+],
+[
+"create_trigger_false_approve_prod_defect_update",
+"17629796 c1380d34 ba4b856a 3481362e b158732a 5c6a3318 92594cc2 d7ee4bb6"
+],
+[
+"create_scheduled_policy_changes",
+"efc6a840 b6563bc7 db500f42 135eade4 b3c91b1b 1dfd6a48 6709f207 441bde9d"
+],
+[
+"idx_scheduled_policy_changes_due",
+"614397b4 3f3ef707 126f149b 041000b8 505c24f2 6975abf2 1e223f12 285f1d3e"
+],
+[
+"add_tasks_freeze_rationale",
+"1619ad74 9df4bc19 42b38f94 4032b427 255689e1 a6ba20ee 434d5040 616c53a7"
+],
+[
+"add_tasks_result_kind",
+"ad568731 f2413db1 7328c7b1 6d4ca5d0 bd1bcd90 7cee74bd 858588ed 8088d1fb"
+],
+[
+"add_tasks_rollback",
+"d8fdeb27 e7c08bc1 c3d977f5 dea52ea1 fc35d38e 5886ff54 42131a88 bdfc214c"
+],
+[
+"add_tasks_unfrozen_generation",
+"451b7d18 3d290278 c085f087 1082f889 fee8b354 af2ee892 98ab0fd7 09d25ee5"
+],
+[
+"add_submissions_state_snapshot",
+"222ae073 250bd0a8 324a54bc d8a9a8a8 2feb5769 1d57ae11 d05599ba 5056d915"
+],
+[
+"add_agent_sessions_projects",
+"702793b8 06afccf8 5e761763 0b2c6746 18deddd0 f1e1ecf3 f3ce2901 5303077d"
+],
+[
+"add_agent_sessions_work_role",
+"888a5534 386a33d9 f536c748 f23d3765 9471db30 ca954df4 d64553de a4306e4c"
+],
+[
+"create_watch_notices",
+"1c98c16d f2a6c6f1 61035708 8e6ca1b0 f31704ec 53368dc2 6d630c05 36f54eea"
+],
+[
+"create_task_evidence",
+"c56dff6f 8ee9d43c 4d0f8c32 3255c5e8 c155acda 6a892295 eef0ef9b 52a4ca26"
+],
+[
+"idx_task_evidence_task",
+"bcb04a67 c70bfd2e 3276f3b3 b713c5dc 87d83c63 6e3e034e 32813131 eb7dd2d4"
+],
+[
+"task_evidence_no_update",
+"890ef302 9fdee6bc 7c0649b3 cd2fafd6 39c9afba 9266c61e 171351ea d64991a9"
+],
+[
+"add_ci_run_reports_provenance",
+"4426a270 72a625ea e97a13d3 7d4902a1 dfb50b05 2618d67b 9e843adc 491ec066"
+],
+[
+"add_ci_run_reports_trust",
+"e8692d47 03458bbf 801014cc b85b4baf 9fa7dabe 226e4942 375776c9 c903d804"
+],
+[
+"add_ci_run_reports_trust_reason",
+"3a2967e0 5cebb57b 9e513098 d1ba80df 85761f6c 5aae1d7a 66b93b36 b981f45e"
+],
+[
+"add_ci_run_reports_attempt_key",
+"75afa088 33996ecf 2ec68ca5 07fcfbfe 85f36bfa cfa4f751 c8bf547d 225c0e56"
+],
+[
+"create_ci_report_attempts",
+"bad2da4e ae6dfb3a 22576242 a3a14045 a3fc922d a3ed0c89 31dc3f64 5e483f15"
+],
+[
+"create_ci_report_state",
+"c4c9a651 41d35b81 4e8401cf 92db213a 71ef28a6 ec6141ee fc889c76 ba29baa6"
+],
+[
+"queue_provenanced_reports_for_verification",
+"1875a263 4a2fff12 154449b5 b39a03b5 98c611c4 52fa930f 9f60493f 028882c2"
+],
+[
+"add_ac_test_results_source",
+"803ceca9 2e72d554 003004aa 38029ce4 1d6ee90e 0b3677b9 da3c0b6c 0fa8ecac"
+],
+[
+"add_tasks_validation_source",
+"1f9cc3ab 877081ad 82007ba9 90f94fe6 ac4d9131 89bf696e a9e70238 f05963f6"
+],
+[
+"legacy_ac_test_results_source",
+"6e3ac6c8 f3cd181f 06806965 0c18f16e df12c4be 644e18cd 6e7d4093 84d8ba71"
+],
+[
+"legacy_tasks_validation_source",
+"4b8cb50c 32a396df 0f3ab3b1 dfa97405 e3b1c0f7 01ea8400 eaba6823 68706bb4"
+],
+[
+"create_ci_integrity_scans",
+"5a30e5f7 91ce3569 a61d6a6d c08206ba b67854b1 dc07adf8 2b8c60a4 1c2cf166"
+],
+[
+"add_machine_reviews_ci_integrity_verdict",
+"b7cd4503 ecfae02a 7f149a17 ff291b3a 13789862 b6cf102a 59bbe654 4567dd70"
+],
+[
+"add_machine_reviews_ci_integrity_explanation",
+"11e07c0b 2271b4ac 2ed22200 fcb8112f 9f6c7d2d 01dc4c1e be79a6d2 2176c978"
+],
+[
+"add_tasks_review_verdict_revision",
+"f78b3c3e 8ff00414 0b239684 f58b1034 bac1fdb6 b32276e4 63a82e92 be592f53"
+],
+[
+"add_tasks_review_verdict_digest",
+"973a7882 5749c8b3 9e69fbee ad02c86b a4877e38 3bb16da9 dfb6ba13 246d93ae"
+],
+[
+"create_ci_attempt_timings",
+"3d6d226f 30fd7c69 216c52e1 9dfef79e 35c5e23a 66866cec f7a850f9 a341be47"
+],
+[
+"create_executor_hosts",
+"4fd3d531 f16eb99a 3317b0d7 71cf7dd6 2f890e0f f453def9 c53c8b1f f38b2cb9"
+],
+[
+"add_executor_runs_channel",
+"e901574c ceb4db0c 07680fb1 2ee90e85 06910897 98fcf269 e145780e 98559ed6"
+],
+[
+"add_executor_runs_slot",
+"46b9274b 8e3695d1 1c7a05fe 1ea6a9c8 d552b4b9 6dd7aa97 8a580df0 e64f5ef7"
+],
+[
+"add_executor_runs_launched_by",
+"21f14201 6a9c395f 1cab0833 efa59b80 7872827d 316bb9a0 e67ab77c 11b4c913"
+],
+[
+"create_executor_orders",
+"8880897f 9fd9bb2f 945d6e59 a672ef1e 1f5239b9 6cb4a255 7df6a4f4 64101e14"
+],
+[
+"idx_executor_orders_one_open_per_host",
+"373fdd55 ae4e3779 939573d7 9a672023 2c7186e4 8e7d9100 f9bac219 8dc8af7b"
+],
+[
+"add_executor_orders_code_hash",
+"a5d6a648 97fe602d 53f4db26 05373e4b 87fde772 4a97aa33 48986ab2 a431ef08"
+],
+[
+"idx_executor_orders_task",
+"fbb592de 574e55cf 755308ee 49a0b38a db724627 fc61b4df 28975f16 f7fe87a2"
+],
+[
+"add_tasks_start_history_unknown",
+"ff3c998b 99029751 199fabc4 0590e19d d5ba8697 837f58e6 26e13d9c 0ebc0fde"
+],
+[
+"backfill_tasks_start_history_unknown",
+"d4b3f9fa bcca531d 9899356e d2c8f1e8 6e7a6c81 b7625997 3e542d67 90985c22"
+],
+[
+"add_tasks_cause_kind",
+"b0204bdd 3ee8dae6 0a93ca5d 98d957e0 132311ed 12f4554a c6a6cb57 877169b9"
+]
+]
