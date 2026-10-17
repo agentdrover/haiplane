@@ -76,6 +76,9 @@ async def refuse_over_live_run(
 
     from hub.services.executor_launch import _reservation_abandoned
 
+    # Write-лок ДО чтения: claim без session_id его не берёт, и бронь, закоммитенная
+    # на втором соединении между проверкой и переходом, иначе прошла бы (#1783).
+    await _lock_for_write(db)
     rows = await fetchall(
         db,
         "SELECT * FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
@@ -86,8 +89,15 @@ async def refuse_over_live_run(
         row = dict(raw)
         if caller_run_id is not None and int(row["id"]) == int(caller_run_id):
             continue
-        if row.get("channel", "cloud") == "slot":
-            continue  # прогон слота держит заказ хосту; его закрывает sweep заказов
+        if row.get("channel", "cloud") == "slot" and not await fetchall(
+            db,
+            "SELECT 1 FROM executor_orders WHERE executor_run_id = ? "
+            "AND state IN ('pending', 'delivered')",
+            (int(row["id"]),),
+        ):
+            # Заказ хосту выкуплен: прогон держит его сессия, и закрывает его
+            # sweep заказов. Невыкупленный заказ — такая же бронь, как облачная.
+            continue
         if not row["agent_id"] and _reservation_abandoned(row):
             continue
         raise HTTPException(

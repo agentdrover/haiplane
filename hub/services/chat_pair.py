@@ -588,8 +588,8 @@ async def _spend_code(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
         " bound_generation, token_hash, expires_at, channel, slot, "
-        " executor_run_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?)",
+        " executor_run_id, claimed_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL)",
         (
             row["principal_id"],
             acting_id,
@@ -1055,8 +1055,10 @@ async def return_task_to_open(
         return False
     # Сессии, запомнившие свой claim_session_id, отдают только его; None — сессия
     # до этой записи (прежнее поведение).
-    if session_claims is not None and None not in session_claims:
-        if (rows[0]["claim_session_id"] or None) not in session_claims:
+    if session_claims is not None and "*" not in session_claims:
+        # None — сессия задачу не брала: захват не её (ни одним claim она его не
+        # объявляла), '*' — сессия до записи claim_session_id (прежнее поведение).
+        if (rows[0]["claim_session_id"] or None) not in session_claims - {None}:
             return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.

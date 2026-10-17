@@ -27,6 +27,7 @@ from hub.services import executor_launch as el
 from hub.services import run_claim
 from tests.test_executor_orders import (  # noqa: F401 - фикстуры и помощники слота
     _claim_and_start,
+    _launch,
     _launch_redeem,
     _rows,
     _submit,
@@ -311,7 +312,7 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-async def _verdict(client, task_id: int) -> dict:
+async def _verdict(client, task_id: int, headers: dict | None = None) -> dict:
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
         json={
@@ -319,13 +320,18 @@ async def _verdict(client, task_id: int) -> dict:
             "agent": "reviewer",
             "findings": [{"id": 1, "severity": "high", "message": "Fix the race"}],
         },
+        headers=headers,
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
 
 
 async def test_repair_is_offered_and_atomic_after_changes_requested(
-    client, db, db_dsn, monkeypatch
+    client,
+    db,
+    db_dsn,
+    monkeypatch,
+    world,  # noqa: F811
 ):
     """Вердикт «на доработку» по задаче завершённого прогона хаба: захват снят,
     кнопка видна сразу и без TTL, повторный прогон запускается; два нажатия и чужой
@@ -338,7 +344,7 @@ async def test_repair_is_offered_and_atomic_after_changes_requested(
     run_id = await _finished_run_id(db, task_id)
     await _hold(db, task_id, run_id, session=False)
 
-    verdict = await _verdict(client, task_id)
+    verdict = await _verdict(client, task_id, world.human_auth)
     assert verdict["status"] == "running"
     task = await _row(db, task_id)
     assert (task["claimed_by"], task["executor_run_id"]) == (None, None)
@@ -366,6 +372,7 @@ async def test_repair_is_offered_and_atomic_after_changes_requested(
 
     await _phase_busy_task_blocks_the_repair(db, monkeypatch, human)
     await _phase_booking_blocks_a_manual_claim(db, monkeypatch)
+    await _phase_slot_booking_blocks_a_manual_claim(world)
     await _phase_repair_reads_the_report_at_the_same_tip(db, monkeypatch)
 
 
@@ -1004,3 +1011,73 @@ async def test_p1_bind_claim_records_the_declared_session(db, monkeypatch):
         (task_id,),
     )
     assert rows[0][0] == "S-declared"
+
+
+async def _phase_slot_booking_blocks_a_manual_claim(slot_world):
+    """Невыкупленный заказ слоту — такая же бронь, как облачная: ручной claim отказан;
+    после выкупа заказ держит сессия хоста, и задачу можно брать (прежнее поведение)."""
+    task_id = await _task(slot_world, "бронь слота")
+    assert (await _launch(slot_world, task_id)).status_code == 200
+    refused = await slot_world.client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": "s-manual"},
+        headers=slot_world.agent_auth,
+    )
+    assert refused.status_code == 409, refused.text
+    assert (await _row(slot_world.db, task_id))["status"] == "open"
+
+
+async def test_the_write_lock_is_taken_before_the_booking_is_read(db, monkeypatch):
+    """claim без session_id write-лок не берёт: проверка брони берёт его сама, иначе
+    бронь, закоммиченная на втором соединении, прошла бы между чтением и переходом."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-lock")
+    await db.commit()
+    assert not db.in_transaction
+    await run_claim.refuse_over_live_run(db, task_id, None)
+    assert db.in_transaction
+
+
+async def test_p1_a_session_that_never_claimed_does_not_take_a_foreign_claim(
+    db, monkeypatch
+):
+    """Сессия без claim (claimed_session NULL) истекает, а тот же принципал взял задачу
+    своим ключом под другим session_id: реапер её не трогает."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-never-claimed")
+    await _hold(db, task_id, None, session=False, status="running")
+    acting = await cp.get_acting_agent(db)
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'nc', datetime('now', '-1 minute'), 'implementer', ?, 1, NULL)",
+        (int(acting["id"]), task_id),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["claimed_by"]
+
+
+async def test_p1_backfill_is_ambiguous_with_two_run_sessions(db, monkeypatch):
+    """Две сессии прогонов на задаче: какая из них взяла захват, неизвестно — доказательства нет."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-two-sessions")
+    run_a = await _finished_run_id(db, task_id)
+    run_b = await _new_run(db, task_id, 2)
+    await _live_run_session(db, task_id, run_a, "two-a")
+    await _live_run_session(db, task_id, run_b, "two-b")
+    await _hold(db, task_id, None, session=False, status="running")
+    await db.execute(
+        "UPDATE tasks SET claimed_at = datetime('now', '-30 minutes') WHERE id = ?",
+        (task_id,),
+    )
+    await db.execute(
+        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
+        "executor_run_id) VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
+        (task_id, run_a),
+    )
+    await _slot_note(db, task_id)
+    await db.commit()
+    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
+    await db.commit()
+    assert (await _row(db, task_id))["executor_run_id"] is None

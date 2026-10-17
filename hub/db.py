@@ -2309,18 +2309,18 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: claim_session_id, под которым сессия взяла задачу (реапер).
+        # #1783: claim_session_id, под которым сессия взяла задачу (реапер);
+        # NULL — не брала; '*' (умолчание) — сессия до этой записи, как прежде.
         "add_chat_pair_sessions_claimed_session",
-        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT DEFAULT '*'",
     ),
     (
-        # #1783: прогон хаба, держащий захват; NULL — ручной (run_claim.py).
+        # #1783: прогон-держатель захвата; NULL — ручной.
         "add_tasks_executor_run_id",
         "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: захват снят — доказательство уходит с ним на любом пути,
-        # включая сырой SQL (иначе оно переехало бы к ручному захвату).
+        # #1783: захват снят — доказательство уходит с ним на любом пути.
         "trg_tasks_claim_cleared_drops_run_proof",
         "CREATE TRIGGER IF NOT EXISTS trg_tasks_claim_cleared_drops_run_proof "
         "AFTER UPDATE OF claimed_by ON tasks "
@@ -2479,13 +2479,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON executor_slots(task_id) WHERE released_at IS NULL",
     ),
     (
-        # #1783: чей слот — прогона, чья сессия его захватила.
         "add_executor_slots_executor_run_id",
         "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: доказательство для захватов при выкате: сессия с заказом + её
-        # слот не раньше claim, и после него «Claimed by» не было; без claim нет.
+        # #1783: доказательство захватам при выкате: единственная сессия с заказом
+        # + её слот не раньше claim, после него «Claimed by» не было.
         "backfill_tasks_executor_run_id",
         "UPDATE tasks SET executor_run_id = (SELECT s.executor_run_id "
         "FROM chat_pair_sessions s JOIN executor_runs r ON r.id = s.executor_run_id "
@@ -2493,7 +2492,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "AND sl.channel = s.channel AND sl.slot = s.slot "
         "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
         "AND r.task_id = tasks.id AND s.principal_id = tasks.implementer_principal_id "
-        "AND tasks.claimed_at IS NOT NULL "
+        "AND (SELECT COUNT(*) FROM chat_pair_sessions x WHERE x.bound_task_id = tasks.id "
+        "AND x.kind = 'implementer') = 1 "
         "AND datetime(sl.captured_at) >= datetime(tasks.claimed_at) "
         "AND EXISTS (SELECT 1 FROM task_updates c WHERE c.task_id = tasks.id "
         "AND c.agent = 'hub' AND c.content LIKE 'канал: %') "
