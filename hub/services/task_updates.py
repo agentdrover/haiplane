@@ -33,7 +33,7 @@ from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
 from hub.services.resubmission_guard import stop_empty_done
-from hub.services import prevention_gate
+from hub.services import chat_pair, prevention_gate
 
 log = logging.getLogger("hub")
 
@@ -205,6 +205,10 @@ async def _route_pair_or_claimed(
     holder = (task.get("claimed_by") or "").strip()
     proven = task.get("executor_run_id") is not None
     was_claimed = task["status"] == "claimed" and holder in ("", agent) and not proven
+    if was_claimed and await chat_pair.claim_is_session_bound(
+        db, task.get("claim_nonce")
+    ):
+        was_claimed = False  # захват сессии: имя в отчёте её не доказывает
     updates_list = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а не любой в
     # истории. Снятое препятствие больше не уводит сдачу мимо доставки, а

@@ -1467,6 +1467,14 @@ async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
     await w.db.commit()
     for path in ("claim", "pair-start"):
         assert (await _manual(path, task_id)).status_code == 409, f"stale {path}"
+    # ручной implementer-код поверх УЖЕ выкупленного заказа слоту — тоже отказан
+    late_code = await w.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task_id},
+        headers={**w.human_auth, "x-forwarded-for": "203.0.113.56"},
+    )
+    assert late_code.status_code == 200, late_code.text
+    assert (await _redeem(w, late_code.json()["code"])).status_code >= 400
     await _claim_and_start(w, task_id, session)  # своя сессия берёт
     assert (await _row(w.db, task_id))["status"] == "running"
 
@@ -1677,3 +1685,32 @@ async def test_c3_finished_without_submission_keeps_its_outcome_when_usage_is_si
         dict(await repo.get_executor_run(db, run))["outcome"]  # type: ignore[arg-type]
         == ed.OUTCOME_FINISHED_WITHOUT_SUBMISSION
     )
+
+
+async def test_c3_a_done_by_name_does_not_clear_a_session_claim(db, monkeypatch):
+    """Захват сделан сессией implementer (метка записана в сессию): отчёт done с тем же
+    именем агента его не снимает — имя не доказывает, что отчёт шлёт та сессия."""
+    from hub import models, services
+
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-done-name")
+    await _hold(db, task_id, None, session=False, status="claimed")
+    await db.execute(
+        "UPDATE tasks SET claim_nonce = 'nn', branch = '' WHERE id = ?", (task_id,)
+    )
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'dn', datetime('now', '+1 hour'), 'implementer', ?, 1, 'nn')",
+        (int(acting["id"]), task_id),
+    )
+    await db.commit()
+    await services.add_update(
+        db,
+        task_id,
+        models.TaskUpdateCreate(
+            agent=config.CHAT_PAIR_AGENT, kind="done", content="запоздалый отчёт"
+        ),
+    )
+    assert (await _row(db, task_id))["claimed_by"] == config.CHAT_PAIR_AGENT

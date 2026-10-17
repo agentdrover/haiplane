@@ -847,6 +847,23 @@ async def bind_claim(
         )
 
 
+async def claim_is_session_bound(db: aiosqlite.Connection, nonce: str | None) -> bool:
+    """Захват сделан сессией implementer (в ней записана его метка, #1783).
+
+    Отчёт ``done`` свободным именем агента такой захват не снимает: имя не
+    доказывает, что отчёт шлёт та самая сессия.
+    """
+    if not nonce:
+        return False
+    return bool(
+        await fetchall(
+            db,
+            "SELECT 1 FROM chat_pair_sessions WHERE claimed_session = ?",
+            (nonce,),
+        )
+    )
+
+
 async def ended_run_session(db: aiosqlite.Connection, token: str, task_id: int) -> bool:
     """Токен сессии прогона, который уже закончен или отозван (#1783).
 

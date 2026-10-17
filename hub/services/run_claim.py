@@ -112,7 +112,7 @@ async def redeem_conflict(db: aiosqlite.Connection, row: dict[str, Any]) -> str:
         ordered = await fetchall(
             db,
             "SELECT 1 FROM executor_orders WHERE task_id = ? "
-            "AND state IN ('pending', 'delivered')",
+            "AND state IN ('pending', 'delivered', 'redeemed')",
             (int(task_id),),
         )
         return "по задаче выдан заказ исполнителю на слот" if ordered else ""
