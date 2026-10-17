@@ -3702,3 +3702,125 @@ async def test_a_state_candidate_at_the_head_of_the_queue_does_not_block_the_exe
 
     assert result.launched and result.task_id == commit_id, result
     assert len(calls) == 1
+
+
+# ---- #1769: параметры варианта модели исполнителя ----
+
+_VARIANT_RAW = "context=256k,reasoning_effort=high,fast=false"
+_VARIANT_PARAMS = [
+    {"id": "context", "value": "256k"},
+    {"id": "reasoning_effort", "value": "high"},
+    {"id": "fast", "value": "false"},
+]
+_ALL_DOORS = [
+    _door_launch,
+    _door_repair,
+    _door_merge,
+    _door_submit_only,
+    _door_continue,
+]
+
+
+async def _last_model(db: aiosqlite.Connection, task_id: int) -> str:
+    return str(
+        [dict(r) for r in await repo.list_executor_runs(db, task_id)][-1]["model"]
+    )
+
+
+async def test_executor_params_reach_every_order_door(db, monkeypatch):
+    """AC-1: все пять дверей заказа кладут в model_params ровно три пары."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", _VARIANT_RAW)
+    human = await _human(db)
+    for door in _ALL_DOORS:
+        calls = _creator(monkeypatch, [_CREATED])
+        _, run = await door(db, human)
+        result = await run()
+        assert result.launched, (door.__name__, result)
+        assert len(calls) == 1, door.__name__
+        assert calls[0]["model_params"] == _VARIANT_PARAMS, door.__name__
+
+
+async def test_empty_executor_params_send_bare_model(db, monkeypatch):
+    """AC-2: настройка пуста — тело без model_params, строка прогона с голой моделью."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", "")
+    human = await _human(db)
+    for door in _ALL_DOORS:
+        calls = _creator(monkeypatch, [_CREATED])
+        task_id, run = await door(db, human)
+        assert (await run()).launched, door.__name__
+        assert not calls[0].get("model_params"), door.__name__
+        assert await _last_model(db, task_id) == _EXEC_MODEL
+
+
+async def _alerts_of(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+
+
+async def test_rejected_executor_params_retry_bare_once(db, monkeypatch):
+    """AC-3: 400 не по лимиту — один повтор без params на весь заказ и строка
+    о сброшенных params после успеха; 429 и 400 usage_limit_exceeded — повтор
+    с теми же params и без строки."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", _VARIANT_RAW)
+    human = await _human(db)
+    bad = cursor_cloud.Refusal(status=400, code="invalid_argument")
+    rate = cursor_cloud.Refusal(status=429, code="rate_limit_exceeded")
+    limit = cursor_cloud.Refusal(status=400, code="usage_limit_exceeded")
+
+    calls = _creator(monkeypatch, [bad, rate, _CREATED])
+    project, task_id = await _launch_project(db, slug="exec-params-drop")
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert result.launched, result
+    assert [bool(c.get("model_params")) for c in calls] == [True, False, False]
+    assert calls[0]["name"] == calls[1]["name"], "голый заказ — та же попытка"
+    alerts = await _alerts_of(db, task_id)
+    assert len(alerts) == 1 and _VARIANT_RAW in alerts[0], alerts
+    assert await _last_model(db, task_id) == _EXEC_MODEL
+
+    calls = _creator(monkeypatch, [rate, limit, _CREATED])
+    project, task_id = await _launch_project(db, slug="exec-params-limit")
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert result.launched, result
+    assert [c.get("model_params") for c in calls] == [_VARIANT_PARAMS] * 3
+    assert await _alerts_of(db, task_id) == []
+
+    calls = _creator(monkeypatch, [bad, bad])
+    project, task_id = await _launch_project(db, slug="exec-params-refused")
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert not result.launched
+    assert len(calls) == 2, "голый заказ один; второй отказ — отказ заказа"
+    assert not any("отверг" in a for a in await _alerts_of(db, task_id))
+
+
+async def test_executor_run_records_the_sent_variant(db, monkeypatch):
+    """AC-4: executor_runs.model — вариант с params, после сброса — голая
+    модель, при подборе агента после обрыва — вариант того заказа."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_MODEL_PARAMS", _VARIANT_RAW)
+    human = await _human(db)
+    variant = f"{_EXEC_MODEL} {_VARIANT_RAW}"
+
+    _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-var-sent")
+    assert (await el.launch_executor(db, project, issuer_principal_id=human)).launched
+    assert await _last_model(db, task_id) == variant
+
+    _creator(monkeypatch, [cursor_cloud.Refusal(status=400), _CREATED])
+    project, task_id = await _launch_project(db, slug="exec-var-bare")
+    assert (await el.launch_executor(db, project, issuer_principal_id=human)).launched
+    assert await _last_model(db, task_id) == _EXEC_MODEL
+
+    async def _seen(_name, pages=3):
+        return cursor_cloud.Reconciliation("bc-found", "run-f", True)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _seen)
+    _creator(monkeypatch, [cursor_cloud.Refusal(status=0, detail="ReadTimeout")])
+    project, task_id = await _launch_project(db, slug="exec-var-adopt")
+    assert (await el.launch_executor(db, project, issuer_principal_id=human)).launched
+    assert await _last_model(db, task_id) == variant
