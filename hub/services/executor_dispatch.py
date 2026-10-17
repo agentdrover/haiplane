@@ -160,7 +160,20 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     # из строки (_spent).
     if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
         return
+    await _release_on_terminal(db, row, run)
     if tokens is None and cents is None:
+        # Идущий прогон без счёта ждёт следующего опроса. Законченный не висит
+        # вечно: ожидание цены ограничено сроком (#1410), по его выходу строка
+        # закрывается исходом провайдера, а прежние цифры не обнуляются. Захват
+        # к этому моменту уже снят (``_release_on_terminal``).
+        done = _outcome_of(row, run)
+        if done is not None and await repo.wait_for_executor_cost(
+            db, row["id"], config.EXECUTOR_COST_WAIT_MIN
+        ):
+            # Срок цены вышел: закрывает тот же _settle, что и при живом /usage, —
+            # со своей классификацией (конец без сдачи — отдельный исход, #1446).
+            await _settle(db, row, run, None, None)
+            return
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     await _settle(db, row, run, tokens, cents)
@@ -202,6 +215,25 @@ def _outcome_of(row: dict[str, Any], run: dict[str, Any]) -> str | None:
     return outcome
 
 
+async def _release_on_terminal(
+    db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Любой терминальный статус провайдера снимает захват прогона сразу (#1783).
+
+    ERROR, EXPIRED, CANCELLED и конец без сдачи — тоже: захват мёртвого прогона
+    никому не нужен, а решение о задаче (needs_decision, повтор «только сдай»)
+    от него не зависит. Не после цены, которой провайдер может не назвать, и не
+    после молчания /usage: от учёта денег снятие не зависит.
+    """
+    if _outcome_of(row, run) is None:
+        return
+    from hub.services import run_claim
+
+    await run_claim.release_after_run_closed(
+        db, int(row["id"]), why=str(_outcome_of(row, run)), run_ended=True
+    )
+
+
 async def _settle(
     db: aiosqlite.Connection,
     row: dict[str, Any],
@@ -213,6 +245,7 @@ async def _settle(
     if outcome == OUTCOME_FINISHED and not await _submission_landed(db, row):
         # #1446: закончился, не сдав своё поколение, — отдельный исход.
         outcome = OUTCOME_FINISHED_WITHOUT_SUBMISSION
+    await _release_on_terminal(db, row, run)
     # Ждать цену — только если её нет ни в ответе, ни в строке: цена,
     # прочитанная опросом во время RUNNING, известна, и конец без cost её не
     # отменяет (COALESCE в update_executor_run её сохранит).

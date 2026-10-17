@@ -1756,6 +1756,8 @@ async def _sweep_ci_trust(db) -> None:
 
 
 async def _sweep_expired_claims(db) -> None:
+    from hub.services import run_claim
+
     # Claim lease expiry (#417): a claim held past the lease without a
     # pair start is auto-released back to open so the task returns to
     # the queue instead of sitting owned by a dead session forever.
@@ -1765,14 +1767,9 @@ async def _sweep_expired_claims(db) -> None:
     for row in expired_claims:
         with _task_isolation("claim expiry", dict(row).get("id")):
             task = dict(row)
-            await repo.update_task(
-                db,
-                task["id"],
-                status="open",
-                claimed_by=None,
-                claim_session_id=None,
-                claimed_at=None,
-            )
+            if not await run_claim.expire_claim(db, task):
+                await db.commit()  # захват успели сменить: выборка устарела
+                continue
             await repo.insert_event(
                 db,
                 kind="claim_expired",

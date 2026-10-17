@@ -464,6 +464,8 @@ _MINE = {
     "add_chat_pair_sessions_slot",
     "create_executor_slots",
     "idx_executor_slots_active",
+    # #1783: колонка прогона у слота и бэкфиллы стоят за таблицей слотов.
+    "add_executor_slots_executor_run_id",
 }
 
 

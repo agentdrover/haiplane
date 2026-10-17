@@ -2309,6 +2309,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
+        # #1783: метка захвата (tasks.claim_nonce), сделанного сессией; NULL — не брала.
+        "add_chat_pair_sessions_claimed_session",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+    ),
+    (
+        "add_tasks_claim_nonce",  # #1783: уникальная метка каждого захвата
+        "ALTER TABLE tasks ADD COLUMN claim_nonce TEXT",
+    ),
+    (
+        # #1783: прогон-держатель захвата; NULL — ручной.
+        "add_tasks_executor_run_id",
+        "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",
+    ),
+    (
+        # #1783: захват снят — доказательство уходит с ним на любом пути.
+        "trg_tasks_claim_cleared_drops_run_proof",
+        "CREATE TRIGGER IF NOT EXISTS trg_tasks_claim_cleared_drops_run_proof "
+        "AFTER UPDATE OF claimed_by ON tasks "
+        "WHEN NEW.claimed_by IS NULL AND NEW.executor_run_id IS NOT NULL "
+        "BEGIN UPDATE tasks SET executor_run_id = NULL WHERE id = NEW.id; END",
+    ),
+    (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
         "idx_events_kind_project",
@@ -2458,6 +2480,10 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_executor_slots_active",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_slots_active "
         "ON executor_slots(task_id) WHERE released_at IS NULL",
+    ),
+    (
+        "add_executor_slots_executor_run_id",
+        "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER",
     ),
     (
         # #919: what a closed production defect left behind — a regression

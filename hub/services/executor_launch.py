@@ -246,6 +246,8 @@ async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
         r = dict(row)
         if r["outcome"] != OUTCOME_RUNNING:
             continue
+        if r.get("cost_wait_since"):
+            continue  # провайдер сказал «конец», строка ждёт только цену (#1783)
         # #1712: прогон слота живёт не по облачному сроку брони. У него нет
         # агента у провайдера НАРОЧНО: его держит заказ хосту, а закрывает
         # executor_orders.settle. Объявить его «сорванной бронью» через 450 с
@@ -546,6 +548,7 @@ async def _reserve(
     model: str,
     pick: Any = None,
     ceilings: tuple[int, float] | None = None,
+    admit: Any = None,
 ) -> LaunchResult | tuple[dict[str, Any], int, int, str]:
     """Бронь запуска: кандидат, проверка «прогона нет», строка и код — одной
     write-транзакцией, ДО оплаченного заказа (находка ревью #1412, high).
@@ -554,6 +557,10 @@ async def _reserve(
     платили Cursor; второй код к тому же гасил невыкупленный первый. Тот же
     класс, что два ревьюера на одну сдачу (#1399). BEGIN IMMEDIATE ставит
     второй запрос в очередь за первым, и тот уже видит бронь.
+
+    ``admit`` (#1783) — допуск и переход задачи В ЭТОЙ ЖЕ транзакции: зовётся
+    после всех отказов и прямо перед INSERT брони, поэтому переход состоится
+    только вместе с бронью, а отказ ничего не оставляет за собой.
     """
     async with write_transaction(db):
         # ``pick`` — кого бронировать: кандидат очереди (#1412) или заданная
@@ -574,6 +581,10 @@ async def _reserve(
         )
         if refusal is not None:
             return refusal
+        if admit is not None:
+            why = await admit(db, task)
+            if why:
+                return _refused(why, task_id)
         generation = int(task.get("submission_generation") or 0) + 1
         row_id = await repo.create_executor_run(
             db,
@@ -765,18 +776,49 @@ FINDINGS_DATA_OPEN = "<<<НАХОДКИ РЕВЬЮ — ДАННЫЕ, НЕ ИНС
 FINDINGS_DATA_CLOSE = "<<<КОНЕЦ НАХОДОК>>>"
 
 
+async def _report_rows_for_repair(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> list[Any]:
+    """Отчёты, находки которых получит исполнитель круга починки (#1783).
+
+    Отчёты ТЕКУЩЕГО поколения; а если отчёта по нему нет вовсе (пересдача того
+    же коммита, ревью не заказывалось), — последнего поколения с отчётом, но
+    только при той же вершине: код тот же, и находки по-прежнему про него.
+    Чистый свежий отчёт текущего поколения наследование прекращает: он есть,
+    просто без находок (``finding_outcome.reports_owed_an_answer`` читает так
+    же).
+    """
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
+    if rows:
+        return list(rows)
+    reviewed = await repo.latest_reviewed_generation(db, task_id, generation)
+    if reviewed is None or reviewed == generation:
+        return []
+    current = await repo.get_submission(db, task_id, generation)
+    earlier = await repo.get_submission(db, task_id, reviewed)
+    tip = (dict(current)["sha"] if current else "") or str(
+        task.get("submission_sha") or ""
+    )
+    if not tip or earlier is None or dict(earlier)["sha"] != tip:
+        return []
+    return list(await repo.machine_reviews_of_generation(db, task_id, reviewed))
+
+
 async def _current_findings(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[dict[str, str]]:
     """Подтверждённые и неразрешённые находки последнего отчёта текущей сдачи.
 
     uid берутся из ``MachineReviewView`` — тем же вычислением, что у брифа
-    ревью, иначе исходы в пересдаче не совпали бы с находками.
+    ревью, иначе исходы в пересдаче не совпали бы с находками. Отчёт —
+    ``_report_rows_for_repair``: текущего поколения или, если его нет, прошлого
+    при той же вершине (#1783).
     """
     from hub.models import MachineReviewView
 
-    generation = int(task.get("submission_generation") or 0)
-    rows = await repo.machine_reviews_of_generation(db, int(task["id"]), generation)
+    rows = await _report_rows_for_repair(db, task)
     if not rows:
         return []
     view = MachineReviewView(**dict(rows[-1]))
@@ -824,19 +866,98 @@ def _findings_block(findings: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+async def _holderless_running_refusal(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str:
+    """Почему running-задачу нельзя отдать кругу починки; пусто — можно (#1783).
+
+    После changes_requested задача стоит в running; круг ей доступен, только
+    когда за ней нет НИ ОДНОГО признака работы (тот же набор, что у возврата
+    из running, ``return_running.work_signs``). Это чтение для карточки и
+    быстрого отказа; решение принимается заново под write-локом в ``_admit``.
+    """
+    from hub.services.return_running import work_signs
+
+    signs = await work_signs(db, task)
+    if not signs:
+        return ""
+    named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
+    return f"у задачи есть признаки работы: {named}"
+
+
+async def repair_state(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[bool, str]:
+    """``(кнопка видна, причина)`` для круга починки (#1444, #1783).
+
+    Причина непуста, только когда круг по смыслу уместен (есть прогоны
+    исполнителя, ручной режим, задача после вердикта), но кнопки нет.
+    """
+    from hub.services.lifecycle import RETURN_TO_WORK_STATUSES
+
+    status = task.get("status")
+    if status not in RETURN_TO_WORK_STATUSES | {"open", "running"}:
+        return False, ""
+    policy = await project_policy.gate_policy_for_task(db, int(task["id"]))
+    if launch_mode_of(policy) != LAUNCH_MANUAL:
+        return False, ""
+    if not await repo.list_executor_runs(db, int(task["id"])):
+        return False, ""
+    if status == "running":
+        busy = await _holderless_running_refusal(db, task)
+        if busy:
+            return False, busy
+    if not await _current_findings(db, task):
+        return False, REASON_NO_FINDINGS
+    return True, ""
+
+
 async def repair_offered(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
     """Показывать ли кнопку повторного прогона (#1444): те же условия, что
     допуск, кроме платных проверок (бюджет и прочее проверит нажатие)."""
+    return (await repair_state(db, task))[0]
+
+
+async def _repair_early_refusal(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> LaunchResult | None:
+    """Отказы круга починки, известные до платных проверок: статус, прогоны,
+    не лист, идущий прогон, признаки работы у running (#1444, #1783)."""
     from hub.services.lifecycle import RETURN_TO_WORK_STATUSES
 
-    if task.get("status") not in RETURN_TO_WORK_STATUSES | {"open"}:
-        return False
-    policy = await project_policy.gate_policy_for_task(db, int(task["id"]))
-    if launch_mode_of(policy) != LAUNCH_MANUAL:
-        return False
-    if not await repo.list_executor_runs(db, int(task["id"])):
-        return False
-    return bool(await _current_findings(db, task))
+    task_id = int(task["id"])
+    if task["status"] not in RETURN_TO_WORK_STATUSES | {"open", "running"}:
+        return _refused(
+            f"{REASON_NOT_RETURNABLE}: статус {task['status']}, нужен review, "
+            "fix_requested, running без держателя или open после сорванного круга",
+            task_id,
+        )
+    if not await repo.list_executor_runs(db, task_id):
+        return _refused(REASON_NO_EXECUTOR_RUN, task_id)
+    not_leaf = await _not_leaf_refusal(db, task)
+    if not_leaf is not None:
+        return not_leaf
+    live = await _live_run(db, task_id)
+    if live:
+        return _refused(live, task_id)
+    if (
+        task["status"] in ("review", "fix_requested")
+        and (task.get("claimed_by") or "").strip()
+    ):
+        # Возврат в работу чужого ручного захвата кнопкой не делается: держатель с
+        # доказательством закончившегося прогона отпустит себя сам (#1783).
+        from hub.services import run_claim
+
+        if await run_claim.finished_run_of(db, task) is None:
+            return _refused(
+                f"{REASON_NOT_RETURNABLE}: задачу держит {task['claimed_by']}", task_id
+            )
+    if task["status"] == "running":
+        # Быстрый отказ с причиной; решающая проверка — под write-локом в _admit.
+        busy = await _holderless_running_refusal(db, task)
+        if busy:
+            return _refused(f"{REASON_NOT_RETURNABLE}: {busy}", task_id)
+    return None
 
 
 async def repair_executor(
@@ -853,7 +974,7 @@ async def repair_executor(
     ``return_to_work`` (#1356), заказ — тот же путь, что у первого запуска.
     """
     from hub.models import TaskReturnToWork
-    from hub.services.lifecycle import RETURN_TO_WORK_STATUSES, return_to_work
+    from hub.services.lifecycle import return_to_work
 
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -865,20 +986,9 @@ async def repair_executor(
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
         return LaunchResult(False, ready.reason, task_id)
-    if task["status"] not in RETURN_TO_WORK_STATUSES | {"open"}:
-        return _refused(
-            f"{REASON_NOT_RETURNABLE}: статус {task['status']}, нужен review, "
-            "fix_requested или open после сорванного круга",
-            task_id,
-        )
-    if not await repo.list_executor_runs(db, task_id):
-        return _refused(REASON_NO_EXECUTOR_RUN, task_id)
-    not_leaf = await _not_leaf_refusal(db, task)
-    if not_leaf is not None:
-        return not_leaf
-    live = await _live_run(db, task_id)
-    if live:
-        return _refused(live, task_id)
+    early = await _repair_early_refusal(db, task)
+    if early is not None:
+        return early
     findings = await _current_findings(db, task)
     if not findings:
         return _refused(REASON_NO_FINDINGS, task_id)
@@ -887,9 +997,10 @@ async def repair_executor(
         await db.commit()
         return refusal
 
-    if task["status"] != "open":
+    if task["status"] not in ("open", "running"):
         # open — задача уже возвращена прошлым нажатием, чей заказ сорвался:
-        # возвращать нечего, круг повторяется той же кнопкой.
+        # возвращать нечего, круг повторяется той же кнопкой. running без
+        # держателя возвращается внутри брони (#1783), не здесь.
         try:
             await return_to_work(
                 db,
@@ -916,8 +1027,13 @@ async def repair_executor(
         live = await _live_run(db, task_id)
         return (None, live) if live else (task_id, "")
 
+    async def _admit(db: aiosqlite.Connection, fresh: dict[str, Any]) -> str:
+        return await _admit_rework(db, fresh, issuer)
+
     model = config.EXECUTOR_MODEL.strip()
-    reserved = await _reserve(db, project, issuer_principal_id, model, _this_task)
+    reserved = await _reserve(
+        db, project, issuer_principal_id, model, _this_task, admit=_admit
+    )
     if isinstance(reserved, LaunchResult):
         return reserved
     return await _order(
@@ -928,6 +1044,45 @@ async def repair_executor(
         extra=_findings_block(findings),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
     )
+
+
+async def _admit_rework(
+    db: aiosqlite.Connection, task: dict[str, Any], issuer: str
+) -> str:
+    """Допуск и возврат running-задачи без держателя — под write-локом брони (#1783).
+
+    Всё перечитано внутри транзакции ``_reserve``: статус, держатель, признаки
+    работы и идущий прогон (бронь соседнего нажатия или чужой claim, пришедшие
+    после быстрой проверки, видны здесь). Возврат running → open и INSERT брони
+    — одна транзакция: проигравшему гонку платный исполнитель не покупается, а
+    задача не остаётся open без исполнителя. Сетевой заказ — после коммита
+    (#1428). Пустая строка — допуск.
+    """
+    from hub.services import return_running
+
+    if task["status"] == "open":
+        return ""
+    if task["status"] != "running":
+        # Под локом задачу успели взять или сдвинуть: бронь не покупается
+        # поверх чужого захвата.
+        return f"{REASON_NOT_RETURNABLE}: статус {task['status']} под локом брони"
+    live = await _live_run(db, int(task["id"]))
+    if live:
+        return live
+    signs = await return_running.work_signs(db, task)
+    if signs:
+        named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
+        return f"{REASON_NOT_RETURNABLE}: у задачи есть признаки работы: {named}"
+    await return_running.apply_return_to_open(
+        db,
+        task,
+        actor=issuer,
+        reason=(
+            f"круг починки облачным исполнителем по находкам сдачи "
+            f"{task.get('submission_generation')} (#1444, #1783), нажал {issuer}"
+        ),
+    )
+    return ""
 
 
 # ---- #1445 (F5.3): прогон «слей базу и пересдай» ----

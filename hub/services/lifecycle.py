@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -20,6 +21,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    empty_resubmission_detail,
     archive_active_work_detail,
     claim_area_conflict_detail,
     submission_contract_violated_detail,
@@ -69,7 +71,7 @@ from hub.services.project_policy import (
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
-from hub.services import finding_outcome, verdict_guard
+from hub.services import finding_outcome, resubmission_guard, verdict_guard
 from hub.services import ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
@@ -1881,6 +1883,7 @@ async def _pair_start_write(
     declared_session: str,
     starting_status: str,
     project_guard: SessionProjectGuard,
+    session_token: str = "",
 ) -> PairGitMode:
     """Plan, branch and the transition to running, up to the commit (#1433).
 
@@ -1955,6 +1958,11 @@ async def _pair_start_write(
             f"Task #{task_id} left {starting_status!r} during pair-start; "
             "retry from its current status",
         )
+    # #1783: не поверх брони прогона хаба; свой прогон звонящего не мешает.
+    from hub.services import chat_pair, run_claim
+
+    caller_run = await chat_pair.run_of_session(db, session_token, task_id)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
     if body.plan:
         await repo.add_task_update(
             db,
@@ -1977,6 +1985,15 @@ async def _pair_start_write(
             409,
             f"Task #{task_id} left {starting_status!r} during pair-start; "
             "retry from its current status",
+        )
+    if starting_status == "open":
+        # #1783: pair-start из open — единственный захват этой задачи, и
+        # доказательство прогона пишется здесь. Из claimed оно уже записано
+        # claim'ом; None у ручного старта стирает чужой хвост.
+        update_fields["executor_run_id"] = caller_run
+        update_fields["claim_nonce"] = secrets.token_hex(8)
+        await chat_pair.bind_claim(
+            db, session_token, task_id, update_fields["claim_nonce"]
         )
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
@@ -2118,6 +2135,7 @@ async def pair_start_task(
             declared_session=declared_session,
             starting_status=starting_status,
             project_guard=project_guard,
+            session_token=session_token if caller_is_agent else "",
         )
     # #1683: навык, уже лежащий в заказе ВЫЗЫВАЮЩЕЙ сессии, второй раз не
     # выдаётся. Слой собирается здесь, чтобы факт выдачи лёг в то же событие.
@@ -3102,6 +3120,21 @@ async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
         state.same_sha_noop = True
 
 
+async def _step_empty_resubmission(state: SubmitContext) -> None:
+    """Пересдача без новых коммитов после «на доработку» отказана (#1783)."""
+    if not state.body.finding_outcomes and resubmission_guard.empty_resubmission_of(
+        state.task, state.submission_sha
+    ):
+        raise HTTPException(
+            422,
+            detail=empty_resubmission_detail(
+                task_id=state.task_id,
+                sha=state.submission_sha,
+                generation=int(state.task.get("submission_generation") or 0),
+            ),
+        )
+
+
 async def _step_delivery_pr(state: SubmitContext) -> None:
     """PR, который повезёт работу (#605, #967, #975)."""
     # #605: record which PR carries this work. The pair flow never sets
@@ -3192,6 +3225,9 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
         _step_same_sha_from_review_is_current,
         refuses=False,
     ),
+    # #1783: после same_sha — из review тот же sha остаётся no-op; здесь только
+    # running после changes_requested. До изменчивых гейтов: отказ без записей.
+    Step("empty_resubmission", _step_empty_resubmission),
 )
 
 SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
@@ -3830,6 +3866,20 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
+        # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
+        live = dict(await repo.get_task(db, task_id) or task)
+        if not body.finding_outcomes and resubmission_guard.empty_resubmission_of(
+            live, submission_sha
+        ):
+            raise HTTPException(
+                422,
+                detail=empty_resubmission_detail(
+                    task_id=task_id,
+                    sha=submission_sha,
+                    generation=int(live.get("submission_generation") or 0),
+                ),
+            )
         # #1687: the CI gates decided before the lock; a report accepted since
         # then withdrew the evidence. They are asked again here, of the database.
         await ci_trust.recheck_in_transaction(
@@ -4766,6 +4816,13 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
                 await repo.update_task(
                     db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
                 )
+                # #1783: захват, который держал закончившийся прогон хаба, не
+                # ждёт TTL — задача остаётся в running без держателя, и круг
+                # починки её видит. Доказательство — executor_run_id, не пустое
+                # claimed_by; живая работа и живые сессии освобождение блокируют.
+                from hub.services import run_claim
+
+                await run_claim.release_for_rework(db, task_id)
                 # #451 restored the workspace to base on submit; on rework put it
                 # back on the task branch so fixes don't land on local base (#457).
                 await _try_switch_pair_workspace_to_task(db, task_id)
@@ -4820,12 +4877,17 @@ async def _claim_write(
     task_id: int,
     body: TaskClaim,
     implementer_principal_id: int | None,
+    session_token: str = "",
 ) -> TaskView | None:
     """The claim's transition and fields, up to the commit (#1433).
 
     Runs inside ``capture_areas``: the area hold lasts until this commit.
     Returns the view when a concurrent claim of the same holder won the race.
     """
+    from hub.services import chat_pair, run_claim
+
+    caller_run = await chat_pair.run_of_session(db, session_token, task_id)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):
@@ -4849,6 +4911,12 @@ async def _claim_write(
         claim_fields["git_mode"] = PairGitMode.remote.value
     if implementer_principal_id is not None:
         claim_fields["implementer_principal_id"] = implementer_principal_id
+    # #1783: прогон хаба, доказавший токеном вызывающей сессии, что берёт
+    # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
+    # чужой прежний executor_run_id у нового держателя не остаётся.
+    claim_fields["executor_run_id"] = caller_run
+    claim_fields["claim_nonce"] = secrets.token_hex(8)
+    await chat_pair.bind_claim(db, session_token, task_id, claim_fields["claim_nonce"])
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when
@@ -4872,6 +4940,7 @@ async def claim_task(
     *,
     implementer_principal_id: int | None = None,
     caller_is_agent: bool = False,
+    session_token: str = "",
 ) -> TaskView:
     """Claim an open task for a single Cursor agent/session.
 
@@ -4928,7 +4997,7 @@ async def claim_task(
         db, task_id, task["status"], project_guard=project_guard
     ) as area_check:
         won_by_same_holder = await _claim_write(
-            db, task_id, body, implementer_principal_id
+            db, task_id, body, implementer_principal_id, session_token
         )
     if won_by_same_holder is not None:
         await project_guard.abort(db)
@@ -4956,6 +5025,9 @@ async def release_task(
     body: TaskRelease,
 ) -> TaskView:
     """Release an active claim and return the task to open."""
+    # Write-лок до проверки держателя: иначе между проверкой и переходом задачу
+    # успевали отпустить и взять заново, и новый захват снимался (#1783).
+    await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -4977,6 +5049,16 @@ async def release_task(
         raise HTTPException(
             409,
             f"Task #{task_id} claim session mismatch",
+        )
+    from hub.services import chat_pair as _chat_pair
+
+    if not body.session_id and await _chat_pair.claim_is_session_bound(
+        db, task.get("claim_nonce")
+    ):
+        # Захват сессии implementer снимает только она (#1783): имя агента в
+        # запросе без session_id чужую сессию той же роли не заменяет.
+        raise HTTPException(
+            409, f"Task #{task_id}: claim is held by a session; pass its session_id"
         )
 
     if not await repo.transition_status_if(
@@ -5748,6 +5830,8 @@ async def prepare_ci_standing(
         await ci_trust.refresh_quietly(db, task_id, sha)
     fresh = dict(await repo.get_task(db, task_id) or task)
     fresh[PREPARED_CI_SHA] = tip
+    # git-факты для guard пустой пересдачи — тоже до транзакции (#1783).
+    fresh.update(await resubmission_guard.collect_git_facts(db, fresh))
     return fresh
 
 
@@ -5821,8 +5905,9 @@ async def _task_inside_transaction(
 ) -> dict[str, Any]:
     """The task as the database holds it NOW, with what the caller prepared kept."""
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
-    if PREPARED_CI_SHA in task:
-        fresh[PREPARED_CI_SHA] = task[PREPARED_CI_SHA]
+    for key in (PREPARED_CI_SHA, resubmission_guard.UNCOMMITTED_KEY):
+        if key in task:
+            fresh[key] = task[key]
     return fresh
 
 

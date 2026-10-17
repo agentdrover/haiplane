@@ -379,6 +379,7 @@ async def _return_task(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
         db,
         int(order["task_id"]),
         holders=frozenset(int(r[0]) for r in holders),
+        session_runs=frozenset({int(order["executor_run_id"])}),
         from_status=status,
         note=f"Заказ хосту {order['host']} закрыт, исполнитель потерян; "
         "задача возвращена в open.",
@@ -427,6 +428,14 @@ async def close_order(
         "WHERE id = ? AND outcome = 'running'",
         (run_outcome, f"заказ хосту закрыт: {reason}", int(order["executor_run_id"])),
     )
+    if reason == CLOSE_SUBMITTED:
+        # #1783: принятая сдача слота снимает захват её прогона в этой же
+        # транзакции — сессии отозваны, слот закрыт, статус review не тронут.
+        from hub.services import run_claim
+
+        await run_claim.release_after_run_closed(
+            db, int(order["executor_run_id"]), why=reason
+        )
     if return_task:
         await _return_task(db, order)
     await admin_svc.write_audit(
@@ -594,6 +603,17 @@ async def _task_refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     not_leaf = await el._not_leaf_refusal(db, task)
     if not_leaf is not None:
         return not_leaf.reason
+    # Живая сессия implementer на задаче (ручной код выкуплен раньше) — второй
+    # исполнитель на той же ветке: заказ не выдаётся, выкуп кода был бы отказан
+    # (#1783, k8), и обе стороны ждали бы друг друга до TTL.
+    if await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+        "AND bound_task_id = ? AND revoked_at IS NULL "
+        "AND expires_at > datetime('now')",
+        (task_id,),
+    ):
+        return f"{el.REASON_ALREADY_RUNNING} #{task_id} (живая сессия implementer)"
     return await el._live_run(db, task_id)
 
 

@@ -2861,6 +2861,12 @@ async def _web_task_detail_page(
     executor_runs, repair_offered, merge_offered = await _card_executor_offers(
         db, task_id, row
     )
+    repair_reason = ""
+    if executor_runs and not repair_offered:
+        from hub.services.executor_launch import repair_state
+
+        # #1783: кнопки нет — карточка называет причину (живая работа, нет находок).
+        repair_reason = (await repair_state(db, dict(row)))[1]
     finding_touch = await _card_finding_touch(db, task_id, machine_review)
     delivery = await _card_delivery(db, task_id, task, state_card)
     change_map = await _card_change_map(
@@ -2903,6 +2909,7 @@ async def _web_task_detail_page(
             "steward_judgement": steward_judgement,
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
+            "repair_reason": repair_reason,
             "merge_offered": merge_offered,
             # #1712: хосты, на которые карточка open-задачи предлагает запуск.
             "slot_hosts": await card_hosts(db, task_id)

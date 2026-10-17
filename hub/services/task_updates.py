@@ -32,7 +32,8 @@ from hub.models import TaskUpdateCreate, TaskUpdateView
 from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
-from hub.services import prevention_gate
+from hub.services.resubmission_guard import stop_empty_done
+from hub.services import chat_pair, prevention_gate
 
 log = logging.getLogger("hub")
 
@@ -142,6 +143,9 @@ async def _route_pending_report(
 ) -> None:
     """done на pending_report: в review (Universal Review Gate) или сразу completed."""
     task_id = int(task["id"])
+    # #1783: и этот вход — сдача; пустую пересдачу после «на доработку» не пускаем.
+    if await stop_empty_done(db, task):
+        return
     # #1155: на ЭТОМ маршруте конвейер гейтов не доезжает — обе ветки уходят из
     # pending_report сами, не зовя transition_after_agent_done. Сказать о
     # находках, на которые отчёт не ответил, больше некому. Перед развилкой, а
@@ -185,7 +189,7 @@ async def _route_pending_report(
 
 
 async def _route_pair_or_claimed(
-    db: aiosqlite.Connection, task: dict[str, Any]
+    db: aiosqlite.Connection, task: dict[str, Any], agent: str = ""
 ) -> None:
     """done на running/claimed без job: общий post-done переход, блокер, очистка claim.
 
@@ -194,7 +198,17 @@ async def _route_pair_or_claimed(
     branch — transition_after_agent_done then routes it to completed.
     """
     task_id = int(task["id"])
-    was_claimed = task["status"] == "claimed"
+    # Захват снимает отчёт его держателя; чужой done (старая сессия, другой агент)
+    # чужой захват не трогает. Захват прогона хаба (executor_run_id) отчёт не
+    # снимает вовсе: его, вместе с сессиями и слотом, снимает закрытие прогона
+    # (#1783), иначе доказательство ушло бы раньше, чем прогон закроется.
+    holder = (task.get("claimed_by") or "").strip()
+    proven = task.get("executor_run_id") is not None
+    was_claimed = task["status"] == "claimed" and holder in ("", agent) and not proven
+    if was_claimed and await chat_pair.claim_is_session_bound(
+        db, task.get("claim_nonce")
+    ):
+        was_claimed = False  # захват сессии: имя в отчёте её не доказывает
     updates_list = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а не любой в
     # истории. Снятое препятствие больше не уводит сдачу мимо доставки, а
@@ -222,10 +236,12 @@ async def _route_done(
     # the task is blocked while the current validation run is red/absent. Only
     # completion-bound reports are gated; the poller path is not affected.
     await lc._done_validation_gate(db, task)
+    if body.finding_outcomes:  # ответ на находки — не пустая пересдача (#1783)
+        task = {**task, "_answered_findings": True}
     if task["status"] == "pending_report":
         await _route_pending_report(db, task, body)
     elif task["status"] in ("running", "claimed") and not task.get("job_id"):
-        await _route_pair_or_claimed(db, task)
+        await _route_pair_or_claimed(db, task, (body.agent or "").strip())
     # open + done without pair-start: rejected before insert (AC-2)
 
 
