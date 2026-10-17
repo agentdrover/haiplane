@@ -11,6 +11,9 @@ make loud.
 
 from __future__ import annotations
 
+import re
+
+import pytest
 from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
@@ -892,6 +895,118 @@ def test_the_number_of_parts_is_set_once_by_the_matrix() -> None:
 # ---- #1796: the deploy condition survives a skipped ancestor -------------------
 
 
+_TOKEN = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<op>==|!=|&&|\|\||[()!])"
+    r"|(?P<name>[A-Za-z_][\w.-]*(?:\(\))?))"
+)
+_STATUS_CALLS = ("success()", "failure()", "cancelled()", "always()")
+
+
+def _tokenize(text: str) -> list[tuple[str, str]]:
+    """Condition text -> (kind, value); anything GitHub could read otherwise raises."""
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(text):
+        if not text[pos:].strip():
+            break
+        match = _TOKEN.match(text, pos)
+        if match is None:
+            raise ValueError(f"unsupported syntax at {text[pos:]!r}")
+        kind = match.lastgroup or ""
+        value = match.group(kind)
+        if kind == "str":
+            value = value[1:-1].replace("''", "'")
+        tokens.append((kind, value))
+        pos = match.end()
+    return tokens
+
+
+def _number(value: object) -> float:
+    """GitHub's loose-equality coercion of a non-matching pair to a number."""
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        return float(value) if str(value).strip() else 0.0  # type: ignore[arg-type]
+    except ValueError:
+        return float("nan")
+
+
+def _loosely_equal(left: object, right: object) -> bool:
+    if isinstance(left, str) and isinstance(right, str):
+        return left.lower() == right.lower()  # GitHub compares strings ignoring case
+    if isinstance(left, bool) and isinstance(right, bool):
+        return left == right
+    return _number(left) == _number(right)  # NaN never equals anything
+
+
+class _Condition:
+    """GitHub precedence: ``!`` over ``==``/``!=`` over ``&&`` over ``||``."""
+
+    def __init__(self, tokens, env: dict[str, object], calls: dict[str, bool]) -> None:
+        self.tokens, self.env, self.calls, self.at = tokens, env, calls, 0
+        self.status_called = False
+
+    def peek(self) -> tuple[str, str]:
+        return self.tokens[self.at] if self.at < len(self.tokens) else ("end", "")
+
+    def take(self) -> tuple[str, str]:
+        token = self.peek()
+        self.at += 1
+        return token
+
+    def parse(self) -> object:
+        value = self.or_()
+        if self.peek()[0] != "end":
+            raise ValueError(f"unexpected {self.peek()[1]!r}")
+        return value
+
+    def or_(self) -> object:
+        value = self.and_()
+        while self.peek() == ("op", "||"):
+            self.take()
+            right = self.and_()  # both sides read: an unknown name must raise
+            value = value if value else right
+        return value
+
+    def and_(self) -> object:
+        value = self.equality()
+        while self.peek() == ("op", "&&"):
+            self.take()
+            right = self.equality()
+            value = right if value else value
+        return value
+
+    def equality(self) -> object:
+        value = self.unary()
+        while self.peek()[1] in ("==", "!=") and self.peek()[0] == "op":
+            equal = self.take()[1] == "=="
+            same = _loosely_equal(value, self.unary())
+            value = same if equal else not same
+        return value
+
+    def unary(self) -> object:
+        if self.peek() == ("op", "!"):
+            self.take()
+            return not self.unary()
+        return self.primary()
+
+    def primary(self) -> object:
+        kind, value = self.take()
+        if kind == "str":
+            return value  # a literal is a string, never a call or a name
+        if kind == "op" and value == "(":
+            inner = self.or_()
+            if self.take() != ("op", ")"):
+                raise ValueError("unclosed parenthesis")
+            return inner
+        if kind == "name" and value in _STATUS_CALLS:
+            self.status_called = True
+            return self.calls[value]
+        if kind == "name" and value in self.env:
+            return self.env[value]
+        raise ValueError(f"unsupported name {value!r}")
+
+
 def _job_condition_holds(
     condition: str,
     job: str,
@@ -903,14 +1018,13 @@ def _job_condition_holds(
 ) -> bool:
     """Evaluate a job-level ``if`` the way GitHub does, over the real job graph.
 
-    Supports github.event_name, github.ref, needs.<job>.result, cancelled(),
-    success() and ``!``, ``&&``, ``||``, ``==``, ``!=``. A condition with no
-    status function gets an implicit success(): every transitive ancestor in
-    ``needs`` must have the result "success" (a skipped one makes it false).
-    Unknown names raise instead of being guessed.
+    Supported subset (#1800): single-quoted literals; github.event_name,
+    github.ref, needs.<job>.result; success()/failure()/cancelled()/always();
+    ``!``, ``==``, ``!=``, ``&&``, ``||`` and parentheses, with GitHub's
+    precedence and case-insensitive string comparison. Anything else raises.
+    A condition with no status function gets an implicit success(): every
+    transitive ancestor in ``needs`` must have the result "success".
     """
-    import re
-
     jobs = _doc()["jobs"]
 
     def ancestors(name: str) -> set[str]:
@@ -921,43 +1035,26 @@ def _job_condition_holds(
             found |= ancestors(parent)
         return found
 
-    def success() -> bool:
-        return all(results[a] == "success" for a in ancestors(job))
-
+    needs = jobs[job].get("needs", [])
+    direct = {needs} if isinstance(needs, str) else set(needs)
+    parents = ancestors(job)
+    success = all(results[a] == "success" for a in parents)
+    env: dict[str, object] = {"github.event_name": event, "github.ref": ref}
+    # GitHub puts only the DIRECT dependencies into the needs context
+    env.update({f"needs.{name}.result": results[name] for name in direct})
+    calls = {
+        "success()": success,
+        "failure()": any(results[a] == "failure" for a in parents),
+        "cancelled()": cancelled,
+        "always()": True,
+    }
     text = condition.strip()
     if text.startswith("${{"):
         assert text.endswith("}}"), condition
         text = text[3:-2]
-    has_status = bool(re.search(r"\b(?:success|failure|always|cancelled)\(\)", text))
-    names: dict[str, str] = {}
-
-    def literal(match: re.Match[str]) -> str:
-        names[f"s{len(names)}"] = match.group(0)[1:-1]
-        return f"s{len(names) - 1}"
-
-    code = re.sub(r"'[^']*'", literal, text)
-
-    def need(match: re.Match[str]) -> str:
-        names[f"n{len(names)}"] = results[match.group(1)]
-        return f"n{len(names) - 1}"
-
-    code = re.sub(r"needs\.([\w-]+)\.result", need, code)
-    values = {"github.event_name": event, "github.ref": ref}
-    for key, value in values.items():
-        code = code.replace(key, f"v{len(names)}")
-        names[f"v{len(names)}"] = value
-    code = code.replace("success()", " ok ").replace("cancelled()", " was_cancelled ")
-    code = code.replace("&&", " and ").replace("||", " or ")
-    code = re.sub(r"!(?!=)", " not ", code)
-    leftover = re.sub(
-        r"\b(?:s|n|v)\d+\b|\b(?:ok|was_cancelled|and|or|not)\b|==|!=|[()\s]",
-        "",
-        code,
-    )
-    assert leftover == "", f"unexpected syntax {leftover!r} in {condition!r}"
-    scope = {**names, "ok": success(), "was_cancelled": cancelled}
-    value = bool(eval(code, {"__builtins__": {}}, scope))  # noqa: S307  # nosec B307
-    return value if has_status else (success() and value)
+    parser = _Condition(_tokenize(text), env, calls)
+    value = bool(parser.parse())
+    return value if parser.status_called else (success and value)
 
 
 def _deploy_cases(condition: str) -> dict[str, bool]:
@@ -1007,3 +1104,55 @@ def test_the_pre_1796_condition_skipped_the_deploy() -> None:
     """Вычислитель видит дефект: старое условие даёт False в главном случае."""
     old = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     assert _deploy_cases(old)["push_main_skipped_evidence"] is False
+
+
+# ---- #1800: the evaluator refuses what GitHub would not mean ------------------
+
+_OK = {"treedup": "success", "pytest": "success", "evidence": "success"}
+
+
+def _eval(condition: str, test: str = "success", ancestors=None, **kw) -> bool:
+    results = {**(ancestors or _OK), "test": test}
+    kw.setdefault("event", "push")
+    kw.setdefault("ref", "refs/heads/main")
+    return _job_condition_holds(condition, "deploy", results, **kw)
+
+
+def test_the_job_condition_evaluator_refuses_what_github_would_not_mean() -> None:
+    """AC-2 (#1800): unknown names, literals-as-calls, ! priority, string case."""
+    # an unknown identifier is an error, not a Python variable
+    for name in ("ok", "was_cancelled", "s0", "os", "__import__"):
+        with pytest.raises(ValueError):
+            _eval(f"{name} && success()")
+    with pytest.raises(ValueError):
+        _eval("github.sha == 'x'")
+    with pytest.raises(ValueError):
+        _eval("success() && needs.pytest.result == 'success'")  # not a direct need
+    with pytest.raises(ValueError):
+        _eval("success() ? 1 : 2")
+    with pytest.raises(ValueError):
+        _eval("(success()")
+
+    # a literal is text: it neither calls cancelled() nor lifts the implicit
+    # success(), so a skipped ancestor still makes the job false
+    skipped = {**_OK, "evidence": "skipped"}
+    assert _eval("'cancelled()' == 'cancelled()'", ancestors=skipped) is False
+    assert _eval("'cancelled()' == 'cancelled()'") is True
+    assert _eval("'success()'", ancestors=skipped) is False
+
+    # `!` binds tighter than `==`: (!needs.test.result) == 'failure' is
+    # false == 'failure', which GitHub reads as 0 == NaN, so false
+    mixed = "!cancelled() && !needs.test.result == 'failure'"
+    assert _eval(mixed, test="success") is False
+    assert _eval(mixed, test="failure") is False
+    assert _eval("!(needs.test.result == 'failure')", test="success") is True
+    assert _eval("!cancelled() && !needs.test.result == 'x'", test="x") is False
+
+    # strings compare without regard to case
+    assert _eval("github.ref == 'REFS/HEADS/MAIN'") is True
+    assert _eval("github.ref != 'REFS/HEADS/MAIN'") is False
+
+    # `&&` over `||`, and a status function leaves no implicit success()
+    assert _eval("!always() || success()") is True
+    assert _eval("always()", test="failure", ancestors=skipped) is True
+    assert _eval("failure()", test="failure") is True
