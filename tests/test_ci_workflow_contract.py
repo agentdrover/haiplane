@@ -1035,10 +1035,13 @@ def _job_condition_holds(
             found |= ancestors(parent)
         return found
 
+    needs = jobs[job].get("needs", [])
+    direct = {needs} if isinstance(needs, str) else set(needs)
     parents = ancestors(job)
     success = all(results[a] == "success" for a in parents)
     env: dict[str, object] = {"github.event_name": event, "github.ref": ref}
-    env.update({f"needs.{name}.result": results[name] for name in parents})
+    # GitHub puts only the DIRECT dependencies into the needs context
+    env.update({f"needs.{name}.result": results[name] for name in direct})
     calls = {
         "success()": success,
         "failure()": any(results[a] == "failure" for a in parents),
@@ -1123,6 +1126,8 @@ def test_the_job_condition_evaluator_refuses_what_github_would_not_mean() -> Non
             _eval(f"{name} && success()")
     with pytest.raises(ValueError):
         _eval("github.sha == 'x'")
+    with pytest.raises(ValueError):
+        _eval("success() && needs.pytest.result == 'success'")  # not a direct need
     with pytest.raises(ValueError):
         _eval("success() ? 1 : 2")
     with pytest.raises(ValueError):
