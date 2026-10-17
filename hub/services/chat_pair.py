@@ -581,7 +581,9 @@ async def _spend_code(
     if not cursor.rowcount:
         await db.rollback()
         return None
-    if row.get("channel") == "slot":
+    if row.get("channel") == "slot" or (
+        kind == "implementer" and row.get("executor_run_id") is None
+    ):
         from hub.services import run_claim
 
         # Под write-локом этого выкупа: код слота не отдаётся, если задача уже занята

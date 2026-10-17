@@ -1518,6 +1518,21 @@ async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
     order3 = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == third]
     assert (await _redeem(w, _code_of(w, order3[0]))).status_code >= 400
 
+    # ручной implementer-код поверх выданного заказа слоту: выкупает первый, второй отказан
+    await _free_host()
+    fourth = await _task(w, "k8: порядок 4")
+    assert (await _launch(w, fourth)).status_code == 200
+    manual_code = await w.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": fourth},
+        headers={**w.human_auth, "x-forwarded-for": "203.0.113.55"},
+    )
+    assert manual_code.status_code == 200, manual_code.text
+    manual = await _redeem(w, manual_code.json()["code"])
+    assert manual.status_code >= 400, "ручной код не встаёт поверх заказа слоту"
+    order4 = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == fourth]
+    assert (await _redeem(w, _code_of(w, order4[0]))).status_code == 200
+
 
 async def test_k8_two_connections_redeem_and_claim_leave_one_executor(
     world,  # noqa: F811
@@ -1617,4 +1632,46 @@ async def test_c3_a_run_that_claimed_and_died_returns_the_task_to_open(db, monke
         "open",
         None,
         None,
+    )
+
+
+async def test_c3_finished_without_submission_keeps_its_outcome_when_usage_is_silent(
+    db, monkeypatch
+):
+    """/usage молчит, FINISHED без сдачи: по выходу срока цены строка закрывается тем же
+    _settle — отдельным исходом «закончил без сдачи», а не обычным finished."""
+    from hub.integrations import cursor_cloud
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-no-submission")
+    run = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        agent_id="a",
+        run_id="r",
+        model="m",
+    )
+    await db.commit()
+
+    async def _get_run(agent, run_id):
+        return {"status": "FINISHED"}
+
+    async def _usage(agent, run_id):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since = datetime('now', '-3 hours') "
+        "WHERE id = ?",
+        (run,),
+    )
+    await db.commit()
+    await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+    await db.commit()
+    assert (
+        dict(await repo.get_executor_run(db, run))["outcome"]  # type: ignore[arg-type]
+        == ed.OUTCOME_FINISHED_WITHOUT_SUBMISSION
     )

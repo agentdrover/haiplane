@@ -170,15 +170,9 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         if done is not None and await repo.wait_for_executor_cost(
             db, row["id"], config.EXECUTOR_COST_WAIT_MIN
         ):
-            await repo.update_executor_run(
-                db,
-                row["id"],
-                outcome=done,
-                reason=REASON_COST_NEVER_CAME.format(
-                    minutes=config.EXECUTOR_COST_WAIT_MIN
-                ),
-                finish=True,
-            )
+            # Срок цены вышел: закрывает тот же _settle, что и при живом /usage, —
+            # со своей классификацией (конец без сдачи — отдельный исход, #1446).
+            await _settle(db, row, run, None, None)
             return
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return

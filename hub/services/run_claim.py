@@ -103,8 +103,19 @@ async def redeem_conflict(db: aiosqlite.Connection, row: dict[str, Any]) -> str:
     второй исполнитель поверх занятой задачи (#1783, k8).
     """
     run_id, task_id = row.get("executor_run_id"), row.get("bound_task_id")
-    if run_id is None or task_id is None:
-        return ""  # ручной код: прежнее поведение
+    if task_id is None:
+        return ""
+    if run_id is None:
+        # Ручной код: поверх выданного, но не выкупленного заказа слоту он встал бы
+        # вторым исполнителем; заказ и ручной код не блокируют друг друга навсегда —
+        # выкупает первый, второй отказан.
+        ordered = await fetchall(
+            db,
+            "SELECT 1 FROM executor_orders WHERE task_id = ? "
+            "AND state IN ('pending', 'delivered')",
+            (int(task_id),),
+        )
+        return "по задаче выдан заказ исполнителю на слот" if ordered else ""
     task = await repo.get_task(db, int(task_id))
     if task is not None and (
         (task["claimed_by"] or "").strip() or (task["claim_session_id"] or "").strip()
