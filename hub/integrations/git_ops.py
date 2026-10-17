@@ -3013,6 +3013,10 @@ class GitOpsIntegration:
             return []
         return parse_porcelain_paths(out or "")
 
+    async def unpushed_commits(self, branch: str, repo: str | None = None) -> int:
+        """Локальные коммиты ветки, которых нет в origin/<ветке> (0 — нет или не прочитать)."""
+        return await _count_commits(f"origin/{branch}..{branch}", repo or _repo_root())
+
     async def branch_diff_paths(
         self,
         branch: str,

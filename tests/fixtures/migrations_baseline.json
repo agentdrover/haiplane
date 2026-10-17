@@ -988,6 +988,22 @@
 "4e46f889 2d05567c 4f8daafa 31623e25 e8f3aba5 5a465051 678e2462 0de9ab18"
 ],
 [
+"add_chat_pair_sess_claim",
+"0361a041 3c58518c dd47890d a441de4f 9732916a f526543d 2db45bdc 5c2e8068"
+],
+[
+"t1783_task_nonce",
+"f342c888 e6bb59e4 d98aa548 d07109bd 264ead8e ab801116 4c4071de 6e23b0dd"
+],
+[
+"t1783_task_run",
+"9c787984 819142cf 9250638e 2be7c35d d324d7ec 007bfcc2 60f23d2a 7709e971"
+],
+[
+"trg_tasks_claim_cleared_drops_run_proof",
+"fab66a4b 662ac110 7753873d db8a662b a0e55893 6a3d21a5 614d16bd 211a1311"
+],
+[
 "idx_events_kind_project",
 "0416a3e8 d7d60053 7b1d568c d14db123 273edfd1 4ccaa9d9 bc1d0afb e935277c"
 ],
@@ -1058,6 +1074,10 @@
 [
 "idx_executor_slots_active",
 "dfea0085 3fdef3c8 d47c3860 c5ffa368 4a110112 bfd1aca4 33f0919b 2eccfebc"
+],
+[
+"t1783_slot_run",
+"b35cd4c6 e7fd1b91 a4037eaa 2d3e6236 57ea6254 7aa50864 47d543d5 1a4b3402"
 ],
 [
 "add_defect_prevention_column",
