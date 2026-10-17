@@ -132,10 +132,12 @@ async def redeem_conflict(db: aiosqlite.Connection, row: dict[str, Any]) -> str:
             return f"задачу уже держит {task['claimed_by'] or 'другая сессия'}"
     others = await fetchall(
         db,
-        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
-        "AND bound_task_id = ? AND revoked_at IS NULL "
-        "AND expires_at > datetime('now') "
-        "AND COALESCE(executor_run_id, -1) <> ?",
+        "SELECT 1 FROM chat_pair_sessions s WHERE s.kind = 'implementer' "
+        "AND s.bound_task_id = ? AND s.revoked_at IS NULL "
+        "AND s.expires_at > datetime('now') "
+        "AND COALESCE(s.executor_run_id, -1) <> ? AND NOT EXISTS ("
+        "  SELECT 1 FROM executor_runs r WHERE r.id = s.executor_run_id "
+        "  AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL))",
         (int(task_id), int(run_id)),
     )
     return "у задачи есть живая сессия другого исполнителя" if others else ""

@@ -847,6 +847,37 @@ async def bind_claim(
         )
 
 
+async def live_session(db: aiosqlite.Connection, token: str, task_id: int) -> bool:
+    """Токен — живая implementer-сессия этой задачи (захват делает сессия, #1783)."""
+    if not token:
+        return False
+    return bool(
+        await fetchall(
+            db,
+            "SELECT 1 FROM chat_pair_sessions WHERE token_hash = ? "
+            "AND kind = 'implementer' AND bound_task_id = ? AND revoked_at IS NULL "
+            "AND expires_at > datetime('now')",
+            (hash_pair_code(token), int(task_id)),
+        )
+    )
+
+
+async def adopt_claim(db: aiosqlite.Connection, token: str, task_id: int) -> None:
+    """Сессия implementer, продолжающая захват (повторный claim, pair-start из claimed,
+    в том числе после claim токеном среды), делает его своим: метка появляется
+    у захвата и записывается в сессию. Захват и так принадлежит этому держателю."""
+    if not await live_session(db, token, task_id):
+        return
+    await db.execute(
+        "UPDATE tasks SET claim_nonce = COALESCE(claim_nonce, ?) WHERE id = ?",
+        (secrets.token_hex(8), int(task_id)),
+    )
+    rows = await fetchall(
+        db, "SELECT claim_nonce FROM tasks WHERE id = ?", (int(task_id),)
+    )
+    await bind_claim(db, token, task_id, str(rows[0]["claim_nonce"]))
+
+
 async def claim_is_session_bound(db: aiosqlite.Connection, nonce: str | None) -> bool:
     """Захват сделан сессией implementer (в ней записана его метка, #1783).
 
@@ -1071,7 +1102,7 @@ async def return_task_to_open(
     event_kind: str,
     holders: frozenset[int] | None = None,
     session_runs: frozenset[int | None] | None = None,
-    session_marks: frozenset[tuple[int | None, str | None]] | None = None,
+    session_claim: bool = False,
 ) -> bool:
     """Put a pair task whose implementer is gone back to open; no commit.
 
@@ -1104,14 +1135,12 @@ async def return_task_to_open(
     # после release и уже снятый run_claim чужой сессией не освобождаются.
     if session_runs is not None and rows[0]["executor_run_id"] not in session_runs:
         return False
-    # Сессия отдаёт только тот захват, который сама сделала: ПАРА (прогон, метка
-    # захвата) одной и той же сессии совпадает с задачей. Метка NULL — сессия
-    # задачу не брала (в том числе сессия до этой записи); раздельные множества
-    # прогонов и меток сопоставили бы разные сессии (#1783, круг 3).
-    if session_marks is not None:
-        mark = (rows[0]["executor_run_id"], rows[0]["claim_nonce"])
-        if mark[1] is None or mark not in session_marks:
-            return False
+    # Сессия отдаёт только захват, сделанный через implementer-сессию (метка
+    # claim_nonce есть только у таких): захват человека и обычного токена,
+    # включая claim под тем же агентом и session_id, метки не имеет и не снимается
+    # (#1783, круг 4).
+    if session_claim and rows[0]["claim_nonce"] is None:
+        return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.
     if (rows[0]["job_id"] or "").strip() or (rows[0]["review_job_id"] or "").strip():
@@ -1122,7 +1151,7 @@ async def return_task_to_open(
     if await fetchall(
         db,
         "SELECT 1 FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
-        "AND channel <> 'slot'",
+        "AND channel <> 'slot' AND cost_wait_since IS NULL",
         (int(task_id),),
     ):
         return False
@@ -1212,8 +1241,7 @@ async def release_expired_implementer_tasks(
     rows = await fetchall(
         db,
         "SELECT s.bound_task_id AS task_id, t.status AS status, t.job_id AS job_id, "
-        "s.principal_id AS principal_id, s.executor_run_id AS run_id, "
-        "s.claimed_session AS claimed_session "
+        "s.principal_id AS principal_id, s.executor_run_id AS run_id "
         "FROM chat_pair_sessions s "
         "JOIN tasks t ON t.id = s.bound_task_id "
         "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
@@ -1228,17 +1256,17 @@ async def release_expired_implementer_tasks(
         ")",
     )
     released: list[int] = []
-    pending: dict[int, tuple[str, set[int], set[tuple[int | None, str | None]]]] = {}
+    pending: dict[int, tuple[str, set[int], set[int | None]]] = {}
     for raw in rows:
         row = dict(raw)
         if row.get("job_id"):
             continue
-        status, principals, marks = pending.setdefault(
+        status, principals, runs = pending.setdefault(
             int(row["task_id"]), (str(row["status"]), set(), set())
         )
         principals.add(int(row["principal_id"]))
-        marks.add((row["run_id"], row["claimed_session"]))
-    for task_id, (from_status, principals, marks) in pending.items():
+        runs.add(row["run_id"])
+    for task_id, (from_status, principals, runs) in pending.items():
         # One transaction per task, rolled back as a whole (#1712): the release
         # also closes the host order of the run, and a failure between the two
         # must not leave half of it behind — nor an open write transaction that
@@ -1252,7 +1280,8 @@ async def release_expired_implementer_tasks(
                 event_kind="chat_pair_implementer_expired",
                 # #1712: a task another agent holds now is not this session's.
                 holders=frozenset(principals),
-                session_marks=frozenset(marks),
+                session_runs=frozenset(runs),
+                session_claim=True,
             )
         except Exception:  # noqa: BLE001 - one task must not stop the others
             log.exception("Chat-pair reaper: releasing task #%d failed", task_id)
@@ -1261,6 +1290,7 @@ async def release_expired_implementer_tasks(
             continue
         if freed:
             released.append(task_id)
+    released += await _release_orphans(db, failed, exclude=set(released))
     if released:
         log.info(
             "Chat-pair reaper: released %d implementer-bound task(s) to open",
@@ -1268,6 +1298,52 @@ async def release_expired_implementer_tasks(
         )
     await release_stuck_run_claims(db, failed)
     return released
+
+
+async def _release_orphans(
+    db: aiosqlite.Connection, failed: set[int] | None, *, exclude: set[int]
+) -> list[int]:
+    """Захват implementer-сессии, у которого не осталось ни одной живой сессии (#1783).
+
+    Первый проход идёт от мёртвых сессий, а purge их удаляет: задача, чьи сессии
+    исчезли раньше, чем проход её освободил (вторая сессия того же человека, чужое
+    ожидание), становилась тупиком. Кандидат — сама задача: метка ``claim_nonce``
+    (захват сделан через implementer-сессию; у захвата человека и обычного токена
+    её нет), нет доказательства прогона хаба и нет ни одной живой сессии.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT t.id, t.status FROM tasks t WHERE t.status IN ('running', 'claimed') "
+        "AND t.claim_nonce IS NOT NULL AND t.executor_run_id IS NULL "
+        "AND (t.claimed_by IS NOT NULL OR t.claim_session_id IS NOT NULL) "
+        "AND COALESCE(t.job_id, '') = '' AND NOT EXISTS ("
+        "  SELECT 1 FROM chat_pair_sessions live WHERE live.kind = 'implementer' "
+        "  AND live.bound_task_id = t.id AND live.revoked_at IS NULL "
+        "  AND live.expires_at > datetime('now'))",
+    )
+    freed: list[int] = []
+    for raw in rows:
+        task_id = int(raw["id"])
+        if task_id in exclude:
+            continue
+        try:
+            done = await _release_atomically(
+                db,
+                task_id,
+                from_status=str(raw["status"]),
+                note="Implementer pairing session expired; task returned to open.",
+                event_kind="chat_pair_implementer_expired",
+                session_runs=frozenset({None}),
+                session_claim=True,
+            )
+        except Exception:  # noqa: BLE001 - одна задача не останавливает остальные
+            log.exception("Chat-pair reaper: orphan claim of #%d failed", task_id)
+            if failed is not None:
+                failed.add(task_id)
+            continue
+        if done:
+            freed.append(task_id)
+    return freed
 
 
 async def release_stuck_run_claims(

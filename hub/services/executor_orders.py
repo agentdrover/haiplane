@@ -608,9 +608,11 @@ async def _task_refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     # (#1783, k8), и обе стороны ждали бы друг друга до TTL.
     if await fetchall(
         db,
-        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
-        "AND bound_task_id = ? AND revoked_at IS NULL "
-        "AND expires_at > datetime('now')",
+        "SELECT 1 FROM chat_pair_sessions s WHERE s.kind = 'implementer' "
+        "AND s.bound_task_id = ? AND s.revoked_at IS NULL "
+        "AND s.expires_at > datetime('now') AND NOT EXISTS ("
+        "  SELECT 1 FROM executor_runs r WHERE r.id = s.executor_run_id "
+        "  AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL))",
         (task_id,),
     ):
         return f"{el.REASON_ALREADY_RUNNING} #{task_id} (живая сессия implementer)"

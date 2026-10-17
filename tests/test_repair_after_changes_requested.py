@@ -79,7 +79,7 @@ async def _hold(
         claimed_by=acting["username"],
         claim_session_id="s-run",
         claimed_at=CLAIMED_AT,
-        claim_nonce="n-run",
+        claim_nonce="n-run" if session else None,  # метка — у захвата сессии
         executor_run_id=run_id,
         implementer_principal_id=int(acting["id"]),
         **({"status": status} if status else {}),
@@ -692,7 +692,7 @@ async def test_p1_first_pass_reaper_leaves_a_human_claim_after_a_manual_session(
     await _hold(db, task_id, None, session=True, status="running")
     await db.execute(
         "UPDATE tasks SET claimed_by='alice', claim_session_id='s-alice', "
-        "implementer_principal_id = NULL WHERE id = ?",
+        "claim_nonce = NULL, implementer_principal_id = NULL WHERE id = ?",
         (task_id,),
     )
     await db.commit()
@@ -841,7 +841,7 @@ async def test_p1_reaper_gives_back_only_the_claim_the_session_made(db, monkeypa
     снимается, а её собственный — снимается."""
     _launch_config(monkeypatch)
     acting = await cp.get_acting_agent(db)
-    for tag, nonce, expected in (("own", "n-run", ["task"]), ("other", "n-other", [])):
+    for tag, nonce, expected in (("own", "n-run", ["task"]), ("other", None, [])):
         _, task_id = await _task_with_findings(db, slug=f"rc-bind-{tag}")
         await _hold(db, task_id, None, session=False, status="running")
         await db.execute(
@@ -1272,30 +1272,6 @@ async def test_c3_p1_every_terminal_status_releases_the_claim_without_usage(
         )  # type: ignore[arg-type]
 
 
-async def test_c3_the_session_gives_back_only_the_claim_with_its_own_mark(
-    db, monkeypatch
-):
-    """P1 (Codex): захват отпустили и взяли заново ПОД ТЕМ ЖЕ session_id (человек или
-    обычный токен) — время claim другое, истёкшая сессия его не снимает."""
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    _, task_id = await _task_with_findings(db, slug="rc-c3-same-id")
-    await _hold(db, task_id, None, session=False, status="running")
-    await db.execute(
-        "UPDATE tasks SET claim_session_id = 'S1', claim_nonce = 'n-new' WHERE id = ?",
-        (task_id,),
-    )
-    await db.execute(
-        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
-        "bound_task_id, bound_generation, claimed_session) VALUES "
-        "(?, 'c3-same', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
-        (int(acting["id"]), task_id, "n-old"),
-    )
-    await db.commit()
-    assert await cp.release_expired_implementer_tasks(db) == []
-    assert (await _row(db, task_id))["claimed_by"]
-
-
 async def test_c3_a_foreign_done_does_not_clear_a_claim(db, monkeypatch):
     """done от агента, который задачу не держит, захват (и его прогон) не снимает."""
     from hub import models, services
@@ -1377,41 +1353,6 @@ async def test_c3_a_stuck_claim_in_needs_decision_is_released_too(db, monkeypatc
     await cp.purge_expired(db)
     freed = await _row(db, task_id)
     assert (freed["status"], freed["claimed_by"]) == ("needs_decision", None)
-
-
-async def test_c3_two_claims_in_one_second_have_different_marks(db, monkeypatch):
-    """P1 (Codex): claim, release и новый claim тем же агентом под тем же session_id в
-    одну секунду: метки (claim_nonce) разные, истёкшая сессия первого не снимает второй."""
-    from hub import models
-    from hub.services import lifecycle
-
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    _, task_id = await _task_with_findings(db, slug="rc-c3-nonce")
-    await repo.update_task(db, task_id, status="open")
-    await db.commit()
-    agent, sid = config.CHAT_PAIR_AGENT, "s-same"
-    await lifecycle.claim_task(
-        db, task_id, models.TaskClaim(agent=agent, session_id=sid)
-    )
-    first = (await _row(db, task_id))["claim_nonce"]
-    await db.execute(
-        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
-        "bound_task_id, bound_generation, claimed_session) VALUES "
-        "(?, 'nonce-s', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
-        (int(acting["id"]), task_id, first),
-    )
-    await db.commit()
-    await lifecycle.release_task(
-        db, task_id, models.TaskRelease(agent=agent, session_id=sid)
-    )
-    await lifecycle.claim_task(
-        db, task_id, models.TaskClaim(agent=agent, session_id=sid)
-    )
-    second = (await _row(db, task_id))["claim_nonce"]
-    assert first and second and first != second
-    assert await cp.release_expired_implementer_tasks(db) == []
-    assert (await _row(db, task_id))["status"] == "claimed"
 
 
 async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
@@ -1666,30 +1607,6 @@ async def test_c4_recorded_outcomes_make_the_same_sha_a_real_resubmission(
     )
     state.submission_sha = SHA
     await lifecycle._step_empty_resubmission(state)
-
-
-async def test_c3_the_reaper_pairs_the_run_with_the_mark_of_one_session(
-    db, monkeypatch
-):
-    """Две сессии: ручная без метки и сессия закончившегося прогона с меткой N. На задаче
-    метка N и нет доказательства (захват прогона уже снят): пара «прогон, метка» ни
-    одной сессии не совпадает — задача в open не уходит."""
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    _, task_id = await _task_with_findings(db, slug="rc-c3-pairs")
-    run = await _finished_run_id(db, task_id)
-    await _hold(db, task_id, None, session=False, status="running")
-    await db.execute("UPDATE tasks SET claim_nonce = 'N' WHERE id = ?", (task_id,))
-    for token, run_id, mark in (("pm", None, None), ("pr", run, "N")):
-        await db.execute(
-            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
-            "kind, bound_task_id, bound_generation, executor_run_id, claimed_session) "
-            "VALUES (?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, ?, ?)",
-            (int(acting["id"]), token, task_id, run_id, mark),
-        )
-    await db.commit()
-    assert await cp.release_expired_implementer_tasks(db) == []
-    assert (await _row(db, task_id))["status"] == "running"
 
 
 async def test_c3_a_run_that_claimed_and_died_returns_the_task_to_open(db, monkeypatch):
@@ -1978,3 +1895,92 @@ async def test_c4_a_late_cost_closing_of_an_old_run_does_not_stop_new_work(
     assert await repo.stopped_executor_runs_of_running_tasks(
         db, dispatch.STOPPED_OUTCOMES
     )
+
+
+async def test_c4_only_a_claim_made_through_a_session_is_given_back(db, monkeypatch):
+    """Метка claim_nonce есть только у захвата, сделанного через implementer-сессию.
+    Тот же агент и тот же session_id, но обычным токеном (метки нет), истёкшая сессия
+    первого захвата не снимает; захват сессии без единой живой сессии — снимается и
+    после purge (задача-кандидат, а не сессия)."""
+    from hub import models
+    from hub.services import lifecycle
+
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    agent, sid = config.CHAT_PAIR_AGENT, "s-same"
+    _, retaken = await _task_with_findings(db, slug="rc-c4-api-retake")
+    await repo.update_task(db, retaken, status="open")
+    await db.commit()
+    await lifecycle.claim_task(
+        db, retaken, models.TaskClaim(agent=agent, session_id=sid)
+    )
+    assert (await _row(db, retaken))["claim_nonce"] is None, "обычный токен — без метки"
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation) VALUES "
+        "(?, 'c4-old', datetime('now', '-1 minute'), 'implementer', ?, 1)",
+        (int(acting["id"]), retaken),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, retaken))["status"] == "claimed"
+
+    # захват сессии: сессии purge удалил раньше, чем проход его освободил
+    _, orphan = await _task_with_findings(db, slug="rc-c4-orphan")
+    await _hold(db, orphan, None, session=False, status="running")
+    await db.execute("UPDATE tasks SET claim_nonce = 'nz' WHERE id = ?", (orphan,))
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == [orphan]
+    assert (await _row(db, orphan))["status"] == "open"
+
+
+async def test_c4_a_dead_cloud_runs_session_does_not_block_a_slot_order(
+    world,  # noqa: F811
+):
+    """Облачный агент выкупил код и умер до claim: прогон закрыт, сессия не отозвана. Заказ
+    слоту такой задачи не блокируется её сессией (прогон кончен)."""
+    w = world
+    task_id = await _task(w, "k8: умерший облачный")
+    run = await repo.create_executor_run(
+        w.db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="a",
+        run_id="r",
+        model="m",
+    )
+    acting = await cp.get_acting_agent(w.db)
+    await w.db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, executor_run_id) VALUES "
+        "(?, 'dead-cloud', datetime('now', '+1 hour'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), task_id, run),
+    )
+    await w.db.commit()
+    assert (await _launch(w, task_id)).status_code == 409  # прогон ещё идёт
+    await w.db.execute(
+        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
+        "WHERE id = ?",
+        (run,),
+    )
+    await w.db.commit()
+    assert (await _launch(w, task_id)).status_code == 200
+
+
+async def test_c4_a_session_claim_orphaned_in_review_is_given_back_after_the_verdict(
+    db, monkeypatch
+):
+    """Ручной код: claim -> pair-start -> review -> сессия истекла и purge -> changes_requested.
+    Захват с меткой сессии без единой живой сессии снимается проходом по задачам."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-review-orphan")
+    await _hold(db, task_id, None, session=False, status="review")
+    await db.execute("UPDATE tasks SET claim_nonce = 'nr' WHERE id = ?", (task_id,))
+    await db.commit()
+    await cp.purge_expired(db)  # review: проход его не трогает
+    assert (await _row(db, task_id))["status"] == "review"
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    await cp.purge_expired(db)
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"]) == ("open", None)

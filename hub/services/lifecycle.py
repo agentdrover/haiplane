@@ -1872,6 +1872,35 @@ async def start_task(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def _stamp_claim(
+    db: aiosqlite.Connection,
+    update_fields: dict[str, Any],
+    starting_status: str,
+    caller_run: int | None,
+    session_token: str,
+    task_id: int,
+) -> None:
+    """Доказательство и метка захвата pair-start из open (#1783).
+
+    Из open это единственный захват задачи: прогон хаба пишется как доказательство
+    (None у ручного старта стирает чужой хвост), метка ``claim_nonce`` — только
+    если захват делает implementer-сессия. Из claimed захват уже записан claim'ом.
+    """
+    if starting_status != "open":
+        return
+    from hub.services import chat_pair
+
+    update_fields["executor_run_id"] = caller_run
+    update_fields["claim_nonce"] = (
+        secrets.token_hex(8)
+        if await chat_pair.live_session(db, session_token, task_id)
+        else None
+    )
+    await chat_pair.bind_claim(
+        db, session_token, task_id, update_fields["claim_nonce"] or ""
+    )
+
+
 async def _pair_start_write(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1986,16 +2015,12 @@ async def _pair_start_write(
             f"Task #{task_id} left {starting_status!r} during pair-start; "
             "retry from its current status",
         )
-    if starting_status == "open":
-        # #1783: pair-start из open — единственный захват этой задачи: доказательство
-        # прогона и метка пишутся здесь (None у ручного старта стирает чужой хвост).
-        update_fields["executor_run_id"] = caller_run
-        update_fields["claim_nonce"] = secrets.token_hex(8)
-    # Сессия, продолжающая захват (pair-start после claim, в том числе другим токеном
-    # того же держателя), принимает метку этого захвата.
-    mark = update_fields.get("claim_nonce") or fresh["claim_nonce"]
-    await chat_pair.bind_claim(db, session_token, task_id, mark or "")
+    await _stamp_claim(
+        db, update_fields, starting_status, caller_run, session_token, task_id
+    )
     await repo.update_task(db, task_id, **update_fields)
+    if starting_status == "claimed":
+        await chat_pair.adopt_claim(db, session_token, task_id)
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
     if declared_session:
@@ -4919,8 +4944,15 @@ async def _claim_write(
     # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
     # чужой прежний executor_run_id у нового держателя не остаётся.
     claim_fields["executor_run_id"] = caller_run
-    claim_fields["claim_nonce"] = secrets.token_hex(8)
-    await chat_pair.bind_claim(db, session_token, task_id, claim_fields["claim_nonce"])
+    # Метка — только у захвата, сделанного через implementer-сессию (по токену).
+    claim_fields["claim_nonce"] = (
+        secrets.token_hex(8)
+        if await chat_pair.live_session(db, session_token, task_id)
+        else None
+    )
+    await chat_pair.bind_claim(
+        db, session_token, task_id, claim_fields["claim_nonce"] or ""
+    )
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when
@@ -4979,9 +5011,7 @@ async def claim_task(
             # метку этого захвата: иначе его сессию реапер не свяжет с захватом (#1783).
             from hub.services import chat_pair as _cp
 
-            await _cp.bind_claim(
-                db, session_token, task_id, task.get("claim_nonce") or ""
-            )
+            await _cp.adopt_claim(db, session_token, task_id)
             await db.commit()
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)
