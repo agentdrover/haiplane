@@ -877,8 +877,8 @@ async def ended_run_session(db: aiosqlite.Connection, token: str, task_id: int) 
         "SELECT 1 FROM chat_pair_sessions s JOIN executor_runs r "
         "ON r.id = s.executor_run_id WHERE s.token_hash = ? "
         "AND s.kind = 'implementer' AND s.bound_task_id = ? "
-        "AND (r.outcome <> 'running' OR s.revoked_at IS NOT NULL "
-        "OR s.expires_at <= datetime('now'))",
+        "AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL "
+        "OR s.revoked_at IS NOT NULL OR s.expires_at <= datetime('now'))",
         (hash_pair_code(token), int(task_id)),
     )
     return bool(rows)
@@ -904,7 +904,8 @@ async def run_of_session(
         "WHERE s.token_hash = ? AND s.kind = 'implementer' "
         "AND s.bound_task_id = ? AND s.revoked_at IS NULL "
         "AND s.expires_at > datetime('now') "
-        "AND r.task_id = s.bound_task_id AND r.outcome = 'running'",
+        "AND r.task_id = s.bound_task_id AND r.outcome = 'running' "
+        "AND r.cost_wait_since IS NULL",
         (hash_pair_code(token), int(task_id)),
     )
     if len(rows) != 1:

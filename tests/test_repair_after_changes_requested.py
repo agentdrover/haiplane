@@ -1768,3 +1768,24 @@ async def test_c3_a_claim_held_after_done_is_released_in_ci_check(db, monkeypatc
     await cp.purge_expired(db)
     after = await _row(db, task_id)
     assert (after["status"], after["claimed_by"]) == ("ci_check", None)
+
+
+async def test_c3_a_run_that_providers_called_over_cannot_take_the_task(
+    db, monkeypatch
+):
+    """Провайдер сказал «конец» (строка ждёт цену, cost_wait_since): её сессия задачу уже
+    не берёт — ни как прогон (run_of_session), ни как ручную (ended_run_session)."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-over")
+    run = await _new_run(db, task_id, 2)
+    await _live_run_session(db, task_id, run, cp.hash_pair_code("over-token"))
+    await db.commit()
+    assert await cp.run_of_session(db, "over-token", task_id) == run
+    assert await cp.ended_run_session(db, "over-token", task_id) is False
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since = datetime('now') WHERE id = ?",
+        (run,),
+    )
+    await db.commit()
+    assert await cp.run_of_session(db, "over-token", task_id) is None
+    assert await cp.ended_run_session(db, "over-token", task_id) is True
