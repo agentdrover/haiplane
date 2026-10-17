@@ -31,6 +31,7 @@ from hub.db import (
 )
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
+from hub.services.resubmission_guard import stop_empty_done
 from hub.services.defect_clocks import (
     change_failure_rate,
     shift_left,
@@ -6297,6 +6298,9 @@ async def transition_after_agent_done(
             "done report reached the post-done transition of state task #%s", task_id
         )
         return str(task.get("status") or "")
+
+    if has_done and (halted := await stop_empty_done(db, task)):
+        return halted
 
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once

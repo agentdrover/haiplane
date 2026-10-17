@@ -819,6 +819,34 @@ async def ordered_skill_of_session(
     }
 
 
+async def run_of_session(
+    db: aiosqlite.Connection, token: str, task_id: int
+) -> int | None:
+    """Прогон хаба, чей заказ породил ВЫЗЫВАЮЩУЮ сессию implementer (#1783).
+
+    Доказательство «задачу берёт прогон хаба»: токен → живая сессия этой задачи
+    с ``executor_run_id`` → строка прогона ТОЙ ЖЕ задачи, ещё идущая. Любая
+    неопределённость (нет токена, ручной код, отозванная или чужая сессия,
+    закончившийся прогон) — ``None``: захват тогда ручной и освобождается по
+    TTL, как до задачи.
+    """
+    if not token or not isinstance(task_id, int):
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT s.executor_run_id AS run_id FROM chat_pair_sessions s "
+        "JOIN executor_runs r ON r.id = s.executor_run_id "
+        "WHERE s.token_hash = ? AND s.kind = 'implementer' "
+        "AND s.bound_task_id = ? AND s.revoked_at IS NULL "
+        "AND s.expires_at > datetime('now') "
+        "AND r.task_id = s.bound_task_id AND r.outcome = 'running'",
+        (hash_pair_code(token), int(task_id)),
+    )
+    if len(rows) != 1:
+        return None
+    return int(rows[0]["run_id"])
+
+
 async def get_acting_agent(db: aiosqlite.Connection) -> dict[str, Any] | None:
     """The implementer acting principal, or None if missing/inactive."""
     username = (config.CHAT_PAIR_AGENT or "cloud").strip() or "cloud"
@@ -995,10 +1023,25 @@ async def return_task_to_open(
     await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
     rows = await fetchall(
         db,
-        "SELECT status, implementer_principal_id FROM tasks WHERE id = ?",
+        "SELECT status, implementer_principal_id, job_id, review_job_id "
+        "FROM tasks WHERE id = ?",
         (int(task_id),),
     )
     if not rows or rows[0]["status"] != from_status:
+        return False
+    # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
+    # выборки reaper'а; под локом они видны, и освобождение не состоится.
+    if (rows[0]["job_id"] or "").strip() or (rows[0]["review_job_id"] or "").strip():
+        return False
+    # Прогон слота живёт сессией хоста (#1712): мёртвая сессия — мёртвый прогон,
+    # и его закрывает заказ в этой же операции. Облачный идёт у провайдера и
+    # от сессии хаба не зависит.
+    if await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
+        "AND channel <> 'slot'",
+        (int(task_id),),
+    ):
         return False
     holder = rows[0]["implementer_principal_id"]
     if holders is not None and holder is not None and int(holder) not in holders:
@@ -1124,7 +1167,42 @@ async def release_expired_implementer_tasks(
             "Chat-pair reaper: released %d implementer-bound task(s) to open",
             len(released),
         )
+    await release_stuck_run_claims(db, failed)
     return released
+
+
+async def release_stuck_run_claims(
+    db: aiosqlite.Connection, failed: set[int] | None = None
+) -> list[int]:
+    """Второй проход reaper'а — от задач, а не от сессий (#1783).
+
+    Первый проход находит задачу по мёртвой сессии; purge удаляет эти строки,
+    и задача с захватом завершённого прогона хаба становилась невидимой. Здесь
+    кандидат — сама задача: running/claimed, ``executor_run_id`` указывает на
+    закончившийся прогон. Решение — под write-локом в ``run_claim``.
+    """
+    from hub.services import run_claim
+
+    freed: list[int] = []
+    for task_id in await run_claim.stuck_candidates(db):
+        try:
+            async with write_transaction(db):
+                await db.execute("SAVEPOINT stuck_release")
+                try:
+                    done = await run_claim.release_stuck_task(db, task_id)
+                except BaseException:
+                    await db.execute("ROLLBACK TO stuck_release")
+                    await db.execute("RELEASE stuck_release")
+                    raise
+                await db.execute("RELEASE stuck_release")
+        except Exception:  # noqa: BLE001 - одна задача не останавливает остальные
+            log.exception("Chat-pair reaper: stuck claim of #%d failed", task_id)
+            if failed is not None:
+                failed.add(task_id)
+            continue
+        if done:
+            freed.append(task_id)
+    return freed
 
 
 async def purge_expired(db: aiosqlite.Connection) -> int:
@@ -1153,9 +1231,16 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     # A task whose release just failed keeps its dead sessions: they are the
     # only thing the next pass can find it by (#1712).
     keep = ", ".join("?" for _ in unreleased)
+    # #1783: пока захват задачи ссылается на прогон, строки сессий этого прогона
+    # остаются — по ним задачу находит и объясняет проход reaper'а.
     sessions = await db.execute(
         "DELETE FROM chat_pair_sessions WHERE (expires_at < datetime('now') "  # nosec B608 - placeholders only
-        "OR revoked_at IS NOT NULL)"
+        "OR revoked_at IS NOT NULL) "
+        "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE "
+        "t.executor_run_id IS NOT NULL "
+        "AND t.executor_run_id = chat_pair_sessions.executor_run_id "
+        "AND t.id = chat_pair_sessions.bound_task_id "
+        "AND t.status IN ('running', 'claimed'))"
         + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
         tuple(sorted(unreleased)),
     )

@@ -427,6 +427,14 @@ async def close_order(
         "WHERE id = ? AND outcome = 'running'",
         (run_outcome, f"заказ хосту закрыт: {reason}", int(order["executor_run_id"])),
     )
+    if reason == CLOSE_SUBMITTED:
+        # #1783: принятая сдача слота снимает захват её прогона в этой же
+        # транзакции — сессии отозваны, слот закрыт, статус review не тронут.
+        from hub.services import run_claim
+
+        await run_claim.release_after_run_closed(
+            db, int(order["executor_run_id"]), why=reason
+        )
     if return_task:
         await _return_task(db, order)
     await admin_svc.write_audit(

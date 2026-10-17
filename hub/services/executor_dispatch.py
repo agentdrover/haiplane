@@ -234,6 +234,25 @@ async def _settle(
     if outcome is not None:
         await _note_human_stop(db, row, outcome)
         await _note_silent_finish(db, row, run, outcome)
+        await _release_claim_after_submission(db, row, outcome)
+
+
+async def _release_claim_after_submission(
+    db: aiosqlite.Connection, row: dict[str, Any], outcome: str
+) -> None:
+    """Сдача легла и исполнение закрыто — захват снимается тут же (#1783).
+
+    Только исходы «снят по сдаче» и «закончил со сдачей»: остановка по
+    потолку, человеком, ошибка и конец без сдачи оставляют задачу решению
+    человека. Доказательство — прогон, закрытый строкой выше в этой же
+    транзакции; позднее закрытие СТАРОГО прогона захват нового не трогает
+    (условный UPDATE по executor_run_id).
+    """
+    if outcome not in (OUTCOME_TAKEN_DOWN, OUTCOME_FINISHED):
+        return
+    from hub.services import run_claim
+
+    await run_claim.release_after_run_closed(db, int(row["id"]), why=outcome)
 
 
 async def _note_human_stop(

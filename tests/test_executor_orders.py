@@ -1773,3 +1773,42 @@ async def test_a_slot_launch_without_task_id_takes_the_queue_head(world):
     placed = await _rows(world.db, "SELECT task_id, host FROM executor_orders")
     assert placed == [{"task_id": task_id, "host": "k8"}]
     assert (await _launch(world, None, "k9")).status_code == 409  # очередь пуста
+
+
+async def test_an_accepted_slot_submission_releases_the_runs_claim(world):
+    """#1783 AC-1 (слот): принятая сдача закрывает заказ, и в ТОЙ ЖЕ транзакции
+    сессии прогона отозваны, слот закрыт, захват снят по executor_run_id;
+    статус review не тронут, автор сдачи (implementer_principal_id) остаётся."""
+    task_id = await _task(world, "захват слота после сдачи")
+    alive = await _launch_redeem(world, task_id)
+    await _claim_and_start(world, task_id, alive["session"])
+    held = (await _rows(world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,)))[0]
+    run = (
+        await _rows(
+            world.db, "SELECT id FROM executor_runs WHERE task_id = ?", (task_id,)
+        )
+    )[0]
+    assert held["executor_run_id"] == run["id"] and held["claimed_by"]
+
+    await _submit(world, task_id, generation=1)
+    await orders.settle(world.db)
+    await world.db.commit()
+
+    after = (await _rows(world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,)))[0]
+    assert after["status"] == "review"
+    assert (
+        after["claimed_by"],
+        after["claim_session_id"],
+        after["executor_run_id"],
+    ) == (None, None, None)
+    assert after["implementer_principal_id"] == held["implementer_principal_id"]
+    sessions = await _rows(
+        world.db,
+        "SELECT revoked_at FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run["id"],),
+    )
+    assert sessions and all(s["revoked_at"] for s in sessions)
+    slots = await _rows(
+        world.db, "SELECT released_at FROM executor_slots WHERE task_id = ?", (task_id,)
+    )
+    assert slots and all(s["released_at"] for s in slots)

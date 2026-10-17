@@ -111,6 +111,7 @@ EXPECTED_SUBMIT_ORDER = (
     "branch_matches",
     "pin_submission_sha",
     "same_sha_from_review_is_current",
+    "empty_resubmission",
     "submission_contract",
     "bug_red_test",
     "ci_before_submit",
@@ -237,6 +238,9 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     assert set(submit) - set(headless) == {
         "task_is_submittable",
         "same_sha_from_review_is_current",
+        # #1783: пустая пересдача на headless — не отказ, а needs_decision в
+        # transition_after_agent_done (решение #1122: гейты headless не отказывают).
+        "empty_resubmission",
     }
     assert set(headless) - set(submit) == set()
 
@@ -1406,3 +1410,102 @@ async def test_a_report_between_the_submit_gates_and_the_apply_refuses_the_submi
     assert resp.status_code == 422, resp.text
     assert red._detail(resp)["reason"] == reason
     await red._assert_nothing_recorded(db, task_id, feed_before, dispatch)
+
+
+# --------------------------------------------------------------------------
+# #1783: пустая пересдача после «на доработку»
+# --------------------------------------------------------------------------
+
+
+async def _sent_back(db, monkeypatch, title: str):
+    """Сдача 1 на коммите tip-1, затем changes_requested по ней: задача в running."""
+    git = _install_fixed_tip_git(monkeypatch, "tip-1")
+    task = await _pair_task_ready_to_submit(db, title)
+    await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    await repo.record_review_verdict(db, task.id, "changes_requested")
+    await repo.transition_status_if(
+        db, task.id, expected_from="review", new_status="running"
+    )
+    await db.commit()
+    return git, task
+
+
+async def test_same_sha_after_changes_requested_is_refused(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Тот же коммит после «на доработку» — отказ с причиной, поколение не растёт;
+    новый коммит принимается; done-отчёт pair на том же коммите — отказ;
+    headless — needs_decision; review-путь того же sha остаётся прежним no-op."""
+    git, task = await _sent_back(db, monkeypatch, "Пустая пересдача")
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.submit_for_review(
+            db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+        )
+    assert refused.value.status_code == 422
+    assert refused.value.detail["reason"] == "resubmit_without_changes"
+    assert "изменений нет" in refused.value.detail["message"]
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["submission_generation"], row["status"]) == (1, "running")
+
+    # pair done-отчёт на том же коммите: отказ, строка отчёта откатывается.
+    with pytest.raises(HTTPException) as done_refused:
+        await services.add_update(
+            db,
+            task.id,
+            models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+        )
+    assert done_refused.value.detail["reason"] == "resubmit_without_changes"
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["submission_generation"], row["status"]) == (1, "running")
+    assert not await repo.has_done_updates(db, task.id)
+
+    # headless: отказывать некому — needs_decision с названной причиной.
+    await repo.update_task(db, task.id, job_id="job-h")
+    headless = dict(await repo.get_task(db, task.id))
+    from hub.services.orchestration import transition_after_agent_done
+
+    assert (
+        await transition_after_agent_done(db, headless, has_done=True)
+        == "needs_decision"
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["status"], row["submission_generation"]) == ("needs_decision", 1)
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task.id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("изменений нет" in a for a in alerts)
+    await repo.update_task(db, task.id, job_id=None, status="running")
+    await db.commit()
+
+    # новый коммит принимается.
+    git.tip = "tip-2"
+    accepted = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (accepted.submission_generation, accepted.submission_sha) == (2, "tip-2")
+
+    # review-путь того же sha — прежний no-op, а не отказ (#1054, #1265).
+    again = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (again.submission_generation, again.status) == (2, "review")
+
+
+async def test_same_sha_from_review_stays_a_noop_after_the_1783_gate(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Review-путь того же sha (#1054, #1265) не меняется: no-op, а не отказ."""
+    _install_fixed_tip_git(monkeypatch, "tip-r")
+    task = await _pair_task_ready_to_submit(db, "Повтор из review")
+    await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    again = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert again.submission_generation == 1 and again.status == "review"

@@ -2309,6 +2309,27 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
+        # #1783: какой прогон хаба держит захват задачи. Пишется в транзакции
+        # claim/pair-start сессией implementer с заказом; NULL — ручной захват
+        # и строки до миграции. Освобождение захвата без сессий (после сдачи,
+        # после changes_requested, в reaper) разрешено только по этому
+        # доказательству: пустой claimed_by держателя не доказывает.
+        "add_tasks_executor_run_id",
+        "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",
+    ),
+    (
+        # #1783: захват снят (claimed_by → NULL) — доказательство «его держит
+        # прогон» уходит с ним, на ЛЮБОМ пути снятия, включая сырой SQL. Иначе
+        # застрявший executor_run_id у следующего ручного захвата читался бы
+        # доказательством чужого прогона. Триггер срабатывает только на
+        # присвоение claimed_by; собственный UPDATE executor_run_id его не будит.
+        "trg_tasks_claim_cleared_drops_run_proof",
+        "CREATE TRIGGER IF NOT EXISTS trg_tasks_claim_cleared_drops_run_proof "
+        "AFTER UPDATE OF claimed_by ON tasks "
+        "WHEN NEW.claimed_by IS NULL AND NEW.executor_run_id IS NOT NULL "
+        "BEGIN UPDATE tasks SET executor_run_id = NULL WHERE id = NEW.id; END",
+    ),
+    (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
         "idx_events_kind_project",
