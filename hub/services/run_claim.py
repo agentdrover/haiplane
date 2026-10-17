@@ -121,6 +121,30 @@ async def refuse_over_live_run(
         )
 
 
+async def expire_claim(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Истёкшая аренда: освободить ИМЕННО выбранный захват, не новый (#1783).
+
+    Выборка sweep'а читалась вне write-лока; захват успевали отпустить и взять
+    заново. Под локом сверяются статус и время claim; без совпадения ничего не
+    пишется. Без коммита.
+    """
+    await _lock_for_write(db)
+    live = await repo.get_task(db, int(task["id"]))
+    if live is None or live["status"] != "claimed":
+        return False
+    if live["claimed_at"] != task.get("claimed_at"):
+        return False
+    await repo.update_task(
+        db,
+        int(task["id"]),
+        status="open",
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+    )
+    return True
+
+
 async def drop_run_holdings(
     db: aiosqlite.Connection, task_id: int, run_id: int, *, reason: str = ""
 ) -> None:
