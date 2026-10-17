@@ -3280,6 +3280,11 @@ def structured_fields_to_db(
             # store a causal link nobody resolved — the one thing #909 built
             # the validator to prevent.
             continue
+        if key == "cause_kind" and value is None:
+            # #1791: an explicit null is "leave as is", like the passport
+            # fields above. The kind is never taken back to empty: that would
+            # reopen a closed question and race the closing gate.
+            continue
         if key == "risks":
             if value is None:
                 continue

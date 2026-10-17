@@ -270,6 +270,13 @@ async def test_cause_kind_and_caused_by_must_agree(client, db):
         assert resp.status_code == 200, resp.text
     assert (await _row(db, broken))["cause_kind"] == "regression"
 
+    # --- the kind is never taken back to empty: null means "leave as is" ----
+    named = await _task(db, cause_kind="ops", title="named once")
+    assert (await _refine(client, named, cause_kind=None)).status_code == 200
+    assert (await _bulk(client, named, cause_kind=None)).status_code == 200
+    assert (await _passport(db, named, cause_kind=None)).status_code == 200
+    assert (await _row(db, named))["cause_kind"] == "ops"
+
     # --- a value outside the list is refused by every input ----------------
     stray = await _task(db, title="stray kind")
     assert (await _refine(client, stray, cause_kind="bad")).status_code == 422
