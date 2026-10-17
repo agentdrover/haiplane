@@ -212,3 +212,56 @@ async def stop_empty_done(
         orig[EMPTY_UNLESS_COMMITTED] = True
         return ""
     return await _refuse(db, task, sha, undo_bump=False)
+
+
+async def commit_tail_work(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    git_repo: str | None,
+    branch: str,
+    exit_code: int | None,
+    result_text: str | None,
+) -> str:
+    """Коммит работы в git-хвосте done и перепроверка sha после него (#1783).
+
+    Пусто — идти дальше. ``needs_decision`` — хвост остановлен: чужая ветка
+    (``WorkspaceBranchMismatchError``) либо коммит ничего не добавил там, где
+    guard пустой пересдачи пропустил отчёт ради этого коммита.
+    """
+    from hub.integrations.registry import plugins
+    from hub.integrations.git_ops import WorkspaceBranchMismatchError
+    from hub.services import watch_notices
+
+    task_id = task["id"]
+    try:
+        committed = await plugins.git_ops.auto_commit(
+            task_id,
+            title=task.get("title", ""),
+            repo=git_repo,
+            expected_branch=branch,
+        )
+    except WorkspaceBranchMismatchError as exc:
+        await repo.update_task(
+            db,
+            task_id,
+            status="needs_decision",
+            exit_code=exit_code,
+            result_text=str(exc),
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "blocker",
+            f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
+            f"переписать историю чужой ветки. Решите через REST POST /api/tasks/<id>/decide.",
+        )
+        await watch_notices.emit_needs_decision(
+            db,
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "done_branch_mismatch", "branch": branch},
+        )
+        log.error("Task #%d → needs_decision: %s", task_id, exc)
+        return "needs_decision"
+    return await recheck_after_commit(db, task, committed)

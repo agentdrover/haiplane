@@ -31,7 +31,7 @@ from hub.db import (
 )
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
-from hub.services.resubmission_guard import recheck_after_commit, stop_empty_done
+from hub.services.resubmission_guard import commit_tail_work, stop_empty_done
 from hub.services.defect_clocks import (
     change_failure_rate,
     shift_left,
@@ -42,7 +42,6 @@ from hub.integrations import git_ops as git_ops_mod
 from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
     MERGE_UNCONFIRMED,
-    WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
 from hub.integrations.protocols import (
@@ -6027,38 +6026,9 @@ async def _route_after_done(
     # success while HEAD ends up elsewhere. Its refusal RAISES rather than
     # returning False, because False also means "nothing to commit" and
     # collapsing the two left the guard inert — squash and push ran anyway.
-    try:
-        committed = await plugins.git_ops.auto_commit(
-            task_id,
-            title=task.get("title", ""),
-            repo=git_repo,
-            expected_branch=branch,
-        )
-    except WorkspaceBranchMismatchError as exc:
-        await repo.update_task(
-            db,
-            task_id,
-            status="needs_decision",
-            exit_code=exit_code,
-            result_text=str(exc),
-        )
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "blocker",
-            f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
-            f"переписать историю чужой ветки. Решите через REST POST /api/tasks/<id>/decide.",
-        )
-        await watch_notices.emit_needs_decision(
-            db,
-            task_id=task_id,
-            actor="hub",
-            payload={"reason": "done_branch_mismatch", "branch": branch},
-        )
-        log.error("Task #%d → needs_decision: %s", task_id, exc)
-        return "needs_decision"
-    if halted := await recheck_after_commit(db, task, committed):
+    if halted := await commit_tail_work(
+        db, task, git_repo, branch, exit_code, result_text
+    ):
         return halted
     # #991: the CI gate asks for a PR where it means "is there anything to
     # deliver". For a task whose work is not code — a policy turned on, a
