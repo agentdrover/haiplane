@@ -1917,13 +1917,26 @@ async def test_c4_a_changed_token_adopts_the_claim_and_is_not_a_dead_end(
         headers=s2,
     )
     assert started2.status_code == 200, started2.text
+    # (3) повторный claim другим токеном без pair-start: метку принимает сам claim
+    _, third = await _task_with_findings(db, slug="rc-c4-claim-only")
+    await repo.update_task(db, third, status="open", branch="task-z/work")
+    await db.commit()
+    a3 = await _manual_token(client, world, third, "203.0.113.84")
+    b3 = await _manual_token(client, world, third, "203.0.113.85")
+    body3 = {"agent": agent, "session_id": "s-sw3"}
+    for headers in (a3, b3):
+        resp = await client.post(
+            f"/api/tasks/{third}/claim", json=body3, headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+    # живыми остаются только сессии «B»: A истекла давно
     await db.execute(
         "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute')"
     )
     await db.commit()
     await cp.purge_expired(db)
     await cp.purge_expired(db)
-    for task_id in (first, second):
+    for task_id in (first, second, third):
         after = await _row(db, task_id)
         assert after["status"] == "open" and after["claimed_by"] is None, task_id
 
