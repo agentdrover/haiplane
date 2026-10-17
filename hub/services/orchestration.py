@@ -31,7 +31,7 @@ from hub.db import (
 )
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
-from hub.services.resubmission_guard import stop_empty_done
+from hub.services.resubmission_guard import recheck_after_commit, stop_empty_done
 from hub.services.defect_clocks import (
     change_failure_rate,
     shift_left,
@@ -6028,7 +6028,7 @@ async def _route_after_done(
     # returning False, because False also means "nothing to commit" and
     # collapsing the two left the guard inert — squash and push ran anyway.
     try:
-        await plugins.git_ops.auto_commit(
+        committed = await plugins.git_ops.auto_commit(
             task_id,
             title=task.get("title", ""),
             repo=git_repo,
@@ -6058,6 +6058,8 @@ async def _route_after_done(
         )
         log.error("Task #%d → needs_decision: %s", task_id, exc)
         return "needs_decision"
+    if halted := await recheck_after_commit(db, task, committed):
+        return halted
     # #991: the CI gate asks for a PR where it means "is there anything to
     # deliver". For a task whose work is not code — a policy turned on, a
     # mechanism watched, a decision recorded — the branch exists (pair_start

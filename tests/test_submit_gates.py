@@ -1524,22 +1524,18 @@ async def test_same_sha_after_changes_requested_is_refused(
     from hub.services import orchestration
     from hub.services import resubmission_guard as _rg
 
-    assert (
-        await _rg.stop_empty_done(
-            db, dict(await repo.get_task(db, task.id)), tail_pending=True
-        )
-        == ""
-    )
+    async def _prepared() -> dict:
+        """Задача со снимком git, собранным ДО транзакции (как prepare_ci_standing)."""
+        row = dict(await repo.get_task(db, task.id))
+        row.update(await _rg.collect_git_facts(db, row))
+        return row
+
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
     # pair-путь: done с локальными исправлениями в worktree тоже доезжает до хвоста
     await repo.update_task(db, task.id, status="running", job_id=None)
     await db.commit()
     git.dirty_paths = _dirty
-    assert (
-        await _rg.stop_empty_done(
-            db, dict(await repo.get_task(db, task.id)), tail_pending=True
-        )
-        == ""
-    )
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
     git.dirty_paths = real_dirty
     await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
     await db.commit()
@@ -1548,9 +1544,7 @@ async def test_same_sha_after_changes_requested_is_refused(
     await db.commit()
     git.dirty_paths = _dirty
     assert (
-        await _rg.stop_empty_done(
-            db, dict(await repo.get_task(db, task.id)), tail_pending=True
-        )
+        await _rg.stop_empty_done(db, await _prepared(), tail_pending=True)
         == "needs_decision"
     )
     await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
@@ -1587,19 +1581,14 @@ async def test_same_sha_after_changes_requested_is_refused(
     real_ctx = orchestration.project_git_context
     orchestration.project_git_context = AsyncMock(return_value={"repo": None})
     real_dirty2, git.dirty_paths = git.dirty_paths, _dirty_seen
-    assert await _rg._uncommitted_work(
-        db, dict(await repo.get_task(db, task.id))
-    ) is True and seen == [None]
+    assert await _rg.collect_git_facts(db, dict(await repo.get_task(db, task.id))) == {
+        _rg.UNCOMMITTED_KEY: True
+    } and seen == [None]
     git.dirty_paths = real_dirty2
     orchestration.project_git_context = real_ctx
     await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
     await db.commit()
-    assert (
-        await _rg.stop_empty_done(
-            db, dict(await repo.get_task(db, task.id)), tail_pending=True
-        )
-        == ""
-    )
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
     del git.unpushed_commits
 
     # done через pending_report (поллер не нашёл отчёта) — тот же запрет.
@@ -1673,3 +1662,65 @@ async def test_same_sha_from_review_stays_a_noop_after_the_1783_gate(
         db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
     )
     assert again.submission_generation == 1 and again.status == "review"
+
+
+async def test_after_a_dirty_tree_the_tail_must_really_commit(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 3: грязное дерево пропускает guard ради хвоста, но если хвост ничего не
+    закоммитил (auto_commit=False, своих коммитов впереди нет), sha прежний — исход тот
+    же, что у пустой пересдачи, а бамп поколения откатывается; факты git собраны ДО
+    транзакции."""
+    from hub.services import resubmission_guard as _rg
+    from hub.services.orchestration import transition_after_agent_done
+
+    git, task = await _sent_back(db, monkeypatch, "Хвост без коммита")
+    in_txn: list[bool] = []
+
+    async def _dirty(repo=None):
+        in_txn.append(db.in_transaction)
+        return ["hub/x.py"]
+
+    async def _checkout(branch, repo=None):
+        return True
+
+    async def _commit(*args, **kwargs):
+        return False
+
+    for name, fn in (
+        ("dirty_paths", _dirty),
+        ("checkout", _checkout),
+        ("auto_commit", _commit),
+    ):
+        monkeypatch.setattr(git, name, fn)
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    row = dict(await repo.get_task(db, task.id))
+    assert await transition_after_agent_done(db, row, has_done=True) == "needs_decision"
+    after = dict(await repo.get_task(db, task.id))
+    assert (after["status"], after["submission_generation"]) == ("needs_decision", 1)
+    # первый вызов — сбор фактов guard (prepare_ci_standing), вне транзакции;
+    # остальные — прежний хвост конвейера (сверка области коммита)
+    assert in_txn and in_txn[0] is False, "git-факты собраны вне write-транзакции"
+
+    # коммит случился — пересдача настоящая, ничего не откатывается
+    prepared = dict(await repo.get_task(db, task.id))
+    prepared[_rg.EMPTY_UNLESS_COMMITTED] = True
+    assert await _rg.recheck_after_commit(db, prepared, True) == ""
+
+    # свои коммиты впереди origin — тоже не пустая пересдача
+    async def _ahead(branch, repo=None):
+        return 2
+
+    monkeypatch.setattr(git, "unpushed_commits", _ahead)
+    assert await _rg.recheck_after_commit(db, prepared, False) == ""
+
+    # внутри guard git не зовётся: он читает факты, собранные заранее
+    async def _boom(repo=None):
+        raise AssertionError("git внутри guard")
+
+    monkeypatch.setattr(git, "dirty_paths", _boom)
+    monkeypatch.setattr(git, "unpushed_commits", _boom)
+    again = dict(await repo.get_task(db, task.id))
+    again[_rg.UNCOMMITTED_KEY] = True
+    assert await _rg.stop_empty_done(db, again, tail_pending=True) == ""

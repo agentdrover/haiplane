@@ -2314,14 +2314,6 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
     ),
     (
-        "backfill_chat_pair_sessions_claimed_session",
-        "UPDATE chat_pair_sessions SET claimed_session = (SELECT "
-        "COALESCE(t.claim_session_id, '*') FROM tasks t WHERE t.id = "
-        "chat_pair_sessions.bound_task_id AND t.status IN ('claimed', 'running') "
-        "AND (t.claimed_by IS NOT NULL OR t.claim_session_id IS NOT NULL)) "
-        "WHERE kind = 'implementer' AND bound_task_id IS NOT NULL AND claimed_session IS NULL",
-    ),
-    (
         # #1783: прогон-держатель захвата; NULL — ручной.
         "add_tasks_executor_run_id",
         "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",

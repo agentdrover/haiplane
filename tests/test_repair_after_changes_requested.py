@@ -928,45 +928,6 @@ async def test_p1_a_session_that_never_claimed_does_not_take_a_foreign_claim(
     assert await cp.release_expired_implementer_tasks(db) == []
 
 
-async def test_the_legacy_sessions_take_the_claim_standing_at_rollout(db, monkeypatch):
-    """Миграция: сессия implementer до записи claimed_session получает claim_session_id
-    стоящего захвата (прежнее поведение на момент выката); без захвата — NULL."""
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    ids = {}
-    for tag, status, claim in (
-        ("held", "running", "S-old"),
-        ("nameless", "running", None),
-        ("idle", "open", None),
-    ):
-        _, t = await _task_with_findings(db, slug=f"rc-legacy-{tag}")
-        await repo.update_task(db, t, status=status)
-        await db.execute(
-            "UPDATE tasks SET claim_session_id = ?, claimed_by = ? WHERE id = ?",
-            (claim, "cloud" if tag != "idle" else None, t),
-        )
-        await db.execute(
-            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
-            "kind, bound_task_id, bound_generation) VALUES "
-            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1)",
-            (int(acting["id"]), f"lg-{tag}", t),
-        )
-        ids[tag] = t
-    await db.commit()
-    await db.execute(
-        dict(db_module._MIGRATIONS)["backfill_chat_pair_sessions_claimed_session"]
-    )
-    await db.commit()
-    got = {
-        r[0]: r[1]
-        for r in await db.execute_fetchall(
-            "SELECT token_hash, claimed_session FROM chat_pair_sessions "
-            "WHERE token_hash LIKE 'lg-%'"
-        )
-    }
-    assert got == {"lg-held": "S-old", "lg-nameless": "*", "lg-idle": None}
-
-
 async def test_a_token_of_a_finished_run_cannot_take_the_task(client, db, monkeypatch):
     """Задержанный claim зомби-агента: прогон закончен, токен ещё жив — захват отказан,
     иначе он стал бы ручным и его никто не смог бы снять."""
@@ -1215,5 +1176,91 @@ async def test_the_done_guard_looks_in_the_worktree_of_a_pair_task(
     monkeypatch.setattr(orchestration, "worktree_per_task_enabled", lambda: True)
     monkeypatch.setattr(plugins.git_ops, "worktree_path", lambda tid, ws: str(tmp_path))
     monkeypatch.setattr(plugins.git_ops, "dirty_paths", _dirty)
-    assert await resubmission_guard._uncommitted_work(db, await _row(db, task_id))
+    await repo.update_task(
+        db,
+        task_id,
+        status="running",
+        review_verdict="changes_requested",
+        branch="task-x/work",
+        auto_review=1,
+    )
+    await db.commit()
+    facts = await resubmission_guard.collect_git_facts(db, await _row(db, task_id))
+    assert facts == {resubmission_guard.UNCOMMITTED_KEY: True}
     assert seen == [str(tmp_path)]
+
+
+# ---------------------------------------------------------------------------
+# Круг 3 (CHANGES_REQUESTED на поколение 2)
+# ---------------------------------------------------------------------------
+
+
+async def test_c3_p1_migration_gives_old_sessions_no_claim_they_did_not_make(
+    db, monkeypatch
+):
+    """P1-1: старые сессии implementer остаются с NULL: нынешний захват задачи
+    миграция им не приписывает, и истёкшая сессия не снимает новый ручной claim."""
+    _launch_config(monkeypatch)
+    assert "backfill_chat_pair_sessions_claimed_session" not in dict(
+        db_module._MIGRATIONS
+    )
+    _, task_id = await _task_with_findings(db, slug="rc-c3-legacy")
+    await _hold(db, task_id, None, session=False, status="running")
+    acting = await cp.get_acting_agent(db)
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation) VALUES "
+        "(?, 'c3-old', datetime('now', '-1 minute'), 'implementer', ?, 1)",
+        (int(acting["id"]), task_id),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["claimed_by"]
+
+
+async def test_c3_p1_every_terminal_status_releases_the_claim_without_usage(
+    db, monkeypatch
+):
+    """P1-2: ERROR, EXPIRED, CANCELLED и FINISHED без сдачи при недоступном /usage:
+    захват снят сразу, строка прогона не висит вечно (закрывается по сроку цены)."""
+    from hub.integrations import cursor_cloud
+
+    _launch_config(monkeypatch)
+
+    async def _usage(agent, run_id):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    for status in ("ERROR", "EXPIRED", "CANCELLED", "FINISHED"):
+        _, task_id = await _task_with_findings(db, slug=f"rc-c3-{status.lower()}")
+        run = await repo.create_executor_run(
+            db,
+            task_id=task_id,
+            submission_generation=2,
+            agent_id="a",
+            run_id="r",
+            model="m",
+        )
+        await repo.update_task(db, task_id, status="running", submission_generation=1)
+        await _hold(db, task_id, run, session=True, live=True, status="running")
+
+        async def _get_run(agent, run_id, _s=status):
+            return {"status": _s}
+
+        monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+        await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+        await db.commit()
+        after = await _row(db, task_id)
+        assert (after["claimed_by"], after["executor_run_id"]) == (None, None), status
+        # срок ожидания цены вышел: строка закрывается исходом провайдера
+        await db.execute(
+            "UPDATE executor_runs SET cost_wait_since = datetime('now', '-3 hours') "
+            "WHERE id = ?",
+            (run,),
+        )
+        await db.commit()
+        await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+        await db.commit()
+        assert dict(await repo.get_executor_run(db, run))["outcome"] != "running", (
+            status
+        )  # type: ignore[arg-type]

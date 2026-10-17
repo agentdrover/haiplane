@@ -1073,11 +1073,10 @@ async def return_task_to_open(
     # после release и уже снятый run_claim чужой сессией не освобождаются.
     if session_runs is not None and rows[0]["executor_run_id"] not in session_runs:
         return False
-    # Сессии, запомнившие свой claim_session_id, отдают только его; None — сессия
-    # до этой записи (прежнее поведение).
-    if session_claims is not None and "*" not in session_claims:
-        # None — сессия задачу не брала: захват не её (ни одним claim она его не
-        # объявляла), '*' — сессия до записи claim_session_id (прежнее поведение).
+    # Сессия отдаёт только тот захват, который сама объявила (bind_claim): без
+    # записи (NULL — не брала, в том числе сессии до этой записи) задачу не трогаем,
+    # а чужой claim_session_id не совпадёт (#1783, круг 3).
+    if session_claims is not None:
         if (rows[0]["claim_session_id"] or None) not in session_claims - {None}:
             return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после

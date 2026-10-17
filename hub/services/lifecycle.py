@@ -5808,6 +5808,8 @@ async def prepare_ci_standing(
         await ci_trust.refresh_quietly(db, task_id, sha)
     fresh = dict(await repo.get_task(db, task_id) or task)
     fresh[PREPARED_CI_SHA] = tip
+    # git-факты для guard пустой пересдачи — тоже до транзакции (#1783).
+    fresh.update(await resubmission_guard.collect_git_facts(db, fresh))
     return fresh
 
 
@@ -5881,8 +5883,9 @@ async def _task_inside_transaction(
 ) -> dict[str, Any]:
     """The task as the database holds it NOW, with what the caller prepared kept."""
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
-    if PREPARED_CI_SHA in task:
-        fresh[PREPARED_CI_SHA] = task[PREPARED_CI_SHA]
+    for key in (PREPARED_CI_SHA, resubmission_guard.UNCOMMITTED_KEY):
+        if key in task:
+            fresh[key] = task[key]
     return fresh
 
 

@@ -161,7 +161,9 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
         return
     await _release_on_terminal(db, row, run)
-    if tokens is None and cents is None:
+    if tokens is None and cents is None and _outcome_of(row, run) is None:
+        # Идущий прогон без счёта ждёт следующего опроса; законченный идёт в
+        # _settle, где ожидание цены ограничено сроком (#1410).
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     await _settle(db, row, run, tokens, cents)
@@ -206,20 +208,20 @@ def _outcome_of(row: dict[str, Any], run: dict[str, Any]) -> str | None:
 async def _release_on_terminal(
     db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any]
 ) -> None:
-    """Провайдер сказал «конец» после сдачи — захват снят сразу (#1783).
+    """Любой терминальный статус провайдера снимает захват прогона сразу (#1783).
 
-    Не после цены, которой провайдер может не назвать до 30 минут, и не после
-    молчания /usage: от учёта денег снятие не зависит.
+    ERROR, EXPIRED, CANCELLED и конец без сдачи — тоже: захват мёртвого прогона
+    никому не нужен, а решение о задаче (needs_decision, повтор «только сдай»)
+    от него не зависит. Не после цены, которой провайдер может не назвать, и не
+    после молчания /usage: от учёта денег снятие не зависит.
     """
-    outcome = _outcome_of(row, run)
-    if outcome == OUTCOME_FINISHED and not await _submission_landed(db, row):
+    if _outcome_of(row, run) is None:
         return
-    if outcome in (OUTCOME_TAKEN_DOWN, OUTCOME_FINISHED):
-        from hub.services import run_claim
+    from hub.services import run_claim
 
-        await run_claim.release_after_run_closed(
-            db, int(row["id"]), why=outcome, run_ended=True
-        )
+    await run_claim.release_after_run_closed(
+        db, int(row["id"]), why=str(_outcome_of(row, run)), run_ended=True
+    )
 
 
 async def _settle(
