@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -1990,8 +1991,9 @@ async def _pair_start_write(
         # доказательство прогона пишется здесь. Из claimed оно уже записано
         # claim'ом; None у ручного старта стирает чужой хвост.
         update_fields["executor_run_id"] = caller_run
+        update_fields["claim_nonce"] = secrets.token_hex(8)
         await chat_pair.bind_claim(
-            db, session_token, task_id, declared_session, fresh["claimed_at"]
+            db, session_token, task_id, update_fields["claim_nonce"]
         )
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
@@ -3867,7 +3869,9 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
-        if resubmission_guard.empty_resubmission_of(live, submission_sha):
+        if not body.finding_outcomes and resubmission_guard.empty_resubmission_of(
+            live, submission_sha
+        ):
             raise HTTPException(
                 422,
                 detail=empty_resubmission_detail(
@@ -4911,9 +4915,8 @@ async def _claim_write(
     # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
     # чужой прежний executor_run_id у нового держателя не остаётся.
     claim_fields["executor_run_id"] = caller_run
-    await chat_pair.bind_claim(
-        db, session_token, task_id, body.session_id or "", claim_fields["claimed_at"]
-    )
+    claim_fields["claim_nonce"] = secrets.token_hex(8)
+    await chat_pair.bind_claim(db, session_token, task_id, claim_fields["claim_nonce"])
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when

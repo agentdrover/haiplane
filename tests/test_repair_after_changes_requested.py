@@ -76,6 +76,7 @@ async def _hold(
         claimed_by=acting["username"],
         claim_session_id="s-run",
         claimed_at=CLAIMED_AT,
+        claim_nonce="n-run",
         executor_run_id=run_id,
         implementer_principal_id=int(acting["id"]),
         **({"status": status} if status else {}),
@@ -87,7 +88,7 @@ async def _hold(
         await db.execute(
             "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
             "kind, bound_task_id, bound_generation, executor_run_id, claimed_session) "
-            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?, 's-run|{CLAIMED_AT}')",  # nosec B608 - literals
+            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?, 'n-run')",  # nosec B608 - literals
             (int(acting["id"]), f"h-{task_id}-{run_id}-{live}", task_id, run_id),
         )
     await db.commit()
@@ -248,16 +249,10 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
         "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
         (run,),
     )
-    assert bound[0][0].startswith("s-1783|2"), "сессия запомнила свой claim"
+    assert bound[0][0] and bound[0][0] == (await _row(db, task_id))["claim_nonce"]
 
-    # done из claimed снимает захват и вместе с ним закрывает сессии и слот прогона:
-    # доказательство уходит с захватом, и позже закрыть эти остатки было бы нечем.
-    await db.execute(
-        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot, "
-        "executor_run_id) VALUES (?, 'cloud', '', ?)",
-        (task_id, run),
-    )
-    await db.commit()
+    # done держателя из claimed захват прогона хаба НЕ снимает: его (с сессиями и
+    # слотом) снимает закрытие прогона, иначе доказательство ушло бы раньше.
     from hub import models, services
 
     await services.add_update(
@@ -267,18 +262,16 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
             agent=config.CHAT_PAIR_AGENT, kind="done", content="готово"
         ),
     )
-    assert (await _row(db, task_id))["claimed_by"] is None
-    left = await db.execute_fetchall(
+    kept = await _row(db, task_id)
+    assert (kept["claimed_by"], kept["executor_run_id"]) == (
+        config.CHAT_PAIR_AGENT,
+        run,
+    )
+    live = await db.execute_fetchall(
         "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ? AND revoked_at IS NULL",
         (task_id,),
     )
-    assert not left
-    assert not await db.execute_fetchall(
-        "SELECT 1 FROM executor_slots WHERE task_id = ? AND released_at IS NULL",
-        (task_id,),
-    )
-    await repo.update_task(db, task_id, claimed_by="x", executor_run_id=run)
-    await db.commit()
+    assert live
     # Снятие захвата на любом пути (в том числе сырым SQL) уносит доказательство.
     await db.execute("UPDATE tasks SET claimed_by = NULL WHERE id = ?", (task_id,))
     await db.commit()
@@ -310,7 +303,7 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
         "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
         (run2,),
     )
-    assert bound2[0][0] == "s-1783-ps|"
+    assert bound2[0][0] and bound2[0][0] == (await _row(db, second))["claim_nonce"]
 
 
 # ---------------------------------------------------------------------------
@@ -844,18 +837,16 @@ async def test_p1_reaper_gives_back_only_the_claim_the_session_made(db, monkeypa
     снимается, а её собственный — снимается."""
     _launch_config(monkeypatch)
     acting = await cp.get_acting_agent(db)
-    for tag, claim, expected in (("own", "S1", ["task"]), ("other", "S2", [])):
+    for tag, nonce, expected in (("own", "n-run", ["task"]), ("other", "n-other", [])):
         _, task_id = await _task_with_findings(db, slug=f"rc-bind-{tag}")
         await _hold(db, task_id, None, session=False, status="running")
         await db.execute(
-            "UPDATE tasks SET claim_session_id = ? WHERE id = ?", (claim, task_id)
+            "UPDATE tasks SET claim_nonce = ? WHERE id = ?", (nonce, task_id)
         )
         await db.execute(
             "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
             "kind, bound_task_id, bound_generation, claimed_session) VALUES "
-            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, 'S1|"
-            + CLAIMED_AT
-            + "')",
+            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, 'n-run')",
             (int(acting["id"]), f"bind-{tag}", task_id),
         )
         await db.commit()
@@ -878,12 +869,12 @@ async def test_p1_bind_claim_records_the_declared_session(db, monkeypatch):
         (int(acting["id"]), cp.hash_pair_code("tok-bind"), task_id),
     )
     await db.commit()
-    await cp.bind_claim(db, "tok-bind", task_id, "S-declared", CLAIMED_AT)
+    await cp.bind_claim(db, "tok-bind", task_id, "nonce-x")
     rows = await db.execute_fetchall(
         "SELECT claimed_session FROM chat_pair_sessions WHERE bound_task_id = ?",
         (task_id,),
     )
-    assert rows[0][0] == "S-declared|2026-10-16T10:00:00+00:00"
+    assert rows[0][0] == "nonce-x"
 
 
 async def _phase_slot_booking_blocks_a_manual_claim(slot_world):
@@ -1275,7 +1266,7 @@ async def test_c3_p1_every_terminal_status_releases_the_claim_without_usage(
         )  # type: ignore[arg-type]
 
 
-async def test_c3_the_session_gives_back_only_the_claim_with_its_own_time(
+async def test_c3_the_session_gives_back_only_the_claim_with_its_own_mark(
     db, monkeypatch
 ):
     """P1 (Codex): захват отпустили и взяли заново ПОД ТЕМ ЖЕ session_id (человек или
@@ -1285,15 +1276,14 @@ async def test_c3_the_session_gives_back_only_the_claim_with_its_own_time(
     _, task_id = await _task_with_findings(db, slug="rc-c3-same-id")
     await _hold(db, task_id, None, session=False, status="running")
     await db.execute(
-        "UPDATE tasks SET claim_session_id = 'S1', claimed_at = '2026-10-17T09:00:00+00:00' "
-        "WHERE id = ?",
+        "UPDATE tasks SET claim_session_id = 'S1', claim_nonce = 'n-new' WHERE id = ?",
         (task_id,),
     )
     await db.execute(
         "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
         "bound_task_id, bound_generation, claimed_session) VALUES "
         "(?, 'c3-same', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
-        (int(acting["id"]), task_id, cp.claim_mark("S1", CLAIMED_AT)),
+        (int(acting["id"]), task_id, "n-old"),
     )
     await db.commit()
     assert await cp.release_expired_implementer_tasks(db) == []
@@ -1381,3 +1371,38 @@ async def test_c3_a_stuck_claim_in_needs_decision_is_released_too(db, monkeypatc
     await cp.purge_expired(db)
     freed = await _row(db, task_id)
     assert (freed["status"], freed["claimed_by"]) == ("needs_decision", None)
+
+
+async def test_c3_two_claims_in_one_second_have_different_marks(db, monkeypatch):
+    """P1 (Codex): claim, release и новый claim тем же агентом под тем же session_id в
+    одну секунду: метки (claim_nonce) разные, истёкшая сессия первого не снимает второй."""
+    from hub import models
+    from hub.services import lifecycle
+
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-nonce")
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+    agent, sid = config.CHAT_PAIR_AGENT, "s-same"
+    await lifecycle.claim_task(
+        db, task_id, models.TaskClaim(agent=agent, session_id=sid)
+    )
+    first = (await _row(db, task_id))["claim_nonce"]
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'nonce-s', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), task_id, first),
+    )
+    await db.commit()
+    await lifecycle.release_task(
+        db, task_id, models.TaskRelease(agent=agent, session_id=sid)
+    )
+    await lifecycle.claim_task(
+        db, task_id, models.TaskClaim(agent=agent, session_id=sid)
+    )
+    second = (await _row(db, task_id))["claim_nonce"]
+    assert first and second and first != second
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["status"] == "claimed"

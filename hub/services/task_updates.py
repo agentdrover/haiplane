@@ -33,7 +33,7 @@ from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
 from hub.services.resubmission_guard import stop_empty_done
-from hub.services import prevention_gate, run_claim
+from hub.services import prevention_gate
 
 log = logging.getLogger("hub")
 
@@ -199,9 +199,12 @@ async def _route_pair_or_claimed(
     """
     task_id = int(task["id"])
     # Захват снимает отчёт его держателя; чужой done (старая сессия, другой агент)
-    # чужой захват и его прогон не трогает (#1783, круг 3).
+    # чужой захват не трогает. Захват прогона хаба (executor_run_id) отчёт не
+    # снимает вовсе: его, вместе с сессиями и слотом, снимает закрытие прогона
+    # (#1783), иначе доказательство ушло бы раньше, чем прогон закроется.
     holder = (task.get("claimed_by") or "").strip()
-    was_claimed = task["status"] == "claimed" and holder in ("", agent)
+    proven = task.get("executor_run_id") is not None
+    was_claimed = task["status"] == "claimed" and holder in ("", agent) and not proven
     updates_list = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а не любой в
     # истории. Снятое препятствие больше не уводит сдачу мимо доставки, а
@@ -212,10 +215,6 @@ async def _route_pair_or_claimed(
     else:
         await lc.transition_after_agent_done(db, task, has_done=True)
     if was_claimed:
-        if task.get("executor_run_id") is not None:
-            # #1783: снятие захвата уносит доказательство (триггер) — сессии и
-            # слот прогона закрываются здесь же, а не остаются без хозяина.
-            await run_claim.drop_run_holdings(db, task_id, int(task["executor_run_id"]))
         await repo.update_task(db, task_id, claimed_by=None, claim_session_id=None)
     refreshed = await repo.get_task(db, task_id)
     if refreshed and dict(refreshed)["status"] == "completed":

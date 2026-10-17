@@ -2309,9 +2309,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: под каким claim_session_id сессия взяла задачу; NULL — не брала.
+        # #1783: метка захвата (tasks.claim_nonce), сделанного сессией; NULL — не брала.
         "add_chat_pair_sessions_claimed_session",
         "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+    ),
+    (
+        "add_tasks_claim_nonce",  # #1783: уникальная метка каждого захвата
+        "ALTER TABLE tasks ADD COLUMN claim_nonce TEXT",
     ),
     (
         # #1783: прогон-держатель захвата; NULL — ручной.
