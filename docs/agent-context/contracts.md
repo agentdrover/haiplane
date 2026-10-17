@@ -10,7 +10,7 @@
 | CLI surface | `hub/cli.py` |
 | MCP tool surface | `hub/mcp_server.py` |
 | Integration interfaces | `hub/integrations/protocols.py` |
-| DB schema and migrations | `hub/db.py` |
+| DB schema and migrations | `hub/db.py`, `hub/migrations/` |
 
 ## Surface Rules
 
