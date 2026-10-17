@@ -86,7 +86,7 @@ async def notified_projects(
 
 
 def _digest(picture: list[tuple[int, str]]) -> str:
-    return hashlib.sha1(json.dumps(sorted(picture)).encode()).hexdigest()[:12]
+    return hashlib.sha256(json.dumps(sorted(picture)).encode()).hexdigest()[:12]
 
 
 async def _pictures(
