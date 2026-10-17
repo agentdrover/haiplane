@@ -248,6 +248,14 @@ async def test_pair_start_sends_the_full_skill_unless_its_own_order_carried_the_
         )
     ]
     assert versions[0] != versions[1]
+    # #1783: старая сессия закрытого прогона не берёт задачу поверх живого нового —
+    # новый прогон здесь закончен, чтобы проверялось только решение по заказу.
+    await hub.db.execute(
+        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
+        "WHERE id=?",
+        (second_id,),
+    )
+    await hub.db.commit()
     resp = await _pair_start(hub, task_b, old_session)
     assert resp.status_code == 200, resp.text
     skill = resp.json()["working_rules"]["hub_skill"]
@@ -290,6 +298,13 @@ async def test_a_stale_or_broken_link_gives_the_full_text(hub, monkeypatch, spoi
     other = (await services.create_task(hub.db, TaskCreate(title="соседняя"))).id
     await hub.db.execute(spoil.format(other=other))
     await hub.db.commit()
+    if "SET executor_run_id" in spoil:
+        # #1783: сессия без доказательства — ручная; чужой живой прогон ей не мешает,
+        # только когда он закончен (иначе её пустили бы поверх брони хаба).
+        await hub.db.execute(
+            "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now')"
+        )
+        await hub.db.commit()
 
     resp = await _pair_start(hub, task_id, session)
     assert resp.status_code == 200, resp.text

@@ -1528,6 +1528,50 @@ async def test_same_sha_after_changes_requested_is_refused(
     await repo.update_task(db, task.id, job_id=None, status="running")
     await db.commit()
 
+    # локальный коммит исполнителя, ещё не запушенный хвостом конвейера, — не пустая пересдача.
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+
+    async def _ahead(branch, repo=None):
+        return 1
+
+    git.unpushed_commits = _ahead
+    assert await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id))) == ""
+    del git.unpushed_commits
+
+    # done через pending_report (поллер не нашёл отчёта) — тот же запрет.
+    await repo.update_task(db, task.id, status="pending_report", job_id="job-h")
+    await db.commit()
+    await services.add_update(
+        db,
+        task.id,
+        models.TaskUpdateCreate(agent="dev", kind="done", content="поздний отчёт"),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["status"], row["submission_generation"]) == ("needs_decision", 1)
+    await repo.update_task(db, task.id, status="running", job_id=None)
+    await db.commit()
+
+    # снимок «сдача не пустая» устарел до лока: перепроверка в транзакции перехода.
+    async def _snapshot_said_fine(state):
+        return None
+
+    real_step = lifecycle._step_empty_resubmission
+    monkeypatch.setattr(lifecycle, "_step_empty_resubmission", _snapshot_said_fine)
+    steps = lifecycle.SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK
+    patched = tuple(
+        Step(x.name, _snapshot_said_fine) if x.name == "empty_resubmission" else x
+        for x in steps
+    )
+    monkeypatch.setattr(lifecycle, "SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK", patched)
+    with pytest.raises(HTTPException) as late:
+        await lifecycle.submit_for_review(
+            db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+        )
+    assert late.value.detail["reason"] == "resubmit_without_changes"
+    monkeypatch.setattr(lifecycle, "SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK", steps)
+    monkeypatch.setattr(lifecycle, "_step_empty_resubmission", real_step)
+
     # новый коммит принимается.
     git.tip = "tip-2"
     accepted = await lifecycle.submit_for_review(

@@ -641,6 +641,11 @@ async def test_the_reaper_does_not_return_a_task_whose_claim_was_just_released(
 # ---------------------------------------------------------------------------
 
 
+async def _slot_note(db, task_id: int) -> None:
+    """Запись «канал: cloud» в ленте — так record_capture метит захват сессией прогона."""
+    await repo.add_task_update(db, task_id, "hub", "status", "канал: cloud")
+
+
 async def _live_run_session(db, task_id: int, run_id: int, token: str) -> None:
     acting = await cp.get_acting_agent(db)
     await db.execute(
@@ -666,6 +671,8 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
         "VALUES (?, 'cloud', '', datetime('now', '-30 minutes'), ?)",
         (retaken, run_id),
     )
+    await _slot_note(db, retaken)
+    await repo.add_task_update(db, retaken, "alice", "status", "Claimed by alice")
     await _hold(db, retaken, None, session=False, status="running")
     await db.execute(
         "UPDATE tasks SET claimed_at = datetime('now', '-5 minutes') WHERE id = ?",
@@ -687,6 +694,7 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
         "VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
         (own, own_run),
     )
+    await _slot_note(db, own)
     # другой принципал, отозванная сессия, нет слота — тоже не доказательство
     negatives = []
     for tag in ("other", "revoked", "noslot"):
@@ -707,6 +715,7 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
                 "executor_run_id) VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
                 (t, r),
             )
+            await _slot_note(db, t)
         if tag == "other":
             await db.execute(
                 "UPDATE tasks SET implementer_principal_id = ? WHERE id = ?",
@@ -719,6 +728,26 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
                 (t,),
             )
         negatives.append(t)
+    # та же секунда: слот прогона и ручной claim неразличимы по часам, различает лента
+    _, same = await _task_with_findings(db, slug="rc-p1-samesec")
+    same_run = await _finished_run_id(db, same)
+    await db.execute(
+        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (same_run,)
+    )
+    await _live_run_session(db, same, same_run, "p1-same")
+    await _hold(db, same, None, session=False, status="running")
+    await db.execute(
+        "UPDATE tasks SET claimed_at = '2026-10-17T10:00:00+00:00' WHERE id = ?",
+        (same,),
+    )
+    await db.execute(
+        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
+        "executor_run_id) VALUES (?, 'cloud', '', '2026-10-17 10:00:00', ?)",
+        (same, same_run),
+    )
+    await _slot_note(db, same)
+    await repo.add_task_update(db, same, "alice", "status", "Claimed by alice")
+    negatives.append(same)
     await db.commit()
     await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
     await db.commit()
@@ -726,6 +755,24 @@ async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
     assert (await _row(db, own))["executor_run_id"] == own_run
     for t in negatives:
         assert (await _row(db, t))["executor_run_id"] is None, t
+
+
+async def test_p1_first_pass_reaper_leaves_a_human_claim_after_a_manual_session(
+    db, monkeypatch
+):
+    """P1-2 (вариант): истёкшая РУЧНАЯ сессия (без прогона) и свежий захват человека —
+    принципал держателя неизвестен, имя не её: реапер задачу не трогает."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-p1-human-manual")
+    await _hold(db, task_id, None, session=True, status="running")
+    await db.execute(
+        "UPDATE tasks SET claimed_by='alice', claim_session_id='s-alice', "
+        "implementer_principal_id = NULL WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["claimed_by"] == "alice"
 
 
 async def test_p1_first_pass_reaper_leaves_a_human_claim(db, monkeypatch):
@@ -770,18 +817,19 @@ async def test_p1_backfill_covers_review_and_the_1732_chain(db, monkeypatch):
         "VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
         (task_id, run_id),
     )
-    await db.commit()
-    assert (await _row(db, task_id))["status"] == "review"
-    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
-    await db.commit()
-    assert (await _row(db, task_id))["executor_run_id"] == run_id
-
+    await _slot_note(db, task_id)
+    # сессия к выкату уже истекла, но ещё не удалена purge
     await db.execute(
         "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
         "WHERE bound_task_id = ?",
         (task_id,),
     )
     await db.commit()
+    assert (await _row(db, task_id))["status"] == "review"
+    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
+    await db.commit()
+    assert (await _row(db, task_id))["executor_run_id"] == run_id
+
     await cp.purge_expired(db)
     await repo.update_task(
         db,

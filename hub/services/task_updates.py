@@ -32,6 +32,7 @@ from hub.models import TaskUpdateCreate, TaskUpdateView
 from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
+from hub.services.resubmission_guard import stop_empty_done
 from hub.services import prevention_gate, run_claim
 
 log = logging.getLogger("hub")
@@ -142,6 +143,9 @@ async def _route_pending_report(
 ) -> None:
     """done на pending_report: в review (Universal Review Gate) или сразу completed."""
     task_id = int(task["id"])
+    # #1783: и этот вход — сдача; пустую пересдачу после «на доработку» не пускаем.
+    if await stop_empty_done(db, task):
+        return
     # #1155: на ЭТОМ маршруте конвейер гейтов не доезжает — обе ветки уходят из
     # pending_report сами, не зовя transition_after_agent_done. Сказать о
     # находках, на которые отчёт не ответил, больше некому. Перед развилкой, а

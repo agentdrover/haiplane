@@ -3859,6 +3859,18 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
+        # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
+        live = dict(await repo.get_task(db, task_id) or task)
+        if resubmission_guard.empty_resubmission_of(live, submission_sha):
+            raise HTTPException(
+                422,
+                detail=empty_resubmission_detail(
+                    task_id=task_id,
+                    sha=submission_sha,
+                    generation=int(live.get("submission_generation") or 0),
+                ),
+            )
         # #1687: the CI gates decided before the lock; a report accepted since
         # then withdrew the evidence. They are asked again here, of the database.
         await ci_trust.recheck_in_transaction(

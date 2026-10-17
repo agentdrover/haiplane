@@ -1053,6 +1053,19 @@ async def return_task_to_open(
     holder = rows[0]["implementer_principal_id"]
     if holders is not None and holder is not None and int(holder) not in holders:
         return False
+    if holders is not None and holder is None and (rows[0]["claimed_by"] or "").strip():
+        # #1783 (круг 2): держатель не назван принципалом — это захват человека
+        # или env-токена, а не сессии. Сессия отдаёт только захват под именем
+        # своего принципала; «неизвестный держатель — её» остаётся лишь для
+        # задачи, взятой без claim (pair-start из open: claimed_by пусто).
+        names = await fetchall(
+            db,
+            "SELECT username FROM principals WHERE id IN (%s)"  # nosec B608 - ids
+            % ", ".join("?" for _ in holders or {-1}),
+            tuple(holders) or (-1,),
+        )
+        if (rows[0]["claimed_by"] or "").strip() not in {r["username"] for r in names}:
+            return False
     live = await fetchall(
         db,
         "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "

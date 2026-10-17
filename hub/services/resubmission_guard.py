@@ -45,8 +45,10 @@ def empty_resubmission_of(task: dict[str, Any], sha: str) -> bool:
     return (task.get("submission_sha") or "").strip() == sha.strip()
 
 
-async def _uncommitted_work(db: aiosqlite.Connection, task_id: int) -> bool:
-    """В рабочем каталоге headless-задачи есть то, что хвост ещё закоммитит."""
+async def _uncommitted_work(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> bool:
+    """В рабочем каталоге headless-задачи есть то, что хвост ещё закоммитит или запушит."""
     from hub.integrations.registry import plugins
     from hub.services.orchestration import project_git_context
 
@@ -54,7 +56,11 @@ async def _uncommitted_work(db: aiosqlite.Connection, task_id: int) -> bool:
     workspace = ctx.get("repo")
     if not workspace:
         return False
-    return bool(await plugins.git_ops.dirty_paths(repo=workspace))
+    if await plugins.git_ops.dirty_paths(repo=workspace):
+        return True
+    return (
+        bool(branch) and await plugins.git_ops.unpushed_commits(branch, workspace) > 0
+    )
 
 
 async def stop_empty_done(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
@@ -83,9 +89,11 @@ async def stop_empty_done(db: aiosqlite.Connection, task: dict[str, Any]) -> str
     if not empty_resubmission_of(task, sha):
         return ""
     task_id = int(task["id"])
-    if task.get("job_id") and await _uncommitted_work(db, task_id):
-        # Headless: правки исполнителя лежат в рабочем каталоге, их коммитит и
-        # пушит хвост конвейера ПОСЛЕ этого места. Удалённая вершина до него —
+    if task.get("job_id") and await _uncommitted_work(
+        db, task_id, task.get("branch") or ""
+    ):
+        # Headless: правки исполнителя лежат в рабочем каталоге (или в локальных
+        # коммитах), их коммитит и пушит хвост конвейера ПОСЛЕ этого места. Удалённая вершина до него —
         # прежняя, и это не пустая пересдача (#1783, круг 2).
         return ""
     generation = int(task.get("submission_generation") or 0)

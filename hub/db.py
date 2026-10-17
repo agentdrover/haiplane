@@ -2309,20 +2309,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: какой прогон хаба держит захват задачи. Пишется в транзакции
-        # claim/pair-start сессией implementer с заказом; NULL — ручной захват
-        # и строки до миграции. Освобождение захвата без сессий (после сдачи,
-        # после changes_requested, в reaper) разрешено только по этому
-        # доказательству: пустой claimed_by держателя не доказывает.
+        # #1783: прогон хаба, держащий захват (claim/pair-start сессией с
+        # заказом); NULL — ручной захват. Снятие захвата без сессий — только
+        # по этому доказательству (см. services/run_claim.py).
         "add_tasks_executor_run_id",
         "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: захват снят (claimed_by → NULL) — доказательство «его держит
-        # прогон» уходит с ним, на ЛЮБОМ пути снятия, включая сырой SQL. Иначе
-        # застрявший executor_run_id у следующего ручного захвата читался бы
-        # доказательством чужого прогона. Триггер срабатывает только на
-        # присвоение claimed_by; собственный UPDATE executor_run_id его не будит.
+        # #1783: захват снят — доказательство уходит с ним на любом пути,
+        # включая сырой SQL (иначе оно переехало бы к ручному захвату).
         "trg_tasks_claim_cleared_drops_run_proof",
         "CREATE TRIGGER IF NOT EXISTS trg_tasks_claim_cleared_drops_run_proof "
         "AFTER UPDATE OF claimed_by ON tasks "
@@ -2481,33 +2476,30 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON executor_slots(task_id) WHERE released_at IS NULL",
     ),
     (
-        # #1783 (круг 2): слот знает, чей он — прогона, чья сессия его захватила.
-        # Без этого «слот задачи» нельзя отличить от слота другого держателя.
+        # #1783: чей слот — прогона, чья сессия его захватила.
         "add_executor_slots_executor_run_id",
         "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: захваты, уже стоящие на момент выката, получают доказательство
-        # ТОЛЬКО связкой «задача + сессия implementer с заказом + слот, который
-        # эта сессия записала при захвате»: слот открыт, канал и имя слота — её,
-        # записан не раньше текущего захвата, а сессия жива, её прогон — по этой
-        # задаче, принципал — держатель. Совпадения принципала мало: после release
-        # ручной claim тем же агентом при живой сессии старого прогона дал бы
-        # чужому прогону право снять новый захват. Статусы — все, где захват ещё
-        # стоит (в том числе review: тупик #1732 вырастает оттуда). Один раз.
+        # #1783: доказательство для захватов, стоящих при выкате: сессия с
+        # заказом + её слот, записанный не раньше захвата, и после него никто
+        # не брал задачу («Claimed by» новее «канал:»). Остаток: ручной
+        # pair-start из open в ту же секунду. Один раз.
         "backfill_tasks_executor_run_id",
-        "UPDATE tasks SET executor_run_id = ("
-        "SELECT s.executor_run_id FROM chat_pair_sessions s "
-        "JOIN executor_runs r ON r.id = s.executor_run_id "
-        "JOIN executor_slots sl ON sl.task_id = tasks.id "
-        "AND sl.released_at IS NULL AND sl.channel = s.channel AND sl.slot = s.slot "
+        "UPDATE tasks SET executor_run_id = (SELECT s.executor_run_id "
+        "FROM chat_pair_sessions s JOIN executor_runs r ON r.id = s.executor_run_id "
+        "JOIN executor_slots sl ON sl.task_id = tasks.id AND sl.released_at IS NULL "
+        "AND sl.channel = s.channel AND sl.slot = s.slot "
         "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
-        "AND r.task_id = tasks.id "
-        "AND s.principal_id = tasks.implementer_principal_id "
-        "AND s.revoked_at IS NULL AND s.expires_at > datetime('now') "
-        "AND datetime(sl.captured_at) >= "
-        "datetime(COALESCE(tasks.claimed_at, tasks.status_entered_at)) "
-        "ORDER BY s.id DESC LIMIT 1) "
+        "AND r.task_id = tasks.id AND s.principal_id = tasks.implementer_principal_id "
+        "AND s.revoked_at IS NULL AND (tasks.claimed_at IS NULL "
+        "OR datetime(sl.captured_at) >= datetime(tasks.claimed_at)) "
+        "AND EXISTS (SELECT 1 FROM task_updates c WHERE c.task_id = tasks.id "
+        "AND c.agent = 'hub' AND c.content LIKE 'канал: %') "
+        "AND NOT EXISTS (SELECT 1 FROM task_updates m WHERE m.task_id = tasks.id "
+        "AND m.content LIKE 'Claimed by %' AND m.id > (SELECT MAX(c2.id) "
+        "FROM task_updates c2 WHERE c2.task_id = tasks.id AND c2.agent = 'hub' "
+        "AND c2.content LIKE 'канал: %')) ORDER BY s.id DESC LIMIT 1) "
         "WHERE status IN ('claimed', 'running', 'review', 'fix_requested', "
         "'needs_decision') AND executor_run_id IS NULL "
         "AND (claimed_by IS NOT NULL OR claim_session_id IS NOT NULL)",

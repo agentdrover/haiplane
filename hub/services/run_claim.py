@@ -68,8 +68,9 @@ async def refuse_over_live_run(
 
     Круг починки оставляет задачу open с бронью прогона до сетевого create, и
     ручной захват на втором соединении иначе пропускал бы платного агента
-    поверх занятой задачи. Свой прогон звонящего (по токену его сессии) и
-    брошенная бронь без агента не мешают. Исключение — HTTP 409.
+    поверх занятой задачи. Облачный прогон (бронь или живой агент) задачу держит;
+    свой прогон звонящего (по токену его сессии), прогон слота (его держит заказ
+    хосту) и брошенная бронь без агента не мешают. Исключение — HTTP 409.
     """
     from fastapi import HTTPException
 
@@ -85,9 +86,10 @@ async def refuse_over_live_run(
         row = dict(raw)
         if caller_run_id is not None and int(row["id"]) == int(caller_run_id):
             continue
-        if not row["agent_id"] and row.get("channel", "cloud") != "slot":
-            if _reservation_abandoned(row):
-                continue
+        if row.get("channel", "cloud") == "slot":
+            continue  # прогон слота держит заказ хосту; его закрывает sweep заказов
+        if not row["agent_id"] and _reservation_abandoned(row):
+            continue
         raise HTTPException(
             409,
             f"Task #{task_id}: по ней идёт прогон исполнителя хаба #{row['id']} "
