@@ -1645,6 +1645,28 @@ async def test_c4_recorded_outcomes_make_the_same_sha_a_real_resubmission(
     await db.commit()
     assert await rg.findings_answered(db, await _row(db, task_id))
 
+    # и сам шаг submit с пустым телом уже не отказывает (раньше — 422)
+    from hub import models
+    from hub.services import lifecycle
+
+    await repo.update_task(
+        db,
+        task_id,
+        status="running",
+        review_verdict="changes_requested",
+        review_verdict_generation=1,
+        submission_sha=SHA,
+    )
+    await db.commit()
+    state = lifecycle.SubmitContext(
+        db=db,
+        task_id=task_id,
+        task=await _row(db, task_id),
+        body=models.TaskSubmitReview(agent="dev"),
+    )
+    state.submission_sha = SHA
+    await lifecycle._step_empty_resubmission(state)
+
 
 async def test_c3_the_reaper_pairs_the_run_with_the_mark_of_one_session(
     db, monkeypatch
