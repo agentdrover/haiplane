@@ -1582,24 +1582,68 @@ async def test_k8_two_connections_redeem_and_claim_leave_one_executor(
     assert (await _row(w.db, task_id))["claimed_by"] is None
 
 
-async def test_c3_repair_does_not_return_a_manual_holders_task_from_review(
+async def test_c3_repair_does_not_evict_a_live_manual_executor_from_review(
     db, monkeypatch
 ):
-    """Кнопка повторного прогона из review не снимает ручной захват (без доказательства
-    закончившегося прогона): отказ с причиной, провайдер не зван, задача цела."""
+    """Кнопка повторного прогона из review не вытесняет ручного исполнителя с ЖИВОЙ
+    сессией; без живой сессии возврат идёт как на develop."""
     _launch_config(monkeypatch)
     calls = _creator(monkeypatch, [_CREATED])
     human = await _human(db)
     _, task_id = await _task_with_findings(db, slug="rc-c3-manual-review")
     await repo.update_task(db, task_id, claimed_by="alice", claim_session_id="s-a")
+    await _live_run_session(db, task_id, 0, "alive-manual")
+    await db.execute(
+        "UPDATE chat_pair_sessions SET executor_run_id = NULL WHERE token_hash = ?",
+        ("alive-manual",),
+    )
     await db.commit()
     result = await el.repair_executor(
         db, task_id, issuer_principal_id=human, issuer="o"
     )
     assert not result.launched and "alice" in result.reason
     assert calls == []
-    after = await _row(db, task_id)
-    assert (after["status"], after["claimed_by"]) == ("review", "alice")
+    assert (await _row(db, task_id))["claimed_by"] == "alice"
+    # сессия истекла: как на develop, задача возвращается и заказ уходит
+    await db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute')"
+    )
+    await db.commit()
+    again = await el.repair_executor(db, task_id, issuer_principal_id=human, issuer="o")
+    assert again.launched, again
+    assert len(calls) == 1
+
+
+async def test_c4_recorded_outcomes_make_the_same_sha_a_real_resubmission(
+    db, monkeypatch
+):
+    """Исходы находок записаны ОТДЕЛЬНО (false_positive по всем) — тот же коммит дальше
+    не «пустая пересдача», хотя в самом запросе исходов нет."""
+    from hub.services import resubmission_guard as rg
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-outcomes")
+    task = await _row(db, task_id)
+    assert not await rg.findings_answered(db, task)
+    report = (await repo.machine_reviews_of_generation(db, task_id, 1))[-1]
+    from hub.models import MachineReviewView
+
+    view = MachineReviewView(**dict(report))
+    for finding in [*view.findings_confirmed, *view.unresolved]:
+        kind = "confirmed" if finding in view.findings_confirmed else "unresolved"
+        await db.execute(
+            "INSERT INTO finding_outcomes (review_id, task_id, submission_generation, "
+            "finding_uid, finding_index, outcome, note, reported_by) "
+            "VALUES (?, ?, 1, ?, -1, ?, 'n', 'dev')",
+            (
+                dict(report)["id"],
+                task_id,
+                finding.finding_uid,
+                "false_positive" if kind == "confirmed" else "not_a_defect",
+            ),
+        )
+    await db.commit()
+    assert await rg.findings_answered(db, await _row(db, task_id))
 
 
 async def test_c3_the_reaper_pairs_the_run_with_the_mark_of_one_session(

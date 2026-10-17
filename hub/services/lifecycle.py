@@ -3122,8 +3122,10 @@ async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
 
 async def _step_empty_resubmission(state: SubmitContext) -> None:
     """Пересдача без новых коммитов после «на доработку» отказана (#1783)."""
-    if not state.body.finding_outcomes and resubmission_guard.empty_resubmission_of(
-        state.task, state.submission_sha
+    if (
+        not state.body.finding_outcomes
+        and resubmission_guard.empty_resubmission_of(state.task, state.submission_sha)
+        and not await resubmission_guard.findings_answered(state.db, state.task)
     ):
         raise HTTPException(
             422,
@@ -3869,8 +3871,10 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
-        if not body.finding_outcomes and resubmission_guard.empty_resubmission_of(
-            live, submission_sha
+        if (
+            not body.finding_outcomes
+            and resubmission_guard.empty_resubmission_of(live, submission_sha)
+            and not await resubmission_guard.findings_answered(db, live)
         ):
             raise HTTPException(
                 422,

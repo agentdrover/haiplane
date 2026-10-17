@@ -63,6 +63,26 @@ UNCOMMITTED_KEY = "_uncommitted_work"
 EMPTY_UNLESS_COMMITTED = "_empty_unless_committed"
 
 
+async def findings_answered(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """На находки отчёта текущего поколения уже записаны исходы, открытых не осталось.
+
+    Тот же коммит с ответом по существу (false_positive, not_a_defect) — не пустая
+    пересдача, даже если исходы записаны отдельной записью, а не в этом запросе.
+    """
+    from hub.services import finding_outcome
+
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    reports = await finding_outcome.reports_owed_an_answer(db, task_id, generation)
+    answered = False
+    for report in reports:
+        if await repo.list_finding_outcomes(db, int(dict(report)["id"])):
+            answered = True
+    if not answered:
+        return False
+    return not await finding_outcome.open_findings(db, task_id, generation)
+
+
 def tail_runs(task: dict[str, Any]) -> bool:
     """Git-хвост done (коммит и пуш в ``_route_after_done``) для задачи состоится."""
     from hub.services.orchestration import review_budget_exhausted
@@ -211,7 +231,7 @@ async def stop_empty_done(
         sha, _ = await lifecycle.resolve_branch_tip(
             db, int(task["id"]), task.get("branch") or ""
         )
-    if not empty_resubmission_of(task, sha):
+    if not empty_resubmission_of(task, sha) or await findings_answered(db, task):
         return ""
     if tail_pending and tail_runs(task) and task.get(UNCOMMITTED_KEY):
         # Правки исполнителя ещё не в удалённой ветке: их коммитит и пушит хвост

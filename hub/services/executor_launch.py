@@ -41,7 +41,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import chat_pair, orchestrator_queue, project_policy
-from hub.db import write_transaction
+from hub.db import fetchall, write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
 from hub.services.result_kind import (
@@ -944,11 +944,18 @@ async def _repair_early_refusal(
         task["status"] in ("review", "fix_requested")
         and (task.get("claimed_by") or "").strip()
     ):
-        # Возврат в работу чужого ручного захвата кнопкой не делается: держатель с
-        # доказательством закончившегося прогона отпустит себя сам (#1783).
+        # Ручной исполнитель с ЖИВОЙ сессией кнопкой не вытесняется (#1783); без живой
+        # сессии возврат идёт как на develop.
         from hub.services import run_claim
 
-        if await run_claim.finished_run_of(db, task) is None:
+        live_session = await fetchall(
+            db,
+            "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+            "AND bound_task_id = ? AND revoked_at IS NULL "
+            "AND expires_at > datetime('now')",
+            (task_id,),
+        )
+        if live_session and await run_claim.finished_run_of(db, task) is None:
             return _refused(
                 f"{REASON_NOT_RETURNABLE}: задачу держит {task['claimed_by']}", task_id
             )
