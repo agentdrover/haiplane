@@ -23,6 +23,7 @@ from fastapi import HTTPException
 import aiosqlite
 
 from hub import config, models
+from hub import db as db_module
 from hub import repository as repo
 from hub import services
 from hub.db import deserialize_str_list
@@ -1758,3 +1759,43 @@ async def test_a_pair_done_with_local_fixes_reaches_the_tail(
     row = dict(await repo.get_task(db, task.id))
     assert row["submission_generation"] == 2, "отчёт принят, поколение открыто"
     assert seen[0] is False, "факты git собраны вне write-транзакции"
+
+
+async def test_c3_answering_the_findings_is_not_an_empty_resubmission(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Автор оспаривает находки исходами на том же коммите: это ответ по существу.
+    Шаг пустой пересдачи с исходами не отказывает; без них — отказывает."""
+    _git, task = await _sent_back(db, monkeypatch, "Ответ исходами")
+    row = dict(await repo.get_task(db, task.id))
+
+    def _state(outcomes):
+        body = models.TaskSubmitReview(agent="dev", finding_outcomes=outcomes)
+        state = lifecycle.SubmitContext(db=db, task_id=task.id, task=row, body=body)
+        state.submission_sha = "tip-1"
+        return state
+
+    item = models.FindingOutcomeItem(
+        finding_uid="abc", outcome="false_positive", note="n"
+    )
+    await lifecycle._step_empty_resubmission(_state([item]))
+    with pytest.raises(HTTPException):
+        await lifecycle._step_empty_resubmission(_state([]))
+
+
+async def test_c3_the_guard_does_not_ask_the_network_inside_a_transaction(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Нет подготовленной вершины, а транзакция открыта: guard сеть не зовёт, вершина
+    неизвестна — это не «правок нет»."""
+    from hub.services import resubmission_guard as _rg
+
+    _git, task = await _sent_back(db, monkeypatch, "Сеть под локом")
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("сеть под write-локом")
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _boom)
+    row = dict(await repo.get_task(db, task.id))
+    async with db_module.write_transaction(db):
+        assert await _rg.stop_empty_done(db, row) == ""

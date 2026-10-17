@@ -44,6 +44,7 @@ from tests.test_executor_dispatch import (
 )
 
 SHA = "a" * 40
+CLAIMED_AT = "2026-10-16T10:00:00+00:00"
 
 
 async def _row(db: aiosqlite.Connection, task_id: int) -> dict:
@@ -74,7 +75,7 @@ async def _hold(
         task_id,
         claimed_by=acting["username"],
         claim_session_id="s-run",
-        claimed_at="2026-10-16T10:00:00+00:00",
+        claimed_at=CLAIMED_AT,
         executor_run_id=run_id,
         implementer_principal_id=int(acting["id"]),
         **({"status": status} if status else {}),
@@ -86,7 +87,7 @@ async def _hold(
         await db.execute(
             "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
             "kind, bound_task_id, bound_generation, executor_run_id, claimed_session) "
-            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?, 's-run')",  # nosec B608 - literals
+            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?, 's-run|{CLAIMED_AT}')",  # nosec B608 - literals
             (int(acting["id"]), f"h-{task_id}-{run_id}-{live}", task_id, run_id),
         )
     await db.commit()
@@ -247,7 +248,7 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
         "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
         (run,),
     )
-    assert bound[0][0] == "s-1783", "сессия запомнила свой claim_session_id"
+    assert bound[0][0].startswith("s-1783|2"), "сессия запомнила свой claim"
 
     # done из claimed снимает захват и вместе с ним закрывает сессии и слот прогона:
     # доказательство уходит с захватом, и позже закрыть эти остатки было бы нечем.
@@ -309,7 +310,7 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
         "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
         (run2,),
     )
-    assert bound2[0][0] == "s-1783-ps"
+    assert bound2[0][0] == "s-1783-ps|"
 
 
 # ---------------------------------------------------------------------------
@@ -496,10 +497,16 @@ async def test_stuck_claim_without_sessions_is_released(client, db, monkeypatch)
     )
     await db.commit()
     await cp.purge_expired(db)
-    assert not await db.execute_fetchall(
-        "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ?", (task_id,)
-    )
+    # Теперь и в review: доказательство есть, прогон закончен — страховка снимает захват
+    # (раньше он висел до вердикта и становился тупиком).
+    assert (await _row(db, task_id))["claimed_by"] is None
     # Сам вердикт (b) освободил бы захват; здесь воспроизводим уже зависшее состояние.
+    await _hold(db, task_id, run_id, session=False)
+    await db.execute(
+        "INSERT INTO executor_slots (task_id, channel, slot, executor_run_id) "
+        "VALUES (?, 'cloud', '', ?)",
+        (task_id, run_id),
+    )
     await repo.update_task(
         db,
         task_id,
@@ -527,7 +534,7 @@ async def test_stuck_claim_without_sessions_is_released(client, db, monkeypatch)
             (task_id,),
         )
     ]
-    assert len(notes) == 1
+    assert len(notes) == 2  # снятие в review и снятие после вердикта
 
     await _phase_reaper_leaves_what_is_not_provable(db, monkeypatch)
     await _phase_manual_session_released_by_ttl(db, monkeypatch)
@@ -846,7 +853,9 @@ async def test_p1_reaper_gives_back_only_the_claim_the_session_made(db, monkeypa
         await db.execute(
             "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
             "kind, bound_task_id, bound_generation, claimed_session) VALUES "
-            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, 'S1')",
+            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1, 'S1|"
+            + CLAIMED_AT
+            + "')",
             (int(acting["id"]), f"bind-{tag}", task_id),
         )
         await db.commit()
@@ -869,12 +878,12 @@ async def test_p1_bind_claim_records_the_declared_session(db, monkeypatch):
         (int(acting["id"]), cp.hash_pair_code("tok-bind"), task_id),
     )
     await db.commit()
-    await cp.bind_claim(db, "tok-bind", task_id, "S-declared")
+    await cp.bind_claim(db, "tok-bind", task_id, "S-declared", CLAIMED_AT)
     rows = await db.execute_fetchall(
         "SELECT claimed_session FROM chat_pair_sessions WHERE bound_task_id = ?",
         (task_id,),
     )
-    assert rows[0][0] == "S-declared"
+    assert rows[0][0] == "S-declared|2026-10-16T10:00:00+00:00"
 
 
 async def _phase_slot_booking_blocks_a_manual_claim(slot_world):
@@ -1264,3 +1273,111 @@ async def test_c3_p1_every_terminal_status_releases_the_claim_without_usage(
         assert dict(await repo.get_executor_run(db, run))["outcome"] != "running", (
             status
         )  # type: ignore[arg-type]
+
+
+async def test_c3_the_session_gives_back_only_the_claim_with_its_own_time(
+    db, monkeypatch
+):
+    """P1 (Codex): захват отпустили и взяли заново ПОД ТЕМ ЖЕ session_id (человек или
+    обычный токен) — время claim другое, истёкшая сессия его не снимает."""
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-same-id")
+    await _hold(db, task_id, None, session=False, status="running")
+    await db.execute(
+        "UPDATE tasks SET claim_session_id = 'S1', claimed_at = '2026-10-17T09:00:00+00:00' "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'c3-same', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), task_id, cp.claim_mark("S1", CLAIMED_AT)),
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    assert (await _row(db, task_id))["claimed_by"]
+
+
+async def test_c3_a_foreign_done_does_not_clear_a_claim(db, monkeypatch):
+    """done от агента, который задачу не держит, захват (и его прогон) не снимает."""
+    from hub import models, services
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-foreign-done")
+    run = await _new_run(db, task_id, 2)
+    await _hold(db, task_id, run, session=True, live=True, status="claimed")
+    await db.execute("UPDATE tasks SET branch = '' WHERE id = ?", (task_id,))
+    await db.commit()
+    await services.add_update(
+        db,
+        task_id,
+        models.TaskUpdateCreate(agent="stranger", kind="done", content="чужой отчёт"),
+    )
+    held = await _row(db, task_id)
+    assert (held["claimed_by"], held["executor_run_id"]) == ("cloud", run)
+    live = await db.execute_fetchall(
+        "SELECT 1 FROM chat_pair_sessions WHERE executor_run_id = ? AND revoked_at IS NULL",
+        (run,),
+    )
+    assert live, "сессии чужого прогона не отозваны"
+
+
+async def test_c3_the_stale_claim_sweep_leaves_a_retaken_claim(db, monkeypatch):
+    """Sweep аренды выбрал захват, а его успели отпустить и взять заново: новый не снимается."""
+    from hub import poller
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-sweep")
+    await repo.update_task(db, task_id, status="claimed")
+    await db.execute(
+        "UPDATE tasks SET claimed_by='new', claimed_at='2026-10-17T11:00:00+00:00' "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+    stale = dict(await _row(db, task_id)) | {"claimed_at": "2026-10-17T08:00:00+00:00"}
+
+    async def _stale_list(_db, _minutes):
+        return [stale]
+
+    monkeypatch.setattr(repo, "list_expired_claims", _stale_list)
+    await poller._sweep_expired_claims(db)
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"]) == ("claimed", "new")
+
+
+async def test_c3_release_task_takes_the_lock_before_it_looks_at_the_holder(
+    db, monkeypatch
+):
+    """release_task берёт write-лок ДО проверки держателя."""
+    from hub import models
+    from hub.services import lifecycle
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-release")
+    await repo.update_task(db, task_id, status="claimed", claimed_by="alice")
+    await db.commit()
+    seen: list[bool] = []
+    real = repo.get_task
+
+    async def _spy(conn, tid):
+        seen.append(conn.in_transaction)
+        return await real(conn, tid)
+
+    monkeypatch.setattr(lifecycle.repo, "get_task", _spy)
+    await lifecycle.release_task(db, task_id, models.TaskRelease(agent="alice"))
+    assert seen and seen[0] is True
+
+
+async def test_c3_a_stuck_claim_in_needs_decision_is_released_too(db, monkeypatch):
+    """Прогон закончился ошибкой, снятие при сдаче отказало, задача ушла в needs_decision:
+    второй проход снимает захват и там (доказательство есть, признаков работы нет)."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-nd")
+    run = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, run, session=True, status="needs_decision")
+    await cp.purge_expired(db)
+    freed = await _row(db, task_id)
+    assert (freed["status"], freed["claimed_by"]) == ("needs_decision", None)

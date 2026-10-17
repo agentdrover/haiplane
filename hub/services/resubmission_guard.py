@@ -45,6 +45,8 @@ def empty_resubmission_of(task: dict[str, Any], sha: str) -> bool:
     """
     if task.get("status") in ("review", "completed", "open") or not sha:
         return False
+    if task.get("_answered_findings"):
+        return False  # исходы находок — ответ по существу, не пустая пересдача
     if (task.get("review_verdict") or "") != "changes_requested":
         return False
     generation = int(task.get("submission_generation") or 0)
@@ -197,9 +199,12 @@ async def stop_empty_done(
         return ""
     # Подготовленный вне транзакции результат — в том числе «вершина не
     # прочитана» (пусто) — не повод идти в сеть под write-локом. Спрашиваем сами
-    # только там, где подготовки не было (headless-путь поллера).
+    # только там, где подготовки не было и это headless-путь поллера (его закрепление
+    # вершины так же ходит в git) либо транзакции нет; pair внутри транзакции
+    # неизвестную вершину за «правок нет» не принимает.
     sha = (task.get(lifecycle.PREPARED_CI_SHA) or "").strip()
-    if not sha and lifecycle.PREPARED_CI_SHA not in task:
+    unprepared = lifecycle.PREPARED_CI_SHA not in task
+    if not sha and unprepared and (task.get("job_id") or not db.in_transaction):
         sha, _ = await lifecycle.resolve_branch_tip(
             db, int(task["id"]), task.get("branch") or ""
         )

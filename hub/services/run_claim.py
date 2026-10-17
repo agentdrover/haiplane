@@ -29,6 +29,10 @@ from hub.services.return_running import work_signs
 log = logging.getLogger(__name__)
 
 EVENT_CLAIM_RELEASED = "executor_claim_released"
+#: Статусы, в которых захват доказанного прогона ещё может стоять и подлежит
+#: страховочному снятию: попытка снять при сдаче могла отказать (чужая живая
+#: сессия), а статус — уйти дальше (review, needs_decision).
+HELD_STATUSES = ("claimed", "running", "review", "fix_requested", "needs_decision")
 #: Прогон кончился, пока у него были сессии или слот: что закрыто вместе с ним.
 SLOT_REASON = "захват снят: прогон хаба #{run} закончен"
 
@@ -226,7 +230,7 @@ async def release_after_run_closed(
         db,
         int(dict(run)["task_id"]),
         run_id=int(run_id),
-        statuses=("claimed", "running", "review", "fix_requested", "needs_decision"),
+        statuses=HELD_STATUSES,
         close_own_sessions=True,
         note=f"Захват снят: исполнение прогона хаба #{run_id} закрыто ({why}); "
         "сессии прогона отозваны, слот закрыт (#1783).",
@@ -263,7 +267,8 @@ async def stuck_candidates(db: aiosqlite.Connection) -> list[int]:
     rows = await fetchall(
         db,
         "SELECT t.id FROM tasks t JOIN executor_runs r ON r.id = t.executor_run_id "
-        "WHERE t.status IN ('running', 'claimed') AND r.outcome <> 'running' "
+        "WHERE t.status IN ('claimed', 'running', 'review', 'fix_requested', "
+        "'needs_decision') AND r.outcome <> 'running' "
         "AND r.task_id = t.id ORDER BY t.id",
     )
     return [int(r["id"]) for r in rows]
@@ -280,7 +285,7 @@ async def release_stuck_task(db: aiosqlite.Connection, task_id: int) -> bool:
     if found is None:
         return False
     task = dict(found)
-    if task["status"] not in ("running", "claimed"):
+    if task["status"] not in HELD_STATUSES:
         return False
     run = await finished_run_of(db, task)
     if run is None:

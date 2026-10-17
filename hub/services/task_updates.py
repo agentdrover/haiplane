@@ -189,7 +189,7 @@ async def _route_pending_report(
 
 
 async def _route_pair_or_claimed(
-    db: aiosqlite.Connection, task: dict[str, Any]
+    db: aiosqlite.Connection, task: dict[str, Any], agent: str = ""
 ) -> None:
     """done на running/claimed без job: общий post-done переход, блокер, очистка claim.
 
@@ -198,7 +198,10 @@ async def _route_pair_or_claimed(
     branch — transition_after_agent_done then routes it to completed.
     """
     task_id = int(task["id"])
-    was_claimed = task["status"] == "claimed"
+    # Захват снимает отчёт его держателя; чужой done (старая сессия, другой агент)
+    # чужой захват и его прогон не трогает (#1783, круг 3).
+    holder = (task.get("claimed_by") or "").strip()
+    was_claimed = task["status"] == "claimed" and holder in ("", agent)
     updates_list = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а не любой в
     # истории. Снятое препятствие больше не уводит сдачу мимо доставки, а
@@ -230,10 +233,12 @@ async def _route_done(
     # the task is blocked while the current validation run is red/absent. Only
     # completion-bound reports are gated; the poller path is not affected.
     await lc._done_validation_gate(db, task)
+    if body.finding_outcomes:  # ответ на находки — не пустая пересдача (#1783)
+        task = {**task, "_answered_findings": True}
     if task["status"] == "pending_report":
         await _route_pending_report(db, task, body)
     elif task["status"] in ("running", "claimed") and not task.get("job_id"):
-        await _route_pair_or_claimed(db, task)
+        await _route_pair_or_claimed(db, task, (body.agent or "").strip())
     # open + done without pair-start: rejected before insert (AC-2)
 
 

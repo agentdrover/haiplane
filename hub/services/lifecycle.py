@@ -1990,7 +1990,9 @@ async def _pair_start_write(
         # доказательство прогона пишется здесь. Из claimed оно уже записано
         # claim'ом; None у ручного старта стирает чужой хвост.
         update_fields["executor_run_id"] = caller_run
-        await chat_pair.bind_claim(db, session_token, task_id, declared_session)
+        await chat_pair.bind_claim(
+            db, session_token, task_id, declared_session, fresh["claimed_at"]
+        )
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
@@ -3118,7 +3120,9 @@ async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
 
 async def _step_empty_resubmission(state: SubmitContext) -> None:
     """Пересдача без новых коммитов после «на доработку» отказана (#1783)."""
-    if resubmission_guard.empty_resubmission_of(state.task, state.submission_sha):
+    if not state.body.finding_outcomes and resubmission_guard.empty_resubmission_of(
+        state.task, state.submission_sha
+    ):
         raise HTTPException(
             422,
             detail=empty_resubmission_detail(
@@ -4907,7 +4911,9 @@ async def _claim_write(
     # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
     # чужой прежний executor_run_id у нового держателя не остаётся.
     claim_fields["executor_run_id"] = caller_run
-    await chat_pair.bind_claim(db, session_token, task_id, body.session_id or "")
+    await chat_pair.bind_claim(
+        db, session_token, task_id, body.session_id or "", claim_fields["claimed_at"]
+    )
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when
@@ -5016,6 +5022,9 @@ async def release_task(
     body: TaskRelease,
 ) -> TaskView:
     """Release an active claim and return the task to open."""
+    # Write-лок до проверки держателя: иначе между проверкой и переходом задачу
+    # успевали отпустить и взять заново, и новый захват снимался (#1783).
+    await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")

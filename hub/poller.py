@@ -1765,6 +1765,17 @@ async def _sweep_expired_claims(db) -> None:
     for row in expired_claims:
         with _task_isolation("claim expiry", dict(row).get("id")):
             task = dict(row)
+            # Выборка устарела, если захват успели отпустить и взять заново (#1783):
+            # под write-локом освобождается только тот захват, что выбран.
+            await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
+            live = await repo.get_task(db, task["id"])
+            if (
+                live is None
+                or live["status"] != "claimed"
+                or live["claimed_at"] != task.get("claimed_at")
+            ):
+                await db.commit()
+                continue
             await repo.update_task(
                 db,
                 task["id"],

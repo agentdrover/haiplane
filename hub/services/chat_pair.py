@@ -819,19 +819,33 @@ async def ordered_skill_of_session(
     }
 
 
-async def bind_claim(
-    db: aiosqlite.Connection, token: str, task_id: int, declared_session: str
-) -> None:
-    """Сессия implementer запоминает, под каким claim_session_id она взяла задачу.
+def claim_mark(claim_session_id: str | None, claimed_at: str | None) -> str:
+    """Метка захвата: объявленный session_id и время claim (одно и то же у сессии и у задачи)."""
+    return f"{claim_session_id or ''}|{claimed_at or ''}"
 
-    Реапер потом отдаёт задачу мёртвой сессии, только если захват — её (#1783):
-    независимый claim тем же принципалом под другим session_id её не наследует.
+
+async def bind_claim(
+    db: aiosqlite.Connection,
+    token: str,
+    task_id: int,
+    declared_session: str,
+    claimed_at: str | None,
+) -> None:
+    """Сессия implementer запоминает, КАКОЙ захват она сделала (#1783).
+
+    Реапер отдаёт задачу мёртвой сессии, только если захват — тот самый: тот же
+    session_id и то же время claim. Независимый claim тем же принципалом, даже
+    под тем же session_id, время имеет другое и сессию не наследует.
     """
     if token and declared_session:
         await db.execute(
             "UPDATE chat_pair_sessions SET claimed_session = ? "
             "WHERE token_hash = ? AND kind = 'implementer' AND bound_task_id = ?",
-            (declared_session, hash_pair_code(token), int(task_id)),
+            (
+                claim_mark(declared_session, claimed_at),
+                hash_pair_code(token),
+                int(task_id),
+            ),
         )
 
 
@@ -1062,7 +1076,8 @@ async def return_task_to_open(
     rows = await fetchall(
         db,
         "SELECT status, implementer_principal_id, job_id, review_job_id, "
-        "claimed_by, claim_session_id, executor_run_id FROM tasks WHERE id = ?",
+        "claimed_by, claim_session_id, claimed_at, executor_run_id "
+        "FROM tasks WHERE id = ?",
         (int(task_id),),
     )
     if not rows or rows[0]["status"] != from_status:
@@ -1077,7 +1092,8 @@ async def return_task_to_open(
     # записи (NULL — не брала, в том числе сессии до этой записи) задачу не трогаем,
     # а чужой claim_session_id не совпадёт (#1783, круг 3).
     if session_claims is not None:
-        if (rows[0]["claim_session_id"] or None) not in session_claims - {None}:
+        mark = claim_mark(rows[0]["claim_session_id"], rows[0]["claimed_at"])
+        if mark not in session_claims - {None}:
             return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.
@@ -1308,7 +1324,8 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
         "t.executor_run_id IS NOT NULL "
         "AND t.executor_run_id = chat_pair_sessions.executor_run_id "
         "AND t.id = chat_pair_sessions.bound_task_id "
-        "AND t.status IN ('running', 'claimed'))"
+        "AND t.status IN ('claimed', 'running', 'review', 'fix_requested', "
+        "'needs_decision'))"
         + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
         tuple(sorted(unreleased)),
     )
