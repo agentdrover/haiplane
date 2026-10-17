@@ -35,11 +35,14 @@ async def _defect(
     status: str = "pending_report",
     task_type: str = "task",
     parent_id: int | None = None,
+    cause_kind: str | None = "unknown",
 ) -> int:
+    # #1791: the kind of cause is a second reason of the same gate; these tests
+    # are about the prevention, so the defect arrives with its cause named.
     cur = await db.execute(
         "INSERT INTO tasks (title, description, status, found_in, auto_review, "
-        "task_type, parent_id) VALUES (?, '', ?, ?, 0, ?, ?)",
-        (f"defect {found_in}", status, found_in, task_type, parent_id),
+        "task_type, parent_id, cause_kind) VALUES (?, '', ?, ?, 0, ?, ?, ?)",
+        (f"defect {found_in}", status, found_in, task_type, parent_id, cause_kind),
     )
     await db.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]

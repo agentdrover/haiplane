@@ -25,6 +25,17 @@ hear it:
   are not blocked, but a close without an output is written as its own event
   (``prod_defect_closed_without_prevention``) and alert, so it is counted and
   visible rather than indistinguishable from a close that had one.
+
+The kind of cause (#1791, ``tasks.cause_kind``) rides the same gate as a second,
+independent reason. A prod defect closes only with a named kind of cause —
+``unknown`` is an answer ("looked, not established"), an empty field is not —
+and it must not be read off the prevention the caller happened to send: a
+valid prevention does not make the kind present. Both reasons are judged on the
+row as it stands in the transaction, apart from the task dict a caller carries.
+``unknown`` does not stand in for the prevention either: the gate wants both.
+A human close without a kind is its own event
+(``prod_defect_closed_without_cause_kind``), counted apart from the missing
+prevention.
 """
 
 from __future__ import annotations
@@ -40,10 +51,12 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import FINAL_STATUSES, DefectPrevention
 from hub.services import watch_notices
+from hub.services.cause_kind import CAUSE_KINDS
 
 _FINAL = frozenset(s.value for s in FINAL_STATUSES)
 
 CLOSED_WITHOUT_PREVENTION = "prod_defect_closed_without_prevention"
+CLOSED_WITHOUT_CAUSE_KIND = "prod_defect_closed_without_cause_kind"
 
 PREVENTION_OPTIONS = (
     "regression_test — ref: локатор регрессионного теста (tests/x.py::test_y)",
@@ -69,6 +82,34 @@ SUBMIT_DOOR = (
 )
 
 
+#: How the missing kind is set, per door; the same call for every door.
+CAUSE_KIND_HINT = (
+    "Задайте его: hub_refine_task(cause_kind), POST /api/tasks/{id}/refine или "
+    "oc-hub refine --cause-kind; regression требует caused_by_task_id, "
+    "unknown — «причина не установлена»."
+)
+
+
+def cause_kind_gap(task: dict[str, Any]) -> str:
+    """Why the kind of cause is missing, or "" when the gate does not apply."""
+    if (task.get("found_in") or "") != "prod":
+        return ""
+    if (task.get("cause_kind") or "").strip():
+        return ""
+    return (
+        "cause_kind_required: у прод-дефекта (found_in='prod') не назван вид "
+        f"причины — один из: {CAUSE_KINDS}. {CAUSE_KIND_HINT}"
+    )
+
+
+def completion_gap(task: dict[str, Any], door: str = "") -> str:
+    """Every reason a prod defect may not complete yet, or "".
+
+    The two reasons are independent: neither is read off the other.
+    """
+    return " ".join(g for g in (prevention_gap(task, door), cause_kind_gap(task)) if g)
+
+
 def prevention_gap(task: dict[str, Any], door: str = "") -> str:
     """Why this task may not complete yet, or "" when the gate does not apply."""
     if (task.get("found_in") or "") != "prod":
@@ -84,6 +125,23 @@ def prevention_gap(task: dict[str, Any], door: str = "") -> str:
 def refuse_without_prevention(task: dict[str, Any], door: str = DONE_DOOR) -> None:
     """Agent doors: refuse, naming the three options and this door's field."""
     gap = prevention_gap(task, door)
+    if gap:
+        raise HTTPException(422, gap)
+
+
+async def _fresh(db: aiosqlite.Connection, task: dict[str, Any]) -> dict[str, Any]:
+    """The row as it stands now: the caller's dict may predate a refine (#1791)."""
+    row = await repo.get_task(db, int(task["id"]))
+    return dict(row) if row is not None else task
+
+
+def refuse_without_cause_kind(task: dict[str, Any], door: str = "") -> None:
+    """Agent doors: refuse a prod defect with no kind of cause, whatever came
+    with the report — the prevention sent along does not name the cause.
+
+    When the prevention is missing too, one refusal names both.
+    """
+    gap = completion_gap(task, door) if door else cause_kind_gap(task)
     if gap:
         raise HTTPException(422, gap)
 
@@ -141,6 +199,12 @@ async def record_done_prevention(
     back with it: a feed line saying "done" next to a refused close is the
     false record #364 removed.
     """
+    if kind == "done":
+        # #1791: the cause is judged on every done report, with or without a
+        # prevention in it; before anything is stored, so a refusal leaves
+        # nothing behind but the savepoint rollback.
+        fresh = await _fresh(db, task)
+        refuse_without_cause_kind(fresh, DONE_DOOR if prevention is None else "")
     if prevention is None:
         if kind == "done":
             refuse_without_prevention(task)
@@ -179,6 +243,10 @@ async def check_submission(
     that could still refuse, like the finding outcomes (#911): an output
     recorded for a submission that never happened would read as answered.
     """
+    # #1791: the kind of cause is judged whatever prevention came with the
+    # submission, on the row as it stands in this transaction.
+    fresh = await _fresh(db, task)
+    refuse_without_cause_kind(fresh, SUBMIT_DOOR if prevention is None else "")
     if prevention is None:
         refuse_without_prevention(task, SUBMIT_DOOR)
         return None
@@ -186,10 +254,11 @@ async def check_submission(
 
 
 ROLLUP_HELD_NOTE = (
-    "Родитель — прод-дефект (found_in='prod') без вывода: роллап не закрыл "
-    "его, хотя дети завершены. Закрытие ждёт собственного отчёта с выводом "
-    "(prevention в hub_report_done или hub_submit_for_review) — тест, правило из "
-    "category_checks или принятый риск с причиной и сроком пересмотра."
+    "Родитель — прод-дефект (found_in='prod') без вывода или без вида причины: "
+    "роллап не закрыл его, хотя дети завершены. Закрытие ждёт собственного "
+    "отчёта с выводом (prevention в hub_report_done или hub_submit_for_review) — "
+    "тест, правило из category_checks или принятый риск с причиной и сроком "
+    "пересмотра — и названного вида причины (cause_kind в refine)."
 )
 
 
@@ -219,9 +288,10 @@ async def hold_completion(
         # human through the emergency exit, say — is not reopened by a sweep
         # that happens to pass over it.
         return False
-    gap = prevention_gap(dict(row))
+    gap = completion_gap(dict(row))
     if not gap:
         return False
+    reason = "prevention_missing" if prevention_gap(dict(row)) else "cause_kind_missing"
     # Conditional, in one UPDATE: a close that landed between the read above
     # and this write leaves the row as it is — "already closed", not an error.
     if not await repo.transition_status_if(
@@ -235,14 +305,14 @@ async def hold_completion(
         "alert",
         f"Прод-дефект не завершён ({via}): {gap} Решение за человеком "
         "(REST POST /api/tasks/<id>/decide): rework вернёт задачу в работу, чтобы агент "
-        "пересдал отчёт с выводом; accept закроет её без вывода, и это "
-        "будет записано отдельным событием.",
+        "пересдал отчёт с выводом и названным видом причины; accept закроет её "
+        "без недостающего, и это будет записано отдельным событием.",
     )
     await watch_notices.emit_needs_decision(
         db,
         task_id=task_id,
         actor=actor,
-        payload={"reason": "prevention_missing", "via": via},
+        payload={"reason": reason, "via": via},
     )
     return True
 
@@ -250,22 +320,43 @@ async def hold_completion(
 async def note_close_without_prevention(
     db: aiosqlite.Connection, task: dict[str, Any], *, via: str, actor: str
 ) -> None:
-    """Human doors: the close goes through, and its missing output is named."""
-    if not prevention_gap(task):
-        return
-    await repo.add_task_update(
-        db,
-        task["id"],
-        "hub",
-        "alert",
-        f"Прод-дефект закрыт человеком ({via}) без вывода: ни регрессионного "
-        "теста, ни правила, ни принятого риска. Закрытие засчитано как "
-        "аварийный выход и видно в отчёте отдельно.",
-    )
-    await repo.insert_event(
-        db,
-        kind=CLOSED_WITHOUT_PREVENTION,
-        task_id=task["id"],
-        actor=actor,
-        payload={"via": via},
-    )
+    """Human doors: the close goes through, and what is missing is named.
+
+    The missing prevention and the missing kind of cause (#1791) are two
+    bypasses: each is its own alert and event, so the count of closes without
+    a kind is not mixed into the count of closes without an output.
+    """
+    if prevention_gap(task):
+        await repo.add_task_update(
+            db,
+            task["id"],
+            "hub",
+            "alert",
+            f"Прод-дефект закрыт человеком ({via}) без вывода: ни регрессионного "
+            "теста, ни правила, ни принятого риска. Закрытие засчитано как "
+            "аварийный выход и видно в отчёте отдельно.",
+        )
+        await repo.insert_event(
+            db,
+            kind=CLOSED_WITHOUT_PREVENTION,
+            task_id=task["id"],
+            actor=actor,
+            payload={"via": via},
+        )
+    if cause_kind_gap(task):
+        await repo.add_task_update(
+            db,
+            task["id"],
+            "hub",
+            "alert",
+            f"Прод-дефект закрыт человеком ({via}) без вида причины (cause_kind). "
+            "Закрытие засчитано как аварийный выход и видно отдельно от "
+            "закрытий без вывода.",
+        )
+        await repo.insert_event(
+            db,
+            kind=CLOSED_WITHOUT_CAUSE_KIND,
+            task_id=task["id"],
+            actor=actor,
+            payload={"via": via},
+        )

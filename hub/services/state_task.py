@@ -467,9 +467,14 @@ async def _completion_hold(
     """
     from hub.services import lifecycle as lc
 
-    gap = prevention_gate.prevention_gap(task)
+    gap = prevention_gate.completion_gap(task)
     if gap:
-        return "prevention_missing", f"Прод-дефект не завершён (state_approved): {gap}"
+        code = (
+            "prevention_missing"
+            if prevention_gate.prevention_gap(task)
+            else "cause_kind_missing"
+        )
+        return code, f"Прод-дефект не завершён (state_approved): {gap}"
     updates = [dict(u) for u in await repo.get_task_updates(db, int(task["id"]))]
     holding = lc.blocker_holding_the_done_report(updates)
     if holding is not None:
