@@ -2043,3 +2043,23 @@ async def test_c4_adopt_claim_ignores_a_claim_that_changed_hands(db, monkeypatch
     assert (await _row(db, task_id))["claim_nonce"] is None
     await cp.adopt_claim(db, "adopt-token", task_id, ("newcomer", "s-new"))
     assert (await _row(db, task_id))["claim_nonce"]
+
+
+async def test_c4_a_released_manual_session_does_not_block_a_slot_handover(
+    world,  # noqa: F811
+):
+    """Ручной код -> claim -> release -> заказ слоту: сессия, уже брав шая и отпустившая задачу,
+    не мешает ни выдаче, ни выкупу заказа (критерий занятости один и тот же)."""
+    w = world
+    task_id = await _task(w, "k8: передача")
+    acting = await cp.get_acting_agent(w.db)
+    await w.db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, claimed_session) VALUES "
+        "(?, 'released-manual', datetime('now', '+1 hour'), 'implementer', ?, 1, 'rm')",
+        (int(acting["id"]), task_id),
+    )
+    await w.db.commit()
+    assert (await _launch(w, task_id)).status_code == 200
+    order = (await _orders(w)).json()["orders"][0]
+    assert (await _redeem(w, _code_of(w, order))).status_code == 200
