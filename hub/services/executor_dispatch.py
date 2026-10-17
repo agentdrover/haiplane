@@ -161,9 +161,25 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
         return
     await _release_on_terminal(db, row, run)
-    if tokens is None and cents is None and _outcome_of(row, run) is None:
-        # Идущий прогон без счёта ждёт следующего опроса; законченный идёт в
-        # _settle, где ожидание цены ограничено сроком (#1410).
+    if tokens is None and cents is None:
+        # Идущий прогон без счёта ждёт следующего опроса. Законченный не висит
+        # вечно: ожидание цены ограничено сроком (#1410), по его выходу строка
+        # закрывается исходом провайдера, а прежние цифры не обнуляются. Захват
+        # к этому моменту уже снят (``_release_on_terminal``).
+        done = _outcome_of(row, run)
+        if done is not None and await repo.wait_for_executor_cost(
+            db, row["id"], config.EXECUTOR_COST_WAIT_MIN
+        ):
+            await repo.update_executor_run(
+                db,
+                row["id"],
+                outcome=done,
+                reason=REASON_COST_NEVER_CAME.format(
+                    minutes=config.EXECUTOR_COST_WAIT_MIN
+                ),
+                finish=True,
+            )
+            return
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     await _settle(db, row, run, tokens, cents)
