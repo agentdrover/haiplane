@@ -61,6 +61,7 @@ from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
 from hub.services.ci_timing import ci_minutes_metrics
+from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
@@ -811,6 +812,9 @@ async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str,
     # A work type all of whose rows are excluded still gets a line: saying
     # "5 tasks, no completion stamp, no median" is information, while omitting
     # the row entirely reads as "no work of this type happened" (#518).
+    # #1790: the queue and the path after the start, each over its own sample,
+    # attached BESIDE the total — the keys above are not touched.
+    split = await cycle_split(db, scope)
     cycle_times = [
         {
             "work_type": wt,
@@ -820,9 +824,13 @@ async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str,
             "median_hours": (
                 round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
             ),
+            **(split.get(wt) or empty_split()),
         }
         for wt in sorted(
-            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
+            set(by_type)
+            | set(unmeasurable_by_type)
+            | set(no_completion_by_type)
+            | set(split)
         )
     ]
     return cycle_times
