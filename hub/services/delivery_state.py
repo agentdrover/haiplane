@@ -45,7 +45,7 @@ from typing import Any
 from hub import config
 from hub import repository as repo
 
-# Пороги доказательства доставки живут в hub/db.py: их применяют ДВА места
+# Пороги доказательства доставки определены в hub/migrations/sql_constants.py (реэкспорт из hub.db): их применяют ДВА места
 # — живая дверь в этом файле и SQL засыпки, — и пока определений было два,
 # они разошлись (находка 80fcb9c9).
 from hub.db import MIN_EVIDENCE_CHARS, MIN_SHA_CHARS
