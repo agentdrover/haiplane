@@ -482,6 +482,7 @@ def ci_key_route_allowed(
 # the same thing against the database, because here only the path is known.
 SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/orders"),
+    ("GET", "/api/executor-hosts/{name}/orders/{order_id}"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/report"),
 )

@@ -908,6 +908,35 @@ async def _own_order(
     return dict(rows[0]) if rows else None
 
 
+async def read_order_outcome(
+    db: aiosqlite.Connection, host: str, order_id: int
+) -> dict[str, Any] | None:
+    """Итог заказа для хоста (#1831); None — чужой или нет такого.
+
+    Только чтение, без кода, шифротекста, хеша и текста заказа: хост узнаёт,
+    сдана ли работа, когда сессия прогона уже отозвана при сдаче.
+    """
+    order = await _own_order(db, host, order_id)
+    if order is None:
+        return None
+    task = await repo.get_task(db, int(order["task_id"]))
+    row = dict(task) if task is not None else {}
+    return {
+        "id": order["id"],
+        "host": order["host"],
+        "state": order["state"],
+        "close_reason": order["close_reason"],
+        "task_id": order["task_id"],
+        "generation": order["generation"],
+        "task_status": row.get("status"),
+        "submission_generation": row.get("submission_generation"),
+        "submission_sha": row.get("submission_sha") or "",
+        "branch": row.get("branch") or "",
+        "pr_number": row.get("pr_number"),
+        "report_outcome": order["report_outcome"],
+    }
+
+
 async def ack_order(
     db: aiosqlite.Connection, host: str, order_id: int, result: str
 ) -> dict[str, Any]:
