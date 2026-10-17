@@ -637,4 +637,34 @@ ready_at 11.07 — теперь они видны в предыдущем сто
         {% endfor %}
     </tbody>
 </table>
+
+<h3>Очередь и путь после начала (#1790)</h3>
+<p class="muted">Те же задачи, разделённые на два интервала, у каждого своя
+выборка и свои причины исключения. «Очередь» — от ready_at до started_at.
+«От начала до завершения» — от started_at до completed_at; это НЕ время работы
+исполнителя: сюда входят ревью, CI, вопросы, повторная очередь и доставка.
+started_at пишется только для работы, начатой после выката: у более старых задач
+начала нет («начало неизвестно»), и сегодняшняя дата за него не выдаётся.
+Считаются только листья (task/subtask без детей); закрытые роллапом контейнеры —
+в столбце «Контейнеров» и в медианы этих интервалов не входят. Прежняя таблица
+выше не изменилась.</p>
+<table class="task-table">
+    <thead><tr><th>Work type</th><th>Очередь: в медиане</th><th>Очередь: не измерена</th>
+        <th>Очередь, median, hours</th><th>С начала: в медиане</th>
+        <th>С начала: не измерена</th><th>От начала до завершения, median, hours</th>
+        <th>Контейнеров</th></tr></thead>
+    <tbody>
+        {% for c in m.cycle_times %}
+        {% set q = c.queue %}{% set s = c.since_start %}
+        <tr><td>{{ c.work_type }}</td>
+            <td data-metric="cycle_times.{{ c.work_type }}.queue.tasks">{{ q.tasks }}</td>
+            <td>{% set qr = [("no_completion", q.no_completion), ("no_ready_at", q.no_ready_at), ("no_started_at", q.no_started_at), ("ready_after_start", q.ready_after_start), ("zero", q.zero), ("unreadable", q.unreadable)] %}{% set qn = qr | selectattr(1) | list %}{% if qn %}{% for reason, n in qn %}{{ reason }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
+            <td>{% if q.median_hours is not none %}{{ q.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td>
+            <td data-metric="cycle_times.{{ c.work_type }}.since_start.tasks">{{ s.tasks }}</td>
+            <td>{% set sr = [("no_completion", s.no_completion), ("start_history_unknown", s.start_history_unknown), ("no_started_at", s.no_started_at), ("negative", s.negative), ("zero", s.zero), ("unreadable", s.unreadable)] %}{% set sn = sr | selectattr(1) | list %}{% if sn %}{% for reason, n in sn %}{{ reason }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
+            <td>{% if s.median_hours is not none %}{{ s.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td>
+            <td>{% if c.rollup.tasks %}{{ c.rollup.tasks }}{% else %}—{% endif %}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
 {% endblock %}
