@@ -1724,3 +1724,37 @@ async def test_after_a_dirty_tree_the_tail_must_really_commit(
     again = dict(await repo.get_task(db, task.id))
     again[_rg.UNCOMMITTED_KEY] = True
     assert await _rg.stop_empty_done(db, again, tail_pending=True) == ""
+
+
+async def test_a_pair_done_with_local_fixes_reaches_the_tail(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Pair done после «на доработку» с недокоммиченными правками: факты git собраны до
+    транзакции и доезжают до guard сквозь перечитывание задачи — отчёт не отклонён."""
+    git, task = await _sent_back(db, monkeypatch, "Pair с правками")
+    seen: list[bool] = []
+
+    async def _dirty(repo=None):
+        seen.append(db.in_transaction)
+        return ["hub/x.py"]
+
+    async def _checkout(branch, repo=None):
+        return True
+
+    async def _commit(*args, **kwargs):
+        return True
+
+    for name, fn in (
+        ("dirty_paths", _dirty),
+        ("checkout", _checkout),
+        ("auto_commit", _commit),
+    ):
+        monkeypatch.setattr(git, name, fn)
+    await services.add_update(
+        db,
+        task.id,
+        models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert row["submission_generation"] == 2, "отчёт принят, поколение открыто"
+    assert seen[0] is False, "факты git собраны вне write-транзакции"
