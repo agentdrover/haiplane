@@ -21,8 +21,8 @@
     },
     {
       "path": "hub/db.py",
-      "measured": 4454,
-      "max": 4677,
+      "measured": 1645,
+      "max": 1728,
       "removed_by": "unclaimed"
     },
     {

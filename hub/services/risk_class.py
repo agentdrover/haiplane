@@ -53,6 +53,14 @@ _AUTH_SURFACES: frozenset[str] = frozenset(
 # shadow mode judges declarations; the diff-based recompute (#583) will see
 # the actual ALTER/CREATE. Erring upward is the point of the owner's rule.
 _MIGRATION_SURFACE = "hub/db.py"
+# Since #1809 the migration list lives in the hub/migrations package; a new
+# migration is written there, so the owner's R3 rule must follow it.
+_MIGRATION_PACKAGE = "hub/migrations/"
+
+
+def _is_migration_surface(area: str) -> bool:
+    return area == _MIGRATION_SURFACE or area.startswith(_MIGRATION_PACKAGE)
+
 
 _ORDER: list[RiskClass] = [
     RiskClass.r0,
@@ -145,7 +153,7 @@ def derive_risk_class(
     # written in the hub's own vocabulary ("код хаба") and would be a lie
     # about a satellite's file; paths the project map rescued get their own
     # line below, naming the bucket their owner assigned.
-    migration_native = sorted(a for a in areas if a == _MIGRATION_SURFACE)
+    migration_native = sorted(a for a in areas if _is_migration_surface(a))
     auth_native = sorted(a for a in areas if a in _AUTH_SURFACES)
     contract_native = sorted(a for a in areas if a in _CONTRACT_SURFACES)
     code_native = sorted(
@@ -154,7 +162,7 @@ def derive_risk_class(
         if a.startswith("hub/")
         and a not in _CONTRACT_SURFACES
         and a not in _AUTH_SURFACES
-        and a != _MIGRATION_SURFACE
+        and not _is_migration_surface(a)
         and not _is_presentation(a)
         and not _is_tests(a)
         and not _is_docs(a)
@@ -186,7 +194,7 @@ def derive_risk_class(
         result = _at_least(result, RiskClass.r3)
         if migration_native:
             reasons.append(
-                "R3: затронут hub/db.py — возможна миграция; любая миграция — "
+                "R3: затронут hub/db.py или hub/migrations — возможна миграция; любая миграция — "
                 "минимум R3 (правило владельца 31.07.2026)"
             )
     if auth_native or "auth" in rescued:

@@ -16,7 +16,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 | MCP usage telemetry or the usage report | `hub/services/mcp_telemetry.py`, `hub/repository.py` | `hub/mcp_server.py` (call path), `hub/db.py`, `hub/app.py`, `hub/web.py` | `tests/test_mcp_telemetry.py`, `tests/test_agent_api_metrics.py`, `tests/test_db_migrations.py` |
 | MCP catalog size or its CI budget | `hub/mcp_catalog.py`, `docs/agent-context/mcp-catalog-budget.json` | `scripts/mcp_catalog_budget.py`, `hub/mcp_server.py` (tool docstrings and signatures) | `tests/test_mcp_catalog_budget.py` |
 | Persistence queries | `hub/repository.py` | `hub/db.py`, service callers | `tests/test_repository.py`, `tests/test_repository_structured.py` |
-| DB schema or migrations | `hub/db.py` | `hub/repository.py`, `hub/models.py` | `tests/test_db_migrations.py`, repository tests |
+| DB schema or migrations | `hub/migrations/` (append to `part_3.py`), `hub/db.py` (runner only) | `hub/repository.py`, `hub/models.py` | `tests/test_db_migrations.py`, repository tests |
 | Plugin interfaces | `hub/integrations/protocols.py` | `hub/integrations/registry.py`, concrete plugin file, service caller | `tests/test_poller.py`, `tests/test_services.py` |
 | Dispatch / review orchestration | `hub/services/orchestration.py`, `hub/poller.py` | `hub/integrations/dispatch.py`, `hub/integrations/git_ops.py`, `hub/integrations/github.py` | `tests/test_poller.py`, `tests/test_services.py` |
 | Auth changes | `hub/auth.py`, `hub/app.py`, `hub/web.py` | templates if login/UI changes | `tests/test_auth.py`, `tests/test_web*.py` |
@@ -31,7 +31,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 ## High-Risk Couplings
 
 - Changing `TaskStatus`, `TaskType`, or structured enums usually affects API, CLI, MCP, persistence, and tests together.
-- Changing task row fields usually means touching both migration logic in `hub/db.py` and serialization/deserialization paths.
+- Changing task row fields usually means touching both migration logic in `hub/migrations/` and serialization/deserialization paths.
 - Adding a REST route does NOT grant it to chat-pair sessions: access for `auth_source=chat_pair` is the deny-by-default allowlist in `hub/auth.py` (#961). Widening that list is a decision with a reason in the task, never a step in an unrelated change.
 - Changing DoR or readiness logic can break approval behavior even if the API schema stays the same.
 - Changing plugin protocols is a cross-cutting contract change; inspect noop and real adapters together.

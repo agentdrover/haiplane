@@ -11,7 +11,7 @@
 - Use `uv run pytest`; do not use `python -m pytest`.
 - Use `uv add <package>` for dependencies.
 - If a change touches API contracts, update `hub/cli.py`, `hub/mcp_server.py`, and affected tests in the same pass.
-- If a change touches persisted task data or schema, update migrations in `hub/db.py`.
+- If a change touches persisted task data or schema, update migrations in `hub/migrations/` (append to `part_3.py`; `hub/db.py` only applies them).
 - Функция сверх бюджета сложности красит CI (`scripts/complexity_budget.py`,
   #1066). Пороги — в `pyproject.toml`, ledger исключений — в
   `docs/agent-context/complexity-budget.json`. Разбейте функцию; если это
@@ -63,7 +63,8 @@
 - `hub/app.py`: FastAPI app and API routes
 - `hub/web.py`: dashboard and HTMX routes
 - `hub/services/`: lifecycle, readiness, orchestration, refinement
-- `hub/db.py`: schema and migrations
+- `hub/db.py`: schema, migration runner, serialization helpers
+- `hub/migrations/`: the migration list (`_MIGRATIONS`) and its SQL constants
 - `hub/repository.py`: SQL access layer
 - `hub/models.py`: contracts and enums
 - `hub/cli.py`: `oc-hub`

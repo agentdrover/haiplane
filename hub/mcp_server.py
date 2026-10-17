@@ -216,6 +216,9 @@ mcp = InstrumentedFastMCP(
     # scoped (AuthMiddleware contextvars), so each POST stands alone.
     # Must be set here: hub.app builds the streamable app from these settings.
     stateless_http=True,
+    # mcp >= 1.29 caps the body at 4 MiB (413 before any tool runs); bulk calls
+    # such as hub_refine_tasks exceed it. Explicit finite cap from config.
+    max_request_body_size=config.MCP_MAX_REQUEST_BODY_BYTES,
 )
 
 

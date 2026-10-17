@@ -47,6 +47,13 @@ def test_harmless_path_cannot_lower_a_risky_class():
     assert mixed is risky is RiskClass.r3
 
 
+def test_migration_package_is_a_migration_surface():
+    # #1809: the migration list moved from hub/db.py to hub/migrations/.
+    risk, reasons = derive_risk_class(["hub/migrations/part_3.py"])
+    assert risk is RiskClass.r3
+    assert any("hub/migrations" in r for r in reasons)
+
+
 # ---------------------------------------------------------------------------
 # AC-1: docs-only change is a low class, with its reasons listed
 # ---------------------------------------------------------------------------

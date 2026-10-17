@@ -1,0 +1,860 @@
+[
+[
+"index",
+"idx_acceptance_criteria_task_id",
+"acceptance_criteria",
+"CREATE INDEX idx_acceptance_criteria_task_id ON acceptance_criteria(task_id)"
+],
+[
+"index",
+"idx_admin_audit_actor",
+"admin_audit_log",
+"CREATE INDEX idx_admin_audit_actor ON admin_audit_log(actor_principal_id)"
+],
+[
+"index",
+"idx_admin_audit_target",
+"admin_audit_log",
+"CREATE INDEX idx_admin_audit_target ON admin_audit_log(target_type, target_id)"
+],
+[
+"index",
+"idx_agent_messages_address",
+"agent_messages",
+"CREATE INDEX idx_agent_messages_address ON agent_messages(to_kind, to_ref, id)"
+],
+[
+"index",
+"idx_agent_sessions_last_seen",
+"agent_sessions",
+"CREATE INDEX idx_agent_sessions_last_seen ON agent_sessions(last_seen_at)"
+],
+[
+"index",
+"idx_api_keys_prefix",
+"api_keys",
+"CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix)"
+],
+[
+"index",
+"idx_api_keys_principal_id",
+"api_keys",
+"CREATE INDEX idx_api_keys_principal_id ON api_keys(principal_id)"
+],
+[
+"index",
+"idx_browser_sessions_principal_id",
+"browser_sessions",
+"CREATE INDEX idx_browser_sessions_principal_id ON browser_sessions(principal_id)"
+],
+[
+"index",
+"idx_category_checks_unique",
+"category_checks",
+"CREATE UNIQUE INDEX idx_category_checks_unique ON category_checks(category)"
+],
+[
+"index",
+"idx_chat_pair_codes_principal",
+"chat_pair_codes",
+"CREATE INDEX idx_chat_pair_codes_principal ON chat_pair_codes(principal_id)"
+],
+[
+"index",
+"idx_chat_pair_sessions_principal",
+"chat_pair_sessions",
+"CREATE INDEX idx_chat_pair_sessions_principal ON chat_pair_sessions(principal_id)"
+],
+[
+"index",
+"idx_events_created_at",
+"events",
+"CREATE INDEX idx_events_created_at ON events(created_at)"
+],
+[
+"index",
+"idx_events_kind_project",
+"events",
+"CREATE INDEX idx_events_kind_project ON events(kind, project_id, id)"
+],
+[
+"index",
+"idx_executor_orders_one_open_per_host",
+"executor_orders",
+"CREATE UNIQUE INDEX idx_executor_orders_one_open_per_host ON executor_orders(host) WHERE state <> 'closed'"
+],
+[
+"index",
+"idx_executor_orders_task",
+"executor_orders",
+"CREATE INDEX idx_executor_orders_task ON executor_orders(task_id)"
+],
+[
+"index",
+"idx_executor_runs_outcome",
+"executor_runs",
+"CREATE INDEX idx_executor_runs_outcome ON executor_runs(outcome, task_id)"
+],
+[
+"index",
+"idx_executor_slots_active",
+"executor_slots",
+"CREATE UNIQUE INDEX idx_executor_slots_active ON executor_slots(task_id) WHERE released_at IS NULL"
+],
+[
+"index",
+"idx_finding_dispositions_unique",
+"finding_dispositions",
+"CREATE UNIQUE INDEX idx_finding_dispositions_unique ON finding_dispositions(review_id, finding_index)"
+],
+[
+"index",
+"idx_finding_outcomes_task",
+"finding_outcomes",
+"CREATE INDEX idx_finding_outcomes_task ON finding_outcomes(task_id, submission_generation)"
+],
+[
+"index",
+"idx_live_checks_task",
+"live_checks",
+"CREATE INDEX idx_live_checks_task ON live_checks(task_id, id)"
+],
+[
+"index",
+"idx_machine_reviews_task",
+"machine_reviews",
+"CREATE INDEX idx_machine_reviews_task ON machine_reviews(task_id, submission_generation)"
+],
+[
+"index",
+"idx_mcp_call_events_window",
+"mcp_call_events",
+"CREATE INDEX idx_mcp_call_events_window ON mcp_call_events(created_at, tool)"
+],
+[
+"index",
+"idx_outcome_answers_task",
+"outcome_answers",
+"CREATE INDEX idx_outcome_answers_task ON outcome_answers(task_id, answered_at)"
+],
+[
+"index",
+"idx_principals_kind_status",
+"principals",
+"CREATE INDEX idx_principals_kind_status ON principals(kind, status)"
+],
+[
+"index",
+"idx_releases_project",
+"releases",
+"CREATE INDEX idx_releases_project ON releases(project_id, id)"
+],
+[
+"index",
+"idx_scheduled_policy_changes_due",
+"scheduled_policy_changes",
+"CREATE INDEX idx_scheduled_policy_changes_due ON scheduled_policy_changes(state, at, id)"
+],
+[
+"index",
+"idx_skills_name_status",
+"skills",
+"CREATE INDEX idx_skills_name_status ON skills(name, status)"
+],
+[
+"index",
+"idx_steward_judgements_unique",
+"steward_judgements",
+"CREATE UNIQUE INDEX idx_steward_judgements_unique ON steward_judgements(task_id, generation, kind)"
+],
+[
+"index",
+"idx_steward_runs_open",
+"steward_runs",
+"CREATE INDEX idx_steward_runs_open ON steward_runs(status, deadline_at)"
+],
+[
+"index",
+"idx_task_dependencies_depends_on",
+"task_dependencies",
+"CREATE INDEX idx_task_dependencies_depends_on ON task_dependencies(depends_on_task_id)"
+],
+[
+"index",
+"idx_task_dependencies_task",
+"task_dependencies",
+"CREATE INDEX idx_task_dependencies_task ON task_dependencies(task_id)"
+],
+[
+"index",
+"idx_task_evidence_task",
+"task_evidence",
+"CREATE INDEX idx_task_evidence_task ON task_evidence(task_id, generation)"
+],
+[
+"index",
+"idx_task_updates_task_id",
+"task_updates",
+"CREATE INDEX idx_task_updates_task_id ON task_updates(task_id)"
+],
+[
+"index",
+"idx_tasks_archived",
+"tasks",
+"CREATE INDEX idx_tasks_archived ON tasks(archived)"
+],
+[
+"index",
+"idx_tasks_caused_by",
+"tasks",
+"CREATE INDEX idx_tasks_caused_by ON tasks(caused_by_task_id)"
+],
+[
+"index",
+"idx_tasks_found_in",
+"tasks",
+"CREATE INDEX idx_tasks_found_in ON tasks(found_in)"
+],
+[
+"index",
+"idx_tasks_parent_id",
+"tasks",
+"CREATE INDEX idx_tasks_parent_id ON tasks(parent_id)"
+],
+[
+"index",
+"idx_tasks_project_id",
+"tasks",
+"CREATE INDEX idx_tasks_project_id ON tasks(project_id)"
+],
+[
+"index",
+"idx_tasks_release_id",
+"tasks",
+"CREATE INDEX idx_tasks_release_id ON tasks(release_id)"
+],
+[
+"index",
+"idx_tasks_status",
+"tasks",
+"CREATE INDEX idx_tasks_status ON tasks(status)"
+],
+[
+"index",
+"idx_tasks_type_status",
+"tasks",
+"CREATE INDEX idx_tasks_type_status ON tasks(task_type, status)"
+],
+[
+"index",
+"ix_pipeline_merges_project_pr",
+"pipeline_merges",
+"CREATE INDEX ix_pipeline_merges_project_pr ON pipeline_merges (project_id, pr_number)"
+],
+[
+"index",
+"sqlite_autoindex__migrations_1",
+"_migrations",
+null
+],
+[
+"index",
+"sqlite_autoindex_ac_test_results_1",
+"ac_test_results",
+null
+],
+[
+"index",
+"sqlite_autoindex_acceptance_criteria_1",
+"acceptance_criteria",
+null
+],
+[
+"index",
+"sqlite_autoindex_agent_sessions_1",
+"agent_sessions",
+null
+],
+[
+"index",
+"sqlite_autoindex_api_keys_1",
+"api_keys",
+null
+],
+[
+"index",
+"sqlite_autoindex_autopilot_digests_1",
+"autopilot_digests",
+null
+],
+[
+"index",
+"sqlite_autoindex_base_branch_drift_1",
+"base_branch_drift",
+null
+],
+[
+"index",
+"sqlite_autoindex_browser_sessions_1",
+"browser_sessions",
+null
+],
+[
+"index",
+"sqlite_autoindex_chat_pair_codes_1",
+"chat_pair_codes",
+null
+],
+[
+"index",
+"sqlite_autoindex_chat_pair_sessions_1",
+"chat_pair_sessions",
+null
+],
+[
+"index",
+"sqlite_autoindex_ci_attempt_timings_1",
+"ci_attempt_timings",
+null
+],
+[
+"index",
+"sqlite_autoindex_ci_integrity_scans_1",
+"ci_integrity_scans",
+null
+],
+[
+"index",
+"sqlite_autoindex_ci_report_attempts_1",
+"ci_report_attempts",
+null
+],
+[
+"index",
+"sqlite_autoindex_ci_report_state_1",
+"ci_report_state",
+null
+],
+[
+"index",
+"sqlite_autoindex_ci_run_reports_1",
+"ci_run_reports",
+null
+],
+[
+"index",
+"sqlite_autoindex_cursor_usage_events_1",
+"cursor_usage_events",
+null
+],
+[
+"index",
+"sqlite_autoindex_defect_cause_suggestions_1",
+"defect_cause_suggestions",
+null
+],
+[
+"index",
+"sqlite_autoindex_executor_hosts_1",
+"executor_hosts",
+null
+],
+[
+"index",
+"sqlite_autoindex_finding_outcomes_1",
+"finding_outcomes",
+null
+],
+[
+"index",
+"sqlite_autoindex_human_queue_reminders_1",
+"human_queue_reminders",
+null
+],
+[
+"index",
+"sqlite_autoindex_path_notice_results_1",
+"path_notice_results",
+null
+],
+[
+"index",
+"sqlite_autoindex_principal_roles_1",
+"principal_roles",
+null
+],
+[
+"index",
+"sqlite_autoindex_principals_1",
+"principals",
+null
+],
+[
+"index",
+"sqlite_autoindex_projects_1",
+"projects",
+null
+],
+[
+"index",
+"sqlite_autoindex_review_order_claims_1",
+"review_order_claims",
+null
+],
+[
+"index",
+"sqlite_autoindex_role_permissions_1",
+"role_permissions",
+null
+],
+[
+"index",
+"sqlite_autoindex_roles_1",
+"roles",
+null
+],
+[
+"index",
+"sqlite_autoindex_skills_1",
+"skills",
+null
+],
+[
+"index",
+"sqlite_autoindex_steward_false_approvals_1",
+"steward_false_approvals",
+null
+],
+[
+"index",
+"sqlite_autoindex_steward_runs_1",
+"steward_runs",
+null
+],
+[
+"index",
+"sqlite_autoindex_submissions_1",
+"submissions",
+null
+],
+[
+"index",
+"sqlite_autoindex_task_dependencies_1",
+"task_dependencies",
+null
+],
+[
+"index",
+"sqlite_autoindex_task_evidence_1",
+"task_evidence",
+null
+],
+[
+"index",
+"sqlite_autoindex_task_idempotency_keys_1",
+"task_idempotency_keys",
+null
+],
+[
+"index",
+"sqlite_autoindex_watch_notices_1",
+"watch_notices",
+null
+],
+[
+"index",
+"ux_pipeline_merges_project_sha",
+"pipeline_merges",
+"CREATE UNIQUE INDEX ux_pipeline_merges_project_sha ON pipeline_merges (project_id, merge_sha) WHERE merge_sha <> ''"
+],
+[
+"table",
+"_migrations",
+"_migrations",
+"CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))"
+],
+[
+"table",
+"ac_test_results",
+"ac_test_results",
+"CREATE TABLE ac_test_results (\n            task_id INTEGER NOT NULL REFERENCES tasks(id),\n            ac_id TEXT NOT NULL,\n            submission_generation INTEGER NOT NULL,\n            status TEXT NOT NULL,\n            created_at TEXT NOT NULL DEFAULT (datetime('now')), source TEXT NOT NULL DEFAULT 'manual',\n            PRIMARY KEY (task_id, ac_id)\n        )"
+],
+[
+"table",
+"acceptance_criteria",
+"acceptance_criteria",
+"CREATE TABLE acceptance_criteria (\n            id              INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            ac_id           TEXT    NOT NULL,\n            given           TEXT    NOT NULL,\n            when_clause     TEXT    NOT NULL,\n            then_clause     TEXT    NOT NULL,\n            verifiable_by   TEXT    NOT NULL,\n            test_ref        TEXT,\n            position        INTEGER NOT NULL DEFAULT 0,\n            created_at      TEXT    NOT NULL DEFAULT (datetime('now')), expectation_source TEXT,\n            UNIQUE (task_id, ac_id)\n        )"
+],
+[
+"table",
+"activity_log",
+"activity_log",
+"CREATE TABLE activity_log (\n    id        INTEGER PRIMARY KEY AUTOINCREMENT,\n    kind      TEXT NOT NULL,\n    summary   TEXT NOT NULL,\n    detail    TEXT,\n    timestamp TEXT NOT NULL DEFAULT (datetime('now'))\n)"
+],
+[
+"table",
+"admin_audit_log",
+"admin_audit_log",
+"CREATE TABLE admin_audit_log (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            actor_principal_id INTEGER REFERENCES principals(id),\n            action TEXT NOT NULL,\n            target_type TEXT NOT NULL,\n            target_id TEXT NOT NULL DEFAULT '',\n            summary TEXT NOT NULL,\n            detail TEXT,\n            ip_hash TEXT NOT NULL DEFAULT '',\n            created_at TEXT NOT NULL DEFAULT (datetime('now'))\n        )"
+],
+[
+"table",
+"agent_messages",
+"agent_messages",
+"CREATE TABLE agent_messages (\n            id                INTEGER PRIMARY KEY AUTOINCREMENT,\n            thread_id         TEXT    NOT NULL DEFAULT '',\n            from_principal_id INTEGER,\n            from_session_id   TEXT    NOT NULL DEFAULT '',\n            from_agent        TEXT    NOT NULL DEFAULT '',\n            from_model        TEXT    NOT NULL DEFAULT '',\n            to_kind           TEXT    NOT NULL,\n            to_ref            TEXT    NOT NULL,\n            kind              TEXT    NOT NULL DEFAULT 'note',\n            body              TEXT    NOT NULL,\n            related_task_id   INTEGER,\n            created_at        TEXT    NOT NULL DEFAULT (datetime('now'))\n        , for_session TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"agent_sessions",
+"agent_sessions",
+"CREATE TABLE agent_sessions (\n            id              INTEGER PRIMARY KEY AUTOINCREMENT,\n            session_id      TEXT    NOT NULL UNIQUE,\n            principal_id    INTEGER,\n            agent           TEXT    NOT NULL DEFAULT '',\n            model           TEXT    NOT NULL DEFAULT '',\n            host            TEXT    NOT NULL DEFAULT '',\n            workspace       TEXT    NOT NULL DEFAULT '',\n            current_task_id INTEGER,\n            started_at      TEXT    NOT NULL DEFAULT (datetime('now')),\n            last_seen_at    TEXT    NOT NULL DEFAULT (datetime('now'))\n        , projects TEXT NOT NULL DEFAULT '', work_role TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"api_keys",
+"api_keys",
+"CREATE TABLE api_keys (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,\n            name TEXT NOT NULL,\n            key_prefix TEXT NOT NULL,\n            key_hash TEXT NOT NULL UNIQUE,\n            scopes TEXT NOT NULL DEFAULT '[]',\n            expires_at TEXT,\n            last_used_at TEXT,\n            revoked_at TEXT,\n            created_by INTEGER REFERENCES principals(id),\n            created_at TEXT NOT NULL DEFAULT (datetime('now'))\n        )"
+],
+[
+"table",
+"autopilot_digests",
+"autopilot_digests",
+"CREATE TABLE autopilot_digests (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n            digest_date TEXT    NOT NULL,\n            payload     TEXT    NOT NULL DEFAULT '{}',\n            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (project_id, digest_date)\n        )"
+],
+[
+"table",
+"base_branch_drift",
+"base_branch_drift",
+"CREATE TABLE base_branch_drift (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n            sha         TEXT    NOT NULL,\n            branch      TEXT    NOT NULL,\n            subject     TEXT    NOT NULL DEFAULT '',\n            author      TEXT    NOT NULL DEFAULT '',\n            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (project_id, sha)\n        )"
+],
+[
+"table",
+"browser_sessions",
+"browser_sessions",
+"CREATE TABLE browser_sessions (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,\n            session_hash TEXT NOT NULL UNIQUE,\n            expires_at TEXT NOT NULL,\n            last_seen_at TEXT,\n            revoked_at TEXT,\n            created_at TEXT NOT NULL DEFAULT (datetime('now')),\n            ip_hash TEXT NOT NULL DEFAULT '',\n            user_agent TEXT NOT NULL DEFAULT ''\n        )"
+],
+[
+"table",
+"category_checks",
+"category_checks",
+"CREATE TABLE category_checks (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            category    TEXT    NOT NULL,\n            check_ref   TEXT    NOT NULL,\n            note        TEXT    NOT NULL DEFAULT '',\n            recorded_by TEXT    NOT NULL DEFAULT '',\n            recorded_at TEXT    NOT NULL DEFAULT (datetime('now'))\n        , created_at TEXT)"
+],
+[
+"table",
+"chat_pair_codes",
+"chat_pair_codes",
+"CREATE TABLE chat_pair_codes (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            principal_id INTEGER NOT NULL REFERENCES principals(id)\n                         ON DELETE CASCADE,\n            code_hash    TEXT    NOT NULL UNIQUE,\n            expires_at   TEXT    NOT NULL,\n            redeemed_at  TEXT,\n            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))\n        , kind TEXT NOT NULL DEFAULT 'intake', bound_task_id INTEGER REFERENCES tasks(id), bound_generation INTEGER, executor_run_id INTEGER, channel TEXT NOT NULL DEFAULT '', slot TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"chat_pair_sessions",
+"chat_pair_sessions",
+"CREATE TABLE chat_pair_sessions (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            principal_id INTEGER NOT NULL REFERENCES principals(id)\n                         ON DELETE CASCADE,\n            token_hash   TEXT    NOT NULL UNIQUE,\n            expires_at   TEXT    NOT NULL,\n            revoked_at   TEXT,\n            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))\n        , kind TEXT NOT NULL DEFAULT 'intake', bound_task_id INTEGER REFERENCES tasks(id), bound_generation INTEGER, acting_principal_id INTEGER REFERENCES principals(id), executor_run_id INTEGER, claimed_session TEXT, channel TEXT NOT NULL DEFAULT '', slot TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"ci_attempt_timings",
+"ci_attempt_timings",
+"CREATE TABLE ci_attempt_timings (\n            id             INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            run_id         TEXT    NOT NULL,\n            run_attempt    TEXT    NOT NULL,\n            head_sha       TEXT    NOT NULL DEFAULT '',\n            event          TEXT    NOT NULL DEFAULT '',\n            conclusion     TEXT    NOT NULL DEFAULT '',\n            completed_at   TEXT    NOT NULL,\n            state          TEXT    NOT NULL DEFAULT 'ok',\n            reason         TEXT    NOT NULL DEFAULT '',\n            jobs           TEXT    NOT NULL DEFAULT '[]',\n            runner_seconds REAL,\n            complete       INTEGER NOT NULL DEFAULT 0,\n            steps_seconds  TEXT    NOT NULL DEFAULT '{}',\n            reported_by    TEXT    NOT NULL DEFAULT '',\n            received_at    TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (task_id, run_id, run_attempt)\n        )"
+],
+[
+"table",
+"ci_integrity_scans",
+"ci_integrity_scans",
+"CREATE TABLE ci_integrity_scans (\n            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            head_sha   TEXT    NOT NULL,\n            state      TEXT    NOT NULL,\n            signs      TEXT    NOT NULL DEFAULT '[]',\n            reason     TEXT    NOT NULL DEFAULT '',\n            scanned_at TEXT    NOT NULL DEFAULT (datetime('now')),\n            PRIMARY KEY (task_id, head_sha)\n        )"
+],
+[
+"table",
+"ci_report_attempts",
+"ci_report_attempts",
+"CREATE TABLE ci_report_attempts (\n            id                INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            head_sha          TEXT    NOT NULL,\n            run_id            TEXT    NOT NULL DEFAULT '',\n            run_attempt       TEXT    NOT NULL DEFAULT '',\n            ac_results        TEXT    NOT NULL DEFAULT '{}',\n            checks            TEXT    NOT NULL DEFAULT '{}',\n            validation_status TEXT    NOT NULL DEFAULT '',\n            validation_log    TEXT    NOT NULL DEFAULT '',\n            reason            TEXT    NOT NULL DEFAULT '',\n            reported_by       TEXT    NOT NULL DEFAULT '',\n            mutations         TEXT    NOT NULL DEFAULT '{}',\n            baseline          TEXT    NOT NULL DEFAULT '{}',\n            provenance        TEXT    NOT NULL DEFAULT '{}',\n            submitted         TEXT    NOT NULL DEFAULT '{}',\n            body_version      INTEGER NOT NULL DEFAULT 0,\n            trust             TEXT    NOT NULL DEFAULT 'unverified',\n            trust_reason      TEXT    NOT NULL DEFAULT 'pending',\n            trust_final       INTEGER NOT NULL DEFAULT 0,\n            checked_at        TEXT,\n            reported_at       TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (task_id, head_sha, run_id, run_attempt)\n        )"
+],
+[
+"table",
+"ci_report_state",
+"ci_report_state",
+"CREATE TABLE ci_report_state (\n            task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            head_sha TEXT    NOT NULL,\n            version  INTEGER NOT NULL DEFAULT 0,\n            PRIMARY KEY (task_id, head_sha)\n        )"
+],
+[
+"table",
+"ci_run_reports",
+"ci_run_reports",
+"CREATE TABLE ci_run_reports (\n            id                INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            head_sha          TEXT    NOT NULL,\n            ac_results        TEXT    NOT NULL DEFAULT '{}',\n            validation_status TEXT    NOT NULL DEFAULT '',\n            validation_log    TEXT    NOT NULL DEFAULT '',\n            reason            TEXT    NOT NULL DEFAULT '',\n            reported_by       TEXT    NOT NULL DEFAULT '',\n            reported_at       TEXT    NOT NULL DEFAULT (datetime('now')), checks TEXT NOT NULL DEFAULT '{}', mutations TEXT NOT NULL DEFAULT '{}', baseline TEXT NOT NULL DEFAULT '{}', provenance TEXT NOT NULL DEFAULT '{}', trust TEXT NOT NULL DEFAULT 'unverified', trust_reason TEXT NOT NULL DEFAULT 'legacy', attempt_key TEXT NOT NULL DEFAULT '',\n            UNIQUE (task_id, head_sha)\n        )"
+],
+[
+"table",
+"cursor_usage_events",
+"cursor_usage_events",
+"CREATE TABLE cursor_usage_events (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            agent_id     TEXT    NOT NULL,\n            event_date   TEXT    NOT NULL,\n            total_tokens INTEGER NOT NULL,\n            model        TEXT    NOT NULL DEFAULT '',\n            dispatch_id  INTEGER,\n            imported_at  TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (agent_id, event_date, total_tokens, model)\n        )"
+],
+[
+"table",
+"defect_cause_suggestions",
+"defect_cause_suggestions",
+"CREATE TABLE defect_cause_suggestions (\n            id                INTEGER PRIMARY KEY AUTOINCREMENT,\n            defect_task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            candidate_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            release_id        INTEGER NOT NULL REFERENCES releases(id),\n            overlap           TEXT    NOT NULL DEFAULT '[]',\n            suggested_at      TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (defect_task_id, candidate_task_id, release_id)\n        )"
+],
+[
+"table",
+"delivery_discrepancies",
+"delivery_discrepancies",
+"CREATE TABLE delivery_discrepancies (\n            task_id       INTEGER PRIMARY KEY REFERENCES tasks(id)\n                          ON DELETE CASCADE,\n            pr_number     INTEGER,\n            state         TEXT    NOT NULL,\n            reason        TEXT    NOT NULL DEFAULT '',\n            delivery_path TEXT    NOT NULL DEFAULT '',\n            disposition   TEXT    NOT NULL DEFAULT '',\n            accepted_via  TEXT    NOT NULL DEFAULT '',\n            -- множество уже озвученных состояний через запятую (#294):\n            -- одна ячейка затиралась при дребезге провайдера\n            alerted_state TEXT    NOT NULL DEFAULT '',\n            first_seen_at TEXT    NOT NULL DEFAULT (datetime('now')),\n            checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))\n        , acknowledged_at TEXT NOT NULL DEFAULT '', acknowledged_by TEXT NOT NULL DEFAULT '', ack_reason TEXT NOT NULL DEFAULT '', acknowledged_state TEXT NOT NULL DEFAULT '', alerted_age_bucket INTEGER NOT NULL DEFAULT 0, observed_at TEXT NOT NULL DEFAULT '', observed_by TEXT NOT NULL DEFAULT '', observed_probe TEXT NOT NULL DEFAULT '', observed_evidence TEXT NOT NULL DEFAULT '', observed_sha TEXT NOT NULL DEFAULT '', observed_state TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"egress_state",
+"egress_state",
+"CREATE TABLE egress_state (id INTEGER PRIMARY KEY CHECK (id = 1), checked_at TEXT NOT NULL, interval_seconds INTEGER NOT NULL, ok INTEGER NOT NULL, reason_code TEXT NOT NULL DEFAULT '', streak INTEGER NOT NULL DEFAULT 0, first_fail_at TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"events",
+"events",
+"CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, task_id INTEGER, project_id INTEGER, actor TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+],
+[
+"table",
+"executor_hosts",
+"executor_hosts",
+"CREATE TABLE executor_hosts (\n            name           TEXT PRIMARY KEY,\n            principal_id   INTEGER NOT NULL REFERENCES principals(id),\n            public_key_pem TEXT    NOT NULL,\n            enabled        INTEGER NOT NULL DEFAULT 1,\n            created_at     TEXT    NOT NULL DEFAULT (datetime('now')),\n            created_by     INTEGER REFERENCES principals(id),\n            disabled_at    TEXT,\n            disabled_by    INTEGER REFERENCES principals(id)\n        )"
+],
+[
+"table",
+"executor_orders",
+"executor_orders",
+"CREATE TABLE executor_orders (\n            id              INTEGER PRIMARY KEY AUTOINCREMENT,\n            host            TEXT    NOT NULL REFERENCES executor_hosts(name),\n            task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            generation      INTEGER NOT NULL,\n            executor_run_id INTEGER NOT NULL\n                            REFERENCES executor_runs(id) ON DELETE CASCADE,\n            pair_code_id    INTEGER,\n            code_ciphertext TEXT    NOT NULL DEFAULT '',\n            order_text      TEXT    NOT NULL DEFAULT '',\n            state           TEXT    NOT NULL DEFAULT 'pending'\n                            CHECK (state IN\n                                   ('pending', 'delivered', 'redeemed', 'closed')),\n            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),\n            expires_at      TEXT    NOT NULL,\n            delivered_at    TEXT,\n            redeemed_at     TEXT,\n            closed_at       TEXT,\n            close_reason    TEXT    NOT NULL DEFAULT '',\n            ack_result      TEXT    NOT NULL DEFAULT '',\n            acked_at        TEXT,\n            report_outcome  TEXT    NOT NULL DEFAULT '',\n            report_sha      TEXT    NOT NULL DEFAULT '',\n            report_branch   TEXT    NOT NULL DEFAULT '',\n            report_note     TEXT    NOT NULL DEFAULT '',\n            reported_at     TEXT\n        , code_hash TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"executor_runs",
+"executor_runs",
+"CREATE TABLE executor_runs (\n            id                    INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id               INTEGER NOT NULL\n                                  REFERENCES tasks(id) ON DELETE CASCADE,\n            submission_generation INTEGER NOT NULL DEFAULT 0,\n            agent_id              TEXT    NOT NULL DEFAULT '',\n            run_id                TEXT    NOT NULL DEFAULT '',\n            model                 TEXT    NOT NULL DEFAULT '',\n            tokens                INTEGER,\n            cents                 REAL,\n            started_at            TEXT    NOT NULL DEFAULT (datetime('now')),\n            finished_at           TEXT,\n            duration_ms           INTEGER,\n            outcome               TEXT    NOT NULL DEFAULT 'running',\n            reason                TEXT    NOT NULL DEFAULT '',\n            polled_at             TEXT\n        , cost_wait_since TEXT, token_ceiling INTEGER, cents_ceiling REAL, cancel_intent TEXT NOT NULL DEFAULT '', cancel_attempts INTEGER NOT NULL DEFAULT 0, cancel_last_at TEXT, starting_ref TEXT, ordered_skill_version INTEGER, channel TEXT NOT NULL DEFAULT 'cloud', slot TEXT NOT NULL DEFAULT '', launched_by INTEGER)"
+],
+[
+"table",
+"executor_slots",
+"executor_slots",
+"CREATE TABLE executor_slots (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            channel      TEXT    NOT NULL,\n            slot         TEXT    NOT NULL DEFAULT '',\n            captured_at  TEXT    NOT NULL DEFAULT (datetime('now')),\n            released_at  TEXT,\n            outcome      TEXT    NOT NULL DEFAULT 'occupied',\n            reason       TEXT    NOT NULL DEFAULT ''\n        , executor_run_id INTEGER)"
+],
+[
+"table",
+"finding_dispositions",
+"finding_dispositions",
+"CREATE TABLE finding_dispositions (\n            id                    INTEGER PRIMARY KEY AUTOINCREMENT,\n            review_id             INTEGER NOT NULL,\n            task_id               INTEGER NOT NULL,\n            submission_generation INTEGER NOT NULL,\n            finding_index         INTEGER NOT NULL,\n            finding_title         TEXT    NOT NULL DEFAULT '',\n            disposition           TEXT    NOT NULL,\n            note                  TEXT    NOT NULL DEFAULT '',\n            decided_by            TEXT    NOT NULL DEFAULT '',\n            decided_at            TEXT    NOT NULL DEFAULT (datetime('now'))\n        , finding_uid TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"finding_outcomes",
+"finding_outcomes",
+"CREATE TABLE finding_outcomes (  id INTEGER PRIMARY KEY AUTOINCREMENT,  review_id INTEGER NOT NULL,  task_id INTEGER NOT NULL,  submission_generation INTEGER NOT NULL,  finding_uid TEXT NOT NULL,  finding_index INTEGER NOT NULL DEFAULT -1,  finding_title TEXT NOT NULL DEFAULT '',  outcome TEXT NOT NULL,  note TEXT NOT NULL DEFAULT '',  linked_task_id INTEGER,  reported_by TEXT NOT NULL DEFAULT '',  reported_at TEXT NOT NULL DEFAULT (datetime('now')), finding_kind TEXT NOT NULL DEFAULT 'confirmed',  UNIQUE(review_id, finding_uid))"
+],
+[
+"table",
+"human_queue_reminders",
+"human_queue_reminders",
+"CREATE TABLE human_queue_reminders (  id INTEGER PRIMARY KEY AUTOINCREMENT,  task_id INTEGER NOT NULL,  instance TEXT NOT NULL,  entered_at TEXT NOT NULL,  rung TEXT NOT NULL,  age_minutes INTEGER NOT NULL,  age_estimated INTEGER NOT NULL DEFAULT 0,  created_at TEXT NOT NULL DEFAULT (datetime('now')),  UNIQUE(task_id, instance, entered_at, rung))"
+],
+[
+"table",
+"live_checks",
+"live_checks",
+"CREATE TABLE live_checks (\n            id             INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            sha            TEXT    NOT NULL DEFAULT '',\n            outcome        TEXT    NOT NULL DEFAULT 'done',\n            probe          TEXT    NOT NULL DEFAULT '',\n            observation    TEXT    NOT NULL DEFAULT '',\n            reason         TEXT    NOT NULL DEFAULT '',\n            recorded_by    INTEGER,\n            recorded_agent TEXT    NOT NULL DEFAULT '',\n            created_at     TEXT    NOT NULL DEFAULT (datetime('now'))\n        , deploy_state TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"machine_reviews",
+"machine_reviews",
+"CREATE TABLE machine_reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, submission_generation INTEGER NOT NULL, harness_skill TEXT NOT NULL DEFAULT '', harness_version INTEGER, agent_count INTEGER, tokens_spent INTEGER, duration_ms INTEGER, orchestrator TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', raw_count INTEGER NOT NULL DEFAULT 0, findings_confirmed TEXT NOT NULL DEFAULT '[]', findings_rejected TEXT NOT NULL DEFAULT '[]', submitted_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), incomplete INTEGER, unresolved TEXT NOT NULL DEFAULT '[]', lost_dimensions TEXT NOT NULL DEFAULT '[]', incomplete_reason TEXT NOT NULL DEFAULT '', provider_tokens INTEGER, profile TEXT NOT NULL DEFAULT '', self_reviewed INTEGER NOT NULL DEFAULT 0, principal_id INTEGER, carried_from_review_id INTEGER, ci_integrity_verdict TEXT NOT NULL DEFAULT '', ci_integrity_explanation TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"mcp_call_events",
+"mcp_call_events",
+"CREATE TABLE mcp_call_events (\n            id             INTEGER PRIMARY KEY AUTOINCREMENT,\n            tool           TEXT    NOT NULL,\n            profile        TEXT    NOT NULL DEFAULT 'v1',\n            principal_id   INTEGER,\n            principal_role TEXT    NOT NULL DEFAULT '',\n            status         TEXT    NOT NULL DEFAULT 'ok',\n            error_reason   TEXT    NOT NULL DEFAULT '',\n            latency_ms     INTEGER NOT NULL DEFAULT 0,\n            response_chars INTEGER NOT NULL DEFAULT 0,\n            task_id        INTEGER,\n            created_at     TEXT    NOT NULL DEFAULT (datetime('now'))\n        , unknown_arg_count INTEGER)"
+],
+[
+"table",
+"outcome_answers",
+"outcome_answers",
+"CREATE TABLE outcome_answers (\n            id             INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id        INTEGER NOT NULL,\n            verdict        TEXT    NOT NULL,\n            measured_value TEXT    NOT NULL,\n            note           TEXT    NOT NULL DEFAULT '',\n            answered_by    TEXT    NOT NULL DEFAULT '',\n            answered_at    TEXT    NOT NULL DEFAULT (datetime('now'))\n        , hypothesis_snapshot TEXT)"
+],
+[
+"table",
+"password_credentials",
+"password_credentials",
+"CREATE TABLE password_credentials (\n            principal_id INTEGER PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,\n            password_hash TEXT NOT NULL,\n            hash_algorithm TEXT NOT NULL DEFAULT 'argon2id',\n            password_changed_at TEXT NOT NULL DEFAULT (datetime('now')),\n            must_rotate INTEGER NOT NULL DEFAULT 0,\n            failed_attempts INTEGER NOT NULL DEFAULT 0,\n            locked_until TEXT,\n            last_login_at TEXT\n        )"
+],
+[
+"table",
+"path_notice_results",
+"path_notice_results",
+"CREATE TABLE path_notice_results (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            generation INTEGER NOT NULL,\n            sha        TEXT    NOT NULL DEFAULT '',\n            state      TEXT    NOT NULL,\n            reason     TEXT    NOT NULL DEFAULT '',\n            notices    TEXT    NOT NULL DEFAULT '[]',\n            created_at TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (task_id, generation)\n        )"
+],
+[
+"table",
+"pipeline_merges",
+"pipeline_merges",
+"CREATE TABLE \"pipeline_merges\" (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id   INTEGER,\n            pr_number    INTEGER NOT NULL,\n            task_id      INTEGER,\n            merged_at    TEXT    NOT NULL DEFAULT (datetime('now')),\n            merge_sha    TEXT,\n            released_pr  INTEGER,\n            released_sha TEXT\n        )"
+],
+[
+"table",
+"principal_roles",
+"principal_roles",
+"CREATE TABLE principal_roles (\n            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,\n            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,\n            granted_by INTEGER REFERENCES principals(id),\n            granted_at TEXT NOT NULL DEFAULT (datetime('now')),\n            PRIMARY KEY (principal_id, role_id)\n        )"
+],
+[
+"table",
+"principals",
+"principals",
+"CREATE TABLE principals (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            kind TEXT NOT NULL CHECK(kind IN ('human','agent','service')),\n            username TEXT NOT NULL UNIQUE,\n            display_name TEXT NOT NULL DEFAULT '',\n            email TEXT NOT NULL DEFAULT '',\n            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','locked')),\n            notes TEXT NOT NULL DEFAULT '',\n            created_by INTEGER REFERENCES principals(id),\n            created_at TEXT NOT NULL DEFAULT (datetime('now')),\n            updated_at TEXT NOT NULL DEFAULT (datetime('now')),\n            last_seen_at TEXT\n        )"
+],
+[
+"table",
+"projects",
+"projects",
+"CREATE TABLE projects (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            slug TEXT NOT NULL UNIQUE,\n            name TEXT NOT NULL,\n            repo TEXT NOT NULL DEFAULT '',\n            workspace_path TEXT NOT NULL DEFAULT '',\n            default_branch TEXT NOT NULL DEFAULT 'develop',\n            default_branch_policy TEXT NOT NULL DEFAULT '{}',\n            archived INTEGER NOT NULL DEFAULT 0,\n            created_at TEXT NOT NULL DEFAULT (datetime('now')),\n            updated_at TEXT NOT NULL DEFAULT (datetime('now'))\n        , status TEXT NOT NULL DEFAULT 'active', machine_review TEXT NOT NULL DEFAULT 'auto', provision_status TEXT NOT NULL DEFAULT 'none', provision_detail TEXT NOT NULL DEFAULT '', drift_baseline_sha TEXT, gate_policy TEXT NOT NULL DEFAULT '{}', forge TEXT NOT NULL DEFAULT 'github')"
+],
+[
+"table",
+"releases",
+"releases",
+"CREATE TABLE releases (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id   INTEGER,\n            deployed_sha TEXT    NOT NULL,\n            ref          TEXT    NOT NULL DEFAULT '',\n            status       TEXT    NOT NULL DEFAULT 'success',\n            source       TEXT    NOT NULL DEFAULT '',\n            deployed_at  TEXT    NOT NULL DEFAULT (datetime('now'))\n        , backup TEXT NOT NULL DEFAULT '')"
+],
+[
+"table",
+"review_dispatches",
+"review_dispatches",
+"CREATE TABLE review_dispatches (\n            id                    INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id               INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            submission_generation INTEGER NOT NULL,\n            agent_id              TEXT    NOT NULL,\n            run_id                TEXT    NOT NULL DEFAULT '',\n            model                 TEXT    NOT NULL DEFAULT '',\n            status                TEXT    NOT NULL DEFAULT 'active',\n            created_at            TEXT    NOT NULL DEFAULT (datetime('now'))\n        , profile TEXT NOT NULL DEFAULT '', reviewer_principal_id INTEGER, provider_tokens INTEGER, channel TEXT NOT NULL DEFAULT 'cloud', run_status TEXT NOT NULL DEFAULT '', replaces_dispatch_id INTEGER, second_door_reason TEXT NOT NULL DEFAULT '', only_tests TEXT, usage_scope TEXT NOT NULL DEFAULT '', usage_checked_at TEXT, profile_assignment TEXT NOT NULL DEFAULT 'rule', billed_tokens INTEGER, billed_events INTEGER)"
+],
+[
+"table",
+"review_order_claims",
+"review_order_claims",
+"CREATE TABLE review_order_claims (\n            task_id               INTEGER NOT NULL\n                                  REFERENCES tasks(id) ON DELETE CASCADE,\n            submission_generation INTEGER NOT NULL,\n            profile               TEXT    NOT NULL,\n            claimed_at            TEXT    NOT NULL DEFAULT (datetime('now')),\n            PRIMARY KEY (task_id, submission_generation, profile)\n        )"
+],
+[
+"table",
+"role_permissions",
+"role_permissions",
+"CREATE TABLE role_permissions (\n            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,\n            permission TEXT NOT NULL,\n            PRIMARY KEY (role_id, permission)\n        )"
+],
+[
+"table",
+"roles",
+"roles",
+"CREATE TABLE roles (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            slug TEXT NOT NULL UNIQUE,\n            name TEXT NOT NULL,\n            description TEXT NOT NULL DEFAULT '',\n            system INTEGER NOT NULL DEFAULT 0,\n            created_at TEXT NOT NULL DEFAULT (datetime('now')),\n            updated_at TEXT NOT NULL DEFAULT (datetime('now'))\n        )"
+],
+[
+"table",
+"scheduled_policy_changes",
+"scheduled_policy_changes",
+"CREATE TABLE scheduled_policy_changes (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id  INTEGER NOT NULL REFERENCES projects(id),\n            at          TEXT    NOT NULL,\n            patch       TEXT    NOT NULL,\n            note        TEXT    NOT NULL DEFAULT '',\n            created_by  TEXT    NOT NULL DEFAULT '',\n            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),\n            state       TEXT    NOT NULL DEFAULT 'pending'\n                CHECK (state IN ('pending', 'applied', 'refused', 'cancelled')),\n            executed_at TEXT,\n            result      TEXT    NOT NULL DEFAULT '{}'\n        )"
+],
+[
+"table",
+"skills",
+"skills",
+"CREATE TABLE skills (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'prompt', version INTEGER NOT NULL, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', project_id INTEGER, status TEXT NOT NULL DEFAULT 'draft', created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), activated_by TEXT NOT NULL DEFAULT '', publication_record TEXT NOT NULL DEFAULT '', UNIQUE(name, version))"
+],
+[
+"table",
+"sqlite_sequence",
+"sqlite_sequence",
+"CREATE TABLE sqlite_sequence(name,seq)"
+],
+[
+"table",
+"steward_false_approvals",
+"steward_false_approvals",
+"CREATE TABLE steward_false_approvals (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id     INTEGER NOT NULL,\n            source      TEXT    NOT NULL,\n            generation  INTEGER NOT NULL DEFAULT 0,\n            detail      TEXT    NOT NULL DEFAULT '',\n            ref         TEXT    NOT NULL DEFAULT '',\n            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),\n            cleared_by  TEXT,\n            cleared_at  TEXT,\n            clear_note  TEXT    NOT NULL DEFAULT '',\n            UNIQUE (task_id, source, ref)\n        )"
+],
+[
+"table",
+"steward_judgements",
+"steward_judgements",
+"CREATE TABLE steward_judgements (\n            id                 INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id            INTEGER NOT NULL,\n            generation         INTEGER NOT NULL,\n            kind               TEXT    NOT NULL,\n            submitted_verdict  TEXT    NOT NULL,\n            verdict            TEXT    NOT NULL,\n            confidence         TEXT    NOT NULL DEFAULT '',\n            escalate_reason    TEXT    NOT NULL DEFAULT '',\n            grounds            TEXT    NOT NULL DEFAULT '[]',\n            findings           TEXT    NOT NULL DEFAULT '[]',\n            closures           TEXT    NOT NULL DEFAULT '[]',\n            model              TEXT    NOT NULL DEFAULT '',\n            tokens_spent       INTEGER,\n            duration_ms        INTEGER,\n            submitted_by       TEXT    NOT NULL DEFAULT '',\n            principal_id       INTEGER,\n            created_at         TEXT    NOT NULL DEFAULT (datetime('now'))\n        , tokens_unknown_reason TEXT NOT NULL DEFAULT '', judged_id INTEGER, packet_hash TEXT NOT NULL DEFAULT '', contour INTEGER NOT NULL DEFAULT 1, advisor_outcome TEXT NOT NULL DEFAULT '', advisor_claimed_at TEXT)"
+],
+[
+"table",
+"steward_runs",
+"steward_runs",
+"CREATE TABLE steward_runs (  id INTEGER PRIMARY KEY AUTOINCREMENT,  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,  generation INTEGER NOT NULL,  kind TEXT NOT NULL,  status TEXT NOT NULL DEFAULT 'open',  model TEXT NOT NULL DEFAULT '',  project_id INTEGER,  deadline_at TEXT NOT NULL,  closed_reason TEXT NOT NULL DEFAULT '',  created_at TEXT NOT NULL DEFAULT (datetime('now')),  closed_at TEXT, agent_id TEXT NOT NULL DEFAULT '', run_id TEXT NOT NULL DEFAULT '', started_at TEXT, packet_hash TEXT NOT NULL DEFAULT '',  UNIQUE(task_id, generation, kind))"
+],
+[
+"table",
+"submissions",
+"submissions",
+"CREATE TABLE submissions (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            generation   INTEGER NOT NULL,\n            sha          TEXT    NOT NULL DEFAULT '',\n            base_branch  TEXT    NOT NULL DEFAULT '',\n            submitted_at TEXT    NOT NULL DEFAULT (datetime('now')), state_snapshot TEXT NOT NULL DEFAULT '',\n            UNIQUE (task_id, generation)\n        )"
+],
+[
+"table",
+"task_dependencies",
+"task_dependencies",
+"CREATE TABLE task_dependencies (\n            id                 INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id            INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            created_at         TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (task_id, depends_on_task_id),\n            CHECK (task_id != depends_on_task_id)\n        )"
+],
+[
+"table",
+"task_evidence",
+"task_evidence",
+"CREATE TABLE task_evidence (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n            generation   INTEGER NOT NULL,\n            ac_id        TEXT    NOT NULL,\n            action       TEXT    NOT NULL,\n            observed     TEXT    NOT NULL,\n            target       TEXT    NOT NULL,\n            observed_at  TEXT    NOT NULL,\n            principal_id INTEGER,\n            agent        TEXT    NOT NULL DEFAULT '',\n            created_at   TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (task_id, generation, ac_id)\n        )"
+],
+[
+"table",
+"task_idempotency_keys",
+"task_idempotency_keys",
+"CREATE TABLE task_idempotency_keys (\n            client_request_id TEXT PRIMARY KEY,\n            task_id INTEGER NOT NULL REFERENCES tasks(id),\n            request_hash TEXT NOT NULL,\n            created_at TEXT NOT NULL DEFAULT (datetime('now'))\n        )"
+],
+[
+"table",
+"task_updates",
+"task_updates",
+"CREATE TABLE task_updates (\n    id         INTEGER PRIMARY KEY AUTOINCREMENT,\n    task_id    INTEGER NOT NULL REFERENCES tasks(id),\n    agent      TEXT    NOT NULL DEFAULT '',\n    kind       TEXT    NOT NULL DEFAULT 'status',\n    content    TEXT    NOT NULL,\n    created_at TEXT    NOT NULL DEFAULT (datetime('now'))\n, principal_id INTEGER, author_kind TEXT NOT NULL DEFAULT 'legacy', agent_claimed INTEGER NOT NULL DEFAULT 1)"
+],
+[
+"table",
+"tasks",
+"tasks",
+"CREATE TABLE tasks (\n    id              INTEGER PRIMARY KEY AUTOINCREMENT,\n    title           TEXT    NOT NULL,\n    description     TEXT    NOT NULL DEFAULT '',\n    status          TEXT    NOT NULL DEFAULT 'open',\n    runtime         TEXT    NOT NULL DEFAULT 'auto',\n    source          TEXT    NOT NULL DEFAULT 'human',\n    assigned_agent  TEXT    NOT NULL DEFAULT '',\n    rationale       TEXT    NOT NULL DEFAULT '',\n    job_id          TEXT,\n    exit_code       INTEGER,\n    result_text     TEXT,\n    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),\n    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))\n, review_cycle INTEGER NOT NULL DEFAULT 0, auto_review INTEGER NOT NULL DEFAULT 1, review_job_id TEXT, branch TEXT, pr_number INTEGER, ci_fix_cycle INTEGER NOT NULL DEFAULT 0, task_type TEXT NOT NULL DEFAULT 'task', parent_id INTEGER REFERENCES tasks(id), position INTEGER NOT NULL DEFAULT 0, priority TEXT NOT NULL DEFAULT 'medium', work_type TEXT NOT NULL DEFAULT 'feature', class_of_service TEXT NOT NULL DEFAULT 'standard', size TEXT, wip_tag TEXT, due_date TEXT, user_story TEXT NOT NULL DEFAULT '', problem_statement TEXT NOT NULL DEFAULT '', business_value TEXT NOT NULL DEFAULT '', scope_in TEXT NOT NULL DEFAULT '[]', scope_out TEXT NOT NULL DEFAULT '[]', affected_areas TEXT NOT NULL DEFAULT '[]', technical_hints TEXT NOT NULL DEFAULT '', constraints TEXT NOT NULL DEFAULT '[]', assumptions TEXT NOT NULL DEFAULT '[]', validation_commands TEXT NOT NULL DEFAULT '[]', out_of_scope_for_review TEXT NOT NULL DEFAULT '[]', risks TEXT NOT NULL DEFAULT '[]', readiness_score INTEGER, dor_passed INTEGER, ready_at TEXT, started_at TEXT, completed_at TEXT, human_owner TEXT NOT NULL DEFAULT '', human_reviewer TEXT NOT NULL DEFAULT '', review_checklist TEXT NOT NULL DEFAULT '[]', archived INTEGER NOT NULL DEFAULT 0, prepared_by TEXT NOT NULL DEFAULT '', prepared_at TEXT, claimed_by TEXT, claim_session_id TEXT, claimed_at TEXT, submission_generation INTEGER NOT NULL DEFAULT 0, review_verdict TEXT, review_verdict_generation INTEGER, review_findings TEXT NOT NULL DEFAULT '[]', project_id INTEGER, implementer_principal_id INTEGER, machine_review_override TEXT, review_self_approved INTEGER NOT NULL DEFAULT 0, status_entered_at TEXT, ci_check_started_at TEXT, ci_no_pr_attempts INTEGER NOT NULL DEFAULT 0, ci_run_requested_sha TEXT NOT NULL DEFAULT '', job_missing_since TEXT, arbiter_generation INTEGER, arbiter_state TEXT, arbiter_job_id TEXT, arbiter_dispatch_at TEXT, validation_generation INTEGER, validation_status TEXT, validation_log TEXT, outcome_metric TEXT NOT NULL DEFAULT '', outcome_indicator TEXT NOT NULL DEFAULT '', outcome_deadline TEXT NOT NULL DEFAULT '', outcome_revisit_condition TEXT NOT NULL DEFAULT '', redesign_decision TEXT, redesign_rationale TEXT NOT NULL DEFAULT '', agent_fit TEXT, submission_sha TEXT NOT NULL DEFAULT '', risk_class TEXT, risk_class_reasons TEXT NOT NULL DEFAULT '[]', submission_model TEXT NOT NULL DEFAULT '', found_in TEXT NOT NULL DEFAULT 'unknown', caused_by_task_id INTEGER REFERENCES tasks(id), detected_at TEXT, resolved_at TEXT, waiting_for TEXT NOT NULL DEFAULT '', waiting_until TEXT, waiting_declared_by TEXT NOT NULL DEFAULT '', git_mode TEXT NOT NULL DEFAULT 'hub', ci_fix_charged_generation INTEGER NOT NULL DEFAULT -1, statement_generation INTEGER NOT NULL DEFAULT 0, statement_fingerprint TEXT NOT NULL DEFAULT '', live_probe TEXT NOT NULL DEFAULT '', review_verdict_closed_generation INTEGER, gate_squashed_sha TEXT NOT NULL DEFAULT '', claim_nonce TEXT, executor_run_id INTEGER, release_id INTEGER REFERENCES releases(id), defect_prevention TEXT, completed_exit_seq INTEGER NOT NULL DEFAULT 0, freeze_rationale TEXT NOT NULL DEFAULT '', result_kind TEXT NOT NULL DEFAULT 'commit', rollback TEXT NOT NULL DEFAULT '', unfrozen_generation INTEGER NOT NULL DEFAULT 0, validation_source TEXT NOT NULL DEFAULT 'manual', review_verdict_revision INTEGER NOT NULL DEFAULT 0, review_verdict_digest TEXT NOT NULL DEFAULT '', start_history_unknown INTEGER NOT NULL DEFAULT 0, cause_kind TEXT)"
+],
+[
+"table",
+"watch_notices",
+"watch_notices",
+"CREATE TABLE watch_notices (key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+],
+[
+"trigger",
+"task_evidence_no_update",
+"task_evidence",
+"CREATE TRIGGER task_evidence_no_update\n        BEFORE UPDATE ON task_evidence\n        BEGIN\n            SELECT RAISE(ABORT, 'task_evidence is insert-only');\n        END"
+],
+[
+"trigger",
+"trg_false_approve_human_return",
+"events",
+"CREATE TRIGGER trg_false_approve_human_return\n        AFTER INSERT ON events\n        WHEN NEW.kind = 'review_verdict_recorded' AND NEW.task_id IS NOT NULL\n          AND NEW.actor NOT IN ('hub', 'policy', 'steward')\n          AND json_extract(NEW.payload, '$.verdict') = 'changes_requested'\n        BEGIN\n            INSERT OR IGNORE INTO steward_false_approvals\n              (task_id, source, generation, detail, ref)\n            SELECT j.task_id, 'human_changes_requested', j.generation, 'человек вернул поколение ' || COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0) || ' (пара одобрила поколение ' || j.generation || '), событие #' || NEW.id, CAST(NEW.id AS TEXT)\n            FROM steward_judgements a\n            JOIN steward_judgements j ON j.id = a.judged_id\n            WHERE a.kind = 'advisor' AND a.verdict = 'concur'\n              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2\n              AND a.task_id = NEW.task_id AND j.generation <= COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0);\n        END"
+],
+[
+"trigger",
+"trg_false_approve_prod_defect_insert",
+"tasks",
+"CREATE TRIGGER trg_false_approve_prod_defect_insert\n        AFTER INSERT ON tasks\n        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL\n        BEGIN\n            INSERT OR IGNORE INTO steward_false_approvals\n              (task_id, source, generation, detail, ref)\n            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)\n            FROM steward_judgements a\n            JOIN steward_judgements j ON j.id = a.judged_id\n            WHERE a.kind = 'advisor' AND a.verdict = 'concur'\n              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2\n              AND a.task_id = NEW.caused_by_task_id;\n        END"
+],
+[
+"trigger",
+"trg_false_approve_prod_defect_update",
+"tasks",
+"CREATE TRIGGER trg_false_approve_prod_defect_update\n        AFTER UPDATE OF found_in, caused_by_task_id ON tasks\n        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL\n          AND (OLD.found_in IS NOT 'prod'\n               OR OLD.caused_by_task_id IS NOT NEW.caused_by_task_id)\n        BEGIN\n            INSERT OR IGNORE INTO steward_false_approvals\n              (task_id, source, generation, detail, ref)\n            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)\n            FROM steward_judgements a\n            JOIN steward_judgements j ON j.id = a.judged_id\n            WHERE a.kind = 'advisor' AND a.verdict = 'concur'\n              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2\n              AND a.task_id = NEW.caused_by_task_id;\n        END"
+],
+[
+"trigger",
+"trg_false_approve_reopened",
+"tasks",
+"CREATE TRIGGER trg_false_approve_reopened\n        AFTER UPDATE OF status ON tasks\n        WHEN OLD.status = 'completed' AND NEW.status != 'completed'\n        BEGIN\n            UPDATE tasks SET completed_exit_seq = completed_exit_seq + 1\n            WHERE id = NEW.id;\n            INSERT OR IGNORE INTO steward_false_approvals\n              (task_id, source, generation, detail, ref)\n            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || (SELECT completed_exit_seq FROM tasks WHERE id = NEW.id)\n            FROM steward_judgements a\n            JOIN steward_judgements j ON j.id = a.judged_id\n            WHERE a.kind = 'advisor' AND a.verdict = 'concur'\n              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2\n              AND a.task_id = NEW.id;\n        END"
+],
+[
+"trigger",
+"trg_tasks_claim_cleared_drops_run_proof",
+"tasks",
+"CREATE TRIGGER trg_tasks_claim_cleared_drops_run_proof AFTER UPDATE OF claimed_by ON tasks WHEN NEW.claimed_by IS NULL AND NEW.executor_run_id IS NOT NULL BEGIN UPDATE tasks SET executor_run_id = NULL WHERE id = NEW.id; END"
+]
+]

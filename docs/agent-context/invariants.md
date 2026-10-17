@@ -120,7 +120,7 @@ These are the rules most likely to be broken by “small” changes.
 
 ## Persistence Invariants
 
-- Schema changes belong in `hub/db.py` migrations.
+- Schema changes belong in `hub/migrations/` (the list), applied by `hub/db.py`.
 - Repository helpers must serialize and deserialize structured list/JSON fields consistently.
 - It is safer to fail loudly on missing structured columns than silently treat them as empty.
 
