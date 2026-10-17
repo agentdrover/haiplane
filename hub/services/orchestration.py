@@ -32,6 +32,7 @@ from hub.db import (
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
 from hub.services.defect_clocks import (
+    cause_split,
     change_failure_rate,
     shift_left,
     measured_escapes,
@@ -1048,6 +1049,9 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
         # so the two numbers cannot be read as one.
         "escaped": await measured_escapes(db, scope),
         "source": "found_in",
+        # #1791: the same prod defects by kind of cause; the headline above
+        # is the sum of these rows, never recomputed from them.
+        **await cause_split(db, scope),
         "reconstructed": {
             "label": RECONSTRUCTED_ESCAPES_LABEL,
             **await _escaped_defect_metrics(db, scope),
@@ -5766,7 +5770,9 @@ async def _complete_without_review(
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
     pr_delivered = bool(task.get("pr_number"))
-    if not await _write_completed(db, task, exit_code, result_text):
+    if (written := await _write_completed(db, task, exit_code, result_text)) is None:
+        return "needs_decision"
+    if not written:
         await delivery_notes.note_approval_gone(db, task, merged=pr_delivered)
         return "running"
     return "completed"
@@ -5777,8 +5783,10 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-) -> bool:
+) -> bool | None:
     """The write of ``completed`` after a done report, with its validation gate.
+
+    ``None``: the defect gate holds it, asked again of the row here (#1791).
 
     The approval of the CURRENT submission is asked again here in every case
     (#1706): ``completed`` says "approved work was delivered", and a merge made
@@ -5800,6 +5808,8 @@ async def _write_completed(
     async with write_transaction(db):
         if not await approval_stands(db, task):
             return False
+        if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
+            return None
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 

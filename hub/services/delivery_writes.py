@@ -17,6 +17,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.services import watch_notices
+from hub.services.prevention_gate import hold_completion
 
 log = logging.getLogger("hub.delivery_writes")
 
@@ -129,6 +130,11 @@ async def complete_delivered(
     db: aiosqlite.Connection, task_id: int, pr_num: Any
 ) -> None:
     """pair-свип: PR влит, одобрение действует — завершить задачу (#306, #1706)."""
+    # #1791: the gate ran before the merge; the passport may have changed under
+    # it. Asked again of the row, in the transaction that would write completed.
+    if await hold_completion(db, task_id, via="poller_delivery_write", actor="hub"):
+        await db.commit()
+        return
     # Said out loud, because a completed task with no done report otherwise
     # reads as a lost record rather than as work the hub carried home (AC-5).
     await repo.add_task_update(
