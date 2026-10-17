@@ -2038,19 +2038,15 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # branch as merge_failed on a corpse: #1204, twice. resolve_delivery_pr
     # wraps the one rule (#959) the done-report path already applies.
     #
-    # delivery_pr.reason is NOT written here, unconditionally, on its own.
-    # This sweep revisits a running task every pass, and a raw write here
-    # would either repeat every 30s when the gate keeps waiting on the same
-    # transient cause (#534), or — worse — leave the connection sitting in
-    # an open transaction: on a deduped pass _note_pair_delivery_wait below
-    # returns without a commit, and a write made before it is then the only
-    # uncommitted thing on the connection (found by machine review, #1261
-    # submission #1, F1/F2). So the terminal branches below (needs_decision,
-    # delivered) write it themselves, right before the commit each already
-    # makes — each runs at most once per task, since the task leaves this
-    # sweep's candidate list the moment either one fires — and the transient
-    # branch folds it into _note_pair_delivery_wait's own dedupe-and-commit
-    # cycle instead of a second one.
+    # delivery_pr.reason is NOT written here unconditionally. This sweep
+    # revisits a running task every pass: a raw write would repeat every 30s
+    # while the gate waits on one transient cause (#534), or leave an open
+    # transaction on a deduped pass, where _note_pair_delivery_wait returns
+    # without a commit (machine review, #1261 submission #1, F1/F2). So the
+    # terminal branches (needs_decision, delivered) write it right before
+    # their own commit — each runs once per task, which then leaves this
+    # sweep — and the transient branch folds it into
+    # _note_pair_delivery_wait's dedupe-and-commit cycle.
     # #919: a prod defect without its prevention output is held before the
     # merge — the sweep would otherwise be the one door that never asks.
     if await hold_completion(db, task_id, via="poller_delivery", actor="hub"):
@@ -2183,13 +2179,16 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # while the approved submission is still the current one, and the check
     # shares one write transaction with the write. Otherwise one explicit
     # outcome, and the task is left to the human.
-    stands, _ = await services.record_delivery_outcome(
+    stands, completed = await services.record_delivery_outcome(
         db,
         task,
         partial(delivery_writes.complete_delivered, db, task_id, pr_num),
         merged=True,
     )
     if not stands:
+        return
+    if not completed:
+        await delivery_writes.log_held(db, task_id)  # #1800
         return
     await _roll_up_parent_after_delivery(db, task_id)
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
