@@ -2310,7 +2310,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ),
     # #1783: метка захвата сессии (claim_nonce), прогон-держатель (executor_run_id)
     (
-        "t1783_sess_claim",
+        "add_chat_pair_sess_claim",
         "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
     ),
     ("t1783_task_nonce", "ALTER TABLE tasks ADD COLUMN claim_nonce TEXT"),

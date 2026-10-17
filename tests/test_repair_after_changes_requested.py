@@ -1846,3 +1846,116 @@ async def test_c4_a_manual_session_claim_is_cleared_by_its_done(
     )
     final = await _row(db, task_id)
     assert final["claimed_by"] is None, "после purge захвата нет: тупика нет"
+
+
+async def _manual_token(client, world_, task_id: int, ip: str) -> dict:
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task_id},
+        headers={**world_.human_auth, "x-forwarded-for": ip},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await _redeem(world_, issued.json()["code"])
+    assert redeemed.status_code == 200, redeemed.text
+    return {"Authorization": f"Bearer {redeemed.json()['token']}"}
+
+
+async def test_c4_a_changed_token_adopts_the_claim_and_is_not_a_dead_end(
+    client,
+    db,
+    monkeypatch,
+    world,  # noqa: F811
+):
+    """Регрессия-проверка: захват идёт под тем же agent/session_id, но другим токеном (два
+    ручных кода; либо claim токеном среды и pair-start токеном сессии). Сессия, продолжившая
+    захват, принимает его метку, и после истечения и purge задача возвращается в open."""
+    _launch_config(monkeypatch)
+    agent = config.CHAT_PAIR_AGENT
+    # (1) два ручных кода одного человека, claim через A, повтор через B, pair-start через B
+    _, first = await _task_with_findings(db, slug="rc-c4-two-tokens")
+    await repo.update_task(db, first, status="open", branch="task-x/work")
+    await db.commit()
+    a = await _manual_token(client, world, first, "203.0.113.81")
+    b = await _manual_token(client, world, first, "203.0.113.82")
+    body = {"agent": agent, "session_id": "s-sw"}
+    assert (
+        await client.post(f"/api/tasks/{first}/claim", json=body, headers=a)
+    ).status_code == 200
+    assert (
+        await client.post(f"/api/tasks/{first}/claim", json=body, headers=b)
+    ).status_code == 200
+    started = await client.post(
+        f"/api/tasks/{first}/pair-start",
+        json={
+            "assigned_agent": agent,
+            "session_id": "s-sw",
+            "plan": "Plan: x",
+            "git_mode": "remote",
+        },
+        headers=b,
+    )
+    assert started.status_code == 200, started.text
+    # (2) claim токеном среды, pair-start токеном сессии
+    _, second = await _task_with_findings(db, slug="rc-c4-env-then-session")
+    await repo.update_task(db, second, status="open", branch="task-y/work")
+    await db.commit()
+    s2 = await _manual_token(client, world, second, "203.0.113.83")
+    env_body = {"agent": agent, "session_id": "s-env"}
+    assert (
+        await client.post(
+            f"/api/tasks/{second}/claim", json=env_body, headers=world.agent_auth
+        )
+    ).status_code == 200
+    started2 = await client.post(
+        f"/api/tasks/{second}/pair-start",
+        json={
+            "assigned_agent": agent,
+            "session_id": "s-env",
+            "plan": "Plan: y",
+            "git_mode": "remote",
+        },
+        headers=s2,
+    )
+    assert started2.status_code == 200, started2.text
+    await db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute')"
+    )
+    await db.commit()
+    await cp.purge_expired(db)
+    await cp.purge_expired(db)
+    for task_id in (first, second):
+        after = await _row(db, task_id)
+        assert after["status"] == "open" and after["claimed_by"] is None, task_id
+
+
+async def test_c4_a_late_cost_closing_of_an_old_run_does_not_stop_new_work(
+    db, monkeypatch
+):
+    """Старый прогон снят провайдером без цены, захват снят, задачу взяли заново; запоздалое
+    закрытие учёта (finished_at позже входа задачи в running) новую работу в needs_decision
+    не переводит: время конца — по cost_wait_since."""
+    from hub.services import executor_dispatch as dispatch
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-late-close")
+    run = await _new_run(db, task_id, 2)
+    await repo.update_task(db, task_id, status="running", submission_generation=1)
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now') WHERE id = ?", (task_id,)
+    )
+    await db.execute(
+        "UPDATE executor_runs SET outcome='cancelled', finished_at=datetime('now'), "
+        "cost_wait_since=datetime('now', '-30 minutes') WHERE id = ?",
+        (run,),
+    )
+    await db.commit()
+    assert not await repo.stopped_executor_runs_of_running_tasks(
+        db, dispatch.STOPPED_OUTCOMES
+    )
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since = NULL WHERE id = ?", (run,)
+    )
+    await db.commit()
+    assert await repo.stopped_executor_runs_of_running_tasks(
+        db, dispatch.STOPPED_OUTCOMES
+    )

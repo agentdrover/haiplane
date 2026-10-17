@@ -839,7 +839,7 @@ async def bind_claim(
     Независимый захват тем же принципалом, под тем же session_id и в ту же
     секунду, метки не наследует.
     """
-    if token:
+    if token and nonce:
         await db.execute(
             "UPDATE chat_pair_sessions SET claimed_session = ? "
             "WHERE token_hash = ? AND kind = 'implementer' AND bound_task_id = ?",

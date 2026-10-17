@@ -1987,14 +1987,14 @@ async def _pair_start_write(
             "retry from its current status",
         )
     if starting_status == "open":
-        # #1783: pair-start из open — единственный захват этой задачи, и
-        # доказательство прогона пишется здесь. Из claimed оно уже записано
-        # claim'ом; None у ручного старта стирает чужой хвост.
+        # #1783: pair-start из open — единственный захват этой задачи: доказательство
+        # прогона и метка пишутся здесь (None у ручного старта стирает чужой хвост).
         update_fields["executor_run_id"] = caller_run
         update_fields["claim_nonce"] = secrets.token_hex(8)
-        await chat_pair.bind_claim(
-            db, session_token, task_id, update_fields["claim_nonce"]
-        )
+    # Сессия, продолжающая захват (pair-start после claim, в том числе другим токеном
+    # того же держателя), принимает метку этого захвата.
+    mark = update_fields.get("claim_nonce") or fresh["claim_nonce"]
+    await chat_pair.bind_claim(db, session_token, task_id, mark or "")
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
@@ -4975,6 +4975,14 @@ async def claim_task(
             task.get("claimed_by") == body.agent
             and (task.get("claim_session_id") or "") == body.session_id
         ):
+            # Тот же держатель с другой сессией implementer (смена токена) принимает
+            # метку этого захвата: иначе его сессию реапер не свяжет с захватом (#1783).
+            from hub.services import chat_pair as _cp
+
+            await _cp.bind_claim(
+                db, session_token, task_id, task.get("claim_nonce") or ""
+            )
+            await db.commit()
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)
             tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
