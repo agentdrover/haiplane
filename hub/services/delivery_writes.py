@@ -17,6 +17,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
 from hub.services import watch_notices
 from hub.services.prevention_gate import hold_completion
 
@@ -167,12 +168,11 @@ async def complete_delivered(
 
 async def log_held(db: aiosqlite.Connection, task_id: int) -> None:
     """Лог поллера об удержании: причина из последнего needs_decision (#1800)."""
-    rows = list(
-        await db.execute_fetchall(
-            "SELECT payload FROM events WHERE task_id=? AND kind='needs_decision' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        )
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind='needs_decision' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
     )
     try:
         why = str(json.loads(rows[0]["payload"]).get("reason") or "unknown")
