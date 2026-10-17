@@ -5050,16 +5050,6 @@ async def release_task(
             409,
             f"Task #{task_id} claim session mismatch",
         )
-    from hub.services import chat_pair as _chat_pair
-
-    if not body.session_id and await _chat_pair.claim_is_session_bound(
-        db, task.get("claim_nonce")
-    ):
-        # Захват сессии implementer снимает только она (#1783): имя агента в
-        # запросе без session_id чужую сессию той же роли не заменяет.
-        raise HTTPException(
-            409, f"Task #{task_id}: claim is held by a session; pass its session_id"
-        )
 
     if not await repo.transition_status_if(
         db, task_id, expected_from="claimed", new_status="open"

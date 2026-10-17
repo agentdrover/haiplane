@@ -1698,67 +1698,6 @@ async def test_c3_finished_without_submission_keeps_its_outcome_when_usage_is_si
     )
 
 
-async def test_c3_a_done_by_name_does_not_clear_a_session_claim(db, monkeypatch):
-    """Захват сделан сессией implementer (метка записана в сессию): отчёт done с тем же
-    именем агента его не снимает — имя не доказывает, что отчёт шлёт та сессия."""
-    from hub import models, services
-
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    _, task_id = await _task_with_findings(db, slug="rc-c3-done-name")
-    await _hold(db, task_id, None, session=False, status="claimed")
-    await db.execute(
-        "UPDATE tasks SET claim_nonce = 'nn', branch = '' WHERE id = ?", (task_id,)
-    )
-    await db.execute(
-        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
-        "bound_task_id, bound_generation, claimed_session) VALUES "
-        "(?, 'dn', datetime('now', '+1 hour'), 'implementer', ?, 1, 'nn')",
-        (int(acting["id"]), task_id),
-    )
-    await db.commit()
-    await services.add_update(
-        db,
-        task_id,
-        models.TaskUpdateCreate(
-            agent=config.CHAT_PAIR_AGENT, kind="done", content="запоздалый отчёт"
-        ),
-    )
-    assert (await _row(db, task_id))["claimed_by"] == config.CHAT_PAIR_AGENT
-
-
-async def test_c3_release_by_name_does_not_free_a_session_claim(db, monkeypatch):
-    """release без session_id не снимает захват, сделанный сессией implementer."""
-    from fastapi import HTTPException
-
-    from hub import models
-    from hub.services import lifecycle
-
-    _launch_config(monkeypatch)
-    acting = await cp.get_acting_agent(db)
-    _, task_id = await _task_with_findings(db, slug="rc-c3-release-name")
-    await _hold(db, task_id, None, session=False, status="claimed")
-    await db.execute("UPDATE tasks SET claim_nonce = 'rn' WHERE id = ?", (task_id,))
-    await db.execute(
-        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
-        "bound_task_id, bound_generation, claimed_session) VALUES "
-        "(?, 'rn-s', datetime('now', '+1 hour'), 'implementer', ?, 1, 'rn')",
-        (int(acting["id"]), task_id),
-    )
-    await db.commit()
-    with pytest.raises(HTTPException) as refused:
-        await lifecycle.release_task(
-            db, task_id, models.TaskRelease(agent=config.CHAT_PAIR_AGENT)
-        )
-    assert refused.value.status_code == 409
-    await lifecycle.release_task(
-        db,
-        task_id,
-        models.TaskRelease(agent=config.CHAT_PAIR_AGENT, session_id="s-run"),
-    )
-    assert (await _row(db, task_id))["status"] == "open"
-
-
 async def test_c3_a_claim_held_after_done_is_released_in_ci_check(db, monkeypatch):
     """Доказанный держатель сдал через done (ci_check), прогон кончился: захват снят и там."""
     _launch_config(monkeypatch)
@@ -1789,3 +1728,55 @@ async def test_c3_a_run_that_providers_called_over_cannot_take_the_task(
     await db.commit()
     assert await cp.run_of_session(db, "over-token", task_id) is None
     assert await cp.ended_run_session(db, "over-token", task_id) is True
+
+
+async def test_c4_a_manual_session_claim_is_cleared_by_its_done(
+    client,
+    db,
+    monkeypatch,
+    world,  # noqa: F811
+):
+    """Регрессия круга 3: ручной implementer-код (выдан человеком, без прогона). claim ->
+    done -> сессия истекла и purge -> changes_requested: захват снят сдачей, как на
+    develop, тупика running + claimed_by + 0 сессий нет."""
+    from hub import models, services
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-manual")
+    await repo.update_task(db, task_id, status="open", branch="task-x/work")
+    await db.commit()
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task_id},
+        headers={**world.human_auth, "x-forwarded-for": "203.0.113.70"},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await _redeem(world, issued.json()["code"])
+    assert redeemed.status_code == 200, redeemed.text
+    headers = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    claimed = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": config.CHAT_PAIR_AGENT, "session_id": "s-manual-c4"},
+        headers=headers,
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert (await _row(db, task_id))["executor_run_id"] is None
+    await services.add_update(
+        db,
+        task_id,
+        models.TaskUpdateCreate(
+            agent=config.CHAT_PAIR_AGENT, kind="done", content="сдано"
+        ),
+    )
+    after = await _row(db, task_id)
+    assert after["claimed_by"] is None and after["claim_session_id"] is None
+    await db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute')"
+    )
+    await db.commit()
+    await cp.purge_expired(db)
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ?", (task_id,)
+    )
+    final = await _row(db, task_id)
+    assert final["claimed_by"] is None, "после purge захвата нет: тупика нет"
