@@ -1187,3 +1187,25 @@ async def test_a_silent_usage_does_not_delay_releasing_the_claim(db, monkeypatch
     await db.commit()
     after = await _row(db, task_id)
     assert (after["claimed_by"], after["executor_run_id"]) == (None, None)
+
+
+async def test_the_done_guard_looks_in_the_worktree_of_a_pair_task(
+    db, monkeypatch, tmp_path
+):
+    """Pair-задача с worktree: недокоммиченное ищется там, куда смотрит git-хвост."""
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration, resubmission_guard
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-worktree")
+    seen: list = []
+
+    async def _dirty(repo=None):
+        seen.append(repo)
+        return ["a.py"]
+
+    monkeypatch.setattr(orchestration, "worktree_per_task_enabled", lambda: True)
+    monkeypatch.setattr(plugins.git_ops, "worktree_path", lambda tid, ws: str(tmp_path))
+    monkeypatch.setattr(plugins.git_ops, "dirty_paths", _dirty)
+    assert await resubmission_guard._uncommitted_work(db, await _row(db, task_id))
+    assert seen == [str(tmp_path)]
