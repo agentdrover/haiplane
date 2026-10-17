@@ -231,6 +231,11 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
     redeemed = await client.post("/api/auth/chat-pair/redeem", json={"code": code})
     assert redeemed.status_code == 200, redeemed.text
     headers = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    fresh = await db.execute_fetchall(
+        "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run,),
+    )
+    assert fresh[0][0] is None, "новая сессия задачу ещё не брала"
     claimed = await client.post(
         f"/api/tasks/{task_id}/claim",
         json={"agent": config.CHAT_PAIR_AGENT, "session_id": "s-1783"},
@@ -1056,6 +1061,12 @@ async def test_p1_a_session_that_never_claimed_does_not_take_a_foreign_claim(
     await db.commit()
     assert await cp.release_expired_implementer_tasks(db) == []
     assert (await _row(db, task_id))["claimed_by"]
+    # и когда у захвата session_id не объявлен: NULL с NULL не совпадение
+    await db.execute(
+        "UPDATE tasks SET claim_session_id = NULL WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
 
 
 async def test_p1_backfill_is_ambiguous_with_two_run_sessions(db, monkeypatch):
