@@ -665,7 +665,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     # Only deploy real merges into main, never on pull_request runs.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # #1796: a condition without a status function gets an implicit success(),
+    # and success() is false when ANY transitive ancestor was skipped. On push
+    # the evidence job is skipped (evidence_run=false), so the old condition
+    # skipped every deploy. !cancelled() replaces the implicit success() and
+    # needs.test.result == 'success' keeps a red or skipped test from shipping.
+    if: ${{ !cancelled() && needs.test.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     environment: production
     # #1588: деплой ждёт идущие локальные deep-ревью до 1800 с (deploy/review-drain.sh),
     # потом rsync, pip, restart и health. Без своего предела job жил бы до 6 часов
