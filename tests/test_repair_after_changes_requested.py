@@ -1466,6 +1466,23 @@ async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
     )
     await w.db.commit()
     pending = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == held]
+    run_of_held = (
+        await w.db.execute_fetchall(
+            "SELECT id FROM executor_runs WHERE task_id = ? ORDER BY id DESC", (held,)
+        )
+    )[0][0]
+    conflict = await run_claim.redeem_conflict(
+        w.db, {"executor_run_id": run_of_held, "bound_task_id": held}
+    )
+    assert "держит" in conflict, "держатель другого захвата назван причиной"
+    # свой же захват этого прогона выкуп не блокирует
+    await repo.update_task(w.db, held, executor_run_id=run_of_held)
+    await w.db.commit()
+    assert not await run_claim.redeem_conflict(
+        w.db, {"executor_run_id": run_of_held, "bound_task_id": held}
+    )
+    await repo.update_task(w.db, held, executor_run_id=None)
+    await w.db.commit()
     blocked = await _redeem(w, _code_of(w, pending[0]))
     assert blocked.status_code >= 400, blocked.text
     assert not await w.db.execute_fetchall(
@@ -1516,3 +1533,23 @@ async def test_k8_two_connections_redeem_and_claim_leave_one_executor(
     assert redeem.status_code == 200, redeem.text
     assert (await _row(w.db, task_id))["status"] == "open"
     assert (await _row(w.db, task_id))["claimed_by"] is None
+
+
+async def test_c3_repair_does_not_return_a_manual_holders_task_from_review(
+    db, monkeypatch
+):
+    """Кнопка повторного прогона из review не снимает ручной захват (без доказательства
+    закончившегося прогона): отказ с причиной, провайдер не зван, задача цела."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human = await _human(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-manual-review")
+    await repo.update_task(db, task_id, claimed_by="alice", claim_session_id="s-a")
+    await db.commit()
+    result = await el.repair_executor(
+        db, task_id, issuer_principal_id=human, issuer="o"
+    )
+    assert not result.launched and "alice" in result.reason
+    assert calls == []
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"]) == ("review", "alice")
