@@ -996,6 +996,31 @@ async def revoke_sessions(
     return int(cursor.rowcount or 0)
 
 
+async def _claim_released_from_run(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> bool:
+    """Захват прогона хаба уже снят (#1783): сессии прогона задачу не держат.
+
+    Задача без захвата и без доказательства, у которой есть сессии с заказом, —
+    это та, чей захват снял ``run_claim`` (после сдачи, по вердикту) между
+    выборкой реапера и его записью. Возвращать её в open нельзя: она ждёт
+    доставки или починки, а ``implementer_principal_id`` нужен запрету
+    самопроверки.
+    """
+    if task["claimed_by"] or task["claim_session_id"]:
+        return False
+    if task["executor_run_id"] is not None:
+        return False
+    return bool(
+        await fetchall(
+            db,
+            "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+            "AND bound_task_id = ? AND executor_run_id IS NOT NULL",
+            (int(task_id),),
+        )
+    )
+
+
 async def return_task_to_open(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1023,11 +1048,13 @@ async def return_task_to_open(
     await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
     rows = await fetchall(
         db,
-        "SELECT status, implementer_principal_id, job_id, review_job_id "
-        "FROM tasks WHERE id = ?",
+        "SELECT status, implementer_principal_id, job_id, review_job_id, "
+        "claimed_by, claim_session_id, executor_run_id FROM tasks WHERE id = ?",
         (int(task_id),),
     )
     if not rows or rows[0]["status"] != from_status:
+        return False
+    if await _claim_released_from_run(db, task_id, dict(rows[0])):
         return False
     # #1783: задание и идущий прогон хаба — признаки работы, появившиеся после
     # выборки reaper'а; под локом они видны, и освобождение не состоится.

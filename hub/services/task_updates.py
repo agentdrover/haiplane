@@ -32,7 +32,7 @@ from hub.models import TaskUpdateCreate, TaskUpdateView
 from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
-from hub.services import prevention_gate
+from hub.services import prevention_gate, run_claim
 
 log = logging.getLogger("hub")
 
@@ -205,6 +205,10 @@ async def _route_pair_or_claimed(
     else:
         await lc.transition_after_agent_done(db, task, has_done=True)
     if was_claimed:
+        if task.get("executor_run_id") is not None:
+            # #1783: снятие захвата уносит доказательство (триггер) — сессии и
+            # слот прогона закрываются здесь же, а не остаются без хозяина.
+            await run_claim.drop_run_holdings(db, task_id, int(task["executor_run_id"]))
         await repo.update_task(db, task_id, claimed_by=None, claim_session_id=None)
     refreshed = await repo.get_task(db, task_id)
     if refreshed and dict(refreshed)["status"] == "completed":

@@ -234,6 +234,35 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
     assert claimed.status_code == 200, claimed.text
     assert (await _row(db, task_id))["executor_run_id"] == run
 
+    # done из claimed снимает захват и вместе с ним закрывает сессии и слот прогона:
+    # доказательство уходит с захватом, и позже закрыть эти остатки было бы нечем.
+    await db.execute(
+        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot) "
+        "VALUES (?, 'cloud', '')",
+        (task_id,),
+    )
+    await db.commit()
+    from hub import models, services
+
+    await services.add_update(
+        db,
+        task_id,
+        models.TaskUpdateCreate(
+            agent=config.CHAT_PAIR_AGENT, kind="done", content="готово"
+        ),
+    )
+    assert (await _row(db, task_id))["claimed_by"] is None
+    left = await db.execute_fetchall(
+        "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ? AND revoked_at IS NULL",
+        (task_id,),
+    )
+    assert not left
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM executor_slots WHERE task_id = ? AND released_at IS NULL",
+        (task_id,),
+    )
+    await repo.update_task(db, task_id, claimed_by="x", executor_run_id=run)
+    await db.commit()
     # Снятие захвата на любом пути (в том числе сырым SQL) уносит доказательство.
     await db.execute("UPDATE tasks SET claimed_by = NULL WHERE id = ?", (task_id,))
     await db.commit()
@@ -433,6 +462,11 @@ async def test_stuck_claim_without_sessions_is_released(client, db, monkeypatch)
     run_id = await _finished_run_id(db, task_id)
     # Инцидент: сессия прогона истекла, пока задача была в review; purge её убрал.
     await _hold(db, task_id, run_id, session=True)
+    await db.execute(
+        "INSERT INTO executor_slots (task_id, channel, slot) VALUES (?, 'cloud', '')",
+        (task_id,),
+    )
+    await db.commit()
     await cp.purge_expired(db)
     assert not await db.execute_fetchall(
         "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ?", (task_id,)
@@ -453,6 +487,10 @@ async def test_stuck_claim_without_sessions_is_released(client, db, monkeypatch)
 
     freed = await _row(db, task_id)
     assert (freed["claimed_by"], freed["executor_run_id"]) == (None, None)
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM executor_slots WHERE task_id = ? AND released_at IS NULL",
+        (task_id,),
+    ), "слот ушёл вместе с захватом: иначе open_slot блокирует повторный запуск"
     assert freed["status"] == "running"
     notes = [
         u
@@ -574,6 +612,19 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
     _launch_config(monkeypatch)
     _, run_held = await _task_with_findings(db, slug="rc-bf-run")
     run_id = await _finished_run_id(db, run_held)
+    # на момент выката прогон ИДЁТ — только тогда сессия говорит о текущем захвате
+    await db.execute(
+        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (run_id,)
+    )
+    _, history = await _task_with_findings(db, slug="rc-bf-history")
+    await _hold(db, history, None, session=False, status="running")
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, executor_run_id) VALUES "
+        "((SELECT id FROM principals WHERE username = ?), 'bf-3', "
+        "datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (config.CHAT_PAIR_AGENT, history, await _finished_run_id(db, history)),
+    )
     await _hold(db, run_held, None, session=False, status="running")
     acting = await cp.get_acting_agent(db)
     await db.execute(
@@ -603,3 +654,30 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
     assert (await _row(db, run_held))["executor_run_id"] == run_id
     assert (await _row(db, manual))["executor_run_id"] is None
     assert (await _row(db, other_holder))["executor_run_id"] is None
+    # закончившийся прогон — история: задачу с тех пор взяли вручную
+    assert (await _row(db, history))["executor_run_id"] is None
+
+
+async def test_the_reaper_does_not_return_a_task_whose_claim_was_just_released(
+    db, monkeypatch
+):
+    """Реапер выбрал задачу со старым захватом, а между выборкой и записью захват
+    снял run_claim: задача (running, без захвата и доказательства) в open не уходит."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-reaper-race")
+    run_id = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, run_id, session=True, status="running")
+    await repo.update_task(db, task_id, claimed_by=None, claim_session_id=None)
+    await db.commit()
+    freed = await cp.return_task_to_open(
+        db,
+        task_id,
+        from_status="running",
+        note="x",
+        event_kind="chat_pair_implementer_expired",
+        holders=frozenset(
+            {int((await cp.get_acting_agent(db))["id"])}  # type: ignore[index]
+        ),
+    )
+    assert freed is False
+    assert (await _row(db, task_id))["status"] == "running"

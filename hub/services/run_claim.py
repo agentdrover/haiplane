@@ -57,6 +57,27 @@ async def finished_run_of(
     return row
 
 
+async def drop_run_holdings(
+    db: aiosqlite.Connection, task_id: int, run_id: int, *, reason: str = ""
+) -> None:
+    """Сессии прогона отозвать, слот задачи закрыть; без коммита (#1783).
+
+    Захват и всё, что к нему привязано, уходят вместе: слот без захвата
+    блокировал бы повторный запуск (``open_slot`` — признак работы), а живая
+    сессия — возврат в работу.
+    """
+    await db.execute(
+        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+        "WHERE executor_run_id = ? AND bound_task_id = ? AND revoked_at IS NULL",
+        (int(run_id), int(task_id)),
+    )
+    await db.execute(
+        "UPDATE executor_slots SET released_at = datetime('now'), "
+        "outcome = 'freed', reason = ? WHERE task_id = ? AND released_at IS NULL",
+        (reason or SLOT_REASON.format(run=run_id), int(task_id)),
+    )
+
+
 async def release_run_claim(
     db: aiosqlite.Connection,
     task_id: int,
@@ -98,18 +119,7 @@ async def release_run_claim(
     )
     if not cursor.rowcount:
         return False
-    if close_own_sessions:
-        await db.execute(
-            "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
-            "WHERE executor_run_id = ? AND bound_task_id = ? AND revoked_at IS NULL",
-            (int(run_id), int(task_id)),
-        )
-        await db.execute(
-            "UPDATE executor_slots SET released_at = datetime('now'), "
-            "outcome = 'freed', reason = ? "
-            "WHERE task_id = ? AND released_at IS NULL",
-            (SLOT_REASON.format(run=run_id), int(task_id)),
-        )
+    await drop_run_holdings(db, int(task_id), int(run_id))
     session = (task.get("claim_session_id") or "").strip()
     if session:
         await db.execute(
