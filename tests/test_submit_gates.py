@@ -1496,6 +1496,38 @@ async def test_same_sha_after_changes_requested_is_refused(
     assert await resubmission_guard.stop_empty_done(db, row) == ""
     monkeypatch.setattr(lifecycle, "resolve_branch_tip", real_tip)
 
+    # done из claimed (после повторного захвата) и headless из fix_requested не
+    # обходят запрет: проверка по поколению с действующим вердиктом, не по статусу.
+    await repo.update_task(db, task.id, status="claimed", job_id=None)
+    await db.commit()
+    with pytest.raises(HTTPException) as claimed_refused:
+        await services.add_update(
+            db,
+            task.id,
+            models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+        )
+    assert claimed_refused.value.detail["reason"] == "resubmit_without_changes"
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    fix = dict(await repo.get_task(db, task.id))
+    assert await transition_after_agent_done(db, fix, has_done=True) == "needs_decision"
+    # headless с недокоммиченной работой в рабочем каталоге: пустой пересдачей не
+    # считается — хвост конвейера закоммитит и запушит её позже.
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    real_dirty = git.dirty_paths
+
+    async def _dirty(repo=None):
+        return ["hub/x.py"]
+
+    git.dirty_paths = _dirty
+    from hub.services import resubmission_guard as _rg
+
+    assert await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id))) == ""
+    git.dirty_paths = real_dirty
+    await repo.update_task(db, task.id, job_id=None, status="running")
+    await db.commit()
+
     # новый коммит принимается.
     git.tip = "tip-2"
     accepted = await lifecycle.submit_for_review(

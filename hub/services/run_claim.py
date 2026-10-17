@@ -39,7 +39,7 @@ async def _lock_for_write(db: aiosqlite.Connection) -> None:
 
 
 async def finished_run_of(
-    db: aiosqlite.Connection, task: dict[str, Any]
+    db: aiosqlite.Connection, task: dict[str, Any], *, ended: bool = False
 ) -> dict[str, Any] | None:
     """Прогон, чей захват держит задача, если он ЗАКОНЧЕН; иначе None.
 
@@ -52,9 +52,47 @@ async def finished_run_of(
     if run is None:
         return None
     row = dict(run)
-    if int(row["task_id"]) != int(task["id"]) or row["outcome"] == "running":
+    if int(row["task_id"]) != int(task["id"]):
+        return None
+    # ``ended`` — провайдер подтвердил конец прогона, а строка ещё ждёт цену:
+    # снятие захвата от учёта стоимости не зависит (#1783, круг 2).
+    if row["outcome"] == "running" and not ended:
         return None
     return row
+
+
+async def refuse_over_live_run(
+    db: aiosqlite.Connection, task_id: int, caller_run_id: int | None
+) -> None:
+    """claim/pair-start под write-локом: задачу нельзя взять поверх брони хаба (#1783).
+
+    Круг починки оставляет задачу open с бронью прогона до сетевого create, и
+    ручной захват на втором соединении иначе пропускал бы платного агента
+    поверх занятой задачи. Свой прогон звонящего (по токену его сессии) и
+    брошенная бронь без агента не мешают. Исключение — HTTP 409.
+    """
+    from fastapi import HTTPException
+
+    from hub.services.executor_launch import _reservation_abandoned
+
+    rows = await fetchall(
+        db,
+        "SELECT * FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
+        "ORDER BY id",
+        (int(task_id),),
+    )
+    for raw in rows:
+        row = dict(raw)
+        if caller_run_id is not None and int(row["id"]) == int(caller_run_id):
+            continue
+        if not row["agent_id"] and row.get("channel", "cloud") != "slot":
+            if _reservation_abandoned(row):
+                continue
+        raise HTTPException(
+            409,
+            f"Task #{task_id}: по ней идёт прогон исполнителя хаба #{row['id']} "
+            "(бронь или заказ) — захватить её нельзя, пока он не закончен (#1783)",
+        )
 
 
 async def drop_run_holdings(
@@ -73,8 +111,9 @@ async def drop_run_holdings(
     )
     await db.execute(
         "UPDATE executor_slots SET released_at = datetime('now'), "
-        "outcome = 'freed', reason = ? WHERE task_id = ? AND released_at IS NULL",
-        (reason or SLOT_REASON.format(run=run_id), int(task_id)),
+        "outcome = 'freed', reason = ? WHERE task_id = ? AND released_at IS NULL "
+        "AND executor_run_id = ?",
+        (reason or SLOT_REASON.format(run=run_id), int(task_id), int(run_id)),
     )
 
 
@@ -87,6 +126,7 @@ async def release_run_claim(
     note: str,
     close_own_sessions: bool = False,
     reason: str = "",
+    run_ended: bool = False,
 ) -> bool:
     """Снять захват задачи, доказанно принадлежащий закончившемуся прогону.
 
@@ -103,11 +143,15 @@ async def release_run_claim(
     states = tuple(statuses)
     if task["status"] not in states or task.get("executor_run_id") != int(run_id):
         return False
-    run = await finished_run_of(db, task)
+    run = await finished_run_of(db, task, ended=run_ended)
     if run is None or int(run["id"]) != int(run_id):
         return False
     if await work_signs(
-        db, task, own_run_id=int(run_id), closing_own_sessions=close_own_sessions
+        db,
+        task,
+        own_run_id=int(run_id),
+        closing_own_sessions=close_own_sessions,
+        own_run_ended=run_ended,
     ):
         return False
     marks = ", ".join("?" for _ in states)
@@ -144,7 +188,7 @@ async def release_run_claim(
 
 
 async def release_after_run_closed(
-    db: aiosqlite.Connection, run_id: int, *, why: str
+    db: aiosqlite.Connection, run_id: int, *, why: str, run_ended: bool = False
 ) -> bool:
     """Исполнение закрыто сдачей (облако: taken_down/finished; слот: сдача принята).
 
@@ -165,6 +209,7 @@ async def release_after_run_closed(
         note=f"Захват снят: исполнение прогона хаба #{run_id} закрыто ({why}); "
         "сессии прогона отозваны, слот закрыт (#1783).",
         reason=why,
+        run_ended=run_ended,
     )
 
 

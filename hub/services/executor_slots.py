@@ -96,7 +96,7 @@ async def _capture_session(
     """Канал сессии, которая САМА захватывает задачу; соседняя не в счёт."""
     rows = await fetchall(
         db,
-        "SELECT channel, slot FROM chat_pair_sessions "
+        "SELECT channel, slot, executor_run_id FROM chat_pair_sessions "
         "WHERE kind = 'implementer' AND bound_task_id = ? AND token_hash = ? "
         "AND channel <> '' AND revoked_at IS NULL AND expires_at > datetime('now')",
         (int(task_id), token_hash),
@@ -118,9 +118,9 @@ async def record_capture(
         return ""
     channel, slot = str(session["channel"]), str(session["slot"] or "")
     cursor = await db.execute(
-        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot) "
-        "VALUES (?, ?, ?)",
-        (int(task_id), channel, slot),
+        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot, "
+        "executor_run_id) VALUES (?, ?, ?, ?)",
+        (int(task_id), channel, slot, session.get("executor_run_id")),
     )
     if not cursor.rowcount:
         return ""

@@ -379,6 +379,7 @@ async def _return_task(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
         db,
         int(order["task_id"]),
         holders=frozenset(int(r[0]) for r in holders),
+        session_runs=frozenset({int(order["executor_run_id"])}),
         from_status=status,
         note=f"Заказ хосту {order['host']} закрыт, исполнитель потерян; "
         "задача возвращена в open.",

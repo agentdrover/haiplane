@@ -40,6 +40,7 @@ async def work_signs(
     *,
     own_run_id: int | None = None,
     closing_own_sessions: bool = False,
+    own_run_ended: bool = False,
 ) -> list[dict]:
     """Признаки работы у задачи: ``[{"sign": код, "detail": сведения}]``.
 
@@ -74,18 +75,23 @@ async def work_signs(
             add(field, str(task[field]).strip())
     for row in await fetchall(
         db,
-        "SELECT channel, slot FROM executor_slots "
+        "SELECT channel, slot, executor_run_id FROM executor_slots "
         "WHERE task_id = ? AND released_at IS NULL ORDER BY id",
         (task_id,),
     ):
-        if not own:
-            add("open_slot", f"{row['channel']}:{row['slot'] or '-'}")
+        # Свой — только слот ЭТОГО прогона (#1783, круг 2): слот другого
+        # держателя или без хозяина остаётся признаком работы.
+        if own and row["executor_run_id"] == own_run_id:
+            continue
+        add("open_slot", f"{row['channel']}:{row['slot'] or '-'}")
     for row in await fetchall(
         db,
         "SELECT id, agent_id, run_id FROM executor_runs "
         "WHERE task_id = ? AND outcome = 'running' ORDER BY id",
         (task_id,),
     ):
+        if own and own_run_ended and row["id"] == own_run_id:
+            continue  # провайдер сказал «конец», строка ждёт только цену (#1783)
         add(
             "executor_run",
             f"run #{row['id']} agent_id={row['agent_id'] or '-'} "

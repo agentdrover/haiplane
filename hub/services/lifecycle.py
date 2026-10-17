@@ -1957,6 +1957,11 @@ async def _pair_start_write(
             f"Task #{task_id} left {starting_status!r} during pair-start; "
             "retry from its current status",
         )
+    # #1783: не поверх брони прогона хаба; свой прогон звонящего не мешает.
+    from hub.services import chat_pair, run_claim
+
+    caller_run = await chat_pair.run_of_session(db, session_token, task_id)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run)
     if body.plan:
         await repo.add_task_update(
             db,
@@ -1984,11 +1989,7 @@ async def _pair_start_write(
         # #1783: pair-start из open — единственный захват этой задачи, и
         # доказательство прогона пишется здесь. Из claimed оно уже записано
         # claim'ом; None у ручного старта стирает чужой хвост.
-        from hub.services import chat_pair
-
-        update_fields["executor_run_id"] = await chat_pair.run_of_session(
-            db, session_token, task_id
-        )
+        update_fields["executor_run_id"] = caller_run
     await repo.update_task(db, task_id, **update_fields)
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
@@ -4862,6 +4863,10 @@ async def _claim_write(
     Runs inside ``capture_areas``: the area hold lasts until this commit.
     Returns the view when a concurrent claim of the same holder won the race.
     """
+    from hub.services import chat_pair, run_claim
+
+    caller_run = await chat_pair.run_of_session(db, session_token, task_id)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run)
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):
@@ -4888,11 +4893,7 @@ async def _claim_write(
     # #1783: прогон хаба, доказавший токеном вызывающей сессии, что берёт
     # задачу, — в той же транзакции. Всегда пишется (None у ручного захвата):
     # чужой прежний executor_run_id у нового держателя не остаётся.
-    from hub.services import chat_pair
-
-    claim_fields["executor_run_id"] = await chat_pair.run_of_session(
-        db, session_token, task_id
-    )
+    claim_fields["executor_run_id"] = caller_run
     await repo.update_task(db, task_id, **claim_fields)
     # The registry follows the claim inside the same transaction (#771 AC-3):
     # two places may not disagree about which task a session holds. Silent when
