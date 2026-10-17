@@ -364,7 +364,10 @@ async def test_approval_holds_on_a_live_blocker_and_on_a_missing_prevention(
     )
 
     prod = await make_state_task(db, title="прод-дефект")
-    await db.execute("UPDATE tasks SET found_in='prod' WHERE id=?", (prod,))
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='unknown' WHERE id=?",
+        (prod,),
+    )
     await db.commit()
     assert (await pair_start(client, prod, headers=headers["impl"])).status_code == 200
     sent = await submit(

@@ -3102,6 +3102,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "WHERE started_at IS NULL AND status != 'draft' "
         "AND start_history_unknown = 0",
     ),
+    (
+        # #1791: вид причины дефекта. NULL — причину никто не называл; это не
+        # unknown (названо «не знаю») и не regression: у старых строк с
+        # caused_by_task_id вид остаётся пустым и регрессией не объявляется.
+        "add_tasks_cause_kind",
+        "ALTER TABLE tasks ADD COLUMN cause_kind TEXT",
+    ),
 ]
 
 
@@ -3236,6 +3243,7 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # listed is stored and never seen again.
     "found_in",
     "caused_by_task_id",
+    "cause_kind",
     "detected_at",
     "resolved_at",
     # #917: the release the defect showed up in — resolved against releases
@@ -3271,6 +3279,11 @@ def structured_fields_to_db(
             # by ``repo.set_defect_passport``. Letting it through here would
             # store a causal link nobody resolved — the one thing #909 built
             # the validator to prevent.
+            continue
+        if key == "cause_kind" and value is None:
+            # #1791: an explicit null is "leave as is", like the passport
+            # fields above. The kind is never taken back to empty: that would
+            # reopen a closed question and race the closing gate.
             continue
         if key == "risks":
             if value is None:

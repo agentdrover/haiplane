@@ -143,6 +143,48 @@ async def measured_escapes(db: aiosqlite.Connection, scope: Scope) -> int:
     return int(rows[0]["n"] or 0) if rows else 0
 
 
+# #1791: the kinds of cause in the order of the enum, the empty field last and
+# apart. ``unknown`` ("looked, not established") and ``empty`` (nobody named a
+# cause yet) are different answers and never one row.
+CAUSE_EMPTY = "empty"
+
+
+async def cause_split(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
+    """The prod defects of ``measured_escapes`` split by kind of cause (#1791).
+
+    Same rows as ``measured_escapes`` — the sum of the split is that number, by
+    construction, so the headline does not move. ``regressions`` is the
+    ``regression`` row repeated as its own key: the figure the delivery process
+    answers for, as opposed to latent design, dependencies and ops. A row with a
+    caused_by link and no kind stays in ``empty``: the link is attribution, not
+    a classification.
+    """
+    from hub.models import DefectCauseKind
+
+    where, params = _prod_defect_where(scope)
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(NULLIF(t.cause_kind, ''), ?) AS kind, COUNT(*) AS n "
+        f"FROM tasks t WHERE {where} GROUP BY kind",  # nosec B608 - constant SQL
+        (CAUSE_EMPTY, *params),
+    )
+    counts = {str(r["kind"]): int(r["n"] or 0) for r in rows}
+    total = sum(counts.values())
+    order = [kind.value for kind in DefectCauseKind] + [CAUSE_EMPTY]
+    return {
+        "by_cause_kind": [
+            {
+                "cause_kind": kind,
+                "defects": counts.get(kind, 0),
+                "share": _share(counts.get(kind, 0), total),
+            }
+            for kind in order
+        ],
+        "regressions": counts.get(DefectCauseKind.regression.value, 0),
+        "without_cause_kind": counts.get(CAUSE_EMPTY, 0),
+    }
+
+
 # #914: the stages in the order a miss gets dearer, unknown last and apart.
 SHIFT_LEFT_STAGES = ("review", "ci", "test", "staging", "prod", "unknown")
 
@@ -187,6 +229,9 @@ async def shift_left(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
         "recorded": total - unknown,
         "unknown": unknown,
         "unknown_share": _share(unknown, total),
+        # #1791: the prod bucket by kind of cause — the same result as
+        # ``escaped_defects``, so both readings of the prod stage agree.
+        "prod_by_cause_kind": await cause_split(db, scope),
         "by_stage": [
             {
                 "stage": stage,

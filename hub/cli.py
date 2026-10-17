@@ -1279,6 +1279,7 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     # Defect passport (#910, epic #900).
     ("found_in", "found_in"),
     ("caused_by", "caused_by_task_id"),
+    ("cause_kind", "cause_kind"),
     ("detected_at", "detected_at"),
     ("release_id", "release_id"),
 )
@@ -2315,6 +2316,53 @@ def _add_projects_parser(sub: Any) -> None:
     pp_create.set_defaults(func=cmd_projects_create)
 
 
+def _add_refine_passport_options(p: Any) -> None:
+    """Defect passport flags of ``refine`` (#910, #917, #1791).
+
+    Kept out of build_parser, which sits at its complexity ceiling.
+    """
+    p.add_argument(
+        "--found-in",
+        dest="found_in",
+        choices=["unknown", "review", "ci", "test", "staging", "prod"],
+        default=None,
+        help="Defect passport: stage the defect was caught at",
+    )
+    p.add_argument(
+        "--caused-by",
+        dest="caused_by",
+        type=int,
+        default=None,
+        help="Defect passport: task whose change introduced this defect",
+    )
+    p.add_argument(
+        "--cause-kind",
+        dest="cause_kind",
+        choices="regression latent_design dependency ops not_a_defect unknown".split(),
+        default=None,
+        help="Defect passport: kind of cause; regression needs --caused-by (#1791)",
+    )
+    p.add_argument(
+        "--detected-at",
+        dest="detected_at",
+        default=None,
+        help="Defect passport: when the defect was noticed",
+    )
+    p.add_argument(
+        "--release-id",
+        dest="release_id",
+        type=int,
+        default=None,
+        help="Defect passport: release the defect showed up in (#917)",
+    )
+    p.add_argument(
+        "--clear-caused-by",
+        dest="clear_caused_by",
+        action="store_true",
+        help="Defect passport: drop the existing attribution",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2974,39 +3022,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Kanban class of service",
     )
     p_refine.add_argument("--size", choices=["XS", "S", "M", "L", "XL"], default=None)
-    p_refine.add_argument(
-        "--found-in",
-        dest="found_in",
-        choices=["unknown", "review", "ci", "test", "staging", "prod"],
-        default=None,
-        help="Defect passport: stage the defect was caught at",
-    )
-    p_refine.add_argument(
-        "--caused-by",
-        dest="caused_by",
-        type=int,
-        default=None,
-        help="Defect passport: task whose change introduced this defect",
-    )
-    p_refine.add_argument(
-        "--detected-at",
-        dest="detected_at",
-        default=None,
-        help="Defect passport: when the defect was noticed",
-    )
-    p_refine.add_argument(
-        "--release-id",
-        dest="release_id",
-        type=int,
-        default=None,
-        help="Defect passport: release the defect showed up in (#917)",
-    )
-    p_refine.add_argument(
-        "--clear-caused-by",
-        dest="clear_caused_by",
-        action="store_true",
-        help="Defect passport: drop the existing attribution",
-    )
+    _add_refine_passport_options(p_refine)
     p_refine.add_argument(
         "--wip-tag",
         dest="wip_tag",
