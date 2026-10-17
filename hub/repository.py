@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import aiosqlite
 
 from hub import config
+from hub.repository_stamps import STARTED_AT_ON_INSERT_SQL, STARTED_AT_ON_RUNNING_SQL
 from hub.repository_verdict import write_review_verdict
 from hub.db import (
     inserted_id,
@@ -3042,8 +3043,9 @@ async def create_task(
     cur = await db.execute(
         "INSERT INTO tasks (title, description, runtime, source, assigned_agent, "
         "rationale, status, auto_review, task_type, parent_id, priority, position, "
-        "status_entered_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        "status_entered_at, started_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), "
+        f"{STARTED_AT_ON_INSERT_SQL})",
         (
             title,
             description,
@@ -3057,6 +3059,7 @@ async def create_task(
             parent_id,
             priority,
             position,
+            status,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -3114,6 +3117,8 @@ async def update_task(
         if "resolved_at" not in fields:
             sets.append(RESOLVED_AT_ON_COMPLETION_SQL)
             values.extend([fields["status"], fields["status"]])
+        sets.append(STARTED_AT_ON_RUNNING_SQL)
+        values.append(fields["status"])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -3253,17 +3258,9 @@ async def transition_status_if(
         "completed_at = CASE WHEN ? = 'completed' AND status != ? "
         "THEN datetime('now') ELSE completed_at END, "
         # #916: and a prod defect's recovery moment, by the same rule.
-        f"{RESOLVED_AT_ON_COMPLETION_SQL} "
+        f"{RESOLVED_AT_ON_COMPLETION_SQL}, {STARTED_AT_ON_RUNNING_SQL} "
         "WHERE id=? AND status=?",
-        (
-            new_status,
-            new_status,
-            new_status,
-            new_status,
-            new_status,
-            task_id,
-            expected_from,
-        ),
+        (*([new_status] * 6), task_id, expected_from),
     )
     return (cur.rowcount or 0) > 0
 
@@ -3664,8 +3661,9 @@ async def record_state_decision(
         "status=?",
         "status_entered_at=datetime('now')",
         "updated_at=datetime('now')",
+        STARTED_AT_ON_RUNNING_SQL,
     ]
-    params: list[Any] = [verdict, findings_json, new_status]
+    params: list[Any] = [verdict, findings_json, new_status, new_status]
     if new_status == "completed":
         sets += [
             "completed_at=datetime('now')",
@@ -4567,9 +4565,9 @@ async def create_task_full(
     cur = await db.execute(
         # status_entered_at is stamped in SQL so it shares datetime('now')
         # format with created_at/updated_at (#416).
-        f"INSERT INTO tasks ({', '.join(columns)}, status_entered_at) "  # nosec B608
-        f"VALUES ({placeholders}, datetime('now'))",
-        tuple(values),
+        f"INSERT INTO tasks ({', '.join(columns)}, status_entered_at, started_at) "  # nosec B608
+        f"VALUES ({placeholders}, datetime('now'), {STARTED_AT_ON_INSERT_SQL})",
+        (*values, status),
     )
     return cur.lastrowid  # type: ignore[return-value]
 
