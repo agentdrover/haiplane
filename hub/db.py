@@ -2309,21 +2309,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
     (
-        # #1783: claim_session_id, под которым сессия взяла задачу (реапер);
-        # NULL — не брала; '*' — любой (хозяин без session_id, до #852).
+        # #1783: под каким claim_session_id сессия взяла задачу; NULL — не брала.
         "add_chat_pair_sessions_claimed_session",
         "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
     ),
     (
-        # Сессии до этой записи: захват, стоящий сейчас, считается их (как и
-        # раньше); хозяин без session_id — '*' (любой). Ничего не стоит — NULL.
         "backfill_chat_pair_sessions_claimed_session",
         "UPDATE chat_pair_sessions SET claimed_session = (SELECT "
         "COALESCE(t.claim_session_id, '*') FROM tasks t WHERE t.id = "
         "chat_pair_sessions.bound_task_id AND t.status IN ('claimed', 'running') "
         "AND (t.claimed_by IS NOT NULL OR t.claim_session_id IS NOT NULL)) "
-        "WHERE kind = 'implementer' AND bound_task_id IS NOT NULL "
-        "AND claimed_session IS NULL",
+        "WHERE kind = 'implementer' AND bound_task_id IS NOT NULL AND claimed_session IS NULL",
     ),
     (
         # #1783: прогон-держатель захвата; NULL — ручной.
