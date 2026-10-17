@@ -215,6 +215,11 @@ EXECUTOR_CANCEL_PAUSE_S = int(env_get("EXECUTOR_CANCEL_PAUSE_S", "60"))
 # причиной: семейство обязано отличаться от ревьюера и стюарда (#758, #1008),
 # и угадывать его хаб не берётся.
 EXECUTOR_MODEL = env_get("EXECUTOR_MODEL", "")
+# #1769: параметры варианта модели исполнителя, пары ``id=value`` через запятую
+# (``context=256k,reasoning_effort=high,fast=false``). Пусто — заказ без params,
+# вариант по умолчанию у Cursor. Контракт Cursor требует полный набор параметров
+# варианта; отказ 400 даёт один повтор без params (``executor_launch._create``).
+EXECUTOR_MODEL_PARAMS = env_get("EXECUTOR_MODEL_PARAMS", "")
 # #1434 (F7): сколько минут слот может молчать — ни записи исполнителя в
 # карточке, ни heartbeat сессии на задаче, — прежде чем поллер освободит его с
 # названной причиной. Ключ политики проекта ``slot_dead_minutes`` сильнее: агент

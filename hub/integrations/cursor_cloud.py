@@ -416,7 +416,10 @@ def parse_model_params(raw: str) -> list[ModelParam]:
             continue
         key, sep, value = item.partition("=")
         if not sep or not key.strip():
-            log.warning("CURSOR_REVIEW_MODEL_PARAMS: skipped malformed %r", item)
+            log.warning(
+                "model params (CURSOR_REVIEW_MODEL_PARAMS, EXECUTOR_MODEL_PARAMS): skipped malformed %r",
+                item,
+            )
             continue
         params.append({"id": key.strip(), "value": value.strip()})
     return params
