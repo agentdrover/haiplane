@@ -462,9 +462,10 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []]
     step = next(s for s in steps if s.get("id") == "baseline")
     assert step["continue-on-error"] is True
-    # #1606: «только task-*» теперь решает шаг evidence (см. contract-тест).
-    assert "steps.evidence.outputs.run" in step["if"]
-    assert "!cancelled()" in step["if"], "красный Test не стирает baseline"
+    # #1606: «только task-*» теперь решает шаг evidence (см. contract-тест);
+    # #1785: он стоит в job treedup, а baseline идёт в job evidence.
+    assert "needs.treedup.outputs.evidence_run == 'true'" in step["if"]
+    assert "!cancelled()" in step["if"], "красный шаг мутаций не стирает baseline"
     assert "scripts/red_test_baseline.py" in step["run"]
     reporter_step = next(s for s in steps if "hub-ci-report" in str(s.get("uses")))
     assert steps.index(step) < steps.index(reporter_step)
@@ -718,7 +719,9 @@ def _treedup_reuses_a_pr_run_whose_mutations_were_skipped(tmp_path: Path) -> Non
     # parts of job `pytest` (each skipped on the dedup output), and job `test`
     # judges them in the step `tests`, skipped only when the tree was green AND
     # the parts did not fail.
-    treedup = next(s for s in doc["jobs"]["treedup"]["steps"] if s.get("id"))
+    treedup = next(
+        s for s in doc["jobs"]["treedup"]["steps"] if s.get("id") == "treedup"
+    )
     assert treedup["id"] == "treedup"
     part = next(s for s in doc["jobs"]["pytest"]["steps"] if s.get("id") == "shard")
     judge = next(s for s in doc["jobs"]["test"]["steps"] if s.get("id") == "tests")
