@@ -607,6 +607,9 @@ class NoopGitOps:
     async def dirty_paths(self, repo: str | None = None) -> list[str]:
         return []
 
+    async def unpushed_commits(self, branch: str, repo: str | None = None) -> int:
+        return 0
+
     async def branch_diff_paths(
         self,
         branch: str,

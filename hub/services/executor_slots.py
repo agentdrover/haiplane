@@ -96,7 +96,7 @@ async def _capture_session(
     """Канал сессии, которая САМА захватывает задачу; соседняя не в счёт."""
     rows = await fetchall(
         db,
-        "SELECT channel, slot FROM chat_pair_sessions "
+        "SELECT channel, slot, executor_run_id FROM chat_pair_sessions "
         "WHERE kind = 'implementer' AND bound_task_id = ? AND token_hash = ? "
         "AND channel <> '' AND revoked_at IS NULL AND expires_at > datetime('now')",
         (int(task_id), token_hash),
@@ -113,14 +113,24 @@ async def record_capture(
     Одна живая строка на задачу держится уникальным индексом: claim, а за ним
     pair-start той же сессией — одна строка в карточке, не две.
     """
+    # Write-лок до чтения: параллельное снятие захвата (run_claim) иначе разошлось
+    # бы с записью слота по устаревшему снимку (#1783).
+    await db.execute("UPDATE tasks SET updated_at = updated_at WHERE id = -1")
     session = await _capture_session(db, task_id, token_hash)
     if session is None:
         return ""
+    run_id = session.get("executor_run_id")
+    if run_id is not None:
+        held = await fetchall(
+            db, "SELECT executor_run_id FROM tasks WHERE id = ?", (int(task_id),)
+        )
+        if not held or held[0]["executor_run_id"] != run_id:
+            return ""  # захват этого прогона уже снят: слот за ним некому закрыть
     channel, slot = str(session["channel"]), str(session["slot"] or "")
     cursor = await db.execute(
-        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot) "
-        "VALUES (?, ?, ?)",
-        (int(task_id), channel, slot),
+        "INSERT OR IGNORE INTO executor_slots (task_id, channel, slot, "
+        "executor_run_id) VALUES (?, ?, ?, ?)",
+        (int(task_id), channel, slot, session.get("executor_run_id")),
     )
     if not cursor.rowcount:
         return ""

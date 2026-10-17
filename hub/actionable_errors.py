@@ -1000,6 +1000,40 @@ def ci_before_submit_unproven_detail(
     )
 
 
+def empty_resubmission_detail(
+    *, task_id: int, sha: str, generation: int
+) -> dict[str, Any]:
+    """Пересдача того же коммита после «на доработку» без единой правки (#1783).
+
+    my-home #1732, 16.10: повторный прогон сдал поколение 2 на том же коммите,
+    что поколение 1, без правок и без исходов находок, и хаб засчитал его новым
+    поколением. Находки остаются открытыми — отказ называет это исполнителю.
+    """
+    short = (sha or "")[:12] or "—"
+    return enrich_error_payload(
+        {
+            "reason": "resubmit_without_changes",
+            "actor_hint": "agent",
+            "retry_by_same_caller": False,
+            "task_id": task_id,
+            "sha": sha,
+            "generation": generation,
+            "message": (
+                f"Task #{task_id}: изменений нет, находки открыты — коммит "
+                f"{short} уже сдан как поколение {generation}, и на него стоит "
+                "вердикт «на доработку»."
+            ),
+            "hint": (
+                "Nothing was recorded: no generation, the status did not "
+                "change. Исправьте находки ревью новым коммитом, запушьте ветку "
+                "и повторите сдачу (hub_submit_for_review) с finding_outcomes по "
+                "каждой находке. Тот же коммит повторно не принимается."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
 def claim_area_conflict_detail(
     *, task_id: int, current_status: str, conflict: dict[str, Any]
 ) -> dict[str, Any]:
