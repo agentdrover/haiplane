@@ -30,7 +30,7 @@ Source-of-truth enums and request/response models live in `hub/models.py`.
 | Contracts | `hub/models.py` | enums, payloads, views, readiness models |
 | API/Web entry | `hub/app.py`, `hub/web.py` | route wiring, request parsing, response shaping |
 | Service layer | `hub/services/` | lifecycle, readiness, recommendations, orchestration, dashboard, refinement |
-| Persistence | `hub/repository.py`, `hub/db.py` | SQL, migrations, hierarchy helpers, structured field serialization |
+| Persistence | `hub/repository.py`, `hub/db.py`, `hub/migrations/` | SQL, migration list (`hub/migrations/`) and runner, hierarchy helpers, structured field serialization |
 | Integrations | `hub/integrations/` | plugin protocols and concrete adapters |
 | Background sync | `hub/poller.py` | polling dispatch jobs, CI/review state progression |
 | UX assets | `hub/templates/`, `hub/static/` | dashboard rendering |

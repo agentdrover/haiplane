@@ -23,7 +23,7 @@
 ## Contract Checklist
 
 - [ ] API, CLI, MCP, and Web contracts stayed aligned or were updated together.
-- [ ] Persisted schema changes include `hub/db.py` migration coverage.
+- [ ] Persisted schema changes include `hub/migrations/` migration coverage.
 - [ ] No secrets, local databases, or generated caches are included.
 - [ ] Docs were updated for workflow or public behavior changes.
 

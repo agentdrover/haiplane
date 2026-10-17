@@ -30,7 +30,7 @@ Pick the smallest useful validation set first, then widen only if the diff cross
 ## Expansion Rules
 
 - If a change touches `hub/models.py`, run model tests plus the nearest consumer tests.
-- If a change touches `hub/db.py`, run migration tests and repository tests.
+- If a change touches `hub/db.py` or `hub/migrations/`, run migration tests and repository tests.
 - If a change touches `hub/services/lifecycle.py`, include API approve or service tests even if the diff looked internal.
 - If a change touches `hub/mcp_server.py`, run MCP tests and the API tests that back the same operation.
 

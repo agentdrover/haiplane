@@ -166,14 +166,14 @@ test: cover pending report force complete api
 - `hub/mcp_server.py`;
 - `hub/web.py` и templates;
 - `hub/repository.py`;
-- `hub/db.py`, если меняется persisted schema;
+- `hub/db.py` и `hub/migrations/`, если меняется persisted schema;
 - affected tests.
 
 MCP и CLI должны оставаться поведенчески согласованными с REST API.
 
 ## Миграции
 
-- Любое новое persisted поле или изменение схемы вносить через `hub/db.py`.
+- Любое новое persisted поле или изменение схемы вносить миграцией в `hub/migrations/`.
 - Добавлять тесты свежей схемы и migration path.
 - Не трактовать отсутствующие structured columns как пустые silently, если это скрывает ошибку миграции.
 

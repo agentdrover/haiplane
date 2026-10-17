@@ -87,11 +87,12 @@ FAMILIES: tuple[Family, ...] = (
     Family(
         name="schema and storage",
         why=(
-            "change-map: a task row field means the migration in hub/db.py "
+            "change-map: a task row field means the migration in hub/migrations "
             "and the serialization paths that read it"
         ),
         surfaces=(
             "hub/db.py",
+            "hub/migrations/*",
             "hub/repository.py",
             "hub/models.py",
         ),
