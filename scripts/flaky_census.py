@@ -46,7 +46,7 @@ PER_PAGE = 100
 HISTORY_REF = ["origin/develop"]  # --history-ref: фиксируется для воспроизводимости
 # Имена job и шага, как их называет .github/workflows/ci.yml; tests/test_flaky_census.py
 # сверяет эти константы с самим workflow (#1767).
-PART_JOB_PREFIX = "Tests part "  # job частей набора: "Tests part N/3"
+PART_JOB_PREFIX = "Tests part "  # job частей набора: "Tests part N/M"
 TEST_STEP_NAME = "Test"
 TEST_JOB_HINT = "pytest"  # прогоны до #1767: один job "Ruff and pytest" с шагом Test
 FAIL_CONCLUSIONS = {"failure", "timed_out"}
@@ -252,7 +252,7 @@ def attempts_of(gh: Gh, run: dict) -> list[dict]:
 
 
 def test_jobs(gh: Gh, run_id: int, attempt: int) -> list[dict]:
-    """Job-ы, где гонялся набор: все части "Tests part N/3", иначе старый job.
+    """Job-ы, где гонялся набор: все части "Tests part N/M", иначе старый job.
 
     Старый job (один "pytest" в имени) читается для прогонов до #1767. Если
     частей нет, а старый job есть, но шага Test в нём нет, это видно из

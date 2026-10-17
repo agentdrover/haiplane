@@ -89,21 +89,16 @@ inputs:
     required: false
     default: ""
 
-  mutations-outcome:
+  evidence-run:
     description: >-
-      Outcome of the step that wrote mutations-file (#1606): success | failure |
-      cancelled | skipped. `skipped` ⇒ the step did not run and the hub is sent
-      no mutations key, so a report never erases evidence stored earlier for
-      the same commit. Any other value means the step ran: a missing or broken
-      file is then sent as an explicit error with its cause. Empty ⇒ the
-      caller does not say, and the file alone decides (a missing file sends
-      nothing).
-    required: false
-    default: ""
-
-  baseline-outcome:
-    description: >-
-      The same as mutations-outcome, for the step that wrote baseline-file.
+      Whether the mutations and the red-test baseline were EXPECTED in this run
+      (#1606, #1785): "true" | "false" | empty. The caller decides it once from
+      the GitHub event. `false` ⇒ they were deliberately not computed and the
+      hub is sent no mutations / baseline key, so a report never erases evidence
+      stored earlier for the same commit. `true` ⇒ they were expected: a file
+      that is missing or broken is sent as an explicit error with its cause,
+      never as "no survivors" and never as an absent key. Empty ⇒ the caller does
+      not say, and the file alone decides (a missing file sends nothing).
     required: false
     default: ""
 
@@ -131,8 +126,7 @@ runs:
         HAIPLANE_HUB_CI_RAN: ${{ inputs.ran-commands }}
         HAIPLANE_HUB_CI_MUTATIONS: ${{ inputs.mutations-file }}
         HAIPLANE_HUB_CI_BASELINE: ${{ inputs.baseline-file }}
-        HAIPLANE_HUB_CI_MUTATIONS_OUTCOME: ${{ inputs.mutations-outcome }}
-        HAIPLANE_HUB_CI_BASELINE_OUTCOME: ${{ inputs.baseline-outcome }}
+        HAIPLANE_HUB_CI_EVIDENCE_RUN: ${{ inputs.evidence-run }}
         HAIPLANE_HUB_CI_EVENT_ACTION: ${{ inputs.event-action }}
       run: |
         set -u

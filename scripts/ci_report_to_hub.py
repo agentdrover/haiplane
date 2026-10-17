@@ -46,11 +46,12 @@ HAIPLANE_HUB_CI_BASELINE (#913: path to the JSON written by
 scripts/red_test_baseline.py — the branch's changed tests run over the
 merge-base code, sent under its own ``baseline`` key; absent or unreadable ⇒
 the key is not sent, and the log says why),
-HAIPLANE_HUB_CI_MUTATIONS_OUTCOME / HAIPLANE_HUB_CI_BASELINE_OUTCOME (#1606: how
-the step that wrote the file ended. ``skipped`` ⇒ the step did not run and the
-key is NOT sent, so the hub keeps what it stored for this commit; any other
-value ⇒ it ran, and a missing or broken file is sent as an explicit
-``state=error`` with its cause; empty ⇒ not stated, the file alone decides),
+HAIPLANE_HUB_CI_EVIDENCE_RUN (#1606, #1785: whether the mutations and the
+baseline were EXPECTED in this run. ``false`` ⇒ not computed on purpose and the
+keys are NOT sent, so the hub keeps what it stored for this commit; ``true`` ⇒
+expected, and a missing or broken file is sent as an explicit ``state=error``
+with its cause — never as an absent key, never as "no survivors"; empty ⇒ not
+stated, the file alone decides),
 HAIPLANE_HUB_CI_EVENT_ACTION (#1606: the event's activity type, part of the
 provenance — run id, URL, event, time — written inside each evidence block).
 """
@@ -673,24 +674,29 @@ def provenance() -> dict:
 def evidence_block(
     label: str,
     path: str,
-    outcome: str,
+    expected: str,
     trim: Callable[[dict], dict],
     states: frozenset[str],
 ) -> dict | None:
     """The block to send under an evidence key, or None for "send no key" (#1606).
 
-    Three cases, never collapsed: a step that did not run (``skipped``) sends
-    no key, because the hub reads an absent key as "keep what you stored"; a
-    step that ran but left no usable file sends ``state=error`` with the cause,
-    because a timeout is a fact the reader must see; a valid file is sent as
-    it is. An outcome the caller does not state falls back to the file alone,
-    which is how reporters written before this contract behave.
+    ``expected`` is the caller's decision whether this run was to produce the
+    evidence (#1785). Three cases, never collapsed: not expected (``false``)
+    sends no key, because the hub reads an absent key as "keep what you
+    stored"; expected (``true``) with no usable file sends ``state=error`` with
+    the cause, because a missing file is a fact the reader must see; a valid
+    file is sent as it is. A caller that does not state it (empty) falls back
+    to the file alone, which is how reporters written before this contract
+    behave. Any other value is not a decision and is read as "expected": an
+    unreadable instruction must not erase the evidence silently.
     """
-    outcome = (outcome or "").strip().lower()
+    expected = (expected or "").strip().lower()
     if not path:
         return None
-    if outcome == "skipped":
-        log(f"{label} step did not run — no key sent; the hub keeps what it stored")
+    if expected == "false":
+        log(
+            f"{label} evidence not expected in this run — no key sent; the hub keeps what it stored"
+        )
         return None
     report, why = _read_report(path)
     if report is not None and report.get("state") not in states:
@@ -700,12 +706,13 @@ def evidence_block(
         )
     if report is None:
         log(f"{label} report {path} not usable: {why}")
-        if not outcome:
+        if not expected:
             return None
         report = {
             "state": "error",
             "reason": (
-                f"the {label} step ended {outcome} without a readable report ({why})"
+                f"the {label} evidence was expected in this run but there is no "
+                f"readable report ({why})"
             ),
         }
     else:
@@ -748,7 +755,7 @@ def attach_evidence(payload: dict, keep: set[str]) -> None:
     mutations = evidence_block(
         "mutation",
         env_get("HUB_CI_MUTATIONS"),
-        env_get("HUB_CI_MUTATIONS_OUTCOME"),
+        env_get("HUB_CI_EVIDENCE_RUN"),
         trim_mutations,
         _MUTATION_STATES,
     )
@@ -758,7 +765,7 @@ def attach_evidence(payload: dict, keep: set[str]) -> None:
     baseline = evidence_block(
         "baseline",
         env_get("HUB_CI_BASELINE"),
-        env_get("HUB_CI_BASELINE_OUTCOME"),
+        env_get("HUB_CI_EVIDENCE_RUN"),
         lambda report: trim_baseline(report, keep),
         _BASELINE_STATES,
     )

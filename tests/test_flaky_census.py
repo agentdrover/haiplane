@@ -321,13 +321,39 @@ def test_the_part_count_is_the_matrix_of_ci_yml() -> None:
     )
     part = doc["jobs"]["pytest"]
     total = len(part["strategy"]["matrix"]["shard"])
-    assert re.search(rf"/{total}$", part["name"]), (part["name"], total)
+    # #1785: the number is the matrix, read back through strategy.job-total.
+    assert part["name"].endswith("/${{ strategy.job-total }}"), part["name"]
     names = [
-        part["name"].replace("${{ matrix.shard }}", str(i)) for i in range(1, total + 1)
+        part["name"]
+        .replace("${{ matrix.shard }}", str(i))
+        .replace("${{ strategy.job-total }}", str(total))
+        for i in range(1, total + 1)
     ]
+    assert all(re.search(rf"/{total}$", n) for n in names), names
     ok = [_job(30 + i, n, fc.TEST_STEP_NAME) for i, n in enumerate(names)]
     assert fc.test_step_state(ok) == "success"
     assert fc.test_step_state(ok[:-1]) == "no_step"
+
+
+def test_four_parts_and_attempts_with_different_numbers_of_parts() -> None:
+    """#1785: the census reads /4 as well as the historic /3, per attempt."""
+    ok = "success"
+    four = [f"Tests part {i}/4" for i in range(1, 5)]
+    assert fc.test_step_state(_named(*[(n, ok) for n in four])) == "success"
+    assert fc.test_step_state(_named(*[(n, ok) for n in four[:3]])) == "no_step"
+    # three parts of a four-part attempt prove nothing; the historic three do
+    three = [f"Tests part {i}/3" for i in range(1, 4)]
+    assert fc.test_step_state(_named(*[(n, ok) for n in three])) == "success"
+    # two attempts of one run with different N: each is judged by its own N
+    gh = _FakeGh(_named(*[(n, ok) for n in four]))
+    assert fc.green_attempts(gh, {"id": 9, "run_attempt": 1}) == [1]
+    gh = _FakeGh(_named(*[(n, ok) for n in three]))
+    assert fc.green_attempts(gh, {"id": 9, "run_attempt": 1}) == [1]
+    # a mix of /3 and /4 names inside one attempt is not a complete set
+    mixed = [(four[0], ok), (four[1], ok), (three[2], ok), (four[3], ok)]
+    assert fc.test_step_state(_named(*mixed)) == "no_step"
+    # a failure in a four-part attempt is known even when the set is incomplete
+    assert fc.test_step_state(_named((four[0], ok), (four[2], "failure"))) == "failure"
 
 
 class _GoneGh(_FakeGh):

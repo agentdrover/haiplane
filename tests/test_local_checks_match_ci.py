@@ -35,21 +35,13 @@ EXCEPTIONS: dict[str, str] = {
         "подготовка окружения для тестов копий (#1707), не проверка"
     ),
     "Fail a cancelled run": ("красит отменённый прогон, локально отмены нет — #1767"),
-    "Tests outcome of the three parts": (
-        "итог трёх частей набора из job pytest, сам тесты не гоняет — #1767; "
+    "Tests outcome of the parts": (
+        "итог частей набора из job pytest, сам тесты не гоняет — #1767; "
         "части покрыты тестом test_a_test_part_is_what_make_test_runs"
     ),
     "Surface parity (warning only)": ("только PR и warning-only: exit 0 всегда"),
-    "Decide whether mutations and baseline are worth their minutes": (
-        "решение по событию GitHub, не проверка — #1606"
-    ),
-    "Mutations of changed functions (warning only)": (
-        "ручной прогон и открытие PR task-ветки, warning-only: exit 0 всегда, "
-        "серия дольше make check — #1270, #1606"
-    ),
-    "Red-test baseline on merge-base (data only)": (
-        "данные для гейта красного теста (#913): только ветки task-*, exit 0 "
-        "всегда — падение теста на базе это доказательство, а не провал"
+    "Download the evidence files of job evidence": (
+        "передача файлов мутаций и baseline из job evidence, не проверка — #1785"
     ),
     "Collect AC test and validation results for the Hub": (
         "сбор данных для отчёта, не проверка — #1686"

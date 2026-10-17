@@ -105,7 +105,7 @@ def test_the_audit_step_cannot_block_delivery():
     assert not parts["Test"].get("continue-on-error"), "a test part must fail the run"
     for blocking in (
         "Lint",
-        "Tests outcome of the three parts",
+        "Tests outcome of the parts",
         "Secret scan",
         "Static security scan",
     ):
