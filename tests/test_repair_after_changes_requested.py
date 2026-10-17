@@ -630,15 +630,27 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
     await db.execute(
         "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
         "bound_task_id, bound_generation, executor_run_id) VALUES "
-        "(?, 'bf-1', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        "(?, 'bf-1', datetime('now', '+1 hour'), 'implementer', ?, 1, ?)",
         (int(acting["id"]), run_held, run_id),
+    )
+    _, retaken = await _task_with_findings(db, slug="rc-bf-retaken")
+    await _hold(db, retaken, None, session=False, status="running")
+    retaken_run = await _finished_run_id(db, retaken)
+    await db.execute(
+        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (retaken_run,)
+    )
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
+        "revoked_at, kind, bound_task_id, bound_generation, executor_run_id) VALUES "
+        "(?, 'bf-4', datetime('now', '+1 hour'), datetime('now'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), retaken, retaken_run),
     )
     _, other_holder = await _task_with_findings(db, slug="rc-bf-other")
     await _hold(db, other_holder, None, session=False, status="running")
     await db.execute(
         "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
         "bound_task_id, bound_generation, executor_run_id) VALUES "
-        "(?, 'bf-2', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        "(?, 'bf-2', datetime('now', '+1 hour'), 'implementer', ?, 1, ?)",
         (int(acting["id"]), other_holder, await _finished_run_id(db, other_holder)),
     )
     await db.execute(
@@ -656,6 +668,8 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
     assert (await _row(db, other_holder))["executor_run_id"] is None
     # закончившийся прогон — история: задачу с тех пор взяли вручную
     assert (await _row(db, history))["executor_run_id"] is None
+    # отозванная сессия идущего прогона — след прежнего захвата, не текущего
+    assert (await _row(db, retaken))["executor_run_id"] is None
 
 
 async def test_the_reaper_does_not_return_a_task_whose_claim_was_just_released(

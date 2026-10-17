@@ -2342,6 +2342,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "JOIN executor_runs r ON r.id = s.executor_run_id "
         "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
         "AND r.task_id = tasks.id AND r.outcome = 'running' "
+        "AND s.revoked_at IS NULL AND s.expires_at > datetime('now') "
         "AND s.principal_id = tasks.implementer_principal_id "
         "ORDER BY s.id DESC LIMIT 1) "
         "WHERE status IN ('claimed', 'running') AND executor_run_id IS NULL "
