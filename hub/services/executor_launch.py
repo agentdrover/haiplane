@@ -246,6 +246,8 @@ async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
         r = dict(row)
         if r["outcome"] != OUTCOME_RUNNING:
             continue
+        if r.get("cost_wait_since"):
+            continue  # провайдер сказал «конец», строка ждёт только цену (#1783)
         # #1712: прогон слота живёт не по облачному сроку брони. У него нет
         # агента у провайдера НАРОЧНО: его держит заказ хосту, а закрывает
         # executor_orders.settle. Объявить его «сорванной бронью» через 450 с

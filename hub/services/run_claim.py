@@ -60,7 +60,7 @@ async def finished_run_of(
         return None
     # ``ended`` — провайдер подтвердил конец прогона, а строка ещё ждёт цену:
     # снятие захвата от учёта стоимости не зависит (#1783, круг 2).
-    if row["outcome"] == "running" and not ended:
+    if row["outcome"] == "running" and not (ended or row.get("cost_wait_since")):
         return None
     return row
 
@@ -164,7 +164,7 @@ async def refuse_over_live_run(
     rows = await fetchall(
         db,
         "SELECT * FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
-        "ORDER BY id",
+        "AND cost_wait_since IS NULL ORDER BY id",
         (int(task_id),),
     )
     for raw in rows:
@@ -369,7 +369,7 @@ async def stuck_candidates(db: aiosqlite.Connection) -> list[int]:
         db,
         "SELECT t.id FROM tasks t JOIN executor_runs r ON r.id = t.executor_run_id "
         "WHERE t.status IN ('claimed', 'running', 'review', 'fix_requested', "
-        "'needs_decision') AND r.outcome <> 'running' "
+        "'needs_decision') AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL) "
         "AND r.task_id = t.id ORDER BY t.id",
     )
     return [int(r["id"]) for r in rows]

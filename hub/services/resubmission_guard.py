@@ -12,6 +12,7 @@ needs_decision, потому что гейты headless не отказываю�
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import aiosqlite
@@ -75,8 +76,6 @@ def tail_runs(task: dict[str, Any]) -> bool:
 
 def _tail_repo(task: dict[str, Any], workspace: str | None) -> str | None:
     """Каталог, в котором работает хвост: worktree pair-задачи, иначе проекта."""
-    import os
-
     from hub.integrations.registry import plugins
     from hub.services.orchestration import worktree_per_task_enabled
 
@@ -106,6 +105,10 @@ async def collect_git_facts(
 
     workspace = (await project_git_context(db, int(task["id"]))).get("repo")
     git_repo = _tail_repo(task, workspace)
+    if git_repo and not os.path.isdir(git_repo):
+        # Каталога нет: прочитать нечего, а «git ничего не нашёл» — не «чисто». Незнание
+        # не отказывает: пересдача считается ждущей хвоста (#1783).
+        return {UNCOMMITTED_KEY: True}
     if await plugins.git_ops.dirty_paths(repo=git_repo):
         return {UNCOMMITTED_KEY: True}
     branch = task.get("branch") or ""

@@ -87,7 +87,8 @@ async def work_signs(
     for row in await fetchall(
         db,
         "SELECT id, agent_id, run_id FROM executor_runs "
-        "WHERE task_id = ? AND outcome = 'running' ORDER BY id",
+        "WHERE task_id = ? AND outcome = 'running' AND cost_wait_since IS NULL "
+        "ORDER BY id",
         (task_id,),
     ):
         if own and own_run_ended and row["id"] == own_run_id:

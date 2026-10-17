@@ -1256,6 +1256,8 @@ async def test_c3_p1_every_terminal_status_releases_the_claim_without_usage(
         await db.commit()
         after = await _row(db, task_id)
         assert (after["claimed_by"], after["executor_run_id"]) == (None, None), status
+        # конец сказан провайдером: строка ждёт только цену и повторному запуску не мешает
+        assert await el._live_run(db, task_id) == "", status
         # срок ожидания цены вышел: строка закрывается исходом провайдера
         await db.execute(
             "UPDATE executor_runs SET cost_wait_since = datetime('now', '-3 hours') "

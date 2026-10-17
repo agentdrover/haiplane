@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi import HTTPException
@@ -664,7 +665,9 @@ def _install_fixed_tip_git(
     monkeypatch.setattr(
         orchestration,
         "project_git_context",
-        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+        AsyncMock(
+            return_value={"repo": os.path.dirname(__file__), "base_branch": "develop"}
+        ),
     )
     return git
 
@@ -1799,3 +1802,23 @@ async def test_c3_the_guard_does_not_ask_the_network_inside_a_transaction(
     row = dict(await repo.get_task(db, task.id))
     async with db_module.write_transaction(db):
         assert await _rg.stop_empty_done(db, row) == ""
+
+
+async def test_c3_an_unreadable_workspace_is_not_proof_of_no_changes(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Каталога хвоста нет: git молчит, а «пусто» — не «правок нет». Факт читается как
+    «работа ждёт хвоста», пересдачу пустой не объявляем."""
+    from unittest.mock import AsyncMock
+
+    from hub.services import orchestration
+    from hub.services import resubmission_guard as _rg
+
+    _git, task = await _sent_back(db, monkeypatch, "Нет каталога")
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/nonexistent/workspace-1783"}),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert await _rg.collect_git_facts(db, row) == {_rg.UNCOMMITTED_KEY: True}
