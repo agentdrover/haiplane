@@ -3041,7 +3041,7 @@ async def create_task(
     position: int = 0,
 ) -> int:
     cur = await db.execute(
-        "INSERT INTO tasks (title, description, runtime, source, assigned_agent, "
+        "INSERT INTO tasks (title, description, runtime, source, assigned_agent, "  # nosec B608 - constant fragment
         "rationale, status, auto_review, task_type, parent_id, priority, position, "
         "status_entered_at, started_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), "
