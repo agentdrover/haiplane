@@ -58,8 +58,11 @@ async def stop_empty_done(db: aiosqlite.Connection, task: dict[str, Any]) -> str
         or (task.get("review_verdict") or "") != "changes_requested"
     ):
         return ""
+    # Подготовленный вне транзакции результат — в том числе «вершина не
+    # прочитана» (пусто) — не повод идти в сеть под write-локом. Спрашиваем сами
+    # только там, где подготовки не было (headless-путь поллера).
     sha = (task.get(lifecycle.PREPARED_CI_SHA) or "").strip()
-    if not sha:
+    if not sha and lifecycle.PREPARED_CI_SHA not in task:
         sha, _ = await lifecycle.resolve_branch_tip(
             db, int(task["id"]), task.get("branch") or ""
         )

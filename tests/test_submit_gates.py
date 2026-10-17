@@ -1489,11 +1489,36 @@ async def test_same_sha_after_changes_requested_is_refused(
     )
     assert (accepted.submission_generation, accepted.submission_sha) == (2, "tip-2")
 
+    # Подготовленная вне транзакции «вершина не прочитана» (пусто) — не повод
+    # идти в сеть под write-локом.
+    from hub.services import resubmission_guard
+
+    async def _no_network(*args, **kwargs):
+        raise AssertionError("сеть под write-локом")
+
+    real_tip = lifecycle.resolve_branch_tip
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _no_network)
+    row = dict(await repo.get_task(db, task.id))
+    row[lifecycle.PREPARED_CI_SHA] = ""
+    assert await resubmission_guard.stop_empty_done(db, row) == ""
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", real_tip)
+
     # review-путь того же sha — прежний no-op, а не отказ (#1054, #1265).
     again = await lifecycle.submit_for_review(
         db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
     )
     assert (again.submission_generation, again.status) == (2, "review")
+
+    # вердикт «на доработку» прошлого поколения (1) не действует на поколение 2:
+    # вернули в running без нового вердикта — тот же коммит не «пустая пересдача».
+    await repo.transition_status_if(
+        db, task.id, expected_from="review", new_status="running"
+    )
+    await db.commit()
+    stale = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (stale.submission_generation, stale.status) == (3, "review")
 
 
 async def test_same_sha_from_review_stays_a_noop_after_the_1783_gate(

@@ -2330,6 +2330,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "BEGIN UPDATE tasks SET executor_run_id = NULL WHERE id = NEW.id; END",
     ),
     (
+        # #1783: захваты, уже стоящие на момент выката, получают доказательство
+        # из того, что хаб про них знает: сессия implementer с заказом по этой
+        # задаче и тот же принципал-держатель (как в executor_orders._task_is_this_runs).
+        # Без этого такая задача не отличалась бы от ручной. Выполняется один раз.
+        "backfill_tasks_executor_run_id",
+        "UPDATE tasks SET executor_run_id = ("
+        "SELECT s.executor_run_id FROM chat_pair_sessions s "
+        "JOIN executor_runs r ON r.id = s.executor_run_id "
+        "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
+        "AND r.task_id = tasks.id "
+        "AND s.principal_id = tasks.implementer_principal_id "
+        "ORDER BY s.id DESC LIMIT 1) "
+        "WHERE status IN ('claimed', 'running') AND executor_run_id IS NULL "
+        "AND (claimed_by IS NOT NULL OR claim_session_id IS NOT NULL)",
+    ),
+    (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
         "idx_events_kind_project",

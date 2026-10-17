@@ -1122,6 +1122,10 @@ async def release_expired_implementer_tasks(
         "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
         "AND (s.expires_at < datetime('now') OR s.revoked_at IS NOT NULL) "
         "AND t.status IN ('running', 'claimed') "
+        # #1783: захват прогона хаба снят (после сдачи, #1783) — сессия этого
+        # прогона держателя больше не обозначает, и мёртвой она задачу не отдаёт.
+        "AND NOT (s.executor_run_id IS NOT NULL AND t.executor_run_id IS NULL "
+        "  AND t.claimed_by IS NULL AND t.claim_session_id IS NULL) "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM chat_pair_sessions live "
         "  WHERE live.kind = 'implementer' "

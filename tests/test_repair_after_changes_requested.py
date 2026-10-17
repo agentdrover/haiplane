@@ -112,7 +112,11 @@ async def _finished_run_id(db: aiosqlite.Connection, task_id: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def test_closing_a_run_releases_only_its_own_claim(world, db, monkeypatch):
+async def test_closing_a_run_releases_only_its_own_claim(
+    world,  # noqa: F811
+    db,
+    monkeypatch,
+):
     """Прогон taken_down после сдачи: сессии отозваны, слот закрыт, захват снят
     по executor_run_id, статус review. Позднее закрытие СТАРОГО прогона захват
     нового держателя не трогает."""
@@ -172,11 +176,21 @@ async def test_closing_a_run_releases_only_its_own_claim(world, db, monkeypatch)
     # новый прогон «закончился» сам, но держит захват другой, более поздний прогон
     newest = await _new_run(db, task_id, 3)
     await repo.update_task(db, task_id, executor_run_id=newest)
+    # Держатель закончил тоже: от чужого закрытия захват спасает только доказательство.
+    await db.execute(
+        "UPDATE executor_runs SET outcome='finished', finished_at=datetime('now') "
+        "WHERE id = ?",
+        (newest,),
+    )
     await db.commit()
     assert await run_claim.release_after_run_closed(db, old, why="late") is False
     assert await run_claim.release_after_run_closed(db, new, why="late") is False
     held = await _row(db, task_id)
     assert held["executor_run_id"] == newest and held["claimed_by"]
+
+    # Одобренная задача, вернувшаяся в running после снятия захвата (ждёт доставки),
+    # мёртвой сессией прогона в open не уходит: реапер её держателем не считает.
+    await _approved_in_running_is_not_yanked(db, old_task=task_id)
 
     await _phase_slot_submission_releases_the_claim(world)
 
@@ -217,6 +231,34 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
     )
     assert claimed.status_code == 200, claimed.text
     assert (await _row(db, task_id))["executor_run_id"] == run
+
+    # Снятие захвата на любом пути (в том числе сырым SQL) уносит доказательство.
+    await db.execute("UPDATE tasks SET claimed_by = NULL WHERE id = ?", (task_id,))
+    await db.commit()
+    assert (await _row(db, task_id))["executor_run_id"] is None
+
+    # pair-start из open без claim — тоже захват: доказательство пишется в нём.
+    _, second = await _task_with_findings(db, slug="rc-claim-ps")
+    await repo.update_task(db, second, status="open")
+    await db.commit()
+    run2 = await _new_run(db, second, 2)
+    code2, _ = await cp.issue_run_code(
+        db, second, 2, issued_by_principal_id=human, executor_run_id=run2
+    )
+    redeemed2 = await client.post("/api/auth/chat-pair/redeem", json={"code": code2})
+    assert redeemed2.status_code == 200, redeemed2.text
+    started = await client.post(
+        f"/api/tasks/{second}/pair-start",
+        json={
+            "assigned_agent": config.CHAT_PAIR_AGENT,
+            "plan": "Plan: go",
+            "session_id": "s-1783-ps",
+            "git_mode": "remote",
+        },
+        headers={"Authorization": f"Bearer {redeemed2.json()['token']}"},
+    )
+    assert started.status_code == 200, started.text
+    assert (await _row(db, second))["executor_run_id"] == run2
 
 
 # ---------------------------------------------------------------------------
@@ -277,13 +319,15 @@ async def test_repair_is_offered_and_atomic_after_changes_requested(
     ]
     assert len(running) == 1
 
+    await _phase_busy_task_blocks_the_repair(db, monkeypatch, human)
+    await _phase_repair_reads_the_report_at_the_same_tip(db, monkeypatch)
 
-async def _phase_busy_task_blocks_the_repair(client, db, monkeypatch):
+
+async def _phase_busy_task_blocks_the_repair(db, monkeypatch, human):
     """Чужой claim, живая сессия или идущий прогон: кнопки нет, заказа нет,
     задача не тронута, причина читается на карточке (repair_state)."""
     _launch_config(monkeypatch)
     calls = _creator(monkeypatch, [_CREATED])
-    human = await _human(db)
     _, task_id = await _task_with_findings(db, slug="rc-ac2-busy")
     await repo.update_task(
         db,
@@ -315,6 +359,31 @@ async def _phase_busy_task_blocks_the_repair(client, db, monkeypatch):
     )
     assert not refused.launched and calls == []
     assert (await _row(db, task_id))["status"] == "running"
+
+    # Допуск под write-локом сам перечитывает признаки: быстрая проверка вне лока
+    # обойдена, а чужой claim и идущий прогон всё равно не дают вернуть задачу.
+    async with db_module.write_transaction(db):
+        busy = await el._admit_rework(db, await _row(db, task_id), "o")
+    assert busy, "идущий прогон (бронь) не даёт вернуть задачу"
+    assert (await _row(db, task_id))["status"] == "running"
+    await db.execute(
+        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
+        "WHERE task_id = ? AND outcome = 'running'",
+        (task_id,),
+    )
+    await db.execute("UPDATE tasks SET claimed_by='someone' WHERE id=?", (task_id,))
+    await db.commit()
+    async with db_module.write_transaction(db):
+        claimed = await el._admit_rework(db, await _row(db, task_id), "o")
+    assert "claimed_by" in claimed
+    assert (await _row(db, task_id))["status"] == "running"
+
+    # Свежий статус под локом не running и не open (чужой claim) — бронь отказана.
+    await repo.update_task(db, task_id, claimed_by=None, status="claimed")
+    await db.commit()
+    async with db_module.write_transaction(db):
+        foreign = await el._admit_rework(db, await _row(db, task_id), "o")
+    assert "claimed" in foreign
 
 
 async def _phase_repair_reads_the_report_at_the_same_tip(db, monkeypatch):
@@ -457,27 +526,65 @@ async def _phase_purge_keeps_sessions_a_claim_points_to(db, monkeypatch):
     assert (await _row(db, task_id))["claimed_by"]
 
 
-async def _phase_slot_submission_releases_the_claim(world):
+async def _phase_slot_submission_releases_the_claim(slot_world):
     """Канал слота: принятая сдача снимает захват её прогона (executor_orders)."""
     from hub.services import executor_orders as orders
 
-    task_id = await _task(world, "захват слота после сдачи")
-    alive = await _launch_redeem(world, task_id)
-    await _claim_and_start(world, task_id, alive["session"])
-    held = (await _rows(world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,)))[0]
+    task_id = await _task(slot_world, "захват слота после сдачи")
+    alive = await _launch_redeem(slot_world, task_id)
+    await _claim_and_start(slot_world, task_id, alive["session"])
+    held = (await _rows(slot_world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,)))[
+        0
+    ]
     assert held["executor_run_id"] is not None and held["claimed_by"]
-    await _submit(world, task_id, generation=1)
-    await orders.settle(world.db)
-    await world.db.commit()
-    after = (await _rows(world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,)))[0]
+    await _submit(slot_world, task_id, generation=1)
+    await orders.settle(slot_world.db)
+    await slot_world.db.commit()
+    after = (
+        await _rows(slot_world.db, "SELECT * FROM tasks WHERE id = ?", (task_id,))
+    )[0]
     assert (after["status"], after["claimed_by"], after["executor_run_id"]) == (
         "review",
         None,
         None,
     )
     sessions = await _rows(
-        world.db,
+        slot_world.db,
         "SELECT revoked_at FROM chat_pair_sessions WHERE bound_task_id = ?",
         (task_id,),
     )
     assert sessions and all(x["revoked_at"] for x in sessions)
+
+
+async def _approved_in_running_is_not_yanked(db, old_task: int) -> None:
+    await repo.update_task(db, old_task, status="running")
+    await db.commit()
+    assert await cp.release_expired_implementer_tasks(db) == []
+    after = await _row(db, old_task)
+    assert after["status"] == "running" and after["implementer_principal_id"]
+
+
+async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
+    db, monkeypatch
+):
+    """Миграция: захват на момент выката получает доказательство от сессии прогона
+    по этой задаче и тому же держателю; ручной — нет."""
+    _launch_config(monkeypatch)
+    _, run_held = await _task_with_findings(db, slug="rc-bf-run")
+    run_id = await _finished_run_id(db, run_held)
+    await _hold(db, run_held, None, session=False, status="running")
+    acting = await cp.get_acting_agent(db)
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, executor_run_id) VALUES "
+        "(?, 'bf-1', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), run_held, run_id),
+    )
+    _, manual = await _task_with_findings(db, slug="rc-bf-manual")
+    await _hold(db, manual, None, session=True, status="running")
+    await db.commit()
+    sql = dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"]
+    await db.execute(sql)
+    await db.commit()
+    assert (await _row(db, run_held))["executor_run_id"] == run_id
+    assert (await _row(db, manual))["executor_run_id"] is None

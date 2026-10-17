@@ -1046,8 +1046,12 @@ async def _admit_rework(
     """
     from hub.services import return_running
 
-    if task["status"] != "running":
+    if task["status"] == "open":
         return ""
+    if task["status"] != "running":
+        # Под локом задачу успели взять или сдвинуть: бронь не покупается
+        # поверх чужого захвата.
+        return f"{REASON_NOT_RETURNABLE}: статус {task['status']} под локом брони"
     live = await _live_run(db, int(task["id"]))
     if live:
         return live
