@@ -1929,7 +1929,13 @@ async def test_c4_a_changed_token_adopts_the_claim_and_is_not_a_dead_end(
             f"/api/tasks/{third}/claim", json=body3, headers=headers
         )
         assert resp.status_code == 200, resp.text
-    # живыми остаются только сессии «B»: A истекла давно
+    # сессия A давно удалена purge, жива только B
+    await db.execute(
+        "DELETE FROM chat_pair_sessions WHERE bound_task_id = ? AND token_hash = "
+        "(SELECT token_hash FROM chat_pair_sessions WHERE bound_task_id = ? "
+        "ORDER BY id LIMIT 1)",
+        (third, third),
+    )
     await db.execute(
         "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute')"
     )
