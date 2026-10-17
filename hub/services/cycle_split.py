@@ -23,7 +23,9 @@ work that began after it started being written; older rows carry
 ``start_history_unknown`` and are named so instead of being dated today.
 A zero or negative interval follows the rule of the total: it is not a fast
 task, it is a pair of stamps that cannot be a measurement, and it is counted
-apart (``zero`` / ``negative`` or ``ready_after_start``).
+apart (``zero`` / ``negative``). The queue differs: equal ``ready_at`` and
+``started_at`` is a measured queue of zero, only a negative one is
+``ready_after_start``.
 
 Only real leaves are measured: ``task_type`` task/subtask with no children.
 A container (epic, feature, or any task that has children) closes by roll-up
@@ -57,7 +59,6 @@ QUEUE_REASONS = (
     NO_READY_AT,
     NO_STARTED_AT,
     READY_AFTER_START,
-    ZERO,
     UNREADABLE,
 )
 SINCE_START_REASONS = (
@@ -75,14 +76,16 @@ _LEAF_SQL = (
 )
 
 
-def _span(hours: float | None, negative: str) -> tuple[float | None, str]:
+def _span(
+    hours: float | None, negative: str, *, zero_is_measured: bool = False
+) -> tuple[float | None, str]:
     """The measured hours, or the reason a computed span cannot be one."""
     if hours is None:
         # Both stamps are present but one of them is not a date SQLite reads.
         return None, UNREADABLE
     if hours < 0:
         return None, negative
-    if hours == 0:
+    if hours == 0 and not zero_is_measured:
         return None, ZERO
     return hours, ""
 
@@ -94,7 +97,8 @@ def _queue_of(row: Any) -> tuple[float | None, str]:
         return None, NO_READY_AT
     if row["started_at"] is None:
         return None, NO_STARTED_AT
-    return _span(row["queue_hours"], READY_AFTER_START)
+    # Equal stamps are a queue of zero: the task started at once (Codex P2).
+    return _span(row["queue_hours"], READY_AFTER_START, zero_is_measured=True)
 
 
 def _since_start_of(row: Any) -> tuple[float | None, str]:

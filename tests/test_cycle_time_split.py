@@ -111,13 +111,13 @@ async def test_each_interval_has_its_own_sample_and_reasons(
     feature = await _feature(client)
 
     queue = feature["queue"]
-    # A 10, B 2, G 7, H 1 -> median 4.5
-    assert queue["tasks"] == 4
-    _near(queue["median_hours"], 4.5)
+    # A 10, B 2, G 7, H 1, Z 0 -> median 2: equal stamps are a measured zero
+    assert queue["tasks"] == 5
+    _near(queue["median_hours"], 2.0)
     assert queue["no_ready_at"] == 1  # C
     assert queue["no_started_at"] == 2  # D, F: no start to measure from
     assert queue["ready_after_start"] == 1  # E
-    assert queue["zero"] == 1  # Z: equal stamps are not a fast queue
+    assert "zero" not in queue
     assert queue["no_completion"] == 1  # N
 
     since = feature["since_start"]
