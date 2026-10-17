@@ -40,6 +40,7 @@ HELD_STATUSES = (
     "needs_decision",
     "ci_check",
     "pending_report",
+    "completed",
 )
 #: Прогон кончился, пока у него были сессии или слот: что закрыто вместе с ним.
 SLOT_REASON = "захват снят: прогон хаба #{run} закончен"
@@ -379,7 +380,7 @@ async def stuck_candidates(db: aiosqlite.Connection) -> list[int]:
         db,
         "SELECT t.id FROM tasks t JOIN executor_runs r ON r.id = t.executor_run_id "
         "WHERE t.status IN ('claimed', 'running', 'review', 'fix_requested', "
-        "'needs_decision', 'ci_check', 'pending_report') AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL) "
+        "'needs_decision', 'ci_check', 'pending_report', 'completed') AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL) "
         "AND r.task_id = t.id ORDER BY t.id",
     )
     return [int(r["id"]) for r in rows]

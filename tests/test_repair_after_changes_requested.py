@@ -1984,3 +1984,62 @@ async def test_c4_a_session_claim_orphaned_in_review_is_given_back_after_the_ver
     await cp.purge_expired(db)
     after = await _row(db, task_id)
     assert (after["status"], after["claimed_by"]) == ("open", None)
+
+
+async def test_c4_done_without_an_agent_name_clears_the_claim_as_on_develop(
+    db, monkeypatch
+):
+    """hub_report_done(task_id, summary) без agent: имя в отчёте пусто, держатель — тот,
+    кто сдаёт; захват снимается, как на develop."""
+    from hub import models, services
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-no-agent")
+    await _hold(db, task_id, None, session=False, status="claimed")
+    await db.execute(
+        "UPDATE tasks SET claimed_by = 'dev', branch = '' WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    await services.add_update(
+        db, task_id, models.TaskUpdateCreate(agent="", kind="done", content="готово")
+    )
+    assert (await _row(db, task_id))["claimed_by"] is None
+
+
+async def test_c4_a_claim_kept_by_a_completed_task_is_given_back_when_its_run_ends(
+    db, monkeypatch
+):
+    """Задача завершена раньше закрытия прогона: захват прогона освобождается страховкой и
+    в completed."""
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-completed")
+    run = await _finished_run_id(db, task_id)
+    await _hold(db, task_id, run, session=False, status="completed")
+    await cp.purge_expired(db)
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"]) == ("completed", None)
+
+
+async def test_c4_adopt_claim_ignores_a_claim_that_changed_hands(db, monkeypatch):
+    """Повторный claim прочитал старого держателя, а захват отпустили и взяли заново:
+    метка новому захвату не ставится."""
+    _launch_config(monkeypatch)
+    acting = await cp.get_acting_agent(db)
+    _, task_id = await _task_with_findings(db, slug="rc-c4-adopt-race")
+    await _hold(db, task_id, None, session=False, status="claimed")
+    await db.execute(
+        "UPDATE tasks SET claimed_by = 'newcomer', claim_session_id = 's-new', "
+        "claim_nonce = NULL WHERE id = ?",
+        (task_id,),
+    )
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation) VALUES "
+        "(?, ?, datetime('now', '+1 hour'), 'implementer', ?, 1)",
+        (int(acting["id"]), cp.hash_pair_code("adopt-token"), task_id),
+    )
+    await db.commit()
+    await cp.adopt_claim(db, "adopt-token", task_id, (config.CHAT_PAIR_AGENT, "s-run"))
+    assert (await _row(db, task_id))["claim_nonce"] is None
+    await cp.adopt_claim(db, "adopt-token", task_id, ("newcomer", "s-new"))
+    assert (await _row(db, task_id))["claim_nonce"]

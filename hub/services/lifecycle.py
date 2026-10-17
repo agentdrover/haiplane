@@ -2020,7 +2020,9 @@ async def _pair_start_write(
     )
     await repo.update_task(db, task_id, **update_fields)
     if starting_status == "claimed":
-        await chat_pair.adopt_claim(db, session_token, task_id)
+        await chat_pair.adopt_claim(
+            db, session_token, task_id, (fresh["claimed_by"], fresh["claim_session_id"])
+        )
     # The registry follows the task the same way it follows a claim (#771
     # AC-3): silent when the session is unregistered.
     if declared_session:
@@ -5011,7 +5013,12 @@ async def claim_task(
             # метку этого захвата: иначе его сессию реапер не свяжет с захватом (#1783).
             from hub.services import chat_pair as _cp
 
-            await _cp.adopt_claim(db, session_token, task_id)
+            await _cp.adopt_claim(
+                db,
+                session_token,
+                task_id,
+                (task.get("claimed_by"), task.get("claim_session_id")),
+            )
             await db.commit()
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)

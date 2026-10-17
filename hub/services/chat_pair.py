@@ -862,16 +862,30 @@ async def live_session(db: aiosqlite.Connection, token: str, task_id: int) -> bo
     )
 
 
-async def adopt_claim(db: aiosqlite.Connection, token: str, task_id: int) -> None:
+async def adopt_claim(
+    db: aiosqlite.Connection,
+    token: str,
+    task_id: int,
+    holder: tuple[str | None, str | None],
+) -> None:
     """Сессия implementer, продолжающая захват (повторный claim, pair-start из claimed,
     в том числе после claim токеном среды), делает его своим: метка появляется
-    у захвата и записывается в сессию. Захват и так принадлежит этому держателю."""
+    у захвата и записывается в сессию.
+
+    Только если захват под write-локом всё ещё тот, что видел вызывающий
+    (``holder`` = claimed_by и claim_session_id): отпущенный и взятый заново
+    чужой захват метку не получает (#1783).
+    """
     if not await live_session(db, token, task_id):
         return
-    await db.execute(
-        "UPDATE tasks SET claim_nonce = COALESCE(claim_nonce, ?) WHERE id = ?",
-        (secrets.token_hex(8), int(task_id)),
+    cursor = await db.execute(
+        "UPDATE tasks SET claim_nonce = COALESCE(claim_nonce, ?) WHERE id = ? "
+        "AND status IN ('claimed', 'running') AND claimed_by IS ? "
+        "AND claim_session_id IS ?",
+        (secrets.token_hex(8), int(task_id), holder[0], holder[1]),
     )
+    if not cursor.rowcount:
+        return
     rows = await fetchall(
         db, "SELECT claim_nonce FROM tasks WHERE id = ?", (int(task_id),)
     )
@@ -1416,7 +1430,7 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
         "AND t.executor_run_id = chat_pair_sessions.executor_run_id "
         "AND t.id = chat_pair_sessions.bound_task_id "
         "AND t.status IN ('claimed', 'running', 'review', 'fix_requested', "
-        "'needs_decision', 'ci_check', 'pending_report'))"
+        "'needs_decision', 'ci_check', 'pending_report', 'completed'))"
         + (f" AND COALESCE(bound_task_id, -1) NOT IN ({keep})" if unreleased else ""),
         tuple(sorted(unreleased)),
     )

@@ -204,7 +204,8 @@ async def _route_pair_or_claimed(
     # (#1783), иначе доказательство ушло бы раньше, чем прогон закроется.
     holder = (task.get("claimed_by") or "").strip()
     proven = task.get("executor_run_id") is not None
-    was_claimed = task["status"] == "claimed" and holder in ("", agent) and not proven
+    named = not agent or holder in ("", agent)  # без имени в отчёте — как на develop
+    was_claimed = task["status"] == "claimed" and named and not proven
     updates_list = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а не любой в
     # истории. Снятое препятствие больше не уводит сдачу мимо доставки, а

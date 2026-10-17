@@ -610,6 +610,7 @@ async def _task_refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
         db,
         "SELECT 1 FROM chat_pair_sessions s WHERE s.kind = 'implementer' "
         "AND s.bound_task_id = ? AND s.revoked_at IS NULL "
+        "AND s.claimed_session IS NULL "
         "AND s.expires_at > datetime('now') AND NOT EXISTS ("
         "  SELECT 1 FROM executor_runs r WHERE r.id = s.executor_run_id "
         "  AND (r.outcome <> 'running' OR r.cost_wait_since IS NOT NULL))",
