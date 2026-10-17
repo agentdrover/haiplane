@@ -477,7 +477,7 @@ async def maybe_rollup_parent(
     if _parent_has_own_work(parent):
         await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
-    if prevention_gate.prevention_gap(parent):
+    if prevention_gate.completion_gap(parent):
         # #919: a rollup cannot answer for a prod defect's output; the parent
         # waits for its own report, like one with its own work above — and,
         # like it, says so instead of standing silently.
@@ -535,7 +535,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
             await _note_rollup_awaits_own_report(db, parent_id, parent)
             noted = True
             continue
-        if prevention_gate.prevention_gap(parent):
+        if prevention_gate.completion_gap(parent):
             await prevention_gate.note_rollup_held(db, parent_id)
             noted = True
             continue

@@ -57,6 +57,12 @@ from hub.db import fetchall, write_transaction
 # «постановка» и есть то, что refine правит. Поле, добавленное туда и
 # забытое здесь, стало бы правкой, которой счётчик не заметит, — поэтому
 # соответствие проверяется тестом, а не памятью.
+# #1791: поле, добавленное после того, как отпечатки уже посчитаны, кладётся в
+# них только когда заполнено. Пустое значение, записанное ключом, сменило бы
+# отпечаток каждой существующей задачи и объявило бы ревизию на ровном месте
+# (тот же приём, что у result_kind ниже).
+_KEY_ONLY_WHEN_SET = frozenset({"cause_kind"})
+
 STATEMENT_FIELDS: tuple[str, ...] = (
     "title",
     "description",
@@ -77,6 +83,7 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "agent_fit",
     "found_in",
     "caused_by_task_id",
+    "cause_kind",
     "detected_at",
     "release_id",
     "scope_in",
@@ -109,7 +116,11 @@ async def statement_fingerprint(db: aiosqlite.Connection, task_id: int) -> str:
     if row is None:
         return ""
     task = dict(row)
-    payload: dict[str, Any] = {f: task.get(f) for f in STATEMENT_FIELDS}
+    payload: dict[str, Any] = {
+        f: task.get(f)
+        for f in STATEMENT_FIELDS
+        if f not in _KEY_ONLY_WHEN_SET or task.get(f) is not None
+    }
     if (task.get("result_kind") or "commit") == "state":
         # #1647: способ отката и вид результата — часть постановки state-задачи.
         # Ключи кладутся ТОЛЬКО у state: отпечаток commit-задачи не меняется, и

@@ -33,6 +33,7 @@ from hub.models import (
     TaskRisk,
 )
 from hub.db import write_transaction, deserialize_str_list, fetchall, serialize_str_list
+from hub.services import cause_kind
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
 from hub.services.project_policy import risk_map_for_task
@@ -116,6 +117,7 @@ BOOKKEEPING_FIELDS = frozenset(
         # a delivery look stale (#616).
         "found_in",
         "caused_by_task_id",
+        "cause_kind",
         "detected_at",
         "clear_caused_by",
         # #917: which release the defect showed up in — bookkeeping too.
@@ -166,6 +168,9 @@ def stamp_statement_date(payload: TaskRefine) -> TaskRefine:
 _PASSPORT_FIELDS = frozenset(
     {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by", "release_id"}
 )
+
+
+_CAUSE_PAIR_FIELDS = frozenset({"cause_kind", "caused_by_task_id", "clear_caused_by"})
 
 
 class TaskNotFoundError(LookupError):
@@ -455,6 +460,15 @@ async def _apply_refine_writes(
             release_id=payload.release_id,
         )
         updated_columns.update(applied)
+
+    # #1791: the kind of cause is a plain column, written with the PATCH above;
+    # what is judged is the pair it forms with the link AFTER every write of
+    # this refine, so one PATCH naming both, either half or "clear" is read the
+    # same way. A PATCH touching neither half is not judged.
+    if _CAUSE_PAIR_FIELDS & payload.model_fields_set:
+        problem = await cause_kind.pair_problem(db, task_id)
+        if problem:
+            raise repo.DefectPassportError(problem)
 
     # #917: a culprit is proposed when the defect gets its release or its
     # area changes — and recorded as a hypothesis, never as caused_by.

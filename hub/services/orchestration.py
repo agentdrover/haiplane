@@ -32,6 +32,7 @@ from hub.db import (
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
 from hub.services.defect_clocks import (
+    cause_split,
     change_failure_rate,
     shift_left,
     measured_escapes,
@@ -1048,6 +1049,9 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
         # so the two numbers cannot be read as one.
         "escaped": await measured_escapes(db, scope),
         "source": "found_in",
+        # #1791: the same prod defects by kind of cause; the headline above
+        # is the sum of these rows, never recomputed from them.
+        **await cause_split(db, scope),
         "reconstructed": {
             "label": RECONSTRUCTED_ESCAPES_LABEL,
             **await _escaped_defect_metrics(db, scope),

@@ -4272,6 +4272,10 @@ def _change_failure_lines(data: dict) -> list[str]:
     parts = [_cfr_part(row) for row in cfr.get("by_project") or []]
     esc = data.get("escaped_defects") or {}
     rec = esc.get("reconstructed") or {}
+    causes = ", ".join(
+        f"{r.get('cause_kind')} {r.get('defects', 0)}"
+        for r in esc.get("by_cause_kind") or []
+    )
     return [
         "Change failure rate: "
         + ("; ".join(parts) if parts else "— (no successful deploys in window)")
@@ -4279,6 +4283,8 @@ def _change_failure_lines(data: dict) -> list[str]:
         f"Escaped to prod (measured, found_in): {esc.get('escaped', 0)}; "
         f"reconstructed by completed_at, {rec.get('label', '')}: "
         f"{rec.get('escaped', 0)}",
+        f"Escaped to prod by cause_kind: {causes or '—'}; "
+        f"regressions {esc.get('regressions', 0)}",
     ]
 
 
@@ -5561,6 +5567,7 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("cause_kind", "паспорт дефекта (#1791), а не поле доводки"),
     Hidden("release_id", "паспорт дефекта (#917): релиз, а не поле доводки"),
     Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
     Hidden("result_kind", "вид результата (#1647) задают при создании и в draft"),
@@ -5768,12 +5775,8 @@ async def hub_refine_task(
 
     Args:
         task_id: Task to refine.
-        title: New title.
         description: Statement text; "" clears it.
         work_type: Kind of work (a frozen project admits by type).
-        class_of_service: Class of service.
-        size: T-shirt size.
-        wip_tag: WIP bucket.
         due_date: ISO date (fixed_date).
         user_story: As a / I want / so that.
         problem_statement: What is broken.
@@ -5782,10 +5785,9 @@ async def hub_refine_task(
         outcome_deadline: When checked.
         outcome_revisit_condition: What reopens it.
         redesign_decision: adapt | redesign.
-        redesign_rationale: Why.
-        agent_fit: Agent fit.
         found_in: Defect stage (prod: not feature).
         caused_by_task_id: Causing task.
+        cause_kind: regression|latent_design|dependency|ops|not_a_defect|unknown.
         technical_hints: Hints, approach.
         scope_in: In scope.
         scope_out: Out of scope.

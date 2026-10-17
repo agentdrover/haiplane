@@ -3102,6 +3102,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "WHERE started_at IS NULL AND status != 'draft' "
         "AND start_history_unknown = 0",
     ),
+    (
+        # #1791: вид причины дефекта. NULL — причину никто не называл; это не
+        # unknown (названо «не знаю») и не regression: у старых строк с
+        # caused_by_task_id вид остаётся пустым и регрессией не объявляется.
+        "add_tasks_cause_kind",
+        "ALTER TABLE tasks ADD COLUMN cause_kind TEXT",
+    ),
 ]
 
 
@@ -3236,6 +3243,7 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # listed is stored and never seen again.
     "found_in",
     "caused_by_task_id",
+    "cause_kind",
     "detected_at",
     "resolved_at",
     # #917: the release the defect showed up in — resolved against releases

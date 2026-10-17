@@ -171,6 +171,31 @@ class DefectFoundIn(str, Enum):
     prod = "prod"
 
 
+class DefectCauseKind(str, Enum):
+    """Why a defect happened — the kind of cause, not the stage (#1791).
+
+    ``found_in`` says where it was caught; this says what it was. A prod
+    defect is not always a regression of a delivery: a vulnerable dependency,
+    a latent design flaw or an ops incident land in the same bucket otherwise.
+
+    * ``regression`` — a change delivered earlier broke it; needs
+      ``caused_by_task_id``;
+    * ``latent_design`` — it was always there, nobody's change introduced it;
+    * ``dependency`` — a third-party package or image;
+    * ``ops`` — environment, configuration, infrastructure;
+    * ``not_a_defect`` — filed as a defect, turned out not to be one;
+    * ``unknown`` — the cause is not established; an explicit "I do not know",
+      different from an empty field (nobody has looked yet).
+    """
+
+    regression = "regression"
+    latent_design = "latent_design"
+    dependency = "dependency"
+    ops = "ops"
+    not_a_defect = "not_a_defect"
+    unknown = "unknown"
+
+
 class ClassOfService(str, Enum):
     """Kanban class of service for prioritization and SLA."""
 
@@ -2448,6 +2473,10 @@ class TaskRefine(BaseModel):
     caused_by_task_id: int | None = Field(default=None, ge=1)
     detected_at: str | None = Field(default=None, max_length=32)
     clear_caused_by: bool = False
+    # #1791: the kind of cause. Agreed with caused_by_task_id on the FINAL pair
+    # by ``repo.set_defect_passport``; empty is allowed at registration and
+    # refused at closing (prevention_gate).
+    cause_kind: DefectCauseKind | None = None
     # #917: the release row the defect showed up in; resolved by
     # ``repo.set_defect_passport`` (exists, succeeded, same project).
     release_id: int | None = None
@@ -3244,6 +3273,8 @@ class TaskView(BaseModel):
     # lands, never accepted straight off a refine payload.
     found_in: DefectFoundIn = DefectFoundIn.unknown
     caused_by_task_id: int | None = None
+    # #1791: None = nobody named the cause yet; ``unknown`` = looked, not found.
+    cause_kind: DefectCauseKind | None = None
     detected_at: str | None = None
     resolved_at: str | None = None
     # #917: the release the defect showed up in (None = not stated), and the
