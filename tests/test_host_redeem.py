@@ -547,3 +547,49 @@ async def test_closed_order_session_is_revoked_for_every_unused_close(world):
     await orders.disable_host(world.db, "k9", by=world.human_id)
     assert await _live(world, order["executor_run_id"]) == []
     assert await _whoami(world, first["token"]) == 401
+
+
+async def test_rotation_update_refuses_a_token_used_after_the_check(world, monkeypatch):
+    """AC-2: UPDATE ротации сам называет first_used_at IS NULL, а не полагается на проверку выше.
+
+    Проверка в _retry видит устаревшее «не использован» (подмена чтения), а токен
+    уже предъявлен: ротация обязана отказать и не заменить хеш.
+    """
+    _t, order, code, first = await _redeemed(world, title="устаревшее чтение")
+    assert await _whoami(world, first["token"]) == 200  # токен использован
+    before = await _snapshot(world, order["id"], order["executor_run_id"])
+    real = host_redeem.fetchall
+
+    async def stale(db, sql, params=()):
+        rows = await real(db, sql, params)
+        if "JOIN chat_pair_sessions s" in sql:
+            rows = [{**dict(r), "first_used_at": None} for r in rows]
+        return rows
+
+    monkeypatch.setattr(host_redeem, "fetchall", stale)
+    conn = await hub_db.connect(world.dsn)
+    try:
+        with pytest.raises(orders.HostError) as refused:
+            await host_redeem.redeem_for_host(conn, "k8", order["id"], code)
+    finally:
+        await conn.close()
+    assert refused.value.detail["reason"] == host_redeem.REASON_IN_USE  # type: ignore[index]
+    assert before == await _snapshot(world, order["id"], order["executor_run_id"])
+    assert await _whoami(world, first["token"]) == 200
+
+
+async def test_public_gate_only_for_slot_channel_codes(world, monkeypatch):
+    """AC-5: код канала НЕ slot с именем слота, совпавшим с хостом, флагом не закрывается."""
+    acting = await cp.get_acting_agent(world.db)
+    task_id = await _task(world, "канал не slot")
+    code, _ = await cp.issue_code(
+        world.db,
+        int(acting["id"]),
+        kind="implementer",
+        bound_task_id=task_id,
+        channel="",
+        slot="k8",
+    )
+    await world.db.commit()
+    monkeypatch.setattr(config, "HOST_ORDER_PUBLIC_REDEEM_CLOSED", True)
+    assert (await _redeem(world, code)).status_code == 200
