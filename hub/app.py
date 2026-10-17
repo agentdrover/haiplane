@@ -3389,14 +3389,7 @@ async def api_pair_start_task(
         caller=identity.username,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
-        # #1683: привязка к заказу — только по токену ВЫЗЫВАЮЩЕЙ сессии
-        # implementer; остальные входы токена кода не несут.
-        session_token=(
-            (_extract_bearer(request) or "")
-            if identity.auth_source == "chat_pair"
-            and identity.chat_pair_kind == "implementer"
-            else ""
-        ),
+        session_token=_implementer_token(request, identity),
     )
     await _record_slot_capture(request, identity, task_id)
     return view
@@ -3418,9 +3411,17 @@ async def api_claim_task(
         body,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
+        session_token=_implementer_token(request, identity),
     )
     await _record_slot_capture(request, identity, task_id)
     return view
+
+
+def _implementer_token(request: Request, identity) -> str:
+    """Токен вызывающей сессии implementer (#1683, #1783); у прочих входов пусто."""
+    if identity.auth_source != "chat_pair" or identity.chat_pair_kind != "implementer":
+        return ""
+    return _extract_bearer(request) or ""
 
 
 async def _record_slot_capture(request: Request, identity, task_id: int) -> None:

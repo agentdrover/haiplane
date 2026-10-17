@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi import HTTPException
@@ -23,6 +24,7 @@ from fastapi import HTTPException
 import aiosqlite
 
 from hub import config, models
+from hub import db as db_module
 from hub import repository as repo
 from hub import services
 from hub.db import deserialize_str_list
@@ -111,6 +113,7 @@ EXPECTED_SUBMIT_ORDER = (
     "branch_matches",
     "pin_submission_sha",
     "same_sha_from_review_is_current",
+    "empty_resubmission",
     "submission_contract",
     "bug_red_test",
     "ci_before_submit",
@@ -237,6 +240,9 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     assert set(submit) - set(headless) == {
         "task_is_submittable",
         "same_sha_from_review_is_current",
+        # #1783: пустая пересдача на headless — не отказ, а needs_decision в
+        # transition_after_agent_done (решение #1122: гейты headless не отказывают).
+        "empty_resubmission",
     }
     assert set(headless) - set(submit) == set()
 
@@ -659,7 +665,9 @@ def _install_fixed_tip_git(
     monkeypatch.setattr(
         orchestration,
         "project_git_context",
-        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+        AsyncMock(
+            return_value={"repo": os.path.dirname(__file__), "base_branch": "develop"}
+        ),
     )
     return git
 
@@ -1406,3 +1414,411 @@ async def test_a_report_between_the_submit_gates_and_the_apply_refuses_the_submi
     assert resp.status_code == 422, resp.text
     assert red._detail(resp)["reason"] == reason
     await red._assert_nothing_recorded(db, task_id, feed_before, dispatch)
+
+
+# --------------------------------------------------------------------------
+# #1783: пустая пересдача после «на доработку»
+# --------------------------------------------------------------------------
+
+
+async def _sent_back(db, monkeypatch, title: str):
+    """Сдача 1 на коммите tip-1, затем changes_requested по ней: задача в running."""
+    git = _install_fixed_tip_git(monkeypatch, "tip-1")
+    task = await _pair_task_ready_to_submit(db, title)
+    await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    await repo.record_review_verdict(db, task.id, "changes_requested")
+    await repo.transition_status_if(
+        db, task.id, expected_from="review", new_status="running"
+    )
+    await db.commit()
+    return git, task
+
+
+async def test_same_sha_after_changes_requested_is_refused(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Тот же коммит после «на доработку» — отказ с причиной, поколение не растёт;
+    новый коммит принимается; done-отчёт pair на том же коммите — отказ;
+    headless — needs_decision; review-путь того же sha остаётся прежним no-op."""
+    git, task = await _sent_back(db, monkeypatch, "Пустая пересдача")
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.submit_for_review(
+            db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+        )
+    assert refused.value.status_code == 422
+    assert refused.value.detail["reason"] == "resubmit_without_changes"
+    assert "изменений нет" in refused.value.detail["message"]
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["submission_generation"], row["status"]) == (1, "running")
+
+    # pair done-отчёт на том же коммите: отказ, строка отчёта откатывается.
+    with pytest.raises(HTTPException) as done_refused:
+        await services.add_update(
+            db,
+            task.id,
+            models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+        )
+    assert done_refused.value.detail["reason"] == "resubmit_without_changes"
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["submission_generation"], row["status"]) == (1, "running")
+    assert not await repo.has_done_updates(db, task.id)
+
+    # headless: отказывать некому — needs_decision с названной причиной.
+    await repo.update_task(db, task.id, job_id="job-h")
+    headless = dict(await repo.get_task(db, task.id))
+    from hub.services.orchestration import transition_after_agent_done
+
+    assert (
+        await transition_after_agent_done(db, headless, has_done=True)
+        == "needs_decision"
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["status"], row["submission_generation"]) == ("needs_decision", 1)
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task.id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("изменений нет" in a for a in alerts)
+    await repo.update_task(db, task.id, job_id=None, status="running")
+    await db.commit()
+
+    # Подготовленная вне транзакции «вершина не прочитана» (пусто) — не повод
+    # идти в сеть под write-локом.
+    from hub.services import resubmission_guard
+
+    async def _no_network(*args, **kwargs):
+        raise AssertionError("сеть под write-локом")
+
+    real_tip = lifecycle.resolve_branch_tip
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _no_network)
+    row = dict(await repo.get_task(db, task.id))
+    row[lifecycle.PREPARED_CI_SHA] = ""
+    assert await resubmission_guard.stop_empty_done(db, row) == ""
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", real_tip)
+
+    # done из claimed (после повторного захвата) и headless из fix_requested не
+    # обходят запрет: проверка по поколению с действующим вердиктом, не по статусу.
+    await repo.update_task(db, task.id, status="claimed", job_id=None)
+    await db.commit()
+    with pytest.raises(HTTPException) as claimed_refused:
+        await services.add_update(
+            db,
+            task.id,
+            models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+        )
+    assert claimed_refused.value.detail["reason"] == "resubmit_without_changes"
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    fix = dict(await repo.get_task(db, task.id))
+    assert await transition_after_agent_done(db, fix, has_done=True) == "needs_decision"
+    # headless с недокоммиченной работой в рабочем каталоге: пустой пересдачей не
+    # считается — хвост конвейера закоммитит и запушит её позже.
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    real_dirty = git.dirty_paths
+
+    async def _dirty(repo=None):
+        return ["hub/x.py"]
+
+    git.dirty_paths = _dirty
+    from hub.services import orchestration
+    from hub.services import resubmission_guard as _rg
+
+    async def _prepared() -> dict:
+        """Задача со снимком git, собранным ДО транзакции (как prepare_ci_standing)."""
+        row = dict(await repo.get_task(db, task.id))
+        row.update(await _rg.collect_git_facts(db, row))
+        return row
+
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
+    # pair-путь: done с локальными исправлениями в worktree тоже доезжает до хвоста
+    await repo.update_task(db, task.id, status="running", job_id=None)
+    await db.commit()
+    git.dirty_paths = _dirty
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
+    git.dirty_paths = real_dirty
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    # без ревью (auto_review=0) хвост конвейера не коммитит: недокоммиченное не оправдание
+    await db.execute("UPDATE tasks SET auto_review = 0 WHERE id = ?", (task.id,))
+    await db.commit()
+    git.dirty_paths = _dirty
+    assert (
+        await _rg.stop_empty_done(db, await _prepared(), tail_pending=True)
+        == "needs_decision"
+    )
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.execute("UPDATE tasks SET auto_review = 1 WHERE id = ?", (task.id,))
+    await db.commit()
+    git.dirty_paths = real_dirty
+    await repo.update_task(db, task.id, job_id=None, status="running")
+    await db.commit()
+
+    # локальный коммит исполнителя, ещё не запушенный хвостом конвейера, — не пустая пересдача.
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+
+    async def _ahead(branch, repo=None):
+        return 1
+
+    git.unpushed_commits = _ahead
+    # pending_report хвоста конвейера не выполняет: там недокоммиченное не оправдание.
+    assert (
+        await _rg.stop_empty_done(db, dict(await repo.get_task(db, task.id)))
+        == "needs_decision"
+    )
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    # проект без workspace_path: git по умолчанию, как у хвоста (repo=None доходит до git)
+    from unittest.mock import AsyncMock
+
+    seen: list = []
+
+    async def _dirty_seen(repo=None):
+        seen.append(repo)
+        return ["a.py"]
+
+    real_ctx = orchestration.project_git_context
+    orchestration.project_git_context = AsyncMock(return_value={"repo": None})
+    real_dirty2, git.dirty_paths = git.dirty_paths, _dirty_seen
+    assert await _rg.collect_git_facts(db, dict(await repo.get_task(db, task.id))) == {
+        _rg.UNCOMMITTED_KEY: True
+    } and seen == [None]
+    git.dirty_paths = real_dirty2
+    orchestration.project_git_context = real_ctx
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    assert await _rg.stop_empty_done(db, await _prepared(), tail_pending=True) == ""
+    del git.unpushed_commits
+
+    # done через pending_report (поллер не нашёл отчёта) — тот же запрет.
+    await repo.update_task(db, task.id, status="pending_report", job_id="job-h")
+    await db.commit()
+    await services.add_update(
+        db,
+        task.id,
+        models.TaskUpdateCreate(agent="dev", kind="done", content="поздний отчёт"),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert (row["status"], row["submission_generation"]) == ("needs_decision", 1)
+    await repo.update_task(db, task.id, status="running", job_id=None)
+    await db.commit()
+
+    # снимок «сдача не пустая» устарел до лока: перепроверка в транзакции перехода.
+    async def _snapshot_said_fine(state):
+        return None
+
+    real_step = lifecycle._step_empty_resubmission
+    monkeypatch.setattr(lifecycle, "_step_empty_resubmission", _snapshot_said_fine)
+    steps = lifecycle.SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK
+    patched = tuple(
+        Step(x.name, _snapshot_said_fine) if x.name == "empty_resubmission" else x
+        for x in steps
+    )
+    monkeypatch.setattr(lifecycle, "SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK", patched)
+    with pytest.raises(HTTPException) as late:
+        await lifecycle.submit_for_review(
+            db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+        )
+    assert late.value.detail["reason"] == "resubmit_without_changes"
+    monkeypatch.setattr(lifecycle, "SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK", steps)
+    monkeypatch.setattr(lifecycle, "_step_empty_resubmission", real_step)
+
+    # новый коммит принимается.
+    git.tip = "tip-2"
+    accepted = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (accepted.submission_generation, accepted.submission_sha) == (2, "tip-2")
+
+    # review-путь того же sha — прежний no-op, а не отказ (#1054, #1265).
+    again = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (again.submission_generation, again.status) == (2, "review")
+
+    # вердикт «на доработку» прошлого поколения (1) не действует на поколение 2:
+    # вернули в running без нового вердикта — тот же коммит не «пустая пересдача».
+    await repo.transition_status_if(
+        db, task.id, expected_from="review", new_status="running"
+    )
+    await db.commit()
+    stale = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (stale.submission_generation, stale.status) == (3, "review")
+
+
+async def test_same_sha_from_review_stays_a_noop_after_the_1783_gate(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Review-путь того же sha (#1054, #1265) не меняется: no-op, а не отказ."""
+    _install_fixed_tip_git(monkeypatch, "tip-r")
+    task = await _pair_task_ready_to_submit(db, "Повтор из review")
+    await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    again = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert again.submission_generation == 1 and again.status == "review"
+
+
+async def test_after_a_dirty_tree_the_tail_must_really_commit(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 3: грязное дерево пропускает guard ради хвоста, но если хвост ничего не
+    закоммитил (auto_commit=False, своих коммитов впереди нет), sha прежний — исход тот
+    же, что у пустой пересдачи, а бамп поколения откатывается; факты git собраны ДО
+    транзакции."""
+    from hub.services import resubmission_guard as _rg
+    from hub.services.orchestration import transition_after_agent_done
+
+    git, task = await _sent_back(db, monkeypatch, "Хвост без коммита")
+    in_txn: list[bool] = []
+
+    async def _dirty(repo=None):
+        in_txn.append(db.in_transaction)
+        return ["hub/x.py"]
+
+    async def _checkout(branch, repo=None):
+        return True
+
+    async def _commit(*args, **kwargs):
+        return False
+
+    for name, fn in (
+        ("dirty_paths", _dirty),
+        ("checkout", _checkout),
+        ("auto_commit", _commit),
+    ):
+        monkeypatch.setattr(git, name, fn)
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.commit()
+    row = dict(await repo.get_task(db, task.id))
+    assert await transition_after_agent_done(db, row, has_done=True) == "needs_decision"
+    after = dict(await repo.get_task(db, task.id))
+    assert (after["status"], after["submission_generation"]) == ("needs_decision", 1)
+    # первый вызов — сбор фактов guard (prepare_ci_standing), вне транзакции;
+    # остальные — прежний хвост конвейера (сверка области коммита)
+    assert in_txn and in_txn[0] is False, "git-факты собраны вне write-транзакции"
+
+    # коммит случился — пересдача настоящая, ничего не откатывается
+    prepared = dict(await repo.get_task(db, task.id))
+    prepared[_rg.EMPTY_UNLESS_COMMITTED] = True
+    assert await _rg.recheck_after_commit(db, prepared, True) == ""
+
+    # свои коммиты впереди origin — тоже не пустая пересдача
+    async def _ahead(branch, repo=None):
+        return 2
+
+    monkeypatch.setattr(git, "unpushed_commits", _ahead)
+    assert await _rg.recheck_after_commit(db, prepared, False) == ""
+
+    # внутри guard git не зовётся: он читает факты, собранные заранее
+    async def _boom(repo=None):
+        raise AssertionError("git внутри guard")
+
+    monkeypatch.setattr(git, "dirty_paths", _boom)
+    monkeypatch.setattr(git, "unpushed_commits", _boom)
+    again = dict(await repo.get_task(db, task.id))
+    again[_rg.UNCOMMITTED_KEY] = True
+    assert await _rg.stop_empty_done(db, again, tail_pending=True) == ""
+
+
+async def test_a_pair_done_with_local_fixes_reaches_the_tail(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Pair done после «на доработку» с недокоммиченными правками: факты git собраны до
+    транзакции и доезжают до guard сквозь перечитывание задачи — отчёт не отклонён."""
+    git, task = await _sent_back(db, monkeypatch, "Pair с правками")
+    seen: list[bool] = []
+
+    async def _dirty(repo=None):
+        seen.append(db.in_transaction)
+        return ["hub/x.py"]
+
+    async def _checkout(branch, repo=None):
+        return True
+
+    async def _commit(*args, **kwargs):
+        return True
+
+    for name, fn in (
+        ("dirty_paths", _dirty),
+        ("checkout", _checkout),
+        ("auto_commit", _commit),
+    ):
+        monkeypatch.setattr(git, name, fn)
+    await services.add_update(
+        db,
+        task.id,
+        models.TaskUpdateCreate(agent="dev", kind="done", content="готово"),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert row["submission_generation"] == 2, "отчёт принят, поколение открыто"
+    assert seen[0] is False, "факты git собраны вне write-транзакции"
+
+
+async def test_c3_answering_the_findings_is_not_an_empty_resubmission(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Автор оспаривает находки исходами на том же коммите: это ответ по существу.
+    Шаг пустой пересдачи с исходами не отказывает; без них — отказывает."""
+    _git, task = await _sent_back(db, monkeypatch, "Ответ исходами")
+    row = dict(await repo.get_task(db, task.id))
+
+    def _state(outcomes):
+        body = models.TaskSubmitReview(agent="dev", finding_outcomes=outcomes)
+        state = lifecycle.SubmitContext(db=db, task_id=task.id, task=row, body=body)
+        state.submission_sha = "tip-1"
+        return state
+
+    item = models.FindingOutcomeItem(
+        finding_uid="abc", outcome="false_positive", note="n"
+    )
+    await lifecycle._step_empty_resubmission(_state([item]))
+    with pytest.raises(HTTPException):
+        await lifecycle._step_empty_resubmission(_state([]))
+
+
+async def test_c3_the_guard_does_not_ask_the_network_inside_a_transaction(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Нет подготовленной вершины, а транзакция открыта: guard сеть не зовёт, вершина
+    неизвестна — это не «правок нет»."""
+    from hub.services import resubmission_guard as _rg
+
+    _git, task = await _sent_back(db, monkeypatch, "Сеть под локом")
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("сеть под write-локом")
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _boom)
+    row = dict(await repo.get_task(db, task.id))
+    async with db_module.write_transaction(db):
+        assert await _rg.stop_empty_done(db, row) == ""
+
+
+async def test_c3_an_unreadable_workspace_is_not_proof_of_no_changes(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Каталога хвоста нет: git молчит, а «пусто» — не «правок нет». Факт читается как
+    «работа ждёт хвоста», пересдачу пустой не объявляем."""
+    from unittest.mock import AsyncMock
+
+    from hub.services import orchestration
+    from hub.services import resubmission_guard as _rg
+
+    _git, task = await _sent_back(db, monkeypatch, "Нет каталога")
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/nonexistent/workspace-1783"}),
+    )
+    row = dict(await repo.get_task(db, task.id))
+    assert await _rg.collect_git_facts(db, row) == {_rg.UNCOMMITTED_KEY: True}

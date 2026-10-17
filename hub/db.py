@@ -2308,6 +2308,21 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_chat_pair_sessions_executor_run_id",
         "ALTER TABLE chat_pair_sessions ADD COLUMN executor_run_id INTEGER",
     ),
+    # #1783: метка захвата сессии (claim_nonce), прогон-держатель (executor_run_id)
+    (
+        "add_chat_pair_sess_claim",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+    ),
+    ("t1783_task_nonce", "ALTER TABLE tasks ADD COLUMN claim_nonce TEXT"),
+    ("t1783_task_run", "ALTER TABLE tasks ADD COLUMN executor_run_id INTEGER"),
+    (
+        # #1783: захват снят — доказательство уходит с ним на любом пути.
+        "trg_tasks_claim_cleared_drops_run_proof",
+        "CREATE TRIGGER IF NOT EXISTS trg_tasks_claim_cleared_drops_run_proof AFTER "
+        "UPDATE OF claimed_by ON tasks WHEN NEW.claimed_by IS NULL AND "
+        "NEW.executor_run_id IS NOT NULL BEGIN UPDATE tasks SET executor_run_id = NULL "
+        "WHERE id = NEW.id; END",
+    ),
     (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
@@ -2459,6 +2474,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_slots_active "
         "ON executor_slots(task_id) WHERE released_at IS NULL",
     ),
+    ("t1783_slot_run", "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER"),
     (
         # #919: what a closed production defect left behind — a regression
         # test, a rule from category_checks (#878), or an accepted risk with a

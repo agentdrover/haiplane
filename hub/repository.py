@@ -6819,7 +6819,8 @@ async def stopped_executor_runs_of_running_tasks(
         "WHERE t.status = 'running' AND t.archived = 0 "
         "AND r.id = (SELECT MAX(x.id) FROM executor_runs x WHERE x.task_id = t.id) "
         f"AND r.outcome IN ({marks}) AND r.finished_at IS NOT NULL "  # nosec B608 - placeholders only, values are params
-        "AND r.finished_at >= COALESCE(t.status_entered_at, '') "
+        "AND COALESCE(r.cost_wait_since, r.finished_at) >= "
+        "COALESCE(t.status_entered_at, '') "
         "AND COALESCE(t.submission_generation, 0) < r.submission_generation "
         "ORDER BY r.id",
         tuple(outcomes),
