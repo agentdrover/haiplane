@@ -1588,3 +1588,33 @@ async def test_c3_the_reaper_pairs_the_run_with_the_mark_of_one_session(
     await db.commit()
     assert await cp.release_expired_implementer_tasks(db) == []
     assert (await _row(db, task_id))["status"] == "running"
+
+
+async def test_c3_a_run_that_claimed_and_died_returns_the_task_to_open(db, monkeypatch):
+    """Прогон взял задачу (claimed), pair-start не успел и закончился ошибкой: захват снят
+    и задача в open — не висит claimed без держателя и без срока аренды."""
+    from hub.integrations import cursor_cloud
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-c3-claimed-dead")
+    run = await _new_run(db, task_id, 1)
+    await _hold(db, task_id, run, session=True, live=True, status="claimed")
+    await repo.update_task(db, task_id, submission_generation=0)
+    await db.commit()
+
+    async def _get_run(agent, run_id):
+        return {"status": "ERROR"}
+
+    async def _usage(agent, run_id):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    await ed._poll_one(db, dict(await repo.get_executor_run(db, run)))  # type: ignore[arg-type]
+    await db.commit()
+    after = await _row(db, task_id)
+    assert (after["status"], after["claimed_by"], after["executor_run_id"]) == (
+        "open",
+        None,
+        None,
+    )

@@ -273,6 +273,13 @@ async def release_run_claim(
     if not cursor.rowcount:
         return False
     await drop_run_holdings(db, int(task_id), int(run_id))
+    if task["status"] == "claimed":
+        # Прогон взял задачу и закончился, не начав работу (pair-start не было):
+        # без держателя и без срока аренды она осталась бы claimed навсегда, и
+        # sweep аренды её уже не видит — возвращается в очередь, как вернул бы он.
+        await repo.transition_status_if(
+            db, int(task_id), expected_from="claimed", new_status="open"
+        )
     session = (task.get("claim_session_id") or "").strip()
     if session:
         await db.execute(
