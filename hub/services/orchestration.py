@@ -5770,7 +5770,9 @@ async def _complete_without_review(
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
     pr_delivered = bool(task.get("pr_number"))
-    if not await _write_completed(db, task, exit_code, result_text):
+    if (written := await _write_completed(db, task, exit_code, result_text)) is None:
+        return "needs_decision"
+    if not written:
         await delivery_notes.note_approval_gone(db, task, merged=pr_delivered)
         return "running"
     return "completed"
@@ -5781,8 +5783,10 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-) -> bool:
+) -> bool | None:
     """The write of ``completed`` after a done report, with its validation gate.
+
+    ``None``: the defect gate holds it, asked again of the row here (#1791).
 
     The approval of the CURRENT submission is asked again here in every case
     (#1706): ``completed`` says "approved work was delivered", and a merge made
@@ -5804,6 +5808,8 @@ async def _write_completed(
     async with write_transaction(db):
         if not await approval_stands(db, task):
             return False
+        if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
+            return None
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 

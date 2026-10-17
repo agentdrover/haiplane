@@ -724,6 +724,15 @@ async def test_an_empty_window_splits_into_zeros_without_shares(db):
 # --- AC-4: one set of keys and numbers on every surface ---------------------
 
 
+def split_of(escaped: dict) -> dict:
+    keys = ("by_cause_kind", "regressions", "without_cause_kind")
+    return {k: escaped[k] for k in keys}
+
+
+def direct_sl(escaped: dict) -> dict:
+    return split_of(escaped)
+
+
 async def test_cause_split_is_the_same_on_every_surface(client, db):
     from hub import cli
     from hub.mcp_server import hub_practice_metrics
@@ -761,6 +770,20 @@ async def test_cause_split_is_the_same_on_every_surface(client, db):
     )
     assert f"Escaped to prod by cause_kind: {expected}; regressions 1" in text
 
+    # shift-left carries the same split of its prod stage: REST, CLI, MCP
+    sl = rest["shift_left"]
+    assert sl["prod_by_cause_kind"] == split_of(split)
+    assert sl["prod_by_cause_kind"] == direct_sl(direct)
+    shown: list[dict] = []
+    with (
+        patch.object(sys, "argv", ["oc-hub", "shift-left"]),
+        patch.object(cli, "_api", return_value=rest),
+        patch.object(cli, "_print_json", side_effect=shown.append),
+    ):
+        assert cli.main() in (0, None)
+    assert shown[0]["prod_by_cause_kind"] == sl["prod_by_cause_kind"]
+    assert f"Shift-left prod by cause_kind: {expected}; regressions 1" in text
+
     # the page: a cell per row, the regression subset beside them
     page = (await client.get("/metrics")).text
     for row in split["by_cause_kind"]:
@@ -792,3 +815,49 @@ def test_the_refine_surfaces_accept_the_kind():
     with patch.object(mcp_server, "_api_post", post):
         asyncio.run(mcp_server.hub_refine_task(task_id=5, cause_kind="ops"))
     assert post.call_args.args[1] == {"cause_kind": "ops"}
+
+
+# --- the gate is asked again where completed is written ----------------------
+
+
+async def test_a_passport_changed_after_the_gate_does_not_complete(db):
+    """The gate ran before the network wait; found_in turned prod under it."""
+    from hub.services import delivery_writes, orchestration
+
+    # the done-report writer
+    task_id = await _task(db, found_in="unknown", status="review", title="done write")
+    task = await _row(db, task_id)
+    assert not await prevention_gate.hold_completion(
+        db, task_id, via="report_done", actor="hub"
+    ), "the gate passed: not a prod defect yet"
+    await db.execute("UPDATE tasks SET found_in='prod' WHERE id=?", (task_id,))
+    await db.commit()
+    with patch.object(orchestration, "approval_stands", AsyncMock(return_value=True)):
+        written = await orchestration._write_completed(db, task, 0, "done")
+    assert written is None
+    assert (await _row(db, task_id))["status"] == "needs_decision"
+    assert not await _events(db, task_id, "task_completed")
+    [held] = await _events(db, task_id, "needs_decision")
+    assert json.loads(held["payload"])["reason"] == "prevention_missing"
+
+    # the poller's delivery write; prevention is there, the kind is not
+    poll_id = await _task(db, found_in="unknown", status="review", title="poll write")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', defect_prevention=? WHERE id=?",
+        (json.dumps(PREVENTION), poll_id),
+    )
+    await db.commit()
+    await delivery_writes.complete_delivered(db, poll_id, 7)
+    assert (await _row(db, poll_id))["status"] == "needs_decision"
+    assert not await _events(db, poll_id, "task_completed")
+    [held] = await _events(db, poll_id, "needs_decision")
+    assert json.loads(held["payload"])["reason"] == "cause_kind_missing"
+
+    # a task that meets the gate still completes through both writers
+    ok = await _task(db, status="review", cause_kind="ops", title="fine")
+    await db.execute(
+        "UPDATE tasks SET defect_prevention=? WHERE id=?", (json.dumps(PREVENTION), ok)
+    )
+    await db.commit()
+    await delivery_writes.complete_delivered(db, ok, 8)
+    assert (await _row(db, ok))["status"] == "completed"

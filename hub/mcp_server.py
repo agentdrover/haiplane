@@ -4288,6 +4288,19 @@ def _change_failure_lines(data: dict) -> list[str]:
     ]
 
 
+def _prod_cause_lines(split: dict[str, Any]) -> list[str]:
+    """#1791: the prod stage of shift-left by kind of cause."""
+    if not split:
+        return []
+    kinds = ", ".join(
+        f"{r.get('cause_kind')} {r.get('defects', 0)}"
+        for r in split.get("by_cause_kind") or []
+    )
+    return [
+        f"Shift-left prod by cause_kind: {kinds}; regressions {split.get('regressions', 0)}"
+    ]
+
+
 def _shift_left_lines(sl: dict[str, Any]) -> list[str]:
     """#914: defects by found_in; unknown named apart with its share."""
     if not sl:
@@ -4298,7 +4311,8 @@ def _shift_left_lines(sl: dict[str, Any]) -> list[str]:
         f"Shift-left (defects by found_in, {sl.get('defects', 0)}): "
         + ", ".join(f"{r.get('stage')} {r.get('defects', 0)}" for r in stages)
         + f"; unknown {sl.get('unknown', 0)} "
-        + (f"({round(share * 100, 1)}%)" if share is not None else "(no defects)")
+        + (f"({round(share * 100, 1)}%)" if share is not None else "(no defects)"),
+        *_prod_cause_lines(sl.get("prod_by_cause_kind") or {}),
     ]
 
 

@@ -229,6 +229,9 @@ async def shift_left(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
         "recorded": total - unknown,
         "unknown": unknown,
         "unknown_share": _share(unknown, total),
+        # #1791: the prod bucket by kind of cause — the same result as
+        # ``escaped_defects``, so both readings of the prod stage agree.
+        "prod_by_cause_kind": await cause_split(db, scope),
         "by_stage": [
             {
                 "stage": stage,
