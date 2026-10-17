@@ -130,7 +130,7 @@ Host key (`slot_runner`), exactly four routes of its OWN host:
   at admission in `chat_pair.resolve_session`) — never rotated; 409
   `redeem_retry_expired` after `retry_until` (also after purge/restart; the order
   row keeps the window); 409 `order_closed`/`session_gone`/`host_disabled`; 429
-  `redeem_retry_limited` (≤ 5 rotations per order, 30 attempts/5 min per host; it
+  `redeem_retry_limited` (≤ 5 rotations per order, 60 attempts/5 min per host; it
   does not close the order). Repeats write no feed entries. Host side: store the
   order BEFORE the call; on timeout/5xx retry with backoff inside `retry_until`;
   ignore an answer with a smaller `token_version`; start the VM once; `redeem_lost`

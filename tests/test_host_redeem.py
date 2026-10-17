@@ -41,6 +41,13 @@ _no_cloud = _eo._no_cloud
 ASSERT_NO_STATE_CHANGE = "отказ не меняет состояние"
 
 
+@pytest.fixture(autouse=True)
+def _clean_host_limiter():
+    host_redeem.host_redeem_limiter._buckets.clear()
+    yield
+    host_redeem.host_redeem_limiter._buckets.clear()
+
+
 def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -593,3 +600,40 @@ async def test_public_gate_only_for_slot_channel_codes(world, monkeypatch):
     await world.db.commit()
     monkeypatch.setattr(config, "HOST_ORDER_PUBLIC_REDEEM_CLOSED", True)
     assert (await _redeem(world, code)).status_code == 200
+
+
+async def test_overlapping_first_redeems_second_becomes_a_retry(world, monkeypatch):
+    """Codex P2: первый выкуп успел между чтением заказа и тратой — это повтор, не отказ."""
+    _t, order, code = await _launched(world, title="перекрытие")
+    real = orders._own_order
+    calls = {"n": 0}
+
+    async def stale_once(db, host, order_id):
+        row = await real(db, host, order_id)
+        calls["n"] += 1
+        if calls["n"] == 1 and row is not None:
+            # Читатель B видит заказ ДО первого выкупа A.
+            snap = dict(row)
+            first = await _host_redeem(world, order["id"], code)
+            assert first.status_code == 200
+            return snap
+        return row
+
+    monkeypatch.setattr(orders, "_own_order", stale_once)
+    conn = await hub_db.connect(world.dsn)
+    try:
+        got = await host_redeem.redeem_for_host(conn, "k8", order["id"], code)
+    finally:
+        await conn.close()
+    assert got["token_version"] == 2
+    assert len(await _live(world, order["executor_run_id"])) == 1
+
+
+async def test_refused_attempts_count_against_the_host_limit(world):
+    """Codex P3: и отказы идут в лимит попыток хоста (429 после 60)."""
+    _t, order, code, first = await _redeemed(world, title="лимит отказов")
+    assert await _whoami(world, first["token"]) == 200  # дальше любой повтор — 409
+    codes = [
+        (await _host_redeem(world, order["id"], code)).status_code for _ in range(62)
+    ]
+    assert codes[0] == 409 and 429 in codes

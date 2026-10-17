@@ -41,7 +41,7 @@ REASON_LIMITED = "redeem_retry_limited"
 REASON_UNAVAILABLE = "order_unavailable"
 
 #: Попытки выкупа одного хоста в окне; 429 заказ не закрывает.
-host_redeem_limiter = LoginRateLimiter(max_attempts=30, window_seconds=300)
+host_redeem_limiter = LoginRateLimiter(max_attempts=60, window_seconds=300)
 
 _LIVE = "revoked_at IS NULL AND expires_at > datetime('now')"
 
@@ -215,25 +215,27 @@ async def redeem_for_host(
     """
     if host_redeem_limiter.is_blocked(host):
         raise _refuse(429, REASON_LIMITED, "слишком много попыток выкупа")
+    # Попытка считается сразу, до первого await: отказы тоже стоят замка записи.
+    host_redeem_limiter.record(host)
     code_hash = chat_pair.hash_pair_code(chat_pair.normalize_pair_code(raw_code))
     order = await orders._own_order(db, host, order_id)
     if order is None or not hmac.compare_digest(str(order["code_hash"]), code_hash):
-        host_redeem_limiter.record(host)
         raise _refuse(403, REASON_UNAVAILABLE, "заказ недоступен для этого кода")
-    if order["first_redeemed_at"]:
-        answer = await _retry(db, host, order_id)
-        host_redeem_limiter.record(host)
-        return answer
-    if order["state"] not in orders._UNREDEEMED:
-        raise _refuse(409, REASON_EXPIRED, "повтор невозможен: окно не открыто")
-    session, refusal = await chat_pair.redeem_code_explained(
-        db, raw_code, via_host=True
-    )
-    if session is None:
-        host_redeem_limiter.record(host)
-        reason = refusal.reason if refusal is not None else "refused"
-        raise _refuse(409, "redeem_refused", f"код не принят: {reason}")
-    fresh = await orders._own_order(db, host, order_id)
-    if fresh is None:
-        raise _refuse(500, "order_gone", "заказ исчез при выкупе")
-    return _answer(session, fresh, 1)
+    if not order["first_redeemed_at"]:
+        if order["state"] not in orders._UNREDEEMED:
+            raise _refuse(409, REASON_EXPIRED, "повтор невозможен: окно не открыто")
+        session, refusal = await chat_pair.redeem_code_explained(
+            db, raw_code, via_host=True
+        )
+        if session is not None:
+            fresh = await orders._own_order(db, host, order_id)
+            if fresh is None:
+                raise _refuse(500, "order_gone", "заказ исчез при выкупе")
+            return _answer(session, fresh, 1)
+        # Перекрывающийся повтор: первый выкуп успел между чтением и тратой —
+        # это повтор после потерянного ответа, а не окончательный отказ.
+        order = await orders._own_order(db, host, order_id)
+        if order is None or not order["first_redeemed_at"]:
+            reason = refusal.reason if refusal is not None else "refused"
+            raise _refuse(409, "redeem_refused", f"код не принят: {reason}")
+    return await _retry(db, host, order_id)
