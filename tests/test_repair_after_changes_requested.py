@@ -85,8 +85,8 @@ async def _hold(
         )
         await db.execute(
             "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
-            "kind, bound_task_id, bound_generation, executor_run_id) "
-            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?)",  # nosec B608 - literals
+            "kind, bound_task_id, bound_generation, executor_run_id, claimed_session) "
+            f"VALUES (?, ?, {expires}, 'implementer', ?, 1, ?, 's-run')",  # nosec B608 - literals
             (int(acting["id"]), f"h-{task_id}-{run_id}-{live}", task_id, run_id),
         )
     await db.commit()
@@ -678,103 +678,6 @@ async def _live_run_session(db, task_id: int, run_id: int, token: str) -> None:
     )
 
 
-async def test_p1_backfill_does_not_prove_a_manual_retake(db, monkeypatch):
-    """P1-1: после release ручной claim тем же агентом при живой сессии старого
-    прогона — не владение этого прогона: слот прогона записан ДО нового захвата."""
-    _launch_config(monkeypatch)
-    _, retaken = await _task_with_findings(db, slug="rc-p1-retake")
-    run_id = await _finished_run_id(db, retaken)
-    await db.execute(
-        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (run_id,)
-    )
-    await _live_run_session(db, retaken, run_id, "p1-1")
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, executor_run_id) "
-        "VALUES (?, 'cloud', '', datetime('now', '-30 minutes'), ?)",
-        (retaken, run_id),
-    )
-    await _slot_note(db, retaken)
-    await repo.add_task_update(db, retaken, "alice", "status", "Claimed by alice")
-    await _hold(db, retaken, None, session=False, status="running")
-    await db.execute(
-        "UPDATE tasks SET claimed_at = datetime('now', '-5 minutes') WHERE id = ?",
-        (retaken,),
-    )
-    _, own = await _task_with_findings(db, slug="rc-p1-own")
-    own_run = await _finished_run_id(db, own)
-    await db.execute(
-        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (own_run,)
-    )
-    await _live_run_session(db, own, own_run, "p1-1b")
-    await _hold(db, own, None, session=False, status="running")
-    await db.execute(
-        "UPDATE tasks SET claimed_at = datetime('now', '-30 minutes') WHERE id = ?",
-        (own,),
-    )
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, executor_run_id) "
-        "VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
-        (own, own_run),
-    )
-    await _slot_note(db, own)
-    # другой принципал, отозванная сессия, нет слота — тоже не доказательство
-    negatives = []
-    for tag in ("other", "noslot", "lateclaim", "nullclaim"):
-        _, t = await _task_with_findings(db, slug=f"rc-p1-{tag}")
-        r = await _finished_run_id(db, t)
-        await db.execute(
-            "UPDATE executor_runs SET outcome='running' WHERE id = ?", (r,)
-        )
-        await _live_run_session(db, t, r, f"p1-{tag}")
-        await _hold(db, t, None, session=False, status="running")
-        await db.execute(
-            "UPDATE tasks SET claimed_at = datetime('now', ?) WHERE id = ?",
-            ("-5 minutes" if tag == "lateclaim" else "-30 minutes", t),
-        )
-        if tag == "nullclaim":  # pair-start из open: claim не было, часам верить нельзя
-            await db.execute("UPDATE tasks SET claimed_at = NULL WHERE id = ?", (t,))
-        if tag != "noslot":
-            await db.execute(
-                "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
-                "executor_run_id) VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
-                (t, r),
-            )
-            await _slot_note(db, t)
-        if tag == "other":
-            await db.execute(
-                "UPDATE tasks SET implementer_principal_id = ? WHERE id = ?",
-                (await _human(db), t),
-            )
-        negatives.append(t)
-    # та же секунда: слот прогона и ручной claim неразличимы по часам, различает лента
-    _, same = await _task_with_findings(db, slug="rc-p1-samesec")
-    same_run = await _finished_run_id(db, same)
-    await db.execute(
-        "UPDATE executor_runs SET outcome='running' WHERE id = ?", (same_run,)
-    )
-    await _live_run_session(db, same, same_run, "p1-same")
-    await _hold(db, same, None, session=False, status="running")
-    await db.execute(
-        "UPDATE tasks SET claimed_at = '2026-10-17T10:00:00+00:00' WHERE id = ?",
-        (same,),
-    )
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
-        "executor_run_id) VALUES (?, 'cloud', '', '2026-10-17 10:00:00', ?)",
-        (same, same_run),
-    )
-    await _slot_note(db, same)
-    await repo.add_task_update(db, same, "alice", "status", "Claimed by alice")
-    negatives.append(same)
-    await db.commit()
-    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
-    await db.commit()
-    assert (await _row(db, retaken))["executor_run_id"] is None
-    assert (await _row(db, own))["executor_run_id"] == own_run
-    for t in negatives:
-        assert (await _row(db, t))["executor_run_id"] is None, t
-
-
 async def test_p1_first_pass_reaper_leaves_a_human_claim_after_a_manual_session(
     db, monkeypatch
 ):
@@ -835,50 +738,6 @@ async def test_p1_first_pass_reaper_leaves_a_human_claim(db, monkeypatch):
     assert await cp.release_expired_implementer_tasks(db) == []
     after = await _row(db, task_id)
     assert (after["status"], after["claimed_by"]) == ("running", "alice")
-
-
-async def test_p1_backfill_covers_review_and_the_1732_chain(db, monkeypatch):
-    """P1-3: задача в review при выкате получает доказательство; дальше вся цепочка
-    #1732 (прогон закрыт → сессия истекла → purge → changes_requested) снимается."""
-    _launch_config(monkeypatch)
-    _, task_id = await _task_with_findings(db, slug="rc-p1-review")
-    run_id = await _finished_run_id(db, task_id)
-    await _live_run_session(db, task_id, run_id, "p1-3")
-    await _hold(db, task_id, None, session=False)
-    await db.execute(
-        "UPDATE tasks SET claimed_at = datetime('now', '-30 minutes') WHERE id = ?",
-        (task_id,),
-    )
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, executor_run_id) "
-        "VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
-        (task_id, run_id),
-    )
-    await _slot_note(db, task_id)
-    # сессия к выкату уже истекла, но ещё не удалена purge
-    await db.execute(
-        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
-        "WHERE bound_task_id = ?",
-        (task_id,),
-    )
-    await db.commit()
-    assert (await _row(db, task_id))["status"] == "review"
-    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
-    await db.commit()
-    assert (await _row(db, task_id))["executor_run_id"] == run_id
-
-    await cp.purge_expired(db)
-    await repo.update_task(
-        db,
-        task_id,
-        status="running",
-        review_verdict="changes_requested",
-        review_verdict_generation=1,
-    )
-    await db.commit()
-    await cp.purge_expired(db)
-    freed = await _row(db, task_id)
-    assert (freed["claimed_by"], freed["executor_run_id"]) == (None, None)
 
 
 async def _phase_foreign_slot_is_not_the_runs(db, monkeypatch):
@@ -1069,26 +928,179 @@ async def test_p1_a_session_that_never_claimed_does_not_take_a_foreign_claim(
     assert await cp.release_expired_implementer_tasks(db) == []
 
 
-async def test_p1_backfill_is_ambiguous_with_two_run_sessions(db, monkeypatch):
-    """Две сессии прогонов на задаче: какая из них взяла захват, неизвестно — доказательства нет."""
+async def test_the_legacy_sessions_take_the_claim_standing_at_rollout(db, monkeypatch):
+    """Миграция: сессия implementer до записи claimed_session получает claim_session_id
+    стоящего захвата (прежнее поведение на момент выката); без захвата — NULL."""
     _launch_config(monkeypatch)
-    _, task_id = await _task_with_findings(db, slug="rc-two-sessions")
-    run_a = await _finished_run_id(db, task_id)
-    run_b = await _new_run(db, task_id, 2)
-    await _live_run_session(db, task_id, run_a, "two-a")
-    await _live_run_session(db, task_id, run_b, "two-b")
-    await _hold(db, task_id, None, session=False, status="running")
-    await db.execute(
-        "UPDATE tasks SET claimed_at = datetime('now', '-30 minutes') WHERE id = ?",
-        (task_id,),
-    )
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at, "
-        "executor_run_id) VALUES (?, 'cloud', '', datetime('now', '-29 minutes'), ?)",
-        (task_id, run_a),
-    )
-    await _slot_note(db, task_id)
+    acting = await cp.get_acting_agent(db)
+    ids = {}
+    for tag, status, claim in (
+        ("held", "running", "S-old"),
+        ("nameless", "running", None),
+        ("idle", "open", None),
+    ):
+        _, t = await _task_with_findings(db, slug=f"rc-legacy-{tag}")
+        await repo.update_task(db, t, status=status)
+        await db.execute(
+            "UPDATE tasks SET claim_session_id = ?, claimed_by = ? WHERE id = ?",
+            (claim, "cloud" if tag != "idle" else None, t),
+        )
+        await db.execute(
+            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, "
+            "kind, bound_task_id, bound_generation) VALUES "
+            "(?, ?, datetime('now', '-1 minute'), 'implementer', ?, 1)",
+            (int(acting["id"]), f"lg-{tag}", t),
+        )
+        ids[tag] = t
     await db.commit()
-    await db.execute(dict(db_module._MIGRATIONS)["backfill_tasks_executor_run_id"])
+    await db.execute(
+        dict(db_module._MIGRATIONS)["backfill_chat_pair_sessions_claimed_session"]
+    )
     await db.commit()
-    assert (await _row(db, task_id))["executor_run_id"] is None
+    got = {
+        r[0]: r[1]
+        for r in await db.execute_fetchall(
+            "SELECT token_hash, claimed_session FROM chat_pair_sessions "
+            "WHERE token_hash LIKE 'lg-%'"
+        )
+    }
+    assert got == {"lg-held": "S-old", "lg-nameless": "*", "lg-idle": None}
+
+
+async def test_a_token_of_a_finished_run_cannot_take_the_task(client, db, monkeypatch):
+    """Задержанный claim зомби-агента: прогон закончен, токен ещё жив — захват отказан,
+    иначе он стал бы ручным и его никто не смог бы снять."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"tok-zombie": TokenIdentity("bot", "agent")}
+    )
+    human = await _human(db)
+    _, task_id = await _task_with_findings(db, slug="rc-zombie")
+    await repo.update_task(db, task_id, status="open")
+    run = await _new_run(db, task_id, 2)
+    code, _ = await cp.issue_run_code(
+        db, task_id, 2, issued_by_principal_id=human, executor_run_id=run
+    )
+    redeemed = await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+    headers = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    await db.execute(
+        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
+        "WHERE id = ?",
+        (run,),
+    )
+    await db.commit()
+    for path, body in (
+        ("claim", {"agent": config.CHAT_PAIR_AGENT, "session_id": "z"}),
+        (
+            "pair-start",
+            {
+                "assigned_agent": config.CHAT_PAIR_AGENT,
+                "plan": "Plan: x",
+                "session_id": "z",
+            },
+        ),
+    ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/{path}", json=body, headers=headers
+        )
+        assert resp.status_code == 409, (path, resp.text)
+    assert (await _row(db, task_id))["status"] == "open"
+
+
+async def test_the_done_guard_reads_the_verdict_from_the_database(db, monkeypatch):
+    """Снимок задачи вызывающего устарел (вердикт «на доработку» записан параллельно):
+    guard читает вердикт и сдачу из базы, а не из подставленных APPROVAL_FIELDS."""
+    from hub.services import lifecycle, resubmission_guard
+
+    _launch_config(monkeypatch)
+    _, task_id = await _task_with_findings(db, slug="rc-stale-snapshot")
+    await repo.update_task(
+        db,
+        task_id,
+        status="running",
+        review_verdict="changes_requested",
+        review_verdict_generation=1,
+        submission_sha=SHA,
+    )
+    await db.commit()
+    stale = {**await _row(db, task_id), "review_verdict": None}
+    stale[lifecycle.PREPARED_CI_SHA] = SHA
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException):
+        await resubmission_guard.stop_empty_done(db, stale)
+
+
+async def test_the_1732_chain_end_to_end(
+    client,
+    db,
+    monkeypatch,
+    world,  # noqa: F811
+):
+    """my-home #1732: claim прогона → сдача → прогон снят → (сессия истекает, purge) →
+    «на доработку» → кнопка видна сразу → повторный прогон → пустая пересдача отклонена."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human = await _human(db)
+    _, task_id = await _task_with_findings(db, slug="rc-1732")
+    await repo.update_task(db, task_id, status="open", submission_generation=0)
+    run = await _new_run(db, task_id, 1)
+    code, _ = await cp.issue_run_code(
+        db, task_id, 1, issued_by_principal_id=human, executor_run_id=run
+    )
+    redeemed = await client.post("/api/auth/chat-pair/redeem", json={"code": code})
+    headers = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    for path, body in (
+        ("claim", {"agent": config.CHAT_PAIR_AGENT, "session_id": "s-1732"}),
+        (
+            "pair-start",
+            {
+                "assigned_agent": config.CHAT_PAIR_AGENT,
+                "session_id": "s-1732",
+                "plan": "Plan: go",
+                "git_mode": "remote",
+            },
+        ),
+    ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/{path}", json=body, headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+    assert (await _row(db, task_id))["executor_run_id"] == run
+
+    # сдача легла, провайдер снимает прогон
+    await repo.update_task(
+        db, task_id, status="review", submission_generation=1, submission_sha=SHA
+    )
+    await db.commit()
+    row = dict(await repo.get_executor_run(db, run))  # type: ignore[arg-type]
+    await ed._settle(
+        db,
+        {**row, "cancel_intent": ed.OUTCOME_TAKEN_DOWN},
+        {"status": "CANCELLED"},
+        1,
+        1.0,
+    )
+    await db.commit()
+    task = await _row(db, task_id)
+    assert (task["status"], task["claimed_by"], task["executor_run_id"]) == (
+        "review",
+        None,
+        None,
+    )
+    await cp.purge_expired(db)
+
+    verdict = await _verdict(client, task_id, world.human_auth)
+    assert verdict["status"] == "running"
+    task = await _row(db, task_id)
+    await db.execute(
+        "INSERT OR REPLACE INTO submissions (task_id, generation, sha) VALUES (?, 1, ?)",
+        (task_id, SHA),
+    )
+    await db.commit()
+    assert await el.repair_offered(db, task), "кнопка видна сразу, не через TTL"
+    assert (
+        await el.repair_executor(db, task_id, issuer_principal_id=human, issuer="o")
+    ).launched
+    assert len(calls) == 1

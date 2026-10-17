@@ -1530,6 +1530,19 @@ async def test_same_sha_after_changes_requested_is_refused(
         )
         == ""
     )
+    # без ревью (auto_review=0) хвост конвейера не коммитит: недокоммиченное не оправдание
+    await db.execute("UPDATE tasks SET auto_review = 0 WHERE id = ?", (task.id,))
+    await db.commit()
+    git.dirty_paths = _dirty
+    assert (
+        await _rg.stop_empty_done(
+            db, dict(await repo.get_task(db, task.id)), tail_pending=True
+        )
+        == "needs_decision"
+    )
+    await repo.update_task(db, task.id, status="fix_requested", job_id="job-h")
+    await db.execute("UPDATE tasks SET auto_review = 1 WHERE id = ?", (task.id,))
+    await db.commit()
     git.dirty_paths = real_dirty
     await repo.update_task(db, task.id, job_id=None, status="running")
     await db.commit()

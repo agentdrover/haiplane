@@ -835,6 +835,26 @@ async def bind_claim(
         )
 
 
+async def ended_run_session(db: aiosqlite.Connection, token: str, task_id: int) -> bool:
+    """Токен сессии прогона, который уже закончен (#1783).
+
+    Задержанный запрос зомби-агента не должен занять задачу как ручную: такой
+    захват никто не докажет и не снимет. Сессия ручная или прогон идёт — False.
+    """
+    if not token or not isinstance(task_id, int):
+        return False
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_sessions s JOIN executor_runs r "
+        "ON r.id = s.executor_run_id WHERE s.token_hash = ? "
+        "AND s.kind = 'implementer' AND s.bound_task_id = ? "
+        "AND s.revoked_at IS NULL AND s.expires_at > datetime('now') "
+        "AND r.outcome <> 'running'",
+        (hash_pair_code(token), int(task_id)),
+    )
+    return bool(rows)
+
+
 async def run_of_session(
     db: aiosqlite.Connection, token: str, task_id: int
 ) -> int | None:

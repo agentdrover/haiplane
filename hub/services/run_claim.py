@@ -62,7 +62,10 @@ async def finished_run_of(
 
 
 async def refuse_over_live_run(
-    db: aiosqlite.Connection, task_id: int, caller_run_id: int | None
+    db: aiosqlite.Connection,
+    task_id: int,
+    caller_run_id: int | None,
+    session_token: str = "",
 ) -> None:
     """claim/pair-start под write-локом: задачу нельзя взять поверх брони хаба (#1783).
 
@@ -79,6 +82,13 @@ async def refuse_over_live_run(
     # Write-лок ДО чтения: claim без session_id его не берёт, и бронь, закоммитенная
     # на втором соединении между проверкой и переходом, иначе прошла бы (#1783).
     await _lock_for_write(db)
+    from hub.services import chat_pair
+
+    if await chat_pair.ended_run_session(db, session_token, task_id):
+        raise HTTPException(
+            409,
+            f"Task #{task_id}: прогон этой сессии уже закончен — захватывать нечем (#1783)",
+        )
     rows = await fetchall(
         db,
         "SELECT * FROM executor_runs WHERE task_id = ? AND outcome = 'running' "

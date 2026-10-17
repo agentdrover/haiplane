@@ -2310,9 +2310,20 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ),
     (
         # #1783: claim_session_id, под которым сессия взяла задачу (реапер);
-        # NULL — не брала; '*' (умолчание) — сессия до этой записи, как прежде.
+        # NULL — не брала; '*' — любой (хозяин без session_id, до #852).
         "add_chat_pair_sessions_claimed_session",
-        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT DEFAULT '*'",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN claimed_session TEXT",
+    ),
+    (
+        # Сессии до этой записи: захват, стоящий сейчас, считается их (как и
+        # раньше); хозяин без session_id — '*' (любой). Ничего не стоит — NULL.
+        "backfill_chat_pair_sessions_claimed_session",
+        "UPDATE chat_pair_sessions SET claimed_session = (SELECT "
+        "COALESCE(t.claim_session_id, '*') FROM tasks t WHERE t.id = "
+        "chat_pair_sessions.bound_task_id AND t.status IN ('claimed', 'running') "
+        "AND (t.claimed_by IS NOT NULL OR t.claim_session_id IS NOT NULL)) "
+        "WHERE kind = 'implementer' AND bound_task_id IS NOT NULL "
+        "AND claimed_session IS NULL",
     ),
     (
         # #1783: прогон-держатель захвата; NULL — ручной.
@@ -2481,35 +2492,6 @@ _MIGRATIONS: list[tuple[str, str]] = [
     (
         "add_executor_slots_executor_run_id",
         "ALTER TABLE executor_slots ADD COLUMN executor_run_id INTEGER",
-    ),
-    (
-        # #1783: доказательство захватам при выкате: единственная сессия с заказом
-        # + её слот не раньше claim, после него «Claimed by» не было.
-        "backfill_tasks_executor_run_id",
-        "UPDATE tasks SET executor_run_id = (SELECT s.executor_run_id "
-        "FROM chat_pair_sessions s JOIN executor_runs r ON r.id = s.executor_run_id "
-        "JOIN executor_slots sl ON sl.task_id = tasks.id AND sl.released_at IS NULL "
-        "AND sl.channel = s.channel AND sl.slot = s.slot "
-        "WHERE s.bound_task_id = tasks.id AND s.kind = 'implementer' "
-        "AND r.task_id = tasks.id AND s.principal_id = tasks.implementer_principal_id "
-        "AND (SELECT COUNT(*) FROM chat_pair_sessions x WHERE x.bound_task_id = tasks.id "
-        "AND x.kind = 'implementer') = 1 "
-        "AND datetime(sl.captured_at) >= datetime(tasks.claimed_at) "
-        "AND EXISTS (SELECT 1 FROM task_updates c WHERE c.task_id = tasks.id "
-        "AND c.agent = 'hub' AND c.content LIKE 'канал: %') "
-        "AND NOT EXISTS (SELECT 1 FROM task_updates m WHERE m.task_id = tasks.id "
-        "AND m.content LIKE 'Claimed by %' AND m.id > (SELECT MAX(c2.id) "
-        "FROM task_updates c2 WHERE c2.task_id = tasks.id AND c2.agent = 'hub' "
-        "AND c2.content LIKE 'канал: %')) ORDER BY s.id DESC LIMIT 1) "
-        "WHERE status IN ('claimed', 'running', 'review', 'fix_requested', "
-        "'needs_decision') AND executor_run_id IS NULL "
-        "AND (claimed_by IS NOT NULL OR claim_session_id IS NOT NULL)",
-    ),
-    (
-        "backfill_executor_slots_executor_run_id",
-        "UPDATE executor_slots SET executor_run_id = ("
-        "SELECT t.executor_run_id FROM tasks t WHERE t.id = executor_slots.task_id) "
-        "WHERE released_at IS NULL AND executor_run_id IS NULL",
     ),
     (
         # #919: what a closed production defect left behind — a regression

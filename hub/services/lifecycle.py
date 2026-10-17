@@ -1961,7 +1961,7 @@ async def _pair_start_write(
     from hub.services import chat_pair, run_claim
 
     caller_run = await chat_pair.run_of_session(db, session_token, task_id)
-    await run_claim.refuse_over_live_run(db, task_id, caller_run)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
     if body.plan:
         await repo.add_task_update(
             db,
@@ -4879,7 +4879,7 @@ async def _claim_write(
     from hub.services import chat_pair, run_claim
 
     caller_run = await chat_pair.run_of_session(db, session_token, task_id)
-    await run_claim.refuse_over_live_run(db, task_id, caller_run)
+    await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):

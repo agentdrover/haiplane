@@ -22,6 +22,14 @@ from hub.actionable_errors import empty_resubmission_detail
 
 log = logging.getLogger(__name__)
 
+_LIVE_FIELDS = (
+    "status",
+    "review_verdict",
+    "review_verdict_generation",
+    "submission_generation",
+    "submission_sha",
+)
+
 
 def empty_resubmission_of(task: dict[str, Any], sha: str) -> bool:
     """Сдача ``sha`` повторяет коммит поколения с действующим changes_requested.
@@ -73,7 +81,14 @@ async def stop_empty_done(
     впереди и закоммитит то, что лежит в рабочем каталоге.
     """
     from hub.services import lifecycle, watch_notices
+    from hub.services.orchestration import review_budget_exhausted
 
+    # Вердикт и сдача — как их держит база сейчас: снимок вызывающего мог быть
+    # прочитан до параллельного вердикта «на доработку» (APPROVAL_FIELDS в
+    # transition_after_agent_done подставляются из него намеренно).
+    live = await repo.get_task(db, int(task["id"]))
+    if live is not None:
+        task = {**task, **{k: dict(live)[k] for k in _LIVE_FIELDS}}
     if (
         task.get("status") in ("review", "completed", "open")
         or (task.get("review_verdict") or "") != "changes_requested"
@@ -93,11 +108,14 @@ async def stop_empty_done(
     if (
         tail_pending
         and task.get("job_id")
+        and task.get("auto_review")
+        and task.get("branch")
+        and not review_budget_exhausted(task.get("review_cycle", 0))
         and await _uncommitted_work(db, task_id, task.get("branch") or "")
     ):
         # Правки исполнителя ещё не в удалённой ветке: их коммитит и пушит хвост
         # конвейера ПОСЛЕ этого места, и это не пустая пересдача. Только там, где
-        # хвост есть: pending_report его не выполняет, и git под write-локом
+        # хвост есть (auto_review, ветка, бюджет кругов не исчерпан): pending_report его не выполняет, и git под write-локом
         # done-потока не зовётся (#1783, круг 2).
         return ""
     generation = int(task.get("submission_generation") or 0)
