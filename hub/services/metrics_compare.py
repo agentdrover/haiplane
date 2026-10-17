@@ -87,6 +87,15 @@ def _cycle_feature(sections: dict[str, Any]) -> Extracted:
     return None, 0
 
 
+def _cycle_since_start_feature(sections: dict[str, Any]) -> Extracted:
+    """#1790: feature leaves, from the start to the completion (own sample)."""
+    for row in sections.get("cycle_times") or []:
+        if row.get("work_type") == "feature":
+            part = row.get("since_start") or {}
+            return part.get("median_hours"), int(part.get("tasks") or 0)
+    return None, 0
+
+
 @dataclass(frozen=True)
 class Indicator:
     """Ключевой показатель спеки §4: где он лежит в ответе и что значит «хорошо»."""
@@ -156,6 +165,15 @@ INDICATORS: tuple[Indicator, ...] = (
         "cycle_times[work_type=feature].median_hours",
         False,
         _cycle_feature,
+    ),
+    Indicator(
+        "cycle_since_start_feature_median_hours",
+        "От начала до завершения, feature, медиана",
+        "hours",
+        "lower",
+        "cycle_times[work_type=feature].since_start.median_hours",
+        False,
+        _cycle_since_start_feature,
     ),
 )
 

@@ -3080,6 +3080,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_executor_orders_task "
         "ON executor_orders(task_id)",
     ),
+    (
+        # #1790: started_at пишут примитивы статуса, но только для работы,
+        # начатой после выката. У задач, которые до него хоть раз побывали в
+        # работе, момента начала нет и восстановить его нечем (#810): флаг
+        # запрещает примитивам ставить сегодняшнюю дату на старую работу.
+        "add_tasks_start_history_unknown",
+        "ALTER TABLE tasks ADD COLUMN start_history_unknown INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        # #1790: однократное заполнение — миграция применяется один раз
+        # (запись в _migrations) и при старте нового процесса до поллера, пока
+        # в базе лежат только строки старого кода. Draft исключён: до выката
+        # в работе он не был, его первый running уже будет записан. Остальные
+        # статусы, архив и завершённые включены: unarchive_task, return_to_work
+        # и chat_pair.return_task_to_open возвращают старые задачи в работу.
+        # Условие само идемпотентно: строка с проставленным started_at или уже
+        # помеченная под него не попадает.
+        "backfill_tasks_start_history_unknown",
+        "UPDATE tasks SET start_history_unknown = 1 "
+        "WHERE started_at IS NULL AND status != 'draft' "
+        "AND start_history_unknown = 0",
+    ),
 ]
 
 
