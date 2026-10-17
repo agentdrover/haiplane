@@ -1482,13 +1482,6 @@ async def test_same_sha_after_changes_requested_is_refused(
     await repo.update_task(db, task.id, job_id=None, status="running")
     await db.commit()
 
-    # новый коммит принимается.
-    git.tip = "tip-2"
-    accepted = await lifecycle.submit_for_review(
-        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
-    )
-    assert (accepted.submission_generation, accepted.submission_sha) == (2, "tip-2")
-
     # Подготовленная вне транзакции «вершина не прочитана» (пусто) — не повод
     # идти в сеть под write-локом.
     from hub.services import resubmission_guard
@@ -1502,6 +1495,13 @@ async def test_same_sha_after_changes_requested_is_refused(
     row[lifecycle.PREPARED_CI_SHA] = ""
     assert await resubmission_guard.stop_empty_done(db, row) == ""
     monkeypatch.setattr(lifecycle, "resolve_branch_tip", real_tip)
+
+    # новый коммит принимается.
+    git.tip = "tip-2"
+    accepted = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert (accepted.submission_generation, accepted.submission_sha) == (2, "tip-2")
 
     # review-путь того же sha — прежний no-op, а не отказ (#1054, #1265).
     again = await lifecycle.submit_for_review(

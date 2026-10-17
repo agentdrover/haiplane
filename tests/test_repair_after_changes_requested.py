@@ -165,6 +165,12 @@ async def test_closing_a_run_releases_only_its_own_claim(
     )
     assert slot[0][0]
 
+    # Одобренная задача, вернувшаяся в running после снятия захвата (ждёт доставки),
+    # мёртвой сессией прогона в open не уходит: реапер её держателем не считает.
+    await _approved_in_running_is_not_yanked(db, old_task=task_id)
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
     # Новый держатель; закрытие старого прогона (повторное, позднее) его не трогает.
     new = await _new_run(db, task_id, 2)
     await _hold(db, task_id, new, live=True, status="running")
@@ -187,10 +193,6 @@ async def test_closing_a_run_releases_only_its_own_claim(
     assert await run_claim.release_after_run_closed(db, new, why="late") is False
     held = await _row(db, task_id)
     assert held["executor_run_id"] == newest and held["claimed_by"]
-
-    # Одобренная задача, вернувшаяся в running после снятия захвата (ждёт доставки),
-    # мёртвой сессией прогона в open не уходит: реапер её держателем не считает.
-    await _approved_in_running_is_not_yanked(db, old_task=task_id)
 
     await _phase_slot_submission_releases_the_claim(world)
 
@@ -580,6 +582,18 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
         "(?, 'bf-1', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
         (int(acting["id"]), run_held, run_id),
     )
+    _, other_holder = await _task_with_findings(db, slug="rc-bf-other")
+    await _hold(db, other_holder, None, session=False, status="running")
+    await db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation, executor_run_id) VALUES "
+        "(?, 'bf-2', datetime('now', '-1 minute'), 'implementer', ?, 1, ?)",
+        (int(acting["id"]), other_holder, await _finished_run_id(db, other_holder)),
+    )
+    await db.execute(
+        "UPDATE tasks SET implementer_principal_id = ? WHERE id = ?",
+        (await _human(db), other_holder),
+    )
     _, manual = await _task_with_findings(db, slug="rc-bf-manual")
     await _hold(db, manual, None, session=True, status="running")
     await db.commit()
@@ -588,3 +602,4 @@ async def test_the_backfill_proves_only_run_held_claims_present_at_rollout(
     await db.commit()
     assert (await _row(db, run_held))["executor_run_id"] == run_id
     assert (await _row(db, manual))["executor_run_id"] is None
+    assert (await _row(db, other_holder))["executor_run_id"] is None
