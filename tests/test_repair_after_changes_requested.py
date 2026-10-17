@@ -299,6 +299,11 @@ async def test_a_claim_by_a_run_session_records_the_run(client, db, monkeypatch)
     )
     assert started.status_code == 200, started.text
     assert (await _row(db, second))["executor_run_id"] == run2
+    bound2 = await db.execute_fetchall(
+        "SELECT claimed_session FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run2,),
+    )
+    assert bound2[0][0] == "s-1783-ps"
 
 
 # ---------------------------------------------------------------------------
