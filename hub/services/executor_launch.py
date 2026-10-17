@@ -938,6 +938,18 @@ async def _repair_early_refusal(
     live = await _live_run(db, task_id)
     if live:
         return _refused(live, task_id)
+    if (
+        task["status"] in ("review", "fix_requested")
+        and (task.get("claimed_by") or "").strip()
+    ):
+        # Возврат в работу чужого ручного захвата кнопкой не делается: держатель с
+        # доказательством закончившегося прогона отпустит себя сам (#1783).
+        from hub.services import run_claim
+
+        if await run_claim.finished_run_of(db, task) is None:
+            return _refused(
+                f"{REASON_NOT_RETURNABLE}: задачу держит {task['claimed_by']}", task_id
+            )
     if task["status"] == "running":
         # Быстрый отказ с причиной; решающая проверка — под write-локом в _admit.
         busy = await _holderless_running_refusal(db, task)

@@ -581,6 +581,14 @@ async def _spend_code(
     if not cursor.rowcount:
         await db.rollback()
         return None
+    if row.get("channel") == "slot":
+        from hub.services import run_claim
+
+        # Под write-локом этого выкупа: код слота не отдаётся, если задача уже занята
+        # (#1783) — иначе второй исполнитель встал бы на ту же ветку.
+        if await run_claim.redeem_conflict(db, row):
+            await db.rollback()
+            return None
 
     token = generate_session_token()
     ttl = config.CHAT_PAIR_TTL_SECONDS

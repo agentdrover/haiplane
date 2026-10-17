@@ -65,6 +65,63 @@ async def finished_run_of(
     return row
 
 
+async def _slot_is_about_to_claim(
+    db: aiosqlite.Connection, run_id: int, session_token: str
+) -> bool:
+    """Прогон слота ещё возьмёт задачу: заказ не выкуплен либо сессия выкупила, но не брала.
+
+    Это второй исполнитель на той же ветке, если сейчас взять задачу другой
+    сессией (#1783, k8). Собственная сессия прогона не мешает себе.
+    """
+    from hub.services import chat_pair
+
+    if await fetchall(
+        db,
+        "SELECT 1 FROM executor_orders WHERE executor_run_id = ? "
+        "AND state IN ('pending', 'delivered')",
+        (int(run_id),),
+    ):
+        return True
+    own = chat_pair.hash_pair_code(session_token) if session_token else ""
+    return bool(
+        await fetchall(
+            db,
+            "SELECT 1 FROM chat_pair_sessions WHERE executor_run_id = ? "
+            "AND kind = 'implementer' AND claimed_session IS NULL "
+            "AND revoked_at IS NULL AND expires_at > datetime('now') "
+            "AND token_hash <> ?",
+            (int(run_id), own),
+        )
+    )
+
+
+async def redeem_conflict(db: aiosqlite.Connection, row: dict[str, Any]) -> str:
+    """Код слота нельзя выкупить: у задачи уже есть другой держатель или сессия.
+
+    Под write-локом выкупа. Пусто — можно. Держатель с доказательством ДРУГОГО
+    прогона, ручной захват и живая сессия, не принадлежащая этому прогону, — это
+    второй исполнитель поверх занятой задачи (#1783, k8).
+    """
+    run_id, task_id = row.get("executor_run_id"), row.get("bound_task_id")
+    if run_id is None or task_id is None:
+        return ""  # ручной код: прежнее поведение
+    task = await repo.get_task(db, int(task_id))
+    if task is not None and (
+        (task["claimed_by"] or "").strip() or (task["claim_session_id"] or "").strip()
+    ):
+        if task["executor_run_id"] != int(run_id):
+            return f"задачу уже держит {task['claimed_by'] or 'другая сессия'}"
+    others = await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_sessions WHERE kind = 'implementer' "
+        "AND bound_task_id = ? AND revoked_at IS NULL "
+        "AND expires_at > datetime('now') "
+        "AND COALESCE(executor_run_id, -1) <> ?",
+        (int(task_id), int(run_id)),
+    )
+    return "у задачи есть живая сессия другого исполнителя" if others else ""
+
+
 async def refuse_over_live_run(
     db: aiosqlite.Connection,
     task_id: int,
@@ -103,14 +160,12 @@ async def refuse_over_live_run(
         row = dict(raw)
         if caller_run_id is not None and int(row["id"]) == int(caller_run_id):
             continue
-        if row.get("channel", "cloud") == "slot" and not await fetchall(
-            db,
-            "SELECT 1 FROM executor_orders WHERE executor_run_id = ? "
-            "AND state IN ('pending', 'delivered')",
-            (int(row["id"]),),
+        if row.get("channel", "cloud") == "slot" and not await _slot_is_about_to_claim(
+            db, int(row["id"]), session_token
         ):
-            # Заказ хосту выкуплен: прогон держит его сессия, и закрывает его
-            # sweep заказов. Невыкупленный заказ — такая же бронь, как облачная.
+            # Заказ выкуплен и сессия хоста уже брала задачу (или её нет): прогон
+            # держит она, закрывает sweep заказов — ручная передача задачи (человек
+            # отпустил, взял другой агент) остаётся возможной.
             continue
         if not row["agent_id"] and _reservation_abandoned(row):
             continue

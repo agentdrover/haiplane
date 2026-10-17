@@ -27,7 +27,10 @@ from hub.services import executor_launch as el
 from hub.services import run_claim
 from tests.test_executor_orders import (  # noqa: F401 - фикстуры и помощники слота
     _claim_and_start,
+    _code_of,
     _launch,
+    _orders,
+    _redeem,
     _launch_redeem,
     _rows,
     _submit,
@@ -372,6 +375,7 @@ async def test_repair_is_offered_and_atomic_after_changes_requested(
     await _phase_busy_task_blocks_the_repair(db, monkeypatch, human)
     await _phase_booking_blocks_a_manual_claim(db, monkeypatch)
     await _phase_slot_booking_blocks_a_manual_claim(world)
+    await _phase_slot_second_executor_is_refused_both_ways(world)
     await _phase_repair_reads_the_report_at_the_same_tip(db, monkeypatch)
 
 
@@ -1406,3 +1410,109 @@ async def test_c3_two_claims_in_one_second_have_different_marks(db, monkeypatch)
     assert first and second and first != second
     assert await cp.release_expired_implementer_tasks(db) == []
     assert (await _row(db, task_id))["status"] == "claimed"
+
+
+async def _phase_slot_second_executor_is_refused_both_ways(slot_world):
+    """k8: заказ слоту на ту же задачу и второй исполнитель (#1783).
+
+    (а) пока заказ не выкуплен И после выкупа, пока сессия хоста не взяла задачу,
+    ручные claim и pair-start отказаны, а своя сессия задачу берёт;
+    (б) выкуп кода отказан, если у задачи уже есть другой держатель или живая
+    сессия другого исполнителя: сессия не создаётся, заказ остаётся выкупаемым."""
+    w = slot_world
+
+    async def _free_host() -> None:
+        """Хост занят чужим заказом из соседней фазы: закрыть его, как закрыл бы sweep."""
+        await w.db.execute(
+            "UPDATE executor_orders SET state = 'closed', close_reason = 'test' "
+            "WHERE state <> 'closed'"
+        )
+        await w.db.execute(
+            "UPDATE executor_runs SET outcome = 'failed', finished_at = datetime('now') "
+            "WHERE outcome = 'running'"
+        )
+        await w.db.commit()
+
+    await _free_host()
+    # (а) заказ не выкуплен, затем выкуплен, но сессия ещё не брала
+    task_id = await _task(w, "k8: порядок 1")
+    assert (await _launch(w, task_id)).status_code == 200
+    order = (await _orders(w)).json()["orders"][0]
+
+    async def _manual(path: str, tid: int):
+        body = {"agent": "bot", "session_id": "s-other"}
+        if path == "pair-start":
+            body |= {"assigned_agent": "bot", "plan": "Plan: x", "git_mode": "remote"}
+        return await w.client.post(
+            f"/api/tasks/{tid}/{path}", json=body, headers=w.agent_auth
+        )
+
+    for path in ("claim", "pair-start"):
+        assert (await _manual(path, task_id)).status_code == 409, path
+    redeemed = await _redeem(w, _code_of(w, order))
+    assert redeemed.status_code == 200, redeemed.text
+    session = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    for path in ("claim", "pair-start"):
+        assert (await _manual(path, task_id)).status_code == 409, f"after redeem {path}"
+    await _claim_and_start(w, task_id, session)  # своя сессия берёт
+    assert (await _row(w.db, task_id))["status"] == "running"
+
+    # (б) выкуп отказан, когда задачу уже держит другой
+    await _free_host()
+    held = await _task(w, "k8: порядок 2")
+    assert (await _launch(w, held)).status_code == 200
+    await repo.update_task(
+        w.db, held, status="claimed", claimed_by="alice", claim_session_id="s-alice"
+    )
+    await w.db.commit()
+    pending = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == held]
+    blocked = await _redeem(w, _code_of(w, pending[0]))
+    assert blocked.status_code >= 400, blocked.text
+    assert not await w.db.execute_fetchall(
+        "SELECT 1 FROM chat_pair_sessions WHERE bound_task_id = ?", (held,)
+    )
+    state = await w.db.execute_fetchall(
+        "SELECT state FROM executor_orders WHERE task_id = ?", (held,)
+    )
+    assert state[0][0] in ("pending", "delivered")
+    # живая сессия чужого исполнителя — то же
+    await _free_host()
+    third = await _task(w, "k8: порядок 3")
+    assert (await _launch(w, third)).status_code == 200
+    acting = await cp.get_acting_agent(w.db)
+    await w.db.execute(
+        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at, kind, "
+        "bound_task_id, bound_generation) VALUES "
+        "(?, 'k8-foreign', datetime('now', '+1 hour'), 'implementer', ?, 1)",
+        (int(acting["id"]), third),
+    )
+    await w.db.commit()
+    order3 = [o for o in (await _orders(w)).json()["orders"] if o["task_id"] == third]
+    assert (await _redeem(w, _code_of(w, order3[0]))).status_code >= 400
+
+
+async def test_k8_two_connections_redeem_and_claim_leave_one_executor(
+    world,  # noqa: F811
+    db_dsn,
+):
+    """Две стороны гонки: выкуп кода слота и ручной claim. Что бы ни пришло первым,
+    на задаче ровно один исполнитель: claim при невыкупленном или ещё не бравшем
+    заказе отказан."""
+    w = world
+    task_id = await _task(w, "k8: гонка")
+    assert (await _launch(w, task_id)).status_code == 200
+    order = (await _orders(w)).json()["orders"][0]
+    code = _code_of(w, order)
+
+    async def _claim():
+        return await w.client.post(
+            f"/api/tasks/{task_id}/claim",
+            json={"agent": "bot", "session_id": "s-race"},
+            headers=w.agent_auth,
+        )
+
+    claim, redeem = await asyncio.gather(_claim(), _redeem(w, code))
+    assert claim.status_code == 409, claim.text
+    assert redeem.status_code == 200, redeem.text
+    assert (await _row(w.db, task_id))["status"] == "open"
+    assert (await _row(w.db, task_id))["claimed_by"] is None
