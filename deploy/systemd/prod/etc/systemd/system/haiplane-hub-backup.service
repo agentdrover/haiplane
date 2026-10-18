@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily backup of the Haiplane hub database
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/haiplane-hub-backup

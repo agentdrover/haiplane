@@ -915,7 +915,7 @@ class TokenIdentity:
 
     @property
     def is_slot_runner(self) -> bool:
-        """The key of an executor host (#1712): five routes of its own host (SLOT_RUNNER_ALLOWLIST)."""
+        """The key of an executor host (#1712): six routes of its own host (SLOT_RUNNER_ALLOWLIST)."""
         return self.role == "slot_runner"
 
     @property
