@@ -1080,14 +1080,6 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         )""",
     ),
     (
-<<<<<<< HEAD
-        # #1811: «о чём задача простым языком», до 300 символов (предел задан
-        # моделью). NULL - автор не писал. Время применения этой миграции
-        # (_migrations.applied_at) - граница «новых» задач: has_plain_summary
-        # блокирует только созданные после неё (hub.plain_summary).
-        "add_tasks_plain_summary",
-        "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
-=======
         # #1829: какой текст навыка уже выдан зарегистрированной локальной
         # сессии. Запись — по (сессия, навык, версия, sha256 текста): смена
         # версии или текста даёт новую строку, и текст уходит снова. Старых
@@ -1142,6 +1134,13 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "backfill_executor_orders_final_entry_at",
         "UPDATE executor_orders SET final_entry_at = COALESCE(closed_at, "
         "reported_at, created_at) WHERE final_entry_at IS NULL AND state = 'closed'",
->>>>>>> origin/develop
+    ),
+    (
+        # #1811: «о чём задача простым языком», до 300 символов (предел задан
+        # моделью). NULL - автор не писал. Время применения этой миграции
+        # (_migrations.applied_at) - граница «новых» задач: has_plain_summary
+        # блокирует только созданные после неё (hub.plain_summary).
+        "add_tasks_plain_summary",
+        "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
     ),
 ]
