@@ -4345,6 +4345,23 @@ class DeferredRepeatView(BaseModel):
     title: str = ""
 
 
+class AuthorAnswerView(BaseModel):
+    """What the AUTHOR said about a confirmed finding (finding_outcomes).
+
+    NOT a disposition (#876): it is the author's account, never the gate's
+    judgement, and no metric reads it. ``review_id`` and ``generation`` name the
+    report the answer was given to; ``historical`` is True when that is not the
+    report on screen (the same uid, raised again by a later report).
+    """
+
+    finding_uid: str
+    outcome: str
+    linked_task_id: int | None = None
+    review_id: int = 0
+    generation: int = 0
+    historical: bool = False
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -4405,6 +4422,12 @@ class MachineReviewView(BaseModel):
     # not delivered yet (#1448). Computed on read by the same predicate the
     # autopilot and the steward use; never stored on the report.
     deferred_repeats: list[DeferredRepeatView] = Field(default_factory=list)
+    # The author's answers to confirmed findings nobody judged, read from
+    # finding_outcomes when the report is read; never a disposition.
+    author_answers: list[AuthorAnswerView] = Field(default_factory=list)
+    # Per undisposed finding: what the author said, or that nobody did. Empty
+    # when no author answered any of them.
+    undisposed_author_lines: list[str] = Field(default_factory=list)
     # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
     # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
     # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где

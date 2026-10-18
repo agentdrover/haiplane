@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 from hub import config
 from hub import repository as repo_module
+from hub.services.author_answers import undisposed_findings
 from hub.integrations.registry import plugins
 from hub.models import ReviewInFlight
 
@@ -1066,38 +1067,13 @@ def undisposed_confirmed(machine_review) -> tuple[int, int]:
     nothing about the code being approved now, and counting it would put a
     warning on a verdict it does not describe (#1012).
 
-    ``finding_index`` indexes ``findings_confirmed`` — the same contract
-    record_finding_dispositions enforces when it refuses an index outside the
-    report. Zero dispositions means nobody judged them, never that they were
-    all fine (#549).
+    The author's answers (#1830) do NOT change this count: no reviewer marked
+    the finding, and that is what the count says.
     """
     if machine_review is None or not getattr(machine_review, "is_current", False):
         return 0, 0
-    confirmed = len(machine_review.findings_confirmed)
-    judged = {d.finding_index for d in machine_review.dispositions}
-    # #1244: a finding a later foreign observation refuted by name is not
-    # "unanswered" — the answer is the live check it links to.
-    observed = {c.finding_uid for c in machine_review.observation_closures}
-    return confirmed, sum(
-        1
-        for i, finding in enumerate(machine_review.findings_confirmed)
-        if i not in judged and finding.finding_uid not in observed
-    )
-
-
-def undisposed_note(confirmed: int, undisposed: int) -> str:
-    """The sentence a verdict carries when it overrode findings nobody answered.
-
-    Written for the RECORD, not the screen: the screen is read once and the
-    record is what someone reads a week later asking why this shipped.
-    """
-    if not undisposed:
-        return ""
-    return (
-        f"ОДОБРЕНО ПРИ НЕРАЗМЕЧЕННЫХ НАХОДКАХ: текущий отчёт ревью несёт "
-        f"{confirmed} подтверждённых, из них {undisposed} без диспозиции — "
-        "никто не сказал, чем они оказались. Вердикт записан; находки "
-        "остаются неотвеченными."
+    return len(machine_review.findings_confirmed), len(
+        undisposed_findings(machine_review)
     )
 
 
@@ -1426,6 +1402,9 @@ async def report_view(
         await attach_dispositions(db, machine_review)
         await attach_observation_closures(db, machine_review, task_row)
         await attach_deferred_repeats(db, machine_review)
+        from hub.services.author_answers import attach_author_answers
+
+        await attach_author_answers(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
     return ReviewReport(
