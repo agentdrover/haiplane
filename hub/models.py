@@ -437,13 +437,14 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # не делегирует. Читатель: project_policy.steward_watch_of.
     "steward_watch",
 )
-# Поводы наблюдения стюарда (#1679): ровно пять значений steward_watch.
+# Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
     "needs_decision",
     "machine_review",
     "release",
     "base_branch_red",
     "stale",
+    "reviewer_unavailable",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.

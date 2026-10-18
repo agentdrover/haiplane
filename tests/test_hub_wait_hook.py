@@ -1101,3 +1101,15 @@ def test_a_message_wake_prints_only_sanitized_sender_fields(
         "no injected line"
     )
     assert "X" * 100 not in out and "Y" * 100 not in out, "length is capped"
+
+
+def test_the_hook_knows_every_steward_watch_reason(tmp_path):
+    """Копия поводов в хуке не отстаёт от hub.models (#1826).
+
+    Хук hub не импортирует: отстающая копия считает настоящее уведомление
+    нового повода подделкой.
+    """
+    from hub.models import STEWARD_WATCH_REASONS
+
+    assert "import hub" not in _HOOK.read_text(encoding="utf-8")
+    assert set(_load(tmp_path)._HUB_REASONS) == set(STEWARD_WATCH_REASONS)
