@@ -64,6 +64,18 @@ from tests.test_pair_merge_gate import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _git_config_env_is_not_half_inherited(monkeypatch) -> None:
+    """Окружение машины не должно ломать настоящий git в тестах гейта (#1851).
+
+    Облачная сессия задаёт ``GIT_CONFIG_COUNT`` и ``GIT_CONFIG_KEY_n``;
+    валидация гейта вырезает из env всё с «KEY» в имени и оставляет COUNT,
+    и git отвечает 128 «missing config key GIT_CONFIG_KEY_0». Тесту нужен
+    git без конфигурации машины.
+    """
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+
+
 async def _running_task(client: AsyncClient, title: str = "Undelivered?") -> int:
     task_id = (await client.post("/api/tasks", json={"title": title})).json()["id"]
     await client.post(
