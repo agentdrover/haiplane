@@ -322,8 +322,8 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
     slugs = await _get_principal_role_slugs(db, principal_id)
     for priority in (
         # #1712: a host key is itself and FIRST. Any role added next to it would
-        # otherwise win the order below and lift the key out of its three-route
-        # allowlist (admin + slot_runner read as admin). The allowlist also needs
+        # otherwise win the order below and lift the key out of its allowlist
+        # (SLOT_RUNNER_ALLOWLIST in hub/auth.py) (admin + slot_runner read as admin). The allowlist also needs
         # the principal to BE a registered host, so the role on any other
         # principal confines it to nothing at all.
         "slot_runner",

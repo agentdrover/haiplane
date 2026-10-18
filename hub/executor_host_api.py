@@ -7,8 +7,9 @@
   человек, а cookie-сессия — только с верным CSRF, какой бы ни был глобальный
   режим (``_human_door``). Агент и ключ хоста сюда не проходят.
 * ``/api/executor-hosts/{name}/orders…`` — то, что хост делает своим ключом
-  роли slot_runner: забрать заказы, выкупить код, подтвердить, сообщить итог.
-  Allowlist в ``hub/auth.py`` пускает ключ ровно на эти четыре маршрута своего хоста; здесь
+  роли slot_runner: забрать заказы, выкупить код, прочитать итог заказа, подтвердить,
+  сообщить итог. Allowlist в ``hub/auth.py`` пускает ключ ровно на пять маршрутов
+  своего хоста (SLOT_RUNNER_ALLOWLIST); здесь
   то же проверяется по базе, потому что middleware знает только путь.
 * параметры запуска исполнителя (``ExecutorLaunchRequest``) — на слот хоста.
 """
@@ -23,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
-from hub.auth import current_identity, require_human_or_admin
+from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
 from hub.services import executor_orders, host_redeem
 
 router = APIRouter()
@@ -34,6 +35,10 @@ ORDERS_WAIT_MAX = 60
 #: запас на перезапуск, когда старое соединение ещё не закрылось.
 ORDERS_POLL_MAX = 3
 _polling: dict[str, int] = {}
+#: Чтений итога заказа одним хостом в окне (#1831); сверх — 429.
+ORDER_READ_MAX = 60
+ORDER_READ_WINDOW = 60
+_read_limiter = LoginRateLimiter(ORDER_READ_MAX, ORDER_READ_WINDOW)
 
 
 class ExecutorHostCreate(BaseModel):
@@ -226,6 +231,30 @@ async def api_executor_host_orders(
         if not _polling[name]:
             del _polling[name]
     return {"host": name, "orders": orders}
+
+
+@router.get("/api/executor-hosts/{name}/orders/{order_id}")
+async def api_executor_order_read(name: str, order_id: int, request: Request) -> dict:
+    """Итог заказа своего хоста: состояние, причина закрытия, задача (#1831).
+
+    После сдачи сессии прогона отозваны (#1783), и сдачу хост проверяет этим
+    чтением. Без кода, токенов и постановки. Чужой и несуществующий заказ — один 404.
+    """
+    await _host_caller(request, name)
+    _read_limiter._max_attempts = ORDER_READ_MAX
+    if _read_limiter.is_blocked(name):
+        raise HTTPException(
+            429,
+            detail={
+                "reason": "too_many_reads",
+                "message": f"не больше {ORDER_READ_MAX} чтений итога в {ORDER_READ_WINDOW} с",
+            },
+        )
+    _read_limiter.record(name)
+    outcome = await executor_orders.read_order_outcome(_db(request), name, order_id)
+    if outcome is None:
+        raise HTTPException(404, detail={"reason": "order_not_found"})
+    return outcome
 
 
 @router.post("/api/executor-hosts/{name}/orders/{order_id}/redeem")
