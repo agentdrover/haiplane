@@ -97,11 +97,14 @@ async def web_launch_plaque(task_id: int, request: Request) -> Any:
     """Фрагмент плашки запуска (#1817): HTMX обновляет только его, не страницу."""
     from hub.web import TEMPLATES, _db
 
-    return TEMPLATES.TemplateResponse(
+    plaque = await launch_feedback.plaque(_db(request), task_id)
+    response = TEMPLATES.TemplateResponse(
         request,
         "partials/launch_plaque.html",
-        {
-            "plaque": await launch_feedback.plaque(_db(request), task_id),
-            "task_id": task_id,
-        },
+        {"plaque": plaque, "task_id": task_id},
     )
+    if request.headers.get("hx-request") and not (plaque and plaque["active"]):
+        # Запуск кончился: кнопка запуска вне фрагмента, и страница
+        # перезагружается один раз (закрытая плашка сама уже не опрашивает).
+        response.headers["HX-Refresh"] = "true"
+    return response

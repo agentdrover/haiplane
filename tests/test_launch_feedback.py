@@ -273,3 +273,100 @@ async def test_plaque_fragment_refresh_and_no_secrets(world):
     ):
         assert needle not in final.text and needle not in second.text
     assert "ВМ не стартовала" in final.text
+
+
+async def test_report_reason_refuses_hub_tokens(world, monkeypatch):
+    """Codex P1: токен хаба произвольного вида (длинный hex) в reason не принимается."""
+    token = "ab" * 32  # pragma: allowlist secret
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {token: config.TokenIdentity("b", "agent")}
+    )
+    task_id = await _task(world, "токен в reason")
+    lived = await _launch_redeem(world, task_id)
+    oid = lived["order"]["id"]
+    refused = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{oid}/report",
+        json={"outcome": "failed", "reason": f"вот {token} конец"},
+        headers=world.k8_auth,
+    )
+    assert refused.status_code == 422
+    assert (await _order_row(world, oid))["report_outcome"] == ""
+
+
+async def test_reaper_return_writes_one_feed_entry(world):
+    """Codex P2: возврат задачи reaper'ом и закрытие заказа дают одну запись, не две."""
+    from hub.services import chat_pair as cp
+
+    task_id = await _task(world, "возврат reaper")
+    lived = await _launch_redeem(world, task_id)
+    await _eo._claim_and_start(world, task_id, lived["session"])
+    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+    await world.db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
+        "WHERE bound_task_id = ?",
+        (task_id,),
+    )
+    await world.db.commit()
+    assert await cp.release_expired_implementer_tasks(world.db) == [task_id]
+    await world.db.commit()
+    row = await _order_row(world, lived["order"]["id"])
+    assert row["state"] == "closed" and row["final_entry_at"]
+    entries = await _rows(
+        world.db,
+        "SELECT agent, content FROM task_updates WHERE content LIKE '%закрыт%' "
+        "OR content LIKE '%возвращена%'",
+    )
+    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) - before == 1, (
+        entries
+    )
+
+
+async def test_plaque_fragment_refreshes_page_when_launch_ends(world):
+    """Codex P3: когда запуск кончился, HTMX-опрос просит перезагрузить страницу (кнопка вне фрагмента)."""
+    task_id = await _task(world, "конец запуска")
+    headers, _csrf = await _cookie(world)
+    lived = await _launch_redeem(world, task_id)
+    url = f"/partials/launch-plaque/{task_id}"
+    live = await world.client.get(url, headers={**headers, "HX-Request": "true"})
+    assert "hx-refresh" not in {k.lower() for k in live.headers}
+    failed = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{lived['order']['id']}/report",
+        json={"outcome": "failed", "reason_code": "vm_failed"},
+        headers=world.k8_auth,
+    )
+    assert failed.status_code == 200
+    done = await world.client.get(url, headers={**headers, "HX-Request": "true"})
+    assert done.headers.get("HX-Refresh") == "true"
+    plain = await world.client.get(
+        url, headers=headers
+    )  # обычная загрузка — без обновления
+    assert "hx-refresh" not in {k.lower() for k in plain.headers}
+
+
+async def test_old_reports_and_entries_are_backfilled(world):
+    """Codex P2: миграции подгоняют старые report и итоговые записи под новые правила."""
+    from hub.db import _MIGRATIONS
+
+    sql = dict(_MIGRATIONS)
+    task_id = await _task(world, "старый report")
+    lived = await _launch_redeem(world, task_id)
+    oid = lived["order"]["id"]
+    # Строка в виде «до выката»: report старого клиента, кода и метки нет.
+    await world.db.execute(
+        "UPDATE executor_orders SET report_outcome = 'failed', "
+        "reported_at = datetime('now'), report_reason_code = '', final_entry_at = NULL "
+        "WHERE id = ?",
+        (oid,),
+    )
+    await world.db.execute(sql["backfill_executor_orders_report_reason_code"])
+    await world.db.execute(sql["backfill_executor_orders_final_entry_at"])
+    await world.db.commit()
+    row = await _order_row(world, oid)
+    assert row["report_reason_code"] == "other" and row["final_entry_at"]
+    # Идентичный повтор старого клиента — дубль, не 409.
+    again = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{oid}/report",
+        json={"outcome": "failed"},
+        headers=world.k8_auth,
+    )
+    assert again.status_code == 200 and again.json()["duplicate"] is True

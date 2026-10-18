@@ -1090,4 +1090,19 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "add_executor_orders_final_entry_at",
         "ALTER TABLE executor_orders ADD COLUMN final_entry_at TEXT",
     ),
+    (
+        # #1817: report старого клиента (failed/rescued без reason_code) — это
+        # `other`: иначе его идентичный повтор после выката стал бы 409.
+        "backfill_executor_orders_report_reason_code",
+        "UPDATE executor_orders SET report_reason_code = 'other' "
+        "WHERE report_outcome IN ('failed', 'rescued') AND report_reason_code = ''",
+    ),
+    (
+        # #1817: итоговая запись по заказам, где она уже была (report или
+        # закрытие не сдачей): метка стоит, второй записи не будет.
+        "backfill_executor_orders_final_entry_at",
+        "UPDATE executor_orders SET final_entry_at = COALESCE(reported_at, closed_at, "
+        "created_at) WHERE final_entry_at IS NULL AND (report_outcome <> '' "
+        "OR (state = 'closed' AND close_reason NOT IN ('', 'submitted')))",
+    ),
 ]

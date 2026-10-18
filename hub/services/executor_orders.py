@@ -400,6 +400,7 @@ async def close_order(
     only_states: tuple[str, ...] | None = None,
     return_task: bool = True,
     final_text: str = "",
+    entry: bool = True,
 ) -> bool:
     """Закрыть заказ; True — закрыл именно этот вызов. Коммит — за вызывающим.
 
@@ -478,7 +479,7 @@ async def close_order(
         f"{reason}",
         commit=False,
     )
-    if fresh and not returned:
+    if fresh and not returned and entry:
         await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
     return True
 
@@ -499,6 +500,7 @@ async def close_for_released_task(db: aiosqlite.Connection, task_id: int) -> int
             RUN_OUTCOME_ABORTED,
             only_states=(STATE_REDEEMED,),
             return_task=False,
+            entry=False,  # возврат в open уже записал свою заметку (одна запись, #1817)
         ):
             closed += 1
     return closed
@@ -659,9 +661,11 @@ async def _task_busy(db: aiosqlite.Connection, task_id: int) -> str:
     if not rows:
         return ""
     row = dict(rows[0])
+    from hub.services.executor_launch import REASON_ALREADY_RUNNING
+
     return (
-        f"{REASON_SLOT_BUSY}: по задаче #{task_id} уже идёт заказ #{row['id']} "
-        f"на {row['host']} ({row['state']})"
+        f"{REASON_ALREADY_RUNNING} #{task_id} (слот {row['host']}, "
+        f"заказ #{row['id']}, {row['state']})"
     )
 
 
@@ -740,8 +744,8 @@ async def _book(
     if task is None:
         return why
     refusal = (
-        await _task_refusal(db, task)
-        or await _task_busy(db, int(task["id"]))
+        await _task_busy(db, int(task["id"]))
+        or await _task_refusal(db, task)
         or await _slot_busy(db, host_name)
     )
     if refusal:
@@ -1235,6 +1239,8 @@ def _check_reason_fields(outcome: str, reason_code: str, reason: str) -> str:
         )
     if reason and note_refusal(reason):
         raise HostError(422, note_refusal(reason).replace("note", "reason", 1))
+    if any(str(tok) and str(tok) in reason for tok in config.HUB_TOKENS):
+        raise HostError(422, "reason: совпадает с настроенным токеном хаба")
     if outcome != "submitted" and not reason_code:
         return "other"
     return reason_code
