@@ -73,6 +73,17 @@ async def test_launch_message_and_repeat_refused(world):
         headers=world.human_auth,
     )
     assert rest.status_code == 409 and f"#{number}" in rest.text
+    # Тот же заказ другим хостом (слот k9 свободен) и другая задача на том же хосте:
+    # через REST, где в ответе только причина (на странице номер виден и в плашке).
+    second_task = await _task(world, "вторая задача")
+    for task_id, host in ((chosen, "k9"), (second_task, "k8")):
+        refused = await world.client.post(
+            f"/api/projects/{world.slug}/executor-launch",
+            json={"target": f"slot:{host}", "task_id": task_id},
+            headers=world.human_auth,
+        )
+        assert refused.status_code == 409, refused.text
+        assert f"заказ #{number}" in refused.json()["detail"]["reason"]
     assert len(await _rows(world.db, "SELECT 1 FROM executor_orders")) == 1
     # Облако: свои состояния executor_runs, без номера заказа.
     cloud_task = await _task(world, "облако")
@@ -227,6 +238,13 @@ async def test_plaque_fragment_refresh_and_no_secrets(world):
         headers=world.k8_auth,
     )
     assert leaked.status_code == 422
+    # Код без префикса AH- по виду не секрет: его ловит только сверка по хешу.
+    bare = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{oid}/report",
+        json={"outcome": "failed", "reason": f"вот {code.removeprefix('AH-')} конец"},
+        headers=world.k8_auth,
+    )
+    assert bare.status_code == 422
     # Секрет по виду — тоже; безопасный reason доходит до плашки.
     secret = await world.client.post(
         f"/api/executor-hosts/k8/orders/{oid}/report",
