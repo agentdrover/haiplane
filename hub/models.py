@@ -1073,6 +1073,7 @@ class TaskCreate(BaseModel):
     due_date: str | None = Field(default=None, max_length=32)
     user_story: str = Field("", max_length=1000)
     problem_statement: str = Field("", max_length=2000)
+    plain_summary: str | None = Field(default=None, max_length=300)
     business_value: str = Field("", max_length=500)
     # --- Discovery block (#331): why this, and in what form ---
     outcome_metric: str = Field("", max_length=300)
@@ -2454,6 +2455,7 @@ class TaskRefine(BaseModel):
     due_date: str | None = Field(default=None, max_length=32)
     user_story: str | None = Field(default=None, max_length=1000)
     problem_statement: str | None = Field(default=None, max_length=2000)
+    plain_summary: str | None = Field(default=None, max_length=300)
     business_value: str | None = Field(default=None, max_length=500)
     # --- Discovery block (#331) ---
     outcome_metric: str | None = Field(default=None, max_length=300)
@@ -3251,6 +3253,10 @@ class TaskView(BaseModel):
     due_date: str | None = None
     user_story: str = ""
     problem_statement: str = ""
+    # #1811: как записано (NULL у старых) и то, что показывать читателю.
+    plain_summary: str | None = None
+    plain_summary_shown: str = ""
+    plain_summary_source: str = ""
     business_value: str = ""
     # --- Discovery block (#331) ---
     outcome_metric: str = ""

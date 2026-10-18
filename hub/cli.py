@@ -14,6 +14,7 @@ from typing import Any
 
 from hub import config
 from hub.cli_executor_host import add_executor_host_parsers
+from hub.cli_plain_summary import add_plain_summary_option, put_plain_summary
 from hub.models import (
     DEFAULT_FORGE,
     FORGES,
@@ -439,6 +440,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
             body["parent_id"] = args.parent
         _print_json(_api("POST", "/api/prod-defects", body))
         return 0
+    put_plain_summary(body, args)
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     result = _api("POST", "/api/tasks", body)
@@ -1272,6 +1274,7 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("due_date", "due_date"),
     ("user_story", "user_story"),
     ("problem", "problem_statement"),
+    ("plain_summary", "plain_summary"),
     ("value", "business_value"),
     ("tech_hints", "technical_hints"),
     ("human_owner", "human_owner"),
@@ -3040,6 +3043,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_result_kind_args(p_refine)
     p_refine.add_argument("--problem", dest="problem", default=None)
+    add_plain_summary_option(p_propose, p_refine)
     p_refine.add_argument("--value", dest="value", default=None, help="Business value")
     p_refine.add_argument(
         "--tech-hints",

@@ -1555,3 +1555,61 @@ async def test_patched_migration_list_is_applied(monkeypatch):
         assert names == ["test_patched_list_marker"]
     finally:
         await conn.close()
+
+
+async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
+    """#1811: миграция не трогает существующие задачи и их DoR."""
+    import subprocess
+    import sys
+
+    import hub.db as db_module
+    from hub.services.dor import evaluate_dor
+
+    conn = await aiosqlite.connect(str(tmp_path / "plain.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        full = list(db_module._MIGRATIONS)
+        monkeypatch.setattr(
+            db_module,
+            "_MIGRATIONS",
+            [m for m in full if m[0] != "add_tasks_plain_summary"],
+        )
+        await _migrate(conn)
+        assert "plain_summary" not in await _table_columns(conn, "tasks")
+        await conn.execute(
+            "INSERT INTO tasks (title, status, work_type, user_story, "
+            "problem_statement, business_value, size, wip_tag, scope_in, "
+            "validation_commands, affected_areas, dor_passed, created_at) "
+            "VALUES ('old','draft','feature','us','ps','bv','S','feature_work',"
+            "'[\"a\"]','[\"uv run pytest\"]','[\"hub/x.py\"]',1,"
+            "datetime('now','-1 day'))"
+        )
+        await conn.execute(
+            "INSERT INTO acceptance_criteria (task_id, ac_id, given, when_clause, "
+            "then_clause, verifiable_by) VALUES (1,'AC-1','g','w','t','test')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", full)
+        await _migrate(conn)
+        row = (
+            await conn.execute_fetchall(
+                "SELECT plain_summary, dor_passed FROM tasks WHERE id=1"
+            )
+        )[0]
+        assert row["plain_summary"] is None
+        assert row["dor_passed"] == 1
+        # Пересчёт DoR по-прежнему проходит: задача создана до миграции.
+        assert (await evaluate_dor(conn, 1)).passed is True
+    finally:
+        await conn.close()
+
+    root = Path(__file__).parent.parent
+    run = subprocess.run(
+        [sys.executable, str(root / "scripts" / "mcp_catalog_budget.py")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr

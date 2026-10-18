@@ -3697,6 +3697,7 @@ async def hub_propose_task(
     affected_areas: list[str] | None = None,
     result_kind: str = "commit",
     rollback: str = "",
+    plain_summary: str = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -3718,6 +3719,7 @@ async def hub_propose_task(
         affected_areas: Where it broke (prod defect)
         result_kind: commit | state (leaf only)
         rollback: Undo text for state
+        plain_summary: What it is about in plain words, up to 300 chars
     """
     if defect_verify:
         return await _propose_prod_defect(
@@ -3743,6 +3745,8 @@ async def hub_propose_task(
         body["result_kind"] = result_kind
     if rollback:
         body["rollback"] = rollback
+    if plain_summary:
+        body["plain_summary"] = plain_summary
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
@@ -5788,7 +5792,7 @@ async def hub_refine_task(
 ) -> HubRefineTaskResult:
     """PATCH a task's DoR fields.
 
-    Only fields you pass are written; every list REPLACES the stored one.
+    Writes only passed fields; each list REPLACES the stored one.
 
     Args:
         task_id: Task to refine.
@@ -5797,6 +5801,7 @@ async def hub_refine_task(
         due_date: ISO date (fixed_date).
         user_story: As a / I want / so that.
         problem_statement: What is broken.
+        plain_summary: Plain-words gist, <=300.
         outcome_metric: Which number moves.
         outcome_indicator: Leading signal.
         outcome_deadline: When checked.

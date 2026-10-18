@@ -412,6 +412,7 @@ async def test_readiness_full_feature_returns_100(client: AsyncClient):
         json={
             "user_story": "us",
             "problem_statement": "ps",
+            "plain_summary": "ps",
             "business_value": "bv",
             "scope_in": ["a"],
             "validation_commands": ["uv run pytest"],

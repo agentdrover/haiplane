@@ -1079,4 +1079,12 @@ MIGRATIONS_3: list[tuple[str, str]] = [
             UNIQUE (project_id, release_pr)
         )""",
     ),
+    (
+        # #1811: «о чём задача простым языком», до 300 символов (предел задан
+        # моделью). NULL - автор не писал. Время применения этой миграции
+        # (_migrations.applied_at) - граница «новых» задач: has_plain_summary
+        # блокирует только созданные после неё (hub.plain_summary).
+        "add_tasks_plain_summary",
+        "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
+    ),
 ]

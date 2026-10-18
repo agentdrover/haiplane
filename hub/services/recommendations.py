@@ -77,6 +77,16 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
         ),
         "minutes": 5,
     },
+    "has_plain_summary": {
+        "field": "plain_summary",
+        "message": (
+            "Write 1-2 sentences, up to 300 characters, saying in plain words "
+            "what this task is about, for a reader who does not know the code. "
+            "Example: 'Show a short plain-language line at the top of the task "
+            "card, so the owner does not have to decode the title.'"
+        ),
+        "minutes": 2,
+    },
     "has_business_value": {
         "field": "business_value",
         "message": (

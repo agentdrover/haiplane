@@ -61,7 +61,7 @@ from hub.db import fetchall, write_transaction
 # них только когда заполнено. Пустое значение, записанное ключом, сменило бы
 # отпечаток каждой существующей задачи и объявило бы ревизию на ровном месте
 # (тот же приём, что у result_kind ниже).
-_KEY_ONLY_WHEN_SET = frozenset({"cause_kind"})
+_KEY_ONLY_WHEN_SET = frozenset({"cause_kind", "plain_summary"})
 
 STATEMENT_FIELDS: tuple[str, ...] = (
     "title",
@@ -73,6 +73,7 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "due_date",
     "user_story",
     "problem_statement",
+    "plain_summary",
     "business_value",
     "outcome_metric",
     "outcome_indicator",
