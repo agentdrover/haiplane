@@ -650,6 +650,8 @@ def readme_secret_names(readme: str) -> list[str]:
 
 
 # --- AC-1 ---------------------------------------------------------------------
+# Непрозрачное имя с разделителями (длина 39), собрано по частям.
+OPAQUE_NAME = "_".join(["HAIPLANE", "ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ012"])
 NEGATIVE_EXAMPLES: dict[str, tuple[str, str]] = {
     "одиночные кавычки, значение вне типа": (
         "etc/systemd/system/x.service.d/a.conf",
@@ -765,11 +767,11 @@ NEGATIVE_EXAMPLES: dict[str, tuple[str, str]] = {
     ),
     "EnvironmentFile: непрозрачная строка-имя в чужом файле": (
         f"etc/{PROD_NAME}/{PROD_NAME}.env",
-        "HAIPLANE_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ012\n",
+        OPAQUE_NAME + "\n",
     ),
     "EnvironmentFile runner: другое имя последней строкой": (
         RUNNER_ENV,
-        "HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/x\nHAIPLANE_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ012\n",
+        "HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/x\n" + OPAQUE_NAME + "\n",
     ),
     "EnvironmentFile runner: ARGV не последней строкой": (
         RUNNER_ENV,
