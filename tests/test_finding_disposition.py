@@ -736,3 +736,91 @@ async def test_only_the_hubs_own_probe_counts_as_the_hubs_hand(client: AsyncClie
     assert [(c.finding_uid, c.live_check_id, c.hand) for c in closures] == [
         (uid, check_id, "hub")
     ]
+
+
+# --- #1830: the author's answer is shown beside a missing reviewer marking ---
+
+
+async def test_an_author_outcome_is_shown_beside_a_missing_reviewer_disposition(
+    client: AsyncClient, db
+):
+    """AC-1: «без разметки ревьюера» is true; «никто не сказал» was not."""
+    from hub import repository as repo_module
+    from hub.services.metrics_scope import Scope
+    from hub.services.orchestration import _disposition_metrics
+
+    task_id, review_id = await _task_with_report(client, db)
+    uids = finding_uids(_FINDINGS)
+    # The reviewer marked the first finding; the second has an author's answer
+    # for THIS report and no marking.
+    await record_finding_dispositions(
+        db,
+        task_id,
+        [
+            FindingDispositionItem(
+                finding_uid=uids[0], disposition=FindingDisposition.fixed
+            )
+        ],
+        decided_by="denis",
+    )
+    await repo_module.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=uids[1],
+        finding_index=1,
+        finding_title="race on retry",
+        outcome="deferred",
+        note="later",
+        linked_task_id=1800,
+        reported_by="dev",
+    )
+    await db.commit()
+    scope = Scope(start="2000-01-01 00:00:00")
+    precision_before = await _disposition_metrics(db, scope)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    updates = (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    written = "\n".join(u["content"] for u in updates if u["kind"] == "review")
+    assert "без разметки ревьюера: 1" in written
+    assert "ответ автора: deferred → #1800" in written
+    assert "никто не сказал" not in written
+    assert "ответ отчёту" not in written, "the answer was given to THIS report"
+    # The author's answer is not a disposition: nothing was added to the table
+    # precision reads, and the numbers did not move.
+    assert len(await _stored(db, review_id)) == 1
+    assert await _disposition_metrics(db, scope) == precision_before
+
+
+async def test_author_answers_cost_a_fixed_number_of_queries(db):
+    """#1830: the history is ONE query per report, not one per finding."""
+    from hub.models import MachineReviewView
+    from hub.services.author_answers import attach_author_answers
+
+    async def reads(count: int) -> int:
+        view = MachineReviewView(
+            id=1,
+            task_id=1,
+            submission_generation=1,
+            is_current=True,
+            findings_confirmed=[
+                {"title": f"finding {i}", "severity": "medium"} for i in range(count)
+            ],
+        )
+        seen: list[str] = []
+        await db.set_trace_callback(
+            lambda sql: seen.append(sql) if "finding_outcomes" in sql else None
+        )
+        try:
+            await attach_author_answers(db, view)
+        finally:
+            await db.set_trace_callback(None)
+        return len(seen)
+
+    assert await reads(1) == await reads(25) == 2

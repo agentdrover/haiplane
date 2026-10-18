@@ -2199,3 +2199,81 @@ async def test_state_statement_is_frozen_between_submission_and_rework(
     assert resp.status_code == 422, resp.text
     assert "draft" in resp.text
     assert dict(await repo.get_task(db, opened)).get("result_kind") == "state"
+
+
+async def _answer(
+    db, task_id, review_id, generation, uid, *, linked, note="later", kind="confirmed"
+):
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=generation,
+        finding_uid=uid,
+        finding_index=0,
+        finding_title="",
+        outcome="deferred",
+        note=note,
+        linked_task_id=linked,
+        reported_by="dev",
+        finding_kind=kind,
+    )
+    await db.commit()
+
+
+async def _approve_and_read(client: AsyncClient, task_id: int) -> tuple[str, str]:
+    # The card is read BEFORE the verdict: afterwards it lists the record itself
+    # among the task's updates and could not tell the two sources apart.
+    card = (await client.get(f"/tasks/{task_id}")).text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    return await _verdict_updates(client, task_id), card
+
+
+async def test_the_verdict_and_the_card_tell_author_answers_from_silence(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2: three shapes, and the record and the card say the same thing."""
+    uid = finding_uids([{"title": "cursor never advances", "severity": "medium"}])[0]
+
+    # (а) neither a marking nor an answer: the old sentence stands.
+    a = await _task_in_review(client, "silence")
+    # An answer about an UNRESOLVED finding of an earlier report is not an
+    # answer to a confirmed one: the vocabularies differ.
+    earlier = await _report(db, a, 0, ["cursor never advances"])
+    await _answer(db, a, earlier, 0, uid, linked=2, kind="unresolved")
+    # Another task answered the very same uid: that is not this task's answer.
+    other = await _task_in_review(client, "elsewhere")
+    other_report = await _report(db, other, 1, ["cursor never advances"])
+    await _answer(db, other, other_report, 1, uid, linked=1)
+    await _report(db, a, 1, ["cursor never advances"])
+    record, _card = await _approve_and_read(client, a)
+    assert (
+        "никто не сказал, чем они оказались. Вердикт записан; находки "
+        "остаются неотвеченными." in record
+    )
+    assert "ответ автора" not in record and "без разметки ревьюера" not in record
+
+    # (б) answered a generation ago; the new report raises the same uid.
+    b = await _task_in_review(client, "historical answer")
+    old = await _report(db, b, 1, ["cursor never advances"])
+    await _answer(db, b, old, 1, uid, linked=1800)
+    await repo.update_task(db, b, submission_generation=2)
+    await db.commit()
+    await _report(db, b, 2, ["cursor never advances"])
+    record_b, card_b = await _approve_and_read(client, b)
+    line_b = f"ответ автора: deferred → #1800 (ответ отчёту #{old}, поколение 1)"
+    assert line_b in record_b and "никто не сказал" not in record_b
+    assert line_b in card_b, "the card shows what the record says"
+
+    # (в) deferred without a link: the auto-draft's number is not promised.
+    c = await _task_in_review(client, "no link")
+    rid = await _report(db, c, 1, ["cursor never advances"])
+    await _answer(db, c, rid, 1, uid, linked=None)
+    record_c, card_c = await _approve_and_read(client, c)
+    line_c = "deferred без ссылки (авто-драфт)"
+    assert line_c in record_c and line_c in card_c
+    assert "#None" not in record_c
