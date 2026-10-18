@@ -757,8 +757,10 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # уже иного состава. Часы — нормализация created_at/written_at и снятие timings.
 # #1706: бриф получил поле review_verdict_revision (ревизия стоящего вердикта),
 # эталон переснят осознанно; пакет стюарда и его хеш остались прежними.
-GOLDEN_REST_BRIEF = "5d27a4d92634ee4272db04f9b6dc2275747eb631498554ee2d68de1edd5a384b"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "0e49d37ec6b654caacb331d17b6215f0293bc07e6771d3aabde5c3737e8abdef"  # pragma: allowlist secret
+# #1830: machine_review получил author_answers и undisposed_author_lines (пустые
+# здесь); переснят REST-бриф и пакет стюарда, packet_hash прежний.
+GOLDEN_REST_BRIEF = "f1433041b773f86935d4e8c77371e7e0af014f8380baf1898fda826c3ddaa708"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "2f00995ebf810d3c70a45ead2b1e2694af5ae2a16ea026855cc78c848c14433f"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
