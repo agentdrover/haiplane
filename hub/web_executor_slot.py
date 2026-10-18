@@ -15,7 +15,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from hub import repository as repo
 from hub.auth import current_identity
-from hub.services import executor_launch, executor_orders, project_policy
+from hub.services import (
+    executor_launch,
+    executor_orders,
+    launch_feedback,
+    project_policy,
+)
 
 router = APIRouter()
 
@@ -85,3 +90,18 @@ async def web_executor_slot(
             status_code=409,
         )
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.get("/partials/launch-plaque/{task_id}", response_class=HTMLResponse)
+async def web_launch_plaque(task_id: int, request: Request) -> Any:
+    """Фрагмент плашки запуска (#1817): HTMX обновляет только его, не страницу."""
+    from hub.web import TEMPLATES, _db
+
+    return TEMPLATES.TemplateResponse(
+        request,
+        "partials/launch_plaque.html",
+        {
+            "plaque": await launch_feedback.plaque(_db(request), task_id),
+            "task_id": task_id,
+        },
+    )

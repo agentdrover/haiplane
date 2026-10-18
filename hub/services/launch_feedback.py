@@ -22,7 +22,12 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
 
-PHASES: Final[tuple[str, ...]] = ("vm_starting", "agent_running", "critic", "submitting")
+PHASES: Final[tuple[str, ...]] = (
+    "vm_starting",
+    "agent_running",
+    "critic",
+    "submitting",
+)
 
 PHASE_TEXT: Final[dict[str, str]] = {
     "vm_starting": "хост запускает ВМ",
@@ -119,7 +124,9 @@ async def record_phase(
         if order is None:
             raise HostError(403, "заказ не принадлежит этому хосту")
         if order["state"] != STATE_REDEEMED:
-            raise HostError(409, f"фаза возможна у выкупленного заказа: {order['state']}")
+            raise HostError(
+                409, f"фаза возможна у выкупленного заказа: {order['state']}"
+            )
         if order["report_outcome"]:
             raise HostError(409, "итог по заказу уже записан: фазы закрыты")
         current = order["phase"] or ""
@@ -141,7 +148,9 @@ def _step(label: str, at: Any, done: bool) -> dict[str, Any]:
     return {"label": label, "at": str(at) if at else "", "done": done}
 
 
-async def _slot_plaque(db: aiosqlite.Connection, order: dict[str, Any]) -> dict[str, Any]:
+async def _slot_plaque(
+    db: aiosqlite.Connection, order: dict[str, Any]
+) -> dict[str, Any]:
     from hub.services.executor_orders import CLOSE_SUBMITTED, STATE_CLOSED
 
     host, number = order["host"], order["id"]
@@ -150,7 +159,7 @@ async def _slot_plaque(db: aiosqlite.Connection, order: dict[str, Any]) -> dict[
     t = dict(task) if task is not None else {}
     landed = int(t.get("submission_generation") or 0) >= int(order["generation"]) and (
         order["close_reason"] == CLOSE_SUBMITTED
-        or (state != STATE_CLOSED and t.get("executor_run_id") == order["executor_run_id"])
+        or t.get("executor_run_id") == order["executor_run_id"]
     )
     redeemed = bool(order["redeemed_at"])
     steps = [
@@ -160,7 +169,13 @@ async def _slot_plaque(db: aiosqlite.Connection, order: dict[str, Any]) -> dict[
     ]
     reached = PHASES.index(order["phase"]) if order["phase"] in PHASES else -1
     for i, name in enumerate(PHASES):
-        steps.append(_step(PHASE_TEXT[name], order["phase_at"] if i == reached else "", i <= reached))
+        steps.append(
+            _step(
+                PHASE_TEXT[name],
+                order["phase_at"] if i == reached else "",
+                i <= reached,
+            )
+        )
     active = state != STATE_CLOSED and not landed
     outcome = ""
     if landed:

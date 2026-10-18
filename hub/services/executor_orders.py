@@ -37,6 +37,7 @@ import aiosqlite
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from hub import config
 from hub import repository as repo
 from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
@@ -518,9 +519,14 @@ async def _settled_reason(
 ) -> tuple[str, str, tuple[str, ...] | None]:
     """(причина, исход прогона, допустимые состояния) — или пусто, если держится."""
     task = await repo.get_task(db, int(order["task_id"]))
-    landed = task is not None and int(
-        dict(task).get("submission_generation") or 0
-    ) >= int(order["generation"])
+    # #1831: сдача засчитывается заказу, только если задачу держал ЕГО прогон:
+    # пересдача облаком или ручным pair того же поколения заказу не принадлежит.
+    landed = (
+        task is not None
+        and int(dict(task).get("submission_generation") or 0)
+        >= int(order["generation"])
+        and dict(task).get("executor_run_id") == int(order["executor_run_id"])
+    )
     if landed:
         return CLOSE_SUBMITTED, RUN_OUTCOME_FINISHED, None
     run = await repo.get_executor_run(db, int(order["executor_run_id"]))
@@ -734,8 +740,8 @@ async def _book(
     if task is None:
         return why
     refusal = (
-        await _task_busy(db, int(task["id"]))
-        or await _task_refusal(db, task)
+        await _task_refusal(db, task)
+        or await _task_busy(db, int(task["id"]))
         or await _slot_busy(db, host_name)
     )
     if refusal:
@@ -952,6 +958,102 @@ async def _own_order(
     return dict(rows[0]) if rows else None
 
 
+_SQLITE_MAX_INT = 2**63 - 1
+#: Статусы задачи в работе исполнителя: сданный заказ о них молчит (#1831).
+_WORK_STATUSES = ("open", "claimed", "running")
+
+
+async def _fields_hold_any_code(db: aiosqlite.Connection, text: str) -> bool:
+    """Назван ли в тексте ЛЮБОЙ код хаба — по хешу, не только код заказа хоста.
+
+    Ветку после закрытия заказа может задать ручной или облачный pair, и её слаг
+    способен нести их код без префикса ``AH-``.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT code_hash FROM chat_pair_codes UNION "
+        "SELECT code_hash FROM executor_orders WHERE code_hash <> ''",
+    )
+    wanted = {str(r[0]) for r in rows}
+    flat = re.sub(r"[^0-9A-Za-z]", "", text).upper()
+    size = chat_pair.CODE_LENGTH
+    return any(
+        chat_pair.hash_pair_code(flat[i : i + size]) in wanted
+        for i in range(max(0, len(flat) - size + 1))
+    )
+
+
+async def read_order_outcome(
+    db: aiosqlite.Connection, host: str, order_id: int
+) -> dict[str, Any] | None:
+    """Итог заказа для хоста (#1831); None — чужой или нет такого.
+
+    Только чтение, без кода, шифротекста, хеша и текста заказа: хост узнаёт,
+    сдана ли работа, когда сессия прогона уже отозвана при сдаче.
+    """
+    if not 0 <= int(order_id) <= _SQLITE_MAX_INT:
+        return None
+    # ОДИН запрос = один снимок: заказ, «есть ли новее» и задача читаются вместе.
+    # Два чтения оставляли окно, в которое успевает встать новый заказ.
+    rows = await fetchall(
+        db,
+        "SELECT o.*, t.status AS t_status, t.submission_generation AS t_generation, "
+        "t.executor_run_id AS t_holder, "
+        "t.submission_sha AS t_sha, t.branch AS t_branch, t.pr_number AS t_pr, "
+        "EXISTS (SELECT 1 FROM executor_orders n WHERE n.task_id = o.task_id "
+        "AND n.id > o.id) AS newer "
+        "FROM executor_orders o LEFT JOIN tasks t ON t.id = o.task_id "
+        "WHERE o.id = ? AND o.host = ?",
+        (int(order_id), host),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    # Сдачу сделал ЭТОТ прогон, если задачу держал он: заказ закрыт причиной
+    # «submitted» (её ставит settle только при совпадении держателя) либо ещё
+    # не закрыт, а держатель задачи — его прогон. Поколение одно и то же у
+    # сдачи другого прогона (облако, ручной pair), поэтому оно не доказательство.
+    generation = row["t_generation"] if row["t_generation"] is not None else 0
+    attributed = row["close_reason"] == CLOSE_SUBMITTED or (
+        row["state"] != STATE_CLOSED and row["t_holder"] == row["executor_run_id"]
+    )
+    foreign = generation >= int(row["generation"]) and not attributed
+    # Закрытая сдачей заказ не говорит о задаче, ушедшей в новую работу (возврат
+    # в работу, ручной pair-start): поля задачи тогда принадлежат другому исполнителю.
+    moved_on = (
+        row["close_reason"] == CLOSE_SUBMITTED and row["t_status"] in _WORK_STATUSES
+    )
+    superseded = (
+        bool(row["newer"]) or generation > int(row["generation"]) or foreign or moved_on
+    )
+    submitted = not superseded and generation == int(row["generation"])
+    branch = str(row["t_branch"] or "") if submitted else ""
+    if branch and (
+        any(shape.search(branch) for shape in _SECRET_SHAPES)
+        or any(str(tok) and str(tok) in branch for tok in config.HUB_TOKENS)
+        or await _fields_hold_any_code(db, branch)
+    ):
+        branch = (
+            ""  # слаг ветки задаёт вызывающий pair-start: секрету в ответе не место
+        )
+    return {
+        "id": row["id"],
+        "host": row["host"],
+        "state": row["state"],
+        "close_reason": row["close_reason"],
+        "task_id": row["task_id"],
+        "generation": row["generation"],
+        "superseded": superseded,
+        "submitted": submitted,
+        "task_status": None if superseded else row["t_status"],
+        "submission_generation": generation if submitted else None,
+        "submission_sha": (row["t_sha"] or "") if submitted else "",
+        "branch": branch,
+        "pr_number": row["t_pr"] if submitted else None,
+        "report_outcome": row["report_outcome"],
+    }
+
+
 async def ack_order(
     db: aiosqlite.Connection, host: str, order_id: int, result: str
 ) -> dict[str, Any]:
@@ -1143,9 +1245,13 @@ async def report_outcome(
     """
     _check_report_fields(outcome, sha, branch, note)
     if reason_code and reason_code not in launch_feedback.REASON_CODES:
-        raise HostError(422, f"reason_code: один из {', '.join(launch_feedback.REASON_CODES)}")
+        raise HostError(
+            422, f"reason_code: один из {', '.join(launch_feedback.REASON_CODES)}"
+        )
     if len(reason) > launch_feedback.REASON_MAX:
-        raise HostError(422, f"reason: не длиннее {launch_feedback.REASON_MAX} символов")
+        raise HostError(
+            422, f"reason: не длиннее {launch_feedback.REASON_MAX} символов"
+        )
     if reason and note_refusal(reason):
         raise HostError(422, note_refusal(reason).replace("note", "reason", 1))
     if outcome != "submitted" and not reason_code:

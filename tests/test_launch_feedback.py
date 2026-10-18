@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from hub import config
 from hub.csrf import token_for_session_cookie
@@ -17,12 +16,8 @@ from hub.services import launch_feedback
 from tests import test_executor_orders as _eo
 from tests.test_executor_orders import (
     HUB_URL,
-    _code_of,
-    _launch,
     _launch_redeem,
     _order_row,
-    _orders,
-    _redeem,
     _rows,
     _task,
 )
@@ -47,25 +42,21 @@ async def test_launch_message_and_repeat_refused(world):
     chosen = await _task(world, "запуск с карточки")
     headers, csrf = await _cookie(world)
 
-    async def press(host: str = "k8"):
-        return await world.client.post(
-            f"/tasks/{chosen}/web-executor-slot",
-            data={"host": host, "csrf_token": csrf},
-            headers=headers,
-            follow_redirects=True,
-        )
-
-    ok = await press()
+    pressed = await world.client.post(
+        f"/tasks/{chosen}/web-executor-slot",
+        data={"host": "k8", "csrf_token": csrf},
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert pressed.status_code == 303, pressed.text
+    ok = await world.client.get(f"/tasks/{chosen}", headers=headers)
     assert ok.status_code == 200, ok.text
     placed = await _rows(world.db, "SELECT id FROM executor_orders")
     assert len(placed) == 1
     number = placed[0]["id"]
     assert f"Заказ #{number} создан, ждёт k8" in ok.text
     # Кнопка неактивна и называет шаг.
-    assert (
-        "disabled" in ok.text
-        and "отправлен хосту" not in ok.text.split("disabled")[0][-0:]
-    )
+    assert "Запуск идёт" in ok.text and "disabled" in ok.text
     # Повтор при активном заказе: 409 с номером, второго заказа нет.
     again = await world.client.post(
         f"/tasks/{chosen}/web-executor-slot",

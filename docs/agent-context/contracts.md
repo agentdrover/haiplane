@@ -110,7 +110,7 @@ Human-only (a person, CSRF for cookies):
   never the code. Card button «Запустить на <host>» →
   `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
 
-Host key (`slot_runner`), exactly four routes of its OWN host:
+Host key (`slot_runner`), exactly six routes of its OWN host:
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
@@ -135,15 +135,28 @@ Host key (`slot_runner`), exactly four routes of its OWN host:
   order BEFORE the call; on timeout/5xx retry with backoff inside `retry_until`;
   ignore an answer with a smaller `token_version`; start the VM once; `redeem_lost`
   is the final refusal to recover.
+- `GET …/orders/{id}` (#1831) → the outcome of the host's OWN order: `state`,
+  `close_reason`, `task_id`, `task_status`, `submission_generation`,
+  `submission_sha`, `branch`, `pr_number`, `report_outcome` — no code, ciphertext,
+  tokens or order text. After a submission the run's sessions are revoked (#1783),
+  so the host checks the submission with THIS read, not with the agent session.
+  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; likewise when the task's `submission_generation` moved past the order's `generation` (a resubmission by another run: cloud, manual pair). `submitted` is true only when the generations are equal; `submission_*` and `pr_number` are given only then. A submission is the order's own only when the order's run held the task (`tasks.executor_run_id` = the order's run; `settle` closes the order with `submitted` only then, and the order stays attributed after the holder is released); a resubmission of the SAME generation by cloud or a manual pair is foreign (`superseded`). A `submitted` order whose task went back to open/claimed/running is `superseded` too. A branch that carries a hub code or token is returned empty. Order, "newer order exists" and task are ONE query (one snapshot); a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
 - `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
   `redeemed` is informational (the hub sees the spend itself) and keeps the
   booking; the other two close the order, burn the code, REVOKE the session while its token was never presented, abort the run; once the token was presented they are 409 `already_redeemed_in_use` and change nothing (#1825). A repeat
   with a DIFFERENT result is 409 (the first word of the host stands). Foreign or
   unknown order: 403. At most 3 concurrent long-polls per host (429).
+- `POST …/orders/{id}/phase {phase: vm_starting|agent_running|critic|submitting}` (#1817)
+  — the host tells which step the run is on; the card plaque shows the last accepted
+  one. Only the host's own order that is FACTUALLY `redeemed` (not merely delivered),
+  unclosed and without a report; phases go forward only, skipping is fine; the same
+  phase again is 200 `duplicate`, backwards / before redeem / after report or close
+  is 409, a foreign order is 403, an unknown phase 422, over 30/min per host 429.
+  Phases are never written to the task feed. Old hosts that send none keep working.
 - `POST …/orders/{id}/report {outcome: submitted|rescued|failed, sha?, branch?,
-  note?}` — one feed entry per order, repeat is a no-op, a different outcome is 409,
+  note?, reason_code?, reason?}` — one feed entry per order (the final entry is written once, by whichever of report, order close and return-to-open comes first, `executor_orders.final_entry_at`; a late report after a close refines the plaque reason and writes no second entry), repeat is a no-op, a different outcome is 409,
   `note` ≤ 500 chars without codes or tokens (422), never changes the task status;
-  works on a closed order. `failed`/`rescued` also CLOSE the order (the run ended
+  works on a closed order. `reason_code` (#1817): channel_check_failed, setup_failed, redeem_failed, vm_failed, busy, over_budget, agent_failed, critic_failed, timeout, hub_unavailable, stale_token, other (absent on failed/rescued from an old client = `other`; unknown value 422); `reason` ≤ 200 chars passes the same secret and order-code checks as `note`; the reason of the first report is immutable (a repeat with another `reason_code` is 409, an identical repeat is a no-op). `failed`/`rescued` also CLOSE the order (the run ended
   without a submission: unspent code burnt, run aborted, slot free); `submitted`
   does not (the landed submission closes it). `branch` is a WHITELIST: the task's own `tasks.branch` or `task-<order task id>/rescue-<digits>`, anything else is 422; `sha` is `^[0-9a-f]{7,40}$`; `note` has the secret and long-token checks (no heuristics on branch/sha).
 
