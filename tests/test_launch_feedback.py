@@ -486,6 +486,31 @@ async def test_host_failed_after_accepted_submission_keeps_the_submission(world)
     assert "failed" not in feed[-1]
     plaque = await launch_feedback.plaque(world.db, task_id)
     assert plaque is not None and "сдан" in plaque["outcome"].lower()
+    # Каноническая причина закрытия и исход прогона — сдача; слово хоста отдельно.
+    row = await _order_row(world, oid)
+    assert row["close_reason"] == "submitted" and row["report_outcome"] == "failed"
+    run = await _rows(
+        world.db,
+        "SELECT outcome FROM executor_runs WHERE id = ?",
+        (row["executor_run_id"],),
+    )
+    assert run[0]["outcome"] == "finished"
+    # После прохода reaper'а по застрявшим захватам ответ тот же: k8 читает его
+    # (#1831), чтобы отличить submitted от rescued.
+    from hub.services import chat_pair as cp
+
+    await cp.release_stuck_run_claims(world.db)
+    await world.db.commit()
+    got = await world.client.get(
+        f"/api/executor-hosts/k8/orders/{oid}", headers=world.k8_auth
+    )
+    assert got.status_code == 200, got.text
+    body = got.json()
+    assert body["submitted"] is True and body["superseded"] is False
+    assert body["close_reason"] == "submitted" and body["report_outcome"] == "failed"
+    after = await launch_feedback.plaque(world.db, task_id)
+    assert after is not None and "сдан" in after["outcome"].lower()
+    assert "упал" not in after["outcome"].lower()
     # Повторный failed — дубль, ленте ничего.
     again = await _report(
         world,

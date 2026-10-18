@@ -175,7 +175,7 @@ async def _slot_plaque(
         outcome = CLOSE_REASON_TEXT["submitted"]
     elif state == STATE_CLOSED:
         outcome = close_reason_text(order["close_reason"], order["report_reason_code"])
-    if outcome and order["report_reason"]:
+    if outcome and order["report_reason"] and not landed:  # сдача сильнее слова хоста
         outcome = f"{outcome} — {order['report_reason']}"
     saved = [
         x

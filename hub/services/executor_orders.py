@@ -410,6 +410,17 @@ async def close_order(
     кода ``redeemed_at`` уже стоит и строку DELETE не трогает, а у непотраченного
     после сдачи другим путём применения не остаётся.
     """
+    # #1817: фактический исход на момент закрытия — до снятия захвата, который
+    # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа. Сдача сильнее
+    # любой иной причины (в том числе слова хоста failed до закрытия): причина
+    # закрытия и исход прогона записываются каноническими «submitted/finished»,
+    # слово хоста остаётся отдельно в report_*. Иначе после снятия захвата ответ
+    # GET заказа и плашка перевернулись бы на «упал», а k8 объявил бы ложный rescued.
+    landed = reason == CLOSE_SUBMITTED or await launch_feedback.landed_by_order(
+        db, order
+    )
+    if landed:
+        reason, run_outcome = CLOSE_SUBMITTED, RUN_OUTCOME_FINISHED
     states = only_states or (STATE_PENDING, STATE_DELIVERED, STATE_REDEEMED)
     marks = ", ".join("?" for _ in states)
     cursor = await db.execute(
@@ -420,11 +431,6 @@ async def close_order(
     )
     if not cursor.rowcount:
         return False
-    # #1817: фактический исход на момент закрытия — до снятия захвата, который
-    # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа.
-    landed = reason == CLOSE_SUBMITTED or await launch_feedback.landed_by_order(
-        db, order
-    )
     if order.get("pair_code_id") is not None:
         await db.execute(
             "DELETE FROM chat_pair_codes WHERE id = ? AND redeemed_at IS NULL",

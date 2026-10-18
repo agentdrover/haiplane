@@ -330,7 +330,12 @@ async def api_executor_order_phase(
 async def api_executor_order_report(
     name: str, order_id: int, body: ExecutorOrderReport, request: Request
 ) -> dict:
-    """Итог прогона в ленту задачи; статус задачи маршрут не меняет."""
+    """Итог прогона хоста: сохраняется в заказе и показывается на карточке.
+
+    В ленту задачи report не пишет (итоговую запись пишет закрытие заказа; для
+    failed/rescued report закрывает заказ, и его текст становится этой записью).
+    Статус задачи маршрут не меняет.
+    """
     await _host_caller(request, name)
     try:
         return await executor_orders.report_outcome(
