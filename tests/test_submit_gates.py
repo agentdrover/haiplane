@@ -1336,7 +1336,10 @@ def test_ci_green_proof_predicate_reads_damaged_fields_as_malformed():
         "ac_results": '{"AC-1": "pass"}',
         "validation_status": "pass",
     }
-    assert proof.proof_gap(good, rows, "s" * 40) is None
+    from hub.services.ci_contract import HUB_CONTRACT
+
+    good["contract_fp"] = HUB_CONTRACT.fingerprint
+    assert proof.proof_gap(good, rows, "s" * 40, HUB_CONTRACT) is None
     damaged = [
         {"checks": ""},
         {"checks": None},
@@ -1349,12 +1352,17 @@ def test_ci_green_proof_predicate_reads_damaged_fields_as_malformed():
         {"ac_results": '{"AC-1": {"s": "pass"}}'},
     ]
     for patch_ in damaged:
-        gap = proof.proof_gap({**good, **patch_}, rows, "s" * 40)
+        gap = proof.proof_gap({**good, **patch_}, rows, "s" * 40, HUB_CONTRACT)
         assert gap is not None and gap.cause == proof.MALFORMED, patch_
     # AC без валидного локатора репортёр не оценивает — отсутствие не мешает.
     unlocated = [{"ac_id": "AC-9", "verifiable_by": "test", "test_ref": "нет"}]
-    assert proof.proof_gap({**good, "ac_results": "{}"}, unlocated, "s" * 40) is None
-    missing = proof.proof_gap({**good, "ac_results": "{}"}, rows, "s" * 40)
+    assert (
+        proof.proof_gap({**good, "ac_results": "{}"}, unlocated, "s" * 40, HUB_CONTRACT)
+        is None
+    )
+    missing = proof.proof_gap(
+        {**good, "ac_results": "{}"}, rows, "s" * 40, HUB_CONTRACT
+    )
     assert missing is not None and missing.cause == proof.RED
 
 
@@ -1822,3 +1830,127 @@ async def test_c3_an_unreadable_workspace_is_not_proof_of_no_changes(
     )
     row = dict(await repo.get_task(db, task.id))
     assert await _rg.collect_git_facts(db, row) == {_rg.UNCOMMITTED_KEY: True}
+
+
+# --------------------------------------------------------------------------
+# #1848: сдача спутника проходит гейт CI по контракту его проекта
+# --------------------------------------------------------------------------
+
+
+async def _sat_ci_task(db, slug: str, mode: str) -> int:
+    from tests.ci_trust_support import SAT_CONTRACT
+
+    task_id = await _ci_task(db, slug, mode)
+    project_id = dict(await repo.resolve_project_for_task(db, task_id))["id"]
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=json.dumps({"ci_before_submit": mode, "ci_contract": SAT_CONTRACT}),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _sat_report(client, task_id: int, *, path=None, **fields) -> dict:
+    """What the satellite's sender POSTs for tests.yml; the run is on the fake GitHub."""
+    from unittest.mock import patch
+
+    from tests import test_red_test_gate as red
+    from tests.ci_trust_support import SAT_CHECKS, SAT_PATH
+
+    body = {
+        "head_sha": red._TIP,
+        "ac_results": {"AC-1": "pass", "AC-2": "pass"},
+        "checks": dict(SAT_CHECKS),
+        "validation_status": "pass",
+        **fields,
+    }
+    sent = red.GH.attempt(
+        task_id,
+        body["head_sha"],
+        path=path or SAT_PATH,
+        ac_results=body["ac_results"],
+        checks=body["checks"],
+        validation_status=body["validation_status"],
+        stamp=False,
+    )
+    tokens = config.parse_tokens("ci:ci-token:admin")
+    with (
+        patch.object(config, "HUB_TOKENS", tokens),
+        patch.object(config, "HUB_AUTH_DISABLED", False),
+    ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json={**body, **sent["provenance"]},
+            headers={"Authorization": "Bearer ci-token"},
+        )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_a_satellite_submit_meets_the_ci_gate(client, db):
+    from tests import test_red_test_gate as red
+    from tests.test_red_test_gate import _detail, _feed, _submit
+
+    task_id = await _sat_ci_task(db, "sat-require", "require")
+    feed_before = len(await _feed(db, task_id))
+
+    async def refused(cause: str, label: str):
+        resp, dispatch = await _submit(client, task_id)
+        assert resp.status_code == 422, (label, resp.text)
+        detail = _detail(resp)
+        assert detail["reason"] == "ci_before_submit_unproven", label
+        assert detail["cause"] == cause, (label, detail)
+        await _nothing_recorded(db, task_id, feed_before, dispatch)
+
+    # A run of another workflow is not confirmed by the project's contract.
+    out = await _sat_report(client, task_id, path=".github/workflows/other.yml")
+    assert (out["trust"], out["trust_reason"]) == ("unverified", "wrong_workflow")
+    await refused("unverified", "another workflow")
+
+    # Confirmed, but the gate wants a green proof.
+    out = await _sat_report(client, task_id, validation_status="skipped")
+    assert out["trust"] == "verified"
+    await refused("validation_not_pass", "validation skipped")
+    await _sat_report(client, task_id, checks={"tests": "pass", "lint": "fail"})
+    await refused("red", "an optional check failed")
+    await _sat_report(client, task_id, checks={})
+    await refused("not_green", "tests absent")
+    await _sat_report(client, task_id, checks={"tests": "skipped"})
+    await refused("not_green", "tests skipped")
+    await _sat_report(client, task_id, ac_results={"AC-1": "fail", "AC-2": "pass"})
+    await refused("red", "an AC failed")
+    await _sat_report(client, task_id, ac_results={"AC-1": "not_found", "AC-2": "pass"})
+    await refused("red", "an AC not found")
+    await _sat_report(client, task_id, ac_results={"AC-1": "pass"})
+    await refused("red", "an AC without a result")
+
+    # Green by the satellite's contract: tests=pass, validation=pass, no fail, AC pass.
+    await _sat_report(client, task_id)
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1
+    dispatch.assert_awaited_once()
+    assert red._TIP
+
+    # off: the submission is accepted whatever the report; the review is held only
+    # by a CONFIRMED report that names a failed check.
+    from hub.services import review_ci_gate
+
+    off_id = await _sat_ci_task(db, "sat-off", "off")
+    await _sat_report(
+        client, off_id, path=".github/workflows/other.yml", checks={"tests": "fail"}
+    )
+    resp, _ = await _submit(client, off_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1
+    task = dict(await repo.get_task(db, off_id))
+    assert await review_ci_gate.ci_forbids_review(db, task) == [], (
+        "unconfirmed holds nothing"
+    )
+    await _sat_report(client, off_id, checks={"tests": "fail"})
+    assert await review_ci_gate.ci_forbids_review(db, task) == ["tests"]
+    # The same SHA from review stays a no-op.
+    resp, dispatch = await _submit(client, off_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1

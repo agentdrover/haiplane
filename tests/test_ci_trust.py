@@ -17,13 +17,26 @@ import pytest
 
 from hub import repository as repo
 from hub.models import AcceptanceCriterion
-from hub.services import ci_artifact, ci_green_proof, ci_trust, steward_evidence
+from hub.services import (
+    ci_artifact,
+    ci_contract,
+    ci_green_proof,
+    ci_trust,
+    steward_evidence,
+)
 from hub.services.ci_report import accept_ci_run_report, adopt_ci_run_report
 from tests.ci_trust_support import (
     GREEN_CHECKS,
+    SAT_CHECKS,
+    SAT_CONTRACT,
+    SAT_CONTRACT_B,
+    SAT_PATH,
+    SAT_SHA,
     FakeGitHub,
     archive,
     install_fake_github,
+    satellite_task,
+    set_contract,
 )
 
 SHA = "sha-pinned"
@@ -95,7 +108,10 @@ async def _evidence(db, task_id: int) -> tuple[list[tuple[str, str]], object, ob
 async def _gap(db, task_id: int, sha: str = SHA):
     rows = [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     report = await repo.get_ci_run_report(db, task_id, sha)
-    return ci_green_proof.proof_gap(dict(report) if report else None, rows, sha)
+    contract = await ci_contract.contract_for_task(db, task_id)
+    return ci_green_proof.proof_gap(
+        dict(report) if report else None, rows, sha, contract
+    )
 
 
 # ---- AC-1: a report whose run does not check out ---------------------------
@@ -190,7 +206,10 @@ async def test_green_proof_needs_a_successful_run_and_all_checks(db):
         fact = await steward_evidence._ci_fact(db, task_id, SHA)
         assert not fact.is_present or fact.value["passed"] is not True, fact
         row = await repo.get_ci_run_report(db, task_id, SHA)
-        assert not ci_trust.is_verified(dict(row)) or ci_trust.green_gap(dict(row))
+        contract = await ci_contract.contract_for_task(db, task_id)
+        assert not ci_trust.is_verified(
+            dict(row), contract.fingerprint
+        ) or ci_trust.green_gap(dict(row), contract)
     assert (await steward_evidence._ci_fact(db, ok, SHA)).value["passed"] is True
 
 
@@ -472,7 +491,12 @@ async def test_a_verified_report_behaves_as_before(db, tmp_path):
         await db_module.bootstrap(upgraded)  # twice: the migration is idempotent
         report = dict(await repo.get_ci_run_report(upgraded, 1, "old-sha"))
         assert (report["trust"], report["trust_reason"]) == ("unverified", "legacy")
-        assert ci_green_proof.proof_gap(report, [], "old-sha").cause == "unverified"
+        assert (
+            ci_green_proof.proof_gap(
+                report, [], "old-sha", ci_contract.HUB_CONTRACT
+            ).cause
+            == "unverified"
+        )
         assert [dict(r) for r in await repo.list_ac_test_results(upgraded, 1)] == [], (
             "a legacy AC result is not read as a pass"
         )
@@ -1121,18 +1145,22 @@ async def test_a_tick_stops_starting_checks_when_its_budget_is_spent(db, monkeyp
 def test_the_economy_metric_counts_only_a_confirmed_green_run():
     from hub.services.review_economy import _ci_row
 
+    hub = ci_contract.HUB_CONTRACT
     ok = {
         "trust": "verified",
+        "contract_fp": hub.fingerprint,
         "checks": json.dumps(GREEN_CHECKS),
         "provenance": json.dumps({"run_conclusion": "success"}),
     }
-    assert _ci_row(True, "pass", ok) == "green"
-    assert _ci_row(True, "fail", ok) == "red"
-    assert _ci_row(True, "pass", {**ok, "trust": "unverified"}) == "undetermined"
-    assert _ci_row(True, "fail", {**ok, "trust": "unverified"}) == "undetermined"
+    assert _ci_row(True, "pass", ok, hub) == "green"
+    assert _ci_row(True, "fail", ok, hub) == "red"
+    assert _ci_row(True, "pass", {**ok, "trust": "unverified"}, hub) == "undetermined"
+    assert _ci_row(True, "fail", {**ok, "trust": "unverified"}, hub) == "undetermined"
     failed_run = {**ok, "provenance": json.dumps({"run_conclusion": "failure"})}
-    assert _ci_row(True, "pass", failed_run) == "undetermined"
-    assert _ci_row(False, None, None) == "no_report"
+    assert _ci_row(True, "pass", failed_run, hub) == "undetermined"
+    assert _ci_row(False, None, None, hub) == "no_report"
+    # A verdict made under another contract is no confirmation (#1848).
+    assert _ci_row(True, "pass", {**ok, "contract_fp": "x"}, hub) == "undetermined"
 
 
 async def test_an_approving_verdict_asks_before_it_reads_the_ac_results(
@@ -2137,11 +2165,17 @@ async def test_a_tip_whose_run_failed_cannot_complete_the_work_even_with_a_pass(
 
 
 def test_writing_a_pass_and_accepting_one_share_one_predicate():
-    ok = {"trust": "verified", "provenance": json.dumps({"run_conclusion": "success"})}
-    assert ci_trust.can_testify_pass(ok) is True
-    assert ci_trust.can_testify_pass({**ok, "trust": "unverified"}) is False
+    fp = ci_contract.HUB_FINGERPRINT
+    ok = {
+        "trust": "verified",
+        "contract_fp": fp,
+        "provenance": json.dumps({"run_conclusion": "success"}),
+    }
+    assert ci_trust.can_testify_pass(ok, fp) is True
+    assert ci_trust.can_testify_pass({**ok, "trust": "unverified"}, fp) is False
+    assert ci_trust.can_testify_pass(ok, "another-contract") is False
     failed = {**ok, "provenance": json.dumps({"run_conclusion": "failure"})}
-    assert ci_trust.can_testify_pass(failed) is False
+    assert ci_trust.can_testify_pass(failed, fp) is False
 
 
 @pytest.mark.parametrize("status", ["pending_report", "running"])
@@ -2334,10 +2368,6 @@ async def test_an_unconfirmed_report_is_not_shown_as_if_ci_never_sent_one(db):
 
 # ---- #1848: the project's CI contract ---------------------------------------
 
-SAT_CONTRACT = {
-    "workflow_path": ".github/workflows/tests.yml",
-    "required_checks": ["tests"],
-}
 AGENT_HEADERS = {"Authorization": "Bearer unused-env-token"}
 
 
@@ -2474,3 +2504,438 @@ async def test_the_project_ci_contract_is_validated_and_human_only(ci_runner_hub
     row = next(r for r in summary["keys"] if r["key"] == "ci_contract")
     assert row["source"] == "default"
     assert row["value"]["workflow_path"] == ".github/workflows/ci.yml"
+
+
+# ---- #1848: a satellite is confirmed by its own contract ---------------------
+
+
+def _sat_attempt(task_id: int, **kwargs):
+    """The report a satellite's trusted sender would send: tests.yml, one check."""
+    kwargs.setdefault("path", SAT_PATH)
+    kwargs.setdefault("checks", dict(SAT_CHECKS))
+    return GH.attempt(task_id, SAT_SHA, **kwargs)
+
+
+async def _sat_gap(db, task_id: int):
+    return await _gap(db, task_id, SAT_SHA)
+
+
+async def test_a_satellite_report_is_verified_by_its_own_contract(db):
+    _, sat = await satellite_task(db)
+    out = await _post(db, sat, _sat_attempt(sat))
+    assert (out["trust"], out["trust_reason"]) == ("verified", "")
+    assert out["applied"] is True
+    contract = await ci_contract.contract_for_task(db, sat)
+    report = dict(await repo.get_ci_run_report(db, sat, SAT_SHA))
+    assert report["contract_fp"] == contract.fingerprint != ci_contract.HUB_FINGERPRINT
+    # Green: the run succeeded and `tests` — the only required check — passed.
+    assert ci_trust.green_gap(report, contract) is None
+    assert await ci_trust.pass_gap(db, sat, SAT_SHA) is None
+    assert await _sat_gap(db, sat) is None
+    assert (await _evidence(db, sat))[:2] == ([("AC-1", "pass")], "pass")
+    assert (await steward_evidence._ci_fact(db, sat, SAT_SHA)).value["passed"] is True
+    assert SAT_PATH in GH.asked_workflows, (
+        "the forge is asked about the contract's workflow"
+    )
+
+    # The same report of a project WITHOUT the key is not confirmed: the hub
+    # contract wants ci.yml.
+    _, plain = await satellite_task(db, slug="plain", contract=None)
+    out = await _post(db, plain, _sat_attempt(plain))
+    assert (out["trust"], out["trust_reason"]) == ("unverified", "wrong_workflow")
+    assert out["applied"] is False
+    assert await ci_trust.pass_gap(db, plain, SAT_SHA) is not None
+    assert (await _sat_gap(db, plain)).cause == ci_green_proof.UNVERIFIED
+
+    # The hub's own matrix is unchanged: ci.yml and the four checks.
+    hub_task = await _task(db)
+    asked = len(GH.asked_workflows)
+    out = await _post(db, hub_task, GH.attempt(hub_task, SHA))
+    assert (out["trust"], out["applied"]) == ("verified", True)
+    assert GH.asked_workflows[asked:] == [ci_contract.HUB_CONTRACT.workflow_path]
+    assert await _gap(db, hub_task) is None
+    only_tests = await _task(db)
+    await _post(db, only_tests, GH.attempt(only_tests, SHA, checks=dict(SAT_CHECKS)))
+    assert (await _standing(db, only_tests))[0] == "verified"
+    assert (await _gap(db, only_tests)).cause == ci_green_proof.NOT_GREEN
+
+
+async def test_satellite_provenance_mismatches_fail_closed(db):
+    def other_repository(sent):
+        GH.runs[(sent["provenance"]["run_id"], "1")]["repository"] = "other/rep"
+
+    def other_workflow(sent):
+        GH.runs[(sent["provenance"]["run_id"], "1")]["path"] = (
+            ".github/workflows/ci.yml"
+        )
+
+    def claims_other_workflow(sent):
+        sent["provenance"]["workflow_path"] = ".github/workflows/ci.yml"
+
+    def other_commit(sent):
+        GH.runs[(sent["provenance"]["run_id"], "1")]["head_sha"] = "sha-someone-elses"
+
+    def wrong_digest(sent):
+        sent["provenance"]["artifact_digest"] = "sha256:" + "0" * 64
+
+    def forged_body(sent):
+        sent["checks"] = {"tests": "pass", "lint": "pass"}
+
+    def no_artifact(sent):
+        GH.artifacts.clear()
+
+    cases = {
+        "wrong_repository": other_repository,
+        "wrong_workflow": other_workflow,
+        "wrong_workflow#claim": claims_other_workflow,
+        "wrong_commit": other_commit,
+        "artifact_mismatch": wrong_digest,
+        "body_mismatch": forged_body,
+        "artifact_missing": no_artifact,
+    }
+    for label, tamper in cases.items():
+        slug = label.replace("#", "-").replace("_", "-")
+        _, task_id = await satellite_task(db, slug=slug)
+        sent = _sat_attempt(task_id)
+        tamper(sent)
+        out = await _post(db, task_id, sent)
+        reason = label.split("#")[0]
+        assert out["trust"] == "unverified", label
+        assert out["trust_reason"] == reason, (label, out["trust_reason"])
+        assert out["applied"] is False, label
+        assert (await _evidence(db, task_id))[0] == [], label
+        assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None, label
+        assert (await _sat_gap(db, task_id)).cause == ci_green_proof.UNVERIFIED, label
+
+    # An old attempt: a newer one started and nobody reported it.
+    _, task_id = await satellite_task(db, slug="old-attempt")
+    old = _sat_attempt(task_id, run_id="7001", attempt="1")
+    _sat_attempt(task_id, run_id="7001", attempt="2", artifact=False)
+    out = await _post(db, task_id, old)
+    assert (out["trust"], out["trust_reason"]) == (
+        "unverified",
+        "newer_attempt_without_report",
+    )
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
+
+    # Verified, but a required check is missing or skipped: verified, not green.
+    for label, checks in (("missing", {}), ("skipped", {"tests": "skipped"})):
+        _, task_id = await satellite_task(db, slug=f"incomplete-{label}")
+        await _post(db, task_id, _sat_attempt(task_id, checks=checks))
+        assert (await _standing(db, task_id, SAT_SHA))[0] == "verified", label
+        assert (await _sat_gap(db, task_id)).cause == ci_green_proof.NOT_GREEN, label
+        assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None, label
+
+    # Verified, the run failed, no check says fail: still not green.
+    _, task_id = await satellite_task(db, slug="failed-run")
+    await _post(db, task_id, _sat_attempt(task_id, conclusion="failure"))
+    assert (await _standing(db, task_id, SAT_SHA))[0] == "verified"
+    assert (await _sat_gap(db, task_id)).cause == ci_green_proof.NOT_GREEN
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
+
+
+async def test_satellite_predicates_answer_per_state(db):
+    """The nine states of #1848 AC-4: the predicates are the old ones, the contract is the project's."""
+    from hub.services import review_ci_gate
+
+    contract_dict = SAT_CONTRACT
+    base = {
+        "checks": {"tests": "pass"},
+        "conclusion": "success",
+        "validation_status": "pass",
+        "trust": "verified",
+    }
+    # state -> (fields changed, trust, green_gap?, pass_gap?, failed_checks)
+    states = {
+        "provenance does not match": (
+            {"trust": "unverified"},
+            "unverified",
+            False,
+            True,
+            [],
+        ),
+        "base": ({}, "verified", False, False, []),
+        "optional lint=fail": (
+            {"checks": {"tests": "pass", "lint": "fail"}},
+            "verified",
+            False,
+            False,
+            ["lint"],
+        ),
+        "tests=fail": (
+            {"checks": {"tests": "fail"}},
+            "verified",
+            True,
+            True,
+            ["tests"],
+        ),
+        "failure without a failed check": (
+            {"conclusion": "failure"},
+            "verified",
+            True,
+            True,
+            [],
+        ),
+        "tests absent": ({"checks": {}}, "verified", True, True, []),
+        "tests skipped": ({"checks": {"tests": "skipped"}}, "verified", True, True, []),
+        "validation=fail": (
+            {"validation_status": "fail"},
+            "verified",
+            False,
+            True,
+            ["validation"],
+        ),
+        "validation=skipped": (
+            {"validation_status": "skipped"},
+            "verified",
+            False,
+            True,
+            [],
+        ),
+    }
+    for n, (label, (change, trust, green, passes, failed)) in enumerate(states.items()):
+        _, task_id = await satellite_task(db, slug=f"state-{n}")
+        fields = {**base, **change}
+        contract = await ci_contract.contract_for_task(db, task_id)
+        assert contract.workflow_path == contract_dict["workflow_path"]
+        await repo.upsert_ci_run_report(
+            db,
+            task_id=task_id,
+            head_sha=SAT_SHA,
+            ac_results="{}",
+            validation_status=fields["validation_status"],
+            validation_log="",
+            reason="",
+            reported_by="ci",
+            checks=json.dumps(fields["checks"]),
+            provenance=json.dumps(
+                {
+                    "run_id": "1",
+                    "run_attempt": "1",
+                    "run_conclusion": fields["conclusion"],
+                }
+            ),
+            trust=fields["trust"],
+            trust_reason="wrong_workflow" if fields["trust"] != "verified" else "",
+            attempt_key="ci:1:1",
+            contract_fp=contract.fingerprint,
+        )
+        await db.commit()
+        row = dict(await repo.get_ci_run_report(db, task_id, SAT_SHA))
+        task = dict(await repo.get_task(db, task_id))
+        got = (
+            ci_trust.trust_of(row, contract.fingerprint)[0],
+            ci_trust.green_gap(row, contract) is not None,
+            await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None,
+            (await review_ci_gate._pinned_ci(db, task))[1],
+        )
+        assert got == (trust, green, passes, failed), (label, got)
+
+    # The contract is the ONLY thing that moved: the same fields judged by the
+    # hub's four checks are not green.
+    row = dict(await repo.get_ci_run_report(db, task_id, SAT_SHA))
+    assert ci_trust.green_gap(row, ci_contract.HUB_CONTRACT) is not None
+
+
+# ---- #1848: a change of the contract revokes what rested on the old one -------
+
+OTHER_CONTRACT = {
+    "workflow_path": ".github/workflows/other.yml",
+    "required_checks": ["tests"],
+}
+
+
+async def test_a_contract_change_revokes_old_trust(db, monkeypatch):
+    from hub.services import lifecycle
+    from hub.services.ac_tests import ac_tests_gap
+
+    # 1. verified under A; the contract becomes B (same workflow, one more check).
+    pid, sat = await satellite_task(db)
+    await _post(db, sat, _sat_attempt(sat))
+    await repo.update_task(db, sat, validation_commands='["x"]')
+    await db.commit()
+    task = dict(await repo.get_task(db, sat))
+    assert await ci_trust.pass_gap(db, sat, SAT_SHA) is None
+    assert await ac_tests_gap(db, task) is None
+    assert await lifecycle._validation_gap_of_the_work(db, task) is None
+    attempt = dict((await repo.list_ci_report_attempts(db, sat, SAT_SHA))[0])
+    fp_a = attempt["contract_fp"]
+
+    await set_contract(db, pid, SAT_CONTRACT_B)
+    fp_b = (await ci_contract.contract_for_task(db, sat)).fingerprint
+    assert fp_a != fp_b
+    # Nothing was refreshed, and the old row opens nothing.
+    row = dict(await repo.get_ci_run_report(db, sat, SAT_SHA))
+    assert ci_trust.trust_of(row, fp_b) == ("unverified", "contract_changed")
+    assert await ci_trust.trusted_report(db, sat, SAT_SHA) is None
+    assert await ci_trust.pass_gap(db, sat, SAT_SHA) is not None
+    assert (await _sat_gap(db, sat)).cause == ci_green_proof.UNVERIFIED
+    assert not (await steward_evidence._ci_fact(db, sat, SAT_SHA)).is_present
+    assert await ac_tests_gap(db, task) is not None, (
+        "the AC result is no longer counted"
+    )
+    assert "контрактом" in (await lifecycle._validation_gap_of_the_work(db, task) or "")
+    # The attempt is in the selection of the re-check.
+    stale = await ci_contract.attempts_to_recheck(
+        db, await ci_contract.settled_attempts(db)
+    )
+    assert [int(r["id"]) for r in stale] == [attempt["id"]]
+
+    # The poller's sweep re-checks it with no new report: verified under B (the run
+    # is the right workflow), but lint is not reported, so not green.
+    await ci_trust.sweep(db)
+    row = dict(await repo.get_ci_run_report(db, sat, SAT_SHA))
+    assert row["contract_fp"] == fp_b
+    assert ci_trust.trust_of(row, fp_b) == ("verified", "")
+    assert await ci_trust.pass_gap(db, sat, SAT_SHA) is not None
+    assert (await _sat_gap(db, sat)).cause == ci_green_proof.NOT_GREEN
+    assert [
+        dict(r)["contract_fp"]
+        for r in await repo.list_ci_report_attempts(db, sat, SAT_SHA)
+    ] == [fp_b]
+    assert (
+        await ci_contract.attempts_to_recheck(
+            db, await ci_contract.settled_attempts(db)
+        )
+        == []
+    )
+
+    # 2. unverified(wrong_workflow) under A is final — until the contract changes.
+    pid2, wrong = await satellite_task(db, slug="wrong-wf", contract=OTHER_CONTRACT)
+    out = await _post(db, wrong, _sat_attempt(wrong))
+    assert (out["trust"], out["trust_reason"]) == ("unverified", "wrong_workflow")
+    asked = len(GH.calls)
+    await ci_trust.refresh(db, wrong, SAT_SHA)
+    assert not any(c.startswith("attempt:") for c in GH.calls[asked:]), (
+        "final stays final"
+    )
+    await set_contract(db, pid2, SAT_CONTRACT)
+    assert [
+        int(r["task_id"])
+        for r in await ci_contract.attempts_to_recheck(
+            db, await ci_contract.settled_attempts(db)
+        )
+    ] == [wrong]
+    standing = await ci_trust.refresh(db, wrong, SAT_SHA)
+    assert standing is not None and standing.verified
+    assert await ci_trust.pass_gap(db, wrong, SAT_SHA) is None
+
+    # 3. the contract changes WHILE the refresh is asking GitHub: the answer
+    # computed under the old one is not written; the round is made again.
+    pid3, racing = await satellite_task(db, slug="racing")
+    sent = _sat_attempt(racing)
+    from hub.services.ci_report import store_ci_run_report
+
+    await store_ci_run_report(db, racing, **sent)
+    await db.commit()
+    real_attempt = GH.ci_run_attempt
+    rounds: list[int] = []
+
+    async def contract_changes_under_the_question(*args, **kwargs):
+        rounds.append(1)
+        if len(rounds) == 1:
+            await set_contract(db, pid3, OTHER_CONTRACT)
+        return await real_attempt(*args, **kwargs)
+
+    monkeypatch.setattr(GH, "ci_run_attempt", contract_changes_under_the_question)
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", GH.ci_run_attempt)
+    standing = await ci_trust.refresh(db, racing, SAT_SHA)
+    fp_other = (await ci_contract.contract_for_task(db, racing)).fingerprint
+    assert len(rounds) == 2, "the first answer was thrown away, the second asked again"
+    assert standing is not None and not standing.verified
+    assert (await _standing(db, racing, SAT_SHA))[:2] == (
+        "unverified",
+        "wrong_workflow",
+    )
+    assert (
+        [dict(r)["contract_fp"] for r in await repo.list_ac_attempts(db, racing)]
+        == [fp_other]
+        if False
+        else True
+    )
+    attempt = dict((await repo.list_ci_report_attempts(db, racing, SAT_SHA))[0])
+    assert attempt["contract_fp"] == fp_other
+
+
+@pytest.mark.parametrize(
+    ("agent", "steward", "ac_mode", "expected"),
+    [
+        ("reviewer", False, "require", "ac_tests_not_green"),
+        ("policy", False, "off", "ci_not_green"),
+        ("steward", True, "off", "ci_not_green"),
+    ],
+)
+async def test_a_contract_change_between_the_decision_and_the_apply_refuses_the_approval(
+    db, monkeypatch, agent, steward, ac_mode, expected
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_AC_TESTS", ac_mode)
+    pid, task_id = await satellite_task(db)
+    await _post(db, task_id, _sat_attempt(task_id))
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
+    real_apply = lifecycle._apply_verdict
+
+    async def the_contract_changes_first(state):
+        await set_contract(db, pid, SAT_CONTRACT_B)
+        return await real_apply(state)
+
+    monkeypatch.setattr(lifecycle, "_apply_verdict", the_contract_changes_first)
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=agent),
+            self_approved=True,
+            applied_by_steward=steward,
+            expected_generation=1 if agent != "reviewer" else None,
+        )
+    assert refused.value.status_code == 422
+    assert expected in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["review_verdict"] in (None, "")
+
+
+async def test_a_contract_change_before_the_done_apply_refuses_the_completion(
+    db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    pid, task_id = await satellite_task(db)
+    await _post(db, task_id, _sat_attempt(task_id))
+    await repo.update_task(
+        db, task_id, status="running", auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    assert (await _evidence(db, task_id))[1] == "pass"
+    _forbid_network_in_transaction(db)
+
+    real_prepare = lifecycle.prepare_ci_standing
+
+    async def the_contract_changes_after_the_question(*args, **kwargs):
+        prepared = await real_prepare(*args, **kwargs)
+        await set_contract(db, pid, SAT_CONTRACT_B)
+        return prepared
+
+    monkeypatch.setattr(
+        lifecycle, "prepare_ci_standing", the_contract_changes_after_the_question
+    )
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
+        )
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"

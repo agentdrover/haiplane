@@ -20,10 +20,18 @@ from typing import Any
 from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
+from hub.models import AcceptanceCriterion
 
 REPO = "own/rep"
 CI_PATH = ".github/workflows/ci.yml"
 GREEN_CHECKS = {"lint": "pass", "format": "pass", "types": "pass", "tests": "pass"}
+# A satellite project (#1848): its own workflow and ONE required check. Kept
+# apart from the hub's constants above — the strict hub fixture is not widened.
+SAT_PATH = ".github/workflows/tests.yml"
+SAT_CHECKS = {"tests": "pass"}
+SAT_CONTRACT = {"workflow_path": SAT_PATH, "required_checks": ["tests"]}
+# The same workflow with one more required check: another contract, another fingerprint.
+SAT_CONTRACT_B = {"workflow_path": SAT_PATH, "required_checks": ["lint", "tests"]}
 
 
 #: The columns a stored report row has once GitHub confirmed it, for tests that
@@ -55,6 +63,7 @@ class FakeGitHub:
         self.down = False
         self.zip_down = False
         self.calls: list[str] = []
+        self.asked_workflows: list[str] = []
         self._clock = 0
         self._ids = 1000
         self._runs = 0
@@ -76,8 +85,11 @@ class FakeGitHub:
         found = self.runs.get((str(run_id), str(attempt)))
         return self._facts(found, gh_repo) if found else {}
 
-    async def ci_runs_for_sha(self, head_sha, repo=None, gh_repo=None, forge=""):
+    async def ci_runs_for_sha(
+        self, head_sha, repo=None, gh_repo=None, forge="", workflow_path=CI_PATH
+    ):
         self.calls.append(f"runs:{head_sha}")
+        self.asked_workflows.append(workflow_path)
         if self.down:
             return None
         latest: dict[str, dict[str, Any]] = {}
@@ -334,3 +346,60 @@ async def seed_clean_integrity(db: Any, task_id: int, head_sha: str) -> None:
     from hub import repository_ci_integrity as store
 
     await store.save_ci_integrity_scan(db, task_id, head_sha, "clean", "[]", "")
+
+
+async def satellite_task(
+    db: Any, *, slug: str = "sat", contract: dict | None = SAT_CONTRACT
+) -> tuple[int, int]:
+    """``(project_id, task_id)`` of a running task of a satellite project.
+
+    The project carries ``ci_contract`` (None = none, i.e. the hub contract) and
+    the task is bound to it directly. The task is pinned at generation 1 on
+    ``SAT_SHA`` so the readers of the pinned commit have something to read.
+    """
+    pid = await repo.create_project(db, slug=slug, name=slug.title())
+    policy = {} if contract is None else {"ci_contract": contract}
+    await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+    task_id = await repo.create_task(
+        db,
+        title="A satellite task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, project_id=pid)
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
+            )
+        ],
+    )
+    await repo.bump_submission_generation(db, task_id)
+    await repo.update_task(db, task_id, submission_sha=SAT_SHA)
+    await db.commit()
+    return pid, task_id
+
+
+async def set_contract(db: Any, project_id: int, contract: dict | None) -> None:
+    """What a human's PATCH leaves in the project's policy (the write path has its own test)."""
+    policy = {} if contract is None else {"ci_contract": contract}
+    await repo.update_project(db, project_id, gate_policy=json.dumps(policy))
+    await db.commit()
+
+
+SAT_SHA = "sha-satellite"

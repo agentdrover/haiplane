@@ -166,7 +166,9 @@ def source_attempt(source: str) -> tuple[str, str] | None:
     return parts[1], parts[2]
 
 
-async def evidence_stale(db: Any, task_id: int, source: str) -> bool:
+async def evidence_stale(
+    db: Any, task_id: int, source: str, current_fp: str | None = None
+) -> bool:
     """Доказательство CI (AC-результат, validation) выдано под контрактом, которого уже нет.
 
     ``source`` — ``ci:<run>:<attempt>``. Попытка с другим отпечатком (или без
@@ -186,7 +188,19 @@ async def evidence_stale(db: Any, task_id: int, source: str) -> bool:
     )
     if not rows:
         return False
-    return str(rows[0][0] or "") != await fingerprint_for_task(db, task_id)
+    if current_fp is None:
+        current_fp = await fingerprint_for_task(db, task_id)
+    return str(rows[0][0] or "") != current_fp
+
+
+async def drop_stale_results(db: Any, task_id: int, rows: Any) -> list[Any]:
+    """The recorded results whose source is not a stale CI attempt (#1848)."""
+    fp = await fingerprint_for_task(db, task_id)
+    return [
+        r
+        for r in rows
+        if not await evidence_stale(db, task_id, str(r["source"] or ""), fp)
+    ]
 
 
 async def attempts_to_recheck(db: Any, rows: list[Any]) -> list[Any]:

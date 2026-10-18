@@ -34,7 +34,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
-from hub.services import ci_trust
+from hub.services import ci_contract, ci_trust
 
 EVENT_JUDGED_WITHOUT_CI = "steward_judges_without_verified_ci"
 
@@ -65,8 +65,8 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
     # окончательность попытки A под ключом уже переключённой проекции на B.
     rows = await fetchall(
         db,
-        "SELECT r.trust, r.trust_reason, r.attempt_key, a.id AS attempt_id, "
-        "a.trust_final FROM ci_run_reports r LEFT JOIN ci_report_attempts a "
+        "SELECT r.trust, r.trust_reason, r.attempt_key, r.contract_fp, "
+        "a.id AS attempt_id, a.trust_final, a.contract_fp AS attempt_fp FROM ci_run_reports r LEFT JOIN ci_report_attempts a "
         "ON a.task_id=r.task_id AND a.head_sha=r.head_sha "
         "AND r.attempt_key != '' AND a.run_id != '' AND a.run_attempt != '' "
         "AND 'ci:' || a.run_id || ':' || a.run_attempt = r.attempt_key "
@@ -76,7 +76,8 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
     if not rows:
         return CiWait(True, "отчёта CI по закреплённому коммиту нет")
     row = dict(rows[0])
-    trust, reason = ci_trust.trust_of(row)
+    fp = await ci_contract.fingerprint_for_task(db, task_id)
+    trust, reason = ci_trust.trust_of(row, fp)
     if trust == ci_trust.VERIFIED:
         return NOT_WAITING
     if row["attempt_id"] is None:
@@ -85,7 +86,7 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
             True,
             f"unverified({reason}): у текущей попытки {key or '—'} нет строки учёта",
         )
-    if int(row.get("trust_final") or 0):
+    if int(row.get("trust_final") or 0) and row.get("attempt_fp") == fp:
         return NOT_WAITING
     return CiWait(True, f"unverified({reason}), проверка не окончательна")
 
