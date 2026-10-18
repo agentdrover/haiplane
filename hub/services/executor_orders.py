@@ -37,6 +37,7 @@ import aiosqlite
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from hub import config
 from hub import repository as repo
 from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
@@ -914,6 +915,8 @@ async def _own_order(
 
 
 _SQLITE_MAX_INT = 2**63 - 1
+#: Статусы задачи в работе исполнителя: сданный заказ о них молчит (#1831).
+_WORK_STATUSES = ("open", "claimed", "running")
 
 
 async def _fields_hold_any_code(db: aiosqlite.Connection, text: str) -> bool:
@@ -971,11 +974,19 @@ async def read_order_outcome(
         row["state"] != STATE_CLOSED and row["t_holder"] == row["executor_run_id"]
     )
     foreign = generation >= int(row["generation"]) and not attributed
-    superseded = bool(row["newer"]) or generation > int(row["generation"]) or foreign
+    # Закрытая сдачей заказ не говорит о задаче, ушедшей в новую работу (возврат
+    # в работу, ручной pair-start): поля задачи тогда принадлежат другому исполнителю.
+    moved_on = (
+        row["close_reason"] == CLOSE_SUBMITTED and row["t_status"] in _WORK_STATUSES
+    )
+    superseded = (
+        bool(row["newer"]) or generation > int(row["generation"]) or foreign or moved_on
+    )
     submitted = not superseded and generation == int(row["generation"])
     branch = str(row["t_branch"] or "") if submitted else ""
     if branch and (
         any(shape.search(branch) for shape in _SECRET_SHAPES)
+        or any(str(tok) and str(tok) in branch for tok in config.HUB_TOKENS)
         or await _fields_hold_any_code(db, branch)
     ):
         branch = (

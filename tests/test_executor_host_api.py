@@ -285,3 +285,40 @@ async def test_order_read_branch_hides_any_hub_code(world):
     got = await _read(world, "k8", lived["order"]["id"])
     assert got.json()["submitted"] is True and got.json()["branch"] == ""
     assert bare not in got.text and manual not in got.text
+
+
+async def test_submitted_order_is_silent_after_the_task_moves_on(world, monkeypatch):
+    """Codex P2: после возврата в работу сданный заказ не склеивает SHA прежней сдачи с новой веткой."""
+    from hub import config
+    from hub import repository as repo
+
+    task_id = await _task(world, "возврат в работу")
+    lived = await _launch_redeem(world, task_id)
+    await repo.update_task(world.db, task_id, submission_sha="1" * 40, pr_number=2)
+    await _submit(world, task_id, 1)
+    from hub.services import executor_orders as orders
+
+    await orders.sweep_executor_orders(world.db)  # сдача закрыла заказ
+    await world.db.commit()
+    done = (await _read(world, "k8", lived["order"]["id"])).json()
+    assert done["submitted"] is True and done["submission_sha"] == "1" * 40
+    # Задача ушла в новую работу с другой веткой, поколение прежнее.
+    await repo.update_task(
+        world.db, task_id, status="running", branch=f"task-{task_id}/new-run"
+    )
+    await world.db.commit()
+    moved = (await _read(world, "k8", lived["order"]["id"])).json()
+    assert moved["superseded"] is True and moved["submitted"] is False
+    assert moved["submission_sha"] == "" and moved["branch"] == ""
+    assert moved["task_status"] is None
+
+    # Токен произвольного вида из окружения хаба в слаге ветки не возвращается.
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"plain-secret-xyz": config.TokenIdentity("b", "agent")}
+    )
+    await repo.update_task(
+        world.db, task_id, status="review", branch=f"task-{task_id}/plain-secret-xyz"
+    )
+    await world.db.commit()
+    leak = await _read(world, "k8", lived["order"]["id"])
+    assert "plain-secret-xyz" not in leak.text
