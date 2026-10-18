@@ -1064,4 +1064,30 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "ALTER TABLE executor_orders ADD COLUMN redeem_rotations "
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        # #1817: последняя принятая фаза хоста (vm_starting, agent_running,
+        # critic, submitting) и её время. В ленту фазы не пишутся.
+        "add_executor_orders_phase",
+        "ALTER TABLE executor_orders ADD COLUMN phase TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_executor_orders_phase_at",
+        "ALTER TABLE executor_orders ADD COLUMN phase_at TEXT",
+    ),
+    (
+        # #1817: код причины и текст причины из report хоста (reason ≤ 200).
+        "add_executor_orders_report_reason_code",
+        "ALTER TABLE executor_orders ADD COLUMN report_reason_code "
+        "TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_executor_orders_report_reason",
+        "ALTER TABLE executor_orders ADD COLUMN report_reason TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1817: итоговая запись в ленте по заказу пишется один раз: кто первым
+        # (report, закрытие заказа, возврат задачи в open) ставит метку.
+        "add_executor_orders_final_entry_at",
+        "ALTER TABLE executor_orders ADD COLUMN final_entry_at TEXT",
+    ),
 ]

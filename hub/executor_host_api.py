@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import current_identity, require_human_or_admin
-from hub.services import executor_orders, host_redeem
+from hub.services import executor_orders, host_redeem, launch_feedback
 
 router = APIRouter()
 
@@ -50,11 +50,17 @@ class ExecutorOrderRedeem(BaseModel):
     code: str
 
 
+class ExecutorOrderPhase(BaseModel):
+    phase: str
+
+
 class ExecutorOrderReport(BaseModel):
     outcome: str
     sha: str = ""
     branch: str = ""
     note: str = ""
+    reason_code: str = ""
+    reason: str = ""
 
 
 class ExecutorLaunchRequest(BaseModel):
@@ -259,6 +265,34 @@ async def api_executor_order_ack(
         raise _as_http(exc) from exc
 
 
+@router.post("/api/executor-hosts/{name}/orders/{order_id}/phase")
+async def api_executor_order_phase(
+    name: str, order_id: int, body: ExecutorOrderPhase, request: Request
+) -> dict:
+    """Фаза прогона на хосте (#1817): только вперёд, у выкупленного заказа.
+
+    Повтор той же — 200 без изменений; назад, до redeemed, после report или
+    закрытия — 409; сверх квоты хоста — 429. В ленту задачи фаза не пишется.
+    """
+    await _host_caller(request, name)
+    _phase_limiter._max_attempts = PHASE_MAX
+    if _phase_limiter.is_blocked(name):
+        raise HTTPException(
+            429,
+            detail={
+                "reason": "too_many_phases",
+                "message": f"не больше {PHASE_MAX} фаз в {PHASE_WINDOW} с",
+            },
+        )
+    _phase_limiter.record(name)
+    try:
+        return await launch_feedback.record_phase(
+            _db(request), name, order_id, body.phase
+        )
+    except executor_orders.HostError as exc:
+        raise _as_http(exc) from exc
+
+
 @router.post("/api/executor-hosts/{name}/orders/{order_id}/report")
 async def api_executor_order_report(
     name: str, order_id: int, body: ExecutorOrderReport, request: Request
@@ -274,6 +308,8 @@ async def api_executor_order_report(
             sha=body.sha,
             branch=body.branch,
             note=body.note,
+            reason_code=body.reason_code,
+            reason=body.reason,
             principal_id=current_identity(request).principal_id,
         )
     except executor_orders.HostError as exc:

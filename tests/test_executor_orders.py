@@ -1878,3 +1878,61 @@ async def test_redeem_lost_revokes_unused_session(world):
     assert kept["state"] == "redeemed" and kept["ack_result"] == ""
     assert await _sessions_of(world, used_run) == sessions
     assert (await repo.get_task(world.db, used_task))["status"] == "running"
+
+
+async def _phase(world, order_id: int, phase: str, host: str = "k8", auth=None):
+    return await world.client.post(
+        f"/api/executor-hosts/{host}/orders/{order_id}/phase",
+        json={"phase": phase},
+        headers=auth or getattr(world, f"{host}_auth"),
+    )
+
+
+async def test_order_phase_contract(world, monkeypatch):
+    """#1817 AC-2: фазы хоста — только после redeemed, вперёд, без записей в ленту."""
+    from hub import executor_host_api
+
+    task_id = await _task(world, "фазы")
+    assert (await _launch(world, task_id)).status_code == 200
+    order = (await _orders(world)).json()["orders"][0]  # выдан, не выкуплен
+    feed_before = await _rows(world.db, "SELECT 1 FROM task_updates")
+    # До фактического redeemed: 409, фаза не записана.
+    assert (await _phase(world, order["id"], "vm_starting")).status_code == 409
+    redeemed = await _redeem(world, _code_of(world, order))
+    assert redeemed.status_code == 200
+    # Мусорная фаза — 422.
+    assert (await _phase(world, order["id"], "teleport")).status_code == 422
+    # Первая, затем вперёд с пропуском.
+    first = await _phase(world, order["id"], "vm_starting")
+    assert first.status_code == 200 and first.json()["phase"] == "vm_starting"
+    skip = await _phase(world, order["id"], "critic")
+    assert skip.status_code == 200 and skip.json()["duplicate"] is False
+    # Повтор той же — 200 без изменений; назад — 409.
+    again = await _phase(world, order["id"], "critic")
+    assert again.status_code == 200 and again.json()["duplicate"] is True
+    assert (await _phase(world, order["id"], "agent_running")).status_code == 409
+    assert (await _order_row(world, order["id"]))["phase"] == "critic"
+    # Чужой хост: ключ k9 на пути k8 и заказ k8 по пути k9.
+    assert (
+        await _phase(world, order["id"], "submitting", "k8", world.k9_auth)
+    ).status_code == 403
+    assert (await _phase(world, order["id"], "submitting", "k9")).status_code == 403
+    # Ни одна фаза не пишет в ленту.
+    assert (
+        len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+        == feed_before.__len__()
+    )
+    # Квота на хост: 429 сверх лимита, фаза не меняется.
+    executor_host_api._phase_limiter._buckets.clear()
+    monkeypatch.setattr(executor_host_api, "PHASE_MAX", 2)
+    codes = [(await _phase(world, order["id"], "critic")).status_code for _ in range(4)]
+    assert codes[:2] == [200, 200] and 429 in codes
+    executor_host_api._phase_limiter._buckets.clear()
+    # После отчёта и после закрытия — 409.
+    done = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order['id']}/report",
+        json={"outcome": "failed", "note": "упал"},
+        headers=world.k8_auth,
+    )
+    assert done.status_code == 200, done.text
+    assert (await _phase(world, order["id"], "submitting")).status_code == 409
