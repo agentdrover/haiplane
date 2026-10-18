@@ -3390,8 +3390,8 @@ async def api_pair_start_task(
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
         session_token=_implementer_token(request, identity),
+        after=lambda: _record_slot_capture(request, identity, task_id),
     )
-    await _record_slot_capture(request, identity, task_id)
     return view
 
 

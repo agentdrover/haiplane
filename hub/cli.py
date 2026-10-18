@@ -499,6 +499,8 @@ def _warn_area_check(result: Any) -> None:
             f"({skill.get('chars')} знаков), повторно не выдаётся",
             file=sys.stderr,
         )
+    if isinstance(skill, dict) and skill.get("delivered_to_session"):
+        print("навык уже выдан этой сессии; --full-rules", file=sys.stderr)
     foreign = result.get("project_check") if isinstance(result, dict) else None
     if isinstance(foreign, dict) and foreign.get("task_project"):
         # #1674: the task belongs to a project the session did not declare.
@@ -522,6 +524,8 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["session_id"] = args.session_id
     if getattr(args, "git_mode", None):
         body["git_mode"] = args.git_mode
+    if getattr(args, "full_rules", False):
+        body["full_rules"] = True
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
     _warn_area_check(result)
@@ -2564,6 +2568,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="hub (default) prepares the branch on the hub host; remote skips host git",
     )
+    p_pair_start.add_argument("--full-rules", action="store_true", help="Resend skill")
     p_pair_start.set_defaults(func=cmd_pair_start)
 
     _add_outcome_debt_parser(sub)
