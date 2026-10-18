@@ -5790,14 +5790,12 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
 async def hub_refine_task(
     task_id: int, include_task: bool = False, **fields: Any
 ) -> HubRefineTaskResult:
-    """PATCH a task's DoR fields.
-
-    Writes only passed fields; each list REPLACES the stored one.
+    """PATCH DoR fields; only passed ones are written, lists REPLACE.
 
     Args:
         task_id: Task to refine.
         description: Statement text; "" clears it.
-        work_type: Kind of work (a frozen project admits by type).
+        work_type: Kind of work.
         due_date: ISO date (fixed_date).
         user_story: As a / I want / so that.
         problem_statement: What is broken.
@@ -5809,21 +5807,21 @@ async def hub_refine_task(
         redesign_decision: adapt | redesign.
         found_in: Defect stage (prod: not feature).
         caused_by_task_id: Causing task.
-        cause_kind: regression|latent_design|dependency|ops|not_a_defect|unknown.
-        technical_hints: Hints, approach.
+        cause_kind: Defect cause class.
+        technical_hints: Approach hints.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        affected_areas: Paths impacted.
+        affected_areas: Paths hit.
         validation_commands: Proof commands.
-        live_probe: Post-delivery probe (registry name).
-        result_kind: commit|state; draft only.
-        rollback: Undo of a state result.
-        out_of_scope_for_review: Reviewer ignores.
+        live_probe: Post-delivery probe name.
+        result_kind: Draft only.
+        rollback: State undo.
+        out_of_scope_for_review: Reviewer skips.
         review_checklist: Reviewer verifies.
         human_owner: Who is accountable.
         human_reviewer: Who accepts.
-        freeze_rationale: Why it may enter a freeze.
+        freeze_rationale: Freeze admission reason.
         acceptance_criteria: Full AC replacement.
         risks: Full replacement.
         include_task: Echo the task.
