@@ -437,29 +437,78 @@ def env_line_problems(line: str, bare_name_ok: bool = False) -> list[str]:
     return []
 
 
-ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{2,})=([^\s]*)")
+ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{2,})=")
+SUDOERS_RULE = re.compile(r"\S+\s+ALL\s*=\s*\(\S+\)\s+(NOPASSWD:\s*)?/\S+.*")
+SUDOERS_HEADER = "########## sudoers.d"
 
 
-def prose_line_problems(line: str) -> list[str]:
-    """README и CAPTURE: каждое NAME=VALUE в строке подчиняется белому списку и типам."""
+def _unit_problems(unit: str) -> list[str]:
+    """Единица разметки целиком: NAME=VALUE ровно с начала, значение - весь остаток."""
     problems = []
-    for name, raw in ASSIGNMENT.findall(line):
-        if name == "ALL":
-            continue  # синтаксис sudoers (host=(user) ...), не переменная
-        value = raw.rstrip("`'|,;)")
-        if f"{name}={value}" != shown(name, value):
+    for m in ASSIGNMENT.finditer(unit):
+        name, value = m.group(1), unit[m.end() :]
+        if m.start() != 0 or f"{name}={value}" != shown(name, value):
             problems.append(f"{name}: значение вне белого списка или типа")
     return problems
 
 
-def readme_table_problems(text: str) -> list[str]:
-    """Ячейки «значение» таблицы переменных README: имя, значение по типу или скрыто."""
+def _raw_line_problems(line: str) -> list[str]:
+    """Строка снятия: слова через пробел, оболочка Environment= и одиночные кавычки снимаются."""
     problems = []
-    for name, _src, value in re.findall(
-        r"^\| `([A-Z][A-Z0-9_]*)` \| `([^`]+)` \| `([^`]*)` \|", text, flags=re.M
-    ):
-        if f"{name}={value}" != shown(name, value):
-            problems.append(f"{name}: значение в таблице вне белого списка или типа")
+    for token in line.split():
+        token = token.removeprefix("Environment=")
+        if token.startswith("'"):
+            token = token[1:]
+            token = token.removesuffix("'")
+        problems += _unit_problems(token)
+    return problems
+
+
+def _markdown_line_problems(line: str) -> list[str]:
+    problems = []
+    for span in re.findall(r"`([^`]*)`", line):
+        problems += _unit_problems(span)
+    rest = re.sub(r"`[^`]*`", " ", line)
+    for token in re.split(r"[\s|]+", rest):
+        problems += _unit_problems(token)
+    return problems
+
+
+def prose_problems(rel: str, lines: list[str]) -> list[tuple[int, str]]:
+    """README и CAPTURE: присваивания NAME=VALUE подчиняются белому списку и типам."""
+    out: list[tuple[int, str]] = []
+    in_fence = False
+    in_sudoers = False
+    for number, line in enumerate(lines, 1):
+        if rel == "CAPTURE.txt":
+            if line.startswith("##########"):
+                in_sudoers = line.startswith(SUDOERS_HEADER)
+            if in_sudoers and SUDOERS_RULE.fullmatch(line):
+                continue  # правило sudoers: ``ALL=`` это синтаксис, не переменная
+            found = _raw_line_problems(line)
+        else:
+            if line.startswith("```"):
+                in_fence = not in_fence
+                continue
+            found = (
+                _raw_line_problems(line) if in_fence else _markdown_line_problems(line)
+            )
+        out.extend((number, p) for p in found)
+    return out
+
+
+def readme_table_problems(text: str) -> list[str]:
+    """Ячейки таблицы переменных README, с обратными кавычками и без них."""
+    problems = []
+    for line in text.split("\n"):
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip().strip("`") for c in line.strip("|").split("|")]
+        if len(cells) >= 4 and re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", cells[0]):
+            if f"{cells[0]}={cells[2]}" != shown(cells[0], cells[2]):
+                problems.append(
+                    f"{cells[0]}: значение в таблице вне белого списка или типа"
+                )
     return problems
 
 
@@ -495,7 +544,7 @@ def snapshot_violations(root: Path) -> list[str]:
             out.append(f"{rel}: не UTF-8")
             continue
         if rel in NON_SOURCE_FILES:
-            checker = prose_line_problems
+            checker = None
             if rel == "README.md":
                 out.extend(f"{rel}: {p}" for p in readme_table_problems(text))
         elif rel.startswith("etc/systemd/system/") and rel.endswith(
@@ -512,6 +561,8 @@ def snapshot_violations(root: Path) -> list[str]:
         lines = text.split("\n")
         if lines and lines[-1] == "":
             lines.pop()  # завершающий LF
+        if rel in NON_SOURCE_FILES:
+            out.extend(f"{rel}:{n}: {p}" for n, p in prose_problems(rel, lines))
         for number, line in enumerate(lines, 1):
             problems = generic_line_problems(line)
             if checker is env_line_problems:
@@ -652,6 +703,8 @@ def readme_secret_names(readme: str) -> list[str]:
 # --- AC-1 ---------------------------------------------------------------------
 # Непрозрачное имя с разделителями (длина 39), собрано по частям.
 OPAQUE_NAME = "_".join(["HAIPLANE", "ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ012"])
+# Значения для отрицательных примеров собраны по частям (не литералами).
+DEMO_VALUE = "demo" + "_value_" + "42"
 NEGATIVE_EXAMPLES: dict[str, tuple[str, str]] = {
     "одиночные кавычки, значение вне типа": (
         "etc/systemd/system/x.service.d/a.conf",
@@ -748,6 +801,34 @@ NEGATIVE_EXAMPLES: dict[str, tuple[str, str]] = {
     "EnvironmentFile: многострочное значение": (
         f"etc/{PROD_NAME}/{PROD_NAME}.env",
         f"HAIPLANE_HUB_HOME=/var/lib/{PROD_NAME}\nsecond-line-of-a-value\n",
+    ),
+    "README: ALL= вне sudoers": (
+        "README.md",
+        f"Пример: ALL={DEMO_VALUE}\n",
+    ),
+    "CAPTURE: ALL= вне раздела sudoers": (
+        "CAPTURE.txt",
+        f"\n########## x\nALL={DEMO_VALUE}\n",
+    ),
+    "CAPTURE: ALL= в sudoers, но не правило": (
+        "CAPTURE.txt",
+        f"\n########## sudoers.d (x)\nALL={DEMO_VALUE}\n",
+    ),
+    "README: хвост пунктуации после значения": (
+        "README.md",
+        "Пример: HAIPLANE_HUB_PORT=8080);;;\n",
+    ),
+    "README: хвост пунктуации после маски": (
+        "README.md",
+        "Пример: HAIPLANE_HUB_TOKENS=<скрыто>;;;\n",
+    ),
+    "CAPTURE: хвост пунктуации после маски": (
+        "CAPTURE.txt",
+        "HAIPLANE_HUB_TOKENS=<скрыто>;;;\n",
+    ),
+    "README: ячейка таблицы без кавычек": (
+        "README.md",
+        f"| HAIPLANE_HUB_TOKENS | x.env | {DEMO_VALUE} | действует |\n",
     ),
     "README: открытый токен": (
         "README.md",
