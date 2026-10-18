@@ -2330,3 +2330,147 @@ async def test_an_unconfirmed_report_is_not_shown_as_if_ci_never_sent_one(db):
     )
     evidence = await review_evidence.ci_evidence_state(db, task)
     assert "не подтверждён: body_mismatch" in evidence.baseline.reason
+
+
+# ---- #1848: the project's CI contract ---------------------------------------
+
+SAT_CONTRACT = {
+    "workflow_path": ".github/workflows/tests.yml",
+    "required_checks": ["tests"],
+}
+AGENT_HEADERS = {"Authorization": "Bearer unused-env-token"}
+
+
+async def _project(hub, slug: str) -> int:
+    resp = await hub.client.post(
+        "/api/projects", json={"slug": slug, "name": slug.title()}, headers=hub.human
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"]
+
+
+async def _stored_policy(db, pid: int) -> dict:
+    return json.loads((await repo.get_project(db, pid))["gate_policy"] or "{}")
+
+
+async def test_the_project_ci_contract_is_validated_and_human_only(ci_runner_hub):
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    hub = ci_runner_hub
+    db, client = hub.db, hub.client
+    pid = await _project(hub, "sat-contract")
+    default_pid = await _project(hub, "default")
+
+    async def write(value, headers=None, project=pid):
+        return await client.patch(
+            f"/api/projects/{project}",
+            json={"gate_policy": {"ci_contract": value}},
+            headers=headers or hub.human,
+        )
+
+    # Every malformed contract is refused, and nothing is stored.
+    bad = [
+        {**SAT_CONTRACT, "workflow_path": "ci.yml"},
+        {**SAT_CONTRACT, "workflow_path": ".github/workflows/sub/tests.yml"},
+        {**SAT_CONTRACT, "workflow_path": ".github/workflows/../ci.yml"},
+        {**SAT_CONTRACT, "workflow_path": ".github/workflows/tests.txt"},
+        {**SAT_CONTRACT, "workflow_path": ".github/actions/tests.yml"},
+        {**SAT_CONTRACT, "required_checks": []},
+        {**SAT_CONTRACT, "required_checks": ["tests", "tests"]},
+        {**SAT_CONTRACT, "required_checks": ["tests", "security"]},
+        {**SAT_CONTRACT, "extra": 1},
+        {"workflow_path": SAT_CONTRACT["workflow_path"]},
+        {"required_checks": ["tests"]},
+        "tests.yml",
+        ["tests"],
+    ]
+    for value in bad:
+        refused = await write(value)
+        assert refused.status_code == 422, (value, refused.text)
+    assert "ci_contract" not in await _stored_policy(db, pid)
+
+    # An agent and a ci_runner key are refused; neither writes the key.
+    assert (await write(SAT_CONTRACT, AGENT_HEADERS)).status_code == 403
+    assert (await write(SAT_CONTRACT, hub.ci)).status_code == 403
+    assert "ci_contract" not in await _stored_policy(db, pid)
+
+    # The hub's own project keeps the hub contract: refused for everybody.
+    locked = await write(SAT_CONTRACT, project=default_pid)
+    assert locked.status_code == 422, locked.text
+    assert locked.json()["detail"]["error"] == "ci_contract_not_for_default"
+    assert "ci_contract" not in await _stored_policy(db, default_pid)
+
+    # A deferred patch with the key (and with null) is refused when created...
+    at = (datetime.now(UTC) + timedelta(days=3)).isoformat()
+    url = "/api/projects/sat-contract/policy-schedule"
+    for patch in ({"ci_contract": SAT_CONTRACT}, {"ci_contract": None}):
+        made = await client.post(
+            url, json={"at": at, "patch": patch}, headers=hub.human
+        )
+        assert made.status_code == 422, (patch, made.text)
+        assert made.json()["detail"]["error"] == "ci_contract_not_schedulable"
+    assert await repo.list_scheduled_policy_changes(db, pid) == []
+
+    # ...and when it is executed (a row that got past creation, e.g. by SQL).
+    for patch in ({"ci_contract": SAT_CONTRACT}, {"ci_contract": None}):
+        await repo.insert_scheduled_policy_change(
+            db,
+            project_id=pid,
+            at="2026-01-01T00:00:00Z",
+            patch=patch,
+            note="",
+            created_by="x",
+        )
+    await db.commit()
+    outcomes = await policy_change.run_due(db)
+    assert [o["outcome"] for o in outcomes] == ["refused", "refused"]
+    assert {o["error"] for o in outcomes} == {"ci_contract_not_schedulable"}
+    assert "ci_contract" not in await _stored_policy(db, pid)
+
+    # A human writes it; the audit says what it was and what it became.
+    ok = await write(
+        {"required_checks": ["tests"], "workflow_path": SAT_CONTRACT["workflow_path"]}
+    )
+    assert ok.status_code == 200, ok.text
+    assert (await _stored_policy(db, pid))["ci_contract"] == SAT_CONTRACT
+    event = (await repo.list_project_events(db, pid, "project_gate_policy_changed"))[0]
+    changes = json.loads(event["payload"])["changes"]["ci_contract"]
+    assert changes == {"was": None, "now": SAT_CONTRACT}
+    # The checks are stored sorted, whatever order they were sent in.
+    sorted_ok = await write({**SAT_CONTRACT, "required_checks": ["tests", "lint"]})
+    assert sorted_ok.status_code == 200
+    assert (await _stored_policy(db, pid))["ci_contract"]["required_checks"] == [
+        "lint",
+        "tests",
+    ]
+
+    # effective_policy shows the key, with the fingerprint the trust rests on.
+    summary = (
+        await client.get(
+            "/api/projects/sat-contract/effective-policy", headers=hub.human
+        )
+    ).json()
+    row = next(r for r in summary["keys"] if r["key"] == "ci_contract")
+    assert row["source"] == "project"
+    assert row["value"]["workflow_path"] == SAT_CONTRACT["workflow_path"]
+    assert row["value"]["required_checks"] == ["lint", "tests"]
+    assert len(row["value"]["fingerprint"]) == 64
+
+    # Removing the key (the rollback) returns the project to the hub contract.
+    removed = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"ci_contract": None}},
+        headers=hub.human,
+    )
+    assert removed.status_code == 200, removed.text
+    assert "ci_contract" not in await _stored_policy(db, pid)
+    summary = (
+        await client.get(
+            "/api/projects/sat-contract/effective-policy", headers=hub.human
+        )
+    ).json()
+    row = next(r for r in summary["keys"] if r["key"] == "ci_contract")
+    assert row["source"] == "default"
+    assert row["value"]["workflow_path"] == ".github/workflows/ci.yml"

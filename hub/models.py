@@ -436,6 +436,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1679: какие поводы хаб кладёт в ящик steward@<проект>. Не гейт и ничего
     # не делегирует. Читатель: project_policy.steward_watch_of.
     "steward_watch",
+    # #1848: workflow и обязательные проверки CI проекта-спутника. Правит
+    # только человек. Читатель: project_policy.ci_contract_from.
+    "ci_contract",
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -3549,6 +3552,10 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_release_artifacts(v)
     _validate_freeze(v)
     _validate_steward_watch(v)
+    if "ci_contract" in v:
+        from hub.services.ci_contract import validated_ci_contract
+
+        v["ci_contract"] = validated_ci_contract(v["ci_contract"])
     return v
 
 
