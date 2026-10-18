@@ -390,7 +390,14 @@ def note_unidentified_session(payload: str) -> None:
 # ---------------------------------------------------------------------------
 
 _HUB_REASONS = frozenset(
-    {"needs_decision", "machine_review", "release", "base_branch_red", "stale"}
+    {
+        "needs_decision",
+        "machine_review",
+        "release",
+        "base_branch_red",
+        "stale",
+        "reviewer_unavailable",
+    }
 )
 _NOTICE_KEYS = frozenset(
     {
