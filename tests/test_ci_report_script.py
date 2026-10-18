@@ -1725,15 +1725,26 @@ def test_the_satellite_sender_is_trusted_and_data_only(
         shutil.rmtree(tmp_path / "runner", ignore_errors=True)
         refused = []
         api = _FakeApi(blob)
+        # The run's own path equals the bad configuration: only the shape check refuses.
         _run(
             trusted,
             tmp_path,
-            _event(path=_TESTS_YML),
+            _event(path=bad),
             api,
             refused,
             HAIPLANE_CI_WORKFLOW_PATH=bad,
         )
         assert refused == [] and api.calls == [], bad
+        assert "not a workflow file" in capsys.readouterr().out, bad
+
+    # The renderer refuses what the hub would refuse in a contract.
+    for name, path in (
+        ("Tests", "ci.yml"),
+        ("Tests", ".github/workflows/../x.yml"),
+        ("a\nb", _TESTS_YML),
+    ):
+        with pytest.raises(ValueError):
+            satellite_ci.render_sender(name, path)
 
     # The hub's strict mode is unchanged: with no configuration only ci.yml.
     shutil.rmtree(tmp_path / "runner", ignore_errors=True)

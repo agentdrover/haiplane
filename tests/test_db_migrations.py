@@ -1717,5 +1717,37 @@ async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
         assert ci_trust.trust_of({**fresh_attempt, "trust": "verified"}, fp)[0] == (
             "unverified"
         )
+        # A verdict stamps the attempt; a repeated claim of that attempt takes the
+        # stamp away again - it is a new claim.
+        await repo.set_ci_attempt_trust(
+            conn,
+            fresh_attempt["id"],
+            trust="verified",
+            trust_reason="",
+            final=True,
+            body_version=fresh_attempt["body_version"],
+            contract_fp=fp,
+        )
+        stamped = dict((await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0])
+        assert stamped["contract_fp"] == fp
+        await repo.upsert_ci_report_attempt(
+            conn,
+            task_id=1,
+            head_sha="sha-new",
+            run_id="13",
+            run_attempt="1",
+            ac_results="{}",
+            checks="{}",
+            validation_status="pass",
+            validation_log="",
+            reason="",
+            reported_by="ci",
+            mutations=None,
+            baseline=None,
+            provenance="{}",
+            submitted="{}",
+        )
+        again = dict((await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0])
+        assert again["contract_fp"] == "" and again["trust"] == "unverified"
     finally:
         await conn.close()

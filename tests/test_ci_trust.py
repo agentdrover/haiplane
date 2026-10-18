@@ -671,6 +671,43 @@ async def test_the_github_adapter_reads_runs_artifacts_and_the_archive(monkeypat
     assert calls[0][2] == "repos/own/rep/actions/artifacts/7/zip"
 
 
+async def test_the_github_adapter_asks_for_the_workflow_of_the_contract(monkeypatch):
+    from hub.integrations.forge import github as gh_module
+    from hub.integrations.noop import NoopGitOps
+
+    seen: list[str] = []
+
+    async def fake_gh(*args, repo=None, **kw):
+        seen.append(args[1].split("?")[0])
+        return 0, json.dumps({"workflow_runs": []}), ""
+
+    monkeypatch.setattr(gh_module, "_gh", fake_gh)
+    forge = gh_module.GitHubForge()
+    assert await forge.ci_runs_for_sha("abc", gh_repo="own/rep") == []
+    assert (
+        await forge.ci_runs_for_sha("abc", gh_repo="own/rep", workflow_path=SAT_PATH)
+        == []
+    )
+    assert seen == [
+        "repos/own/rep/actions/workflows/ci.yml/runs",
+        "repos/own/rep/actions/workflows/tests.yml/runs",
+    ]
+    # A path that is not a workflow file is no question for GitHub: unknown, not "no runs".
+    for bad in (
+        "tests.yml",
+        ".github/workflows/../x.yml",
+        ".github/workflows/a/b.yml",
+        ".github/workflows/x.yml?a=b",
+    ):
+        assert (
+            await forge.ci_runs_for_sha("abc", gh_repo="own/rep", workflow_path=bad)
+            is None
+        )
+    assert len(seen) == 2
+    # Without a forge nothing is visible: "not supported" is None, never "no runs".
+    assert await NoopGitOps().ci_runs_for_sha("abc", workflow_path=SAT_PATH) is None
+
+
 async def test_the_noop_and_gitverse_forges_cannot_ask_and_say_so():
     from hub.integrations.forge.gitverse import GitVerseForge
     from hub.integrations.noop import NoopForge, NoopGitOps
