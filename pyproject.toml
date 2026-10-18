@@ -72,7 +72,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.6",
-    "ruff>=0.15.10",
+    "ruff>=0.16.8",
 ]
 
 [tool.mypy]
@@ -85,6 +85,12 @@ files = ["hub"]
 plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[tool.ruff.lint]
+# Набор правил задан явно (#1838): ruff 0.16 расширил набор по умолчанию, на
+# 18.10 это 1327 замечаний. Здесь ровно прежний набор 0.15.10 (E4, E7, E9, F);
+# новые правила включаются отдельной задачей, а не сменой версии ruff.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.lint.mccabe]
 # Бюджет сложности (#1066, эпик #1064). Пороги живут здесь, чтобы у числа было
