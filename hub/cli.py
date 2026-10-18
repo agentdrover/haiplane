@@ -524,7 +524,8 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["session_id"] = args.session_id
     if getattr(args, "git_mode", None):
         body["git_mode"] = args.git_mode
-    body["full_rules"] = bool(getattr(args, "full_rules", False))
+    if getattr(args, "full_rules", False):
+        body["full_rules"] = True
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
     _warn_area_check(result)
