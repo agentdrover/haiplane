@@ -286,3 +286,28 @@ async def test_a_project_that_cannot_be_read_closes_trust_not_opens_the_hubs(
     await ci_trust.refresh_quietly(db, task_id, SAT_SHA)
     assert base.GH.calls[asked:] == []
     assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
+
+
+async def test_a_refresh_under_no_contract_asks_and_writes_nothing(db, monkeypatch):
+    from hub.services.ci_contract import UNRESOLVED
+
+    pid, task_id = await satellite_task(db, slug="nocontract")
+    await base._post(db, task_id, base._sat_attempt(task_id))
+    before = dict(await repo.get_ci_run_report(db, task_id, SAT_SHA))
+
+    async def unresolved(db_, task_id_):
+        return UNRESOLVED
+
+    monkeypatch.setattr(ci_contract, "contract_for_task", unresolved)
+    asked = len(base.GH.calls)
+    with pytest.raises(RuntimeError):
+        await ci_trust.refresh(db, task_id, SAT_SHA)
+    assert base.GH.calls[asked:] == [], "GitHub is not asked under no contract"
+    after = dict(await repo.get_ci_run_report(db, task_id, SAT_SHA))
+    assert (after["trust"], after["contract_fp"]) == (
+        before["trust"],
+        before["contract_fp"],
+    )
+    # Called quietly it never raises, and leaves nothing confirmed.
+    await ci_trust.refresh_quietly(db, task_id, SAT_SHA)
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
