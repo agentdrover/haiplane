@@ -90,3 +90,77 @@ async def test_plain_summary_empty_falls_back_to_problem_statement(
     )
     assert refined.json()["plain_summary_shown"] == TEXT
     assert refined.json()["plain_summary_source"] == "plain_summary"
+
+
+async def test_plain_summary_none_keeps_old_idempotency_hash():
+    from hub.models import TaskCreate
+    from hub.services.task_idempotency import hash_task_create_payload
+
+    old = TaskCreate(title="t")
+    payload = old.model_dump(mode="json", exclude={"client_request_id"})
+    payload.pop("plain_summary")
+    payload.pop("freeze_rationale")
+    import hashlib
+    import json
+
+    legacy = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert hash_task_create_payload(old) == legacy
+    assert hash_task_create_payload(TaskCreate(title="t", plain_summary="x")) != legacy
+
+
+def test_plain_summary_with_defect_verify_is_written_after_filing(capsys):
+    from unittest.mock import MagicMock, patch
+
+    from hub import cli
+
+    api = MagicMock(return_value={"task": {"id": 41}})
+    with (
+        patch(
+            "sys.argv",
+            [
+                "oc-hub",
+                "propose",
+                "--title",
+                "T",
+                "--defect-verify",
+                "v",
+                "--area",
+                "hub/x.py",
+                "--plain-summary",
+                TEXT,
+            ],
+        ),
+        patch.object(cli, "_api", api),
+    ):
+        assert cli.main() == 0
+    assert api.call_args_list[-1].args == (
+        "POST",
+        "/api/tasks/41/refine",
+        {"plain_summary": TEXT},
+    )
+
+
+async def test_plain_summary_defect_verify_mcp_refines_the_filed_draft():
+    with patch("hub.mcp_server._api_post", new_callable=AsyncMock) as post:
+        post.return_value = {"task": {"id": 41}, "release_id": None}
+        await hub_propose_task(
+            "T", "broken", defect_verify="v", affected_areas=["a"], plain_summary=TEXT
+        )
+    assert post.await_args_list[-1].args == (
+        "/api/tasks/41/refine",
+        {"plain_summary": TEXT},
+    )
+
+
+def test_plain_summary_fallback_is_one_short_line_without_secrets():
+    from hub.plain_summary import plain_summary_view
+
+    noisy = "$ curl -H 'Authorization: Bearer abc123SECRET' x\n" + "строка\n" * 200
+    view = plain_summary_view(None, noisy)
+    assert "abc123SECRET" not in view["plain_summary_shown"]
+    assert len(view["plain_summary_shown"]) <= 300
+    assert "\n" not in view["plain_summary_shown"]
+    assert plain_summary_view(None, "x" * 900)["plain_summary_shown"].endswith("…")
+    assert len(plain_summary_view(None, "x" * 900)["plain_summary_shown"]) == 300

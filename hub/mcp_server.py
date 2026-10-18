@@ -3659,6 +3659,7 @@ async def _propose_prod_defect(
     areas: list[str] | None,
     agent: str,
     parent_id: int | None,
+    plain_summary: str = "",
 ) -> str:
     """The prod-defect branch of hub_propose_task: POST /api/prod-defects."""
     body: dict[str, Any] = {
@@ -3671,6 +3672,11 @@ async def _propose_prod_defect(
     if parent_id is not None:
         body["parent_id"] = parent_id
     filed = await _api_post("/api/prod-defects", body)
+    if plain_summary:
+        # #1811: черновик прод-дефекта создаёт отдельный маршрут без этого поля.
+        await _api_post(
+            f"/api/tasks/{filed['task']['id']}/refine", {"plain_summary": plain_summary}
+        )
     release = (
         f"release #{filed['release_id']}"
         if filed.get("release_id") is not None
@@ -3723,7 +3729,13 @@ async def hub_propose_task(
     """
     if defect_verify:
         return await _propose_prod_defect(
-            title, description, defect_verify, affected_areas, agent, parent_id
+            title,
+            description,
+            defect_verify,
+            affected_areas,
+            agent,
+            parent_id,
+            plain_summary,
         )
     if task_type not in ("task", "subtask", "feature", "epic"):
         return format_echo_response(

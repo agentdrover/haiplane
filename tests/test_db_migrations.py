@@ -1613,3 +1613,28 @@ async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
         text=True,
     )
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+async def test_plain_summary_boundary_same_second_task_is_old(tmp_path):
+    """#1811: задача той же секунды, что и миграция, не считается новой."""
+    from hub.plain_summary import is_new_task
+
+    conn = await aiosqlite.connect(str(tmp_path / "b.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await _migrate(conn)
+        await conn.execute(
+            "UPDATE _migrations SET applied_at='2026-01-01 10:00:00' "
+            "WHERE name='add_tasks_plain_summary'"
+        )
+        for tid, stamp in ((1, "2026-01-01 10:00:00"), (2, "2026-01-01 10:00:01")):
+            await conn.execute(
+                "INSERT INTO tasks (id, title, created_at) VALUES (?, 't', ?)",
+                (tid, stamp),
+            )
+        await conn.commit()
+        assert await is_new_task(conn, 1) is False
+        assert await is_new_task(conn, 2) is True
+    finally:
+        await conn.close()
