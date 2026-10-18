@@ -145,6 +145,22 @@ async def record_raised(db: aiosqlite.Connection, outage: ra.Observation) -> int
     return event_id
 
 
+async def refresh(db: aiosqlite.Connection, outage: ra.Observation) -> None:
+    """Сигнал уже сказан в эти сутки: ящики всё равно сверить с проектами задач.
+
+    Набор сигнала (task_id, reason) проекта не знает: задача, сменившая проект,
+    событие не меняет. Нового события нет, ссылка — на последнее событие подъёма
+    или обновления; commit у вызывающего.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT MAX(id) AS id FROM events WHERE kind = ?",
+        (ra.REVIEWER_UNAVAILABLE,),
+    )
+    if rows and rows[0]["id"] is not None:
+        await _notify_changed(db, int(rows[0]["id"]), outage.waiting)
+
+
 async def record_cleared(db: aiosqlite.Connection, why: dict[str, Any]) -> int:
     """Событие снятия и уведомления всем проектам инцидента; commit — у вызывающего."""
     incident = await incident_id(db)  # до события: после него инцидента уже нет

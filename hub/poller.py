@@ -1483,6 +1483,8 @@ async def _sweep_reviewer_unavailable(db) -> None:
             return
     if raised and await ra.same_picture_as_raised(db, outage):
         if await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
+            await reviewer_notice.refresh(db, outage)  # проект задачи мог смениться
+            await db.commit()
             return  # тот же набор и уже сказано в этих сутках
     waiting = [row["task_id"] for row in outage.waiting]
     await reviewer_notice.record_raised(db, outage)  # событие и уведомления (#1826)

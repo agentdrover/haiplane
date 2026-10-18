@@ -442,3 +442,33 @@ async def test_the_clearing_notice_is_in_the_transaction_of_its_event(db, monkey
     with pytest.raises(RuntimeError, match="commit failed"):
         await _sweep(db)
     assert seen == [(1, 2)]  # событие снятия; сообщения подъёма и снятия
+
+
+async def test_a_task_moving_between_projects_is_told_before_the_daily_repeat(
+    db, monkeypatch
+):
+    """Тот же набор (task_id, reason), но задача сменила проект: A -> B.
+
+    Сторож молчит (набор прежний, события моложе суток), а ящики должны
+    обновиться сразу: B узнаёт о задаче, у A набор стал пустым. Нового события нет.
+    """
+    watch = _Watch(monkeypatch)
+    pa = await make_project(db, "pa")
+    pb = await make_project(db, "pb")
+    t1, t2 = await _task_in(db, pa), await _task_in(db, pa)
+    watch.queue(t1, t2)
+    await _sweep(db)
+    assert await _counts(db, "pa", "pb") == {"pa": 1, "pb": 0}
+    raised = await _raised_ids(db)
+
+    epic = (await repo.get_task(db, t1))["parent_id"]
+    await repo.update_task(db, epic, project_id=pb)  # эпик перешёл в проект B
+    await repo.update_task(db, t2, parent_id=await epic_of(db, pa))
+    await db.commit()
+    await _sweep(db)
+
+    assert await _raised_ids(db) == raised, "нового события нет"
+    assert await _counts(db, "pa", "pb") == {"pa": 2, "pb": 1}
+    assert (await _signal_notes(db, "pb"))[0]["source_event_id"] == raised[-1]
+    await _sweep(db)  # и повторно ничего
+    assert await _counts(db, "pa", "pb") == {"pa": 2, "pb": 1}
