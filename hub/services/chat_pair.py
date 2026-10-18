@@ -594,7 +594,7 @@ async def _spend_code(
 
     token = generate_session_token()
     ttl = config.CHAT_PAIR_TTL_SECONDS
-    await db.execute(
+    inserted = await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
         " bound_generation, token_hash, expires_at, channel, slot, "
@@ -615,11 +615,18 @@ async def _spend_code(
     )
     if row.get("channel") == "slot":
         # #1712: the order moves with the spend, in the same transaction.
+        # #1825: and records the FIRST redeem — the retry window is counted
+        # from it and never extended, and the session it minted.
         await db.execute(
             "UPDATE executor_orders SET state = 'redeemed', "
-            "redeemed_at = datetime('now') "
+            "redeemed_at = datetime('now'), first_redeemed_at = datetime('now'), "
+            "retry_until = datetime('now', ?), session_id = ? "
             "WHERE pair_code_id = ? AND state IN ('pending', 'delivered')",
-            (row["id"],),
+            (
+                f"+{min(int(config.HOST_REDEEM_RETRY_SECONDS), int(ttl))} seconds",
+                inserted.lastrowid,
+                row["id"],
+            ),
         )
     await db.commit()
 
@@ -648,7 +655,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
 
 
 async def redeem_code_explained(
-    db: aiosqlite.Connection, raw_code: str
+    db: aiosqlite.Connection, raw_code: str, *, via_host: bool = False
 ) -> tuple[dict[str, Any] | None, RedeemRefusal | None]:
     """Exchange a code for a session, naming the reason when it fails (#1694).
 
@@ -681,6 +688,11 @@ async def redeem_code_explained(
     if not rows:
         return None, RedeemRefusal("unknown")
     row = dict(rows[0])
+    if not via_host and config.HOST_ORDER_PUBLIC_REDEEM_CLOSED:
+        from hub.services.host_redeem import is_host_order_code
+
+        if await is_host_order_code(db, row):  # #1825: host route only
+            return None, _row_refusal(row, "host_code_public_closed")
     if row["spent"]:
         return None, _row_refusal(row, "spent")
     if row["expired"]:
@@ -974,7 +986,9 @@ async def get_acting_agent(db: aiosqlite.Connection) -> dict[str, Any] | None:
     return row
 
 
-async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity | None:
+async def resolve_session(
+    db: aiosqlite.Connection, token: str, *, dsn: str | None = None
+) -> TokenIdentity | None:
     """Identity behind a chat-pair bearer token, or ``None``.
 
     Intake keeps ``role='human'`` as presentational naming of the issuer.
@@ -987,7 +1001,8 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
     rows = await fetchall(
         db,
         "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
-        "s.bound_generation, p.username AS issuer_username, p.status AS issuer_status "
+        "s.bound_generation, s.first_used_at, "
+        "p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
         "AND s.expires_at > datetime('now')",
@@ -998,6 +1013,11 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
     row = dict(rows[0])
     if row["issuer_status"] != "active":
         return None
+    if row["first_used_at"] is None:
+        from hub.services.host_redeem import admit_first_use
+
+        if not await admit_first_use(db, hash_pair_code(token), dsn):
+            return None
     kind = (row.get("kind") or "intake").strip().lower() or "intake"
     bound = row.get("bound_task_id")
     bound_id = int(bound) if bound is not None else None
@@ -1410,11 +1430,14 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     # explained by looking the row up, and a row dropped the minute it expired
     # turns "expired" into "unknown". Spent reviewer rows count from redeemed_at.
     codes = await db.execute(
-        "DELETE FROM chat_pair_codes WHERE "
+        "DELETE FROM chat_pair_codes WHERE ("
         "(kind = 'reviewer' AND ((redeemed_at IS NULL AND expires_at < datetime('now', ?)) "
         "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?)))) "
         "OR (kind <> 'reviewer' AND (expires_at < datetime('now') "
-        "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))))",
+        "  OR (redeemed_at IS NOT NULL AND redeemed_at < datetime('now', ?))))) "
+        # #1825: a code whose order can still be retried is kept until retry_until.
+        "AND NOT EXISTS (SELECT 1 FROM executor_orders o "
+        "WHERE o.pair_code_id = chat_pair_codes.id AND o.retry_until > datetime('now'))",
         (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
     )
     # A task whose release just failed keeps its dead sessions: they are the
