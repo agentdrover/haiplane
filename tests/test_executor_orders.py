@@ -1979,7 +1979,7 @@ async def _failed_entry_part(world):
             if outcome == "failed"
             else f"task-{task_id}/rescue-3"
         )
-        sha = "fedcba9876543210fedc"
+        sha = "fedcba9876543210fedc"  # pragma: allowlist secret
         done = await world.client.post(
             f"/api/executor-hosts/k8/orders/{order['id']}/report",
             json={"outcome": outcome, "sha": sha, "branch": branch, "note": "итог"},
