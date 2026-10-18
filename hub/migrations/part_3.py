@@ -1120,4 +1120,17 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "created_at) WHERE final_entry_at IS NULL AND (report_outcome <> '' "
         "OR (state = 'closed' AND close_reason NOT IN ('', 'submitted')))",
     ),
+    (
+        # #1817: класс исхода итоговой записи ленты (ok — сдача, not_ok — всё
+        # прочее): повтор ТОГО ЖЕ исхода подавляется, другой исход пишется.
+        "add_executor_orders_final_entry_kind",
+        "ALTER TABLE executor_orders ADD COLUMN final_entry_kind "
+        "TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "backfill_executor_orders_final_entry_kind",
+        "UPDATE executor_orders SET final_entry_kind = CASE WHEN report_outcome = "
+        "'submitted' THEN 'ok' ELSE 'not_ok' END "
+        "WHERE final_entry_at IS NOT NULL AND final_entry_kind = ''",
+    ),
 ]

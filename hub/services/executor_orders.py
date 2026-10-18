@@ -459,13 +459,15 @@ async def close_order(
         f"{launch_feedback.close_reason_text(reason, '')}"
         + ("." if reason == CLOSE_SUBMITTED else "; непотраченный код сожжён.")
     )
-    already = bool(
-        await fetchall(
-            db,
-            "SELECT 1 FROM executor_orders WHERE id = ? AND final_entry_at IS NOT NULL",
-            (int(order["id"]),),
-        )
+    # Класс исхода: сдача («ok») или всё прочее («not_ok»). Подавляется только
+    # ПОВТОР того же исхода; другой исход (хост сказал submitted, а сессия
+    # истекла и задача вернулась в open) пишет исправляющую запись.
+    cls = (
+        launch_feedback.CLASS_OK
+        if reason == CLOSE_SUBMITTED
+        else launch_feedback.CLASS_NOT_OK
     )
+    told = await launch_feedback.entry_class(db, int(order["id"]))
     returned = return_task and await _return_task(db, order, text)
     await admin_svc.write_audit(
         db,
@@ -477,15 +479,13 @@ async def close_order(
         f"{reason}",
         commit=False,
     )
-    if not already:
-        await db.execute(
-            "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
-            (int(order["id"]),),
-        )
-        # Сдача уже говорит за себя: «Submitted for review» и «Захват снят…» —
-        # своя пара записей; третья по тому же заказу была бы дублем.
-        if not returned and entry and reason != CLOSE_SUBMITTED:
+    # Метка ставится только вместе с настоящей записью. Сдача сама ничего не
+    # пишет здесь: «Submitted for review» и «Захват снят…» — её записи, а
+    # метка без записи глушила бы последующий report хоста.
+    if reason != CLOSE_SUBMITTED and told != cls:
+        if not returned and entry:
             await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+        await launch_feedback.mark_entry(db, int(order["id"]), cls)
     return True
 
 
@@ -1349,6 +1349,11 @@ async def report_outcome(
                 db,
                 order,
                 text,
+                cls=(
+                    launch_feedback.CLASS_OK
+                    if outcome == "submitted"
+                    else launch_feedback.CLASS_NOT_OK
+                ),
                 agent=host_username(host),
                 principal_id=principal_id,
                 author_kind="principal",
