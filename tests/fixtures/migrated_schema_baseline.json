@@ -397,6 +397,12 @@ null
 ],
 [
 "index",
+"sqlite_autoindex_release_merges_1",
+"release_merges",
+null
+],
+[
+"index",
 "sqlite_autoindex_review_order_claims_1",
 "review_order_claims",
 null
@@ -712,6 +718,12 @@ null
 "projects",
 "projects",
 "CREATE TABLE projects (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            slug TEXT NOT NULL UNIQUE,\n            name TEXT NOT NULL,\n            repo TEXT NOT NULL DEFAULT '',\n            workspace_path TEXT NOT NULL DEFAULT '',\n            default_branch TEXT NOT NULL DEFAULT 'develop',\n            default_branch_policy TEXT NOT NULL DEFAULT '{}',\n            archived INTEGER NOT NULL DEFAULT 0,\n            created_at TEXT NOT NULL DEFAULT (datetime('now')),\n            updated_at TEXT NOT NULL DEFAULT (datetime('now'))\n        , status TEXT NOT NULL DEFAULT 'active', machine_review TEXT NOT NULL DEFAULT 'auto', provision_status TEXT NOT NULL DEFAULT 'none', provision_detail TEXT NOT NULL DEFAULT '', drift_baseline_sha TEXT, gate_policy TEXT NOT NULL DEFAULT '{}', forge TEXT NOT NULL DEFAULT 'github')"
+],
+[
+"table",
+"release_merges",
+"release_merges",
+"CREATE TABLE release_merges (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id  INTEGER NOT NULL,\n            release_pr  INTEGER NOT NULL,\n            release_sha TEXT,\n            merged_at   TEXT    NOT NULL DEFAULT (datetime('now')),\n            UNIQUE (project_id, release_pr)\n        )"
 ],
 [
 "table",

@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import delivery_notes, delivery_writes, watch_notices
+from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
@@ -2509,6 +2510,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
+    Sweep("release_deploy_watch", release_deploy_sweep),
     Sweep("orchestrator_queue", _sweep_orchestrator_queue),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),

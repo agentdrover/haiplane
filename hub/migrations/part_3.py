@@ -1065,6 +1065,21 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "INTEGER NOT NULL DEFAULT 0",
     ),
     (
+        # #1828: факт релизного мержа, записанный самим релизом. Строка пишется
+        # сразу после успешного merge_pr — ДО чтения merge_commit_sha, поэтому
+        # release_sha NULL-able: пока sha не прочитан, строка уже есть и свип
+        # называет это отдельной причиной. Старых релизов в таблице нет.
+        "create_release_merges",
+        """CREATE TABLE IF NOT EXISTS release_merges (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL,
+            release_pr  INTEGER NOT NULL,
+            release_sha TEXT,
+            merged_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (project_id, release_pr)
+        )""",
+    ),
+    (
         # #1817: последняя принятая фаза хоста (vm_starting, agent_running,
         # critic, submitting) и её время. В ленту фазы не пишутся.
         "add_executor_orders_phase",
