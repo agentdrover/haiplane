@@ -1079,4 +1079,19 @@ MIGRATIONS_3: list[tuple[str, str]] = [
             UNIQUE (project_id, release_pr)
         )""",
     ),
+    (
+        # #1829: какой текст навыка уже выдан зарегистрированной локальной
+        # сессии. Запись — по (сессия, навык, версия, sha256 текста): смена
+        # версии или текста даёт новую строку, и текст уходит снова. Старых
+        # выдач в таблице нет — первая выдача после выката идёт полным текстом.
+        "create_skill_deliveries",
+        """CREATE TABLE IF NOT EXISTS skill_deliveries (
+            session_id     TEXT NOT NULL,
+            skill          TEXT NOT NULL,
+            version        INTEGER NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            delivered_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (session_id, skill, version, content_sha256)
+        )""",
+    ),
 ]
