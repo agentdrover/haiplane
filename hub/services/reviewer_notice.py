@@ -18,7 +18,9 @@
   ретенции видна и без уведомления.
 * Картина проекта — набор его ожидающих сдач с причинами (как у сигнала).
   Проект получает сообщение, когда хеш картины отличается от хеша ПОСЛЕДНЕГО
-  уведомления ему в инциденте; последнее — максимальный числовой event_id.
+  уведомления ему в инциденте; последнее — максимальная ревизия (монотонный номер
+  уведомления проекта в инциденте, не event_id: ``refresh`` пишет несколько картин
+  при одном событии).
 * Получатели снятия — проекты из ключей этого инцидента: ключи вечные, новой
   таблицы нет.
 
@@ -38,6 +40,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import project_policy
 from hub.services import review_availability as ra
 from hub.services import watch_notices
 
@@ -59,7 +62,7 @@ async def incident_id(db: aiosqlite.Connection) -> int | None:
 async def notified_projects(
     db: aiosqlite.Connection, incident: int
 ) -> dict[int, tuple[int, str]]:
-    """Проект -> (event_id, хеш) ПОСЛЕДНЕГО уведомления о картине в инциденте.
+    """Проект -> (ревизия, хеш) ПОСЛЕДНЕГО уведомления о картине в инциденте.
 
     Префикс сравнивается точно (``substr``), а не ``LIKE``: подчёркивание в
     имени повода для LIKE — шаблон. Двоеточие после номера инцидента не даёт
@@ -79,9 +82,9 @@ async def notified_projects(
             continue
         if len(parts) != 3:
             continue
-        project_id, event_id = int(parts[0]), int(parts[1])
-        if event_id > last.get(project_id, (-1, ""))[0]:
-            last[project_id] = (event_id, parts[2])
+        project_id, revision = int(parts[0]), int(parts[1])
+        if revision > last.get(project_id, (-1, ""))[0]:
+            last[project_id] = (revision, parts[2])
     return last
 
 
@@ -104,6 +107,20 @@ async def _pictures(
     return groups
 
 
+async def _enabled(db: aiosqlite.Connection, project_id: int) -> bool:
+    """Включён ли повод у проекта сейчас — тот же ответ, что даст notify_steward.
+
+    notify_steward возвращает False и за выключенный повод, и за сбой, и за
+    уже занятый ключ, поэтому различить их по ответу нельзя; политика читается
+    в той же транзакции теми же функциями, контракт канала не меняется.
+    """
+    project = await repo.get_project(db, project_id)
+    if project is None:
+        return True  # пусть решает notify_steward: он запишет «нет проекта»
+    policy = project_policy.gate_policy_of(project)
+    return REASON in project_policy.steward_watch_of(policy)
+
+
 async def _notify_changed(
     db: aiosqlite.Connection, event_id: int, waiting: list[dict[str, Any]]
 ) -> None:
@@ -116,11 +133,20 @@ async def _notify_changed(
         digest = _digest(groups.get(project_id, []))
         if project_id in last and last[project_id][1] == digest:
             continue
+        revision = last.get(project_id, (0, ""))[0] + 1
+        key = f"{REASON}:{incident}:{project_id}:{revision}:{digest}"
+        if not await _enabled(db, project_id):
+            # Повод выключен: картина записана ключом-маркером без сообщения,
+            # чтобы включение повода не доигрывало прошлое (never replayed).
+            await db.execute(
+                "INSERT OR IGNORE INTO watch_notices (key) VALUES (?)", (key,)
+            )
+            continue
         await watch_notices.notify_steward(
             db,
             REASON,
             project_id=project_id,
-            source_key=f"{REASON}:{incident}:{project_id}:{event_id}:{digest}",
+            source_key=key,
             source_event_id=event_id,
         )
 

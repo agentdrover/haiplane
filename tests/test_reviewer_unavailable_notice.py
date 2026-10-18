@@ -175,8 +175,15 @@ async def test_the_outage_reaches_each_waiting_project_once_per_picture(
     all_keys = [k for k in await keys(db) if k.startswith("reviewer_unavailable:")]
     assert {k.split(":")[1] for k in all_keys} == {str(incident)}
     assert len(all_keys) == len(set(all_keys)) == 8
-    # event_id пересекал границу 99 -> 100: "последнее" берётся по числу.
-    assert max(int(k.split(":")[3]) for k in all_keys) >= 100
+    # Ревизии растут по проекту: у pa их четыре подряд.
+    assert sorted(
+        int(k.split(":")[3]) for k in all_keys if k.split(":")[2] == str(pa)
+    ) == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
 
 async def test_the_clearing_reaches_every_notified_project(db, monkeypatch):
@@ -472,3 +479,56 @@ async def test_a_task_moving_between_projects_is_told_before_the_daily_repeat(
     assert (await _signal_notes(db, "pb"))[0]["source_event_id"] == raised[-1]
     await _sweep(db)  # и повторно ничего
     assert await _counts(db, "pa", "pb") == {"pa": 2, "pb": 1}
+
+
+async def test_returning_to_a_project_inside_the_day_is_told_again(db, monkeypatch):
+    """A -> B -> A -> B при одном событии: на каждом шаге сообщение нужному проекту.
+
+    Ключ несёт ревизию уведомления проекта, а не event_id: refresh пишет
+    несколько картин при одном событии.
+    """
+    watch = _Watch(monkeypatch)
+    pa = await make_project(db, "pa")
+    pb = await make_project(db, "pb")
+    t1 = await _task_in(db, pa)
+    t2 = await _task_in(db, pa)
+    epic = (await repo.get_task(db, t1))["parent_id"]
+    watch.queue(t1, t2)
+    await _sweep(db)
+    assert await _counts(db, "pa", "pb") == {"pa": 1, "pb": 0}
+    raised = await _raised_ids(db)
+
+    expected = [
+        (pb, {"pa": 2, "pb": 1}),  # A -> B: B узнал, у A набор пуст
+        (pa, {"pa": 3, "pb": 2}),  # B -> A: возврат не теряется
+        (pb, {"pa": 4, "pb": 3}),
+    ]
+    for target, counts in expected:
+        await repo.update_task(db, epic, project_id=target)
+        await repo.update_task(db, t2, parent_id=epic)
+        await db.commit()
+        await _sweep(db)
+        assert await _counts(db, "pa", "pb") == counts
+    assert await _raised_ids(db) == raised, "событие одно, картины разные"
+
+
+async def test_a_muted_picture_is_not_replayed_when_the_reason_is_enabled(
+    db, monkeypatch
+):
+    """Подъём при выключенном поводе; включили; тот же набор — сообщения нет."""
+    watch = _Watch(monkeypatch)
+    pa = await make_project(db, "pa")
+    await set_watch(db, "pa", [])
+    t1 = await _task_in(db, pa)
+    watch.queue(t1)
+    await _sweep(db)
+    assert await _signal_notes(db, "pa") == []
+
+    await set_watch(db, "pa", None)
+    await _sweep(db)  # ранний выход: картина прежняя
+    assert await _signal_notes(db, "pa") == [], "прошлое не доигрывается"
+
+    t2 = await _task_in(db, pa)
+    watch.queue(t1, t2)
+    await _sweep(db)  # картина изменилась уже при включённом поводе
+    assert len(await _signal_notes(db, "pa")) == 1
