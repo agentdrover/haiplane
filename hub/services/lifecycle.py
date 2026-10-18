@@ -4455,7 +4455,10 @@ async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
             attach_observation_closures,
             undisposed_confirmed,
         )
-        from hub.services.review_evidence import undisposed_note as _undisposed_note
+        from hub.services.author_answers import (
+            attach_author_answers,
+            undisposed_note as _undisposed_note,
+        )
         from hub.models import MachineReviewView
 
         mr_row = await repo.get_latest_machine_review(state.db, state.task_id)
@@ -4468,7 +4471,11 @@ async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
             # #1244: the card discounts findings a foreign observation closed;
             # the record written with the verdict must say the same.
             await attach_observation_closures(state.db, mr_view, state.task)
-            state.undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+            # #1830: the author's answer is shown beside the missing marking.
+            await attach_author_answers(state.db, mr_view)
+            state.undisposed_note = _undisposed_note(
+                *undisposed_confirmed(mr_view), mr_view.undisposed_author_lines
+            )
 
         has_current_report = False
         if mr_row is not None:
