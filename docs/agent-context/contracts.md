@@ -110,21 +110,40 @@ Human-only (a person, CSRF for cookies):
   never the code. Card button «Запустить на <host>» →
   `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
 
-Host key (`slot_runner`), exactly the routes of `auth.SLOT_RUNNER_ALLOWLIST`, all of its OWN host:
+Host key (`slot_runner`), exactly five routes of its OWN host:
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
   every unclosed unredeemed order, repeated until acked or closed (stable `id`,
   dedupe on it); the first delivery sets `delivered_at`.
+- `POST …/orders/{id}/redeem {code}` (#1825) → the `chat-pair/redeem` answer plus
+  `order_id`, `token_version`, `retry_until`. Only the order's own host, only the
+  code of THAT order (any mismatch of host, order or code: one 403
+  `order_unavailable`). The first call spends the code (same `_spend_code`, same
+  session, `first_redeemed_at` and `retry_until` = first redeem + 600 s,
+  `HAIPLANE_HOST_REDEEM_RETRY_SECONDS`, never extended, capped by the session TTL).
+  A repeat inside the window while the token was NEVER presented replaces the token
+  hash of the SAME session (rotation, `token_version`+1, original session expiry,
+  old token dead) — this is the safe retry after a lost answer (network, 502 during
+  a deploy). 409 `already_redeemed_in_use`: the token was presented once (any
+  request, GET/MCP and business errors included; `first_used_at` is set atomically
+  at admission in `chat_pair.resolve_session`) — never rotated; 409
+  `redeem_retry_expired` after `retry_until` (also after purge/restart; the order
+  row keeps the window); 409 `order_closed`/`session_gone`/`host_disabled`; 429
+  `redeem_retry_limited` (≤ 5 rotations per order, 60 attempts/5 min per host; it
+  does not close the order). Repeats write no feed entries. Host side: store the
+  order BEFORE the call; on timeout/5xx retry with backoff inside `retry_until`;
+  ignore an answer with a smaller `token_version`; start the VM once; `redeem_lost`
+  is the final refusal to recover.
 - `GET …/orders/{id}` (#1831) → the outcome of the host's OWN order: `state`,
   `close_reason`, `task_id`, `task_status`, `submission_generation`,
   `submission_sha`, `branch`, `pr_number`, `report_outcome` — no code, ciphertext,
   tokens or order text. After a submission the run's sessions are revoked (#1783),
   so the host checks the submission with THIS read, not with the agent session.
-  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; likewise when the task's `submission_generation` moved past the order's `generation` (a resubmission by another run: cloud, manual pair). `submitted` is true only when the generations are equal; `submission_*` and `pr_number` are given only then. Order, "newer order exists" and task are ONE query (one snapshot); a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
+  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; likewise when the task's `submission_generation` moved past the order's `generation` (a resubmission by another run: cloud, manual pair). `submitted` is true only when the generations are equal; `submission_*` and `pr_number` are given only then. A submission is the order's own only when the order's run held the task (`tasks.executor_run_id` = the order's run; `settle` closes the order with `submitted` only then, and the order stays attributed after the holder is released); a resubmission of the SAME generation by cloud or a manual pair is foreign (`superseded`). A `submitted` order whose task went back to open/claimed/running is `superseded` too. A branch that carries a hub code or token is returned empty. Order, "newer order exists" and task are ONE query (one snapshot); a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
 - `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
   `redeemed` is informational (the hub sees the spend itself) and keeps the
-  booking; the other two close the order, burn the code, abort the run. A repeat
+  booking; the other two close the order, burn the code, REVOKE the session while its token was never presented, abort the run; once the token was presented they are 409 `already_redeemed_in_use` and change nothing (#1825). A repeat
   with a DIFFERENT result is 409 (the first word of the host stands). Foreign or
   unknown order: 403. At most 3 concurrent long-polls per host (429).
 - `POST …/orders/{id}/report {outcome: submitted|rescued|failed, sha?, branch?,
@@ -136,8 +155,10 @@ Host key (`slot_runner`), exactly the routes of `auth.SLOT_RUNNER_ALLOWLIST`, al
 
 Host contract: decrypt `code_ciphertext` (RSA-OAEP, SHA-256 in OAEP and MGF1, no
 label, base64url without padding — reference `scripts/executor_host_decrypt.py`),
-put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at the
-unchanged `POST /api/auth/chat-pair/redeem` (session `ahcp_`, `channel=slot`,
+put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
+`POST /api/executor-hosts/{name}/orders/{id}/redeem` (#1825; the public
+`POST /api/auth/chat-pair/redeem` still takes a host's code until the switch
+`HAIPLANE_HOST_ORDER_PUBLIC_REDEEM_CLOSED=1`, default off — then the public route answers a host order code with the one indistinguishable 401; cloud and manual codes are never affected) (session `ahcp_`, `channel=slot`,
 `slot=<host>`, bound to the task and generation), ack, then claim/pair-start with
 `git_mode=remote`. The host key never enters the executor VM.
 

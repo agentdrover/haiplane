@@ -43,7 +43,7 @@ from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
 from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
-from hub.services import chat_pair, project_policy
+from hub.services import chat_pair, host_redeem, project_policy
 
 log = logging.getLogger("hub.services.executor_orders")
 
@@ -93,8 +93,8 @@ REASON_TARGET = "цель запуска: cloud или slot:<имя хоста>"
 class HostError(Exception):
     """Отказ операции над хостом: код ответа и текст для человека."""
 
-    def __init__(self, status: int, detail: str) -> None:
-        super().__init__(detail)
+    def __init__(self, status: int, detail: str | dict[str, str]) -> None:
+        super().__init__(str(detail))
         self.status = status
         self.detail = detail
 
@@ -421,6 +421,15 @@ async def close_order(
             "DELETE FROM chat_pair_codes WHERE id = ? AND redeemed_at IS NULL",
             (int(order["pair_code_id"]),),
         )
+    # #1825: закрытый заказ не оставляет живой токен, который ни разу не
+    # предъявлен: слот свободен, а исполнитель с ним мог бы встать на задачу.
+    # Использованный токен здесь не трогается: его снимают пути, знающие
+    # причину (сдача, итог failed/rescued, смерть сессии, отключение хоста).
+    await db.execute(
+        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+        "WHERE executor_run_id = ? AND revoked_at IS NULL AND first_used_at IS NULL",
+        (int(order["executor_run_id"]),),
+    )
     await db.execute(
         "UPDATE executor_runs SET outcome = ?, reason = ?, "
         "finished_at = datetime('now'), polled_at = datetime('now'), "
@@ -1026,6 +1035,18 @@ async def ack_order(
         if order is None:
             raise HostError(403, "заказ не принадлежит этому хосту")
         first = not order["ack_result"]
+        if result != ACK_REDEEMED and await host_redeem.token_in_use(
+            db, int(order["executor_run_id"])
+        ):
+            # #1825: токен уже предъявлен — исполнитель работает; «потерян» или
+            # «не выкуплен» неверно, заказ и сессия остаются как были.
+            raise HostError(
+                409,
+                {
+                    "reason": host_redeem.REASON_IN_USE,
+                    "message": f"токен заказа уже используется: {result} отклонён",
+                },
+            )
         if not first and order["ack_result"] != result:
             # Противоречащий повтор не переписывает слово хоста: поздний
             # redeem_failed после redeemed закрыл бы работающий прогон.

@@ -483,6 +483,7 @@ def ci_key_route_allowed(
 SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/orders"),
     ("GET", "/api/executor-hosts/{name}/orders/{order_id}"),
+    ("POST", "/api/executor-hosts/{name}/orders/{order_id}/redeem"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/report"),
 )
@@ -705,7 +706,9 @@ async def _resolve_chat_pair(request: Request, token: str) -> TokenIdentity | No
     try:
         from hub.services.chat_pair import resolve_session
 
-        return await resolve_session(db_conn, token)
+        return await resolve_session(
+            db_conn, token, dsn=getattr(request.app.state, "dsn", None)
+        )
     except Exception:
         return None
 

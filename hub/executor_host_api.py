@@ -7,9 +7,9 @@
   человек, а cookie-сессия — только с верным CSRF, какой бы ни был глобальный
   режим (``_human_door``). Агент и ключ хоста сюда не проходят.
 * ``/api/executor-hosts/{name}/orders…`` — то, что хост делает своим ключом
-  роли slot_runner: забрать заказы, подтвердить, сообщить итог. Allowlist в
-  ``hub/auth.py`` пускает ключ ровно на маршруты своего хоста из SLOT_RUNNER_ALLOWLIST (список
-  заказов, итог заказа, ack, report; число в списке не дублируется); здесь
+  роли slot_runner: забрать заказы, выкупить код, прочитать итог заказа, подтвердить,
+  сообщить итог. Allowlist в ``hub/auth.py`` пускает ключ ровно на пять маршрутов
+  своего хоста (SLOT_RUNNER_ALLOWLIST); здесь
   то же проверяется по базе, потому что middleware знает только путь.
 * параметры запуска исполнителя (``ExecutorLaunchRequest``) — на слот хоста.
 """
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
-from hub.services import executor_orders
+from hub.services import executor_orders, host_redeem
 
 router = APIRouter()
 
@@ -49,6 +49,10 @@ class ExecutorHostCreate(BaseModel):
 
 class ExecutorOrderAck(BaseModel):
     result: str
+
+
+class ExecutorOrderRedeem(BaseModel):
+    code: str
 
 
 class ExecutorOrderReport(BaseModel):
@@ -251,6 +255,24 @@ async def api_executor_order_read(name: str, order_id: int, request: Request) ->
     if outcome is None:
         raise HTTPException(404, detail={"reason": "order_not_found"})
     return outcome
+
+
+@router.post("/api/executor-hosts/{name}/orders/{order_id}/redeem")
+async def api_executor_order_redeem(
+    name: str, order_id: int, body: ExecutorOrderRedeem, request: Request
+) -> dict:
+    """Выкуп кода заказа ключом хоста; повтор после потерянного ответа (#1825).
+
+    Первый вызов — токен сессии; повтор в окне, пока токен не предъявлен, —
+    новый токен той же сессии с большей ``token_version``. Тело ответа — секрет.
+    """
+    await _host_caller(request, name)
+    try:
+        return await host_redeem.redeem_for_host(
+            _db(request), name, order_id, body.code
+        )
+    except executor_orders.HostError as exc:
+        raise _as_http(exc) from exc
 
 
 @router.post("/api/executor-hosts/{name}/orders/{order_id}/ack")

@@ -5,8 +5,8 @@ implementer channel=slot и заказ хосту с шифротекстом н
 забирает заказ своим ключом роли slot_runner, расшифровывает и выкупает код.
 
 Здесь проверяются границы, которые держат безопасность: открытого кода нет
-нигде (грепается вся база, ответы и журнал), ключ хоста открывает маршруты
-своего хоста (SLOT_RUNNER_ALLOWLIST) и ничего больше (настоящий DB API key, не подмена роли), бронь слота
+нигде (грепается вся база, ответы и журнал), ключ хоста открывает пять маршрутов
+своего хоста и ничего больше (настоящий DB API key, не подмена роли), бронь слота
 держит индекс, а любое закрытие сжигает код.
 """
 
@@ -464,7 +464,7 @@ async def _rollback_part(world, monkeypatch):
 
 
 async def test_slot_runner_key_reaches_only_its_orders(world, monkeypatch):
-    """AC-2: настоящий DB API key хоста — маршруты своего хоста и всё."""
+    """AC-2: настоящий DB API key хоста — пять маршрутов своего хоста и всё."""
     # Пустой long-poll держится в пределах wait.
     started = time.monotonic()
     empty = await _orders(world, "k8", wait=2)
@@ -773,8 +773,8 @@ async def test_any_close_burns_the_code(world, monkeypatch):
     )[0]
     assert run2["outcome"] == "expired"
 
-    # (3) redeem_lost при живой сессии: заказ закрыт, а задачу, которую держит
-    # живая сессия, никто не трогает.
+    # (3) redeem_lost при живой ИСПОЛЬЗОВАННОЙ сессии (#1825): 409, заказ и
+    # задача не тронуты; задачу, которую держит живая сессия, никто не возвращает.
     t3 = await _task(world, "lost")
     lived = await _launch_redeem(world, t3)
     await _claim_and_start(world, t3, lived["session"])
@@ -783,8 +783,8 @@ async def test_any_close_burns_the_code(world, monkeypatch):
         json={"result": "redeem_lost"},
         headers=world.k8_auth,
     )
-    assert lost.status_code == 200
-    assert (await _order_row(world, lived["order"]["id"]))["state"] == "closed"
+    assert lost.status_code == 409
+    assert (await _order_row(world, lived["order"]["id"]))["state"] == "redeemed"
     assert (await repo.get_task(world.db, t3))["status"] == "running"
     # Живая сессия держит задачу и под блокировкой записи: устаревшее решение
     # «вернуть» (сессия тем временем возобновилась) её не возвращает.
@@ -800,6 +800,13 @@ async def test_any_close_burns_the_code(world, monkeypatch):
     )
     await world.db.commit()
     assert (await repo.get_task(world.db, t3))["status"] == "running"
+    # Работающий заказ закрывает итог хоста, а не redeem_lost: слот освобождается.
+    ended = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{lived['order']['id']}/report",
+        json={"outcome": "failed", "note": "прогон упал"},
+        headers=world.k8_auth,
+    )
+    assert ended.status_code == 200, ended.text
 
     # (4) смерть сессии после выкупа: reaper возвращает задачу, заказ закрыт той же операцией.
     t4 = await _task(world, "reaper")
@@ -1825,3 +1832,62 @@ async def test_an_accepted_slot_submission_releases_the_runs_claim(world):
         world.db, "SELECT released_at FROM executor_slots WHERE task_id = ?", (task_id,)
     )
     assert slots and all(s["released_at"] for s in slots)
+
+
+async def _sessions_of(world, run_id: int) -> list[dict]:
+    await world.db.commit()
+    return await _rows(
+        world.db,
+        "SELECT * FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run_id,),
+    )
+
+
+async def _ack(world, order_id: int, result: str):
+    return await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order_id}/ack",
+        json={"result": result},
+        headers=world.k8_auth,
+    )
+
+
+async def test_redeem_lost_revokes_unused_session(world):
+    """AC-4: redeem_lost до первого использования токена закрывает заказ И отзывает сессию.
+
+    Раньше close_order сжигал только непотраченный код: потраченный код оставлял
+    живую сессию при закрытом заказе — слот свободен, исполнитель жив. После
+    первого использования токена тот же ack — 409, заказ и сессия не тронуты.
+    """
+    # До использования: выкуплен, токен ни разу не предъявлен.
+    unused_task = await _task(world, "токен не использован")
+    unused = await _launch_redeem(world, unused_task)
+    run_id = unused["order"]["executor_run_id"]
+    before = await _sessions_of(world, run_id)
+    assert len(before) == 1 and before[0]["revoked_at"] is None
+    lost = await _ack(world, unused["order"]["id"], "redeem_lost")
+    assert lost.status_code == 200, lost.text
+    order = await _order_row(world, unused["order"]["id"])
+    assert order["state"] == "closed" and order["close_reason"] == "redeem_lost"
+    after = await _sessions_of(world, run_id)
+    assert len(after) == 1 and after[0]["revoked_at"] is not None
+    # Слот свободен, и токен действительно недействителен.
+    revoked = await world.client.get("/api/whoami", headers=unused["session"])
+    assert revoked.status_code == 401
+    assert (await _launch(world, await _task(world, "следующая"))).status_code == 200
+
+    # После использования: токен предъявлен (claim) — отказ 409, всё как было.
+    used_task = await _task(world, "токен использован")
+    used = await _launch_redeem(world, used_task, "k9")
+    await _claim_and_start(world, used_task, used["session"])
+    used_run = used["order"]["executor_run_id"]
+    sessions = await _sessions_of(world, used_run)
+    refused = await world.client.post(
+        f"/api/executor-hosts/k9/orders/{used['order']['id']}/ack",
+        json={"result": "redeem_lost"},
+        headers=world.k9_auth,
+    )
+    assert refused.status_code == 409, refused.text
+    kept = await _order_row(world, used["order"]["id"])
+    assert kept["state"] == "redeemed" and kept["ack_result"] == ""
+    assert await _sessions_of(world, used_run) == sessions
+    assert (await repo.get_task(world.db, used_task))["status"] == "running"

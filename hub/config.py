@@ -734,6 +734,16 @@ CHAT_PAIR_REDEEM_WINDOW_SECONDS = int(env_get("CHAT_PAIR_REDEEM_WINDOW_SECONDS",
 # enough to answer "was this code used?", short enough not to be an archive.
 CHAT_PAIR_SPENT_RETENTION_HOURS = int(env_get("CHAT_PAIR_SPENT_RETENTION_HOURS", "24"))
 
+# Выкуп кода заказа хоста исполнителя (#1825). Окно повтора отсчитано от
+# первого выкупа и не продлевается; ротаций токена на заказ не больше max.
+HOST_REDEEM_RETRY_SECONDS = int(env_get("HOST_REDEEM_RETRY_SECONDS", "600"))
+HOST_REDEEM_MAX_ROTATIONS = int(env_get("HOST_REDEEM_MAX_ROTATIONS", "5"))
+# Флаг переключения: 1 — публичный POST /api/auth/chat-pair/redeem отказывает
+# кодам заказов зарегистрированного хоста (их выкупает только хост своим
+# ключом). По умолчанию выключен: старый клиент k8 ходит публично, пока сторона
+# k8 не перешла на маршрут хоста. Облачные и ручные коды флаг не затрагивает.
+HOST_ORDER_PUBLIC_REDEEM_CLOSED = env_get("HOST_ORDER_PUBLIC_REDEEM_CLOSED", "0") == "1"
+
 # Fixed, not derived. Post a task, read it back, sharpen it — that is the whole
 # job of this channel. Notably absent: tasks.human_gate, tasks.decision,
 # tasks.archive, tasks.delete, admin.*, integrations.vast.manage and
@@ -901,7 +911,7 @@ class TokenIdentity:
 
     @property
     def is_slot_runner(self) -> bool:
-        """The key of an executor host (#1712): the routes of its own host (SLOT_RUNNER_ALLOWLIST)."""
+        """The key of an executor host (#1712): five routes of its own host (SLOT_RUNNER_ALLOWLIST)."""
         return self.role == "slot_runner"
 
     @property
