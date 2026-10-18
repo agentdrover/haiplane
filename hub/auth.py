@@ -485,6 +485,7 @@ SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/orders/{order_id}"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/redeem"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
+    ("POST", "/api/executor-hosts/{name}/orders/{order_id}/phase"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/report"),
 )
 #: ``executor-host-<name>`` — the username of the principal a host registration

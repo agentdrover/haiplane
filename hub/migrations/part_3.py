@@ -1080,11 +1080,68 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         )""",
     ),
     (
+<<<<<<< HEAD
         # #1811: «о чём задача простым языком», до 300 символов (предел задан
         # моделью). NULL - автор не писал. Время применения этой миграции
         # (_migrations.applied_at) - граница «новых» задач: has_plain_summary
         # блокирует только созданные после неё (hub.plain_summary).
         "add_tasks_plain_summary",
         "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
+=======
+        # #1829: какой текст навыка уже выдан зарегистрированной локальной
+        # сессии. Запись — по (сессия, навык, версия, sha256 текста): смена
+        # версии или текста даёт новую строку, и текст уходит снова. Старых
+        # выдач в таблице нет — первая выдача после выката идёт полным текстом.
+        "create_skill_deliveries",
+        """CREATE TABLE IF NOT EXISTS skill_deliveries (
+            session_id     TEXT NOT NULL,
+            skill          TEXT NOT NULL,
+            version        INTEGER NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            delivered_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (session_id, skill, version, content_sha256)
+        )""",
+    ),
+    (
+        # #1817: последняя принятая фаза хоста (vm_starting, agent_running,
+        # critic, submitting) и её время. В ленту фазы не пишутся.
+        "add_executor_orders_phase",
+        "ALTER TABLE executor_orders ADD COLUMN phase TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_executor_orders_phase_at",
+        "ALTER TABLE executor_orders ADD COLUMN phase_at TEXT",
+    ),
+    (
+        # #1817: код причины и текст причины из report хоста (reason ≤ 200).
+        "add_executor_orders_report_reason_code",
+        "ALTER TABLE executor_orders ADD COLUMN report_reason_code "
+        "TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_executor_orders_report_reason",
+        "ALTER TABLE executor_orders ADD COLUMN report_reason TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1817: когда закрытие заказа записало его итог в ленту (одна запись на
+        # заказ; report хоста и возврат задачи своей записи не пишут).
+        "add_executor_orders_final_entry_at",
+        "ALTER TABLE executor_orders ADD COLUMN final_entry_at TEXT",
+    ),
+    (
+        # #1817: report старого клиента (failed/rescued без reason_code) — это
+        # `other`: иначе его идентичный повтор после выката стал бы 409.
+        "backfill_executor_orders_report_reason_code",
+        "UPDATE executor_orders SET report_reason_code = 'other' "
+        "WHERE report_outcome IN ('failed', 'rescued') AND report_reason_code = ''",
+    ),
+    (
+        # #1817: итоговую запись пишет только закрытие заказа. Уже закрытые заказы
+        # помечены: поздних записей по ним не будет (допустимо: их итог уже в ленте
+        # или в записях сдачи).
+        "backfill_executor_orders_final_entry_at",
+        "UPDATE executor_orders SET final_entry_at = COALESCE(closed_at, "
+        "reported_at, created_at) WHERE final_entry_at IS NULL AND state = 'closed'",
+>>>>>>> origin/develop
     ),
 ]

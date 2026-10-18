@@ -5,7 +5,7 @@ implementer channel=slot и заказ хосту с шифротекстом н
 забирает заказ своим ключом роли slot_runner, расшифровывает и выкупает код.
 
 Здесь проверяются границы, которые держат безопасность: открытого кода нет
-нигде (грепается вся база, ответы и журнал), ключ хоста открывает пять маршрутов
+нигде (грепается вся база, ответы и журнал), ключ хоста открывает шесть маршрутов
 своего хоста и ничего больше (настоящий DB API key, не подмена роли), бронь слота
 держит индекс, а любое закрытие сжигает код.
 """
@@ -464,7 +464,7 @@ async def _rollback_part(world, monkeypatch):
 
 
 async def test_slot_runner_key_reaches_only_its_orders(world, monkeypatch):
-    """AC-2: настоящий DB API key хоста — пять маршрутов своего хоста и всё."""
+    """AC-2: настоящий DB API key хоста — шесть маршрутов своего хоста и всё."""
     # Пустой long-poll держится в пределах wait.
     started = time.monotonic()
     empty = await _orders(world, "k8", wait=2)
@@ -1365,7 +1365,7 @@ async def test_launch_a_chosen_task_on_the_slot_from_the_card(world):
 
 
 async def test_host_reports_run_outcome_to_the_feed(world):
-    """AC-11: одна запись итога в ленте, повтор идемпотентен, статус не меняется."""
+    """AC-11: итог хоста сохранён в заказе (в ленту не пишется, #1817), повтор идемпотентен."""
     task_id = await _task(world)
     other = await _task(world, "на k9")
     assert (await _launch(world, task_id)).status_code == 200
@@ -1396,17 +1396,19 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
     await world.db.commit()
 
-    feed = [
+    # #1817: report хоста ленту не пишет (итог заказа пишет его закрытие); исход,
+    # sha, ветка и заметка сохранены в заказе — их читают плашка и GET заказа.
+    assert [
         u
         for u in await _rows(
             world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
         )
         if "Итог прогона" in u["content"]
-    ]
-    assert len(feed) == 1
-    assert sha in feed[0]["content"] and f"task-{task_id}/work" in feed[0]["content"]
-    assert "submitted" in feed[0]["content"] and "k8" in feed[0]["content"]
-    assert feed[0]["agent"] == "executor-host-k8"
+    ] == []
+    stored = await _order_row(world, order["id"])
+    assert (stored["report_outcome"], stored["report_sha"]) == ("submitted", sha)
+    assert stored["report_branch"] == f"task-{task_id}/work"
+    assert stored["report_note"] == "всё хорошо"
     assert (await repo.get_task(world.db, task_id))["status"] == status_before
 
     # Другой итог по тому же заказу — 409; чужой заказ — 403.
@@ -1424,6 +1426,15 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     third = await _task(world, "не выданная")
     await _submit(world, task_id)  # освободить слот k8
     assert (await _launch(world, third)).status_code == 200
+    # Сдача принята: закрытие заказа пишет ровно одну итоговую запись, sha в ней виден.
+    closing = [
+        u["content"]
+        for u in await _rows(
+            world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
+        )
+        if f"Заказ #{order['id']} " in u["content"]
+    ]
+    assert len(closing) == 1 and sha in closing[0] and "сдана" in closing[0].lower()
     fresh = (
         await _rows(
             world.db, "SELECT id FROM executor_orders WHERE task_id=?", (third,)
@@ -1456,6 +1467,7 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     )
     assert first_after_close.status_code == 200
     assert first_after_close.json()["duplicate"] is False
+    await _failed_entry_part(world)
     await _notes_part(world, k9_order, other)
 
 
@@ -1891,3 +1903,96 @@ async def test_redeem_lost_revokes_unused_session(world):
     assert kept["state"] == "redeemed" and kept["ack_result"] == ""
     assert await _sessions_of(world, used_run) == sessions
     assert (await repo.get_task(world.db, used_task))["status"] == "running"
+
+
+async def _phase(world, order_id: int, phase: str, host: str = "k8", auth=None):
+    return await world.client.post(
+        f"/api/executor-hosts/{host}/orders/{order_id}/phase",
+        json={"phase": phase},
+        headers=auth or getattr(world, f"{host}_auth"),
+    )
+
+
+async def test_order_phase_contract(world, monkeypatch):
+    """#1817 AC-2: фазы хоста — только после redeemed, вперёд, без записей в ленту."""
+    from hub import executor_host_api
+
+    task_id = await _task(world, "фазы")
+    assert (await _launch(world, task_id)).status_code == 200
+    order = (await _orders(world)).json()["orders"][0]  # выдан, не выкуплен
+    feed_before = await _rows(world.db, "SELECT 1 FROM task_updates")
+    # До фактического redeemed: 409, фаза не записана.
+    assert (await _phase(world, order["id"], "vm_starting")).status_code == 409
+    redeemed = await _redeem(world, _code_of(world, order))
+    assert redeemed.status_code == 200
+    # Мусорная фаза — 422.
+    assert (await _phase(world, order["id"], "teleport")).status_code == 422
+    # Первая, затем вперёд с пропуском.
+    first = await _phase(world, order["id"], "vm_starting")
+    assert first.status_code == 200 and first.json()["phase"] == "vm_starting"
+    skip = await _phase(world, order["id"], "critic")
+    assert skip.status_code == 200 and skip.json()["duplicate"] is False
+    # Повтор той же — 200 без изменений; назад — 409.
+    again = await _phase(world, order["id"], "critic")
+    assert again.status_code == 200 and again.json()["duplicate"] is True
+    assert (await _phase(world, order["id"], "agent_running")).status_code == 409
+    assert (await _order_row(world, order["id"]))["phase"] == "critic"
+    # Чужой хост: ключ k9 на пути k8 и заказ k8 по пути k9.
+    assert (
+        await _phase(world, order["id"], "submitting", "k8", world.k9_auth)
+    ).status_code == 403
+    assert (await _phase(world, order["id"], "submitting", "k9")).status_code == 403
+    # Ни одна фаза не пишет в ленту.
+    assert (
+        len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+        == feed_before.__len__()
+    )
+    # Квота на хост: 429 сверх лимита, фаза не меняется.
+    executor_host_api._phase_limiter._buckets.clear()
+    monkeypatch.setattr(executor_host_api, "PHASE_MAX", 2)
+    codes = [(await _phase(world, order["id"], "critic")).status_code for _ in range(4)]
+    assert codes[:2] == [200, 200] and 429 in codes
+    executor_host_api._phase_limiter._buckets.clear()
+    # После отчёта и после закрытия — 409.
+    done = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order['id']}/report",
+        json={"outcome": "failed", "note": "упал"},
+        headers=world.k8_auth,
+    )
+    assert done.status_code == 200, done.text
+    assert (await _phase(world, order["id"], "submitting")).status_code == 409
+
+
+async def _failed_entry_part(world):
+    """#1817: failed/rescued — единственная запись закрытия несёт sha и ветку из report."""
+    for outcome in ("failed", "rescued"):
+        await world.db.execute(
+            "UPDATE executor_orders SET state = 'closed' WHERE host = 'k8' "
+            "AND state <> 'closed'"
+        )
+        await world.db.commit()
+        task_id = await _task(world, f"{outcome} с sha")
+        assert (await _launch(world, task_id, "k8")).status_code == 200
+        order = (await _orders(world, "k8")).json()["orders"][0]
+        branch = (
+            f"task-{task_id}/work"
+            if outcome == "failed"
+            else f"task-{task_id}/rescue-3"
+        )
+        sha = "fedcba9876543210fedc"  # pragma: allowlist secret
+        done = await world.client.post(
+            f"/api/executor-hosts/k8/orders/{order['id']}/report",
+            json={"outcome": outcome, "sha": sha, "branch": branch, "note": "итог"},
+            headers=world.k8_auth,
+        )
+        assert done.status_code == 200, done.text
+        entries = [
+            u["content"]
+            for u in await _rows(
+                world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
+            )
+            if f"Заказ #{order['id']} " in u["content"]
+            or "Итог прогона" in u["content"]
+        ]
+        assert len(entries) == 1, entries
+        assert sha in entries[0] and branch in entries[0] and outcome in entries[0]
