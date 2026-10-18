@@ -110,7 +110,7 @@ Human-only (a person, CSRF for cookies):
   never the code. Card button «Запустить на <host>» →
   `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
 
-Host key (`slot_runner`), exactly four routes of its OWN host:
+Host key (`slot_runner`), exactly five routes of its OWN host:
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
@@ -135,6 +135,12 @@ Host key (`slot_runner`), exactly four routes of its OWN host:
   order BEFORE the call; on timeout/5xx retry with backoff inside `retry_until`;
   ignore an answer with a smaller `token_version`; start the VM once; `redeem_lost`
   is the final refusal to recover.
+- `GET …/orders/{id}` (#1831) → the outcome of the host's OWN order: `state`,
+  `close_reason`, `task_id`, `task_status`, `submission_generation`,
+  `submission_sha`, `branch`, `pr_number`, `report_outcome` — no code, ciphertext,
+  tokens or order text. After a submission the run's sessions are revoked (#1783),
+  so the host checks the submission with THIS read, not with the agent session.
+  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; likewise when the task's `submission_generation` moved past the order's `generation` (a resubmission by another run: cloud, manual pair). `submitted` is true only when the generations are equal; `submission_*` and `pr_number` are given only then. A submission is the order's own only when the order's run held the task (`tasks.executor_run_id` = the order's run; `settle` closes the order with `submitted` only then, and the order stays attributed after the holder is released); a resubmission of the SAME generation by cloud or a manual pair is foreign (`superseded`). A `submitted` order whose task went back to open/claimed/running is `superseded` too. A branch that carries a hub code or token is returned empty. Order, "newer order exists" and task are ONE query (one snapshot); a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
 - `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
   `redeemed` is informational (the hub sees the spend itself) and keeps the
   booking; the other two close the order, burn the code, REVOKE the session while its token was never presented, abort the run; once the token was presented they are 409 `already_redeemed_in_use` and change nothing (#1825). A repeat
