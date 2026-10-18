@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from typing import Any
 
 import aiosqlite
@@ -46,6 +47,13 @@ _REACHABLE = "reachable"
 # Строки старше окна не смотрятся: лента событий живёт 14 дней, и по более
 # старой строке дедуп по событию потерялся бы.
 LOOKBACK_DAYS = 7
+# Репозиторий хаба живёт на GitHub (см. forge_of: так читается и отсутствие значения).
+HUB_FORGE = "github"
+# Недоступный коммит повторно тянется не чаще раза в это время: сетевой
+# таймаут на каждую строку каждого тика задерживал бы остальные свипы.
+FETCH_RETRY_SECONDS = 30 * 60
+_fetch_failed: dict[tuple[int, str], float] = {}
+_clock = time.monotonic
 
 
 async def record_merge(
@@ -74,7 +82,9 @@ async def set_sha(
 def _is_hub_project(project: dict[str, Any]) -> bool:
     mine = (project.get("repo") or "").strip().lower()
     hub = (config.REPO_NAME or "").strip().lower()
-    return bool(mine and hub and mine == hub)
+    # Имя без площадки не определяет репозиторий: GitVerse-проект с тем же
+    # owner/name — другой репозиторий, и выката хаба для него нет.
+    return bool(mine and hub and mine == hub and forge_of(project) == HUB_FORGE)
 
 
 async def _due_rows(db: aiosqlite.Connection, project_id: int) -> list[dict[str, Any]]:
@@ -115,11 +125,25 @@ async def _read_sha(
 async def _ensure_commits(
     db: aiosqlite.Connection, project_id: int, shas: list[tuple[str, str]]
 ) -> None:
+    """Подтянуть коммиты; неудача по (проект, sha) запоминается на FETCH_RETRY_SECONDS.
+
+    Кеш общий для строк одного прохода (один deployed_sha — один fetch) и для
+    следующих проходов: уже объявленная тревога не оплачивается сетью каждый тик.
+    """
     from hub.services.delivery_state import ensure_commit_available
 
     for sha, ref in shas:
+        key = (project_id, sha)
+        failed_at = _fetch_failed.get(key)
+        if failed_at is not None and _clock() - failed_at < FETCH_RETRY_SECONDS:
+            continue
+        ok = False
         with contextlib.suppress(Exception):  # best effort: git скажет None
-            await ensure_commit_available(db, sha, ref, project_id=project_id)
+            ok = await ensure_commit_available(db, sha, ref, project_id=project_id)
+        if ok:
+            _fetch_failed.pop(key, None)
+        else:
+            _fetch_failed[key] = _clock()
 
 
 async def _classify(
@@ -135,11 +159,11 @@ async def _classify(
         return UNOBSERVED, "нет ни одного успешного выката", {"release_sha": sha}
     deployed_sha = str(deployed.get("deployed_sha") or "")
     details = {"release_sha": sha, "deployed_sha": deployed_sha}
+    if sha == deployed_sha:  # равенство — достижимость без git и без копии
+        return _REACHABLE, "", details
     workspace = (project.get("workspace_path") or "").strip()
     if not workspace:
         return UNOBSERVED, "у проекта нет рабочей копии на этом хосте", details
-    if sha == deployed_sha:
-        return _REACHABLE, "", details
     await _ensure_commits(
         db, project_id, [(sha, ""), (deployed_sha, str(deployed.get("ref") or ""))]
     )

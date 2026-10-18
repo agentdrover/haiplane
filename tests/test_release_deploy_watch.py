@@ -295,3 +295,74 @@ async def test_a_project_of_a_foreign_repository_is_not_watched(db) -> None:
     assert not await _events(db, "release_not_in_prod")
     assert not await _events(db, "release_deploy_unobserved")
     git.is_ancestor.assert_not_awaited()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fetch_cache():
+    watch._fetch_failed.clear()
+    yield
+    watch._fetch_failed.clear()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_commits_are_fetched_once_per_backoff(db) -> None:
+    # Недоступный git: два прохода и две строки — не больше одного fetch на sha.
+    pid = await _pid(db)
+    await _deploy(db, pid, DEPLOYED)
+    await _row(db, pid, 1, RELEASE_A)
+    await _row(db, pid, 2, RELEASE_B)
+    g = _ancestry({})
+    g.commit_exists = AsyncMock(return_value=False)
+    g.fetch_commit = AsyncMock(return_value=(False, "timeout"))
+
+    await watch.sweep(db)
+    await watch.sweep(db)
+
+    fetched = [c.args[1] for c in g.fetch_commit.await_args_list]
+    assert sorted(fetched) == sorted({RELEASE_A, RELEASE_B, DEPLOYED}), fetched
+
+    clock = watch._clock()
+    with patch.object(watch, "_clock", lambda: clock + watch.FETCH_RETRY_SECONDS + 1):
+        await watch.sweep(db)
+    assert len(g.fetch_commit.await_args_list) == 6, "после срока — повтор"
+
+
+@pytest.mark.asyncio
+async def test_equal_sha_is_reachable_without_a_workspace(db) -> None:
+    # Равенство sha решает вопрос без git: пустая копия не даёт «нет данных».
+    pid = await _pid(db)
+    await repo.update_project(db, pid, workspace_path="")
+    await db.commit()
+    await _deploy(db, pid, DEPLOYED)
+    await _row(db, pid, 1, DEPLOYED)
+    _ancestry({})
+
+    await watch.sweep(db)
+    assert not await _events(db, "release_deploy_unobserved")
+    assert not await _messages(db)
+
+    # После прежней тревоги — release_deployed_late.
+    await db.execute(
+        "INSERT INTO events (kind, project_id, actor, payload) VALUES "
+        "('release_deploy_unobserved', ?, 'hub', json_object('release_merge_id', "
+        "(SELECT id FROM release_merges)))",
+        (pid,),
+    )
+    await db.commit()
+    await watch.sweep(db)
+    assert len(await _events(db, "release_deployed_late")) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_name_on_another_forge_is_not_watched(db) -> None:
+    pid = await _pid(db)
+    await repo.update_project(db, pid, forge="gitverse")
+    await db.commit()
+    await _row(db, pid, 1, RELEASE_A)
+    git = _ancestry({(RELEASE_A, DEPLOYED): False})
+    await _deploy(db, pid, DEPLOYED)
+
+    await watch.sweep(db)
+
+    assert not await _events(db, "release_not_in_prod")
+    git.is_ancestor.assert_not_awaited()
