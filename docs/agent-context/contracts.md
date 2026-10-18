@@ -110,7 +110,7 @@ Human-only (a person, CSRF for cookies):
   never the code. Card button «Запустить на <host>» →
   `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
 
-Host key (`slot_runner`), exactly five routes of its OWN host:
+Host key (`slot_runner`), exactly six routes of its OWN host:
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
@@ -146,10 +146,15 @@ Host key (`slot_runner`), exactly five routes of its OWN host:
   booking; the other two close the order, burn the code, REVOKE the session while its token was never presented, abort the run; once the token was presented they are 409 `already_redeemed_in_use` and change nothing (#1825). A repeat
   with a DIFFERENT result is 409 (the first word of the host stands). Foreign or
   unknown order: 403. At most 3 concurrent long-polls per host (429).
+- `POST …/orders/{id}/phase {phase: vm_starting|agent_running|critic|submitting}` (#1817)
+  — the host tells which step the run is on; the card plaque shows the last accepted
+  one. Only the host's own order that is FACTUALLY `redeemed` (not merely delivered),
+  unclosed and without a report; phases go forward only, skipping is fine; the same
+  phase again is 200 `duplicate`, backwards / before redeem / after report or close
+  is 409, a foreign order is 403, an unknown phase 422, over 30/min per host 429.
+  Phases are never written to the task feed. Old hosts that send none keep working.
 - `POST …/orders/{id}/report {outcome: submitted|rescued|failed, sha?, branch?,
-  note?}` — one feed entry per order, repeat is a no-op, a different outcome is 409,
-  `note` ≤ 500 chars without codes or tokens (422), never changes the task status;
-  works on a closed order. `failed`/`rescued` also CLOSE the order (the run ended
+  note?, reason_code?, reason?}` — NO feed entry (#1817: a host report only stores outcome, sha, branch, note and reason for the card plaque and `GET …/orders/{id}`; the ONE final feed entry of an order is written by the order's close, in the transaction that sets `state=closed`, from the actual outcome at that moment — the task submitted by this order's run → submission, otherwise the close reason with the host `reason_code`/`reason` as detail; a return of the task to open or a claim release of THIS order's run writes none of its own, any other run writes its normal entry), repeat is a no-op, a different outcome is 409, `note` ≤ 500 chars without codes or tokens (422), never changes the task status; works on a closed order. `reason_code` (#1817): channel_check_failed, setup_failed, redeem_failed, vm_failed, busy, over_budget, agent_failed, critic_failed, timeout, hub_unavailable, stale_token, other (absent on failed/rescued from an old client = `other`; unknown value 422); `reason` ≤ 200 chars passes the same secret and order-code checks as `note`; the reason of the first report is immutable (a repeat with another `reason_code` is 409, an identical repeat is a no-op). `failed`/`rescued` also CLOSE the order (the run ended
   without a submission: unspent code burnt, run aborted, slot free); `submitted`
   does not (the landed submission closes it). `branch` is a WHITELIST: the task's own `tasks.branch` or `task-<order task id>/rescue-<digits>`, anything else is 422; `sha` is `^[0-9a-f]{7,40}$`; `note` has the secret and long-token checks (no heuristics on branch/sha).
 

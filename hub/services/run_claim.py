@@ -309,7 +309,13 @@ async def release_run_claim(
             "WHERE session_id = ? AND current_task_id = ?",
             (session, int(task_id)),
         )
-    await repo.add_task_update(db, int(task_id), "hub", "status", note)
+    # #1817: прогон заказа хоста: итоговую запись даёт закрытие заказа, не снятие захвата.
+    if not await fetchall(
+        db,
+        "SELECT 1 FROM executor_orders WHERE executor_run_id = ?",
+        (int(run_id),),
+    ):
+        await repo.add_task_update(db, int(task_id), "hub", "status", note)
     await repo.insert_event(
         db,
         kind=EVENT_CLAIM_RELEASED,
