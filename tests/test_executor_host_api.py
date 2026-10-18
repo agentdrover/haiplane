@@ -154,3 +154,65 @@ async def test_order_read_hides_secrets_stale_runs_and_overflow(world):
     big = await _read(world, "k8", 2**63)
     assert big.status_code == 404
     assert big.json() == (await _read(world, "k8", 999999)).json()
+
+
+async def test_order_read_snapshot_is_atomic(world, monkeypatch):
+    """CR-1: заказ, «есть ли новее» и задача читаются ОДНИМ запросом — одним снимком.
+
+    Любое отдельное чтение задачи или заказов между ними оставляет окно, в
+    которое успевает встать новый заказ; поэтому второе чтение здесь — отказ.
+    """
+    from hub.services import executor_orders as orders
+
+    task_id = await _task(world, "снимок")
+    first = (await _eo._launch(world, task_id, "k8")).json()["order_id"]
+
+    async def second_read(*_a, **_k):
+        raise AssertionError("итог читает задачу отдельным запросом: нет общего снимка")
+
+    monkeypatch.setattr(orders.repo, "get_task", second_read)
+    seen: list[str] = []
+    real = orders.fetchall
+
+    async def counting(db, sql, params=()):
+        seen.append(sql)
+        return await real(db, sql, params)
+
+    monkeypatch.setattr(orders, "fetchall", counting)
+    body = await _read(world, "k8", first)
+    assert body.status_code == 200, body.text
+    reads = [
+        q for q in seen if "JOIN tasks" in q or "FROM tasks" in q or "n.task_id" in q
+    ]
+    assert len(reads) == 1, reads  # заказ, newer и задача — в одном запросе
+
+
+async def test_order_read_binds_submission_to_its_own_run(world):
+    """CR-2: сдача другого прогона (облако, ручной pair) не выдаётся за итог заказа."""
+    from hub import repository as repo
+
+    task_id = await _task(world, "чужая пересдача")
+    lived = await _launch_redeem(world, task_id)
+    order_id = lived["order"]["id"]
+    # Прогон ещё не сдавал: чужих submission_* нет, вопрос «сдано ли» — нет.
+    await repo.update_task(world.db, task_id, submission_sha="c" * 40, pr_number=5)
+    await world.db.commit()
+    waiting = (await _read(world, "k8", order_id)).json()
+    assert waiting["superseded"] is False and waiting["submitted"] is False
+    assert waiting["submission_sha"] == "" and waiting["pr_number"] is None
+    # Свой прогон сдал: поколение заказа совпало.
+    await _submit(world, task_id, 1)
+    mine = (await _read(world, "k8", order_id)).json()
+    assert mine["submitted"] is True and mine["superseded"] is False
+    assert mine["submission_sha"] == "c" * 40 and mine["submission_generation"] == 1
+    # Пересдача облаком или вручную (поколение 2): старый заказ — superseded без полей.
+    await repo.update_task(
+        world.db, task_id, submission_generation=2, submission_sha="d" * 40, pr_number=6
+    )
+    await world.db.commit()
+    other = (await _read(world, "k8", order_id)).json()
+    assert other["superseded"] is True and other["submitted"] is False
+    for field in ("submission_sha", "branch"):
+        assert other[field] == ""
+    assert other["pr_number"] is None and other["task_status"] is None
+    assert other["submission_generation"] is None

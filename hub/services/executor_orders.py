@@ -921,40 +921,50 @@ async def read_order_outcome(
     """
     if not 0 <= int(order_id) <= _SQLITE_MAX_INT:
         return None
-    order = await _own_order(db, host, order_id)
-    if order is None:
-        return None
-    # Задача могла уйти в новый заказ (этого или другого хоста): её сдача тогда
-    # не итог ЭТОГО заказа, и отдавать её старому заказу нельзя.
-    newer = await fetchall(
+    # ОДИН запрос = один снимок: заказ, «есть ли новее» и задача читаются вместе.
+    # Два чтения оставляли окно, в которое успевает встать новый заказ.
+    rows = await fetchall(
         db,
-        "SELECT 1 FROM executor_orders WHERE task_id = ? AND id > ? LIMIT 1",
-        (int(order["task_id"]), int(order["id"])),
+        "SELECT o.*, t.status AS t_status, t.submission_generation AS t_generation, "
+        "t.submission_sha AS t_sha, t.branch AS t_branch, t.pr_number AS t_pr, "
+        "EXISTS (SELECT 1 FROM executor_orders n WHERE n.task_id = o.task_id "
+        "AND n.id > o.id) AS newer "
+        "FROM executor_orders o LEFT JOIN tasks t ON t.id = o.task_id "
+        "WHERE o.id = ? AND o.host = ?",
+        (int(order_id), host),
     )
-    task = None if newer else await repo.get_task(db, int(order["task_id"]))
-    row = dict(task) if task is not None else {}
-    branch = str(row.get("branch") or "")
+    if not rows:
+        return None
+    row = dict(rows[0])
+    # Сдачу сделал ЭТОТ прогон, если поколение задачи дошло ровно до поколения
+    # заказа. Больше — сдавал другой (новый заказ, облако, ручной pair): итог
+    # чужой, и старому заказу он не отдаётся.
+    generation = row["t_generation"] if row["t_generation"] is not None else 0
+    superseded = bool(row["newer"]) or generation > int(row["generation"])
+    submitted = not superseded and generation == int(row["generation"])
+    branch = "" if superseded else str(row["t_branch"] or "")
     if branch and (
         any(shape.search(branch) for shape in _SECRET_SHAPES)
-        or await _fields_hold_the_code(db, order, branch)
+        or await _fields_hold_the_code(db, row, branch)
     ):
         branch = (
             ""  # слаг ветки задаёт вызывающий pair-start: секрету в ответе не место
         )
     return {
-        "id": order["id"],
-        "host": order["host"],
-        "state": order["state"],
-        "close_reason": order["close_reason"],
-        "task_id": order["task_id"],
-        "generation": order["generation"],
-        "superseded": bool(newer),
-        "task_status": row.get("status"),
-        "submission_generation": row.get("submission_generation"),
-        "submission_sha": row.get("submission_sha") or "",
+        "id": row["id"],
+        "host": row["host"],
+        "state": row["state"],
+        "close_reason": row["close_reason"],
+        "task_id": row["task_id"],
+        "generation": row["generation"],
+        "superseded": superseded,
+        "submitted": submitted,
+        "task_status": None if superseded else row["t_status"],
+        "submission_generation": generation if submitted else None,
+        "submission_sha": (row["t_sha"] or "") if submitted else "",
         "branch": branch,
-        "pr_number": row.get("pr_number"),
-        "report_outcome": order["report_outcome"],
+        "pr_number": row["t_pr"] if submitted else None,
+        "report_outcome": row["report_outcome"],
     }
 
 

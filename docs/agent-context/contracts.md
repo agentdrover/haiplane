@@ -110,7 +110,7 @@ Human-only (a person, CSRF for cookies):
   never the code. Card button «Запустить на <host>» →
   `POST /tasks/{id}/web-executor-slot`. CLI: `oc-hub executor-launch`.
 
-Host key (`slot_runner`), exactly four routes of its OWN host:
+Host key (`slot_runner`), exactly the routes of `auth.SLOT_RUNNER_ALLOWLIST`, all of its OWN host:
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
@@ -121,7 +121,7 @@ Host key (`slot_runner`), exactly four routes of its OWN host:
   `submission_sha`, `branch`, `pr_number`, `report_outcome` — no code, ciphertext,
   tokens or order text. After a submission the run's sessions are revoked (#1783),
   so the host checks the submission with THIS read, not with the agent session.
-  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
+  If the task was ordered again later (any host) the order is `superseded: true` and carries no task fields; likewise when the task's `submission_generation` moved past the order's `generation` (a resubmission by another run: cloud, manual pair). `submitted` is true only when the generations are equal; `submission_*` and `pr_number` are given only then. Order, "newer order exists" and task are ONE query (one snapshot); a branch that looks like a secret is returned empty. Foreign, unknown and out-of-range order id: one 404; ≤ 60 reads/min per host (429).
 - `POST …/orders/{id}/ack {result: redeemed|redeem_failed|redeem_lost}` — idempotent;
   `redeemed` is informational (the hub sees the spend itself) and keeps the
   booking; the other two close the order, burn the code, abort the run. A repeat
