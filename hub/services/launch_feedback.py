@@ -184,6 +184,16 @@ async def _slot_plaque(
         outcome = close_reason_text(order["close_reason"], order["report_reason_code"])
     if outcome and order["report_reason"]:
         outcome = f"{outcome} — {order['report_reason']}"
+    saved = [
+        x
+        for x in (
+            f"ветка {order['report_branch']}" if order["report_branch"] else "",
+            f"sha {order['report_sha']}" if order["report_sha"] else "",
+        )
+        if x
+    ]
+    if outcome and saved and not landed:
+        outcome = f"{outcome} ({', '.join(saved)})"
     if state in ("pending", "delivered"):
         headline = f"Заказ #{number} создан, ждёт {host}"
         step = "отправлен хосту" if state == "delivered" else "создан, ждёт хоста"

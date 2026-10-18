@@ -451,24 +451,22 @@ async def close_order(
         await run_claim.release_after_run_closed(
             db, int(order["executor_run_id"]), why=reason
         )
-    # #1817: итог заказа — ОДНА запись в ленте. Метку ставит первый из report,
-    # закрытия и возврата в open; возврат несёт текст итога как свою заметку.
+    # #1817: итог заказа — ОДНА запись в ленте. Метка ставится после возврата
+    # задачи: пока её нет, возврат несёт текст итога как свою заметку, а когда
+    # она уже стоит (report или прежнее закрытие), возврат молчит.
     text = final_text or (
         f"Заказ хосту {order['host']} (сдача {order['generation']}) закрыт: "
-        f"{launch_feedback.close_reason_text(reason, '')}; непотраченный код сожжён."
+        f"{launch_feedback.close_reason_text(reason, '')}"
+        + ("." if reason == CLOSE_SUBMITTED else "; непотраченный код сожжён.")
     )
-    fresh = reason != CLOSE_SUBMITTED and bool(
-        (
-            await db.execute(
-                "UPDATE executor_orders SET final_entry_at = datetime('now') "
-                "WHERE id = ? AND final_entry_at IS NULL",
-                (int(order["id"]),),
-            )
-        ).rowcount
+    already = bool(
+        await fetchall(
+            db,
+            "SELECT 1 FROM executor_orders WHERE id = ? AND final_entry_at IS NOT NULL",
+            (int(order["id"]),),
+        )
     )
-    returned = return_task and await _return_task(
-        db, order, text if fresh or reason == CLOSE_SUBMITTED else ""
-    )
+    returned = return_task and await _return_task(db, order, text)
     await admin_svc.write_audit(
         db,
         actor_id=None,
@@ -479,8 +477,15 @@ async def close_order(
         f"{reason}",
         commit=False,
     )
-    if fresh and not returned and entry:
-        await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+    if not already:
+        await db.execute(
+            "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
+            (int(order["id"]),),
+        )
+        # Сдача уже говорит за себя: «Submitted for review» и «Захват снят…» —
+        # своя пара записей; третья по тому же заказу была бы дублем.
+        if not returned and entry and reason != CLOSE_SUBMITTED:
+            await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
     return True
 
 
@@ -740,6 +745,10 @@ async def _book(
     host = await _enabled_host(db, host_name)
     if isinstance(host, str):
         return host
+    if task_id is not None:
+        busy = await _task_busy(db, int(task_id))  # номер заказа важнее статуса задачи
+        if busy:
+            return busy
     task, why = await _chosen_task(db, project, task_id)
     if task is None:
         return why

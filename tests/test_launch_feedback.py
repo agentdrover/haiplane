@@ -370,3 +370,91 @@ async def test_old_reports_and_entries_are_backfilled(world):
         headers=world.k8_auth,
     )
     assert again.status_code == 200 and again.json()["duplicate"] is True
+
+
+async def test_final_entry_is_written_once_in_every_close_path(world):
+    """Codex круг 2: сдача сама фиксирует итог; submitted-report + reaper; поздний rescued."""
+    from hub import repository as repo
+    from hub.services import chat_pair as cp
+
+    async def feed_len() -> int:
+        await world.db.commit()
+        return len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+
+    # (1) Сдача приняла заказ без report хоста: заказ запись не добавляет (её уже
+    # дала сдача: «Захват снят…»), метка стоит, поздний report её не двоит.
+    t1 = await _task(world, "сдача без report")
+    o1 = (await _launch_redeem(world, t1))["order"]["id"]
+    await _eo._submit(world, t1)
+    before = await feed_len()
+    await orders.sweep_executor_orders(world.db)
+    assert await feed_len() - before == 1
+    assert (await _order_row(world, o1))["final_entry_at"]
+    # Поздний submitted-report запись не двоит.
+    late = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{o1}/report",
+        json={"outcome": "submitted"},
+        headers=world.k8_auth,
+    )
+    assert late.status_code == 200 and await feed_len() - before == 1
+
+    # (2) submitted-report, затем сессия истекла и reaper вернул задачу: запись одна.
+    t2 = await _task(world, "report и reaper")
+    l2 = await _launch_redeem(world, t2)
+    await _eo._claim_and_start(world, t2, l2["session"])
+    rep = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{l2['order']['id']}/report",
+        json={"outcome": "submitted"},
+        headers=world.k8_auth,
+    )
+    assert rep.status_code == 200
+    before = await feed_len()
+    await world.db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
+        "WHERE bound_task_id = ?",
+        (t2,),
+    )
+    await world.db.commit()
+    assert await cp.release_expired_implementer_tasks(world.db) == [t2]
+    assert await feed_len() - before == 0
+
+    # (3) Поздний rescued после закрытия reaper'ом: ветка и sha видны в плашке.
+    t3 = await _task(world, "поздний rescued")
+    l3 = await _launch_redeem(world, t3)
+    await _close(world, l3["order"]["id"], "session_gone")
+    await repo.update_task(world.db, t3, branch=f"task-{t3}/work")
+    await world.db.commit()
+    resc = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{l3['order']['id']}/report",
+        json={
+            "outcome": "rescued",
+            "branch": f"task-{t3}/rescue-7",
+            "sha": "a1b2c3d4e5f6",
+            "reason_code": "agent_failed",
+        },
+        headers=world.k8_auth,
+    )
+    assert resc.status_code == 200, resc.text
+    plaque = await launch_feedback.plaque(world.db, t3)
+    assert plaque is not None
+    assert (
+        f"task-{t3}/rescue-7" in plaque["outcome"]
+        and "a1b2c3d4e5f6" in plaque["outcome"]
+    )
+
+
+async def test_repeat_launch_after_claim_names_the_active_order(world):
+    """Codex P3: когда задача уже claimed/running, отказ всё равно называет номер заказа."""
+    from hub import repository as repo
+
+    task_id = await _task(world, "уже в работе")
+    lived = await _launch_redeem(world, task_id)
+    await _eo._claim_and_start(world, task_id, lived["session"])
+    assert (await repo.get_task(world.db, task_id))["status"] == "running"
+    again = await world.client.post(
+        f"/api/projects/{world.slug}/executor-launch",
+        json={"target": "slot:k9", "task_id": task_id},
+        headers=world.human_auth,
+    )
+    assert again.status_code == 409
+    assert f"заказ #{lived['order']['id']}" in again.json()["detail"]["reason"]
