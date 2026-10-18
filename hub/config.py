@@ -653,6 +653,11 @@ MCP_TELEMETRY_MAX_WINDOW_DAYS = int(env_get("MCP_TELEMETRY_MAX_WINDOW_DAYS", "90
 # splits it into core/extension profiles, and the reports built here are what
 # decides where the line falls.
 MCP_PROFILE = env_get("MCP_PROFILE", "v1")
+# Streamable HTTP request body cap. mcp >= 1.29 enforces 4 MiB by default, which
+# rejects (413) large bulk calls such as hub_refine_tasks before any tool runs.
+MCP_MAX_REQUEST_BODY_BYTES = int(
+    env_get("MCP_MAX_REQUEST_BODY_BYTES", str(16 * 1024 * 1024))
+)
 
 # Release branch (#812): where develop is carried when the project releases by
 # policy. Separate from PAIR_BASE_BRANCH so "where work lands" and "what is in
