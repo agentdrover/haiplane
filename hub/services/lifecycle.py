@@ -2170,7 +2170,13 @@ async def pair_start_task(
     skill_fact: dict[str, Any] = {}
     if not state_task:
         working_rules_block, skill_fact = await _build_pair_rules(
-            db, task_id, agent_rules, session_token if caller_is_agent else ""
+            db,
+            task_id,
+            agent_rules,
+            session_token if caller_is_agent else "",
+            declared_session=declared_session,
+            principal_id=implementer_principal_id,
+            full_rules=bool(body and body.full_rules),
         )
     await log_activity(
         db,
@@ -2212,6 +2218,10 @@ async def _build_pair_rules(
     task_id: int,
     agent_rules: dict[str, Any] | None,
     session_token: str,
+    *,
+    declared_session: str = "",
+    principal_id: int | None = None,
+    full_rules: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Блок «Правила работы» pair-start и факт выдачи навыка (#1683).
 
@@ -2228,6 +2238,14 @@ async def _build_pair_rules(
         ordered_skill_version=order["skill_version"] if order else None,
     )
     if order is None:
+        # #1829: локальная зарегистрированная сессия — текст один раз.
+        await working_rules.apply_session_delivery(
+            db,
+            block.hub_skill,
+            declared_session,
+            principal_id=principal_id,
+            force_full=full_rules,
+        )
         return block, {}
     skill = block.hub_skill
     return block, {
