@@ -2560,6 +2560,7 @@ async def hub_pair_start(
     branch_slug: str = "",
     session_id: str = "",
     git_mode: str = "",
+    full_rules: bool = False,
 ) -> str:
     """Start pair mode: move an open task to running without headless dispatch.
 
@@ -2581,10 +2582,13 @@ async def hub_pair_start(
             refused with pair_start_session_mismatch.
         git_mode: hub (default) prepares the branch on the hub host; remote
             records the canonical name and skips host git (#975).
+        full_rules: resend the skill text a registered session already got.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
     body: dict[str, Any] = {}
+    if full_rules:
+        body["full_rules"] = True
     if plan:
         body["plan"] = plan
     if assigned_agent:
