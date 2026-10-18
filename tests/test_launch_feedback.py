@@ -563,3 +563,21 @@ async def test_return_to_open_is_silent_after_the_same_outcome_whatever_the_stat
         freed is True and (await repo.get_task(world.db, task_id))["status"] == "open"
     )
     assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) == before
+
+
+async def test_host_report_of_another_outcome_after_close_is_written(world):
+    """Codex: подавляется только повтор того же исхода — submitted после not_ok пишется."""
+    task_id = await _task(world, "другой исход")
+    lived = await _launch_redeem(world, task_id)
+    oid = lived["order"]["id"]
+    await _close(world, oid, "session_gone")  # not_ok уже записан
+    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+    rep = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{oid}/report",
+        json={"outcome": "submitted"},
+        headers=world.k8_auth,
+    )
+    assert rep.status_code == 200
+    await world.db.commit()
+    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) - before == 1
+    assert (await _order_row(world, oid))["final_entry_kind"] == "ok"
