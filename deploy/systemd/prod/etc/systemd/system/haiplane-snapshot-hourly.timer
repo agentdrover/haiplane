@@ -1,0 +1,10 @@
+[Unit]
+Description=Haiplane hub: hourly snapshot
+
+[Timer]
+OnCalendar=*:17:00
+RandomizedDelaySec=<скрыто>
+Persistent=true
+
+[Install]
+WantedBy=timers.target
