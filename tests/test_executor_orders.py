@@ -5,7 +5,7 @@ implementer channel=slot и заказ хосту с шифротекстом н
 забирает заказ своим ключом роли slot_runner, расшифровывает и выкупает код.
 
 Здесь проверяются границы, которые держат безопасность: открытого кода нет
-нигде (грепается вся база, ответы и журнал), ключ хоста открывает четыре маршрута
+нигде (грепается вся база, ответы и журнал), ключ хоста открывает пять маршрутов
 своего хоста и ничего больше (настоящий DB API key, не подмена роли), бронь слота
 держит индекс, а любое закрытие сжигает код.
 """
@@ -279,10 +279,23 @@ async def _order_row(world, order_id: int) -> dict:
     )[0]
 
 
-async def _submit(world, task_id: int, generation: int = 1) -> None:
-    await repo.update_task(
-        world.db, task_id, status="review", submission_generation=generation
+async def _submit(
+    world, task_id: int, generation: int = 1, *, holder: bool = True
+) -> None:
+    """Сдача задачи прогоном заказа: держатель задачи — прогон её последнего заказа (#1831).
+
+    ``holder=False`` — сдача чужого прогона (облако, ручной pair): держателя нет.
+    """
+    fields: dict = {"status": "review", "submission_generation": generation}
+    last = await _rows(
+        world.db,
+        "SELECT executor_run_id FROM executor_orders WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
     )
+    if holder and last:
+        fields["executor_run_id"] = last[0]["executor_run_id"]
+    await repo.update_task(world.db, task_id, **fields)
     await world.db.commit()
 
 
@@ -451,7 +464,7 @@ async def _rollback_part(world, monkeypatch):
 
 
 async def test_slot_runner_key_reaches_only_its_orders(world, monkeypatch):
-    """AC-2: настоящий DB API key хоста — четыре маршрута своего хоста и всё."""
+    """AC-2: настоящий DB API key хоста — пять маршрутов своего хоста и всё."""
     # Пустой long-poll держится в пределах wait.
     started = time.monotonic()
     empty = await _orders(world, "k8", wait=2)

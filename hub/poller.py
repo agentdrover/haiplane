@@ -1475,6 +1475,7 @@ async def _sweep_reviewer_unavailable(db) -> None:
     сдачи, которых уже нет в review. Тот же набор — без нового события.
     """
     from hub.services import review_availability as ra
+    from hub.services import reviewer_notice
 
     outage = await ra.observe_outage(db)
     raised = await ra.signal_state(db) == ra.REVIEWER_UNAVAILABLE
@@ -1483,22 +1484,11 @@ async def _sweep_reviewer_unavailable(db) -> None:
             return
     if raised and await ra.same_picture_as_raised(db, outage):
         if await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
+            await reviewer_notice.refresh(db, outage)  # проект задачи мог смениться
+            await db.commit()
             return  # тот же набор и уже сказано в этих сутках
     waiting = [row["task_id"] for row in outage.waiting]
-    await repo.insert_event(
-        db,
-        kind=ra.REVIEWER_UNAVAILABLE,
-        actor="hub",
-        payload={
-            "provider": ra.PROVIDER,
-            "since": outage.since,
-            "refused_tasks": outage.refused_tasks,
-            "waiting_count": len(waiting),
-            "waiting": outage.waiting,
-            "threshold_hours": config.REVIEWER_UNAVAILABLE_HOURS,
-            "observed": outage.kind,
-        },
-    )
+    await reviewer_notice.record_raised(db, outage)  # событие и уведомления (#1826)
     await db.commit()
     await log_activity(
         db,
@@ -1524,16 +1514,12 @@ async def _clear_reviewer_unavailable(db, observed) -> bool:
     поднятым, и его картину сверяет вызывающий.
     """
     from hub.services import review_availability as ra
+    from hub.services import reviewer_notice
 
     why = await ra.clearing(db, observed)
     if why is None:
         return False
-    await repo.insert_event(
-        db,
-        kind=ra.REVIEWER_SIGNAL_CLEARED,
-        actor="hub",
-        payload={"provider": ra.PROVIDER, **why},
-    )
+    await reviewer_notice.record_cleared(db, why)  # событие и уведомления (#1826)
     await db.commit()
     await log_activity(db, ra.REVIEWER_SIGNAL_CLEARED, why["message"])
     return True

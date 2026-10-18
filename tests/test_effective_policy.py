@@ -1280,7 +1280,7 @@ async def test_claim_project_check_key_is_read_and_validated(
 async def test_steward_watch_key_is_read_and_validated(
     client: AsyncClient, db: aiosqlite.Connection
 ):
-    # AC-6 (#1679): без ключа — все пять поводов, [] — выключено, неизвестное
+    # AC-6 (#1679, #1826): без ключа — все шесть поводов, [] — выключено, неизвестное
     # значение и не список — 422, PATCH null — сброс; политика читается в
     # момент события, прошлые события не догоняются.
     from tests.watch_notice_support import (
@@ -1292,10 +1292,23 @@ async def test_steward_watch_key_is_read_and_validated(
     )
 
     read = project_policy.steward_watch_of
-    five = ["needs_decision", "machine_review", "release", "base_branch_red", "stale"]
+    five = [
+        "needs_decision",
+        "machine_review",
+        "release",
+        "base_branch_red",
+        "stale",
+        "reviewer_unavailable",
+    ]
     assert list(read({})) == five
     assert list(read({"steward_watch": []})) == []
     assert list(read({"steward_watch": ["release"]})) == ["release"]
+    assert list(read({"steward_watch": ["reviewer_unavailable"]})) == [
+        "reviewer_unavailable"
+    ]
+    # Явный старый список без нового повода его не включает (#1826).
+    old_list = ["needs_decision", "machine_review", "release", "base_branch_red"]
+    assert "reviewer_unavailable" not in read({"steward_watch": old_list})
     assert list(read({"steward_watch": "release"})) == five  # нечитаемое — умолчание
     assert "steward_watch" in GATE_POLICY_KEYS
     assert effective_policy.unsummarised_keys() == []
