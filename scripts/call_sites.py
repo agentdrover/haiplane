@@ -145,13 +145,18 @@ def _error_target(target: str, kind: str, message: str) -> dict[str, object]:
 
 
 def run_query(root: Path, targets: list[str]) -> dict[str, object]:
-    index, unparsed = build_call_index(str(root))
     base: dict[str, object] = {
         "root": str(root),
         "blind_spots": list(BLIND_SPOTS),
-        "unparsed": sorted(unparsed),
+        "unparsed": [],
         "targets": [],
     }
+    if not root.is_dir():
+        base["status"] = "error"
+        base["message"] = f"каталог --root не найден: {root}"
+        return base
+    index, unparsed = build_call_index(str(root))
+    base["unparsed"] = sorted(unparsed)
     if not index:
         base["status"] = "not_analysed"
         base["message"] = (
@@ -218,9 +223,11 @@ def _table(result: dict[str, object]) -> list[str]:
 
 
 def render(result: dict[str, object], markdown: bool) -> str:
-    if result["status"] == "not_analysed":
+    if result["status"] == "error" and "message" in result:
         return str(result["message"])
     lines = _header_lines(result, markdown)
+    if result["status"] == "not_analysed":
+        return "\n".join([str(result["message"]), "", *lines])
     lines.append("")
     for target in result["targets"]:  # type: ignore[attr-defined]
         lines += _target_lines(target, markdown)

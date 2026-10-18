@@ -226,3 +226,29 @@ def test_argument_errors_are_json_under_json_and_rc_2(tmp_path: Path) -> None:
         assert body["status"] == "error" and body["message"]
     plain = _run("--unknown")
     assert plain.returncode == 2 and plain.stdout == "" and plain.stderr
+
+
+def test_not_analysed_still_shows_unparsed_and_a_bad_root_is_its_own_error(
+    tmp_path: Path,
+) -> None:
+    broken = _tree(tmp_path / "broken", {"hub/broken.py": "def oops(:\n"})
+    for flag in ([], ["--markdown"]):
+        done = _run("--root", str(broken), "f", *flag)
+        assert done.returncode == 2, flag
+        assert "не проанализировано" in done.stdout
+        assert "hub/broken.py" in done.stdout
+        assert "алиас" in done.stdout
+    as_json = _run("--root", str(broken), "f", "--json")
+    assert as_json.returncode == 2
+    assert json.loads(as_json.stdout)["unparsed"] == ["hub/broken.py"]
+
+    a_file = tmp_path / "plain.txt"
+    a_file.write_text("x", encoding="utf-8")
+    for bad in (tmp_path / "nope", a_file):
+        text = _run("--root", str(bad), "f")
+        assert text.returncode == 2, bad
+        assert "каталог --root не найден" in text.stdout
+        assert "в индексе нет" not in text.stdout
+        body = json.loads(_run("--root", str(bad), "f", "--json").stdout)
+        assert body["status"] == "error"
+        assert "каталог --root не найден" in body["message"]
