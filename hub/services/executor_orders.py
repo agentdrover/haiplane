@@ -43,7 +43,7 @@ from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
 from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
-from hub.services import chat_pair, host_redeem, project_policy
+from hub.services import chat_pair, host_redeem, launch_feedback, project_policy
 
 log = logging.getLogger("hub.services.executor_orders")
 
@@ -366,7 +366,9 @@ async def _task_is_this_runs(db: aiosqlite.Connection, order: dict[str, Any]) ->
     return status if bound else ""
 
 
-async def _return_task(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
+async def _return_task(
+    db: aiosqlite.Connection, order: dict[str, Any], note: str = ""
+) -> bool:
     status = await _task_is_this_runs(db, order)
     if not status or await _live_implementer_session(db, int(order["task_id"])):
         return False
@@ -382,7 +384,8 @@ async def _return_task(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
         holders=frozenset(int(r[0]) for r in holders),
         session_runs=frozenset({int(order["executor_run_id"])}),
         from_status=status,
-        note=f"Заказ хосту {order['host']} закрыт, исполнитель потерян; "
+        note=note
+        or f"Заказ хосту {order['host']} закрыт, исполнитель потерян; "
         "задача возвращена в open.",
         event_kind=EVENT_ORDER_CLOSED,
     )
@@ -396,6 +399,7 @@ async def close_order(
     *,
     only_states: tuple[str, ...] | None = None,
     return_task: bool = True,
+    final_text: str = "",
 ) -> bool:
     """Закрыть заказ; True — закрыл именно этот вызов. Коммит — за вызывающим.
 
@@ -406,6 +410,17 @@ async def close_order(
     кода ``redeemed_at`` уже стоит и строку DELETE не трогает, а у непотраченного
     после сдачи другим путём применения не остаётся.
     """
+    # #1817: фактический исход на момент закрытия — до снятия захвата, который
+    # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа. Сдача сильнее
+    # любой иной причины (в том числе слова хоста failed до закрытия): причина
+    # закрытия и исход прогона записываются каноническими «submitted/finished»,
+    # слово хоста остаётся отдельно в report_*. Иначе после снятия захвата ответ
+    # GET заказа и плашка перевернулись бы на «упал», а k8 объявил бы ложный rescued.
+    landed = reason == CLOSE_SUBMITTED or await launch_feedback.landed_by_order(
+        db, order
+    )
+    if landed:
+        reason, run_outcome = CLOSE_SUBMITTED, RUN_OUTCOME_FINISHED
     states = only_states or (STATE_PENDING, STATE_DELIVERED, STATE_REDEEMED)
     marks = ", ".join("?" for _ in states)
     cursor = await db.execute(
@@ -446,6 +461,23 @@ async def close_order(
         await run_claim.release_after_run_closed(
             db, int(order["executor_run_id"]), why=reason
         )
+    # #1817: итоговую запись в ленту пишет ТОЛЬКО закрытие заказа, один раз, в
+    # транзакции перехода в closed (условный UPDATE выше пропускает один вызов).
+    # Исход — фактический на момент закрытия: прогон заказа сдал задачу → сдача,
+    # иначе причина закрытия (сообщение хоста — её уточнение). Report хоста, возврат
+    # задачи и снятие захвата прогона этого заказа своей записи не пишут.
+    if landed:
+        task_row = await repo.get_task(db, int(order["task_id"]))
+        sha = (dict(task_row).get("submission_sha") if task_row else "") or order.get(
+            "report_sha"
+        )
+        text = (
+            f"Заказ #{order['id']} хосту {order['host']} (сдача {order['generation']}) "
+            f"закрыт: {launch_feedback.CLOSE_REASON_TEXT[CLOSE_SUBMITTED]}"
+            + (f"; sha {sha}." if sha else ".")
+        )
+    else:
+        text = final_text or launch_feedback.close_text(order, reason)
     if return_task:
         await _return_task(db, order)
     await admin_svc.write_audit(
@@ -458,15 +490,11 @@ async def close_order(
         f"{reason}",
         commit=False,
     )
-    if reason != CLOSE_SUBMITTED:
-        await repo.add_task_update(
-            db,
-            int(order["task_id"]),
-            "hub",
-            "status",
-            f"Заказ хосту {order['host']} (сдача {order['generation']}) закрыт: "
-            f"{reason}; непотраченный код сожжён.",
-        )
+    await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+    await db.execute(
+        "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
+        (int(order["id"]),),
+    )
     return True
 
 
@@ -635,10 +663,29 @@ async def _task_refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     return await el._live_run(db, task_id)
 
 
+async def _task_busy(db: aiosqlite.Connection, task_id: int) -> str:
+    """У задачи уже есть незакрытый заказ (любого хоста): повтор нажатия — отказ с номером."""
+    rows = await fetchall(
+        db,
+        "SELECT id, host, state FROM executor_orders WHERE task_id = ? "
+        "AND state <> 'closed' ORDER BY id DESC LIMIT 1",
+        (int(task_id),),
+    )
+    if not rows:
+        return ""
+    row = dict(rows[0])
+    from hub.services.executor_launch import REASON_ALREADY_RUNNING
+
+    return (
+        f"{REASON_ALREADY_RUNNING} #{task_id} (слот {row['host']}, "
+        f"заказ #{row['id']}, {row['state']})"
+    )
+
+
 async def _slot_busy(db: aiosqlite.Connection, host: str) -> str:
     rows = await fetchall(
         db,
-        "SELECT task_id, state FROM executor_orders WHERE host = ? "
+        "SELECT id, task_id, state FROM executor_orders WHERE host = ? "
         "AND state <> 'closed'",
         (host,),
     )
@@ -646,7 +693,8 @@ async def _slot_busy(db: aiosqlite.Connection, host: str) -> str:
         return ""
     row = dict(rows[0])
     return (
-        f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} ({row['state']})"
+        f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} "
+        f"({row['state']}), заказ #{row['id']}"
     )
 
 
@@ -705,10 +753,18 @@ async def _book(
     host = await _enabled_host(db, host_name)
     if isinstance(host, str):
         return host
+    if task_id is not None:
+        busy = await _task_busy(db, int(task_id))  # номер заказа важнее статуса задачи
+        if busy:
+            return busy
     task, why = await _chosen_task(db, project, task_id)
     if task is None:
         return why
-    refusal = await _task_refusal(db, task) or await _slot_busy(db, host_name)
+    refusal = (
+        await _task_busy(db, int(task["id"]))
+        or await _task_refusal(db, task)
+        or await _slot_busy(db, host_name)
+    )
     if refusal:
         return refusal
     return _Booking(task, host, skill)
@@ -1188,6 +1244,50 @@ async def _branch_refusal(
     return f"branch: только ветка задачи ({own or 'не названа'}) или {prefix}<цифры>"
 
 
+def _check_reason_fields(outcome: str, reason_code: str, reason: str) -> str:
+    """Код и текст причины report (#1817): форма и секреты; код старого клиента — other."""
+    if reason_code and reason_code not in launch_feedback.REASON_CODES:
+        raise HostError(
+            422, f"reason_code: один из {', '.join(launch_feedback.REASON_CODES)}"
+        )
+    if len(reason) > launch_feedback.REASON_MAX:
+        raise HostError(
+            422, f"reason: не длиннее {launch_feedback.REASON_MAX} символов"
+        )
+    if reason and note_refusal(reason):
+        raise HostError(422, note_refusal(reason).replace("note", "reason", 1))
+    if any(str(tok) and str(tok) in reason for tok in config.HUB_TOKENS):
+        raise HostError(422, "reason: совпадает с настроенным токеном хаба")
+    if outcome != "submitted" and not reason_code:
+        return "other"
+    return reason_code
+
+
+def _report_text(
+    order: dict[str, Any],
+    host: str,
+    outcome: str,
+    sha: str,
+    branch: str,
+    note: str,
+    reason_code: str,
+    reason: str,
+) -> str:
+    """Текст итоговой записи ленты по report хоста."""
+    parts = [f"Итог прогона на хосте {host} (сдача {order['generation']}): {outcome}"]
+    if sha:
+        parts.append(f"sha {sha}")
+    if branch:
+        parts.append(f"ветка {branch}")
+    if note:
+        parts.append(f"заметка: {note}")
+    if outcome in ("failed", "rescued") and reason_code:
+        parts.append(f"причина: {launch_feedback.reason_code_text(reason_code)}")
+    if reason:
+        parts.append(f"сообщение хоста: {reason}")
+    return "; ".join(parts) + "."
+
+
 async def report_outcome(
     db: aiosqlite.Connection,
     host: str,
@@ -1198,15 +1298,21 @@ async def report_outcome(
     branch: str = "",
     note: str = "",
     principal_id: int | None = None,
+    reason_code: str = "",
+    reason: str = "",
 ) -> dict[str, Any]:
-    """Итог прогона от хоста: одна запись в ленте задачи, статус не меняется.
+    """Итог прогона от хоста: сохраняется в заказе, статус задачи не меняется.
 
+    В ленту report НЕ пишет (#1817): итоговую запись пишет закрытие заказа. Для
+    failed/rescued report сам закрывает заказ, и его текст (исход, sha, ветка,
+    заметка, причина) становится этой записью; submitted заказ не закрывает.
     Идемпотентно: тот же итог повторно — тот же ответ без второй записи;
     другой итог по тому же заказу — 409 (первое слово хоста не переписывается).
     Работает и на закрытом заказе: сдача закрывает его раньше, чем хост
     успевает сказать, чем кончился прогон.
     """
     _check_report_fields(outcome, sha, branch, note)
+    reason_code = _check_reason_fields(outcome, reason_code, reason)
     async with write_transaction(db):
         order = await _own_order(db, host, order_id)
         if order is None:
@@ -1218,10 +1324,12 @@ async def report_outcome(
                 order["report_outcome"],
                 order["report_sha"],
                 order["report_branch"],
+                order["report_reason_code"],
             ) == (
                 outcome,
                 sha,
                 branch,
+                reason_code,
             )
             if not same:
                 raise HostError(
@@ -1232,32 +1340,20 @@ async def report_outcome(
         refusal = await _branch_refusal(db, order, branch)
         if refusal:
             raise HostError(422, refusal)
-        if await _fields_hold_the_code(db, order, note, branch, sha):
+        if await _fields_hold_the_code(db, order, note, branch, sha, reason):
             raise HostError(422, "в полях итога код этого заказа")
         await db.execute(
             "UPDATE executor_orders SET report_outcome = ?, report_sha = ?, "
-            "report_branch = ?, report_note = ?, reported_at = datetime('now') "
+            "report_branch = ?, report_note = ?, report_reason_code = ?, "
+            "report_reason = ?, reported_at = datetime('now') "
             "WHERE id = ? AND report_outcome = ''",
-            (outcome, sha, branch, note, order["id"]),
+            (outcome, sha, branch, note, reason_code, reason, order["id"]),
         )
-        parts = [
-            f"Итог прогона на хосте {host} (сдача {order['generation']}): {outcome}"
-        ]
-        if sha:
-            parts.append(f"sha {sha}")
-        if branch:
-            parts.append(f"ветка {branch}")
-        if note:
-            parts.append(f"заметка: {note}")
-        await repo.add_task_update(
-            db,
-            int(order["task_id"]),
-            host_username(host),
-            "status",
-            "; ".join(parts) + ".",
-            principal_id=principal_id,
-            author_kind="principal",
+        text = _report_text(
+            order, host, outcome, sha, branch, note, reason_code, reason
         )
+        # Report хоста в ленту не пишет никогда (ни до закрытия, ни после): итог
+        # заказа пишет его закрытие; здесь исход и причина только сохранены для плашки.
         if outcome in ("failed", "rescued"):
             # Прогон на хосте кончился без сдачи: бронь не ждёт конца сессии
             # (решение владельца 16.10). Сдача (submitted) заказ не закрывает —
@@ -1269,5 +1365,11 @@ async def report_outcome(
                 "WHERE executor_run_id = ? AND revoked_at IS NULL",
                 (int(order["executor_run_id"]),),
             )
-            await close_order(db, order, f"reported_{outcome}", RUN_OUTCOME_ABORTED)
+            await close_order(
+                db,
+                order,
+                f"reported_{outcome}",
+                RUN_OUTCOME_ABORTED,
+                final_text=text,
+            )
     return {"id": order["id"], "outcome": outcome, "duplicate": False}

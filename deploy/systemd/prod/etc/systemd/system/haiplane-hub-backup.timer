@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily backup of the Haiplane hub database
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+RandomizedDelaySec=<скрыто>
+Persistent=true
+
+[Install]
+WantedBy=timers.target
