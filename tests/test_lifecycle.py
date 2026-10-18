@@ -2201,7 +2201,9 @@ async def test_state_statement_is_frozen_between_submission_and_rework(
     assert dict(await repo.get_task(db, opened)).get("result_kind") == "state"
 
 
-async def _answer(db, task_id, review_id, generation, uid, *, linked, note="later"):
+async def _answer(
+    db, task_id, review_id, generation, uid, *, linked, note="later", kind="confirmed"
+):
     await repo.upsert_finding_outcome(
         db,
         review_id=review_id,
@@ -2214,6 +2216,7 @@ async def _answer(db, task_id, review_id, generation, uid, *, linked, note="late
         note=note,
         linked_task_id=linked,
         reported_by="dev",
+        finding_kind=kind,
     )
     await db.commit()
 
@@ -2238,6 +2241,14 @@ async def test_the_verdict_and_the_card_tell_author_answers_from_silence(
 
     # (а) neither a marking nor an answer: the old sentence stands.
     a = await _task_in_review(client, "silence")
+    # An answer about an UNRESOLVED finding of an earlier report is not an
+    # answer to a confirmed one: the vocabularies differ.
+    earlier = await _report(db, a, 0, ["cursor never advances"])
+    await _answer(db, a, earlier, 0, uid, linked=2, kind="unresolved")
+    # Another task answered the very same uid: that is not this task's answer.
+    other = await _task_in_review(client, "elsewhere")
+    other_report = await _report(db, other, 1, ["cursor never advances"])
+    await _answer(db, other, other_report, 1, uid, linked=1)
     await _report(db, a, 1, ["cursor never advances"])
     record, _card = await _approve_and_read(client, a)
     assert (

@@ -796,3 +796,31 @@ async def test_an_author_outcome_is_shown_beside_a_missing_reviewer_disposition(
     # precision reads, and the numbers did not move.
     assert len(await _stored(db, review_id)) == 1
     assert await _disposition_metrics(db, scope) == precision_before
+
+
+async def test_author_answers_cost_a_fixed_number_of_queries(db):
+    """#1830: the history is ONE query per report, not one per finding."""
+    from hub.models import MachineReviewView
+    from hub.services.author_answers import attach_author_answers
+
+    async def reads(count: int) -> int:
+        view = MachineReviewView(
+            id=1,
+            task_id=1,
+            submission_generation=1,
+            is_current=True,
+            findings_confirmed=[
+                {"title": f"finding {i}", "severity": "medium"} for i in range(count)
+            ],
+        )
+        seen: list[str] = []
+        await db.set_trace_callback(
+            lambda sql: seen.append(sql) if "finding_outcomes" in sql else None
+        )
+        try:
+            await attach_author_answers(db, view)
+        finally:
+            await db.set_trace_callback(None)
+        return len(seen)
+
+    assert await reads(1) == await reads(25) == 2

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from hub import repository as repo_module
+from hub.db import fetchall
 
 
 def undisposed_findings(machine_review) -> list[Any]:
@@ -34,6 +35,28 @@ def undisposed_findings(machine_review) -> list[Any]:
     ]
 
 
+async def _latest_answers(db, task_id: int, uids: list[str]) -> dict[str, dict]:
+    """The latest confirmed-section answer per uid, over every report of the task.
+
+    ONE query for all uids, however many findings the report carries. Same
+    order as ``finding_outcome_for_uid``: newest generation, then newest row.
+    """
+    if not uids:
+        return {}
+    marks = ",".join("?" for _ in uids)
+    rows = await fetchall(
+        db,
+        "SELECT * FROM finding_outcomes WHERE task_id=? AND finding_kind='confirmed' "  # nosec B608 - placeholders only
+        f"AND finding_uid IN ({marks}) "
+        "ORDER BY submission_generation DESC, rowid DESC",
+        (task_id, *uids),
+    )
+    latest: dict[str, dict] = {}
+    for row in rows:
+        latest.setdefault(str(row["finding_uid"]), dict(row))
+    return latest
+
+
 async def attach_author_answers(db, view) -> None:
     """Load the author's answers to the confirmed findings (#1830).
 
@@ -55,14 +78,13 @@ async def attach_author_answers(db, view) -> None:
         for r in await repo_module.list_finding_outcomes(db, int(view.id))
         if (dict(r).get("finding_kind") or "confirmed") == "confirmed"
     }
+    unanswered = [
+        f.finding_uid for f in view.findings_confirmed if f.finding_uid not in own
+    ]
+    history = await _latest_answers(db, int(view.task_id), unanswered)
     for finding in view.findings_confirmed:
         uid = finding.finding_uid
-        row = own.get(uid)
-        if row is None:
-            found = await repo_module.finding_outcome_for_uid(
-                db, int(view.task_id), uid, finding_kind="confirmed"
-            )
-            row = dict(found) if found is not None else None
+        row = own.get(uid) or history.get(uid)
         if row is None:
             continue
         review_id = int(row.get("review_id") or 0)
