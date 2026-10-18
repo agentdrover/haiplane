@@ -1,0 +1,18 @@
+{#- #1817: плашка запуска исполнителя. Активная сама перезапрашивает ТОЛЬКО этот
+    фрагмент; закрытая — нет. Текст (причина хоста, сообщение) экранируется. -#}
+{%- if plaque %}
+<div id="launch-plaque" class="task-action-note launch-plaque"
+     {%- if plaque.active %} hx-get="/partials/launch-plaque/{{ task_id }}" hx-trigger="every 5s" hx-swap="outerHTML"{% endif %}>
+    <strong>{{ plaque.headline }}</strong>
+    <ol class="launch-plaque-steps">
+        {%- for step in plaque.steps %}
+        <li{% if step.done %} class="done"{% endif %}>{{ step.label }}{% if step.at %} <span class="muted">{{ step.at }}</span>{% endif %}</li>
+        {%- endfor %}
+    </ol>
+    {%- if plaque.outcome %}
+    <div class="launch-plaque-outcome{% if plaque.outcome_ok %} ok{% endif %}">{{ plaque.outcome }}</div>
+    {%- endif %}
+</div>
+{%- else %}
+<div id="launch-plaque"></div>
+{%- endif %}

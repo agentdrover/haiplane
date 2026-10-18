@@ -8,8 +8,8 @@
   режим (``_human_door``). Агент и ключ хоста сюда не проходят.
 * ``/api/executor-hosts/{name}/orders…`` — то, что хост делает своим ключом
   роли slot_runner: забрать заказы, выкупить код, прочитать итог заказа, подтвердить,
-  сообщить итог. Allowlist в ``hub/auth.py`` пускает ключ ровно на пять маршрутов
-  своего хоста (SLOT_RUNNER_ALLOWLIST); здесь
+  сообщить фазу и итог. Allowlist в ``hub/auth.py`` пускает ключ ровно на шесть
+  маршрутов своего хоста (SLOT_RUNNER_ALLOWLIST); здесь
   то же проверяется по базе, потому что middleware знает только путь.
 * параметры запуска исполнителя (``ExecutorLaunchRequest``) — на слот хоста.
 """
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
-from hub.services import executor_orders, host_redeem
+from hub.services import executor_orders, host_redeem, launch_feedback
 
 router = APIRouter()
 
@@ -39,6 +39,10 @@ _polling: dict[str, int] = {}
 ORDER_READ_MAX = 60
 ORDER_READ_WINDOW = 60
 _read_limiter = LoginRateLimiter(ORDER_READ_MAX, ORDER_READ_WINDOW)
+#: Фаз заказа от одного хоста в окне (#1817); сверх — 429.
+PHASE_MAX = 30
+PHASE_WINDOW = 60
+_phase_limiter = LoginRateLimiter(PHASE_MAX, PHASE_WINDOW)
 
 
 class ExecutorHostCreate(BaseModel):
@@ -55,11 +59,17 @@ class ExecutorOrderRedeem(BaseModel):
     code: str
 
 
+class ExecutorOrderPhase(BaseModel):
+    phase: str
+
+
 class ExecutorOrderReport(BaseModel):
     outcome: str
     sha: str = ""
     branch: str = ""
     note: str = ""
+    reason_code: str = ""
+    reason: str = ""
 
 
 class ExecutorLaunchRequest(BaseModel):
@@ -288,11 +298,44 @@ async def api_executor_order_ack(
         raise _as_http(exc) from exc
 
 
+@router.post("/api/executor-hosts/{name}/orders/{order_id}/phase")
+async def api_executor_order_phase(
+    name: str, order_id: int, body: ExecutorOrderPhase, request: Request
+) -> dict:
+    """Фаза прогона на хосте (#1817): только вперёд, у выкупленного заказа.
+
+    Повтор той же — 200 без изменений; назад, до redeemed, после report или
+    закрытия — 409; сверх квоты хоста — 429. В ленту задачи фаза не пишется.
+    """
+    await _host_caller(request, name)
+    _phase_limiter._max_attempts = PHASE_MAX
+    if _phase_limiter.is_blocked(name):
+        raise HTTPException(
+            429,
+            detail={
+                "reason": "too_many_phases",
+                "message": f"не больше {PHASE_MAX} фаз в {PHASE_WINDOW} с",
+            },
+        )
+    _phase_limiter.record(name)
+    try:
+        return await launch_feedback.record_phase(
+            _db(request), name, order_id, body.phase
+        )
+    except executor_orders.HostError as exc:
+        raise _as_http(exc) from exc
+
+
 @router.post("/api/executor-hosts/{name}/orders/{order_id}/report")
 async def api_executor_order_report(
     name: str, order_id: int, body: ExecutorOrderReport, request: Request
 ) -> dict:
-    """Итог прогона в ленту задачи; статус задачи маршрут не меняет."""
+    """Итог прогона хоста: сохраняется в заказе и показывается на карточке.
+
+    В ленту задачи report не пишет (итоговую запись пишет закрытие заказа; для
+    failed/rescued report закрывает заказ, и его текст становится этой записью).
+    Статус задачи маршрут не меняет.
+    """
     await _host_caller(request, name)
     try:
         return await executor_orders.report_outcome(
@@ -303,6 +346,8 @@ async def api_executor_order_report(
             sha=body.sha,
             branch=body.branch,
             note=body.note,
+            reason_code=body.reason_code,
+            reason=body.reason,
             principal_id=current_identity(request).principal_id,
         )
     except executor_orders.HostError as exc:
