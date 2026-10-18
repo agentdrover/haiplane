@@ -10,4 +10,3 @@ NoNewPrivileges=yes
 TimeoutStartSec=600
 TemporaryFileSystem=<скрыто>
 ExecStart=/usr/bin/python3 /usr/local/lib/haiplane-backup/hub-snapshot.py hourly
-

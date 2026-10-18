@@ -7,5 +7,3 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-
-TimersCalendar=*-*-* 03:47:00 UTC

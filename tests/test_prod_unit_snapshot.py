@@ -13,9 +13,14 @@ AC-2: ``CAPTURE.txt`` не тронут (sha256), а файлы снимка, т
 Правило границ раздела ``CAPTURE.txt`` (закреплено ``parse_sections``):
 раздел начинается строкой ``--- файл <путь>`` или ``--- EnvironmentFile
 <путь> (ignore_errors=...)`` и идёт до следующей строки, начинающейся с
-``--- `` или с ``##########``, не включая её. Строка заголовка в файл не
-входит; все строки раздела, включая пустые и завершающие, входят побайтно.
-Строки делятся только по LF.
+``--- ``, ``##########``, ``TimersCalendar=`` или строки проверки каталога
+``/путь: mode=0o... uid=.. gid=..``, не включая её. Эти последние две строки
+печатает сам скрипт снятия, в файл хоста они не входят и остаются только в
+``CAPTURE.txt``. Строка заголовка в файл не входит. Строки делятся только по LF.
+Хвост: юниты, таймеры и drop-in-ы скрипт печатает одним ``print`` (текст
+файла уже кончается LF), поэтому к телу раздела добавлен лишний LF и файл
+хоста равен телу без последнего LF; tmpfiles и EnvironmentFile скрипт
+печатает построчно, там файл равен телу целиком (``host_file_text``).
 """
 
 from __future__ import annotations
@@ -315,7 +320,6 @@ DIRECTIVE = {
     "LockPersonality": t_enum,
     "MemoryDenyWriteExecute": t_enum,
     "OnCalendar": _t_calendar,
-    "TimersCalendar": _t_calendar,  # строка, которую снятие добавляет к таймерам
     "Persistent": t_enum,
     "RandomizedDelaySec": t_number,
     "Unit": t_names,
@@ -432,10 +436,6 @@ def env_line_problems(line: str) -> list[str]:
 def tmpfiles_line_problems(line: str) -> list[str]:
     if line == "":
         return []
-    if re.fullmatch(
-        r"/[A-Za-z0-9_./-]+: mode=0o[0-7]{3,4} uid=[0-9]+ gid=[0-9]+", line
-    ):
-        return []  # проверка каталога, добавленная снятием
     words = line.split(None, 6)
     if len(words) < 6 or line != line.strip():
         return ["запись tmpfiles разобрана не полностью"]
@@ -489,12 +489,25 @@ def snapshot_violations(root: Path) -> list[str]:
 
 
 # --- разбор CAPTURE.txt -------------------------------------------------------
+# Строка проверки каталога, которую печатает скрипт снятия после файла tmpfiles.
+STAT_LINE = re.compile(r"/\S+: mode=0o[0-7]+ uid=\d+ gid=\d+\n?")
+UNIT_DIR = "/etc/systemd/system/"
+
+
+def host_file_text(host_path: str, body: str) -> str:
+    """Файл хоста по телу раздела: без лишнего LF, добавленного ``print``."""
+    if host_path.startswith(UNIT_DIR):
+        assert body.endswith("\n\n"), host_path
+        return body[:-1]
+    return body
+
+
 def parse_sections(text: str) -> list[tuple[str, str, str]]:
     """Разделы источников: (вид, путь, тело).
 
     Вид - ``file`` (``--- файл <путь>``) или ``env`` (``--- EnvironmentFile
     <путь> (ignore_errors=..)``). Тело - все строки до следующей строки,
-    начинающейся с ``--- `` или ``##########`` (её в тело не входит), побайтно.
+    начинающейся с границы раздела (``BOUNDARY``; её в тело не входит), побайтно.
     """
     pieces = text.split("\n")
     lines = [p + "\n" for p in pieces[:-1]] + ([pieces[-1]] if pieces[-1] else [])
@@ -507,7 +520,9 @@ def parse_sections(text: str) -> list[tuple[str, str, str]]:
             sections.append((current[0], current[1], "".join(body)))
 
     for line in lines:
-        if line.startswith(("--- ", "##########")):
+        if line.startswith(
+            ("--- ", "##########", "TimersCalendar=")
+        ) or STAT_LINE.fullmatch(line):
             close()
             body = []
             current = None
@@ -536,7 +551,7 @@ def source_sections(capture: str) -> dict[str, str]:
         bodies.setdefault(host_path, set()).add(body)
     differing = sorted(p for p, b in bodies.items() if len(b) != 1)
     assert not differing, f"один источник описан в CAPTURE.txt по-разному: {differing}"
-    return {p: next(iter(b)) for p, b in bodies.items()}
+    return {p: host_file_text(p, next(iter(b))) for p, b in bodies.items()}
 
 
 def unit_blocks(capture: str) -> dict[str, dict[str, str]]:
@@ -840,6 +855,21 @@ def test_the_parser_reads_the_section_boundary_rule() -> None:
         ("file", "/a", "L1\n\n"),
         ("env", "/b", "K=1\n"),
     ]
+    timer = "--- файл /t\n[Timer]\nOnCalendar=x\n\nTimersCalendar=x\n--- PATH\n"
+    assert parse_sections(timer) == [("file", "/t", "[Timer]\nOnCalendar=x\n\n")]
+    tmp = "--- файл /c\nd /x 2770 a b -\n/x: mode=0o2770 uid=998 gid=1001\n\n##########z\n"
+    assert parse_sections(tmp) == [("file", "/c", "d /x 2770 a b -\n")]
+    # слово TimersCalendar= или stat-строка внутри содержимого - только в начале строки
+    assert parse_sections("--- файл /a\nx TimersCalendar=1\n") == [
+        ("file", "/a", "x TimersCalendar=1\n")
+    ]
+    assert (
+        host_file_text("/etc/systemd/system/a.service", "[Unit]\nX=1\n\n")
+        == "[Unit]\nX=1\n"
+    )
+    assert (
+        host_file_text("/etc/tmpfiles.d/a.conf", "d /x - - - -\n") == "d /x - - - -\n"
+    )
 
 
 @pytest.mark.parametrize("line", ["task-1849", "disk-usage", "risk-class"])

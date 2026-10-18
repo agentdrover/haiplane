@@ -9,4 +9,3 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 TimeoutStartSec=600
 ExecStart=/usr/bin/python3 /usr/local/lib/haiplane-backup/hub-snapshot.py daily
-
