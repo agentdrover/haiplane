@@ -1,0 +1,329 @@
+"""Справка для решения без LLM (#1810): что произошло, риски, рекомендация, проверки.
+
+AC-1: «Принять» только когда ВСЕ доказательства чисты.
+AC-2: словарь стюарда переводится в словарь формы; старое поколение не слушаем.
+AC-3: у каждого состояния своё действие; у state-задачи нет проверок кода.
+"""
+
+from __future__ import annotations
+
+import json
+
+import aiosqlite
+import pytest
+
+from hub import config
+from hub import repository as repo
+from hub import repository_ci_integrity as integrity_store
+from hub.services import decision_brief
+from tests.state_support import drive_to_review, make_state_task
+from tests.test_auto_verdict import _post_review, _submitted_task
+
+ACCEPT = "Принять"
+
+
+async def _brief(db: aiosqlite.Connection, task_id: int, ctx: dict | None = None):
+    task = dict(await repo.get_task(db, task_id) or {})
+    return await decision_brief.build(db, task, ctx)
+
+
+async def _review_task(client, db, monkeypatch, slug: str, **review) -> int:
+    # Автопилот выключен, чтобы он не вынес вердикт раньше показа справки.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    task_id = await _submitted_task(client, db, slug, {"verdict": "human"})
+    await _post_review(client, task_id, **review)
+    return task_id
+
+
+async def _clean_scan(db, task_id: int) -> None:
+    task = dict(await repo.get_task(db, task_id) or {})
+    await integrity_store.save_ci_integrity_scan(
+        db, task_id, task["submission_sha"], "clean", "[]", ""
+    )
+    await db.commit()
+
+
+def _shape(brief: dict) -> None:
+    assert set(brief) >= {"happened", "need", "risks", "recommend", "checks"}
+    assert len(brief["risks"]) <= 3
+    assert set(brief["recommend"]) >= {"action", "verdict", "why"}
+
+
+async def test_accept_only_when_all_evidence_clean(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    clean = await _review_task(client, db, monkeypatch, "brief-clean")
+    await _clean_scan(db, clean)
+    brief = await _brief(db, clean)
+    _shape(brief)
+    assert brief["recommend"]["action"] == ACCEPT
+    assert brief["recommend"]["verdict"] == "approved"
+
+    doubts: dict[str, int] = {}
+    doubts["unresolved"] = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-unresolved",
+        unresolved=[{"title": "не удалось проверить", "why": "агент упал"}],
+    )
+    doubts["incomplete"] = await _review_task(
+        client, db, monkeypatch, "brief-incomplete", incomplete=True
+    )
+    doubts["self_report"] = await _review_task(client, db, monkeypatch, "brief-self")
+    await db.execute(
+        "UPDATE machine_reviews SET self_reviewed=1 WHERE task_id=?",
+        (doubts["self_report"],),
+    )
+    doubts["no_provenance"] = await _review_task(client, db, monkeypatch, "brief-prov")
+    await db.execute(
+        "UPDATE ci_run_reports SET trust='unverified', trust_reason='no_provenance' "
+        "WHERE task_id=?",
+        (doubts["no_provenance"],),
+    )
+    doubts["integrity"] = await _review_task(client, db, monkeypatch, "brief-integ")
+    task = dict(await repo.get_task(db, doubts["integrity"]) or {})
+    await integrity_store.save_ci_integrity_scan(
+        db,
+        doubts["integrity"],
+        task["submission_sha"],
+        "signs",
+        json.dumps([{"path": ".github/workflows/ci.yml", "rule": "workflow"}]),
+        "",
+    )
+    await db.commit()
+    for name, task_id in doubts.items():
+        if name != "integrity":
+            await _clean_scan(db, task_id)
+        got = await _brief(db, task_id)
+        assert got["recommend"]["action"] != ACCEPT, name
+        assert got["recommend"]["verdict"] != "approved", name
+        assert got["recommend"]["why"], f"{name}: причина не названа"
+        assert got["risks"], f"{name}: риск не назван"
+
+    confirmed = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-confirmed",
+        findings_confirmed=[
+            {
+                "title": "сломан возврат",
+                "category": "correctness",
+                "severity": "high",
+                "file": "hub/x.py",
+                "line": 1,
+                "locator": "lines",
+                "start_line": 1,
+                "detail": "возвращает None",
+            }
+        ],
+    )
+    await _clean_scan(db, confirmed)
+    got = await _brief(db, confirmed)
+    assert got["recommend"]["action"] == "На доработку"
+    assert got["recommend"]["verdict"] == "changes_requested"
+
+
+async def _judgement(db, task_id: int, generation: int, verdict: str, **extra) -> None:
+    await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=generation,
+        kind="verdict",
+        submitted_verdict=verdict,
+        verdict=verdict,
+        escalate_reason=extra.get("escalate_reason", ""),
+        grounds=json.dumps(["основание стюарда"]),
+    )
+    await db.commit()
+
+
+async def test_steward_vocabulary_mapping(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    task_id = await _review_task(client, db, monkeypatch, "brief-steward")
+    await _clean_scan(db, task_id)
+    generation = int(
+        dict(await repo.get_task(db, task_id) or {})["submission_generation"]
+    )
+    # Суждение СТАРОГО поколения не слушаем: без него — правила, и они чисты.
+    await _judgement(db, task_id, generation - 1, "changes_requested")
+    stale = await _brief(db, task_id)
+    assert stale["recommend"]["action"] == ACCEPT
+
+    await _judgement(db, task_id, generation, "changes_requested")
+    mapped = await _brief(db, task_id)
+    assert mapped["recommend"]["action"] == "На доработку"
+    assert mapped["recommend"]["verdict"] == "changes_requested"
+    assert "основание стюарда" in " ".join(mapped["recommend"]["why"])
+
+    second = await _review_task(client, db, monkeypatch, "brief-steward-esc")
+    await _clean_scan(db, second)
+    gen2 = int(dict(await repo.get_task(db, second) or {})["submission_generation"])
+    await _judgement(db, second, gen2, "escalate", escalate_reason="нужен человек")
+    esc = await _brief(db, second)
+    assert esc["recommend"]["action"] == "Решить вам"
+    assert esc["recommend"]["verdict"] == "", "действия по умолчанию нет"
+    assert "нужен человек" in " ".join(esc["recommend"]["why"])
+
+    third = await _review_task(client, db, monkeypatch, "brief-steward-ok")
+    await _clean_scan(db, third)
+    gen3 = int(dict(await repo.get_task(db, third) or {})["submission_generation"])
+    await _judgement(db, third, gen3, "approve")
+    ok = await _brief(db, third)
+    assert ok["recommend"]["action"] == ACCEPT
+    assert ok["recommend"]["verdict"] == "approved"
+    # Вердикт за человеком по маршруту — справка так и говорит.
+    assert "вам" in " ".join(ok["recommend"]["why"]).lower() or ok["need"]
+
+
+async def test_steward_approve_is_downgraded_by_doubt(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    task_id = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-steward-doubt",
+        unresolved=[{"title": "не проверено", "why": "агент упал"}],
+    )
+    await _clean_scan(db, task_id)
+    gen = int(dict(await repo.get_task(db, task_id) or {})["submission_generation"])
+    await _judgement(db, task_id, gen, "approve")
+    got = await _brief(db, task_id)
+    assert got["recommend"]["action"] != ACCEPT
+
+
+async def _task_in(db, status: str, **fields) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=f"brief {status}",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    if fields:
+        await repo.update_task(db, task_id, **fields)
+    await db.commit()
+    return task_id
+
+
+async def test_brief_per_state(client, db: aiosqlite.Connection, monkeypatch):
+    ready = await _task_in(db, "draft", dor_passed=1, readiness_score=90)
+    got = await _brief(db, ready)
+    _shape(got)
+    assert got["recommend"]["action"] == "Одобрить"
+
+    not_ready = await _task_in(db, "draft", dor_passed=0, readiness_score=20)
+    got = await _brief(db, not_ready)
+    assert got["recommend"]["action"] == "Доработать постановку"
+    assert got["recommend"]["why"]
+
+    stalled = await _task_in(db, "needs_decision")
+    await repo.add_task_update(db, stalled, "hub", "alert", "гейт остановился")
+    got = await _brief(db, stalled)
+    assert got["recommend"]["action"] == "Решить вам"
+    assert got["recommend"]["why"]
+
+    repair = await _task_in(db, "running", review_verdict="changes_requested")
+    got = await _brief(db, repair, {"repair_offered": True})
+    assert got["recommend"]["action"] == "Повторный прогон"
+    plain = await _task_in(db, "running")
+    got = await _brief(db, plain, {"repair_offered": False})
+    assert got["recommend"]["action"] == "Идёт работа"
+
+    in_prod = await _task_in(db, "completed")
+    got = await _brief(db, in_prod, {"delivery": {"state": "in_prod"}})
+    assert got["recommend"]["action"] == "Доставлено"
+    for state in ("not_in_prod", "unknown"):
+        merged = await _task_in(db, "completed")
+        got = await _brief(db, merged, {"delivery": {"state": state}})
+        assert got["recommend"]["action"] == "Влито, выкат не подтверждён", state
+
+    state_id = await make_state_task(db)
+    await drive_to_review(client, db, state_id)
+    got = await _brief(db, state_id)
+    _shape(got)
+    names = " ".join(c["name"] for c in got["checks"]).lower()
+    for absent in ("ci", "машинн", "достав"):
+        assert absent not in names, f"у state-задачи нет проверки «{absent}»"
+    risks = " ".join(r["text"] for r in got["risks"])
+    assert "CI не доказан" not in risks
+    assert got["recommend"]["action"] in (ACCEPT, "Проверить")
+    assert "rollback" in " ".join(c["name"] + c["detail"] for c in got["checks"])
+
+    partial = await make_state_task(db)
+    await drive_to_review(client, db, partial)
+    await db.execute(
+        "DELETE FROM task_evidence WHERE task_id=? AND ac_id='AC-2'", (partial,)
+    )
+    await db.commit()
+    got = await _brief(db, partial)
+    assert got["recommend"]["action"] != ACCEPT
+    assert got["risks"]
+
+
+async def test_unreadable_evidence_is_unknown_not_clean(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Нет отчёта CI — «неизвестно», и «Принять» невозможно."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    task_id = await _submitted_task(
+        client, db, "brief-no-ci", {"verdict": "human"}, with_ci=False
+    )
+    await _post_review(client, task_id)
+    await _clean_scan(db, task_id)
+    got = await _brief(db, task_id)
+    assert got["recommend"]["action"] != ACCEPT
+    assert any("CI" in r["text"] for r in got["risks"])
+
+
+@pytest.mark.parametrize("count", [5])
+async def test_risks_are_capped_and_sorted(
+    client, db: aiosqlite.Connection, monkeypatch, count: int
+):
+    task_id = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-risks",
+        unresolved=[{"title": "a", "why": "b"}],
+        findings_confirmed=[
+            {
+                "title": "t",
+                "category": "correctness",
+                "severity": "high",
+                "file": "hub/x.py",
+                "line": 1,
+                "locator": "lines",
+                "start_line": 1,
+                "detail": "d",
+            }
+        ],
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        risks=json.dumps(
+            [
+                {"kind": "technical", "severity": "low", "description": f"r{i}"}
+                for i in range(count)
+            ]
+        ),
+    )
+    await db.commit()
+    got = await _brief(db, task_id)
+    assert len(got["risks"]) == 3
+    weights = [r["severity"] for r in got["risks"]]
+    order = {"high": 3, "medium": 2, "low": 1}
+    assert [order[w] for w in weights] == sorted(
+        (order[w] for w in weights), reverse=True
+    )

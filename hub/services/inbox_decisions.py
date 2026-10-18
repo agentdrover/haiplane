@@ -189,6 +189,17 @@ async def _verdict_grounds(
     )
 
 
+async def _brief_line(
+    db: aiosqlite.Connection, task: dict[str, Any], route: Any
+) -> str:
+    """Рекомендация справки (#1810): тот же ``build``, что у карточки, без второго пересчёта."""
+    from hub.services import decision_brief
+
+    return decision_brief.recommend_line(
+        await decision_brief.build(db, task, {"route": route})
+    )
+
+
 async def _verdict_rows(
     db: aiosqlite.Connection, rows: list[Any]
 ) -> tuple[list[Any], list[dict[str, Any]]]:
@@ -207,6 +218,7 @@ async def _verdict_rows(
                 "action": ACTION_VERDICT,
                 "grounds": grounds,
                 "offer": offer,
+                "brief_line": await _brief_line(db, dict(row), route),
             }
         )
     return kept, entries

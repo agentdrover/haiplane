@@ -2592,6 +2592,23 @@ async def _steward_recommendation(
     return out
 
 
+async def _card_decision_brief(
+    db: aiosqlite.Connection, row: dict[str, Any], repair_offered: bool
+) -> dict[str, Any] | None:
+    """Справка для решения (#1810): тот же ``build``, что строит строку входящих.
+
+    Отдельный хелпер из-за потолка сложности сборщика карточки. Сбой чтения не
+    роняет карточку: без справки страница честно остаётся прежней.
+    """
+    from hub.services import decision_brief
+
+    try:
+        return await decision_brief.build(db, row, {"repair_offered": repair_offered})
+    except Exception as exc:  # noqa: BLE001 - the card must render regardless
+        log.warning("decision brief failed for #%s: %s", row.get("id"), exc)
+        return None
+
+
 async def _card_machine_report(
     db: aiosqlite.Connection, task_id: int, row: dict[str, Any]
 ) -> tuple[bool, Any, Any]:
@@ -2868,6 +2885,7 @@ async def _web_task_detail_page(
         # #1783: кнопки нет — карточка называет причину (живая работа, нет находок).
         repair_reason = (await repair_state(db, dict(row)))[1]
     finding_touch = await _card_finding_touch(db, task_id, machine_review)
+    decision_brief = await _card_decision_brief(db, dict(row), repair_offered)
     delivery = await _card_delivery(db, task_id, task, state_card)
     change_map = await _card_change_map(
         db, task_id, task, evidence, machine_review, state_card
@@ -2907,6 +2925,7 @@ async def _web_task_detail_page(
             "change_map": change_map,
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
+            "decision_brief": decision_brief,
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,
