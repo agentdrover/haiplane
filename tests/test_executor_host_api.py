@@ -216,3 +216,62 @@ async def test_order_read_binds_submission_to_its_own_run(world):
         assert other[field] == ""
     assert other["pr_number"] is None and other["task_status"] is None
     assert other["submission_generation"] is None
+
+
+async def test_same_generation_foreign_submit_is_not_the_orders_result(world):
+    """Codex P1: сдача облаком/ручным pair того же поколения не засчитывается заказу k8."""
+    from hub import repository as repo
+
+    # Заказ закрыт без сдачи; затем чужой прогон сдаёт задачу — поколение 1, как у заказа.
+    task_id = await _task(world, "чужая сдача того же поколения")
+    first = (await _eo._launch(world, task_id, "k8")).json()["order_id"]
+    closed = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{first}/ack",
+        json={"result": "redeem_failed"},
+        headers=world.k8_auth,
+    )
+    assert closed.status_code == 200
+    await repo.update_task(world.db, task_id, submission_sha="e" * 40, pr_number=3)
+    await _submit(world, task_id, 1, holder=False)
+    body = (await _read(world, "k8", first)).json()
+    assert body["submitted"] is False and body["superseded"] is True
+    assert body["submission_sha"] == "" and body["pr_number"] is None
+
+    # То же при ещё не закрытом заказе: держателя задачи нет — сдача не его.
+    other = await _task(world, "незакрытый заказ")
+    lived = await _launch_redeem(world, other, "k9")
+    await repo.update_task(world.db, other, submission_sha="f" * 40, pr_number=4)
+    await _submit(world, other, 1, holder=False)
+    got = await world.client.get(
+        f"/api/executor-hosts/k9/orders/{lived['order']['id']}", headers=world.k9_auth
+    )
+    assert got.json()["submitted"] is False and got.json()["submission_sha"] == ""
+
+    # Своя сдача (держатель — прогон заказа) засчитывается.
+    mine = await _task(world, "своя")
+    own = await _launch_redeem(world, mine)
+    await repo.update_task(world.db, mine, submission_sha="9" * 40, pr_number=8)
+    await _submit(world, mine, 1)
+    ok = (await _read(world, "k8", own["order"]["id"])).json()
+    assert ok["submitted"] is True and ok["submission_sha"] == "9" * 40
+
+
+async def test_order_read_branch_hides_any_hub_code(world):
+    """Codex P2: слаг ветки с кодом ручного pair (без префикса AH-) в ответ не попадает."""
+    from hub import repository as repo
+    from hub.services import chat_pair as cp
+
+    task_id = await _task(world, "ветка с чужим кодом")
+    lived = await _launch_redeem(world, task_id)
+    acting = await cp.get_acting_agent(world.db)
+    manual_task = await _task(world, "ручной pair")
+    manual, _ = await cp.issue_code(
+        world.db, int(acting["id"]), kind="implementer", bound_task_id=manual_task
+    )
+    await world.db.commit()
+    bare = manual.removeprefix("AH-")
+    await repo.update_task(world.db, task_id, branch=f"task-{task_id}/{bare}")
+    await _submit(world, task_id, 1)
+    got = await _read(world, "k8", lived["order"]["id"])
+    assert got.json()["submitted"] is True and got.json()["branch"] == ""
+    assert bare not in got.text and manual not in got.text

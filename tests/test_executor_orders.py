@@ -279,10 +279,23 @@ async def _order_row(world, order_id: int) -> dict:
     )[0]
 
 
-async def _submit(world, task_id: int, generation: int = 1) -> None:
-    await repo.update_task(
-        world.db, task_id, status="review", submission_generation=generation
+async def _submit(
+    world, task_id: int, generation: int = 1, *, holder: bool = True
+) -> None:
+    """Сдача задачи прогоном заказа: держатель задачи — прогон её последнего заказа (#1831).
+
+    ``holder=False`` — сдача чужого прогона (облако, ручной pair): держателя нет.
+    """
+    fields: dict = {"status": "review", "submission_generation": generation}
+    last = await _rows(
+        world.db,
+        "SELECT executor_run_id FROM executor_orders WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
     )
+    if holder and last:
+        fields["executor_run_id"] = last[0]["executor_run_id"]
+    await repo.update_task(world.db, task_id, **fields)
     await world.db.commit()
 
 
