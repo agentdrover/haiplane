@@ -1226,15 +1226,15 @@ async def return_task_to_open(
         claimed_at=None,
         implementer_principal_id=None,
     )
-    # #1817: тот же исход заказа в ленте уже назван (любое состояние заказа) —
-    # возврат молчит; другой исход (был submitted, задача вернулась) пишется.
-    told = await fetchall(
+    # #1817: освобождаемый прогон — прогон заказа хоста: итоговую запись даёт
+    # закрытие заказа (оно идёт следом), своей записи возврат не пишет. Любой
+    # другой прогон (ручная pair-попытка после закрытого слот-заказа) пишет обычную.
+    ordered = rows[0]["executor_run_id"] is not None and await fetchall(
         db,
-        "SELECT 1 FROM executor_orders WHERE final_entry_kind = 'not_ok' AND id = "
-        "(SELECT MAX(id) FROM executor_orders WHERE task_id = ?)",
-        (int(task_id),),
+        "SELECT 1 FROM executor_orders WHERE executor_run_id = ?",
+        (int(rows[0]["executor_run_id"]),),
     )
-    if not told:
+    if not ordered:
         await repo.add_task_update(db, task_id, "hub", "status", note)
     await repo.insert_event(
         db,

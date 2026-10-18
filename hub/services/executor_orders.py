@@ -400,7 +400,6 @@ async def close_order(
     only_states: tuple[str, ...] | None = None,
     return_task: bool = True,
     final_text: str = "",
-    entry: bool = True,
 ) -> bool:
     """Закрыть заказ; True — закрыл именно этот вызов. Коммит — за вызывающим.
 
@@ -421,6 +420,11 @@ async def close_order(
     )
     if not cursor.rowcount:
         return False
+    # #1817: фактический исход на момент закрытия — до снятия захвата, который
+    # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа.
+    landed = reason == CLOSE_SUBMITTED or await launch_feedback.landed_by_order(
+        db, order
+    )
     if order.get("pair_code_id") is not None:
         await db.execute(
             "DELETE FROM chat_pair_codes WHERE id = ? AND redeemed_at IS NULL",
@@ -451,24 +455,20 @@ async def close_order(
         await run_claim.release_after_run_closed(
             db, int(order["executor_run_id"]), why=reason
         )
-    # #1817: итог заказа — ОДНА запись в ленте. Метка ставится после возврата
-    # задачи: пока её нет, возврат несёт текст итога как свою заметку, а когда
-    # она уже стоит (report или прежнее закрытие), возврат молчит.
-    text = final_text or (
-        f"Заказ хосту {order['host']} (сдача {order['generation']}) закрыт: "
-        f"{launch_feedback.close_reason_text(reason, '')}"
-        + ("." if reason == CLOSE_SUBMITTED else "; непотраченный код сожжён.")
-    )
-    # Класс исхода: сдача («ok») или всё прочее («not_ok»). Подавляется только
-    # ПОВТОР того же исхода; другой исход (хост сказал submitted, а сессия
-    # истекла и задача вернулась в open) пишет исправляющую запись.
-    cls = (
-        launch_feedback.CLASS_OK
-        if reason == CLOSE_SUBMITTED
-        else launch_feedback.CLASS_NOT_OK
-    )
-    told = await launch_feedback.entry_class(db, int(order["id"]))
-    returned = return_task and await _return_task(db, order, text)
+    # #1817: итоговую запись в ленту пишет ТОЛЬКО закрытие заказа, один раз, в
+    # транзакции перехода в closed (условный UPDATE выше пропускает один вызов).
+    # Исход — фактический на момент закрытия: прогон заказа сдал задачу → сдача,
+    # иначе причина закрытия (сообщение хоста — её уточнение). Report хоста, возврат
+    # задачи и снятие захвата прогона этого заказа своей записи не пишут.
+    if landed:
+        text = (
+            f"Заказ #{order['id']} хосту {order['host']} (сдача {order['generation']}) "
+            f"закрыт: {launch_feedback.CLOSE_REASON_TEXT[CLOSE_SUBMITTED]}."
+        )
+    else:
+        text = final_text or launch_feedback.close_text(order, reason)
+    if return_task:
+        await _return_task(db, order)
     await admin_svc.write_audit(
         db,
         actor_id=None,
@@ -479,13 +479,11 @@ async def close_order(
         f"{reason}",
         commit=False,
     )
-    # Метка ставится только вместе с настоящей записью. Сдача сама ничего не
-    # пишет здесь: «Submitted for review» и «Захват снят…» — её записи, а
-    # метка без записи глушила бы последующий report хоста.
-    if reason != CLOSE_SUBMITTED and told != cls:
-        if not returned and entry:
-            await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
-        await launch_feedback.mark_entry(db, int(order["id"]), cls)
+    await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+    await db.execute(
+        "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
+        (int(order["id"]),),
+    )
     return True
 
 
@@ -505,7 +503,6 @@ async def close_for_released_task(db: aiosqlite.Connection, task_id: int) -> int
             RUN_OUTCOME_ABORTED,
             only_states=(STATE_REDEEMED,),
             return_task=False,
-            entry=False,  # возврат в open уже записал свою заметку (одна запись, #1817)
         ):
             closed += 1
     return closed
@@ -1341,23 +1338,8 @@ async def report_outcome(
         text = _report_text(
             order, host, outcome, sha, branch, note, reason_code, reason
         )
-        if outcome == "submitted" or order["state"] == STATE_CLOSED:
-            # Сдача заказ не закрывает; закрытый уже сказал свой итог — поздний
-            # report уточняет причину в плашке, а запись пишется только если
-            # закрытие молчало (сдача), и ровно один раз.
-            await launch_feedback.write_final_entry(
-                db,
-                order,
-                text,
-                cls=(
-                    launch_feedback.CLASS_OK
-                    if outcome == "submitted"
-                    else launch_feedback.CLASS_NOT_OK
-                ),
-                agent=host_username(host),
-                principal_id=principal_id,
-                author_kind="principal",
-            )
+        # Report хоста в ленту не пишет никогда (ни до закрытия, ни после): итог
+        # заказа пишет его закрытие; здесь исход и причина только сохранены для плашки.
         if outcome in ("failed", "rescued"):
             # Прогон на хосте кончился без сдачи: бронь не ждёт конца сессии
             # (решение владельца 16.10). Сдача (submitted) заказ не закрывает —

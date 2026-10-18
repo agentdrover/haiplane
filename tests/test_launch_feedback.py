@@ -355,7 +355,8 @@ async def test_old_reports_and_entries_are_backfilled(world):
     # Строка в виде «до выката»: report старого клиента, кода и метки нет.
     await world.db.execute(
         "UPDATE executor_orders SET report_outcome = 'failed', "
-        "reported_at = datetime('now'), report_reason_code = '', final_entry_at = NULL "
+        "reported_at = datetime('now'), report_reason_code = '', final_entry_at = NULL, "
+        "state = 'closed', closed_at = datetime('now'), close_reason = 'reported_failed' "
         "WHERE id = ?",
         (oid,),
     )
@@ -373,46 +374,53 @@ async def test_old_reports_and_entries_are_backfilled(world):
     assert again.status_code == 200 and again.json()["duplicate"] is True
 
 
+async def _feed(world) -> list[str]:
+    await world.db.commit()
+    return [
+        r["content"]
+        for r in await _rows(world.db, "SELECT content FROM task_updates ORDER BY id")
+    ]
+
+
+async def _report(world, oid: int, body: dict, host: str = "k8"):
+    return await world.client.post(
+        f"/api/executor-hosts/{host}/orders/{oid}/report",
+        json=body,
+        headers=getattr(world, f"{host}_auth"),
+    )
+
+
 async def test_final_entry_is_written_once_in_every_close_path(world):
-    """Codex круг 2: сдача сама фиксирует итог; submitted-report + reaper; поздний rescued."""
+    """AC-3: ровно одна запись на заказ на каждом пути закрытия; report ленту не трогает."""
     from hub import repository as repo
     from hub.services import chat_pair as cp
 
-    async def feed_len() -> int:
-        await world.db.commit()
-        return len(await _rows(world.db, "SELECT 1 FROM task_updates"))
-
-    # (1) Сдача приняла заказ без report хоста: заказ запись и метку НЕ ставит
-    # (записи даёт сама сдача: «Захват снят…»); report хоста потом пишется один раз.
-    t1 = await _task(world, "сдача без report")
+    # (1) Сдача принята, хост сказал submitted ДО закрытия: report молчит, закрытие
+    # пишет одну запись «сдана»; «Захват снят…» прогона заказа молчит; поздний report тоже.
+    t1 = await _task(world, "сдача")
     o1 = (await _launch_redeem(world, t1))["order"]["id"]
+    rep = await _report(world, o1, {"outcome": "submitted"})
+    assert rep.status_code == 200
+    before = len(await _feed(world))
     await _eo._submit(world, t1)
-    before = await feed_len()
+    await world.db.commit()
+    before = len(await _feed(world))
     await orders.sweep_executor_orders(world.db)
-    assert await feed_len() - before == 1  # только «Захват снят…»
-    assert not (await _order_row(world, o1))["final_entry_at"]
-    url1 = f"/api/executor-hosts/k8/orders/{o1}/report"
-    late = await world.client.post(
-        url1, json={"outcome": "submitted"}, headers=world.k8_auth
-    )
-    assert late.status_code == 200 and await feed_len() - before == 2
-    again = await world.client.post(
-        url1, json={"outcome": "submitted"}, headers=world.k8_auth
-    )
-    assert again.json()["duplicate"] is True and await feed_len() - before == 2
+    feed = await _feed(world)
+    assert len(feed) - before == 1 and "сдана" in feed[-1].lower(), feed[before:]
+    assert (await _order_row(world, o1))["final_entry_at"]
+    assert (await _report(world, o1, {"outcome": "submitted"})).json()["duplicate"]
+    assert len(await _feed(world)) - before == 1
 
-    # (2) Хост сказал submitted, сдачи хаб не принял; сессия истекла и reaper вернул
-    # задачу: исход ДРУГОЙ — пишется ровно одна исправляющая запись, повтор молчит.
+    # (2) Хост сказал submitted, сдачи хаб не принял; сессия истекла, reaper вернул
+    # задачу: одна запись (закрытие), не две.
     t2 = await _task(world, "report и reaper")
     l2 = await _launch_redeem(world, t2)
     await _eo._claim_and_start(world, t2, l2["session"])
-    rep = await world.client.post(
-        f"/api/executor-hosts/k8/orders/{l2['order']['id']}/report",
-        json={"outcome": "submitted"},
-        headers=world.k8_auth,
-    )
-    assert rep.status_code == 200
-    before = await feed_len()
+    assert (
+        await _report(world, l2["order"]["id"], {"outcome": "submitted"})
+    ).status_code == 200
+    before = len(await _feed(world))
     await world.db.execute(
         "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
         "WHERE bound_task_id = ?",
@@ -420,38 +428,144 @@ async def test_final_entry_is_written_once_in_every_close_path(world):
     )
     await world.db.commit()
     assert await cp.release_expired_implementer_tasks(world.db) == [t2]
-    assert await feed_len() - before == 1
-    fixed = await _rows(
-        world.db,
-        "SELECT content FROM task_updates WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-        (t2,),
-    )
-    assert (
-        "open" in fixed[0]["content"].lower()
-        or "возвращ" in fixed[0]["content"].lower()
-    )
-    assert (await _order_row(world, l2["order"]["id"]))["final_entry_kind"] == "not_ok"
+    feed = await _feed(world)
+    assert len(feed) - before == 1, feed[before:]
+    assert (await repo.get_task(world.db, t2))["status"] == "open"
 
-    # (3) Поздний rescued после закрытия reaper'ом: ветка и sha видны в плашке.
+    # (3) Поздний rescued после закрытия: ленте ничего, ветка и sha — в плашке.
     t3 = await _task(world, "поздний rescued")
     l3 = await _launch_redeem(world, t3)
     await _close(world, l3["order"]["id"], "session_gone")
-    await repo.update_task(world.db, t3, branch=f"task-{t3}/work")
-    await world.db.commit()
-    resc = await world.client.post(
-        f"/api/executor-hosts/k8/orders/{l3['order']['id']}/report",
-        json={
+    before = len(await _feed(world))
+    resc = await _report(
+        world,
+        l3["order"]["id"],
+        {
             "outcome": "rescued",
             "branch": f"task-{t3}/rescue-7",
             "sha": SHA,
             "reason_code": "agent_failed",
         },
-        headers=world.k8_auth,
     )
     assert resc.status_code == 200, resc.text
+    assert len(await _feed(world)) == before
     plaque = await launch_feedback.plaque(world.db, t3)
     assert plaque is not None
     assert f"task-{t3}/rescue-7" in plaque["outcome"] and SHA in plaque["outcome"]
+
+    # (4) Закрытие по сдаче при назначенном review_job_id: «Захват снят…» молчит
+    # всегда, запись даёт закрытие — одна; поздний report её не двоит.
+    t4 = await _task(world, "сдача с review_job")
+    o4 = (await _launch_redeem(world, t4))["order"]["id"]
+    await repo.update_task(world.db, t4, review_job_id="job-1817")
+    await _eo._submit(world, t4)
+    await world.db.commit()
+    before = len(await _feed(world))
+    await orders.sweep_executor_orders(world.db)
+    assert len(await _feed(world)) - before == 1
+    late = await _report(world, o4, {"outcome": "submitted", "sha": "c0ffee1"})
+    assert late.status_code == 200 and len(await _feed(world)) - before == 1
+
+
+async def test_host_failed_after_accepted_submission_keeps_the_submission(world):
+    """Codex gen2: хаб принял сдачу, затем хост шлёт failed — в ленте и плашке остаётся сдача."""
+    task_id = await _task(world, "failed после сдачи")
+    lived = await _launch_redeem(world, task_id)
+    oid = lived["order"]["id"]
+    await _eo._submit(world, task_id)  # сдачу принял хаб (держатель — прогон заказа)
+    await world.db.commit()
+    before = len(await _feed(world))
+    bad = await _report(
+        world,
+        oid,
+        {"outcome": "failed", "reason_code": "agent_failed", "reason": "упал"},
+    )
+    assert bad.status_code == 200, bad.text
+    feed = await _feed(world)
+    assert len(feed) - before == 1 and "сдана" in feed[-1].lower(), feed[before:]
+    assert "failed" not in feed[-1]
+    plaque = await launch_feedback.plaque(world.db, task_id)
+    assert plaque is not None and "сдан" in plaque["outcome"].lower()
+    # Повторный failed — дубль, ленте ничего.
+    again = await _report(
+        world,
+        oid,
+        {"outcome": "failed", "reason_code": "agent_failed", "reason": "упал"},
+    )
+    assert again.json()["duplicate"] is True and len(await _feed(world)) - before == 1
+
+
+async def test_manual_attempt_after_a_closed_slot_order_gets_its_return_entry(world):
+    """Codex gen2: старый слот-заказ не глушит возврат новой ручной pair-попытки."""
+    from hub import repository as repo
+    from hub.services import chat_pair as cp
+
+    task_id = await _task(world, "ручная попытка после слота")
+    lived = await _launch_redeem(world, task_id)
+    await _close(world, lived["order"]["id"], "session_gone")  # запись заказа есть
+    # Новая ручная попытка: задача в работе без прогона хаба (executor_run_id пуст).
+    await repo.update_task(world.db, task_id, status="running", executor_run_id=None)
+    await world.db.commit()
+    before = len(await _feed(world))
+    freed = await cp.return_task_to_open(
+        world.db,
+        task_id,
+        from_status="running",
+        note="ручная попытка возвращена",
+        event_kind="probe",
+    )
+    await world.db.commit()
+    assert freed is True
+    feed = await _feed(world)
+    assert len(feed) - before == 1 and "ручная попытка возвращена" in feed[-1]
+
+
+async def test_disable_host_after_submitted_report_writes_one_entry(world):
+    """Машинное ревью gen1: disable_host после submitted-report — одна запись, от закрытия."""
+    from hub import repository as repo
+
+    task_id = await _task(world, "disable после report")
+    lived = await _launch_redeem(world, task_id, "k9")
+    await _eo._claim_and_start(world, task_id, lived["session"])
+    oid = lived["order"]["id"]
+    assert (
+        await _report(world, oid, {"outcome": "submitted"}, "k9")
+    ).status_code == 200
+    before = len(await _feed(world))
+    await orders.disable_host(world.db, "k9", by=world.human_id)
+    feed = await _feed(world)
+    assert len(feed) - before == 1, feed[before:]
+    row = await _order_row(world, oid)
+    assert row["state"] == "closed" and row["final_entry_at"]
+    assert (await repo.get_task(world.db, task_id))["status"] == "open"
+
+
+async def test_return_to_open_is_silent_for_the_orders_run_whatever_its_state(world):
+    """Возврат прогона заказа молчит и при закрытом заказе: запись уже дало закрытие."""
+    from hub import repository as repo
+    from hub.services import chat_pair as cp
+
+    task_id = await _task(world, "возврат после закрытия")
+    lived = await _launch_redeem(world, task_id)
+    await _eo._claim_and_start(world, task_id, lived["session"])
+    oid = lived["order"]["id"]
+    await _close(world, oid, "session_gone")
+    row = await _order_row(world, oid)
+    assert row["state"] == "closed" and row["final_entry_at"]
+    await world.db.execute(
+        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') WHERE bound_task_id = ?",
+        (task_id,),
+    )
+    await world.db.commit()
+    before = len(await _feed(world))
+    freed = await cp.return_task_to_open(
+        world.db, task_id, from_status="running", note="возврат", event_kind="probe"
+    )
+    await world.db.commit()
+    assert (
+        freed is True and (await repo.get_task(world.db, task_id))["status"] == "open"
+    )
+    assert len(await _feed(world)) == before
 
 
 async def test_repeat_launch_after_claim_names_the_active_order(world):
@@ -469,115 +583,3 @@ async def test_repeat_launch_after_claim_names_the_active_order(world):
     )
     assert again.status_code == 409
     assert f"заказ #{lived['order']['id']}" in again.json()["detail"]["reason"]
-
-
-async def test_disable_host_after_submitted_report_writes_one_correction(world):
-    """Машинное ревью c836850bfa969a88: disable_host после submitted-report — одна запись, и та исправляющая."""
-    from hub import repository as repo
-
-    task_id = await _task(world, "disable после report")
-    lived = await _launch_redeem(world, task_id, "k9")
-    await _eo._claim_and_start(world, task_id, lived["session"])
-    oid = lived["order"]["id"]
-    sent = await world.client.post(
-        f"/api/executor-hosts/k9/orders/{oid}/report",
-        json={"outcome": "submitted"},
-        headers=world.k9_auth,
-    )
-    assert sent.status_code == 200
-    await world.db.commit()
-    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
-    await orders.disable_host(world.db, "k9", by=world.human_id)
-    await world.db.commit()
-    added = await _rows(
-        world.db, "SELECT content FROM task_updates ORDER BY id DESC LIMIT 5"
-    )
-    count = len(await _rows(world.db, "SELECT 1 FROM task_updates")) - before
-    assert count == 1, [r["content"][:80] for r in added[:count]]
-    row = await _order_row(world, oid)
-    assert row["state"] == "closed" and row["final_entry_kind"] == "not_ok"
-    assert (await repo.get_task(world.db, task_id))["status"] == "open"
-    # Закрытый заказ тот же исход повторно не пишет (любое состояние заказа).
-    assert (
-        await launch_feedback.write_final_entry(world.db, row, "повтор", cls="not_ok")
-        is False
-    )
-
-
-async def test_submit_close_with_review_job_leaves_host_report_audible(world):
-    """Codex: сдача при назначенном review_job_id молчит, но метки нет — report хоста пишется."""
-    from hub import repository as repo
-
-    task_id = await _task(world, "сдача с review_job")
-    o = (await _launch_redeem(world, task_id))["order"]["id"]
-    await repo.update_task(world.db, task_id, review_job_id="job-1817")
-    await _eo._submit(world, task_id)
-    await world.db.commit()
-    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
-    await orders.sweep_executor_orders(world.db)
-    await world.db.commit()
-    row = await _order_row(world, o)
-    assert row["state"] == "closed" and row["close_reason"] == "submitted"
-    assert not row["final_entry_at"] and not row["final_entry_kind"]
-    rep = await world.client.post(
-        f"/api/executor-hosts/k8/orders/{o}/report",
-        json={"outcome": "submitted", "sha": "c0ffee1"},
-        headers=world.k8_auth,
-    )
-    assert rep.status_code == 200
-    await world.db.commit()
-    texts = [
-        r["content"]
-        for r in await _rows(world.db, "SELECT content FROM task_updates ORDER BY id")
-    ][before:]
-    assert any("Итог прогона" in t and "submitted" in t for t in texts), texts
-
-
-async def test_return_to_open_is_silent_after_the_same_outcome_whatever_the_state(
-    world,
-):
-    """Машинное ревью c836850bfa969a88: пропуск записи возврата решает метка заказа, не его состояние."""
-    from hub import repository as repo
-    from hub.services import chat_pair as cp
-
-    task_id = await _task(world, "возврат после закрытия")
-    lived = await _launch_redeem(world, task_id)
-    await _eo._claim_and_start(world, task_id, lived["session"])
-    oid = lived["order"]["id"]
-    await _close(
-        world, oid, "session_gone"
-    )  # закрыт, not_ok записан (return_task=False)
-    row = await _order_row(world, oid)
-    assert row["state"] == "closed" and row["final_entry_kind"] == "not_ok"
-    await world.db.execute(
-        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') WHERE bound_task_id = ?",
-        (task_id,),
-    )
-    await world.db.commit()
-    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
-    freed = await cp.return_task_to_open(
-        world.db, task_id, from_status="running", note="возврат", event_kind="probe"
-    )
-    await world.db.commit()
-    assert (
-        freed is True and (await repo.get_task(world.db, task_id))["status"] == "open"
-    )
-    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) == before
-
-
-async def test_host_report_of_another_outcome_after_close_is_written(world):
-    """Codex: подавляется только повтор того же исхода — submitted после not_ok пишется."""
-    task_id = await _task(world, "другой исход")
-    lived = await _launch_redeem(world, task_id)
-    oid = lived["order"]["id"]
-    await _close(world, oid, "session_gone")  # not_ok уже записан
-    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
-    rep = await world.client.post(
-        f"/api/executor-hosts/k8/orders/{oid}/report",
-        json={"outcome": "submitted"},
-        headers=world.k8_auth,
-    )
-    assert rep.status_code == 200
-    await world.db.commit()
-    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) - before == 1
-    assert (await _order_row(world, oid))["final_entry_kind"] == "ok"

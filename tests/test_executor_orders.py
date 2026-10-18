@@ -1365,7 +1365,7 @@ async def test_launch_a_chosen_task_on_the_slot_from_the_card(world):
 
 
 async def test_host_reports_run_outcome_to_the_feed(world):
-    """AC-11: одна запись итога в ленте, повтор идемпотентен, статус не меняется."""
+    """AC-11: итог хоста сохранён в заказе (в ленту не пишется, #1817), повтор идемпотентен."""
     task_id = await _task(world)
     other = await _task(world, "на k9")
     assert (await _launch(world, task_id)).status_code == 200
@@ -1396,6 +1396,8 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
     await world.db.commit()
 
+    # #1817: report хоста ленту не пишет никогда (итог заказа пишет его закрытие);
+    # исход, sha, ветка и заметка сохранены в заказе — их читают плашка и GET заказа.
     feed = [
         u
         for u in await _rows(
@@ -1403,10 +1405,11 @@ async def test_host_reports_run_outcome_to_the_feed(world):
         )
         if "Итог прогона" in u["content"]
     ]
-    assert len(feed) == 1
-    assert sha in feed[0]["content"] and f"task-{task_id}/work" in feed[0]["content"]
-    assert "submitted" in feed[0]["content"] and "k8" in feed[0]["content"]
-    assert feed[0]["agent"] == "executor-host-k8"
+    assert feed == []
+    stored = await _order_row(world, order["id"])
+    assert (stored["report_outcome"], stored["report_sha"]) == ("submitted", sha)
+    assert stored["report_branch"] == f"task-{task_id}/work"
+    assert stored["report_note"] == "всё хорошо"
     assert (await repo.get_task(world.db, task_id))["status"] == status_before
 
     # Другой итог по тому же заказу — 409; чужой заказ — 403.

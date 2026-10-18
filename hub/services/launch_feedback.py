@@ -82,54 +82,26 @@ def close_reason_text(reason: str, reason_code: str = "") -> str:
     return base
 
 
-#: Класс исхода заказа в итоговой записи ленты: сдача и всё остальное.
-CLASS_OK: Final[str] = "ok"
-CLASS_NOT_OK: Final[str] = "not_ok"
-
-
-async def entry_class(db: aiosqlite.Connection, order_id: int) -> str:
-    """Класс исхода, о котором итоговая запись по заказу уже сказала; пусто — не говорила."""
-    rows = await fetchall(
-        db,
-        "SELECT final_entry_kind FROM executor_orders WHERE id = ?",
-        (int(order_id),),
-    )
-    return str(rows[0][0]) if rows else ""
-
-
-async def mark_entry(db: aiosqlite.Connection, order_id: int, cls: str) -> None:
-    """Отметить, что итоговая запись этого класса ЕСТЬ в ленте (только вместе с ней)."""
-    await db.execute(
-        "UPDATE executor_orders SET final_entry_at = datetime('now'), "
-        "final_entry_kind = ? WHERE id = ?",
-        (cls, int(order_id)),
-    )
-
-
-async def write_final_entry(
-    db: aiosqlite.Connection,
-    order: dict[str, Any],
-    text: str,
-    *,
-    cls: str,
-    agent: str = "hub",
-    principal_id: int | None = None,
-    author_kind: str = "hub",
-) -> bool:
-    """Итоговая запись о заказе: повтор ТОГО ЖЕ исхода подавляется, другой — пишется."""
-    if await entry_class(db, int(order["id"])) == cls:
+async def landed_by_order(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
+    """Задачу сдал прогон ЭТОГО заказа: поколение дошло до заказного, держатель — его прогон."""
+    task = await repo.get_task(db, int(order["task_id"]))
+    if task is None:
         return False
-    await repo.add_task_update(
-        db,
-        int(order["task_id"]),
-        agent,
-        "status",
-        text,
-        principal_id=principal_id,
-        author_kind=author_kind,
+    t = dict(task)
+    return int(t.get("submission_generation") or 0) >= int(order["generation"]) and (
+        t.get("executor_run_id") == order["executor_run_id"]
     )
-    await mark_entry(db, int(order["id"]), cls)
-    return True
+
+
+def close_text(order: dict[str, Any], reason: str) -> str:
+    """Текст итоговой записи не-сдачи: причина закрытия, сообщение хоста — уточнение."""
+    detail = close_reason_text(reason, order.get("report_reason_code") or "")
+    if order.get("report_reason"):
+        detail = f"{detail} — {order['report_reason']}"
+    return (
+        f"Заказ #{order['id']} хосту {order['host']} (сдача {order['generation']}) "
+        f"закрыт: {detail}; непотраченный код сожжён."
+    )
 
 
 async def record_phase(
