@@ -1614,3 +1614,151 @@ def test_more_jobs_than_the_body_carries_is_unavailable_not_a_smaller_sum(
     (body,) = _timing(posts)
     assert body["state"] == "timing_unavailable" and body["jobs"] == []
     assert "101 jobs" in body["reason"]
+
+
+# ---- #1848: the satellite's sender is trusted and reads data only -------------
+
+_TESTS_YML = ".github/workflows/tests.yml"
+
+
+def test_the_satellite_sender_is_trusted_and_data_only(
+    trusted, script, tmp_path, monkeypatch, capsys
+):
+    import json as _json
+    import shutil
+
+    import yaml
+
+    from hub.services import satellite_ci
+
+    sender = yaml.safe_load(satellite_ci.render_sender("Tests", _TESTS_YML))
+    producer = yaml.safe_load(satellite_ci.render_producer("Tests", _TESTS_YML))
+
+    # The sender: workflow_run (so GitHub runs the DEFAULT branch's definition),
+    # the checkout of the default branch SHA, the report key only through the
+    # environment, and no step that executes anything from the run or its branch.
+    on = sender.get("on") or sender.get(True)
+    assert set(on) == {"workflow_run"}
+    assert on["workflow_run"] == {"workflows": ["Tests"], "types": ["completed"]}
+    job = sender["jobs"]["report"]
+    assert job["environment"] == "hub-report"
+    checkout, send = job["steps"]
+    assert checkout["uses"].startswith("actions/checkout@")
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert checkout["with"]["persist-credentials"] is False
+    assert "hub-ci-send" in send["uses"]
+    assert send["with"]["workflow-path"] == _TESTS_YML
+    assert not any("run" in step for step in job["steps"]), "nothing is executed here"
+    assert _TESTS_YML == send["with"]["workflow-path"]
+    key = "secrets.HAIPLANE_HUB_CI_TOKEN"
+    assert _json.dumps(sender).count(key) == 1, "the report key is in one step only"
+    assert key in _json.dumps(send)
+
+    # The producer runs the branch's code: no environment, no report key, a read key.
+    test_job = producer["jobs"]["test"]
+    assert "environment" not in test_job
+    flat = _json.dumps(producer)
+    assert "HAIPLANE_HUB_CI_TOKEN" not in flat and "hub-token" not in flat.replace(
+        "hub-read-token", ""
+    )
+    collect = next(s for s in test_job["steps"] if "hub-ci-report" in s.get("uses", ""))
+    assert (
+        collect["with"]["hub-read-token"] == "${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}"
+    )
+    upload = next(
+        s for s in test_job["steps"] if "upload-artifact" in s.get("uses", "")
+    )
+    assert upload["with"]["name"] == "hub-ci-results-${{ github.run_attempt }}"
+
+    # The artifact is created: the collector (read key, no report key) writes results.json.
+    results_dir = tmp_path / "hub-ci-results"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_READ_TOKEN", "read-secret")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_CI_RESULTS_DIR", str(results_dir))
+    monkeypatch.setenv("HAIPLANE_HUB_CI_CHECKS", "tests=success")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-1686/x")
+    monkeypatch.setenv("HEAD_SHA", SHA)
+    posts: list = []
+
+    def card(url, token, payload=None):
+        posts.append((url, token, payload))
+        return {"acceptance_criteria": [], "validation_commands": []}
+
+    monkeypatch.setattr(script, "hub_request", card)
+    assert script.main() == 0
+    assert [(u, t) for u, t, _ in posts] == [
+        ("https://hub.example/api/tasks/1686", "read-secret")
+    ], "collect mode only reads the card"
+    written = _json.loads((results_dir / "results.json").read_text())
+    assert written["checks"] == {"tests": "pass"} and written["head_sha"] == SHA
+
+    # Template -> sender -> POST: the satellite's tests.yml run is reported ...
+    environ = {"HAIPLANE_CI_WORKFLOW_PATH": send["with"]["workflow-path"]}
+    blob = _zip(
+        {"results.json": _json.dumps(_results(checks={"tests": "pass"})).encode()}
+    )
+    sent: list = []
+    _run(trusted, tmp_path, _event(path=_TESTS_YML), _FakeApi(blob), sent, **environ)
+    assert len(sent) == 1
+    url, token, body = sent[0]
+    assert url == "https://hub.example/api/tasks/1686/ci-run-report"
+    assert token == "report-key"  # noqa: S105
+    assert body["workflow_path"] == _TESTS_YML and body["checks"] == {"tests": "pass"}
+    assert body["head_sha"] == SHA and body["run_conclusion"] == "success"
+
+    # ... a run of another workflow is not, whatever the artifact says.
+    for label, path in (
+        ("another workflow", ".github/workflows/other.yml"),
+        ("the hub's ci.yml", ".github/workflows/ci.yml"),
+        ("a path with a ref suffix is the same file only", ".github/workflows/x.yml@r"),
+    ):
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+        refused: list = []
+        api = _FakeApi(blob)
+        _run(trusted, tmp_path, _event(path=path), api, refused, **environ)
+        assert refused == [] and api.calls == [], label
+        assert "not reporting" in capsys.readouterr().out, label
+
+    # A configuration that is not a workflow file reports nothing.
+    for bad in ("tests.yml", ".github/workflows/../x.yml", ".github/workflows/a/b.yml"):
+        shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+        refused = []
+        api = _FakeApi(blob)
+        _run(
+            trusted,
+            tmp_path,
+            _event(path=_TESTS_YML),
+            api,
+            refused,
+            HAIPLANE_CI_WORKFLOW_PATH=bad,
+        )
+        assert refused == [] and api.calls == [], bad
+
+    # The hub's strict mode is unchanged: with no configuration only ci.yml.
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+    strict: list = []
+    _run(trusted, tmp_path, _event(path=_TESTS_YML), _FakeApi(blob), strict)
+    assert strict == []
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+    _run(trusted, tmp_path, _event(), _FakeApi(blob), strict)
+    assert len(strict) == 1
+
+    # Hostile text in the artifact of a satellite run is still only text.
+    shutil.rmtree(tmp_path / "runner", ignore_errors=True)
+    marker = tmp_path / "pwned"
+    hostile = f"$(touch {marker}) ; touch {marker}"
+    evil = _zip(
+        {"results.json": _json.dumps(_results(validation_log=hostile)).encode()}
+    )
+    hostile_posts: list = []
+    _run(
+        trusted,
+        tmp_path,
+        _event(path=_TESTS_YML),
+        _FakeApi(evil),
+        hostile_posts,
+        **environ,
+    )
+    assert hostile_posts[0][2]["validation_log"] == hostile
+    assert not marker.exists()

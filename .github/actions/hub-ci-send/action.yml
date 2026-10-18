@@ -1,0 +1,49 @@
+name: Send the CI results of a finished run to Haiplane Hub
+description: >-
+  The trusted half of the satellite CI report (#1848). Runs ONLY in a workflow
+  started by `workflow_run` from the DEFAULT branch, in a job bound to an
+  environment whose deployment branches are limited to the default branch: that
+  is the one place the report key (a ci_runner principal) may be. It reads the
+  artifact hub-ci-results-<run_attempt> of the finished run as DATA, takes every
+  fact about the run from the event payload, and POSTs one report; the hub then
+  checks it against GitHub and against the project's ci_contract. A refusal
+  prints its reason and exits 0 - the hub reads silence as "unknown".
+
+inputs:
+  hub-url:
+    description: Base URL of the hub.
+    required: true
+  hub-token:
+    description: >-
+      The report key (ci_runner principal bound to the project). Pass it from
+      the secrets of the environment, to this step only.
+    required: true
+  workflow-path:
+    description: >-
+      The workflow whose finished runs are reported, e.g.
+      .github/workflows/tests.yml. It must equal the workflow_path of the
+      project's ci_contract in the hub; a run of any other workflow is refused.
+    required: false
+    default: ".github/workflows/ci.yml"
+
+runs:
+  using: composite
+  steps:
+    - name: Send the results of the finished run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HAIPLANE_HUB_URL: ${{ inputs.hub-url }}
+        HAIPLANE_HUB_CI_TOKEN: ${{ inputs.hub-token }}
+        HAIPLANE_CI_WORKFLOW_PATH: ${{ inputs.workflow-path }}
+      run: |
+        set -u
+        # A repo-hosted action ships with its whole repository: the sender sits
+        # three levels up from this action directory, and it is the hub's
+        # revision of the action, never code of the satellite's branch.
+        script="${GITHUB_ACTION_PATH}/../../../scripts/ci_trusted_report.py"
+        if [ ! -f "$script" ]; then
+          echo "[hub-ci-report] sender not found - reporting nothing; the hub reads this as unknown"
+          exit 0
+        fi
+        python3 "$script"
