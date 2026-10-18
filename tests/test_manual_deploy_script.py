@@ -53,6 +53,7 @@ esac
 # container): `-a [--exclude P]... SRC/ DST/` as a tar pipe. Only what the
 # script's local copy and the remote shim above ask for.
 _RSYNC_FALLBACK = r"""#!/usr/bin/env bash
+set -o pipefail
 excludes=()
 paths=()
 while [ $# -gt 0 ]; do
@@ -178,3 +179,31 @@ def test_rollback_to_a_commit_before_the_build_group_needs_an_explicit_set(tmp_p
     assert (tmp_path / "ssh_stdin").read_text() == (
         ROOT / "deploy/remote-deploy.sh"
     ).read_text()
+
+
+def test_the_tar_stand_in_for_rsync_fails_when_the_archive_cannot_be_made(tmp_path):
+    """A failed ``tar -c`` must not be hidden by a successful ``tar -x`` (#1851)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stand_in = bin_dir / "rsync-fallback"
+    stand_in.write_text(_RSYNC_FALLBACK)
+    stand_in.chmod(0o755)
+    tar = bin_dir / "tar"
+    tar.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  -c) head -c 10240 /dev/zero; exit 1 ;;\n"
+        "  *) cat >/dev/null ;;\n"
+        "esac\n"
+    )
+    tar.chmod(0o755)
+    src = tmp_path / "src"
+    src.mkdir()
+    done = subprocess.run(
+        [str(stand_in), "-a", f"{src}/", f"{tmp_path / 'dst'}/"],
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert done.returncode != 0, done
