@@ -20,6 +20,8 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
+from hub.models import FindingOutcome
 from hub.services import (
     ci_integrity,
     ci_trust,
@@ -29,8 +31,9 @@ from hub.services import (
     verdict_evidence,
 )
 from hub.services.auto_verdict import text_origin_refusal
-from hub.services.finding_identity import finding_uids
+from hub.services.finding_identity import unresolved_uids
 from hub.services.finding_outcome import KIND_UNRESOLVED
+from hub.services.gate_grounds import sibling_mismatch_ground
 from hub.services.readiness import parse_risks_from_row
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
@@ -63,6 +66,11 @@ _STEWARD_ACTIONS = {
 }
 
 
+CODE_CI = "ci"
+CODE_INTEGRITY = "integrity"
+CODE_REPORT = "report"
+
+
 @dataclass(frozen=True)
 class Doubt:
     """Признак сомнения: из-за него «Принять» невозможно."""
@@ -71,6 +79,8 @@ class Doubt:
     severity: str
     risk: str
     why: str
+    #: Группа проверки (CODE_*): по ней, а не по тексту, строятся «проверки».
+    code: str = "report"
 
 
 def _recommend(
@@ -120,7 +130,9 @@ def _check(name: str, state: str, detail: str) -> dict[str, str]:
 async def _ci_doubt(db: aiosqlite.Connection, task: dict[str, Any]) -> Doubt | None:
     sha = str(task.get("submission_sha") or "").strip()
     if not sha:
-        return Doubt(CHECK, "high", "CI не доказан: коммит сдачи не закреплён", "")
+        return Doubt(
+            CHECK, "high", "CI не доказан: коммит сдачи не закреплён", "", CODE_CI
+        )
     gap = await ci_trust.pass_gap(db, int(task["id"]), sha)
     if gap is None:
         return None
@@ -128,9 +140,13 @@ async def _ci_doubt(db: aiosqlite.Connection, task: dict[str, Any]) -> Doubt | N
     if row is not None and ci_trust.is_verified(dict(row)):
         status = str(dict(row).get("validation_status") or "").strip()
         if status == "fail":
-            return Doubt(REWORK, "high", "CI красный на коммите сдачи", gap)
+            return Doubt(REWORK, "high", "CI красный на коммите сдачи", gap, CODE_CI)
     return Doubt(
-        CHECK, "high", "CI не доказан: нет подтверждённого зелёного отчёта", gap
+        CHECK,
+        "high",
+        "CI не доказан: нет подтверждённого зелёного отчёта",
+        gap,
+        CODE_CI,
     )
 
 
@@ -140,7 +156,13 @@ async def _integrity_doubt(
     gap = (await ci_integrity.standing_of(db, task)).gap
     if gap is None:
         return None
-    return Doubt(CHECK, "high", "Изменены входы CI или целостность не проверена", gap)
+    return Doubt(
+        CHECK,
+        "high",
+        "Изменены входы CI или целостность не проверена",
+        gap,
+        CODE_INTEGRITY,
+    )
 
 
 # ---- отчёт машинного ревью ---------------------------------------------------
@@ -151,15 +173,32 @@ async def _unanswered_unresolved(
 ) -> int:
     items = [{"title": u.title, "why": u.why} for u in review.unresolved]
     left = 0
-    for uid in finding_uids(items):
+    for uid in unresolved_uids(items):
         outcome = await repo.finding_outcome_for_uid(
             db, task_id, uid, finding_kind=KIND_UNRESOLVED
         )
-        left += outcome is None
+        # «Не рассудил» — не закрытие: это отсутствие судьбы, а не она.
+        left += outcome is None or (
+            str(dict(outcome).get("outcome") or "") == FindingOutcome.not_judged.value
+        )
     return left
 
 
-def _report_doubts(review: Any, generation: Any) -> list[Doubt]:
+async def _generation_reports(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> list[Any]:
+    """ВСЕ отчёты текущего поколения: «полный и независимый» — про каждый из них."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, incomplete, self_reviewed, principal_id FROM machine_reviews "
+            "WHERE task_id=? AND submission_generation=?",
+            (int(task["id"]), int(task.get("submission_generation") or 0)),
+        )
+    )
+
+
+def _report_doubts(review: Any, generation: Any, reports: list[Any]) -> list[Doubt]:
     if review is None or not review.is_current or not generation.has_review:
         return [
             Doubt(
@@ -170,14 +209,24 @@ def _report_doubts(review: Any, generation: Any) -> list[Doubt]:
             )
         ]
     doubts: list[Doubt] = []
-    if generation.complete is not True:
+    # incomplete: 0 — заявлено «полный»; NULL («не говорил») и 1 — сомнение.
+    if generation.complete is not True or any(r["incomplete"] != 0 for r in reports):
         doubts.append(
             Doubt(CHECK, "high", "Отчёт ревью неполный или не сказал о полноте", "")
         )
     origin = text_origin_refusal(review.model_dump())
-    if review.self_reviewed or origin is not None:
+    if any(r["self_reviewed"] for r in reports) or origin is not None:
         why = origin[1] if origin else "ревью сдал сам автор"
         doubts.append(Doubt(CHECK, "high", "Отчёт — не независимый, а самоотчёт", why))
+    elif any(r["principal_id"] is None for r in reports):
+        doubts.append(
+            Doubt(
+                CHECK,
+                "high",
+                "Независимость ревьюера не подтверждена",
+                "у отчёта нет личности ревьюера: «не самоотчёт» нельзя проверить",
+            )
+        )
     return doubts
 
 
@@ -190,6 +239,11 @@ async def _finding_doubts(
         doubts.append(
             Doubt(REWORK, "high", f"Ревьюер подтвердил проблем: {count}", "confirmed")
         )
+    mismatch = await sibling_mismatch_ground(
+        db, task_id, review.submission_generation, review.id
+    )
+    if mismatch:
+        doubts.append(Doubt(CHECK, "high", "Ревьюеры расходятся", mismatch))
     left = await _unanswered_unresolved(db, task_id, review)
     if left:
         doubts.append(
@@ -205,7 +259,7 @@ async def _review_doubts(
     mr = await repo.get_latest_machine_review(db, int(task["id"]))
     review = (await review_evidence.report_view(db, task, mr)).machine_review
     generation = await generation_review(db, task)
-    doubts = _report_doubts(review, generation)
+    doubts = _report_doubts(review, generation, await _generation_reports(db, task))
     if review is not None and review.is_current:
         doubts += await _finding_doubts(db, int(task["id"]), review)
     for found in (await _ci_doubt(db, task), await _integrity_doubt(db, task)):
@@ -244,6 +298,17 @@ def _route_why(route: Any) -> str:
     return ""
 
 
+def _ground_sources(raw: Any) -> list[str]:
+    """Только имена источников оснований. Текст ``detail`` — из логов и диффов,
+    а справка уходит во входящие дословно: код или секрет оттуда не выводим."""
+    names: list[str] = []
+    for ground in verdict_evidence.parse_grounds(raw):
+        source = ground.get("source") if isinstance(ground, dict) else None
+        if isinstance(source, str) and source.strip():
+            names.append(f"основание стюарда: {source.strip()[:80]}")
+    return names
+
+
 def _from_steward(
     judged: Any, doubts: list[Doubt], route: Any
 ) -> dict[str, Any] | None:
@@ -251,9 +316,9 @@ def _from_steward(
     if mapped is None:
         return None
     action, verdict = mapped
-    why = [str(g) for g in verdict_evidence.parse_grounds(judged["grounds"])]
-    if judged["escalate_reason"]:
-        why.insert(0, str(judged["escalate_reason"]))
+    why = _ground_sources(judged["grounds"])
+    if action == HUMAN_CALL:
+        why.insert(0, "стюард передал решение вам: причина в суждении на карточке")
     if action == ACCEPT and doubts:
         # Стюард сказал approve, но есть сомнение: правила сильнее суждения.
         return None
@@ -300,20 +365,23 @@ async def _review_brief(
 
 
 def _review_checks(doubts: list[Doubt], review: Any) -> list[dict[str, str]]:
-    ci = next((d for d in doubts if d.risk.startswith("CI")), None)
-    integrity = next((d for d in doubts if "входы CI" in d.risk), None)
-    report = next((d for d in doubts if "тчёт" in d.risk or "ревью" in d.risk), None)
+    def of(code: str) -> list[Doubt]:
+        return [d for d in doubts if d.code == code]
+
+    ci, integrity, report = of(CODE_CI), of(CODE_INTEGRITY), of(CODE_REPORT)
     return [
-        _check("CI", "doubt" if ci else "ok", ci.why or ci.risk if ci else "зелёный"),
+        _check(
+            "CI", "doubt" if ci else "ok", ci[0].why or ci[0].risk if ci else "зелёный"
+        ),
         _check(
             "Целостность CI",
             "doubt" if integrity else "ok",
-            integrity.why if integrity else "входы CI не менялись",
+            integrity[0].why if integrity else "входы CI не менялись",
         ),
         _check(
             "Машинное ревью",
             "doubt" if report or review is None else "ok",
-            report.risk if report else "отчёт текущей сдачи полный",
+            "; ".join(d.risk for d in report) or "отчёт текущей сдачи полный",
         ),
     ]
 

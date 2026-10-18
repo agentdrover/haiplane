@@ -35,11 +35,16 @@ async def _review_task(client, db, monkeypatch, slug: str, **review) -> int:
     return task_id
 
 
-async def _clean_scan(db, task_id: int) -> None:
+async def _clean_scan(db, task_id: int, *, reviewer: bool = True) -> None:
+    """Целостность CI чиста; у отчёта есть личность ревьюера (если ``reviewer``)."""
     task = dict(await repo.get_task(db, task_id) or {})
     await integrity_store.save_ci_integrity_scan(
         db, task_id, task["submission_sha"], "clean", "[]", ""
     )
+    if reviewer:
+        await db.execute(
+            "UPDATE machine_reviews SET principal_id=9 WHERE task_id=?", (task_id,)
+        )
     await db.commit()
 
 
@@ -134,7 +139,9 @@ async def _judgement(db, task_id: int, generation: int, verdict: str, **extra) -
         submitted_verdict=verdict,
         verdict=verdict,
         escalate_reason=extra.get("escalate_reason", ""),
-        grounds=json.dumps(["основание стюарда"]),
+        grounds=json.dumps(
+            [{"source": "ci_report", "detail": "TOKEN=hunter2 из лога"}]
+        ),
     )
     await db.commit()
 
@@ -156,7 +163,8 @@ async def test_steward_vocabulary_mapping(
     mapped = await _brief(db, task_id)
     assert mapped["recommend"]["action"] == "На доработку"
     assert mapped["recommend"]["verdict"] == "changes_requested"
-    assert "основание стюарда" in " ".join(mapped["recommend"]["why"])
+    assert "ci_report" in " ".join(mapped["recommend"]["why"])
+    assert "hunter2" not in decision_brief.recommend_line(mapped), "detail не выводим"
 
     second = await _review_task(client, db, monkeypatch, "brief-steward-esc")
     await _clean_scan(db, second)
@@ -165,7 +173,8 @@ async def test_steward_vocabulary_mapping(
     esc = await _brief(db, second)
     assert esc["recommend"]["action"] == "Решить вам"
     assert esc["recommend"]["verdict"] == "", "действия по умолчанию нет"
-    assert "нужен человек" in " ".join(esc["recommend"]["why"])
+    assert "причина в суждении" in " ".join(esc["recommend"]["why"])
+    assert "нужен человек" not in decision_brief.recommend_line(esc)
 
     third = await _review_task(client, db, monkeypatch, "brief-steward-ok")
     await _clean_scan(db, third)
@@ -327,3 +336,104 @@ async def test_risks_are_capped_and_sorted(
     assert [order[w] for w in weights] == sorted(
         (order[w] for w in weights), reverse=True
     )
+
+
+async def _second_report(client, task_id: int, **review) -> None:
+    await _post_review(client, task_id, **review)
+
+
+async def test_every_report_of_the_generation_counts(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 1-2 ревью: смотрим ВСЕ отчёты поколения, а не последний."""
+    finding = {
+        "title": "сломан возврат",
+        "category": "correctness",
+        "severity": "high",
+        "file": "hub/x.py",
+        "line": 1,
+        "locator": "lines",
+        "start_line": 1,
+        "detail": "возвращает None",
+    }
+    late_incomplete = await _review_task(client, db, monkeypatch, "brief-late-inc")
+    await _second_report(client, late_incomplete, incomplete=True)
+    await _clean_scan(db, late_incomplete)
+    got = await _brief(db, late_incomplete)
+    assert got["recommend"]["action"] != ACCEPT, "неполный отчёт позже полного"
+
+    conflict = await _review_task(
+        client, db, monkeypatch, "brief-conflict", findings_confirmed=[finding]
+    )
+    await _second_report(client, conflict)
+    await _clean_scan(db, conflict)
+    got = await _brief(db, conflict)
+    assert got["recommend"]["action"] != ACCEPT, "дефект у другого ревьюера"
+    assert any("расход" in r["text"].lower() for r in got["risks"])
+
+
+async def test_reviewer_identity_is_required_for_accept(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    task_id = await _review_task(client, db, monkeypatch, "brief-no-principal")
+    await _clean_scan(db, task_id, reviewer=False)
+    got = await _brief(db, task_id)
+    assert got["recommend"]["action"] != ACCEPT
+    assert any("Независимость" in r["text"] for r in got["risks"])
+
+
+async def test_unresolved_outcome_is_found_by_its_own_uid(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 4: исход пишется по unresolved_uids; not_judged не закрывает."""
+    from hub.services.finding_identity import unresolved_uids
+
+    item = {"title": "не удалось проверить", "why": "агент упал"}
+    task_id = await _review_task(
+        client, db, monkeypatch, "brief-outcome", unresolved=[item]
+    )
+    await _clean_scan(db, task_id)
+    task = dict(await repo.get_task(db, task_id) or {})
+    review = dict(await repo.get_latest_machine_review(db, task_id) or {})
+    (uid,) = unresolved_uids([item])
+
+    async def record(outcome: str) -> None:
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review["id"],
+            task_id=task_id,
+            submission_generation=task["submission_generation"],
+            finding_uid=uid,
+            finding_index=-1,
+            finding_title=item["title"],
+            outcome=outcome,
+            note="",
+            linked_task_id=None,
+            reported_by="dev",
+            finding_kind="unresolved",
+        )
+        await db.commit()
+
+    assert (await _brief(db, task_id))["recommend"]["action"] != ACCEPT
+    await record("not_judged")
+    assert (await _brief(db, task_id))["recommend"]["action"] != ACCEPT
+    await record("fixed")
+    got = await _brief(db, task_id)
+    assert got["recommend"]["action"] == ACCEPT, got["recommend"]
+
+
+async def test_report_check_follows_the_doubts_not_the_wording(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 6: «Машинное ревью» не зелёная при неотвеченных unresolved."""
+    task_id = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-check",
+        unresolved=[{"title": "не удалось", "why": "x"}],
+    )
+    await _clean_scan(db, task_id)
+    got = await _brief(db, task_id)
+    review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
+    assert review_check["state"] == "doubt"

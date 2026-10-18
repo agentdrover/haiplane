@@ -22,6 +22,9 @@ async def test_inbox_and_card_share_brief(
     await integrity_store.save_ci_integrity_scan(
         db, task_id, task["submission_sha"], "clean", "[]", ""
     )
+    await db.execute(
+        "UPDATE machine_reviews SET principal_id=9 WHERE task_id=?", (task_id,)
+    )
     await db.commit()
 
     inbox = await services.get_inbox_data(db)
