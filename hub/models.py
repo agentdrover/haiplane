@@ -11,6 +11,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+from hub.plain_summary import PlainSummaryView
 
 _models_log = logging.getLogger("hub")
 
@@ -3159,7 +3160,7 @@ class StateReviewView(BaseModel):
     headline: str = ""
 
 
-class TaskView(BaseModel):
+class TaskView(PlainSummaryView):
     id: int
     title: str
     description: str
@@ -3253,10 +3254,7 @@ class TaskView(BaseModel):
     due_date: str | None = None
     user_story: str = ""
     problem_statement: str = ""
-    # #1811: как записано (NULL у старых) и то, что показывать читателю.
     plain_summary: str | None = None
-    plain_summary_shown: str = ""
-    plain_summary_source: str = ""
     business_value: str = ""
     # --- Discovery block (#331) ---
     outcome_metric: str = ""

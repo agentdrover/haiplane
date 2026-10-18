@@ -5,10 +5,22 @@ from __future__ import annotations
 from typing import Any
 
 import aiosqlite
+from pydantic import BaseModel
 
 #: Миграция колонки. Её ``applied_at`` - граница: задача, созданная не раньше,
 #: «новая», и DoR требует у неё plain_summary; старым он только рекомендован.
 MIGRATION = "add_tasks_plain_summary"
+
+
+class PlainSummaryView(BaseModel):
+    """Читаемая часть TaskView: что показывать и откуда оно взято (#1811).
+
+    Вынесено из hub/models.py (бюджет размера, #1669); ``plain_summary`` -
+    как записано (NULL у старых задач) - объявлено в самом TaskView.
+    """
+
+    plain_summary_shown: str = ""
+    plain_summary_source: str = ""
 
 
 def plain_summary_view(
