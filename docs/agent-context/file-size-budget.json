@@ -46,7 +46,7 @@
     {
       "path": "hub/models.py",
       "measured": 4992,
-      "max": 5260,
+      "max": 5242,
       "removed_by": "unclaimed"
     },
     {
@@ -58,7 +58,7 @@
     {
       "path": "hub/repository.py",
       "measured": 6586,
-      "max": 6930,
+      "max": 6916,
       "removed_by": "unclaimed"
     },
     {

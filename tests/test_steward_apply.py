@@ -28,7 +28,7 @@ from hub.services.steward_apply import (
     apply_refusals,
 )
 from tests.test_steward_shadow import _project, _task
-from tests.ci_trust_support import VERIFIED_ROW, seed_clean_integrity
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW, seed_clean_integrity
 
 _PINNED = "a" * 40
 
@@ -52,7 +52,7 @@ async def _green(
     Именно поэтому каждый тест ниже начинается с зелёного и портит ровно
     один факт.
     """
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=_PINNED,
@@ -125,7 +125,7 @@ async def test_precondition_failure_escalates(
 
     # Красный CI на закреплённом sha — отдельный прогон.
     red = await _task(db, project_id)
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=red,
         head_sha=_PINNED,

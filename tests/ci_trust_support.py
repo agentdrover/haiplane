@@ -21,6 +21,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.models import AcceptanceCriterion
+from hub.services import ci_contract
 
 REPO = "own/rep"
 CI_PATH = ".github/workflows/ci.yml"
@@ -309,6 +310,18 @@ def attach_fake_github(target: Any) -> FakeGitHub:
     return fake
 
 
+async def upsert_hub_report(db: Any, **fields: Any) -> None:
+    """``repo.upsert_ci_run_report`` for a row confirmed under the HUB's contract.
+
+    A row stored without a fingerprint confirms nothing (#1848); the tests of the
+    readers that need a confirmed hub row say so explicitly, here.
+    """
+    await repo.upsert_ci_run_report(db, **fields)
+    await ci_contract.stamp_projection(
+        db, fields["task_id"], fields["head_sha"], ci_contract.HUB_FINGERPRINT
+    )
+
+
 async def seed_verified_report(
     db: Any, task_id: int, head_sha: str, **fields: Any
 ) -> None:
@@ -333,7 +346,7 @@ async def seed_verified_report(
     for key in ("ac_results", "checks", "provenance", "mutations", "baseline"):
         if key in row and not isinstance(row[key], str):
             row[key] = json.dumps(row[key])
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=head_sha,

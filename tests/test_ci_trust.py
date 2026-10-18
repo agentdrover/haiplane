@@ -2755,8 +2755,8 @@ async def test_satellite_predicates_answer_per_state(db):
             trust=fields["trust"],
             trust_reason="wrong_workflow" if fields["trust"] != "verified" else "",
             attempt_key="ci:1:1",
-            contract_fp=contract.fingerprint,
         )
+        await ci_contract.stamp_projection(db, task_id, SAT_SHA, contract.fingerprint)
         await db.commit()
         row = dict(await repo.get_ci_run_report(db, task_id, SAT_SHA))
         task = dict(await repo.get_task(db, task_id))
@@ -2782,7 +2782,7 @@ OTHER_CONTRACT = {
 }
 
 
-async def test_a_contract_change_revokes_old_trust(db, monkeypatch):
+async def test_a_contract_change_revokes_old_trust(db, db_dsn, monkeypatch):
     from hub.services import lifecycle
     from hub.services.ac_tests import ac_tests_gap
 
@@ -2857,40 +2857,49 @@ async def test_a_contract_change_revokes_old_trust(db, monkeypatch):
     assert standing is not None and standing.verified
     assert await ci_trust.pass_gap(db, wrong, SAT_SHA) is None
 
-    # 3. the contract changes WHILE the refresh is asking GitHub: the answer
-    # computed under the old one is not written; the round is made again.
+    # 3. the contract changes WHILE the refresh is asking GitHub, through ANOTHER
+    # connection (another process): the answer computed under the old contract is
+    # not written; the round is made again under the new one.
+    import asyncio
+
+    import aiosqlite
+
     pid3, racing = await satellite_task(db, slug="racing")
-    sent = _sat_attempt(racing)
     from hub.services.ci_report import store_ci_run_report
 
-    await store_ci_run_report(db, racing, **sent)
+    await store_ci_run_report(db, racing, **_sat_attempt(racing))
     await db.commit()
     real_attempt = GH.ci_run_attempt
     rounds: list[int] = []
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await other.execute("PRAGMA busy_timeout = 5000")
+        other.row_factory = aiosqlite.Row
 
-    async def contract_changes_under_the_question(*args, **kwargs):
-        rounds.append(1)
-        if len(rounds) == 1:
-            await set_contract(db, pid3, OTHER_CONTRACT)
-        return await real_attempt(*args, **kwargs)
+        async def contract_changes_on_another_connection(*args, **kwargs):
+            rounds.append(1)
+            if len(rounds) == 1:
+                async with asyncio.timeout(10):
+                    await set_contract(other, pid3, OTHER_CONTRACT)
+            return await real_attempt(*args, **kwargs)
 
-    monkeypatch.setattr(GH, "ci_run_attempt", contract_changes_under_the_question)
-    from hub.integrations.registry import plugins
+        monkeypatch.setattr(
+            GH, "ci_run_attempt", contract_changes_on_another_connection
+        )
+        from hub.integrations.registry import plugins
 
-    monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", GH.ci_run_attempt)
-    standing = await ci_trust.refresh(db, racing, SAT_SHA)
+        monkeypatch.setattr(plugins.git_ops, "ci_run_attempt", GH.ci_run_attempt)
+        async with asyncio.timeout(30):
+            standing = await ci_trust.refresh(db, racing, SAT_SHA)
+    finally:
+        await other.close()
     fp_other = (await ci_contract.contract_for_task(db, racing)).fingerprint
+    assert fp_other != ci_contract.contract_from_raw(SAT_CONTRACT, "x").fingerprint
     assert len(rounds) == 2, "the first answer was thrown away, the second asked again"
     assert standing is not None and not standing.verified
     assert (await _standing(db, racing, SAT_SHA))[:2] == (
         "unverified",
         "wrong_workflow",
-    )
-    assert (
-        [dict(r)["contract_fp"] for r in await repo.list_ac_attempts(db, racing)]
-        == [fp_other]
-        if False
-        else True
     )
     attempt = dict((await repo.list_ci_report_attempts(db, racing, SAT_SHA))[0])
     assert attempt["contract_fp"] == fp_other

@@ -1624,7 +1624,9 @@ async def _state_before_1848(tmp_path: Path) -> Path:
         raw.execute(f"ALTER TABLE {table} DROP COLUMN contract_fp")
     raw.execute(
         "DELETE FROM _migrations WHERE name IN "
-        "('add_ci_report_attempts_contract_fp', 'add_ci_run_reports_contract_fp')"
+        "('add_ci_report_attempts_contract_fp', 'add_ci_run_reports_contract_fp', "
+        "'backfill_ci_report_attempts_contract_fp', "
+        "'backfill_ci_run_reports_contract_fp')"
     )
     raw.commit()
     raw.close()
@@ -1652,9 +1654,12 @@ async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
     from hub.services import ci_contract, ci_trust
 
     # The literal in the migration and in the repository is the hub contract's.
-    assert repo.HUB_CONTRACT_FP == ci_contract.HUB_FINGERPRINT
-    sql = dict(db_module._MIGRATIONS)["add_ci_report_attempts_contract_fp"]
-    assert ci_contract.HUB_FINGERPRINT in sql
+    migrations = dict(db_module._MIGRATIONS)
+    for table in ("ci_report_attempts", "ci_run_reports"):
+        assert (
+            ci_contract.HUB_FINGERPRINT in migrations[f"backfill_{table}_contract_fp"]
+        )
+        assert "DEFAULT ''" in migrations[f"add_{table}_contract_fp"]
 
     path = await _state_before_1848(tmp_path)
     conn = await db_module.connect(str(path))
@@ -1692,6 +1697,22 @@ async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
         ]
         assert dict(await repo.get_task(conn, 1))["validation_source"] == "ci:11:1"
 
+        # A row inserted without a fingerprint (DEFAULT '') confirms nothing.
+        await conn.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "trust, trust_reason, trust_final) VALUES (1, 'sha-raw', '90', '1', "
+            "'verified', '', 1)"
+        )
+        await conn.execute(
+            "INSERT INTO ci_run_reports (task_id, head_sha, trust, trust_reason, "
+            "attempt_key, reported_by) VALUES (1, 'sha-raw', 'verified', '', 'ci:90:1', 'ci')"
+        )
+        raw_attempt = dict((await repo.list_ci_report_attempts(conn, 1, "sha-raw"))[0])
+        raw_report = dict(await repo.get_ci_run_report(conn, 1, "sha-raw"))
+        assert raw_attempt["contract_fp"] == raw_report["contract_fp"] == ""
+        assert ci_trust.trust_of(raw_report, fp) == ("unverified", "contract_changed")
+        assert await ci_trust.pass_gap(conn, 1, "sha-raw") is not None
+
         # A claim that arrives after the upgrade has no fingerprint until checked.
         await repo.upsert_ci_report_attempt(
             conn,
@@ -1726,8 +1747,8 @@ async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
             trust_reason="",
             final=True,
             body_version=fresh_attempt["body_version"],
-            contract_fp=fp,
         )
+        await ci_contract.stamp_attempt(conn, fresh_attempt["id"], fp)
         stamped = dict((await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0])
         assert stamped["contract_fp"] == fp
         await repo.upsert_ci_report_attempt(

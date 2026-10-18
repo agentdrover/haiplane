@@ -76,6 +76,8 @@ CHECK_SUPERSEDED = "check_superseded"
 # project's current one (#1848): it proves nothing until the attempt is checked
 # again under the current one.
 CONTRACT_CHANGED = "contract_changed"
+# The project's contract could not be read (#1848): nothing is confirmed.
+CONTRACT_UNRESOLVED = "contract_unresolved"
 
 # The hub's own contract (#1848 made it one of many): kept as names for readers
 # that mean the hub's project.
@@ -135,7 +137,9 @@ def trust_of(report: Mapping[str, Any] | None, current_fp: str) -> tuple[str, st
     reason = str(report.get("trust_reason") or LEGACY)
     if trust != VERIFIED:
         return UNVERIFIED, reason
-    if not current_fp or str(report.get("contract_fp") or "") != current_fp:
+    if not current_fp:
+        return UNVERIFIED, CONTRACT_UNRESOLVED
+    if str(report.get("contract_fp") or "") != current_fp:
         return UNVERIFIED, CONTRACT_CHANGED
     return VERIFIED, ""
 
@@ -595,8 +599,8 @@ async def _project(
             trust=trust,
             trust_reason=reason,
             attempt_key=key or attempt_key(source["run_id"], source["run_attempt"]),
-            contract_fp=source["contract_fp"],
         )
+        await ci_contract.stamp_projection(db, task_id, sha, source["contract_fp"])
     elif stored is not None:
         await repo.set_ci_run_report_trust(
             db, task_id, sha, trust=trust, trust_reason=reason, attempt_key=key
@@ -616,8 +620,8 @@ async def _project(
             trust=trust,
             trust_reason=reason,
             attempt_key=key,
-            contract_fp=source["contract_fp"],
         )
+        await ci_contract.stamp_projection(db, task_id, sha, source["contract_fp"])
     generation = int(task.get("submission_generation") or 0)
     applied, recorded = False, []
     if (task.get("submission_sha") or "").strip() == sha and generation > 0:
@@ -874,6 +878,10 @@ async def _refresh_locked(
         # The contract is captured HERE, before anything is asked of GitHub, and
         # compared again inside the transaction that writes (#1848).
         contract = await ci_contract.contract_for_task(db, task_id)
+        if not contract.fingerprint:
+            # Nothing may be asked or written under no contract: the caller
+            # (refresh_quietly) turns this into unverified(check_failed).
+            raise RuntimeError(f"CI contract of task {task_id} could not be read")
         rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
         if not rows:
             return None
@@ -937,8 +945,9 @@ async def _write_round(
                 trust_reason=reason,
                 final=final,
                 body_version=body,
-                contract_fp=contract.fingerprint,
             )
+            if written:
+                await ci_contract.stamp_attempt(db, attempt_id, contract.fingerprint)
             stale = stale or not written
         if stale:
             return None

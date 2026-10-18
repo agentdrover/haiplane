@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+log = logging.getLogger("hub")
 CI_CONTRACT_KEY = "ci_contract"
 #: Закрытый словарь имён проверок (тот же, что у отчёта хаба). Порядок — порядок
 #: показа в сообщении «проверки не pass».
@@ -49,6 +51,8 @@ class CiContract:
 
     @property
     def fingerprint(self) -> str:
+        if not self.workflow_path:  # UNRESOLVED: no fingerprint, nothing matches it
+            return NO_FINGERPRINT
         return fingerprint_of(self.workflow_path, self.required_checks)
 
     def ordered_checks(self) -> tuple[str, ...]:
@@ -68,6 +72,9 @@ def fingerprint_of(workflow_path: str, required_checks: Any) -> str:
 
 HUB_CONTRACT = CiContract(".github/workflows/ci.yml", tuple(sorted(CHECK_VOCABULARY)))
 HUB_FINGERPRINT = HUB_CONTRACT.fingerprint
+#: The project's contract could not be read: no contract at all, never the hub's.
+#: Trust under it is closed (unverified), whatever the stored verdicts say.
+UNRESOLVED = CiContract("", ())
 
 
 def validated_ci_contract(value: Any) -> dict[str, Any]:
@@ -110,6 +117,22 @@ def validated_ci_contract(value: Any) -> dict[str, Any]:
     return {"workflow_path": path, "required_checks": sorted(checks)}
 
 
+def validate_ci_keys(policy: dict[str, Any]) -> None:
+    """The CI keys of a gate policy: the mode of ci_before_submit (#1629) and the contract (#1848)."""
+    from hub.services.project_policy import CI_BEFORE_SUBMIT_MODES
+
+    if (
+        "ci_before_submit" in policy
+        and policy["ci_before_submit"] not in CI_BEFORE_SUBMIT_MODES
+    ):
+        raise ValueError(
+            "gate_policy ci_before_submit must be one of "
+            f"{', '.join(CI_BEFORE_SUBMIT_MODES)}, got: {policy['ci_before_submit']!r}"
+        )
+    if "ci_contract" in policy:
+        policy["ci_contract"] = validated_ci_contract(policy["ci_contract"])
+
+
 def contract_from_raw(raw: Any, slug: str = "") -> CiContract:
     """Контракт проекта из сохранённого значения ключа; хаба — когда его нет.
 
@@ -147,8 +170,9 @@ async def contract_for_task(db: Any, task_id: int) -> CiContract:
 
     try:
         project = await repo.resolve_project_for_task(db, task_id)
-    except Exception:  # noqa: BLE001 - нечитаемое = самый строгий контракт
-        return HUB_CONTRACT
+    except Exception:  # noqa: BLE001 - не прочли проект = доверия нет
+        log.warning("could not resolve the CI contract of task #%s", task_id)
+        return UNRESOLVED
     if project is None:
         return HUB_CONTRACT
     return project_policy.ci_contract_of(project)
@@ -226,4 +250,22 @@ async def settled_attempts(db: Any) -> list[Any]:
         "WHERE a.trust_final=1 AND t.archived=0 "
         "AND t.status NOT IN ('completed','failed','rejected') "
         "ORDER BY a.id",
+    )
+
+
+async def stamp_attempt(db: Any, attempt_id: int, fingerprint: str) -> None:
+    """Record the contract a verdict of the attempt was made under (same transaction as the verdict)."""
+    await db.execute(
+        "UPDATE ci_report_attempts SET contract_fp=? WHERE id=?",
+        (fingerprint, attempt_id),
+    )
+
+
+async def stamp_projection(
+    db: Any, task_id: int, head_sha: str, fingerprint: str
+) -> None:
+    """The same for the projection row of a commit (the attempt it shows)."""
+    await db.execute(
+        "UPDATE ci_run_reports SET contract_fp=? WHERE task_id=? AND head_sha=?",
+        (fingerprint, task_id, head_sha),
     )

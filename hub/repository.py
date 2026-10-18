@@ -2311,8 +2311,6 @@ async def list_ac_test_results(
 
 # --- CI run reports (#546) -------------------------------------------------
 
-HUB_CONTRACT_FP = "8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca"  # pragma: allowlist secret
-
 
 async def upsert_ci_run_report(
     db: aiosqlite.Connection,
@@ -2331,7 +2329,6 @@ async def upsert_ci_run_report(
     trust: str = "unverified",
     trust_reason: str = "pending",
     attempt_key: str = "",
-    contract_fp: str = HUB_CONTRACT_FP,
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
 
@@ -2354,8 +2351,8 @@ async def upsert_ci_run_report(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
         "validation_status, validation_log, reason, reported_by, checks, "
         "mutations, baseline, provenance, trust, trust_reason, attempt_key, "
-        "contract_fp, reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
         "ac_results=excluded.ac_results, "
         "validation_status=excluded.validation_status, "
@@ -2369,7 +2366,6 @@ async def upsert_ci_run_report(
         "provenance=excluded.provenance, "
         "trust=excluded.trust, trust_reason=excluded.trust_reason, "
         "attempt_key=excluded.attempt_key, "
-        "contract_fp=excluded.contract_fp, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -2386,7 +2382,6 @@ async def upsert_ci_run_report(
             trust,
             trust_reason,
             attempt_key,
-            contract_fp,
             1 if mutations is None else 0,
             1 if baseline is None else 0,
         ),
@@ -2469,9 +2464,8 @@ async def upsert_ci_report_attempt(
     await db.execute(
         "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
         "ac_results, checks, validation_status, validation_log, reason, "
-        "reported_by, mutations, baseline, provenance, submitted, contract_fp, "
-        "reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', datetime('now')) "
+        "reported_by, mutations, baseline, provenance, submitted, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha, run_id, run_attempt) DO UPDATE SET "
         "ac_results=excluded.ac_results, checks=excluded.checks, "
         "validation_status=excluded.validation_status, "
@@ -2561,16 +2555,12 @@ async def set_ci_attempt_trust(
     trust_reason: str,
     final: bool,
     body_version: int,
-    contract_fp: str,
 ) -> bool:
-    """Write a verdict only for the body it was computed for; False if it moved (#1687).
-
-    ``contract_fp``: the CI contract the verdict was made under (#1848).
-    """
+    """Write a verdict only for the body it was computed for; False if it moved (#1687)."""
     cur = await db.execute(
         "UPDATE ci_report_attempts SET trust=?, trust_reason=?, trust_final=?, "
-        "contract_fp=?, checked_at=datetime('now') WHERE id=? AND body_version=?",
-        (trust, trust_reason, 1 if final else 0, contract_fp, attempt_id, body_version),
+        "checked_at=datetime('now') WHERE id=? AND body_version=?",
+        (trust, trust_reason, 1 if final else 0, attempt_id, body_version),
     )
     return cur.rowcount == 1
 

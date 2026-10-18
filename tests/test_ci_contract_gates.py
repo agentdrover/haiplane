@@ -255,4 +255,34 @@ async def test_unreadable_or_default_contracts_read_as_the_hubs(db):
     )
     await db.commit()
     assert await ci_contract.contract_for_task(db, task_id) == hub
-    assert ci_contract.HUB_FINGERPRINT == repo.HUB_CONTRACT_FP
+
+
+async def test_a_project_that_cannot_be_read_closes_trust_not_opens_the_hubs(
+    db, monkeypatch
+):
+    """A hub-confirmed report, the contract changed, and the project cannot be resolved."""
+    from hub.services.ci_contract import UNRESOLVED
+
+    pid, task_id = await satellite_task(db, slug="hubby", contract=None)
+    await base._post(db, task_id, base.GH.attempt(task_id, SAT_SHA))
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is None
+    await set_contract(db, pid, base.SAT_CONTRACT)
+
+    async def unreadable(*args, **kwargs):
+        raise RuntimeError("the project cannot be resolved")
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", unreadable)
+    assert await ci_contract.contract_for_task(db, task_id) == UNRESOLVED
+    assert await ci_contract.fingerprint_for_task(db, task_id) == ""
+    assert await ci_trust.trusted_report(db, task_id, SAT_SHA) is None
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
+    assert "contract_unresolved" in await ci_trust.unconfirmed_reason(
+        db, task_id, SAT_SHA
+    )
+    assert await ci_contract.evidence_stale(db, task_id, "ci:5001:1")
+    # A refresh asks nothing and writes nothing under no contract; it never raises
+    # when called quietly, and what it leaves is unconfirmed.
+    asked = len(base.GH.calls)
+    await ci_trust.refresh_quietly(db, task_id, SAT_SHA)
+    assert base.GH.calls[asked:] == []
+    assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None

@@ -1377,10 +1377,18 @@
 ],
 [
 "add_ci_report_attempts_contract_fp",
-"109ab1d7 8dd8ced4 f5f4e10f 77082405 be46ce2b 635dfe8b c13b337c caa62f23"
+"a3e017c3 bd1f0f85 8f4d0098 8e7867e4 35dc125e dd8bcfec 35b80c61 20adcc25"
 ],
 [
 "add_ci_run_reports_contract_fp",
-"1761afd8 43f9c87e f182a079 c3834e6f df239682 60863e51 e959d664 ec33c745"
+"a8cc17e4 f292fab7 bc19045d a60f9904 9513dd10 17b16e13 cf4a9d6b 5ef429d2"
+],
+[
+"backfill_ci_report_attempts_contract_fp",
+"99026006 887764e9 26214f96 7af8d220 20f1c986 41551a65 0cb6f32f b0d44988"
+],
+[
+"backfill_ci_run_reports_contract_fp",
+"e9c6b0ee 4fc19e95 06da0285 1d3cc956 882e71ba 9e157ce5 f625369f e9a19d37"
 ]
 ]

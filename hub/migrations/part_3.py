@@ -1138,18 +1138,25 @@ MIGRATIONS_3: list[tuple[str, str]] = [
     (
         # #1848: отпечаток проектного контракта CI (sha256 канонического JSON
         # {workflow_path, required_checks}), под которым вынесен вердикт
-        # попытки. DEFAULT = отпечаток контракта хаба (ci.yml, четыре проверки):
-        # ДО этой задачи другого контракта не было, поэтому вердикты, уже
-        # стоящие в таблице, вынесены именно под ним — verified хаба остаются
-        # verified, unverified и legacy не становятся verified. Новая
-        # непроверенная претензия получает '' («нет отпечатка») из кода.
+        # попытки. DEFAULT '' = «нет отпечатка»: строка, вставленная без него,
+        # ничего не подтверждает. Вердикты, уже стоящие в таблицах, вынесены под
+        # контрактом хаба (другого ДО этой задачи не было) - их ставит backfill ниже.
         "add_ci_report_attempts_contract_fp",
-        "ALTER TABLE ci_report_attempts ADD COLUMN contract_fp "
-        "TEXT NOT NULL DEFAULT '8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca'",  # pragma: allowlist secret
+        "ALTER TABLE ci_report_attempts ADD COLUMN contract_fp TEXT NOT NULL DEFAULT ''",
     ),
     (
         "add_ci_run_reports_contract_fp",
-        "ALTER TABLE ci_run_reports ADD COLUMN contract_fp "
-        "TEXT NOT NULL DEFAULT '8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca'",  # pragma: allowlist secret
+        "ALTER TABLE ci_run_reports ADD COLUMN contract_fp TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Один раз, при добавлении колонки: все существующие строки - под
+        # контрактом хаба (ci.yml, четыре проверки). verified хаба остаются
+        # verified, unverified и legacy verified не становятся.
+        "backfill_ci_report_attempts_contract_fp",
+        "UPDATE ci_report_attempts SET contract_fp = '8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca'",  # pragma: allowlist secret
+    ),
+    (
+        "backfill_ci_run_reports_contract_fp",
+        "UPDATE ci_run_reports SET contract_fp = '8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca'",  # pragma: allowlist secret
     ),
 ]

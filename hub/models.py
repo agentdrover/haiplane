@@ -436,9 +436,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1679: какие поводы хаб кладёт в ящик steward@<проект>. Не гейт и ничего
     # не делегирует. Читатель: project_policy.steward_watch_of.
     "steward_watch",
-    # #1848: workflow и обязательные проверки CI проекта-спутника. Правит
-    # только человек. Читатель: project_policy.ci_contract_from.
-    "ci_contract",
+    "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -802,20 +800,6 @@ def _validate_bug_red_test(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy bug_red_test must be one of "
             f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
-        )
-
-
-def _validate_ci_before_submit(policy: dict[str, Any]) -> None:
-    """Refuse a CI-before-submit mode the reader would read as warn by accident (#1629)."""
-    from hub.services.project_policy import CI_BEFORE_SUBMIT_MODES
-
-    if (
-        "ci_before_submit" in policy
-        and policy["ci_before_submit"] not in CI_BEFORE_SUBMIT_MODES
-    ):
-        raise ValueError(
-            "gate_policy ci_before_submit must be one of "
-            f"{', '.join(CI_BEFORE_SUBMIT_MODES)}, got: {policy['ci_before_submit']!r}"
         )
 
 
@@ -3499,6 +3483,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     # только здесь; делегирующие из них живут в project_policy, и оба
     # перечня сверяются тестом.
     from hub.services.project_policy import GATE_VALUES
+    from hub.services.ci_contract import validate_ci_keys
 
     bad = {
         k: val
@@ -3535,7 +3520,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
     _validate_bug_red_test(v)
-    _validate_ci_before_submit(v)
+    validate_ci_keys(v)
     _validate_claim_area_check(v)
     _validate_claim_project_check(v)
     _validate_statement_paths(v)
@@ -3552,10 +3537,6 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_release_artifacts(v)
     _validate_freeze(v)
     _validate_steward_watch(v)
-    if "ci_contract" in v:
-        from hub.services.ci_contract import validated_ci_contract
-
-        v["ci_contract"] = validated_ci_contract(v["ci_contract"])
     return v
 
 
