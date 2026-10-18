@@ -9,7 +9,7 @@ from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import contextlib
@@ -2048,11 +2048,35 @@ async def pair_start_task(
     task_id: int,
     body: TaskPairStart | None = None,
     *,
+    after: Callable[[], Awaitable[None]] | None = None,
+    **kwargs: Any,
+) -> TaskView:
+    """pair_start, затем ``after`` вызывающего, затем запись выдачи навыка.
+
+    #1829: выдача навыка записывается ПОСЛЕДНЕЙ — после всего, что вызывающий
+    делает с ответом (``after``: захват слота REST-обработчиком может бросить).
+    Исключение раньше записи — записи нет, и следующий старт отдаст текст.
+    Остальные параметры — как у ``_pair_start_core``.
+    """
+    from hub.services import working_rules
+
+    view, pending_delivery = await _pair_start_core(db, task_id, body, **kwargs)
+    if after is not None:
+        await after()
+    await working_rules.record_skill_delivery(db, pending_delivery)
+    return view
+
+
+async def _pair_start_core(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskPairStart | None = None,
+    *,
     caller: str = "",
     implementer_principal_id: int | None = None,
     caller_is_agent: bool = False,
     session_token: str = "",
-) -> TaskView:
+) -> tuple[TaskView, Any]:
     """Start an open task in pair mode: running without headless dispatch.
 
     ``implementer_principal_id`` records WHO implements as an authenticated
@@ -2168,9 +2192,16 @@ async def pair_start_task(
     # выдаётся. Слой собирается здесь, чтобы факт выдачи лёг в то же событие.
     working_rules_block = None
     skill_fact: dict[str, Any] = {}
+    pending_delivery = None
     if not state_task:
-        working_rules_block, skill_fact = await _build_pair_rules(
-            db, task_id, agent_rules, session_token if caller_is_agent else ""
+        working_rules_block, skill_fact, pending_delivery = await _build_pair_rules(
+            db,
+            task_id,
+            agent_rules,
+            session_token if caller_is_agent else "",
+            declared_session=declared_session,
+            principal_id=implementer_principal_id,
+            full_rules=bool(body and body.full_rules),
         )
     await log_activity(
         db,
@@ -2195,7 +2226,7 @@ async def pair_start_task(
     if state_task:
         # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
         # что уехало в базу: постановка state-задачи не о коде.
-        return tv
+        return tv, None
     # #615: the statement may be older than the work that invalidated it. Told
     # HERE, on the server, so CLI and REST callers see it too — computing it in
     # the MCP tool would leave every other client blind.
@@ -2204,7 +2235,7 @@ async def pair_start_task(
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.worktree_hint = _worktree_hint(task_id)
     tv.working_rules = working_rules_block
-    return tv
+    return tv, pending_delivery
 
 
 async def _build_pair_rules(
@@ -2212,7 +2243,11 @@ async def _build_pair_rules(
     task_id: int,
     agent_rules: dict[str, Any] | None,
     session_token: str,
-) -> tuple[Any, dict[str, Any]]:
+    *,
+    declared_session: str = "",
+    principal_id: int | None = None,
+    full_rules: bool = False,
+) -> tuple[Any, dict[str, Any], Any]:
     """Блок «Правила работы» pair-start и факт выдачи навыка (#1683).
 
     Привязка к заказу — только по токену вызывающей сессии implementer; нет
@@ -2228,15 +2263,27 @@ async def _build_pair_rules(
         ordered_skill_version=order["skill_version"] if order else None,
     )
     if order is None:
-        return block, {}
+        # #1829: локальная зарегистрированная сессия — текст один раз.
+        pending = await working_rules.apply_session_delivery(
+            db,
+            block.hub_skill,
+            declared_session,
+            principal_id=principal_id,
+            force_full=full_rules,
+        )
+        return block, {}, pending
     skill = block.hub_skill
-    return block, {
-        "executor_run_id": order["executor_run_id"],
-        "skill_version": skill.version,
-        "ordered_skill_version": order["skill_version"],
-        "delivered_in_order": skill.delivered_in_order,
-        "omitted_chars": skill.chars if skill.delivered_in_order else 0,
-    }
+    return (
+        block,
+        {
+            "executor_run_id": order["executor_run_id"],
+            "skill_version": skill.version,
+            "ordered_skill_version": order["skill_version"],
+            "delivered_in_order": skill.delivered_in_order,
+            "omitted_chars": skill.chars if skill.delivered_in_order else 0,
+        },
+        None,
+    )
 
 
 async def _resolve_branch_diff(

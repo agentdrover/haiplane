@@ -57,6 +57,7 @@ from hub.services.lifecycle import DELIVER_DISPOSITION, REGISTRY_REFUSAL_PREFIX
 from hub.services.review_evidence import inflight_view
 from hub.services import verdict_evidence
 from hub.version import get_app_version
+from hub.services import launch_feedback
 from hub.web_executor_slot import card_hosts
 from hub.models import (
     DeliveryAcknowledgement,
@@ -2934,6 +2935,8 @@ async def _web_task_detail_page(
             "slot_hosts": await card_hosts(db, task_id)
             if task.status.value == "open"
             else [],
+            # #1817: плашка запуска исполнителя (слот или облако).
+            "launch_plaque": await launch_feedback.plaque(db, task_id),
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,
