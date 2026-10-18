@@ -23,6 +23,7 @@ from tests.test_executor_orders import (
 )
 
 LEAK = "abcdef123456789"  # pragma: allowlist secret
+SHA = "a1b2c3d4e5f6"  # pragma: allowlist secret
 
 world = _eo.world
 keys = _eo.keys
@@ -429,7 +430,7 @@ async def test_final_entry_is_written_once_in_every_close_path(world):
         json={
             "outcome": "rescued",
             "branch": f"task-{t3}/rescue-7",
-            "sha": "a1b2c3d4e5f6",
+            "sha": SHA,
             "reason_code": "agent_failed",
         },
         headers=world.k8_auth,
@@ -437,10 +438,7 @@ async def test_final_entry_is_written_once_in_every_close_path(world):
     assert resc.status_code == 200, resc.text
     plaque = await launch_feedback.plaque(world.db, t3)
     assert plaque is not None
-    assert (
-        f"task-{t3}/rescue-7" in plaque["outcome"]
-        and "a1b2c3d4e5f6" in plaque["outcome"]
-    )
+    assert f"task-{t3}/rescue-7" in plaque["outcome"] and SHA in plaque["outcome"]
 
 
 async def test_repeat_launch_after_claim_names_the_active_order(world):
