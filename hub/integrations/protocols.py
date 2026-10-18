@@ -616,6 +616,7 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None: ...
     async def ci_run_artifacts(
         self,
@@ -991,7 +992,12 @@ class ForgePlugin(Protocol):
         gh_repo: str | None = None,
     ) -> dict[str, Any] | None: ...
     async def ci_runs_for_sha(
-        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None: ...
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
