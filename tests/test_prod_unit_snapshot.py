@@ -413,14 +413,18 @@ def _environment_problems(value: str) -> list[str]:
     return problems
 
 
-def env_line_problems(line: str) -> list[str]:
+RUNNER_ENV = "etc/haiplane-review-runner.env"
+RUNNER_STOP_NAME = "HAIPLANE_REVIEW_RUNNER_ARGV"
+
+
+def env_line_problems(line: str, bare_name_ok: bool = False) -> list[str]:
     if line == "":
         return ["пустая строка"]
     if line.startswith(("#", ";")):
         return ["комментарий"]
     if line != line.strip():
         return ["пробелы по краям строки"]
-    if NAME.match(line) and not KEY_SHAPE.search(line):
+    if bare_name_ok and line == RUNNER_STOP_NAME:
         return []  # разбор файла остановлен на этом имени (раздел НЕПОЛНО)
     m = re.fullmatch(r"([A-Za-z_][A-Za-z_0-9]*)=(.*)", line)
     if not m:
@@ -431,6 +435,32 @@ def env_line_problems(line: str) -> list[str]:
     if line != shown(name, value):
         return [f"{name}: значение вне белого списка или типа"]
     return []
+
+
+ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{2,})=([^\s]*)")
+
+
+def prose_line_problems(line: str) -> list[str]:
+    """README и CAPTURE: каждое NAME=VALUE в строке подчиняется белому списку и типам."""
+    problems = []
+    for name, raw in ASSIGNMENT.findall(line):
+        if name == "ALL":
+            continue  # синтаксис sudoers (host=(user) ...), не переменная
+        value = raw.rstrip("`'|,;)")
+        if f"{name}={value}" != shown(name, value):
+            problems.append(f"{name}: значение вне белого списка или типа")
+    return problems
+
+
+def readme_table_problems(text: str) -> list[str]:
+    """Ячейки «значение» таблицы переменных README: имя, значение по типу или скрыто."""
+    problems = []
+    for name, _src, value in re.findall(
+        r"^\| `([A-Z][A-Z0-9_]*)` \| `([^`]+)` \| `([^`]*)` \|", text, flags=re.M
+    ):
+        if f"{name}={value}" != shown(name, value):
+            problems.append(f"{name}: значение в таблице вне белого списка или типа")
+    return problems
 
 
 def tmpfiles_line_problems(line: str) -> list[str]:
@@ -465,7 +495,9 @@ def snapshot_violations(root: Path) -> list[str]:
             out.append(f"{rel}: не UTF-8")
             continue
         if rel in NON_SOURCE_FILES:
-            checker = None
+            checker = prose_line_problems
+            if rel == "README.md":
+                out.extend(f"{rel}: {p}" for p in readme_table_problems(text))
         elif rel.startswith("etc/systemd/system/") and rel.endswith(
             (".service", ".timer", ".conf")
         ):
@@ -482,7 +514,10 @@ def snapshot_violations(root: Path) -> list[str]:
             lines.pop()  # завершающий LF
         for number, line in enumerate(lines, 1):
             problems = generic_line_problems(line)
-            if checker is not None:
+            if checker is env_line_problems:
+                last = rel == RUNNER_ENV and number == len(lines)
+                problems += env_line_problems(line, bare_name_ok=last)
+            elif checker is not None:
                 problems += checker(line)
             out.extend(f"{rel}:{number}: {p}" for p in problems)
     return out
@@ -711,6 +746,34 @@ NEGATIVE_EXAMPLES: dict[str, tuple[str, str]] = {
     "EnvironmentFile: многострочное значение": (
         f"etc/{PROD_NAME}/{PROD_NAME}.env",
         f"HAIPLANE_HUB_HOME=/var/lib/{PROD_NAME}\nsecond-line-of-a-value\n",
+    ),
+    "README: открытый токен": (
+        "README.md",
+        "Пример: HAIPLANE_HUB_TOKENS=abc\n",
+    ),
+    "README: токен в ячейке таблицы": (
+        "README.md",
+        f"| `HAIPLANE_HUB_TOKENS` | `{PROD_NAME}.env` | `abc` | действует |\n",
+    ),
+    "CAPTURE: открытый токен": (
+        "CAPTURE.txt",
+        "\n########## x\nHAIPLANE_HUB_TOKENS=abc\n",
+    ),
+    "CAPTURE: ключ в Environment": (
+        "CAPTURE.txt",
+        "Environment='HAIPLANE_HUB_PORT=ghp_aaaa'\n",
+    ),
+    "EnvironmentFile: непрозрачная строка-имя в чужом файле": (
+        f"etc/{PROD_NAME}/{PROD_NAME}.env",
+        "HAIPLANE_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ012\n",
+    ),
+    "EnvironmentFile runner: другое имя последней строкой": (
+        RUNNER_ENV,
+        "HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/x\nHAIPLANE_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ012\n",
+    ),
+    "EnvironmentFile runner: ARGV не последней строкой": (
+        RUNNER_ENV,
+        "HAIPLANE_REVIEW_RUNNER_ARGV\nHAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/x\n",
     ),
     "tmpfiles: запись f с содержимым": (
         "etc/tmpfiles.d/x.conf",
