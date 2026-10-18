@@ -244,6 +244,38 @@ async def test_the_delivery_is_recorded_last_and_not_after_a_failure(
     assert len(await _deliveries(db)) == 1
 
 
+async def test_the_delivery_is_not_recorded_when_the_slot_capture_fails(
+    client, db, monkeypatch
+):
+    import hub.app as hub_app
+
+    await _publish(db, TEXT)
+    await _register(db, "s-slot")
+    t1 = await task_in_project(client, db, slug="wr1829-s1")
+    t2 = await task_in_project(client, db, slug="wr1829-s2")
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("slot capture failed")
+
+    real = hub_app._record_slot_capture
+    monkeypatch.setattr(hub_app, "_record_slot_capture", _boom)
+    with pytest.raises(RuntimeError):
+        await client.post(
+            f"/api/tasks/{t1}/pair-start",
+            json={
+                "plan": "Plan: x",
+                "assigned_agent": "a",
+                "session_id": "s-slot",
+                "git_mode": "remote",
+            },
+        )
+    assert await _deliveries(db) == []
+
+    monkeypatch.setattr(hub_app, "_record_slot_capture", real)
+    skill = await _pair(client, t2, "s-slot")
+    assert skill["content"] == TEXT and len(await _deliveries(db)) == 1
+
+
 async def test_pair_start_forwards_full_rules_from_cli_and_mcp(monkeypatch):
     from hub import cli, mcp_server
     from hub.models import TaskPairStart

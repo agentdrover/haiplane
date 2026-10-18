@@ -9,7 +9,7 @@ from functools import partial
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import contextlib
@@ -2048,11 +2048,35 @@ async def pair_start_task(
     task_id: int,
     body: TaskPairStart | None = None,
     *,
+    after: Callable[[], Awaitable[None]] | None = None,
+    **kwargs: Any,
+) -> TaskView:
+    """pair_start, затем ``after`` вызывающего, затем запись выдачи навыка.
+
+    #1829: выдача навыка записывается ПОСЛЕДНЕЙ — после всего, что вызывающий
+    делает с ответом (``after``: захват слота REST-обработчиком может бросить).
+    Исключение раньше записи — записи нет, и следующий старт отдаст текст.
+    Остальные параметры — как у ``_pair_start_core``.
+    """
+    from hub.services import working_rules
+
+    view, pending_delivery = await _pair_start_core(db, task_id, body, **kwargs)
+    if after is not None:
+        await after()
+    await working_rules.record_skill_delivery(db, pending_delivery)
+    return view
+
+
+async def _pair_start_core(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskPairStart | None = None,
+    *,
     caller: str = "",
     implementer_principal_id: int | None = None,
     caller_is_agent: bool = False,
     session_token: str = "",
-) -> TaskView:
+) -> tuple[TaskView, Any]:
     """Start an open task in pair mode: running without headless dispatch.
 
     ``implementer_principal_id`` records WHO implements as an authenticated
@@ -2202,7 +2226,7 @@ async def pair_start_task(
     if state_task:
         # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
         # что уехало в базу: постановка state-задачи не о коде.
-        return tv
+        return tv, None
     # #615: the statement may be older than the work that invalidated it. Told
     # HERE, on the server, so CLI and REST callers see it too — computing it in
     # the MCP tool would leave every other client blind.
@@ -2211,9 +2235,7 @@ async def pair_start_task(
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.worktree_hint = _worktree_hint(task_id)
     tv.working_rules = working_rules_block
-    # #1829: выдача навыка записывается ПОСЛЕДНЕЙ, когда ответ собран.
-    await working_rules.record_skill_delivery(db, pending_delivery)
-    return tv
+    return tv, pending_delivery
 
 
 async def _build_pair_rules(
