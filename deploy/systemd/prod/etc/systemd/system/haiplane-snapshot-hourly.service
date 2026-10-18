@@ -1,0 +1,13 @@
+[Unit]
+Description=Haiplane hub: hourly encrypted database snapshot
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+PrivateTmp=yes
+NoNewPrivileges=yes
+TimeoutStartSec=600
+TemporaryFileSystem=<скрыто>
+ExecStart=/usr/bin/python3 /usr/local/lib/haiplane-backup/hub-snapshot.py hourly
+

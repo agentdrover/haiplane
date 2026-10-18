@@ -1,0 +1,19 @@
+[Unit]
+Description=Haiplane review runner (launches the local reviewer for the hub)
+After=network.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=haiplane-review
+EnvironmentFile=/etc/haiplane-review-runner.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
+UMask=0007
+Restart=on-failure
+RestartSec=5
+<скрыто>=2
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+

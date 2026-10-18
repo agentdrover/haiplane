@@ -1,0 +1,11 @@
+[Unit]
+Description=Haiplane hub: daily settings archive
+
+[Timer]
+OnCalendar=*-*-* 03:47:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+TimersCalendar=*-*-* 03:47:00 UTC
