@@ -2729,6 +2729,9 @@ async def test_the_sweep_order_is_pinned(db):
         "stale_worktrees",
         "sessions_retention",
         "release_policy",
+        # #1828: сторож «влит, но не в проде» стоит сразу за релизом: строка
+        # release_merges этого прохода уже записана, свип её только читает.
+        "release_deploy_watch",
         # #1274: очередь исполнения в тени — после релиза, чтобы доставка
         # этого прохода уже снимала зависимости; только пишет событие.
         "orchestrator_queue",
