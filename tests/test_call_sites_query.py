@@ -7,7 +7,9 @@ call would prove neither.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -118,11 +120,11 @@ def test_the_query_lists_name_candidates(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     blank = _run("--root", str(empty), "f")
-    assert blank.returncode != 0
+    assert blank.returncode == 2
     assert "не проанализировано" in blank.stdout
     assert "вызовов нет" not in blank.stdout
     blank_json = _run("--root", str(empty), "f", "--json")
-    assert blank_json.returncode != 0
+    assert blank_json.returncode == 2
     assert json.loads(blank_json.stdout)["status"] == "not_analysed"
 
 
@@ -164,9 +166,63 @@ def test_a_module_expands_to_its_top_level_public_functions(tmp_path: Path) -> N
     # A missing or unparsable module is an error, in JSON too.
     for module in ("hub/missing.py", "hub/broken.py"):
         err = _run("--root", str(root), module)
-        assert err.returncode != 0, module
+        assert err.returncode == 2, module
         err_json = _run("--root", str(root), module, "--json")
-        assert err_json.returncode != 0, module
+        assert err_json.returncode == 2, module
         body = json.loads(err_json.stdout)
         assert body["status"] == "error"
         assert body["targets"][0]["error"]
+
+
+def test_the_indexer_comes_from_this_checkout_not_from_pythonpath(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "fake"
+    (fake / "hub" / "services").mkdir(parents=True)
+    (fake / "hub" / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "hub" / "services" / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "hub" / "services" / "call_sites.py").write_text(
+        "raise RuntimeError('foreign indexer imported')\n", encoding="utf-8"
+    )
+    root = _tree(tmp_path / "proj", FILES)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    done = subprocess.run(
+        [sys.executable, "-B", str(SCRIPT), "--root", str(root), "f"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=elsewhere,
+        env={**os.environ, "PYTHONPATH": str(fake)},
+    )
+    assert done.returncode == 0, done.stderr
+    assert "foreign indexer" not in done.stderr + done.stdout
+    assert "hub/direct.py:5" in done.stdout
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("call_sites_script", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_foreign_indexer_is_rc_2_and_json_when_asked(monkeypatch, capsys) -> None:
+    module = _load_script()
+    assert module._indexer_problem() is None
+    monkeypatch.setattr(module, "_indexer_file", lambda: "/other/hub/call_sites.py")
+    assert module.main(["f", "--json"]) == 2
+    body = json.loads(capsys.readouterr().out)
+    assert body["status"] == "error" and "не из этой ветки" in body["message"]
+    assert module.main(["f"]) == 2
+
+
+def test_argument_errors_are_json_under_json_and_rc_2(tmp_path: Path) -> None:
+    for argv in (["--json"], ["f", "--json", "--unknown"]):
+        done = _run(*argv)
+        assert done.returncode == 2, argv
+        body = json.loads(done.stdout)
+        assert body["status"] == "error" and body["message"]
+    plain = _run("--unknown")
+    assert plain.returncode == 2 and plain.stdout == "" and plain.stderr

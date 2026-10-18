@@ -31,9 +31,12 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# The indexer comes from THIS checkout, whatever PYTHONPATH or an editable
+# install of another checkout says: our root goes first, older entries go.
+sys.path[:] = [p for p in sys.path if p not in ("", str(REPO_ROOT))]
+sys.path.insert(0, str(REPO_ROOT))
 
+from hub.services import call_sites as _indexer  # noqa: E402
 from hub.services.call_sites import CallSite, build_call_index  # noqa: E402
 
 RC_OK = 0
@@ -226,8 +229,46 @@ def render(result: dict[str, object], markdown: bool) -> str:
     return "\n".join(lines)
 
 
+def _indexer_file() -> str:
+    return str(getattr(_indexer, "__file__", "") or "")
+
+
+def _indexer_problem() -> str | None:
+    """Say so when the indexer was loaded from outside this checkout."""
+    path = _indexer_file()
+    try:
+        inside = Path(path).resolve().is_relative_to(REPO_ROOT)
+    except (OSError, ValueError):
+        inside = False
+    if inside:
+        return None
+    return f"индексатор загружен не из этой ветки: {path or 'путь неизвестен'}"
+
+
+class _ArgError(Exception):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # type: ignore[override]
+        raise _ArgError(message)
+
+
+def _fail(message: str, as_json: bool) -> int:
+    if as_json:
+        print(json.dumps({"status": "error", "message": message}, ensure_ascii=False))
+    else:
+        print(f"ОШИБКА: {message}", file=sys.stderr)
+    return RC_FAIL
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    raw = list(sys.argv[1:] if argv is None else argv)
+    as_json = "--json" in raw
+    problem = _indexer_problem()
+    if problem:
+        return _fail(problem, as_json)
+    parser = _Parser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "targets", nargs="+", help="символ (trust_of, mod.f) или модуль .py"
     )
@@ -235,7 +276,10 @@ def main(argv: list[str] | None = None) -> int:
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--markdown", action="store_true", help="таблица markdown")
     fmt.add_argument("--json", action="store_true", help="машиночитаемый вывод")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(raw)
+    except _ArgError as exc:
+        return _fail(str(exc), as_json)
 
     result = run_query(Path(args.root), list(args.targets))
     if args.json:
