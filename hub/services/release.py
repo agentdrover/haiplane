@@ -37,6 +37,7 @@ from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.protocols import CIProbeOutcome, MergeabilityOutcome
 from hub.integrations.registry import plugins
+from hub.services import release_deploy_watch
 from hub.services.project_policy import (
     base_branch_of,
     forge_of,
@@ -525,6 +526,13 @@ async def _stamp_released_merges(
     Best effort by contract: a release that shipped must not read as failed
     because its bookkeeping did not.
     """
+    project_id = int(dict(project_row)["id"])
+    # #1828: факт релиза пишется ПЕРВЫМ, до чтения sha, и независимо от штампа
+    # задач: релиз без строк pipeline_merges тоже должен попасть под наблюдение.
+    try:
+        await release_deploy_watch.record_merge(db, project_id, pr_number)
+    except Exception:  # noqa: BLE001 - bookkeeping must not fail the release
+        log.exception("release #%s: release_merges not recorded", pr_number)
     try:
         release_sha = await plugins.git_ops.merge_commit_sha(
             pr_number,
@@ -537,9 +545,10 @@ async def _stamp_released_merges(
                 "release #%s: merge commit unknown, merges left unstamped", pr_number
             )
             return
+        await release_deploy_watch.set_sha(db, project_id, pr_number, release_sha)
         stamped = await repo.mark_merges_released(
             db,
-            project_id=int(dict(project_row)["id"]),
+            project_id=project_id,
             release_pr=pr_number,
             release_sha=release_sha,
         )

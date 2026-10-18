@@ -564,6 +564,10 @@ REVIEWER_UNAVAILABLE_HOURS = float(env_get("REVIEWER_UNAVAILABLE_HOURS", "2"))
 # before the delivery gate existed was merged by hand and is not news.
 DELIVERY_SCAN_MINUTES = int(env_get("DELIVERY_SCAN_MINUTES", "15"))
 DELIVERY_SCAN_LOOKBACK_DAYS = int(env_get("DELIVERY_SCAN_LOOKBACK_DAYS", "30"))
+# #1828: срок, после которого влитый релиз обязан быть в проде. test до 90 мин
+# плюс очередь deploy; позже этого срока свип release_deploy_watch проверяет
+# достижимость release_sha от последнего успешного выката.
+DEPLOY_SLA_MINUTES = int(env_get("DEPLOY_SLA_MINUTES", "120"))
 STALE_CLAIMED_MINUTES = int(env_get("STALE_CLAIMED_MINUTES", "240"))
 STALE_NEEDS_INFO_MINUTES = int(env_get("STALE_NEEDS_INFO_MINUTES", "480"))
 # Machine-owned dead-end statuses (#393): visible via stale alerts until the
