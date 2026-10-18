@@ -6,18 +6,24 @@ import re
 from typing import Any
 
 import aiosqlite
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 #: Миграция колонки. Её ``applied_at`` - граница: задача, созданная строго позже,
 #: «новая», и DoR требует у неё plain_summary; старым он только рекомендован.
 MIGRATION = "add_tasks_plain_summary"
 
 
-class PlainSummaryView(BaseModel):
+class PlainSummaryInput(BaseModel):
+    """Поле записи в TaskCreate и TaskRefine (#1811); вынесено из hub/models.py."""
+
+    plain_summary: str | None = Field(default=None, max_length=300)
+
+
+class PlainSummaryView(PlainSummaryInput):
     """Читаемая часть TaskView: что показывать и откуда оно взято (#1811).
 
     Вынесено из hub/models.py (бюджет размера, #1669); ``plain_summary`` -
-    как записано (NULL у старых задач) - объявлено в самом TaskView.
+    как записано (NULL у старых задач) - наследуется от PlainSummaryInput.
     """
 
     plain_summary_shown: str = ""

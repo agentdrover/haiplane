@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, time
 from enum import Enum
 from typing import Any, Literal
 
-import re
-
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
-from hub.plain_summary import PlainSummaryView
+from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
 _models_log = logging.getLogger("hub")
 
@@ -1045,7 +1044,7 @@ IN_FLIGHT_STATUSES = ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES - QUEUED_STATUSES
 # --- Request models ---
 
 
-class TaskCreate(BaseModel):
+class TaskCreate(PlainSummaryInput):
     title: str = Field(..., min_length=1, max_length=500)
     # Bind an EPIC to a project at creation (#346); virtual field, epic-only.
     project: str | None = Field(default=None, max_length=60)
@@ -1074,7 +1073,6 @@ class TaskCreate(BaseModel):
     due_date: str | None = Field(default=None, max_length=32)
     user_story: str = Field("", max_length=1000)
     problem_statement: str = Field("", max_length=2000)
-    plain_summary: str | None = Field(default=None, max_length=300)
     business_value: str = Field("", max_length=500)
     # --- Discovery block (#331): why this, and in what form ---
     outcome_metric: str = Field("", max_length=300)
@@ -2434,7 +2432,7 @@ class TaskRisk(BaseModel):
     mitigation: str = Field("", max_length=1000)
 
 
-class TaskRefine(BaseModel):
+class TaskRefine(PlainSummaryInput):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
 
@@ -2458,7 +2456,6 @@ class TaskRefine(BaseModel):
     due_date: str | None = Field(default=None, max_length=32)
     user_story: str | None = Field(default=None, max_length=1000)
     problem_statement: str | None = Field(default=None, max_length=2000)
-    plain_summary: str | None = Field(default=None, max_length=300)
     business_value: str | None = Field(default=None, max_length=500)
     # --- Discovery block (#331) ---
     outcome_metric: str | None = Field(default=None, max_length=300)
@@ -3258,7 +3255,6 @@ class TaskView(PlainSummaryView):
     due_date: str | None = None
     user_story: str = ""
     problem_statement: str = ""
-    plain_summary: str | None = None
     business_value: str = ""
     # --- Discovery block (#331) ---
     outcome_metric: str = ""

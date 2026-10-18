@@ -14,7 +14,8 @@ from typing import Any
 
 from hub import config
 from hub.cli_executor_host import add_executor_host_parsers
-from hub.cli_plain_summary import (
+from hub.cli_task_fields import (
+    _add_result_kind_args,
     add_plain_summary_option,
     put_plain_summary,
     put_plain_summary_after,
@@ -241,26 +242,6 @@ def _put_state_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
         body["result_kind"] = args.result_kind
     if getattr(args, "rollback", None):
         body["rollback"] = args.rollback
-
-
-def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--result-kind",
-        dest="result_kind",
-        choices=("commit", "state"),
-        default=None,
-        help=(
-            "commit (default) or state (#1647): the result is a state of the "
-            "world, submitted with evidence and accepted by a human; leaf "
-            "task/subtask only, changes only in draft"
-        ),
-    )
-    parser.add_argument(
-        "--rollback",
-        dest="rollback",
-        default=None,
-        help="How to undo a state result (required by DoR for state tasks)",
-    )
 
 
 def cmd_task(args: argparse.Namespace) -> int:

@@ -1,4 +1,5 @@
-"""Флаг ``--plain-summary`` для propose и refine (#1811).
+"""Флаги полей постановки для propose и refine: ``--plain-summary`` (#1811),
+``--result-kind``/``--rollback`` (#1647).
 
 Вынесено из ``hub/cli.py``: у того бюджет размера (#1669).
 """
@@ -31,3 +32,23 @@ def put_plain_summary_after(
     if getattr(args, "plain_summary", None) is not None:
         body = {"plain_summary": args.plain_summary}
         api("POST", f"/api/tasks/{filed['task']['id']}/refine", body)
+
+
+def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--result-kind",
+        dest="result_kind",
+        choices=("commit", "state"),
+        default=None,
+        help=(
+            "commit (default) or state (#1647): the result is a state of the "
+            "world, submitted with evidence and accepted by a human; leaf "
+            "task/subtask only, changes only in draft"
+        ),
+    )
+    parser.add_argument(
+        "--rollback",
+        dest="rollback",
+        default=None,
+        help="How to undo a state result (required by DoR for state tasks)",
+    )
