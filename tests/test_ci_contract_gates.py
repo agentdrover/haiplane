@@ -15,6 +15,7 @@ from hub.services import ci_contract, ci_trust, steward_evidence
 from tests import test_ci_trust as base
 from tests.ci_trust_support import (
     SAT_CONTRACT_B,
+    SAT_CONTRACT_C,
     SAT_SHA,
     install_fake_github,
     satellite_task,
@@ -53,7 +54,7 @@ async def test_a_contract_change_between_the_decision_and_the_apply_refuses_the_
     real_apply = lifecycle._apply_verdict
 
     async def the_contract_changes_first(state):
-        await set_contract(db, pid, SAT_CONTRACT_B)
+        await set_contract(db, pid, SAT_CONTRACT_C)
         return await real_apply(state)
 
     monkeypatch.setattr(lifecycle, "_apply_verdict", the_contract_changes_first)
@@ -94,7 +95,7 @@ async def test_a_contract_change_before_the_done_apply_refuses_the_completion(
 
     async def the_contract_changes_after_the_question(*args, **kwargs):
         prepared = await real_prepare(*args, **kwargs)
-        await set_contract(db, pid, SAT_CONTRACT_B)
+        await set_contract(db, pid, SAT_CONTRACT_C)
         return prepared
 
     monkeypatch.setattr(
@@ -179,3 +180,79 @@ async def test_every_reader_picks_the_projects_contract(db):
     assert [r["trust_reason"] for r in ci_trust._under_contract(rows, contract_b)] == [
         "contract_changed"
     ]
+
+
+async def test_the_brief_does_not_show_ac_results_of_a_contract_that_is_gone(
+    db, monkeypatch
+):
+    from hub.services.review_brief import build_review_brief
+
+    pid, sat = await satellite_task(db)
+    await base._post(db, sat, base._sat_attempt(sat))
+    shown = (await build_review_brief(db, sat)).ac_test_results
+    assert [(r.ac_id, r.status) for r in shown] == [("AC-1", "pass")]
+    await set_contract(db, pid, SAT_CONTRACT_C)
+
+    async def no_refresh(*args, **kwargs):
+        return None
+
+    # Even when the refresh that would withdraw the evidence did not happen.
+    monkeypatch.setattr(ci_trust, "refresh_quietly", no_refresh)
+    assert (await build_review_brief(db, sat)).ac_test_results == []
+
+
+async def test_the_done_gate_inside_the_transaction_reads_the_contract_of_that_moment(
+    db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub.db import write_transaction
+    from hub.services import lifecycle
+
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    pid, task_id = await satellite_task(db)
+    await base._post(db, task_id, base._sat_attempt(task_id))
+    await repo.update_task(
+        db, task_id, status="running", auto_review=0, validation_commands='["x"]'
+    )
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+    async with write_transaction(db):
+        await lifecycle._done_validation_gate(db, task)  # confirmed: passes
+    await set_contract(db, pid, SAT_CONTRACT_C)
+    async with write_transaction(db):
+        with pytest.raises(HTTPException) as refused:
+            await lifecycle._done_validation_gate(db, task)
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+
+
+async def test_unreadable_or_default_contracts_read_as_the_hubs(db):
+    from tests.ci_trust_support import SAT_CONTRACT
+
+    hub = ci_contract.HUB_CONTRACT
+    assert ci_contract.contract_from_raw(None) == hub
+    for junk in ("tests.yml", {"workflow_path": "x"}, {**SAT_CONTRACT, "extra": 1}, []):
+        assert ci_contract.contract_from_raw(junk, "sat") == hub, junk
+    assert ci_contract.contract_from_raw(SAT_CONTRACT, "sat") != hub
+    # The hub's own project ignores a key that somebody put into its row.
+    assert ci_contract.contract_from_raw(SAT_CONTRACT, "default") == hub
+    pid = await repo.create_project(db, slug="default", name="Default")
+    await set_contract(db, pid, SAT_CONTRACT)
+    task_id = await repo.create_task(
+        db,
+        title="hub task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    assert await ci_contract.contract_for_task(db, task_id) == hub
+    assert ci_contract.HUB_FINGERPRINT == repo.HUB_CONTRACT_FP

@@ -1944,6 +1944,9 @@ async def test_a_satellite_submit_meets_the_ci_gate(client, db):
     resp, _ = await _submit(client, off_id)
     assert resp.status_code == 200, resp.text
     assert resp.json()["submission_generation"] == 1
+    assert not any(
+        "CI до сдачи" in (u["content"] or "") for u in await _feed(db, off_id)
+    ), "off is silent: not even a warn note"
     task = dict(await repo.get_task(db, off_id))
     assert await review_ci_gate.ci_forbids_review(db, task) == [], (
         "unconfirmed holds nothing"

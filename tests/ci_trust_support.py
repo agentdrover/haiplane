@@ -32,6 +32,12 @@ SAT_CHECKS = {"tests": "pass"}
 SAT_CONTRACT = {"workflow_path": SAT_PATH, "required_checks": ["tests"]}
 # The same workflow with one more required check: another contract, another fingerprint.
 SAT_CONTRACT_B = {"workflow_path": SAT_PATH, "required_checks": ["lint", "tests"]}
+# Another file, the same one check: the old report is still GREEN by its checks, so
+# only the fingerprint can tell that it was confirmed under a contract that is gone.
+SAT_CONTRACT_C = {
+    "workflow_path": ".github/workflows/tests2.yml",
+    "required_checks": ["tests"],
+}
 
 
 #: The columns a stored report row has once GitHub confirmed it, for tests that
