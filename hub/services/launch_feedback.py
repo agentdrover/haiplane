@@ -48,7 +48,7 @@ REASON_CODE_TEXT: Final[dict[str, str]] = {
     "critic_failed": "критик отклонил результат",
     "timeout": "вышло время",
     "hub_unavailable": "хост не достучался до хаба",
-    "stale_token": "остаток токена прошлого заказа не удалось отозвать",
+    "stale_token": "остаток токена прошлого заказа не удалось отозвать",  # nosec B105 - текст причины, не секрет
     "other": "причина не названа",
 }
 REASON_CODES: Final[tuple[str, ...]] = tuple(REASON_CODE_TEXT)

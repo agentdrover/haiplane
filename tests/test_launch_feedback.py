@@ -22,6 +22,8 @@ from tests.test_executor_orders import (
     _task,
 )
 
+LEAK = "abcdef123456789"  # pragma: allowlist secret
+
 world = _eo.world
 keys = _eo.keys
 _clean_limiter = _eo._clean_limiter
@@ -228,7 +230,7 @@ async def test_plaque_fragment_refresh_and_no_secrets(world):
     # Секрет по виду — тоже; безопасный reason доходит до плашки.
     secret = await world.client.post(
         f"/api/executor-hosts/k8/orders/{oid}/report",
-        json={"outcome": "failed", "reason": "token=abcdef123456789"},
+        json={"outcome": "failed", "reason": f"token={LEAK}"},
         headers=world.k8_auth,
     )
     assert secret.status_code == 422
@@ -246,6 +248,10 @@ async def test_plaque_fragment_refresh_and_no_secrets(world):
     assert (
         "<html" not in final.text and "hx-trigger" not in final.text
     )  # итог — не опрашивает
-    for needle in (code, code.removeprefix("AH-"), "abcdef123456789"):
+    for needle in (
+        code,
+        code.removeprefix("AH-"),
+        LEAK,
+    ):
         assert needle not in final.text and needle not in second.text
     assert "ВМ не стартовала" in final.text

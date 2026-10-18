@@ -1223,6 +1223,48 @@ async def _branch_refusal(
     return f"branch: только ветка задачи ({own or 'не названа'}) или {prefix}<цифры>"
 
 
+def _check_reason_fields(outcome: str, reason_code: str, reason: str) -> str:
+    """Код и текст причины report (#1817): форма и секреты; код старого клиента — other."""
+    if reason_code and reason_code not in launch_feedback.REASON_CODES:
+        raise HostError(
+            422, f"reason_code: один из {', '.join(launch_feedback.REASON_CODES)}"
+        )
+    if len(reason) > launch_feedback.REASON_MAX:
+        raise HostError(
+            422, f"reason: не длиннее {launch_feedback.REASON_MAX} символов"
+        )
+    if reason and note_refusal(reason):
+        raise HostError(422, note_refusal(reason).replace("note", "reason", 1))
+    if outcome != "submitted" and not reason_code:
+        return "other"
+    return reason_code
+
+
+def _report_text(
+    order: dict[str, Any],
+    host: str,
+    outcome: str,
+    sha: str,
+    branch: str,
+    note: str,
+    reason_code: str,
+    reason: str,
+) -> str:
+    """Текст итоговой записи ленты по report хоста."""
+    parts = [f"Итог прогона на хосте {host} (сдача {order['generation']}): {outcome}"]
+    if sha:
+        parts.append(f"sha {sha}")
+    if branch:
+        parts.append(f"ветка {branch}")
+    if note:
+        parts.append(f"заметка: {note}")
+    if outcome in ("failed", "rescued") and reason_code:
+        parts.append(f"причина: {launch_feedback.reason_code_text(reason_code)}")
+    if reason:
+        parts.append(f"сообщение хоста: {reason}")
+    return "; ".join(parts) + "."
+
+
 async def report_outcome(
     db: aiosqlite.Connection,
     host: str,
@@ -1244,18 +1286,7 @@ async def report_outcome(
     успевает сказать, чем кончился прогон.
     """
     _check_report_fields(outcome, sha, branch, note)
-    if reason_code and reason_code not in launch_feedback.REASON_CODES:
-        raise HostError(
-            422, f"reason_code: один из {', '.join(launch_feedback.REASON_CODES)}"
-        )
-    if len(reason) > launch_feedback.REASON_MAX:
-        raise HostError(
-            422, f"reason: не длиннее {launch_feedback.REASON_MAX} символов"
-        )
-    if reason and note_refusal(reason):
-        raise HostError(422, note_refusal(reason).replace("note", "reason", 1))
-    if outcome != "submitted" and not reason_code:
-        reason_code = "other"  # старый клиент без поля
+    reason_code = _check_reason_fields(outcome, reason_code, reason)
     async with write_transaction(db):
         order = await _own_order(db, host, order_id)
         if order is None:
@@ -1292,20 +1323,9 @@ async def report_outcome(
             "WHERE id = ? AND report_outcome = ''",
             (outcome, sha, branch, note, reason_code, reason, order["id"]),
         )
-        parts = [
-            f"Итог прогона на хосте {host} (сдача {order['generation']}): {outcome}"
-        ]
-        if sha:
-            parts.append(f"sha {sha}")
-        if branch:
-            parts.append(f"ветка {branch}")
-        if note:
-            parts.append(f"заметка: {note}")
-        if outcome in ("failed", "rescued") and reason_code:
-            parts.append(f"причина: {launch_feedback.reason_code_text(reason_code)}")
-        if reason:
-            parts.append(f"сообщение хоста: {reason}")
-        text = "; ".join(parts) + "."
+        text = _report_text(
+            order, host, outcome, sha, branch, note, reason_code, reason
+        )
         if outcome == "submitted" or order["state"] == STATE_CLOSED:
             # Сдача заказ не закрывает; закрытый уже сказал свой итог — поздний
             # report уточняет причину в плашке, а запись пишется только если
