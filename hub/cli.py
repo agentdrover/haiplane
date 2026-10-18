@@ -500,12 +500,7 @@ def _warn_area_check(result: Any) -> None:
             file=sys.stderr,
         )
     if isinstance(skill, dict) and skill.get("delivered_to_session"):
-        # #1829: текст навыка этой версии уже выдан сессии.
-        print(
-            f"навык {skill.get('name')} v{skill.get('version')} уже выдан этой "
-            "сессии, повторно не выдаётся; принудительно — --full-rules",
-            file=sys.stderr,
-        )
+        print("навык уже выдан этой сессии; --full-rules", file=sys.stderr)
     foreign = result.get("project_check") if isinstance(result, dict) else None
     if isinstance(foreign, dict) and foreign.get("task_project"):
         # #1674: the task belongs to a project the session did not declare.
@@ -529,8 +524,7 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["session_id"] = args.session_id
     if getattr(args, "git_mode", None):
         body["git_mode"] = args.git_mode
-    if getattr(args, "full_rules", False):
-        body["full_rules"] = True
+    body["full_rules"] = bool(getattr(args, "full_rules", False))
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
     _warn_area_check(result)
@@ -2573,12 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="hub (default) prepares the branch on the hub host; remote skips host git",
     )
-    p_pair_start.add_argument(
-        "--full-rules",
-        dest="full_rules",
-        action="store_true",
-        help="Send the full skill text even if this session already got it (#1829)",
-    )
+    p_pair_start.add_argument("--full-rules", action="store_true", help="Resend skill")
     p_pair_start.set_defaults(func=cmd_pair_start)
 
     _add_outcome_debt_parser(sub)

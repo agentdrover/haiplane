@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 
-import pytest
 
 from hub import repository as repo
 from hub.models import WorkingRulesSkill
@@ -199,7 +198,7 @@ async def test_pair_start_forwards_full_rules_from_cli_and_mcp(monkeypatch):
         return {}
 
     monkeypatch.setattr(cli, "_api", _fake_api)
-    for flag, expected in (([], None), (["--full-rules"], True)):
+    for flag, expected in (([], False), (["--full-rules"], True)):
         args = cli.build_parser().parse_args(["pair-start", "1", *flag])
         assert args.func(args) == 0
         assert sent[-1].get("full_rules") == expected

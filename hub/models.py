@@ -1244,8 +1244,7 @@ class TaskPairStart(BaseModel):
     # routes by session. Required for agent callers; humans pair-start as before.
     session_id: str = Field("", max_length=200)
     git_mode: PairGitMode = PairGitMode.hub
-    # #1829: принудительно отдать полный текст навыка, даже если этой
-    # зарегистрированной сессии он уже выдан.
+    # #1829: полный текст навыка, даже если сессии он уже выдан.
     full_rules: bool = False
 
 
@@ -3020,9 +3019,7 @@ class WorkingRulesSkill(BaseModel):
     delivered_in_order: bool = False
     ordered_version: int | None = None
     version_changed: bool = False
-    # #1829: текст этой версии и этого хеша уже выдан зарегистрированной
-    # локальной сессии — content пуст, version и chars названы. Только по записи
-    # о выдаче; недоказанная выдача всегда идёт полным текстом.
+    # #1829: версия и хеш уже выданы локальной сессии (по записи) — content пуст.
     delivered_to_session: bool = False
 
 
