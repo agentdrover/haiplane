@@ -540,7 +540,14 @@
            разметил — так #987 и уехал в прод. Гейт остаётся
            человеческим; он просто перестаёт молчать. #}
         {% if mr_undisposed %}
-        <span class="badge badge-failed">{{ mr_undisposed }} из {{ mr_confirmed }} находок без диспозиции</span>
+        <span class="badge badge-failed">{{ mr_undisposed }} из {{ mr_confirmed }} находок без диспозиции</span>{# #1830: без разметки ревьюера != «никто не сказал». Ответ автора — отдельная
+           сущность, не диспозиция; пустой список не добавляет ни символа. #}{% if machine_review.undisposed_author_lines %}
+        <ul class="task-review-findings">
+            <li>без разметки ревьюера: {{ mr_undisposed }}</li>
+            {% for line in machine_review.undisposed_author_lines %}
+            <li>{{ line }}</li>
+            {% endfor %}
+        </ul>{% endif %}
         {% endif %}
         {# #549: «0 подтверждённых» значит что-то только рядом с полнотой
            прогона. Агенты и unresolved показаны здесь же, чтобы

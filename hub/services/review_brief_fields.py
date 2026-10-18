@@ -96,6 +96,15 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "machine_review.dispositions": (MANDATORY, ""),
     "machine_review.observation_closures": (MANDATORY, ""),
     "machine_review.deferred_repeats": (MANDATORY, ""),
+    "machine_review.author_answers": (
+        FULL_ONLY,
+        "the author's account (finding_outcomes), not a disposition and not a "
+        "gate input; the verdict note carries it",
+    ),
+    "machine_review.undisposed_author_lines": (
+        FULL_ONLY,
+        "free text built from author_answers",
+    ),
     "machine_review.outcome": (MANDATORY, ""),
     "machine_review.outcome_label": (MANDATORY, ""),
     "machine_review.outcome_names_clean": (MANDATORY, ""),
