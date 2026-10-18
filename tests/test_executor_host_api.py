@@ -246,6 +246,16 @@ async def test_same_generation_foreign_submit_is_not_the_orders_result(world):
         f"/api/executor-hosts/k9/orders/{lived['order']['id']}", headers=world.k9_auth
     )
     assert got.json()["submitted"] is False and got.json()["submission_sha"] == ""
+    # Проход поллера не закрывает такой заказ причиной «submitted» (иначе она
+    # стала бы постоянным доказательством чужой сдачи).
+    from hub.services import executor_orders as orders
+
+    await orders.sweep_executor_orders(world.db)
+    again = await world.client.get(
+        f"/api/executor-hosts/k9/orders/{lived['order']['id']}", headers=world.k9_auth
+    )
+    assert again.json()["close_reason"] != "submitted"
+    assert again.json()["submitted"] is False and again.json()["superseded"] is True
 
     # Своя сдача (держатель — прогон заказа) засчитывается.
     mine = await _task(world, "своя")
