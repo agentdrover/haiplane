@@ -20,6 +20,7 @@ present | missing | unreadable и не падает. Git вызывается н
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any
@@ -254,6 +255,73 @@ def apply_order_reference(skill: WorkingRulesSkill, ordered: int | None) -> int:
     return omitted
 
 
+async def apply_session_delivery(
+    db: aiosqlite.Connection,
+    skill: WorkingRulesSkill,
+    session_id: str,
+    *,
+    principal_id: int | None = None,
+    force_full: bool = False,
+) -> tuple[str, str, int, str] | None:
+    """Локальной зарегистрированной сессии текст навыка отдаётся один раз (#1829).
+
+    Ключ выдачи — (сессия, навык, версия, sha256 текста). Запись есть и
+    ``force_full`` нет — текст убирается (``delivered_to_session``), возврат
+    None. Иначе текст остаётся, а возвращается ключ: записать выдачу должен
+    вызывающий ``record_skill_delivery`` ПОСЛЕДНИМ шагом, когда ответ уже
+    собран (исключение раньше — записи нет, агент текста не получил).
+    Нет сессии, чужая сессия (владелец известен, а principal вызывающего
+    другой или не назван), ошибка чтения — полный текст, без чтения и записи.
+    """
+    sid = (session_id or "").strip()
+    if not sid or skill.state != "active" or skill.version is None:
+        return None
+    try:
+        session = await repo.get_agent_session(db, sid)
+        if session is None:
+            return None
+        owner = session["principal_id"]
+        if owner is not None and principal_id != owner:
+            return None
+        digest = hashlib.sha256(skill.content.encode()).hexdigest()
+        key = (sid, skill.name, skill.version, digest)
+        if not force_full:
+            seen = await repo.fetchall(
+                db,
+                "SELECT 1 FROM skill_deliveries WHERE session_id=? AND skill=? "
+                "AND version=? AND content_sha256=?",
+                key,
+            )
+            if seen:
+                skill.content = ""
+                skill.delivered_to_session = True
+                return None
+        return key
+    except Exception as exc:  # noqa: BLE001
+        log.warning("skill delivery of session %s not read: %s", sid, exc)
+        return None
+
+
+async def record_skill_delivery(
+    db: aiosqlite.Connection, key: tuple[str, str, int, str] | None
+) -> None:
+    """Записать выдачу текста (#1829); последний шаг pair_start, сбой не бросает.
+
+    Нет записи — следующий pair_start просто отдаст текст снова.
+    """
+    if key is None:
+        return
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO skill_deliveries "
+            "(session_id, skill, version, content_sha256) VALUES (?, ?, ?, ?)",
+            key,
+        )
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("skill delivery of session %s not recorded: %s", key[0], exc)
+
+
 def _cut(text: str, cap: int | None) -> tuple[str, bool]:
     if cap is None or len(text) <= cap:
         return text, False
@@ -342,6 +410,13 @@ def render_working_rules(
         lines.append(
             f"текст навыка v{skill.version} уже в заказе этого прогона "
             f"({skill.chars} знаков), повторно не выдаётся"
+        )
+    elif skill.state == "active" and skill.delivered_to_session:
+        lines.append(f"### Навык хаба {skill.name} v{skill.version} (доверенный слой)")
+        lines.append(
+            f"навык {skill.name} v{skill.version} уже выдан этой сессии "
+            f"({skill.chars} знаков); полный текст — hub_get_skill"
+            f'("{skill.name}"); принудительно — pair_start(full_rules=true)'
         )
     elif skill.state == "active":
         text, cut = _cut(skill.content, skill_cap)

@@ -421,6 +421,12 @@ null
 ],
 [
 "index",
+"sqlite_autoindex_skill_deliveries_1",
+"skill_deliveries",
+null
+],
+[
+"index",
 "sqlite_autoindex_skills_1",
 "skills",
 null
@@ -760,6 +766,12 @@ null
 "scheduled_policy_changes",
 "scheduled_policy_changes",
 "CREATE TABLE scheduled_policy_changes (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id  INTEGER NOT NULL REFERENCES projects(id),\n            at          TEXT    NOT NULL,\n            patch       TEXT    NOT NULL,\n            note        TEXT    NOT NULL DEFAULT '',\n            created_by  TEXT    NOT NULL DEFAULT '',\n            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),\n            state       TEXT    NOT NULL DEFAULT 'pending'\n                CHECK (state IN ('pending', 'applied', 'refused', 'cancelled')),\n            executed_at TEXT,\n            result      TEXT    NOT NULL DEFAULT '{}'\n        )"
+],
+[
+"table",
+"skill_deliveries",
+"skill_deliveries",
+"CREATE TABLE skill_deliveries (\n            session_id     TEXT NOT NULL,\n            skill          TEXT NOT NULL,\n            version        INTEGER NOT NULL,\n            content_sha256 TEXT NOT NULL,\n            delivered_at   TEXT NOT NULL DEFAULT (datetime('now')),\n            PRIMARY KEY (session_id, skill, version, content_sha256)\n        )"
 ],
 [
 "table",

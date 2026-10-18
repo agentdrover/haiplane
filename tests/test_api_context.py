@@ -510,6 +510,8 @@ async def test_context_and_views_match_the_pre_refactor_baseline(client, db):
 
     from tests.read_view_baseline_support import snapshot_all
 
+    # #1829: в слое hub_skill появилось поле delivered_to_session (False) —
+    # эталон обновлён осознанно, только этим полем.
     golden = Path(__file__).parent / "golden" / "read_views_1691.json"
     got = await snapshot_all(client, db)
     rendered = json.dumps(got, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
