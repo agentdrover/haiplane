@@ -1396,16 +1396,15 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     await repo.update_task(world.db, task_id, branch=f"task-{task_id}/work")
     await world.db.commit()
 
-    # #1817: report хоста ленту не пишет никогда (итог заказа пишет его закрытие);
-    # исход, sha, ветка и заметка сохранены в заказе — их читают плашка и GET заказа.
-    feed = [
+    # #1817: report хоста ленту не пишет (итог заказа пишет его закрытие); исход,
+    # sha, ветка и заметка сохранены в заказе — их читают плашка и GET заказа.
+    assert [
         u
         for u in await _rows(
             world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
         )
         if "Итог прогона" in u["content"]
-    ]
-    assert feed == []
+    ] == []
     stored = await _order_row(world, order["id"])
     assert (stored["report_outcome"], stored["report_sha"]) == ("submitted", sha)
     assert stored["report_branch"] == f"task-{task_id}/work"
@@ -1427,6 +1426,15 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     third = await _task(world, "не выданная")
     await _submit(world, task_id)  # освободить слот k8
     assert (await _launch(world, third)).status_code == 200
+    # Сдача принята: закрытие заказа пишет ровно одну итоговую запись, sha в ней виден.
+    closing = [
+        u["content"]
+        for u in await _rows(
+            world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
+        )
+        if f"Заказ #{order['id']} " in u["content"]
+    ]
+    assert len(closing) == 1 and sha in closing[0] and "сдана" in closing[0].lower()
     fresh = (
         await _rows(
             world.db, "SELECT id FROM executor_orders WHERE task_id=?", (third,)
@@ -1459,6 +1467,7 @@ async def test_host_reports_run_outcome_to_the_feed(world):
     )
     assert first_after_close.status_code == 200
     assert first_after_close.json()["duplicate"] is False
+    await _failed_entry_part(world)
     await _notes_part(world, k9_order, other)
 
 
@@ -1952,3 +1961,38 @@ async def test_order_phase_contract(world, monkeypatch):
     )
     assert done.status_code == 200, done.text
     assert (await _phase(world, order["id"], "submitting")).status_code == 409
+
+
+async def _failed_entry_part(world):
+    """#1817: failed/rescued — единственная запись закрытия несёт sha и ветку из report."""
+    for outcome in ("failed", "rescued"):
+        await world.db.execute(
+            "UPDATE executor_orders SET state = 'closed' WHERE host = 'k8' "
+            "AND state <> 'closed'"
+        )
+        await world.db.commit()
+        task_id = await _task(world, f"{outcome} с sha")
+        assert (await _launch(world, task_id, "k8")).status_code == 200
+        order = (await _orders(world, "k8")).json()["orders"][0]
+        branch = (
+            f"task-{task_id}/work"
+            if outcome == "failed"
+            else f"task-{task_id}/rescue-3"
+        )
+        sha = "fedcba9876543210fedc"
+        done = await world.client.post(
+            f"/api/executor-hosts/k8/orders/{order['id']}/report",
+            json={"outcome": outcome, "sha": sha, "branch": branch, "note": "итог"},
+            headers=world.k8_auth,
+        )
+        assert done.status_code == 200, done.text
+        entries = [
+            u["content"]
+            for u in await _rows(
+                world.db, "SELECT * FROM task_updates WHERE task_id=?", (task_id,)
+            )
+            if f"Заказ #{order['id']} " in u["content"]
+            or "Итог прогона" in u["content"]
+        ]
+        assert len(entries) == 1, entries
+        assert sha in entries[0] and branch in entries[0] and outcome in entries[0]

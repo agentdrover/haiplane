@@ -461,9 +461,14 @@ async def close_order(
     # иначе причина закрытия (сообщение хоста — её уточнение). Report хоста, возврат
     # задачи и снятие захвата прогона этого заказа своей записи не пишут.
     if landed:
+        task_row = await repo.get_task(db, int(order["task_id"]))
+        sha = (dict(task_row).get("submission_sha") if task_row else "") or order.get(
+            "report_sha"
+        )
         text = (
             f"Заказ #{order['id']} хосту {order['host']} (сдача {order['generation']}) "
-            f"закрыт: {launch_feedback.CLOSE_REASON_TEXT[CLOSE_SUBMITTED]}."
+            f"закрыт: {launch_feedback.CLOSE_REASON_TEXT[CLOSE_SUBMITTED]}"
+            + (f"; sha {sha}." if sha else ".")
         )
     else:
         text = final_text or launch_feedback.close_text(order, reason)
@@ -1290,8 +1295,11 @@ async def report_outcome(
     reason_code: str = "",
     reason: str = "",
 ) -> dict[str, Any]:
-    """Итог прогона от хоста: одна запись в ленте задачи, статус не меняется.
+    """Итог прогона от хоста: сохраняется в заказе, статус задачи не меняется.
 
+    В ленту report НЕ пишет (#1817): итоговую запись пишет закрытие заказа. Для
+    failed/rescued report сам закрывает заказ, и его текст (исход, sha, ветка,
+    заметка, причина) становится этой записью; submitted заказ не закрывает.
     Идемпотентно: тот же итог повторно — тот же ответ без второй записи;
     другой итог по тому же заказу — 409 (первое слово хоста не переписывается).
     Работает и на закрытом заказе: сдача закрывает его раньше, чем хост
