@@ -2168,8 +2168,9 @@ async def pair_start_task(
     # выдаётся. Слой собирается здесь, чтобы факт выдачи лёг в то же событие.
     working_rules_block = None
     skill_fact: dict[str, Any] = {}
+    pending_delivery = None
     if not state_task:
-        working_rules_block, skill_fact = await _build_pair_rules(
+        working_rules_block, skill_fact, pending_delivery = await _build_pair_rules(
             db,
             task_id,
             agent_rules,
@@ -2210,6 +2211,8 @@ async def pair_start_task(
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.worktree_hint = _worktree_hint(task_id)
     tv.working_rules = working_rules_block
+    # #1829: выдача навыка записывается ПОСЛЕДНЕЙ, когда ответ собран.
+    await working_rules.record_skill_delivery(db, pending_delivery)
     return tv
 
 
@@ -2222,7 +2225,7 @@ async def _build_pair_rules(
     declared_session: str = "",
     principal_id: int | None = None,
     full_rules: bool = False,
-) -> tuple[Any, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any], Any]:
     """Блок «Правила работы» pair-start и факт выдачи навыка (#1683).
 
     Привязка к заказу — только по токену вызывающей сессии implementer; нет
@@ -2239,22 +2242,26 @@ async def _build_pair_rules(
     )
     if order is None:
         # #1829: локальная зарегистрированная сессия — текст один раз.
-        await working_rules.apply_session_delivery(
+        pending = await working_rules.apply_session_delivery(
             db,
             block.hub_skill,
             declared_session,
             principal_id=principal_id,
             force_full=full_rules,
         )
-        return block, {}
+        return block, {}, pending
     skill = block.hub_skill
-    return block, {
-        "executor_run_id": order["executor_run_id"],
-        "skill_version": skill.version,
-        "ordered_skill_version": order["skill_version"],
-        "delivered_in_order": skill.delivered_in_order,
-        "omitted_chars": skill.chars if skill.delivered_in_order else 0,
-    }
+    return (
+        block,
+        {
+            "executor_run_id": order["executor_run_id"],
+            "skill_version": skill.version,
+            "ordered_skill_version": order["skill_version"],
+            "delivered_in_order": skill.delivered_in_order,
+            "omitted_chars": skill.chars if skill.delivered_in_order else 0,
+        },
+        None,
+    )
 
 
 async def _resolve_branch_diff(

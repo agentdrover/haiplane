@@ -262,25 +262,27 @@ async def apply_session_delivery(
     *,
     principal_id: int | None = None,
     force_full: bool = False,
-) -> bool:
+) -> tuple[str, str, int, str] | None:
     """Локальной зарегистрированной сессии текст навыка отдаётся один раз (#1829).
 
     Ключ выдачи — (сессия, навык, версия, sha256 текста). Запись есть и
-    ``force_full`` нет — текст убирается (``delivered_to_session``). Иначе текст
-    остаётся и выдача записывается. Нет сессии в ``agent_sessions``, чужая
-    сессия, ошибка чтения или записи — полный текст, как будто выдачи не было.
-    Возвращает True, если текст убран.
+    ``force_full`` нет — текст убирается (``delivered_to_session``), возврат
+    None. Иначе текст остаётся, а возвращается ключ: записать выдачу должен
+    вызывающий ``record_skill_delivery`` ПОСЛЕДНИМ шагом, когда ответ уже
+    собран (исключение раньше — записи нет, агент текста не получил).
+    Нет сессии, чужая сессия (владелец известен, а principal вызывающего
+    другой или не назван), ошибка чтения — полный текст, без чтения и записи.
     """
     sid = (session_id or "").strip()
     if not sid or skill.state != "active" or skill.version is None:
-        return False
+        return None
     try:
         session = await repo.get_agent_session(db, sid)
         if session is None:
-            return False
+            return None
         owner = session["principal_id"]
-        if owner is not None and principal_id is not None and owner != principal_id:
-            return False
+        if owner is not None and principal_id != owner:
+            return None
         digest = hashlib.sha256(skill.content.encode()).hexdigest()
         key = (sid, skill.name, skill.version, digest)
         if not force_full:
@@ -293,7 +295,23 @@ async def apply_session_delivery(
             if seen:
                 skill.content = ""
                 skill.delivered_to_session = True
-                return True
+                return None
+        return key
+    except Exception as exc:  # noqa: BLE001
+        log.warning("skill delivery of session %s not read: %s", sid, exc)
+        return None
+
+
+async def record_skill_delivery(
+    db: aiosqlite.Connection, key: tuple[str, str, int, str] | None
+) -> None:
+    """Записать выдачу текста (#1829); последний шаг pair_start, сбой не бросает.
+
+    Нет записи — следующий pair_start просто отдаст текст снова.
+    """
+    if key is None:
+        return
+    try:
         await db.execute(
             "INSERT OR IGNORE INTO skill_deliveries "
             "(session_id, skill, version, content_sha256) VALUES (?, ?, ?, ?)",
@@ -301,8 +319,7 @@ async def apply_session_delivery(
         )
         await db.commit()
     except Exception as exc:  # noqa: BLE001
-        log.warning("skill delivery of session %s not recorded: %s", sid, exc)
-    return False
+        log.warning("skill delivery of session %s not recorded: %s", key[0], exc)
 
 
 def _cut(text: str, cap: int | None) -> tuple[str, bool]:

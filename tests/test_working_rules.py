@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 
 from hub import repository as repo
 from hub.models import WorkingRulesSkill
@@ -170,18 +172,76 @@ async def test_the_session_of_another_principal_is_not_trusted(client, db):
         db, session_id="s-foreign", principal_id=999, agent="a"
     )
     await db.commit()
-    skill = WorkingRulesSkill(
-        name=wr.DISCIPLINE_SKILL,
-        state="active",
-        version=1,
-        content=TEXT,
-        chars=len(TEXT),
-    )
-    for _ in range(2):
-        removed = await wr.apply_session_delivery(
-            db, skill, "s-foreign", principal_id=5
+
+    def _skill() -> WorkingRulesSkill:
+        return WorkingRulesSkill(
+            name=wr.DISCIPLINE_SKILL,
+            state="active",
+            version=1,
+            content=TEXT,
+            chars=len(TEXT),
         )
-        assert removed is False and skill.content == TEXT
+
+    # Другой principal и безымянный вызывающий: ни чтения, ни записи.
+    for caller in (5, None):
+        for _ in range(2):
+            skill = _skill()
+            assert (
+                await wr.apply_session_delivery(
+                    db, skill, "s-foreign", principal_id=caller
+                )
+                is None
+            )
+            assert skill.content == TEXT and not skill.delivered_to_session
+            await wr.record_skill_delivery(db, None)
+    assert await _deliveries(db) == []
+
+    # Владелец: первая выдача — текст и ключ к записи; после записи — без текста.
+    skill = _skill()
+    key = await wr.apply_session_delivery(db, skill, "s-foreign", principal_id=999)
+    assert key is not None and skill.content == TEXT
+    await wr.record_skill_delivery(db, key)
+    again = _skill()
+    assert (
+        await wr.apply_session_delivery(db, again, "s-foreign", principal_id=999)
+        is None
+    )
+    assert again.delivered_to_session and again.content == ""
+
+
+async def test_the_delivery_is_recorded_last_and_not_after_a_failure(
+    client, db, monkeypatch
+):
+    from hub.services import lifecycle
+
+    await _publish(db, TEXT)
+    await _register(db, "s-late")
+    t1 = await task_in_project(client, db, slug="wr1829-l1")
+    t2 = await task_in_project(client, db, slug="wr1829-l2")
+
+    real = lifecycle.log_activity
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("after the decision")
+
+    monkeypatch.setattr(lifecycle, "log_activity", _boom)
+    with pytest.raises(RuntimeError):
+        await client.post(
+            f"/api/tasks/{t1}/pair-start",
+            json={
+                "plan": "Plan: x",
+                "assigned_agent": "a",
+                "session_id": "s-late",
+                "git_mode": "remote",
+            },
+        )
+    assert await _deliveries(db) == []
+
+    # Ответ не дошёл, записи нет: следующий старт той же сессии — полный текст.
+    monkeypatch.setattr(lifecycle, "log_activity", real)
+    skill = await _pair(client, t2, "s-late")
+    assert skill["content"] == TEXT and skill["delivered_to_session"] is False
+    assert len(await _deliveries(db)) == 1
 
 
 async def test_pair_start_forwards_full_rules_from_cli_and_mcp(monkeypatch):
