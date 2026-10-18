@@ -1021,4 +1021,47 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "add_tasks_cause_kind",
         "ALTER TABLE tasks ADD COLUMN cause_kind TEXT",
     ),
+    (
+        # #1825: первое использование токена сессии. Ставится при допуске
+        # первого запроса с токеном (hub.services.chat_pair.resolve_session) и
+        # необратимо. NULL — токен ни разу не предъявлен.
+        "add_chat_pair_sessions_first_used_at",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN first_used_at TEXT",
+    ),
+    (
+        # #1825: у сессий, выданных до этой миграции, «не использован» нечем
+        # доказать — они считаются использованными. Иначе redeem_lost отозвал бы
+        # живую работу, а повтор выкупа заменил бы токен работающего исполнителя.
+        "backfill_chat_pair_sessions_first_used_at",
+        "UPDATE chat_pair_sessions SET first_used_at = COALESCE(created_at, "
+        "datetime('now')) WHERE first_used_at IS NULL",
+    ),
+    (
+        # #1825: версия токена сессии растёт при каждой ротации повторного
+        # выкупа; хост игнорирует ответ с меньшей версией.
+        "add_chat_pair_sessions_token_version",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN token_version "
+        "INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        # #1825: первый выкуп кода заказа хоста и окно безопасного повтора.
+        # retry_until отсчитан от first_redeemed_at и не продлевается.
+        "add_executor_orders_first_redeemed_at",
+        "ALTER TABLE executor_orders ADD COLUMN first_redeemed_at TEXT",
+    ),
+    (
+        "add_executor_orders_retry_until",
+        "ALTER TABLE executor_orders ADD COLUMN retry_until TEXT",
+    ),
+    (
+        # #1825: сессия, выданная выкупом этого заказа (строка chat_pair_sessions).
+        "add_executor_orders_session_id",
+        "ALTER TABLE executor_orders ADD COLUMN session_id INTEGER",
+    ),
+    (
+        # #1825: число успешных ротаций токена повторным выкупом (лимит на заказ).
+        "add_executor_orders_redeem_rotations",
+        "ALTER TABLE executor_orders ADD COLUMN redeem_rotations "
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ]

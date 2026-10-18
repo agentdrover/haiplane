@@ -1310,5 +1310,33 @@
 [
 "add_tasks_cause_kind",
 "b0204bdd 3ee8dae6 0a93ca5d 98d957e0 132311ed 12f4554a c6a6cb57 877169b9"
+],
+[
+"add_chat_pair_sessions_first_used_at",
+"a5487d29 fb9bd665 25612f38 45bd1af2 2f28404c f6c81708 8bbad666 4308a2b4"
+],
+[
+"backfill_chat_pair_sessions_first_used_at",
+"9ff7bc8d 7900bc72 434e782f 4cfaf440 b73ac2c9 6a8181ae 5a5914cc 42121c7f"
+],
+[
+"add_chat_pair_sessions_token_version",
+"e4b27551 9eea131b aeeab4ea 6f8e7549 8557f852 a22e6d27 453ab80d 28c3b503"
+],
+[
+"add_executor_orders_first_redeemed_at",
+"4581f5f9 0fd732e9 138cf2f5 7d22e232 de934412 a54cbaab 90e9d33c fe7c685a"
+],
+[
+"add_executor_orders_retry_until",
+"671e2aac 989ada41 65a4f35c e6a4a131 9281b67f 0a038d9a a7440c86 c184e36a"
+],
+[
+"add_executor_orders_session_id",
+"6b5f6402 763eb616 5ecfbdb1 2dc1c70d c13d05cc 81094494 5633fa8f eb5cd0de"
+],
+[
+"add_executor_orders_redeem_rotations",
+"9339ed9b c741168d 6744ac67 7fd9ae6d 856c1612 9c7aeb6b 9ce6f0a0 8bc5615d"
 ]
 ]
