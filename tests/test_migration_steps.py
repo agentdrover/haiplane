@@ -15,14 +15,15 @@ from hub.migrations import FROZEN_MIGRATIONS
 from hub.migrations.steps import (
     MigrationStepError,
     assemble,
-    load_step_modules,
+    load_step_files,
     load_steps,
+    stray_entries,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from migration_steps_add_only import main as add_only_main  # noqa: E402
+from migration_steps_add_only import ci_base, main as add_only_main  # noqa: E402
 from migration_steps_add_only import violations  # noqa: E402
 
 STEP_A = "m202610190900_9001_probe_a.py"
@@ -61,11 +62,13 @@ def test_steps_are_discovered_in_file_order(tmp_path):
     _write(directory, STEP_A, _A_SRC)
     (directory / "__pycache__").mkdir()
 
-    modules = load_step_modules(directory)
-    assert [name for name, _ in modules] == [STEP_A, STEP_B]
-    # Модули загружены именно из переданного каталога, а не из пакета hub.
-    for name, module in modules:
-        assert Path(module.__file__) == directory / name
+    files = load_step_files(directory, strict=True)
+    assert [f.name for f in files] == [STEP_A, STEP_B]
+    # Прочитано именно из переданного каталога: путь и содержимое из tmp_path.
+    for f in files:
+        assert f.path == directory / f.name
+        assert f.path.read_text(encoding="utf-8") in (_A_SRC, _B_SRC)
+    assert files[1].migrations[0][0] == "probe_b_table"
 
     assembled = assemble(FROZEN_MIGRATIONS, directory)
     assert assembled[: len(FROZEN_MIGRATIONS)] == FROZEN_MIGRATIONS
@@ -87,25 +90,40 @@ def test_steps_are_discovered_in_file_order(tmp_path):
         "m202610191200_1854_x.txt",
     ],
 )
-def test_bad_file_name_fails_before_import(tmp_path, bad_name):
-    directory = _steps_dir(tmp_path)
-    # Тело файла падает при импорте: ошибка имени обязана прийти раньше.
+def test_bad_file_name_is_strict_error_but_startup_skips_it(tmp_path, caplog, bad_name):
+    directory = _steps_dir(tmp_path, **{STEP_A: _A_SRC})
+    # Тело файла упало бы при исполнении: имя обязано отсечь его раньше чтения.
     _write(directory, bad_name, 'raise SystemExit("imported")')
-    with pytest.raises(MigrationStepError, match="не по шаблону"):
-        load_steps(directory)
+    with pytest.raises(MigrationStepError, match="посторонние записи"):
+        load_steps(directory, strict=True)
+    with caplog.at_level("WARNING", logger="hub.migrations.steps"):
+        assert [n for n, _ in load_steps(directory)] == [
+            "probe_a_column",
+            "probe_a_index",
+        ]
+    assert bad_name in caplog.text
 
 
 @pytest.mark.parametrize(
     "source, message",
     [
-        ("X = 1\n", "MIGRATIONS отсутствует"),
+        ("# пусто\n", "MIGRATIONS отсутствует"),
+        ("X = 1\n", "допустимо только литеральное"),
         ('MIGRATIONS = (("a", "SELECT 1"),)\n', "не list"),
         ('MIGRATIONS = ["a"]\n', "кортеж"),
         ('MIGRATIONS = [("a", 1)]\n', "кортеж"),
         ('MIGRATIONS = [("a", "SELECT 1", "x")]\n', "кортеж"),
-        ("from hub.db import _SCHEMA\nMIGRATIONS = []\n", "не импортирует"),
-        ("import hub\nMIGRATIONS = []\n", "не импортирует"),
-        ("from . import x\nMIGRATIONS = []\n", "не импортирует"),
+        ("from hub.db import _SCHEMA\nMIGRATIONS = []\n", "допустимо только"),
+        ("import hub\nMIGRATIONS = []\n", "допустимо только"),
+        ("from . import x\nMIGRATIONS = []\n", "допустимо только"),
+        ("import importlib\nMIGRATIONS = []\n", "допустимо только"),
+        ('MIGRATIONS = [__import__("hub.db")]\n', "не литерал"),
+        ('MIGRATIONS = [("a", __import__("os").name)]\n', "не литерал"),
+        ('MIGRATIONS = [("a", "SELECT " + "1")]\n', "не литерал"),
+        ('MIGRATIONS = [("a", f"SELECT {1}")]\n', "не литерал"),
+        ('__import__("hub.db")\nMIGRATIONS = []\n', "допустимо только"),
+        ("MIGRATIONS = []\nMIGRATIONS = []\n", "допустимо только"),
+        ("MIGRATIONS = [\n", "не разбирается"),
     ],
 )
 def test_bad_step_content_fails(tmp_path, source, message):
@@ -255,6 +273,12 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
+def _rev(repo: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
 def _repo_with_integrated_step(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     steps = repo / "hub" / "migrations" / "steps"
@@ -301,22 +325,100 @@ def test_add_only_without_base_fails_closed(tmp_path):
     assert add_only_main(["--base", "no-such-ref", "--repo", str(repo)]) == 2
 
 
-def test_stray_metadata_is_ignored_but_symlink_is_not(tmp_path):
+def test_annotated_docstring_future_and_implicit_concat_are_accepted(tmp_path):
+    src = (
+        '"""Шаг."""\n'
+        "from __future__ import annotations\n"
+        "MIGRATIONS: list[tuple[str, str]] = [\n"
+        '    ("a", "SELECT "\n          "1"),\n'
+        "]\n"
+    )
+    directory = _steps_dir(tmp_path, **{STEP_A: src})
+    assert load_steps(directory, strict=True) == [("a", "SELECT 1")]
+
+
+def test_step_is_never_executed(tmp_path):
+    marker = tmp_path / "executed"
+    src = f'open({str(marker)!r}, "w").close()\nMIGRATIONS = []\n'
+    directory = _steps_dir(tmp_path, **{STEP_A: src})
+    with pytest.raises(MigrationStepError):
+        load_steps(directory)
+    assert not marker.exists()
+    # Даже корректный по форме файл не исполняется: докстрока и литерал - всё.
+    _write(directory, STEP_A, f'"""x"""\nMIGRATIONS = [("n", "{marker}")]\n')
+    assert load_steps(directory) == [("n", str(marker))]
+    assert not marker.exists()
+
+
+def test_symlink_step_is_rejected(tmp_path):
     directory = _steps_dir(tmp_path, **{STEP_A: _A_SRC})
-    (directory / ".DS_Store").write_bytes(b"\x00")
-    assert [n for n, _ in load_step_modules(directory)] == [STEP_A]
     (directory / STEP_B).symlink_to(directory / STEP_A)
     with pytest.raises(MigrationStepError, match="не ссылкой"):
         load_steps(directory)
 
 
-def test_unicode_digits_and_trailing_newline_in_name_are_rejected(tmp_path):
-    for bad in ("m٢٠٢٦١٠١٩١٢٠٠_1_x.py", "m202610191200_1_x.py\n"):
-        directory = tmp_path / str(abs(hash(bad)))
-        directory.mkdir()
-        _write(directory, bad, "MIGRATIONS = []\n")
-        with pytest.raises(MigrationStepError, match="не по шаблону"):
-            load_steps(directory)
+@pytest.mark.parametrize(
+    "stray",
+    [
+        "README.md",
+        ".keep",
+        ".DS_Store",
+        STEP_A + "~",
+        "m٢٠٢٦١٠١٩١٢٠٠_1_x.py",
+        STEP_B + "\n",
+    ],
+)
+def test_stray_entry_does_not_stop_startup_but_reddens_the_ci_check(
+    tmp_path, capsys, stray
+):
+    repo = _repo_with_integrated_step(tmp_path)
+    steps = repo / "hub" / "migrations" / "steps"
+    (steps / stray).write_text("не шаг\n")
+    # Старт: шаг A на месте, посторонний файл пропущен (с предупреждением).
+    assert [n for n, _ in load_steps(steps)] == ["probe_a_column", "probe_a_index"]
+    assert stray_entries(steps) == [stray]
+    # CI: строгая проверка краснеет и называет запись.
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 1
+    assert "посторонние записи" in capsys.readouterr().err
+
+
+def test_ci_check_is_green_on_a_clean_directory(tmp_path):
+    repo = _repo_with_integrated_step(tmp_path)
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 0
+
+
+def test_ci_base_is_the_state_before_the_event():
+    zero = "0" * 40
+    assert ci_base("pull_request", "", "develop") == "origin/develop"
+    assert ci_base("pull_request", "abc", "main") == "origin/main"
+    assert ci_base("push", "abc123", "") == "abc123"
+    assert ci_base("push", zero, "") == "origin/develop"  # новая ветка: нет «до»
+    assert ci_base("push", "", "") == "origin/develop"
+    assert ci_base("workflow_dispatch", "abc", "") == "origin/develop"
+
+
+def test_push_that_edits_an_integrated_step_is_red(tmp_path, capsys):
+    """Push в develop: HEAD сам develop, правка уже в нём; база - before."""
+    repo = _repo_with_integrated_step(tmp_path)
+    steps = repo / "hub" / "migrations" / "steps"
+    _git(repo, "checkout", "-q", "develop")
+    before = _rev(repo, "HEAD")
+    _write(steps, STEP_A, _A_SRC + "# edit after merge\n")
+    _git(repo, "commit", "-aqm", "push to develop edits an integrated step")
+
+    # Старая база (сама ветка): правка невидима - именно эта дыра закрыта.
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 0
+    capsys.readouterr()
+    # База события: before. CI передаёт её флагами.
+    argv = ["--github-event", "push", "--before", before, "--repo", str(repo)]
+    assert add_only_main(argv) == 1
+    assert STEP_A in capsys.readouterr().err
+    # Новый файл тем же push - чисто.
+    _git(repo, "checkout", "-q", before, "--", str(steps / STEP_A))
+    _write(steps, STEP_B, _B_SRC)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "revert edit, add new step")
+    assert add_only_main(argv) == 0
 
 
 def test_add_only_sees_symlink_swap(tmp_path, capsys):
@@ -328,3 +430,10 @@ def test_add_only_sees_symlink_swap(tmp_path, capsys):
     (steps / STEP_A).symlink_to(steps / "link_target.txt")
     assert run() == 1
     assert "сменил тип" in capsys.readouterr().err
+
+
+def test_ci_passes_the_event_base_to_the_check():
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    step = ci[ci.index("- name: Migration steps add-only") :].split("- name:", 2)[1]
+    for needle in ("github.event.before", "github.base_ref", "--github-event"):
+        assert needle in step, needle

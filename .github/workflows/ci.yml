@@ -437,12 +437,20 @@ jobs:
         if: ${{ !cancelled() }}
         run: uv run python scripts/layer_rules.py
 
-      # #1854: влитый файл hub/migrations/steps/ не правится и не удаляется
-      # (сверка с merge-base от origin/develop); исправление - новый файл.
+      # #1854: влитый файл hub/migrations/steps/ не правится и не удаляется,
+      # посторонние записи в каталоге красят CI (старт их терпит). База сверки -
+      # состояние ДО события: на push HEAD уже содержит правку, и сверка с самой
+      # веткой молчала бы (push: github.event.before, PR: база PR).
       - name: Migration steps add-only
         id: migration_steps
         if: ${{ !cancelled() }}
-        run: uv run python scripts/migration_steps_add_only.py
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          uv run python scripts/migration_steps_add_only.py \
+            --github-event "$EVENT_NAME" --before "$EVENT_BEFORE" --base-ref "$BASE_REF"
 
       - name: Check formatting
         id: format

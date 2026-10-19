@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Влитый файл миграции-шага не меняется и не удаляется (#1854).
+"""Каталог миграций-шагов под присмотром CI (#1854): add-only и строгая опись.
 
 Миграции хаба лежат по одному файлу в ``hub/migrations/steps/``. Прод уже
 отметил их имена в ``_migrations`` и больше не исполнит: правка влитого файла
@@ -8,11 +8,20 @@
 
     uv run python scripts/migration_steps_add_only.py                    # origin/develop
     uv run python scripts/migration_steps_add_only.py --base origin/main
+    # CI: база - состояние ДО события (push: github.event.before, PR: база PR)
+    uv run python scripts/migration_steps_add_only.py --github-event push --before <sha>
+
+Вторая проверка - строгая опись каталога: запись не по шаблону имени шага
+(``README.md``, ``.keep``, ``*.py~``) и шаг, который не читается как литерал,
+красят CI. Старт хаба такие записи терпит (пропускает с предупреждением), поэтому
+строгость живёт здесь.
 
 Файлы, которые есть на merge-base с базой, обязаны совпадать с рабочим деревом
-байт в байт; новые файлы разрешены. Код возврата: 0 - чисто, 1 - названы
-изменённые или удалённые файлы, 2 - сравнить не удалось (нет базы, нет git):
-молчаливое «чисто» при отсутствии базы запрещено.
+байт в байт; новые файлы разрешены. На push в develop/main HEAD уже содержит
+правку, поэтому база там обязана быть состоянием до события (``before``), а не
+веткой, в которую пушат: merge-base с самой собой пуст. Код возврата: 0 - чисто,
+1 - названы нарушения, 2 - сравнить не удалось (нет базы, нет git): молчаливое
+«чисто» при отсутствии базы запрещено.
 """
 
 from __future__ import annotations
@@ -26,6 +35,24 @@ from pathlib import Path
 DEFAULT_BASE = "origin/develop"
 STEPS_PREFIX = "hub/migrations/steps/"
 _NOT_STEPS = ("__init__.py",)
+
+
+_NO_SHA = "0" * 40
+
+
+def ci_base(
+    event: str, before: str = "", base_ref: str = "", default: str = DEFAULT_BASE
+) -> str:
+    """База сравнения для события CI: состояние репозитория ДО него.
+
+    pull_request - ветка, в которую идёт PR; push - ``before`` (нулевой sha у
+    новой ветки не база); остальное (workflow_dispatch, локально) - ``default``.
+    """
+    if event == "pull_request" and base_ref:
+        return f"origin/{base_ref}"
+    if event == "push" and before and before != _NO_SHA:
+        return before
+    return default
 
 
 class CompareError(RuntimeError):
@@ -73,18 +100,34 @@ def violations(
     return found
 
 
+def structure_problems(repo: Path) -> list[str]:
+    """Строгая опись каталога шагов: посторонние записи и нечитаемые шаги."""
+    from hub.migrations.steps import MigrationStepError, load_steps
+
+    try:
+        load_steps(repo / STEPS_PREFIX, strict=True)
+    except MigrationStepError as exc:
+        return [str(exc)]
+    return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", default=DEFAULT_BASE)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--github-event", default="", help="pull_request | push | ...")
+    parser.add_argument("--before", default="", help="github.event.before")
+    parser.add_argument("--base-ref", default="", help="github.base_ref")
     args = parser.parse_args(argv)
+    if args.github_event:
+        args.base = ci_base(args.github_event, args.before, args.base_ref, args.base)
     try:
-        found = violations(args.repo, args.base)
+        found = [*structure_problems(args.repo), *violations(args.repo, args.base)]
     except CompareError as exc:
         print(f"migration steps: сравнить не удалось: {exc}", file=sys.stderr)
         return 2
     if found:
-        print("migration steps: влитые файлы шагов править нельзя:", file=sys.stderr)
+        print("migration steps: нарушения в hub/migrations/steps/:", file=sys.stderr)
         for line in found:
             print(f"  {line}", file=sys.stderr)
         print(
