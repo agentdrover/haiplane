@@ -469,8 +469,33 @@ async def _row_after_ci_refresh(db, task_id: int, row):
     return await repo.get_task(db, task_id) or row
 
 
+async def _brief_branch_tip(
+    db, task_id: int, branch: str, submission_sha: str, observe_only: bool, timer
+) -> tuple[str, str]:
+    """Вершина ветки для сверки со сдачей: свежий fetch или последнее наблюдение (#1810).
+
+    ``observe_only`` — путь показа карточки: сеть не трогаем. Без закреплённой
+    сдачи или ветки сверять не с чем — пустая вершина (``unknown``).
+    """
+    if not (submission_sha and branch):
+        return "", ""
+    if observe_only:
+        from hub.services.lifecycle import observed_branch_tip
+
+        return observed_branch_tip(task_id, branch)
+    from hub import services
+
+    return await timer.run(
+        "branch_tip", services.resolve_branch_tip(db, task_id, branch)
+    )
+
+
 async def build_review_brief(
-    db, task_id: int, *, self_review_warning: SelfReviewWarning | None = None
+    db,
+    task_id: int,
+    *,
+    self_review_warning: SelfReviewWarning | None = None,
+    observe_tip_only: bool = False,
 ) -> ReviewBrief | None:
     """Assemble the whole review brief for ``task_id`` (#308, #823).
 
@@ -480,6 +505,12 @@ async def build_review_brief(
     ``self_review_warning`` (#433) is passed in rather than computed here: it
     is a statement about the CALLER, and this builder is deliberately blind to
     identity so that both readers get the same evidence.
+
+    ``observe_tip_only`` (#1810): вершина ветки — только из последнего
+    наблюдения хаба, без ``git fetch``. Так собирается карточка: она
+    перерисовывается каждые 15 с, и сеть на каждый показ — нагрузка и
+    зависание. Явный запрос брифа (REST, стюард) по-прежнему идёт со свежим
+    fetch: ради него он и существует.
     """
     from hub import services
 
@@ -577,11 +608,9 @@ async def build_review_brief(
     # itself, not as "nothing moved". Costs one fetch, and only when there is
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
-    current_tip, tip_reason = "", ""
-    if submission_sha and task_view.branch:
-        current_tip, tip_reason = await timer.run(
-            "branch_tip", services.resolve_branch_tip(db, task_id, task_view.branch)
-        )
+    current_tip, tip_reason = await _brief_branch_tip(
+        db, task_id, task_view.branch or "", submission_sha, observe_tip_only, timer
+    )
     # #1334: the classification is one function, shared with the review
     # queue — which feeds it the tip the hub last observed instead of a fetch.
     sha_check, sha_check_reason = review_evidence.sha_check_of(
@@ -916,7 +945,7 @@ async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
     if status not in GATE_STATUSES:
         return None
     try:
-        return await build_review_brief(db, int(task_row["id"]))
+        return await build_review_brief(db, int(task_row["id"]), observe_tip_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
         return None
