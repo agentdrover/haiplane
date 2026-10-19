@@ -276,10 +276,14 @@ class _Hunk:
         prefix = line[: self.parents].ljust(self.parents)
         if any(c not in " +-" for c in prefix):
             return False
+        # git's columns: on a line the result lost, '-' marks the parents that
+        # had it; on any other line, ' ' marks the parents that had it, '+'
+        # the ones that did not. The result side owns every line not lost.
+        lost = "-" in prefix
         for i, c in enumerate(prefix):
-            if c in " -":
+            if c == ("-" if lost else " "):
                 self.old[i] -= 1
-        if "-" not in prefix:
+        if not lost:
             self.new -= 1
         return self.new >= 0 and all(n >= 0 for n in self.old)
 
@@ -300,37 +304,54 @@ def _header_path(line: str) -> str:
     return raw[2:] if raw.startswith("b/") else raw
 
 
+def _diff_lines(diff: str) -> list[str]:
+    """Lines as git ends them: by LF only, never by VT, FF, U+2028 and the like.
+
+    ``str.splitlines`` would cut a hunk body at a ``\\v`` inside a literal and
+    invent a line the counters never owed (#1856).
+    """
+    return re.findall(r"[^\n]*\n|[^\n]+", diff)
+
+
 def _file_spans(lines: list[str]) -> list[_FileSpan]:
-    """Per line, the file it belongs to; ``trusted`` False when counters broke."""
+    """Per line, the file it belongs to.
+
+    After the FIRST place where the counters do not add up nothing is trusted
+    any more, to the end of the diff: once we cannot tell where a hunk ends we
+    cannot tell where the next file starts, and a guess is a hidden signal.
+    """
     spans = [_FileSpan()]
     owner: list[_FileSpan] = []
     hunk = _Hunk()
+    broke = False
+
+    def fresh() -> _FileSpan:
+        span = _FileSpan(trusted=not broke)
+        spans.append(span)
+        return span
+
     for n, line in enumerate(lines):
-        text = line.rstrip("\n")
+        text = line.rstrip("\n").removesuffix("\r")
         cur = spans[-1]
         if hunk.open:
             if hunk.consume(text):
                 owner.append(cur)
                 continue
-            # The body does not add up: whatever it is, it is code, not noise.
-            cur.trusted = False
+            broke, cur.trusted = True, False
             hunk.reset()
         if text.startswith(_FILE_STARTS) or (
             text.startswith("--- ") and cur.plus_at is not None
         ):
-            cur = _FileSpan()
-            spans.append(cur)
+            cur = fresh()
         elif text.startswith("+++ "):
-            if cur.plus_at is not None:
-                cur = _FileSpan()
-                spans.append(cur)
+            cur = fresh() if cur.plus_at is not None else cur
             cur.plus_at, cur.path = n, _header_path(text)
         elif text.startswith("@@"):
             cur.hunks += 1
-            cur.trusted = cur.trusted and hunk.start(text)
+            if not hunk.start(text):
+                broke, cur.trusted = True, False
         elif cur.hunks and text[:1] in ("+", "-", " "):
-            # Body text after the counters ran out: they undercounted.
-            cur.trusted = False
+            broke, cur.trusted = True, False  # counters undercounted the body
         owner.append(cur)
     if hunk.open:
         owner[-1].trusted = False
@@ -346,7 +367,7 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
     body is decided by the hunk counters (:class:`_Hunk`). A file whose hunks
     do not add up is NOT dropped: a hidden signal costs more than a deep run.
     """
-    lines = diff.splitlines(keepends=True)
+    lines = _diff_lines(diff)
     owner = _file_spans(lines)
     kept: list[str] = []
     dropped: list[str] = []

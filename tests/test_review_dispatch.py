@@ -18,6 +18,7 @@ from hub.services.review_dispatch import (
     pick_review_model,
     pick_review_profile,
     process_surface_reasons,
+    _diff_lines,
     split_generated,
     sweep_review_dispatches,
 )
@@ -1238,10 +1239,68 @@ def test_hunk_that_does_not_add_up_is_kept_as_code():
     )
     assert process_surface_reasons(short) == _SUBPROCESS
     kept, dropped = split_generated(short)
-    # The broken README stays whole; the clean lock after it is still cut.
-    assert dropped == ["uv.lock"] and "+subprocess.run(1)" in kept
-    assert "+x" not in kept
+    # Once the counters broke nothing after that is cut: not even a clean lock.
+    assert dropped == [] and kept == short
     bad_header = (
         "--- a/README.md\n+++ b/README.md\n@@ nonsense @@\n+subprocess.run(1)\n"
     )
     assert process_surface_reasons(bad_header) == _SUBPROCESS
+
+
+_COMBINED_BODY = (
+    "@@@ -1,2 -1,2 +1,2 @@@\n- old1\n -old2\n--- junk\n+++ README.md\n"
+    '++subprocess.run(["ls"])\n'
+)
+
+
+def _combined(path: str, body: str = _COMBINED_BODY) -> str:
+    return f"diff --cc {path}\n--- a/{path}\n--- a/{path}\n+++ b/{path}\n{body}"
+
+
+def test_combined_hunk_counts_each_parent_by_its_own_column():
+    # #1856: "-" in a column means the PARENT of that column had the line.
+    # Counting every parent on every line ran the counters out early and made
+    # "--- junk" / "+++ README.md" look like a new document.
+    assert process_surface_reasons(_combined("hub/x.py")) == _SUBPROCESS
+    # The same body in a generated file is a normal generated file: cut whole.
+    code = _added("hub/y.py", "subprocess.run(1)")
+    kept, dropped = split_generated(_combined("uv.lock") + code)
+    assert dropped == ["uv.lock"]
+    assert "junk" not in kept and "subprocess.run" in kept
+    assert process_surface_reasons(_combined("uv.lock") + code) == _SUBPROCESS
+
+
+def test_diff_is_cut_into_lines_by_lf_only():
+    # #1856: git ends a line at LF. A VT, FF or U+2028 inside a literal is text.
+    assert _diff_lines("+a\v+b\n+c\x0c\u2028d\r\n") == [
+        "+a\v+b\n",
+        "+c\x0c\u2028d\r\n",
+    ]
+    lock = (
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1,2 @@\n+x\v+y\n+z\n"
+    )
+    code = _added("hub/x.py", "subprocess.run(1)")
+    kept, dropped = split_generated(lock + code)
+    assert dropped == ["uv.lock"] and "x\v" not in kept and code in kept
+    assert process_surface_reasons(lock + code) == _SUBPROCESS
+
+
+def test_after_the_first_mismatch_nothing_is_cut():
+    # #1856: not "this file is code" but "the rest of the diff is code". The
+    # lock AFTER a broken hunk stays, and so does the document after it.
+    broken = "diff --git a/hub/a.py b/hub/a.py\n--- a/hub/a.py\n+++ b/hub/a.py\n@@ -0,0 +1,3 @@\n+a\n"
+    tail = (
+        _added("uv.lock", "x")
+        + _added("docs/a.md", "git worktree add")
+        + _added("hub/z.py", "subprocess.run(1)")
+    )
+    kept, dropped = split_generated(broken + tail)
+    assert dropped == [] and kept == broken + tail
+    reasons = process_surface_reasons(broken + tail)
+    assert reasons == [
+        "запуск подпроцессов: subprocess.run",
+        "воркспейс и ветки: worktree",
+    ]
+    # Before the mismatch the same files are cut as usual.
+    assert split_generated(tail)[1] == ["uv.lock"]
