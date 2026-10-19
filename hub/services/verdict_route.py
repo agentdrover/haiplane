@@ -90,6 +90,10 @@ _PENDING_TEXT = {
         "вершина ветки на месте, дифф в заявленных областях и класс не "
         "вырос (проверка по сети, при показе не делалась)"
     ),
+    "class_ceiling": (
+        "класс по диффу не выше потолка проекта (auto_approve_max_class; "
+        "дифф при показе не читался)"
+    ),
     "ci_integrity": (
         "дифф не меняет входы CI (проверка по клону, при показе не делалась)"
     ),
@@ -197,6 +201,22 @@ async def _steward_route(
             CODE_STEWARD_SHADOW,
             "стюард в тени: суждение записывается, вердикт выносит человек",
         )
+    from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
+
+    key = "steward_approve_max_class"
+    found = ceiling_reason(
+        await steward_apply.current_ceiling(db, int(task["id"]), key),
+        task.get("risk_class"),
+        key=key,
+    )
+    ceiling_condition = ""
+    if found is not None and found[0] == BLOCKED:
+        return _human(found[1]["code"], found[1]["detail"], mode)
+    if found is not None:
+        ceiling_condition = (
+            "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
+            "дифф при показе не читался)"
+        )
     return VerdictRoute(
         DECIDER_STEWARD,
         DECIDER_STEWARD,
@@ -204,7 +224,7 @@ async def _steward_route(
         CODE_STEWARD_ACT,
         f"автопилот не вынесет ({stance.reason}); судит стюард",
         "если суждение — approve, советник-критик согласен на том же пакете и "
-        "привратник применения не возражает; иначе "
+        "привратник применения не возражает" + ceiling_condition + "; иначе "
         "вердикт остаётся человеку",
     )
 
