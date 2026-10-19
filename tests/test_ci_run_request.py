@@ -1746,3 +1746,28 @@ async def test_a_slow_clone_cannot_starve_the_announcements(
         await _cycle(db)
     assert asyncio.get_running_loop().time() - started < 3.0
     assert len(await _announced(db, task_id)) == 1
+
+
+async def test_a_policy_switched_off_after_the_reservation_gives_the_attempt_back(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """Политику выключили между резервом и dispatch: запроса нет, попытка не потрачена."""
+    task_id = await _cloud_task(db, slug="lateoff", branch="task-19/lateoff")
+    cloud.heads["task-19/lateoff"] = HEAD_A
+    before = cloud.probes
+
+    async def switched_off_late():
+        if cloud.probes >= before + 2:
+            project = await repo.resolve_project_for_task(db, task_id)
+            policy = {"ci_contract": SAT_CONTRACT, "ci_before_submit": "off"}
+            await repo.update_project(db, project["id"], gate_policy=json.dumps(policy))
+            await db.commit()
+
+    cloud.on_probe = switched_off_late
+    await _cycle(db)
+    assert cloud.requests == []
+    assert await _state_of(db, task_id) == "seen"
+    cur = await db.execute(
+        "SELECT attempts FROM ci_head_runs WHERE task_id=?", (task_id,)
+    )
+    assert (await cur.fetchone())[0] == 0
