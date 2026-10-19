@@ -71,6 +71,7 @@ async def reserve_request(
     db: aiosqlite.Connection,
     task_id: int,
     sha: str,
+    branch: str,
     *,
     grace_seconds: int,
     retry_seconds: int,
@@ -78,23 +79,51 @@ async def reserve_request(
     """Занять попытку запроса по (задача, sha); True - попытка ваша.
 
     Первая - из состояния seen после grace; вторая - из reserved (исход первой
-    неоднозначен) после срока повтора. Больше ``MAX_REQUESTS`` не бывает.
+    неоднозначен) после срока повтора. Больше ``MAX_REQUESTS`` не бывает. Область
+    задачи (running, эта ветка, нет сдачи и PR) проверяется В ЭТОМ ЖЕ UPDATE:
+    выборка кандидатов и сетевые вызовы между ней и резервом задачу меняют.
     """
     async with write_transaction(db):
         cur = await db.execute(
             "UPDATE ci_head_runs SET state='reserved', attempts=attempts+1, "
             "reserved_at=datetime('now') WHERE task_id=? AND sha=? AND attempts<? "
             "AND ((state='seen' AND first_seen_at <= datetime('now', ?)) "
-            "OR (state='reserved' AND reserved_at <= datetime('now', ?)))",
+            "OR (state='reserved' AND reserved_at <= datetime('now', ?))) "
+            "AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=ci_head_runs.task_id "
+            "AND t.status='running' AND t.archived=0 AND t.branch=? "
+            "AND t.submission_generation=0 AND COALESCE(t.submission_sha, '')='' "
+            "AND (t.pr_number IS NULL OR t.pr_number=0))",
             (
                 task_id,
                 sha,
                 MAX_REQUESTS,
                 f"-{int(grace_seconds)} seconds",
                 f"-{int(retry_seconds)} seconds",
+                branch,
             ),
         )
         return (cur.rowcount or 0) == 1
+
+
+async def adopt_unplanned(
+    db: aiosqlite.Connection, task_id: int, sha: str, branch: str
+) -> None:
+    """Голова сдвинулась, пока шёл запрос: прогон мог пойти по НОВОЙ голове.
+
+    Новая голова записывается как «запрошена, исход неизвестен»: следующий цикл
+    сначала ищет её прогон, а второй запрос возможен только после срока повтора.
+    """
+    async with write_transaction(db):
+        await db.execute(
+            "INSERT OR IGNORE INTO ci_head_runs (task_id, sha, branch) "
+            "VALUES (?, ?, ?)",
+            (task_id, sha, branch),
+        )
+        await db.execute(
+            "UPDATE ci_head_runs SET state='reserved', attempts=1, "
+            "reserved_at=datetime('now') WHERE task_id=? AND sha=? AND state='seen'",
+            (task_id, sha),
+        )
 
 
 async def settle(
@@ -117,25 +146,42 @@ async def settle(
         return (cur.rowcount or 0) == 1
 
 
+#: Строк в одной странице объявлений и страниц за проход.
+ANNOUNCE_PAGE = 50
+ANNOUNCE_PAGES = 4
+
+
 async def unannounced_verified(
-    db: aiosqlite.Connection, limit: int = 50
+    db: aiosqlite.Connection, limit: int = ANNOUNCE_PAGE, before_id: int | None = None
 ) -> list[dict[str, Any]]:
     """Подтверждённые попытки отчёта по головам журнала, ещё не объявленные.
 
-    Новые первыми: строка, которую нельзя объявить (контракт сменился после
-    подтверждения), остаётся в выборке, и старые такие не должны вытеснять новые.
+    Новые первыми и постранично (``before_id``): строка, которую нельзя
+    объявить (контракт сменился после подтверждения), остаётся в выборке, и
+    пачка таких не должна вытеснять объявляемые за границу страницы.
     """
     rows = await fetchall(
         db,
         "SELECT a.* FROM ci_report_attempts a JOIN ci_head_runs j "
         "ON j.task_id=a.task_id AND j.sha=a.head_sha "
-        "WHERE a.trust='verified' AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
+        "WHERE a.trust='verified' AND (? IS NULL OR a.id < ?) "
+        "AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
         "WHERE n.task_id=a.task_id AND n.sha=a.head_sha "
         "AND n.attempt_key = a.run_id || ':' || a.run_attempt) "
         "ORDER BY a.id DESC LIMIT ?",
-        (limit,),
+        (before_id, before_id, limit),
     )
     return [dict(r) for r in rows]
+
+
+async def get_attempt(
+    db: aiosqlite.Connection, attempt_id: int
+) -> dict[str, Any] | None:
+    """Строка попытки отчёта СЕЙЧАС (внутри транзакции объявления)."""
+    rows = await fetchall(
+        db, "SELECT * FROM ci_report_attempts WHERE id=?", (attempt_id,)
+    )
+    return dict(rows[0]) if rows else None
 
 
 async def claim_announcement(

@@ -659,6 +659,8 @@ class _CloudGit(NoopGitOps):
         self.heads: dict[str, str] = {}
         self.heads_down = False
         self.head_reads = 0
+        self.on_probe = None  # type: ignore[var-annotated]
+        self.on_request = None  # type: ignore[var-annotated]
         self.requests: list[tuple[str, str | None]] = []
         self.outcomes: list[object] = []
         self.github = attach_fake_github(self)
@@ -671,6 +673,8 @@ class _CloudGit(NoopGitOps):
             forge="",
             workflow_path=".github/workflows/ci.yml",
         ):
+            if self.on_probe is not None:
+                await self.on_probe()
             runs = await every_run(head_sha, repo, gh_repo, forge, workflow_path)
             if runs is None:
                 return None
@@ -688,6 +692,8 @@ class _CloudGit(NoopGitOps):
         self, branch, repo=None, gh_repo=None, forge="", workflow_path=None
     ):
         self.requests.append((branch, workflow_path))
+        if self.on_request is not None:
+            await self.on_request()
         step = (
             self.outcomes.pop(0)
             if self.outcomes
@@ -721,13 +727,20 @@ async def _cloud_task(
     status: str = "running",
     slug: str = "cloud",
     branch: str = HEAD_BRANCH,
+    gh_repo: str = "own/rep",
+    workspace: str = "",
 ) -> int:
     policy: dict = {"ci_contract": SAT_CONTRACT}
     if mode is not None:
         policy["ci_before_submit"] = mode
     pid = await repo.create_project(db, slug=slug, name=slug.title())
     await repo.update_project(
-        db, pid, gate_policy=json.dumps(policy), repo="own/rep", forge=forge
+        db,
+        pid,
+        gate_policy=json.dumps(policy),
+        repo=gh_repo,
+        forge=forge,
+        workspace_path=workspace,
     )
     task_id = await repo.create_task(
         db,
@@ -895,6 +908,7 @@ async def test_running_task_no_duplicate_or_foreign_runs(
         ("task-4/amb", SAT_PATH)
     ], "срок повтора не истёк: резерв держится"
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    _restart()  # отступ после неоднозначного исхода истёк
     for _ in range(4):
         await _cycle(db)
     assert len([r for r in cloud.requests if r[0] == "task-4/amb"]) == 2, (
@@ -908,8 +922,10 @@ async def test_running_task_no_duplicate_or_foreign_runs(
     late = await _cloud_task(db, slug="late", branch="task-5/late")
     cloud.heads["task-5/late"] = "f6" * 20
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    _restart()
     await _cycle(db)
     cloud.github.attempt(late, "f6" * 20, path=SAT_PATH, checks=dict(SAT_CHECKS))
+    _restart()
     for _ in range(3):
         await _cycle(db)
     assert len([r for r in cloud.requests if r[0] == "task-5/late"]) == 1, (
@@ -977,6 +993,7 @@ async def test_ci_report_for_running_head_is_announced_once(
     # подтверждение под прежним контрактом не объявляется; устаревший список
     # выборки не плодит запись (дедуп держит журнал, а не выборка)
     await _contract_change_blocks_announcement(db, cloud)
+    await _snapshot_gone_stale_blocks_announcement(db, cloud, monkeypatch)
     await _stale_list_writes_one_entry(db, cloud, monkeypatch)
 
 
@@ -1101,6 +1118,41 @@ async def _contract_change_blocks_announcement(
     assert await _announced(db, task_id) == []
 
 
+async def _snapshot_gone_stale_blocks_announcement(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+) -> None:
+    """(Codex) Отчёт потерял подтверждение между выборкой и записью - не объявляем."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+    from hub.services.ci_report import accept_ci_run_report
+
+    branch = "task-10/snapshot"
+    cloud.heads[branch] = HEAD_A
+    task_id = await _cloud_task(db, slug="snapshot", branch=branch)
+    await _cycle(db)
+    sent = cloud.github.attempt(
+        task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="9101"
+    )
+    await accept_ci_run_report(db, task_id, **sent)
+    snapshot = [
+        r for r in await journal.unannounced_verified(db) if r["task_id"] == task_id
+    ]
+    assert len(snapshot) == 1
+    await db.execute(
+        "UPDATE ci_report_attempts SET trust='unverified', trust_reason='replaced' "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    real = journal.unannounced_verified
+    monkeypatch.setattr(
+        journal, "unannounced_verified", AsyncMock(return_value=snapshot)
+    )
+    await ci_head_run.announce_results(db)
+    monkeypatch.setattr(journal, "unannounced_verified", real)
+    assert await _announced(db, task_id) == []
+
+
 async def _stale_list_writes_one_entry(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ) -> None:
@@ -1127,3 +1179,129 @@ async def _stale_list_writes_one_entry(
     await ci_head_run.announce_results(db)
     await ci_head_run.announce_results(db)
     assert len(await _announced(db, task_id)) == 1
+
+
+async def test_a_head_that_moves_during_the_request_is_not_requested_twice(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862 (Codex): запрос идёт по ref; сдвинутая голова B не получает второй запрос."""
+
+    async def branch_moves():
+        cloud.heads[HEAD_BRANCH] = HEAD_B
+
+    cloud.on_request = branch_moves
+    task_id = await _cloud_task(db)
+    await _cycle(db)
+    assert len(cloud.requests) == 1
+    moved = await _notes(db, task_id, "сдвинулась")
+    assert len(moved) == 1 and HEAD_A[:12] in moved[0] and HEAD_B[:12] in moved[0]
+    cloud.on_request = None
+    await _cycle(db)
+    await _cycle(db)
+    assert len(cloud.requests) == 1, (
+        "B уже записана как «запрошена»: её прогон ищут, второй не заказывают"
+    )
+
+
+async def test_the_reservation_rechecks_that_the_task_is_still_in_scope(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862 (Codex): пока шла проба, задача ушла из running - запрос не уходит."""
+    task_id = await _cloud_task(db)
+
+    async def task_moves_on():
+        await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        await db.commit()
+
+    cloud.on_probe = task_moves_on
+    await _cycle(db)
+    assert cloud.requests == [], "статус сменился между выборкой и резервом"
+
+
+async def test_the_journal_state_and_the_feed_entry_stand_or_fall_together(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862 (Codex): сбой записи в ленту не оставляет «requested» без записи."""
+    task_id = await _cloud_task(db)
+    real = repo.add_task_update
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("лента недоступна")
+
+    monkeypatch.setattr(repo, "add_task_update", broken)
+    await _cycle(db)
+    monkeypatch.setattr(repo, "add_task_update", real)
+    cur = await db.execute("SELECT state FROM ci_head_runs WHERE task_id=?", (task_id,))
+    assert (await cur.fetchone())[0] == "reserved", (
+        "состояние откатилось вместе с записью: исход остаётся неоднозначным"
+    )
+
+
+async def test_a_foreign_repository_without_a_clone_is_out_of_scope(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862 (Codex): без клона головы читались бы из клона хаба, а запрос ушёл бы в чужой репо."""
+    await _cloud_task(db, gh_repo="another/project", workspace="")
+    await _cycle(db)
+    assert cloud.head_reads == 0 and cloud.requests == []
+    await _cloud_task(db, slug="cloned", gh_repo="another/project", workspace="/srv/x")
+    await _cycle(db)
+    assert len(cloud.requests) == 1, "с клоном проекта читаем оттуда"
+
+
+async def test_the_announcement_queue_is_read_page_by_page(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862 (Codex): пачка необъявляемых строк не вытесняет объявляемую за границу страницы."""
+    from hub import repository_ci_head as journal
+    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
+
+    old_branch = "task-6/old"
+    cloud.heads[old_branch] = HEAD_A
+    good = await _cloud_task(db, slug="good", branch=old_branch)
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        good,
+        **cloud.github.attempt(
+            good, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="6001"
+        ),
+    )
+    other_branch = "task-6/newer"
+    cloud.heads[other_branch] = HEAD_B
+    bad = await _cloud_task(db, slug="bad", branch=other_branch)
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        bad,
+        **cloud.github.attempt(
+            bad, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="6002"
+        ),
+    )
+    project = await repo.resolve_project_for_task(db, bad)
+    await set_contract(db, project["id"], SAT_CONTRACT_C)
+    await db.commit()
+    monkeypatch.setattr(journal, "ANNOUNCE_PAGE", 1)
+    await _cycle(db)
+    assert len(await _announced(db, good)) == 1, "второй странице тоже доходит очередь"
+    assert await _announced(db, bad) == []
+
+
+async def test_a_slow_cycle_stops_starting_tasks_and_a_failed_send_backs_off(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862 (Codex): бюджет прохода; после неоднозначного исхода форж не трогаем."""
+    from hub.services import ci_head_run
+
+    await _cloud_task(db)
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", -1.0)
+    await _cycle(db)
+    assert cloud.requests == [], "бюджет прохода исчерпан - новых задач не начинаем"
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 45.0)
+    cloud.outcomes = [TimeoutError("после отправки")]
+    await _cycle(db)
+    assert len(cloud.requests) == 1
+    reads = cloud.head_reads
+    await _cycle(db)
+    assert cloud.head_reads == reads, "после неоднозначного исхода - отступ"
