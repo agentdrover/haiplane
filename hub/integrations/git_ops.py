@@ -3409,9 +3409,10 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None:
         return await self._forge_for(forge).ci_runs_for_sha(
-            head_sha, repo=repo, gh_repo=gh_repo
+            head_sha, repo=repo, gh_repo=gh_repo, workflow_path=workflow_path
         )
 
     async def ci_run_artifacts(

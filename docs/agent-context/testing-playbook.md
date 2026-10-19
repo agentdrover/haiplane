@@ -71,3 +71,8 @@ name with `grep -rn "def <name>" tests/test_web*.py`. Each file stays under
 
 - `uv run python scripts/complexity_budget.py` красит CI при исключении `unclaimed`, у которого живой замер от 90% своего `max`, и при `removed_by` не по формату (`task:#N`, `permanent — <причина>`, `unclaimed — <причина>`). Лечение: назначить задачу или объявить постоянным с причиной.
 - Сверить `measured` без пополнения запаса: `--refresh-measured`. `--update` пересчитывает потолки и остаётся решением человека.
+
+## Тесты не зависят от настроек машины (#1851)
+
+- Тест не опирается на личность git, системный rsync, права не-root или версию Python машины: зависимость убирают в тесте или фикстуре (env, шим, проходимый каталог), assert не ослабляют. Облачный контейнер claude.ai/code (root, без rsync, с `GIT_CONFIG_COUNT`) — штатная среда, `make check` в нём обязан быть зелёным.
+- Пропуск — только когда возможности в окружении нет и обойти это нельзя; предикат живёт в `tests/env_caps.py`, возвращает причину и в CI (`GITHUB_ACTIONS=true`) — `None`. Сторож `tests/test_environment_policy.py::test_every_env_cap_runs_in_ci` проверяет каждый публичный предикат модуля.

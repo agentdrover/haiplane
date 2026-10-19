@@ -31,6 +31,11 @@ def ci_report_action() -> str:
     return f"{github_slug()}/.github/actions/hub-ci-report@main"
 
 
+def ci_send_action() -> str:
+    """The trusted sender of a satellite's CI report (#1848)."""
+    return f"{github_slug()}/.github/actions/hub-ci-send@main"
+
+
 def require_github_owner() -> str:
     if not GITHUB_OWNER:
         raise ValueError(
