@@ -315,17 +315,22 @@ def _section_header_path(line: str) -> str:
 
 
 def _git_section_path(line: str) -> str:
-    """New-side path of a ``diff --git`` line, quoted or not, as a bare path.
+    """Path of a ``diff --git`` line when both sides name the same file, else "".
 
     The key the sections are matched on is the path as ``changed_paths`` and
-    ``split_generated`` spell it: unquoted, without ``a/`` and ``b/``.
+    ``split_generated`` spell it: unquoted, without ``a/`` and ``b/``. Sides
+    that differ are a rename or a copy: the header cannot be split safely
+    (" b/" may sit inside a name), so the key stays empty until ``rename to``
+    or ``+++`` names the file.
     """
     # The line comes from diff_lines with its ending: LF would end up in the key.
     line = line.rstrip("\r\n")
-    named = [p for p in _git_line_paths(line[len("diff --git ") :]) if p]
-    if named:
-        return named[-1].removeprefix("b/")
-    return line.rsplit(" b/", 1)[-1]
+    sides = _git_line_paths(line[len("diff --git ") :])
+    if len(sides) == 2 and sides[0] and sides[1]:
+        old, new = sides[0].removeprefix("a/"), sides[1].removeprefix("b/")
+        if old == new:
+            return new
+    return ""
 
 
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:
@@ -352,6 +357,8 @@ def diff_file_sections(diff: str) -> list[tuple[str, str]]:
             path, in_header, buf = _git_section_path(line), True, []
         elif in_header and line.startswith("@@"):
             in_header = False
+        elif in_header and line.startswith(("rename to ", "copy to ")):
+            path = (_unquote_path(line.split(" ", 2)[2]) or "").strip() or path
         elif in_header and line.startswith("+++ "):
             named = _section_header_path(line)
             path = path if named == "/dev/null" else named
@@ -397,7 +404,8 @@ def _inline_diff_lines(
     sections = [
         (path, text)
         for path, text in diff_file_sections(diff)
-        if path not in dropped and (not delta_paths or path in delta_paths)
+        if not path
+        or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
     text, omitted = fit_file_sections(sections, ceiling)
     lines = []
@@ -1028,6 +1036,17 @@ def _git_line_paths(rest: str) -> list[str | None]:
         if end < 0:
             return [None]
         return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
+    # Same name on both sides (everything but a rename or copy): "a/P b/P" is
+    # split by length, so a " b/" inside P cannot move the cut.
+    size = (len(rest) - 5) // 2
+    if (
+        size > 0
+        and len(rest) == 2 * size + 5
+        and rest.startswith("a/")
+        and rest[2 + size : 5 + size] == " b/"
+        and rest[2 : 2 + size] == rest[5 + size :]
+    ):
+        return [rest[: 2 + size], "b/" + rest[5 + size :]]
     left, sep, right = rest.partition(" b/")
     if not sep or not left.startswith("a/"):
         return [None]

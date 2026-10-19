@@ -146,3 +146,42 @@ def test_sections_without_a_plus_header_are_attached_on_a_resubmission():
     # And CRLF endings leave no CR in the key either.
     crlf = _NO_PLUS_HEADER["run.sh"].replace("\n", "\r\n")
     assert diff_file_sections(crlf)[0][0] == "run.sh"
+
+
+def test_a_name_with_b_slash_inside_keeps_its_section_on_a_resubmission():
+    # " b/" inside a name must not move the cut of the "diff --git" line.
+    rename = (
+        "diff --git a/x b/old.py b/new.py\nsimilarity index 100%\n"
+        "rename from x b/old.py\nrename to new.py\n"
+    )
+    rename_edit = (
+        "diff --git a/x b/old.py b/new.py\nsimilarity index 90%\n"
+        "rename from x b/old.py\nrename to new.py\nindex 1..2 100644\n"
+        "--- a/x b/old.py\n+++ b/new.py\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+    same_name = {
+        "d b/f.py": "diff --git a/d b/f.py b/d b/f.py\nold mode 100644\nnew mode 100755\n",
+        "d b/g.png": (
+            "diff --git a/d b/g.png b/d b/g.png\nindex 1..2 100644\n"
+            "Binary files a/d b/g.png and b/d b/g.png differ\n"
+        ),
+        "d b/\u044f.py": (
+            'diff --git "a/d b/\\321\\217.py" "b/d b/\\321\\217.py"\n'
+            "old mode 100644\nnew mode 100755\n"
+        ),
+    }
+    cases = {"new.py": rename, **same_name}
+    cases_edit = {"new.py": rename_edit}
+    for path, diff in [*cases.items(), *cases_edit.items()]:
+        ((key, text),) = diff_file_sections(diff)
+        assert key == path and text == diff, path
+        lines, omitted = _inline_diff_lines(diff, [], [path], 100_000)
+        assert omitted == [] and diff in "".join(lines), path
+
+
+def test_a_section_whose_key_cannot_be_read_is_attached_not_dropped():
+    odd = "diff --git a/p b/q\nsome future header line\n"
+    ((key, _),) = diff_file_sections(odd)
+    assert key == ""
+    lines, omitted = _inline_diff_lines(odd, [], ["elsewhere.py"], 100_000)
+    assert omitted == [] and odd in "".join(lines)
