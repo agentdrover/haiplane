@@ -2058,7 +2058,11 @@ async def test_the_overdue_alert_is_rechecked_inside_its_own_transaction(
     task_id = await _requested_overdue(db, cloud, monkeypatch, "late", "task-24/late")
     ci_head_run.reset_state()
 
+    reads_before = cloud.head_reads
+
     async def submitted_during_the_read():
+        if cloud.head_reads < reads_before + 2:
+            return  # первое чтение - половина запросов; сдача - на чтении просрочки
         await db.execute(
             "UPDATE tasks SET submission_generation=1, submission_sha='x' WHERE id=?",
             (task_id,),
