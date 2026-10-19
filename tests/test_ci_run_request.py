@@ -664,7 +664,11 @@ class _CloudGit(NoopGitOps):
         every_run = self.github.ci_runs_for_sha
 
         async def only_the_asked_workflow(
-            head_sha, repo=None, gh_repo=None, forge="", workflow_path=SAT_PATH
+            head_sha,
+            repo=None,
+            gh_repo=None,
+            forge="",
+            workflow_path=".github/workflows/ci.yml",
         ):
             runs = await every_run(head_sha, repo, gh_repo, forge, workflow_path)
             if runs is None:
@@ -858,7 +862,10 @@ async def test_running_task_no_duplicate_or_foreign_runs(
 
     # 4. неоднозначный исход: резерв держится, не больше двух запросов
     cloud.requests.clear()
-    cloud.outcomes = [TimeoutError("после отправки"), TimeoutError("снова")]
+    cloud.outcomes = [
+        TimeoutError("после отправки"),
+        CIRunRequestResult(CIRunRequestOutcome.unavailable, "dispatch_call_failed"),
+    ]
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600)
     amb = await _cloud_task(db, slug="amb", branch="task-4/amb")
     cloud.heads["task-4/amb"] = "e5" * 20
@@ -1011,3 +1018,22 @@ async def test_remote_heads_reads_every_branch_in_one_call(monkeypatch):
     reply["rc"] = 128
     assert await ops.remote_heads(["task-3/gone"], repo="/r") is None
     assert await ops.remote_heads([], repo="/r") == {}
+
+
+async def test_the_real_git_ops_hands_the_workflow_to_the_forge(monkeypatch):
+    """#1862: GitOpsIntegration.request_ci_run не теряет workflow_path по дороге к форжу."""
+    from hub.integrations import git_ops as git_ops_mod
+
+    seen: dict[str, object] = {}
+
+    class _Forge:
+        async def request_ci_run(self, branch, *, repo=None, gh_repo=None, **kw):
+            seen.update(kw)
+            return CIRunRequestResult(CIRunRequestOutcome.requested, "ok")
+
+    ops = git_ops_mod.GitOpsIntegration()
+    monkeypatch.setattr(ops, "_forge_for", lambda forge="": _Forge())
+    await ops.request_ci_run(
+        "task-1/x", gh_repo="own/rep", workflow_path=".github/workflows/tests.yml"
+    )
+    assert seen == {"workflow_path": ".github/workflows/tests.yml"}
