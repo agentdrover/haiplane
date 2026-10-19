@@ -48,7 +48,7 @@ async def test_completed_brief_without_delivery_in_ctx_never_asks_git(
 
     monkeypatch.setattr(delivery_state, "delivery_state", boom)
     got = await _build(db, await _completed(db))
-    assert got["recommend"]["action"] == "Влито, выкат не подтверждён"
+    assert got["recommend"]["action"] == "Проверить"
     assert "Работа влита" not in got["happened"], "факт мержа не доказан"
 
 

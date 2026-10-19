@@ -469,7 +469,11 @@ async def _row_after_ci_refresh(db, task_id: int, row):
 
 
 async def build_review_brief(
-    db, task_id: int, *, self_review_warning: SelfReviewWarning | None = None
+    db,
+    task_id: int,
+    *,
+    self_review_warning: SelfReviewWarning | None = None,
+    observe_tip_only: bool = False,
 ) -> ReviewBrief | None:
     """Assemble the whole review brief for ``task_id`` (#308, #823).
 
@@ -479,6 +483,12 @@ async def build_review_brief(
     ``self_review_warning`` (#433) is passed in rather than computed here: it
     is a statement about the CALLER, and this builder is deliberately blind to
     identity so that both readers get the same evidence.
+
+    ``observe_tip_only`` (#1810): вершина ветки — только из последнего
+    наблюдения хаба, без ``git fetch``. Так собирается карточка: она
+    перерисовывается каждые 15 с, и сеть на каждый показ — нагрузка и
+    зависание. Явный запрос брифа (REST, стюард) по-прежнему идёт со свежим
+    fetch: ради него он и существует.
     """
     from hub import services
 
@@ -577,7 +587,11 @@ async def build_review_brief(
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
     current_tip, tip_reason = "", ""
-    if submission_sha and task_view.branch:
+    if submission_sha and task_view.branch and observe_tip_only:
+        from hub.services.lifecycle import observed_branch_tip
+
+        current_tip, tip_reason = observed_branch_tip(task_id, task_view.branch)
+    elif submission_sha and task_view.branch:
         current_tip, tip_reason = await timer.run(
             "branch_tip", services.resolve_branch_tip(db, task_id, task_view.branch)
         )
@@ -853,7 +867,7 @@ async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
     if status not in GATE_STATUSES:
         return None
     try:
-        return await build_review_brief(db, int(task_row["id"]))
+        return await build_review_brief(db, int(task_row["id"]), observe_tip_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
         return None

@@ -32,6 +32,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
 from hub.models import FindingOutcome, MachineReviewView
 from hub.services import (
     ci_contract,
@@ -125,15 +126,35 @@ def _strict_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+async def _earlier_generation(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int | None:
+    """Ближайшее более раннее поколение, в котором есть отчёты: из него и переносят."""
+    rows = await fetchall(
+        db,
+        "SELECT MAX(submission_generation) AS g FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation<?",
+        (task_id, generation),
+    )
+    value = dict(rows[0]).get("g") if rows else None
+    return int(value) if value is not None else None
+
+
 async def _judged_rows(
     db: aiosqlite.Connection, row: dict[str, Any], seen: set[tuple[int, int]]
 ) -> list[dict[str, Any]]:
-    """Строки, по которым судят отчёт. У переноса (#1361) — ВСЕ отчёты исходного поколения.
+    """Строки, по которым судят отчёт. ЕДИНЫЙ разворот переносов (#1361).
 
-    Копия переноса не несёт токенов провайдера по контракту (перенос — не новое
-    чтение), поэтому улика лежит в исходных отчётах. Судить по одному исходному
-    нельзя: соседний отчёт того же поколения мог нести unresolved или находки, а
-    перенос «чистого» их бы скрыл. Нет исходного — отчёт нечитаем.
+    Копия переноса стоит за ВСЕМИ отчётами ближайшего более раннего поколения
+    (ссылка ``carried_from_review_id`` схлопывается до корня и промежуточные
+    поколения теряет, поэтому по ней цепочку не развернуть). Разворот
+    рекурсивный: копия в том поколении разворачивается дальше, и каждый
+    отчёт на каждом шаге проверяется.
+
+    Сама копия — тоже отчёт: её разделы читаются строго и проходят белый
+    список. Единственное, что берётся у корня, — ``provider_tokens``: перенос не
+    чтение и токенов по контракту не несёт. Нет корня или нет более раннего
+    поколения — отчёт нечитаем.
     """
     root = row.get("carried_from_review_id")
     if not root:
@@ -141,15 +162,17 @@ async def _judged_rows(
     source = await repo.get_machine_review(db, int(root))
     if source is None:
         raise UnreadableReport(int(row["id"]), f"исходный отчёт #{root} не найден")
-    task_id, generation = (
-        int(row["task_id"]),
-        int(dict(source)["submission_generation"]),
-    )
-    if (task_id, generation) in seen:
-        return []
-    seen.add((task_id, generation))
-    out: list[dict[str, Any]] = []
-    for sibling in await repo.machine_reviews_of_generation(db, task_id, generation):
+    copy = dict(row)
+    copy["provider_tokens"] = dict(source).get("provider_tokens")
+    task_id, generation = int(row["task_id"]), int(row["submission_generation"])
+    earlier = await _earlier_generation(db, task_id, generation)
+    if earlier is None:
+        raise UnreadableReport(int(row["id"]), "перенос без более раннего поколения")
+    out = [copy]
+    if (task_id, earlier) in seen:
+        return out
+    seen.add((task_id, earlier))
+    for sibling in await repo.machine_reviews_of_generation(db, task_id, earlier):
         out.extend(await _judged_rows(db, dict(sibling), seen))
     return out
 
@@ -157,7 +180,7 @@ async def _judged_rows(
 async def generation_views(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[MachineReviewView]:
-    """ВСЕ отчёты текущего поколения (у переноса — исходного), прочитанные строго."""
+    """ВСЕ отчёты текущего поколения (и за копиями переноса), прочитанные строго."""
     rows = await repo.machine_reviews_of_generation(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )

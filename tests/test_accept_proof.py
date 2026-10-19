@@ -266,3 +266,126 @@ async def test_a_carried_report_needs_every_report_of_the_source_generation(
     )
     await db.commit()
     assert await _action(db, task_id) != ACCEPT
+
+
+async def _copy(db, task_id: int, generation: int, source_id: int, **over) -> int:
+    """Копия переноса #1361 в поколении ``generation``; ссылка схлопнута до корня."""
+    source = dict(await repo.get_machine_review(db, source_id) or {})
+    carried = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill=source["harness_skill"],
+        harness_version=source["harness_version"],
+        agent_count=source["agent_count"],
+        orchestrator=source["orchestrator"],
+        model=source["model"],
+        raw_count=int(source["raw_count"]),
+        findings_confirmed=over.get("findings_confirmed", "[]"),
+        findings_rejected=source["findings_rejected"],
+        submitted_by=source["submitted_by"],
+        incomplete=False,
+        unresolved=over.get("unresolved", "[]"),
+        lost_dimensions=over.get("lost_dimensions", "[]"),
+        profile=source["profile"],
+        principal_id=source["principal_id"],
+        carried_from_review_id=source_id,
+        ci_integrity=("", ""),
+    )
+    await db.commit()
+    return carried
+
+
+@pytest.mark.parametrize("middle_is_clean", [True, False])
+async def test_a_double_carry_unfolds_every_generation(
+    client, db: aiosqlite.Connection, monkeypatch, middle_is_clean: bool
+):
+    """gen1 чистый A; gen2: B + копия A; gen3: повторный перенос (ссылка — на A).
+
+    Промежуточное поколение не теряется: если в нём был B с unresolved — не «Принять».
+    """
+    task_id, ids = await _task(
+        client, db, monkeypatch, f"ap-double-{middle_is_clean}", 2
+    )
+    a, b = ids
+    unresolved = "[]" if middle_is_clean else '[{"title":"не проверено","why":"x"}]'
+    await db.execute(
+        "UPDATE machine_reviews SET submission_generation=2, unresolved=? WHERE id=?",
+        (unresolved, b),
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET submission_generation=1 WHERE id=?", (a,)
+    )
+    await _copy(db, task_id, 2, a)
+    await _copy(db, task_id, 3, a)
+    await db.execute("UPDATE tasks SET submission_generation=3 WHERE id=?", (task_id,))
+    await db.commit()
+    assert (await _action(db, task_id) == ACCEPT) is middle_is_clean
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"unresolved": '[{"title":"в копии","why":"x"}]'},
+        {"lost_dimensions": '["security: files not read"]'},
+        {
+            "findings_confirmed": (
+                '[{"title":"в копии","severity":"high","category":"c","file":"a.py",'
+                '"line":1,"locator":"lines","start_line":1,"detail":"d"}]'
+            )
+        },
+        {"unresolved": "не json"},
+    ],
+)
+async def test_the_carried_copy_itself_is_read_and_judged(
+    client, db: aiosqlite.Connection, monkeypatch, over: dict
+):
+    """Копия — тоже отчёт: её разделы читаются строго и проходят белый список."""
+    task_id, ids = await _task(
+        client, db, monkeypatch, f"ap-copy-{len(str(over))}-{sorted(over)[0]}", 1
+    )
+    task = dict(await repo.get_task(db, task_id) or {})
+    generation = int(task["submission_generation"])
+    await db.execute(
+        "UPDATE machine_reviews SET submission_generation=? WHERE id=?",
+        (generation - 1, ids[0]),
+    )
+    await _copy(db, task_id, generation, ids[0], **over)
+    assert await _action(db, task_id) != ACCEPT
+
+
+async def test_every_display_path_is_free_of_git_fetch(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Запрет на уровне ВСЕХ путей показа: build, входящие, блок карточки и полный GET."""
+    from hub import services, web
+
+    task_id, _ = await _task(client, db, monkeypatch, "ap-nofetch-all", 1)
+    calls: list[str] = []
+
+    def spy(name: str):
+        async def _spy(*_a, **_k):
+            calls.append(name)
+            return ("b" * 40) if name == "head_sha" else (True, "")
+
+        return _spy
+
+    monkeypatch.setattr(plugins.git_ops, "fetch_base", spy("fetch_base"))
+    monkeypatch.setattr(plugins.git_ops, "head_sha", spy("head_sha"))
+    task = dict(await repo.get_task(db, task_id) or {})
+    await decision_brief.build(db, task)
+    await services.get_inbox_data(db)
+    await web._card_decision_brief(db, task, False)
+    assert calls == [], f"пути справки зовут git: {calls}"
+    assert (await client.get(f"/tasks/{task_id}")).status_code == 200
+    assert calls == [], f"полный GET /tasks/{{id}} зовёт git: {calls}"
+
+
+async def test_completed_without_delivery_data_does_not_claim_a_merge(
+    db: aiosqlite.Connection,
+):
+    from tests.test_decision_brief_fresh_review import _build, _completed
+
+    got = await _build(db, await _completed(db))
+    assert got["recommend"]["action"] == "Проверить"
+    assert "влит" not in (got["happened"] + " ".join(got["recommend"]["why"])).lower()
