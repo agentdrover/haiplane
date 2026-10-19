@@ -51,7 +51,8 @@ STEPS_DIR = Path(__file__).resolve().parent
 # точка допустима только перед расширением.
 STEP_FILE_RE = re.compile(r"m[0-9]{12}_[a-z0-9]+(?:_[a-z0-9]+)+\.py")
 
-_IGNORED = frozenset({"__init__.py", "__pycache__"})
+# .DS_Store: Finder создаёт его сам, в git его нет - не стоит краснить локальный check.
+_IGNORED = frozenset({"__init__.py", "__pycache__", ".DS_Store"})
 
 
 class MigrationStepError(RuntimeError):
@@ -89,10 +90,21 @@ def _inventory(directory: Path, *, strict: bool) -> list[str]:
         log.warning("migration steps: %s пропущен - имя не по шаблону шага", name)
     with os.scandir(directory) as entries:
         names = sorted(e.name for e in entries if STEP_FILE_RE.fullmatch(e.name))
-    links = [n for n in names if (directory / n).is_symlink()]
-    if links:
-        raise MigrationStepError(f"шаг должен быть обычным файлом, не ссылкой: {links}")
+    # Только обычные файлы: ссылка, каталог или FIFO с именем шага - не шаг.
+    odd = [
+        n
+        for n in names
+        if (directory / n).is_symlink() or not (directory / n).is_file()
+    ]
+    if odd:
+        raise MigrationStepError(f"шаг должен быть обычным файлом, не ссылкой: {odd}")
     return names
+
+
+def _plain_annotation(node: ast.expr) -> bool:
+    """Аннотация вроде ``list[tuple[str, str]]``: только имена и подписки."""
+    allowed = (ast.Name, ast.Subscript, ast.Tuple, ast.Load, ast.Attribute)
+    return all(isinstance(n, allowed) for n in ast.walk(node))
 
 
 def _literal_migrations(path: Path) -> object:
@@ -101,6 +113,7 @@ def _literal_migrations(path: Path) -> object:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (
+        OSError,
         SyntaxError,
         UnicodeDecodeError,
         ValueError,
@@ -117,13 +130,23 @@ def _literal_migrations(path: Path) -> object:
             and isinstance(node.value.value, str)
         ):
             continue  # докстрока
-        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "__future__"
+            and node.level == 0
+            and found is None
+            and all(a.name == "annotations" and a.asname is None for a in node.names)
+        ):
             continue
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target, value = node.targets[0], node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and _plain_annotation(node.annotation)
+        ):
             target, value = node.target, node.value
         if isinstance(target, ast.Name) and target.id == "MIGRATIONS" and found is None:
             found = value

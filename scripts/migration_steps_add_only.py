@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -60,28 +62,47 @@ class CompareError(RuntimeError):
 
 
 def _git(args: list[str], repo: Path, *, text: bool = True) -> str | bytes:
-    result = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=text, check=False
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=text, check=False
+        )
+    except OSError as exc:
+        raise CompareError(f"git не запускается: {exc}") from exc
     if result.returncode != 0:
         err = result.stderr if text else result.stderr.decode(errors="replace")
         raise CompareError(f"git {' '.join(args)}: {err.strip()}")
     return result.stdout
 
 
+def _snapshot(
+    repo: Path, base: str, exact: bool, git: Callable[..., str | bytes]
+) -> str:
+    """Коммит, с которым сравниваем: merge-base с базой или ровно база события."""
+    if not exact:
+        return str(git(["merge-base", base, "HEAD"], repo)).strip()
+    try:
+        return str(git(["rev-parse", "--verify", f"{base}^{{commit}}"], repo)).strip()
+    except CompareError:
+        # Прежняя вершина после force-push может быть не в клоне: один добор.
+        git(["fetch", "-q", "--no-tags", "origin", base], repo)
+        return str(git(["rev-parse", "--verify", f"{base}^{{commit}}"], repo)).strip()
+
+
 def violations(
     repo: Path,
     base: str = DEFAULT_BASE,
     *,
+    exact: bool = False,
     git: Callable[..., str | bytes] = _git,
 ) -> list[str]:
-    """Строки-нарушения: файл шага с merge-base изменён, удалён или сменил тип.
+    """Строки-нарушения: файл шага со снимка изменён, удалён или сменил тип/режим.
 
-    Содержимое сравнивается как его видит git (``hash-object`` применяет те же
-    фильтры, что и ``add``: autocrlf не делает файл «изменённым»), режим
-    записи - как в дереве merge-base (ссылка вместо файла - нарушение).
+    Снимок - merge-base с базой (локально, PR) или ровно ``base`` (``exact``:
+    push, где merge-base при force-push откатился бы к общему предку и скрыл
+    шаг). Содержимое сравнивается как его видит git (``hash-object`` применяет
+    те же фильтры, что и ``add``: autocrlf не делает файл «изменённым»).
     """
-    merge_base = str(git(["merge-base", base, "HEAD"], repo)).strip()
+    merge_base = _snapshot(repo, base, exact, git)
     listing = str(git(["ls-tree", "-r", "-z", merge_base, "--", STEPS_PREFIX], repo))
     found: list[str] = []
     for entry in sorted(e for e in listing.split("\0") if e):
@@ -89,24 +110,45 @@ def violations(
         mode, _kind, blob = meta.split()
         if path.removeprefix(STEPS_PREFIX) in _NOT_STEPS or "__pycache__" in path:
             continue
-        at = f"на merge-base {merge_base[:12]}"
+        at = f"на снимке {merge_base[:12]}"
         current = repo / path
         if not (current.is_file() or current.is_symlink()):
             found.append(f"{path}: удалён (есть {at})")
         elif current.is_symlink() != (mode == "120000"):
             found.append(f"{path}: сменил тип файла (на {at} режим {mode})")
+        elif mode != "120000" and os.access(current, os.X_OK) != (mode == "100755"):
+            found.append(f"{path}: сменил режим (на {at} {mode})")
         elif str(git(["hash-object", "--", path], repo)).strip() != blob:
             found.append(f"{path}: изменён (на {at} другой)")
     return found
 
 
+def _load_loader(repo: Path):  # noqa: ANN202
+    """Загрузчик проверяемого дерева по пути файла, а не через ``import hub``.
+
+    ``import hub.migrations`` собрал бы список по настоящему steps/ ещё до
+    проверки и упал бы трейсбеком на том самом плохом файле, который надо
+    назвать; файл загрузчика зависит только от stdlib.
+    """
+    path = repo / STEPS_PREFIX / "__init__.py"
+    spec = importlib.util.spec_from_file_location("_steps_loader_under_check", path)
+    if spec is None or spec.loader is None:
+        raise CompareError(f"загрузчик не найден: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # NamedTuple ищет модуль по имени
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - любая причина = «не удалось»
+        raise CompareError(f"загрузчик {path} не импортируется: {exc}") from exc
+    return module
+
+
 def structure_problems(repo: Path) -> list[str]:
     """Строгая опись каталога шагов: посторонние записи и нечитаемые шаги."""
-    from hub.migrations.steps import MigrationStepError, load_steps
-
+    loader = _load_loader(repo)
     try:
-        load_steps(repo / STEPS_PREFIX, strict=True)
-    except MigrationStepError as exc:
+        loader.load_steps(repo / STEPS_PREFIX, strict=True)
+    except loader.MigrationStepError as exc:
         return [str(exc)]
     return []
 
@@ -119,10 +161,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--before", default="", help="github.event.before")
     parser.add_argument("--base-ref", default="", help="github.base_ref")
     args = parser.parse_args(argv)
+    exact = False
     if args.github_event:
         args.base = ci_base(args.github_event, args.before, args.base_ref, args.base)
+        exact = args.github_event == "push" and args.base == args.before
     try:
-        found = [*structure_problems(args.repo), *violations(args.repo, args.base)]
+        found = [
+            *structure_problems(args.repo),
+            *violations(args.repo, args.base, exact=exact),
+        ]
     except CompareError as exc:
         print(f"migration steps: сравнить не удалось: {exc}", file=sys.stderr)
         return 2

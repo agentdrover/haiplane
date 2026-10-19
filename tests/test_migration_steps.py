@@ -279,11 +279,14 @@ def _rev(repo: Path, ref: str) -> str:
     ).stdout.strip()
 
 
+_LOADER = REPO_ROOT / "hub" / "migrations" / "steps" / "__init__.py"
+
+
 def _repo_with_integrated_step(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     steps = repo / "hub" / "migrations" / "steps"
     steps.mkdir(parents=True)
-    (steps / "__init__.py").write_text("# loader\n")
+    (steps / "__init__.py").write_text(_LOADER.read_text(encoding="utf-8"))
     _write(steps, STEP_A, _A_SRC)
     _git(repo, "init", "-q", "-b", "develop")
     _git(repo, "add", "-A")
@@ -362,7 +365,6 @@ def test_symlink_step_is_rejected(tmp_path):
     [
         "README.md",
         ".keep",
-        ".DS_Store",
         STEP_A + "~",
         "m٢٠٢٦١٠١٩١٢٠٠_1_x.py",
         STEP_B + "\n",
@@ -380,6 +382,78 @@ def test_stray_entry_does_not_stop_startup_but_reddens_the_ci_check(
     # CI: строгая проверка краснеет и называет запись.
     assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 1
     assert "посторонние записи" in capsys.readouterr().err
+
+
+def test_finder_metadata_is_not_a_stray_entry(tmp_path):
+    repo = _repo_with_integrated_step(tmp_path)
+    (repo / "hub" / "migrations" / "steps" / ".DS_Store").write_bytes(b"\0")
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 0
+
+
+def test_step_named_directory_is_a_named_error_not_a_traceback(tmp_path):
+    directory = _steps_dir(tmp_path, **{STEP_A: _A_SRC})
+    (directory / STEP_B).mkdir()
+    with pytest.raises(MigrationStepError, match="обычным файлом"):
+        load_steps(directory)
+
+
+def test_ci_check_names_a_broken_step_instead_of_crashing(tmp_path, capsys):
+    repo = _repo_with_integrated_step(tmp_path)
+    # Загрузчик берётся из проверяемого дерева по пути: плохой шаг называется,
+    # а не роняет скрипт трейсбеком при импорте hub.migrations.
+    _write(repo / "hub/migrations/steps", STEP_B, '__import__("os")\nMIGRATIONS = []\n')
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 1
+    assert STEP_B in capsys.readouterr().err
+
+
+def test_missing_loader_is_exit_2_not_a_traceback(tmp_path):
+    repo = _repo_with_integrated_step(tmp_path)
+    (repo / "hub/migrations/steps/__init__.py").unlink()
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 2
+
+
+def test_force_push_does_not_hide_a_removed_step(tmp_path, capsys):
+    """before - вершина с шагом B; push откатил develop к коммиту без него."""
+    repo = _repo_with_integrated_step(tmp_path)
+    steps = repo / "hub" / "migrations" / "steps"
+    _git(repo, "checkout", "-q", "develop")
+    first = _rev(repo, "HEAD")
+    _write(steps, STEP_B, _B_SRC)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "step B")
+    before = _rev(repo, "HEAD")
+    _git(repo, "reset", "-q", "--hard", first)
+    argv = ["--github-event", "push", "--before", before, "--repo", str(repo)]
+    assert add_only_main(argv) == 1
+    assert STEP_B in capsys.readouterr().err
+
+
+def test_unknown_before_is_exit_2(tmp_path):
+    repo = _repo_with_integrated_step(tmp_path)
+    argv = ["--github-event", "push", "--before", "1" * 40, "--repo", str(repo)]
+    assert add_only_main(argv) == 2
+
+
+def test_step_mode_change_is_a_violation(tmp_path, capsys):
+    repo = _repo_with_integrated_step(tmp_path)
+    (repo / "hub/migrations/steps" / STEP_A).chmod(0o755)
+    assert add_only_main(["--base", "develop", "--repo", str(repo)]) == 1
+    assert "режим" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        'MIGRATIONS: __import__("os").getcwd() = []\n',
+        "MIGRATIONS = []\nfrom __future__ import annotations\n",
+        "from __future__ import braces\nMIGRATIONS = []\n",
+        "from .__future__ import annotations\nMIGRATIONS = []\n",
+    ],
+)
+def test_annotation_and_future_import_are_part_of_the_literal_format(tmp_path, src):
+    directory = _steps_dir(tmp_path, **{STEP_A: src})
+    with pytest.raises(MigrationStepError):
+        load_steps(directory)
 
 
 def test_ci_check_is_green_on_a_clean_directory(tmp_path):
