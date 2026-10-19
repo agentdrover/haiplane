@@ -23,8 +23,10 @@ MAX_REQUESTS = 2
 SETTLED = ("observed", "declined", "exhausted")
 #: Открытые состояния: по sha ещё нет прогона, и заявка может вернуться в очередь.
 OPEN_STATES = ("seen", "reserved", "requested")
-#: Ключ сохраняемого курсора очереди объявлений.
+#: Ключи сохраняемого состояния очереди объявлений: курсор (верхняя граница
+#: следующей страницы, 0 - с вершины) и наибольший id, при котором курсор сброшен.
 ANNOUNCE_CURSOR = "announce_cursor"
+ANNOUNCE_TOP = "announce_top"
 
 
 async def running_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -312,3 +314,27 @@ async def latest_run_id(db: aiosqlite.Connection, task_id: int, sha: str) -> str
         (task_id, sha),
     )
     return str(rows[0]["run_id"]) if rows else ""
+
+
+async def top_attempt_id(db: aiosqlite.Connection) -> int:
+    """Наибольший id попытки отчёта: новая попытка возвращает очередь к вершине."""
+    rows = await fetchall(
+        db, "SELECT COALESCE(MAX(id), 0) AS top FROM ci_report_attempts"
+    )
+    return int(rows[0]["top"])
+
+
+async def prune_finished(db: aiosqlite.Connection, *, days: int) -> int:
+    """Убрать строки журналов задач, завершённых или архивных дольше ``days`` суток."""
+    removed = 0
+    marks = f"-{int(days)} days"
+    async with write_transaction(db):
+        for table in ("ci_head_announced", "ci_head_runs"):
+            cur = await db.execute(
+                f"DELETE FROM {table} WHERE task_id IN (SELECT id FROM tasks "  # nosec B608 - fixed names
+                "WHERE (status IN ('completed', 'failed', 'rejected') OR archived=1) "
+                "AND updated_at < datetime('now', ?))",
+                (marks,),
+            )
+            removed += cur.rowcount or 0
+    return removed

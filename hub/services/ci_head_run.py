@@ -61,9 +61,6 @@ LABEL_BUDGET_SECONDS = 3.0
 #: Доля бюджета прохода, которую может съесть половина запросов: остальное -
 #: объявлениям, чтобы медленные клоны их не морили.
 REQUEST_SHARE = 0.7
-#: Жёсткий потолок прохода сверх бюджета: ждать БД и транзакции под дедлайн нельзя
-#: (aiosqlite не знает о нём), поэтому проход целиком ограничен ещё и снаружи.
-HARD_CAP_EXTRA_SECONDS = 5.0
 #: Меньше этого остатка платный запрос не начинаем: резерв не должен пропасть зря.
 MIN_DISPATCH_LEFT_SECONDS = 2.0
 
@@ -100,8 +97,9 @@ class _Deadline:
 
 def reset_state() -> None:
     """Забыть всё, что держится в памяти процесса (рестарт; тесты)."""
-    global _down_until, _cursor
+    global _down_until, _cursor, _last_prune
     _down_until = 0.0
+    _last_prune = 0.0
     _heads_down.clear()
     _cursor = 0
 
@@ -279,6 +277,8 @@ async def _ask_forge(scope: _Scope, dl: _Deadline) -> tuple[bool, str]:
             ),
             DISPATCH_CEILING_SECONDS,
         )
+    except _OutOfTime:
+        raise  # бюджет кончился ДО вызова: ничего не отправлено, попытка вернётся
     except Exception as exc:  # noqa: BLE001 - after a send the outcome is unknown
         log.warning("CI run request for #%s failed: %r", scope.task_id, exc)
         return False, "ambiguous"
@@ -602,27 +602,19 @@ async def _announce_one(
             )
 
 
-async def _scan_page(
+async def _announce_row(
     db: aiosqlite.Connection,
-    before: int | None,
-    known: dict[int, str],
-    dl: _Deadline,
-) -> tuple[int, int]:
-    """Одна страница очереди объявлений; ``(строк, наименьший id)``."""
-    rows = await journal.unannounced_verified(
-        db, limit=journal.ANNOUNCE_PAGE, before_id=before
-    )
-    if not rows:
-        return 0, 0
-    heads = await _current_heads(db, rows, known, dl)
-    for row in rows:
-        if dl.left() <= 0:
-            raise _OutOfTime
-        try:
-            await _announce_one(db, row, heads)
-        except Exception:  # noqa: BLE001 - one row must not stop the queue
-            log.exception("CI head run: announcing attempt %s failed", row["id"])
-    return len(rows), min(int(r["id"]) for r in rows)
+    row: dict[str, Any],
+    heads: dict[int, str],
+    fps: dict[int, str],
+) -> None:
+    """Одна строка очереди. Непригодную по снимку отсекаем БЕЗ транзакции."""
+    task_id = int(row["task_id"])
+    if task_id not in fps:
+        fps[task_id] = await ci_contract.fingerprint_for_task(db, task_id)
+    if not ci_trust.is_verified(row, fps[task_id]):
+        return  # подтверждение под другим контрактом: позже, когда его перепроверят
+    await _announce_one(db, row, heads)
 
 
 async def announce_results(
@@ -632,28 +624,73 @@ async def announce_results(
 ) -> None:
     """Вторая половина прохода: подтверждённые итоги - в ленту, по разу на попытку.
 
-    Очередь читается ПОСТРАНИЧНО с сохраняемым курсором: каждый проход начинает с
-    самой новой страницы (свежие отчёты не ждут) и продолжает с того места, где
-    остановился прошлый. Пачка необъявляемых строк (контракт сменился после
-    подтверждения) остаётся в выборке, но проходит мимо за несколько тиков, а не
-    запирает объявляемую за собой навсегда.
+    Очередь читается СВЕРХУ ВНИЗ постранично с сохраняемым курсором, и курсор
+    стоит на ПОСЛЕДНЕЙ ОБРАБОТАННОЙ строке при любом исходе - в том числе когда
+    время вышло посреди страницы. Пачка необъявляемых строк (контракт сменился
+    после подтверждения) проходит мимо за несколько тиков и не запирает
+    объявляемую за собой. Новая попытка отчёта (id выше прежней вершины)
+    возвращает очередь к вершине: свежий итог не ждёт хвоста.
     """
     dl = dl or _Deadline(CYCLE_BUDGET_SECONDS)
     known = known_heads or {}
-    count, low = await _scan_page(db, None, known, dl)
-    if count < journal.ANNOUNCE_PAGE:
+    top = await journal.top_attempt_id(db)
+    if top > await journal.get_state(db, journal.ANNOUNCE_TOP):
+        await journal.set_state(db, journal.ANNOUNCE_TOP, top)
         await journal.set_state(db, journal.ANNOUNCE_CURSOR, 0)
-        return
-    start = await journal.get_state(db, journal.ANNOUNCE_CURSOR) or low
+    cursor = await journal.get_state(db, journal.ANNOUNCE_CURSOR)
+    before: int | None = cursor or None
+    progress = cursor
+    fps: dict[int, str] = {}
     try:
         for _page in range(journal.ANNOUNCE_PAGES):
-            count, low = await _scan_page(db, start, known, dl)
-            if count < journal.ANNOUNCE_PAGE:
-                start = 0  # очередь пройдена до дна: следующий проход - с вершины
-                break
-            start = low
+            rows = await journal.unannounced_verified(
+                db, limit=journal.ANNOUNCE_PAGE, before_id=before
+            )
+            if not rows:
+                progress = 0  # до дна дошли
+                return
+            heads = await _current_heads(db, rows, known, dl)
+            for row in rows:
+                if dl.left() <= 0:
+                    raise _OutOfTime
+                try:
+                    await _announce_row(db, row, heads, fps)
+                except Exception:  # noqa: BLE001 - one row must not stop the queue
+                    log.exception(
+                        "CI head run: announcing attempt %s failed", row["id"]
+                    )
+                progress = int(row["id"])
+            if len(rows) < journal.ANNOUNCE_PAGE:
+                progress = 0
+                return
+            before = progress
+    except _OutOfTime:
+        pass  # время вышло: курсор уже на последней обработанной строке
     finally:
-        await journal.set_state(db, journal.ANNOUNCE_CURSOR, start)
+        await journal.set_state(db, journal.ANNOUNCE_CURSOR, progress)
+
+
+async def _overdue_scopes(
+    db: aiosqlite.Connection, rows: list[dict[str, Any]]
+) -> dict[int, _Scope]:
+    """Области задач из просроченных ожиданий, которые СЕЙЧАС ещё законны.
+
+    Те же условия, что и для dispatch: политика и контракт проекта, GitHub,
+    задача в running на той же ветке и без сдачи.
+    """
+    scopes: dict[int, _Scope] = {}
+    for row in rows:
+        task_id = int(row["task_id"])
+        try:
+            project = await repo.resolve_project_for_task(db, task_id)
+            if project is None or not _in_scope(project):
+                continue
+            if not await journal.task_in_scope(db, task_id, str(row["branch"])):
+                continue
+            scopes[task_id] = _Scope(task_id, str(row["branch"]), project)
+        except Exception:  # noqa: BLE001 - unreadable scope: no alert this time
+            log.exception("CI head run: overdue scope of #%s unreadable", task_id)
+    return scopes
 
 
 async def announce_overdue(db: aiosqlite.Connection) -> None:
@@ -661,10 +698,25 @@ async def announce_overdue(db: aiosqlite.Connection) -> None:
 
     Срок ``CI_HEAD_RUN_WAIT_MINUTES`` считается от заявки (или от первого
     наблюдения головы, если CI запустил сам исполнитель). Один раз на (задача,
-    sha, число заявок): повторная заявка - новое ожидание.
+    sha, число заявок): повторная заявка - новое ожидание. Alert говорит только о
+    том, что ещё актуально: область задачи перепроверяется, а голова ветки
+    читается заново и должна совпасть с ожидаемым sha; голову прочитать не
+    удалось - молчим до следующего прохода.
     """
-    for row in await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES)):
+    rows = await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES))
+    scopes = await _overdue_scopes(db, rows)
+    if not scopes:
+        return
+    try:
+        heads = await _read_heads(
+            list(scopes.values()), _Deadline(LABEL_BUDGET_SECONDS)
+        )
+    except _OutOfTime:
+        return
+    for row in rows:
         task_id, sha = int(row["task_id"]), str(row["sha"])
+        if task_id not in scopes or heads.get(task_id) != sha:
+            continue
         try:
             run_id = await journal.latest_run_id(db, task_id, sha)
             text = (
@@ -684,6 +736,20 @@ async def announce_overdue(db: aiosqlite.Connection) -> None:
                     )
         except Exception:  # noqa: BLE001 - one task must not stop the others
             log.exception("CI head run: overdue note for #%s failed", task_id)
+
+
+_last_prune = 0.0
+PRUNE_EVERY_SECONDS = 3600.0
+JOURNAL_RETENTION_DAYS = 14
+
+
+async def prune_journals(db: aiosqlite.Connection) -> None:
+    """Раз в час: журналы завершённых задач старше срока уходят."""
+    global _last_prune
+    if time.monotonic() - _last_prune < PRUNE_EVERY_SECONDS and _last_prune:
+        return
+    _last_prune = time.monotonic()
+    await journal.prune_finished(db, days=JOURNAL_RETENTION_DAYS)
 
 
 async def sweep(db: aiosqlite.Connection) -> None:
@@ -706,20 +772,22 @@ async def sweep(db: aiosqlite.Connection) -> None:
         log.exception("CI head run: the announce half failed")
     try:
         await announce_overdue(db)
+        await prune_journals(db)
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the overdue half failed")
 
 
 async def run_sweep(db: aiosqlite.Connection) -> None:
-    """Вход для SWEEPS поллера: проход не имеет права убить тик и не держит его.
+    """Вход для SWEEPS поллера: проход не имеет права убить тик.
 
-    Сетевые вызовы идут под дедлайном прохода; ожидания БД (aiosqlite) ему не
-    подчиняются, поэтому весь проход ограничен ещё и снаружи.
+    Дедлайн прохода - КООПЕРАТИВНЫЙ: сеть идёт под ``asyncio.timeout`` (там отмена
+    безопасна, транзакция не держится), а между шагами БД проверяется остаток.
+    Операции БД снаружи НЕ отменяются никогда: отменённый await оставляет
+    aiosqlite дорабатывать SQL, и общее соединение поллера оказывается в
+    транзакции, которую никто не завершит. Ожидание замка ограничено
+    ``busy_timeout`` самого соединения.
     """
     try:
-        async with asyncio.timeout(CYCLE_BUDGET_SECONDS + HARD_CAP_EXTRA_SECONDS):
-            await sweep(db)
-    except TimeoutError:
-        log.warning("CI head run: the pass ran out of its hard time cap")
+        await sweep(db)
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("CI head run sweep failed")
