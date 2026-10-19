@@ -48,13 +48,21 @@ CYCLE_BUDGET_SECONDS = 45.0
 
 _down_until = 0.0
 _cursor = 0
+#: Клон, из которого головы не прочитались, на минуту выпадает из очереди:
+#: недоступный репозиторий не должен держать остальные проекты.
+_heads_down: dict[str | None, float] = {}
 
 
 def reset_state() -> None:
     """Забыть всё, что держится в памяти процесса (рестарт; тесты)."""
     global _down_until, _cursor
     _down_until = 0.0
+    _heads_down.clear()
     _cursor = 0
+
+
+def _workspace_down(workspace: str | None) -> bool:
+    return time.monotonic() < _heads_down.get(workspace, 0.0)
 
 
 def _back_off() -> None:
@@ -102,15 +110,20 @@ async def _scopes(db: aiosqlite.Connection) -> list[_Scope]:
     for row in await journal.running_candidates(db):
         project = await repo.resolve_project_for_task(db, int(row["id"]))
         if project is not None and _in_scope(project):
-            found.append(_Scope(int(row["id"]), str(row["branch"]), project))
+            scope = _Scope(int(row["id"]), str(row["branch"]), project)
+            if not _workspace_down(scope.workspace):
+                found.append(scope)
     found.sort(key=lambda s: s.task_id)
     after = [s for s in found if s.task_id > _cursor]
     ordered = after + [s for s in found if s.task_id <= _cursor]
     return ordered[: max(1, int(config.CI_HEAD_RUN_TASKS_PER_CYCLE))]
 
 
-async def _read_heads(scopes: list[_Scope]) -> dict[int, str] | None:
-    """Головы веток: одно чтение на репозиторий; None - спросить не удалось."""
+async def _read_heads(scopes: list[_Scope]) -> dict[int, str]:
+    """Головы веток: одно чтение на репозиторий. Клон, не давший ответ, - в отступ.
+
+    Задача без головы в ответе значит «головы не видно» и ничего не решает.
+    """
     by_workspace: dict[str | None, list[_Scope]] = {}
     for scope in scopes:
         by_workspace.setdefault(scope.workspace, []).append(scope)
@@ -120,7 +133,8 @@ async def _read_heads(scopes: list[_Scope]) -> dict[int, str] | None:
             [s.branch for s in group], repo=workspace
         )
         if found is None:
-            return None
+            _heads_down[workspace] = time.monotonic() + BACKOFF_SECONDS
+            continue
         for scope in group:
             if found.get(scope.branch):
                 heads[scope.task_id] = found[scope.branch]
@@ -260,10 +274,12 @@ async def _verify_after_requests(
     except Exception:  # noqa: BLE001 - the check is best effort
         return
     for scope, sha in accepted:
-        head = (now or {}).get(scope.task_id)
+        head = now.get(scope.task_id)
         if head and head != sha:
             async with write_transaction(db):
-                await journal.adopt_unplanned(db, scope.task_id, head, scope.branch)
+                await journal.adopt_unplanned(
+                    db, scope.task_id, head, scope.branch, previous=sha
+                )
                 await repo.add_task_update(
                     db,
                     scope.task_id,
@@ -287,9 +303,6 @@ async def request_for_new_heads(db: aiosqlite.Connection) -> dict[int, str]:
     if not scopes:
         return {}
     heads = await _read_heads(scopes)
-    if heads is None:
-        _back_off()
-        return {}
     started = time.monotonic()
     accepted: list[tuple[_Scope, str]] = []
     for scope in scopes:
@@ -334,12 +347,16 @@ async def _current_heads(
         project = await repo.resolve_project_for_task(db, task_id)
         if task is not None and project is not None and (task["branch"] or ""):
             scopes[task_id] = _Scope(task_id, str(task["branch"]), project)
-    readable = [s for s in scopes.values() if _in_scope_for_read(s)]
+    readable = [
+        s
+        for s in scopes.values()
+        if _in_scope_for_read(s) and not _workspace_down(s.workspace)
+    ]
     if readable:
         try:
-            found.update(await _read_heads(readable) or {})
+            found.update(await _read_heads(readable))
         except Exception:  # noqa: BLE001 - the label is a courtesy, not a gate
-            pass
+            log.debug("could not read the heads for the result labels", exc_info=True)
     return found
 
 

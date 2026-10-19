@@ -106,14 +106,21 @@ async def reserve_request(
 
 
 async def adopt_unplanned(
-    db: aiosqlite.Connection, task_id: int, sha: str, branch: str
+    db: aiosqlite.Connection, task_id: int, sha: str, branch: str, *, previous: str
 ) -> None:
     """Голова сдвинулась, пока шёл запрос: прогон мог пойти по НОВОЙ голове.
 
     Новая голова записывается как «запрошена, исход неизвестен»: следующий цикл
     сначала ищет её прогон, а второй запрос возможен только после срока повтора.
+    Прежняя (``previous``) возвращается из «запрошена» в «исход неизвестен»: CI
+    мог пойти и не по ней, и вернувшаяся голова не должна остаться без прогона.
     """
     async with write_transaction(db):
+        await db.execute(
+            "UPDATE ci_head_runs SET state='reserved' "
+            "WHERE task_id=? AND sha=? AND state='requested'",
+            (task_id, previous),
+        )
         await db.execute(
             "INSERT OR IGNORE INTO ci_head_runs (task_id, sha, branch) "
             "VALUES (?, ?, ?)",

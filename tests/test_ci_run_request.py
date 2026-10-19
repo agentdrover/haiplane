@@ -659,6 +659,7 @@ class _CloudGit(NoopGitOps):
         self.heads: dict[str, str] = {}
         self.heads_down = False
         self.head_reads = 0
+        self.broken_clones: set[str] = set()
         self.on_probe = None  # type: ignore[var-annotated]
         self.on_request = None  # type: ignore[var-annotated]
         self.requests: list[tuple[str, str | None]] = []
@@ -684,7 +685,7 @@ class _CloudGit(NoopGitOps):
 
     async def remote_heads(self, branches, repo=None):
         self.head_reads += 1
-        if self.heads_down:
+        if self.heads_down or repo in self.broken_clones:
             return None
         return {b: self.heads[b] for b in branches if b in self.heads}
 
@@ -1184,7 +1185,7 @@ async def _stale_list_writes_one_entry(
 
 
 async def test_a_head_that_moves_during_the_request_is_not_requested_twice(
-    db: aiosqlite.Connection, cloud: _CloudGit
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ):
     """#1862 (Codex): запрос идёт по ref; сдвинутая голова B не получает второй запрос."""
 
@@ -1202,6 +1203,13 @@ async def test_a_head_that_moves_during_the_request_is_not_requested_twice(
     await _cycle(db)
     assert len(cloud.requests) == 1, (
         "B уже записана как «запрошена»: её прогон ищут, второй не заказывают"
+    )
+    # голова вернулась на A, а прогона по ней нет (CI шёл по B): A не потеряна
+    cloud.heads[HEAD_BRANCH] = HEAD_A
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    await _cycle(db)
+    assert len(cloud.requests) == 2, (
+        "A вернулась в «исход неизвестен» и получила повтор"
     )
 
 
@@ -1316,3 +1324,21 @@ async def test_a_cycle_serves_a_bounded_number_of_tasks_in_turn(
     assert [r[0] for r in cloud.requests] == branches, (
         "по кругу: хвост очереди не голодает, и никто не получает запрос дважды"
     )
+
+
+async def test_an_unreachable_clone_does_not_hold_the_queue_of_the_others(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862 (Codex): клон без ответа выпадает из очереди, здоровые проекты идут."""
+    cloud.broken_clones.add("/broken")
+    cloud.heads["task-11/broken"] = HEAD_A
+    cloud.heads["task-11/healthy"] = HEAD_B
+    await _cloud_task(db, slug="broken", branch="task-11/broken", workspace="/broken")
+    await _cloud_task(
+        db, slug="healthy", branch="task-11/healthy", workspace="/healthy"
+    )
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == ["task-11/healthy"]
+    reads = cloud.head_reads
+    await _cycle(db)
+    assert cloud.head_reads == reads + 1, "сломанный клон не спрашивают, здоровый - да"
