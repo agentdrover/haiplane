@@ -136,6 +136,20 @@ def _forget_observed_branch_tips():
 
 
 @pytest.fixture(autouse=True)
+def _forget_ci_head_run_memory():
+    """Курсор и отступ прохода ci_head_run (#1862) живут в памяти процесса.
+
+    Номера задач перезапускаются в каждой тестовой базе, поэтому курсор одного
+    теста читался бы как «после этой задачи» в следующем.
+    """
+    from hub.services import ci_head_run
+
+    ci_head_run.reset_state()
+    yield
+    ci_head_run.reset_state()
+
+
+@pytest.fixture(autouse=True)
 def _forget_pair_delivery_waits():
     """Empty the poller's delivery-wait dedupe memory around every test (#1261).
 

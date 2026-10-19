@@ -1742,6 +1742,18 @@ async def _sweep_ci_trust(db) -> None:
         log.exception("CI trust sweep failed")
 
 
+async def _sweep_ci_head_run(db) -> None:
+    # #1862: CI на новой голове ветки задачи в running запрашивает хаб, а его
+    # итог после подтверждения отчёта пишет в ленту. Ходит после ci_trust:
+    # объявление читает уже разрешённое доверие.
+    try:
+        from hub.services.ci_head_run import sweep
+
+        await sweep(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("CI head run sweep failed")
+
+
 async def _sweep_expired_claims(db) -> None:
     from hub.services import run_claim
 
@@ -2486,6 +2498,8 @@ SWEEPS: tuple[Sweep, ...] = (
     # #1687: before review settlement, which reads CI evidence — the standing
     # of the CI report (attempt, trust) is refreshed first.
     Sweep("ci_trust", _sweep_ci_trust),
+    # #1862: after ci_trust — announcing a result needs the trust it resolved.
+    Sweep("ci_head_run", _sweep_ci_head_run),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),
     Sweep("parent_rollup", _sweep_parent_rollup),

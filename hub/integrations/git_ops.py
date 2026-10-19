@@ -3455,6 +3455,7 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult:
         """Попросить форж о прогоне на вершине ``branch`` (#1197).
 
@@ -3464,8 +3465,38 @@ class GitOpsIntegration:
         оно жило бы в вызывающем и разъезжалось бы с реализациями.
         """
         return await self._forge_for(forge).request_ci_run(
-            branch, repo=repo, gh_repo=gh_repo
+            branch, repo=repo, gh_repo=gh_repo, workflow_path=workflow_path
         )
+
+    async def remote_heads(
+        self, branches: Sequence[str], repo: str | None = None
+    ) -> dict[str, str] | None:
+        """Heads of ``origin`` branches in ONE ``ls-remote`` (#1862).
+
+        ``{branch: sha}`` for the branches origin has; a branch it lacks is
+        simply absent. None when origin did not answer: "could not look" is not
+        "no branches", and the caller must tell the two apart.
+        """
+        names = [b for b in dict.fromkeys(branches) if b]
+        if not names:
+            return {}
+        rc, out, _err = await _git(
+            "ls-remote",
+            "--heads",
+            "origin",
+            *[f"refs/heads/{b}" for b in names],
+            repo=repo or _repo_root(),
+            check=False,
+            timeout=60,
+        )
+        if rc != 0:
+            return None
+        found: dict[str, str] = {}
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref.startswith("refs/heads/") and sha.strip():
+                found[ref[len("refs/heads/") :]] = sha.strip()
+        return found
 
     async def pr_for_branch(
         self,

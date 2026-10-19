@@ -592,7 +592,12 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult: ...
+    # #1862: головы веток одним чтением (ls-remote); None = спросить не удалось.
+    async def remote_heads(
+        self, branches: Sequence[str], repo: str | None = None
+    ) -> dict[str, str] | None: ...
     async def branch_ci_runs(
         self,
         branch: str,
@@ -971,7 +976,12 @@ class ForgePlugin(Protocol):
     # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:
     # «отказано осмысленно» и «вызов не долетел» лечатся разными руками.
     async def request_ci_run(
-        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        branch: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult: ...
     async def branch_ci_runs(
         self,

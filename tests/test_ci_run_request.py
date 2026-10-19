@@ -623,3 +623,391 @@ async def test_an_unknown_workflow_set_is_declined_not_guessed(monkeypatch):
     assert "release-please.yml" in (result.details or ""), (
         "отказ обязан назвать, что именно он видел"
     )
+
+
+# ---- #1862: хаб сам просит прогон на новой голове ветки задачи в работе ----
+#
+# До сдачи у облачного исполнителя нет gh, и CI на его коммит никто не
+# запускает. Проход поллера ci_head_run видит голову ветки задачи в running и
+# один раз на (задача, sha) просит прогон; итог прогона после разрешения
+# доверия пишет в ленту. Тесты ходят в ПРОХОД ПОЛЛЕРА, а не в вспомогательную
+# функцию: AC говорит про циклы поллера.
+
+import asyncio  # noqa: E402
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+
+from hub import config  # noqa: E402
+from tests.ci_trust_support import (  # noqa: E402
+    SAT_CHECKS,
+    SAT_CONTRACT,
+    SAT_PATH,
+    attach_fake_github,
+)
+
+HEAD_A = "a1" * 20
+HEAD_B = "b2" * 20
+HEAD_BRANCH = "task-1862/cloud-branch"
+ASKED = "запрос CI принят для ветки"
+
+
+class _CloudGit(NoopGitOps):
+    """Git, в котором головы веток и прогоны задаёт тест, а запрос прогона пишется."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.heads: dict[str, str] = {}
+        self.heads_down = False
+        self.requests: list[tuple[str, str | None]] = []
+        self.outcomes: list[object] = []
+        self.github = attach_fake_github(self)
+        every_run = self.github.ci_runs_for_sha
+
+        async def only_the_asked_workflow(
+            head_sha, repo=None, gh_repo=None, forge="", workflow_path=SAT_PATH
+        ):
+            runs = await every_run(head_sha, repo, gh_repo, forge, workflow_path)
+            if runs is None:
+                return None
+            return [r for r in runs if r["path"] == workflow_path]
+
+        self.ci_runs_for_sha = only_the_asked_workflow  # type: ignore[method-assign]
+
+    async def remote_heads(self, branches, repo=None):
+        if self.heads_down:
+            return None
+        return {b: self.heads[b] for b in branches if b in self.heads}
+
+    async def request_ci_run(
+        self, branch, repo=None, gh_repo=None, forge="", workflow_path=None
+    ):
+        self.requests.append((branch, workflow_path))
+        step = (
+            self.outcomes.pop(0)
+            if self.outcomes
+            else CIRunRequestResult(
+                CIRunRequestOutcome.requested,
+                "workflow_dispatched",
+                details=workflow_path,
+            )
+        )
+        if isinstance(step, BaseException):
+            raise step
+        return step  # type: ignore[return-value]
+
+
+@pytest.fixture
+def cloud(monkeypatch) -> _CloudGit:
+    monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 0, raising=False)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600, raising=False)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 5, raising=False)
+    git = _CloudGit()
+    git.heads[HEAD_BRANCH] = HEAD_A
+    plugins.git_ops = git
+    return git
+
+
+async def _cloud_task(
+    db: aiosqlite.Connection,
+    *,
+    mode: str | None = "require",
+    forge: str = "github",
+    status: str = "running",
+    slug: str = "cloud",
+    branch: str = HEAD_BRANCH,
+) -> int:
+    policy: dict = {"ci_contract": SAT_CONTRACT}
+    if mode is not None:
+        policy["ci_before_submit"] = mode
+    pid = await repo.create_project(db, slug=slug, name=slug.title())
+    await repo.update_project(
+        db, pid, gate_policy=json.dumps(policy), repo="own/rep", forge=forge
+    )
+    task_id = await repo.create_task(
+        db,
+        title="Cloud task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, project_id=pid, branch=branch)
+    await db.commit()
+    return task_id
+
+
+async def _cycle(conn: aiosqlite.Connection) -> None:
+    """Один проход поллера ci_head_run на данном соединении."""
+    from hub.poller import SWEEPS
+
+    sweep = next((s for s in SWEEPS if s.name == "ci_head_run"), None)
+    assert sweep is not None, "в конвейере поллера нет прохода ci_head_run"
+    await sweep.run(conn)
+
+
+def _restart() -> None:
+    """Процесс хаба перезапущен: всё, что держалось в памяти, забыто."""
+    if importlib.util.find_spec("hub.services.ci_head_run") is not None:
+        from hub.services import ci_head_run
+
+        ci_head_run.reset_state()
+
+
+async def _notes(db: aiosqlite.Connection, task_id: int, needle: str) -> list[str]:
+    return [
+        u["content"]
+        for u in (dict(r) for r in await repo.get_task_updates(db, task_id))
+        if needle in (u.get("content") or "")
+    ]
+
+
+async def test_running_task_new_head_gets_one_ci_run(
+    db: aiosqlite.Connection, db_dsn: str, cloud: _CloudGit
+):
+    """AC-1: ровно один запрос на (задача, sha) при гонке, рестарте и возврате A→B→A."""
+    task_id = await _cloud_task(db)
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await other.execute("PRAGMA busy_timeout = 5000")
+        other.row_factory = aiosqlite.Row
+        async with asyncio.timeout(30):
+            await asyncio.gather(_cycle(db), _cycle(other))
+        assert cloud.requests == [(HEAD_BRANCH, SAT_PATH)], (
+            "два цикла на двух соединениях заказали один прогон на один коммит; "
+            "запрос идёт workflow'ом из ci_contract проекта"
+        )
+        first = await _notes(db, task_id, ASKED)
+        assert (
+            len(first) == 1 and HEAD_A[:12] in first[0] and HEAD_BRANCH in first[0]
+        ), "в ленте одна запись о запросе: ветка и наблюдаемый sha"
+
+        _restart()
+        await _cycle(db)
+        assert len(cloud.requests) == 1, "рестарт не стирает журнал запросов"
+
+        cloud.heads[HEAD_BRANCH] = HEAD_B
+        await _cycle(db)
+        assert [r[0] for r in cloud.requests] == [HEAD_BRANCH] * 2, (
+            "новая голова — новый запрос"
+        )
+        cloud.heads[HEAD_BRANCH] = HEAD_A
+        await _cycle(db)
+        await _cycle(other)
+        assert len(cloud.requests) == 2, "возврат к A третьего запроса не рождает"
+        notes = await _notes(db, task_id, ASKED)
+        assert len(notes) == 2 and HEAD_B[:12] in notes[1]
+    finally:
+        await other.close()
+
+
+async def test_running_task_no_duplicate_or_foreign_runs(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """AC-2: когда запроса быть не должно — его нет; когда должен — он есть."""
+    # 1. прогон нужного workflow уже есть (запустил исполнитель)
+    task_id = await _cloud_task(db, slug="has-run")
+    cloud.github.attempt(task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS))
+    await _cycle(db)
+    assert cloud.requests == [], "прогон есть — просить нечего"
+    assert (await repo.get_task(db, task_id))["ci_run_requested_sha"] in ("", None), (
+        "попытка #1197 после сдачи не израсходована"
+    )
+
+    # 2. есть только чужой workflow — запрос нужен
+    foreign = await _cloud_task(db, slug="foreign", branch="task-1/foreign")
+    cloud.heads["task-1/foreign"] = HEAD_B
+    cloud.github.attempt(foreign, HEAD_B, path=".github/workflows/release.yml")
+    await _cycle(db)
+    assert cloud.requests == [("task-1/foreign", SAT_PATH)], (
+        "чужой workflow — не прогон тестов проекта"
+    )
+
+    # 3. не выходит за рамки: grace, режим off и без ключа, GitVerse, статус
+    cloud.requests.clear()
+    cloud.heads["task-2/grace"] = "c3" * 20
+    await _cloud_task(db, slug="grace", branch="task-2/grace")
+    cases = [
+        ("off", dict(mode="off")),
+        ("nokey", dict(mode=None)),
+        ("gitverse", dict(forge="gitverse")),
+        ("review", dict(status="review")),
+    ]
+    for slug, extra in cases:
+        branch = f"task-3/{slug}"
+        cloud.heads[branch] = "d4" * 20
+        await _cloud_task(db, slug=slug, branch=branch, **extra)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 3600)
+    await _cycle(db)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 0)
+    await _cycle(db)
+    asked = {r[0] for r in cloud.requests}
+    assert asked == {"task-2/grace"}, (
+        f"запросили {sorted(asked)}: только grace-задача, истёкший срок, "
+        "остальные случаи молчат (off, нет ключа, GitVerse, не running)"
+    )
+    rows = await db.execute(
+        "SELECT count(*) FROM ci_head_runs WHERE branch LIKE 'task-3/%'"
+    )
+    assert (await rows.fetchone())[0] == 0, "вне области — без записей журнала"
+
+    # 4. неоднозначный исход: резерв держится, не больше двух запросов
+    cloud.requests.clear()
+    cloud.outcomes = [TimeoutError("после отправки"), TimeoutError("снова")]
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600)
+    amb = await _cloud_task(db, slug="amb", branch="task-4/amb")
+    cloud.heads["task-4/amb"] = "e5" * 20
+    for _ in range(3):
+        await _cycle(db)
+    assert [r for r in cloud.requests if r[0] == "task-4/amb"] == [
+        ("task-4/amb", SAT_PATH)
+    ], "срок повтора не истёк: резерв держится"
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    for _ in range(4):
+        await _cycle(db)
+    assert len([r for r in cloud.requests if r[0] == "task-4/amb"]) == 2, (
+        "всего не больше двух запросов на (задача, sha)"
+    )
+    assert (await repo.get_task(db, amb))["ci_run_requested_sha"] in ("", None)
+
+    # 5. неоднозначный исход, а прогон потом появился — повтора нет
+    cloud.requests.clear()
+    cloud.outcomes = [TimeoutError("после отправки")]
+    late = await _cloud_task(db, slug="late", branch="task-5/late")
+    cloud.heads["task-5/late"] = "f6" * 20
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    await _cycle(db)
+    cloud.github.attempt(late, "f6" * 20, path=SAT_PATH, checks=dict(SAT_CHECKS))
+    for _ in range(3):
+        await _cycle(db)
+    assert len([r for r in cloud.requests if r[0] == "task-5/late"]) == 1, (
+        "прогон появился — повторять запрос нечего"
+    )
+
+
+async def _announced(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return await _notes(db, task_id, "CI на sha")
+
+
+async def test_ci_report_for_running_head_is_announced_once(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """AC-3: итог объявляется один раз на (задача, sha, попытка) после доверия."""
+    from hub.services import ci_trust
+    from hub.services.ci_report import accept_ci_run_report
+
+    task_id = await _cloud_task(db)
+    await _cycle(db)
+
+    def report(**kw):
+        return cloud.github.attempt(
+            task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), **kw
+        )
+
+    # отчёт пришёл, а GitHub недоступен: доверия нет — молчим
+    first = report(run_id="7001")
+    cloud.github.down = True
+    await accept_ci_run_report(db, task_id, **first)
+    await _cycle(db)
+    assert await _announced(db, task_id) == [], "непроверенный отчёт не объявляется"
+
+    # доверие разрешилось позже (проход ci_trust): объявление ровно одно
+    cloud.github.down = False
+    standing = await ci_trust.refresh(db, task_id, HEAD_A)
+    assert standing is not None and standing.verified
+    await _cycle(db)
+    await _cycle(db)
+    notes = await _announced(db, task_id)
+    assert len(notes) == 1, "повторные циклы и повторный отчёт не множат запись"
+    assert HEAD_A[:12] in notes[0] and "success" in notes[0] and "7001" in notes[0]
+    assert "голова уже другая" not in notes[0]
+
+    await accept_ci_run_report(db, task_id, **first)
+    await _cycle(db)
+    assert len(await _announced(db, task_id)) == 1, "тот же attempt — та же запись"
+
+    # новая попытка того же прогона — отдельная запись
+    second = report(run_id="7001", attempt="2", conclusion="failure")
+    await accept_ci_run_report(db, task_id, **second)
+    await _cycle(db)
+    notes = await _announced(db, task_id)
+    assert len(notes) == 2 and "failure" in notes[1] and "попытка 2" in notes[1]
+
+    # отчёт для устаревшей головы: голова ушла, запись помечена
+    cloud.heads[HEAD_BRANCH] = HEAD_B
+    await _cycle(db)
+    old = report(run_id="7002")
+    await accept_ci_run_report(db, task_id, **old)
+    await _cycle(db)
+    notes = await _announced(db, task_id)
+    assert len(notes) == 3 and "голова уже другая" in notes[2]
+
+
+async def test_the_dispatch_goes_to_the_workflow_named_by_the_contract(monkeypatch):
+    """#1862: workflow из ci_contract - единственный, что дёргается; нет такого - отказ."""
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(cmd)
+        joined = " ".join(cmd)
+        if "dispatches" in joined:
+            return 0, "", ""
+        return (
+            0,
+            '{"workflows": ['
+            '{"id": 1, "state": "active", "path": ".github/workflows/ci.yml"},'
+            '{"id": 2, "state": "active", "path": ".github/workflows/tests.yml"}]}',
+            "",
+        )
+
+    monkeypatch.setattr("hub.integrations.proc.run", fake_run)
+    forge = GitHubForge()
+
+    got = await forge.request_ci_run(
+        "task-1/x", gh_repo="own/rep", workflow_path=".github/workflows/tests.yml"
+    )
+    assert got.outcome is CIRunRequestOutcome.requested
+    assert got.details == ".github/workflows/tests.yml"
+    assert any("workflows/2/dispatches" in " ".join(c) for c in calls), (
+        "контракт назвал tests.yml - запрос идёт ему, а не предпочтению хаба"
+    )
+    assert not any("workflows/1/dispatches" in " ".join(c) for c in calls)
+
+    calls.clear()
+    missing = await forge.request_ci_run(
+        "task-1/x", gh_repo="own/rep", workflow_path=".github/workflows/absent.yml"
+    )
+    assert missing.outcome is CIRunRequestOutcome.declined
+    assert missing.reason == "no_known_ci_workflow"
+    assert not any("dispatches" in " ".join(c) for c in calls)
+
+
+async def test_remote_heads_reads_every_branch_in_one_call(monkeypatch):
+    """#1862: одно чтение на репозиторий; «не ответил» (None) не равно «веток нет» ({})."""
+    from hub.integrations import git_ops as git_ops_mod
+
+    seen: list[tuple[str, ...]] = []
+    reply: dict[str, object] = {"rc": 0, "out": ""}
+
+    async def fake_git(*args, **kw):
+        seen.append(args)
+        return reply["rc"], reply["out"], ""
+
+    monkeypatch.setattr(git_ops_mod, "_git", fake_git)
+    ops = git_ops_mod.GitOpsIntegration()
+
+    reply["out"] = f"{HEAD_A}\trefs/heads/task-1/a\n{HEAD_B}\trefs/heads/task-2/b\n"
+    got = await ops.remote_heads(["task-1/a", "task-2/b", "task-3/gone"], repo="/r")
+    assert got == {"task-1/a": HEAD_A, "task-2/b": HEAD_B}
+    assert len(seen) == 1, "три ветки - один ls-remote"
+
+    reply["out"] = ""
+    assert await ops.remote_heads(["task-3/gone"], repo="/r") == {}
+    reply["rc"] = 128
+    assert await ops.remote_heads(["task-3/gone"], repo="/r") is None
+    assert await ops.remote_heads([], repo="/r") == {}

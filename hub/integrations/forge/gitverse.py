@@ -1096,7 +1096,12 @@ class GitVerseForge:
         return False, f"gitverse_api_refused_{resp.status}"
 
     async def request_ci_run(
-        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        branch: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult:
         """GitVerse не просят о прогоне — граница, а не недоделка (#1197).
 
