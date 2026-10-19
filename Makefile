@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test lint format types budget layers security check
+.PHONY: setup hooks doctor test lint format types budget layers migration-steps security check
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:
@@ -64,6 +64,10 @@ budget:
 layers:
 	uv run python scripts/layer_rules.py
 
+# Влитые файлы hub/migrations/steps/ не правятся (#1854); база - origin/develop.
+migration-steps:
+	uv run python scripts/migration_steps_add_only.py
+
 security:
 	uv run bandit -r hub -q
 	uv run python scripts/secret_scan.py
@@ -71,4 +75,4 @@ security:
 # Состав обязан покрывать статические шаги CI-джоба test: сверку держит
 # tests/test_local_checks_match_ci.py — новый шаг в CI без цели здесь красит
 # тесты, а не проходит незамеченным (#1080).
-check: lint types budget layers security test
+check: lint types budget layers migration-steps security test

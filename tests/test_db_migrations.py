@@ -1454,19 +1454,37 @@ def _spaced(digest: str) -> str:
     return " ".join(digest[i : i + 8] for i in range(0, len(digest), 8))
 
 
-def test_migration_list_unchanged_after_move():
+def test_frozen_parts_unchanged():
+    """#1854: части part_1..part_3 заморожены (имя, порядок, байты SQL).
+
+    Эталон снят с develop до заморозки. Добавление миграции в part_1..3 роняет
+    тест: новая миграция кладётся файлом в hub/migrations/steps/.
+    """
     import hashlib
 
-    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
 
+    hint = "новая миграция - файлом в hub/migrations/steps/, части заморожены"
     expected = json.loads((_FIXTURES / "migrations_baseline.json").read_text())
     actual = [
         [name, _spaced(hashlib.sha256(sql.encode()).hexdigest())]
-        for name, sql in db_module._MIGRATIONS
+        for name, sql in FROZEN_MIGRATIONS
     ]
-    assert len(actual) == len(expected)
-    assert [n for n, _ in actual] == [n for n, _ in expected]
-    assert actual == expected
+    assert len(actual) == len(expected), hint
+    assert [n for n, _ in actual] == [n for n, _ in expected], hint
+    assert actual == expected, hint
+
+
+def test_assembled_list_is_frozen_parts_then_steps():
+    """Полный собранный список: части как есть, затем шаги каталога по порядку."""
+    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
+    from hub.migrations.steps import load_steps
+
+    steps = load_steps()
+    assert db_module._MIGRATIONS == [*FROZEN_MIGRATIONS, *steps]
+    names = [n for n, _ in db_module._MIGRATIONS]
+    assert len(names) == len(set(names))
 
 
 async def _schema_dump(conn: aiosqlite.Connection) -> list[list]:
@@ -1476,7 +1494,13 @@ async def _schema_dump(conn: aiosqlite.Connection) -> list[list]:
     return [list(r) for r in rows]
 
 
-async def test_moved_migrations_are_noop_on_migrated_db():
+async def test_moved_migrations_are_noop_on_migrated_db(monkeypatch):
+    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
+
+    # Эталоны охраняют только замороженные части (#1854): шаги из steps/ сюда
+    # не входят, их охраняет tests/test_migration_steps.py.
+    monkeypatch.setattr(db_module, "_MIGRATIONS", list(FROZEN_MIGRATIONS))
     conn = await _make_db()
     try:
         # Свежая база новым кодом даёт ту же схему, что дал старый код.
@@ -1515,7 +1539,7 @@ async def test_moved_migrations_are_noop_on_migrated_db():
             await _migrate(conn)
         finally:
             conn.execute = real_execute  # type: ignore[method-assign]
-        migration_sql = {sql for _, sql in _MIGRATIONS}
+        migration_sql = {sql for _, sql in FROZEN_MIGRATIONS}
         assert not [s for s in executed if s in migration_sql]
 
         assert [
