@@ -523,6 +523,14 @@ MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
 # SHA" is a named fact rather than a wait. Same window the poller already
 # used (#1041). Project-level policy is a sibling, not this change.
 CI_GRACE_PERIOD = 180
+# #1862: хаб сам просит прогон CI на новой голове ветки задачи в running.
+# Окно после первого наблюдения головы (исполнитель мог запустить CI сам),
+# срок до повтора при неоднозначном исходе запроса и число задач за цикл.
+CI_HEAD_RUN_GRACE_SECONDS = int(env_get("CI_HEAD_RUN_GRACE_SECONDS", "120"))
+CI_HEAD_RUN_RETRY_SECONDS = int(env_get("CI_HEAD_RUN_RETRY_SECONDS", "600"))
+CI_HEAD_RUN_TASKS_PER_CYCLE = int(env_get("CI_HEAD_RUN_TASKS_PER_CYCLE", "5"))
+# Сколько минут от заявки ждём итог прогона, прежде чем сказать об этом вслух.
+CI_HEAD_RUN_WAIT_MINUTES = int(env_get("CI_HEAD_RUN_WAIT_MINUTES", "60"))
 REVIEW_RUNTIME = env_get("REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = env_get("REVIEW_AGENT", "code-reviewer")
 

@@ -26,6 +26,12 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "hub/integrations/forge/github.py",
+      "measured": 1504,
+      "max": 1580,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "hub/integrations/git_ops.py",
       "measured": 4672,
       "max": 4906,
