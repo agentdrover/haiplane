@@ -20,7 +20,11 @@ from hub.db import fetchall, write_transaction
 #: Всего запросов на (задача, sha), включая повтор после неоднозначного исхода.
 MAX_REQUESTS = 2
 #: Состояния, из которых запрос больше не просят.
-SETTLED = ("requested", "observed", "declined", "exhausted")
+SETTLED = ("observed", "declined", "exhausted")
+#: Открытые состояния: по sha ещё нет прогона, и заявка может вернуться в очередь.
+OPEN_STATES = ("seen", "reserved", "requested")
+#: Ключ сохраняемого курсора очереди объявлений.
+ANNOUNCE_CURSOR = "announce_cursor"
 
 
 async def running_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -88,7 +92,8 @@ async def reserve_request(
             "UPDATE ci_head_runs SET state='reserved', attempts=attempts+1, "
             "reserved_at=datetime('now') WHERE task_id=? AND sha=? AND attempts<? "
             "AND ((state='seen' AND first_seen_at <= datetime('now', ?)) "
-            "OR (state='reserved' AND reserved_at <= datetime('now', ?))) "
+            "OR (state IN ('reserved', 'requested') "
+            "AND reserved_at <= datetime('now', ?))) "
             "AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=ci_head_runs.task_id "
             "AND t.status='running' AND t.archived=0 AND t.branch=? "
             "AND t.submission_generation=0 AND COALESCE(t.submission_sha, '')='' "
@@ -106,21 +111,14 @@ async def reserve_request(
 
 
 async def adopt_unplanned(
-    db: aiosqlite.Connection, task_id: int, sha: str, branch: str, *, previous: str
+    db: aiosqlite.Connection, task_id: int, sha: str, branch: str
 ) -> None:
     """Голова сдвинулась, пока шёл запрос: прогон мог пойти по НОВОЙ голове.
 
     Новая голова записывается как «запрошена, исход неизвестен»: следующий цикл
     сначала ищет её прогон, а второй запрос возможен только после срока повтора.
-    Прежняя (``previous``) возвращается из «запрошена» в «исход неизвестен»: CI
-    мог пойти и не по ней, и вернувшаяся голова не должна остаться без прогона.
     """
     async with write_transaction(db):
-        await db.execute(
-            "UPDATE ci_head_runs SET state='reserved' "
-            "WHERE task_id=? AND sha=? AND state='requested'",
-            (task_id, previous),
-        )
         await db.execute(
             "INSERT OR IGNORE INTO ci_head_runs (task_id, sha, branch) "
             "VALUES (?, ?, ?)",
@@ -140,7 +138,7 @@ async def settle(
     state: str,
     *,
     note: str = "",
-    only_from: tuple[str, ...] = ("seen", "reserved"),
+    only_from: tuple[str, ...] = OPEN_STATES,
 ) -> bool:
     """Перевести строку в итоговое состояние; True, если перевод сделан этим вызовом."""
     marks = ",".join("?" for _ in only_from)
@@ -201,3 +199,18 @@ async def claim_announcement(
         (task_id, sha, attempt_key),
     )
     return (cur.rowcount or 0) == 1
+
+
+async def get_state(db: aiosqlite.Connection, key: str) -> int:
+    """Сохраняемое число прохода (курсор); 0, если не записано."""
+    rows = await fetchall(db, "SELECT value FROM ci_head_state WHERE key=?", (key,))
+    return int(rows[0]["value"]) if rows else 0
+
+
+async def set_state(db: aiosqlite.Connection, key: str, value: int) -> None:
+    async with write_transaction(db):
+        await db.execute(
+            "INSERT INTO ci_head_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, int(value)),
+        )

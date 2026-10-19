@@ -14,6 +14,11 @@
 4. итог прогона пишет в ленту один раз на (задача, sha, попытка) - только после
    того, как доверие к отчёту разрешено (``trust=verified``), не на приёме.
 
+Проход живёт под ОДНИМ дедлайном ``CYCLE_BUDGET_SECONDS``, отсчитанным от его
+начала: каждая сетевая операция получает оставшееся время (не больше своего
+потолка), не хватает времени - остальное следующим тиком. Каждый клон и каждая
+задача изолированы: исключение - отказ этого клона с отступом, не прохода.
+
 Область первого шага: форж GitHub и проекты с ``ci_before_submit`` не ``off`` и
 с контрактом CI. Остальное пропускается молча. Попытку #1197 после сдачи
 (``tasks.ci_run_requested_sha``) этот модуль не трогает.
@@ -24,8 +29,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypeVar
 
 import aiosqlite
 
@@ -39,18 +44,48 @@ from hub.services import ci_contract, ci_trust, project_policy
 
 log = logging.getLogger("hub")
 
-#: После отказа форжа или git ничего не спрашиваем столько секунд (образец ci_trust).
+T = TypeVar("T")
+
+#: После отказа форжа или клона ничего не спрашиваем столько секунд (образец ci_trust).
 BACKOFF_SECONDS = 60.0
-#: Верхняя граница одного запроса прогона; дольше - исход неоднозначен.
-REQUEST_TIMEOUT_SECONDS = 60.0
-#: Новые задачи цикла не начинаются позже этого срока: проход не держит поллер.
-CYCLE_BUDGET_SECONDS = 45.0
+#: Дедлайн на ВЕСЬ проход (запросы и объявления); поллер ждёт его целиком.
+CYCLE_BUDGET_SECONDS = 25.0
+#: Потолки отдельных сетевых операций; операция получает min(потолок, остаток).
+HEADS_CEILING_SECONDS = 20.0
+PROBE_CEILING_SECONDS = 15.0
+DISPATCH_CEILING_SECONDS = 30.0
+#: Меньше этого остатка платный запрос не начинаем: резерв не должен пропасть зря.
+MIN_DISPATCH_LEFT_SECONDS = 2.0
 
 _down_until = 0.0
 _cursor = 0
 #: Клон, из которого головы не прочитались, на минуту выпадает из очереди:
 #: недоступный репозиторий не должен держать остальные проекты.
 _heads_down: dict[str | None, float] = {}
+#: Состояния, из которых запрос больше не просят.
+_RETRYABLE = ("reserved", "requested")
+
+
+class _OutOfTime(Exception):
+    """Бюджет прохода кончился: остальное - следующим тиком, без отступов."""
+
+
+class _Deadline:
+    """Один дедлайн на проход; сетевые вызовы идут через ``run``."""
+
+    def __init__(self, seconds: float) -> None:
+        self.end = time.monotonic() + seconds
+
+    def left(self) -> float:
+        return self.end - time.monotonic()
+
+    async def run(self, make: Callable[[], Awaitable[T]], ceiling: float) -> T:
+        """Выполнить вызов за min(потолок, остаток); остатка нет - ``_OutOfTime``."""
+        allowed = min(ceiling, self.left())
+        if allowed <= 0:
+            raise _OutOfTime
+        async with asyncio.timeout(allowed):
+            return await make()
 
 
 def reset_state() -> None:
@@ -83,6 +118,10 @@ class _Scope:
         self.forge = project_policy.forge_of(project) if gh_repo else ""
         self.workflow_path = project_policy.ci_contract_of(project).workflow_path
 
+    def key(self) -> tuple[Any, ...]:
+        """Всё, от чего зависит, КУДА и ЧЕМ уйдёт запрос."""
+        return (self.gh_repo, self.workspace, self.forge, self.workflow_path)
+
 
 def _in_scope(project: Any) -> bool:
     """GitHub, ci_before_submit не off, контракт CI у проекта есть."""
@@ -104,34 +143,60 @@ def _in_scope(project: Any) -> bool:
     return has_clone or not gh_repo or gh_repo == config.REPO_NAME
 
 
+async def _fresh_scope(db: aiosqlite.Connection, scope: _Scope) -> _Scope | None:
+    """Область задачи СЕЙЧАС (политика и контракт перечитаны); None - вышла из области."""
+    project = await repo.resolve_project_for_task(db, scope.task_id)
+    if project is None or not _in_scope(project):
+        return None
+    fresh = _Scope(scope.task_id, scope.branch, project)
+    return fresh if fresh.key() == scope.key() else None
+
+
 async def _scopes(db: aiosqlite.Connection) -> list[_Scope]:
     """Задачи в области, не больше N за цикл, по кругу (курсор по id задачи)."""
     found: list[_Scope] = []
     for row in await journal.running_candidates(db):
-        project = await repo.resolve_project_for_task(db, int(row["id"]))
-        if project is not None and _in_scope(project):
-            scope = _Scope(int(row["id"]), str(row["branch"]), project)
-            if not _workspace_down(scope.workspace):
-                found.append(scope)
+        try:
+            project = await repo.resolve_project_for_task(db, int(row["id"]))
+            if project is not None and _in_scope(project):
+                scope = _Scope(int(row["id"]), str(row["branch"]), project)
+                if not _workspace_down(scope.workspace):
+                    found.append(scope)
+        except Exception:  # noqa: BLE001 - one unreadable task is skipped, not the pass
+            log.exception("CI head run: task #%s scope unreadable", row["id"])
     found.sort(key=lambda s: s.task_id)
     after = [s for s in found if s.task_id > _cursor]
     ordered = after + [s for s in found if s.task_id <= _cursor]
     return ordered[: max(1, int(config.CI_HEAD_RUN_TASKS_PER_CYCLE))]
 
 
-async def _read_heads(scopes: list[_Scope]) -> dict[int, str]:
-    """Головы веток: одно чтение на репозиторий. Клон, не давший ответ, - в отступ.
+async def _read_heads(scopes: list[_Scope], dl: _Deadline) -> dict[int, str]:
+    """Головы веток: одно чтение на клон, каждое - за остаток дедлайна.
 
-    Задача без головы в ответе значит «головы не видно» и ничего не решает.
+    Любое исключение клона (нет каталога, git не ответил, срок) - отказ ЭТОГО
+    клона: он уходит в отступ, остальные читаются дальше. Задача без головы в
+    ответе значит «головы не видно» и ничего не решает. Кончился бюджет прохода -
+    ``_OutOfTime`` наружу: ни отступов, ни догадок.
     """
     by_workspace: dict[str | None, list[_Scope]] = {}
     for scope in scopes:
         by_workspace.setdefault(scope.workspace, []).append(scope)
     heads: dict[int, str] = {}
     for workspace, group in by_workspace.items():
-        found = await plugins.git_ops.remote_heads(
-            [s.branch for s in group], repo=workspace
-        )
+        branches = [s.branch for s in group]
+
+        async def read(
+            ws: str | None = workspace, br: list[str] = branches
+        ) -> dict[str, str] | None:
+            return await plugins.git_ops.remote_heads(br, repo=ws)
+
+        try:
+            found = await dl.run(read, HEADS_CEILING_SECONDS)
+        except _OutOfTime:
+            raise
+        except Exception as exc:  # noqa: BLE001 - this clone failed, not the pass
+            log.warning("CI head run: heads of %r unreadable: %r", workspace, exc)
+            found = None
         if found is None:
             _heads_down[workspace] = time.monotonic() + BACKOFF_SECONDS
             continue
@@ -141,29 +206,60 @@ async def _read_heads(scopes: list[_Scope]) -> dict[int, str]:
     return heads
 
 
-async def _runs_exist(scope: _Scope, sha: str) -> bool | None:
+async def _runs_exist(scope: _Scope, sha: str, dl: _Deadline) -> bool | None:
     """Есть ли прогон workflow контракта по sha; None - форж не ответил."""
-    runs = await plugins.git_ops.ci_runs_for_sha(
-        sha,
-        repo=scope.workspace,
-        gh_repo=scope.gh_repo,
-        forge=scope.forge,
-        workflow_path=scope.workflow_path,
-    )
+    try:
+        runs = await dl.run(
+            lambda: plugins.git_ops.ci_runs_for_sha(
+                sha,
+                repo=scope.workspace,
+                gh_repo=scope.gh_repo,
+                forge=scope.forge,
+                workflow_path=scope.workflow_path,
+            ),
+            PROBE_CEILING_SECONDS,
+        )
+    except _OutOfTime:
+        raise
+    except Exception as exc:  # noqa: BLE001 - "could not ask" is not "no runs"
+        log.warning("CI head run: runs of %s unreadable: %r", sha[:12], exc)
+        return None
     return None if runs is None else bool(runs)
 
 
-async def _ask_forge(scope: _Scope) -> tuple[bool, str]:
+async def _open_pr(scope: _Scope, dl: _Deadline) -> bool:
+    """Есть ли у ветки открытый PR (его pull_request сам запускает CI)."""
+    try:
+        number = await dl.run(
+            lambda: plugins.git_ops.pr_for_branch(
+                scope.branch,
+                repo=scope.workspace,
+                gh_repo=scope.gh_repo,
+                forge=scope.forge,
+            ),
+            PROBE_CEILING_SECONDS,
+        )
+    except _OutOfTime:
+        raise
+    except Exception:  # noqa: BLE001 - unknown PR state: do not dispatch blind
+        log.warning("CI head run: PR of %s unreadable", scope.branch)
+        return True
+    return bool(number)
+
+
+async def _ask_forge(scope: _Scope, dl: _Deadline) -> tuple[bool, str]:
     """Попросить прогон; ``(принят, пояснение)``. Исключение и таймаут - неоднозначно."""
     try:
-        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
-            result = await plugins.git_ops.request_ci_run(
+        result = await dl.run(
+            lambda: plugins.git_ops.request_ci_run(
                 scope.branch,
                 repo=scope.workspace,
                 gh_repo=scope.gh_repo,
                 forge=scope.forge,
                 workflow_path=scope.workflow_path,
-            )
+            ),
+            DISPATCH_CEILING_SECONDS,
+        )
     except Exception as exc:  # noqa: BLE001 - after a send the outcome is unknown
         log.warning("CI run request for #%s failed: %r", scope.task_id, exc)
         return False, "ambiguous"
@@ -172,11 +268,6 @@ async def _ask_forge(scope: _Scope) -> tuple[bool, str]:
     if result.outcome == CIRunRequestOutcome.unavailable:
         return False, "ambiguous"
     return False, f"{result.outcome.value}/{result.reason}"
-
-
-async def _note(db: aiosqlite.Connection, task_id: int, text: str) -> None:
-    async with write_transaction(db):
-        await repo.add_task_update(db, task_id, "hub", "status", text)
 
 
 async def _settle_noting(
@@ -191,14 +282,62 @@ async def _settle_noting(
     """Состояние журнала и запись в ленту - ОДНА транзакция: без записи без состояния."""
     async with write_transaction(db):
         if await journal.settle(
-            db, task_id, sha, state, note=note, only_from=("reserved",)
+            db, task_id, sha, state, note=note, only_from=journal.OPEN_STATES
         ):
             await repo.add_task_update(db, task_id, "hub", "status", text)
 
 
-async def _request(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
+async def _reserve(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
+    """Занять попытку; политика и контракт проекта перечитываются В ЭТОЙ ЖЕ транзакции."""
+    async with write_transaction(db):
+        if await _fresh_scope(db, scope) is None:
+            return False
+        return await journal.reserve_request(
+            db,
+            scope.task_id,
+            sha,
+            scope.branch,
+            grace_seconds=int(config.CI_HEAD_RUN_GRACE_SECONDS),
+            retry_seconds=int(config.CI_HEAD_RUN_RETRY_SECONDS),
+        )
+
+
+async def _external_ci_present(
+    db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
+) -> bool:
+    """Непосредственно перед dispatch: прогон уже есть или у ветки открытый PR.
+
+    Остаточное окно (его называет отчёт): между этой проверкой и самим запросом
+    проходят миллисекунды, а список прогонов GitHub отстаёт на секунды - ручной
+    запуск, начатый в эти секунды, хаб не увидит.
+    """
+    if await _runs_exist(scope, sha, dl):
+        await journal.settle(
+            db, scope.task_id, sha, "observed", only_from=journal.OPEN_STATES
+        )
+        return True
+    if await _open_pr(scope, dl):
+        await journal.settle(
+            db,
+            scope.task_id,
+            sha,
+            "observed",
+            note="pr_open",
+            only_from=journal.OPEN_STATES,
+        )
+        return True
+    return False
+
+
+async def _request(
+    db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
+) -> bool:
     """Попросить прогон по зарезервированной голове; True - форж принял."""
-    accepted, why = await _ask_forge(scope)
+    if await _external_ci_present(db, scope, sha, dl):
+        return False
+    if await _fresh_scope(db, scope) is None:
+        return False  # политика сменилась, пока шли пробы: резерв остаётся, запроса нет
+    accepted, why = await _ask_forge(scope, dl)
     if accepted:
         await _settle_noting(
             db,
@@ -224,8 +363,16 @@ async def _request(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
     return accepted
 
 
-async def _handle_head(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
-    """Одна голова одной задачи; True - запрос принят форжем в этом проходе."""
+async def _handle_head(
+    db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
+) -> bool:
+    """Одна голова одной задачи; True - запрос принят форжем в этом проходе.
+
+    «requested» - НЕподтверждённая заявка: запрос идёт по ref ветки, а не по sha.
+    Пока по sha нет прогона workflow контракта, заявка остаётся открытой: прогон
+    нашёлся - ``observed``; срока повтора ещё нет - ждём; срок вышел - заявка
+    возвращается в очередь (не больше ``MAX_REQUESTS`` на sha).
+    """
     grace = int(config.CI_HEAD_RUN_GRACE_SECONDS)
     retry = int(config.CI_HEAD_RUN_RETRY_SECONDS)
     row = await journal.observe_head(
@@ -233,53 +380,51 @@ async def _handle_head(db: aiosqlite.Connection, scope: _Scope, sha: str) -> boo
     )
     if row["state"] in journal.SETTLED or not row["grace_over"]:
         return False
-    exists = await _runs_exist(scope, sha)
+    exists = await _runs_exist(scope, sha, dl)
     if exists is None:
         _back_off()
         return False
     if exists:
-        await journal.settle(db, scope.task_id, sha, "observed")
+        await journal.settle(
+            db, scope.task_id, sha, "observed", only_from=journal.OPEN_STATES
+        )
         return False
-    if row["state"] == "reserved" and row["attempts"] >= journal.MAX_REQUESTS:
-        if row["retry_over"]:
-            await _settle_noting(
-                db,
-                scope.task_id,
-                sha,
-                "exhausted",
-                f"Хаб: по голове {sha[:12]} прогон так и не появился после "
-                f"{journal.MAX_REQUESTS} запросов. Запустите CI сами.",
-            )
+    if row["state"] in _RETRYABLE and not row["retry_over"]:
         return False
-    if not await journal.reserve_request(
-        db, scope.task_id, sha, scope.branch, grace_seconds=grace, retry_seconds=retry
-    ):
+    if row["state"] in _RETRYABLE and row["attempts"] >= journal.MAX_REQUESTS:
+        await _settle_noting(
+            db,
+            scope.task_id,
+            sha,
+            "exhausted",
+            f"Хаб: по голове {sha[:12]} прогон так и не появился после "
+            f"{journal.MAX_REQUESTS} запросов. Запустите CI сами.",
+        )
         return False
-    return await _request(db, scope, sha)
+    if dl.left() < MIN_DISPATCH_LEFT_SECONDS:
+        raise _OutOfTime
+    if not await _reserve(db, scope, sha):
+        return False
+    return await _request(db, scope, sha, dl)
 
 
 async def _verify_after_requests(
-    db: aiosqlite.Connection, accepted: list[tuple[_Scope, str]]
+    db: aiosqlite.Connection, accepted: list[tuple[_Scope, str]], dl: _Deadline
 ) -> None:
-    """Голова не сдвинулась, пока шёл запрос? Одно чтение на репозиторий за проход.
+    """Голова не сдвинулась, пока шёл запрос? Одно чтение на клон за проход.
 
-    Запрос идёт по ref ветки, а не по sha: если голова ушла на B, прогон мог
-    пойти по B. B записывается «запрошена, исход неизвестен», чтобы следующий
-    цикл искал её прогон, а не заказывал второй.
+    Если голова ушла на B, прогон мог пойти по B. B записывается «запрошена,
+    исход неизвестен»: следующий цикл ищет её прогон, а не заказывает второй.
+    Прежняя голова остаётся открытой заявкой и вернётся в очередь по сроку.
     """
     if not accepted:
         return
-    try:
-        now = await _read_heads([scope for scope, _ in accepted])
-    except Exception:  # noqa: BLE001 - the check is best effort
-        return
+    now = await _read_heads([scope for scope, _ in accepted], dl)
     for scope, sha in accepted:
         head = now.get(scope.task_id)
         if head and head != sha:
             async with write_transaction(db):
-                await journal.adopt_unplanned(
-                    db, scope.task_id, head, scope.branch, previous=sha
-                )
+                await journal.adopt_unplanned(db, scope.task_id, head, scope.branch)
                 await repo.add_task_update(
                     db,
                     scope.task_id,
@@ -291,7 +436,9 @@ async def _verify_after_requests(
                 )
 
 
-async def request_for_new_heads(db: aiosqlite.Connection) -> dict[int, str]:
+async def request_for_new_heads(
+    db: aiosqlite.Connection, dl: _Deadline
+) -> dict[int, str]:
     """Первая половина прохода: новые головы без прогона получают запрос.
 
     Возвращает головы, прочитанные в этом проходе (для пометки объявлений).
@@ -302,22 +449,27 @@ async def request_for_new_heads(db: aiosqlite.Connection) -> dict[int, str]:
     scopes = await _scopes(db)
     if not scopes:
         return {}
-    heads = await _read_heads(scopes)
-    started = time.monotonic()
+    heads: dict[int, str] = {}
     accepted: list[tuple[_Scope, str]] = []
-    for scope in scopes:
-        if time.monotonic() - started > CYCLE_BUDGET_SECONDS:
-            break  # остальные - следующим проходом, курсор остаётся на последней
-        _cursor = scope.task_id
-        sha = heads.get(scope.task_id)
-        if not sha:
-            continue
-        try:
-            if await _handle_head(db, scope, sha):
-                accepted.append((scope, sha))
-        except Exception:  # noqa: BLE001 - one task must not skip the rest
-            log.exception("CI head run for task #%s failed", scope.task_id)
-    await _verify_after_requests(db, accepted)
+    try:
+        heads = await _read_heads(scopes, dl)
+        for scope in scopes:
+            if dl.left() <= 0:
+                break  # остальные - следующим проходом, курсор на последней
+            _cursor = scope.task_id
+            sha = heads.get(scope.task_id)
+            if not sha:
+                continue
+            try:
+                if await _handle_head(db, scope, sha, dl):
+                    accepted.append((scope, sha))
+            except _OutOfTime:
+                break
+            except Exception:  # noqa: BLE001 - one task must not skip the rest
+                log.exception("CI head run for task #%s failed", scope.task_id)
+        await _verify_after_requests(db, accepted, dl)
+    except _OutOfTime:
+        pass
     return heads
 
 
@@ -333,38 +485,49 @@ def _announcement(row: Mapping[str, Any], stale: bool) -> str:
     return f"{text}; голова уже другая" if stale else text
 
 
-async def _current_heads(
-    db: aiosqlite.Connection, rows: list[dict[str, Any]], known: dict[int, str]
-) -> dict[int, str]:
-    """Головы веток задач этих объявлений: известные с прохода + одно чтение на остальных."""
-    found = dict(known)
-    scopes: dict[int, _Scope] = {}
-    for row in rows:
-        task_id = int(row["task_id"])
-        if task_id in found or task_id in scopes:
-            continue
-        task = await repo.get_task(db, task_id)
-        project = await repo.resolve_project_for_task(db, task_id)
-        if task is not None and project is not None and (task["branch"] or ""):
-            scopes[task_id] = _Scope(task_id, str(task["branch"]), project)
-    readable = [
-        s
-        for s in scopes.values()
-        if _in_scope_for_read(s) and not _workspace_down(s.workspace)
-    ]
-    if readable:
-        try:
-            found.update(await _read_heads(readable))
-        except Exception:  # noqa: BLE001 - the label is a courtesy, not a gate
-            log.debug("could not read the heads for the result labels", exc_info=True)
-    return found
-
-
 def _in_scope_for_read(scope: _Scope) -> bool:
     """Головы читаются из клона проекта или из клона хаба (его репозиторий)."""
     return (
         bool(scope.workspace) or not scope.gh_repo or scope.gh_repo == config.REPO_NAME
     )
+
+
+async def _label_scopes(
+    db: aiosqlite.Connection, rows: list[dict[str, Any]], known: dict[int, str]
+) -> list[_Scope]:
+    """Задачи объявлений, чью голову ещё не читали и можно прочитать."""
+    scopes: dict[int, _Scope] = {}
+    for row in rows:
+        task_id = int(row["task_id"])
+        if task_id in known or task_id in scopes:
+            continue
+        try:
+            task = await repo.get_task(db, task_id)
+            project = await repo.resolve_project_for_task(db, task_id)
+            if task is not None and project is not None and (task["branch"] or ""):
+                scope = _Scope(task_id, str(task["branch"]), project)
+                if _in_scope_for_read(scope) and not _workspace_down(scope.workspace):
+                    scopes[task_id] = scope
+        except Exception:  # noqa: BLE001 - the label is a courtesy, not a gate
+            log.debug("CI head run: no label scope for #%s", task_id, exc_info=True)
+    return list(scopes.values())
+
+
+async def _current_heads(
+    db: aiosqlite.Connection,
+    rows: list[dict[str, Any]],
+    known: dict[int, str],
+    dl: _Deadline,
+) -> dict[int, str]:
+    """Головы веток задач этих объявлений: известные с прохода + чтение на остальных."""
+    found = dict(known)
+    readable = await _label_scopes(db, rows, known)
+    if readable:
+        try:
+            found.update(await _read_heads(readable, dl))
+        except _OutOfTime:
+            pass  # без пометки «голова уже другая»: она - любезность, не условие
+    return found
 
 
 async def _announce_one(
@@ -386,26 +549,82 @@ async def _announce_one(
             )
 
 
-async def announce_results(
-    db: aiosqlite.Connection, known_heads: dict[int, str] | None = None
-) -> None:
-    """Вторая половина прохода: подтверждённые итоги - в ленту, по разу на попытку."""
-    before: int | None = None
-    for _page in range(journal.ANNOUNCE_PAGES):
-        rows = await journal.unannounced_verified(
-            db, limit=journal.ANNOUNCE_PAGE, before_id=before
-        )
-        if not rows:
-            return
-        heads = await _current_heads(db, rows, known_heads or {})
-        for row in rows:
+async def _scan_page(
+    db: aiosqlite.Connection,
+    before: int | None,
+    known: dict[int, str],
+    dl: _Deadline,
+) -> tuple[int, int]:
+    """Одна страница очереди объявлений; ``(строк, наименьший id)``."""
+    rows = await journal.unannounced_verified(
+        db, limit=journal.ANNOUNCE_PAGE, before_id=before
+    )
+    if not rows:
+        return 0, 0
+    heads = await _current_heads(db, rows, known, dl)
+    for row in rows:
+        if dl.left() <= 0:
+            raise _OutOfTime
+        try:
             await _announce_one(db, row, heads)
-        if len(rows) < journal.ANNOUNCE_PAGE:
-            return
-        before = min(int(r["id"]) for r in rows)
+        except Exception:  # noqa: BLE001 - one row must not stop the queue
+            log.exception("CI head run: announcing attempt %s failed", row["id"])
+    return len(rows), min(int(r["id"]) for r in rows)
+
+
+async def announce_results(
+    db: aiosqlite.Connection,
+    known_heads: dict[int, str] | None = None,
+    dl: _Deadline | None = None,
+) -> None:
+    """Вторая половина прохода: подтверждённые итоги - в ленту, по разу на попытку.
+
+    Очередь читается ПОСТРАНИЧНО с сохраняемым курсором: каждый проход начинает с
+    самой новой страницы (свежие отчёты не ждут) и продолжает с того места, где
+    остановился прошлый. Пачка необъявляемых строк (контракт сменился после
+    подтверждения) остаётся в выборке, но проходит мимо за несколько тиков, а не
+    запирает объявляемую за собой навсегда.
+    """
+    dl = dl or _Deadline(CYCLE_BUDGET_SECONDS)
+    known = known_heads or {}
+    count, low = await _scan_page(db, None, known, dl)
+    if count < journal.ANNOUNCE_PAGE:
+        await journal.set_state(db, journal.ANNOUNCE_CURSOR, 0)
+        return
+    start = await journal.get_state(db, journal.ANNOUNCE_CURSOR) or low
+    try:
+        for _page in range(journal.ANNOUNCE_PAGES):
+            count, low = await _scan_page(db, start, known, dl)
+            if count < journal.ANNOUNCE_PAGE:
+                start = 0  # очередь пройдена до дна: следующий проход - с вершины
+                break
+            start = low
+    finally:
+        await journal.set_state(db, journal.ANNOUNCE_CURSOR, start)
 
 
 async def sweep(db: aiosqlite.Connection) -> None:
-    """Проход поллера: запросы на новые головы, затем объявление итогов."""
-    heads = await request_for_new_heads(db)
-    await announce_results(db, heads)
+    """Проход поллера: запросы на новые головы, затем объявление итогов.
+
+    Одно общее время на обе половины; сбой одной не отменяет другую.
+    """
+    dl = _Deadline(float(CYCLE_BUDGET_SECONDS))
+    heads: dict[int, str] = {}
+    try:
+        heads = await request_for_new_heads(db, dl)
+    except Exception:  # noqa: BLE001 - announcing must still happen
+        log.exception("CI head run: the request half failed")
+    try:
+        await announce_results(db, heads, dl)
+    except _OutOfTime:
+        pass
+    except Exception:  # noqa: BLE001
+        log.exception("CI head run: the announce half failed")
+
+
+async def run_sweep(db: aiosqlite.Connection) -> None:
+    """Вход для SWEEPS поллера: проход не имеет права убить тик."""
+    try:
+        await sweep(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("CI head run sweep failed")

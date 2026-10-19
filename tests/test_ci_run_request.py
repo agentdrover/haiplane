@@ -1118,6 +1118,7 @@ async def _contract_change_blocks_announcement(
     db: aiosqlite.Connection, cloud: _CloudGit
 ) -> None:
     """Подтверждение выдано под контрактом, которого уже нет, - не объявляем."""
+    _restart()  # отступ предыдущего шага (форж «лежал») не относится к этому
     from hub.services.ci_report import accept_ci_run_report
     from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
 
@@ -1140,6 +1141,7 @@ async def _snapshot_gone_stale_blocks_announcement(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ) -> None:
     """(Codex) Отчёт потерял подтверждение между выборкой и записью - не объявляем."""
+    _restart()  # отступ предыдущего шага (форж «лежал») не относится к этому
     from hub import repository_ci_head as journal
     from hub.services import ci_head_run
     from hub.services.ci_report import accept_ci_run_report
@@ -1175,6 +1177,7 @@ async def _stale_list_writes_one_entry(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ) -> None:
     """Дедуп держит журнал, а не выборка: устаревший список не плодит записи."""
+    _restart()  # отступ предыдущего шага (форж «лежал») не относится к этому
     from hub import repository_ci_head as journal
     from hub.services import ci_head_run
     from hub.services.ci_report import accept_ci_run_report

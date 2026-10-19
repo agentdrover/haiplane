@@ -4,7 +4,8 @@
 голову, сколько раз за неё просили прогон и чем кончилось. Уникальный ключ
 пары и есть гарантия «не больше одного запроса на коммит» между циклами,
 рестартами и соединениями. ``ci_head_announced`` - одна строка на (задача, sha,
-попытка): по ней итог прогона попадает в ленту один раз.
+попытка): по ней итог прогона попадает в ленту один раз. ``ci_head_state`` -
+сохраняемый курсор очереди объявлений.
 """
 
 MIGRATIONS = [
@@ -30,6 +31,13 @@ MIGRATIONS = [
             attempt_key  TEXT    NOT NULL,
             announced_at TEXT    NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (task_id, sha, attempt_key)
+        )""",
+    ),
+    (
+        "create_ci_head_state",
+        """CREATE TABLE IF NOT EXISTS ci_head_state (
+            key   TEXT    PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
         )""",
     ),
 ]
