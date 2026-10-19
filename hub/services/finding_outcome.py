@@ -267,7 +267,7 @@ def refusal_text(open_items: list[dict[str, Any]]) -> str:
     )
 
 
-def warn_note(open_items: list[dict[str, Any]]) -> str:
+def warn_note(open_items: list[dict[str, Any]], *, with_list: bool = True) -> str:
     """Заметка режима warn, называющая разделы своими именами (#1085).
 
     Жила в lifecycle одной строкой «НЕ названы для N подтверждённых находок»,
@@ -276,6 +276,9 @@ def warn_note(open_items: list[dict[str, Any]]) -> str:
     подтверждённых. Текст переехал сюда, к тому месту, которое умеет отличать
     разделы, — чтобы следующий читатель не искал, где ещё осталось старое
     существительное.
+
+    ``with_list=False`` (#1909): поимённый список даёт подсказка
+    (:func:`build_hint`) — один ограниченный список на всю запись, а не два.
     """
     confirmed = sum(1 for i in open_items if i.get("finding_kind") != KIND_UNRESOLVED)
     unresolved = len(open_items) - confirmed
@@ -284,11 +287,11 @@ def warn_note(open_items: list[dict[str, Any]]) -> str:
         parts.append(f"подтверждённых {confirmed}")
     if unresolved:
         parts.append(f"неразрешённых {unresolved}")
-    return (
+    head = (
         f"Исходы находок: НЕ названы для {len(open_items)} находок предыдущей "
         f"сдачи ({', '.join(parts)}). Режим проверки — warn, сдача принята. "
-        + refusal_text(open_items)
     )
+    return head + (refusal_text(open_items) if with_list else "")
 
 
 #: Сколько находок подсказка называет поимённо (#1909); остаток — счётчиком.

@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 import aiosqlite
 from httpx import AsyncClient
 
@@ -19,6 +21,7 @@ from hub import repository as repo
 from hub.mcp_server import hub_submit_for_review
 from hub.models import CONFIRMED_OUTCOMES, UNRESOLVED_OUTCOMES, FindingOutcomeItem
 from hub.services import finding_outcome
+from tests.test_finding_outcomes_on_done import quiet_git_ops  # noqa: F401
 
 
 def _finding(title: str) -> dict:
@@ -314,3 +317,82 @@ async def test_done_report_hint_is_silent_when_the_gate_is_off(
     )
     assert resp.status_code in (200, 201), resp.text
     assert not any("finding_outcomes" in w for w in (resp.json().get("warnings") or []))
+
+
+@pytest.mark.usefixtures("quiet_git_ops")
+async def test_pending_report_completion_route_carries_the_hint(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch
+):
+    """done при auto_review=false завершает без бампа поколения и всё равно называет долг."""
+    from tests.test_finding_outcomes_on_done import (
+        _pending_report_after_a_dispatch_run,
+        _sent_back_with_a_finding,
+    )
+
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    task_id, _review_id, uid = await _sent_back_with_a_finding(client, db, "Без бампа")
+    await repo.update_task(db, task_id, auto_review=0)
+    await _pending_report_after_a_dispatch_run(db, task_id)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+    assert any(uid in w for w in resp.json().get("warnings") or [])
+
+
+async def test_same_commit_retry_carries_the_hint_and_stays_idempotent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Повтор того же sha из review: находки, появившиеся без ответа, названы."""
+    from tests.test_submit_gates import _install_fixed_tip_git
+
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    _install_fixed_tip_git(monkeypatch, "tip-1")
+    task_id = await _started(client, "Повтор без ответа")
+    first = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert first.status_code == 200 and first.json()["outcome_hint"] is None
+    await _report(db, task_id, 1, [_finding("осталась без ответа")])
+    retry = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["submission_generation"] == 1, "новое поколение не открыто"
+    hint = retry.json()["outcome_hint"]
+    assert [i["title"] for i in hint["items"]] == ["осталась без ответа"]
+
+    uid = hint["items"][0]["finding_uid"]
+    body = {"finding_outcomes": [{"finding_uid": uid, "outcome": "fixed"}]}
+    answered = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+    assert answered.status_code == 200 and answered.json()["outcome_hint"] is None
+    again = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+    assert again.status_code == 200 and again.json()["outcome_hint"] is None
+
+
+async def test_feed_note_lists_each_open_finding_once_and_within_the_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """15 подтверждённых + 15 неразрешённых: в записи ленты 20 UID, а не 25-30."""
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    task_id = await _first_generation_sent_back(
+        client,
+        db,
+        "Лимит в ленте",
+        [_finding(f"подтверждённая {n}") for n in range(15)],
+        [_unresolved(f"спорная {n}") for n in range(15)],
+    )
+    owed = {
+        f["finding_uid"] for f in await finding_outcome.open_findings(db, task_id, 1)
+    }
+    assert len(owed) == 30
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert" and "Исходы находок" in dict(u)["content"]
+    ]
+    assert len(alerts) == 1
+    named = {uid for uid in owed if uid in alerts[0]}
+    assert len(named) == 20
+    assert "и ещё 10" in alerts[0]

@@ -2853,7 +2853,9 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
             # #1909: в режиме warn сдача принимается, и автор получает то,
             # чего ему не хватало для ответа, — UID, словарь и готовый пример.
             state.outcome_hint = finding_outcome.build_hint(still_open)
-            state.outcome_note = finding_outcome.warn_note(still_open)
+            state.outcome_note = finding_outcome.warn_note(
+                still_open, with_list=state.outcome_hint is None
+            )
             if state.outcome_hint is not None:
                 state.outcome_note += "\n" + state.outcome_hint.text
 
@@ -3597,7 +3599,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
             )
         ]
         try:
-            outcome_writes, _still_open = finding_outcome.plan_outcomes(
+            outcome_writes, still_open = finding_outcome.plan_outcomes(
                 open_items, pending
             )
         except ValueError as exc:
@@ -3606,6 +3608,13 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
             await finding_outcome.apply_outcomes(
                 db, task_id, generation, outcome_writes, reported_by=agent
             )
+        # #1909: повтор без ответа на находки получает ту же подсказку, что и
+        # обычная сдача; в ленту она не пишется — повтор второй строки не даёт.
+        retry_hint = (
+            finding_outcome.build_hint(still_open)
+            if (config.FINDING_OUTCOME or "warn").strip().lower() != "off"
+            else None
+        )
         if body.accept_areas:
             await _record_accepted_scope(db, task_id, state.task, state.accepted_paths)
             # Дифф прочитан заново — и пересчитанный по нему класс риска
@@ -3648,6 +3657,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         "открыто, ревью и вердикт остаются текущими как были (#1265)."
     )
     view.wait_baseline = wait_baseline_for(dict(row))
+    view.outcome_hint = retry_hint
     # #1589: повтор того же коммита возвращает СОХРАНЁННЫЙ результат поколения
     # и не пишет второй строки ленты.
     from hub.services import path_notices
@@ -5912,22 +5922,19 @@ async def _done_report_warnings(
 async def _outcome_hint_warning(
     db: aiosqlite.Connection, before: dict[str, Any]
 ) -> str:
-    """Подсказка по неотвеченным находкам, если ЭТОТ done-отчёт открыл поколение (#1909).
+    """Подсказка по находкам, на которые done-отчёт не ответил (#1909).
 
     Тот же список, что у гейта (``open_findings`` над поколением ДО бампа) и тот
     же режим: при ``off`` подсказки нет. Исходы, пришедшие с отчётом, уже
-    записаны и из списка вычтены.
+    записаны и из списка вычтены. От бампа поколения не зависит: маршрут
+    «pending_report → completed» поколение не открывает, а долг называет.
     """
     if (config.FINDING_OUTCOME or "warn").strip().lower() == "off":
         return ""
-    row = await repo.get_task(db, int(before["id"]))
-    if row is None:
-        return ""
-    before_generation = int(before.get("submission_generation") or 0)
-    if int(dict(row).get("submission_generation") or 0) <= before_generation:
-        return ""
     hint = finding_outcome.build_hint(
-        await finding_outcome.open_findings(db, int(before["id"]), before_generation)
+        await finding_outcome.open_findings(
+            db, int(before["id"]), int(before.get("submission_generation") or 0)
+        )
     )
     return hint.text if hint is not None else ""
 
