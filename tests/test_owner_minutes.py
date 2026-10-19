@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -561,6 +562,19 @@ async def test_each_counted_gate_accrues_once_per_surface(
     ids = {r["source_event_id"] for r in rows}
     assert not ids & {c["id"] for c in completed}
 
+    # Исключённые виды не считаются, даже если событие несёт личность человека.
+    for kind in (
+        "task_completed",
+        "task_rejected",
+        "task_returned_to_work",
+        "audit_result",
+        "disposition_recorded",
+        "steward_applied",
+    ):
+        await _human_event(db, world.owner_id, rest_approve, kind=kind)
+    await _pass(db)
+    assert _by(await _accruals(db)) == sorted(expected)
+
 
 async def test_the_launch_event_shares_the_reservation_transaction(
     world, db, monkeypatch
@@ -695,6 +709,20 @@ async def test_non_human_actors_never_accrue(world, db, monkeypatch):
     # Событие с подделанной личностью прямо в ленте: принципал не human в базе.
     await _event_at(db, world.machine_id, forged, "2026-10-19 09:00:00")
     await _event_at(db, 999, forged, "2026-10-19 09:00:01")
+
+    # Ломаные штампы личности: нет флага human, он ложный, принципал не число,
+    # принципал bool, нет задачи у события.
+    for payload, task in (
+        ({"principal_id": world.owner_id}, forged),
+        ({"principal_id": world.owner_id, "human": False}, forged),
+        ({"principal_id": str(world.owner_id), "human": True}, forged),
+        ({"principal_id": True, "human": True}, forged),
+        ({"principal_id": world.owner_id, "human": True}, None),
+    ):
+        await repo.insert_event(
+            db, kind="task_approved", task_id=task, actor="human", payload=payload
+        )
+    await db.commit()
 
     await _pass(db)
     rows = await _accruals(db)
@@ -863,6 +891,14 @@ async def test_accrual_pass_is_idempotent_and_restartable(
         == (await _rows(db, "SELECT MAX(id) AS m FROM events"))[0]["m"]
     )
 
+    # Курсор откатили назад (бэкап, ручная правка): повторная обработка событий
+    # дублей не даёт и не падает - source_event_id уникален.
+    before = await _accruals(db)
+    await db.execute("UPDATE owner_minutes_state SET cursor_event_id = ?", (first - 1,))
+    await db.commit()
+    await _pass(db)
+    assert await _accruals(db) == before
+
     # Записанные решения не изменились: задача на месте, события целы.
     assert dict(await repo.get_task(db, task_id))["status"] == "open"
     assert len(await _accruals(db)) == 4
@@ -1009,6 +1045,36 @@ async def test_a_pass_between_the_reads_cannot_outrun_the_sum(world, db):
     )
     assert (estimate.total_seconds or 0) >= covered[0]["s"], estimate
     assert not (estimate.status == "no_data" and covered[0]["s"]), estimate
+
+    # То же для дня: пас между чтением суммы окна и курсора.
+    fired["done"] = False
+    await _event_at(db, world.owner_id, task_id, "2026-10-19 09:30:00")
+    real_window = store.principal_window
+
+    async def _window(conn, *args):
+        return await _once_after(real_window, conn, *args)
+
+    with (
+        patch.object(store, "principal_window", _window),
+        patch.object(store, "get_state", _state),
+    ):
+        day = await owner_minutes.day_estimate(
+            db, world.owner_id, datetime.date(2026, 10, 19)
+        )
+    covered = await _rows(
+        db,
+        "SELECT COALESCE(SUM(seconds), 0) AS s FROM owner_minute_accruals "
+        "WHERE principal_id = ? AND source_event_id <= ? AND occurred_at >= ? "
+        "AND occurred_at < ?",
+        (
+            world.owner_id,
+            day.processed_through_event_id,
+            "2026-10-18 21:00:00",
+            "2026-10-19 21:00:00",
+        ),
+    )
+    assert (day.total_seconds or 0) >= covered[0]["s"], day
+    assert not (day.status == "no_data" and covered[0]["s"]), day
 
 
 # ---------------------------------------------------------------------------
