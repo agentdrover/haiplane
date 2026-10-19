@@ -97,6 +97,7 @@ def inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     g("add", "-A")
     g("commit", "-q", "-m", "change")
     plain = g("diff", "HEAD~1", "HEAD")
+    numstat = g("diff", "--numstat", "HEAD~1", "HEAD")
     # --- a merge with a hand-resolved conflict, shown as a combined diff
     g("checkout", "-q", "side")
     _write(repo, "я m b/m.py", "1\nside\n3\n")
@@ -112,6 +113,7 @@ def inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     show = g("show", "--cc", "HEAD")
     log = g("log", "-p", "--cc", "-1", "--format=%x1e%H%x09%s", "HEAD")
     return {
+        "numstat": numstat,
         "plain": plain,
         "show-cc": show,
         "log-cc": log,
@@ -141,10 +143,12 @@ def _with_deleted(kind: str) -> set[str]:
 def test_every_reader_names_the_same_files(inputs: dict[str, str], kind: str):
     diff = inputs[kind]
     live, everything = _live(kind), _with_deleted(kind)
+    # The SUBJECT of a review is the files that carry a "+++" header: no deleted
+    # file, no rename without edits, no binary file, no mode change (as always).
+    subject = live - {BINARY, MODE_ONLY, RENAMED_TO}
 
-    # a deleted file contributes no directory of rules, everything else does
-    assert set(changed_paths(diff)) == live, "changed_paths"
-    assert {p for p, _ in file_line_counts(diff)} == everything, "file_line_counts"
+    assert set(changed_paths(diff)) == subject, "changed_paths"
+    assert {p for p, _ in file_line_counts(diff)} == subject, "file_line_counts"
     assert {k for k, _ in diff_file_sections(diff) if k} == everything, "sections"
     # one section per file; the commit header of `git show` is a section of its own
     sections = diff_file_sections(diff)
@@ -169,8 +173,21 @@ def test_every_reader_names_the_same_files(inputs: dict[str, str], kind: str):
     if kind != "plain+show-cc":  # --git and --cc spell the same file's key differently
         keys = {k for k in _author_edit(diff) if k}  # "" holds the commit header
         assert len(keys) == len(everything), "base_merge._author_edit"
-    counted = sum(n for p, n in file_line_counts(diff) if p != GENERATED)
-    assert author_delta_lines(diff) == counted, "author_delta_lines"
+    # numbers of real git: --numstat for the plain diff, three lines in the merge
+    stat = [ln.split("\t") for ln in inputs["numstat"].splitlines()]
+    plain_lines = sum(
+        int(a) + int(d)
+        for a, d, name in stat
+        if a != "-" and "node_modules" not in name
+    )
+    merge_lines = 3  # "- main", " -side", "++resolved"
+    expected_lines = {
+        "plain": plain_lines,
+        "show-cc": merge_lines,
+        "log-cc": merge_lines,
+        "plain+show-cc": plain_lines + merge_lines,
+    }[kind]
+    assert author_delta_lines(diff) == expected_lines, "author_delta_lines"
     # -U0-style ranges name files that have text hunks and are not deleted
     ranged = set(changed_line_ranges(diff))
     assert ranged <= live and ranged >= (live - {BINARY, MODE_ONLY, RENAMED_TO}), (

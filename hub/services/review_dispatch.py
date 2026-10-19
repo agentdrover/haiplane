@@ -40,7 +40,7 @@ import aiosqlite
 from hub.db import deserialize_str_list, fetchall
 from hub.services.diff_scan import _unquote_path as _unquote_path
 from hub.services.diff_scan import _git_line_paths as _git_line_paths
-from hub.services.diff_scan import changed_line, diff_texts, scan_diff
+from hub.services.diff_scan import diff_texts, is_plus_header, scan_diff
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -294,19 +294,25 @@ def is_inert_for_process(path: str) -> bool:
 def file_line_counts(diff: str) -> list[tuple[str, int]]:
     """How many diff lines each changed file carries, biggest first.
 
-    Files and body lines come from the hunk counters (:mod:`diff_scan`): an
-    added ``+++ x`` is a line of the file being edited, not a file of its own.
-    A line the counters could not place still counts, under the file it
-    follows; a line before any file counts under no name and is not listed.
+    The SUBJECT of a review: files named by a ``+++`` header, as before #1856.
+    A deleted file (``+++ /dev/null``) is not listed and its lines count for no
+    one; a rename without edits, a binary file and a mode change have no
+    ``+++`` and are not listed. A line counts when it starts with ``+`` or
+    ``-``, headers of the next file included, exactly as the numbers have
+    always been made: the ceiling (``REVIEW_FILE_LINE_CAP``) is tuned on them.
+    Only the ROBUSTNESS changed: which line is a ``+++`` header is decided by
+    the hunk counters (:mod:`diff_scan`), and quoted names are decoded.
     """
     counts: dict[str, int] = {}
+    current = ""
     for entry in scan_diff(diff):
-        path = entry.span.path
-        if not path:
+        if is_plus_header(entry):
+            current = "" if entry.span.deleted else entry.span.path or ""
+            if current:
+                counts.setdefault(current, 0)
             continue
-        counts.setdefault(path, 0)
-        if changed_line(entry):
-            counts[path] += 1
+        if current and entry.text[:1] in ("+", "-"):
+            counts[current] += 1
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
@@ -1623,16 +1629,19 @@ def rules_char_cap() -> int:
 def changed_paths(diff: str) -> list[str]:
     """Repository paths the diff touches, in order of first appearance.
 
-    Taken from the ``+++`` headers (read by the hunk counters, so a line of
-    text that looks like one names no file), and a deleted file
-    (``+++ /dev/null``) does not contribute a directory whose rules nobody
-    needs.
+    Taken from the ``+++`` headers (found by the hunk counters, quoted names
+    decoded), so a deleted file (``+++ /dev/null``) does not contribute a
+    directory whose rules nobody needs, and a rename without edits, a binary
+    file or a mode change, which have no ``+++``, are not listed. That is the
+    SUBJECT of a review and its meaning has not changed (#1856); every file
+    the diff names is :func:`diff_file_sections`.
     """
     paths: list[str] = []
     for entry in scan_diff(diff):
-        span = entry.span
-        if span.path and not span.deleted and span.path not in paths:
-            paths.append(span.path)
+        path = entry.span.path
+        if is_plus_header(entry) and path and not entry.span.deleted:
+            if path not in paths:
+                paths.append(path)
     return paths
 
 

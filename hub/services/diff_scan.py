@@ -199,6 +199,7 @@ class Scanned(NamedTuple):
     text: str  # without LF and CR
     span: _FileSpan
     body: int  # hunk body: width of the +/- columns (1; parents of a merge); else 0
+    idx: int  # line number in the diff
 
 
 _HEADER_NOTES = ("--- ", "rename ", "copy ", "deleted file mode")
@@ -239,7 +240,7 @@ def scan_diff(diff: str) -> list[Scanned]:
         cur = spans[-1]
         if hunk.open:
             if hunk.consume(text):
-                out.append(Scanned(line, text, cur, hunk.parents))
+                out.append(Scanned(line, text, cur, hunk.parents, n))
                 prev = ""  # a body line is never half of a header
                 continue
             broke, cur.trusted = True, False
@@ -270,11 +271,16 @@ def scan_diff(diff: str) -> list[Scanned]:
                 broke, cur.trusted = True, False
         elif cur.hunks and text[:1] in ("+", "-", " "):
             broke, cur.trusted = True, False  # counters undercounted the body
-        out.append(Scanned(line, text, cur, 0))
+        out.append(Scanned(line, text, cur, 0, n))
         prev = text
     if hunk.open and out:
         out[-1].span.trusted = False
     return out
+
+
+def is_plus_header(entry: Scanned) -> bool:
+    """Is this the ``+++`` line that names the file (not text that looks like it)?"""
+    return entry.idx == entry.span.plus_at
 
 
 def changed_line(entry: Scanned) -> bool:
