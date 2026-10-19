@@ -658,6 +658,7 @@ class _CloudGit(NoopGitOps):
         super().__init__()
         self.heads: dict[str, str] = {}
         self.heads_down = False
+        self.head_reads = 0
         self.requests: list[tuple[str, str | None]] = []
         self.outcomes: list[object] = []
         self.github = attach_fake_github(self)
@@ -678,6 +679,7 @@ class _CloudGit(NoopGitOps):
         self.ci_runs_for_sha = only_the_asked_workflow  # type: ignore[method-assign]
 
     async def remote_heads(self, branches, repo=None):
+        self.head_reads += 1
         if self.heads_down:
             return None
         return {b: self.heads[b] for b in branches if b in self.heads}
@@ -704,7 +706,7 @@ class _CloudGit(NoopGitOps):
 def cloud(monkeypatch) -> _CloudGit:
     monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 0, raising=False)
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600, raising=False)
-    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 5, raising=False)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 50, raising=False)
     git = _CloudGit()
     git.heads[HEAD_BRANCH] = HEAD_A
     plugins.git_ops = git
@@ -832,6 +834,21 @@ async def test_running_task_no_duplicate_or_foreign_runs(
         "чужой workflow — не прогон тестов проекта"
     )
 
+    # 2b. grace не истёк: голову увидели, исполнитель мог запустить CI сам
+    cloud.requests.clear()
+    monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 3600)
+    cloud.heads["task-1b/waits"] = "9a" * 20
+    await _cloud_task(db, slug="waits", branch="task-1b/waits")
+    await _cycle(db)
+    assert [r for r in cloud.requests if r[0] == "task-1b/waits"] == [], (
+        "окно grace не истекло - запроса нет"
+    )
+    monkeypatch.setattr(config, "CI_HEAD_RUN_GRACE_SECONDS", 0)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests if r[0] == "task-1b/waits"] == [
+        "task-1b/waits"
+    ], "окно истекло - запрос ушёл"
+
     # 3. не выходит за рамки: grace, режим off и без ключа, GitVerse, статус
     cloud.requests.clear()
     cloud.heads["task-2/grace"] = "c3" * 20
@@ -863,8 +880,8 @@ async def test_running_task_no_duplicate_or_foreign_runs(
     # 4. неоднозначный исход: резерв держится, не больше двух запросов
     cloud.requests.clear()
     cloud.outcomes = [
-        TimeoutError("после отправки"),
         CIRunRequestResult(CIRunRequestOutcome.unavailable, "dispatch_call_failed"),
+        TimeoutError("после отправки"),
     ]
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600)
     amb = await _cloud_task(db, slug="amb", branch="task-4/amb")
@@ -1012,6 +1029,9 @@ async def test_remote_heads_reads_every_branch_in_one_call(monkeypatch):
     got = await ops.remote_heads(["task-1/a", "task-2/b", "task-3/gone"], repo="/r")
     assert got == {"task-1/a": HEAD_A, "task-2/b": HEAD_B}
     assert len(seen) == 1, "три ветки - один ls-remote"
+    assert all(
+        f"refs/heads/{b}" in seen[0] for b in ("task-1/a", "task-2/b", "task-3/gone")
+    ), "в одном вызове названы все ветки"
 
     reply["out"] = ""
     assert await ops.remote_heads(["task-3/gone"], repo="/r") == {}
@@ -1037,3 +1057,56 @@ async def test_the_real_git_ops_hands_the_workflow_to_the_forge(monkeypatch):
         "task-1/x", gh_repo="own/rep", workflow_path=".github/workflows/tests.yml"
     )
     assert seen == {"workflow_path": ".github/workflows/tests.yml"}
+
+
+async def test_a_failed_head_read_backs_off_instead_of_asking_every_cycle(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862: git не ответил - отступ, а не повтор вопроса на каждом цикле (образец ci_trust)."""
+    await _cloud_task(db)
+    cloud.heads_down = True
+    await _cycle(db)
+    await _cycle(db)
+    assert cloud.head_reads == 1, "после отказа отступаем, а не спрашиваем снова"
+    assert cloud.requests == [], "голов не видно - вслепую не просим"
+
+
+async def test_a_verdict_under_a_changed_contract_is_not_announced(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """#1862: подтверждение выдано под контрактом, которого уже нет, - не объявляем."""
+    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
+
+    task_id = await _cloud_task(db)
+    await _cycle(db)
+    sent = cloud.github.attempt(
+        task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="8001"
+    )
+    await accept_ci_run_report(db, task_id, **sent)
+    project = await repo.resolve_project_for_task(db, task_id)
+    await set_contract(db, project["id"], SAT_CONTRACT_C)
+    await db.commit()
+    await _cycle(db)
+    assert await _announced(db, task_id) == []
+
+
+async def test_a_cycle_serves_a_bounded_number_of_tasks_in_turn(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862: не больше N задач за цикл, круговая очередь, одно чтение голов на репозиторий."""
+    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 2)
+    branches = [f"task-7/b{i}" for i in range(5)]
+    for i, branch in enumerate(branches):
+        cloud.heads[branch] = f"{i:02d}" * 20
+        await _cloud_task(db, slug=f"turn{i}", branch=branch)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == branches[:2]
+    # одно чтение голов на репозиторий + по одному контрольному после каждого
+    # принятого запроса (голова могла сдвинуться, пока шёл запрос)
+    assert cloud.head_reads == 1 + 2
+    await _cycle(db)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == branches, (
+        "по кругу: хвост очереди не голодает, и никто не получает запрос дважды"
+    )
