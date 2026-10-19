@@ -27,6 +27,8 @@ Two rules this module exists to keep:
 
 from __future__ import annotations
 
+from hub.services.diff_scan import FILE_STARTS, scan_diff
+
 import logging
 from typing import Any
 
@@ -71,6 +73,27 @@ def _hunk_start(header: str) -> int | None:
     return int(number) if number.isdigit() else None
 
 
+def _line_kind(entry: Any) -> str:
+    """``"+"`` added, ``"-"`` removed, ``" "`` context (in the result), ``""`` none.
+
+    A hunk body is read by its columns (:mod:`diff_scan`): in a merge's combined
+    diff a line is in the result when no column holds ``-``, and added when one
+    holds ``+``. Outside a hunk (headers, text the counters could not place)
+    the first character decides, and ``+++ `` / ``--- `` are headers.
+    """
+    text = entry.text
+    if entry.body:
+        if text.startswith("\\"):
+            return ""
+        prefix = text[: entry.body].ljust(entry.body)
+        return "-" if "-" in prefix else "+" if "+" in prefix else " "
+    if text.startswith("+") and not text.startswith("+++"):
+        return "+"
+    if text.startswith("-") and not text.startswith("---"):
+        return "-"
+    return " " if text.startswith(" ") or text == "" else ""
+
+
 def split_files(diff: str) -> list[dict[str, Any]]:
     """Split a unified diff into per-file entries, in the order git printed them.
 
@@ -83,38 +106,44 @@ def split_files(diff: str) -> list[dict[str, Any]]:
     dropping them, because a lost hunk is a change nobody was shown.
     """
     files: list[dict[str, Any]] = []
+    owners: list[Any] = []  # the span of each entry: its path is known only later
     current: dict[str, Any] | None = None
+    last: Any = None
     new_line: int | None = None
-    for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            path = line.split(" b/", 1)[-1].strip() if " b/" in line else line
-            current = {"path": path, "added": 0, "removed": 0, "lines": []}
+    for entry in scan_diff(diff):
+        line, body = entry.text, bool(entry.body)
+        if entry.span is not last:
+            last = entry.span
+            current = {
+                "path": "(diff preamble)" if not files and not entry.span.path else "",
+                "added": 0,
+                "removed": 0,
+                "lines": [],
+            }
             files.append(current)
+            owners.append(entry.span)
             new_line = None
+        if line.startswith(FILE_STARTS):
+            current["fallback"] = line  # type: ignore[index]
             continue
-        if current is None:
-            # Output before any file header (git rarely emits this) — keep it
-            # under a named entry instead of discarding it.
-            current = {"path": "(diff preamble)", "added": 0, "removed": 0, "lines": []}
-            files.append(current)
-            new_line = None
+        if current is None:  # unreachable: the first line opens a file
+            continue
 
         number: int | None = None
-        if line.startswith("@@"):
+        kind = _line_kind(entry)
+        if line.startswith("@@") and not body:
             new_line = _hunk_start(line)
-        elif new_line is not None and not line.startswith("---"):
-            if line.startswith("+"):
-                number, new_line = new_line, new_line + 1
-            elif line.startswith("-"):
-                number = None
-            elif line.startswith(" ") or line == "":
-                number, new_line = new_line, new_line + 1
+        elif new_line is not None and kind in ("+", " "):
+            number, new_line = new_line, new_line + 1
 
         current["lines"].append({"text": line, "new_line": number})
-        if line.startswith("+") and not line.startswith("+++"):
+        if kind == "+":
             current["added"] += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif kind == "-":
             current["removed"] += 1
+    for item, span in zip(files, owners, strict=True):
+        fallback = item.pop("fallback", "")
+        item["path"] = span.path or item["path"] or fallback
     return files
 
 

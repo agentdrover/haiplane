@@ -29,7 +29,7 @@ import math
 import re
 import secrets
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -38,6 +38,9 @@ from typing import Any, NamedTuple
 import aiosqlite
 
 from hub.db import deserialize_str_list, fetchall
+from hub.services.diff_scan import _unquote_path as _unquote_path
+from hub.services.diff_scan import _git_line_paths as _git_line_paths
+from hub.services.diff_scan import diff_texts, is_plus_header, scan_diff
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -229,90 +232,116 @@ def is_generated(path: str) -> bool:
 
 
 def split_generated(diff: str) -> tuple[str, list[str]]:
-    """``(diff without generated files, names of what was dropped)``.
+    """``(diff without generated files, names of what was dropped)``."""
+    return _split_files(diff, is_generated)
 
-    Splits on the ``+++`` headers the same way :func:`changed_paths` reads
-    them, so both functions agree on where a file's hunk begins. A diff that
-    starts with lines before any header keeps them: dropping text we could not
-    attribute would be the silent cut this whole task exists to prevent.
+
+def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]]:
+    """``(diff without the files ``drop`` accepts, names of what was dropped)``.
+
+    A file starts at ``diff --git`` / ``diff --cc`` / ``diff --combined`` or,
+    in a plain unified diff, at its ``+++`` header; the cut begins at that
+    header and the lines above it stay. What is a header and what is a hunk
+    body is decided by the hunk counters (:class:`_Hunk`). A file whose hunks
+    do not add up is NOT dropped: a hidden signal costs more than a deep run.
     """
+    scanned = scan_diff(diff)
     kept: list[str] = []
     dropped: list[str] = []
-    skipping = False
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("+++ "):
-            raw = line[4:].strip()
-            path = raw[2:] if raw.startswith("b/") else raw
-            skipping = path != "/dev/null" and is_generated(path)
-            if skipping:
-                if path not in dropped:
-                    dropped.append(path)
-                # The header of the dropped file goes with it; the "--- a/..."
-                # line above it was already kept, which is why the reader sees
-                # the pair broken rather than the file silently absent.
-                continue
-        elif skipping and line.startswith("diff --git "):
-            skipping = False
-        if not skipping:
+    for n, entry in enumerate(scanned):
+        line, span = entry.line, entry.span
+        path = span.path
+        cut = (
+            span.trusted
+            and path is not None
+            and span.plus_at is not None
+            and n >= span.plus_at
+            and not span.deleted
+            and drop(path)
+        )
+        if not cut:
             kept.append(line)
+        elif path is not None and path not in dropped:
+            dropped.append(path)
     return "".join(kept), dropped
 
 
+# Files whose text names a process surface without operating one (#1856).
+# Documents talk about worktrees; a snapshot of the prod unit files, pinned to
+# its source, copies a drop-in called worktree.conf. Neither runs anything in
+# the diff. Deliberately two entries and no wider: deploy/ and tests/ hold
+# working shell and units, and hub/**.py, scripts, CI YAML stay a signal.
+_INERT_SNAPSHOT_DIR = "deploy/systemd/prod/"
+_INERT_SNAPSHOT_FILES = frozenset(
+    {"deploy/systemd/prod/CAPTURE.txt", "deploy/systemd/prod/README.md"}
+)
+_INERT_SNAPSHOT_TREE = "deploy/systemd/prod/etc/"
+
+
+def is_inert_for_process(path: str) -> bool:
+    """Is this path a document or a pinned prod snapshot, not an operation?
+
+    Markdown counts only where ``is_documentation`` says it is documentation:
+    a ``.md`` in hub/, skills/ or agents/ is an instruction somebody runs.
+    The snapshot is its listed files and etc/**; any other file in that
+    directory (a script) stays a signal.
+    """
+    if path.endswith(".md") and is_documentation(path):
+        return True
+    return path in _INERT_SNAPSHOT_FILES or path.startswith(_INERT_SNAPSHOT_TREE)
+
+
 def file_line_counts(diff: str) -> list[tuple[str, int]]:
-    """How many diff lines each changed file carries, biggest first."""
+    """How many diff lines each changed file carries, biggest first.
+
+    The SUBJECT of a review: files named by a ``+++`` header, as before #1856.
+    A deleted file (``+++ /dev/null``) is not listed and its lines count for no
+    one; a rename without edits, a binary file and a mode change have no
+    ``+++`` and are not listed. A line counts when it starts with ``+`` or
+    ``-``, headers of the next file included, exactly as the numbers have
+    always been made: the ceiling (``REVIEW_FILE_LINE_CAP``) is tuned on them.
+    Only the ROBUSTNESS changed: which line is a ``+++`` header is decided by
+    the hunk counters (:mod:`diff_scan`), and quoted names are decoded.
+    """
     counts: dict[str, int] = {}
     current = ""
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            raw = line[4:].strip()
-            path = raw[2:] if raw.startswith("b/") else raw
-            current = "" if path == "/dev/null" else path
-            counts.setdefault(current, 0)
+    for entry in scan_diff(diff):
+        if is_plus_header(entry):
+            current = "" if entry.span.deleted else entry.span.path or ""
+            if current:
+                counts.setdefault(current, 0)
             continue
-        if current and (line.startswith("+") or line.startswith("-")):
+        if current and entry.text[:1] in ("+", "-"):
             counts[current] += 1
-    counts.pop("", None)
     return sorted(counts.items(), key=lambda item: -item[1])
-
-
-def _section_header_path(line: str) -> str:
-    raw = line[4:].strip()
-    return raw[2:] if raw[:2] in ("a/", "b/") else raw
 
 
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:
     """``[(path, text of that file's part of the diff)]`` in diff order (#1582).
 
-    A file begins ONLY at a ``diff --git`` line, which git writes at the start
-    of every file and which a hunk body can never contain (its lines carry a
-    ``+``, ``-`` or space prefix). ``---``/``+++`` are read as headers only
-    between that line and the first ``@@``: inside a hunk a removed ``-- sql
-    comment`` reads as ``--- sql comment`` and an added ``++ x`` as ``+++ x``,
-    and taking them for a header used to swallow the rest of the edit.
-
-    Text before the first ``diff --git`` is a section of its own, with its
-    path from its ``+++`` header if it has one: dropping what cannot be
-    attributed would be the silent cut this function exists to prevent.
+    A file begins at ``diff --git``, ``diff --cc`` or ``diff --combined`` (or,
+    in a plain unified diff, at its ``---``/``+++`` pair); which lines are
+    headers and which hunk body is decided by the hunk counters
+    (:mod:`diff_scan`), and the key is the file's single path key
+    (``span.path``). Text before the first file is a section of its own: it
+    carries the path of its ``+++`` header if it has one, else "". A section
+    whose path cannot be read has the key "" and the caller must keep it:
+    dropping what cannot be attributed is the silent cut this exists to prevent.
+    The text of every section is the diff exactly as it came (#1582).
     """
     sections: list[tuple[str, str]] = []
-    path, in_header = "", True
+    last: object = None
     buf: list[str] = []
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("diff --git "):
-            if buf:
-                sections.append((path, "".join(buf)))
-            path, in_header, buf = line.rstrip("\n").rsplit(" b/", 1)[-1], True, []
-        elif in_header and line.startswith("@@"):
-            in_header = False
-        elif in_header and line.startswith("+++ "):
-            named = _section_header_path(line)
-            path = path if named == "/dev/null" else named
-        elif in_header and line.startswith("--- ") and not path:
-            named = _section_header_path(line)
-            path = "" if named == "/dev/null" else named
-        buf.append(line)
+    key = ""
+    for entry in scan_diff(diff):
+        if entry.span is not last and buf:
+            sections.append((key, "".join(buf)))
+            buf = []
+        last = entry.span
+        key = entry.span.path or ""
+        buf.append(entry.line)
     if buf:
-        sections.append((path, "".join(buf)))
+        sections.append((key, "".join(buf)))
     return sections
 
 
@@ -349,7 +378,8 @@ def _inline_diff_lines(
     sections = [
         (path, text)
         for path, text in diff_file_sections(diff)
-        if path not in dropped and (not delta_paths or path in delta_paths)
+        if not path
+        or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
     text, omitted = fit_file_sections(sections, ceiling)
     lines = []
@@ -864,11 +894,14 @@ def process_surface_reasons(diff: str) -> list[str]:
     nobody wrote — the cheapest possible way to lose the saving #807 exists for.
     """
     diff, _ = split_generated(diff)
+    diff, _ = _split_files(diff, is_inert_for_process)
+    scanned = scan_diff(diff)
     reasons: list[str] = []
     for group, markers in _PROCESS_SURFACES:
         hits: list[str] = []
-        for raw in diff.splitlines():
-            if not raw.startswith("+") or raw.startswith("+++"):
+        for entry in scanned:
+            raw = entry.text
+            if not raw.startswith("+") or (not entry.body and raw.startswith("+++")):
                 continue
             code = raw[1:]
             if _is_comment(code):
@@ -970,55 +1003,6 @@ def is_documentation(path: str) -> bool:
     return not any(d.startswith(".") or d in _NOT_DOC_DIRS for d in parts[:-1])
 
 
-_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
-
-
-def _unquote_path(raw: str) -> str | None:
-    """A path as git prints it in a header, or None when it cannot be read.
-
-    With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
-    or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
-    Undecodable means unknown, never documentation.
-    """
-    raw = raw.strip()
-    if not raw.startswith('"'):
-        return raw
-    if len(raw) < 2 or not raw.endswith('"'):
-        return None
-    body, out, i = raw[1:-1], bytearray(), 0
-    while i < len(body):
-        ch = body[i]
-        if ch != "\\":
-            out += ch.encode("utf-8")
-            i += 1
-        elif body[i + 1 : i + 4].isdigit() and len(body[i + 1 : i + 4]) == 3:
-            out.append(int(body[i + 1 : i + 4], 8) & 0xFF)
-            i += 4
-        elif i + 1 < len(body):
-            nxt = body[i + 1]
-            out.append(_C_ESCAPES.get(nxt, ord(nxt) if nxt.isascii() else 0))
-            i += 2
-        else:
-            return None
-    try:
-        return out.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def _git_line_paths(rest: str) -> list[str | None]:
-    """The two sides of ``diff --git <a> <b>``, quoted or not."""
-    if rest.startswith('"'):
-        end = rest.find('" ', 1)
-        if end < 0:
-            return [None]
-        return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
-    left, sep, right = rest.partition(" b/")
-    if not sep or not left.startswith("a/"):
-        return [None]
-    return [left, "b/" + right]
-
-
 def _header_paths(line: str) -> list[str | None] | None:
     """Paths a FILE HEADER line names; None when the line is not a header.
 
@@ -1054,17 +1038,13 @@ def _diff_touched_paths(diff: str) -> list[str | None]:
     yields ``None`` — unknown, which the caller must never read as prose.
     """
     paths: list[str | None] = []
-    in_hunk = False
-    for line in diff.splitlines():
+    for entry in scan_diff(diff):
+        if entry.body:
+            continue
+        line = entry.text
         if line.startswith("diff "):
-            in_hunk = False
             found = _header_paths(line)
             paths.extend(found if found is not None else [None])
-            continue
-        if line.startswith("@@"):
-            in_hunk = True
-            continue
-        if in_hunk:
             continue
         found = _header_paths(line)
         if found:
@@ -1118,7 +1098,7 @@ def author_delta_lines(diff: str) -> int:
     правка и её откат дают две строки — перебор в сторону deep.
     """
     count, width, in_hunk, skip = 0, 1, False, False
-    for line in diff.splitlines():
+    for line in diff_texts(diff):
         if line.startswith("diff "):
             in_hunk = False
             skip = _all_generated(_header_paths(line))
@@ -1649,20 +1629,19 @@ def rules_char_cap() -> int:
 def changed_paths(diff: str) -> list[str]:
     """Repository paths the diff touches, in order of first appearance.
 
-    Taken from the ``+++`` headers, so a deleted file (``+++ /dev/null``) does
-    not contribute a directory whose rules nobody needs.
+    Taken from the ``+++`` headers (found by the hunk counters, quoted names
+    decoded), so a deleted file (``+++ /dev/null``) does not contribute a
+    directory whose rules nobody needs, and a rename without edits, a binary
+    file or a mode change, which have no ``+++``, are not listed. That is the
+    SUBJECT of a review and its meaning has not changed (#1856); every file
+    the diff names is :func:`diff_file_sections`.
     """
     paths: list[str] = []
-    for line in diff.splitlines():
-        if not line.startswith("+++ "):
-            continue
-        raw = line[4:].strip()
-        if not raw or raw == "/dev/null":
-            continue
-        if raw.startswith("b/"):
-            raw = raw[2:]
-        if raw and raw not in paths:
-            paths.append(raw)
+    for entry in scan_diff(diff):
+        path = entry.span.path
+        if is_plus_header(entry) and path and not entry.span.deleted:
+            if path not in paths:
+                paths.append(path)
     return paths
 
 
