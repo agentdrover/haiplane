@@ -1772,3 +1772,110 @@ async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
         assert again["contract_fp"] == "" and again["trust"] == "unverified"
     finally:
         await conn.close()
+
+
+_PLAIN_SUMMARY_MIGRATIONS = {
+    "add_tasks_plain_summary",
+    "create_plain_summary_boundary",
+    "set_plain_summary_boundary",
+}
+
+
+async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
+    """#1811: миграция не трогает существующие задачи и их DoR."""
+    import subprocess
+    import sys
+
+    import hub.db as db_module
+    from hub.services.dor import evaluate_dor
+
+    conn = await aiosqlite.connect(str(tmp_path / "plain.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        full = list(db_module._MIGRATIONS)
+        monkeypatch.setattr(
+            db_module,
+            "_MIGRATIONS",
+            [m for m in full if m[0] not in _PLAIN_SUMMARY_MIGRATIONS],
+        )
+        await _migrate(conn)
+        assert "plain_summary" not in await _table_columns(conn, "tasks")
+        await conn.execute(
+            "INSERT INTO tasks (title, status, work_type, user_story, "
+            "problem_statement, business_value, size, wip_tag, scope_in, "
+            "validation_commands, affected_areas, dor_passed, created_at) "
+            "VALUES ('old','draft','feature','us','ps','bv','S','feature_work',"
+            "'[\"a\"]','[\"uv run pytest\"]','[\"hub/x.py\"]',1,"
+            "datetime('now','-1 day'))"
+        )
+        await conn.execute(
+            "INSERT INTO acceptance_criteria (task_id, ac_id, given, when_clause, "
+            "then_clause, verifiable_by) VALUES (1,'AC-1','g','w','t','test')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", full)
+        await _migrate(conn)
+        row = (
+            await conn.execute_fetchall(
+                "SELECT plain_summary, dor_passed FROM tasks WHERE id=1"
+            )
+        )[0]
+        assert row["plain_summary"] is None
+        assert row["dor_passed"] == 1
+        # Пересчёт DoR по-прежнему проходит: задача создана до миграции.
+        assert (await evaluate_dor(conn, 1)).passed is True
+    finally:
+        await conn.close()
+
+    root = Path(__file__).parent.parent
+    run = subprocess.run(
+        [sys.executable, str(root / "scripts" / "mcp_catalog_budget.py")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
+async def test_plain_summary_boundary_is_the_max_id_at_migration(tmp_path, monkeypatch):
+    """#1811: порядок вставки, а не метка времени: при равных секундах задача
+    до миграции старая, после - новая."""
+    import hub.db as db_module
+    from hub.plain_summary import is_new_task
+
+    conn = await aiosqlite.connect(str(tmp_path / "b.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        full = list(db_module._MIGRATIONS)
+        monkeypatch.setattr(
+            db_module,
+            "_MIGRATIONS",
+            [m for m in full if m[0] not in _PLAIN_SUMMARY_MIGRATIONS],
+        )
+        await _migrate(conn)
+        stamp = "2026-01-01 10:00:00"
+        await conn.execute(
+            "INSERT INTO tasks (id, title, created_at) VALUES (1, 'before', ?)",
+            (stamp,),
+        )
+        await conn.commit()
+        monkeypatch.setattr(db_module, "_MIGRATIONS", full)
+        await _migrate(conn)
+        await conn.execute(
+            "INSERT INTO tasks (id, title, created_at) VALUES (2, 'after', ?)",
+            (stamp,),
+        )
+        await conn.commit()
+        assert await is_new_task(conn, 1) is False
+        assert await is_new_task(conn, 2) is True
+        # повторная миграция знак не сдвигает
+        await conn.execute(
+            "DELETE FROM _migrations WHERE name=?", ("set_plain_summary_boundary",)
+        )
+        await _migrate(conn)
+        assert await is_new_task(conn, 2) is True
+    finally:
+        await conn.close()

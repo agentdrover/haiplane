@@ -26,6 +26,10 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.plain_summary import is_new_task
+
+#: Входы, которых нет в строке задачи: считаются при снятии снимка (#1811).
+DERIVED_TASK_FIELDS: tuple[str, ...] = ("plain_summary_required",)
 
 #: Поля задачи, из которых считаются DoR, оценка и рекомендации одобрения.
 #: Снимок содержит ТОЛЬКО их: чтение любого другого поля в расчёте - KeyError,
@@ -47,6 +51,9 @@ TASK_FIELDS: tuple[str, ...] = (
     # #1647: профиль DoR задачи-состояния читает эти два поля.
     "result_kind",
     "rollback",
+    # #1811: текст и «новая ли задача» (граница - время миграции колонки).
+    "plain_summary",
+    *DERIVED_TASK_FIELDS,
 )
 
 #: Поля критерия приёмки (строка acceptance_criteria).
@@ -163,8 +170,10 @@ async def load_dor_snapshot(db: aiosqlite.Connection, task_id: int) -> DorSnapsh
             raise ValueError(f"task {task_id} not found")
         ac_rows = await repo.list_acceptance_criteria(conn, task_id)
         project_row, source_id = await repo.resolve_project_with_source(conn, task_id)
+        is_new = await is_new_task(conn, task_id)
 
-    task = {name: row[name] for name in TASK_FIELDS}
+    task = {name: row[name] for name in TASK_FIELDS if name not in DERIVED_TASK_FIELDS}
+    task["plain_summary_required"] = is_new
     acs = tuple({name: (dict(ac).get(name)) for name in AC_FIELDS} for ac in ac_rows)
     if project_row is None:
         project: dict[str, Any] = {name: None for name in PROJECT_FIELDS}

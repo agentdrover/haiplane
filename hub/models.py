@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, time
 from enum import Enum
 from typing import Any, Literal
 
-import re
-
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
 _models_log = logging.getLogger("hub")
 
@@ -1031,7 +1031,7 @@ IN_FLIGHT_STATUSES = ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES - QUEUED_STATUSES
 # --- Request models ---
 
 
-class TaskCreate(BaseModel):
+class TaskCreate(PlainSummaryInput):
     title: str = Field(..., min_length=1, max_length=500)
     # Bind an EPIC to a project at creation (#346); virtual field, epic-only.
     project: str | None = Field(default=None, max_length=60)
@@ -2419,7 +2419,7 @@ class TaskRisk(BaseModel):
     mitigation: str = Field("", max_length=1000)
 
 
-class TaskRefine(BaseModel):
+class TaskRefine(PlainSummaryInput):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
 
@@ -2931,7 +2931,7 @@ class DeployView(BaseModel):
     backup: str = "неизвестно"
 
 
-class ProdDefectCreate(BaseModel):
+class ProdDefectCreate(PlainSummaryInput):
     """A production defect filed in one call (#915): the minimum DoR.
 
     What broke, how to check the fix and where — nothing the hub can fill
@@ -3148,7 +3148,7 @@ class StateReviewView(BaseModel):
     headline: str = ""
 
 
-class TaskView(BaseModel):
+class TaskView(PlainSummaryView):
     id: int
     title: str
     description: str
