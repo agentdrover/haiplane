@@ -230,3 +230,46 @@ async def set_state(db: aiosqlite.Connection, key: str, value: int) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, int(value)),
         )
+
+
+async def overdue_waits(
+    db: aiosqlite.Connection, minutes: int, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Головы, чьего итога ждут дольше срока и о ком ещё не сказано вслух.
+
+    Только заявленные или замеченные (``requested``/``observed``) головы задачи
+    в running, и только ПОСЛЕДНЯЯ голова журнала задачи: прежние перекрыты
+    новыми коммитами и ждать от них нечего. Итог объявлен (любая реальная
+    попытка в ``ci_head_announced``) или это ожидание уже названо
+    (``timeout:<число заявок>``) - строки нет.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT j.task_id, j.sha, j.branch, j.attempts, "
+        "CAST((julianday('now') - julianday(COALESCE(j.reserved_at, "
+        "j.first_seen_at))) * 1440 AS INTEGER) AS waited "
+        "FROM ci_head_runs j JOIN tasks t ON t.id=j.task_id "
+        "WHERE j.state IN ('requested', 'observed') AND t.status='running' "
+        "AND t.archived=0 "
+        "AND COALESCE(j.reserved_at, j.first_seen_at) <= datetime('now', ?) "
+        "AND j.rowid = (SELECT MAX(x.rowid) FROM ci_head_runs x "
+        "WHERE x.task_id=j.task_id) "
+        "AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
+        "WHERE n.task_id=j.task_id AND n.sha=j.sha AND "
+        "(n.attempt_key NOT LIKE 'timeout:%' "
+        "OR n.attempt_key = 'timeout:' || j.attempts)) "
+        "ORDER BY j.task_id LIMIT ?",
+        (f"-{int(minutes)} minutes", limit),
+    )
+    return [dict(r) for r in rows]
+
+
+async def latest_run_id(db: aiosqlite.Connection, task_id: int, sha: str) -> str:
+    """Номер прогона из самого свежего отчёта по голове; '' - отчёта нет."""
+    rows = await fetchall(
+        db,
+        "SELECT run_id FROM ci_report_attempts WHERE task_id=? AND head_sha=? "
+        "AND run_id != '' ORDER BY id DESC LIMIT 1",
+        (task_id, sha),
+    )
+    return str(rows[0]["run_id"]) if rows else ""

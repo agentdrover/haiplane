@@ -41,7 +41,7 @@ from hub.db import write_transaction
 from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.protocols import CIRunRequestOutcome
 from hub.integrations.registry import plugins
-from hub.services import ci_contract, ci_trust, project_policy
+from hub.services import ci_contract, ci_trust, project_policy, watch_notices
 
 log = logging.getLogger("hub")
 
@@ -621,6 +621,38 @@ async def announce_results(
         await journal.set_state(db, journal.ANNOUNCE_CURSOR, start)
 
 
+async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
+    """Итог не пришёл за срок: одна запись в ленту, alert и уведомление ответственному.
+
+    Срок ``CI_HEAD_RUN_WAIT_MINUTES`` считается от заявки (или от первого
+    наблюдения головы, если CI запустил сам исполнитель). Один раз на (задача,
+    sha, число заявок): повторная заявка - новое ожидание.
+    """
+    for row in await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES)):
+        if dl.left() <= 0:
+            return
+        task_id, sha = int(row["task_id"]), str(row["sha"])
+        try:
+            run_id = await journal.latest_run_id(db, task_id, sha)
+            text = (
+                f"CI не пришёл за {row['waited']} мин: sha {sha[:12]}, run "
+                f"{run_id or 'не найден'}. Итог не объявлен; запустите или "
+                "проверьте CI."
+            )
+            key = f"timeout:{row['attempts']}"
+            async with write_transaction(db):
+                if await journal.claim_announcement(db, task_id, sha, key):
+                    await repo.add_task_update(db, task_id, "hub", "alert", text)
+                    await watch_notices.notify_steward(
+                        db,
+                        "stale",
+                        task_id=task_id,
+                        source_key=f"ci_head_timeout:{task_id}:{sha}:{row['attempts']}",
+                    )
+        except Exception:  # noqa: BLE001 - one task must not stop the others
+            log.exception("CI head run: overdue note for #%s failed", task_id)
+
+
 async def sweep(db: aiosqlite.Connection) -> None:
     """Проход поллера: запросы на новые головы, затем объявление итогов.
 
@@ -638,6 +670,10 @@ async def sweep(db: aiosqlite.Connection) -> None:
         pass
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the announce half failed")
+    try:
+        await announce_overdue(db, dl)
+    except Exception:  # noqa: BLE001
+        log.exception("CI head run: the overdue half failed")
 
 
 async def run_sweep(db: aiosqlite.Connection) -> None:

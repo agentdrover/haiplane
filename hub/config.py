@@ -529,6 +529,8 @@ CI_GRACE_PERIOD = 180
 CI_HEAD_RUN_GRACE_SECONDS = int(env_get("CI_HEAD_RUN_GRACE_SECONDS", "120"))
 CI_HEAD_RUN_RETRY_SECONDS = int(env_get("CI_HEAD_RUN_RETRY_SECONDS", "600"))
 CI_HEAD_RUN_TASKS_PER_CYCLE = int(env_get("CI_HEAD_RUN_TASKS_PER_CYCLE", "5"))
+# Сколько минут от заявки ждём итог прогона, прежде чем сказать об этом вслух.
+CI_HEAD_RUN_WAIT_MINUTES = int(env_get("CI_HEAD_RUN_WAIT_MINUTES", "60"))
 REVIEW_RUNTIME = env_get("REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = env_get("REVIEW_AGENT", "code-reviewer")
 

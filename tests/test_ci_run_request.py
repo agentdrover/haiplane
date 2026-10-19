@@ -1639,3 +1639,40 @@ async def test_a_stalled_database_cannot_hold_the_pass_beyond_its_hard_cap(
     async with asyncio.timeout(5):
         await _cycle(db)
     assert asyncio.get_running_loop().time() - started < 2.0
+
+
+async def test_a_ci_result_that_never_comes_is_said_aloud_once(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """Разбор 2б: за срок итога нет - запись, alert и уведомление, один раз на заявку."""
+    from hub.services.ci_report import accept_ci_run_report
+
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 60, raising=False)
+    silent = await _cloud_task(db, slug="silent", branch="task-17/silent")
+    cloud.heads["task-17/silent"] = HEAD_A
+    answered = await _cloud_task(db, slug="answered", branch="task-17/answered")
+    cloud.heads["task-17/answered"] = HEAD_B
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        answered,
+        **cloud.github.attempt(
+            answered, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="1701"
+        ),
+    )
+    await _cycle(db)
+    assert await _notes(db, silent, "CI не пришёл") == [], "срок ещё не вышел"
+
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 0)
+    await _cycle(db)
+    await _cycle(db)
+    said = await _notes(db, silent, "CI не пришёл")
+    assert len(said) == 1 and HEAD_A[:12] in said[0] and "run не найден" in said[0]
+    kinds = [dict(u)["kind"] for u in await repo.get_task_updates(db, silent)]
+    assert "alert" in kinds, "это alert, а не обычная строка ленты"
+    cur = await db.execute(
+        "SELECT count(*) FROM agent_messages WHERE related_task_id=?", (silent,)
+    )
+    assert (await cur.fetchone())[0] == 1, "уведомление ответственному - одно"
+    assert await _notes(db, answered, "CI не пришёл") == [], "итог пришёл вовремя"
+    assert len(await _announced(db, answered)) == 1
