@@ -36,9 +36,10 @@ STEPS_DIR = Path(__file__).resolve().parent
 
 # m<YYYYMMDDHHMM>_<задача>_<суть>.py: нижний регистр, цифры и подчёркивания,
 # точка допустима только перед расширением.
-STEP_FILE_RE = re.compile(r"^m\d{12}_[a-z0-9]+(?:_[a-z0-9]+)+\.py$")
+STEP_FILE_RE = re.compile(r"m[0-9]{12}_[a-z0-9]+(?:_[a-z0-9]+)+\.py")
 
-_IGNORED = frozenset({"__init__.py", "__pycache__"})
+# .DS_Store: метаданные macOS не должны ронять старт (Docker копирует каталог).
+_IGNORED = frozenset({"__init__.py", "__pycache__", ".DS_Store"})
 
 
 class MigrationStepError(RuntimeError):
@@ -49,12 +50,16 @@ def _inventory(directory: Path) -> list[str]:
     """Имена записей каталога до любого импорта; ``[]``, если каталога нет."""
     if not directory.is_dir():
         return []
-    names = sorted(e.name for e in os.scandir(directory) if e.name not in _IGNORED)
-    bad = [n for n in names if not STEP_FILE_RE.match(n)]
+    with os.scandir(directory) as entries:
+        names = sorted(e.name for e in entries if e.name not in _IGNORED)
+    bad = [n for n in names if not STEP_FILE_RE.fullmatch(n)]
     if bad:
         raise MigrationStepError(
             f"имя файла шага не по шаблону m<YYYYMMDDHHMM>_<задача>_<суть>.py: {bad}"
         )
+    links = [n for n in names if (directory / n).is_symlink()]
+    if links:
+        raise MigrationStepError(f"шаг должен быть обычным файлом, не ссылкой: {links}")
     return names
 
 

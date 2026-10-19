@@ -48,20 +48,28 @@ def violations(
     *,
     git: Callable[..., str | bytes] = _git,
 ) -> list[str]:
-    """Строки-нарушения: файл шага с merge-base изменён или удалён."""
+    """Строки-нарушения: файл шага с merge-base изменён, удалён или сменил тип.
+
+    Содержимое сравнивается как его видит git (``hash-object`` применяет те же
+    фильтры, что и ``add``: autocrlf не делает файл «изменённым»), режим
+    записи - как в дереве merge-base (ссылка вместо файла - нарушение).
+    """
     merge_base = str(git(["merge-base", base, "HEAD"], repo)).strip()
-    listing = str(git(["ls-tree", "-r", "--name-only", merge_base, STEPS_PREFIX], repo))
+    listing = str(git(["ls-tree", "-r", "-z", merge_base, "--", STEPS_PREFIX], repo))
     found: list[str] = []
-    for path in sorted(p for p in listing.splitlines() if p):
+    for entry in sorted(e for e in listing.split("\0") if e):
+        meta, path = entry.split("\t", 1)
+        mode, _kind, blob = meta.split()
         if path.removeprefix(STEPS_PREFIX) in _NOT_STEPS or "__pycache__" in path:
             continue
+        at = f"на merge-base {merge_base[:12]}"
         current = repo / path
-        if not current.is_file():
-            found.append(f"{path}: удалён (есть на merge-base {merge_base[:12]})")
-            continue
-        old = git(["show", f"{merge_base}:{path}"], repo, text=False)
-        if old != current.read_bytes():
-            found.append(f"{path}: изменён (на merge-base {merge_base[:12]} другой)")
+        if not (current.is_file() or current.is_symlink()):
+            found.append(f"{path}: удалён (есть {at})")
+        elif current.is_symlink() != (mode == "120000"):
+            found.append(f"{path}: сменил тип файла (на {at} режим {mode})")
+        elif str(git(["hash-object", "--", path], repo)).strip() != blob:
+            found.append(f"{path}: изменён (на {at} другой)")
     return found
 
 

@@ -301,7 +301,30 @@ def test_add_only_without_base_fails_closed(tmp_path):
     assert add_only_main(["--base", "no-such-ref", "--repo", str(repo)]) == 2
 
 
-def test_steps_must_not_import_hub():
-    # Против настоящего каталога: ни один влитый шаг не тянет hub.*.
-    for name, module in load_step_modules():
-        assert module.MIGRATIONS, name
+def test_stray_metadata_is_ignored_but_symlink_is_not(tmp_path):
+    directory = _steps_dir(tmp_path, **{STEP_A: _A_SRC})
+    (directory / ".DS_Store").write_bytes(b"\x00")
+    assert [n for n, _ in load_step_modules(directory)] == [STEP_A]
+    (directory / STEP_B).symlink_to(directory / STEP_A)
+    with pytest.raises(MigrationStepError, match="не ссылкой"):
+        load_steps(directory)
+
+
+def test_unicode_digits_and_trailing_newline_in_name_are_rejected(tmp_path):
+    for bad in ("m٢٠٢٦١٠١٩١٢٠٠_1_x.py", "m202610191200_1_x.py\n"):
+        directory = tmp_path / str(abs(hash(bad)))
+        directory.mkdir()
+        _write(directory, bad, "MIGRATIONS = []\n")
+        with pytest.raises(MigrationStepError, match="не по шаблону"):
+            load_steps(directory)
+
+
+def test_add_only_sees_symlink_swap(tmp_path, capsys):
+    repo = _repo_with_integrated_step(tmp_path)
+    steps = repo / "hub" / "migrations" / "steps"
+    run = lambda: add_only_main(["--base", "develop", "--repo", str(repo)])  # noqa: E731
+    (steps / "link_target.txt").write_text(_A_SRC)
+    (steps / STEP_A).unlink()
+    (steps / STEP_A).symlink_to(steps / "link_target.txt")
+    assert run() == 1
+    assert "сменил тип" in capsys.readouterr().err
