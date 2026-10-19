@@ -1919,13 +1919,11 @@ async def test_the_announce_cursor_follows_the_last_processed_row_when_interrupt
         return real_left(self) if calls["n"] <= 2 else 0.0
 
     monkeypatch.setattr(ci_head_run._Deadline, "left", two_rows_per_pass)
-    for _ in range(4):
-        calls["n"] = 0
-        await ci_head_run.announce_results(db, known, ci_head_run._Deadline(100))
-    assert len(await _announced(db, good)) == 1, (
-        "курсор шёл вниз, а не топтался на месте"
+    calls["n"] = 0
+    await ci_head_run.announce_results(db, known, ci_head_run._Deadline(100))
+    assert await journal.get_state(db, journal.ANNOUNCE_CURSOR) > 0, (
+        "прервано посреди страницы: курсор стоит на последней обработанной строке"
     )
-
     # свежий отчёт возвращает очередь к вершине: он не ждёт хвоста
     fresh_branch = "task-21/fresh"
     cloud.heads[fresh_branch] = HEAD_B
@@ -1940,11 +1938,17 @@ async def test_the_announce_cursor_follows_the_last_processed_row_when_interrupt
             fresh, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="2301"
         ),
     )
+    known[fresh] = HEAD_B
     calls["n"] = 0
-    await ci_head_run.announce_results(
-        db, {**known, fresh: HEAD_B}, ci_head_run._Deadline(100)
-    )
+    await ci_head_run.announce_results(db, known, ci_head_run._Deadline(100))
     assert len(await _announced(db, fresh)) == 1, "свежая попытка - с вершины"
+
+    for _ in range(4):
+        calls["n"] = 0
+        await ci_head_run.announce_results(db, known, ci_head_run._Deadline(100))
+    assert len(await _announced(db, good)) == 1, (
+        "курсор шёл вниз, а не топтался на месте"
+    )
 
 
 async def test_finished_tasks_leave_the_journals(
