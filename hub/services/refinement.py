@@ -66,6 +66,7 @@ STATEMENT_FIELDS = frozenset(
         "description",
         "user_story",
         "problem_statement",
+        "plain_summary",
         "business_value",
         "outcome_metric",
         "outcome_indicator",
