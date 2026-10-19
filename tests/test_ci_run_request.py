@@ -660,6 +660,11 @@ class _CloudGit(NoopGitOps):
         self.heads_down = False
         self.head_reads = 0
         self.broken_clones: set[str] = set()
+        self.raising_clones: dict[str, BaseException] = {}
+        self.head_delay = 0.0
+        self.request_delay = 0.0
+        self.open_prs: dict[str, int] = {}
+        self.probes = 0
         self.on_probe = None  # type: ignore[var-annotated]
         self.on_request = None  # type: ignore[var-annotated]
         self.requests: list[tuple[str, str | None]] = []
@@ -674,6 +679,7 @@ class _CloudGit(NoopGitOps):
             forge="",
             workflow_path=".github/workflows/ci.yml",
         ):
+            self.probes += 1
             if self.on_probe is not None:
                 await self.on_probe()
             runs = await every_run(head_sha, repo, gh_repo, forge, workflow_path)
@@ -685,14 +691,23 @@ class _CloudGit(NoopGitOps):
 
     async def remote_heads(self, branches, repo=None):
         self.head_reads += 1
+        if self.head_delay:
+            await asyncio.sleep(self.head_delay)
+        if repo in self.raising_clones:
+            raise self.raising_clones[repo]
         if self.heads_down or repo in self.broken_clones:
             return None
         return {b: self.heads[b] for b in branches if b in self.heads}
+
+    async def pr_for_branch(self, branch, repo=None, gh_repo=None, forge=""):
+        return self.open_prs.get(branch)
 
     async def request_ci_run(
         self, branch, repo=None, gh_repo=None, forge="", workflow_path=None
     ):
         self.requests.append((branch, workflow_path))
+        if self.request_delay:
+            await asyncio.sleep(self.request_delay)
         if self.on_request is not None:
             await self.on_request()
         step = (
@@ -1342,3 +1357,163 @@ async def test_an_unreachable_clone_does_not_hold_the_queue_of_the_others(
     reads = cloud.head_reads
     await _cycle(db)
     assert cloud.head_reads == reads + 1, "сломанный клон не спрашивают, здоровый - да"
+
+
+# ---- #1862, вердикт 1: общий дедлайн, изоляция, PR, сверка прогона, политика, курсор ----
+
+
+async def test_slow_clones_stay_inside_the_budget_of_the_whole_pass(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P1: дедлайн на весь проход с самого начала; сеть получает оставшееся время."""
+    from hub.services import ci_head_run
+
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.6)
+    cloud.head_delay = 5.0
+    for i in range(4):
+        branch = f"task-12/slow{i}"
+        cloud.heads[branch] = f"{i:02d}" * 20
+        await _cloud_task(db, slug=f"slow{i}", branch=branch, workspace=f"/clone{i}")
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(6):
+        await _cycle(db)
+    assert asyncio.get_running_loop().time() - started < 3.0, (
+        "четыре медленных клона не выходят за бюджет прохода"
+    )
+
+    # то же для платных вызовов: dispatch не длиннее остатка бюджета
+    cloud.head_delay = 0.0
+    cloud.request_delay = 5.0
+    ci_head_run.reset_state()
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(6):
+        await _cycle(db)
+    assert asyncio.get_running_loop().time() - started < 3.0
+
+
+async def test_a_broken_clone_does_not_stop_the_pass_for_the_healthy_one(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """Исключение клона (FileNotFoundError и любое) - отказ ЭТОГО клона."""
+    cloud.raising_clones["/gone"] = FileNotFoundError("/gone")
+    cloud.heads["task-13/gone"] = HEAD_A
+    cloud.heads["task-13/ok"] = HEAD_B
+    await _cloud_task(db, slug="gone", branch="task-13/gone", workspace="/gone")
+    await _cloud_task(db, slug="okay", branch="task-13/ok", workspace="/ok")
+    await _cycle(db)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == ["task-13/ok"]
+    cloud.raising_clones["/gone"] = RuntimeError("любое другое")
+    cloud.heads["task-13/ok2"] = HEAD_A
+    await _cloud_task(db, slug="okay2", branch="task-13/ok2", workspace="/ok")
+    from hub.services import ci_head_run
+
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert "task-13/ok2" in [r[0] for r in cloud.requests]
+
+
+async def test_no_dispatch_for_an_open_pr_or_a_run_that_appeared_meanwhile(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """Открытый PR сам запускает CI; перед dispatch прогон ищется ещё раз."""
+    cloud.heads["task-14/pr"] = HEAD_A
+    cloud.open_prs["task-14/pr"] = 7
+    await _cloud_task(db, slug="haspr", branch="task-14/pr")
+    await _cycle(db)
+    assert cloud.requests == [], "у ветки открытый PR"
+
+    cloud.heads["task-14/manual"] = HEAD_B
+    manual = await _cloud_task(db, slug="manual", branch="task-14/manual")
+
+    async def executor_runs_it_by_hand():
+        if cloud.probes >= 2 and not cloud.github.runs:
+            cloud.github.attempt(manual, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS))
+
+    cloud.on_probe = executor_runs_it_by_hand
+    await _cycle(db)
+    assert cloud.requests == [], "ручной прогон появился между пробой и dispatch"
+
+
+async def test_a_run_that_landed_on_another_sha_hands_the_request_back(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """A->B->A: dispatch по ref попал на B; A без прогона заказывается снова, но не больше двух."""
+    task_id = await _cloud_task(db)
+
+    async def lands_on_b():
+        cloud.heads[HEAD_BRANCH] = HEAD_B
+        cloud.github.attempt(task_id, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS))
+
+    cloud.on_request = lands_on_b
+    await _cycle(db)
+    assert len(cloud.requests) == 1
+    cloud.on_request = None
+    cloud.heads[HEAD_BRANCH] = HEAD_A
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    from hub.services import ci_head_run
+
+    for _ in range(4):
+        ci_head_run.reset_state()
+        await _cycle(db)
+    asked = [r for r in cloud.requests]
+    assert len(asked) == 2, "прогона на A нет: заявка возвращена, но лимит два"
+
+
+async def test_the_policy_is_reread_inside_the_reservation(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """ci_before_submit переключили в off во время прохода - dispatch не уходит."""
+    task_id = await _cloud_task(db)
+
+    async def switched_off():
+        project = await repo.resolve_project_for_task(db, task_id)
+        policy = {"ci_contract": SAT_CONTRACT, "ci_before_submit": "off"}
+        await repo.update_project(db, project["id"], gate_policy=json.dumps(policy))
+        await db.commit()
+
+    cloud.on_probe = switched_off
+    await _cycle(db)
+    assert cloud.requests == []
+
+
+async def test_old_good_report_is_announced_behind_a_pile_of_unfit_rows(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """1 подходящий старый отчёт и 200 новых со старым контрактом - объявление появляется."""
+    from hub import repository_ci_head as journal
+    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
+
+    monkeypatch.setattr(journal, "ANNOUNCE_PAGE", 20)
+    monkeypatch.setattr(journal, "ANNOUNCE_PAGES", 2)
+    cloud.heads["task-15/old"] = HEAD_A
+    good = await _cloud_task(db, slug="oldgood", branch="task-15/old")
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        good,
+        **cloud.github.attempt(
+            good, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="1501"
+        ),
+    )
+    bad = await _cloud_task(db, slug="pile", branch="task-15/pile")
+    project = await repo.resolve_project_for_task(db, bad)
+    await set_contract(db, project["id"], SAT_CONTRACT_C)
+    for i in range(200):
+        sha = f"{i:040x}"
+        await db.execute(
+            "INSERT INTO ci_head_runs (task_id, sha, branch, state) "
+            "VALUES (?, ?, 'task-15/pile', 'observed')",
+            (bad, sha),
+        )
+        await db.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "trust, trust_reason, trust_final, contract_fp) "
+            "VALUES (?, ?, ?, '1', 'verified', '', 1, 'old-contract')",
+            (bad, sha, str(9000 + i)),
+        )
+    await db.commit()
+    for _ in range(12):
+        await _cycle(db)
+    assert len(await _announced(db, good)) == 1
