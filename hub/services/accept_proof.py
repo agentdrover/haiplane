@@ -275,10 +275,12 @@ def _verdict_blocker(task: dict[str, Any]) -> Blocker | None:
             "",
             CODE_VERDICT,
         )
+    # Блокирует всё, что не названо out_of_scope: неизвестное значение scope и
+    # не-словарь — не «безопасно», а «не доказано».
     open_in_scope = [
         f
         for f in raw
-        if isinstance(f, dict) and f.get("scope", "in_scope") == "in_scope"
+        if not (isinstance(f, dict) and f.get("scope", "in_scope") == "out_of_scope")
     ]
     why = f"открытых находок в рамках задачи: {len(open_in_scope)}"
     if verdict == "changes_requested":

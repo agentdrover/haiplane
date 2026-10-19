@@ -225,7 +225,8 @@ async def _verdict_rows(
                 "action": ACTION_VERDICT,
                 "grounds": grounds,
                 "offer": offer,
-                "brief_line": await _brief_line(db, dict(row), route),
+                # Справка дорога: строится после обрезки, только для показанных.
+                "_route": route,
             }
         )
     return kept, entries
@@ -288,6 +289,10 @@ async def collect(db: aiosqlite.Connection, scoped: dict[str, Any]) -> dict[str,
     }
     drafts, asked, decide = _cap(drafts), _cap(asked), _cap(decide)
     reviewing, verdicts = _cap(reviewing), _cap(verdicts)
+    for row, entry in zip(reviewing, verdicts, strict=True):
+        entry["brief_line"] = await _brief_line(db, dict(row), entry["_route"])
+    for entry in verdicts:
+        entry.pop("_route", None)
     shown = {
         "черновики": len(drafts),
         "вопросы": len(asked),

@@ -2594,7 +2594,10 @@ async def _steward_recommendation(
 
 
 async def _card_decision_brief(
-    db: aiosqlite.Connection, row: dict[str, Any], repair_offered: bool
+    db: aiosqlite.Connection,
+    row: dict[str, Any],
+    repair_offered: bool,
+    delivery: Any = None,
 ) -> dict[str, Any] | None:
     """Справка для решения (#1810): тот же ``build``, что строит строку входящих.
 
@@ -2604,7 +2607,8 @@ async def _card_decision_brief(
     from hub.services import decision_brief
 
     try:
-        brief = await decision_brief.build(db, row, {"repair_offered": repair_offered})
+        ctx = {"repair_offered": repair_offered, "delivery": delivery}
+        brief = await decision_brief.build(db, row, ctx)
         # Для статуса без решения человека (open и пр.) блока нет: он был бы шумом.
         return (
             None if brief["recommend"]["action"] == decision_brief.NO_ACTION else brief
@@ -2890,8 +2894,8 @@ async def _web_task_detail_page(
         # #1783: кнопки нет — карточка называет причину (живая работа, нет находок).
         repair_reason = (await repair_state(db, dict(row)))[1]
     finding_touch = await _card_finding_touch(db, task_id, machine_review)
-    decision_brief = await _card_decision_brief(db, dict(row), repair_offered)
     delivery = await _card_delivery(db, task_id, task, state_card)
+    decision_brief = await _card_decision_brief(db, dict(row), repair_offered, delivery)
     change_map = await _card_change_map(
         db, task_id, task, evidence, machine_review, state_card
     )

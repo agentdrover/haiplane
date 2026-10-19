@@ -33,7 +33,7 @@ from hub.services.accept_proof import (
     prove_state_accept,
 )
 from hub.services.readiness import parse_risks_from_row
-from hub.services.result_kind import automation_not_applicable
+from hub.services.result_kind import automation_not_applicable, state_accepted
 from hub.services.verdict_route import DECIDER_HUMAN, DECIDER_STEWARD, verdict_route
 
 ACCEPT = "Принять"
@@ -253,7 +253,11 @@ async def _state_brief(
     ]
     risks = [_risk("high", b.risk, b.why) for b in blockers]
     if proof is None:
-        recommend = _recommend(CHECK, "", [view.headline] + [b.risk for b in blockers])
+        rework = any(b.level == REWORK for b in blockers)
+        action, verdict = (REWORK, VERDICT_CHANGES) if rework else (CHECK, "")
+        recommend = _recommend(
+            action, verdict, [view.headline] + [b.risk for b in blockers]
+        )
     else:
         recommend = _accept(proof, [have, "откат назван, комплект полон"])
     return _brief(
@@ -312,11 +316,9 @@ async def _decision_brief(
 async def _running_brief(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    offered = ctx.get("repair_offered")
-    if offered is None and task.get("review_verdict") == VERDICT_CHANGES:
-        from hub.services.executor_launch import repair_offered
-
-        offered = await repair_offered(db, task)
+    # Повторный прогон предлагает вызывающий (карточка знает repair_offered);
+    # без него справка не опрашивает исполнителей и говорит «идёт работа».
+    offered = bool(ctx.get("repair_offered"))
     if offered:
         return _brief(
             "Вердикт «на доработку» вынесен, исправление не запущено.",
@@ -334,16 +336,25 @@ async def _completed_brief(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
     if automation_not_applicable(task):
+        # «Принято» — по единому признаку, а не по статусу: completed закрывает и
+        # force-complete (result_kind.state_accepted).
+        if state_accepted(task):
+            return _brief(
+                "Состояние изменено и принято.",
+                "От вас ничего не нужно.",
+                _recommend(DELIVERED, "", ["задача-состояние: выкат не применим"]),
+            )
         return _brief(
-            "Состояние изменено и принято.",
-            "От вас ничего не нужно.",
-            _recommend(DELIVERED, "", ["задача-состояние: выкат не применим"]),
+            "Задача-состояние закрыта без действующего одобрения.",
+            "Стоит проверить, почему закрыта без вердикта.",
+            _recommend(CHECK, "", ["статус completed принятия не доказывает"]),
+            risks=[_risk("medium", "Закрыта без одобрения текущей сдачи")],
         )
-    delivery = ctx.get("delivery")
-    if delivery is None:
-        from hub.services.delivery_state import delivery_state
-
-        delivery = await delivery_state(db, int(task["id"]))
+    # Доставку считает вызывающий (карточка уже её знает): справка в git не ходит.
+    delivery = ctx.get("delivery") or {
+        "state": "unknown",
+        "reason": "доставка в справку не передана: выкат не сверен",
+    }
     if delivery.get("state") == "in_prod":
         return _brief(
             "Работа влита и запущена в проде.",
@@ -352,7 +363,7 @@ async def _completed_brief(
         )
     reason = str(delivery.get("reason") or "выкат не подтверждён")
     return _brief(
-        "Работа влита, но запуск в проде не подтверждён.",
+        "Запуск в проде не подтверждён.",
         "Стоит убедиться, что выкат состоялся.",
         _recommend(MERGED_NOT_SHIPPED, "", [reason]),
         risks=[_risk("medium", "Выкат не подтверждён", reason)],
