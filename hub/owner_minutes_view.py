@@ -33,6 +33,8 @@ class OwnerMinutesView(BaseModel):
     caught_up: bool = False
     norms_version: int = 0
     label: str = ESTIMATE_LABEL
+    #: Применённый часовой пояс (IANA): по нему считается «день».
+    timezone: str = ""
     #: Готовая строка для людей («7 мин (оценка, с начала учёта)»): карточка,
     #: MCP и CLI печатают её, а не пересчитывают число у себя.
     line: str = ""
@@ -41,4 +43,3 @@ class OwnerMinutesView(BaseModel):
 class OwnerMinutesDayView(OwnerMinutesView):
     principal_id: int
     date: str
-    timezone: str

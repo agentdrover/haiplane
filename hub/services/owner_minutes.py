@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -185,17 +187,41 @@ def _candidate_of(event: dict[str, Any]) -> _Candidate | None:
     )
 
 
+@asynccontextmanager
+async def _atomic(db: aiosqlite.Connection) -> AsyncIterator[None]:
+    """Атомарная граница пакета - и когда соединение УЖЕ внутри чужой транзакции.
+
+    Соединение поллера живёт весь процесс; предыдущий проход тика мог упасть, не
+    закоммитив. Вложенный ``write_transaction`` тогда не владеет транзакцией и не
+    откатывает ничего: частичный пакет без курсора коммитил бы следующий проход
+    (находка Codex #1874). Поэтому в чужой транзакции пакет идёт под точкой
+    сохранения: сбой откатывает ТОЛЬКО его, а чужие записи остаются владельцу.
+    """
+    if not db.in_transaction:
+        async with write_transaction(db):
+            yield
+        return
+    await db.execute("SAVEPOINT owner_minutes_batch")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO SAVEPOINT owner_minutes_batch")
+        await db.execute("RELEASE SAVEPOINT owner_minutes_batch")
+        raise
+    await db.execute("RELEASE SAVEPOINT owner_minutes_batch")
+
+
 async def _ensure_state(db: aiosqlite.Connection) -> None:
     """Однократная инициализация: tracking_since и курсор MAX(events.id) - вместе."""
     if await store.get_state(db) is not None:
         return
-    async with write_transaction(db):
+    async with _atomic(db):
         await store.init_state(db)
 
 
 async def _one_batch(db: aiosqlite.Connection, batch: int) -> tuple[int, bool]:
-    """Один пакет: (число начислений, лента кончилась). Одна write-транзакция."""
-    async with write_transaction(db):
+    """Один пакет: (число начислений, лента кончилась). Одна атомарная граница."""
+    async with _atomic(db):
         state = await store.get_state(db)
         if state is None:
             return 0, True
@@ -282,9 +308,13 @@ def _with_line(view: Any) -> Any:
 
 async def task_estimate(db: aiosqlite.Connection, task_id: int) -> OwnerMinutesView:
     """Оценка минут по задаче: все учтённые люди с разбивкой по principal."""
+    # Порядок чтения несущий (находка Codex #1874): СНАЧАЛА курсор, потом суммы.
+    # Курсор, прочитанный позже сумм, мог обогнать их, если пас отработал между
+    # чтениями: ответ «нет данных, пас догнал» при уже начисленных секундах.
+    # Так суммы всегда включают всё, что лежит не дальше прочитанного курсора.
+    progress = await _progress(db)
     split = await store.task_split(db, task_id)
     accruals = sum(int(p["accruals"]) for p in split)
-    progress = await _progress(db)
     return _with_line(
         OwnerMinutesView(
             status=_status(progress, accruals),
@@ -296,6 +326,7 @@ async def task_estimate(db: aiosqlite.Connection, task_id: int) -> OwnerMinutesV
             caught_up=progress["caught_up"],
             norms_version=int(NORMS_VERSION),
             label=ESTIMATE_LABEL,
+            timezone=str(config.OWNER_MINUTES_TIMEZONE),
         )
     )
 
@@ -321,8 +352,8 @@ async def day_estimate(
 ) -> OwnerMinutesDayView:
     """Оценка минут принципала за локальный день по всем проектам."""
     start, end = local_day_bounds(day)
+    progress = await _progress(db)  # курсор раньше сумм, см. task_estimate
     seconds, accruals = await store.principal_window(db, principal_id, start, end)
-    progress = await _progress(db)
     return _with_line(
         OwnerMinutesDayView(
             status=_status(progress, accruals),

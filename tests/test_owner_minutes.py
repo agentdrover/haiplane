@@ -765,10 +765,31 @@ async def test_accrual_pass_is_idempotent_and_restartable(
         ):
             with pytest.raises((RuntimeError, asyncio.CancelledError)):
                 await _pass(db)
-        await db.rollback()
+        # Откат сделал сам пас: ни своей транзакции, ни следов в ней.
+        assert not db.in_transaction
         assert [r["source_event_id"] for r in await _accruals(db)] == [first, second]
         now = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
         assert now["cursor_event_id"] == cursor_before
+
+    # Соединение поллера уже внутри чужой недокоммиченной транзакции (проход
+    # раньше упал): сбой пакета откатывает ТОЛЬКО пакет, а чужой коммит
+    # следующего прохода не несёт ни начислений без курсора, ни курсора без них.
+    await db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) "
+        "VALUES ('foreign', ?, 'hub', '{}')",
+        (task_id,),
+    )
+    assert db.in_transaction
+    with patch(
+        "hub.repository_owner_minutes.advance_cursor",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        with pytest.raises(RuntimeError):
+            await _pass(db)
+    await db.commit()
+    assert [r["source_event_id"] for r in await _accruals(db)] == [first, second]
+    now = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
+    assert now["cursor_event_id"] == cursor_before
 
     # Падение паса, затем очистка events, затем восстановление: непрочитанный
     # хвост старше 14 дней пережил очистку и начислен позже.
@@ -790,17 +811,57 @@ async def test_accrual_pass_is_idempotent_and_restartable(
         third,
     ]
 
-    # Пакеты по 200: курсор идёт по всем событиям, включая неучитываемые.
+    # Пакеты по 200: курсор идёт по всем событиям, включая неучитываемые, и
+    # каждый пакет закоммичен сам. Третий пакет падает - первые два остались.
+    from hub import repository_owner_minutes as store
+
     noise = 450
     await db.executemany(
         "INSERT INTO events (kind, task_id, actor, payload) VALUES ('noise', ?, 'hub', '{}')",
         [(task_id,)] * noise,
     )
     tail = await _human_event(db, world.owner_id, task_id)
+    old_cursor = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[
+        0
+    ]["cursor_event_id"]
+    seen: list[tuple[int, int]] = []
+    batches = {"advanced": 0}
+    real_after, real_advance = store.events_after, store.advance_cursor
+
+    async def _spy_after(conn, cursor, limit):
+        rows = await real_after(conn, cursor, limit)
+        seen.append((limit, len(rows)))
+        return rows
+
+    async def _flaky_advance(conn, cursor):
+        batches["advanced"] += 1
+        if batches["advanced"] == 3:
+            raise RuntimeError("third batch")
+        await real_advance(conn, cursor)
+
+    with (
+        patch.object(store, "events_after", _spy_after),
+        patch.object(store, "advance_cursor", _flaky_advance),
+    ):
+        with pytest.raises(RuntimeError, match="third batch"):
+            await _pass(db)
+    assert seen[:2] == [(200, 200), (200, 200)], seen
+    after_two = (
+        await _rows(
+            db,
+            "SELECT id FROM events WHERE id > ? ORDER BY id LIMIT 1 OFFSET 399",
+            (old_cursor,),
+        )
+    )[0]["id"]
+    now = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
+    assert now["cursor_event_id"] == after_two, "два пакета закоммичены по отдельности"
     await _pass(db)
     assert (await _accruals(db))[-1]["source_event_id"] == tail
     state = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
-    assert state["cursor_event_id"] == tail
+    assert (
+        state["cursor_event_id"]
+        == (await _rows(db, "SELECT MAX(id) AS m FROM events"))[0]["m"]
+    )
 
     # Записанные решения не изменились: задача на месте, события целы.
     assert dict(await repo.get_task(db, task_id))["status"] == "open"
@@ -863,6 +924,7 @@ async def test_sums_by_task_and_local_day(world, db, monkeypatch):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["total_seconds"] == 180 * 3 and body["accruals"] == 3
+    assert body["timezone"] == "Europe/Moscow"
     split = {p["principal_id"]: p["seconds"] for p in body["by_principal"]}
     assert split == {world.owner_id: 360, world.second_id: 180}
     empty = (
@@ -902,6 +964,51 @@ async def test_sums_by_task_and_local_day(world, db, monkeypatch):
     assert gone.status_code == 200 and gone.json()["total_seconds"] == 180 * 3 + 600
     after = await day("2026-10-19", world.owner_id)
     assert after["total_seconds"] == 180 + 240 + 600
+
+
+async def test_a_pass_between_the_reads_cannot_outrun_the_sum(world, db):
+    """AC-4 (гонка чтения): пас отработал между чтением суммы и курсора.
+
+    Курсор читается раньше сумм: всё, что лежит не дальше ответного
+    ``processed_through_event_id``, обязано быть в сумме. Иначе ответ «нет
+    данных, пас догнал» при уже начисленных секундах.
+    """
+    from hub import repository_owner_minutes as store
+
+    task_id = await _mk_task(db, "open", "race")
+    await _event_at(db, world.owner_id, task_id, "2026-10-19 09:00:00")
+
+    fired = {"done": False}
+    real_split, real_state = store.task_split, store.get_state
+
+    async def _once_after(real, *args):
+        result = await real(*args)
+        if not fired["done"]:
+            fired["done"] = True
+            await _pass(db)  # пас отрабатывает между двумя чтениями ответа
+        return result
+
+    async def _split(conn, task):
+        return await _once_after(real_split, conn, task)
+
+    async def _state(conn):
+        return await _once_after(real_state, conn)
+
+    from hub.services import owner_minutes
+
+    with (
+        patch.object(store, "task_split", _split),
+        patch.object(store, "get_state", _state),
+    ):
+        estimate = await owner_minutes.task_estimate(db, task_id)
+    covered = await _rows(
+        db,
+        "SELECT COALESCE(SUM(seconds), 0) AS s FROM owner_minute_accruals "
+        "WHERE task_id = ? AND source_event_id <= ?",
+        (task_id, estimate.processed_through_event_id),
+    )
+    assert (estimate.total_seconds or 0) >= covered[0]["s"], estimate
+    assert not (estimate.status == "no_data" and covered[0]["s"]), estimate
 
 
 # ---------------------------------------------------------------------------
