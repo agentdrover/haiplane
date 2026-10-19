@@ -47,6 +47,8 @@ DEFAULT_CORPUS = Path(__file__).resolve().parent.parent / (
 #: Окно строк вокруг локатора, в котором находка считается попавшей в место.
 LINE_WINDOW = 20
 EXPECTATIONS = ("defect", "clean")
+#: Окно наблюдения чистой: меньше 14 дней не бывает ни в корпусе, ни в счёте.
+MIN_WINDOW_DAYS = 14
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 #: Эскалация судьи, которая не суждение о коде: хаб превратил ответ в
@@ -81,6 +83,21 @@ NO_DATA = "нет данных"
 # --- корпус ---------------------------------------------------------------
 
 
+def _is_int(value: Any) -> bool:
+    """int без bool: True — подкласс int и прошёл бы как 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_date(value: Any) -> bool:
+    from datetime import date
+
+    try:
+        date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return False
+    return True
+
+
 def load_corpus(path: Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -94,7 +111,7 @@ def _validate_locators(
         start, end = loc.get("start_line"), loc.get("end_line")
         if not isinstance(file_, str) or not file_.strip():
             errors.append(f"{where}: у локатора нет файла")
-        if not (isinstance(start, int) and isinstance(end, int) and 1 <= start <= end):
+        if not (_is_int(start) and _is_int(end) and 1 <= start <= end):
             errors.append(f"{where}: локатор {file_}: диапазон строк неверен")
         cls = loc.get("defect_class")
         if cls is not None and cls not in classes:
@@ -108,12 +125,12 @@ def _validate_truth(case: dict[str, Any], where: str) -> list[str]:
         return [f"{where}: нет ссылки на истину (truth)"]
     kind = truth.get("kind")
     if kind == "human_review":
-        if not isinstance(truth.get("update_id"), int):
+        if not _is_int(truth.get("update_id")):
             return [f"{where}: truth.human_review без update_id записи kind=review"]
         return []
     if kind == "prod_defect":
         ids = (truth.get("task_id"), truth.get("caused_by_task_id"))
-        if not all(isinstance(i, int) for i in ids):
+        if not all(_is_int(i) for i in ids):
             return [f"{where}: truth.prod_defect без task_id и caused_by_task_id"]
         return []
     return [f"{where}: неизвестный вид истины {kind!r}"]
@@ -141,8 +158,14 @@ def _validate_expectation(
         errors.append(f"{where}: чистая без вердикта APPROVED")
     if not delivery.get("update_id") or not delivery.get("at"):
         errors.append(f"{where}: у чистой нет записи о доставке (delivery)")
-    if not case.get("checked_at") or not isinstance(case.get("window_days"), int):
+    window = case.get("window_days")
+    if not case.get("checked_at") or not _is_int(window):
         errors.append(f"{where}: у чистой нет checked_at и window_days")
+    elif window < MIN_WINDOW_DAYS:
+        errors.append(f"{where}: window_days {window} меньше {MIN_WINDOW_DAYS}")
+    dates = (case.get("checked_at"), delivery.get("at"))
+    if not all(_valid_date(d) for d in dates if d):
+        errors.append(f"{where}: checked_at или delivery.at не дата")
     return errors
 
 
@@ -186,7 +209,7 @@ def is_provisional(case: dict[str, Any]) -> bool:
     from datetime import date
 
     span = date.fromisoformat(checked) - date.fromisoformat(delivered)
-    return span.days < int(case.get("window_days") or 0)
+    return span.days < max(int(case.get("window_days") or 0), MIN_WINDOW_DAYS)
 
 
 # --- сопоставление находки с местом -----------------------------------------
@@ -199,10 +222,10 @@ def _norm_path(path: Any) -> str:
 
 def _span(finding: dict[str, Any]) -> tuple[int, int] | None:
     start = finding.get("start_line") or finding.get("line")
-    if not isinstance(start, int):
+    if not _is_int(start):
         return None
     end = finding.get("end_line")
-    return start, end if isinstance(end, int) and end >= start else start
+    return start, end if _is_int(end) and end >= start else start
 
 
 def finding_matches(finding: Any, locators: list[dict[str, Any]]) -> bool:
@@ -486,19 +509,24 @@ def _machine_lines(s: dict[str, Any]) -> list[str]:
     ]
 
 
+def _judged_rate(held: int, approved: int) -> str:
+    """Доля «удержал» среди суждений по существу: held + approved."""
+    if not held + approved:
+        return "нет суждений по существу"
+    return _rate(held, held + approved)
+
+
 def _judge_lines(s: dict[str, Any]) -> list[str]:
     d, c = s["judge_defect"], s["judge_clean"]
-    d_total = sum(d.values()) - d["none"]
-    c_total = sum(c.values()) - c["none"]
     return [
-        "СУДЬЯ СТЮАРДА",
-        f"  удержал дефектную (не approve): {_rate(d['held'], d_total)}"
-        f" (покрытие {_rate(d_total, s['defects_scored'])})",
-        f"  одобрил дефектную: {d['approved']}; процедурная эскалация: {d['procedural']}"
-        f"; суждения нет: {d['none']}",
-        f"  ложно удержал чистую: {_rate(c['held'], c_total)}"
-        f" (покрытие {_rate(c_total, s['cleans_scored'])}){_prov(s)}",
-        f"  чистые: одобрил {c['approved']}; процедурная эскалация {c['procedural']}"
+        "СУДЬЯ СТЮАРДА (знаменатель — суждения по существу: удержал + одобрил)",
+        f"  удержал дефектную (не approve): {_judged_rate(d['held'], d['approved'])}"
+        f" (покрытие {_rate(d['held'] + d['approved'], s['defects_scored'])})",
+        f"  ложно удержал чистую: {_judged_rate(c['held'], c['approved'])}"
+        f" (покрытие {_rate(c['held'] + c['approved'], s['cleans_scored'])}){_prov(s)}",
+        f"  вне знаменателя, дефектные: процедурная эскалация {d['procedural']}"
+        f"; суждения нет {d['none']}",
+        f"  вне знаменателя, чистые: процедурная эскалация {c['procedural']}"
         f"; суждения нет {c['none']}",
     ]
 
@@ -599,13 +627,20 @@ def read_target_cost(
     return "none", None
 
 
-def render_plan(conn: sqlite3.Connection, cases: list[dict[str, Any]], cap: int) -> str:
+def render_plan(
+    conn: sqlite3.Connection, cases: list[dict[str, Any]], cap: int, skipped: int = 0
+) -> str:
     targets = plan_targets(cases)
     chosen = targets[: max(cap, 0)]
     lines = ["", "ПЛАН ПЕРЕПРОГОНА РЕВЬЮЕРА (только печать, ничего не запускается)"]
     lines.append(
         f"  целей без дублей: {len(targets)}, в плане по потолку {cap}: {len(chosen)}"
     )
+    if skipped:
+        lines.append(
+            f"  исключено из плана: {skipped} случаев со sha, не совпавшим с сдачей"
+            " или без сдачи"
+        )
     billed = provider = unknown = 0
     for t in chosen:
         task, gen, sha = t["key"]
@@ -655,7 +690,11 @@ def run(corpus_path: Path, db_path: str, plan_cap: int | None) -> tuple[int, str
         rows = [evaluate_case(conn, c) for c in corpus["cases"]]
         out = render_report(rows)
         if plan_cap is not None:
-            out += render_plan(conn, corpus["cases"], plan_cap)
+            ok = {r["case_id"] for r in rows if r["status"] == STATUS_SCORED}
+            planned = [c for c in corpus["cases"] if c["case_id"] in ok]
+            out += render_plan(
+                conn, planned, plan_cap, len(corpus["cases"]) - len(planned)
+            )
     finally:
         conn.close()
     return 0, out

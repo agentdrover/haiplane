@@ -75,7 +75,11 @@ def test_corpus_validation_names_each_break():
 def test_window_provisional_by_corpus_fields_not_clock():
     clean = {"delivery": {"at": "2026-10-10T00:00"}, "checked_at": "2026-10-19"}
     assert ev.is_provisional({**clean, "window_days": 14})
-    assert not ev.is_provisional({**clean, "window_days": 9})
+    # окно меньше 14 дней не бывает: 9 и 0 не делают случай окончательным
+    assert ev.is_provisional({**clean, "window_days": 9})
+    assert ev.is_provisional({**clean, "window_days": 0})
+    done = {"delivery": {"at": "2026-10-01T00:00"}, "checked_at": "2026-10-19"}
+    assert not ev.is_provisional({**done, "window_days": 14})
 
 
 def test_finding_match_window_and_file_rules():
@@ -269,7 +273,7 @@ async def test_offline_score_recall_and_false_alarms(
         "полнота на дефектных: 1/5 (20.0%)" in first
     )  # c1; c2 насторожился, c3, c6, c7 — нет
     assert "ложные тревоги на чистых: 1/1 (100.0%)" in first
-    assert "процедурная эскалация: 1" in first
+    assert "процедурная эскалация 1" in first
     assert "procedural_object 1" in first
 
 
@@ -390,3 +394,75 @@ async def test_clean_shares_are_marked_provisional(synthetic, db_dsn, capsys):
     out = capsys.readouterr().out
     assert "предварительно: окно не истекло у 0" not in out
     assert out.count("чистых в счёте") in (0, 3)  # окно синтетической чистой истекло
+
+
+def test_validator_rejects_short_window_bool_and_bad_date():
+    corpus = ev.load_corpus(CORPUS)
+    clean = next(c for c in corpus["cases"] if c["expectation"] == "clean")
+    for field, value, needle in (
+        ("window_days", 9, "меньше 14"),
+        ("window_days", True, "нет checked_at и window_days"),
+        ("checked_at", "вчера", "не дата"),
+    ):
+        bad = json.loads(json.dumps(corpus))
+        target = next(c for c in bad["cases"] if c["case_id"] == clean["case_id"])
+        target[field] = value
+        assert needle in "\n".join(ev.validate_corpus(bad)), (field, value)
+    bad = json.loads(json.dumps(corpus))
+    next(c for c in bad["cases"] if c["expectation"] == "defect")["locators"][0][
+        "start_line"
+    ] = True
+    assert "диапазон строк неверен" in "\n".join(ev.validate_corpus(bad))
+
+
+async def test_plan_skips_sha_mismatch_and_judge_counts_substance_only(
+    db, db_dsn, tmp_path, capsys
+):
+    for n in (1, 2, 3):
+        await _task(db, n)
+    for n in (1, 2, 3):
+        await db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, billed_tokens) VALUES (?, 1, 'bc', ?)",
+            (n, 9_000_000 if n == 1 else 100),
+        )
+    await _judge(db, 2, "escalate", "no_grounds")  # процедурный отказ — не в счёте
+    await _judge(db, 3, "changes_requested", "")
+    await db.commit()
+    # c1 — чужой sha и дорогой чужой прогон; он не должен занять место под потолком
+    cases = [_case(1, "defect", sha="e" * 40), _case(2, "defect"), _case(3, "defect")]
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps({"version": 1, "defect_classes": ["k"], "cases": cases}),
+        encoding="utf-8",
+    )
+    assert ev.main(["--corpus", str(path), "--db", db_dsn, "--plan-cap", "2"]) == 0
+    out = capsys.readouterr().out
+    plan = out.split("ПЛАН ПЕРЕПРОГОНА")[1]
+    assert "целей без дублей: 2, в плане по потолку 2: 2" in plan
+    assert "исключено из плана: 1" in plan
+    assert "9000000" not in plan
+    assert "оценка цены: 200 токенов" in plan
+    judge = out.split("СУДЬЯ СТЮАРДА")[1].split("СОВЕТНИК")[0]
+    assert "удержал дефектную (не approve): 1/1 (100.0%)" in judge  # c3
+    assert "0/1" not in judge
+    # без единого суждения по существу цифры нет, а не 0/1
+    only_procedural = ev.render_report(
+        [{**row, "judge": "procedural"} for row in _FAKE_ROWS]
+    )
+    assert "удержал дефектную (не approve): нет суждений по существу" in only_procedural
+    assert "вне знаменателя, дефектные: процедурная эскалация 1" in judge
+
+
+_FAKE_ROWS = [
+    {
+        "case_id": "x",
+        "task_id": 1,
+        "generation": 1,
+        "expectation": "defect",
+        "provisional": False,
+        "status": "scored",
+        "machine": "missed",
+        "advisor": "not_applicable",
+    }
+]
