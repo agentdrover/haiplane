@@ -254,6 +254,7 @@ CODE_DEFAULT_LOCKED = "default_project_autopilot_locked"
 PENDING_BRANCH = "branch"
 PENDING_PROVIDER_USAGE = "provider_usage"
 PENDING_CI_INTEGRITY = "ci_integrity"
+PENDING_CEILING = "class_ceiling"
 
 
 @dataclass(frozen=True)
@@ -530,8 +531,33 @@ async def _observed_facts_stage(
         ctx.pending.append(PENDING_BRANCH)
         if not (task.get("risk_class") or "").strip():
             return _refuse_with(CODE_CLASS_MISSING, "класс риска не вычислен", ctx)
-        return None
+        return await _stored_ceiling_stage(db, task_id, ctx)
     return await _branch_stage(db, task_id, ctx)
+
+
+async def _stored_ceiling_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    """Потолок по СОХРАНЁННОМУ классу, без сети (``observe=False``, #1855).
+
+    Выше потолка (или потолок нечитаем) — человек сразу. В пределах — класс по
+    диффу ещё не виден, и это условие ответа, а не «чисто».
+    """
+    from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
+    from hub.services.steward_apply import current_ceiling
+
+    key = "auto_approve_max_class"
+    found = ceiling_reason(
+        await current_ceiling(db, task_id, key),
+        ctx.task.get("risk_class"),
+        key=key,
+    )
+    if found is None:
+        return None
+    if found[0] == BLOCKED:
+        return _refuse_with(CODE_CEILING, found[1]["detail"], ctx)
+    ctx.pending.append(PENDING_CEILING)
+    return None
 
 
 async def _integrity_stage(

@@ -63,8 +63,11 @@ def _reason(code: str, detail: str) -> dict[str, str]:
     return {"code": code, "detail": detail}
 
 
-def _ceiling_reason(
-    ceiling: str | None, stored_raw: Any, recomputed_raw: Any = None
+def ceiling_reason(
+    ceiling: str | None,
+    stored_raw: Any,
+    recomputed_raw: Any = None,
+    key: str = "steward_approve_max_class",
 ) -> tuple[str, dict[str, str]] | None:
     """(BLOCKED|UNKNOWN, причина) по потолку, или None, если потолка нет.
 
@@ -77,7 +80,7 @@ def _ceiling_reason(
 
     if ceiling is None:
         return None
-    named = f"steward_approve_max_class={ceiling}"
+    named = f"{key}={ceiling}"
     if ceiling == project_policy.STEWARD_CEILING_UNREADABLE:
         return BLOCKED, _reason(
             REFUSED_CLASS_CEILING, f"{named}: значение потолка нечитаемо"
@@ -138,7 +141,7 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
         blocked.append(_reason(*not_delegated))
     project = await repo.resolve_project_for_task(db, task_id)
     policy = project_policy.gate_policy_of(project) if project is not None else {}
-    ceiling = _ceiling_reason(
+    ceiling = ceiling_reason(
         project_policy.steward_approve_max_class_of(policy), row["risk_class"]
     )
     if ceiling:

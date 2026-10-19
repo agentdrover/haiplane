@@ -57,6 +57,8 @@
    (`verdict=steward`, `steward_shadow=false`). Это первый шаг после выката.
    Шаг 3а: PATCH `auto_approve_max_class=r1` на проектах с `verdict=auto`
    (их список — `autopilot scope` в отчёте). Откат: PATCH `null`.
+   На проекте с `verdict=steward` автопилот тоже решает (кроме default, где его
+   закрывает замок #743), поэтому потолок ставь обоими ключами.
 4. Повтори отчёт готовности. Кандидаты выше потолка должны стать `blocked`
    с причиной `class_above_policy_ceiling`.
 5. Режим act уже включён. Если нужно включить заново: в `50-steward.conf`

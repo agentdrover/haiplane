@@ -1552,12 +1552,12 @@ async def test_the_act_readiness_report_is_a_pure_read(
     assert report["candidate_counts"] == {"ready": 1, "blocked": 4, "unknown": 2}
 
     # Пересчитанный класс известен вызывающему: сравнивается max(stored, recomputed).
-    from hub.services.steward_act_readiness import _ceiling_reason
+    from hub.services.steward_act_readiness import ceiling_reason
 
-    assert _ceiling_reason("r1", "R1", "R2")[0] == "blocked"
-    assert _ceiling_reason("r1", "R1", "R1") is None
-    assert _ceiling_reason("r1", "R1")[0] == "unknown"
-    assert _ceiling_reason(None, None) is None
+    assert ceiling_reason("r1", "R1", "R2")[0] == "blocked"
+    assert ceiling_reason("r1", "R1", "R1") is None
+    assert ceiling_reason("r1", "R1")[0] == "unknown"
+    assert ceiling_reason(None, None) is None
 
     # Гипотетический расчёт равен фактическому при act.
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
