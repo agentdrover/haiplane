@@ -11,23 +11,23 @@ index 00000000..699b6db3
 +haiplane-review-runner.service enabled enabled
 +haiplane-snapshot-daily.service static -
 +haiplane-snapshot-hourly.service static -
-+openclaw-hub.service enabled enabled
++haiplane-hub.service enabled enabled
 +haiplane-hub-backup.timer enabled enabled
 +haiplane-snapshot-daily.timer enabled enabled
 +haiplane-snapshot-hourly.timer enabled enabled
 +
 +########## псевдонимы и ссылки
-+haiplane-hub.service: Id=openclaw-hub.service Names=openclaw-hub.service haiplane-hub.service
-+openclaw-hub.service: Id=openclaw-hub.service Names=openclaw-hub.service haiplane-hub.service
-+/etc/systemd/system/haiplane-hub.service -> /etc/systemd/system/openclaw-hub.service
-+/opt/haiplane-hub -> /opt/openclaw-hub (link=True, mode=0o777)
-+/opt/openclaw-hub -> /opt/openclaw-hub (link=False, mode=0o750)
++haiplane-hub.service: Id=haiplane-hub.service Names=haiplane-hub.service haiplane-hub.service
++haiplane-hub.service: Id=haiplane-hub.service Names=haiplane-hub.service haiplane-hub.service
++/etc/systemd/system/haiplane-hub.service -> /etc/systemd/system/haiplane-hub.service
++/opt/haiplane-hub -> /opt/haiplane-hub (link=True, mode=0o777)
++/opt/haiplane-hub -> /opt/haiplane-hub (link=False, mode=0o750)
 +/etc/haiplane-hub: нет
-+/etc/openclaw-hub -> /etc/openclaw-hub (link=False, mode=0o750)
++/etc/haiplane-hub -> /etc/haiplane-hub (link=False, mode=0o750)
 +/var/lib/haiplane-hub: нет
-+/var/lib/openclaw-hub -> /var/lib/openclaw-hub (link=False, mode=0o750)
++/var/lib/haiplane-hub -> /var/lib/haiplane-hub (link=False, mode=0o750)
 +/var/log/haiplane-hub: нет
-+/var/log/openclaw-hub -> /var/log/openclaw-hub (link=False, mode=0o750)
++/var/log/haiplane-hub -> /var/log/haiplane-hub (link=False, mode=0o750)
 +
 +########## haiplane-hub-backup.service
 +UnitFileState=static
@@ -47,31 +47,31 @@ index 00000000..699b6db3
 +########## haiplane-hub.service
 +UnitFileState=enabled
 +ActiveState=active
-+FragmentPath=/etc/systemd/system/openclaw-hub.service
-+DropInPaths=/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf /etc/systemd/system/openclaw-hub.service.d/50-local-review.conf /etc/systemd/system/openclaw-hub.service.d/50-steward.conf /etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf /etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf /etc/systemd/system/openclaw-hub.service.d/executor.conf /etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf /etc/systemd/system/openclaw-hub.service.d/sdd.conf /etc/systemd/system/openclaw-hub.service.d/worktree.conf /etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf /etc/systemd/system/openclaw-hub.service.d/zz-models.conf
-+--- файл /etc/systemd/system/openclaw-hub.service
++FragmentPath=/etc/systemd/system/haiplane-hub.service
++DropInPaths=/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf /etc/systemd/system/haiplane-hub.service.d/50-local-review.conf /etc/systemd/system/haiplane-hub.service.d/50-steward.conf /etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf /etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf /etc/systemd/system/haiplane-hub.service.d/executor.conf /etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf /etc/systemd/system/haiplane-hub.service.d/sdd.conf /etc/systemd/system/haiplane-hub.service.d/worktree.conf /etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf /etc/systemd/system/haiplane-hub.service.d/zz-models.conf
++--- файл /etc/systemd/system/haiplane-hub.service
 +[Unit]
-+Description=OpenClaw Hub
++Description=Haiplane Hub
 +After=network-online.target
 +Wants=network-online.target
 +
 +[Service]
 +Type=simple
-+User=openclaw
-+Group=openclaw
-+WorkingDirectory=/opt/openclaw-hub/src
-+EnvironmentFile=/etc/openclaw-hub/openclaw-hub.env
++User=haiplane
++Group=haiplane
++WorkingDirectory=/opt/haiplane-hub/src
++EnvironmentFile=/etc/haiplane-hub/haiplane-hub.env
 +EnvironmentFile=<скрыто>
-+ExecStart=/opt/openclaw-hub/venv/bin/haiplane-hub
++ExecStart=/opt/haiplane-hub/venv/bin/haiplane-hub
 +Restart=on-failure
 +RestartSec=5
-+StandardOutput=append:/var/log/openclaw-hub/service.log
-+StandardError=append:/var/log/openclaw-hub/service.err
++StandardOutput=append:/var/log/haiplane-hub/service.log
++StandardError=append:/var/log/haiplane-hub/service.err
 +NoNewPrivileges=true
 +PrivateTmp=true
 +ProtectSystem=strict
 +ProtectHome=true
-+ReadWritePaths=/var/lib/openclaw-hub /var/log/openclaw-hub /opt/openclaw-hub
++ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub /opt/haiplane-hub
 +ProtectKernelTunables=true
 +ProtectKernelModules=true
 +ProtectControlGroups=true
@@ -83,11 +83,11 @@ index 00000000..699b6db3
 +[Install]
 +WantedBy=multi-user.target
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf
 +[Service]
 +Environment=HAIPLANE_AUTO_APPROVE_MAX_CLASS=r1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/50-local-review.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/50-local-review.conf
 +[Service]
 +Environment='HAIPLANE_LOCAL_REVIEW_CMD=<скрыто>'
 +Environment='HAIPLANE_LOCAL_REVIEW_SANDBOX=<скрыто>'
@@ -95,62 +95,62 @@ index 00000000..699b6db3
 +Environment=HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=1800
 +Environment=HAIPLANE_LOCAL_REVIEW_TOKEN_CEILING=2000000
 +Environment=HAIPLANE_LOCAL_REVIEW_TRANSPORT=runner
-+Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/openclaw-hub/review-spool
++Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/haiplane-hub/review-spool
 +Environment=HAIPLANE_LOCAL_REVIEW_MODEL=deepseek-v4-pro
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/50-steward.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/50-steward.conf
 +[Service]
 +Environment=HAIPLANE_STEWARD_MODE=shadow
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf
 +[Service]
 +Environment=HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3
 +Environment=HAIPLANE_STEWARD_ADVISOR_MODELS=glm-5.3,grok-4.6,composer-2.5
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf
 +[Service]
 +Environment=HAIPLANE_REVIEW_RANDOM_DEEP_SHARE=0.2
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/executor.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/executor.conf
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=gemini-3.8-flash
 +Environment=HAIPLANE_EXECUTOR_TOKEN_CEILING=40000000
 +Environment=HAIPLANE_EXECUTOR_CENTS_CEILING=500
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf
 +[Service]
 +Environment=HAIPLANE_LOCAL_REVIEW_SNAPSHOT=1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/sdd.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/sdd.conf
 +[Service]
 +Environment=HAIPLANE_SDD_AC_LOCATOR=require
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/worktree.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/worktree.conf
 +[Service]
 +Environment=HAIPLANE_WORKTREE_PER_TASK=1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf
 +[Service]
 +Environment=HAIPLANE_CSRF_MODE=require
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/zz-models.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/zz-models.conf
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=grok-4.7
 +Environment='HAIPLANE_EXECUTOR_MODEL_PARAMS=<скрыто>'
 +
-+--- EnvironmentFile /etc/openclaw-hub/openclaw-hub.env (ignore_errors=no)
++--- EnvironmentFile /etc/haiplane-hub/haiplane-hub.env (ignore_errors=no)
 +HAIPLANE_HUB_HOST=127.0.0.1
 +HAIPLANE_HUB_PORT=8080
-+HAIPLANE_HUB_HOME=/var/lib/openclaw-hub
-+HAIPLANE_HUB_DB=/var/lib/openclaw-hub/hub.db
-+HAIPLANE_TRANSCRIPTS_DIR=/var/lib/openclaw-hub/transcripts
++HAIPLANE_HUB_HOME=/var/lib/haiplane-hub
++HAIPLANE_HUB_DB=/var/lib/haiplane-hub/hub.db
++HAIPLANE_TRANSCRIPTS_DIR=/var/lib/haiplane-hub/transcripts
 +HAIPLANE_HUB_COOKIE_SECURE=1
 +HAIPLANE_HUB_TOKENS=<скрыто>
-+HAIPLANE_WORKSPACE_REPO=/var/lib/openclaw-hub/workspaces/_default
++HAIPLANE_WORKSPACE_REPO=/var/lib/haiplane-hub/workspaces/_default
 +HAIPLANE_HUB_URL=https://agenthai.ru
 +HAIPLANE_HUB_REPO=agentdrover/haiplane
 +HAIPLANE_HUB_ALLOWED_HOSTS=agenthai.ru,www.agenthai.ru,hub.agenthai.ru,haiplane.com,www.haiplane.com,localhost,127.0.0.1
-+--- EnvironmentFile /etc/openclaw-hub/secrets.env (ignore_errors=yes)
++--- EnvironmentFile /etc/haiplane-hub/secrets.env (ignore_errors=yes)
 +HAIPLANE_GITVERSE_TOKEN=<скрыто>
 +CURSOR_API_KEY=<скрыто>
 +CURSOR_REVIEWER_HUB_TOKEN=<скрыто>
@@ -170,7 +170,7 @@ index 00000000..699b6db3
 +
 +[Service]
 +Type=simple
-+User=openclaw
++User=haiplane
 +Group=haiplane-review
 +EnvironmentFile=/etc/haiplane-review-runner.env
 +ExecStart=/usr/bin/python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
@@ -184,7 +184,7 @@ index 00000000..699b6db3
 +WantedBy=multi-user.target
 +
 +--- EnvironmentFile /etc/haiplane-review-runner.env (ignore_errors=no)
-+HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/openclaw-hub/review-spool
++HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/haiplane-hub/review-spool
 +HAIPLANE_REVIEW_RUNNER_SCRATCH_DIR=/var/lib/haiplane-review/scratch
 +HAIPLANE_REVIEW_RUNNER_ARGV
 +--- PATH службы: в проверенных источниках не задан; итог неизвестен (вероятно, умолчание systemd)
@@ -230,34 +230,34 @@ index 00000000..699b6db3
 +
 +--- PATH службы: в проверенных источниках не задан; итог неизвестен (вероятно, умолчание systemd)
 +
-+########## openclaw-hub.service
++########## haiplane-hub.service
 +UnitFileState=enabled
 +ActiveState=active
-+FragmentPath=/etc/systemd/system/openclaw-hub.service
-+DropInPaths=/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf /etc/systemd/system/openclaw-hub.service.d/50-local-review.conf /etc/systemd/system/openclaw-hub.service.d/50-steward.conf /etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf /etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf /etc/systemd/system/openclaw-hub.service.d/executor.conf /etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf /etc/systemd/system/openclaw-hub.service.d/sdd.conf /etc/systemd/system/openclaw-hub.service.d/worktree.conf /etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf /etc/systemd/system/openclaw-hub.service.d/zz-models.conf
-+--- файл /etc/systemd/system/openclaw-hub.service
++FragmentPath=/etc/systemd/system/haiplane-hub.service
++DropInPaths=/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf /etc/systemd/system/haiplane-hub.service.d/50-local-review.conf /etc/systemd/system/haiplane-hub.service.d/50-steward.conf /etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf /etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf /etc/systemd/system/haiplane-hub.service.d/executor.conf /etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf /etc/systemd/system/haiplane-hub.service.d/sdd.conf /etc/systemd/system/haiplane-hub.service.d/worktree.conf /etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf /etc/systemd/system/haiplane-hub.service.d/zz-models.conf
++--- файл /etc/systemd/system/haiplane-hub.service
 +[Unit]
-+Description=OpenClaw Hub
++Description=Haiplane Hub
 +After=network-online.target
 +Wants=network-online.target
 +
 +[Service]
 +Type=simple
-+User=openclaw
-+Group=openclaw
-+WorkingDirectory=/opt/openclaw-hub/src
-+EnvironmentFile=/etc/openclaw-hub/openclaw-hub.env
++User=haiplane
++Group=haiplane
++WorkingDirectory=/opt/haiplane-hub/src
++EnvironmentFile=/etc/haiplane-hub/haiplane-hub.env
 +EnvironmentFile=<скрыто>
-+ExecStart=/opt/openclaw-hub/venv/bin/haiplane-hub
++ExecStart=/opt/haiplane-hub/venv/bin/haiplane-hub
 +Restart=on-failure
 +RestartSec=5
-+StandardOutput=append:/var/log/openclaw-hub/service.log
-+StandardError=append:/var/log/openclaw-hub/service.err
++StandardOutput=append:/var/log/haiplane-hub/service.log
++StandardError=append:/var/log/haiplane-hub/service.err
 +NoNewPrivileges=true
 +PrivateTmp=true
 +ProtectSystem=strict
 +ProtectHome=true
-+ReadWritePaths=/var/lib/openclaw-hub /var/log/openclaw-hub /opt/openclaw-hub
++ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub /opt/haiplane-hub
 +ProtectKernelTunables=true
 +ProtectKernelModules=true
 +ProtectControlGroups=true
@@ -269,11 +269,11 @@ index 00000000..699b6db3
 +[Install]
 +WantedBy=multi-user.target
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf
 +[Service]
 +Environment=HAIPLANE_AUTO_APPROVE_MAX_CLASS=r1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/50-local-review.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/50-local-review.conf
 +[Service]
 +Environment='HAIPLANE_LOCAL_REVIEW_CMD=<скрыто>'
 +Environment='HAIPLANE_LOCAL_REVIEW_SANDBOX=<скрыто>'
@@ -281,62 +281,62 @@ index 00000000..699b6db3
 +Environment=HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=1800
 +Environment=HAIPLANE_LOCAL_REVIEW_TOKEN_CEILING=2000000
 +Environment=HAIPLANE_LOCAL_REVIEW_TRANSPORT=runner
-+Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/openclaw-hub/review-spool
++Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/haiplane-hub/review-spool
 +Environment=HAIPLANE_LOCAL_REVIEW_MODEL=deepseek-v4-pro
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/50-steward.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/50-steward.conf
 +[Service]
 +Environment=HAIPLANE_STEWARD_MODE=shadow
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf
 +[Service]
 +Environment=HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3
 +Environment=HAIPLANE_STEWARD_ADVISOR_MODELS=glm-5.3,grok-4.6,composer-2.5
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf
 +[Service]
 +Environment=HAIPLANE_REVIEW_RANDOM_DEEP_SHARE=0.2
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/executor.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/executor.conf
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=gemini-3.8-flash
 +Environment=HAIPLANE_EXECUTOR_TOKEN_CEILING=40000000
 +Environment=HAIPLANE_EXECUTOR_CENTS_CEILING=500
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf
 +[Service]
 +Environment=HAIPLANE_LOCAL_REVIEW_SNAPSHOT=1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/sdd.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/sdd.conf
 +[Service]
 +Environment=HAIPLANE_SDD_AC_LOCATOR=require
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/worktree.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/worktree.conf
 +[Service]
 +Environment=HAIPLANE_WORKTREE_PER_TASK=1
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf
 +[Service]
 +Environment=HAIPLANE_CSRF_MODE=require
 +
-+--- файл /etc/systemd/system/openclaw-hub.service.d/zz-models.conf
++--- файл /etc/systemd/system/haiplane-hub.service.d/zz-models.conf
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=grok-4.7
 +Environment='HAIPLANE_EXECUTOR_MODEL_PARAMS=<скрыто>'
 +
-+--- EnvironmentFile /etc/openclaw-hub/openclaw-hub.env (ignore_errors=no)
++--- EnvironmentFile /etc/haiplane-hub/haiplane-hub.env (ignore_errors=no)
 +HAIPLANE_HUB_HOST=127.0.0.1
 +HAIPLANE_HUB_PORT=8080
-+HAIPLANE_HUB_HOME=/var/lib/openclaw-hub
-+HAIPLANE_HUB_DB=/var/lib/openclaw-hub/hub.db
-+HAIPLANE_TRANSCRIPTS_DIR=/var/lib/openclaw-hub/transcripts
++HAIPLANE_HUB_HOME=/var/lib/haiplane-hub
++HAIPLANE_HUB_DB=/var/lib/haiplane-hub/hub.db
++HAIPLANE_TRANSCRIPTS_DIR=/var/lib/haiplane-hub/transcripts
 +HAIPLANE_HUB_COOKIE_SECURE=1
 +HAIPLANE_HUB_TOKENS=<скрыто>
-+HAIPLANE_WORKSPACE_REPO=/var/lib/openclaw-hub/workspaces/_default
++HAIPLANE_WORKSPACE_REPO=/var/lib/haiplane-hub/workspaces/_default
 +HAIPLANE_HUB_URL=https://agenthai.ru
 +HAIPLANE_HUB_REPO=agentdrover/haiplane
 +HAIPLANE_HUB_ALLOWED_HOSTS=agenthai.ru,www.agenthai.ru,hub.agenthai.ru,haiplane.com,www.haiplane.com,localhost,127.0.0.1
-+--- EnvironmentFile /etc/openclaw-hub/secrets.env (ignore_errors=yes)
++--- EnvironmentFile /etc/haiplane-hub/secrets.env (ignore_errors=yes)
 +HAIPLANE_GITVERSE_TOKEN=<скрыто>
 +CURSOR_API_KEY=<скрыто>
 +CURSOR_REVIEWER_HUB_TOKEN=<скрыто>
@@ -405,14 +405,14 @@ index 00000000..699b6db3
 +
 +########## tmpfiles
 +--- файл /etc/tmpfiles.d/haiplane-review-spool.conf
-+d /var/lib/openclaw-hub/review-spool 2770 openclaw haiplane-review -
-+/var/lib/openclaw-hub/review-spool: mode=0o2770 uid=998 gid=1001
++d /var/lib/haiplane-hub/review-spool 2770 haiplane haiplane-review -
++/var/lib/haiplane-hub/review-spool: mode=0o2770 uid=998 gid=1001
 +
 +########## sudoers.d (правила про хаб и ревьюер)
 +--- файл /etc/sudoers.d/haiplane-advisor
 +<правило скрыто: не прошло проверку>
 +--- файл /etc/sudoers.d/haiplane-review
-+openclaw ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-review-run
++haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-review-run
 +
 +########## НЕПОЛНО
 +/etc/haiplane-review-runner.env: разбор остановлен на значении HAIPLANE_REVIEW_RUNNER_ARGV
@@ -468,7 +468,7 @@ index 00000000..2bab94c4
 +tmpfiles и EnvironmentFile скрипт печатает построчно: файл равен телу раздела целиком.
 +Правило проверяет `tests/test_prod_unit_snapshot.py` (`parse_sections`, `host_file_text`).
 +
-+Разделы `haiplane-hub.service` и `openclaw-hub.service` в `CAPTURE.txt` описывают один и тот же юнит
++Разделы `haiplane-hub.service` и `haiplane-hub.service` в `CAPTURE.txt` описывают один и тот же юнит
 +и совпадают побайтно; файл один (см. ниже).
 +
 +## Файлы снимка
@@ -478,18 +478,18 @@ index 00000000..2bab94c4
 +
 +| Путь в снимке | Путь на хосте | Состояние |
 +|---|---|---|
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service` | `/etc/systemd/system/openclaw-hub.service` | enabled/active |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf` | `/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-local-review.conf` | `/etc/systemd/system/openclaw-hub.service.d/50-local-review.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-steward.conf` | `/etc/systemd/system/openclaw-hub.service.d/50-steward.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf` | `/etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf` | `/etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/executor.conf` | `/etc/systemd/system/openclaw-hub.service.d/executor.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf` | `/etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/sdd.conf` | `/etc/systemd/system/openclaw-hub.service.d/sdd.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/worktree.conf` | `/etc/systemd/system/openclaw-hub.service.d/worktree.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf` | `/etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf` | drop-in openclaw-hub.service |
-+| `deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-models.conf` | `/etc/systemd/system/openclaw-hub.service.d/zz-models.conf` | drop-in openclaw-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service` | `/etc/systemd/system/haiplane-hub.service` | enabled/active |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf` | `/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-local-review.conf` | `/etc/systemd/system/haiplane-hub.service.d/50-local-review.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-steward.conf` | `/etc/systemd/system/haiplane-hub.service.d/50-steward.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf` | `/etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf` | `/etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/executor.conf` | `/etc/systemd/system/haiplane-hub.service.d/executor.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf` | `/etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/sdd.conf` | `/etc/systemd/system/haiplane-hub.service.d/sdd.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/worktree.conf` | `/etc/systemd/system/haiplane-hub.service.d/worktree.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf` | `/etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf` | drop-in haiplane-hub.service |
++| `deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-models.conf` | `/etc/systemd/system/haiplane-hub.service.d/zz-models.conf` | drop-in haiplane-hub.service |
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-review-runner.service` | `/etc/systemd/system/haiplane-review-runner.service` | enabled/active |
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-hub-backup.service` | `/etc/systemd/system/haiplane-hub-backup.service` | static/inactive |
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-hub-backup.timer` | `/etc/systemd/system/haiplane-hub-backup.timer` | enabled/active |
@@ -497,16 +497,16 @@ index 00000000..2bab94c4
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-snapshot-daily.timer` | `/etc/systemd/system/haiplane-snapshot-daily.timer` | enabled/active |
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-snapshot-hourly.service` | `/etc/systemd/system/haiplane-snapshot-hourly.service` | static/inactive |
 +| `deploy/systemd/prod/etc/systemd/system/haiplane-snapshot-hourly.timer` | `/etc/systemd/system/haiplane-snapshot-hourly.timer` | enabled/active |
-+| `deploy/systemd/prod/etc/openclaw-hub/openclaw-hub.env` | `/etc/openclaw-hub/openclaw-hub.env` | EnvironmentFile |
++| `deploy/systemd/prod/etc/haiplane-hub/haiplane-hub.env` | `/etc/haiplane-hub/haiplane-hub.env` | EnvironmentFile |
 +| `deploy/systemd/prod/etc/haiplane-review-runner.env` | `/etc/haiplane-review-runner.env` | EnvironmentFile |
 +| `deploy/systemd/prod/etc/tmpfiles.d/haiplane-review-spool.conf` | `/etc/tmpfiles.d/haiplane-review-spool.conf` | tmpfiles.d |
 +
 +### Псевдоним haiplane-hub.service
 +
 +Отдельного файла `haiplane-hub.service` на проде нет: `/etc/systemd/system/haiplane-hub.service` это ссылка на
-+`/etc/systemd/system/openclaw-hub.service`; оба имени дают `Id=openclaw-hub.service`. Копия не создана дважды.
-+Ссылка `/opt/haiplane-hub` ведёт на `/opt/openclaw-hub`. Каталогов `/etc/haiplane-hub`, `/var/lib/haiplane-hub`,
-+`/var/log/haiplane-hub` на проде нет; есть `/etc/openclaw-hub`, `/var/lib/openclaw-hub`, `/var/log/openclaw-hub`.
++`/etc/systemd/system/haiplane-hub.service`; оба имени дают `Id=haiplane-hub.service`. Копия не создана дважды.
++Ссылка `/opt/haiplane-hub` ведёт на `/opt/haiplane-hub`. Каталогов `/etc/haiplane-hub`, `/var/lib/haiplane-hub`,
++`/var/log/haiplane-hub` на проде нет; есть `/etc/haiplane-hub`, `/var/lib/haiplane-hub`, `/var/log/haiplane-hub`.
 +
 +### Только в CAPTURE.txt
 +
@@ -516,7 +516,7 @@ index 00000000..2bab94c4
 +
 +### secrets.env: перечень имён (файла нет)
 +
-+Источник `/etc/openclaw-hub/secrets.env` подключён к `openclaw-hub.service` (`ignore_errors=yes`). Файла-копии
++Источник `/etc/haiplane-hub/secrets.env` подключён к `haiplane-hub.service` (`ignore_errors=yes`). Файла-копии
 +в снимке нет, значения скрыты снятием, ниже только имена в порядке файла (тест сверяет их с `CAPTURE.txt`):
 +
 +- `HAIPLANE_GITVERSE_TOKEN`
@@ -541,7 +541,7 @@ index 00000000..2bab94c4
 +| `HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC` | `50-local-review.conf` | `1800` | действует (единственный источник) |
 +| `HAIPLANE_LOCAL_REVIEW_TOKEN_CEILING` | `50-local-review.conf` | `2000000` | действует (единственный источник) |
 +| `HAIPLANE_LOCAL_REVIEW_TRANSPORT` | `50-local-review.conf` | `runner` | действует (единственный источник) |
-+| `HAIPLANE_LOCAL_REVIEW_SPOOL_DIR` | `50-local-review.conf` | `/var/lib/openclaw-hub/review-spool` | действует (единственный источник) |
++| `HAIPLANE_LOCAL_REVIEW_SPOOL_DIR` | `50-local-review.conf` | `/var/lib/haiplane-hub/review-spool` | действует (единственный источник) |
 +| `HAIPLANE_LOCAL_REVIEW_MODEL` | `50-local-review.conf` | `deepseek-v4-pro` | действует (единственный источник) |
 +| `HAIPLANE_STEWARD_MODE` | `50-steward.conf` | `shadow` | действует (единственный источник) |
 +| `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` | `52-steward-glm-advisor.conf` | `glm-5.3` | действует (единственный источник) |
@@ -556,18 +556,18 @@ index 00000000..2bab94c4
 +| `HAIPLANE_CSRF_MODE` | `zz-csrf.conf` | `require` | действует (единственный источник) |
 +| `HAIPLANE_EXECUTOR_MODEL` | `zz-models.conf` | `grok-4.7` | действует (позже по DropInPaths) |
 +| `HAIPLANE_EXECUTOR_MODEL_PARAMS` | `zz-models.conf` | `<скрыто>` | действует (единственный источник) |
-+| `HAIPLANE_HUB_HOST` | `openclaw-hub.env` | `127.0.0.1` | действует (единственный источник) |
-+| `HAIPLANE_HUB_PORT` | `openclaw-hub.env` | `8080` | действует (единственный источник) |
-+| `HAIPLANE_HUB_HOME` | `openclaw-hub.env` | `/var/lib/openclaw-hub` | действует (единственный источник) |
-+| `HAIPLANE_HUB_DB` | `openclaw-hub.env` | `/var/lib/openclaw-hub/hub.db` | действует (единственный источник) |
-+| `HAIPLANE_TRANSCRIPTS_DIR` | `openclaw-hub.env` | `/var/lib/openclaw-hub/transcripts` | действует (единственный источник) |
-+| `HAIPLANE_HUB_COOKIE_SECURE` | `openclaw-hub.env` | `1` | действует (единственный источник) |
-+| `HAIPLANE_HUB_TOKENS` | `openclaw-hub.env` | `<скрыто>` | действует (единственный источник) |
-+| `HAIPLANE_WORKSPACE_REPO` | `openclaw-hub.env` | `/var/lib/openclaw-hub/workspaces/_default` | действует (единственный источник) |
-+| `HAIPLANE_HUB_URL` | `openclaw-hub.env` | `https://agenthai.ru` | действует (единственный источник) |
-+| `HAIPLANE_HUB_REPO` | `openclaw-hub.env` | `agentdrover/haiplane` | действует (единственный источник) |
-+| `HAIPLANE_HUB_ALLOWED_HOSTS` | `openclaw-hub.env` | `agenthai.ru,www.agenthai.ru,hub.agenthai.ru,haiplane.com,www.haiplane.com,localhost,127.0.0.1` | действует (единственный источник) |
-+| `HAIPLANE_REVIEW_RUNNER_SPOOL_DIR` | `haiplane-review-runner.env` | `/var/lib/openclaw-hub/review-spool` | действует (единственный источник) |
++| `HAIPLANE_HUB_HOST` | `haiplane-hub.env` | `127.0.0.1` | действует (единственный источник) |
++| `HAIPLANE_HUB_PORT` | `haiplane-hub.env` | `8080` | действует (единственный источник) |
++| `HAIPLANE_HUB_HOME` | `haiplane-hub.env` | `/var/lib/haiplane-hub` | действует (единственный источник) |
++| `HAIPLANE_HUB_DB` | `haiplane-hub.env` | `/var/lib/haiplane-hub/hub.db` | действует (единственный источник) |
++| `HAIPLANE_TRANSCRIPTS_DIR` | `haiplane-hub.env` | `/var/lib/haiplane-hub/transcripts` | действует (единственный источник) |
++| `HAIPLANE_HUB_COOKIE_SECURE` | `haiplane-hub.env` | `1` | действует (единственный источник) |
++| `HAIPLANE_HUB_TOKENS` | `haiplane-hub.env` | `<скрыто>` | действует (единственный источник) |
++| `HAIPLANE_WORKSPACE_REPO` | `haiplane-hub.env` | `/var/lib/haiplane-hub/workspaces/_default` | действует (единственный источник) |
++| `HAIPLANE_HUB_URL` | `haiplane-hub.env` | `https://agenthai.ru` | действует (единственный источник) |
++| `HAIPLANE_HUB_REPO` | `haiplane-hub.env` | `agentdrover/haiplane` | действует (единственный источник) |
++| `HAIPLANE_HUB_ALLOWED_HOSTS` | `haiplane-hub.env` | `agenthai.ru,www.agenthai.ru,hub.agenthai.ru,haiplane.com,www.haiplane.com,localhost,127.0.0.1` | действует (единственный источник) |
++| `HAIPLANE_REVIEW_RUNNER_SPOOL_DIR` | `haiplane-review-runner.env` | `/var/lib/haiplane-hub/review-spool` | действует (единственный источник) |
 +| `HAIPLANE_REVIEW_RUNNER_SCRATCH_DIR` | `haiplane-review-runner.env` | `/var/lib/haiplane-review/scratch` | действует (единственный источник) |
 +
 +## Расхождения
@@ -578,14 +578,14 @@ index 00000000..2bab94c4
 +
 +| № | Расхождение | Действие | Исполнитель |
 +|---|---|---|---|
-+| 1 | Имена. Прод: `openclaw-hub.service`, `/opt/openclaw-hub`, `/etc/openclaw-hub`. Репозиторий и `deploy/remote-deploy.sh` (строки 11-14, 52, 355, 373) зовут `haiplane-hub` и `/opt/haiplane-hub`. Работает через псевдоним юнита и ссылку `/opt/haiplane-hub`. | Не менять прод. При сборке стенда и нового хоста воспроизвести псевдоним и ссылку либо переименовать пути единым решением. Решить, когда переименовывать прод. | Владелец (решение); задачи нет |
++| 1 | Имена. Прод: `haiplane-hub.service`, `/opt/haiplane-hub`, `/etc/haiplane-hub`. Репозиторий и `deploy/remote-deploy.sh` (строки 11-14, 52, 355, 373) зовут `haiplane-hub` и `/opt/haiplane-hub`. Работает через псевдоним юнита и ссылку `/opt/haiplane-hub`. | Не менять прод. При сборке стенда и нового хоста воспроизвести псевдоним и ссылку либо переименовать пути единым решением. Решить, когда переименовывать прод. | Владелец (решение); задачи нет |
 +| 2 | `PATH` не задан в `Environment=` ни одной службы и в проверенных EnvironmentFile; в `haiplane-review-runner.env` файл прочитан неполностью (раздел «Неполнота»). Итог: в проверенных источниках не задан, вероятно умолчание systemd, точно неизвестно. | Не полагаться на умолчание при сборке стенда. Снять фактический `PATH` процесса и вписать его в drop-in после решения владельца. | Владелец (решение); снятие процесса и правка drop-in-а: задачи нет |
 +| 3 | Дубль `HAIPLANE_EXECUTOR_MODEL`: `executor.conf` даёт `gemini-3.8-flash`, `zz-models.conf` даёт `grok-4.7`. Действует `zz-models.conf` (идёт позже в `DropInPaths`), значение в `executor.conf` мертво. | Убрать строку из `executor.conf` или объединить файлы. Прод не менять без решения. | Владелец (решение); задачи нет |
-+| 4 | Пример юнита `haiplane-hub.service` в корне репозитория против прода: пользователь `haiplane` против `openclaw`; запуск `python -m uvicorn hub.app:app` против `/opt/openclaw-hub/venv/bin/haiplane-hub`; нет песочницы против `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `MemoryDenyWriteExecute` и др.; журнал в `hub.log` против `/var/log/openclaw-hub/service.log` и `service.err`; нет `ReadWritePaths`. | Привести пример к снимку либо пометить его как устаревший. | Владелец (решение); задачи нет |
-+| 5 | `docs/admin-agent-deployment-guide.md`: `ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub` (строка 215), на проде добавлен `/opt/openclaw-hub`. Резервная копия в руководстве через `cron.daily` (строки 355-369), на проде `haiplane-hub-backup.timer` в 00:30 UTC (команда `/usr/local/sbin/haiplane-hub-backup`), а также `haiplane-snapshot-hourly.timer` (минута 17 каждого часа) и `haiplane-snapshot-daily.timer` (03:47 UTC). | Поправить руководство по снимку. | Владелец (решение); задачи нет |
++| 4 | Пример юнита `haiplane-hub.service` в корне репозитория против прода: пользователь `haiplane` против `haiplane`; запуск `python -m uvicorn hub.app:app` против `/opt/haiplane-hub/venv/bin/haiplane-hub`; нет песочницы против `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `MemoryDenyWriteExecute` и др.; журнал в `hub.log` против `/var/log/haiplane-hub/service.log` и `service.err`; нет `ReadWritePaths`. | Привести пример к снимку либо пометить его как устаревший. | Владелец (решение); задачи нет |
++| 5 | `docs/admin-agent-deployment-guide.md`: `ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub` (строка 215), на проде добавлен `/opt/haiplane-hub`. Резервная копия в руководстве через `cron.daily` (строки 355-369), на проде `haiplane-hub-backup.timer` в 00:30 UTC (команда `/usr/local/sbin/haiplane-hub-backup`), а также `haiplane-snapshot-hourly.timer` (минута 17 каждого часа) и `haiplane-snapshot-daily.timer` (03:47 UTC). | Поправить руководство по снимку. | Владелец (решение); задачи нет |
 +| 6 | `deploy/TAILSCALE.md` (строки 86-103): юнит под пользователем `haiplane` из домашнего каталога, `EnvironmentFile=/home/haiplane/.haiplane-hub.env`, без песочницы. `deploy/LOCAL-REVIEW.md` (строки 285-292): `HAIPLANE_LOCAL_REVIEWER_HUB_TOKEN` предписано класть в drop-in; на проде имя в `secrets.env`, а в drop-in его нет. | Пометить `TAILSCALE.md` как руководство для другого типа хоста; поправить рецепт токена в `LOCAL-REVIEW.md`. | Владелец (решение); задачи нет |
-+| 7 | Шаблоны в `deploy/review-runner/` и `deploy/backup/install.sh` против снимка: в шаблоне службы `User=<пользователь хаба>`, на проде `User=openclaw`; в шаблоне есть директива запрета перезапуска при коде выхода 2 и комментарии, а в снимке эта строка записана как `<скрыто>=2` (имя скрыто последним фильтром снятия); шаблон tmpfiles и таймеры снимков совпадают по смыслу с продом. | Сверять шаблоны со снимком при следующем изменении службы ревью; строку со скрытым именем не домысливать. | Владелец (решение); задачи нет |
-+| 8 | Правило sudoers `haiplane-advisor` скрыто снятием. `deploy/LOCAL-REVIEW.md` (строка 1384) описывает его для пользователя `haiplane`, хаб на проде работает под `openclaw`; фактический текст правила неизвестен. | Повторить снятие правила с расширенной проверкой или прочитать правило владельцем и записать результат сюда. | Владелец; задачи нет |
++| 7 | Шаблоны в `deploy/review-runner/` и `deploy/backup/install.sh` против снимка: в шаблоне службы `User=<пользователь хаба>`, на проде `User=haiplane`; в шаблоне есть директива запрета перезапуска при коде выхода 2 и комментарии, а в снимке эта строка записана как `<скрыто>=2` (имя скрыто последним фильтром снятия); шаблон tmpfiles и таймеры снимков совпадают по смыслу с продом. | Сверять шаблоны со снимком при следующем изменении службы ревью; строку со скрытым именем не домысливать. | Владелец (решение); задачи нет |
++| 8 | Правило sudoers `haiplane-advisor` скрыто снятием. `deploy/LOCAL-REVIEW.md` (строка 1384) описывает его для пользователя `haiplane`, хаб на проде работает под `haiplane`; фактический текст правила неизвестен. | Повторить снятие правила с расширенной проверкой или прочитать правило владельцем и записать результат сюда. | Владелец; задачи нет |
 +| 9 | Неполнота снятия: `haiplane-review-runner.env` разобран только до `HAIPLANE_REVIEW_RUNNER_ARGV` (rc 3). | Повторить снятие после правки скрипта снятия (значение ARGV должно пройти проверку или быть скрыто целиком, а разбор файла идти дальше). | Владелец; задачи нет |
 +| 10 | `HAIPLANE_LOCAL_REVIEW_*` в `50-local-review.conf` и `haiplane-review-runner.service` используются советником стюарда (`HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3`, см. `deploy/LOCAL-REVIEW.md`, раздел советника, и `hub/services/steward_advisor_local.py`) и, возможно, `local_review_fallback` других проектов. При `deep_reviewer=cloud` проект default локальный ревьюер не заказывает, но служба нужна. По записи стюарда от 07.10 локальный ревьюер выключен; снимком это не подтверждено. | Не убирать и не останавливать. Решение об уборке только после проверки потребителей: советник, fallback, политики проектов. | Владелец (решение); задачи нет |
 diff --git a/deploy/systemd/prod/etc/haiplane-review-runner.env b/deploy/systemd/prod/etc/haiplane-review-runner.env
@@ -594,23 +594,23 @@ index 00000000..706cb369
 --- /dev/null
 +++ b/deploy/systemd/prod/etc/haiplane-review-runner.env
 @@ -0,0 +1,3 @@
-+HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/openclaw-hub/review-spool
++HAIPLANE_REVIEW_RUNNER_SPOOL_DIR=/var/lib/haiplane-hub/review-spool
 +HAIPLANE_REVIEW_RUNNER_SCRATCH_DIR=/var/lib/haiplane-review/scratch
 +HAIPLANE_REVIEW_RUNNER_ARGV
-diff --git a/deploy/systemd/prod/etc/openclaw-hub/openclaw-hub.env b/deploy/systemd/prod/etc/openclaw-hub/openclaw-hub.env
+diff --git a/deploy/systemd/prod/etc/haiplane-hub/haiplane-hub.env b/deploy/systemd/prod/etc/haiplane-hub/haiplane-hub.env
 new file mode 100644
 index 00000000..c5806cf5
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/openclaw-hub/openclaw-hub.env
++++ b/deploy/systemd/prod/etc/haiplane-hub/haiplane-hub.env
 @@ -0,0 +1,11 @@
 +HAIPLANE_HUB_HOST=127.0.0.1
 +HAIPLANE_HUB_PORT=8080
-+HAIPLANE_HUB_HOME=/var/lib/openclaw-hub
-+HAIPLANE_HUB_DB=/var/lib/openclaw-hub/hub.db
-+HAIPLANE_TRANSCRIPTS_DIR=/var/lib/openclaw-hub/transcripts
++HAIPLANE_HUB_HOME=/var/lib/haiplane-hub
++HAIPLANE_HUB_DB=/var/lib/haiplane-hub/hub.db
++HAIPLANE_TRANSCRIPTS_DIR=/var/lib/haiplane-hub/transcripts
 +HAIPLANE_HUB_COOKIE_SECURE=1
 +HAIPLANE_HUB_TOKENS=<скрыто>
-+HAIPLANE_WORKSPACE_REPO=/var/lib/openclaw-hub/workspaces/_default
++HAIPLANE_WORKSPACE_REPO=/var/lib/haiplane-hub/workspaces/_default
 +HAIPLANE_HUB_URL=https://agenthai.ru
 +HAIPLANE_HUB_REPO=agentdrover/haiplane
 +HAIPLANE_HUB_ALLOWED_HOSTS=agenthai.ru,www.agenthai.ru,hub.agenthai.ru,haiplane.com,www.haiplane.com,localhost,127.0.0.1
@@ -654,7 +654,7 @@ index 00000000..b3d4e36b
 +
 +[Service]
 +Type=simple
-+User=openclaw
++User=haiplane
 +Group=haiplane-review
 +EnvironmentFile=/etc/haiplane-review-runner.env
 +ExecStart=/usr/bin/python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
@@ -732,34 +732,34 @@ index 00000000..dc2aacae
 +
 +[Install]
 +WantedBy=timers.target
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service
 new file mode 100644
 index 00000000..8c722ea6
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service
 @@ -0,0 +1,32 @@
 +[Unit]
-+Description=OpenClaw Hub
++Description=Haiplane Hub
 +After=network-online.target
 +Wants=network-online.target
 +
 +[Service]
 +Type=simple
-+User=openclaw
-+Group=openclaw
-+WorkingDirectory=/opt/openclaw-hub/src
-+EnvironmentFile=/etc/openclaw-hub/openclaw-hub.env
++User=haiplane
++Group=haiplane
++WorkingDirectory=/opt/haiplane-hub/src
++EnvironmentFile=/etc/haiplane-hub/haiplane-hub.env
 +EnvironmentFile=<скрыто>
-+ExecStart=/opt/openclaw-hub/venv/bin/haiplane-hub
++ExecStart=/opt/haiplane-hub/venv/bin/haiplane-hub
 +Restart=on-failure
 +RestartSec=5
-+StandardOutput=append:/var/log/openclaw-hub/service.log
-+StandardError=append:/var/log/openclaw-hub/service.err
++StandardOutput=append:/var/log/haiplane-hub/service.log
++StandardError=append:/var/log/haiplane-hub/service.err
 +NoNewPrivileges=true
 +PrivateTmp=true
 +ProtectSystem=strict
 +ProtectHome=true
-+ReadWritePaths=/var/lib/openclaw-hub /var/log/openclaw-hub /opt/openclaw-hub
++ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub /opt/haiplane-hub
 +ProtectKernelTunables=true
 +ProtectKernelModules=true
 +ProtectControlGroups=true
@@ -770,19 +770,19 @@ index 00000000..8c722ea6
 +
 +[Install]
 +WantedBy=multi-user.target
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf
 new file mode 100644
 index 00000000..2ed49301
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/30-auto-approve.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/30-auto-approve.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_AUTO_APPROVE_MAX_CLASS=r1
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-local-review.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-local-review.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-local-review.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-local-review.conf
 new file mode 100644
 index 00000000..57490398
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-local-review.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-local-review.conf
 @@ -0,0 +1,9 @@
 +[Service]
 +Environment='HAIPLANE_LOCAL_REVIEW_CMD=<скрыто>'
@@ -791,80 +791,80 @@ index 00000000..57490398
 +Environment=HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=1800
 +Environment=HAIPLANE_LOCAL_REVIEW_TOKEN_CEILING=2000000
 +Environment=HAIPLANE_LOCAL_REVIEW_TRANSPORT=runner
-+Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/openclaw-hub/review-spool
++Environment=HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=/var/lib/haiplane-hub/review-spool
 +Environment=HAIPLANE_LOCAL_REVIEW_MODEL=deepseek-v4-pro
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-steward.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-steward.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-steward.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-steward.conf
 new file mode 100644
 index 00000000..45f21740
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/50-steward.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/50-steward.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_STEWARD_MODE=shadow
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf
 new file mode 100644
 index 00000000..5090ac02
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/52-steward-glm-advisor.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/52-steward-glm-advisor.conf
 @@ -0,0 +1,3 @@
 +[Service]
 +Environment=HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3
 +Environment=HAIPLANE_STEWARD_ADVISOR_MODELS=glm-5.3,grok-4.6,composer-2.5
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf
 new file mode 100644
 index 00000000..a4e38698
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/53-review-random-deep.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/53-review-random-deep.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_REVIEW_RANDOM_DEEP_SHARE=0.2
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/executor.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/executor.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/executor.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/executor.conf
 new file mode 100644
 index 00000000..d319bfcf
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/executor.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/executor.conf
 @@ -0,0 +1,4 @@
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=gemini-3.8-flash
 +Environment=HAIPLANE_EXECUTOR_TOKEN_CEILING=40000000
 +Environment=HAIPLANE_EXECUTOR_CENTS_CEILING=500
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf
 new file mode 100644
 index 00000000..ec7af950
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/review-snapshot.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/review-snapshot.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_LOCAL_REVIEW_SNAPSHOT=1
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/sdd.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/sdd.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/sdd.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/sdd.conf
 new file mode 100644
 index 00000000..1ad13b67
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/sdd.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/sdd.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_SDD_AC_LOCATOR=require
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/worktree.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/worktree.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/worktree.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/worktree.conf
 new file mode 100644
 index 00000000..f92456df
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/worktree.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/worktree.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_WORKTREE_PER_TASK=1
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf
 new file mode 100644
 index 00000000..37c5cf1a
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-csrf.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-csrf.conf
 @@ -0,0 +1,2 @@
 +[Service]
 +Environment=HAIPLANE_CSRF_MODE=require
-diff --git a/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-models.conf b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-models.conf
+diff --git a/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-models.conf b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-models.conf
 new file mode 100644
 index 00000000..818907e2
 --- /dev/null
-+++ b/deploy/systemd/prod/etc/systemd/system/openclaw-hub.service.d/zz-models.conf
++++ b/deploy/systemd/prod/etc/systemd/system/haiplane-hub.service.d/zz-models.conf
 @@ -0,0 +1,3 @@
 +[Service]
 +Environment=HAIPLANE_EXECUTOR_MODEL=grok-4.7
@@ -875,7 +875,7 @@ index 00000000..037bd1b0
 --- /dev/null
 +++ b/deploy/systemd/prod/etc/tmpfiles.d/haiplane-review-spool.conf
 @@ -0,0 +1 @@
-+d /var/lib/openclaw-hub/review-spool 2770 openclaw haiplane-review -
++d /var/lib/haiplane-hub/review-spool 2770 haiplane haiplane-review -
 diff --git a/tests/test_no_legacy_name.py b/tests/test_no_legacy_name.py
 index 52b34a6e..55100d62 100644
 --- a/tests/test_no_legacy_name.py
