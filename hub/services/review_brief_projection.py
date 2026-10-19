@@ -330,6 +330,24 @@ _REDUCERS: dict[str, Callable[[dict[str, Any]], Any]] = {
 }
 
 
+def cause_task_line(block: dict[str, Any] | None) -> str:
+    """Строка блока «задача-причина» для текста брифа (#1858); "" — блока нет.
+
+    Одна функция на оба текста (компактный и section=full): читатель текста не
+    должен гадать, «причины нет» это или «поле не показали».
+    """
+    if not block:
+        return ""
+    if block.get("state") != "known":
+        return str(block.get("note") or "Задача-причина: нет данных")
+    areas = ", ".join(block.get("affected_areas") or []) or "-"
+    return (
+        f"Задача-причина #{block.get('task_id')}: {block.get('title')} "
+        f"({block.get('link')}), {block.get('areas_note')}: {areas}; "
+        f"cause_kind={block.get('cause_kind')}"
+    )
+
+
 def mandatory_part(brief: dict[str, Any]) -> dict[str, Any]:
     """Decision-critical fields. Whatever the budget, none of them is cut."""
     part: dict[str, Any] = {"projection": True}
@@ -825,6 +843,9 @@ def _head_lines(proj: dict[str, Any]) -> list[str]:
             f"Review circle: {proj['review_circle'].get('laps')} laps — "
             + "; ".join(proj["review_circle"].get("breakdown") or [])
         )
+    cause_line = cause_task_line(proj.get("cause_task"))
+    if cause_line:
+        lines.append(cause_line)
     if proj["stacking_warning"]:
         lines.append(str(proj["stacking_warning"]))
     if proj["path_notices"] and proj["path_notices"].get("text"):
