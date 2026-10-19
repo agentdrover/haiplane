@@ -92,7 +92,8 @@ FAMILIES: tuple[Family, ...] = (
         ),
         surfaces=(
             "hub/db.py",
-            "hub/migrations/*",
+            # #1854: новая миграция - файл в steps/; «|» - альтернативы одной поверхности.
+            "hub/migrations/*|hub/migrations/steps/*",
             "hub/repository.py",
             "hub/models.py",
         ),
@@ -142,7 +143,10 @@ def _matches(path: str, pattern: str) -> bool:
     ``hub/app.py`` surface — PurePosixPath.match otherwise matches from the
     right and would treat a namesake in another directory as the real thing.
     """
-    return PurePosixPath("/" + path).match("/" + pattern)
+    return any(
+        PurePosixPath("/" + path).match("/" + alternative)
+        for alternative in pattern.split("|")
+    )
 
 
 def classify(
