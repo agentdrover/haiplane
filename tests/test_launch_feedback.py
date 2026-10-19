@@ -330,6 +330,7 @@ async def test_plaque_fragment_refreshes_page_when_launch_ends(world):
     url = f"/partials/launch-plaque/{task_id}"
     live = await world.client.get(url, headers={**headers, "HX-Request": "true"})
     assert "hx-refresh" not in {k.lower() for k in live.headers}
+    assert "hx-trigger" not in {k.lower() for k in live.headers}
     failed = await world.client.post(
         f"/api/executor-hosts/k8/orders/{lived['order']['id']}/report",
         json={"outcome": "failed", "reason_code": "vm_failed"},
@@ -337,11 +338,13 @@ async def test_plaque_fragment_refreshes_page_when_launch_ends(world):
     )
     assert failed.status_code == 200
     done = await world.client.get(url, headers={**headers, "HX-Request": "true"})
-    assert done.headers.get("HX-Refresh") == "true"
+    assert "hx-refresh" not in {k.lower() for k in done.headers}
+    assert done.headers.get("HX-Trigger") == "hub-launch-ended"
     plain = await world.client.get(
         url, headers=headers
     )  # обычная загрузка — без обновления
     assert "hx-refresh" not in {k.lower() for k in plain.headers}
+    assert "hx-trigger" not in {k.lower() for k in plain.headers}
 
 
 async def test_old_reports_and_entries_are_backfilled(world):
