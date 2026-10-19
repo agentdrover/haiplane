@@ -817,3 +817,72 @@ async def test_the_dispatch_start_refuses_the_same_way(
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"]["found_in_task_id"] == other_id
     assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "open"
+
+
+# --- plain_summary (#1811) ---
+
+
+async def test_plain_summary_blocking_only_for_new_tasks(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    ids = []
+    for _ in range(2):
+        resp = await client.post(
+            "/api/tasks", json={"title": "t", "source": "agent", "agent": "a"}
+        )
+        task_id = resp.json()["id"]
+        ids.append(task_id)
+        ready = await client.post(
+            f"/api/tasks/{task_id}/refine",
+            json={
+                "user_story": "as a user, I want X so that Y",
+                "problem_statement": "ps",
+                "business_value": "bv",
+                "scope_in": ["a"],
+                "validation_commands": ["uv run pytest"],
+                "size": "S",
+                "wip_tag": "feature_work",
+                "affected_areas": ["hub/services/dor.py"],
+                "acceptance_criteria": [
+                    {
+                        "id": "AC-1",
+                        "given": "g",
+                        "when": "w",
+                        "then": "t",
+                        "verifiable_by": "test",
+                    }
+                ],
+            },
+        )
+        assert ready.status_code == 200, ready.text
+    old_id, new_id = ids
+    # Водяной знак: старая - id не больше знака, новая - больше; время создания
+    # у обеих может совпасть, различает порядок вставки.
+    await db.execute("UPDATE plain_summary_boundary SET max_task_id=?", (old_id,))
+    await db.commit()
+
+    # Новая без plain_summary: DoR не пройден, approve отказан с тем же основанием.
+    new_view = (await client.get(f"/api/tasks/{new_id}/readiness")).json()
+    assert new_view["dor_passed"] is False
+    assert "has_plain_summary" in new_view["missing_required"]
+    denied = await client.post(f"/api/tasks/{new_id}/approve", json={})
+    assert denied.status_code == 422
+    assert "has_plain_summary" in denied.json()["detail"]["missing_required"]
+
+    # Старая: DoR прежний, пункт - только рекомендация без блокировки и очков.
+    old_view = (await client.get(f"/api/tasks/{old_id}/readiness")).json()
+    assert old_view["dor_passed"] is True
+    assert "has_plain_summary" not in old_view["missing_required"]
+    assert old_view["score"] == 100
+    fields = {r["field"]: r["severity"] for r in old_view["recommendations"]}
+    assert fields["plain_summary"] != "blocking"
+    approved = await client.post(f"/api/tasks/{old_id}/approve", json={})
+    assert approved.status_code == 200, approved.text
+
+    # Новая проходит, когда plain_summary заполнен.
+    await client.post(
+        f"/api/tasks/{new_id}/refine", json={"plain_summary": "О чём задача."}
+    )
+    assert (
+        await client.post(f"/api/tasks/{new_id}/approve", json={})
+    ).status_code == 200

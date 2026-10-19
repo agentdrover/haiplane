@@ -19,6 +19,10 @@ description: Use when turning a request into a structured Haiplane Hub task pack
 3. Use `hub/models.py` as the schema source of truth.
 4. Write scope in and scope out so implementation boundaries are unambiguous.
 5. Make every acceptance criterion observable and verifiable.
+6. Write `plain_summary` (#1811): 1-2 sentences, up to 300 characters, in plain
+   words for a reader who does not know the code — what the task is about, not
+   how it is built. Required by DoR (`has_plain_summary`) for tasks created
+   after the field shipped; without it the task cannot be approved.
 
 ## Проверка утверждений
 
@@ -78,6 +82,7 @@ uv run python scripts/call_sites.py <модуль.py | символ ...> --markd
 ## Output Requirements
 
 - clear `work_type`
+- `plain_summary` in plain words, up to 300 characters
 - explicit `scope_in`
 - acceptance criteria with a validation path
 - realistic validation commands
