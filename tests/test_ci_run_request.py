@@ -1429,8 +1429,10 @@ async def test_no_dispatch_for_an_open_pr_or_a_run_that_appeared_meanwhile(
     cloud.heads["task-14/manual"] = HEAD_B
     manual = await _cloud_task(db, slug="manual", branch="task-14/manual")
 
+    before = cloud.probes
+
     async def executor_runs_it_by_hand():
-        if cloud.probes >= 2 and not cloud.github.runs:
+        if cloud.probes >= before + 2 and not cloud.github.runs:
             cloud.github.attempt(manual, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS))
 
     cloud.on_probe = executor_runs_it_by_hand
@@ -1520,3 +1522,28 @@ async def test_old_good_report_is_announced_behind_a_pile_of_unfit_rows(
     for _ in range(12):
         await _cycle(db)
     assert len(await _announced(db, good)) == 1
+
+
+async def test_a_failing_request_half_does_not_cancel_the_announcements(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """Половины прохода изолированы: сбой запросов не отменяет объявления."""
+    from hub.services import ci_head_run
+    from hub.services.ci_report import accept_ci_run_report
+
+    task_id = await _cloud_task(db)
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        task_id,
+        **cloud.github.attempt(
+            task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="1701"
+        ),
+    )
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("половина запросов упала")
+
+    monkeypatch.setattr(ci_head_run, "request_for_new_heads", broken)
+    await _cycle(db)
+    assert len(await _announced(db, task_id)) == 1
