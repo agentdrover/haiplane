@@ -9,8 +9,8 @@
   "waivers": [
     {
       "path": "hub/app.py",
-      "measured": 4303,
-      "max": 4519,
+      "measured": 4526,
+      "max": 4753,
       "removed_by": "unclaimed"
     },
     {

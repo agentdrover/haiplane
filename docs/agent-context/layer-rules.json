@@ -20,6 +20,7 @@
         "hub.web_*",
         "hub.cli",
         "hub.cli_task_fields",
+        "hub.cli_owner_minutes",
         "hub.cli_executor_host",
         "hub.mcp_server",
         "hub.mcp_catalog",
@@ -70,7 +71,8 @@
       "modules": [
         "hub.models",
         "hub.plain_summary",
-        "hub.cause_task_view"
+        "hub.cause_task_view",
+        "hub.owner_minutes_view"
       ],
       "trees": []
     },

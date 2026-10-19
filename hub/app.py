@@ -160,7 +160,7 @@ from hub.mcp_catalog import (
 )
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
-from hub.services import policy_change, project_policy
+from hub.services import owner_minutes, policy_change, project_policy
 from hub.services.steward_evidence import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -193,6 +193,7 @@ from hub.services.tree_output import (
 )
 from hub.poller import start_poller
 from hub.decisions_api import router as decisions_router
+from hub.owner_minutes_api import router as owner_minutes_router
 from hub.verdict_evidence_api import router as verdict_evidence_router
 from hub.web_executor_slot import router as executor_slot_web_router
 from hub.executor_host_api import (
@@ -430,6 +431,7 @@ async def _cancel_local_advisors() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.validate_network_auth()
+    owner_minutes.validate_timezone()  # #1874: unknown IANA zone stops the start
     _register_plugins()
     # DSN, а не только соединение (#1065): по нему обработчик запроса открывает
     # СВОЁ соединение. Общее соединение на процесс означало, что commit одной
@@ -544,6 +546,7 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
+app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
 app.include_router(executor_slot_web_router)
 
@@ -1144,6 +1147,7 @@ async def api_executor_merge(
         task_id,
         issuer_principal_id=int(issuer),
         issuer=current_identity(request).username,
+        issuer_human=_identity.is_human,
     )
     if not result.launched:
         raise HTTPException(
@@ -1205,6 +1209,7 @@ async def api_executor_repair(
         task_id,
         issuer_principal_id=int(issuer),
         issuer=current_identity(request).username,
+        issuer_human=_identity.is_human,
     )
     if not result.launched:
         raise HTTPException(
@@ -1371,6 +1376,7 @@ async def api_executor_launch(
         issuer_principal_id=int(issuer),
         target=wanted.target,
         task_id=wanted.task_id,
+        issuer_human=_identity.is_human,
     )
     if not result.launched:
         raise HTTPException(
@@ -3341,7 +3347,7 @@ async def api_batch_approve(
     Human-only like single approve; ``force`` is intentionally unsupported —
     overrides remain individual, audited actions.
     """
-    return await services.batch_approve_tasks(_db(request), body)
+    return await services.batch_approve_tasks(_db(request), body, who=_identity)
 
 
 @app.post("/api/tasks/{task_id}/approve", response_model=TaskView)
@@ -3351,7 +3357,7 @@ async def api_approve_task(
     body: TaskApprove | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    return await services.approve_task(_db(request), task_id, body)
+    return await services.approve_task(_db(request), task_id, body, who=_identity)
 
 
 @app.post("/api/tasks/{task_id}/reject", response_model=TaskView)
@@ -3649,7 +3655,7 @@ async def api_task_answer(
     request: Request,
     _identity=Depends(require_human_or_admin),
 ):
-    return await services.answer_question(_db(request), task_id, body)
+    return await services.answer_question(_db(request), task_id, body, who=_identity)
 
 
 # --- Decide (after arbiter) ---
@@ -3662,7 +3668,7 @@ async def api_decide_task(
     request: Request,
     _identity=Depends(require_human_or_admin),
 ):
-    return await services.decide_task(_db(request), task_id, body)
+    return await services.decide_task(_db(request), task_id, body, who=_identity)
 
 
 @app.post("/api/tasks/{task_id}/return-to-work", response_model=TaskView)
@@ -4035,8 +4041,9 @@ async def api_proposal_action_compat(
     action = raw.get("action", "")
     comment = raw.get("comment", "")
     if action == "approved":
+        body = TaskApprove(comment=comment, run=True)
         return await services.approve_task(
-            _db(request), proposal_id, TaskApprove(comment=comment, run=True)
+            _db(request), proposal_id, body, who=_identity
         )
     elif action == "rejected":
         return await services.reject_task(

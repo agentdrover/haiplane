@@ -43,7 +43,13 @@ from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
 from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
-from hub.services import chat_pair, host_redeem, launch_feedback, project_policy
+from hub.services import (
+    chat_pair,
+    host_redeem,
+    launch_feedback,
+    owner_minutes,
+    project_policy,
+)
 
 log = logging.getLogger("hub.services.executor_orders")
 
@@ -777,6 +783,7 @@ async def launch_on_slot(
     host: str,
     task_id: int | None,
     issuer_principal_id: int,
+    issuer_human: bool = False,
 ) -> Any:
     """Запуск исполнителя на слот хоста по нажатию человека (#1712).
 
@@ -800,7 +807,11 @@ async def launch_on_slot(
             if isinstance(booked, str):
                 return _refused(booked, task_id)
             order_id, row_id = await _issue_atomically(
-                db, project, booked, issuer_principal_id=issuer_principal_id
+                db,
+                project,
+                booked,
+                issuer_principal_id=issuer_principal_id,
+                issuer_human=issuer_human,
             )
     except aiosqlite.IntegrityError:
         # Второе соединение успело вставить заказ раньше: UNIQUE по хосту.
@@ -819,6 +830,7 @@ async def _issue_atomically(
     booked: _Booking,
     *,
     issuer_principal_id: int,
+    issuer_human: bool = False,
 ) -> tuple[int, int]:
     """``_issue`` под SAVEPOINT: сбой откатывает ЕГО записи, а не только свои.
 
@@ -830,7 +842,11 @@ async def _issue_atomically(
     await db.execute("SAVEPOINT executor_slot_issue")
     try:
         result = await _issue(
-            db, project, booked, issuer_principal_id=issuer_principal_id
+            db,
+            project,
+            booked,
+            issuer_principal_id=issuer_principal_id,
+            issuer_human=issuer_human,
         )
     except BaseException:
         await db.execute("ROLLBACK TO executor_slot_issue")
@@ -846,6 +862,7 @@ async def _issue(
     booked: _Booking,
     *,
     issuer_principal_id: int,
+    issuer_human: bool = False,
 ) -> tuple[int, int]:
     """Прогон, код, шифротекст и заказ — без commit; (id заказа, id прогона)."""
     task, host = booked.task, booked.host
@@ -896,6 +913,18 @@ async def _issue(
         ),
     )
     order_id = int(cursor.lastrowid or 0)
+    # #1874: заказ принят - событие для учёта минут владельца, в той же транзакции.
+    await owner_minutes.record_order_accepted(
+        db,
+        task_id,
+        row_id,
+        generation,
+        issuer_principal_id,
+        "launch",
+        issuer_human,
+        channel="slot",
+        host=host["name"],
+    )
     await repo.add_task_update(
         db,
         task_id,

@@ -71,7 +71,12 @@ from hub.services.project_policy import (
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
-from hub.services import finding_outcome, resubmission_guard, verdict_guard
+from hub.services import (
+    finding_outcome,
+    owner_minutes,
+    resubmission_guard,
+    verdict_guard,
+)
 from hub.services import ci_contract, ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
@@ -925,6 +930,9 @@ async def enrich_task_view(
         repeated_categories=list(circle.repeated_categories),
     )
 
+    # #1874: оценка минут владельца - один объект на карточку, REST, MCP и CLI.
+    task_view.owner_minutes = await owner_minutes.task_estimate(db, task_view.id)
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(
@@ -1216,6 +1224,7 @@ async def _open_draft_under_lock(
     readiness: Any,
     snapshot: DorSnapshot,
     caller_owns_tx: bool = False,
+    who: Any = None,
 ) -> str | None:
     """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
 
@@ -1326,7 +1335,12 @@ async def _open_draft_under_lock(
                 kind="task_approved",
                 task_id=task_id,
                 actor="human",
-                payload={"run": bool(body.run), "force": bool(body.force)},
+                payload={
+                    "run": bool(body.run),
+                    "force": bool(body.force),
+                    # #1874: автор для учёта минут владельца; не из actor и не из тела.
+                    **owner_minutes.stamp(who),
+                },
             )
         if not transitioned:
             raise HTTPException(409, "task is no longer draft (concurrent approve?)")
@@ -1339,6 +1353,7 @@ async def _approve_on_current_dor(
     task: dict[str, Any],
     body: TaskApprove,
     caller_owns_tx: bool,
+    who: Any = None,
 ) -> str | None:
     """DoR и отпечаток из одного снимка; под локом снимок сверяется (#1610).
 
@@ -1365,7 +1380,7 @@ async def _approve_on_current_dor(
             await db.commit()
         try:
             return await _open_draft_under_lock(
-                db, task_id, task, body, readiness, snapshot, caller_owns_tx
+                db, task_id, task, body, readiness, snapshot, caller_owns_tx, who
             )
         except _StatementMoved:
             continue
@@ -1376,6 +1391,8 @@ async def approve_task(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskApprove | None = None,
+    *,
+    who: Any = None,
 ) -> TaskView:
     """Approve a draft task, optionally dispatching it.
 
@@ -1425,7 +1442,7 @@ async def approve_task(
 
     # --- DoR gate -----------------------------------------------------------
     dor_override_summary = await _approve_on_current_dor(
-        db, task_id, task, body, caller_owns_tx
+        db, task_id, task, body, caller_owns_tx, who
     )
 
     # #1264: the approval stands; only the run waits for the review queue.
@@ -1522,6 +1539,8 @@ async def _warn_on_dead_locators(
 async def batch_approve_tasks(
     db: aiosqlite.Connection,
     body: BatchApprove,
+    *,
+    who: Any = None,
 ) -> BatchApproveResult:
     """Approve many drafts with per-task guards and partial success (#252).
 
@@ -1577,7 +1596,7 @@ async def batch_approve_tasks(
                 continue
 
         try:
-            await approve_task(db, task_id, TaskApprove(comment=body.comment))
+            await approve_task(db, task_id, TaskApprove(comment=body.comment), who=who)
         except HTTPException as exc:
             reason = "approve_failed"
             detail = exc.detail
@@ -4792,6 +4811,8 @@ def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
         "verdict": state.body.verdict.value,
         "submission_generation": state.task.get("submission_generation") or 0,
         "self_approved": self_approved,
+        # #1874: автор для учёта минут; только вызов человека (REST/веб ставят).
+        **owner_minutes.stamp_ids(state.principal_id, state.human_caller),
     }
     if state.applied_by_steward:
         payload["source"] = STEWARD_APPLIED_SOURCE
@@ -5265,6 +5286,8 @@ async def answer_question(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskAnswer,
+    *,
+    who: Any = None,
 ) -> TaskView:
     """Answer a question and optionally resume the task."""
     row = await repo.get_task(db, task_id)
@@ -5283,7 +5306,7 @@ async def answer_question(
         kind="question_answered",
         task_id=task_id,
         actor="human",
-        payload={"resume": bool(body.resume)},
+        payload={"resume": bool(body.resume), **owner_minutes.stamp(who)},
     )
     await db.commit()
 
@@ -5694,6 +5717,8 @@ async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskDecide,
+    *,
+    who: Any = None,
 ) -> TaskView:
     """Human decision after arbiter review: accept or rework.
 
@@ -5743,6 +5768,7 @@ async def decide_task(
             payload={
                 "action": "accept",
                 "entered_at": task.get("status_entered_at") or "",
+                **owner_minutes.stamp(who),
             },
         )
         await db.commit()
@@ -5787,6 +5813,7 @@ async def decide_task(
                 # somebody will want; reading it out of feed prose is not a
                 # way to count. Null when there was nothing to close.
                 "closed_verdict_generation": closed_generation,
+                **owner_minutes.stamp(who),
             },
         )
         await db.commit()

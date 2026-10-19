@@ -53,7 +53,7 @@ from hub.workflow_reference import (
 )
 from mcp.types import CallToolResult
 
-from hub.mcp_task_card import bounds_lines, build_compact_view
+from hub.mcp_task_card import bounds_lines, build_compact_view, owner_minutes_lines
 from hub.services import review_brief_projection as brief_projection
 from hub.services import verdict_evidence
 from hub.mcp_structured import (
@@ -1412,6 +1412,7 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(_dependency_lines(task))
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
     parts.extend(filter(None, [_verdict_route_line(task)]))
+    parts.extend(owner_minutes_lines(task))
     return parts
 
 

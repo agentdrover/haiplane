@@ -41,6 +41,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services import (
+    owner_minutes,
     prevention_gate,
     state_evidence,
     submission_contract,
@@ -600,7 +601,11 @@ async def record_state_verdict(
             kind="review_verdict_recorded",
             task_id=task_id,
             actor=agent,
-            payload=lc._verdict_event_payload(state, False),
+            payload={
+                **lc._verdict_event_payload(state, False),
+                # #1874: автор для учёта минут (state-контекст human_caller не несёт).
+                **owner_minutes.stamp_ids(principal_id, human_caller),
+            },
         )
         if body.verdict == ReviewVerdict.changes_requested:
             await repo.update_task(
