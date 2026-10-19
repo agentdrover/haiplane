@@ -1025,8 +1025,14 @@ async def _submitted_in(
     diff: str = _DIFF_506,
     risks: list[dict] | None = None,
     override: str = "",
+    passport: dict[str, object] | None = None,
 ) -> int:
-    """Сдача в УЖЕ заведённый проект: потолок считается по проекту."""
+    """Сдача в УЖЕ заведённый проект: потолок считается по проекту.
+
+    ``passport`` — колонки паспорта дефекта (found_in, cause_kind,
+    caused_by_task_id), записанные мимо refine: тест проверяет выбор профиля,
+    а не проверку пары (#1791).
+    """
     epic = await _node(db, title="epic", task_type="epic", parent_id=None)
     await repo.update_task(db, epic, project_id=pid)
     feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
@@ -1039,6 +1045,10 @@ async def _submitted_in(
         await db.execute(
             "UPDATE tasks SET machine_review_override = ? WHERE id = ?",
             (override, task_id),
+        )
+    for column, value in (passport or {}).items():
+        await db.execute(
+            f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id)
         )
     await db.commit()
     plugins.git_ops = _PinnedGitOps(_TIP, ["docs/notes.md"], diff)

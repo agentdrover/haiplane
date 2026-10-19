@@ -140,3 +140,18 @@ def test_only_entered_families_are_reported():
     report = classify(["a.py"], families)
 
     assert [gap.family for gap in report.gaps] == ["touched"]
+
+
+def test_migration_step_files_belong_to_schema_family():
+    """#1854: файл шага в hub/migrations/steps/ - схема и хранилище, не «неразмеченное»."""
+    step = "hub/migrations/steps/m202610191200_1854_example_probe.py"
+    report = classify([step])
+
+    gap = _gap(report, "schema and storage")
+    assert gap is not None
+    assert report.unmapped == ()
+    assert "hub/migrations/*|hub/migrations/steps/*" in gap.touched
+    assert "hub/db.py" in gap.missing
+    # Часть по-прежнему видна поверхности, а namesake в другом каталоге - нет.
+    assert classify(["hub/migrations/part_3.py"]).unmapped == ()
+    assert classify(["docs/" + step]).unmapped == ("docs/" + step,)

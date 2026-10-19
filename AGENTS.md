@@ -11,7 +11,7 @@
 - Use `uv run pytest`; do not use `python -m pytest`.
 - Use `uv add <package>` for dependencies.
 - If a change touches API contracts, update `hub/cli.py`, `hub/mcp_server.py`, and affected tests in the same pass.
-- If a change touches persisted task data or schema, update migrations in `hub/migrations/` (append to `part_3.py`; `hub/db.py` only applies them).
+- If a change touches persisted task data or schema, a migration is a NEW FILE `hub/migrations/steps/m<YYYYMMDDHHMM>_<task>_<what>.py` (`MIGRATIONS` list; `part_1..3` are frozen; a merged step file is never edited; `hub/db.py` only applies them). Tests of the feature go in a thematic test file, not in `test_db_migrations.py`.
 - Функция сверх бюджета сложности красит CI (`scripts/complexity_budget.py`,
   #1066). Пороги — в `pyproject.toml`, ledger исключений — в
   `docs/agent-context/complexity-budget.json`. Разбейте функцию; если это

@@ -17,6 +17,7 @@ where the command would be, with the blocks it disabled saying so themselves.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -2019,3 +2020,188 @@ async def test_slow_brief_logs_once_above_threshold(
     other = slow.model_copy(deep=True)
     other.timings = at_threshold.timings
     assert packet_hash(packet(slow)) == packet_hash(packet(other))
+
+
+async def test_the_brief_shows_the_causing_task(client: AsyncClient, db):
+    """AC-2 (#1858): исправление регрессии показывает задачу-причину в брифе."""
+    cause = (
+        await client.post(
+            "/api/tasks", json={"title": "Task that broke it", "task_type": "task"}
+        )
+    ).json()["id"]
+    await db.execute(
+        "UPDATE tasks SET affected_areas = ? WHERE id = ?",
+        (json.dumps(["hub/a.py", "tests/test_a.py"]), cause),
+    )
+    task_id = await _submitted_task(client, db, "Fix of a regression")
+    # Блок показывается только внутри одного проекта: обе задачи под одним эпиком.
+    pid = await repo.create_project(
+        db, slug="same-proj", name="same", workspace_path="/tmp/ws"
+    )
+    epic = (
+        await client.post("/api/tasks", json={"title": "e", "task_type": "epic"})
+    ).json()["id"]
+    await repo.update_task(db, epic, project_id=pid)
+    await db.execute(
+        "UPDATE tasks SET parent_id=? WHERE id IN (?, ?)", (epic, cause, task_id)
+    )
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (cause, task_id),
+    )
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    block = brief["cause_task"]
+    assert block["state"] == "known", block
+    assert block["task_id"] == cause
+    assert block["title"] == "Task that broke it"
+    assert block["link"] == f"/tasks/{cause}"
+    assert block["affected_areas"] == ["hub/a.py", "tests/test_a.py"]
+    assert "заявленные" in block["areas_note"], block
+    assert block["cause_kind"] == "regression"
+
+    # Причина удалена: явное «нет данных», блок не пропадает.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.execute("DELETE FROM tasks WHERE id = ?", (cause,))
+    await db.commit()
+    gone = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()["cause_task"]
+    assert gone["state"] == "no_data", gone
+    assert "нет данных" in gone["note"], gone
+    assert gone["task_id"] is None, "удалённая причина не называется"
+
+    # Не регрессия: блока нет.
+    await db.execute("UPDATE tasks SET cause_kind='ops' WHERE id=?", (task_id,))
+    await db.commit()
+    other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert other["cause_task"] is None
+
+
+async def test_a_cause_in_another_project_is_not_disclosed(client: AsyncClient, db):
+    """#1858 (Codex P1): причина из чужого проекта = та же заглушка, что у удалённой."""
+    from tests.review_dispatch_support import _node
+
+    async def in_project(slug: str, title: str) -> int:
+        pid = await repo.create_project(
+            db, slug=slug, name=slug, workspace_path="/tmp/ws"
+        )
+        epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+        await repo.update_task(db, epic, project_id=pid)
+        task = await _node(db, title=title, task_type="task", parent_id=epic)
+        return task
+
+    secret = await in_project("proj-b", "Секретный заголовок проекта B")
+    await db.execute(
+        "UPDATE tasks SET affected_areas = ? WHERE id = ?",
+        (json.dumps(["secret/b.py"]), secret),
+    )
+    mine = await in_project("proj-a", "Fix in A")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (secret, mine),
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{mine}/review-brief")
+    block = resp.json()["cause_task"]
+    assert block["state"] == "no_data", block
+    assert block["task_id"] is None and block["title"] == "" and block["link"] == ""
+    assert block["affected_areas"] == []
+    for leaked in ("Секретный", "secret/b.py", f"/tasks/{secret}"):
+        assert leaked not in resp.text, leaked
+
+    # Неотличимо от удалённой причины.
+    deleted = await in_project("proj-c", "to delete")
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.execute("DELETE FROM tasks WHERE id = ?", (deleted,))
+    await db.execute("UPDATE tasks SET caused_by_task_id=? WHERE id=?", (deleted, mine))
+    await db.commit()
+    gone = (await client.get(f"/api/tasks/{mine}/review-brief")).json()["cause_task"]
+    assert gone == block, (gone, block)
+
+
+async def test_a_pending_project_cause_is_not_taken_for_default(
+    client: AsyncClient, db
+):
+    """#1858 (Codex r2 P1): запасной default не делает чужую причину своей.
+
+    Исправление вне эпика (по умолчанию в default), причина под эпиком проекта
+    в статусе pending, который резолвер подменяет default-ом. Блок обязан
+    молчать, а в ответе брифа и в пакете стюарда нет ни заголовка, ни номера.
+    """
+    import json as _json
+
+    from hub.services.steward_evidence import build_evidence_packet, packet_payload
+    from tests.review_dispatch_support import _node
+
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    pid = await repo.create_project(
+        db, slug="pend-b", name="b", workspace_path="/tmp/ws", status="pending"
+    )
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    cause = await _node(
+        db, title="Заголовок-из-pending", task_type="task", parent_id=epic
+    )
+    mine = await _submitted_task(client, db, "Fix in default")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (cause, mine),
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{mine}/review-brief")
+    block = resp.json()["cause_task"]
+    assert block["state"] == "no_data" and block["task_id"] is None, block
+    assert "Заголовок-из-pending" not in resp.text
+    assert f"/tasks/{cause}" not in resp.text
+
+    packet = _json.dumps(
+        packet_payload(await build_evidence_packet(db, mine, 1)),
+        ensure_ascii=False,
+        default=str,
+    )
+    assert "Заголовок-из-pending" not in packet
+    assert f"/tasks/{cause}" not in packet
+
+
+async def test_orphan_and_default_epic_count_as_one_project(client: AsyncClient, db):
+    """#1858 (Codex r3): сирота = default; другой явный проект — чужой."""
+    from tests.review_dispatch_support import _node
+
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    default = await repo.get_project_by_slug(db, "default")
+    other = await repo.create_project(
+        db, slug="spike-bo", name="bo", workspace_path="/tmp/ws"
+    )
+
+    async def under(project_id: int | None, title: str) -> int:
+        if project_id is None:
+            return await _node(db, title=title, task_type="task", parent_id=None)
+        epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+        await repo.update_task(db, epic, project_id=project_id)
+        return await _node(db, title=title, task_type="task", parent_id=epic)
+
+    async def block(fix_project: int | None, cause_project: int | None) -> dict:
+        cause = await under(cause_project, "Причина")
+        fix = await under(fix_project, "Исправление")
+        await db.execute(
+            "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+            "caused_by_task_id=? WHERE id=?",
+            (cause, fix),
+        )
+        await db.commit()
+        resp = await client.get(f"/api/tasks/{fix}/review-brief")
+        return resp.json()["cause_task"]
+
+    assert (await block(None, default["id"]))["state"] == "known"
+    assert (await block(default["id"], None))["state"] == "known"
+    assert (await block(None, None))["state"] == "known"
+    assert (await block(None, other))["state"] == "no_data"
+    assert (await block(other, None))["state"] == "no_data"

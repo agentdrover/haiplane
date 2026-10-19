@@ -2303,3 +2303,33 @@ async def test_reviewer_codes_are_kept_a_day_for_diagnosis_then_purged(hub):
         "unknown",
         "unknown",
     ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_session_does_not_read_another_project_through_the_cause(hub):
+    """#1858 (Codex P1): сессия ревьюера задачи A не видит данные B через бриф A."""
+    bound = await _in_review(hub, "исправление в A")
+    foreign = await _in_review(hub, "Секретная причина проекта B")
+    for slug, child in (("proj-a", bound), ("proj-b", foreign)):
+        pid = await repo.create_project(
+            hub.db, slug=slug, name=slug, workspace_path="/tmp/ws"
+        )
+        epic = await _make_task(hub, f"epic {slug}")
+        await hub.db.execute(
+            "UPDATE tasks SET task_type='epic', project_id=? WHERE id=?", (pid, epic)
+        )
+        await hub.db.execute("UPDATE tasks SET parent_id=? WHERE id=?", (epic, child))
+    await hub.db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (foreign, bound),
+    )
+    await hub.db.commit()
+    session = await _reviewer_session(hub, bound)
+
+    direct = await hub.client.get(f"/api/tasks/{foreign}/review-brief", headers=session)
+    assert direct.status_code == 403, direct.text
+    brief = await hub.client.get(f"/api/tasks/{bound}/review-brief", headers=session)
+    assert brief.status_code == 200, brief.text
+    assert brief.json()["cause_task"]["state"] == "no_data"
+    assert "Секретная" not in brief.text
