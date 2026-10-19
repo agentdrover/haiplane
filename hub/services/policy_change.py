@@ -132,6 +132,26 @@ async def refuse_unrunnable_review(db, before, fields: dict) -> None:
     )
 
 
+def refuse_ci_contract(sent: dict[str, Any], *, scheduled: bool) -> None:
+    """Контракт CI правит человек прямо, не расписанием (#1848).
+
+    Ослабление основания для approve не должно срабатывать само в чужой
+    момент: ключ ``ci_contract`` (и его снятие ``null``) отказывает и при
+    создании записи расписания, и при её исполнении.
+    """
+    if scheduled and project_policy.CI_CONTRACT_KEY in sent:
+        raise PolicyRefused(
+            422,
+            {
+                "error": "ci_contract_not_schedulable",
+                "hint": (
+                    "ci_contract меняет только человек прямым PATCH проекта; "
+                    "отложенная правка с этим ключом (и с null) не принимается"
+                ),
+            },
+        )
+
+
 def merged_gate_policy(
     before: Any, sent: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, list[str]]]:
@@ -149,6 +169,20 @@ def merged_gate_policy(
     """
     from hub.models import validated_gate_policy
 
+    if (
+        before["slug"] == project_policy.GATE_LOCK_SLUG
+        and sent.get(project_policy.CI_CONTRACT_KEY) is not None
+    ):
+        raise PolicyRefused(
+            422,
+            {
+                "error": "ci_contract_not_for_default",
+                "hint": (
+                    "проект default (сам хаб) подтверждает CI только по "
+                    "контракту хаба: ci.yml и четыре проверки; ключ не записан"
+                ),
+            },
+        )
     stored = project_policy.gate_policy_of(before)
     merged = {**stored, **{k: v for k, v in sent.items() if v is not None}}
     for key, value in sent.items():
@@ -262,6 +296,7 @@ async def apply_project_fields(
     delta: dict[str, list[str]] | None = None
     changes: dict[str, dict[str, Any]] = {}
     if fields.get("gate_policy") is not None:
+        refuse_ci_contract(fields["gate_policy"], scheduled=bool(schedule))
         merged, delta = merged_gate_policy(before, fields["gate_policy"])
         changes = was_now(project_policy.gate_policy_of(before), merged, delta)
         fields["gate_policy"] = json.dumps(merged)
@@ -319,6 +354,7 @@ async def create_scheduled_change(
     """
     now = now or utcnow()
     at_s = stamp(at)
+    refuse_ci_contract(patch, scheduled=True)
     if at_s <= stamp(now):
         raise PolicyRefused(
             422,

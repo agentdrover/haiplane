@@ -21,7 +21,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.process_kill import kill_process_group
-from hub.services import test_existence
+from hub.services import ci_contract, test_existence
 from hub.services.orchestration import project_git_context
 from hub.services.refinement import row_to_ac
 from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
@@ -367,8 +367,13 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
         if ac.id not in unlocatable and runner_of(ac.test_ref) != PYTEST
     }
     generation = task.get("submission_generation") or 0
+    # A result CI wrote under a contract the project no longer has is no result
+    # (#1848): it proves nothing until an attempt is confirmed under the current one.
     rows = {
-        dict(r)["ac_id"]: dict(r) for r in await repo.list_ac_test_results(db, task_id)
+        dict(r)["ac_id"]: dict(r)
+        for r in await ci_contract.drop_stale_results(
+            db, task_id, await repo.list_ac_test_results(db, task_id)
+        )
     }
     not_green = [
         ac.id

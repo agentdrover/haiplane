@@ -68,6 +68,16 @@ def _ceiling_name(policy: dict) -> str | None:
     return ceiling.value if ceiling is not None else None
 
 
+def _ci_contract_view(policy: dict) -> dict[str, Any]:
+    """Контракт CI, по которому хаб подтверждает отчёты проекта, и его отпечаток (#1848)."""
+    contract = project_policy.ci_contract_from(policy)
+    return {
+        "workflow_path": contract.workflow_path,
+        "required_checks": list(contract.required_checks),
+        "fingerprint": contract.fingerprint,
+    }
+
+
 REGISTRY: dict[str, PolicyEntry] = {
     "dor": PolicyEntry(
         lambda p: project_policy.gate_value_of(p, "dor"),
@@ -189,6 +199,7 @@ REGISTRY: dict[str, PolicyEntry] = {
     "steward_watch": PolicyEntry(
         project_policy.steward_watch_of, "project_policy.steward_watch_of"
     ),
+    "ci_contract": PolicyEntry(_ci_contract_view, "project_policy.ci_contract_from"),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",

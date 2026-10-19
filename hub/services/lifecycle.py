@@ -72,7 +72,7 @@ from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome, resubmission_guard, verdict_guard
-from hub.services import ci_integrity, ci_trust
+from hub.services import ci_contract, ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
@@ -3117,7 +3117,10 @@ async def _step_ci_before_submit(state: SubmitContext) -> None:
     ac_rows = [
         dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
     ]
-    gap = ci_green_proof.proof_gap(dict(report) if report else None, ac_rows, sha)
+    contract = await ci_contract.contract_for_task(state.db, state.task_id)
+    gap = ci_green_proof.proof_gap(
+        dict(report) if report else None, ac_rows, sha, contract
+    )
     if gap is None:
         return
     if mode == RED_TEST_REQUIRE:
@@ -5963,6 +5966,11 @@ async def _validation_gap_of_the_work(
         return None
     gap = validation_gap(fresh)
     source = str(fresh.get("validation_source") or "manual")
+    if await ci_contract.evidence_stale(db, int(fresh["id"]), source):
+        return (
+            "validation записана отчётом CI под контрактом, которого у проекта "
+            "уже нет: нужен новый подтверждённый отчёт"
+        )
     if source == "manual" and not gap:
         # A run the owner or the hub made by hand keeps its meaning (#510):
         # #1687 is about CI evidence, which names a commit; a manual record does not.
@@ -5975,7 +5983,10 @@ async def _validation_gap_of_the_work(
         if (
             report is None
             or status != "pass"
-            or not ci_trust.can_testify_pass(dict(report))
+            or not ci_trust.can_testify_pass(
+                dict(report),
+                await ci_contract.fingerprint_for_task(db, int(fresh["id"])),
+            )
         ):
             return (
                 f"вершина ветки {sha[:12]} не совпадает с закреплённым "

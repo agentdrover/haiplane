@@ -41,7 +41,8 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
 from hub.integrations.registry import plugins
-from hub.services import ci_artifact
+from hub.services import ci_artifact, ci_contract
+from hub.services.ci_contract import CiContract
 from hub.services.ac_tests import record_ac_test_results
 from hub.services.validation_run import record_validation_result
 
@@ -71,12 +72,20 @@ CURRENT_ATTEMPT_INCOMPLETE = "current_attempt_incomplete"
 CURRENT_ATTEMPT_UNKNOWN = "current_attempt_unknown"
 CHECK_FAILED = "check_failed"
 CHECK_SUPERSEDED = "check_superseded"
+# The verdict of an attempt was made under another CI contract than the
+# project's current one (#1848): it proves nothing until the attempt is checked
+# again under the current one.
+CONTRACT_CHANGED = "contract_changed"
+# The project's contract could not be read (#1848): nothing is confirmed.
+CONTRACT_UNRESOLVED = "contract_unresolved"
 
-CANONICAL_WORKFLOW = ".github/workflows/ci.yml"
+# The hub's own contract (#1848 made it one of many): kept as names for readers
+# that mean the hub's project.
+CANONICAL_WORKFLOW = ci_contract.HUB_CONTRACT.workflow_path
 ALLOWED_EVENTS = frozenset({"pull_request", "push", "workflow_dispatch"})
 ARTIFACT_PREFIX = "hub-ci-results-"
 # A green proof names these four checks; a missing key or a skip is not a pass.
-REQUIRED_CHECKS = ("lint", "format", "types", "tests")
+REQUIRED_CHECKS = ci_contract.CHECK_VOCABULARY
 SUCCESS = "success"
 
 RETRY_MINUTES = 5
@@ -115,19 +124,28 @@ class Standing:
 # ---- reading the trust of a stored row --------------------------------------
 
 
-def trust_of(report: Mapping[str, Any] | None) -> tuple[str, str]:
-    """``(trust, reason)`` of a stored report; a row without the column is legacy."""
+def trust_of(report: Mapping[str, Any] | None, current_fp: str) -> tuple[str, str]:
+    """``(trust, reason)`` of a stored report; a row without the column is legacy.
+
+    ``current_fp`` is the fingerprint of the project's CI contract NOW (#1848):
+    a verdict made under another contract (or under none) is not confirmation.
+    The caller says it explicitly — this function does not guess a project.
+    """
     if report is None:
         return UNVERIFIED, "no_report"
     trust = str(report.get("trust") or UNVERIFIED)
     reason = str(report.get("trust_reason") or LEGACY)
     if trust != VERIFIED:
         return UNVERIFIED, reason
+    if not current_fp:
+        return UNVERIFIED, CONTRACT_UNRESOLVED
+    if str(report.get("contract_fp") or "") != current_fp:
+        return UNVERIFIED, CONTRACT_CHANGED
     return VERIFIED, ""
 
 
-def is_verified(report: Mapping[str, Any] | None) -> bool:
-    return trust_of(report)[0] == VERIFIED
+def is_verified(report: Mapping[str, Any] | None, current_fp: str) -> bool:
+    return trust_of(report, current_fp)[0] == VERIFIED
 
 
 def unverified_note(reason: str) -> str:
@@ -139,7 +157,10 @@ async def trusted_report(db: Any, task_id: int, head_sha: str) -> Any:
     if not head_sha:
         return None
     row = await repo.get_ci_run_report(db, task_id, head_sha)
-    return row if row is not None and is_verified(dict(row)) else None
+    if row is None:
+        return None
+    fp = await ci_contract.fingerprint_for_task(db, task_id)
+    return row if is_verified(dict(row), fp) else None
 
 
 async def unconfirmed_reason(db: Any, task_id: int, head_sha: str) -> str:
@@ -149,9 +170,12 @@ async def unconfirmed_reason(db: Any, task_id: int, head_sha: str) -> str:
     confirm it", which readers must not blur.
     """
     row = await repo.get_ci_run_report(db, task_id, head_sha) if head_sha else None
-    if row is None or is_verified(dict(row)):
+    if row is None:
         return ""
-    return unverified_note(trust_of(dict(row))[1])
+    trust, reason = trust_of(
+        dict(row), await ci_contract.fingerprint_for_task(db, task_id)
+    )
+    return "" if trust == VERIFIED else unverified_note(reason)
 
 
 def _json_map(raw: Any) -> dict[str, Any]:
@@ -172,27 +196,29 @@ def run_succeeded(report: Mapping[str, Any]) -> bool:
     return run_conclusion(report) == SUCCESS
 
 
-def can_testify_pass(report: Mapping[str, Any]) -> bool:
+def can_testify_pass(report: Mapping[str, Any], current_fp: str) -> bool:
     """A report's ``pass`` counts as evidence: confirmed by GitHub AND the run succeeded.
 
     The ONE predicate for it: ``write_evidence`` writes a ``pass`` to the task by
     it and the completion gate accepts a tip's validation by it, so the two
     cannot drift apart.
     """
-    return is_verified(report) and run_succeeded(report)
+    return is_verified(report, current_fp) and run_succeeded(report)
 
 
-def green_gap(report: Mapping[str, Any]) -> str | None:
+def green_gap(report: Mapping[str, Any], contract: CiContract) -> str | None:
     """Why a verified report is not a GREEN proof; None when it is.
 
-    Green needs the run to have ended in ``success`` and each of lint, format,
-    types, tests to be ``pass`` — an absent key or a skip proves nothing.
+    Green needs the run to have ended in ``success`` and each check the project's
+    CI contract requires (the hub's: lint, format, types, tests) to be ``pass`` —
+    an absent key or a skip proves nothing. Which checks are required is the
+    only thing the contract changes (#1848); the predicate is the same.
     """
     conclusion = run_conclusion(report)
     if conclusion != SUCCESS:
         return f"прогон закончился как {conclusion or 'неизвестно'}, нужен success"
     checks = _json_map(report.get("checks"))
-    bad = [n for n in REQUIRED_CHECKS if str(checks.get(n) or "") != "pass"]
+    bad = [n for n in contract.ordered_checks() if str(checks.get(n) or "") != "pass"]
     if bad:
         return "проверки не pass: " + ", ".join(
             f"{n}={checks.get(n) or 'нет'}" for n in bad
@@ -203,9 +229,9 @@ def green_gap(report: Mapping[str, Any]) -> str | None:
 # ---- one attempt against GitHub --------------------------------------------
 
 
-def canonical_path(path: str) -> bool:
-    """ci.yml, with the documented ``@<ref>`` suffix of a run's path ignored."""
-    return path.split("@", 1)[0] == CANONICAL_WORKFLOW
+def canonical_path(path: str, contract: CiContract) -> bool:
+    """The contract's workflow, with the documented ``@<ref>`` suffix of a run's path ignored."""
+    return ci_contract.path_matches(contract, path)
 
 
 def attempt_key(run_id: str, run_attempt: str) -> str:
@@ -236,7 +262,11 @@ def _unavailable(row: Any) -> Verdict:
 
 
 def _run_problem(
-    run: dict[str, Any], prov: dict[str, Any], row: Any, gh_repo: str
+    run: dict[str, Any],
+    prov: dict[str, Any],
+    row: Any,
+    gh_repo: str,
+    contract: CiContract,
 ) -> str:
     """The first way a run disagrees with the report, or ''."""
     if run["run_id"] != prov["run_id"] or run["run_attempt"] != prov["run_attempt"]:
@@ -245,8 +275,8 @@ def _run_problem(
         run["head_repository"], gh_repo
     ):
         return WRONG_REPOSITORY
-    if not canonical_path(run["path"]) or not canonical_path(
-        str(prov.get("workflow_path") or "")
+    if not canonical_path(run["path"], contract) or not canonical_path(
+        str(prov.get("workflow_path") or ""), contract
     ):
         return WRONG_WORKFLOW
     if run["head_sha"] != row["head_sha"]:
@@ -258,8 +288,14 @@ def _run_problem(
     return ""
 
 
-async def check_attempt(row: Any, gh_args: Mapping[str, Any]) -> Verdict:
-    """Ask GitHub whether one reported attempt is what its report claims."""
+async def check_attempt(
+    row: Any, gh_args: Mapping[str, Any], contract: CiContract
+) -> Verdict:
+    """Ask GitHub whether one reported attempt is what its report claims.
+
+    ``contract`` is the project's CI contract captured BEFORE the question: the
+    workflow the run must be of (#1848).
+    """
     prov = {k: str(v) for k, v in _json_map(row["provenance"]).items()}
     needed = ("run_id", "run_attempt", "artifact_id", "artifact_digest")
     if any(not prov.get(k) for k in needed):
@@ -277,7 +313,7 @@ async def check_attempt(row: Any, gh_args: Mapping[str, Any]) -> Verdict:
     if not run:
         return UNVERIFIED, RUN_NOT_FOUND, True
     gh_repo = str(gh_args.get("gh_repo") or config.REPO_NAME)
-    problem = _run_problem(run, prov, row, gh_repo)
+    problem = _run_problem(run, prov, row, gh_repo, contract)
     if problem:
         return UNVERIFIED, problem, True
     if run["status"] != "completed":
@@ -375,13 +411,13 @@ def reported_body(row: Any) -> dict[str, Any]:
 
 
 def canonical_runs(
-    runs: list[dict[str, Any]], head_sha: str, gh_repo: str
+    runs: list[dict[str, Any]], head_sha: str, gh_repo: str, contract: CiContract
 ) -> list[dict[str, Any]]:
-    """The runs that count: ci.yml of this repository, on this commit."""
+    """The runs that count: the contract's workflow of this repository, on this commit."""
     return [
         r
         for r in runs
-        if canonical_path(r["path"])
+        if canonical_path(r["path"], contract)
         and r["head_sha"] == head_sha
         and _same_repo(r["repository"], gh_repo)
         and _same_repo(r["head_repository"], gh_repo)
@@ -389,10 +425,10 @@ def canonical_runs(
 
 
 def current_attempt(
-    runs: list[dict[str, Any]], head_sha: str, gh_repo: str
+    runs: list[dict[str, Any]], head_sha: str, gh_repo: str, contract: CiContract
 ) -> dict[str, Any] | None:
-    """The attempt that started last among the commit's runs of ci.yml."""
-    mine = canonical_runs(runs, head_sha, gh_repo)
+    """The attempt that started last among the commit's runs of the contract's workflow."""
+    mine = canonical_runs(runs, head_sha, gh_repo, contract)
     if not mine:
         return None
     return max(mine, key=lambda r: (r["run_started_at"], int(r["run_id"] or 0)))
@@ -404,6 +440,7 @@ def _standing_attempt(
     sha: str,
     gh_repo: str,
     projected_key: str,
+    contract: CiContract,
 ) -> tuple[Mapping[str, Any] | None, str, str, str]:
     """``(attempt row, trust, reason, key)`` the projection must show."""
     by_key = {
@@ -415,7 +452,7 @@ def _standing_attempt(
         # confirmed NOW. A past confirmation stays on its attempt row as
         # history; it is not proof and the evidence it wrote is withdrawn.
         return None, UNVERIFIED, FORGE_UNAVAILABLE, projected_key
-    cur = current_attempt(runs, sha, gh_repo)
+    cur = current_attempt(runs, sha, gh_repo, contract)
     if cur is None:
         if newest["trust"] != VERIFIED:
             return newest, newest["trust"], newest["trust_reason"], ""
@@ -435,7 +472,7 @@ def _standing_attempt(
         if newest["trust"] != VERIFIED and (
             not by_key
             or newest["run_id"]
-            not in {r["run_id"] for r in canonical_runs(runs, sha, gh_repo)}
+            not in {r["run_id"] for r in canonical_runs(runs, sha, gh_repo, contract)}
         ):
             return newest, newest["trust"], newest["trust_reason"], ""
         return None, UNVERIFIED, NEWER_ATTEMPT_WITHOUT_REPORT, key
@@ -470,7 +507,7 @@ async def write_evidence(
     # A run that did not end in success never writes a ``pass``. A missing or
     # skipped check does not stop the per-AC facts from being recorded:
     # ``green_gap`` is the stricter question the gates ask of the same row.
-    green = can_testify_pass({"trust": trust, "provenance": row["provenance"]})
+    green = run_succeeded({"provenance": row["provenance"]})
     ac = {
         str(k): str(v)
         for k, v in _json_map(row["ac_results"]).items()
@@ -503,11 +540,27 @@ async def adopt(
     if stored is None:
         return None
     row = dict(stored)
-    trust, reason = trust_of(row)
+    trust, reason = trust_of(row, await ci_contract.fingerprint_for_task(db, task_id))
     recorded = await write_evidence(
         db, task_id, generation, row, trust, str(row.get("attempt_key") or "")
     )
     return trust, reason, recorded
+
+
+def _under_contract(rows: Sequence[Any], contract: CiContract) -> list[dict[str, Any]]:
+    """The attempts as the CURRENT contract sees them (#1848).
+
+    A verdict made under another contract is not a confirmation now: it is shown
+    as unverified(contract_changed) until the attempt is checked again. An
+    unverified verdict stays what it was (it opens nothing either way).
+    """
+    out = []
+    for row in rows:
+        item = dict(row)
+        if item["trust"] == VERIFIED and item["contract_fp"] != contract.fingerprint:
+            item["trust"], item["trust_reason"] = UNVERIFIED, CONTRACT_CHANGED
+        out.append(item)
+    return out
 
 
 async def _project(
@@ -517,12 +570,14 @@ async def _project(
     rows: Sequence[Any],
     runs: list[dict[str, Any]] | None,
     gh_repo: str,
+    contract: CiContract,
 ) -> Standing:
     task_id = int(task["id"])
     stored = await repo.get_ci_run_report(db, task_id, sha)
     projected_key = str(dict(stored).get("attempt_key") or "") if stored else ""
+    rows = _under_contract(rows, contract)
     pick, trust, reason, key = _standing_attempt(
-        rows, runs, sha, gh_repo, projected_key
+        rows, runs, sha, gh_repo, projected_key, contract
     )
     source = pick if pick is not None else rows[0]
     if pick is not None:
@@ -545,6 +600,7 @@ async def _project(
             trust_reason=reason,
             attempt_key=key or attempt_key(source["run_id"], source["run_attempt"]),
         )
+        await ci_contract.stamp_projection(db, task_id, sha, source["contract_fp"])
     elif stored is not None:
         await repo.set_ci_run_report_trust(
             db, task_id, sha, trust=trust, trust_reason=reason, attempt_key=key
@@ -565,6 +621,7 @@ async def _project(
             trust_reason=reason,
             attempt_key=key,
         )
+        await ci_contract.stamp_projection(db, task_id, sha, source["contract_fp"])
     generation = int(task.get("submission_generation") or 0)
     applied, recorded = False, []
     if (task.get("submission_sha") or "").strip() == sha and generation > 0:
@@ -647,7 +704,7 @@ async def pass_gap(db: Any, task_id: int, head_sha: str) -> str | None:
     report = dict(row)
     if str(report.get("validation_status") or "").strip() != "pass":
         return f"validation_status={report.get('validation_status') or 'пусто'}, нужен pass"
-    return green_gap(report)
+    return green_gap(report, await ci_contract.contract_for_task(db, task_id))
 
 
 async def invalidate(db: Any, task: Mapping[str, Any], head_sha: str) -> None:
@@ -734,10 +791,11 @@ async def _offline_after_timeout(
         return None
     if reserved is not None:
         gh_args = await _forge_args(db, task_id)
+        contract = await ci_contract.contract_for_task(db, task_id)
         verdicts = {
             int(r["id"]): (_unavailable(r), int(r["body_version"]))
             for r in rows
-            if not r["trust_final"]
+            if not r["trust_final"] or r["contract_fp"] != contract.fingerprint
         }
         standing = await _write_round(
             db,
@@ -746,13 +804,17 @@ async def _offline_after_timeout(
             reserved,
             verdicts,
             None,
-            str(gh_args.get("gh_repo") or config.REPO_NAME),
+            (str(gh_args.get("gh_repo") or config.REPO_NAME), contract),
         )
         if standing is not None:
             return standing
     stored = await repo.get_ci_run_report(db, task_id, head_sha)
     trust, reason = (
-        trust_of(dict(stored)) if stored is not None else (UNVERIFIED, PENDING)
+        trust_of(
+            dict(stored), (await ci_contract.contract_for_task(db, task_id)).fingerprint
+        )
+        if stored is not None
+        else (UNVERIFIED, PENDING)
     )
     return Standing(
         trust=trust, reason=reason, has_report=stored is not None, forge_down=True
@@ -764,6 +826,7 @@ async def _ask_github(
     head_sha: str,
     gh_args: Mapping[str, Any],
     backoff: bool,
+    contract: CiContract,
 ) -> tuple[dict[int, tuple[Verdict, int]], list[dict[str, Any]] | None]:
     """Everything one refresh needs from GitHub; goes offline at the first failure."""
     verdicts: dict[int, tuple[Verdict, int]] = {}
@@ -772,12 +835,15 @@ async def _ask_github(
         # The poller tries an unchecked attempt again every RETRY_MINUTES, not
         # every tick; a reader that needs the answer now asks without backoff.
         waiting = backoff and row["checked_minutes_ago"] < RETRY_MINUTES
-        if row["trust_final"] or waiting:
+        # A final verdict holds only under the contract it was made under
+        # (#1848): under another one the attempt is checked again, now.
+        stale = row["contract_fp"] != contract.fingerprint
+        if (row["trust_final"] or waiting) and not stale:
             continue
         if down:  # GitHub already failed in this refresh: do not ask again
             verdict = _unavailable(row)
         else:
-            verdict = await check_attempt(row, gh_args)
+            verdict = await check_attempt(row, gh_args, contract)
             down = verdict[1] == FORGE_UNAVAILABLE
         verdicts[int(row["id"])] = (verdict, int(row["body_version"]))
     if down:
@@ -787,6 +853,7 @@ async def _ask_github(
         repo=gh_args.get("repo"),
         gh_repo=gh_args.get("gh_repo"),
         forge=gh_args.get("forge", ""),
+        workflow_path=contract.workflow_path,
     )
     return verdicts, runs
 
@@ -808,6 +875,13 @@ async def _refresh_locked(
         async with write_transaction(db):
             version = await repo.bump_ci_state_version(db, task_id, head_sha)
         reserved.append(version)
+        # The contract is captured HERE, before anything is asked of GitHub, and
+        # compared again inside the transaction that writes (#1848).
+        contract = await ci_contract.contract_for_task(db, task_id)
+        if not contract.fingerprint:
+            # Nothing may be asked or written under no contract: the caller
+            # (refresh_quietly) turns this into unverified(check_failed).
+            raise RuntimeError(f"CI contract of task {task_id} could not be read")
         rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
         if not rows:
             return None
@@ -826,12 +900,14 @@ async def _refresh_locked(
             verdicts = {
                 int(r["id"]): (_unavailable(r), int(r["body_version"]))
                 for r in rows
-                if not r["trust_final"]
+                if not r["trust_final"] or r["contract_fp"] != contract.fingerprint
             }
         else:
-            verdicts, runs = await _ask_github(rows, head_sha, gh_args, backoff)
+            verdicts, runs = await _ask_github(
+                rows, head_sha, gh_args, backoff, contract
+            )
         standing = await _write_round(
-            db, task_id, head_sha, version, verdicts, runs, gh_repo
+            db, task_id, head_sha, version, verdicts, runs, (gh_repo, contract)
         )
         if standing is not None:
             return standing
@@ -845,15 +921,20 @@ async def _write_round(
     version: int,
     verdicts: dict[int, tuple[Verdict, int]],
     runs: list[dict[str, Any]] | None,
-    gh_repo: str,
+    asked: tuple[str, CiContract],
 ) -> Standing | None:
     """Write a round's verdicts and the projection, only if its version is current.
 
     One short transaction. None: the version moved (or a body was replaced
-    meanwhile) and nothing of this round was projected.
+    meanwhile, or the project's CI contract changed since the round captured it,
+    #1848) and nothing of this round was projected. ``asked`` is the repository
+    and the contract the round asked GitHub under.
     """
+    gh_repo, contract = asked
     async with write_transaction(db):
         if await repo.ci_state_version(db, task_id, head_sha) != version:
+            return None
+        if await ci_contract.fingerprint_for_task(db, task_id) != contract.fingerprint:
             return None
         stale = False
         for attempt_id, ((trust, reason, final), body) in verdicts.items():
@@ -865,12 +946,16 @@ async def _write_round(
                 final=final,
                 body_version=body,
             )
+            if written:
+                await ci_contract.stamp_attempt(db, attempt_id, contract.fingerprint)
             stale = stale or not written
         if stale:
             return None
         fresh = await repo.list_ci_report_attempts(db, task_id, head_sha)
         task = dict(await repo.get_task(db, task_id) or {})
-        standing = await _project(db, task, head_sha, list(fresh), runs, gh_repo)
+        standing = await _project(
+            db, task, head_sha, list(fresh), runs, gh_repo, contract
+        )
         return replace(standing, forge_down=runs is None)
 
 
@@ -980,6 +1065,12 @@ async def sweep(db: Any) -> None:
         found.add((int(row["task_id"]), str(row["head_sha"])))
     for row in await repo.tasks_in_review_with_sha(db):
         found.add((int(row["id"]), str(row["submission_sha"])))
+    # A contract changed under verdicts that were final (#1848): they are
+    # checked again without waiting for a new report.
+    for row in await ci_contract.attempts_to_recheck(
+        db, await ci_contract.settled_attempts(db)
+    ):
+        found.add((int(row["task_id"]), str(row["head_sha"])))
     # The cursor: a tick that ran out of budget leaves the next one to start
     # AFTER the last commit it handled, so slow early tasks cannot starve the
     # tail of the list forever.
