@@ -665,6 +665,7 @@ class _CloudGit(NoopGitOps):
         self.request_delay = 0.0
         self.open_prs: dict[str, int] = {}
         self.pr_errors: set[str] = set()
+        self.on_heads = None  # type: ignore[var-annotated]
         self.probes = 0
         self.on_probe = None  # type: ignore[var-annotated]
         self.on_request = None  # type: ignore[var-annotated]
@@ -692,6 +693,8 @@ class _CloudGit(NoopGitOps):
 
     async def remote_heads(self, branches, repo=None):
         self.head_reads += 1
+        if self.on_heads is not None:
+            await self.on_heads()
         if self.head_delay:
             await asyncio.sleep(self.head_delay)
         if repo in self.raising_clones:
@@ -1983,3 +1986,128 @@ async def test_finished_tasks_leave_the_journals(
         cur = await db.execute(f"SELECT task_id FROM {table}")  # noqa: S608
         left = {r[0] for r in await cur.fetchall()}
         assert done not in left and live in left
+
+
+async def _attempts_of(db: aiosqlite.Connection, task_id: int) -> tuple[int, str]:
+    cur = await db.execute(
+        "SELECT attempts, state FROM ci_head_runs WHERE task_id=?", (task_id,)
+    )
+    row = await cur.fetchone()
+    return int(row[0]), str(row[1])
+
+
+async def test_only_a_started_request_spends_the_attempt(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I3 (Codex круг 3): форж отказал до POST, исключение или отмена до отправки - попытка цела."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    task_id = await _cloud_task(db)
+
+    # форж отказал до отправки (список workflow не прочитан): три прохода подряд
+    cloud.outcomes = [
+        CIRunRequestResult(CIRunRequestOutcome.unavailable, "workflows_unreadable")
+    ] * 3
+    for _ in range(3):
+        ci_head_run.reset_state()
+        await _cycle(db)
+    assert len(cloud.requests) == 3
+    assert await _attempts_of(db, task_id) == (0, "seen"), "отказ до отправки не тратит"
+
+    # настоящая отправка с неизвестным исходом тратит попытку
+    cloud.outcomes = [
+        CIRunRequestResult(CIRunRequestOutcome.unavailable, "dispatch_call_failed")
+    ]
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert (await _attempts_of(db, task_id))[0] == 1
+
+    # исключение после резерва до отправки: попытка возвращается
+    other = await _cloud_task(db, slug="boom", branch="task-23/boom")
+    cloud.heads["task-23/boom"] = HEAD_B
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("чтение области упало")
+
+    real = journal.task_in_scope
+    monkeypatch.setattr(journal, "task_in_scope", boom)
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert (await _attempts_of(db, other)) == (0, "seen")
+
+    # отмена до отправки: то же
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(journal, "task_in_scope", real)
+    cloud.open_pr_between = cancelled  # type: ignore[method-assign]
+    ci_head_run.reset_state()
+    with pytest.raises(asyncio.CancelledError):
+        await _cycle(db)
+    assert (await _attempts_of(db, other)) == (0, "seen")
+
+
+async def test_the_overdue_alert_is_rechecked_inside_its_own_transaction(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I2 (Codex круг 3): задачу сдали, пока читалась голова - alert не пишется."""
+    from hub.services import ci_head_run
+
+    task_id = await _requested_overdue(db, cloud, monkeypatch, "late", "task-24/late")
+    ci_head_run.reset_state()
+
+    async def submitted_during_the_read():
+        await db.execute(
+            "UPDATE tasks SET submission_generation=1, submission_sha='x' WHERE id=?",
+            (task_id,),
+        )
+        await db.commit()
+
+    cloud.on_heads = submitted_during_the_read
+    await _cycle(db)
+    assert await _notes(db, task_id, "CI не пришёл") == []
+
+
+async def test_a_new_top_and_the_reset_cursor_are_saved_together(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """I4 (Codex круг 3): сбой между записью вершины и курсора не оставляет половину."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+
+    task_id = await _cloud_task(db)
+    await db.execute(
+        "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt) "
+        "VALUES (?, 'sha', '1', '1')",
+        (task_id,),
+    )
+    await journal.set_state(db, journal.ANNOUNCE_TOP, 0)
+    await journal.set_state(db, journal.ANNOUNCE_CURSOR, 1)
+    await db.execute(
+        "CREATE TRIGGER boom BEFORE UPDATE ON ci_head_state "
+        "WHEN NEW.key='announce_cursor' BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    await db.commit()
+    with pytest.raises(Exception, match="boom"):
+        await ci_head_run.announce_results(db, {}, ci_head_run._Deadline(30))
+    await db.rollback()
+    assert await journal.get_state(db, journal.ANNOUNCE_TOP) == 0, (
+        "вершина откатилась вместе с курсором"
+    )
+
+
+async def test_overdue_and_pruning_wait_for_the_budget_of_the_pass(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P2 (Codex круг 3): бюджет прохода вышел - просрочка не начинает сеть."""
+    from hub.services import ci_head_run
+
+    task_id = await _requested_overdue(db, cloud, monkeypatch, "budget", "task-25/b")
+    reads = cloud.head_reads
+    await ci_head_run.announce_overdue(db, ci_head_run._Deadline(0.0))
+    assert cloud.head_reads == reads
+    assert await _notes(db, task_id, "CI не пришёл") == []
+    await ci_head_run.announce_overdue(db, ci_head_run._Deadline(30.0))
+    assert len(await _notes(db, task_id, "CI не пришёл")) == 1

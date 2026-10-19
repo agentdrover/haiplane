@@ -127,6 +127,9 @@ class _Scope:
         self.workflow_path = project_policy.ci_contract_of(project).workflow_path
         # PR задачи открывается на базу проекта.
         self.base = git_ops_mod._resolve_base(str(project["default_branch"] or ""))
+        #: Запрос форжу фактически НАЧАТ (вызов состоялся): с этого момента попытка
+        #: потрачена, до него - возвращается при любом выходе, в том числе отмене.
+        self.sent = False
 
     def key(self) -> tuple[Any, ...]:
         """Всё, от чего зависит, КУДА и ЧЕМ уйдёт запрос."""
@@ -264,19 +267,31 @@ async def _open_pr(scope: _Scope, dl: _Deadline) -> bool | None:
     return bool(number)
 
 
+#: Причина ``unavailable``, после которой запрос УЖЕ ушёл (POST dispatch). Любая
+#: другая (список workflow не прочитан, нет id) - это отказ ДО отправки.
+_SENT_REASON = "dispatch_call_failed"
+
+
 async def _ask_forge(scope: _Scope, dl: _Deadline) -> tuple[bool, str]:
-    """Попросить прогон; ``(принят, пояснение)``. Исключение и таймаут - неоднозначно."""
-    try:
-        result = await dl.run(
-            lambda: plugins.git_ops.request_ci_run(
-                scope.branch,
-                repo=scope.workspace,
-                gh_repo=scope.gh_repo,
-                forge=scope.forge,
-                workflow_path=scope.workflow_path,
-            ),
-            DISPATCH_CEILING_SECONDS,
+    """Попросить прогон; ``(принят, пояснение)``.
+
+    Пояснение ``ambiguous`` - запрос уходил, исход неизвестен (исключение или
+    таймаут ВНУТРИ вызова, ``dispatch_call_failed``). ``unsent:<причина>`` -
+    форж отказал до отправки: попытка вернётся.
+    """
+
+    async def call() -> Any:
+        scope.sent = True  # вызов начался: дальше «отправлено» нельзя исключить
+        return await plugins.git_ops.request_ci_run(
+            scope.branch,
+            repo=scope.workspace,
+            gh_repo=scope.gh_repo,
+            forge=scope.forge,
+            workflow_path=scope.workflow_path,
         )
+
+    try:
+        result = await dl.run(call, DISPATCH_CEILING_SECONDS)
     except _OutOfTime:
         raise  # бюджет кончился ДО вызова: ничего не отправлено, попытка вернётся
     except Exception as exc:  # noqa: BLE001 - after a send the outcome is unknown
@@ -285,7 +300,9 @@ async def _ask_forge(scope: _Scope, dl: _Deadline) -> tuple[bool, str]:
     if result.outcome == CIRunRequestOutcome.requested:
         return True, result.details or scope.workflow_path
     if result.outcome == CIRunRequestOutcome.unavailable:
-        return False, "ambiguous"
+        if result.reason == _SENT_REASON:
+            return False, "ambiguous"
+        return False, f"unsent:{result.reason}"
     return False, f"{result.outcome.value}/{result.reason}"
 
 
@@ -397,6 +414,9 @@ async def _request(
         )
     elif why == "ambiguous":
         _back_off()  # исход неизвестен: резерв держится, форж пока не трогаем
+    elif why.startswith("unsent:"):
+        await _release(db, scope, sha, before)  # форж отказал до отправки
+        _back_off()
     else:
         await _settle_noting(
             db,
@@ -453,10 +473,12 @@ async def _handle_head(
     if not await _reserve(db, scope, sha):
         return False
     before = (row["state"], int(row["attempts"]), row["reserved_at"])
+    scope.sent = False
     try:
         return await _request(db, scope, sha, dl, before)
-    except _OutOfTime:
-        await _release(db, scope, sha, before)
+    except BaseException:  # включая отмену: попытка тратится только отправкой
+        if not scope.sent:
+            await _release(db, scope, sha, before)
         raise
 
 
@@ -635,8 +657,7 @@ async def announce_results(
     known = known_heads or {}
     top = await journal.top_attempt_id(db)
     if top > await journal.get_state(db, journal.ANNOUNCE_TOP):
-        await journal.set_state(db, journal.ANNOUNCE_TOP, top)
-        await journal.set_state(db, journal.ANNOUNCE_CURSOR, 0)
+        await journal.reset_announce_queue(db, top)  # вершина и курсор - вместе
     cursor = await journal.get_state(db, journal.ANNOUNCE_CURSOR)
     before: int | None = cursor or None
     progress = cursor
@@ -693,7 +714,19 @@ async def _overdue_scopes(
     return scopes
 
 
-async def announce_overdue(db: aiosqlite.Connection) -> None:
+async def _overdue_still_valid(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> bool:
+    """Область ожидания СЕЙЧАС - внутри транзакции записи alert."""
+    project = await repo.resolve_project_for_task(db, task_id)
+    return (
+        project is not None
+        and _in_scope(project)
+        and await journal.task_in_scope(db, task_id, branch)
+    )
+
+
+async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
     """Итог не пришёл за срок: одна запись в ленту, alert и уведомление ответственному.
 
     Срок ``CI_HEAD_RUN_WAIT_MINUTES`` считается от заявки (или от первого
@@ -703,13 +736,16 @@ async def announce_overdue(db: aiosqlite.Connection) -> None:
     читается заново и должна совпасть с ожидаемым sha; голову прочитать не
     удалось - молчим до следующего прохода.
     """
+    if dl.left() <= 0:
+        return  # бюджет прохода вышел: просрочка подождёт следующего тика
     rows = await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES))
     scopes = await _overdue_scopes(db, rows)
     if not scopes:
         return
     try:
         heads = await _read_heads(
-            list(scopes.values()), _Deadline(LABEL_BUDGET_SECONDS)
+            list(scopes.values()),
+            _Deadline(min(LABEL_BUDGET_SECONDS, max(dl.left(), 0.0))),
         )
     except _OutOfTime:
         return
@@ -726,6 +762,8 @@ async def announce_overdue(db: aiosqlite.Connection) -> None:
             )
             key = f"timeout:{row['attempts']}"
             async with write_transaction(db):
+                if not await _overdue_still_valid(db, task_id, str(row["branch"])):
+                    continue  # сдали или сменили область, пока читали голову
                 if await journal.claim_announcement(db, task_id, sha, key):
                     await repo.add_task_update(db, task_id, "hub", "alert", text)
                     await watch_notices.notify_steward(
@@ -771,8 +809,9 @@ async def sweep(db: aiosqlite.Connection) -> None:
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the announce half failed")
     try:
-        await announce_overdue(db)
-        await prune_journals(db)
+        await announce_overdue(db, dl)
+        if dl.left() > 0:
+            await prune_journals(db)
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the overdue half failed")
 

@@ -338,3 +338,18 @@ async def prune_finished(db: aiosqlite.Connection, *, days: int) -> int:
             )
             removed += cur.rowcount or 0
     return removed
+
+
+async def reset_announce_queue(db: aiosqlite.Connection, top: int) -> None:
+    """Новая вершина очереди и курсор с вершины - ОДНОЙ транзакцией.
+
+    Порознь прерывание между ними сохранило бы новую вершину при старом курсоре:
+    следующий проход счёл бы вершину обработанной и пропустил свежий итог.
+    """
+    async with write_transaction(db):
+        for key, value in ((ANNOUNCE_TOP, top), (ANNOUNCE_CURSOR, 0)):
+            await db.execute(
+                "INSERT INTO ci_head_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, int(value)),
+            )
