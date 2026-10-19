@@ -186,6 +186,8 @@ async def test_plain_summary_defect_verify_mcp_one_request_and_300_cap():
     [
         "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
         "sk-abcdefghijklmnopqrstuv вставлен в запрос.",
+        "Ключ sk-abc123 в запросе.",
+        "Токен ghp_abc123 в логе.",
         "ghp_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",
         "gho_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",
         "github_pat_11ABCDEFG0abcdefghijkl в логе.",
