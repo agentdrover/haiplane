@@ -244,8 +244,15 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
     kept: list[str] = []
     dropped: list[str] = []
     skipping = False
+    in_header = True
     for line in diff.splitlines(keepends=True):
-        if line.startswith("+++ "):
+        # A hunk body is not a header: an added "++ x" reads as "+++ x" there
+        # and would switch off the rest of a live file (#1856).
+        if line.startswith("diff --git "):
+            in_header = True
+        elif in_header and line.startswith("@@"):
+            in_header = False
+        if in_header and line.startswith("+++ "):
             raw = line[4:].strip()
             path = raw[2:] if raw.startswith("b/") else raw
             skipping = path != "/dev/null" and drop(path)
@@ -268,13 +275,24 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
 # its source, copies a drop-in called worktree.conf. Neither runs anything in
 # the diff. Deliberately two entries and no wider: deploy/ and tests/ hold
 # working shell and units, and hub/**.py, scripts, CI YAML stay a signal.
-_INERT_SUFFIXES: tuple[str, ...] = (".md",)
-_INERT_PREFIXES: tuple[str, ...] = ("deploy/systemd/prod/",)
+_INERT_SNAPSHOT_DIR = "deploy/systemd/prod/"
+_INERT_SNAPSHOT_FILES = frozenset(
+    {"deploy/systemd/prod/CAPTURE.txt", "deploy/systemd/prod/README.md"}
+)
+_INERT_SNAPSHOT_TREE = "deploy/systemd/prod/etc/"
 
 
 def is_inert_for_process(path: str) -> bool:
-    """Is this path a document or a pinned prod snapshot, not an operation?"""
-    return path.endswith(_INERT_SUFFIXES) or path.startswith(_INERT_PREFIXES)
+    """Is this path a document or a pinned prod snapshot, not an operation?
+
+    Markdown counts only where ``is_documentation`` says it is documentation:
+    a ``.md`` in hub/, skills/ or agents/ is an instruction somebody runs.
+    The snapshot is its listed files and etc/**; any other file in that
+    directory (a script) stays a signal.
+    """
+    if path.endswith(".md") and is_documentation(path):
+        return True
+    return path in _INERT_SNAPSHOT_FILES or path.startswith(_INERT_SNAPSHOT_TREE)
 
 
 def file_line_counts(diff: str) -> list[tuple[str, int]]:

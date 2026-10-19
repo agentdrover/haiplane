@@ -18,6 +18,7 @@ from hub.services.review_dispatch import (
     pick_review_model,
     pick_review_profile,
     process_surface_reasons,
+    split_generated,
     sweep_review_dispatches,
 )
 from tests.review_dispatch_support import (
@@ -1113,6 +1114,11 @@ def test_docs_and_prod_snapshots_are_not_a_process_surface():
         ("deploy/review-runner/run.sh", "git worktree add"),
         ("deploy/systemd/haiplane-x.service", "ExecStart=git worktree add"),
         ("tests/test_x.py", "worktree = 1"),
+        # Markdown that is run, not read, and non-snapshot files in the dir.
+        ("hub/prompts/run.md", "git worktree add"),
+        ("skills/x/SKILL.md", "git worktree add"),
+        ("agents/x.md", "git worktree add"),
+        ("deploy/systemd/prod/run.sh", "git worktree add"),
     ):
         assert process_surface_reasons(_added(path, line)), path
     # An inert file does not hide a live one beside it.
@@ -1131,3 +1137,23 @@ def test_historical_process_diffs_keep_their_signal():
     assert any(r.startswith("запуск подпроцессов") for r in d509)
     assert any(r.startswith("таймауты и отмена") for r in d509)
     assert any(r.startswith("запуск подпроцессов") for r in d544)
+
+
+def test_added_plus_plus_line_does_not_hide_the_rest_of_a_file():
+    # #1856: an added "++ counters.md" is "+++ counters.md" in the diff. Read as
+    # a file header it ended the live .py section and silenced what follows.
+    diff = (
+        "diff --git a/hub/x.py b/hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@ -0,0 +1,2 @@\n+++ counters.md\n+    subprocess.run(['ls'])\n"
+    )
+    assert process_surface_reasons(diff) == ["запуск подпроцессов: subprocess.run"]
+    # split_generated reads headers the same way: an added "++ uv.lock" line
+    # neither drops the rest of the file nor counts as a dropped file.
+    kept, dropped = split_generated(diff)
+    assert dropped == [] and kept == diff
+    lock = (
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1 @@\n+x\n"
+    )
+    kept, dropped = split_generated(diff + lock)
+    assert dropped == ["uv.lock"] and "subprocess.run" in kept and "+x" not in kept
