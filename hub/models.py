@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+from hub.cause_task_view import CauseTaskView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
 _models_log = logging.getLogger("hub")
@@ -2058,6 +2059,8 @@ class ReviewBrief(BaseModel):
     # #438: advisory — non-empty when the branch carries commits of another
     # unmerged task branch (stacked branches). Never blocks the review.
     stacking_warning: str = ""
+    # #1858: task that broke this one (regression fix); None = not a fix.
+    cause_task: CauseTaskView | None = None
     # #1589: manual server steps named by the project for the paths this
     # generation touched. None = no rules configured at submission.
     path_notices: PathNoticesView | None = None

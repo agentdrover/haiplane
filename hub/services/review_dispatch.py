@@ -1125,6 +1125,29 @@ def _all_generated(paths: list[str | None] | None) -> bool:
     return bool(found) and all(p is not None and is_generated(p) for p in found)
 
 
+#: Слова причины deep для исправления регрессии прода (#1858); по ним ленту
+#: и сводку можно искать так же, как прочие основания.
+REGRESSION_FIX_REASON_MARK = "исправление регрессии прода"
+
+
+def regression_fix_reason(task: dict[str, Any]) -> str:
+    """Причина deep, если задача чинит регрессию прода; иначе пустая строка (#1858).
+
+    Основание — две записи паспорта дефекта: ``found_in=prod`` и
+    ``cause_kind=regression``. Исправления размера S сами порождали дефекты
+    (#1289 → #1600, #1398 → #1437), а малая дельта и класс риска их не видели.
+    Пустое или нечитаемое значение — не регрессия: основание срабатывает только
+    на явную запись.
+    """
+    if str(task.get("found_in") or "").strip() != "prod":
+        return ""
+    if str(task.get("cause_kind") or "").strip() != "regression":
+        return ""
+    cause = task.get("caused_by_task_id")
+    named = f", задача-причина #{cause}" if cause else ""
+    return f"{REGRESSION_FIX_REASON_MARK}{named}"
+
+
 def pick_review_profile(
     task: dict[str, Any],
     diff: str | None = None,
@@ -1174,6 +1197,11 @@ def pick_review_profile(
     Deep bought by the rule becomes lite the same way and names the cancelled
     reason; a human request and a security risk keep deep. The forced paths
     meet the stop in :func:`_forced_deep_past_circle`.
+
+    A task that fixes a prod regression (:func:`regression_fix_reason`, #1858)
+    is deep whatever the class, a documentation-only diff or a small delta.
+    The circle stop still turns it into lite, and the daily cap still applies
+    in the caller: only the rules that sit BEFORE them are overridden.
     """
     if (task.get("machine_review_override") or "").strip() == "require":
         return DEEP, ["ревью запрошено человеком"]
@@ -1189,12 +1217,15 @@ def pick_review_profile(
         profile, reasons = DEEP, ["дифф сдачи прочитать не удалось"]
     else:
         profile, reasons = _profile_by_rule(task, diff, risks)
+    regression = regression_fix_reason(task)
+    if regression:
+        profile, reasons = DEEP, [regression, *(reasons if profile == DEEP else [])]
     if profile != DEEP or _declares_security(risks):
         return profile, reasons
     cancelled = [f"отменён повод deep: {r}" for r in reasons]
     if circle_stop is not None:
         return LITE, [circle_stop_reason(circle_stop), *cancelled]
-    if small_delta is None or small_delta[0] > small_delta[1]:
+    if regression or small_delta is None or small_delta[0] > small_delta[1]:
         return profile, reasons
     lines, limit = small_delta
     return LITE, [

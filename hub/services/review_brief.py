@@ -33,6 +33,7 @@ from hub.db import fetchall
 from hub import repository as repo
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
+from hub.cause_task_view import CauseTaskView
 from hub.models import (
     ACLocatorResolution,
     ACTestResultView,
@@ -781,6 +782,41 @@ async def build_review_brief(
     return brief
 
 
+_AREAS_DECLARED = "заявленные области: так их назвал автор задачи-причины, а не дифф"
+
+
+async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
+    """Блок «задача-причина» для исправления регрессии (#1858); иначе None.
+
+    Показывается при ``cause_kind=regression``. Причина удалена или не читается
+    — явное «нет данных», а не пропуск блока: ревьюер должен знать, что смотреть
+    не на что, а не решить, что причины нет.
+    """
+    if str(task_row.get("cause_kind") or "").strip() != "regression":
+        return None
+    cause_id = task_row.get("caused_by_task_id")
+    if not cause_id:
+        return CauseTaskView(note="нет данных: задача-причина не названа")
+    cause = await repo.get_task(db, int(cause_id))
+    if not cause:
+        return CauseTaskView(
+            task_id=int(cause_id),
+            note=f"нет данных: задача #{cause_id} удалена или недоступна",
+        )
+    try:
+        areas = [str(a) for a in json.loads(cause["affected_areas"] or "[]")]
+    except (ValueError, TypeError):
+        areas = []
+    return CauseTaskView(
+        state="known",
+        task_id=int(cause_id),
+        title=str(cause["title"] or ""),
+        link=f"/tasks/{int(cause_id)}",
+        affected_areas=areas,
+        areas_note=_AREAS_DECLARED,
+    )
+
+
 async def _late_reads(
     db, task_row: dict[str, Any], task_view, mr_row, timer: _BriefTimer
 ) -> dict[str, Any]:
@@ -808,6 +844,7 @@ async def _late_reads(
         notices = await path_notices.view_for_generation(db, task_id, generation)
         in_flight = await review_evidence.inflight_view(db, task_row)
         generation_state = await generation_review(db, task_row)
+        cause_task = await cause_task_view(db, task_row)
     # Models are built outside the read zone: they are assembly, not a read.
     late: dict[str, Any] = {
         "profile_downgrade": downgrade,
@@ -825,6 +862,7 @@ async def _late_reads(
         "path_notices": notices,
         "review_in_flight": in_flight,
         "current_generation_review": generation_state,
+        "cause_task": cause_task,
     }
     late["verdict_route"] = (
         await timer.run("verdict_route", _brief_verdict_route(db, task_view))

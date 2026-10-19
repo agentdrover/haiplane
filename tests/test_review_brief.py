@@ -17,6 +17,7 @@ where the command would be, with the blocks it disabled saying so themselves.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -2019,3 +2020,48 @@ async def test_slow_brief_logs_once_above_threshold(
     other = slow.model_copy(deep=True)
     other.timings = at_threshold.timings
     assert packet_hash(packet(slow)) == packet_hash(packet(other))
+
+
+async def test_the_brief_shows_the_causing_task(client: AsyncClient, db):
+    """AC-2 (#1858): исправление регрессии показывает задачу-причину в брифе."""
+    cause = (
+        await client.post(
+            "/api/tasks", json={"title": "Task that broke it", "task_type": "task"}
+        )
+    ).json()["id"]
+    await db.execute(
+        "UPDATE tasks SET affected_areas = ? WHERE id = ?",
+        (json.dumps(["hub/a.py", "tests/test_a.py"]), cause),
+    )
+    task_id = await _submitted_task(client, db, "Fix of a regression")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (cause, task_id),
+    )
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    block = brief["cause_task"]
+    assert block["state"] == "known", block
+    assert block["task_id"] == cause
+    assert block["title"] == "Task that broke it"
+    assert block["link"] == f"/tasks/{cause}"
+    assert block["affected_areas"] == ["hub/a.py", "tests/test_a.py"]
+    assert "заявленные" in block["areas_note"], block
+    assert block["cause_kind"] == "regression"
+
+    # Причина удалена: явное «нет данных», блок не пропадает.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.execute("DELETE FROM tasks WHERE id = ?", (cause,))
+    await db.commit()
+    gone = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()["cause_task"]
+    assert gone["state"] == "no_data", gone
+    assert "нет данных" in gone["note"], gone
+    assert gone["task_id"] == cause
+
+    # Не регрессия: блока нет.
+    await db.execute("UPDATE tasks SET cause_kind='ops' WHERE id=?", (task_id,))
+    await db.commit()
+    other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert other["cause_task"] is None

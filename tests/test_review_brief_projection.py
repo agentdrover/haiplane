@@ -759,8 +759,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # эталон переснят осознанно; пакет стюарда и его хеш остались прежними.
 # #1830: machine_review получил author_answers и undisposed_author_lines (пустые
 # здесь); переснят REST-бриф и пакет стюарда, packet_hash прежний.
-GOLDEN_REST_BRIEF = "f1433041b773f86935d4e8c77371e7e0af014f8380baf1898fda826c3ddaa708"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "2f00995ebf810d3c70a45ead2b1e2694af5ae2a16ea026855cc78c848c14433f"  # pragma: allowlist secret
+# #1858: REST-бриф получил cause_task (null здесь); переснят он и пакет стюарда.
+GOLDEN_REST_BRIEF = "d32254105fb0900d5f255bd5f238bbde397fdd8e61185dbffaeaa316390e1362"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "afa1fe01e601c119f394cb869aa9d3cf9d7239b3ab53f88fefa14c7e48a88ee4"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
@@ -1266,6 +1267,10 @@ _BAD: dict[str, tuple[str, Any]] = {
         {"reason": "self_review_forbidden", "message": "m", "hint": "h"},
     ),
     "stacking_warning": ("stacking_warning", "стек веток"),
+    "cause_task": (
+        "cause_task",
+        {"state": "known", "task_id": 7, "title": "Причина", "link": "/tasks/7"},
+    ),
     "path_notices": (
         "path_notices",
         {"generation": 1, "state": "matched", "text": "ручной шаг"},
