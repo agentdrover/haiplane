@@ -118,7 +118,8 @@ async def test_replay_of_a_request_created_before_freeze_rationale_is_not_a_conf
     client, db
 ):
     # #1594: хеш, посчитанный кодом до появления freeze_rationale, остаётся
-    # хешем того же запроса; пустое умолчание нового поля его не меняет.
+    # хешем того же запроса; пустое умолчание нового поля его не меняет
+    # (то же для plain_summary, #1811).
     import hashlib
     import json
 
@@ -128,7 +129,8 @@ async def test_replay_of_a_request_created_before_freeze_rationale_is_not_a_conf
     first = await client.post("/api/tasks", json=body)
     assert first.status_code == 201, first.text
     payload = TaskCreate(**body).model_dump(
-        mode="json", exclude={"client_request_id", "freeze_rationale"}
+        mode="json",
+        exclude={"client_request_id", "freeze_rationale", "plain_summary"},
     )
     legacy = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
