@@ -204,9 +204,7 @@ async def _review_brief(
     if recommend is None:
         recommend = _from_rules(proof, blockers, route)
         if judged is not None and proof is None:
-            recommend["why"].append(
-                "суждение стюарда не принято: «Принять» не доказано"
-            )
+            recommend["why"].append("суждение стюарда не принято: условия не доказаны")
     risks = [_risk(b.severity, b.risk, b.why) for b in blockers] + _context_risks(task)
     sha = str(task.get("submission_sha") or "")[:12]
     return _brief(

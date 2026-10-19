@@ -828,6 +828,12 @@
                       {% endif %}
                     </dd>
                     {% endif %}
+                    {# #1874: оценка минут владельца по нормативам; строку собирает
+                       хаб (services/owner_minutes), шаблон её не пересчитывает. #}
+                    {% if task.owner_minutes %}
+                    <dt>Минуты владельца</dt>
+                    <dd data-owner-minutes="{{ task.owner_minutes.status }}">{{ task.owner_minutes.line }}</dd>
+                    {% endif %}
                     {% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>

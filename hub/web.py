@@ -1245,6 +1245,7 @@ async def web_executor_merge(
         task_id,
         issuer_principal_id=int(identity.principal_id),
         issuer=identity.username,
+        issuer_human=identity.is_human,
     )
     if not result.launched:
         return await _web_task_detail_page(
@@ -1314,6 +1315,7 @@ async def web_executor_repair(
         task_id,
         issuer_principal_id=int(identity.principal_id),
         issuer=identity.username,
+        issuer_human=identity.is_human,
     )
     if not result.launched:
         return await _web_task_detail_page(
@@ -1351,7 +1353,11 @@ async def web_executor_launch(
     if project is None:
         return _projects_error_redirect("project not found")
     result = await launch_executor(
-        db, project, issuer_principal_id=int(identity.principal_id), target=target
+        db,
+        project,
+        issuer_principal_id=int(identity.principal_id),
+        target=target,
+        issuer_human=identity.is_human,
     )
     if not result.launched:
         return _projects_error_redirect(
@@ -3187,7 +3193,9 @@ async def web_approve_task(
         force=force,
     )
     try:
-        await services.approve_task(_db(request), task_id, body)
+        await services.approve_task(
+            _db(request), task_id, body, who=current_identity(request)
+        )
     except HTTPException as exc:
         detail = exc.detail
         # Проверка и её следствие должны стоять рядом: isinstance, спрятанный
@@ -3257,7 +3265,9 @@ async def web_answer_task(
 ):
     _require_human_web(request)
     body = TaskAnswer(answer=answer, resume=resume)
-    await services.answer_question(_db(request), task_id, body)
+    await services.answer_question(
+        _db(request), task_id, body, who=current_identity(request)
+    )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
@@ -3328,7 +3338,9 @@ async def web_decide_task(
         # The field that actually failed, not the newest one (#1333 review,
         # 40ac6a807ddad21b): a bad action must not read as a bad PR fate.
         raise HTTPException(400, _invalid_fields_detail(exc)) from exc
-    await services.decide_task(_db(request), task_id, body)
+    await services.decide_task(
+        _db(request), task_id, body, who=current_identity(request)
+    )
     if _is_htmx(request):
         return await _htmx_decide_fragment(
             request, task_id, body.pr_disposition, inbox_project if from_inbox else None
@@ -3435,6 +3447,7 @@ async def web_batch_approve_selected(
         result = await services.batch_approve_tasks(
             db,
             BatchApprove(task_ids=task_ids, comment="Approved from inbox selection"),
+            who=identity,
         )
     if _is_htmx(request):
         # Re-rendered INSIDE the project the reader was looking at: refreshing
@@ -3776,7 +3789,9 @@ async def web_approve_proposal_compat(
 ):
     _require_human_web(request)
     body = TaskApprove(comment=comment, run=True)
-    await services.approve_task(_db(request), proposal_id, body)
+    await services.approve_task(
+        _db(request), proposal_id, body, who=current_identity(request)
+    )
     return RedirectResponse("/", status_code=303)
 
 
