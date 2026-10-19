@@ -68,6 +68,9 @@ def hash_task_create_payload(body: TaskCreate) -> str:
     # обновления, получил бы 409; непустое - изменение запроса.
     if not payload.get("freeze_rationale"):
         payload.pop("freeze_rationale", None)
+    # #1811: то же для plain_summary - NULL (умолчание) хеш не меняет.
+    if payload.get("plain_summary") is None:
+        payload.pop("plain_summary", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

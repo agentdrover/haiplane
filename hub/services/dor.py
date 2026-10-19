@@ -39,6 +39,9 @@ DOR_CHECK_KEYS: tuple[str, ...] = (
     "has_validation_commands",
     "has_size",
     "has_wip_tag",
+    # #1811: «о чём задача простым языком». Рекомендация для всех, блокирует
+    # только задачи, созданные после выката (plain_summary_required).
+    "has_plain_summary",
     # #842: which code the work touches. Required only for the work types
     # that mean a code change — see DOR_REQUIRED_BY_WORK_TYPE.
     "has_affected_areas",
@@ -54,6 +57,9 @@ DOR_CHECK_KEYS: tuple[str, ...] = (
 #: #1604: проект задачи без workspace_path. Не входит в DOR_CHECK_KEYS: пункт
 #: появляется в отчёте только когда клона нет, у проекта с клоном его нет совсем.
 WORKSPACE_MISSING_CHECK = "workspace_missing"
+
+#: #1811: пункт plain_summary; в счёт не идёт, обязателен только новым задачам.
+PLAIN_SUMMARY_CHECK = "has_plain_summary"
 
 # Checks that are visible but free. They appear in the DoR table and earn a
 # recommendation, but cost nothing in the readiness score.
@@ -74,6 +80,7 @@ DOR_ADVISORY_KEYS: frozenset[str] = frozenset(
         # EVERY work type — see DoREvaluation.advisory users in evaluate.
         "statement_paths_resolve",
         WORKSPACE_MISSING_CHECK,
+        PLAIN_SUMMARY_CHECK,
     }
 )
 
@@ -450,6 +457,8 @@ def evaluate_from_data(
     result_kind: str | None = None,
     rollback: str | None = None,
     state_ac_count: int = 0,
+    plain_summary: str | None = None,
+    plain_summary_required: bool = False,
 ) -> DoREvaluation:
     """Pure, side-effect-free DoR evaluation from explicit data.
 
@@ -470,6 +479,15 @@ def evaluate_from_data(
                 "problem_statement is filled"
                 if problem_statement
                 else "problem_statement is empty"
+            ),
+        ),
+        PLAIN_SUMMARY_CHECK: DoRCheckItem(
+            key=PLAIN_SUMMARY_CHECK,
+            passed=bool(plain_summary and plain_summary.strip()),
+            detail=(
+                "plain_summary is filled"
+                if (plain_summary or "").strip()
+                else "plain_summary is empty"
             ),
         ),
         "has_business_value": DoRCheckItem(
@@ -555,6 +573,8 @@ def evaluate_from_data(
     if workspace_gap is not None:
         checks.append(_workspace_missing_item(workspace_gap))
     required = _required_for(work_type)
+    if plain_summary_required:
+        required = required | {PLAIN_SUMMARY_CHECK}
     if state:
         checks += _state_items(rollback, state_ac_count)
         required = (required - STATE_INAPPLICABLE) | {
@@ -569,8 +589,11 @@ def evaluate_from_data(
         # Отказывает только найденное нарушение: «не проверено» не блокирует.
         required = required | {STATEMENT_PATHS_CHECK}
     missing = frozenset(c.key for c in checks if c.key in required and not c.passed)
-    advisory = frozenset({STATEMENT_PATHS_CHECK, WORKSPACE_MISSING_CHECK}) | (
-        DOR_ADVISORY_KEYS - {STATEMENT_PATHS_CHECK, WORKSPACE_MISSING_CHECK}
+    always = frozenset(
+        {STATEMENT_PATHS_CHECK, WORKSPACE_MISSING_CHECK, PLAIN_SUMMARY_CHECK}
+    )
+    advisory = always | (
+        DOR_ADVISORY_KEYS - always
         if (work_type or WorkType.feature.value) in DOR_ADVISORY_WORK_TYPES
         else frozenset()
     )
@@ -754,6 +777,8 @@ async def evaluate_dor(
         result_kind=row["result_kind"],
         rollback=row["rollback"],
         state_ac_count=qualifying_ac_count(snapshot.acs),
+        plain_summary=row["plain_summary"],
+        plain_summary_required=bool(row["plain_summary_required"]),
     )
 
 

@@ -1159,4 +1159,26 @@ MIGRATIONS_3: list[tuple[str, str]] = [
         "backfill_ci_run_reports_contract_fp",
         "UPDATE ci_run_reports SET contract_fp = '8f4dfc401a93a00850b2b78973c6ebd8c7614a35fe0f70b1ec82a448196400ca'",  # pragma: allowlist secret
     ),
+    (
+        # #1811: «о чём задача простым языком», до 300 символов (предел задан
+        # моделью). NULL - автор не писал.
+        "add_tasks_plain_summary",
+        "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
+    ),
+    (
+        # #1811: водяной знак «новых» задач - одна строка. has_plain_summary
+        # блокирует только задачи с id больше знака (hub.plain_summary).
+        "create_plain_summary_boundary",
+        """CREATE TABLE IF NOT EXISTS plain_summary_boundary (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            max_task_id INTEGER NOT NULL
+        )""",
+    ),
+    (
+        # #1811: знак = MAX(tasks.id) на момент применения (0 в пустой базе).
+        # INSERT OR IGNORE: повтор миграции знак не сдвигает.
+        "set_plain_summary_boundary",
+        "INSERT OR IGNORE INTO plain_summary_boundary (id, max_task_id) "
+        "SELECT 1, COALESCE(MAX(id), 0) FROM tasks",
+    ),
 ]

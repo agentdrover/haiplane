@@ -14,6 +14,11 @@ from typing import Any
 
 from hub import config
 from hub.cli_executor_host import add_executor_host_parsers
+from hub.cli_task_fields import (
+    _add_result_kind_args,
+    add_plain_summary_option,
+    put_plain_summary,
+)
 from hub.models import (
     DEFAULT_FORGE,
     FORGES,
@@ -238,26 +243,6 @@ def _put_state_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
         body["rollback"] = args.rollback
 
 
-def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--result-kind",
-        dest="result_kind",
-        choices=("commit", "state"),
-        default=None,
-        help=(
-            "commit (default) or state (#1647): the result is a state of the "
-            "world, submitted with evidence and accepted by a human; leaf "
-            "task/subtask only, changes only in draft"
-        ),
-    )
-    parser.add_argument(
-        "--rollback",
-        dest="rollback",
-        default=None,
-        help="How to undo a state result (required by DoR for state tasks)",
-    )
-
-
 def cmd_task(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "title": args.title,
@@ -437,8 +422,10 @@ def cmd_propose(args: argparse.Namespace) -> int:
         }
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
+        put_plain_summary(body, args)
         _print_json(_api("POST", "/api/prod-defects", body))
         return 0
+    put_plain_summary(body, args)
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     result = _api("POST", "/api/tasks", body)
@@ -1276,6 +1263,7 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("due_date", "due_date"),
     ("user_story", "user_story"),
     ("problem", "problem_statement"),
+    ("plain_summary", "plain_summary"),
     ("value", "business_value"),
     ("tech_hints", "technical_hints"),
     ("human_owner", "human_owner"),
@@ -3045,6 +3033,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_result_kind_args(p_refine)
     p_refine.add_argument("--problem", dest="problem", default=None)
+    add_plain_summary_option(p_propose, p_refine)
     p_refine.add_argument("--value", dest="value", default=None, help="Business value")
     p_refine.add_argument(
         "--tech-hints",

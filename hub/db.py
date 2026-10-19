@@ -9,6 +9,7 @@ from typing import Any
 import aiosqlite
 
 from hub import skill_publish
+from hub.plain_summary import plain_summary_view
 from hub.skill_files import load_skill_files
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
@@ -180,6 +181,8 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "due_date",
     "user_story",
     "problem_statement",
+    # #1811: простым языком; читается TaskView вместе с запасным текстом.
+    "plain_summary",
     "business_value",
     "scope_in",
     "scope_out",
@@ -302,6 +305,10 @@ def structured_fields_from_row(row: Any) -> dict[str, Any]:
             out[field] = deserialize_str_list(value)
         else:
             out[field] = value
+    if "plain_summary" in out:
+        out.update(
+            plain_summary_view(out["plain_summary"], out.get("problem_statement"))
+        )
     for ts_field in (
         "readiness_score",
         "dor_passed",
