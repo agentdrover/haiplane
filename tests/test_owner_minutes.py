@@ -759,6 +759,16 @@ async def test_accrual_pass_is_idempotent_and_restartable(
     await _human_event(db, world.owner_id, task_id)
 
     await _pass(db)  # первая инициализация
+    # Инициализация закоммичена сама и видна другому соединению.
+    assert not db.in_transaction
+    peek = await aiosqlite.connect(db_dsn)
+    try:
+        seen = await (
+            await peek.execute("SELECT COUNT(*) FROM owner_minutes_state")
+        ).fetchone()
+    finally:
+        await peek.close()
+    assert seen[0] == 1
     state = (await _rows(db, "SELECT * FROM owner_minutes_state"))[0]
     top = (await _rows(db, "SELECT MAX(id) AS m FROM events"))[0]["m"]
     assert state["cursor_event_id"] == top and state["tracking_since"]
