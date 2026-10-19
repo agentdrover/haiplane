@@ -24,6 +24,10 @@ TYPE_CHECKING. Разрешение ``from a import b``: существующи�
   * файл, который не разбирается — тихо считать его «без импортов» нельзя;
   * removed_by не по формату (или плейсхолдер ``--update``).
 
+Чего проверка не видит: динамические импорты (``importlib.import_module``,
+``__import__``) и обращения через атрибут (``import hub; hub.services.x``) — в AST
+это не ребро между модулями. Сегодня в hub/ их нет; появятся — расширяйте обход.
+
 ``--update`` дописывает в ledger только новые запрещённые рёбра с плейсхолдером
 и существующих записей не меняет; причину пишет человек.
 """
@@ -55,6 +59,7 @@ class Config:
     layers: dict[str, dict]
     forbidden: dict[str, list[str]]
     ledger: dict[Edge, dict]
+    duplicates: tuple[Edge, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -73,8 +78,10 @@ class Verdict:
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    ledger = {(e["from"], e["to"]): e for e in raw.get("ledger", [])}
-    return Config(raw["layers"], raw["forbidden"], ledger)
+    keys = [(e["from"], e["to"]) for e in raw.get("ledger", [])]
+    ledger = dict(zip(keys, raw.get("ledger", []), strict=True))
+    dupes = tuple(sorted({k for k in keys if keys.count(k) > 1}))
+    return Config(raw["layers"], raw["forbidden"], ledger, dupes)
 
 
 def _pattern(glob: str) -> re.Pattern[str]:
@@ -176,7 +183,7 @@ def _layer_problems(modules: frozenset[str], config: Config) -> list[str]:
 
 def _config_problems(config: Config) -> list[str]:
     names = set(config.layers)
-    problems = []
+    problems = [f"ledger: ребро записано дважды: {_fmt(e)}" for e in config.duplicates]
     for src, dsts in config.forbidden.items():
         for layer in [src, *dsts]:
             if layer not in names:
@@ -207,7 +214,7 @@ def check(scan: Scan, config: Config) -> Report:
     invalid = []
     for edge, entry in sorted(config.ledger.items()):
         problem = validate_removed_by(entry.get("removed_by"))
-        if entry.get("removed_by") == PLACEHOLDER:
+        if str(entry.get("removed_by", "")).strip() == PLACEHOLDER:
             problem = "плейсхолдер --update: впишите причину"
         if problem:
             invalid.append((edge, problem))

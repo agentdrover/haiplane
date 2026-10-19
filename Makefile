@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test lint format types budget security check
+.PHONY: setup hooks doctor test lint format types budget layers security check
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:

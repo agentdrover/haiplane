@@ -113,6 +113,29 @@ def test_every_forbidden_direction_turns_ci_red(tmp_path, capsys):
     assert not failures, "\n".join(failures)
 
 
+def test_the_forbidden_table_is_pinned():
+    """Таблицу запретов не ослабить молча: ожидаемая копия лежит здесь, не в проверяемом файле."""
+    raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+    assert {k: sorted(v) for k, v in raw["forbidden"].items()} == {
+        "services": ["entry"],
+        "integrations": ["db", "entry", "poller", "repository", "services"],
+        "repository": ["entry", "poller", "services"],
+        "models": ["db", "entry", "poller", "repository", "services"],
+        "db": ["entry", "poller", "services"],
+        "security": ["entry"],
+        "support": ["entry"],
+    }
+
+
+def test_a_duplicated_ledger_edge_fails(tmp_path, capsys):
+    edge = {"from": "hub.models", "to": "hub.services.lifecycle"}
+    pkg = _grow(tmp_path, {"models.py": "import hub.services.lifecycle\n"})
+    good = dict(edge, removed_by="task:#1 — снять")
+    bad = dict(edge, removed_by="TODO")
+    rc, out = _run(pkg, _config(tmp_path, [bad, good]), capsys)
+    assert rc == 1 and "дважды" in out, out
+
+
 def test_an_import_from_an_init_module_is_an_edge_too(tmp_path, capsys):
     """AC-1: __init__ пакета — источник ребра; services/__init__ — слой services."""
     pkg = _grow(tmp_path, {"services/__init__.py": "from hub import app\n"})
