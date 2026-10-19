@@ -194,10 +194,11 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
 # line, not on shlex tokens: shlex would strip the quotes of ``'A=1' cmd`` and
 # accept a word the shell takes for a command name. VALUE is a run of plain
 # characters or one-line '...' / "..." groups; a backslash, a backtick, shell
-# operators and an unclosed quote are not supported, so such a line stays "not a
+# operators (in VALUE) and an unclosed quote are not supported; VALUE ends only at
+# a space or tab, as in the shell, so such a line stays "not a
 # command" exactly as before.
 _ENV_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
-_ENV_VALUE = r"""(?:[^\s'"\\;&|<>()`]|'[^']*'|"[^"\\`]*")*"""
+_ENV_VALUE = r"""(?:[^ \t\r\n'"\\;&|<>()`]|'[^'\\]*'|"[^"\\`]*")*"""
 _ENV_ASSIGNMENT = re.compile(rf"^{_ENV_NAME}=")
 _ENV_PREFIX = re.compile(rf"^(?:{_ENV_NAME}={_ENV_VALUE}[ \t]+)+")
 

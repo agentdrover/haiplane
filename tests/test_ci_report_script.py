@@ -150,6 +150,7 @@ def test_env_prefixed_commands_count_as_commands(script, monkeypatch):
         "A=$HOME T",
         "  A=1   T -x  ",
         "A= T",
+        "A=a\u00a0b T",  # NBSP is not a separator for the shell
     ):
         assert script.is_command(line) is True, line
     for line in (
@@ -171,6 +172,8 @@ def test_env_prefixed_commands_count_as_commands(script, monkeypatch):
         "A=$(x y) T",
         "A=1 ;T",
         "A=1 &T",
+        "A='a\\b' T",
+        'A="a\\b" T',
     ):
         assert script.is_command(line) is False, line
     # Lines without a prefix are judged exactly as before.
