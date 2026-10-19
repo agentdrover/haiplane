@@ -242,6 +242,7 @@ CODE_DIFF_UNREADABLE = "diff_unreadable"
 CODE_OUTSIDE_AREAS = "diff_outside_areas"
 CODE_CLASS_MISSING = "risk_class_missing"
 CODE_CLASS_RAISED = "risk_class_raised"
+CODE_CEILING = "class_above_policy_ceiling"
 CODE_MODEL_UNDECLARED = "model_undeclared"
 CODE_TEXT_ORIGIN = "text_recovered_report"
 #: #1688: дифф меняет входы CI (или не прочитан) — автопилот не решает.
@@ -604,7 +605,43 @@ async def _branch_stage(
         order = list(RiskClass)
         if order.index(diff_class) > order.index(RiskClass(stored_raw)):
             return _refuse_with(CODE_CLASS_RAISED, "дифф поднял класс риска", ctx)
-    return None
+    return await _ceiling_stage(db, task_id, ctx, stored_raw, diff_class)
+
+
+async def _ceiling_stage(
+    db: aiosqlite.Connection,
+    task_id: int,
+    ctx: _Ctx,
+    stored_raw: str,
+    diff_class: RiskClass | None,
+) -> AutoStance | None:
+    """Потолок класса проекта (``auto_approve_max_class``, #1855), та же таблица, что у стюарда.
+
+    Неизвестный класс (пересчёта нет) при заданном потолке — вердикт за
+    человеком. Факт запоминается для перепроверки в транзакции записи.
+    """
+    from hub.services.steward_apply import (
+        class_ceiling_refusal,
+        current_ceiling,
+        remember_risk_fact,
+    )
+    from hub.services.steward_evidence import present
+
+    key = "auto_approve_max_class"
+    ceiling = await current_ceiling(db, task_id, key)
+    fact = present(
+        "risk_class",
+        "класс автовердикта",
+        stored=stored_raw,
+        recomputed=diff_class.value if diff_class else None,
+        raised=False,
+    )
+    await remember_risk_fact(db, task_id, ctx.generation, fact, key)
+    refusal = class_ceiling_refusal(ceiling, fact, key)
+    if refusal is None:
+        return None
+    note = f"Автовердикт НЕ вынесен: {refusal[1]}. Вердикт остаётся человеку."
+    return _refuse_with(CODE_CEILING, refusal[1], ctx, note=note)
 
 
 async def _independence_stage(
@@ -703,6 +740,14 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     if await task_automation_not_applicable(db, task_id):
         # #1647: автопилот не выносит вердикт по задаче-состоянию.
         return False
+    from hub.services.steward_apply import ceiling_scope
+
+    # #1855: факт класса ранней проверки живёт одно решение автопилота.
+    async with ceiling_scope():
+        return await _decide(db, task_id)
+
+
+async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
     stance = await autopilot_stance(db, task_id)
     for alert in stance.audit_alerts:
         await repo.add_task_update(

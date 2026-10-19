@@ -440,6 +440,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     "steward_watch",
     "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
     "steward_approve_max_class",  # #1855: читатель project_policy.steward_approve_max_class_of
+    "auto_approve_max_class",  # #1855: тот же потолок автопилота, auto_approve_max_class_of
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (

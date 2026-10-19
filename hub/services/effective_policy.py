@@ -208,6 +208,10 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.steward_approve_max_class_of,
         "project_policy.steward_approve_max_class_of",
     ),
+    "auto_approve_max_class": PolicyEntry(
+        project_policy.auto_approve_max_class_of,
+        "project_policy.auto_approve_max_class_of",
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
@@ -519,6 +523,11 @@ def _readiness_lines(report: dict[str, Any] | None) -> list[str]:
         )
     if not report["projects"]:
         lines.append("    act scope: no project delegates the verdict to the steward")
+    for project in report.get("autopilot_projects") or []:
+        ceiling = project["auto_approve_max_class"] or "none"
+        lines.append(
+            f"    autopilot scope: {project['slug']} (verdict=auto, ceiling {ceiling})"
+        )
     counts = report["candidate_counts"]
     lines.append(
         f"    candidates: ready {counts['ready']}, blocked {counts['blocked']}, "

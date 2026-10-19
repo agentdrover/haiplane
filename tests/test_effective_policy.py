@@ -1365,6 +1365,11 @@ async def test_steward_approve_max_class_is_read_and_validated(ci_runner_hub):
     assert read({"steward_approve_max_class": 1}) == "unreadable"
     assert "steward_approve_max_class" in GATE_POLICY_KEYS
     assert effective_policy.unsummarised_keys() == []
+    # Тот же ключ для автопилота: тот же валидатор и тот же читатель.
+    auto = project_policy.auto_approve_max_class_of
+    assert auto({}) is None and auto({"auto_approve_max_class": "r2"}) == "r2"
+    assert auto({"auto_approve_max_class": "R2"}) == "unreadable"
+    assert "auto_approve_max_class" in GATE_POLICY_KEYS
 
     resp = await client.post(
         "/api/projects", json={"slug": "sam", "name": "Sam"}, headers=human
@@ -1398,6 +1403,19 @@ async def test_steward_approve_max_class_is_read_and_validated(ci_runner_hub):
     assert reset.status_code == 200, reset.text
     row = await rows()
     assert (row["value"], row["source"]) == (None, "default")
+
+    for bad in ("R2", "high", 2):
+        resp = await client.patch(
+            url, json={"gate_policy": {"auto_approve_max_class": bad}}, headers=human
+        )
+        assert resp.status_code == 422, (bad, resp.text)
+    ok = await client.patch(
+        url, json={"gate_policy": {"auto_approve_max_class": "r1"}}, headers=human
+    )
+    assert ok.status_code == 200, ok.text
+    await client.patch(
+        url, json={"gate_policy": {"auto_approve_max_class": None}}, headers=human
+    )
 
     # Правит только человек или админ: агент и ci_runner получают отказ.
     agent = {"Authorization": "Bearer unused-env-token"}
@@ -1517,6 +1535,7 @@ async def test_the_act_readiness_report_is_a_pure_read(
     # Охват поимённо: только проекты с verdict=steward.
     assert [p["slug"] for p in report["projects"]] == ["open-1855", "pilot-1855"]
     assert report["projects"][1]["steward_approve_max_class"] == "r1"
+    assert report["autopilot_projects"] == []
     by_task = {c["task_id"]: c for c in report["candidates"]}
     assert by_task[ready]["state"] == "ready"  # потолка нет
     # Потолок задан, пересчитанного класса нет: «не проверено» не равно «в пределах».

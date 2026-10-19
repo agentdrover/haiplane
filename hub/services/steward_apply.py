@@ -181,7 +181,9 @@ def _class_of(raw: Any) -> RiskClass | None:
         return None
 
 
-def class_ceiling_refusal(ceiling: str | None, fact: Any) -> tuple[str, str] | None:
+def class_ceiling_refusal(
+    ceiling: str | None, fact: Any, key: str = "steward_approve_max_class"
+) -> tuple[str, str] | None:
     """Потолок класса риска для approve стюарда против факта ``risk_class`` (#1855).
 
     Таблица решений при заданном потолке:
@@ -198,7 +200,7 @@ def class_ceiling_refusal(ceiling: str | None, fact: Any) -> tuple[str, str] | N
     """
     if ceiling is None:
         return None
-    named = f"steward_approve_max_class={ceiling}"
+    named = f"{key}={ceiling}"
     if ceiling == STEWARD_CEILING_UNREADABLE:
         return (
             REFUSED_CLASS_CEILING,
@@ -244,7 +246,7 @@ def class_ceiling_refusal(ceiling: str | None, fact: Any) -> tuple[str, str] | N
 # получить (сеть), поэтому берётся факт ранней проверки — привязанный к
 # (задача, поколение, коммит сдачи) и живущий ОДНО применение: контекст
 # открывает ``ceiling_scope``. Нет контекста, записи или совпадения — отказ.
-_EARLY_RISK: ContextVar[dict[int, tuple[int, str, Any]] | None] = ContextVar(
+_EARLY_RISK: ContextVar[dict[int, tuple[int, str, Any, str]] | None] = ContextVar(
     "steward_early_risk", default=None
 )
 
@@ -259,8 +261,12 @@ async def ceiling_scope() -> AsyncIterator[None]:
         _EARLY_RISK.reset(token)
 
 
-async def _remember_risk_fact(
-    db: aiosqlite.Connection, task_id: int, generation: int, fact: Any
+async def remember_risk_fact(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    fact: Any,
+    key: str = "steward_approve_max_class",
 ) -> None:
     from hub import repository as repo
 
@@ -268,25 +274,22 @@ async def _remember_risk_fact(
     if known is None:
         return
     task = dict(await repo.get_task(db, task_id) or {})
-    known[task_id] = (generation, str(task.get("submission_sha") or ""), fact)
+    known[task_id] = (generation, str(task.get("submission_sha") or ""), fact, key)
 
 
-async def current_ceiling(db: aiosqlite.Connection, task_id: int) -> str | None:
-    """Потолок approve стюарда проекта задачи по ПЕРЕЧИТАННОЙ политике (#1855)."""
+async def current_ceiling(
+    db: aiosqlite.Connection, task_id: int, key: str = "steward_approve_max_class"
+) -> str | None:
+    """Потолок решателя (ключ ``key``) по ПЕРЕЧИТАННОЙ политике проекта (#1855)."""
     from hub import repository as repo
-    from hub.services.project_policy import (
-        gate_policy_of,
-        steward_approve_max_class_of,
-    )
+    from hub.services.project_policy import _ceiling_of, gate_policy_of
 
     project = await repo.resolve_project_for_task(db, task_id)
-    return steward_approve_max_class_of(
-        gate_policy_of(project) if project is not None else {}
-    )
+    return _ceiling_of(gate_policy_of(project) if project is not None else {}, key)
 
 
 async def ceiling_gate(
-    db: aiosqlite.Connection, task_id: int
+    db: aiosqlite.Connection, task_id: int, key: str = "steward_approve_max_class"
 ) -> tuple[str, str] | None:
     """Потолок внутри транзакции записи вердикта (#1855).
 
@@ -298,7 +301,7 @@ async def ceiling_gate(
     from hub import repository as repo
     from hub.services.steward_evidence import present
 
-    ceiling = await current_ceiling(db, task_id)
+    ceiling = await current_ceiling(db, task_id, key)
     if ceiling is None:
         return None
     task = dict(await repo.get_task(db, task_id) or {})
@@ -307,10 +310,10 @@ async def ceiling_gate(
         int(task.get("submission_generation") or 0),
         str(task.get("submission_sha") or ""),
     )
-    if record is None or (record[0], record[1]) != live:
+    if record is None or (record[0], record[1], record[3]) != (*live, key):
         return (
             REFUSED_CLASS_CEILING,
-            f"steward_approve_max_class={ceiling}: недостающий факт risk_class — "
+            f"{key}={ceiling}: недостающий факт risk_class — "
             "ранняя проверка не относится к этой сдаче (поколение или коммит)",
         )
     fact = record[2]
@@ -323,7 +326,7 @@ async def ceiling_gate(
             recomputed=value.get("recomputed"),
             raised=value.get("raised"),
         )
-    return class_ceiling_refusal(ceiling, fact)
+    return class_ceiling_refusal(ceiling, fact, key)
 
 
 async def ceiling_refusals(
@@ -331,7 +334,7 @@ async def ceiling_refusals(
 ) -> list[tuple[str, str]]:
     """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
     fact = packet.facts.get("risk_class")
-    await _remember_risk_fact(db, task_id, packet.generation, fact)
+    await remember_risk_fact(db, task_id, packet.generation, fact)
     refusal = class_ceiling_refusal(await current_ceiling(db, task_id), fact)
     return [refusal] if refusal else []
 

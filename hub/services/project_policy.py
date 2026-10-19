@@ -959,26 +959,47 @@ STEWARD_APPROVE_CLASSES: tuple[str, ...] = tuple(c.value.lower() for c in RiskCl
 STEWARD_CEILING_UNREADABLE = "unreadable"
 
 
+# Тот же потолок для автопилота вердикта (verdict=auto): отдельный ключ с тем же
+# валидатором и той же таблицей решений (``steward_apply.class_ceiling_refusal``).
+# Ключ на каждого решателя, а не общий: владелец ставит потолки независимо, а
+# имя ключа говорит, чьё решение он ограничивает.
+AUTO_APPROVE_MAX_CLASS_KEY = "auto_approve_max_class"
+CEILING_KEYS: tuple[str, ...] = (
+    STEWARD_APPROVE_MAX_CLASS_KEY,
+    AUTO_APPROVE_MAX_CLASS_KEY,
+)
+
+
 def validate_steward_approve_max_class(piece: dict) -> None:
-    """Запись ключа: только r0…r5 строчными. ``R1``, ``high``, число — отказ."""
-    value = piece.get(STEWARD_APPROVE_MAX_CLASS_KEY)
-    if STEWARD_APPROVE_MAX_CLASS_KEY in piece and (
-        not isinstance(value, str) or value not in STEWARD_APPROVE_CLASSES
-    ):
-        raise ValueError(
-            f"gate_policy {STEWARD_APPROVE_MAX_CLASS_KEY} must be one of "
-            f"{', '.join(STEWARD_APPROVE_CLASSES)} (lowercase), got: {value!r}"
-        )
+    """Запись ключей потолка: только r0…r5 строчными. ``R1``, ``high``, число — отказ."""
+    for key in CEILING_KEYS:
+        value = piece.get(key)
+        if key in piece and (
+            not isinstance(value, str) or value not in STEWARD_APPROVE_CLASSES
+        ):
+            raise ValueError(
+                f"gate_policy {key} must be one of "
+                f"{', '.join(STEWARD_APPROVE_CLASSES)} (lowercase), got: {value!r}"
+            )
+
+
+def _ceiling_of(policy: dict, key: str) -> str | None:
+    if not isinstance(policy, dict) or key not in policy:
+        return None
+    value = policy[key]
+    if isinstance(value, str) and value in STEWARD_APPROVE_CLASSES:
+        return value
+    return STEWARD_CEILING_UNREADABLE
 
 
 def steward_approve_max_class_of(policy: dict) -> str | None:
     """Потолок approve стюарда: r0…r5, None (нет ключа) или ``unreadable``."""
-    if not isinstance(policy, dict) or STEWARD_APPROVE_MAX_CLASS_KEY not in policy:
-        return None
-    value = policy[STEWARD_APPROVE_MAX_CLASS_KEY]
-    if isinstance(value, str) and value in STEWARD_APPROVE_CLASSES:
-        return value
-    return STEWARD_CEILING_UNREADABLE
+    return _ceiling_of(policy, STEWARD_APPROVE_MAX_CLASS_KEY)
+
+
+def auto_approve_max_class_of(policy: dict) -> str | None:
+    """Потолок автопилота вердикта: r0…r5, None (нет ключа) или ``unreadable``."""
+    return _ceiling_of(policy, AUTO_APPROVE_MAX_CLASS_KEY)
 
 
 # Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:

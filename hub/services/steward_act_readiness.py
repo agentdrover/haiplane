@@ -181,6 +181,24 @@ async def delegated_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     return sorted(out, key=lambda p: p["slug"])
 
 
+async def autopilot_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Проекты с verdict=auto: потолок автопилота (``auto_approve_max_class``)."""
+    out = []
+    for project in await repo.list_projects(db):
+        policy = project_policy.gate_policy_of(project)
+        if project_policy.gate_value_of(policy, "verdict") != "auto":
+            continue
+        out.append(
+            {
+                "slug": str(project["slug"]),
+                "auto_approve_max_class": project_policy.auto_approve_max_class_of(
+                    policy
+                ),
+            }
+        )
+    return sorted(out, key=lambda p: p["slug"])
+
+
 async def readiness_report(
     db: aiosqlite.Connection, mode: dict[str, Any]
 ) -> dict[str, Any]:
@@ -199,6 +217,7 @@ async def readiness_report(
         "act_refusals_v2": refusals,
         "act_would_be_granted": not refusals,
         "projects": await delegated_projects(db),
+        "autopilot_projects": await autopilot_projects(db),
         "candidates": found,
         "candidate_counts": {
             state: sum(1 for c in found if c["state"] == state)
