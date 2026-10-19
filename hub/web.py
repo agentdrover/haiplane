@@ -2604,7 +2604,11 @@ async def _card_decision_brief(
     from hub.services import decision_brief
 
     try:
-        return await decision_brief.build(db, row, {"repair_offered": repair_offered})
+        brief = await decision_brief.build(db, row, {"repair_offered": repair_offered})
+        # Для статуса без решения человека (open и пр.) блока нет: он был бы шумом.
+        return (
+            None if brief["recommend"]["action"] == decision_brief.NO_ACTION else brief
+        )
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("decision brief failed for #%s: %s", row.get("id"), exc)
         return None
