@@ -19,6 +19,7 @@ Design choices:
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -778,8 +779,15 @@ def build_affected_area_warnings(inputs: StatementInputs) -> list[Recommendation
         if root not in candidate.parents and candidate != root:
             # Escapes the working copy: not something this code can judge.
             continue
-        if not candidate.exists():
+        try:
+            os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
             missing.append(area.strip())
+        except (OSError, ValueError):
+            # A symlink loop (ELOOP): Path.resolve() raises on it before 3.13
+            # and returns the looping path from 3.13, where exists() would
+            # then say "missing". Indeterminate either way: stay silent.
+            continue
     if not missing:
         return []
     listed = ", ".join(missing)

@@ -43,12 +43,18 @@ ValidationRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str] |
 _SECRET_HINTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
 
 
+# git reads GIT_CONFIG_COUNT entries from GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n: the
+# three go together or git fails with rc=128 "missing config key" (#1851).
+_GIT_CONFIG_ENV = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+
 def _safe_env() -> dict[str, str]:
     """Child env with obvious secrets stripped (#509 AC-2, best-effort)."""
     return {
         k: v
         for k, v in os.environ.items()
-        if not any(hint in k.upper() for hint in _SECRET_HINTS)
+        if not k.startswith(_GIT_CONFIG_ENV)
+        and not any(hint in k.upper() for hint in _SECRET_HINTS)
     }
 
 
