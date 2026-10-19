@@ -1695,8 +1695,9 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
     if status == "review":
         return (
             f"{base} Universal Review Gate: the done report was routed to "
-            "review, not completion. A reviewer must run hub_get_review_brief "
-            "and hub_submit_review; after an APPROVED verdict, report done again."
+            "review, not completion. An agent reviewer files changes_requested "
+            "(hub_submit_review) or a report (hub_submit_machine_review); "
+            "APPROVED comes from a human or the hub policy, then report done again."
         )
     if status in ("ci_check", "needs_decision"):
         return f"{base} Task entered {status}."
@@ -3122,8 +3123,8 @@ def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult
         parts.append(f"\n{block}")
     parts.append(
         "\nSubmit the verdict with hub_submit_review "
-        "(verdict=approved|changes_requested, findings for changes_requested; "
-        "changes_requested needs at least one scope=in_scope finding)."
+        "(verdict=changes_requested with findings, at least one scope=in_scope; "
+        "an agent's approved is refused, a positive outcome is a review report)."
     )
     return structured_echo_result("\n".join(parts), brief=brief)
 
@@ -3141,13 +3142,14 @@ async def hub_submit_review(
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
-    Not for the task's own implementer — such a verdict is refused. Binds to
+    Not for the task's own implementer — such a verdict is refused. An agent's
+    APPROVED is refused (409 approval_reserved_for_human). Binds to
     the current submission generation. Commit task: does NOT complete it, it
     returns to running (APPROVED: author takes the done path; CHANGES_REQUESTED:
     back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
-    in_scope one — all-out-of-scope means approve and keep them as linked
+    in_scope one — all-out-of-scope means a positive report and linked
     recommendations. Unlinked out_of_scope findings warn, non-blocking.
 
     Auto-drafts (#436): create_tasks_for_out_of_scope=true opens a DRAFT
@@ -3155,7 +3157,7 @@ async def hub_submit_review(
 
     Args:
         task_id: The task under review
-        verdict: 'approved' or 'changes_requested'
+        verdict: 'changes_requested'; an agent's 'approved' is refused
         comments: Free-text review summary
         agent: Reviewer agent name
         findings: For changes_requested — dicts with id (int, stable within

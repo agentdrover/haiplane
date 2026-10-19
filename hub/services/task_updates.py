@@ -167,9 +167,10 @@ async def _route_pending_report(
             "hub",
             "status",
             f"Universal Review Gate: done report routed to review "
-            f"(submission #{generation}). Obtain an APPROVED "
-            "verdict via hub_submit_review, then report done "
-            "again.",
+            f"(submission #{generation}). Obtain a review "
+            "(agent: a review report via hub_submit_machine_review or "
+            "changes_requested via hub_submit_review; APPROVED comes from a "
+            "human or the hub policy), then report done again.",
         )
         await lc.log_activity(
             db,

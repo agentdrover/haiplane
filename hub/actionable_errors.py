@@ -878,13 +878,37 @@ def verdict_repeats_previous_detail(when: str) -> dict[str, Any]:
     )
 
 
-def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str, Any]:
+def verdict_contradicts_its_text_detail(
+    verdict: str, declared: str, *, for_agent: bool = False
+) -> dict[str, Any]:
     """The filed outcome and the body's own first word disagree (#1057).
 
     No acknowledgement for this one. Two outcomes in one call is not a decision
     a reviewer can confirm — it is the typo that filed #1041's 06:33 verdict as
     CHANGES_REQUESTED over a text beginning with the word APPROVED.
+
+    The advice depends on who called (#1872): a human may correct the field to
+    approved; an agent may not record APPROVED, so a positive outcome is a
+    review report or a comment.
     """
+    positive = declared.lower() == "approved"
+    if for_agent and positive:
+        hint = (
+            "A positive outcome is a review report (hub_submit_machine_review) "
+            "or a comment, not an agent's approved: drop the word APPROVED "
+            "from the opening line of a changes_requested verdict, or file the "
+            "report instead. Quoting an earlier verdict further down the text "
+            "is fine — only the first meaningful line is read as a declaration."
+        )
+        tool = "hub_submit_machine_review"
+    else:
+        hint = (
+            "Send the outcome you mean: either change the verdict field or "
+            "drop the opposite word from the opening line. Quoting an "
+            "earlier verdict further down the text is fine — only the "
+            "first meaningful line is read as a declaration."
+        )
+        tool = "hub_submit_review"
     return enrich_error_payload(
         {
             "reason": "verdict_contradicts_its_text",
@@ -894,13 +918,8 @@ def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str
             "message": (
                 f"verdict={verdict} but the text opens by declaring {declared.upper()}"
             ),
-            "hint": (
-                "Send the outcome you mean: either change the verdict field or "
-                "drop the opposite word from the opening line. Quoting an "
-                "earlier verdict further down the text is fine — only the "
-                "first meaningful line is read as a declaration."
-            ),
-            "suggested_tool": "hub_submit_review",
+            "hint": hint,
+            "suggested_tool": tool,
         }
     )
 
