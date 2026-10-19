@@ -951,9 +951,16 @@ class GitHubForge:
     _NO_DISPATCH_TRIGGER = "does not have 'workflow_dispatch' trigger"
 
     async def request_ci_run(
-        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        branch: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult:
         """Ask GitHub for a run on ``branch`` as it stands (#1197).
+
+        ``workflow_path`` (#1862): dispatch only this file (the project's CI).
 
         Only a workflow the hub KNOWS to be the CI pipeline is dispatched, and
         the reason is not tidiness. The delivery gate reads every run for the
@@ -1002,7 +1009,8 @@ class GitHubForge:
             and str(w.get("state") or "").lower() == "active"
             and str(w.get("path") or "").startswith(".github/workflows/")
         }
-        chosen = next((active[p] for p in self._CI_WORKFLOW_PATHS if p in active), None)
+        wanted = (workflow_path,) if workflow_path else self._CI_WORKFLOW_PATHS
+        chosen = next((active[p] for p in wanted if p in active), None)
         if chosen is None:
             return CIRunRequestResult(
                 CIRunRequestOutcome.declined,

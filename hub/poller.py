@@ -17,7 +17,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
-from hub.services import delivery_notes, delivery_writes, watch_notices
+from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
@@ -2495,6 +2495,8 @@ SWEEPS: tuple[Sweep, ...] = (
     # #1687: before review settlement, which reads CI evidence — the standing
     # of the CI report (attempt, trust) is refreshed first.
     Sweep("ci_trust", _sweep_ci_trust),
+    # #1862: after ci_trust — announcing a result needs the trust it resolved.
+    Sweep("ci_head_run", ci_head_run.run_sweep),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),
     Sweep("parent_rollup", _sweep_parent_rollup),

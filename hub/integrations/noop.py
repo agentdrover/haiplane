@@ -696,10 +696,16 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_git_ops_requests_nothing"
         )
+
+    async def remote_heads(
+        self, branches: Sequence[str], repo: str | None = None
+    ) -> dict[str, str] | None:
+        return None  # не поддерживается: голов веток не видно
 
     async def branch_ci_runs(
         self,
@@ -1082,7 +1088,12 @@ class NoopForge:
         return False, "forge_not_configured"
 
     async def request_ci_run(
-        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        branch: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_forge_requests_nothing"
