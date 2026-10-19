@@ -8,7 +8,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.services import decision_brief
-from tests.test_decision_brief_whitelist import ACCEPT, _task
+from tests.test_decision_brief_whitelist import _task
 
 
 async def test_the_card_page_shows_the_brief_block(
@@ -17,11 +17,13 @@ async def test_the_card_page_shows_the_brief_block(
     task_id, _ = await _task(client, db, monkeypatch, "card-accept", 1)
     task = dict(await repo.get_task(db, task_id) or {})
     brief = await decision_brief.build(db, task)
-    assert brief["recommend"]["action"] == ACCEPT
+    assert brief["accept_proven"]
+    assert brief["recommend"]["action"] == "Проверить"
 
     page = (await client.get(f"/tasks/{task_id}")).text
     assert 'id="decision-brief"' in page
-    assert f'data-decision-action="{ACCEPT}"' in page
+    assert 'data-decision-action="Проверить"' in page
+    assert "отдельная задача" in page
     for why in brief["recommend"]["why"]:
         assert html.escape(why) in page, why
     for check in brief["checks"]:

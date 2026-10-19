@@ -6,10 +6,13 @@
 решатель, и только называет ответ простыми словами. Новых таблиц нет, LLM нет:
 справка собирается на запрос, поэтому у карточки и у входящих один текст.
 
-Правило безопасности одно: «Принять» советуется ТОЛЬКО когда доказательства
-чисты целиком. Любой признак сомнения — «Проверить» или «На доработку» с
-названной причиной: ложное «Принять» хуже ложного «Проверить». Отсутствие
-данных — не данные: непрочитанное называется «неизвестно», а не «чисто».
+Правило безопасности одно: ложное «Принять» хуже ложного «Проверить».
+Решение владельца по #1810 (20.10): в этой задаче справка «Принять» НЕ ВЫДАЁТ
+вообще. Максимум — «Проверить» с причиной «доказательство принятия — отдельная
+задача», иначе «На доработку». Предикат ``accept_proof.prove_accept`` остаётся и
+его итог лежит в ``brief["accept_proven"]`` (для следующей задачи), но в
+рекомендацию он не попадает. Отсутствие данных — не данные: непрочитанное
+называется «неизвестно», а не «чисто».
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ from hub.services.readiness import parse_risks_from_row
 from hub.services.result_kind import automation_not_applicable, state_accepted
 from hub.services.verdict_route import DECIDER_HUMAN, DECIDER_STEWARD, verdict_route
 
-ACCEPT = "Принять"
 CHECK = "Проверить"
 REWORK = "На доработку"
 HUMAN_CALL = "Решить вам"
@@ -49,7 +51,6 @@ MERGED_NOT_SHIPPED = "Влито, выкат не подтверждён"
 NO_ACTION = "Действий нет"
 
 #: Словарь формы вердикта (то, что принимает карточка).
-VERDICT_APPROVED = "approved"
 VERDICT_CHANGES = "changes_requested"
 
 MAX_RISKS = 3
@@ -57,7 +58,7 @@ _WEIGHT = {"high": 3, "medium": 2, "low": 1}
 #: Класс риска, с которого справка называет его риском (R3 и выше).
 _HIGH_CLASSES = frozenset({"R3", "R4", "R5"})
 _STEWARD_ACTIONS = {
-    "approve": (ACCEPT, VERDICT_APPROVED),
+    "approve": (CHECK, ""),
     "changes_requested": (REWORK, VERDICT_CHANGES),
     "escalate": (HUMAN_CALL, ""),
 }
@@ -79,8 +80,10 @@ def _brief(
     *,
     risks: list[dict[str, str]] | None = None,
     checks: list[dict[str, str]] | None = None,
+    accept_proven: bool = False,
 ) -> dict[str, Any]:
     return {
+        "accept_proven": accept_proven,
         "happened": happened,
         "need": need,
         "risks": _top_risks(risks or []),
@@ -145,16 +148,15 @@ def _ground_sources(raw: Any) -> list[str]:
     return names
 
 
-def _accept(proof: AcceptProof, why: list[str]) -> dict[str, Any]:
-    """ЕДИНСТВЕННОЕ место, где выдаётся «Принять»: нужно доказательство."""
-    if not isinstance(proof, AcceptProof):
-        raise TypeError("«Принять» выдаётся только по AcceptProof")
-    return _recommend(ACCEPT, VERDICT_APPROVED, why)
+NOT_THIS_TASK = "доказательство принятия — отдельная задача"
 
 
-def _from_steward(
-    judged: Any, proof: AcceptProof | None, route: Any
-) -> dict[str, Any] | None:
+def _proven_but_capped(why: list[str]) -> dict[str, Any]:
+    """Условия доказаны, но «Принять» здесь не выдаётся: максимум — «Проверить»."""
+    return _recommend(CHECK, "", [NOT_THIS_TASK, *why])
+
+
+def _from_steward(judged: Any, route: Any) -> dict[str, Any] | None:
     # Низкая уверенность стюарда по контракту (#1022) — эскалация, а не вердикт.
     word = "escalate" if str(judged["confidence"]) == "low" else str(judged["verdict"])
     mapped = _STEWARD_ACTIONS.get(word)
@@ -167,10 +169,10 @@ def _from_steward(
     if tail := _route_why(route):
         why.append(tail)
     why = why or ["стюард без пояснений"]
-    if action == ACCEPT:
-        # Суждение стюарда «approve» — не доказательство: без AcceptProof правила
-        # сильнее суждения.
-        return _accept(proof, why) if proof is not None else None
+    if action == CHECK and word == "approve":
+        # Суждение стюарда «approve» — не доказательство и в этой задаче не
+        # «Принять»: правила сильнее суждения, итог — «Проверить».
+        return None
     return _recommend(action, verdict, why)
 
 
@@ -185,7 +187,7 @@ def _from_rules(
         ]
         if tail := _route_why(route):
             why.append(tail)
-        return _accept(proof, why)
+        return _proven_but_capped(why)
     rework = any(b.level == REWORK for b in blockers)
     action, verdict = (REWORK, VERDICT_CHANGES) if rework else (CHECK, "")
     alt = "" if rework else "На доработку, если проверка подтвердит сомнение"
@@ -198,7 +200,7 @@ async def _review_brief(
     proof, blockers, views = await prove_accept(db, task, ctx)
     route = ctx.get("route") or await verdict_route(db, int(task["id"]))
     judged = await _steward_row(db, task)
-    recommend = _from_steward(judged, proof, route) if judged is not None else None
+    recommend = _from_steward(judged, route) if judged is not None else None
     if recommend is None:
         recommend = _from_rules(proof, blockers, route)
         if judged is not None and proof is None:
@@ -213,6 +215,7 @@ async def _review_brief(
         recommend,
         risks=risks,
         checks=_review_checks(blockers, views, _tip_age_text(task)),
+        accept_proven=proof is not None,
     )
 
 
@@ -271,13 +274,14 @@ async def _state_brief(
             action, verdict, [view.headline] + [b.risk for b in blockers]
         )
     else:
-        recommend = _accept(proof, [have, "откат назван, комплект полон"])
+        recommend = _proven_but_capped([have, "откат назван, комплект полон"])
     return _brief(
         "Состояние изменено руками, доказательства приложены.",
         "Нужен ваш вердикт.",
         recommend,
         risks=risks + _context_risks(task),
         checks=checks,
+        accept_proven=proof is not None,
     )
 
 
@@ -385,10 +389,11 @@ async def _completed_brief(
         if delivery.get("state") == "not_in_prod"
         else "Запуск в проде не подтверждён; факт мержа не установлен."
     )
+    action = MERGED_NOT_SHIPPED if delivery.get("state") == "not_in_prod" else CHECK
     return _brief(
         happened,
         "Стоит убедиться, что выкат состоялся.",
-        _recommend(MERGED_NOT_SHIPPED, "", [reason]),
+        _recommend(action, "", [reason]),
         risks=[_risk("medium", "Выкат не подтверждён", reason)],
     )
 

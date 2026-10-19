@@ -168,12 +168,19 @@ async def _judged_rows(
     earlier = await _earlier_generation(db, task_id, generation)
     if earlier is None:
         raise UnreadableReport(int(row["id"]), "перенос без более раннего поколения")
+    # Копия стоит за ближайшим более ранним поколением И за поколением корня:
+    # ближайшее может содержать самостоятельный чистый отчёт, и обход, который
+    # на нём остановился бы, потерял бы исходное поколение.
+    origin = int(dict(source)["submission_generation"])
     out = [copy]
-    if (task_id, earlier) in seen:
-        return out
-    seen.add((task_id, earlier))
-    for sibling in await repo.machine_reviews_of_generation(db, task_id, earlier):
-        out.extend(await _judged_rows(db, dict(sibling), seen))
+    for source_generation in sorted({earlier, origin}):
+        if (task_id, source_generation) in seen:
+            continue
+        seen.add((task_id, source_generation))
+        for sibling in await repo.machine_reviews_of_generation(
+            db, task_id, source_generation
+        ):
+            out.extend(await _judged_rows(db, dict(sibling), seen))
     return out
 
 

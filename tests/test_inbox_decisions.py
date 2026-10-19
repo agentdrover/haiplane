@@ -38,7 +38,9 @@ async def test_inbox_and_card_share_brief(
 
     assert card is not None
     assert row["brief_line"] == decision_brief.recommend_line(card)
-    assert row["brief_line"].startswith("Принять"), "случай чистый: советуем принять"
+    # Решение владельца (#1810, 20.10): «Принять» справка не выдаёт даже в чистом случае.
+    assert row["brief_line"].startswith("Проверить")
+    assert "отдельная задача" in row["brief_line"]
 
     page = await client.get(f"/tasks/{task_id}")
     assert page.status_code == 200

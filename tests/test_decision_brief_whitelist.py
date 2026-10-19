@@ -73,8 +73,15 @@ async def _task(
 
 
 async def _action(db: aiosqlite.Connection, task_id: int) -> str:
+    """Что справка сказала бы, будь «Принять» разрешено: решает ПРЕДИКАТ (accept_proven).
+
+    Рекомендация сама «Принять» не выдаёт (решение владельца по #1810, 20.10):
+    это проверяет ``test_the_brief_never_recommends_accept``. Здесь тесты
+    предиката продолжают различать «доказано» и «не доказано».
+    """
     task = dict(await repo.get_task(db, task_id) or {})
-    return (await decision_brief.build(db, task))["recommend"]["action"]
+    brief = await decision_brief.build(db, task)
+    return ACCEPT if brief["accept_proven"] else brief["recommend"]["action"]
 
 
 async def test_control_every_report_fit_earns_accept(

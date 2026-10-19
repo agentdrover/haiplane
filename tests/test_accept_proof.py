@@ -19,11 +19,9 @@ from hub.services.accept_proof import AcceptProof
 from tests.test_decision_brief_whitelist import ACCEPT, _action, _task, observe_tip
 
 
-async def test_a_proof_cannot_be_forged_and_accept_needs_one():
+async def test_a_proof_cannot_be_forged():
     with pytest.raises(TypeError):
         AcceptProof("a" * 40)
-    with pytest.raises(TypeError):
-        decision_brief._accept(None, ["почему"])  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("current", [True, False])
@@ -217,13 +215,14 @@ async def test_a_carried_report_without_its_source_is_unreadable(
     assert await _action(db, task_id) != ACCEPT
 
 
-def test_accept_has_exactly_one_emitter():
-    """«Принять» собирается в одном месте: любая другая выдача мимо доказательства."""
+def test_the_brief_has_no_accept_emitter_at_all():
+    """Решение владельца (#1810, 20.10): справка «Принять» не выдаёт — эмиттеров нет."""
     import inspect
     import re
 
     source = re.sub(r"\s+", " ", inspect.getsource(decision_brief))
-    assert source.count("_recommend( ACCEPT") + source.count("_recommend(ACCEPT") == 1
+    assert "ACCEPT" not in source
+    assert "VERDICT_APPROVED" not in source
 
 
 async def test_a_carried_report_needs_every_report_of_the_source_generation(

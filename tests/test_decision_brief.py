@@ -69,8 +69,9 @@ async def test_accept_only_when_all_evidence_clean(
     await _clean_scan(db, clean)
     brief = await _brief(db, clean)
     _shape(brief)
-    assert brief["recommend"]["action"] == ACCEPT
-    assert brief["recommend"]["verdict"] == "approved"
+    assert brief["accept_proven"]
+    assert brief["recommend"]["action"] == "Проверить"
+    assert brief["recommend"]["verdict"] == ""
 
     doubts: dict[str, int] = {}
     doubts["unresolved"] = await _review_task(
@@ -109,8 +110,9 @@ async def test_accept_only_when_all_evidence_clean(
         if name != "integrity":
             await _clean_scan(db, task_id)
         got = await _brief(db, task_id)
-        assert got["recommend"]["action"] != ACCEPT, name
+        assert not got["accept_proven"], name
         assert got["recommend"]["verdict"] != "approved", name
+        assert not got["accept_proven"], name
         assert got["recommend"]["why"], f"{name}: причина не названа"
         assert got["risks"], f"{name}: риск не назван"
 
@@ -165,7 +167,7 @@ async def test_steward_vocabulary_mapping(
     # Суждение СТАРОГО поколения не слушаем: без него — правила, и они чисты.
     await _judgement(db, task_id, generation - 1, "changes_requested")
     stale = await _brief(db, task_id)
-    assert stale["recommend"]["action"] == ACCEPT
+    assert stale["accept_proven"]
 
     await _judgement(db, task_id, generation, "changes_requested")
     mapped = await _brief(db, task_id)
@@ -189,8 +191,9 @@ async def test_steward_vocabulary_mapping(
     gen3 = int(dict(await repo.get_task(db, third) or {})["submission_generation"])
     await _judgement(db, third, gen3, "approve")
     ok = await _brief(db, third)
-    assert ok["recommend"]["action"] == ACCEPT
-    assert ok["recommend"]["verdict"] == "approved"
+    assert ok["accept_proven"]
+    assert ok["recommend"]["action"] == "Проверить"
+    assert ok["recommend"]["verdict"] == ""
     # Вердикт за человеком по маршруту — справка так и говорит.
     assert "вам" in " ".join(ok["recommend"]["why"]).lower() or ok["need"]
 
@@ -209,7 +212,7 @@ async def test_steward_approve_is_downgraded_by_doubt(
     gen = int(dict(await repo.get_task(db, task_id) or {})["submission_generation"])
     await _judgement(db, task_id, gen, "approve")
     got = await _brief(db, task_id)
-    assert got["recommend"]["action"] != ACCEPT
+    assert not got["accept_proven"]
 
 
 async def _task_in(db, status: str, **fields) -> int:
@@ -260,10 +263,15 @@ async def test_brief_per_state(client, db: aiosqlite.Connection, monkeypatch):
     in_prod = await _task_in(db, "completed")
     got = await _brief(db, in_prod, {"delivery": {"state": "in_prod"}})
     assert got["recommend"]["action"] == "Доставлено"
-    for state in ("not_in_prod", "unknown"):
+    # Решение владельца (#1810, 20.10): «Влито» — только при not_in_prod (факт
+    # мержа есть); unknown — «Проверить», неизвестное не выдаётся за факт.
+    for state, expected in (
+        ("not_in_prod", "Влито, выкат не подтверждён"),
+        ("unknown", "Проверить"),
+    ):
         merged = await _task_in(db, "completed")
         got = await _brief(db, merged, {"delivery": {"state": state}})
-        assert got["recommend"]["action"] == "Влито, выкат не подтверждён", state
+        assert got["recommend"]["action"] == expected, state
 
     state_id = await make_state_task(db)
     await drive_to_review(client, db, state_id)
@@ -274,7 +282,8 @@ async def test_brief_per_state(client, db: aiosqlite.Connection, monkeypatch):
         assert absent not in names, f"у state-задачи нет проверки «{absent}»"
     risks = " ".join(r["text"] for r in got["risks"])
     assert "CI не доказан" not in risks
-    assert got["recommend"]["action"] in (ACCEPT, "Проверить")
+    assert got["recommend"]["action"] == "Проверить"
+    assert got["accept_proven"]
     assert "rollback" in " ".join(c["name"] + c["detail"] for c in got["checks"])
 
     partial = await make_state_task(db)
@@ -284,7 +293,7 @@ async def test_brief_per_state(client, db: aiosqlite.Connection, monkeypatch):
     )
     await db.commit()
     got = await _brief(db, partial)
-    assert got["recommend"]["action"] != ACCEPT
+    assert not got["accept_proven"]
     assert got["risks"]
 
 
@@ -299,7 +308,7 @@ async def test_unreadable_evidence_is_unknown_not_clean(
     await _post_review(client, task_id)
     await _clean_scan(db, task_id)
     got = await _brief(db, task_id)
-    assert got["recommend"]["action"] != ACCEPT
+    assert not got["accept_proven"]
     assert any("CI" in r["text"] for r in got["risks"])
 
 
@@ -368,7 +377,7 @@ async def test_every_report_of_the_generation_counts(
     await _second_report(client, late_incomplete, incomplete=True)
     await _clean_scan(db, late_incomplete)
     got = await _brief(db, late_incomplete)
-    assert got["recommend"]["action"] != ACCEPT, "неполный отчёт позже полного"
+    assert not got["accept_proven"], "неполный отчёт позже полного"
 
     conflict = await _review_task(
         client, db, monkeypatch, "brief-conflict", findings_confirmed=[finding]
@@ -376,7 +385,7 @@ async def test_every_report_of_the_generation_counts(
     await _second_report(client, conflict)
     await _clean_scan(db, conflict)
     got = await _brief(db, conflict)
-    assert got["recommend"]["action"] != ACCEPT, "дефект у другого ревьюера"
+    assert not got["accept_proven"], "дефект у другого ревьюера"
     assert any("подтвердил" in r["text"].lower() for r in got["risks"])
 
 
@@ -386,7 +395,7 @@ async def test_reviewer_identity_is_required_for_accept(
     task_id = await _review_task(client, db, monkeypatch, "brief-no-principal")
     await _clean_scan(db, task_id, reviewer=False)
     got = await _brief(db, task_id)
-    assert got["recommend"]["action"] != ACCEPT
+    assert not got["accept_proven"]
     assert any("Независимость" in r["text"] for r in got["risks"])
 
 
@@ -422,14 +431,14 @@ async def test_unresolved_outcome_is_found_by_its_own_uid(
         )
         await db.commit()
 
-    assert (await _brief(db, task_id))["recommend"]["action"] != ACCEPT
+    assert not (await _brief(db, task_id))["accept_proven"]
     await record("not_judged")
-    assert (await _brief(db, task_id))["recommend"]["action"] != ACCEPT
+    assert not (await _brief(db, task_id))["accept_proven"]
     await record("fixed")
     got = await _brief(db, task_id)
     # Ответ автора находит исход по своему uid (риск «без ответа» ушёл), но
     # «Принять» не даёт: отчёт с unresolved не чист, ответ не доказывает отсутствие дефекта.
-    assert got["recommend"]["action"] != ACCEPT, got["recommend"]
+    assert not got["accept_proven"], got["recommend"]
     assert not any("без ответа" in r["text"] for r in got["risks"])
 
 
@@ -464,7 +473,7 @@ async def test_unresolved_in_a_sibling_report_blocks_accept(
     await _second_report(client, task_id)  # чистый отчёт B позже
     await _clean_scan(db, task_id)
     got = await _brief(db, task_id)
-    assert got["recommend"]["action"] != ACCEPT
+    assert not got["accept_proven"]
     review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
     assert review_check["state"] == "doubt"
 
@@ -484,12 +493,12 @@ async def test_a_report_without_data_never_earns_accept(
     )
     await _clean_scan(db, alone)
     got = await _brief(db, alone)
-    assert got["recommend"]["action"] != ACCEPT, "отчёт с raw_count=0 — нет данных"
+    assert not got["accept_proven"], "отчёт с raw_count=0 — нет данных"
 
     after_full = await _review_task(client, db, monkeypatch, "brief-empty-after")
     await _second_report(client, after_full, raw_count=0, findings_rejected=[])
     await _clean_scan(db, after_full)
     got = await _brief(db, after_full)
-    assert got["recommend"]["action"] != ACCEPT, "полный отчёт, затем пустой"
+    assert not got["accept_proven"], "полный отчёт, затем пустой"
     review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
     assert review_check["state"] == "doubt"
