@@ -1269,10 +1269,17 @@ class GitHubForge:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None:
-        """Прогоны workflow ci.yml по head_sha (последняя попытка каждого)."""
+        """Прогоны workflow контракта (по умолчанию ci.yml) по head_sha (#1848)."""
+        found = re.fullmatch(
+            r"\.github/workflows/([A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml)", workflow_path
+        )
+        if found is None:
+            return None  # не файл workflow: ответить нельзя, а не «прогонов нет»
+        name = found.group(1)
         runs = await self._all_pages(
-            f"repos/{gh_repo or REPO_NAME}/actions/workflows/ci.yml/runs"
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows/{name}/runs"
             f"?head_sha={head_sha}",
             "workflow_runs",
             repo=repo,

@@ -167,6 +167,12 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 `slot=<host>`, bound to the task and generation), ack, then claim/pair-start with
 `git_mode=remote`. The host key never enters the executor VM.
 
+### CI contract of a project (#1848)
+
+- `gate_policy.ci_contract = {"workflow_path": ".github/workflows/<file>.yml|yaml", "required_checks": [<subset of lint, format, types, tests>]}`; sorted on write, extra fields refused, project `default` and `policy-schedule` refused, human PATCH only (`models.validated_gate_policy` -> `ci_contract.validated_ci_contract`; reader `project_policy.ci_contract_from`; shown by `effective-policy` as `ci_contract` with `fingerprint`). Storage: `ci_report_attempts.contract_fp` and `ci_run_reports.contract_fp` (migration `add_ci_*_contract_fp`, DEFAULT = the hub contract's fingerprint; `''` = no fingerprint).
+- Signatures: `ci_trust.trust_of(report, current_fp)`, `is_verified(report, current_fp)`, `can_testify_pass(report, current_fp)`, `green_gap(report, contract)`, `ci_green_proof.proof_gap(report, ac_rows, sha, contract)`, `check_attempt(row, gh_args, contract)`; forge `ci_runs_for_sha(head_sha, ..., workflow_path=".github/workflows/ci.yml")`. The REST/CLI/MCP surfaces carry no new field: the fingerprint is seen in `effective-policy` only.
+- Sender: `scripts/ci_trusted_report.py` reports the workflow named by `HAIPLANE_CI_WORKFLOW_PATH` (set by the default-branch sender workflow through the `workflow-path` input of `.github/actions/hub-ci-send`), else `ci.yml`. Templates: `hub/workflow_templates/satellite-ci-producer.yml` (branch code, read key only) and `satellite-ci-report.yml` (`workflow_run`, environment `hub-report`); rendered by `hub.services.satellite_ci`. Setup, rollback and the acceptance evidence: `docs/satellite-ci-report.md`.
+
 ## Contract-Smell Checklist
 
 - Does the same concept have different names across API, CLI, MCP, and DB?

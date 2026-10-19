@@ -1555,3 +1555,220 @@ async def test_patched_migration_list_is_applied(monkeypatch):
         assert names == ["test_patched_list_marker"]
     finally:
         await conn.close()
+
+
+# ---- #1848: the CI contract fingerprint migration ----------------------------
+
+
+async def _state_before_1848(tmp_path: Path) -> Path:
+    """A database as it stood before #1848: attempts and projections without the column."""
+    import sqlite3
+
+    from hub import db as db_module
+
+    path = tmp_path / "before-1848.db"
+    fresh = await db_module.connect(str(path))
+    await db_module.bootstrap(fresh)
+    await fresh.execute(
+        "INSERT INTO tasks (title, status, submission_generation, submission_sha, "
+        "validation_status, validation_generation, validation_source, "
+        "validation_commands) VALUES "
+        "('verified', 'review', 1, 'sha-v', 'pass', 1, 'ci:11:1', '[\"x\"]'), "
+        "('unverified', 'review', 1, 'sha-u', '', 0, 'manual', '[]')"
+    )
+    from hub import repository as repo
+    from hub.models import AcceptanceCriterion
+
+    await repo.replace_acceptance_criteria(
+        fresh,
+        1,
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
+            )
+        ],
+    )
+    await fresh.execute(
+        "INSERT INTO ac_test_results (task_id, ac_id, submission_generation, status, "
+        "source) VALUES (1, 'AC-1', 1, 'pass', 'ci:11:1')"
+    )
+    prov = json.dumps({"run_id": "11", "run_attempt": "1", "run_conclusion": "success"})
+    checks = json.dumps(
+        {"lint": "pass", "format": "pass", "types": "pass", "tests": "pass"}
+    )
+    for task_id, sha, trust, reason, final, run in (
+        (1, "sha-v", "verified", "", 1, "11"),
+        (2, "sha-u", "unverified", "legacy", 1, "12"),
+    ):
+        await fresh.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "checks, validation_status, provenance, trust, trust_reason, trust_final) "
+            "VALUES (?, ?, ?, '1', ?, 'pass', ?, ?, ?, ?)",
+            (task_id, sha, run, checks, prov, trust, reason, final),
+        )
+        await fresh.execute(
+            "INSERT INTO ci_run_reports (task_id, head_sha, validation_status, checks, "
+            "provenance, trust, trust_reason, attempt_key, reported_by) "
+            "VALUES (?, ?, 'pass', ?, ?, ?, ?, ?, 'ci')",
+            (task_id, sha, checks, prov, trust, reason, f"ci:{run}:1"),
+        )
+    await fresh.commit()
+    await fresh.close()
+    raw = sqlite3.connect(path)
+    for table in ("ci_report_attempts", "ci_run_reports"):
+        raw.execute(f"ALTER TABLE {table} DROP COLUMN contract_fp")
+    raw.execute(
+        "DELETE FROM _migrations WHERE name IN "
+        "('add_ci_report_attempts_contract_fp', 'add_ci_run_reports_contract_fp', "
+        "'backfill_ci_report_attempts_contract_fp', "
+        "'backfill_ci_run_reports_contract_fp')"
+    )
+    raw.commit()
+    raw.close()
+    return path
+
+
+async def _answers(conn, task_id: int, sha: str) -> dict:
+    from hub import config
+    from hub import repository as repo
+    from hub.services import ci_trust, lifecycle
+    from hub.services.ac_tests import ac_tests_gap
+
+    task = dict(await repo.get_task(conn, task_id))
+    return {
+        "pass_gap": await ci_trust.pass_gap(conn, task_id, sha),
+        "ac_gap": await ac_tests_gap(conn, task),
+        "validation_gap": await lifecycle._validation_gap_of_the_work(conn, task),
+        "sdd": config.SDD_VALIDATION,
+    }
+
+
+async def test_ci_contract_fingerprint_migration_keeps_trust(tmp_path):
+    from hub import db as db_module
+    from hub import repository as repo
+    from hub.services import ci_contract, ci_trust
+
+    # The literal in the migration and in the repository is the hub contract's.
+    migrations = dict(db_module._MIGRATIONS)
+    for table in ("ci_report_attempts", "ci_run_reports"):
+        assert (
+            ci_contract.HUB_FINGERPRINT in migrations[f"backfill_{table}_contract_fp"]
+        )
+        assert "DEFAULT ''" in migrations[f"add_{table}_contract_fp"]
+
+    path = await _state_before_1848(tmp_path)
+    conn = await db_module.connect(str(path))
+    try:
+        await db_module.bootstrap(conn)
+        first = await _answers(conn, 1, "sha-v"), await _answers(conn, 2, "sha-u")
+        await db_module.bootstrap(conn)  # a repeated bootstrap changes nothing
+        assert (
+            await _answers(conn, 1, "sha-v"),
+            await _answers(conn, 2, "sha-u"),
+        ) == first
+
+        fp = ci_contract.HUB_FINGERPRINT
+        for task_id, sha, trust in (
+            (1, "sha-v", "verified"),
+            (2, "sha-u", "unverified"),
+        ):
+            report = dict(await repo.get_ci_run_report(conn, task_id, sha))
+            attempt = dict((await repo.list_ci_report_attempts(conn, task_id, sha))[0])
+            # The attempt and the projection carry the same fingerprint: the hub's.
+            assert report["contract_fp"] == attempt["contract_fp"] == fp
+            # The hub's verified stays verified; unverified/legacy never becomes it.
+            assert ci_trust.trust_of(report, fp)[0] == trust
+
+        # The answers of the gates are those of a verified green hub report, and
+        # the evidence CI wrote (the AC result and its source) is still counted.
+        verified, unverified = first
+        assert verified["pass_gap"] is None
+        assert verified["ac_gap"] is None
+        assert verified["validation_gap"] is None
+        assert unverified["pass_gap"] is not None
+        results = [dict(r) for r in await repo.list_ac_test_results(conn, 1)]
+        assert [(r["ac_id"], r["status"], r["source"]) for r in results] == [
+            ("AC-1", "pass", "ci:11:1")
+        ]
+        assert dict(await repo.get_task(conn, 1))["validation_source"] == "ci:11:1"
+
+        # A row inserted without a fingerprint (DEFAULT '') confirms nothing.
+        await conn.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "trust, trust_reason, trust_final) VALUES (1, 'sha-raw', '90', '1', "
+            "'verified', '', 1)"
+        )
+        await conn.execute(
+            "INSERT INTO ci_run_reports (task_id, head_sha, trust, trust_reason, "
+            "attempt_key, reported_by) VALUES (1, 'sha-raw', 'verified', '', 'ci:90:1', 'ci')"
+        )
+        raw_attempt = dict((await repo.list_ci_report_attempts(conn, 1, "sha-raw"))[0])
+        raw_report = dict(await repo.get_ci_run_report(conn, 1, "sha-raw"))
+        assert raw_attempt["contract_fp"] == raw_report["contract_fp"] == ""
+        assert ci_trust.trust_of(raw_report, fp) == ("unverified", "contract_changed")
+        assert await ci_trust.pass_gap(conn, 1, "sha-raw") is not None
+
+        # A claim that arrives after the upgrade has no fingerprint until checked.
+        await repo.upsert_ci_report_attempt(
+            conn,
+            task_id=1,
+            head_sha="sha-new",
+            run_id="13",
+            run_attempt="1",
+            ac_results="{}",
+            checks="{}",
+            validation_status="pass",
+            validation_log="",
+            reason="",
+            reported_by="ci",
+            mutations=None,
+            baseline=None,
+            provenance="{}",
+            submitted="{}",
+        )
+        fresh_attempt = dict(
+            (await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0]
+        )
+        assert fresh_attempt["contract_fp"] == ci_contract.NO_FINGERPRINT == ""
+        assert ci_trust.trust_of({**fresh_attempt, "trust": "verified"}, fp)[0] == (
+            "unverified"
+        )
+        # A verdict stamps the attempt; a repeated claim of that attempt takes the
+        # stamp away again - it is a new claim.
+        await repo.set_ci_attempt_trust(
+            conn,
+            fresh_attempt["id"],
+            trust="verified",
+            trust_reason="",
+            final=True,
+            body_version=fresh_attempt["body_version"],
+        )
+        await ci_contract.stamp_attempt(conn, fresh_attempt["id"], fp)
+        stamped = dict((await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0])
+        assert stamped["contract_fp"] == fp
+        await repo.upsert_ci_report_attempt(
+            conn,
+            task_id=1,
+            head_sha="sha-new",
+            run_id="13",
+            run_attempt="1",
+            ac_results="{}",
+            checks="{}",
+            validation_status="pass",
+            validation_log="",
+            reason="",
+            reported_by="ci",
+            mutations=None,
+            baseline=None,
+            provenance="{}",
+            submitted="{}",
+        )
+        again = dict((await repo.list_ci_report_attempts(conn, 1, "sha-new"))[0])
+        assert again["contract_fp"] == "" and again["trust"] == "unverified"
+    finally:
+        await conn.close()

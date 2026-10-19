@@ -761,6 +761,26 @@ def ci_before_submit_of(policy: dict) -> str:
     return RED_TEST_WARN
 
 
+# Контракт CI проекта (#1848): workflow и обязательные проверки, по которым хаб
+# подтверждает отчёт. Нет ключа — контракт хаба. Правит только человек (PATCH
+# проекта); проект default и отложенная правка его не принимают — см.
+# policy_change.refuse_ci_contract. Само чтение и отпечаток — ci_contract.
+CI_CONTRACT_KEY = "ci_contract"
+
+
+def ci_contract_from(policy: dict, slug: str = ""):
+    """Контракт CI из прочитанной политики (``ci_contract.CiContract``)."""
+    from hub.services.ci_contract import contract_from_raw
+
+    raw = policy.get(CI_CONTRACT_KEY) if isinstance(policy, dict) else None
+    return contract_from_raw(raw, slug)
+
+
+def ci_contract_of(project):
+    """Контракт CI проекта; для default всегда контракт хаба."""
+    return ci_contract_from(gate_policy_of(project), str(project["slug"] or ""))
+
+
 # Кто читает deep первым (#1561). ``cloud`` — как всегда: облако первым,
 # локальный путь только второй дверью после наблюдённого отказа (#1252) и
 # только если проект это разрешил: local_review_fallback=on (#1653).

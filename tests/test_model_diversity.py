@@ -20,7 +20,7 @@ from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.model_family import family, same_family
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 
 _TIP = "b" * 40
 
@@ -113,7 +113,7 @@ async def _submitted_task(
     )
     assert view.status.value == "review"
 
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=_TIP,
