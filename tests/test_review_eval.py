@@ -466,3 +466,46 @@ _FAKE_ROWS = [
         "advisor": "not_applicable",
     }
 ]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: c.update(task_id=True),
+        lambda c: c.update(task_id="abc"),
+        lambda c: c.update(submission_generation=1.5),
+        lambda c: c.update(submission_generation=True),
+        lambda c: c.update(truth=None),
+        lambda c: c.update(truth=[]),
+        lambda c: c.update(delivery="x"),
+        lambda c: c.update(locators=["x"]),
+        lambda c: c.update(locators=5),
+        lambda c: c.update(defect_class=["a"]),
+        lambda c: c.update(case_id=["a"]),
+    ],
+)
+def test_broken_shape_is_an_error_not_a_traceback(mutate):
+    corpus = ev.load_corpus(CORPUS)
+    for expectation in ("defect", "clean"):
+        bad = json.loads(json.dumps(corpus))
+        case = next(c for c in bad["cases"] if c["expectation"] == expectation)
+        mutate(case)
+        assert ev.validate_corpus(bad)  # список ошибок, без исключения
+    bad = json.loads(json.dumps(corpus))
+    bad["cases"].append("не объект")
+    assert ev.validate_corpus(bad)
+    clean = next(c for c in corpus["cases"] if c["expectation"] == "clean")
+    broken = json.loads(json.dumps(clean))
+    broken["delivery"]["update_id"] = True
+    assert any(
+        "доставке" in e for e in ev.validate_case(broken, set(corpus["defect_classes"]))
+    )
+
+
+def test_unreadable_corpus_stops_the_run_with_a_message(tmp_path, capsys):
+    path = tmp_path / "c.json"
+    path.write_text("{не json", encoding="utf-8")
+    assert ev.main(["--corpus", str(path), "--db", str(tmp_path / "x.db")]) == 1
+    assert "не читается" in capsys.readouterr().out
+    path.write_text("[]", encoding="utf-8")
+    assert ev.main(["--corpus", str(path), "--db", str(tmp_path / "x.db")]) == 1

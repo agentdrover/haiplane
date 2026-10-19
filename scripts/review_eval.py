@@ -156,7 +156,7 @@ def _validate_expectation(
     delivery = case.get("delivery") or {}
     if case.get("truth", {}).get("verdict") != "APPROVED":
         errors.append(f"{where}: чистая без вердикта APPROVED")
-    if not delivery.get("update_id") or not delivery.get("at"):
+    if not _is_int(delivery.get("update_id")) or not delivery.get("at"):
         errors.append(f"{where}: у чистой нет записи о доставке (delivery)")
     window = case.get("window_days")
     if not case.get("checked_at") or not _is_int(window):
@@ -169,12 +169,41 @@ def _validate_expectation(
     return errors
 
 
-def validate_case(case: dict[str, Any], classes: set[str]) -> list[str]:
+def _shape_errors(case: Any) -> list[str]:
+    """Типы полей, на которые опираются остальные проверки и сам счёт.
+
+    Битая форма (не словарь, bool вместо числа, строка вместо списка) должна
+    вернуться списком ошибок, а не трейсбеком в середине проверки.
+    """
+    if not isinstance(case, dict):
+        return ["случай не объект"]
     where = str(case.get("case_id", "?"))
     errors: list[str] = []
-    for field in ("case_id", "task_id", "submission_generation", "submission_sha"):
-        if case.get(field) in (None, ""):
-            errors.append(f"{where}: нет поля {field}")
+    if not isinstance(case.get("case_id"), str) or not case["case_id"]:
+        errors.append(f"{where}: case_id не непустая строка")
+    for field in ("task_id", "submission_generation"):
+        if not _is_int(case.get(field)):
+            errors.append(f"{where}: {field} не целое число")
+    if not isinstance(case.get("submission_sha"), str):
+        errors.append(f"{where}: submission_sha не строка")
+    for field in ("truth", "delivery"):
+        if field in case and not isinstance(case[field], dict):
+            errors.append(f"{where}: {field} не объект")
+    locators = case.get("locators", [])
+    if not isinstance(locators, list) or not all(isinstance(x, dict) for x in locators):
+        errors.append(f"{where}: locators не список объектов")
+    for field in ("defect_class", "expectation", "checked_at"):
+        if field in case and not isinstance(case[field], str):
+            errors.append(f"{where}: {field} не строка")
+    return errors
+
+
+def validate_case(case: dict[str, Any], classes: set[str]) -> list[str]:
+    shape = _shape_errors(case)
+    if shape:
+        return shape
+    where = str(case.get("case_id", "?"))
+    errors: list[str] = []
     if not SHA_RE.match(str(case.get("submission_sha", ""))):
         errors.append(f"{where}: submission_sha не 40 hex")
     if case.get("expectation") not in EXPECTATIONS:
@@ -193,7 +222,11 @@ def validate_corpus(corpus: dict[str, Any]) -> list[str]:
         return ["корпус пуст"]
     classes = set(corpus.get("defect_classes") or [])
     errors: list[str] = []
-    ids = Counter(c.get("case_id") for c in cases)
+    ids = Counter(
+        c["case_id"]
+        for c in cases
+        if isinstance(c, dict) and isinstance(c.get("case_id"), str)
+    )
     errors += [f"{i}: case_id повторён" for i, n in sorted(ids.items()) if n > 1]
     for case in cases:
         errors += validate_case(case, classes)
@@ -664,7 +697,7 @@ def _plan_totals(billed: int, provider: int, unknown: int, left_out: int) -> lis
     total = billed + provider
     exact = not provider and not unknown
     mark = "" if exact else "≥ "
-    if not total and unknown:
+    if not total:  # ни одной известной цены: это «нет данных», не ноль
         lines = [f"  оценка цены: {NO_DATA}"]
     else:
         lines = [f"  оценка цены: {mark}{total} токенов"]
@@ -681,7 +714,12 @@ def _plan_totals(billed: int, provider: int, unknown: int, left_out: int) -> lis
 
 
 def run(corpus_path: Path, db_path: str, plan_cap: int | None) -> tuple[int, str]:
-    corpus = load_corpus(corpus_path)
+    try:
+        corpus = load_corpus(corpus_path)
+    except (OSError, ValueError) as exc:
+        return 1, f"корпус: не читается ({exc})\n"
+    if not isinstance(corpus, dict):
+        return 1, "корпус: верхний уровень не объект\n"
     errors = validate_corpus(corpus)
     if errors:
         return 1, "".join(f"корпус: {e}\n" for e in errors)
