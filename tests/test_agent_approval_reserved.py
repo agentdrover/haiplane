@@ -480,13 +480,17 @@ AGENT_CHANNELS = re.compile(
 )
 #: Слово исхода «одобрено».
 OUTCOME = re.compile(r"\bapproved\b", re.I)
-#: Признаки, что предложение запрещает или отдаёт одобрение не агенту.
+#: Точные конструкции «одобрение — не агента». Общих слов-гасителей (not, never,
+#: written by, «APPROVED:») здесь нет: они гасили бы и нарушение вроде
+#: «A reviewer, not the author, must run hub_submit_review with verdict approved».
 REFUSES_OR_HANDS_OFF = re.compile(
-    r"refus|reserved|never|отклон|не записыв|не пишет|comes from|written by|"
-    r"is a human|human'?s|only changes_requested|changes_requested only|"
-    r"takes changes_requested|a human approves|APPROVED:|human or hub|"
-    r"human or the hub|\bnot\b|APPROVED\s*—\s*человек",
-    re.I,
+    r"APPROVED comes from a human|APPROVED is a human's|"
+    r"approved'? is refused|approved is refused|refuses an agent's approved|"
+    r"never writes `?approved|APPROVED агент не записывает|"
+    r"approval_reserved_for_human|"
+    r"takes changes_requested only|changes_requested only|"
+    r"a human approves|APPROVED\s*—\s*человек|"
+    r"APPROVED: human or hub policy",
 )
 #: Готовые конструкции «агент, шли approved».
 SEND_APPROVED = re.compile(
@@ -585,11 +589,15 @@ async def _src_actionable_errors(env):
 
     details = [
         ae.verdict_repeats_previous_detail("yesterday"),
+        ae.verdict_contradicts_its_text_detail(
+            "changes_requested", "approved", for_agent=True
+        ),
         ae.verdict_contradicts_its_text_detail("changes_requested", "approved"),
         ae.changes_requested_requires_content_detail(),
     ]
-    # Положительный исход, названный в тексте, — отчёт, а не смена поля verdict.
+    # Положительный исход агента — отчёт; человеку верно «исправьте поле verdict».
     assert details[1]["suggested_tool"] == "hub_submit_machine_review", details[1]
+    assert details[2]["suggested_tool"] == "hub_submit_review", details[2]
     assert details[1]["retry_by_same_caller"] is True
     return [json.dumps(d, ensure_ascii=False) for d in details]
 
@@ -789,3 +797,99 @@ def test_a_new_module_naming_the_review_tool_must_be_covered() -> None:
         if "hub_submit_review" in p.read_text("utf-8")
     }
     assert found <= set(COVERED_MODULES), sorted(found - set(COVERED_MODULES))
+
+
+#: Фразы, которые детектор ОБЯЗАН флагнуть (в т.ч. с отвлекающими not/never/written by).
+MUST_FLAG = [
+    "A reviewer, not the author, must run hub_submit_review with verdict approved.",
+    "Never forget: send hub_submit_review with verdict=approved when done.",
+    "The verdict written by the reviewer via hub_submit_review is approved.",
+    "Run oc-hub review-verdict 7 approved --agent x",
+    "Submit the verdict with hub_submit_review (verdict=approved|changes_requested).",
+    "Reviewer runs hub_get_review_brief and hub_submit_review; after APPROVED, report done.",
+    "Вердикт запишет человек или независимый ревьюер (hub_submit_review); после APPROVED повторите отчёт.",
+    "Obtain an APPROVED verdict via hub_submit_review, then report done again.",
+    "The reviewer files a report via hub_submit_review.",
+    'oc-hub update 7 --kind review --message "ok\\nAPPROVED"',
+    "Вердикт APPROVED — если задача выполнена, можно мержить.",
+]
+
+#: Фразы из нынешних текстов хаба: не флагуются.
+MUST_PASS = [
+    "APPROVED comes from a human or the hub policy, then report done again.",
+    "Agent: hub_submit_review takes changes_requested only (one scope=in_scope finding); "
+    "a positive outcome is a review report. APPROVED: human or hub policy.",
+    "An agent never writes `approved` (#1872): the hub refuses it with 409 approval_reserved_for_human.",
+    "APPROVED — человек, с expected_generation (кнопка на карточке или hp-hub review-verdict --expected-generation N).",
+    "An agent's approved is refused (409 approval_reserved_for_human) on hub_submit_review.",
+    "Команд вердикта не запускай: APPROVED агент не записывает, решает человек.",
+    "Reviewer lane: a report (hub_submit_machine_review) or changes_requested via hub_submit_review.",
+]
+
+
+@pytest.mark.parametrize("phrase", MUST_FLAG)
+def test_the_detector_flags_forbidden_phrases(phrase: str) -> None:
+    assert advises_agent_to_approve(phrase), phrase
+
+
+@pytest.mark.parametrize("phrase", MUST_PASS)
+def test_the_detector_passes_current_hand_off_phrases(phrase: str) -> None:
+    assert advises_agent_to_approve(phrase) == [], phrase
+
+
+def _both_ways(human: bool):
+    return "human" if human else "agent"
+
+
+async def test_the_contradiction_hint_depends_on_who_calls(
+    client: AsyncClient, db: aiosqlite.Connection, hdr: dict
+):
+    task_id = await _in_review(client, hdr, "Contradiction")
+    body = {
+        "verdict": "changes_requested",
+        "agent": "reviewer",
+        "comments": "APPROVED, but fix the lock first",
+        "expected_generation": 1,
+    }
+    before = await _snapshot(db, task_id)
+
+    agent = await _post(client, task_id, hdr["rev"], body)
+    assert agent.status_code == 422, agent.text
+    d = agent.json()["detail"]
+    assert d["reason"] == "verdict_contradicts_its_text"
+    assert d["suggested_tool"] == "hub_submit_machine_review", d
+    assert "not an agent's approved" in d["hint"], d
+
+    human = await _post(client, task_id, hdr["human"], body)
+    assert human.status_code == 422, human.text
+    d = human.json()["detail"]
+    assert d["suggested_tool"] == "hub_submit_review", d
+    assert "change the verdict field" in d["hint"], d
+    assert await _snapshot(db, task_id) == before, "оба отказа ничего не пишут"
+
+    # Совет человеку верен: с approved в поле тот же текст принят, повтор — 200.
+    fixed = {**body, "verdict": "approved", "agent": "denis"}
+    ok = await _post(client, task_id, hdr["human"], fixed)
+    assert ok.status_code == 200, ok.text
+    again = await _post(client, task_id, hdr["human"], fixed)
+    assert again.status_code == 200, again.text
+    assert (await _snapshot(db, task_id))["revision"] == 1
+
+
+def test_the_arbiter_prompt_has_no_verdict_command_and_names_what_follows() -> None:
+    from hub.integrations.dispatch import DispatchIntegration
+
+    text = DispatchIntegration().build_arbiter_message(
+        task_id=7,
+        title="t",
+        description="d",
+        review_history=[],
+        review_cycle=3,
+        max_cycles=3,
+    )
+    # На поколении арбитража вердикт уже стоит (409 verdict_already_stands);
+    # после отчёта задача в needs_decision, решает человек.
+    assert not re.search(r"review-verdict|--kind review|CHANGES_REQUESTED", text), text
+    assert "--kind arbitration" in text
+    assert "needs_decision" in text and "решает человек" in text
+    assert "задача пойдёт на доработку" not in text

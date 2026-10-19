@@ -4327,7 +4327,9 @@ async def _vstep_verdict_matches_its_text(state: VerdictContext) -> None:
         raise HTTPException(
             422,
             detail=verdict_contradicts_its_text_detail(
-                state.body.verdict.value, declared
+                state.body.verdict.value,
+                declared,
+                for_agent=state.agent_caller and not state.human_caller,
             ),
         )
 
@@ -4363,9 +4365,8 @@ async def _vstep_changes_requested_has_in_scope_finding(state: VerdictContext) -
                         "hint": (
                             "If nothing needs fixing in this task, file a review "
                             "report (hub_submit_machine_review or a comment) "
-                            "recommending to approve — APPROVED is written by a "
-                            "human or the hub's automation, not by an agent — "
-                            "and keep out-of-scope findings "
+                            "recommending to approve (APPROVED comes from a human "
+                            "or the hub policy) and keep out-of-scope findings "
                             "as recommendations (linked to follow-up tasks "
                             "via linked_task_id)."
                         ),
