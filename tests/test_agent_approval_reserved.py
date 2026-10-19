@@ -463,3 +463,8 @@ def test_reviewer_instructions_do_not_ask_an_agent_to_approve() -> None:
     assert "approved|changes_requested" not in brief
     doc = (ROOT / "docs" / "software-development-workflow.md").read_text("utf-8")
     assert "`approval_reserved_for_human`" in doc
+    # Схема основного потока: от агента-ревьюера нет перехода approved -> merge.
+    assert 'P -- "approved"' not in doc
+    assert "(не от агента)" in doc
+    rules = (ROOT / "docs" / "cursor-agent-rules.md").read_text("utf-8")
+    assert "approval_reserved_for_human" in rules

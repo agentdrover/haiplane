@@ -86,7 +86,8 @@ flowchart TD
     N -- "pass" --> P["Reviewer agent"]
     P -- "changes requested" --> Q["fix_requested"]
     Q --> H
-    P -- "approved" --> R["PR merge / completed"]
+    P -- "отчёт ревью: рекомендация принять" --> P2{"Одобрение: человек или автоматика по политике проекта (verdict=auto, steward act)"}
+    P2 -- "APPROVED (не от агента)" --> R["PR merge / completed"]
     P -- "unclear or cycle limit" --> S["needs_decision"]
     S --> T{"Human decision"}
     T -- "accept" --> R
@@ -291,7 +292,9 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 5. **`git push -u origin HEAD`** когда готовы к CI/review.
 6. PR в `develop` (или согласованный base), ссылка на hub task id в описании.
 7. Пройдите Universal Review Gate: `hub_submit_for_review` → вердикт
-   ревьюера (`hub_get_review_brief` + `hub_submit_review`) → при APPROVED
+   ревьюера (`hub_get_review_brief`; агент: отчёт или `changes_requested`
+   через `hub_submit_review`, APPROVED записывает человек или автоматика
+   хаба, #1872) → при APPROVED
    **`hub_report_done`** с validation commands и результатами завершает
    задачу. Done-report без актуального одобрения не завершает задачу, а
    отправляет её в `review`.

@@ -272,7 +272,7 @@ curl -sS \
 
 ### Reviewer-идентичность: не ревьюй под токеном исполнителя (#432)
 
-Universal Review Gate сравнивает **принципалов**, а не тип токена: вердикт
+Universal Review Gate сравнивает **принципалов** (APPROVED агента хаб не принимает вовсе: 409 `approval_reserved_for_human`, #1872 — одобряет человек или автоматика по политике проекта), а не тип токена: вердикт
 (`hub_submit_review` / `POST /api/tasks/{id}/review-verdict`) от той же
 идентичности, что делала `hub_pair_start`/`hub_claim_task`, отклоняется с
 403 `self_review_forbidden`. Сравнение идёт по `principal_id` (DB-токены),
