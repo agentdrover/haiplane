@@ -233,44 +233,138 @@ def split_generated(diff: str) -> tuple[str, list[str]]:
     return _split_files(diff, is_generated)
 
 
+_HUNK_RE = re.compile(r"^(@{2,}) ((?:[-+]\d+(?:,\d+)?(?: |$))+)\1")
+_FILE_STARTS = ("diff --git ", "diff --cc ", "diff --combined ")
+
+
+class _Hunk:
+    """Lines still owed to the current hunk, from its ``@@ -a,b +c,d @@`` header.
+
+    The boundary of a hunk is its counters, never the look of a line: inside
+    the body an added ``++ x`` reads exactly like a ``+++ x`` header (#1856).
+    A combined diff (``@@@ -a,b -c,d +e,f @@@``) carries one old counter per
+    parent. A missing counter is 1. ``consume`` is False when the body does
+    not add up; the caller then trusts nothing about where files begin.
+    """
+
+    def __init__(self) -> None:
+        self.parents = 1
+        self.old: list[int] = []
+        self.new = 0
+
+    @property
+    def open(self) -> bool:
+        return self.new > 0 or any(n > 0 for n in self.old)
+
+    def start(self, header: str) -> bool:
+        match = _HUNK_RE.match(header)
+        if match is None:
+            return False
+        counts = [
+            int(tok.split(",")[1]) if "," in tok else 1
+            for tok in match.group(2).split()
+        ]
+        self.parents = len(match.group(1)) - 1
+        if len(counts) != self.parents + 1:
+            return False
+        self.old, self.new = counts[:-1], counts[-1]
+        return True
+
+    def consume(self, line: str) -> bool:
+        if line.startswith("\\"):
+            return True  # "\ No newline at end of file"
+        prefix = line[: self.parents].ljust(self.parents)
+        if any(c not in " +-" for c in prefix):
+            return False
+        for i, c in enumerate(prefix):
+            if c in " -":
+                self.old[i] -= 1
+        if "-" not in prefix:
+            self.new -= 1
+        return self.new >= 0 and all(n >= 0 for n in self.old)
+
+    def reset(self) -> None:
+        self.old, self.new = [], 0
+
+
+@dataclasses.dataclass
+class _FileSpan:
+    path: str | None = None
+    plus_at: int | None = None  # index of the "+++ " line: the cut starts there
+    hunks: int = 0
+    trusted: bool = True
+
+
+def _header_path(line: str) -> str:
+    raw = _unquote_path(line[4:]) or line[4:].strip()
+    return raw[2:] if raw.startswith("b/") else raw
+
+
+def _file_spans(lines: list[str]) -> list[_FileSpan]:
+    """Per line, the file it belongs to; ``trusted`` False when counters broke."""
+    spans = [_FileSpan()]
+    owner: list[_FileSpan] = []
+    hunk = _Hunk()
+    for n, line in enumerate(lines):
+        text = line.rstrip("\n")
+        cur = spans[-1]
+        if hunk.open:
+            if hunk.consume(text):
+                owner.append(cur)
+                continue
+            # The body does not add up: whatever it is, it is code, not noise.
+            cur.trusted = False
+            hunk.reset()
+        if text.startswith(_FILE_STARTS) or (
+            text.startswith("--- ") and cur.plus_at is not None
+        ):
+            cur = _FileSpan()
+            spans.append(cur)
+        elif text.startswith("+++ "):
+            if cur.plus_at is not None:
+                cur = _FileSpan()
+                spans.append(cur)
+            cur.plus_at, cur.path = n, _header_path(text)
+        elif text.startswith("@@"):
+            cur.hunks += 1
+            cur.trusted = cur.trusted and hunk.start(text)
+        elif cur.hunks and text[:1] in ("+", "-", " "):
+            # Body text after the counters ran out: they undercounted.
+            cur.trusted = False
+        owner.append(cur)
+    if hunk.open:
+        owner[-1].trusted = False
+    return owner
+
+
 def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]]:
     """``(diff without the files ``drop`` accepts, names of what was dropped)``.
 
-    Splits on the ``+++`` headers the same way :func:`changed_paths` reads
-    them, so both functions agree on where a file's hunk begins. A diff that
-    starts with lines before any header keeps them: dropping text we could not
-    attribute would be the silent cut this whole task exists to prevent.
+    A file starts at ``diff --git`` / ``diff --cc`` / ``diff --combined`` or,
+    in a plain unified diff, at its ``+++`` header; the cut begins at that
+    header and the lines above it stay. What is a header and what is a hunk
+    body is decided by the hunk counters (:class:`_Hunk`). A file whose hunks
+    do not add up is NOT dropped: a hidden signal costs more than a deep run.
     """
+    lines = diff.splitlines(keepends=True)
+    owner = _file_spans(lines)
     kept: list[str] = []
     dropped: list[str] = []
-    skipping = False
-    # Only a git diff has hunks that can be told from headers. A plain unified
-    # diff (no "diff --git" line) reads as before: every "+++ " is a header.
-    is_git = any(ln.startswith("diff --git ") for ln in diff.splitlines())
-    in_header = True
-    for line in diff.splitlines(keepends=True):
-        # A hunk body is not a header: an added "++ x" reads as "+++ x" there
-        # and would switch off the rest of a live file (#1856).
-        if line.startswith("diff --git "):
-            in_header = True
-        elif is_git and in_header and line.startswith("@@"):
-            in_header = False
-        if in_header and line.startswith("+++ "):
-            # git C-quotes non-ASCII names: "b/docs/\320\267.md".
-            raw = _unquote_path(line[4:]) or line[4:].strip()
-            path = raw[2:] if raw.startswith("b/") else raw
-            skipping = path != "/dev/null" and drop(path)
-            if skipping:
-                if path not in dropped:
-                    dropped.append(path)
-                # The header of the dropped file goes with it; the "--- a/..."
-                # line above it was already kept, which is why the reader sees
-                # the pair broken rather than the file silently absent.
-                continue
-        elif skipping and line.startswith("diff --git "):
-            skipping = False
-        if not skipping:
+    for n, line in enumerate(lines):
+        span = owner[n]
+        path = span.path
+        cut = (
+            span.trusted
+            and path is not None
+            and span.plus_at is not None
+            and n >= span.plus_at
+            and path != "/dev/null"
+            and drop(path)
+        )
+        if not cut:
             kept.append(line)
+        elif path is not None and path not in dropped:
+            dropped.append(path)
     return "".join(kept), dropped
 
 

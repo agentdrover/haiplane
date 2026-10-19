@@ -1189,3 +1189,59 @@ def test_c_quoted_non_ascii_paths_are_classified_like_ascii_ones():
     assert process_surface_reasons(doc('"b/hub/\\320\\267.py"')) != []
     kept, dropped = split_generated(doc('"b/node_modules/\\320\\267.js"') + code)
     assert dropped == ["node_modules/з.js"]
+
+
+_SUBPROCESS = ["запуск подпроцессов: subprocess.run"]
+_DOC_HUNK = "--- a/README.md\n+++ b/README.md\n@@ -0,0 +1 @@\n+text\n"
+
+
+def test_hunk_body_is_never_a_header():
+    # #1856: the edge of a hunk is its counters. An added line whose text is
+    # "++ README.md" is "+++ README.md" in the diff and must stay a body line,
+    # in a plain unified diff and in a git one.
+    body = "@@ -0,0 +1,2 @@\n+++ README.md\n+    subprocess.run(['ls'])\n"
+    plain = "--- a/hub/x.py\n+++ b/hub/x.py\n" + body
+    git = "diff --git a/hub/x.py b/hub/x.py\n" + plain
+    for diff in (plain, git):
+        assert process_surface_reasons(diff) == _SUBPROCESS
+        assert split_generated(diff) == (diff, [])
+
+
+def test_combined_diff_after_a_document_opens_a_new_file():
+    # #1856: "diff --cc" ends the document before it; "@@@" counts one old
+    # side per parent, so the "++" prefixed line is body of hub/x.py.
+    combined = (
+        "diff --cc hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@@ -1,1 -1,1 +1,2 @@@\n  x\n++subprocess.run(['ls'])\n"
+    )
+    for head in ("diff --git a/README.md b/README.md\n", ""):
+        assert process_surface_reasons(head + _DOC_HUNK + combined) == _SUBPROCESS
+    # Without ---/+++ lines only the "diff --cc" line says a new file began.
+    bare = "diff --cc hub/x.py\n@@@ -1,1 -1,1 +1,2 @@@\n  x\n++subprocess.run(['ls'])\n"
+    assert process_surface_reasons(_DOC_HUNK + bare) == _SUBPROCESS
+    combined2 = combined.replace("diff --cc", "diff --combined")
+    assert process_surface_reasons(_DOC_HUNK + combined2) == _SUBPROCESS
+
+
+def test_hunk_that_does_not_add_up_is_kept_as_code():
+    # #1856: counters that run negative, or a hunk cut short by the next file,
+    # mean we cannot tell where the file ends: nothing is dropped.
+    too_long = (
+        "--- a/README.md\n+++ b/README.md\n@@ -0,0 +1 @@\n+a\n+subprocess.run(1)\n"
+    )
+    assert process_surface_reasons(too_long) == _SUBPROCESS
+    short = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -0,0 +1,5 @@\n+subprocess.run(1)\n"
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1 @@\n+x\n"
+    )
+    assert process_surface_reasons(short) == _SUBPROCESS
+    kept, dropped = split_generated(short)
+    # The broken README stays whole; the clean lock after it is still cut.
+    assert dropped == ["uv.lock"] and "+subprocess.run(1)" in kept
+    assert "+x" not in kept
+    bad_header = (
+        "--- a/README.md\n+++ b/README.md\n@@ nonsense @@\n+subprocess.run(1)\n"
+    )
+    assert process_surface_reasons(bad_header) == _SUBPROCESS
