@@ -729,8 +729,9 @@ async def _cloud_task(
     branch: str = HEAD_BRANCH,
     gh_repo: str = "own/rep",
     workspace: str = "",
+    contract: bool = True,
 ) -> int:
-    policy: dict = {"ci_contract": SAT_CONTRACT}
+    policy: dict = {"ci_contract": SAT_CONTRACT} if contract else {}
     if mode is not None:
         policy["ci_before_submit"] = mode
     pid = await repo.create_project(db, slug=slug, name=slug.title())
@@ -870,6 +871,7 @@ async def test_running_task_no_duplicate_or_foreign_runs(
     cloud.heads["task-2/grace"] = "c3" * 20
     await _cloud_task(db, slug="grace", branch="task-2/grace")
     cases = [
+        ("nocontract", dict(contract=False)),
         ("off", dict(mode="off")),
         ("nokey", dict(mode=None)),
         ("gitverse", dict(forge="gitverse")),
@@ -908,8 +910,8 @@ async def test_running_task_no_duplicate_or_foreign_runs(
         ("task-4/amb", SAT_PATH)
     ], "срок повтора не истёк: резерв держится"
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
-    _restart()  # отступ после неоднозначного исхода истёк
     for _ in range(4):
+        _restart()  # отступ после неоднозначного исхода истёк
         await _cycle(db)
     assert len([r for r in cloud.requests if r[0] == "task-4/amb"]) == 2, (
         "всего не больше двух запросов на (задача, sha)"
@@ -1257,28 +1259,16 @@ async def test_the_announcement_queue_is_read_page_by_page(
     from hub.services.ci_report import accept_ci_run_report
     from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
 
-    old_branch = "task-6/old"
-    cloud.heads[old_branch] = HEAD_A
-    good = await _cloud_task(db, slug="good", branch=old_branch)
+    cloud.heads["task-6/old"] = HEAD_A
+    cloud.heads["task-6/newer"] = HEAD_B
+    good = await _cloud_task(db, slug="good", branch="task-6/old")
+    bad = await _cloud_task(db, slug="bad", branch="task-6/newer")
     await _cycle(db)
-    await accept_ci_run_report(
-        db,
-        good,
-        **cloud.github.attempt(
-            good, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="6001"
-        ),
-    )
-    other_branch = "task-6/newer"
-    cloud.heads[other_branch] = HEAD_B
-    bad = await _cloud_task(db, slug="bad", branch=other_branch)
-    await _cycle(db)
-    await accept_ci_run_report(
-        db,
-        bad,
-        **cloud.github.attempt(
-            bad, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="6002"
-        ),
-    )
+    for task_id, sha, run in ((good, HEAD_A, "6001"), (bad, HEAD_B, "6002")):
+        sent = cloud.github.attempt(
+            task_id, sha, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id=run
+        )
+        await accept_ci_run_report(db, task_id, **sent)
     project = await repo.resolve_project_for_task(db, bad)
     await set_contract(db, project["id"], SAT_CONTRACT_C)
     await db.commit()
@@ -1305,3 +1295,24 @@ async def test_a_slow_cycle_stops_starting_tasks_and_a_failed_send_backs_off(
     reads = cloud.head_reads
     await _cycle(db)
     assert cloud.head_reads == reads, "после неоднозначного исхода - отступ"
+
+
+async def test_a_cycle_serves_a_bounded_number_of_tasks_in_turn(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862: не больше N задач за цикл, круговая очередь, одно чтение голов на репозиторий."""
+    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 2)
+    branches = [f"task-7/b{i}" for i in range(5)]
+    for i, branch in enumerate(branches):
+        cloud.heads[branch] = f"{i:02d}" * 20
+        await _cloud_task(db, slug=f"turn{i}", branch=branch)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == branches[:2]
+    # одно чтение голов на репозиторий + одно контрольное на ВСЕ принятые запросы
+    # прохода (голова могла сдвинуться, пока шёл запрос)
+    assert cloud.head_reads == 1 + 1
+    await _cycle(db)
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == branches, (
+        "по кругу: хвост очереди не голодает, и никто не получает запрос дважды"
+    )
