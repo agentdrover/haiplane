@@ -58,7 +58,7 @@ def _unquote_path(raw: str) -> str | None:
 
 
 _HUNK_RE = re.compile(r"^(@{2,}) ((?:[-+]\d+(?:,\d+)?(?: |$))+)\1")
-_FILE_STARTS = ("diff --git ", "diff --cc ", "diff --combined ")
+FILE_STARTS = ("diff --git ", "diff --cc ", "diff --combined ")
 
 
 class _Hunk:
@@ -117,15 +117,65 @@ class _Hunk:
 
 @dataclasses.dataclass
 class _FileSpan:
-    path: str | None = None
+    path: str | None = None  # THE key of the file; every reader takes it from here
+    old: str | None = None  # the name it had before a rename or a copy
     plus_at: int | None = None  # index of the "+++ " line: the cut starts there
     hunks: int = 0
+    deleted: bool = False
     trusted: bool = True
 
 
-def _header_path(line: str) -> str:
+def _name(line: str) -> str:
+    """The name on a ``--- `` / ``+++ `` line: one key rule, no a/ b/ prefix."""
     raw = _unquote_path(line[4:]) or line[4:].strip()
-    return raw[2:] if raw.startswith("b/") else raw
+    return raw[2:] if raw[:2] in ("a/", "b/") else raw
+
+
+def _git_line_paths(rest: str) -> list[str | None]:
+    """The two sides of ``diff --git <a> <b>``, quoted or not."""
+    if rest.startswith('"'):
+        end = rest.find('" ', 1)
+        if end < 0:
+            return [None]
+        return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
+    # Same name on both sides (everything but a rename or copy): "a/P b/P" is
+    # split by length, so a " b/" inside P cannot move the cut.
+    size = (len(rest) - 5) // 2
+    if (
+        size > 0
+        and len(rest) == 2 * size + 5
+        and rest.startswith("a/")
+        and rest[2 + size : 5 + size] == " b/"
+        and rest[2 : 2 + size] == rest[5 + size :]
+    ):
+        return [rest[: 2 + size], "b/" + rest[5 + size :]]
+    left, sep, right = rest.partition(" b/")
+    if not sep or not left.startswith("a/"):
+        return [None]
+    return [left, "b/" + right]
+
+
+def git_header_path(line: str) -> str | None:
+    """Key of the file a ``diff --git`` / ``diff --cc`` line opens, or None.
+
+    A plain ``diff --git`` line names the file only when both sides spell the
+    same path; sides that differ are a rename or a copy, and the key waits for
+    ``rename to`` / ``+++``. ``diff --cc P`` names it outright.
+    """
+    line = line.rstrip("\r\n")
+    if line.startswith(("diff --cc ", "diff --combined ")):
+        return _unquote_path(line.split(" ", 2)[2]) or None
+    sides = _git_line_paths(line[len("diff --git ") :])
+    if len(sides) == 2 and sides[0] and sides[1]:
+        old, new = sides[0].removeprefix("a/"), sides[1].removeprefix("b/")
+        if old == new:
+            return new
+    return None
+
+
+def _old_name(line: str) -> str | None:
+    named = _name(line)
+    return None if named == "/dev/null" else named
 
 
 def diff_lines(diff: str) -> list[str]:
@@ -149,6 +199,21 @@ class Scanned(NamedTuple):
     text: str  # without LF and CR
     span: _FileSpan
     body: int  # hunk body: width of the +/- columns (1; parents of a merge); else 0
+
+
+_HEADER_NOTES = ("--- ", "rename ", "copy ", "deleted file mode")
+
+
+def _note_header(cur: _FileSpan, text: str) -> None:
+    """What a header line before the first hunk says about the file."""
+    if text.startswith("--- "):
+        cur.old = cur.old or _old_name(text)
+    elif text.startswith(("rename to ", "copy to ")):
+        cur.path = _unquote_path(text.split(" ", 2)[2]) or cur.path
+    elif text.startswith(("rename from ", "copy from ")):
+        cur.old = _unquote_path(text.split(" ", 2)[2]) or cur.old
+    elif text.startswith("deleted file mode"):
+        cur.deleted = True
 
 
 def scan_diff(diff: str) -> list[Scanned]:
@@ -179,17 +244,26 @@ def scan_diff(diff: str) -> list[Scanned]:
                 continue
             broke, cur.trusted = True, False
             hunk.reset()
-        if text.startswith(_FILE_STARTS) or (
-            text.startswith("--- ") and cur.plus_at is not None
-        ):
+        if text.startswith(FILE_STARTS):
             cur = fresh()
+            cur.path = git_header_path(text)
+        elif text.startswith("--- ") and cur.plus_at is not None:
+            cur = fresh()
+            cur.old = _old_name(text)
+        elif not cur.hunks and text.startswith(_HEADER_NOTES):
+            _note_header(cur, text)
         elif text.startswith("+++ ") and cur.hunks and not prev.startswith("--- "):
             # A file header is the pair "--- " + "+++ ". A lone "+++ " after a
             # hunk is body text the counters undercounted, not a new file.
             broke, cur.trusted = True, False
         elif text.startswith("+++ "):
             cur = fresh() if cur.plus_at is not None else cur
-            cur.plus_at, cur.path = n, _header_path(text)
+            named = _name(text)
+            cur.plus_at = n
+            if named == "/dev/null":
+                cur.deleted, cur.path = True, cur.path or cur.old
+            else:
+                cur.path = named
         elif text.startswith("@@"):
             cur.hunks += 1
             if not hunk.start(text):

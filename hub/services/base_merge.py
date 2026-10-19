@@ -37,7 +37,7 @@ merge_failed: конфликт с только что доставленной #
 
 from __future__ import annotations
 
-from hub.services.diff_scan import diff_texts
+from hub.services.diff_scan import FILE_STARTS, diff_texts
 
 # Классы конфликта. ``unresolvable`` — это не «плохо», а «не наш класс»: гейт
 # зовёт человека и называет причину, как и раньше.
@@ -82,8 +82,8 @@ def _author_edit(diff: str) -> dict[str, list[str]]:
     # deep-ревью первой сдачи #1361, воспроизведена на настоящем git).
     in_header = False
     for line in diff_texts(diff):
-        if line.startswith("diff --git "):
-            key = line[len("diff --git ") :]
+        if line.startswith(FILE_STARTS):
+            key = line.split(" ", 2)[2]
             files.setdefault(key, [])
             in_header = True
             continue

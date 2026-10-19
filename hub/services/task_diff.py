@@ -27,7 +27,7 @@ Two rules this module exists to keep:
 
 from __future__ import annotations
 
-from hub.services.diff_scan import scan_diff
+from hub.services.diff_scan import FILE_STARTS, scan_diff
 
 import logging
 from typing import Any
@@ -85,22 +85,28 @@ def split_files(diff: str) -> list[dict[str, Any]]:
     dropping them, because a lost hunk is a change nobody was shown.
     """
     files: list[dict[str, Any]] = []
+    owners: list[Any] = []  # the span of each entry: its path is known only later
     current: dict[str, Any] | None = None
+    last: Any = None
     new_line: int | None = None
     for entry in scan_diff(diff):
         line, body = entry.text, bool(entry.body)
-        if line.startswith("diff --git "):
-            path = line.split(" b/", 1)[-1].strip() if " b/" in line else line
-            current = {"path": path, "added": 0, "removed": 0, "lines": []}
+        if entry.span is not last:
+            last = entry.span
+            current = {
+                "path": "(diff preamble)" if not files and not entry.span.path else "",
+                "added": 0,
+                "removed": 0,
+                "lines": [],
+            }
             files.append(current)
+            owners.append(entry.span)
             new_line = None
+        if line.startswith(FILE_STARTS):
+            current["fallback"] = line  # type: ignore[index]
             continue
-        if current is None:
-            # Output before any file header (git rarely emits this) — keep it
-            # under a named entry instead of discarding it.
-            current = {"path": "(diff preamble)", "added": 0, "removed": 0, "lines": []}
-            files.append(current)
-            new_line = None
+        if current is None:  # unreachable: the first line opens a file
+            continue
 
         number: int | None = None
         if line.startswith("@@"):
@@ -118,6 +124,9 @@ def split_files(diff: str) -> list[dict[str, Any]]:
             current["added"] += 1
         elif line.startswith("-") and (body or not line.startswith("---")):
             current["removed"] += 1
+    for item, span in zip(files, owners, strict=True):
+        fallback = item.pop("fallback", "")
+        item["path"] = span.path or item["path"] or fallback
     return files
 
 

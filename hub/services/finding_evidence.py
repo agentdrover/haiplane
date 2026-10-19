@@ -9,6 +9,8 @@ Three answers, never two (#762). «Could not look» is not «untouched».
 
 from __future__ import annotations
 
+import re
+
 from hub.services.diff_scan import scan_diff
 
 from dataclasses import dataclass
@@ -349,7 +351,6 @@ def _parse_patch_log(out: str) -> _PatchLog:
     hunks: dict[str, list[_Hunk]] = {}
     files: dict[str, set[str]] = {}
     current_sha = ""
-    current_path = ""
     for raw_record in (out or "").split("\x1e"):
         record = raw_record.strip("\n")
         if not record:
@@ -365,54 +366,39 @@ def _parse_patch_log(out: str) -> _PatchLog:
         hunks[sha] = []
         files[sha] = set()
         current_sha = sha
-        current_path = ""
         for entry in scan_diff(rest):
-            line = entry.text
             if entry.body:
                 continue
-            if line.startswith("--- ") or line.startswith("+++ "):
-                parsed_path = _path_from_diff_header(line[4:])
-                if parsed_path:
-                    current_path = parsed_path
-                    files[current_sha].add(parsed_path)
-                continue
-            if line.startswith("diff --git "):
-                current_path = ""
-                continue
-            if not line.startswith("@@ ") or not current_sha:
+            span, line = entry.span, entry.text
+            for named in (span.path, span.old):
+                if named:
+                    files[current_sha].add(named)
+            if not line.startswith("@@") or not span.path:
                 continue
             parsed = _parse_hunk_header(line)
-            if parsed is None or not current_path:
+            if parsed is None:
                 continue
             old_start, old_count, new_start, new_count = parsed
             hunks[current_sha].append(
-                _Hunk(current_path, old_start, old_count, new_start, new_count)
+                _Hunk(span.path, old_start, old_count, new_start, new_count)
             )
     return _PatchLog(commits=commits, hunks=hunks, files=files)
 
 
-def _path_from_diff_header(raw: str) -> str:
-    token = raw.strip().split("\t", 1)[0]
-    if token in {"/dev/null", "nul"}:
-        return ""
-    if token.startswith("b/") or token.startswith("a/"):
-        return token[2:]
-    return token
+_HUNK_HEADER = re.compile(r"^@{2,} (-\S+)(?: -\S+)* (\+\S+) @{2,}")
 
 
 def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
-    body = line.strip()
-    if not body.startswith("@@"):
+    """``(old_start, old_count, new_start, new_count)`` of a hunk header.
+
+    A combined hunk (``@@@ -a,b -c,d +e,f @@@``) reports its first parent as
+    the old side.
+    """
+    match = _HUNK_HEADER.match(line.strip())
+    if match is None:
         return None
-    parts = body.split("@@")
-    if len(parts) < 2:
-        return None
-    span = parts[1].strip()
-    tokens = span.split()
-    if len(tokens) < 2:
-        return None
-    old = _parse_span(tokens[0], prefix="-")
-    new = _parse_span(tokens[1], prefix="+")
+    old = _parse_span(match.group(1), prefix="-")
+    new = _parse_span(match.group(2), prefix="+")
     if old is None or new is None:
         return None
     return old[0], old[1], new[0], new[1]

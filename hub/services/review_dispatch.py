@@ -39,7 +39,8 @@ import aiosqlite
 
 from hub.db import deserialize_str_list, fetchall
 from hub.services.diff_scan import _unquote_path as _unquote_path
-from hub.services.diff_scan import changed_line, diff_lines, diff_texts, scan_diff
+from hub.services.diff_scan import _git_line_paths as _git_line_paths
+from hub.services.diff_scan import changed_line, diff_texts, scan_diff
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -255,7 +256,7 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
             and path is not None
             and span.plus_at is not None
             and n >= span.plus_at
-            and path != "/dev/null"
+            and not span.deleted
             and drop(path)
         )
         if not cut:
@@ -301,7 +302,7 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
     counts: dict[str, int] = {}
     for entry in scan_diff(diff):
         path = entry.span.path
-        if not path or path == "/dev/null":
+        if not path:
             continue
         counts.setdefault(path, 0)
         if changed_line(entry):
@@ -309,65 +310,32 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
-def _section_header_path(line: str) -> str:
-    raw = _unquote_path(line[4:]) or line[4:].strip()
-    return raw[2:] if raw[:2] in ("a/", "b/") else raw
-
-
-def _git_section_path(line: str) -> str:
-    """Path of a ``diff --git`` line when both sides name the same file, else "".
-
-    The key the sections are matched on is the path as ``changed_paths`` and
-    ``split_generated`` spell it: unquoted, without ``a/`` and ``b/``. Sides
-    that differ are a rename or a copy: the header cannot be split safely
-    (" b/" may sit inside a name), so the key stays empty until ``rename to``
-    or ``+++`` names the file.
-    """
-    # The line comes from diff_lines with its ending: LF would end up in the key.
-    line = line.rstrip("\r\n")
-    sides = _git_line_paths(line[len("diff --git ") :])
-    if len(sides) == 2 and sides[0] and sides[1]:
-        old, new = sides[0].removeprefix("a/"), sides[1].removeprefix("b/")
-        if old == new:
-            return new
-    return ""
-
-
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:
     """``[(path, text of that file's part of the diff)]`` in diff order (#1582).
 
-    A file begins ONLY at a ``diff --git`` line, which git writes at the start
-    of every file and which a hunk body can never contain (its lines carry a
-    ``+``, ``-`` or space prefix). ``---``/``+++`` are read as headers only
-    between that line and the first ``@@``: inside a hunk a removed ``-- sql
-    comment`` reads as ``--- sql comment`` and an added ``++ x`` as ``+++ x``,
-    and taking them for a header used to swallow the rest of the edit.
-
-    Text before the first ``diff --git`` is a section of its own, with its
-    path from its ``+++`` header if it has one: dropping what cannot be
-    attributed would be the silent cut this function exists to prevent.
+    A file begins at ``diff --git``, ``diff --cc`` or ``diff --combined`` (or,
+    in a plain unified diff, at its ``---``/``+++`` pair); which lines are
+    headers and which hunk body is decided by the hunk counters
+    (:mod:`diff_scan`), and the key is the file's single path key
+    (``span.path``). Text before the first file is a section of its own: it
+    carries the path of its ``+++`` header if it has one, else "". A section
+    whose path cannot be read has the key "" and the caller must keep it:
+    dropping what cannot be attributed is the silent cut this exists to prevent.
+    The text of every section is the diff exactly as it came (#1582).
     """
     sections: list[tuple[str, str]] = []
-    path, in_header = "", True
+    last: object = None
     buf: list[str] = []
-    for line in diff_lines(diff):
-        if line.startswith("diff --git "):
-            if buf:
-                sections.append((path, "".join(buf)))
-            path, in_header, buf = _git_section_path(line), True, []
-        elif in_header and line.startswith("@@"):
-            in_header = False
-        elif in_header and line.startswith(("rename to ", "copy to ")):
-            path = _unquote_path(line.split(" ", 2)[2]) or path
-        elif in_header and line.startswith("+++ "):
-            named = _section_header_path(line)
-            path = path if named == "/dev/null" else named
-        elif in_header and line.startswith("--- ") and not path:
-            named = _section_header_path(line)
-            path = "" if named == "/dev/null" else named
-        buf.append(line)
+    key = ""
+    for entry in scan_diff(diff):
+        if entry.span is not last and buf:
+            sections.append((key, "".join(buf)))
+            buf = []
+        last = entry.span
+        key = entry.span.path or ""
+        buf.append(entry.line)
     if buf:
-        sections.append((path, "".join(buf)))
+        sections.append((key, "".join(buf)))
     return sections
 
 
@@ -1029,30 +997,6 @@ def is_documentation(path: str) -> bool:
     return not any(d.startswith(".") or d in _NOT_DOC_DIRS for d in parts[:-1])
 
 
-def _git_line_paths(rest: str) -> list[str | None]:
-    """The two sides of ``diff --git <a> <b>``, quoted or not."""
-    if rest.startswith('"'):
-        end = rest.find('" ', 1)
-        if end < 0:
-            return [None]
-        return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
-    # Same name on both sides (everything but a rename or copy): "a/P b/P" is
-    # split by length, so a " b/" inside P cannot move the cut.
-    size = (len(rest) - 5) // 2
-    if (
-        size > 0
-        and len(rest) == 2 * size + 5
-        and rest.startswith("a/")
-        and rest[2 + size : 5 + size] == " b/"
-        and rest[2 : 2 + size] == rest[5 + size :]
-    ):
-        return [rest[: 2 + size], "b/" + rest[5 + size :]]
-    left, sep, right = rest.partition(" b/")
-    if not sep or not left.startswith("a/"):
-        return [None]
-    return [left, "b/" + right]
-
-
 def _header_paths(line: str) -> list[str | None] | None:
     """Paths a FILE HEADER line names; None when the line is not a header.
 
@@ -1686,9 +1630,9 @@ def changed_paths(diff: str) -> list[str]:
     """
     paths: list[str] = []
     for entry in scan_diff(diff):
-        path = entry.span.path
-        if path and path != "/dev/null" and path not in paths:
-            paths.append(path)
+        span = entry.span
+        if span.path and not span.deleted and span.path not in paths:
+            paths.append(span.path)
     return paths
 
 
