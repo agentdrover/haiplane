@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from httpx import AsyncClient
 
 from tests.cli_support import _run_main
@@ -76,16 +75,16 @@ async def test_plain_summary_contract_all_surfaces(client: AsyncClient, db):
         assert post.await_args.args[1] == {"plain_summary": TEXT}
 
 
-async def test_plain_summary_empty_falls_back_to_problem_statement(
+async def test_plain_summary_empty_is_none_not_problem_statement(
     client: AsyncClient,
 ):
     created = await client.post(
-        "/api/tasks", json={"title": "t", "problem_statement": "Проблема."}
+        "/api/tasks", json={"title": "t", "problem_statement": "OPENAI_API_KEY=sk-x"}
     )
     view = created.json()
     assert view["plain_summary"] is None
-    assert view["plain_summary_shown"] == "Проблема."
-    assert view["plain_summary_source"] == "problem_statement"
+    assert view["plain_summary_shown"] == ""
+    assert view["plain_summary_source"] == "none"
     refined = await client.post(
         f"/api/tasks/{view['id']}/refine", json={"plain_summary": TEXT}
     )
@@ -181,42 +180,15 @@ async def test_plain_summary_defect_verify_mcp_one_request_and_300_cap():
         post.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",  # pragma: allowlist secret
-        "sk-abcdefghijklmnopqrstuv вставлен в запрос.",
-        "Ключ sk-abc123 в запросе.",
-        "Токен ghp_abc123 в логе.",
-        "ghp_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",  # pragma: allowlist secret
-        "gho_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",  # pragma: allowlist secret
-        "github_pat_11ABCDEFG0abcdefghijkl в логе.",
-        "xoxb-1234-5678-abcdef в логе.",  # pragma: allowlist secret
-        "AKIAIOSFODNN7EXAMPLE в логе.",  # pragma: allowlist secret
-        "Authorization: Bearer abc123SECRET в запросе.",
-        "PASSWORD=hunter2 в конфиге.",
-        "Хеш 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 не совпал.",
-        "print(123)",
-        "Падает `x = 1` на старте.",
-        'Падает {"a": 1} на старте.',
-        "x = 1",
-        "Первая строка\nвторая строка.",
-        "а" * 301,
-    ],
-)
-def test_plain_summary_fallback_refuses_secrets_and_code(text):
+def test_plain_summary_empty_stays_empty_even_with_a_secret_in_problem_statement():
     from hub.plain_summary import plain_summary_view
 
-    view = plain_summary_view(None, text)
-    assert view == {"plain_summary_shown": "", "plain_summary_source": "none"}
-
-
-def test_plain_summary_fallback_takes_the_first_clean_sentence():
-    from hub.plain_summary import plain_summary_view
-
-    view = plain_summary_view(None, "Карточка не показывает суть. Второе предложение.")
-    assert view == {
-        "plain_summary_shown": "Карточка не показывает суть.",
-        "plain_summary_source": "problem_statement",
+    leaky = "Ключ sk-abc123 в запросе. OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+    empty = {"plain_summary_shown": "", "plain_summary_source": "none"}
+    assert plain_summary_view(None, leaky) == empty
+    assert plain_summary_view("   ", leaky) == empty
+    assert plain_summary_view(None, None) == empty
+    assert plain_summary_view("Своими словами.", leaky) == {
+        "plain_summary_shown": "Своими словами.",
+        "plain_summary_source": "plain_summary",
     }
-    assert plain_summary_view(None, None)["plain_summary_source"] == "none"

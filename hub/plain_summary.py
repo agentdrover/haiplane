@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import aiosqlite
@@ -26,45 +25,21 @@ class PlainSummaryView(PlainSummaryInput):
     plain_summary_source: str = ""
 
 
-#: Запасной текст берётся только если выглядит как фраза, а не как вывод
-#: команды, код или секрет (#1811): маскировать секреты по ключевым словам
-#: нельзя - sk-/ghp_ проходили, - поэтому подозрительное не показывается вовсе.
-LIMIT = 300
-_SUSPICIOUS = re.compile(
-    r"(?i)sk-\w|\bgh[pousr]_|github_pat_|\bxox[a-z]-|\bAKIA[0-9A-Z]|\bbearer\b"
-    r"|\b\w*(key|token|password|passwd|secret)\w*\s*[:=]"
-    r"|[A-Za-z0-9+/_=-]{20,}"  # длинная hex/base64/путь-подобная строка
-    r"|`|[{}]|\b\w+\s*\(|\w\s*=\s*\S|\$\s|^\s*[#>$]"
-)
-_SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
-
-
-def _fallback(problem_statement: str | None) -> str:
-    text = (problem_statement or "").strip()
-    end = _SENTENCE_END.search(text)
-    sentence = text[: end.end()].strip() if end else text
-    if not sentence or len(sentence) > LIMIT or "\n" in sentence:
-        return ""
-    return "" if _SUSPICIOUS.search(sentence) else sentence
-
-
 def plain_summary_view(
     plain_summary: str | None, problem_statement: str | None
 ) -> dict[str, str]:
     """Что показывать читателю и откуда оно взято.
 
-    Пустой plain_summary (NULL или пробелы) не прячется: читатель получает
-    problem_statement (первое предложение, если оно чистое), а
-    ``plain_summary_source`` называет, что это запасной текст; иначе - ``none``.
+    Только то, что написал автор постановки. Пустой plain_summary (NULL или
+    пробелы) даёт пустой показ и источник ``none``: запасной текст из
+    problem_statement убран решением ревьюера (gen3, #1811) - он бывает
+    выводом команды, кодом или секретом, и фильтра надёжнее отказа нет.
+    ``problem_statement`` оставлен в сигнатуре: читатели зовут её одним видом.
     """
     own = (plain_summary or "").strip()
     if own:
         return {"plain_summary_shown": own, "plain_summary_source": "plain_summary"}
-    fallback = _fallback(problem_statement)
-    return {
-        "plain_summary_shown": fallback,
-        "plain_summary_source": "problem_statement" if fallback else "none",
-    }
+    return {"plain_summary_shown": "", "plain_summary_source": "none"}
 
 
 async def is_new_task(db: aiosqlite.Connection, task_id: int) -> bool:
