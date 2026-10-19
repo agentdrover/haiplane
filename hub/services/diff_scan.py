@@ -294,4 +294,13 @@ def changed_line(entry: Scanned) -> bool:
     if entry.body:
         return any(c in "+-" for c in entry.text[: entry.body])
     text = entry.text
-    return text[:1] in ("+", "-") and not text.startswith(("+++ ", "--- "))
+    if text.startswith("+++ "):
+        return entry.idx != entry.span.plus_at  # the header itself is no change
+    if text.startswith("--- "):
+        # Untrusted text: undercounting is worse. A "--- " above the "+++ " of
+        # its file is still the header.
+        span = entry.span
+        if span.trusted:
+            return False
+        return span.plus_at is None or entry.idx > span.plus_at
+    return text[:1] in ("+", "-")

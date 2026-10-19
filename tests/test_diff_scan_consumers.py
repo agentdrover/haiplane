@@ -293,3 +293,29 @@ def test_real_git_output_for_a_quoted_name_with_a_space(tmp_path: Path):
     ]
     assert process_surface_reasons(diff) == []  # a document and a lock: no surface
     assert split_generated(diff)[1] == ["\u044f /uv.lock"]
+
+
+def test_diff_size_names_files_by_the_single_path_key():
+    quoted = (
+        'diff --git "a/hub/\\321\\217.py" "b/hub/\\321\\217.py"\n'
+        '--- "a/hub/\\321\\217.py"\n+++ "b/hub/\\321\\217.py"\n@@ -0,0 +1 @@\n+x\n'
+    )
+    assert diff_size(quoted) == ({"hub/\u044f.py"}, 1)
+    plain = _one_file_diff("hub/x.py", "+y\n", 1)
+    assert diff_size(plain + quoted) == ({"hub/x.py", "hub/\u044f.py"}, 2)
+    # "+++ b/evil.py" after a closed hunk is body text, not a file
+    evil = _one_file_diff("hub/x.py", "+y\n+++ b/evil.py\n", 1)
+    assert diff_size(evil) == ({"hub/x.py"}, 2)
+
+
+def test_task_diff_reads_the_review_example_of_a_combined_hunk():
+    diff = (
+        "diff --cc hub/x.py\n--- a/hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@@ -1,2 -1,2 +1,2 @@@\n  1\n- main\n -side\n++resolved\n"
+    )
+    (entry,) = split_files(diff)
+    numbers = {ln["text"]: ln["new_line"] for ln in entry["lines"]}
+    assert numbers["  1"] == 1 and numbers["++resolved"] == 2
+    assert numbers["- main"] is None and numbers[" -side"] is None
+    assert (entry["added"], entry["removed"]) == (1, 2)
+    assert entry["added"] + entry["removed"] == author_delta_lines(diff)

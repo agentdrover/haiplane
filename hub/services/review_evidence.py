@@ -1423,18 +1423,9 @@ def diff_size(diff: str) -> tuple[set[str], int]:
     An added ``+++ x`` is a changed line of the file being edited, not a file
     header; a line the counters could not place still counts.
     """
-    files: set[str] = set()
-    lines = 0
-    for entry in scan_diff(diff):
-        line = entry.text
-        if entry.body:
-            lines += changed_line(entry)
-        elif line.startswith("+++ b/"):
-            files.add(line[6:])
-        elif line.startswith("--- a/") and line[6:] != "dev/null":
-            files.add(line[6:])
-        elif changed_line(entry):
-            lines += 1
+    entries = scan_diff(diff)
+    files = {e.span.path for e in entries if e.span.path}
+    lines = sum(1 for e in entries if changed_line(e))
     return files, lines
 
 

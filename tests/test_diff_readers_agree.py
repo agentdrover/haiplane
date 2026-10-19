@@ -27,6 +27,7 @@ from hub.services.review_dispatch import (
     file_line_counts,
     split_generated,
 )
+from hub.services.review_evidence import diff_size
 from hub.services.task_diff import split_files
 
 # name -> what the change is. Written with git's own quoting in the diff.
@@ -188,6 +189,15 @@ def test_every_reader_names_the_same_files(inputs: dict[str, str], kind: str):
         "plain+show-cc": plain_lines + merge_lines,
     }[kind]
     assert author_delta_lines(diff) == expected_lines, "author_delta_lines"
+    # the size of the diff: every file it names, every line it changes
+    sized_files, sized_lines = diff_size(diff)
+    assert sized_files == everything, "review_evidence.diff_size"
+    all_lines = (
+        sum(int(a) + int(d) for a, d, _ in stat if a != "-")
+        if kind.startswith("plain")
+        else 0
+    ) + (merge_lines if kind != "plain" else 0)
+    assert sized_lines == all_lines, "diff_size lines"
     # -U0-style ranges name files that have text hunks and are not deleted
     ranged = set(changed_line_ranges(diff))
     assert ranged <= live and ranged >= (live - {BINARY, MODE_ONLY, RENAMED_TO}), (
@@ -211,3 +221,17 @@ def test_a_combined_section_without_plus_lines_is_keyed_by_its_diff_line():
         assert key == "hub/x.bin", head
     ((key, _),) = diff_file_sections('diff --cc "\\321\\217 /x.bin"\nindex 1,2..3\n')
     assert key == "\u044f /x.bin"
+
+
+def test_task_diff_numbers_a_combined_hunk_by_its_columns(inputs: dict[str, str]):
+    # In a merge's diff a line lost by the result (a "-" in any column) has no
+    # place in it; only the other lines advance the new-side number.
+    (entry,) = [
+        e for e in split_files(inputs["show-cc"]) if e["path"] != "(diff preamble)"
+    ]
+    by_text = {ln["text"]: ln["new_line"] for ln in entry["lines"]}
+    assert by_text["  1"] == 1
+    assert by_text["- main"] is None and by_text[" -side"] is None
+    assert by_text["++resolved"] == 2  # the line number in the merged file
+    assert (entry["added"], entry["removed"]) == (1, 2)
+    assert entry["added"] + entry["removed"] == author_delta_lines(inputs["show-cc"])

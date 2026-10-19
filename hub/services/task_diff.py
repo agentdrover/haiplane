@@ -73,6 +73,27 @@ def _hunk_start(header: str) -> int | None:
     return int(number) if number.isdigit() else None
 
 
+def _line_kind(entry: Any) -> str:
+    """``"+"`` added, ``"-"`` removed, ``" "`` context (in the result), ``""`` none.
+
+    A hunk body is read by its columns (:mod:`diff_scan`): in a merge's combined
+    diff a line is in the result when no column holds ``-``, and added when one
+    holds ``+``. Outside a hunk (headers, text the counters could not place)
+    the first character decides, and ``+++ `` / ``--- `` are headers.
+    """
+    text = entry.text
+    if entry.body:
+        if text.startswith("\\"):
+            return ""
+        prefix = text[: entry.body].ljust(entry.body)
+        return "-" if "-" in prefix else "+" if "+" in prefix else " "
+    if text.startswith("+") and not text.startswith("+++"):
+        return "+"
+    if text.startswith("-") and not text.startswith("---"):
+        return "-"
+    return " " if text.startswith(" ") or text == "" else ""
+
+
 def split_files(diff: str) -> list[dict[str, Any]]:
     """Split a unified diff into per-file entries, in the order git printed them.
 
@@ -109,20 +130,16 @@ def split_files(diff: str) -> list[dict[str, Any]]:
             continue
 
         number: int | None = None
-        if line.startswith("@@"):
+        kind = _line_kind(entry)
+        if line.startswith("@@") and not body:
             new_line = _hunk_start(line)
-        elif new_line is not None and (body or not line.startswith("---")):
-            if line.startswith("+"):
-                number, new_line = new_line, new_line + 1
-            elif line.startswith("-"):
-                number = None
-            elif line.startswith(" ") or line == "":
-                number, new_line = new_line, new_line + 1
+        elif new_line is not None and kind in ("+", " "):
+            number, new_line = new_line, new_line + 1
 
         current["lines"].append({"text": line, "new_line": number})
-        if line.startswith("+") and (body or not line.startswith("+++")):
+        if kind == "+":
             current["added"] += 1
-        elif line.startswith("-") and (body or not line.startswith("---")):
+        elif kind == "-":
             current["removed"] += 1
     for item, span in zip(files, owners, strict=True):
         fallback = item.pop("fallback", "")
