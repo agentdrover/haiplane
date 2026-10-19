@@ -35,6 +35,12 @@
   тематический файл (существующий или новый `tests/test_<область>_<тема>.py`),
   новый код — в отдельный модуль. «У порога» — повод разделить файл в той задаче,
   которая его вызвала, или завести задачу на разделение.
+- Новый импорт в запрещённом направлении слоёв красит CI (`scripts/layer_rules.py`,
+  #1852). Таблица слоёв, запреты и ledger текущих исключений — в
+  `docs/agent-context/layer-rules.json`. Уберите импорт; если нельзя, `--update`
+  допишет ребро с плейсхолдером, а `removed_by` впишите руками: `task:#NNNN`,
+  `permanent — <причина>` или `unclaimed — <причина>`. Запись снимается
+  удалением строки, когда ребра больше нет.
 - If a change touches MCP tool docstrings or signatures, it changes the published
   `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too).
   If the headroom is not enough, follow `working_headroom_note` in

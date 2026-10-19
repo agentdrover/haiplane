@@ -429,6 +429,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: uv run python scripts/file_size_budget.py
 
+      # #1852: направления импорта между слоями hub. Таблица слоёв, запреты и
+      # ledger сегодняшних исключений — в docs/agent-context/layer-rules.json;
+      # новое запрещённое ребро красит этот шаг. Печатается всегда.
+      - name: Layer rules
+        id: layers
+        if: ${{ !cancelled() }}
+        run: uv run python scripts/layer_rules.py
+
       - name: Check formatting
         id: format
         run: uv run ruff format --check hub tests
