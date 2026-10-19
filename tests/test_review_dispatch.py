@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import aiosqlite
 from httpx import AsyncClient
@@ -10,12 +11,18 @@ from httpx import AsyncClient
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.services.diff_scan import diff_lines
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
     DEEP,
     LITE,
     pick_review_model,
     pick_review_profile,
+    changed_paths,
+    is_docs_only_diff,
+    file_line_counts,
+    process_surface_reasons,
+    split_generated,
     sweep_review_dispatches,
 )
 from tests.review_dispatch_support import (
@@ -1075,3 +1082,279 @@ async def test_provider_usage_is_stored_on_the_report(
     assert closed["provider_tokens"] == 6_013_569, (
         "the bill lives on the dispatch too — a failed run has no report row"
     )
+
+
+# --- #1856: documents and pinned prod snapshots name a surface, they run none ---
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "process_surface"
+
+
+def _fixture_diff(name: str) -> str:
+    # Full diffs of real commits, saved so the test does not need git in CI.
+    return (_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _added(path: str, line: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n+{line}\n"
+
+
+def test_docs_and_prod_snapshots_are_not_a_process_surface():
+    # AC-1 (#1856): git diff 991d0d94..edba5db8 (#1849) — CAPTURE.txt and README
+    # only mention worktree.conf — buys no deep.
+    assert process_surface_reasons(_fixture_diff("pr1849_991d0d94_edba5db8.diff")) == []
+    # The same words in a document or a snapshot, one line each.
+    assert process_surface_reasons(_added("docs/notes.md", "uses worktree")) == []
+    assert (
+        process_surface_reasons(
+            _added("deploy/systemd/prod/etc/x.service.d/worktree.conf", "worktree")
+        )
+        == []
+    )
+    # Everything that can run stays a signal.
+    for path, line in (
+        ("hub/services/x.py", "path = workspace_path / 'worktree'"),
+        ("scripts/x.sh", "git worktree add"),
+        (".github/workflows/x.yml", "run: git worktree prune"),
+        ("deploy/review-runner/run.sh", "git worktree add"),
+        ("deploy/systemd/haiplane-x.service", "ExecStart=git worktree add"),
+        ("tests/test_x.py", "worktree = 1"),
+        # Markdown that is run, not read, and non-snapshot files in the dir.
+        ("hub/prompts/run.md", "git worktree add"),
+        ("skills/x/SKILL.md", "git worktree add"),
+        ("agents/x.md", "git worktree add"),
+        ("deploy/systemd/prod/run.sh", "git worktree add"),
+    ):
+        assert process_surface_reasons(_added(path, line)), path
+    # An inert file does not hide a live one beside it.
+    mixed = _added("README.md", "worktree") + _added("scripts/x.sh", "git worktree add")
+    assert process_surface_reasons(mixed) == ["воркспейс и ветки: worktree"]
+
+
+def test_historical_process_diffs_keep_their_signal():
+    # AC-2 (#1856): the original diffs of #506, #509 and #544 keep subprocess
+    # and timeout signals.
+    d506 = process_surface_reasons(_fixture_diff("task506_d2c7b7a0.diff"))
+    d509 = process_surface_reasons(_fixture_diff("task509_ca8ce75a.diff"))
+    d544 = process_surface_reasons(_fixture_diff("task544_4077012a.diff"))
+    assert any(r.startswith("запуск подпроцессов") for r in d506)
+    assert any(r.startswith("таймауты и отмена") for r in d506)
+    assert any(r.startswith("запуск подпроцессов") for r in d509)
+    assert any(r.startswith("таймауты и отмена") for r in d509)
+    assert any(r.startswith("запуск подпроцессов") for r in d544)
+
+
+def test_added_plus_plus_line_does_not_hide_the_rest_of_a_file():
+    # #1856: an added "++ counters.md" is "+++ counters.md" in the diff. Read as
+    # a file header it ended the live .py section and silenced what follows.
+    diff = (
+        "diff --git a/hub/x.py b/hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@ -0,0 +1,2 @@\n+++ counters.md\n+    subprocess.run(['ls'])\n"
+    )
+    assert process_surface_reasons(diff) == ["запуск подпроцессов: subprocess.run"]
+    # split_generated reads headers the same way: an added "++ uv.lock" line
+    # neither drops the rest of the file nor counts as a dropped file.
+    kept, dropped = split_generated(diff)
+    assert dropped == [] and kept == diff
+    lock = (
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1 @@\n+x\n"
+    )
+    kept, dropped = split_generated(diff + lock)
+    assert dropped == ["uv.lock"] and "subprocess.run" in kept and "+x" not in kept
+
+
+def test_plain_unified_diff_without_diff_git_keeps_every_header():
+    # #1856: no "diff --git" line, so no hunk/header split: each "+++ " opens a
+    # file. The lock or the document is dropped, the code after it is read.
+    code = (
+        "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+    subprocess.run(['ls'])\n"
+    )
+    lock = "--- a/uv.lock\n+++ b/uv.lock\n@@ -0,0 +1 @@\n+x\n"
+    doc = "--- a/docs/a.md\n+++ b/docs/a.md\n@@ -0,0 +1 @@\n+git worktree add\n"
+    want = ["запуск подпроцессов: subprocess.run"]
+    assert process_surface_reasons(lock + code) == want
+    assert process_surface_reasons(doc + code) == want
+    kept, dropped = split_generated(lock + code)
+    assert dropped == ["uv.lock"] and "subprocess.run" in kept
+
+
+def test_c_quoted_non_ascii_paths_are_classified_like_ascii_ones():
+    # #1856: git prints "b/docs/\320\267.md" for docs/з.md.
+    def doc(path: str) -> str:
+        return (
+            f"diff --git a/x b/x\n--- /dev/null\n+++ {path}\n"
+            "@@ -0,0 +1 @@\n+git worktree add\n"
+        )
+
+    code = _added("hub/x.py", "subprocess.run(['ls'])")
+    want = ["запуск подпроцессов: subprocess.run"]
+    assert process_surface_reasons(doc('"b/docs/\\320\\267.md"') + code) == want
+    assert process_surface_reasons(doc("b/docs/z.md") + code) == want
+    assert process_surface_reasons(doc('"b/hub/\\320\\267.py"')) != []
+    kept, dropped = split_generated(doc('"b/node_modules/\\320\\267.js"') + code)
+    assert dropped == ["node_modules/з.js"]
+
+
+_SUBPROCESS = ["запуск подпроцессов: subprocess.run"]
+_DOC_HUNK = "--- a/README.md\n+++ b/README.md\n@@ -0,0 +1 @@\n+text\n"
+
+
+def test_hunk_body_is_never_a_header():
+    # #1856: the edge of a hunk is its counters. An added line whose text is
+    # "++ README.md" is "+++ README.md" in the diff and must stay a body line,
+    # in a plain unified diff and in a git one.
+    body = "@@ -0,0 +1,2 @@\n+++ README.md\n+    subprocess.run(['ls'])\n"
+    plain = "--- a/hub/x.py\n+++ b/hub/x.py\n" + body
+    git = "diff --git a/hub/x.py b/hub/x.py\n" + plain
+    for diff in (plain, git):
+        assert process_surface_reasons(diff) == _SUBPROCESS
+        assert split_generated(diff) == (diff, [])
+
+
+def test_combined_diff_after_a_document_opens_a_new_file():
+    # #1856: "diff --cc" ends the document before it; "@@@" counts one old
+    # side per parent, so the "++" prefixed line is body of hub/x.py.
+    combined = (
+        "diff --cc hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@@ -1,1 -1,1 +1,2 @@@\n  x\n++subprocess.run(['ls'])\n"
+    )
+    for head in ("diff --git a/README.md b/README.md\n", ""):
+        assert process_surface_reasons(head + _DOC_HUNK + combined) == _SUBPROCESS
+    # Without ---/+++ lines only the "diff --cc" line says a new file began.
+    bare = "diff --cc hub/x.py\n@@@ -1,1 -1,1 +1,2 @@@\n  x\n++subprocess.run(['ls'])\n"
+    assert process_surface_reasons(_DOC_HUNK + bare) == _SUBPROCESS
+    combined2 = combined.replace("diff --cc", "diff --combined")
+    assert process_surface_reasons(_DOC_HUNK + combined2) == _SUBPROCESS
+
+
+def test_hunk_that_does_not_add_up_is_kept_as_code():
+    # #1856: counters that run negative, or a hunk cut short by the next file,
+    # mean we cannot tell where the file ends: nothing is dropped.
+    too_long = (
+        "--- a/README.md\n+++ b/README.md\n@@ -0,0 +1 @@\n+a\n+subprocess.run(1)\n"
+    )
+    assert process_surface_reasons(too_long) == _SUBPROCESS
+    short = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -0,0 +1,5 @@\n+subprocess.run(1)\n"
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1 @@\n+x\n"
+    )
+    assert process_surface_reasons(short) == _SUBPROCESS
+    kept, dropped = split_generated(short)
+    # Once the counters broke nothing after that is cut: not even a clean lock.
+    assert dropped == [] and kept == short
+    bad_header = (
+        "--- a/README.md\n+++ b/README.md\n@@ nonsense @@\n+subprocess.run(1)\n"
+    )
+    assert process_surface_reasons(bad_header) == _SUBPROCESS
+
+
+_COMBINED_BODY = (
+    "@@@ -1,2 -1,2 +1,2 @@@\n- old1\n -old2\n--- junk\n+++ README.md\n"
+    '++subprocess.run(["ls"])\n'
+)
+
+
+def _combined(path: str, body: str = _COMBINED_BODY) -> str:
+    return f"diff --cc {path}\n--- a/{path}\n--- a/{path}\n+++ b/{path}\n{body}"
+
+
+def test_combined_hunk_counts_each_parent_by_its_own_column():
+    # #1856: "-" in a column means the PARENT of that column had the line.
+    # Counting every parent on every line ran the counters out early and made
+    # "--- junk" / "+++ README.md" look like a new document.
+    assert process_surface_reasons(_combined("hub/x.py")) == _SUBPROCESS
+    # The same body in a generated file is a normal generated file: cut whole.
+    code = _added("hub/y.py", "subprocess.run(1)")
+    kept, dropped = split_generated(_combined("uv.lock") + code)
+    assert dropped == ["uv.lock"]
+    assert "junk" not in kept and "subprocess.run" in kept
+    assert process_surface_reasons(_combined("uv.lock") + code) == _SUBPROCESS
+
+
+def test_diff_is_cut_into_lines_by_lf_only():
+    # #1856: git ends a line at LF. A VT, FF or U+2028 inside a literal is text.
+    assert diff_lines("+a\v+b\n+c\x0c\u2028d\r\n") == [
+        "+a\v+b\n",
+        "+c\x0c\u2028d\r\n",
+    ]
+    lock = (
+        "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+        "@@ -0,0 +1,2 @@\n+x\v+y\n+z\n"
+    )
+    code = _added("hub/x.py", "subprocess.run(1)")
+    kept, dropped = split_generated(lock + code)
+    assert dropped == ["uv.lock"] and "x\v" not in kept and code in kept
+    assert process_surface_reasons(lock + code) == _SUBPROCESS
+
+
+def test_after_the_first_mismatch_nothing_is_cut():
+    # #1856: not "this file is code" but "the rest of the diff is code". The
+    # lock AFTER a broken hunk stays, and so does the document after it.
+    broken = "diff --git a/hub/a.py b/hub/a.py\n--- a/hub/a.py\n+++ b/hub/a.py\n@@ -0,0 +1,3 @@\n+a\n"
+    tail = (
+        _added("uv.lock", "x")
+        + _added("docs/a.md", "git worktree add")
+        + _added("hub/z.py", "subprocess.run(1)")
+    )
+    kept, dropped = split_generated(broken + tail)
+    assert dropped == [] and kept == broken + tail
+    reasons = process_surface_reasons(broken + tail)
+    assert reasons == [
+        "запуск подпроцессов: subprocess.run",
+        "воркспейс и ветки: worktree",
+    ]
+    # Before the mismatch the same files are cut as usual.
+    assert split_generated(tail)[1] == ["uv.lock"]
+
+
+def test_added_header_lookalike_is_not_a_file_for_counts_and_paths():
+    # #1856 (review gen1): the first added line of hub/x.py reads "+++ counters.md".
+    diff = (
+        "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1,802 @@\n+++ counters.md\n"
+        + "+x\n" * 801
+    )
+    assert file_line_counts(diff) == [("hub/x.py", 802)]
+    assert changed_paths(diff) == ["hub/x.py"]
+    # The same inside a git diff.
+    git = "diff --git a/hub/x.py b/hub/x.py\n" + diff
+    assert file_line_counts(git) == [("hub/x.py", 802)]
+    assert changed_paths(git) == ["hub/x.py"]
+
+
+def test_changed_paths_read_combined_and_quoted_headers():
+    combined = (
+        "diff --cc hub/x.py\n--- a/hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@@ -1,1 -1,1 +1,2 @@@\n  x\n++y\n"
+    )
+    quoted = (
+        'diff --git "a/docs/\\320\\267.md" "b/docs/\\320\\267.md"\n'
+        '--- "a/docs/\\320\\267.md"\n+++ "b/docs/\\320\\267.md"\n@@ -0,0 +1 @@\n+t\n'
+    )
+    assert changed_paths(_added("README.md", "t") + combined + quoted) == [
+        "README.md",
+        "hub/x.py",
+        "docs/\u0437.md",
+    ]
+    assert file_line_counts(combined) == [("hub/x.py", 1)]
+
+
+def test_counts_do_not_undercount_when_the_hunk_does_not_add_up():
+    # Counters say 1, the body has 3: the path is still listed and every
+    # changed line is counted under it.
+    diff = "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+a\n+b\n+c\n"
+    assert changed_paths(diff) == ["hub/x.py"]
+    assert file_line_counts(diff) == [("hub/x.py", 3)]
+
+
+def test_lookalike_lines_in_a_body_do_not_change_what_the_diff_touches():
+    # A document whose added text reads "+++ b/hub/x.py" is still only a document.
+    doc = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -0,0 +1 @@\n+++ b/hub/x.py\n"
+    )
+    assert is_docs_only_diff(doc)
+    # An added line "++ subprocess.run(1)" is code, not a "+++" header.
+    code = _added("hub/x.py", "++ subprocess.run(1)")
+    assert process_surface_reasons(code) == _SUBPROCESS
