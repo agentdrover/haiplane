@@ -87,6 +87,7 @@
             {% if task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
             {% include "partials/task_verdict_replace.html" %}
             {% endif %}
+            {% if decision_brief %}{% include "partials/decision_brief.html" %}{% endif %}
             {% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
             {% include "partials/task_review_board.html" %}
 

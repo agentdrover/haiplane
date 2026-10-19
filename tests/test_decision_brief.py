@@ -328,7 +328,7 @@ async def test_risks_are_capped_and_sorted(
         task_id,
         risks=json.dumps(
             [
-                {"kind": "technical", "severity": "low", "description": f"r{i}"}
+                {"kind": "other", "severity": "low", "description": f"r{i}"}
                 for i in range(count)
             ]
         ),
@@ -424,7 +424,10 @@ async def test_unresolved_outcome_is_found_by_its_own_uid(
     assert (await _brief(db, task_id))["recommend"]["action"] != ACCEPT
     await record("fixed")
     got = await _brief(db, task_id)
-    assert got["recommend"]["action"] == ACCEPT, got["recommend"]
+    # Ответ автора находит исход по своему uid (риск «без ответа» ушёл), но
+    # «Принять» не даёт: отчёт с unresolved не чист, ответ не доказывает отсутствие дефекта.
+    assert got["recommend"]["action"] != ACCEPT, got["recommend"]
+    assert not any("без ответа" in r["text"] for r in got["risks"])
 
 
 async def test_report_check_follows_the_doubts_not_the_wording(

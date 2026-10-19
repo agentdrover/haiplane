@@ -11,8 +11,10 @@
 * исход отчёта — чисто (``outcome_names_clean``, ступень лестницы #1234);
 * ``incomplete`` заявлен явно и равен false (None — «не заявлено», не «полный»);
 * ``lost_dimensions`` пуст: потерянное измерение — непроверенное, а не чистое;
-* нет неотвеченных unresolved (``unanswered`` считает вызывающий по ledger
-  исходов; исход «не рассудил» ответом не считается);
+* нет unresolved вовсе: исход «неразрешённые» не чист, даже если автор уже
+  ответил по каждому (ответ автора не доказывает, что дефекта нет);
+  ``unanswered`` (по ledger исходов, «не рассудил» ответом не считается)
+  нужен только для текста причины;
 * ``provider_tokens`` > 0: работу ревьюера подтвердил провайдер. Не
   ``raw_count`` и не ``tokens_spent`` — их пишет сам отчёт о себе;
 * происхождение не текстовое: отчёт сдан ревьюером по контракту, а не
@@ -27,7 +29,7 @@
 from __future__ import annotations
 
 from hub.models import MachineReviewView, text_origin_of
-from hub.services.steward_corridor import OUTCOME_CONFIRMED, OUTCOME_UNRESOLVED
+from hub.services.steward_corridor import OUTCOME_CONFIRMED
 
 GAP_CONFIRMED = "confirmed"
 GAP_OUTCOME = "outcome"
@@ -43,11 +45,6 @@ GAP_IDENTITY = "identity"
 def report_gaps(view: MachineReviewView, unanswered: int = 0) -> list[tuple[str, str]]:
     """Какие условия белого списка НЕ выполнены: ``[(код, текст)]``, пусто — годен."""
     gaps: list[tuple[str, str]] = []
-    # Ответом на unresolved закрыт исход «неразрешённые» — но только он: любая
-    # другая нечистая ступень остаётся нечистой.
-    outcome_clean = view.outcome_names_clean or (
-        view.outcome == OUTCOME_UNRESOLVED and unanswered == 0
-    )
     if view.outcome == OUTCOME_CONFIRMED:
         gaps.append(
             (
@@ -55,7 +52,7 @@ def report_gaps(view: MachineReviewView, unanswered: int = 0) -> list[tuple[str,
                 f"Ревьюер подтвердил проблем: {len(view.findings_confirmed)}",
             )
         )
-    elif not outcome_clean:
+    elif not view.outcome_names_clean:
         gaps.append((GAP_OUTCOME, f"Исход отчёта не «чисто»: {view.outcome_label}"))
     if view.incomplete is not False:
         gaps.append((GAP_INCOMPLETE, "Отчёт ревью неполный или не сказал о полноте"))
