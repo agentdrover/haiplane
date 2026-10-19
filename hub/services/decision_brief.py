@@ -23,6 +23,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import FindingOutcome
 from hub.services import (
+    ci_contract,
     ci_integrity,
     ci_trust,
     inbox_decisions,
@@ -138,7 +139,8 @@ async def _ci_doubt(db: aiosqlite.Connection, task: dict[str, Any]) -> Doubt | N
     if gap is None:
         return None
     row = await repo.get_ci_run_report(db, int(task["id"]), sha)
-    if row is not None and ci_trust.is_verified(dict(row)):
+    fingerprint = await ci_contract.fingerprint_for_task(db, int(task["id"]))
+    if row is not None and ci_trust.is_verified(dict(row), fingerprint):
         status = str(dict(row).get("validation_status") or "").strip()
         if status == "fail":
             return Doubt(REWORK, "high", "CI красный на коммите сдачи", gap, CODE_CI)
