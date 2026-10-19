@@ -60,6 +60,10 @@ budget:
 	uv run python scripts/file_size_budget.py
 	uv run python scripts/mcp_catalog_budget.py
 
+# Направления импорта между слоями hub (#1852): ledger — docs/agent-context/layer-rules.json.
+layers:
+	uv run python scripts/layer_rules.py
+
 security:
 	uv run bandit -r hub -q
 	uv run python scripts/secret_scan.py
@@ -67,4 +71,4 @@ security:
 # Состав обязан покрывать статические шаги CI-джоба test: сверку держит
 # tests/test_local_checks_match_ci.py — новый шаг в CI без цели здесь красит
 # тесты, а не проходит незамеченным (#1080).
-check: lint types budget security test
+check: lint types budget layers security test
