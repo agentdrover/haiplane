@@ -1650,3 +1650,200 @@ async def test_a_judgement_is_never_applied_where_the_verdict_is_not_delegated(
     assert REFUSED_NOT_DELEGATED not in _codes(
         await apply_refusals(db, delegated_task)
     ), "verdict=steward отказом политики не задерживается"
+
+
+# ---------------------------------------------------------------------------
+# #1855 AC-1 — потолок класса риска для approve стюарда
+# ---------------------------------------------------------------------------
+
+
+def _risk_packet(task_id: int, fact):
+    from hub.services.steward_evidence import EvidencePacket
+
+    return EvidencePacket(
+        task_id=task_id,
+        generation=1,
+        brief=None,
+        facts={} if fact is None else {"risk_class": fact},
+    )
+
+
+async def _ceiling_codes(
+    db: aiosqlite.Connection, monkeypatch, project_id: int, task_id: int, fact
+) -> list[tuple[str, str]]:
+    async def _packet(_db, tid, _generation=None):
+        return _risk_packet(tid, fact)
+
+    monkeypatch.setattr("hub.services.steward_apply.build_evidence_packet", _packet)
+    return [
+        r
+        for r in await apply_refusals(db, task_id)
+        if r[0] == "class_above_policy_ceiling"
+    ]
+
+
+async def test_the_approve_ceiling_refuses_above_or_unknown_class(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: потолок против max(stored, recomputed); неизвестное — отказ, не R0."""
+    from hub.services.steward_evidence import absent, present
+    from hub.services.steward_exit import contour_counts
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-ceiling")
+    task_id = await _task(db, project_id)
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=json.dumps(
+            {"verdict": "steward", "steward_approve_max_class": "r1"}
+        ),
+    )
+    await db.commit()
+    before = await contour_counts(db)
+
+    def risk(stored, recomputed, raised=False):
+        return present(
+            "risk_class", "класс", stored=stored, recomputed=recomputed, raised=raised
+        )
+
+    async def codes(fact):
+        return await _ceiling_codes(db, monkeypatch, project_id, task_id, fact)
+
+    # stored=R1/recomputed=R1 — потолок не возражает.
+    assert await codes(risk("R1", "R1")) == []
+    assert await codes(risk("R0", "R1")) == []
+    # stored=R2/recomputed=R1 и stored=R1/recomputed=R2 — оба отказ.
+    above_stored = await codes(risk("R2", "R1"))
+    above_diff = await codes(risk("R1", "R2"))
+    assert len(above_stored) == 1 and "R2" in above_stored[0][1]
+    assert len(above_diff) == 1 and "R2" in above_diff[0][1]
+    # recomputed=None и повреждённый класс — отказ с названием факта, не R0.
+    no_diff = await codes(risk("R1", None))
+    assert len(no_diff) == 1 and "risk_class.recomputed" in no_diff[0][1]
+    broken = await codes(risk("R9", "R1"))
+    assert len(broken) == 1 and "risk_class.stored" in broken[0][1]
+    # Факта нет вовсе или пакет его не собрал.
+    assert "факта нет в пакете" in (await codes(None))[0][1]
+    hole = await codes(absent("risk_class", "no_stored_class", "класс не вычислен"))
+    assert len(hole) == 1 and "класс не вычислен" in hole[0][1]
+    # raised=true — прежний отказ предусловия, потолок его не дублирует.
+    raised_fact = risk("R1", "R3", raised=True)
+    assert await codes(raised_fact) == []
+    all_refusals = await apply_refusals(db, task_id)
+    assert any("выше заявленного" in d or "дифф поднял" in d for _, d in all_refusals)
+    # Нечитаемый потолок (мимо модели) — отказ на любой класс.
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=json.dumps(
+            {"verdict": "steward", "steward_approve_max_class": "R1"}
+        ),
+    )
+    await db.commit()
+    unreadable = await codes(risk("R0", "R0"))
+    assert len(unreadable) == 1 and "нечитаем" in unreadable[0][1]
+    # Потолка нет — прежнее поведение: ни одного отказа по классу.
+    await repo.update_project(
+        db, project_id, gate_policy=json.dumps({"verdict": "steward"})
+    )
+    await db.commit()
+    assert await codes(risk("R3", "R5")) == []
+    assert await codes(None) == []
+    # Суждения судьи и знаменатель калибровки привратник не трогает.
+    assert await contour_counts(db) == before
+
+
+async def test_the_ceiling_is_rechecked_inside_the_verdict_transaction(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1855 P1: потолок и класс перечитываются в транзакции записи; факт ранней проверки свеж."""
+    import pytest
+    from fastapi import HTTPException
+
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+    from hub.services.steward_apply import ceiling_scope
+    from hub.services.steward_evidence import present
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-ceiling-txn")
+    risk = present("risk_class", "класс", stored="R1", recomputed="R1", raised=False)
+
+    async def _packet(_db, tid, _generation=None):
+        return _risk_packet(tid, risk)
+
+    monkeypatch.setattr("hub.services.steward_apply.build_evidence_packet", _packet)
+
+    async def set_ceiling(value):
+        policy = {"verdict": "steward"}
+        if value:
+            policy["steward_approve_max_class"] = value
+        await repo.update_project(db, project_id, gate_policy=json.dumps(policy))
+        await db.commit()
+
+    async def write(task_id: int, generation: int = 1):
+        await record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(agent="steward", verdict=ReviewVerdict.approved),
+            expected_generation=generation,
+            applied_by_steward=True,
+        )
+
+    async def refused(task_id: int, generation: int = 1):
+        with pytest.raises(HTTPException) as err:
+            await write(task_id, generation)
+        assert "class_above_policy_ceiling" in str(err.value.detail)
+        assert not ((await repo.get_task(db, task_id))["review_verdict"] or "")
+
+    # Штатный путь: ранняя проверка при r1, класс не менялся — записано.
+    await set_ceiling("r1")
+    normal = await _task(db, project_id)
+    await repo.update_task(db, normal, risk_class="R1")
+    await _green(db, normal)
+    async with ceiling_scope():
+        assert await apply_refusals(db, normal) is not None
+        await write(normal)
+    assert (await repo.get_task(db, normal))["review_verdict"] == "approved"
+
+    # Потолок поставлен ПОСЛЕ ранней проверки.
+    await set_ceiling(None)
+    late = await _task(db, project_id)
+    await repo.update_task(db, late, risk_class="R1")
+    await _green(db, late)
+    async with ceiling_scope():
+        await apply_refusals(db, late)
+        await set_ceiling("r1")
+        await repo.update_task(db, late, risk_class="R2")
+        await db.commit()
+        await refused(late)
+
+    # Сценарий 1: сохранённый класс поднят после ранней проверки (то же поколение).
+    await set_ceiling("r1")
+    raised = await _task(db, project_id)
+    await repo.update_task(db, raised, risk_class="R1")
+    await _green(db, raised)
+    async with ceiling_scope():
+        await apply_refusals(db, raised)
+        await repo.update_task(db, raised, risk_class="R3")
+        await db.commit()
+        await refused(raised)
+
+    # Сценарий 2: факт прошлого применения не переходит на новое поколение.
+    second = await _task(db, project_id)
+    await repo.update_task(db, second, risk_class="R1")
+    await _green(db, second)
+    async with ceiling_scope():
+        await apply_refusals(db, second)
+        await repo.update_task(db, second, submission_generation=2)
+        await db.commit()
+        await refused(second, generation=2)
+
+    # Вне применения (контекст закрыт) факта нет — отказ, а не «прошлый R1».
+    outside = await _task(db, project_id)
+    await repo.update_task(db, outside, risk_class="R1")
+    await _green(db, outside)
+    async with ceiling_scope():
+        await apply_refusals(db, outside)
+    await refused(outside)

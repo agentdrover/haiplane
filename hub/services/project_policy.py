@@ -25,6 +25,7 @@ from hub import repository as repo
 from hub.models import (
     DEFAULT_FORGE,
     FORGES,
+    RiskClass,
     STEWARD_WATCH_REASONS,
     parse_freeze_until,
     validated_freeze,
@@ -945,6 +946,60 @@ def steward_watch_of(policy: dict) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return STEWARD_WATCH_REASONS
     return tuple(r for r in STEWARD_WATCH_REASONS if r in raw)
+
+
+# Потолок класса риска для approve стюарда (#1855). Нет ключа — потолка нет
+# (поведение до задачи). Ключ ограничивает ДЕЛЕГИРОВАННОЕ и ничего не
+# делегирует. Читатель терпит то, что попало в базу мимо модели, но не молча:
+# нечитаемое значение читается как ``UNREADABLE`` и привратник отказывает на
+# любой класс — потолок, который не поняли, не равен «потолка нет».
+STEWARD_APPROVE_MAX_CLASS_KEY = "steward_approve_max_class"
+#: Значения потолка: классы риска строчными, r0…r5.
+STEWARD_APPROVE_CLASSES: tuple[str, ...] = tuple(c.value.lower() for c in RiskClass)
+STEWARD_CEILING_UNREADABLE = "unreadable"
+
+
+# Тот же потолок для автопилота вердикта (verdict=auto): отдельный ключ с тем же
+# валидатором и той же таблицей решений (``steward_apply.class_ceiling_refusal``).
+# Ключ на каждого решателя, а не общий: владелец ставит потолки независимо, а
+# имя ключа говорит, чьё решение он ограничивает.
+AUTO_APPROVE_MAX_CLASS_KEY = "auto_approve_max_class"
+CEILING_KEYS: tuple[str, ...] = (
+    STEWARD_APPROVE_MAX_CLASS_KEY,
+    AUTO_APPROVE_MAX_CLASS_KEY,
+)
+
+
+def validate_steward_approve_max_class(piece: dict) -> None:
+    """Запись ключей потолка: только r0…r5 строчными. ``R1``, ``high``, число — отказ."""
+    for key in CEILING_KEYS:
+        value = piece.get(key)
+        if key in piece and (
+            not isinstance(value, str) or value not in STEWARD_APPROVE_CLASSES
+        ):
+            raise ValueError(
+                f"gate_policy {key} must be one of "
+                f"{', '.join(STEWARD_APPROVE_CLASSES)} (lowercase), got: {value!r}"
+            )
+
+
+def _ceiling_of(policy: dict, key: str) -> str | None:
+    if not isinstance(policy, dict) or key not in policy:
+        return None
+    value = policy[key]
+    if isinstance(value, str) and value in STEWARD_APPROVE_CLASSES:
+        return value
+    return STEWARD_CEILING_UNREADABLE
+
+
+def steward_approve_max_class_of(policy: dict) -> str | None:
+    """Потолок approve стюарда: r0…r5, None (нет ключа) или ``unreadable``."""
+    return _ceiling_of(policy, STEWARD_APPROVE_MAX_CLASS_KEY)
+
+
+def auto_approve_max_class_of(policy: dict) -> str | None:
+    """Потолок автопилота вердикта: r0…r5, None (нет ключа) или ``unreadable``."""
+    return _ceiling_of(policy, AUTO_APPROVE_MAX_CLASS_KEY)
 
 
 # Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:

@@ -31,6 +31,7 @@ from hub.models import (
     FindingOutcome,
     FindingOutcomeItem,
 )
+from hub.outcome_hint import OutcomeHintItem, OutcomeHintView
 from hub.services.finding_identity import finding_uids, unresolved_uids
 
 #: The two sections of a report an author can be asked about (#1085).
@@ -266,7 +267,7 @@ def refusal_text(open_items: list[dict[str, Any]]) -> str:
     )
 
 
-def warn_note(open_items: list[dict[str, Any]]) -> str:
+def warn_note(open_items: list[dict[str, Any]], *, with_list: bool = True) -> str:
     """Заметка режима warn, называющая разделы своими именами (#1085).
 
     Жила в lifecycle одной строкой «НЕ названы для N подтверждённых находок»,
@@ -275,6 +276,9 @@ def warn_note(open_items: list[dict[str, Any]]) -> str:
     подтверждённых. Текст переехал сюда, к тому месту, которое умеет отличать
     разделы, — чтобы следующий читатель не искал, где ещё осталось старое
     существительное.
+
+    ``with_list=False`` (#1909): поимённый список даёт подсказка
+    (:func:`build_hint`) — один ограниченный список на всю запись, а не два.
     """
     confirmed = sum(1 for i in open_items if i.get("finding_kind") != KIND_UNRESOLVED)
     unresolved = len(open_items) - confirmed
@@ -283,11 +287,85 @@ def warn_note(open_items: list[dict[str, Any]]) -> str:
         parts.append(f"подтверждённых {confirmed}")
     if unresolved:
         parts.append(f"неразрешённых {unresolved}")
-    return (
+    head = (
         f"Исходы находок: НЕ названы для {len(open_items)} находок предыдущей "
         f"сдачи ({', '.join(parts)}). Режим проверки — warn, сдача принята. "
-        + refusal_text(open_items)
     )
+    return head + (refusal_text(open_items) if with_list else "")
+
+
+#: Сколько находок подсказка называет поимённо (#1909); остаток — счётчиком.
+HINT_LIMIT = 20
+
+_SELF_EVIDENT = {
+    "confirmed": FindingOutcome.fixed,
+    "unresolved": FindingOutcome.real_fixed,
+}
+
+
+def build_hint(open_items: list[dict[str, Any]]) -> OutcomeHintView | None:
+    """Подсказка автору: какие находки открыты и как на них ответить (#1909).
+
+    Чистая сборка из ТОГО ЖЕ списка, что проверяет гейт (:func:`open_findings`):
+    второй копии логики UID нет. Ничего не пишет и не отказывает. Пусто — None:
+    первая сдача, сдача без отчёта и сдача со всеми исходами ответа не меняют.
+
+    Одна находка в двух отчётах поколения (lite и deep) называется один раз:
+    автор отвечает о дефекте, а не об отчёте.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    for found in open_items:
+        seen.setdefault(str(found["finding_uid"]), found)
+    if not seen:
+        return None
+    shown = list(seen.values())[:HINT_LIMIT]
+    items: list[OutcomeHintItem] = []
+    example: list[dict[str, str]] = []
+    for found in shown:
+        kind = str(found.get("finding_kind") or KIND_CONFIRMED)
+        words = UNRESOLVED_OUTCOMES if kind == KIND_UNRESOLVED else CONFIRMED_OUTCOMES
+        uid = str(found["finding_uid"])
+        items.append(
+            OutcomeHintItem(
+                finding_uid=uid,
+                kind=kind,
+                title=str(found.get("title") or "")[:200],
+                allowed_outcomes=sorted(o.value for o in words),
+            )
+        )
+        example.append({"finding_uid": uid, "outcome": _SELF_EVIDENT[kind].value})
+    view = OutcomeHintView(
+        count=len(seen),
+        items=items,
+        omitted=len(seen) - len(items),
+        example=example,
+    )
+    view.text = hint_text(view)
+    return view
+
+
+def hint_text(view: OutcomeHintView) -> str:
+    """Подсказка словами: те же строки в ответе сдачи, MCP и ленте (#1909)."""
+    lines = [
+        f"Открытые находки прошлой сдачи без исхода ({view.count}); передайте "
+        "finding_outcomes по их finding_uid:"
+    ]
+    for item in view.items:
+        title = item.title[:80] or "без заголовка"
+        lines.append(
+            f"- {item.finding_uid} [{item.kind}] «{title}»: "
+            + "|".join(item.allowed_outcomes)
+        )
+    if view.omitted:
+        lines.append(
+            f"- и ещё {view.omitted} (UID — в hub_get_review_brief section=machine_review)"
+        )
+    lines.append(
+        "Пример finding_outcomes (замените outcome на правду; всё, кроме "
+        "fixed/real_fixed, требует note — одну строку почему): "
+        + json.dumps(view.example, ensure_ascii=False)
+    )
+    return "\n".join(lines)
 
 
 def _listed(items: list[dict[str, Any]]) -> str:
