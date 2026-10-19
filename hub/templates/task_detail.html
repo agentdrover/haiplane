@@ -729,7 +729,8 @@
                         hx-select=".main"
                         hx-target=".main"
                         hx-swap="innerHTML"
-                        hx-trigger="click, every 15s">
+                        hx-trigger="click, every 15s [!window.hubHasUnsavedInput()]"
+                        data-hub-autorefresh>
                     Refresh Status <span class="htmx-indicator">&#10227;</span>
                 </button>
                 {% include "partials/return_to_work.html" %}

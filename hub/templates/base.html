@@ -22,6 +22,63 @@
         }
     });
     </script>
+    {# #1861: автообновление карточки не стирает недописанный ввод. Ввод —
+       поле в #main с фокусом или изменённое относительно загрузки; select
+       сравнивается с выбором при загрузке (defaultSelected у select без
+       явного selected всегда «грязный»). Ручной клик обновляет всегда. #}
+    <script>
+    (function () {
+        var FIELDS = "textarea, input, select";
+        var SKIP = {hidden: 1, submit: 1, button: 1, reset: 1, image: 1};
+        function initialIndex(sel) {
+            for (var i = 0; i < sel.options.length; i++) {
+                if (sel.options[i].defaultSelected) { return i; }
+            }
+            return sel.options.length ? 0 : -1;
+        }
+        function dirty(el) {
+            if (el.tagName === "SELECT") {
+                if (el.multiple) {
+                    return Array.prototype.some.call(el.options, function (o) { return o.selected !== o.defaultSelected; });
+                }
+                return el.selectedIndex !== initialIndex(el);
+            }
+            if (el.tagName === "INPUT") {
+                if (SKIP[el.type]) { return false; }
+                if (el.type === "checkbox" || el.type === "radio") { return el.checked !== el.defaultChecked; }
+            }
+            return el.value !== el.defaultValue;
+        }
+        window.hubHasUnsavedInput = function () {
+            var main = document.getElementById("main");
+            if (!main) { return false; }
+            var active = document.activeElement;
+            if (active && main.contains(active) && active.matches(FIELDS) && !SKIP[active.type]) { return true; }
+            var fields = main.querySelectorAll(FIELDS);
+            for (var i = 0; i < fields.length; i++) {
+                if (dirty(fields[i])) { return true; }
+            }
+            return false;
+        };
+        document.addEventListener("htmx:beforeSwap", function (e) {
+            var elt = e.detail.requestConfig && e.detail.requestConfig.elt;
+            if (!elt || !elt.hasAttribute("data-hub-autorefresh")) { return; }
+            var trigger = e.detail.requestConfig.triggeringEvent;
+            if (trigger && trigger.type === "click") { return; }
+            if (window.hubHasUnsavedInput()) { e.detail.shouldSwap = false; }
+        });
+        var waiting = null;
+        document.addEventListener("hub-launch-ended", function () {
+            if (waiting) { return; }
+            waiting = setInterval(function () {
+                if (!window.hubHasUnsavedInput()) {
+                    clearInterval(waiting);
+                    location.reload();
+                }
+            }, 1000);
+        });
+    })();
+    </script>
 </head>
 <body{% if csrf_token %} hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'{% endif %}>
 {# #623: six sidebar links stood between the keyboard and the content of

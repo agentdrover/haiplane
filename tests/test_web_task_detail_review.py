@@ -371,3 +371,38 @@ async def test_the_card_page_prints_the_circle_before_the_threshold(client, db):
     assert "заходов 1/3" in page, "число заходов напечатано на странице до порога"
     assert "закрыто 1, пришло новых 1" in page, "разбивка едет вместе с числом"
     assert "круг назван" not in page, "видно — не значит позвали: порог не достигнут"
+
+
+# ---- #1861: автообновление карточки не стирает недописанный ввод
+
+
+async def test_auto_refresh_skips_unsaved_input(client: AsyncClient, db):
+    task_id = await _web_task_in_review(client)
+    await db.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+    await db.commit()
+    for status, review_job in (
+        ("running", None),
+        ("fix_requested", None),
+        ("ci_check", None),
+        ("review", "rj-1861"),
+    ):
+        await db.execute(
+            "UPDATE tasks SET status=?, review_job_id=? WHERE id=?",
+            (status, review_job, task_id),
+        )
+        await db.commit()
+        page = (await client.get(f"/tasks/{task_id}")).text
+        assert 'hx-trigger="click, every 15s [!window.hubHasUnsavedInput()]"' in page, (
+            status
+        )
+        assert "window.hubHasUnsavedInput = function" in page, status
+        assert 'addEventListener("htmx:beforeSwap"' in page, status
+        assert "e.detail.shouldSwap = false" in page, status
+        assert "data-hub-autorefresh" in page, status
+
+    await db.execute(
+        "UPDATE tasks SET status='review', review_job_id=NULL WHERE id=?", (task_id,)
+    )
+    await db.commit()
+    board = (await client.get(f"/tasks/{task_id}")).text
+    assert "every 15s" not in board, "the review board has no auto-refresh button"
