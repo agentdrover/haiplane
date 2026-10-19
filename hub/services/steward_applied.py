@@ -934,6 +934,20 @@ async def apply_self_approval(
     *,
     claim: tuple[int, str] | None = None,
 ) -> tuple[str, str] | None:
+    """Одно применение: факт ранней проверки потолка (#1855) живёт только в нём."""
+    from hub.services.steward_apply import ceiling_scope
+
+    async with ceiling_scope():
+        return await _apply_self_approval(db, task_id, generation, claim=claim)
+
+
+async def _apply_self_approval(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    claim: tuple[int, str] | None = None,
+) -> tuple[str, str] | None:
     """Применить правило к записанному approve-суждению. ``None`` — не применялось.
 
     Три разных ответа, и путать их нельзя. ``None`` означает «контур сюда не

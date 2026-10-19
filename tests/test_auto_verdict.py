@@ -838,3 +838,68 @@ async def test_text_recovered_report_never_auto_approves(
         await _record_with_origin(db, task_id, ORIGIN_MCP)
         body = (await client.get(f"/api/tasks/{task_id}")).json()
         assert body["review_verdict"] == "approved", policy
+
+
+async def _ceiling_case(client, db, monkeypatch, slug, ceiling, areas):
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    policy = {"verdict": "auto"}
+    if ceiling:
+        policy["auto_approve_max_class"] = ceiling
+    task_id = await _submitted_task(client, db, slug, policy, areas=areas)
+    await _post_review(client, task_id, raw_count=3)
+    return task_id, (await client.get(f"/api/tasks/{task_id}")).json()
+
+
+async def test_the_project_ceiling_limits_the_autopilot_too(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1855: R3 разрешён автопилоту только БЕЗ потолка проекта; при r1 — R2 к
+    # человеку (class_above_policy_ceiling), R1 одобряется.
+    _, free = await _ceiling_case(
+        client, db, monkeypatch, "ceil-none", None, ["hub/auth.py"]
+    )
+    assert free["risk_class"] == "R3" and free["review_verdict"] == "approved"
+
+    _, above = await _ceiling_case(
+        client, db, monkeypatch, "ceil-r2", "r1", ["hub/services/effective_policy.py"]
+    )
+    assert above["risk_class"] == "R2"
+    assert above["review_verdict"] is None and above["status"] == "review"
+    feed = [u["content"] for u in above["updates"] or []]
+    assert any("class_above_policy_ceiling" in c or "выше потолка" in c for c in feed)
+
+    _, within = await _ceiling_case(
+        client, db, monkeypatch, "ceil-r1", "r1", ["tests/test_x.py"]
+    )
+    assert within["risk_class"] == "R1" and within["review_verdict"] == "approved"
+
+
+async def test_the_autopilot_ceiling_is_rechecked_in_the_verdict_transaction(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1855: запись вердикта автопилота без факта ранней проверки при заданном
+    # потолке отказывает (fail-closed) и ничего не пишет.
+    import pytest
+    from fastapi import HTTPException
+
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.auto_verdict import _POLICY_ACTOR
+    from hub.services.lifecycle import record_review_verdict
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client,
+        db,
+        "ceil-txn",
+        {"verdict": "auto", "auto_approve_max_class": "r1"},
+        areas=["tests/test_x.py"],
+    )
+    with pytest.raises(HTTPException) as refused:
+        await record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=_POLICY_ACTOR),
+            expected_generation=1,
+        )
+    assert "class_above_policy_ceiling" in str(refused.value.detail)
+    assert not ((await repo.get_task(db, task_id))["review_verdict"] or "")
