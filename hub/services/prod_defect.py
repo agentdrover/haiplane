@@ -56,6 +56,7 @@ def _create_body(body: ProdDefectCreate, source: TaskSource) -> TaskCreate:
         problem_statement=body.broken,
         affected_areas=body.affected_areas,
         validation_commands=[body.verify],
+        plain_summary=body.plain_summary,
     )
 
 

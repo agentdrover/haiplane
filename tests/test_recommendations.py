@@ -108,6 +108,7 @@ def test_perfect_task_yields_no_recommendations():
         **_empty_dor_kwargs(
             user_story="us",
             problem_statement="ps",
+            plain_summary="ps",
             business_value="bv",
             scope_in_count=1,
             validation_count=1,
@@ -140,6 +141,7 @@ def test_optional_failures_yield_low_severity():
             work_type=WorkType.docs.value,
             scope_in_count=1,
             size="S",
+            plain_summary="ps",
         )
     )
     recs = build_recommendations(dor)
@@ -190,7 +192,12 @@ def test_estimated_minutes_propagated_from_template():
 def test_build_recommendations_uses_custom_config():
     cfg = ReadinessConfig(penalty_required=20, penalty_optional=5)
     dor = evaluate_from_data(
-        **_empty_dor_kwargs(work_type=WorkType.docs.value, scope_in_count=1, size="S")
+        **_empty_dor_kwargs(
+            work_type=WorkType.docs.value,
+            scope_in_count=1,
+            size="S",
+            plain_summary="ps",
+        )
     )
     recs = build_recommendations(dor, config=cfg)
     for r in recs:
@@ -212,6 +219,7 @@ def test_no_recommendations_for_risks_only():
         **_empty_dor_kwargs(
             user_story="us",
             problem_statement="ps",
+            plain_summary="ps",
             business_value="bv",
             scope_in_count=1,
             validation_count=1,
@@ -244,6 +252,7 @@ async def _make_full_task(db: aiosqlite.Connection) -> int:
         title="t",
         user_story="us",
         problem_statement="ps",
+        plain_summary="ps",
         business_value="bv",
         scope_in=["a"],
         validation_commands=["pytest"],
@@ -266,7 +275,7 @@ async def test_build_for_task_minimal(db: aiosqlite.Connection):
     task_id = await _make_minimal_task(db)
     recs = await build_for_task(db, task_id)
     assert {r.field for r in recs} >= {"user_story", "scope_in", "size"}
-    discovery = {"outcome_metric", "redesign_decision", "agent_fit"}
+    discovery = {"outcome_metric", "redesign_decision", "agent_fit", "plain_summary"}
     assert all(r.severity == "blocking" for r in recs if r.field not in discovery)
     # Discovery suggestions are offered but never charged for (#331).
     assert all(
@@ -347,6 +356,7 @@ async def test_ac_quality_warning_for_thin_ac_is_non_blocking(
         title="t",
         user_story="us",
         problem_statement="ps",
+        plain_summary="ps",
         business_value="bv",
         scope_in=["a"],
         validation_commands=["pytest"],
@@ -791,6 +801,7 @@ async def test_a_missing_area_is_named_and_never_blocks(
         title="t",
         user_story="us",
         problem_statement="ps",
+        plain_summary="ps",
         business_value="bv",
         scope_in=["a"],
         validation_commands=["pytest"],
@@ -869,6 +880,7 @@ async def test_an_unresolvable_area_does_not_500_the_readiness_read(
         title="t",
         user_story="us",
         problem_statement="ps",
+        plain_summary="ps",
         business_value="bv",
         scope_in=["a"],
         validation_commands=["pytest"],
@@ -921,6 +933,7 @@ async def test_no_new_code_charges_the_score(db: aiosqlite.Connection, tmp_path)
         title="t",
         user_story="us",
         problem_statement="ps",
+        plain_summary="ps",
         business_value="bv",
         scope_in=["Закрытый словарь дефектов постановки"],
         validation_commands=["pytest"],

@@ -3663,6 +3663,7 @@ async def _propose_prod_defect(
     areas: list[str] | None,
     agent: str,
     parent_id: int | None,
+    plain_summary: str = "",
 ) -> str:
     """The prod-defect branch of hub_propose_task: POST /api/prod-defects."""
     body: dict[str, Any] = {
@@ -3674,6 +3675,8 @@ async def _propose_prod_defect(
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
+    if plain_summary:
+        body["plain_summary"] = plain_summary
     filed = await _api_post("/api/prod-defects", body)
     release = (
         f"release #{filed['release_id']}"
@@ -3701,6 +3704,7 @@ async def hub_propose_task(
     affected_areas: list[str] | None = None,
     result_kind: str = "commit",
     rollback: str = "",
+    plain_summary: Annotated[str, Field(max_length=300)] = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -3722,10 +3726,17 @@ async def hub_propose_task(
         affected_areas: Where it broke (prod defect)
         result_kind: commit | state (leaf only)
         rollback: Undo text for state
+        plain_summary: What it is about in plain words, up to 300 chars
     """
     if defect_verify:
         return await _propose_prod_defect(
-            title, description, defect_verify, affected_areas, agent, parent_id
+            title,
+            description,
+            defect_verify,
+            affected_areas,
+            agent,
+            parent_id,
+            plain_summary,
         )
     if task_type not in ("task", "subtask", "feature", "epic"):
         return format_echo_response(
@@ -3747,6 +3758,8 @@ async def hub_propose_task(
         body["result_kind"] = result_kind
     if rollback:
         body["rollback"] = rollback
+    if plain_summary:
+        body["plain_summary"] = plain_summary
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
@@ -5790,17 +5803,16 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
 async def hub_refine_task(
     task_id: int, include_task: bool = False, **fields: Any
 ) -> HubRefineTaskResult:
-    """PATCH a task's DoR fields.
-
-    Only fields you pass are written; every list REPLACES the stored one.
+    """PATCH DoR fields; only passed ones are written, lists REPLACE.
 
     Args:
         task_id: Task to refine.
         description: Statement text; "" clears it.
-        work_type: Kind of work (a frozen project admits by type).
+        work_type: Kind of work.
         due_date: ISO date (fixed_date).
         user_story: As a / I want / so that.
         problem_statement: What is broken.
+        plain_summary: Plain-words gist, <=300.
         outcome_metric: Which number moves.
         outcome_indicator: Leading signal.
         outcome_deadline: When checked.
@@ -5808,21 +5820,21 @@ async def hub_refine_task(
         redesign_decision: adapt | redesign.
         found_in: Defect stage (prod: not feature).
         caused_by_task_id: Causing task.
-        cause_kind: regression|latent_design|dependency|ops|not_a_defect|unknown.
-        technical_hints: Hints, approach.
+        cause_kind: Defect cause class.
+        technical_hints: Approach hints.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        affected_areas: Paths impacted.
+        affected_areas: Paths hit.
         validation_commands: Proof commands.
-        live_probe: Post-delivery probe (registry name).
-        result_kind: commit|state; draft only.
-        rollback: Undo of a state result.
-        out_of_scope_for_review: Reviewer ignores.
+        live_probe: Post-delivery probe name.
+        result_kind: Draft only.
+        rollback: State undo.
+        out_of_scope_for_review: Reviewer skips.
         review_checklist: Reviewer verifies.
         human_owner: Who is accountable.
         human_reviewer: Who accepts.
-        freeze_rationale: Why it may enter a freeze.
+        freeze_rationale: Freeze admission reason.
         acceptance_criteria: Full AC replacement.
         risks: Full replacement.
         include_task: Echo the task.
