@@ -1629,27 +1629,6 @@ async def test_the_task_is_rechecked_right_before_the_dispatch(
     assert cloud.requests == []
 
 
-async def test_a_stalled_database_cannot_hold_the_pass_beyond_its_hard_cap(
-    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
-):
-    """P1 (Codex): ожидания БД не подчиняются дедлайну сети - проход ограничен снаружи."""
-    from hub import repository_ci_head as journal
-    from hub.services import ci_head_run
-
-    await _cloud_task(db)
-
-    async def stalled(*args, **kwargs):
-        await asyncio.sleep(30)
-
-    monkeypatch.setattr(journal, "running_candidates", stalled)
-    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.2)
-    monkeypatch.setattr(ci_head_run, "HARD_CAP_EXTRA_SECONDS", 0.2)
-    started = asyncio.get_running_loop().time()
-    async with asyncio.timeout(5):
-        await _cycle(db)
-    assert asyncio.get_running_loop().time() - started < 2.0
-
-
 async def test_a_ci_result_that_never_comes_is_said_aloud_once(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ):
@@ -1771,3 +1750,208 @@ async def test_a_policy_switched_off_after_the_reservation_gives_the_attempt_bac
         "SELECT attempts FROM ci_head_runs WHERE task_id=?", (task_id,)
     )
     assert (await cur.fetchone())[0] == 0
+
+
+# ---- #1862, вердикт 2: состояние при прерывании, область alert, возврат попытки, курсор ----
+
+
+async def test_a_pass_never_leaves_the_shared_connection_inside_a_transaction(
+    db: aiosqlite.Connection, db_dsn: str, cloud: _CloudGit, monkeypatch
+):
+    """I1 (P1): БД не отменяется снаружи; после возврата соединение поллера чисто."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+
+    await _cloud_task(db)
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(ci_head_run, "HARD_CAP_EXTRA_SECONDS", 0.05, raising=False)
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await other.execute("PRAGMA busy_timeout = 5000")
+        await other.execute("BEGIN IMMEDIATE")  # чужая запись держит замок
+
+        async def release_later():
+            await asyncio.sleep(0.4)
+            await other.rollback()
+
+        releaser = asyncio.create_task(release_later())
+        async with asyncio.timeout(10):
+            await _cycle(db)
+        await releaser
+    finally:
+        await other.close()
+    await asyncio.sleep(0.2)
+    assert not db.in_transaction, "после прохода соединение поллера не в транзакции"
+    await journal.set_state(db, "probe", 7)
+    await db.rollback()  # конец тика поллера
+    assert await journal.get_state(db, "probe") == 7, "следующий шаг коммитится"
+
+
+async def _requested_overdue(db, cloud, monkeypatch, slug, branch):
+    """Задача с принятым запросом, чьё ожидание уже просрочено (срок 0)."""
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 60, raising=False)
+    cloud.heads[branch] = HEAD_A
+    task_id = await _cloud_task(db, slug=slug, branch=branch)
+    await _cycle(db)
+    assert len(cloud.requests) >= 1
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 0)
+    return task_id
+
+
+async def test_the_overdue_alert_rechecks_the_same_scope_as_the_dispatch(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I2: пять сценариев ложного alert + контрольный, где он законен."""
+    from hub.services import ci_head_run
+
+    async def policy(task_id, **values):
+        project = await repo.resolve_project_for_task(db, task_id)
+        await repo.update_project(db, project["id"], gate_policy=json.dumps(values))
+        await db.commit()
+
+    cases = {
+        "off": lambda t: policy(t, ci_contract=SAT_CONTRACT, ci_before_submit="off"),
+        "nocontract": lambda t: policy(t, ci_before_submit="require"),
+    }
+
+    async def submitted(t):
+        await db.execute(
+            "UPDATE tasks SET submission_generation=1, submission_sha='x' WHERE id=?",
+            (t,),
+        )
+        await db.commit()
+
+    async def other_branch(t):
+        await db.execute("UPDATE tasks SET branch='task-20/other' WHERE id=?", (t,))
+        await db.commit()
+
+    async def head_moved(t):
+        cloud.heads[f"task-20/{t}-moved"] = HEAD_B
+        ci_head_run._back_off()  # проход запросов в отступе, а голова ушла
+
+    cases["submitted"] = submitted
+    cases["branch"] = other_branch
+    cases["moved"] = head_moved
+    for slug, mutate in cases.items():
+        branch = f"task-20/{slug}"
+        task_id = await _requested_overdue(db, cloud, monkeypatch, slug, branch)
+        if slug == "moved":
+            cloud.heads[branch] = HEAD_B
+            ci_head_run._back_off()
+        else:
+            await mutate(task_id)
+        await _cycle(db)
+        assert await _notes(db, task_id, "CI не пришёл") == [], (
+            f"сценарий {slug}: область изменилась - alert был бы ложным"
+        )
+        ci_head_run.reset_state()
+    ok = await _requested_overdue(db, cloud, monkeypatch, "legit", "task-20/legit")
+    await _cycle(db)
+    assert len(await _notes(db, ok, "CI не пришёл")) == 1
+
+
+async def test_a_deadline_that_ends_before_the_forge_call_gives_the_attempt_back(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I3: «не отправлено» - не «неоднозначно»; попытка не расходуется."""
+    from hub.services import ci_head_run
+
+    # потолок вызова форжа - 0: дедлайн кончается РОВНО перед отправкой
+    monkeypatch.setattr(ci_head_run, "DISPATCH_CEILING_SECONDS", 0.0)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    task_id = await _cloud_task(db)
+    for _ in range(3):
+        ci_head_run.reset_state()
+        await _cycle(db)
+    assert cloud.requests == []
+    cur = await db.execute(
+        "SELECT attempts, state FROM ci_head_runs WHERE task_id=?", (task_id,)
+    )
+    row = await cur.fetchone()
+    assert row[0] == 0 and row[1] == "seen", (
+        "три прохода без отправки не тратят попытки"
+    )
+
+
+async def test_the_announce_cursor_follows_the_last_processed_row_when_interrupted(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I4: сценарий Codex - 3 непригодных + 1 пригодный, страница 3, бюджет на 2 строки."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+    from hub.services.ci_report import accept_ci_run_report
+    from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
+
+    monkeypatch.setattr(journal, "ANNOUNCE_PAGE", 3)
+    cloud.heads["task-21/good"] = HEAD_A
+    good = await _cloud_task(db, slug="goodrow", branch="task-21/good")
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        good,
+        **cloud.github.attempt(
+            good, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="2101"
+        ),
+    )
+    bad = await _cloud_task(db, slug="badrows", branch="task-21/bad")
+    project = await repo.resolve_project_for_task(db, bad)
+    await set_contract(db, project["id"], SAT_CONTRACT_C)
+    for i in range(3):
+        sha = f"{i + 1:040x}"
+        await db.execute(
+            "INSERT INTO ci_head_runs (task_id, sha, branch, state) "
+            "VALUES (?, ?, 'task-21/bad', 'observed')",
+            (bad, sha),
+        )
+        await db.execute(
+            "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
+            "trust, trust_reason, trust_final, contract_fp) "
+            "VALUES (?, ?, ?, '1', 'verified', '', 1, 'old-contract')",
+            (bad, sha, str(2200 + i)),
+        )
+    await db.commit()
+    known = {good: HEAD_A, bad: HEAD_A}
+    calls = {"n": 0}
+    real_left = ci_head_run._Deadline.left
+
+    def two_rows_per_pass(self):
+        calls["n"] += 1
+        return real_left(self) if calls["n"] <= 2 else 0.0
+
+    monkeypatch.setattr(ci_head_run._Deadline, "left", two_rows_per_pass)
+    for _ in range(4):
+        calls["n"] = 0
+        await ci_head_run.announce_results(db, known, ci_head_run._Deadline(100))
+    assert len(await _announced(db, good)) == 1, (
+        "курсор шёл вниз, а не топтался на месте"
+    )
+
+
+async def test_finished_tasks_leave_the_journals(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """I5: строки завершённых задач старше срока чистятся; живых - нет."""
+    from hub import repository_ci_head as journal
+
+    done = await _cloud_task(db, slug="finished", branch="task-22/done")
+    cloud.heads["task-22/done"] = HEAD_A
+    live = await _cloud_task(db, slug="alive", branch="task-22/live")
+    cloud.heads["task-22/live"] = HEAD_B
+    await _cycle(db)
+    for tid in (done, live):
+        await db.execute(
+            "INSERT INTO ci_head_announced (task_id, sha, attempt_key) VALUES (?, 'x', 'k')",
+            (tid,),
+        )
+    await db.execute(
+        "UPDATE tasks SET status='completed', updated_at=datetime('now', '-40 days') "
+        "WHERE id=?",
+        (done,),
+    )
+    await db.commit()
+    removed = await journal.prune_finished(db, days=14)
+    assert removed >= 2
+    for table in ("ci_head_runs", "ci_head_announced"):
+        cur = await db.execute(f"SELECT task_id FROM {table}")  # noqa: S608
+        left = {r[0] for r in await cur.fetchall()}
+        assert done not in left and live in left
