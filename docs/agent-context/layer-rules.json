@@ -1,0 +1,184 @@
+{
+  "_comment": [
+    "Правила слоёв хаба (#1852, архитектура как код). Проверку гоняет",
+    "scripts/layer_rules.py, её же гоняет CI (шаг Layer rules) и make check.",
+    "",
+    "layers: слой модуля задаёт modules (точное имя или шаблон, где * не пересекает",
+    "точку: hub.web_* — модули корня) и trees (пакет и все вложенные). Модуль без слоя",
+    "или в двух слоях краснит проверку.",
+    "forbidden: слой-источник -> слои, импорт в которые запрещён.",
+    "ledger: сегодняшние запрещённые рёбра «from -> to» с removed_by в формате",
+    "complexity_budget (task:#N | permanent — причина | unclaimed — причина). Ребро",
+    "снимается удалением строки: когда ребра нет, проверка сама требует её убрать.",
+    "--update дописывает новые рёбра с плейсхолдером, который CI отвергает."
+  ],
+  "layers": {
+    "entry": {
+      "modules": [
+        "hub.app",
+        "hub.web",
+        "hub.web_*",
+        "hub.cli",
+        "hub.cli_task_fields",
+        "hub.cli_executor_host",
+        "hub.mcp_server",
+        "hub.mcp_catalog",
+        "hub.mcp_http_compat",
+        "hub.mcp_signature",
+        "hub.mcp_task_card",
+        "hub.*_api"
+      ],
+      "trees": []
+    },
+    "security": {
+      "modules": [
+        "hub.auth",
+        "hub.csrf",
+        "hub.host_security",
+        "hub.mcp_internal_auth"
+      ],
+      "trees": []
+    },
+    "services": {
+      "modules": [],
+      "trees": [
+        "hub.services"
+      ]
+    },
+    "repository": {
+      "modules": [
+        "hub.repository",
+        "hub.repository_*"
+      ],
+      "trees": []
+    },
+    "db": {
+      "modules": [
+        "hub.db"
+      ],
+      "trees": [
+        "hub.migrations"
+      ]
+    },
+    "integrations": {
+      "modules": [],
+      "trees": [
+        "hub.integrations"
+      ]
+    },
+    "models": {
+      "modules": [
+        "hub.models",
+        "hub.plain_summary"
+      ],
+      "trees": []
+    },
+    "poller": {
+      "modules": [
+        "hub.poller"
+      ],
+      "trees": []
+    },
+    "support": {
+      "modules": [
+        "hub",
+        "hub.config",
+        "hub.brand",
+        "hub.version",
+        "hub.hub_instance",
+        "hub.actionable_errors",
+        "hub.commit_scope",
+        "hub.git_policy",
+        "hub.process_kill",
+        "hub.release_artifact_paths",
+        "hub.lifecycle_matrix",
+        "hub.workflow_reference",
+        "hub.skill_files",
+        "hub.skill_publish",
+        "hub.mcp_structured",
+        "hub.mcp_envelope"
+      ],
+      "trees": [
+        "hub.workflow_templates",
+        "hub.cli_templates"
+      ]
+    }
+  },
+  "forbidden": {
+    "services": [
+      "entry"
+    ],
+    "integrations": [
+      "services",
+      "repository",
+      "db",
+      "entry",
+      "poller"
+    ],
+    "repository": [
+      "entry",
+      "poller",
+      "services"
+    ],
+    "models": [
+      "entry",
+      "poller",
+      "repository",
+      "db",
+      "services"
+    ],
+    "db": [
+      "entry",
+      "poller",
+      "services"
+    ],
+    "security": [
+      "entry"
+    ],
+    "support": [
+      "entry"
+    ]
+  },
+  "ledger": [
+    {
+      "from": "hub.db",
+      "to": "hub.services.lifecycle",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.models",
+      "to": "hub.services.executor_launch",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.models",
+      "to": "hub.services.ci_contract",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.models",
+      "to": "hub.services.finding_identity",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.models",
+      "to": "hub.services.project_policy",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.models",
+      "to": "hub.services.steward_corridor",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.repository",
+      "to": "hub.services.orchestration",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    },
+    {
+      "from": "hub.repository",
+      "to": "hub.services.project_policy",
+      "removed_by": "unclaimed — задача на снятие ребра не заведена (вне #1852: scope_out «исправление 7 рёбер»)"
+    }
+  ]
+}

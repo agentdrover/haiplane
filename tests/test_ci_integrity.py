@@ -165,6 +165,29 @@ def test_every_line_rule_and_both_sides_of_a_rename_or_delete():
     assert ("tox.ini", "pytest_config") in _rules(_diff("tox.ini", ["[pytest]"]))
 
 
+def test_layer_rules_config_is_a_ci_input():
+    """#1852: the layer table / ledger and the script are CI inputs: edit, delete, rename."""
+    config = "docs/agent-context/layer-rules.json"
+    script = "scripts/layer_rules.py"
+    for path, rule in ((config, "layer_rules_config"), (script, "ci_script")):
+        assert (path, rule) in _rules(_diff(path, ["x"])), f"edit {path}"
+        deleted = (
+            f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n"
+            f"index 1111111..0000000\n--- a/{path}\n+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n-x\n"
+        )
+        assert (path, rule) in _rules(deleted), f"delete {path}"
+        moved_away = (
+            f"diff --git a/{path} b/docs/other.json\nsimilarity index 100%\n"
+            f"rename from {path}\nrename to docs/other.json\n"
+        )
+        assert (path, rule) in _rules(moved_away), f"rename away {path}"
+        moved_in = _diff(path, ["x"], old="docs/other.json")
+        assert (path, rule) in _rules(moved_in), f"rename into {path}"
+    # a neighbour json beside it is not an input
+    assert _rules(_diff("docs/agent-context/other.json", ["x"])) == set()
+
+
 def test_pytest_configuration_is_compared_as_data_not_as_text():
     """Quoted and dotted spellings, new pytest.toml files, deletions and unread files all count."""
     bare = _diff("pyproject.toml", ["x = 1"], start=9)
