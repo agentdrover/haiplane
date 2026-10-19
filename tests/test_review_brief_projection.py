@@ -1231,13 +1231,21 @@ _BAD: dict[str, tuple[str, Any]] = {
     "ci_run_report": ("ci_run_report.trust", "unverified"),
     "ci_integrity": (
         "ci_integrity",
-        {"state": "suspicious", "gap": "g", "signs": [], "question": "q"},
+        {
+            "state": "suspicious",
+            "gap": "разрыв-ци",
+            "signs": [],
+            "question": "вопрос-ци",
+        },
     ),
     "ci_evidence": ("ci_evidence.mutations.state", "not_received"),
     "prepass": ("prepass.state", "failed"),
     "validation": ("validation.needs_human_compare", True),
     "live_check": ("live_check.sha_mismatch", True),
-    "statement_freshness": ("statement_freshness", {"state": "stale", "reason": "r"}),
+    "statement_freshness": (
+        "statement_freshness",
+        {"state": "stale", "reason": "причина-устарела"},
+    ),
     "branch": ("branch", "other"),
     "diff_command": ("diff_command", "git diff x"),
     "diff_base": ("diff_base.state", "unverified"),
@@ -1247,7 +1255,7 @@ _BAD: dict[str, tuple[str, Any]] = {
     "review_circle": ("review_circle.laps", 3),
     "profile_downgrade": (
         "profile_downgrade",
-        {"headline": "h", "required_profile": "deep"},
+        {"headline": "заголовок-понижения", "required_profile": "deep"},
     ),
     "verdict_route": ("verdict_route", {"line": "вердикт: человек", "final": "human"}),
     "catalogue_rules": (
@@ -1269,14 +1277,24 @@ _BAD: dict[str, tuple[str, Any]] = {
     "stacking_warning": ("stacking_warning", "стек веток"),
     "cause_task": (
         "cause_task",
-        {"state": "known", "task_id": 7, "title": "Причина", "link": "/tasks/7"},
+        {
+            "state": "known",
+            "task_id": 7,
+            "title": "Причина-семь",
+            "link": "/tasks/7",
+            "affected_areas": ["hub/seven.py"],
+            "areas_note": "заявленные области",
+        },
     ),
     "path_notices": (
         "path_notices",
         {"generation": 1, "state": "matched", "text": "ручной шаг"},
     ),
     "result_kind": ("result_kind", "state"),
-    "state_review": ("state_review", {"headline": "h", "label": "l"}),
+    "state_review": (
+        "state_review",
+        {"headline": "заголовок-состояния", "label": "метка-состояния"},
+    ),
     "latest_review.verdict": ("latest_review.verdict", "changes_requested"),
     "latest_review.submission_generation": ("latest_review.submission_generation", 7),
     "latest_review.is_current": ("latest_review.is_current", False),
@@ -1431,6 +1449,28 @@ def test_flipping_a_mandatory_field_changes_the_default_answer(path):
     # structured half carries; both halves are measured by the same budget.
     if path not in _STRUCTURED_ONLY:
         assert _text_of(flipped) != _text_of(base), path
+        # Размер ответа меняется и без поля (счётчики): сторож проверяет ТЕКСТ
+        # поля. Хотя бы одна строка «плохого» значения обязана попасть в текст.
+        if path not in _TEXT_ECHO_NOT_CHECKED:
+            echoed = [
+                x
+                for x in _string_leaves(bad)
+                if x in _text_of(flipped) and x not in _text_of(base)
+            ]
+            assert echoed or not _string_leaves(bad), (path, "поле не напечатано")
+
+
+#: Поля, текст которых зависит от значения целиком (печатаются при условии):
+#: проверка строкового листа к ним не применима, их ловит прежнее сравнение.
+_TEXT_ECHO_NOT_CHECKED = {"base_merge", "base_merge.state", "latest_review.verdict"}
+
+
+def _string_leaves(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _string_leaves(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _string_leaves(v)]
+    return [value] if isinstance(value, str) and value else []
 
 
 _STRUCTURED_ONLY = {
@@ -1656,3 +1696,29 @@ def test_every_hint_names_a_section_that_holds_the_omitted_items():
             value = brief[field]
             parts = [value] if isinstance(value, str) else [str(v) for v in value]
             assert all(part in statement for part in parts), field
+
+
+def test_the_cause_task_line_is_in_both_texts():
+    """#1858 (машинное ревью cd05af1b): текст брифа несёт блок причины."""
+    from hub import mcp_server
+
+    known = _clean()
+    known["cause_task"] = _BAD["cause_task"][1]
+    gone = _clean()
+    gone["cause_task"] = {"state": "no_data", "note": "нет данных: причина недоступна"}
+    for brief in (known, gone, _clean()):
+        full = mcp_server._full_brief_result(brief).content[0].text
+        assert ("Причина-семь" in _text_of(brief)) == (brief is known)
+        assert ("Причина-семь" in full) == (brief is known)
+    for text in (_text_of(known), mcp_server._full_brief_result(known).content[0].text):
+        assert "Задача-причина #7: Причина-семь (/tasks/7)" in text, text
+        assert "заявленные области: hub/seven.py" in text, text
+        assert "cause_kind=" in text, text
+    for text in (_text_of(gone), mcp_server._full_brief_result(gone).content[0].text):
+        assert "нет данных: причина недоступна" in text, text
+        assert "Задача-причина #" not in text
+    for text in (
+        _text_of(_clean()),
+        mcp_server._full_brief_result(_clean()).content[0].text,
+    ):
+        assert "Задача-причина" not in text and "причина недоступна" not in text
