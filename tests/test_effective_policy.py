@@ -1475,7 +1475,9 @@ async def test_the_act_readiness_report_is_a_pure_read(
         ),
     )
     human = await _project(db, "human-1855", {"verdict": "human"})
-    ready = await _judged_task(db, pilot, "R1", "concur")
+    open_project = await _project(db, "open-1855", {"verdict": "steward"})
+    ready = await _judged_task(db, open_project, "R1", "concur")
+    unchecked = await _judged_task(db, pilot, "R1", "concur")
     above = await _judged_task(db, pilot, "R2", "concur")
     waiting = await _judged_task(db, pilot, "R1", None)
     no_class = await _judged_task(db, pilot, None, "concur")
@@ -1513,10 +1515,13 @@ async def test_the_act_readiness_report_is_a_pure_read(
     assert report["act_refusals_v2"], "в пустой базе критерии выхода не выполнены"
     assert report["act_would_be_granted"] is False
     # Охват поимённо: только проекты с verdict=steward.
-    assert [p["slug"] for p in report["projects"]] == ["pilot-1855"]
-    assert report["projects"][0]["steward_approve_max_class"] == "r1"
+    assert [p["slug"] for p in report["projects"]] == ["open-1855", "pilot-1855"]
+    assert report["projects"][1]["steward_approve_max_class"] == "r1"
     by_task = {c["task_id"]: c for c in report["candidates"]}
-    assert by_task[ready]["state"] == "ready"
+    assert by_task[ready]["state"] == "ready"  # потолка нет
+    # Потолок задан, пересчитанного класса нет: «не проверено» не равно «в пределах».
+    assert by_task[unchecked]["state"] == "unknown"
+    assert "recomputed" in by_task[unchecked]["reasons"][0]["detail"]
     assert by_task[above]["state"] == "blocked"
     assert by_task[above]["reasons"][0]["code"] == "class_above_policy_ceiling"
     assert by_task[waiting]["state"] == "unknown"
@@ -1525,7 +1530,15 @@ async def test_the_act_readiness_report_is_a_pure_read(
     assert by_task[objected]["state"] == "blocked"
     assert by_task[not_mine]["state"] == "blocked"
     assert by_task[not_mine]["reasons"][0]["code"] == "policy_not_delegated"
-    assert report["candidate_counts"] == {"ready": 1, "blocked": 4, "unknown": 1}
+    assert report["candidate_counts"] == {"ready": 1, "blocked": 4, "unknown": 2}
+
+    # Пересчитанный класс известен вызывающему: сравнивается max(stored, recomputed).
+    from hub.services.steward_act_readiness import _ceiling_reason
+
+    assert _ceiling_reason("r1", "R1", "R2")[0] == "blocked"
+    assert _ceiling_reason("r1", "R1", "R1") is None
+    assert _ceiling_reason("r1", "R1")[0] == "unknown"
+    assert _ceiling_reason(None, None) is None
 
     # Гипотетический расчёт равен фактическому при act.
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
@@ -1549,7 +1562,7 @@ async def test_the_act_readiness_report_is_a_pure_read(
     assert "act scope: pilot-1855 (verdict=steward" in text
     assert f"#{ready} gen 1 ready" in text
     assert f"#{above} gen 1 blocked — class_above_policy_ceiling" in text
-    assert "candidates: ready 1, blocked 4, unknown 1" in text
+    assert "candidates: ready 1, blocked 4, unknown 2" in text
     argv = ["oc-hub", "effective-policy", "pilot-1855"]
     with (
         patch.object(sys, "argv", argv),

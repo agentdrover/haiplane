@@ -4472,6 +4472,14 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     )
     if gap:
         raise HTTPException(422, f"ci_not_green: {gap}")
+    if state.applied_by_steward:
+        # #1855: потолок класса по политике, перечитанной ЗДЕСЬ: владелец мог
+        # поставить его после ранней проверки привратника.
+        from hub.services.steward_apply import ceiling_gate
+
+        ceiling = await ceiling_gate(state.db, state.task_id)
+        if ceiling:
+            raise HTTPException(422, f"{ceiling[0]}: {ceiling[1]}")
     await ci_integrity.verdict_gate(state)  # #1688
 
 

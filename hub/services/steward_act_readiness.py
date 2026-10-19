@@ -63,27 +63,49 @@ def _reason(code: str, detail: str) -> dict[str, str]:
     return {"code": code, "detail": detail}
 
 
-def _ceiling_reason(ceiling: str | None, stored_raw: Any) -> dict[str, str] | None:
-    """Потолок против СОХРАНЁННОГО класса: чего хватает прочитать без записи."""
+def _ceiling_reason(
+    ceiling: str | None, stored_raw: Any, recomputed_raw: Any = None
+) -> tuple[str, dict[str, str]] | None:
+    """(BLOCKED|UNKNOWN, причина) по потолку, или None, если потолка нет.
+
+    Пересчитанный по диффу класс чистым чтением не получить (он собирается
+    вместе с записывающим пакетом), поэтому при заданном потолке кандидат без
+    него не бывает ``ready``: «не проверено» не равно «в пределах». Если
+    пересчитанный класс известен вызывающему, сравнивается max(stored, recomputed).
+    """
     from hub.services.steward_apply import REFUSED_CLASS_CEILING
 
     if ceiling is None:
         return None
     named = f"steward_approve_max_class={ceiling}"
     if ceiling == project_policy.STEWARD_CEILING_UNREADABLE:
-        return _reason(REFUSED_CLASS_CEILING, f"{named}: значение потолка нечитаемо")
+        return BLOCKED, _reason(
+            REFUSED_CLASS_CEILING, f"{named}: значение потолка нечитаемо"
+        )
     try:
         stored = RiskClass(str(stored_raw or "").strip())
     except ValueError:
-        return _reason(
+        return BLOCKED, _reason(
             REFUSED_CLASS_CEILING,
             f"{named}: недостающий факт risk_class.stored — класс задачи не вычислен",
         )
     order = list(RiskClass)
-    if order.index(stored) > order.index(RiskClass(ceiling.upper())):
-        return _reason(
+    limit = order.index(RiskClass(ceiling.upper()))
+    if order.index(stored) > limit:
+        return BLOCKED, _reason(
+            REFUSED_CLASS_CEILING, f"{named}: класс задачи {stored.value} выше потолка"
+        )
+    try:
+        recomputed = RiskClass(str(recomputed_raw or "").strip())
+    except ValueError:
+        return UNKNOWN, _reason(
             REFUSED_CLASS_CEILING,
-            f"{named}: класс задачи {stored.value} выше потолка",
+            f"{named}: пересчитанный класс не проверен (risk_class.recomputed)",
+        )
+    if order.index(recomputed) > limit:
+        return BLOCKED, _reason(
+            REFUSED_CLASS_CEILING,
+            f"{named}: по диффу {recomputed.value} выше потолка",
         )
     return None
 
@@ -120,7 +142,7 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
         project_policy.steward_approve_max_class_of(policy), row["risk_class"]
     )
     if ceiling:
-        blocked.append(ceiling)
+        (blocked if ceiling[0] == BLOCKED else unknown).append(ceiling[1])
     advised = _advisor_reason(await advisor_state(db, task_id, generation))
     if advised:
         (blocked if advised[0] == BLOCKED else unknown).append(advised[1])

@@ -1752,3 +1752,77 @@ async def test_the_approve_ceiling_refuses_above_or_unknown_class(
     assert await codes(None) == []
     # Суждения судьи и знаменатель калибровки привратник не трогает.
     assert await contour_counts(db) == before
+
+
+async def test_the_ceiling_is_rechecked_inside_the_verdict_transaction(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1855 P1: потолок, поставленный ПОСЛЕ ранней проверки, останавливает запись."""
+    import pytest
+    from fastapi import HTTPException
+
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+    from hub.services.steward_evidence import present
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-ceiling-txn")
+    risk = present("risk_class", "класс", stored="R2", recomputed="R2", raised=False)
+
+    async def _packet(_db, tid, _generation=None):
+        return _risk_packet(tid, risk)
+
+    monkeypatch.setattr("hub.services.steward_apply.build_evidence_packet", _packet)
+
+    async def attempt(task_id: int):
+        # Ранняя проверка привратника (запоминает факт класса), затем запись.
+        early = [
+            r
+            for r in await apply_refusals(db, task_id)
+            if r[0] == "class_above_policy_ceiling"
+        ]
+        await record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(agent="steward", verdict=ReviewVerdict.approved),
+            expected_generation=1,
+            applied_by_steward=True,
+        )
+        return early
+
+    # Контроль: без ключа ранняя проверка пуста и запись проходит.
+    control = await _task(db, project_id)
+    await _green(db, control)
+    assert await attempt(control) == []
+    assert (await repo.get_task(db, control))["review_verdict"] == "approved"
+
+    # Политика меняется МЕЖДУ ранней проверкой и записью.
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    real = apply_refusals
+
+    async def early_then_policy_change(db_, tid, generation=None):
+        out = await real(db_, tid, generation)
+        await repo.update_project(
+            db_,
+            project_id,
+            gate_policy=json.dumps(
+                {"verdict": "steward", "steward_approve_max_class": "r1"}
+            ),
+        )
+        await db_.commit()
+        return out
+
+    early = await early_then_policy_change(db, task_id)
+    assert not [r for r in early if r[0] == "class_above_policy_ceiling"]
+    with pytest.raises(HTTPException) as refused:
+        await record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(agent="steward", verdict=ReviewVerdict.approved),
+            expected_generation=1,
+            applied_by_steward=True,
+        )
+    assert "class_above_policy_ceiling" in str(refused.value.detail)
+    row = await repo.get_task(db, task_id)
+    assert not (row["review_verdict"] or "")

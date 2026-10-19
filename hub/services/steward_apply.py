@@ -36,6 +36,7 @@ ladder
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from typing import Any
 
 import aiosqlite
@@ -235,10 +236,21 @@ def class_ceiling_refusal(ceiling: str | None, fact: Any) -> tuple[str, str] | N
     return None
 
 
-async def ceiling_refusals(
-    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
-) -> list[tuple[str, str]]:
-    """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
+# Факт класса, на котором прошла РАННЯЯ проверка потолка. Транзакция записи
+# вердикта (lifecycle._automation_ci_gate) сверяет потолок ещё раз по свежей
+# политике, но пересчитанный по диффу класс в ней не получить (сеть), поэтому
+# берётся тот же факт из пакета. Нет факта — потолок отказывает (неизвестное не R0).
+_EARLY_RISK: ContextVar[dict[int, Any]] = ContextVar("steward_early_risk")
+
+
+def _remember_risk_fact(task_id: int, fact: Any) -> None:
+    known = dict(_EARLY_RISK.get({}))
+    known[task_id] = fact
+    _EARLY_RISK.set(known)
+
+
+async def current_ceiling(db: aiosqlite.Connection, task_id: int) -> str | None:
+    """Потолок approve стюарда проекта задачи по ПЕРЕЧИТАННОЙ политике (#1855)."""
     from hub import repository as repo
     from hub.services.project_policy import (
         gate_policy_of,
@@ -246,10 +258,26 @@ async def ceiling_refusals(
     )
 
     project = await repo.resolve_project_for_task(db, task_id)
-    ceiling = steward_approve_max_class_of(
+    return steward_approve_max_class_of(
         gate_policy_of(project) if project is not None else {}
     )
-    refusal = class_ceiling_refusal(ceiling, packet.facts.get("risk_class"))
+
+
+async def ceiling_gate(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """Потолок внутри транзакции записи вердикта: свежая политика, факт ранней проверки."""
+    ceiling = await current_ceiling(db, task_id)
+    return class_ceiling_refusal(ceiling, _EARLY_RISK.get({}).get(task_id))
+
+
+async def ceiling_refusals(
+    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
+) -> list[tuple[str, str]]:
+    """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
+    fact = packet.facts.get("risk_class")
+    _remember_risk_fact(task_id, fact)
+    refusal = class_ceiling_refusal(await current_ceiling(db, task_id), fact)
     return [refusal] if refusal else []
 
 
