@@ -25,7 +25,9 @@ def main() -> int:
             "detect-secrets",
             "scan",
             "--exclude-files",
-            r"(^uv\.lock$|^\.pytest_cache/|^\.ruff_cache/)",
+            r"(^uv\.lock$|^\.pytest_cache/|^\.ruff_cache/"
+            # Корпус промахов ревью (#1864): 40-hex sha сдач, не секреты.
+            r"|^tests/fixtures/review_eval/cases\.json$)",
         ],
         capture_output=True,
         text=True,
