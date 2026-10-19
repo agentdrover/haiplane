@@ -785,6 +785,13 @@ async def build_review_brief(
 _AREAS_DECLARED = "заявленные области: так их назвал автор задачи-причины, а не дифф"
 
 
+def _same_bound_project(mine, theirs) -> bool:
+    """Оба проекта привязаны явно, активны и один и тот же; два сирот — тоже один."""
+    if mine is None or theirs is None:
+        return mine is None and theirs is None
+    return mine["id"] == theirs["id"] and mine["status"] == "active"
+
+
 async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
     """Блок «задача-причина» для исправления регрессии (#1858); иначе None.
 
@@ -804,12 +811,14 @@ async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
         note="нет данных: причина недоступна (удалена или в другом проекте) — "
         "данные не показываются"
     )
+    # Чтения одинаковы для удалённой и чужой причины (время ответа публикуется),
+    # решение — после них. Проект берётся БЕЗ запасного default: подстановка
+    # (задача вне эпика, проект в pending) не значит «принадлежит default».
+    # Любое сомнение — заглушка.
     cause = await repo.get_task(db, int(cause_id))
-    if not cause:
-        return unavailable
-    mine = await repo.resolve_project_for_task(db, int(task_row["id"]))
-    theirs = await repo.resolve_project_for_task(db, int(cause_id))
-    if mine is None or theirs is None or mine["id"] != theirs["id"]:
+    mine = await repo.resolve_bound_project(db, int(task_row["id"]))
+    theirs = await repo.resolve_bound_project(db, int(cause_id))
+    if not cause or not _same_bound_project(mine, theirs):
         return unavailable
     try:
         areas = [str(a) for a in json.loads(cause["affected_areas"] or "[]")]

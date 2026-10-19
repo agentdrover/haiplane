@@ -33,6 +33,7 @@ from tests.review_dispatch_support import (
     _cap_project,
     _dispatch_row,
     _DispatchRecorder,
+    _dispatch_notes,
     _docs_diff,
     _node,
     _submitted,
@@ -1385,7 +1386,7 @@ async def test_a_regression_fix_gets_deep_within_caps(
     profile, reasons = pick_review_profile(fix, docs)
     assert profile == DEEP, reasons
     assert reasons[0].startswith(REGRESSION_FIX_REASON_MARK), reasons
-    assert "#1600" in reasons[0], reasons
+    assert "#" not in reasons[0], "номер причины в причину профиля не пишется"
     assert pick_review_profile(plain, docs)[0] == LITE
     assert pick_review_profile(plain, _CODE_DIFF)[0] == LITE
 
@@ -1407,6 +1408,7 @@ async def test_a_regression_fix_gets_deep_within_caps(
     stopped, stop_reasons = pick_review_profile(fix, docs, circle_stop=3)
     assert stopped == LITE, stop_reasons
     assert any(REGRESSION_FIX_REASON_MARK in r for r in stop_reasons), stop_reasons
+    assert not any("1600" in r for r in stop_reasons), stop_reasons
 
     # Security и ручной запрос остаются deep как были.
     security = {**fix, "risks": json.dumps([{"kind": "security", "severity": "low"}])}
@@ -1445,3 +1447,6 @@ async def test_a_regression_fix_gets_deep_within_caps(
     reasons = json.loads(rows[-1][0])["profile_reasons"]
     assert any(REGRESSION_FIX_REASON_MARK in r for r in reasons), reasons
     assert any("суточный потолок 1 исчерпан" in r for r in reasons), reasons
+    assert not any(f"#{cause}" in r for r in reasons), reasons
+    notes = " ".join(await _dispatch_notes(db, second))
+    assert f"#{cause}" not in notes, notes

@@ -1143,9 +1143,10 @@ def regression_fix_reason(task: dict[str, Any]) -> str:
         return ""
     if str(task.get("cause_kind") or "").strip() != "regression":
         return ""
-    cause = task.get("caused_by_task_id")
-    named = f", задача-причина #{cause}" if cause else ""
-    return f"{REGRESSION_FIX_REASON_MARK}{named}"
+    # Номер причины сюда не пишется: причина профиля уходит в ленту, понижение,
+    # пакет стюарда и отчёт без проверки доступа читателя. Номер и заголовок
+    # показывает только блок cause_task брифа, когда доступ есть.
+    return REGRESSION_FIX_REASON_MARK
 
 
 def pick_review_profile(

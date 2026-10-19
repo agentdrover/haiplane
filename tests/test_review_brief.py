@@ -2121,3 +2121,48 @@ async def test_a_cause_in_another_project_is_not_disclosed(client: AsyncClient, 
     await db.commit()
     gone = (await client.get(f"/api/tasks/{mine}/review-brief")).json()["cause_task"]
     assert gone == block, (gone, block)
+
+
+async def test_a_pending_project_cause_is_not_taken_for_default(
+    client: AsyncClient, db
+):
+    """#1858 (Codex r2 P1): запасной default не делает чужую причину своей.
+
+    Исправление вне эпика (по умолчанию в default), причина под эпиком проекта
+    в статусе pending, который резолвер подменяет default-ом. Блок обязан
+    молчать, а в ответе брифа и в пакете стюарда нет ни заголовка, ни номера.
+    """
+    import json as _json
+
+    from hub.services.steward_evidence import build_evidence_packet, packet_payload
+    from tests.review_dispatch_support import _node
+
+    pid = await repo.create_project(
+        db, slug="pend-b", name="b", workspace_path="/tmp/ws", status="pending"
+    )
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    cause = await _node(
+        db, title="Заголовок-из-pending", task_type="task", parent_id=epic
+    )
+    mine = await _submitted_task(client, db, "Fix in default")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (cause, mine),
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{mine}/review-brief")
+    block = resp.json()["cause_task"]
+    assert block["state"] == "no_data" and block["task_id"] is None, block
+    assert "Заголовок-из-pending" not in resp.text
+    assert f"/tasks/{cause}" not in resp.text
+
+    packet = _json.dumps(
+        packet_payload(await build_evidence_packet(db, mine, 1)),
+        ensure_ascii=False,
+        default=str,
+    )
+    assert "Заголовок-из-pending" not in packet
+    assert f"/tasks/{cause}" not in packet
