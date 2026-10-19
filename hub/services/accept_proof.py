@@ -109,13 +109,12 @@ class UnreadableReport(Exception):
 def _strict_row(row: dict[str, Any]) -> dict[str, Any]:
     """Строка отчёта, у которой каждый раздел — список; иначе UnreadableReport.
 
-    Пусто и ``None`` — тоже нечитаемо: «раздел не записан» не равно «находок нет».
+    Пустая строка и ``None`` — тоже нечитаемо (json.loads("") падает, None не
+    список): «раздел не записан» не равно «находок нет».
     """
     out = dict(row)
     for name in _LIST_SECTIONS:
         raw = out.get(name)
-        if raw is None or (isinstance(raw, str) and not raw.strip()):
-            raise UnreadableReport(int(row["id"]), f"раздел {name}: пусто")
         try:
             value = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError as exc:
