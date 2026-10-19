@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
+from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
@@ -439,6 +440,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # не делегирует. Читатель: project_policy.steward_watch_of.
     "steward_watch",
     "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
+    "steward_approve_max_class",
+    "auto_approve_max_class",  # #1855: потолки, project_policy.*_max_class_of
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -3336,6 +3339,8 @@ class TaskView(PlainSummaryView):
     # #1589: the path-notice result of THIS submission, set on submit responses
     # only. None = no rules were configured, nothing to say.
     path_notices: PathNoticesView | None = None
+    # #1909: open findings left without an outcome by this submission (None = none).
+    outcome_hint: OutcomeHintView | None = None
     # #1515: where this task's worktree goes, as a template relative to the
     # caller's clone. Set on claim and pair-start only; the hub cannot know the
     # clone's folder name, so the exact path comes from `hp-hub worktree`.
@@ -3488,17 +3493,17 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     # прямо в базу, мимо всех проверок. Значения перечислены здесь и
     # только здесь; делегирующие из них живут в project_policy, и оба
     # перечня сверяются тестом.
-    from hub.services.project_policy import GATE_VALUES
+    from hub.services import project_policy as _policy
     from hub.services.ci_contract import validate_ci_keys
 
     bad = {
         k: val
         for k, val in v.items()
-        if k in ("dor", "verdict") and val not in GATE_VALUES
+        if k in ("dor", "verdict") and val not in _policy.GATE_VALUES
     }
     if bad:
         raise ValueError(
-            f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
+            f"gate_policy values must be one of {sorted(_policy.GATE_VALUES)}, got: {bad}"
         )
     if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
         # Читатель понимает только true (#835); запись отказывает громко,
@@ -3543,6 +3548,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_release_artifacts(v)
     _validate_freeze(v)
     _validate_steward_watch(v)
+    _policy.validate_steward_approve_max_class(v)
     return v
 
 

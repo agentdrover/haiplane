@@ -2762,6 +2762,9 @@ async def hub_submit_for_review(
     if task.get("lifecycle_hint"):
         message += f"\nLifecycle: {task['lifecycle_hint']}"
     message += _path_notices_text(task.get("path_notices"))
+    # #1909: open findings without an outcome, with uids and a ready example.
+    if (task.get("outcome_hint") or {}).get("text"):
+        message += "\n" + str(task["outcome_hint"]["text"])
     return await _task_mutation_response(
         task_id,
         message,

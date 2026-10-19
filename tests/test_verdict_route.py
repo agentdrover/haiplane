@@ -316,3 +316,63 @@ async def test_condition_names_every_unchecked_ground(
     assert "вершина ветки" in route.condition
     assert "провайдер" in route.condition
     assert "провайдер" in (await _status(client, task_id))["verdict_route"]["line"]
+
+
+async def _route_task(client, db, monkeypatch, slug, policy, areas, **review):
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    task_id = await _submitted_task(client, db, slug, policy, areas=areas)
+    await _post_review(client, task_id, **review)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    return task_id
+
+
+async def test_route_without_network_names_the_autopilot_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1855: observe=False сравнивает СОХРАНЁННЫЙ класс с потолком без сети.
+    _steward_on(monkeypatch)
+    policy = {"verdict": "auto", "auto_approve_max_class": "r1"}
+    high = await _route_task(client, db, monkeypatch, "rc-r3", policy, ["hub/auth.py"])
+    route = await verdict_route(db, high)
+    assert (route.decider, route.final) == ("human", "human")
+    assert route.code == "class_above_policy_ceiling"
+    assert "auto_approve_max_class" in route.reason
+
+    low = await _route_task(
+        client, db, monkeypatch, "rc-r1", policy, ["tests/test_x.py"]
+    )
+    route = await verdict_route(db, low)
+    assert route.final == "policy"
+    assert "потолка проекта" in route.condition
+
+    free = await _route_task(
+        client, db, monkeypatch, "rc-free", {"verdict": "auto"}, ["hub/auth.py"]
+    )
+    assert (await verdict_route(db, free)).final == "policy"
+
+
+async def test_steward_route_names_its_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    _steward_on(monkeypatch, "act")
+
+    real = steward_shadow.mode_report
+
+    async def _act(_db):
+        return {**await real(_db), "effective": "act"}
+
+    monkeypatch.setattr(steward_shadow, "mode_report", _act)
+    finding = {"findings_confirmed": [_FINDING]}  # автопилот молчит, судит стюард
+    policy = {"verdict": "steward", "steward_approve_max_class": "r1"}
+    high = await _route_task(
+        client, db, monkeypatch, "rs-r3", policy, ["hub/auth.py"], **finding
+    )
+    route = await verdict_route(db, high)
+    assert route.final == "human" and route.code == "class_above_policy_ceiling"
+
+    low = await _route_task(
+        client, db, monkeypatch, "rs-r1", policy, ["tests/test_x.py"], **finding
+    )
+    route = await verdict_route(db, low)
+    assert route.final == "steward"
+    assert "steward_approve_max_class" in route.condition
