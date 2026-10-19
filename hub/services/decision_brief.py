@@ -30,11 +30,12 @@ from hub.services import (
     state_review,
     verdict_evidence,
 )
-from hub.services.auto_verdict import text_origin_refusal
+from hub.services.auto_verdict import _finding_dicts, text_origin_refusal
 from hub.services.finding_identity import unresolved_uids
 from hub.services.finding_outcome import KIND_UNRESOLVED
 from hub.services.gate_grounds import sibling_mismatch_ground
 from hub.services.readiness import parse_risks_from_row
+from hub.services.orchestration import report_has_evidence
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.verdict_route import DECIDER_HUMAN, DECIDER_STEWARD, verdict_route
@@ -169,11 +170,14 @@ async def _integrity_doubt(
 
 
 async def _unanswered_unresolved(
-    db: aiosqlite.Connection, task_id: int, review: Any
+    db: aiosqlite.Connection, task_id: int, reports: list[Any]
 ) -> int:
-    items = [{"title": u.title, "why": u.why} for u in review.unresolved]
+    """Неотвеченные unresolved по ВСЕМ отчётам поколения (uid без повторов)."""
+    uids: set[str] = set()
+    for report in reports:
+        uids.update(unresolved_uids(_finding_dicts(report["unresolved"])))
     left = 0
-    for uid in unresolved_uids(items):
+    for uid in sorted(uids):
         outcome = await repo.finding_outcome_for_uid(
             db, task_id, uid, finding_kind=KIND_UNRESOLVED
         )
@@ -191,8 +195,7 @@ async def _generation_reports(
     return list(
         await fetchall(
             db,
-            "SELECT id, incomplete, self_reviewed, principal_id FROM machine_reviews "
-            "WHERE task_id=? AND submission_generation=?",
+            "SELECT * FROM machine_reviews WHERE task_id=? AND submission_generation=?",
             (int(task["id"]), int(task.get("submission_generation") or 0)),
         )
     )
@@ -209,6 +212,18 @@ def _report_doubts(review: Any, generation: Any, reports: list[Any]) -> list[Dou
             )
         ]
     doubts: list[Doubt] = []
+    # Каждый отчёт обязан доказать, что проверка была: raw_count 0 — «нет данных»
+    # (пустота без доказательства работы не чистота), и улика исполнения нужна
+    # КАЖДОМУ, а не только тому, что взят за поколение.
+    if any(r["raw_count"] < 1 or not report_has_evidence(dict(r)) for r in reports):
+        doubts.append(
+            Doubt(
+                CHECK,
+                "high",
+                "Отчёт без данных: проверка не доказана",
+                "в поколении есть отчёт без кандидатов или без признаков исполнения",
+            )
+        )
     # incomplete: 0 — заявлено «полный»; NULL («не говорил») и 1 — сомнение.
     if generation.complete is not True or any(r["incomplete"] != 0 for r in reports):
         doubts.append(
@@ -231,7 +246,7 @@ def _report_doubts(review: Any, generation: Any, reports: list[Any]) -> list[Dou
 
 
 async def _finding_doubts(
-    db: aiosqlite.Connection, task_id: int, review: Any
+    db: aiosqlite.Connection, task_id: int, review: Any, reports: list[Any]
 ) -> list[Doubt]:
     doubts: list[Doubt] = []
     if review.findings_confirmed:
@@ -244,7 +259,7 @@ async def _finding_doubts(
     )
     if mismatch:
         doubts.append(Doubt(CHECK, "high", "Ревьюеры расходятся", mismatch))
-    left = await _unanswered_unresolved(db, task_id, review)
+    left = await _unanswered_unresolved(db, task_id, reports)
     if left:
         doubts.append(
             Doubt(CHECK, "high", f"Находок без проверки и без ответа: {left}", "")
@@ -259,9 +274,10 @@ async def _review_doubts(
     mr = await repo.get_latest_machine_review(db, int(task["id"]))
     review = (await review_evidence.report_view(db, task, mr)).machine_review
     generation = await generation_review(db, task)
-    doubts = _report_doubts(review, generation, await _generation_reports(db, task))
+    reports = await _generation_reports(db, task)
+    doubts = _report_doubts(review, generation, reports)
     if review is not None and review.is_current:
-        doubts += await _finding_doubts(db, int(task["id"]), review)
+        doubts += await _finding_doubts(db, int(task["id"]), review, reports)
     for found in (await _ci_doubt(db, task), await _integrity_doubt(db, task)):
         if found is not None:
             doubts.append(found)

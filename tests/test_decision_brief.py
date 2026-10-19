@@ -437,3 +437,48 @@ async def test_report_check_follows_the_doubts_not_the_wording(
     got = await _brief(db, task_id)
     review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
     assert review_check["state"] == "doubt"
+
+
+async def test_unresolved_in_a_sibling_report_blocks_accept(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """P1 gen2: неотвеченный unresolved в НЕ последнем отчёте поколения."""
+    task_id = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-sibling-unres",
+        unresolved=[{"title": "не удалось проверить", "why": "агент упал"}],
+    )
+    await _second_report(client, task_id)  # чистый отчёт B позже
+    await _clean_scan(db, task_id)
+    got = await _brief(db, task_id)
+    assert got["recommend"]["action"] != ACCEPT
+    review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
+    assert review_check["state"] == "doubt"
+
+
+async def test_a_report_without_data_never_earns_accept(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """P1 gen2: «Принять» — только когда КАЖДЫЙ отчёт доказывает, что проверка была."""
+    alone = await _review_task(
+        client,
+        db,
+        monkeypatch,
+        "brief-empty-alone",
+        raw_count=0,
+        findings_rejected=[],
+        tokens_spent=240_000,
+    )
+    await _clean_scan(db, alone)
+    got = await _brief(db, alone)
+    assert got["recommend"]["action"] != ACCEPT, "отчёт с raw_count=0 — нет данных"
+
+    after_full = await _review_task(client, db, monkeypatch, "brief-empty-after")
+    await _second_report(client, after_full, raw_count=0, findings_rejected=[])
+    await _clean_scan(db, after_full)
+    got = await _brief(db, after_full)
+    assert got["recommend"]["action"] != ACCEPT, "полный отчёт, затем пустой"
+    review_check = next(c for c in got["checks"] if c["name"] == "Машинное ревью")
+    assert review_check["state"] == "doubt"
