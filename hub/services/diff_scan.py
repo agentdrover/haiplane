@@ -16,14 +16,19 @@ from typing import NamedTuple
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
 
 
-def _unquote_path(raw: str) -> str | None:
+def _unquote_path(raw: str, *, keep_space: bool = False) -> str | None:
     """A path as git prints it in a header, or None when it cannot be read.
+
+    ``keep_space`` is for lines that carry nothing but the name (``rename to``,
+    ``copy from``): only the line ending goes, a space at the end of an
+    unquoted name stays part of it. A quoted name is decoded and returned as
+    it is, trailing tab included; nothing may strip it afterwards.
 
     With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
     or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
     Undecodable means unknown, never documentation.
     """
-    raw = raw.strip()
+    raw = raw.rstrip("\r\n") if keep_space else raw.strip()
     if not raw.startswith('"'):
         return raw
     if len(raw) < 2 or not raw.endswith('"'):

@@ -185,3 +185,25 @@ def test_a_section_whose_key_cannot_be_read_is_attached_not_dropped():
     assert key == ""
     lines, omitted = _inline_diff_lines(odd, [], ["elsewhere.py"], 100_000)
     assert omitted == [] and odd in "".join(lines)
+
+
+def test_a_quoted_name_keeps_its_trailing_tab_in_the_section_key():
+    # git quotes a name with a TAB; the decoded name ends in it and no strip()
+    # may take it off, or delta_paths (spelled with the TAB) never match.
+    rename = (
+        'diff --git "a/old.py\\t" "b/new.py\\t"\nsimilarity index 100%\n'
+        'rename from "old.py\\t"\nrename to "new.py\\t"\n'
+    )
+    plus = (
+        'diff --git "a/new.py\\t" "b/new.py\\t"\nindex 1..2 100644\n'
+        '--- "a/new.py\\t"\n+++ "b/new.py\\t"\n@@ -1 +1 @@\n-a\n+b\n'
+    )
+    for diff in (rename, plus):
+        ((key, text),) = diff_file_sections(diff)
+        assert key == "new.py\t" and text == diff
+        lines, omitted = _inline_diff_lines(diff, [], ["new.py\t"], 100_000)
+        assert omitted == [] and diff in "".join(lines)
+    assert changed_paths(plus) == ["new.py\t"]
+    # An unquoted name keeps a trailing space; only the line ending goes.
+    spaced = "diff --git a/o b/n \nrename from o\nrename to n \n"
+    assert diff_file_sections(spaced)[0][0] == "n "

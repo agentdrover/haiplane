@@ -358,7 +358,7 @@ def diff_file_sections(diff: str) -> list[tuple[str, str]]:
         elif in_header and line.startswith("@@"):
             in_header = False
         elif in_header and line.startswith(("rename to ", "copy to ")):
-            path = (_unquote_path(line.split(" ", 2)[2]) or "").strip() or path
+            path = _unquote_path(line.split(" ", 2)[2], keep_space=True) or path
         elif in_header and line.startswith("+++ "):
             named = _section_header_path(line)
             path = path if named == "/dev/null" else named
@@ -1067,7 +1067,7 @@ def _header_paths(line: str) -> list[str | None] | None:
     elif line.startswith(("--- ", "+++ ")):
         found = [_unquote_path(line[4:])]
     elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
-        found = [_unquote_path(line.split(" ", 2)[2])]
+        found = [_unquote_path(line.split(" ", 2)[2], keep_space=True)]
     else:
         return None
     return [
