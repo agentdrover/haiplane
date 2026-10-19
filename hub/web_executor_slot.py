@@ -106,5 +106,7 @@ async def web_launch_plaque(task_id: int, request: Request) -> Any:
     if request.headers.get("hx-request") and not (plaque and plaque["active"]):
         # Запуск кончился: кнопка запуска вне фрагмента, и страница
         # перезагружается один раз (закрытая плашка сама уже не опрашивает).
-        response.headers["HX-Refresh"] = "true"
+        # Не HX-Refresh: htmx исполняет его до htmx:beforeSwap и стёр бы
+        # недописанный ввод; обработчик в base.html (#1861) ждёт чистой формы.
+        response.headers["HX-Trigger"] = "hub-launch-ended"
     return response
