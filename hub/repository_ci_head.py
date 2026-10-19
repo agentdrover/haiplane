@@ -120,7 +120,11 @@ async def settle(
 async def unannounced_verified(
     db: aiosqlite.Connection, limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Подтверждённые попытки отчёта по головам журнала, ещё не объявленные."""
+    """Подтверждённые попытки отчёта по головам журнала, ещё не объявленные.
+
+    Новые первыми: строка, которую нельзя объявить (контракт сменился после
+    подтверждения), остаётся в выборке, и старые такие не должны вытеснять новые.
+    """
     rows = await fetchall(
         db,
         "SELECT a.* FROM ci_report_attempts a JOIN ci_head_runs j "
@@ -128,7 +132,7 @@ async def unannounced_verified(
         "WHERE a.trust='verified' AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
         "WHERE n.task_id=a.task_id AND n.sha=a.head_sha "
         "AND n.attempt_key = a.run_id || ':' || a.run_attempt) "
-        "ORDER BY a.id LIMIT ?",
+        "ORDER BY a.id DESC LIMIT ?",
         (limit,),
     )
     return [dict(r) for r in rows]

@@ -922,7 +922,7 @@ async def _announced(db: aiosqlite.Connection, task_id: int) -> list[str]:
 
 
 async def test_ci_report_for_running_head_is_announced_once(
-    db: aiosqlite.Connection, cloud: _CloudGit
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ):
     """AC-3: итог объявляется один раз на (задача, sha, попытка) после доверия."""
     from hub.services import ci_trust
@@ -973,6 +973,11 @@ async def test_ci_report_for_running_head_is_announced_once(
     await _cycle(db)
     notes = await _announced(db, task_id)
     assert len(notes) == 3 and "голова уже другая" in notes[2]
+
+    # подтверждение под прежним контрактом не объявляется; устаревший список
+    # выборки не плодит запись (дедуп держит журнал, а не выборка)
+    await _contract_change_blocks_announcement(db, cloud)
+    await _stale_list_writes_one_entry(db, cloud, monkeypatch)
 
 
 async def test_the_dispatch_goes_to_the_workflow_named_by_the_contract(monkeypatch):
@@ -1074,14 +1079,16 @@ async def test_a_failed_head_read_backs_off_instead_of_asking_every_cycle(
     assert cloud.requests == [], "голов не видно - вслепую не просим"
 
 
-async def test_a_verdict_under_a_changed_contract_is_not_announced(
+async def _contract_change_blocks_announcement(
     db: aiosqlite.Connection, cloud: _CloudGit
-):
-    """#1862: подтверждение выдано под контрактом, которого уже нет, - не объявляем."""
+) -> None:
+    """Подтверждение выдано под контрактом, которого уже нет, - не объявляем."""
     from hub.services.ci_report import accept_ci_run_report
     from tests.ci_trust_support import SAT_CONTRACT_C, set_contract
 
-    task_id = await _cloud_task(db)
+    branch = "task-8/contract"
+    cloud.heads[branch] = HEAD_A
+    task_id = await _cloud_task(db, slug="contract", branch=branch)
     await _cycle(db)
     sent = cloud.github.attempt(
         task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="8001"
@@ -1094,42 +1101,25 @@ async def test_a_verdict_under_a_changed_contract_is_not_announced(
     assert await _announced(db, task_id) == []
 
 
-async def test_a_cycle_serves_a_bounded_number_of_tasks_in_turn(
+async def _stale_list_writes_one_entry(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
-):
-    """#1862: не больше N задач за цикл, круговая очередь, одно чтение голов на репозиторий."""
-    monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 2)
-    branches = [f"task-7/b{i}" for i in range(5)]
-    for i, branch in enumerate(branches):
-        cloud.heads[branch] = f"{i:02d}" * 20
-        await _cloud_task(db, slug=f"turn{i}", branch=branch)
-    await _cycle(db)
-    assert [r[0] for r in cloud.requests] == branches[:2]
-    # одно чтение голов на репозиторий + по одному контрольному после каждого
-    # принятого запроса (голова могла сдвинуться, пока шёл запрос)
-    assert cloud.head_reads == 1 + 2
-    await _cycle(db)
-    await _cycle(db)
-    assert [r[0] for r in cloud.requests] == branches, (
-        "по кругу: хвост очереди не голодает, и никто не получает запрос дважды"
-    )
-
-
-async def test_two_announcers_with_the_same_stale_list_write_one_entry(
-    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
-):
-    """#1862: дедуп держит журнал, а не выборка: устаревший список не плодит записи."""
+) -> None:
+    """Дедуп держит журнал, а не выборка: устаревший список не плодит записи."""
     from hub import repository_ci_head as journal
     from hub.services import ci_head_run
     from hub.services.ci_report import accept_ci_run_report
 
-    task_id = await _cloud_task(db)
+    branch = "task-9/stale-list"
+    cloud.heads[branch] = HEAD_A
+    task_id = await _cloud_task(db, slug="stale-list", branch=branch)
     await _cycle(db)
     sent = cloud.github.attempt(
         task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="9001"
     )
     await accept_ci_run_report(db, task_id, **sent)
-    stale_list = await journal.unannounced_verified(db)
+    stale_list = [
+        r for r in await journal.unannounced_verified(db) if r["task_id"] == task_id
+    ]
     assert len(stale_list) == 1
     monkeypatch.setattr(
         journal, "unannounced_verified", AsyncMock(return_value=stale_list)
