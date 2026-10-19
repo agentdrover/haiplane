@@ -1926,6 +1926,26 @@ async def test_the_announce_cursor_follows_the_last_processed_row_when_interrupt
         "курсор шёл вниз, а не топтался на месте"
     )
 
+    # свежий отчёт возвращает очередь к вершине: он не ждёт хвоста
+    fresh_branch = "task-21/fresh"
+    cloud.heads[fresh_branch] = HEAD_B
+    fresh = await _cloud_task(db, slug="freshrow", branch=fresh_branch)
+    await journal.observe_head(
+        db, fresh, HEAD_B, fresh_branch, grace_seconds=0, retry_seconds=0
+    )
+    await accept_ci_run_report(
+        db,
+        fresh,
+        **cloud.github.attempt(
+            fresh, HEAD_B, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="2301"
+        ),
+    )
+    calls["n"] = 0
+    await ci_head_run.announce_results(
+        db, {**known, fresh: HEAD_B}, ci_head_run._Deadline(100)
+    )
+    assert len(await _announced(db, fresh)) == 1, "свежая попытка - с вершины"
+
 
 async def test_finished_tasks_leave_the_journals(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
@@ -1947,6 +1967,10 @@ async def test_finished_tasks_leave_the_journals(
         "UPDATE tasks SET status='completed', updated_at=datetime('now', '-40 days') "
         "WHERE id=?",
         (done,),
+    )
+    # живая задача, давно без записей: журнал нужен, пока она в работе
+    await db.execute(
+        "UPDATE tasks SET updated_at=datetime('now', '-40 days') WHERE id=?", (live,)
     )
     await db.commit()
     removed = await journal.prune_finished(db, days=14)
