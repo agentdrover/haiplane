@@ -29,9 +29,11 @@ def _unquote_path(raw: str) -> str | None:
     or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
     Undecodable means unknown, never documentation.
     """
-    raw = raw.rstrip("\r\n")
+    # git's service TAB follows a name with a space, quoted or not. A TAB INSIDE
+    # the quotes is the two characters backslash-t, so cutting trailing TABs is safe.
+    raw = raw.rstrip("\r\n").rstrip("\t")
     if not raw.startswith('"'):
-        return raw.rstrip("\t")
+        return raw
     if len(raw) < 2 or not raw.endswith('"'):
         return None
     body, out, i = raw[1:-1], bytearray(), 0
