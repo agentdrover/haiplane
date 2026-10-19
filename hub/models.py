@@ -2944,7 +2944,7 @@ class DeployView(BaseModel):
     backup: str = "неизвестно"
 
 
-class ProdDefectCreate(BaseModel):
+class ProdDefectCreate(PlainSummaryInput):
     """A production defect filed in one call (#915): the minimum DoR.
 
     What broke, how to check the fix and where — nothing the hub can fill

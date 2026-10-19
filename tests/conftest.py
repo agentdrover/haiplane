@@ -255,11 +255,8 @@ async def db(db_dsn):
     await _migrate(conn)
     # #1811: задачи тестов - «старые» для has_plain_summary, иначе каждое
     # одобрение в наборе требовало бы нового поля. Тесты правила сами
-    # возвращают границу в прошлое (см. test_readiness).
-    await conn.execute(
-        "UPDATE _migrations SET applied_at='9999-12-31 23:59:59' "
-        "WHERE name='add_tasks_plain_summary'"
-    )
+    # возвращают водяной знак (см. test_readiness).
+    await conn.execute("UPDATE plain_summary_boundary SET max_task_id=999999999")
     await conn.commit()
     if await _table_exists(conn, "roles"):
         await seed_system_roles(conn)

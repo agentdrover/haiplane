@@ -1137,10 +1137,24 @@ MIGRATIONS_3: list[tuple[str, str]] = [
     ),
     (
         # #1811: «о чём задача простым языком», до 300 символов (предел задан
-        # моделью). NULL - автор не писал. Время применения этой миграции
-        # (_migrations.applied_at) - граница «новых» задач: has_plain_summary
-        # блокирует только созданные после неё (hub.plain_summary).
+        # моделью). NULL - автор не писал.
         "add_tasks_plain_summary",
         "ALTER TABLE tasks ADD COLUMN plain_summary TEXT",
+    ),
+    (
+        # #1811: водяной знак «новых» задач - одна строка. has_plain_summary
+        # блокирует только задачи с id больше знака (hub.plain_summary).
+        "create_plain_summary_boundary",
+        """CREATE TABLE IF NOT EXISTS plain_summary_boundary (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            max_task_id INTEGER NOT NULL
+        )""",
+    ),
+    (
+        # #1811: знак = MAX(tasks.id) на момент применения (0 в пустой базе).
+        # INSERT OR IGNORE: повтор миграции знак не сдвигает.
+        "set_plain_summary_boundary",
+        "INSERT OR IGNORE INTO plain_summary_boundary (id, max_task_id) "
+        "SELECT 1, COALESCE(MAX(id), 0) FROM tasks",
     ),
 ]

@@ -709,6 +709,12 @@ null
 ],
 [
 "table",
+"plain_summary_boundary",
+"plain_summary_boundary",
+"CREATE TABLE plain_summary_boundary (\n            id          INTEGER PRIMARY KEY CHECK (id = 1),\n            max_task_id INTEGER NOT NULL\n        )"
+],
+[
+"table",
 "principal_roles",
 "principal_roles",
 "CREATE TABLE principal_roles (\n            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,\n            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,\n            granted_by INTEGER REFERENCES principals(id),\n            granted_at TEXT NOT NULL DEFAULT (datetime('now')),\n            PRIMARY KEY (principal_id, role_id)\n        )"

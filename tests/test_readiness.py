@@ -825,12 +825,6 @@ async def test_the_dispatch_start_refuses_the_same_way(
 async def test_plain_summary_blocking_only_for_new_tasks(
     client: AsyncClient, db: aiosqlite.Connection
 ):
-    # Граница «новых» - время применения миграции; ставим её в прошлое.
-    await db.execute(
-        "UPDATE _migrations SET applied_at='2000-01-01 00:00:00' "
-        "WHERE name='add_tasks_plain_summary'"
-    )
-    await db.commit()
     ids = []
     for _ in range(2):
         resp = await client.post(
@@ -861,10 +855,10 @@ async def test_plain_summary_blocking_only_for_new_tasks(
             },
         )
         assert ready.status_code == 200, ready.text
-    new_id, old_id = ids
-    await db.execute(
-        "UPDATE tasks SET created_at='1999-01-01 00:00:00' WHERE id=?", (old_id,)
-    )
+    old_id, new_id = ids
+    # Водяной знак: старая - id не больше знака, новая - больше; время создания
+    # у обеих может совпасть, различает порядок вставки.
+    await db.execute("UPDATE plain_summary_boundary SET max_task_id=?", (old_id,))
     await db.commit()
 
     # Новая без plain_summary: DoR не пройден, approve отказан с тем же основанием.

@@ -1557,6 +1557,13 @@ async def test_patched_migration_list_is_applied(monkeypatch):
         await conn.close()
 
 
+_PLAIN_SUMMARY_MIGRATIONS = {
+    "add_tasks_plain_summary",
+    "create_plain_summary_boundary",
+    "set_plain_summary_boundary",
+}
+
+
 async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
     """#1811: миграция не трогает существующие задачи и их DoR."""
     import subprocess
@@ -1573,7 +1580,7 @@ async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
         monkeypatch.setattr(
             db_module,
             "_MIGRATIONS",
-            [m for m in full if m[0] != "add_tasks_plain_summary"],
+            [m for m in full if m[0] not in _PLAIN_SUMMARY_MIGRATIONS],
         )
         await _migrate(conn)
         assert "plain_summary" not in await _table_columns(conn, "tasks")
@@ -1615,26 +1622,43 @@ async def test_plain_summary_migration_keeps_dor(tmp_path, monkeypatch):
     assert run.returncode == 0, run.stdout + run.stderr
 
 
-async def test_plain_summary_boundary_same_second_task_is_old(tmp_path):
-    """#1811: задача той же секунды, что и миграция, не считается новой."""
+async def test_plain_summary_boundary_is_the_max_id_at_migration(tmp_path, monkeypatch):
+    """#1811: порядок вставки, а не метка времени: при равных секундах задача
+    до миграции старая, после - новая."""
+    import hub.db as db_module
     from hub.plain_summary import is_new_task
 
     conn = await aiosqlite.connect(str(tmp_path / "b.db"))
     conn.row_factory = aiosqlite.Row
     try:
         await conn.executescript(_SCHEMA)
+        full = list(db_module._MIGRATIONS)
+        monkeypatch.setattr(
+            db_module,
+            "_MIGRATIONS",
+            [m for m in full if m[0] not in _PLAIN_SUMMARY_MIGRATIONS],
+        )
+        await _migrate(conn)
+        stamp = "2026-01-01 10:00:00"
+        await conn.execute(
+            "INSERT INTO tasks (id, title, created_at) VALUES (1, 'before', ?)",
+            (stamp,),
+        )
+        await conn.commit()
+        monkeypatch.setattr(db_module, "_MIGRATIONS", full)
         await _migrate(conn)
         await conn.execute(
-            "UPDATE _migrations SET applied_at='2026-01-01 10:00:00' "
-            "WHERE name='add_tasks_plain_summary'"
+            "INSERT INTO tasks (id, title, created_at) VALUES (2, 'after', ?)",
+            (stamp,),
         )
-        for tid, stamp in ((1, "2026-01-01 10:00:00"), (2, "2026-01-01 10:00:01")):
-            await conn.execute(
-                "INSERT INTO tasks (id, title, created_at) VALUES (?, 't', ?)",
-                (tid, stamp),
-            )
         await conn.commit()
         assert await is_new_task(conn, 1) is False
+        assert await is_new_task(conn, 2) is True
+        # повторная миграция знак не сдвигает
+        await conn.execute(
+            "DELETE FROM _migrations WHERE name=?", ("set_plain_summary_boundary",)
+        )
+        await _migrate(conn)
         assert await is_new_task(conn, 2) is True
     finally:
         await conn.close()

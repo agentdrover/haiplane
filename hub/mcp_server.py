@@ -3675,12 +3675,9 @@ async def _propose_prod_defect(
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
-    filed = await _api_post("/api/prod-defects", body)
     if plain_summary:
-        # #1811: черновик прод-дефекта создаёт отдельный маршрут без этого поля.
-        await _api_post(
-            f"/api/tasks/{filed['task']['id']}/refine", {"plain_summary": plain_summary}
-        )
+        body["plain_summary"] = plain_summary
+    filed = await _api_post("/api/prod-defects", body)
     release = (
         f"release #{filed['release_id']}"
         if filed.get("release_id") is not None
@@ -3707,7 +3704,7 @@ async def hub_propose_task(
     affected_areas: list[str] | None = None,
     result_kind: str = "commit",
     rollback: str = "",
-    plain_summary: str = "",
+    plain_summary: Annotated[str, Field(max_length=300)] = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 

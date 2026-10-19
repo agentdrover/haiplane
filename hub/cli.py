@@ -18,7 +18,6 @@ from hub.cli_task_fields import (
     _add_result_kind_args,
     add_plain_summary_option,
     put_plain_summary,
-    put_plain_summary_after,
 )
 from hub.models import (
     DEFAULT_FORGE,
@@ -423,9 +422,8 @@ def cmd_propose(args: argparse.Namespace) -> int:
         }
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
-        filed = _api("POST", "/api/prod-defects", body)
-        put_plain_summary_after(filed, args, _api)
-        _print_json(filed)
+        put_plain_summary(body, args)
+        _print_json(_api("POST", "/api/prod-defects", body))
         return 0
     put_plain_summary(body, args)
     if getattr(args, "parent", None) is not None:

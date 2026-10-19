@@ -25,15 +25,6 @@ def put_plain_summary(body: dict[str, Any], args: argparse.Namespace) -> None:
         body["plain_summary"] = args.plain_summary
 
 
-def put_plain_summary_after(
-    filed: dict[str, Any], args: argparse.Namespace, api: Any
-) -> None:
-    """Прод-дефект создаёт отдельный маршрут без поля: дописываем refine-ом."""
-    if getattr(args, "plain_summary", None) is not None:
-        body = {"plain_summary": args.plain_summary}
-        api("POST", f"/api/tasks/{filed['task']['id']}/refine", body)
-
-
 def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--result-kind",
