@@ -664,6 +664,7 @@ class _CloudGit(NoopGitOps):
         self.head_delay = 0.0
         self.request_delay = 0.0
         self.open_prs: dict[str, int] = {}
+        self.pr_errors: set[str] = set()
         self.probes = 0
         self.on_probe = None  # type: ignore[var-annotated]
         self.on_request = None  # type: ignore[var-annotated]
@@ -699,8 +700,10 @@ class _CloudGit(NoopGitOps):
             return None
         return {b: self.heads[b] for b in branches if b in self.heads}
 
-    async def pr_for_branch(self, branch, repo=None, gh_repo=None, forge=""):
-        return self.open_prs.get(branch)
+    async def open_pr_between(self, base, head, repo=None, gh_repo=None, forge=""):
+        if head in self.pr_errors:
+            return (None, f"список PR {head} → {base} не прочитан")
+        return (self.open_prs.get(head), "")
 
     async def request_ci_run(
         self, branch, repo=None, gh_repo=None, forge="", workflow_path=None
@@ -1547,3 +1550,92 @@ async def test_a_failing_request_half_does_not_cancel_the_announcements(
     monkeypatch.setattr(ci_head_run, "request_for_new_heads", broken)
     await _cycle(db)
     assert len(await _announced(db, task_id)) == 1
+
+
+async def _state_of(db: aiosqlite.Connection, task_id: int) -> str:
+    cur = await db.execute("SELECT state FROM ci_head_runs WHERE task_id=?", (task_id,))
+    return (await cur.fetchone())[0]
+
+
+async def test_unknown_is_not_none_before_the_dispatch(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P2 (Codex): не прочитанный список прогонов или PR - не «нет»: dispatch не делается."""
+    from hub.services import ci_head_run
+
+    # прогоны на повторной проверке не прочитались
+    first = await _cloud_task(db, slug="unk-runs", branch="task-16/runs")
+    cloud.heads["task-16/runs"] = HEAD_A
+    before = cloud.probes
+
+    async def forge_fails_on_second_probe():
+        if cloud.probes >= before + 2:
+            cloud.github.down = True
+
+    cloud.on_probe = forge_fails_on_second_probe
+    await _cycle(db)
+    assert cloud.requests == []
+    assert await _state_of(db, first) == "reserved", "заявка не закрыта догадкой"
+    cloud.on_probe = None
+    cloud.github.down = False
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == ["task-16/runs"]
+
+    # список PR не прочитался
+    cloud.requests.clear()
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 3600)
+    second = await _cloud_task(db, slug="unk-pr", branch="task-16/pr")
+    cloud.heads["task-16/pr"] = HEAD_B
+    cloud.pr_errors.add("task-16/pr")
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert cloud.requests == []
+    assert await _state_of(db, second) == "reserved"
+    cloud.pr_errors.clear()
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    ci_head_run.reset_state()
+    await _cycle(db)
+    assert [r[0] for r in cloud.requests] == ["task-16/pr"]
+
+
+async def test_the_task_is_rechecked_right_before_the_dispatch(
+    db: aiosqlite.Connection, cloud: _CloudGit
+):
+    """P2 (Codex): после резерва задача ушла в review со сдачей - dispatch не уходит."""
+    task_id = await _cloud_task(db)
+    before = cloud.probes
+
+    async def task_gets_submitted():
+        if cloud.probes >= before + 2:
+            await db.execute(
+                "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
+                (task_id,),
+            )
+            await db.commit()
+
+    cloud.on_probe = task_gets_submitted
+    await _cycle(db)
+    assert cloud.requests == []
+
+
+async def test_a_stalled_database_cannot_hold_the_pass_beyond_its_hard_cap(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P1 (Codex): ожидания БД не подчиняются дедлайну сети - проход ограничен снаружи."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+
+    await _cloud_task(db)
+
+    async def stalled(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(journal, "running_candidates", stalled)
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(ci_head_run, "HARD_CAP_EXTRA_SECONDS", 0.2)
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(5):
+        await _cycle(db)
+    assert asyncio.get_running_loop().time() - started < 2.0

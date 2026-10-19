@@ -95,9 +95,7 @@ async def reserve_request(
             "OR (state IN ('reserved', 'requested') "
             "AND reserved_at <= datetime('now', ?))) "
             "AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=ci_head_runs.task_id "
-            "AND t.status='running' AND t.archived=0 AND t.branch=? "
-            "AND t.submission_generation=0 AND COALESCE(t.submission_sha, '')='' "
-            "AND (t.pr_number IS NULL OR t.pr_number=0))",
+            "AND " + _TASK_IN_SCOPE + ")",  # nosec B608 - constant fragment
             (
                 task_id,
                 sha,
@@ -108,6 +106,24 @@ async def reserve_request(
             ),
         )
         return (cur.rowcount or 0) == 1
+
+
+#: Условия «задача всё ещё в области»: общие для резерва и для проверки перед dispatch.
+_TASK_IN_SCOPE = (
+    "t.status='running' AND t.archived=0 AND t.branch=? "
+    "AND t.submission_generation=0 AND COALESCE(t.submission_sha, '')='' "
+    "AND (t.pr_number IS NULL OR t.pr_number=0)"
+)
+
+
+async def task_in_scope(db: aiosqlite.Connection, task_id: int, branch: str) -> bool:
+    """Задача СЕЙЧАС в running, на этой ветке, без сдачи и PR (читается перед dispatch)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM tasks t WHERE t.id=? AND " + _TASK_IN_SCOPE,  # nosec B608 - constant
+        (task_id, branch),
+    )
+    return bool(rows)
 
 
 async def adopt_unplanned(

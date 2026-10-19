@@ -38,6 +38,7 @@ from hub import config
 from hub import repository as repo
 from hub import repository_ci_head as journal
 from hub.db import write_transaction
+from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.protocols import CIRunRequestOutcome
 from hub.integrations.registry import plugins
 from hub.services import ci_contract, ci_trust, project_policy
@@ -54,6 +55,9 @@ CYCLE_BUDGET_SECONDS = 25.0
 HEADS_CEILING_SECONDS = 20.0
 PROBE_CEILING_SECONDS = 15.0
 DISPATCH_CEILING_SECONDS = 30.0
+#: Жёсткий потолок прохода сверх бюджета: ждать БД и транзакции под дедлайн нельзя
+#: (aiosqlite не знает о нём), поэтому проход целиком ограничен ещё и снаружи.
+HARD_CAP_EXTRA_SECONDS = 5.0
 #: Меньше этого остатка платный запрос не начинаем: резерв не должен пропасть зря.
 MIN_DISPATCH_LEFT_SECONDS = 2.0
 
@@ -117,10 +121,12 @@ class _Scope:
         # Как project_git_context: форж едет только вместе с репозиторием.
         self.forge = project_policy.forge_of(project) if gh_repo else ""
         self.workflow_path = project_policy.ci_contract_of(project).workflow_path
+        # PR задачи открывается на базу проекта.
+        self.base = git_ops_mod._resolve_base(str(project["default_branch"] or ""))
 
     def key(self) -> tuple[Any, ...]:
         """Всё, от чего зависит, КУДА и ЧЕМ уйдёт запрос."""
-        return (self.gh_repo, self.workspace, self.forge, self.workflow_path)
+        return (self.gh_repo, self.workspace, self.forge, self.workflow_path, self.base)
 
 
 def _in_scope(project: Any) -> bool:
@@ -227,11 +233,16 @@ async def _runs_exist(scope: _Scope, sha: str, dl: _Deadline) -> bool | None:
     return None if runs is None else bool(runs)
 
 
-async def _open_pr(scope: _Scope, dl: _Deadline) -> bool:
-    """Есть ли у ветки открытый PR (его pull_request сам запускает CI)."""
+async def _open_pr(scope: _Scope, dl: _Deadline) -> bool | None:
+    """Открытый PR ветки (его pull_request сам запускает CI); None - не прочитан.
+
+    Список PR, который не удалось прочитать, - не «PR нет»: форж называет сбой
+    причиной, и она читается как неизвестность.
+    """
     try:
-        number = await dl.run(
-            lambda: plugins.git_ops.pr_for_branch(
+        number, why = await dl.run(
+            lambda: plugins.git_ops.open_pr_between(
+                scope.base,
                 scope.branch,
                 repo=scope.workspace,
                 gh_repo=scope.gh_repo,
@@ -243,7 +254,9 @@ async def _open_pr(scope: _Scope, dl: _Deadline) -> bool:
         raise
     except Exception:  # noqa: BLE001 - unknown PR state: do not dispatch blind
         log.warning("CI head run: PR of %s unreadable", scope.branch)
-        return True
+        return None
+    if why:
+        return None
     return bool(number)
 
 
@@ -305,26 +318,29 @@ async def _reserve(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
 async def _external_ci_present(
     db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
 ) -> bool:
-    """Непосредственно перед dispatch: прогон уже есть или у ветки открытый PR.
+    """Непосредственно перед dispatch: запускать ли НЕЛЬЗЯ (есть CI или неизвестно).
+
+    Прогон по sha уже есть или у ветки открытый PR - заявка закрывается как
+    ``observed``. Ответ форжа не получен - заявка остаётся открытой, форж уходит
+    в отступ, dispatch не делается: «не знаю» не равно «нет».
 
     Остаточное окно (его называет отчёт): между этой проверкой и самим запросом
     проходят миллисекунды, а список прогонов GitHub отстаёт на секунды - ручной
     запуск, начатый в эти секунды, хаб не увидит.
     """
-    if await _runs_exist(scope, sha, dl):
-        await journal.settle(
-            db, scope.task_id, sha, "observed", only_from=journal.OPEN_STATES
-        )
+    runs = await _runs_exist(scope, sha, dl)
+    if runs is None:
+        _back_off()
         return True
-    if await _open_pr(scope, dl):
-        await journal.settle(
-            db,
-            scope.task_id,
-            sha,
-            "observed",
-            note="pr_open",
-            only_from=journal.OPEN_STATES,
-        )
+    if runs:
+        await journal.settle(db, scope.task_id, sha, "observed")
+        return True
+    pr = await _open_pr(scope, dl)
+    if pr is None:
+        _back_off()
+        return True
+    if pr:
+        await journal.settle(db, scope.task_id, sha, "observed", note="pr_open")
         return True
     return False
 
@@ -335,8 +351,10 @@ async def _request(
     """Попросить прогон по зарезервированной голове; True - форж принял."""
     if await _external_ci_present(db, scope, sha, dl):
         return False
-    if await _fresh_scope(db, scope) is None:
-        return False  # политика сменилась, пока шли пробы: резерв остаётся, запроса нет
+    if await _fresh_scope(db, scope) is None or not await journal.task_in_scope(
+        db, scope.task_id, scope.branch
+    ):
+        return False  # политика или задача сменились, пока шли пробы: запроса нет
     accepted, why = await _ask_forge(scope, dl)
     if accepted:
         await _settle_noting(
@@ -623,8 +641,15 @@ async def sweep(db: aiosqlite.Connection) -> None:
 
 
 async def run_sweep(db: aiosqlite.Connection) -> None:
-    """Вход для SWEEPS поллера: проход не имеет права убить тик."""
+    """Вход для SWEEPS поллера: проход не имеет права убить тик и не держит его.
+
+    Сетевые вызовы идут под дедлайном прохода; ожидания БД (aiosqlite) ему не
+    подчиняются, поэтому весь проход ограничен ещё и снаружи.
+    """
     try:
-        await sweep(db)
+        async with asyncio.timeout(CYCLE_BUDGET_SECONDS + HARD_CAP_EXTRA_SECONDS):
+            await sweep(db)
+    except TimeoutError:
+        log.warning("CI head run: the pass ran out of its hard time cap")
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("CI head run sweep failed")
