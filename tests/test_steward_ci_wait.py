@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import pytest
 
+from hub.services.ci_contract import HUB_FINGERPRINT
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
@@ -67,13 +68,15 @@ async def _ci(
     await db.execute("DELETE FROM ci_report_attempts WHERE task_id=?", (task_id,))
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, checks, validation_status, "
-        "trust, trust_reason, attempt_key) VALUES (?, ?, ?, 'pass', ?, ?, ?)",
-        (task_id, sha, checks, trust, reason, key),
+        "trust, trust_reason, attempt_key, contract_fp) "
+        "VALUES (?, ?, ?, 'pass', ?, ?, ?, ?)",
+        (task_id, sha, checks, trust, reason, key, HUB_FINGERPRINT),
     )
     for run_id, attempt, is_final in attempts:
         await db.execute(
             "INSERT INTO ci_report_attempts (task_id, head_sha, run_id, run_attempt, "
-            "trust, trust_reason, trust_final) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "trust, trust_reason, trust_final, contract_fp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 sha,
@@ -82,6 +85,7 @@ async def _ci(
                 trust,
                 reason,
                 1 if (is_final or final) else 0,
+                HUB_FINGERPRINT,
             ),
         )
     await db.commit()

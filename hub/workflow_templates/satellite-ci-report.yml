@@ -1,0 +1,52 @@
+# Haiplane Hub: the TRUSTED half of a satellite's CI report (#1848).
+#
+# Copy this file to .github/workflows/ on the DEFAULT branch of the satellite.
+# It is NOT laid down by provisioning: it needs settings only the owner can make
+# (docs/satellite-ci-report.md): the environment `hub-report` with deployment
+# branches limited to the default branch, holding HAIPLANE_HUB_URL and
+# HAIPLANE_HUB_CI_TOKEN (a ci_runner key bound to the project).
+#
+# Why this shape:
+#   * `workflow_run` always runs the workflow definition of the DEFAULT branch,
+#     and github.sha is the default branch head: nothing of the branch under
+#     test is checked out or executed here;
+#   * the report key is reachable ONLY through `environment: hub-report`;
+#   * the artifact of the finished run is DATA: the sender reads it in memory
+#     with strict limits, and takes every fact about the run (commit, run,
+#     attempt, workflow path, event, repository, conclusion) from the event.
+#
+# `workflows:` is the `name:` of the tests workflow, `workflow-path` its file;
+# the file must be the workflow_path of the project's ci_contract in the hub.
+name: Haiplane CI report
+
+on:
+  workflow_run:
+    workflows: [@@WORKFLOW_NAME@@]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report:
+    name: Send CI results to Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: hub-report
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # github.sha of a workflow_run event is the default branch head; it is
+          # spelled out so that no later edit can point this at the run's head.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Send the results of the finished run
+        uses: @@CI_SEND_ACTION@@
+        with:
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
+          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
+          workflow-path: @@WORKFLOW_PATH@@

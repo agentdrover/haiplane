@@ -19,7 +19,10 @@ exits 0, and the hub reads silence as "unknown", never as success.
 Env: GITHUB_EVENT_PATH, GITHUB_REPOSITORY, GITHUB_API_URL, RUNNER_TEMP,
 GITHUB_WORKSPACE, GH_TOKEN (the workflow's own token, to read the run's
 artifacts), HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_TOKEN (the report key),
-HAIPLANE_HUB_CI_AUDIT_TOKEN (the key that files audit drafts).
+HAIPLANE_HUB_CI_AUDIT_TOKEN (the key that files audit drafts),
+HAIPLANE_CI_WORKFLOW_PATH (#1848: the workflow whose runs this sender reports;
+set by the sender workflow ON THE DEFAULT BRANCH, never by a branch or an
+artifact; absent = the hub's own ``.github/workflows/ci.yml``).
 """
 
 from __future__ import annotations
@@ -39,6 +42,10 @@ from pathlib import Path
 from typing import Any
 
 EXPECTED_WORKFLOW_PATH = ".github/workflows/ci.yml"
+# The only shape of a workflow this sender may be told to report (#1848): a file
+# directly in .github/workflows/. The hub checks the SAME path against the
+# project's ci_contract; a disagreement shows there as unverified, not here.
+WORKFLOW_PATH_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$")
 ALLOWED_EVENTS = frozenset({"pull_request", "push", "workflow_dispatch"})
 AUDIT_BRANCHES = frozenset({"develop", "main"})
 ARTIFACT_PREFIX = "hub-ci-results-"
@@ -106,15 +113,27 @@ def env_get(suffix: str) -> str:
 # ---- the event --------------------------------------------------------------
 
 
-def run_facts(event: dict, repository: str) -> dict[str, str]:
+def expected_workflow(environ: dict[str, str]) -> str:
+    """The workflow this sender reports: its own configuration, else the hub's ci.yml."""
+    configured = (environ.get("HAIPLANE_CI_WORKFLOW_PATH") or "").strip()
+    if not configured:
+        return EXPECTED_WORKFLOW_PATH
+    if not WORKFLOW_PATH_RE.match(configured):
+        raise Refused(f"the configured workflow {configured!r} is not a workflow file")
+    return configured
+
+
+def run_facts(
+    event: dict, repository: str, expected: str = EXPECTED_WORKFLOW_PATH
+) -> dict[str, str]:
     """The facts about the finished run, from the event payload, or Refused."""
     run = event.get("workflow_run")
     if not isinstance(run, dict):
         raise Refused("the event carries no workflow_run")
     # workflow_run.path may carry an "@<ref>" suffix; the file is what counts.
     path = str(run.get("path") or "")
-    if path.split("@", 1)[0] != EXPECTED_WORKFLOW_PATH:
-        raise Refused(f"workflow path {path!r} is not {EXPECTED_WORKFLOW_PATH}")
+    if path.split("@", 1)[0] != expected:
+        raise Refused(f"workflow path {path!r} is not {expected}")
     head_repo = (run.get("head_repository") or {}).get("full_name")
     if not repository or head_repo != repository:
         raise Refused(f"head repository {head_repo!r} is not {repository!r}")
@@ -671,7 +690,7 @@ def run(
     repository = environ.get("GITHUB_REPOSITORY", "")
     server = environ.get("GITHUB_SERVER_URL") or "https://github.com"
     try:
-        facts = run_facts(event, repository)
+        facts = run_facts(event, repository, expected_workflow(environ))
     except Refused as exc:
         log(f"not reporting this run: {exc}")
         return 0

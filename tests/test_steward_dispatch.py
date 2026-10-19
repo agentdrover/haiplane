@@ -15,6 +15,7 @@ import json
 import aiosqlite
 import pytest
 
+from hub.services.ci_contract import HUB_FINGERPRINT
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
@@ -2147,8 +2148,8 @@ async def test_every_steward_start_attempt_rechecks_review_state(
 async def _ci_red(db: aiosqlite.Connection, task_id: int) -> None:
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, checks, validation_status, "
-        "trust, trust_reason) VALUES (?, ?, ?, ?, 'verified', '')",
-        (task_id, "a" * 40, json.dumps({"lint": "fail"}), ""),
+        "trust, trust_reason, contract_fp) VALUES (?, ?, ?, ?, 'verified', '', ?)",
+        (task_id, "a" * 40, json.dumps({"lint": "fail"}), "", HUB_FINGERPRINT),
     )
     await db.commit()
 

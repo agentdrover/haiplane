@@ -37,7 +37,7 @@ from hub.services.steward_shadow import (
     start_due_runs,
     start_run,
 )
-from tests.ci_trust_support import VERIFIED_ROW, seed_verified_report
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW, seed_verified_report
 
 _CREATED = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
 
@@ -2052,7 +2052,7 @@ async def _historical_submission(
         "UPDATE machine_reviews SET provider_tokens=? WHERE id=?",
         (tokens, review_id),
     )
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=_SHA,

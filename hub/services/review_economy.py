@@ -30,6 +30,7 @@ from typing import Any
 import aiosqlite
 
 from hub.db import fetchall
+from hub.services import ci_contract
 from hub.services.metrics_scope import Scope
 
 #: Ниже этой выборки доля печатается с пометкой «недобор» (#1153).
@@ -241,11 +242,14 @@ async def _findings_section(db: aiosqlite.Connection, scope: Scope) -> dict[str,
 CI_ROWS: tuple[str, ...] = ("red", "green", "undetermined", "skipped", "no_report")
 
 
-def _ci_row(reported: bool, status: str | None, report: dict | None = None) -> str:
+def _ci_row(
+    reported: bool, status: str | None, report: dict | None, contract: Any
+) -> str:
     """Строка прогона по отчёту CI на закреплённом sha его сдачи.
 
     #1687: зелёным считается только то, что GitHub подтвердил и что проходит
-    общий предикат зелёного (conclusion success, четыре проверки pass); отчёт,
+    общий предикат зелёного (conclusion success, обязательные проверки КОНТРАКТА
+    проекта задачи pass, #1848); отчёт,
     которого GitHub не подтвердил, — «не определился», а не красный и не
     зелёный: подделанный или доподлинный-но-старый pass в метрику не идёт.
     """
@@ -255,9 +259,9 @@ def _ci_row(reported: bool, status: str | None, report: dict | None = None) -> s
     if not reported:
         return "no_report"
     if report is not None:
-        if not ci_trust.is_verified(report):
+        if not ci_trust.is_verified(report, contract.fingerprint):
             return "undetermined"
-        if status == PASS and ci_trust.green_gap(report):
+        if status == PASS and ci_trust.green_gap(report, contract):
             return "undetermined"
     return {FAIL: "red", PASS: "green", SKIPPED: "skipped"}.get(
         status or "", "undetermined"
@@ -277,12 +281,17 @@ async def _red_ci_section(
         db,
         "SELECT s.task_id, s.generation, c.id IS NOT NULL AS reported, "
         "c.validation_status AS ci, c.trust AS trust, c.checks AS checks, "
-        "c.provenance AS provenance "
+        "c.provenance AS provenance, c.contract_fp AS contract_fp "
         "FROM submissions s LEFT JOIN ci_run_reports c "
         "ON c.task_id = s.task_id AND c.head_sha = s.sha",
     )
-    ci_of = {
-        (r["task_id"], r["generation"]): _ci_row(
+    contracts: dict[int, Any] = {}  # one reading of the project's contract per task
+    ci_of = {}
+    for r in rows:
+        task_id = int(r["task_id"])
+        if task_id not in contracts:
+            contracts[task_id] = await ci_contract.contract_for_task(db, task_id)
+        ci_of[(task_id, r["generation"])] = _ci_row(
             bool(r["reported"]),
             r["ci"],
             {
@@ -290,10 +299,10 @@ async def _red_ci_section(
                 "checks": r["checks"],
                 "provenance": r["provenance"],
                 "trust_reason": "",
+                "contract_fp": r["contract_fp"],
             },
+            contracts[task_id],
         )
-        for r in rows
-    }
     by_row: dict[str, list[dict[str, Any]]] = {name: [] for name in CI_ROWS}
     for run in runs:
         by_row[ci_of.get((run["task_id"], run["generation"]), "no_report")].append(run)
