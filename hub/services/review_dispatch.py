@@ -39,7 +39,7 @@ import aiosqlite
 
 from hub.db import deserialize_str_list, fetchall
 from hub.services.diff_scan import _unquote_path as _unquote_path
-from hub.services.diff_scan import changed_line, scan_diff
+from hub.services.diff_scan import changed_line, diff_lines, diff_texts, scan_diff
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -310,8 +310,20 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
 
 
 def _section_header_path(line: str) -> str:
-    raw = line[4:].strip()
+    raw = _unquote_path(line[4:]) or line[4:].strip()
     return raw[2:] if raw[:2] in ("a/", "b/") else raw
+
+
+def _git_section_path(line: str) -> str:
+    """New-side path of a ``diff --git`` line, quoted or not, as a bare path.
+
+    The key the sections are matched on is the path as ``changed_paths`` and
+    ``split_generated`` spell it: unquoted, without ``a/`` and ``b/``.
+    """
+    named = [p for p in _git_line_paths(line[len("diff --git ") :]) if p]
+    if named:
+        return named[-1].removeprefix("b/")
+    return line.rstrip("\n").rsplit(" b/", 1)[-1]
 
 
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:
@@ -331,11 +343,11 @@ def diff_file_sections(diff: str) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     path, in_header = "", True
     buf: list[str] = []
-    for line in diff.splitlines(keepends=True):
+    for line in diff_lines(diff):
         if line.startswith("diff --git "):
             if buf:
                 sections.append((path, "".join(buf)))
-            path, in_header, buf = line.rstrip("\n").rsplit(" b/", 1)[-1], True, []
+            path, in_header, buf = _git_section_path(line), True, []
         elif in_header and line.startswith("@@"):
             in_header = False
         elif in_header and line.startswith("+++ "):
@@ -1115,7 +1127,7 @@ def author_delta_lines(diff: str) -> int:
     правка и её откат дают две строки — перебор в сторону deep.
     """
     count, width, in_hunk, skip = 0, 1, False, False
-    for line in diff.splitlines():
+    for line in diff_texts(diff):
         if line.startswith("diff "):
             in_hunk = False
             skip = _all_generated(_header_paths(line))

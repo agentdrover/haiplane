@@ -11,7 +11,7 @@ from httpx import AsyncClient
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
-from hub.services.diff_scan import _diff_lines
+from hub.services.diff_scan import diff_lines
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
     DEEP,
@@ -1275,7 +1275,7 @@ def test_combined_hunk_counts_each_parent_by_its_own_column():
 
 def test_diff_is_cut_into_lines_by_lf_only():
     # #1856: git ends a line at LF. A VT, FF or U+2028 inside a literal is text.
-    assert _diff_lines("+a\v+b\n+c\x0c\u2028d\r\n") == [
+    assert diff_lines("+a\v+b\n+c\x0c\u2028d\r\n") == [
         "+a\v+b\n",
         "+c\x0c\u2028d\r\n",
     ]

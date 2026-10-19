@@ -120,13 +120,18 @@ def _header_path(line: str) -> str:
     return raw[2:] if raw.startswith("b/") else raw
 
 
-def _diff_lines(diff: str) -> list[str]:
+def diff_lines(diff: str) -> list[str]:
     """Lines as git ends them: by LF only, never by VT, FF, U+2028 and the like.
 
     ``str.splitlines`` would cut a hunk body at a ``\\v`` inside a literal and
     invent a line the counters never owed (#1856).
     """
     return re.findall(r"[^\n]*\n|[^\n]+", diff)
+
+
+def diff_texts(diff: str) -> list[str]:
+    """The lines of ``diff`` as git ends them, without LF and CR (#1856)."""
+    return [ln.rstrip("\n").removesuffix("\r") for ln in diff_lines(diff)]
 
 
 class Scanned(NamedTuple):
@@ -155,7 +160,7 @@ def scan_diff(diff: str) -> list[Scanned]:
         spans.append(span)
         return span
 
-    for n, line in enumerate(_diff_lines(diff)):
+    for n, line in enumerate(diff_lines(diff)):
         text = line.rstrip("\n").removesuffix("\r")
         cur = spans[-1]
         if hunk.open:

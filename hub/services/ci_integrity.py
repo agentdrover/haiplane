@@ -72,6 +72,8 @@ answer to "does it touch CI" is "unknown", never "no".
 
 from __future__ import annotations
 
+from hub.services.diff_scan import diff_texts
+
 import ast
 import json
 import logging
@@ -314,7 +316,7 @@ def parse_diff(diff: str) -> list[_FileDiff]:
     files: list[_FileDiff] = []
     cur: _FileDiff | None = None
     new_no = 0
-    for line in diff.splitlines():
+    for line in diff_texts(diff):
         if line.startswith("diff --git "):
             old, new = _split_header(line[len("diff --git ") :])
             cur = _FileDiff(old=old, new=new)
