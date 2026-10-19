@@ -785,8 +785,15 @@ async def build_review_brief(
 _AREAS_DECLARED = "заявленные области: так их назвал автор задачи-причины, а не дифф"
 
 
-def _same_bound_project(mine, theirs) -> bool:
-    """Оба проекта привязаны явно, активны и один и тот же; два сирот — тоже один."""
+def _same_bound_project(mine, theirs, default) -> bool:
+    """Один активный проект у обеих задач; сирота (без эпика) = default.
+
+    По модели хаба задача вне эпика принадлежит default, поэтому она сравнима
+    с задачей под эпиком, явно привязанным к default. Явный другой проект и
+    проект не в active — разные. Нет самого default — сравнивать нечего,
+    равны только два сироты.
+    """
+    mine, theirs = mine or default, theirs or default
     if mine is None or theirs is None:
         return mine is None and theirs is None
     return mine["id"] == theirs["id"] and mine["status"] == "active"
@@ -818,7 +825,8 @@ async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
     cause = await repo.get_task(db, int(cause_id))
     mine = await repo.resolve_bound_project(db, int(task_row["id"]))
     theirs = await repo.resolve_bound_project(db, int(cause_id))
-    if not cause or not _same_bound_project(mine, theirs):
+    default = await repo.get_project_by_slug(db, "default")
+    if not cause or not _same_bound_project(mine, theirs, default):
         return unavailable
     try:
         areas = [str(a) for a in json.loads(cause["affected_areas"] or "[]")]

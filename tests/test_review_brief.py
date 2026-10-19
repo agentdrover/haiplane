@@ -2137,6 +2137,8 @@ async def test_a_pending_project_cause_is_not_taken_for_default(
     from hub.services.steward_evidence import build_evidence_packet, packet_payload
     from tests.review_dispatch_support import _node
 
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
     pid = await repo.create_project(
         db, slug="pend-b", name="b", workspace_path="/tmp/ws", status="pending"
     )
@@ -2166,3 +2168,40 @@ async def test_a_pending_project_cause_is_not_taken_for_default(
     )
     assert "Заголовок-из-pending" not in packet
     assert f"/tasks/{cause}" not in packet
+
+
+async def test_orphan_and_default_epic_count_as_one_project(client: AsyncClient, db):
+    """#1858 (Codex r3): сирота = default; другой явный проект — чужой."""
+    from tests.review_dispatch_support import _node
+
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    default = await repo.get_project_by_slug(db, "default")
+    other = await repo.create_project(
+        db, slug="spike-bo", name="bo", workspace_path="/tmp/ws"
+    )
+
+    async def under(project_id: int | None, title: str) -> int:
+        if project_id is None:
+            return await _node(db, title=title, task_type="task", parent_id=None)
+        epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+        await repo.update_task(db, epic, project_id=project_id)
+        return await _node(db, title=title, task_type="task", parent_id=epic)
+
+    async def block(fix_project: int | None, cause_project: int | None) -> dict:
+        cause = await under(cause_project, "Причина")
+        fix = await under(fix_project, "Исправление")
+        await db.execute(
+            "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+            "caused_by_task_id=? WHERE id=?",
+            (cause, fix),
+        )
+        await db.commit()
+        resp = await client.get(f"/api/tasks/{fix}/review-brief")
+        return resp.json()["cause_task"]
+
+    assert (await block(None, default["id"]))["state"] == "known"
+    assert (await block(default["id"], None))["state"] == "known"
+    assert (await block(None, None))["state"] == "known"
+    assert (await block(None, other))["state"] == "no_data"
+    assert (await block(other, None))["state"] == "no_data"
