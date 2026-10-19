@@ -3025,6 +3025,20 @@ async def _verdict_block(task_id: int, generation: int | None) -> str:
     return verdict_evidence.format_block(evidence)
 
 
+def _brief_notice_parts(brief: dict[str, Any]) -> list[str]:
+    """Стыковка веток, блок задачи-причины (#1858) и ручные шаги по путям."""
+    parts: list[str] = []
+    if brief.get("stacking_warning"):
+        parts.append(f"\n{brief['stacking_warning']}")
+    cause_line = brief_projection.cause_task_line(brief.get("cause_task"))
+    if cause_line:
+        parts.append(f"\n{cause_line}")
+    notices_text = _path_notices_text(brief.get("path_notices"))
+    if notices_text:
+        parts.append(notices_text)
+    return parts
+
+
 def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult:
     """The whole brief: prose text plus the brief in structuredContent (#308)."""
     parts = []
@@ -3083,11 +3097,7 @@ def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult
             parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
     parts.extend(_brief_evidence_lines(brief))
     parts.extend(_brief_ci_integrity_lines(brief))
-    if brief.get("stacking_warning"):
-        parts.append(f"\n{brief['stacking_warning']}")
-    notices_text = _path_notices_text(brief.get("path_notices"))
-    if notices_text:
-        parts.append(notices_text)
+    parts.extend(_brief_notice_parts(brief))
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")
