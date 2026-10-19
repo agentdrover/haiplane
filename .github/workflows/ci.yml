@@ -437,6 +437,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: uv run python scripts/layer_rules.py
 
+      # #1854: влитый файл hub/migrations/steps/ не правится и не удаляется
+      # (сверка с merge-base от origin/develop); исправление - новый файл.
+      - name: Migration steps add-only
+        id: migration_steps
+        if: ${{ !cancelled() }}
+        run: uv run python scripts/migration_steps_add_only.py
+
       - name: Check formatting
         id: format
         run: uv run ruff format --check hub tests

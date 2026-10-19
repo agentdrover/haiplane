@@ -120,7 +120,7 @@ These are the rules most likely to be broken by “small” changes.
 
 ## Persistence Invariants
 
-- Schema changes belong in `hub/migrations/` (the list), applied by `hub/db.py`.
+- Schema changes belong in `hub/migrations/` (the list), applied by `hub/db.py`. Migrations are one file each (#1854): `hub/migrations/steps/m<YYYYMMDDHHMM>_<task>_<what>.py`, found by the loader and appended after the FROZEN `part_1..3` in file-name order. A merged step file is never edited or deleted (`scripts/migration_steps_add_only.py`, in `make check` and CI); a fix is a new file with a new name. Steps import nothing from `hub`. Independent steps must tolerate any delivery order (a later-named step may be applied before an earlier-named one arrives); a dependent step goes in a later-named file and the tasks carry a dependency. The runner applies each tuple as a separate statement: a file is not atomic as a whole.
 - Repository helpers must serialize and deserialize structured list/JSON fields consistently.
 - It is safer to fail loudly on missing structured columns than silently treat them as empty.
 

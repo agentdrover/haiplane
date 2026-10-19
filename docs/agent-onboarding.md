@@ -559,7 +559,7 @@ uv run pytest -q
 - Используй `uv run pytest`, не `python -m pytest`.
 - Зависимости — через `uv add <package>`.
 - Контрактные изменения: REST + CLI + MCP + Web + тесты в одном проходе.
-- Изменения схемы/persisted данных — миграция в `hub/migrations/` (в конец `part_3.py`).
+- Изменения схемы/persisted данных — миграция в `hub/migrations/` — НОВЫЙ файл `steps/m<YYYYMMDDHHMM>_<задача>_<суть>.py` с `MIGRATIONS: list[tuple[str, str]]`; `part_1..3` заморожены, влитый шаг не правится (#1854). Тесты фичи — в тематический файл, не в `test_db_migrations.py`.
 - Не коммить секреты, реальные `.env`, локальные БД, кэши.
 - Коммиты: `<type>: <короткое описание> (#hub-id)`.
 
