@@ -72,6 +72,9 @@ answer to "does it touch CI" is "unknown", never "no".
 
 from __future__ import annotations
 
+from hub.services.diff_scan import git_header_path
+from hub.services.diff_scan import scan_diff as scan_diff_lines
+
 import ast
 import json
 import logging
@@ -243,7 +246,7 @@ class _FileDiff:
 
 # --- parsing the diff ----------------------------------------------------
 
-_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK = re.compile(r"^@@+ (?:-\d+(?:,\d+)? )+\+(\d+)(?:,(\d+))? @@")
 
 
 def _unquote(path: str) -> str:
@@ -310,29 +313,41 @@ def _header_line(cur: _FileDiff, line: str) -> None:
 
 
 def parse_diff(diff: str) -> list[_FileDiff]:
-    """File blocks of a unified diff with old/new paths, hunks and +/- lines."""
+    """File blocks of a diff with old/new paths, hunks and +/- lines.
+
+    A file opens on ``diff --git``, ``diff --cc`` and ``diff --combined``; hunk
+    bodies are told from headers by the hunk counters (:mod:`diff_scan`).
+    """
     files: list[_FileDiff] = []
     cur: _FileDiff | None = None
     new_no = 0
-    for line in diff.splitlines():
+    for entry in scan_diff_lines(diff):
+        line = entry.text
         if line.startswith("diff --git "):
             old, new = _split_header(line[len("diff --git ") :])
             cur = _FileDiff(old=old, new=new)
             files.append(cur)
+        elif line.startswith(("diff --cc ", "diff --combined ")):
+            merged = git_header_path(line) or line
+            cur = _FileDiff(old=merged, new=merged)
+            files.append(cur)
         elif cur is None:
             continue
-        elif (m := _HUNK.match(line)) is not None:
+        elif not entry.body and (m := _HUNK.match(line)) is not None:
             new_no = int(m.group(1))
             cur.hunks.append((new_no, int(m.group(2) or 1)))
         elif not cur.hunks:
             _header_line(cur, line)
-        elif line.startswith("+"):
-            cur.added.append((new_no, line[1:]))
-            new_no += 1
-        elif line.startswith("-"):
-            cur.removed.append(line[1:])
-        elif line.startswith(" "):
-            new_no += 1
+        else:
+            width = entry.body or 1
+            prefix = line[:width]
+            if "-" in prefix:
+                cur.removed.append(line[width:])
+            elif "+" in prefix:
+                cur.added.append((new_no, line[width:]))
+                new_no += 1
+            elif line.startswith(" ") or (entry.body and not line.startswith("\\")):
+                new_no += 1
     return files
 
 

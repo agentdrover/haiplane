@@ -1,0 +1,257 @@
+commit 4077012ab7d03a87ccdda8e0c68de054bb2ea0b7
+Author: Denis Pukinov <denis.pukinov@example.com>
+Date:   Tue Jul 28 23:52:54 2026 +0300
+
+    fix: kill the process group, not just the pid we spawned (#544)
+    
+    #509 added a kill on the validation timeout path, verified it on macOS, and
+    shipped a leak to the Linux production host. `proc.kill()` signals only the pid
+    we spawned — `/bin/sh` — and whether the payload dies with it depends on
+    whether the shell exec'd it: bash-as-sh does for a simple command, dash does
+    not. CI on Linux caught it in PR #170: the timed-out command kept running.
+    
+    - spawn with start_new_session and SIGKILL the whole group, falling back to the
+      single-pid kill so the outcome is never worse than before
+    - refuse to signal the hub's own group: without start_new_session the child
+      shares it, and killpg would take down the hub itself
+    - same defect in the #506 collector: we spawn `uv`, which runs pytest as a
+      child, so killing `uv` alone left the collector running
+    
+    The AC-1 test now uses a compound command the shell cannot exec away, so the
+    payload is a grandchild on every platform. It fails against the pre-fix runner
+    on macOS too — the old test passed there only because of that exec
+    optimisation, which is precisely how the defect escaped review.
+    
+    Co-Authored-By: Claude <noreply@anthropic.com>
+
+diff --git a/hub/services/process_kill.py b/hub/services/process_kill.py
+new file mode 100644
+index 00000000..15d14b60
+--- /dev/null
++++ b/hub/services/process_kill.py
+@@ -0,0 +1,55 @@
++"""Kill a spawned child and everything it spawned (#544).
++
++``proc.kill()`` signals only the pid the hub spawned, and that pid is rarely the
++process doing the work: ``create_subprocess_shell`` gives us ``/bin/sh``, and
++``uv run pytest`` gives us the launcher. Whether the real payload dies with it
++depends on whether that process ``exec``s — bash-as-sh on macOS does for a
++simple command, dash on Ubuntu does not. So #509 shipped a kill that passed on
++the author's macOS and left the command running on the Linux production host.
++
++Spawn with ``start_new_session=True`` and signal the whole process group; the
++outcome then does not depend on a shell optimisation.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++import os
++import signal
++from typing import Any
++
++log = logging.getLogger("hub")
++
++
++async def kill_process_group(proc: Any) -> None:
++    """SIGKILL the child's process group and reap it. Never raises.
++
++    Falls back to a single-pid kill when the group cannot be signalled, so the
++    outcome is never worse than plain ``proc.kill()``.
++    """
++    if proc is None or proc.returncode is not None:
++        return
++
++    pgid = None
++    with contextlib.suppress(ProcessLookupError, OSError):
++        pgid = os.getpgid(proc.pid)
++
++    # Never signal our own group. Without start_new_session the child shares the
++    # hub's process group, and killpg would SIGKILL the hub itself — a far worse
++    # outcome than the leak this function exists to prevent.
++    if pgid is not None and pgid != os.getpgid(0):
++        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
++            os.killpg(pgid, signal.SIGKILL)
++    else:
++        log.warning(
++            "child %s shares the hub's process group; killing the pid only",
++            proc.pid,
++        )
++
++    # Always follow up on the pid itself: killpg may have been skipped or denied,
++    # and signalling an already-dead process is a no-op.
++    with contextlib.suppress(ProcessLookupError, OSError):
++        proc.kill()
++    with contextlib.suppress(ProcessLookupError, OSError):
++        await proc.wait()
+diff --git a/hub/services/test_existence.py b/hub/services/test_existence.py
+index 0140b11f..411d518d 100644
+--- a/hub/services/test_existence.py
++++ b/hub/services/test_existence.py
+@@ -11,10 +11,10 @@ hole. Best-effort: when the workspace or pytest is unavailable the status is
+ from __future__ import annotations
+ 
+ import asyncio
+-import contextlib
+ import logging
+ from typing import Any
+ 
++from hub.services.process_kill import kill_process_group
+ from hub.services.test_locator import parse_test_locator
+ 
+ log = logging.getLogger("hub")
+@@ -48,15 +48,16 @@ async def collect_test_nodeids(repo_path: str | None) -> set[str] | None:
+             cwd=repo_path,
+             stdout=asyncio.subprocess.PIPE,
+             stderr=asyncio.subprocess.PIPE,
++            # Own session, so the timeout path can signal the whole group (#544).
++            start_new_session=True,
+         )
+         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_COLLECT_TIMEOUT)
+     except (OSError, TimeoutError, asyncio.TimeoutError):
+         # wait_for only cancels the await — the child keeps running and would
+-        # accumulate orphaned collectors on every brief read. Kill it (#506).
+-        if proc is not None and proc.returncode is None:
+-            with contextlib.suppress(ProcessLookupError, OSError):
+-                proc.kill()
+-                await proc.wait()
++        # accumulate orphaned collectors on every brief read (#506). Kill the
++        # group, not the pid: we spawn `uv`, which runs pytest as a child, so
++        # killing `uv` alone leaves the collector running (#544).
++        await kill_process_group(proc)
+         log.warning("AC locator collect-only failed in %s", repo_path)
+         return None
+     if proc.returncode != 0:
+diff --git a/hub/services/validation_run.py b/hub/services/validation_run.py
+index 0f55d254..dbd22db8 100644
+--- a/hub/services/validation_run.py
++++ b/hub/services/validation_run.py
+@@ -11,7 +11,6 @@ the recorded log.
+ from __future__ import annotations
+ 
+ import asyncio
+-import contextlib
+ import json
+ import logging
+ import os
+@@ -19,6 +18,7 @@ from typing import Any, Awaitable, Callable
+ 
+ from hub import repository as repo
+ from hub.services.orchestration import project_git_context
++from hub.services.process_kill import kill_process_group
+ 
+ log = logging.getLogger("hub")
+ 
+@@ -91,15 +91,17 @@ async def default_validation_runner(
+                 stdout=asyncio.subprocess.PIPE,
+                 stderr=asyncio.subprocess.STDOUT,
+                 env=env,
++                # Own session, so the timeout path can signal the whole group
++                # rather than just the shell we spawned (#544).
++                start_new_session=True,
+             )
+             out, dropped = await asyncio.wait_for(_collect(proc), timeout=_RUN_TIMEOUT)
+         except (OSError, TimeoutError, asyncio.TimeoutError):
+             # wait_for cancels only the await — the command keeps running in the
+-            # workspace, and every retry leaks another one. Kill and reap it.
+-            if proc is not None and proc.returncode is None:
+-                with contextlib.suppress(ProcessLookupError, OSError):
+-                    proc.kill()
+-                    await proc.wait()
++            # workspace, and every retry leaks another one. Kill the group: the
++            # shell may not have exec'd the payload, in which case killing its
++            # pid alone leaves the real command alive (#544).
++            await kill_process_group(proc)
+             log.warning("validation command failed to run in %s", repo_path)
+             return None
+         tail = f"\n[... {dropped} bytes dropped]" if dropped else ""
+diff --git a/tests/test_process_kill.py b/tests/test_process_kill.py
+new file mode 100644
+index 00000000..98cb8c3f
+--- /dev/null
++++ b/tests/test_process_kill.py
+@@ -0,0 +1,58 @@
++"""Tests for killing a child and its descendants (#544)."""
++
++from __future__ import annotations
++
++import asyncio
++import os
++
++from hub.services import process_kill
++from hub.services.process_kill import kill_process_group
++
++
++async def test_kills_grandchild_the_shell_did_not_exec(tmp_path):
++    # `sh -c "<payload>; :"` cannot be exec-optimised away, so the payload runs
++    # as a grandchild. Killing only the shell's pid — the pre-#544 behaviour —
++    # leaves it running; the group kill must reach it.
++    marker = tmp_path / "still_alive"
++    payload = (
++        f'python3 -c "import time,pathlib;'
++        f"time.sleep(1.5);pathlib.Path(r'{marker}').write_text('x')\""
++    )
++    proc = await asyncio.create_subprocess_shell(
++        f"{payload}; :",
++        stdout=asyncio.subprocess.DEVNULL,
++        stderr=asyncio.subprocess.DEVNULL,
++        start_new_session=True,
++    )
++    await kill_process_group(proc)
++    await asyncio.sleep(2.0)
++    assert not marker.exists(), "grandchild survived the group kill"
++
++
++async def test_never_signals_the_hubs_own_process_group(monkeypatch):
++    # Without start_new_session the child shares OUR process group. Signalling
++    # it would SIGKILL the hub itself — strictly worse than the leak this
++    # function prevents. The guard must skip the group and kill the pid only.
++    aimed_at: list[int] = []
++    monkeypatch.setattr(
++        process_kill.os, "killpg", lambda pgid, sig: aimed_at.append(pgid)
++    )
++    proc = await asyncio.create_subprocess_shell(
++        "sleep 5",
++        stdout=asyncio.subprocess.DEVNULL,
++        stderr=asyncio.subprocess.DEVNULL,
++    )
++    assert os.getpgid(proc.pid) == os.getpgid(0), "test premise: shared group"
++
++    await kill_process_group(proc)
++
++    assert aimed_at == [], "killpg was aimed at the hub's own process group"
++    assert proc.returncode is not None, "child was not killed and reaped"
++
++
++async def test_already_finished_child_is_a_noop():
++    proc = await asyncio.create_subprocess_shell(
++        ":", stdout=asyncio.subprocess.DEVNULL, start_new_session=True
++    )
++    await proc.wait()
++    await kill_process_group(proc)  # must not raise
+diff --git a/tests/test_validation_run.py b/tests/test_validation_run.py
+index 8a42b9c3..3eb9617f 100644
+--- a/tests/test_validation_run.py
++++ b/tests/test_validation_run.py
+@@ -90,12 +90,19 @@ def test_safe_env_strips_secrets(monkeypatch):
+ async def test_runner_kills_timed_out_command(monkeypatch, tmp_path):
+     # The timed-out child used to survive: wait_for cancels only the read, and
+     # every retry leaked another live process into the workspace.
++    #
++    # The trailing `; :` matters (#544). A shell handed one simple command may
++    # exec it, making the payload the very pid we signalled — which is why the
++    # first version of this test passed on macOS while the leak was still wide
++    # open on the Linux production host. A compound command forces sh to fork,
++    # so the payload is a grandchild and only a process-group kill reaches it.
+     monkeypatch.setattr(validation_run, "_RUN_TIMEOUT", 0.3)
+     marker = tmp_path / "still_alive"
+-    cmd = (
++    payload = (
+         f'python3 -c "import time,pathlib;'
+         f"time.sleep(1.5);pathlib.Path(r'{marker}').write_text('x')\""
+     )
++    cmd = f"{payload}; :"
+     assert await validation_run.default_validation_runner([cmd], str(tmp_path)) is None
+     await asyncio.sleep(2.0)
+     assert not marker.exists(), "timed-out command kept running after the hub gave up"

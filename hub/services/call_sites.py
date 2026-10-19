@@ -28,6 +28,8 @@ distinction between clean and unknown the drift guard makes (#534).
 
 from __future__ import annotations
 
+from hub.services.diff_scan import scan_diff
+
 import ast
 import logging
 import os
@@ -48,7 +50,7 @@ UNTOUCHED_SITES = "untouched_sites"
 ONLY_TESTS = "only_tests"
 NO_CALLERS = "no_callers"
 
-_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK = re.compile(r"^@@+ (?:-\d+(?:,\d+)? )+\+(\d+)(?:,(\d+))? @@")
 
 DYNAMIC_CALLS_NOTE = (
     "Calls resolved at run time — through the plugin registry, getattr, or a "
@@ -167,20 +169,13 @@ class CallSiteReport:
 def changed_line_ranges(diff: str) -> dict[str, set[int]]:
     """New-side line numbers touched per file, from ``git diff -U0``."""
     out: dict[str, set[int]] = {}
-    current: str | None = None
-    for line in (diff or "").splitlines():
-        if line.startswith("+++ b/"):
-            current = line[len("+++ b/") :].strip()
-            out.setdefault(current, set())
-            continue
-        if line.startswith("+++ /dev/null"):
-            current = None
-            continue
-        m = _HUNK.match(line)
-        if m and current:
+    for entry in scan_diff(diff or ""):
+        span = entry.span
+        m = None if entry.body else _HUNK.match(entry.text)
+        if m and span.path and not span.deleted:
             start = int(m.group(1))
             count = int(m.group(2) or 1)
-            out[current].update(range(start, start + max(count, 1)))
+            out.setdefault(span.path, set()).update(range(start, start + max(count, 1)))
     return {f: lines for f, lines in out.items() if lines}
 
 
