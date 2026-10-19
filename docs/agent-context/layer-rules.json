@@ -19,6 +19,7 @@
         "hub.web",
         "hub.web_*",
         "hub.cli",
+        "hub.cli_task_fields",
         "hub.cli_executor_host",
         "hub.mcp_server",
         "hub.mcp_catalog",
@@ -67,7 +68,8 @@
     },
     "models": {
       "modules": [
-        "hub.models"
+        "hub.models",
+        "hub.plain_summary"
       ],
       "trees": []
     },
