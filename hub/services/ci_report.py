@@ -29,7 +29,7 @@ import logging
 from typing import Any
 
 from hub import repository as repo
-from hub.services import ci_trust, red_test_gate
+from hub.services import ci_contract, ci_trust, red_test_gate
 from hub.services.ac_tests import (
     FAIL as AC_FAIL,
     NOT_FOUND as AC_NOT_FOUND,
@@ -234,7 +234,9 @@ async def settle_ci_run_report(db: Any, task_id: int, stored: dict) -> dict:
     current = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
     generation = task.get("submission_generation") or 0
     trust, why = (
-        ci_trust.trust_of(current) if current else (ci_trust.UNVERIFIED, "pending")
+        ci_trust.trust_of(current, await ci_contract.fingerprint_for_task(db, task_id))
+        if current
+        else (ci_trust.UNVERIFIED, "pending")
     )
     return {
         "applied": applied,
@@ -361,7 +363,8 @@ async def ci_report_state(db: Any, task: dict) -> tuple[str, str]:
         return STATE_UNKNOWN, ("коммит сдачи не закреплён — отчёт CI не с чем сверить")
     report = await repo.get_ci_run_report(db, task_id, pinned)
     if report:
-        trust, reason = ci_trust.trust_of(dict(report))
+        fp = await ci_contract.fingerprint_for_task(db, task_id)
+        trust, reason = ci_trust.trust_of(dict(report), fp)
         if trust != ci_trust.VERIFIED:
             return STATE_UNKNOWN, ci_trust.unverified_note(reason)
         return STATE_CURRENT, ""

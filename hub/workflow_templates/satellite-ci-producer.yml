@@ -1,0 +1,58 @@
+# Haiplane Hub: the PRODUCER half of a satellite's CI report (#1848).
+#
+# This job runs the code of a task branch (its tests, its conftest.py, ...), so
+# it holds NO key that makes the hub believe a report: no `environment`, no
+# HAIPLANE_HUB_CI_TOKEN (the report key). The only hub secret here is a READ key
+# (ci_reader bound to the project) for the task card. The collector runs the
+# task's AC tests and validation commands without any HAIPLANE_HUB_* variable
+# and writes the results to hub-ci-results/, uploaded as the artifact
+# hub-ci-results-<run_attempt>. The report itself is sent by the sender workflow
+# (satellite-ci-report.yml) from the default branch after this one completes.
+#
+# Replace the test step with the satellite's own; its `id` and outcome are the
+# only thing reported as a check, and the checks named here must be the
+# `required_checks` of the project's ci_contract in the hub - no more, no less.
+name: @@WORKFLOW_NAME@@
+
+on:
+  pull_request:
+  push:
+    branches: @@PUSH_BRANCHES@@
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      # ADD THIS REPOSITORY'S OWN TEST STEP HERE, with `id: tests`.
+
+      - name: Collect AC test and validation results for the Hub
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: @@CI_REPORT_ACTION@@
+        with:
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
+          hub-read-token: ${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          ac-runner: "@@AC_RUNNER@@"
+          event-action: ${{ github.event.action }}
+          # A step that never ran reports '' and is dropped - silence, not a pass.
+          checks: tests=${{ steps.tests.outcome }}
+
+      - name: Upload results for the trusted report
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-results-${{ github.run_attempt }}
+          path: hub-ci-results/
+          if-no-files-found: ignore
+          retention-days: 7

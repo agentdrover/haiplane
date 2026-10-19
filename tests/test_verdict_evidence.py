@@ -18,7 +18,7 @@ from hub.services import admin as admin_svc
 from hub.services import chat_pair as cp
 from hub.services import verdict_evidence
 from hub.services.steward_evidence import build_evidence_packet, packet_payload
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 from tests.state_support import make_state_task
 
 PATH = "/api/tasks/{}/verdict-evidence"
@@ -114,7 +114,7 @@ async def _review(db, task_id: int, generation: int, **kw) -> None:
 
 async def _ci(db, task_id: int, sha: str, *, reported: str, checked: str | None):
     """Проекция коммита и строка ЕЁ попытки с заданными временами."""
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=sha,

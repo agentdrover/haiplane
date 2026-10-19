@@ -23,7 +23,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.models import to_iso_utc
-from hub.services import ci_trust
+from hub.services import ci_contract, ci_trust
 from hub.services.result_kind import automation_not_applicable
 
 PERMISSION = "verdict.evidence.read"
@@ -150,7 +150,9 @@ async def _ci_part(
     if report is None:
         return None
     data = dict(report)
-    trust, reason = ci_trust.trust_of(data)
+    trust, reason = ci_trust.trust_of(
+        data, await ci_contract.fingerprint_for_task(db, task_id)
+    )
     key = str(data.get("attempt_key") or "")
     attempt = None
     for candidate in await repo.list_ci_report_attempts(db, task_id, sha):

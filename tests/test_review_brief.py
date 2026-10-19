@@ -1561,7 +1561,9 @@ async def test_brief_and_verdict_card_show_path_notices(
 async def _store_report(db, task_id: int, *, mutations: dict, baseline: dict):
     import json
 
-    await repo.upsert_ci_run_report(
+    from tests.ci_trust_support import upsert_hub_report
+
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha="a" * 40,

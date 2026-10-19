@@ -1374,6 +1374,22 @@
 [
 "backfill_executor_orders_final_entry_at",
 "83621b27 48644a86 b52f7e24 6607fbe2 e77a9801 ba1070ec 4ee98ccf 9ec3bca9"
+],
+[
+"add_ci_report_attempts_contract_fp",
+"a3e017c3 bd1f0f85 8f4d0098 8e7867e4 35dc125e dd8bcfec 35b80c61 20adcc25"
+],
+[
+"add_ci_run_reports_contract_fp",
+"a8cc17e4 f292fab7 bc19045d a60f9904 9513dd10 17b16e13 cf4a9d6b 5ef429d2"
+],
+[
+"backfill_ci_report_attempts_contract_fp",
+"99026006 887764e9 26214f96 7af8d220 20f1c986 41551a65 0cb6f32f b0d44988"
+],
+[
+"backfill_ci_run_reports_contract_fp",
+"e9c6b0ee 4fc19e95 06da0285 1d3cc956 882e71ba 9e157ce5 f625369f e9a19d37"
 ]
 ,[
 "add_tasks_plain_summary",

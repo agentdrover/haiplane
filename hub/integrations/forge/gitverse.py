@@ -906,9 +906,14 @@ class GitVerseForge:
         return None
 
     async def ci_runs_for_sha(
-        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None:
-        return None
+        return None  # не поддерживается: GitVerse не отдаёт прогоны CI хабу
 
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
