@@ -1695,8 +1695,9 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
     if status == "review":
         return (
             f"{base} Universal Review Gate: the done report was routed to "
-            "review, not completion. A reviewer must run hub_get_review_brief "
-            "and hub_submit_review; after an APPROVED verdict, report done again."
+            "review, not completion. An agent reviewer files changes_requested "
+            "(hub_submit_review) or a report (hub_submit_machine_review); "
+            "APPROVED comes from a human or the hub policy, then report done again."
         )
     if status in ("ci_check", "needs_decision"):
         return f"{base} Task entered {status}."

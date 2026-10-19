@@ -335,13 +335,17 @@ class DispatchIntegration:
             "2. Проанализируй каждое замечание ревьюера: какие критичны, какие второстепенны, какие ложные\n"
             "3. Оцени качество исправлений разработчика: решена ли основная задача?\n"
             "4. Напиши нейтральный отчёт\n"
-            "5. ОБЯЗАТЕЛЬНО запиши результат ДВУМЯ командами:\n\n"
-            f'   oc-hub update {task_id} --kind arbitration --agent arbiter --message "<детальный отчёт>"\n\n'
-            f'   oc-hub update {task_id} --kind review --agent arbiter --message "<короткий вердикт>\\nAPPROVED"\n'
-            "   ИЛИ\n"
-            f'   oc-hub update {task_id} --kind review --agent arbiter --message "<короткий вердикт>\\nCHANGES_REQUESTED"\n\n'
-            "Вердикт APPROVED — если основная задача выполнена, можно мержить.\n"
-            "Вердикт CHANGES_REQUESTED — если есть критичные проблемы, задача пойдёт на доработку.\n"
+            "5. ОБЯЗАТЕЛЬНО запиши отчёт арбитража и рекомендацию человеку (#1872):\n\n"
+            f'   oc-hub update {task_id} --kind arbitration --agent arbiter --message "<детальный отчёт и рекомендация: принять или вернуть на доработку>"\n\n'
+            "APPROVED агент не записывает: хаб отклоняет его, одобряет человек или "
+            "автоматика хаба. Если основная задача выполнена, так и напиши в "
+            "рекомендации — решение о слиянии за человеком.\n"
+            "Если есть критичные проблемы, запиши вердикт СТРУКТУРИРОВАННОЙ командой:\n"
+            f"   oc-hub review-verdict {task_id} changes_requested --agent arbiter "
+            "--expected-generation <submission_generation из oc-hub review-brief "
+            f'{task_id}> --comments "<короткий вердикт>" '
+            '--findings-json \'[{"id":1,"severity":"high","message":"..."}]\'\n'
+            "Задача пойдёт на доработку.\n"
         )
 
         return "\n\n".join(parts)

@@ -466,44 +466,199 @@ def test_reviewer_instructions_do_not_ask_an_agent_to_approve() -> None:
     assert "approval_reserved_for_human" in rules
 
 
-#: Совет агенту слать approved: так выглядят все формулировки, которые снимали.
-_ADVISES_APPROVED = re.compile(
-    r"verdict=approved|approved\s*\|\s*changes|approved' or|approve and keep|"
-    r"Obtain an APPROVED|report or changes_requested|through hub_submit_review\)?\. A positive",
+# ---- рантайм-тексты для агента: проверка смысла по источникам --------------
+#
+# Словарь запретных конструкций — ЗДЕСЬ и только здесь. Ловится смысл:
+# (а) текст поручает агенту записать APPROVED (канал записи и слово исхода в
+#     одном предложении без признака запрета/передачи человеку), либо содержит
+#     готовую конструкцию «слать approved»;
+# (б) шаг одобрения назван действием агента (actor=agent).
+
+#: Каналы, которыми агент что-то записывает в вердикт/ревью.
+AGENT_CHANNELS = re.compile(
+    r"hub_submit_review|review-verdict|--kind review|review_verdict", re.I
+)
+#: Слово исхода «одобрено».
+OUTCOME = re.compile(r"\bapproved\b", re.I)
+#: Признаки, что предложение запрещает или отдаёт одобрение не агенту.
+REFUSES_OR_HANDS_OFF = re.compile(
+    r"refus|reserved|never|отклон|не записыв|не пишет|comes from|written by|"
+    r"is a human|human'?s|only changes_requested|changes_requested only|"
+    r"takes changes_requested|a human approves|APPROVED:|human or hub|"
+    r"human or the hub|\bnot\b|APPROVED\s*—\s*человек",
+    re.I,
+)
+#: Готовые конструкции «агент, шли approved».
+SEND_APPROVED = re.compile(
+    r"(?:submit|send|file)[^.\n]{0,20}verdict=approved|approved\s*\|\s*changes|'approved' or|"
+    r"--message[^\n]*APPROVED|review-verdict\s+\S+\s+approved|можно мержить|"
+    r"Вердикт APPROVED\s*—|Obtain an APPROVED|"
+    # отчёт ревью сдаётся hub_submit_machine_review; hub_submit_review — только
+    # changes_requested
+    r"(?:report|отчёт)[^.\n;]{0,25}(?:via|through|через)\s+hub_submit_review",
     re.I,
 )
 
 
-async def test_runtime_texts_an_agent_reads_never_advise_approved(
-    client: AsyncClient, db: aiosqlite.Connection, hdr: dict, monkeypatch
-):
-    """Тексты рантайма: бриф (по умолчанию и full), каталог MCP, отказ 422, лента."""
+def advises_agent_to_approve(text: str) -> list[str]:
+    """Предложения текста, которые поручают агенту слать APPROVED."""
+    bad = [m.group(0) for m in SEND_APPROVED.finditer(text)]
+    for sentence in re.split(r"(?<=[.!?])\s|\n", text):
+        if (
+            AGENT_CHANNELS.search(sentence)
+            and OUTCOME.search(sentence)
+            and not REFUSES_OR_HANDS_OFF.search(sentence)
+        ):
+            bad.append(sentence.strip())
+    return bad
+
+
+def approval_step_is_agents(schema: dict) -> list[str]:
+    """(б): шаг одобрения, названный действием агента, в схеме процесса."""
+    bad = []
+    if schema["gates"]["review"].get("actor") == "agent":
+        bad.append("gates.review.actor=agent")
+    for t in schema["transitions"]:
+        if (
+            t.get("tool") == "hub_submit_review"
+            and t.get("actor") == "agent"
+            and t.get("to") == "completed"
+        ):
+            bad.append(f"transition {t['from']}->completed actor=agent")
+    return bad
+
+
+class Env:
+    def __init__(self, client, db, hdr, monkeypatch, task_id):
+        self.client, self.db, self.hdr = client, db, hdr
+        self.monkeypatch, self.task_id = monkeypatch, task_id
+
+
+async def _brief(env: Env, **args) -> str:
     from tests.test_mcp_server import _call_tool_text
 
-    task_id = await _in_review(client, hdr, "Runtime texts")
-
     async def _api_get(path: str, **_):
-        return (await client.get(path, headers=hdr["rev"])).json()
+        return (await env.client.get(path, headers=env.hdr["rev"])).json()
 
-    monkeypatch.setattr(mcp_server, "_api_get", _api_get)
-    seen: dict[str, str] = {}
-    for label, args in (("default", {}), ("full", {"section": "full"})):
-        result = await mcp_server.mcp.call_tool(
-            "hub_get_review_brief", {"task_id": task_id, **args}
-        )
-        text = _call_tool_text(result)
-        assert "hub_submit_review" in text, label  # футер на месте
-        seen[f"brief:{label}"] = text
+    env.monkeypatch.setattr(mcp_server, "_api_get", _api_get)
+    result = await mcp_server.mcp.call_tool(
+        "hub_get_review_brief", {"task_id": env.task_id, **args}
+    )
+    return _call_tool_text(result)
 
+
+async def _src_brief_default(env):
+    return [await _brief(env)]
+
+
+async def _src_brief_full(env):
+    return [await _brief(env, section="full")]
+
+
+async def _src_mcp_catalog(env):
     tools = await mcp_server.mcp.list_tools()
-    desc = next(t for t in tools if t.name == "hub_submit_review")
-    seen["catalog"] = (desc.description or "") + json.dumps(desc.inputSchema)
+    return [(t.description or "") + json.dumps(t.inputSchema) for t in tools]
 
-    # Отказ «все находки вне объёма»: подсказка агенту-ревьюеру.
+
+async def _src_openapi(env):
+    return [(await env.client.get("/openapi.json")).text]
+
+
+async def _src_envelope(env):
+    from hub import mcp_envelope
+
+    reasons = [None, "self_review_forbidden", "human_decision_required"]
+    out = [
+        mcp_envelope.compute_next_action(st, aw, reason=r)
+        for st in ("review", "running", "needs_decision", "pending_report")
+        for aw in ("review", "none", "human_decision", "ci")
+        for r in reasons
+    ]
+    for decider in ("human", "policy", "steward", "none"):
+        route = {"decider": decider, "final": decider, "reason": "x"}
+        out.append(mcp_envelope.next_action_of(route) or "")
+    return out
+
+
+async def _src_actionable_errors(env):
+    from hub import actionable_errors as ae
+
+    details = [
+        ae.verdict_repeats_previous_detail("yesterday"),
+        ae.verdict_contradicts_its_text_detail("changes_requested", "approved"),
+        ae.changes_requested_requires_content_detail(),
+    ]
+    # Положительный исход, названный в тексте, — отчёт, а не смена поля verdict.
+    assert details[1]["suggested_tool"] == "hub_submit_machine_review", details[1]
+    assert details[1]["retry_by_same_caller"] is True
+    return [json.dumps(d, ensure_ascii=False) for d in details]
+
+
+async def _src_workflow_reference(env):
+    from hub import workflow_reference as wr
+
+    return [
+        json.dumps(wr.workflow_reference_dict(), indent=1),
+        "\n".join(wr.lifecycle_map_lines()),
+        wr.mcp_workflow_instruction_section(),
+        wr.build_mcp_instructions(),
+    ]
+
+
+async def _src_done_message(env):
+    return [
+        mcp_server._format_hub_report_done_message(env.task_id, 1, st)
+        for st in ("review", "pending_report", "needs_decision", "ci_check")
+    ]
+
+
+async def _src_dispatch(env):
+    from hub.integrations.dispatch import DispatchIntegration
+
+    d = DispatchIntegration()
+    return [
+        d.build_review_message(
+            task_id=7, title="t", description="d", review_cycle=0, max_cycles=3
+        ),
+        d.build_arbiter_message(
+            task_id=7,
+            title="t",
+            description="d",
+            review_history=[],
+            review_cycle=3,
+            max_cycles=3,
+        ),
+        d.build_fix_message(7, "t", "d", "fix", 1, 3),
+    ]
+
+
+async def _src_feed_done_report(env):
+    """Запись хаба о маршруте done-отчёта в review (pending_report и running)."""
+    out = []
+    # Путь pending_report: done-отчёт без одобрения становится сдачей на ревью.
+    await repo.update_task(env.db, env.task_id, status="pending_report")
+    await env.db.commit()
+    done = await env.client.post(
+        f"/api/tasks/{env.task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+        headers=env.hdr["impl"],
+    )
+    out.append(done.text)
+    feed = (
+        await env.client.get(
+            f"/api/tasks/{env.task_id}/updates", headers=env.hdr["human"]
+        )
+    ).json()
+    out += [u["content"] for u in feed]
+    assert any("routed to review" in t for t in out), out
+    return out
+
+
+async def _src_refusal_422(env):
     resp = await _post(
-        client,
-        task_id,
-        hdr["rev"],
+        env.client,
+        env.task_id,
+        env.hdr["rev"],
         {
             "verdict": "changes_requested",
             "agent": "reviewer",
@@ -514,10 +669,123 @@ async def test_runtime_texts_an_agent_reads_never_advise_approved(
         },
     )
     assert resp.status_code == 422, resp.text
-    seen["refusal"] = resp.text
+    return [resp.text]
 
-    for label, text in seen.items():
-        assert not _ADVISES_APPROVED.search(text), (
-            label,
-            _ADVISES_APPROVED.search(text),
+
+async def _src_skills(env):
+    texts = [p.read_text("utf-8") for p in sorted((ROOT / "skills").glob("*/SKILL.md"))]
+    texts += [p.read_text("utf-8") for p in sorted((ROOT / "agents").glob("*.md"))]
+    return texts
+
+
+async def _src_seeded_skills(env):
+    from hub import db as hub_db
+
+    return [
+        hub_db.MULTI_AGENT_REVIEW_SKILL,
+        hub_db.MACHINE_REVIEW_CYCLE_SKILL,
+        hub_db.EXECUTOR_PAIR_DISCIPLINE_SKILL,
+    ]
+
+
+async def _src_hub_string_literals(env):
+    """Все строковые литералы hub/ с каналом записи вердикта (кроме docstring).
+
+    Закрывает то, до чего не дотянуться вызовом: записи ленты orchestration и
+    poller, подсказки в ветках, которые в тесте не случаются.
+    """
+    import ast
+
+    out: list[str] = []
+    for path in sorted((ROOT / "hub").rglob("*.py")):
+        tree = ast.parse(path.read_text("utf-8"))
+        docs = {
+            id(n.body[0].value)
+            for n in ast.walk(tree)
+            if isinstance(
+                n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            )
+            and n.body
+            and isinstance(n.body[0], ast.Expr)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docs
+                and AGENT_CHANNELS.search(node.value)
+                and not re.match(r"\s*(SELECT|UPDATE|INSERT|DELETE|WITH)\b", node.value)
+            ):
+                out.append(node.value)
+    assert out
+    return out
+
+
+SOURCES = {
+    "hub_string_literals": _src_hub_string_literals,
+    "brief_default": _src_brief_default,
+    "brief_full": _src_brief_full,
+    "mcp_catalog": _src_mcp_catalog,
+    "openapi": _src_openapi,
+    "envelope": _src_envelope,
+    "actionable_errors": _src_actionable_errors,
+    "workflow_reference": _src_workflow_reference,
+    "mcp_done_message": _src_done_message,
+    "dispatch_prompts": _src_dispatch,
+    "feed_done_report": _src_feed_done_report,
+    "refusal_422": _src_refusal_422,
+    "skills_files_and_roles": _src_skills,
+    "seeded_skills": _src_seeded_skills,
+}
+
+
+@pytest.mark.parametrize("source", sorted(SOURCES))
+async def test_runtime_texts_an_agent_reads_never_advise_approved(
+    source: str,
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    hdr: dict,
+    monkeypatch,
+):
+    task_id = await _in_review(client, hdr, f"Runtime {source}")
+    env = Env(client, db, hdr, monkeypatch, task_id)
+    texts = await SOURCES[source](env)
+    assert texts and all(isinstance(t, str) for t in texts), source
+    for text in texts:
+        assert not advises_agent_to_approve(text), (
+            source,
+            advises_agent_to_approve(text),
         )
+
+
+def test_the_approval_step_is_never_the_agents_in_the_process_schema() -> None:
+    from hub import workflow_reference as wr
+
+    assert approval_step_is_agents(wr.workflow_reference_dict()) == []
+
+
+#: Модули hub/, где упомянут hub_submit_review; для каждого — источник выше или причина.
+COVERED_MODULES = {
+    "hub/actionable_errors.py": "actionable_errors, refusal_422",
+    "hub/app.py": "openapi",
+    "hub/mcp_envelope.py": "envelope",
+    "hub/mcp_server.py": "mcp_catalog, mcp_done_message, brief_*",
+    "hub/models.py": "openapi (описание поля)",
+    "hub/workflow_reference.py": "workflow_reference",
+    "hub/services/lifecycle.py": "refusal_422, комментарии",
+    "hub/services/orchestration.py": "feed_done_report",
+    "hub/services/task_updates.py": "feed_done_report",
+    "hub/services/review_brief_projection.py": "brief_default",
+    "hub/services/machine_review_intake.py": "комментарий кода, агенту не показывается",
+    "hub/poller.py": "ленты poller: 'Awaiting review verdict' без слова исхода; "
+    "needs_decision адресован человеку",
+}
+
+
+def test_a_new_module_naming_the_review_tool_must_be_covered() -> None:
+    found = {
+        str(p.relative_to(ROOT))
+        for p in (ROOT / "hub").rglob("*.py")
+        if "hub_submit_review" in p.read_text("utf-8")
+    }
+    assert found <= set(COVERED_MODULES), sorted(found - set(COVERED_MODULES))

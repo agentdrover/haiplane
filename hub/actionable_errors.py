@@ -895,12 +895,19 @@ def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str
                 f"verdict={verdict} but the text opens by declaring {declared.upper()}"
             ),
             "hint": (
-                "Send the outcome you mean: either change the verdict field or "
-                "drop the opposite word from the opening line. Quoting an "
+                "Send the outcome you mean: a negative one is "
+                "changes_requested with the opposite word dropped from the "
+                "opening line; a positive one is a review report "
+                "(hub_submit_machine_review) or a comment, not an agent's "
+                "approved. Quoting an "
                 "earlier verdict further down the text is fine — only the "
                 "first meaningful line is read as a declaration."
             ),
-            "suggested_tool": "hub_submit_review",
+            "suggested_tool": (
+                "hub_submit_machine_review"
+                if declared.lower() == "approved"
+                else "hub_submit_review"
+            ),
         }
     )
 
