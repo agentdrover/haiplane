@@ -431,11 +431,15 @@ async def test_another_agent_resubmits_a_returned_task(
     # токеном (#1241) не должен упираться в запрет саморевью.
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
-        json={"verdict": "approved", "agent": "agent-a"},
+        json={
+            "verdict": "changes_requested",
+            "agent": "agent-a",
+            "comments": "нужна правка блокировки",
+        },
         headers=_AGENT_A,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["review_approved_current"] is True
+    assert resp.json()["review_verdict"] == "changes_requested"
 
 
 async def test_returning_to_work_is_human_only_and_status_bound(

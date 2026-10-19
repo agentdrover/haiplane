@@ -34,7 +34,11 @@
   `hub_my_context(task_id)` for wider hierarchy context when needed.
 - Check the diff against acceptance criteria, declared validation commands, and
   contract surfaces, not only code style.
-- Deliver the verdict ONLY through `hub_submit_review`: `approved`, or
+- An agent never writes `approved` (#1872): the hub refuses it with 409
+  `approval_reserved_for_human` and writes nothing. A positive outcome is a
+  review report with a recommendation to the human (`hub_submit_machine_review`
+  or a review comment); the owner or the hub's own automation approves.
+- Deliver a negative verdict ONLY through `hub_submit_review`:
   `changes_requested` with structured findings (stable ids within the
   submission, severity high/medium/low, message, optional file/line and
   recommendation). Free-text status updates are not a verdict — the server
@@ -48,7 +52,7 @@
   naming the revision, and only a human replaces it (`supersedes_revision`).
   Without the generation the hub warns that it cannot tell which submission
   you judged.
-- Your output is the verdict. Do not approve or merge PRs, do not call
+- Your output is the verdict or the report. Do not approve or merge PRs, do not call
   `hub_report_done`, and never try to decide a task — the decision gate is the
   human's (REST `POST /api/tasks/{id}/decide`, not in your tool list). Never review your own implementation work.
 - Verdicts are submission-bound: after `changes_requested` the developer fixes
@@ -56,7 +60,7 @@
   makes your prior verdict stale, so review the new submission fresh. You see
   only the branch of the task under review — never assume changes from another
   task's unmerged branch are present.
-- Do not approve work with failed CI, unresolved blockers, or missing
+- Do not recommend work with failed CI, unresolved blockers, or missing
   required validation — use `changes_requested` with findings instead.
 - When work is acceptable but the agent report is weak or missing, leave the
   task in `pending_report` for an explicit human force-complete

@@ -4671,6 +4671,14 @@ async def record_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    # #1872: первым шагом, до state-ветки и до _standing_verdict_gate — отказ
+    # не зависит от маршрута, статуса и стоящего вердикта и ничего не пишет.
+    verdict_guard.ensure_approval_is_human(
+        body,
+        agent_caller=agent_caller,
+        human_caller=human_caller,
+        self_approved=self_approved,
+    )
     task = dict(row)
     if is_state(task):
         # #1647: вердикт по задаче-состоянию — только с поколением, APPROVED

@@ -207,9 +207,12 @@ APPROVED. Правило применяется в общем service-слое (
    Блок `evidence_coverage` подводит итог по всем блокам доказательств:
    сколько дали сигнал, что не отработало и почему. `sha_check: match`
    в этот счёт не входит — он сравнивает, куда указывает ветка, а не код.
-3. Ревьюер выносит вердикт `hub_submit_review`: `approved` или
-   `changes_requested` со структурированными findings (стабильные id,
-   severity high/medium/low).
+3. Ревьюер-агент выносит `changes_requested` через `hub_submit_review` со
+   структурированными findings (стабильные id, severity high/medium/low).
+   Положительный итог агента — отчёт ревью (`hub_submit_machine_review`) с
+   рекомендацией: `approved` от агента хаб отклоняет (409
+   `approval_reserved_for_human`, #1872), его записывает человек или
+   автоматика хаба по политике проекта.
 4. При `changes_requested` задача возвращается в `running`; разработчик
    исправляет findings по номерам и отправляет работу снова. Прежний
    вердикт при этом протухает автоматически (generation вырос).
@@ -227,10 +230,10 @@ Human-переопределения (`/decide` accept, `/force-complete`)
 
 - **Cursor** — второй агент/композер в отдельном чате или другой человек:
   открывает `hub_get_review_brief`, смотрит diff по advisory-команде,
-  выносит `hub_submit_review`.
+  выносит `changes_requested` через `hub_submit_review` либо отчёт ревью.
 - **Codex** — отдельный reviewer-запуск (или другая сессия) с теми же двумя
-  инструментами; вердикт — только через `hub_submit_review`, не через
-  свободный текст в updates.
+  инструментами; вердикт `changes_requested` — только через `hub_submit_review`, не через
+  свободный текст в updates; положительный итог — отчёт ревью.
 - **Claude Code** — субагент или отдельная сессия в роли
   `agents/code-reviewer.md`; человек-ревьюер может отдать вердикт через
   CLI (`oc-hub review-brief`, `oc-hub review-verdict`) или API.
