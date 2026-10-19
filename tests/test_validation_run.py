@@ -74,6 +74,21 @@ async def test_run_validation_skipped_without_commands(db):
     assert dict(await repo.get_task(db, task_id))["validation_status"] is None
 
 
+def test_safe_env_strips_the_git_config_env_as_a_whole(monkeypatch):
+    """GIT_CONFIG_COUNT without its KEY_n makes git exit 128 (#1851)."""
+    import subprocess
+
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "credential.interactive")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "never")
+    env = _safe_env()
+    assert not [k for k in env if k.startswith("GIT_CONFIG_")], env
+    done = subprocess.run(
+        ["git", "config", "--get", "user.name"], env=env, capture_output=True
+    )
+    assert done.returncode in (0, 1), done.stderr
+
+
 def test_safe_env_strips_secrets(monkeypatch):
     # AC-2 (#509): secret-looking env vars never reach the child environment.
     monkeypatch.setenv("HAIPLANE_HUB_TOKENS", "s3cret")

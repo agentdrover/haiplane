@@ -27,6 +27,7 @@ import pytest
 
 from hub import config
 from hub.integrations import local_reviewer, review_snapshot
+from tests import env_caps
 
 _ROOT = Path(__file__).resolve().parent.parent
 _RUNNER_FILE = _ROOT / "deploy/review-runner/haiplane-review-runner.py"
@@ -1949,16 +1950,39 @@ def test_the_snapshot_modes_keep_the_reviewer_uid_out_of_write(tmp_path) -> None
     assert unpacker.remove_tree(str(work)) is True and not work.exists()
 
 
+@pytest.fixture
+def traversable_tmp():
+    """Каталог, до которого дойдёт чужой uid (#1851).
+
+    ``tmp_path`` лежит в ``/tmp/pytest-of-<user>`` с режимом 0700: второй uid
+    не пройдёт предка и получит EACCES раньше, чем дело дойдёт до проверяемых
+    режимов снимка. Каталог в системном tmp открыт на обход.
+    """
+    import shutil
+
+    root = Path(tempfile.mkdtemp(prefix="haiplane-uid-"))
+    root.chmod(0o755)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 @pytest.mark.skipif(
     not _ROOT_USER,
     reason="нужен root, чтобы стать вторым uid; без него перенесено в ручную "
     "пробу владельца (deploy/LOCAL-REVIEW.md, «Проба снимка»)",
 )
+@pytest.mark.skipif(
+    env_caps.no_world_traversable_tmp() is not None,
+    reason=str(env_caps.no_world_traversable_tmp()),
+)
 def test_a_second_uid_in_the_group_reads_but_cannot_write_or_replace_src(
-    tmp_path,
+    traversable_tmp,
 ) -> None:
     import subprocess
 
+    tmp_path = traversable_tmp
     unpacker = _load_unpacker()
     work = tmp_path / "w"
     work.mkdir(mode=0o700)

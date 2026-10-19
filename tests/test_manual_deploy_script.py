@@ -1,7 +1,8 @@
 """The manual deploy goes through the canonical script and stops on any error (#1620).
 
 The real scripts/manual_deploy.sh runs in a tmpdir with shims for uv, ssh and the
-REMOTE rsync (the local copy uses the real rsync). The properties: a failed lock
+REMOTE rsync (the local copy uses the real rsync, or a tar stand-in when
+the machine has none). The properties: a failed lock
 check or export ships nothing; a tree from before #1620 (no ``build`` group)
 needs an explicit build set and still gets the canonical server scripts.
 """
@@ -12,6 +13,10 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from tests import env_caps
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/manual_deploy.sh"
@@ -39,10 +44,29 @@ case "$*" in
     echo "rsync-remote $*" >>"$CALLS"
     for last; do :; done
     src="${*: -2:1}"
-    /usr/bin/env rsync -a "$src" "$STAGED"/
+    "$REAL_RSYNC" -a "$src" "$STAGED"/
     ;;
   *) exec "$REAL_RSYNC" "$@" ;;
 esac
+"""
+# Stands in for a system rsync that the machine may not have (a clean cloud
+# container): `-a [--exclude P]... SRC/ DST/` as a tar pipe. Only what the
+# script's local copy and the remote shim above ask for.
+_RSYNC_FALLBACK = r"""#!/usr/bin/env bash
+set -o pipefail
+excludes=()
+paths=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --exclude) excludes+=("--exclude=$2"); shift 2 ;;
+    -*) shift ;;
+    *) paths+=("$1"); shift ;;
+  esac
+done
+src="${paths[0]}"
+dst="${paths[1]}"
+mkdir -p "$dst"
+tar -c "${excludes[@]}" -C "$src" . | tar -x -C "$dst"
 """
 
 
@@ -69,7 +93,13 @@ def _run(tmp: Path, bin_dir: Path, tree: Path, staged: Path, *args: str, **env: 
     calls.touch()
     # The real rsync is found BEFORE the shim directory goes first on PATH.
     real_rsync = shutil.which("rsync")
-    assert real_rsync
+    if not real_rsync:
+        if (reason := env_caps.no_tar()) is not None:
+            pytest.skip(reason)
+        fallback = bin_dir / "rsync-fallback"
+        fallback.write_text(_RSYNC_FALLBACK)
+        fallback.chmod(0o755)
+        real_rsync = str(fallback)
     full = {
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -149,3 +179,31 @@ def test_rollback_to_a_commit_before_the_build_group_needs_an_explicit_set(tmp_p
     assert (tmp_path / "ssh_stdin").read_text() == (
         ROOT / "deploy/remote-deploy.sh"
     ).read_text()
+
+
+def test_the_tar_stand_in_for_rsync_fails_when_the_archive_cannot_be_made(tmp_path):
+    """A failed ``tar -c`` must not be hidden by a successful ``tar -x`` (#1851)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stand_in = bin_dir / "rsync-fallback"
+    stand_in.write_text(_RSYNC_FALLBACK)
+    stand_in.chmod(0o755)
+    tar = bin_dir / "tar"
+    tar.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  -c) head -c 10240 /dev/zero; exit 1 ;;\n"
+        "  *) cat >/dev/null ;;\n"
+        "esac\n"
+    )
+    tar.chmod(0o755)
+    src = tmp_path / "src"
+    src.mkdir()
+    done = subprocess.run(
+        [str(stand_in), "-a", f"{src}/", f"{tmp_path / 'dst'}/"],
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert done.returncode != 0, done
