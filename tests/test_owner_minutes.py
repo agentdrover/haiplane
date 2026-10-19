@@ -562,6 +562,37 @@ async def test_each_counted_gate_accrues_once_per_surface(
     assert not ids & {c["id"] for c in completed}
 
 
+async def test_the_launch_event_shares_the_reservation_transaction(
+    world, db, monkeypatch
+):
+    """AC-1 (ловушка commit=False): событие запуска, бронь и код - одна транзакция.
+
+    Запись события падает после того, как бронь и код записаны: откатиться должно
+    всё. Если код выписан с собственным commit, бронь и код переживают сбой, а
+    событие уходит отдельной транзакцией.
+    """
+    from hub.services import executor_launch as el
+    from hub.services import owner_minutes
+
+    _executor_config(monkeypatch)
+    project, task_id = await _cloud_project(db, "ac1-atomic")
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("event write failed")
+
+    monkeypatch.setattr(owner_minutes, "record_order_accepted", _boom)
+    with pytest.raises(RuntimeError, match="event write failed"):
+        await el.launch_executor(
+            db, project, issuer_principal_id=world.owner_id, issuer_human=True
+        )
+    assert await _rows(db, "SELECT id FROM executor_runs") == []
+    assert await _rows(db, "SELECT id FROM chat_pair_codes") == []
+    assert (
+        await _rows(db, "SELECT id FROM events WHERE kind='executor_order_accepted'")
+        == []
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC-2: нечеловеческие авторы начислений не дают
 # ---------------------------------------------------------------------------
