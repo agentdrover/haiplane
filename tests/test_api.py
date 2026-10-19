@@ -1306,7 +1306,7 @@ async def test_review_verdict_api_rejects_all_out_of_scope_findings(
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail["reason"] == "changes_requested_requires_in_scope_finding"
-    assert "approved" in detail["hint"]
+    assert "APPROVED" in detail["hint"]
 
 
 async def test_review_verdict_api_approved_returns_to_running_current(

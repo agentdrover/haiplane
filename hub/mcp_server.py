@@ -3138,7 +3138,7 @@ async def hub_submit_review(
     back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
-    in_scope one — all-out-of-scope means approve and keep them as linked
+    in_scope one — all-out-of-scope means a positive report and linked
     recommendations. Unlinked out_of_scope findings warn, non-blocking.
 
     Auto-drafts (#436): create_tasks_for_out_of_scope=true opens a DRAFT
@@ -3146,7 +3146,7 @@ async def hub_submit_review(
 
     Args:
         task_id: The task under review
-        verdict: 'approved' or 'changes_requested'
+        verdict: 'changes_requested'; an agent's 'approved' is refused
         comments: Free-text review summary
         agent: Reviewer agent name
         findings: For changes_requested — dicts with id (int, stable within

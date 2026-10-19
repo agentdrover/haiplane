@@ -6437,9 +6437,11 @@ async def transition_after_agent_done(
             "hub",
             "status",
             f"Universal Review Gate: done report routed to review "
-            f"(submission #{generation_num}). Obtain an APPROVED verdict via "
-            "hub_submit_review (reviewer: hub_get_review_brief), then report "
-            "done again.",
+            f"(submission #{generation_num}). Obtain a review "
+            "(reviewer: hub_get_review_brief, then a review report via "
+            "hub_submit_machine_review or changes_requested via "
+            "hub_submit_review; APPROVED comes from a human or the hub "
+            "policy), then report done again.",
         )
         # Заметки гейтов — в ленту тем же способом, что на pair-пути (#1122).
         # Гейт, который отработал и промолчал, хуже невыполненного: читатель

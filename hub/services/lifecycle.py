@@ -4361,8 +4361,11 @@ async def _vstep_changes_requested_has_in_scope_finding(state: VerdictContext) -
                             "finding; all findings are out_of_scope"
                         ),
                         "hint": (
-                            "If nothing needs fixing in this task, submit "
-                            "verdict=approved and keep out-of-scope findings "
+                            "If nothing needs fixing in this task, file a review "
+                            "report (hub_submit_machine_review or a comment) "
+                            "recommending to approve — APPROVED is written by a "
+                            "human or the hub's automation, not by an agent — "
+                            "and keep out-of-scope findings "
                             "as recommendations (linked to follow-up tasks "
                             "via linked_task_id)."
                         ),

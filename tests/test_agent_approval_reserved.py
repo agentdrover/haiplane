@@ -434,8 +434,6 @@ async def test_an_agent_with_the_human_gate_counts_as_a_human(
 
 
 def test_reviewer_instructions_do_not_ask_an_agent_to_approve() -> None:
-    import inspect
-
     from hub.integrations.dispatch import DispatchIntegration
 
     plugin = DispatchIntegration()
@@ -459,8 +457,6 @@ def test_reviewer_instructions_do_not_ask_an_agent_to_approve() -> None:
         r"verdict[^.\n]*\bapproved\b[^.\n]*hub_submit_review", reviewer
     )
 
-    brief = inspect.getsource(mcp_server.hub_get_review_brief)
-    assert "approved|changes_requested" not in brief
     doc = (ROOT / "docs" / "software-development-workflow.md").read_text("utf-8")
     assert "`approval_reserved_for_human`" in doc
     # Схема основного потока: от агента-ревьюера нет перехода approved -> merge.
@@ -468,3 +464,60 @@ def test_reviewer_instructions_do_not_ask_an_agent_to_approve() -> None:
     assert "(не от агента)" in doc
     rules = (ROOT / "docs" / "cursor-agent-rules.md").read_text("utf-8")
     assert "approval_reserved_for_human" in rules
+
+
+#: Совет агенту слать approved: так выглядят все формулировки, которые снимали.
+_ADVISES_APPROVED = re.compile(
+    r"verdict=approved|approved\s*\|\s*changes|approved' or|approve and keep|"
+    r"Obtain an APPROVED|report or changes_requested|through hub_submit_review\)?\. A positive",
+    re.I,
+)
+
+
+async def test_runtime_texts_an_agent_reads_never_advise_approved(
+    client: AsyncClient, db: aiosqlite.Connection, hdr: dict, monkeypatch
+):
+    """Тексты рантайма: бриф (по умолчанию и full), каталог MCP, отказ 422, лента."""
+    from tests.test_mcp_server import _call_tool_text
+
+    task_id = await _in_review(client, hdr, "Runtime texts")
+
+    async def _api_get(path: str, **_):
+        return (await client.get(path, headers=hdr["rev"])).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _api_get)
+    seen: dict[str, str] = {}
+    for label, args in (("default", {}), ("full", {"section": "full"})):
+        result = await mcp_server.mcp.call_tool(
+            "hub_get_review_brief", {"task_id": task_id, **args}
+        )
+        text = _call_tool_text(result)
+        assert "hub_submit_review" in text, label  # футер на месте
+        seen[f"brief:{label}"] = text
+
+    tools = await mcp_server.mcp.list_tools()
+    desc = next(t for t in tools if t.name == "hub_submit_review")
+    seen["catalog"] = (desc.description or "") + json.dumps(desc.inputSchema)
+
+    # Отказ «все находки вне объёма»: подсказка агенту-ревьюеру.
+    resp = await _post(
+        client,
+        task_id,
+        hdr["rev"],
+        {
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "expected_generation": 1,
+            "findings": [
+                {"id": 1, "severity": "low", "message": "x", "scope": "out_of_scope"}
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    seen["refusal"] = resp.text
+
+    for label, text in seen.items():
+        assert not _ADVISES_APPROVED.search(text), (
+            label,
+            _ADVISES_APPROVED.search(text),
+        )

@@ -887,9 +887,9 @@ def _projection_summary(proj: dict[str, Any], exceeded: bool) -> str:
             f"\n[{EXCEEDED_NOTE}: {MAX_CHARS}] the mandatory part alone is bigger"
         )
     lines.append(
-        "\nSubmit the verdict with hub_submit_review (verdict=approved|"
-        "changes_requested, findings for changes_requested; changes_requested "
-        "needs at least one scope=in_scope finding)."
+        "\nAgent: hub_submit_review takes changes_requested only (one scope="
+        "in_scope finding); a positive outcome is a review report. APPROVED: "
+        "human or hub policy."
     )
     return "\n".join(lines)
 
