@@ -1157,3 +1157,35 @@ def test_added_plus_plus_line_does_not_hide_the_rest_of_a_file():
     )
     kept, dropped = split_generated(diff + lock)
     assert dropped == ["uv.lock"] and "subprocess.run" in kept and "+x" not in kept
+
+
+def test_plain_unified_diff_without_diff_git_keeps_every_header():
+    # #1856: no "diff --git" line, so no hunk/header split: each "+++ " opens a
+    # file. The lock or the document is dropped, the code after it is read.
+    code = (
+        "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+    subprocess.run(['ls'])\n"
+    )
+    lock = "--- a/uv.lock\n+++ b/uv.lock\n@@ -0,0 +1 @@\n+x\n"
+    doc = "--- a/docs/a.md\n+++ b/docs/a.md\n@@ -0,0 +1 @@\n+git worktree add\n"
+    want = ["запуск подпроцессов: subprocess.run"]
+    assert process_surface_reasons(lock + code) == want
+    assert process_surface_reasons(doc + code) == want
+    kept, dropped = split_generated(lock + code)
+    assert dropped == ["uv.lock"] and "subprocess.run" in kept
+
+
+def test_c_quoted_non_ascii_paths_are_classified_like_ascii_ones():
+    # #1856: git prints "b/docs/\320\267.md" for docs/з.md.
+    def doc(path: str) -> str:
+        return (
+            f"diff --git a/x b/x\n--- /dev/null\n+++ {path}\n"
+            "@@ -0,0 +1 @@\n+git worktree add\n"
+        )
+
+    code = _added("hub/x.py", "subprocess.run(['ls'])")
+    want = ["запуск подпроцессов: subprocess.run"]
+    assert process_surface_reasons(doc('"b/docs/\\320\\267.md"') + code) == want
+    assert process_surface_reasons(doc("b/docs/z.md") + code) == want
+    assert process_surface_reasons(doc('"b/hub/\\320\\267.py"')) != []
+    kept, dropped = split_generated(doc('"b/node_modules/\\320\\267.js"') + code)
+    assert dropped == ["node_modules/з.js"]

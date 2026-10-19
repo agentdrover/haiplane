@@ -244,16 +244,20 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
     kept: list[str] = []
     dropped: list[str] = []
     skipping = False
+    # Only a git diff has hunks that can be told from headers. A plain unified
+    # diff (no "diff --git" line) reads as before: every "+++ " is a header.
+    is_git = any(ln.startswith("diff --git ") for ln in diff.splitlines())
     in_header = True
     for line in diff.splitlines(keepends=True):
         # A hunk body is not a header: an added "++ x" reads as "+++ x" there
         # and would switch off the rest of a live file (#1856).
         if line.startswith("diff --git "):
             in_header = True
-        elif in_header and line.startswith("@@"):
+        elif is_git and in_header and line.startswith("@@"):
             in_header = False
         if in_header and line.startswith("+++ "):
-            raw = line[4:].strip()
+            # git C-quotes non-ASCII names: "b/docs/\320\267.md".
+            raw = _unquote_path(line[4:]) or line[4:].strip()
             path = raw[2:] if raw.startswith("b/") else raw
             skipping = path != "/dev/null" and drop(path)
             if skipping:
