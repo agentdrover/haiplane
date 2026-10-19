@@ -310,6 +310,11 @@ def _verdict_blocker(task: dict[str, Any]) -> Blocker | None:
         return Blocker(
             REWORK, "high", "Действует вердикт «на доработку»", why, CODE_VERDICT
         )
+    if verdict != "approved":
+        # Белый список: неизвестное значение вердикта — «не доказано».
+        return Blocker(
+            CHECK, "high", f"Неизвестный вердикт «{verdict}»", why, CODE_VERDICT
+        )
     if open_in_scope:
         return Blocker(
             CHECK,

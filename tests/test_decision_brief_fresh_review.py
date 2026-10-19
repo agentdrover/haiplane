@@ -128,3 +128,60 @@ async def test_state_task_keeps_the_rework_level_of_a_standing_verdict(
     await db.commit()
     got = await _build(db, task_id)
     assert got["recommend"]["action"] == "На доработку"
+
+
+async def test_tip_check_shows_the_age_of_the_observation(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Свежесть доказательства видна читателю (свежий взгляд, раунд 7)."""
+    task_id, _ = await _task(client, db, monkeypatch, "fr-age", 1)
+    got = await _build(db, task_id)
+    check = next(c for c in got["checks"] if c["name"] == "Ветка = сдача")
+    assert check["state"] == "ok"
+    assert "мин назад" in check["detail"]
+
+
+async def test_unknown_delivery_is_not_called_a_merge_in_the_text(
+    db: aiosqlite.Connection,
+):
+    got = await _build(
+        db,
+        await _completed(db),
+        {"delivery": {"state": "unknown", "reason": "хаб не мержил эту задачу"}},
+    )
+    assert "влит" not in got["happened"].lower()
+    assert "хаб не мержил эту задачу" in " ".join(got["recommend"]["why"])
+
+
+async def test_an_unknown_verdict_value_blocks_accept(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    task_id, _ = await _task(client, db, monkeypatch, "fr-weird-verdict", 1)
+    task = dict(await repo.get_task(db, task_id) or {})
+    await db.execute(
+        "UPDATE tasks SET review_verdict='странный', review_verdict_generation=?, "
+        "review_findings='[]' WHERE id=?",
+        (task["submission_generation"], task_id),
+    )
+    await db.commit()
+    assert await _action(db, task_id) != ACCEPT
+
+
+async def test_steward_low_confidence_is_an_escalation_not_a_firm_verdict(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    task_id, _ = await _task(client, db, monkeypatch, "fr-low-conf", 1)
+    task = dict(await repo.get_task(db, task_id) or {})
+    await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=int(task["submission_generation"]),
+        kind="verdict",
+        submitted_verdict="changes_requested",
+        verdict="changes_requested",
+        confidence="low",
+        grounds=json.dumps([{"source": "x", "detail": ""}]),
+    )
+    await db.commit()
+    got = await _build(db, task_id)
+    assert got["recommend"]["action"] == "Решить вам"

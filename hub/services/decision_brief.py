@@ -155,7 +155,9 @@ def _accept(proof: AcceptProof, why: list[str]) -> dict[str, Any]:
 def _from_steward(
     judged: Any, proof: AcceptProof | None, route: Any
 ) -> dict[str, Any] | None:
-    mapped = _STEWARD_ACTIONS.get(str(judged["verdict"]))
+    # Низкая уверенность стюарда по контракту (#1022) — эскалация, а не вердикт.
+    word = "escalate" if str(judged["confidence"]) == "low" else str(judged["verdict"])
+    mapped = _STEWARD_ACTIONS.get(word)
     if mapped is None:
         return None
     action, verdict = mapped
@@ -210,12 +212,22 @@ async def _review_brief(
         "Нужен ваш вердикт.",
         recommend,
         risks=risks,
-        checks=_review_checks(blockers, views),
+        checks=_review_checks(blockers, views, _tip_age_text(task)),
     )
 
 
+def _tip_age_text(task: dict[str, Any]) -> str:
+    """Возраст наблюдения вершины: «совпало» держится на нём, читатель его видит."""
+    from hub.services.lifecycle import observed_tip_age_minutes
+
+    age = observed_tip_age_minutes(int(task["id"]), str(task.get("branch") or ""))
+    if age is None:
+        return "вершина ветки равна сданному коммиту"
+    return f"вершина ветки равна сданному коммиту (наблюдение {age} мин назад)"
+
+
 def _review_checks(
-    blockers: list[Blocker], views: list[MachineReviewView]
+    blockers: list[Blocker], views: list[MachineReviewView], tip_ok_text: str
 ) -> list[dict[str, str]]:
     def row(name: str, code: str, ok_text: str) -> dict[str, str]:
         found = [b for b in blockers if b.code == code]
@@ -230,7 +242,7 @@ def _review_checks(
         row("CI", CODE_CI, "зелёный"),
         row("Целостность CI", CODE_INTEGRITY, "входы CI не менялись"),
         report,
-        row("Ветка = сдача", CODE_SHA, "вершина ветки равна сданному коммиту"),
+        row("Ветка = сдача", CODE_SHA, tip_ok_text),
         row("Вердикт", CODE_VERDICT, "действующего «на доработку» нет"),
     ]
 
@@ -367,8 +379,14 @@ async def _completed_brief(
             _recommend(DELIVERED, "", [str(delivery.get("reason") or "в проде")]),
         )
     reason = str(delivery.get("reason") or "выкат не подтверждён")
+    # «Неизвестно» не выдаётся за факт: про мерж говорим только при not_in_prod.
+    happened = (
+        "Работа влита, но запуск в проде не подтверждён."
+        if delivery.get("state") == "not_in_prod"
+        else "Запуск в проде не подтверждён; факт мержа не установлен."
+    )
     return _brief(
-        "Запуск в проде не подтверждён.",
+        happened,
         "Стоит убедиться, что выкат состоялся.",
         _recommend(MERGED_NOT_SHIPPED, "", [reason]),
         risks=[_risk("medium", "Выкат не подтверждён", reason)],
