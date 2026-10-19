@@ -1306,7 +1306,7 @@ async def test_review_verdict_api_rejects_all_out_of_scope_findings(
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail["reason"] == "changes_requested_requires_in_scope_finding"
-    assert "approved" in detail["hint"]
+    assert "APPROVED" in detail["hint"]
 
 
 async def test_review_verdict_api_approved_returns_to_running_current(
@@ -1712,15 +1712,27 @@ async def test_self_review_blocked_by_principal_despite_name_mismatch(
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "self_review_forbidden"
 
-    # AC-3: a different principal passes.
+    # AC-3: a different principal passes the independence gate. Its APPROVED
+    # is the human's (#1872); its CHANGES_REQUESTED is recorded.
     other = {"Authorization": "Bearer other-pid-token"}
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
         json={"verdict": "approved", "agent": "reviewer-y"},
         headers=other,
     )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "approval_reserved_for_human"
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer-y",
+            "comments": "fix the lock",
+        },
+        headers=other,
+    )
     assert resp.status_code == 200
-    assert resp.json()["review_approved_current"] is True
+    assert resp.json()["review_verdict"] == "changes_requested"
 
 
 async def test_claim_records_and_release_clears_implementer_principal(
@@ -1800,12 +1812,16 @@ async def test_provisioned_reviewer_identity_verdict_passes_gate(
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
-        json={"verdict": "approved", "agent": "cursor-reviewer"},
+        json={
+            "verdict": "changes_requested",
+            "agent": "cursor-reviewer",
+            "comments": "fix the lock",
+        },
         headers=reviewer,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["review_approved_current"] is True
+    assert body["review_verdict"] == "changes_requested"
     assert body["status"] == "running"
 
 
@@ -3412,7 +3428,11 @@ async def test_review_verdict_update_records_the_reviewer_principal(
 
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
-        json={"verdict": "approved", "agent": "any-display-name"},
+        json={
+            "verdict": "changes_requested",
+            "agent": "any-display-name",
+            "comments": "fix the lock",
+        },
         headers=reviewer,
     )
     assert resp.status_code == 200, resp.text
@@ -4256,6 +4276,24 @@ async def test_refusal_names_the_version_mismatch(client: AsyncClient, monkeypat
 # ---------------------------------------------------------------------------
 
 
+def _gate_agent(monkeypatch) -> dict:
+    """Агент с ``tasks.human_gate``: по #1872 он человек, замок #743 его всё ещё видит."""
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            **config.HUB_TOKENS,
+            "gate-token": TokenIdentity(
+                "gatebot", "agent", permissions=frozenset({"tasks.human_gate"})
+            ),
+        },
+    )
+    return {"headers": {"Authorization": "Bearer gate-token"}}
+
+
 def _lock_tokens(monkeypatch) -> tuple[dict, dict]:
     from hub import config
     from hub.config import TokenIdentity
@@ -4448,10 +4486,17 @@ async def test_agent_cannot_approve_on_default_while_the_steward_holds_the_verdi
         client, db, monkeypatch, {"verdict": "steward"}
     )
     human, agent = _lock_tokens(monkeypatch)
+    gate_agent = _gate_agent(monkeypatch)
     url = f"/api/tasks/{task_id}/review-verdict"
 
-    refused = await client.post(
+    # #1872: обычный агент отклоняется раньше замка; замок видит агента с human_gate.
+    plain = await client.post(
         url, json={"verdict": "approved", "agent": "reviewer"}, **agent
+    )
+    assert plain.status_code == 409, plain.text
+    assert plain.json()["detail"]["reason"] == "approval_reserved_for_human"
+    refused = await client.post(
+        url, json={"verdict": "approved", "agent": "reviewer"}, **gate_agent
     )
     assert refused.status_code == 409, refused.text
     detail = refused.json()["detail"]
@@ -4496,7 +4541,8 @@ async def test_agent_approval_is_unchanged_where_the_steward_does_not_hold_the_v
     other_task = await _submitted_task(
         client, db, "spike-steward-rest", {"verdict": "steward"}
     )
-    _, agent = _lock_tokens(monkeypatch)
+    _lock_tokens(monkeypatch)
+    agent = _gate_agent(monkeypatch)
     for task_id in (human_task, other_task):
         resp = await client.post(
             f"/api/tasks/{task_id}/review-verdict",
@@ -4520,7 +4566,8 @@ async def test_cli_and_mcp_review_verdict_hit_the_guarded_route(
     task_id = await _default_review_task(
         client, db, monkeypatch, {"verdict": "steward"}
     )
-    _, agent = _lock_tokens(monkeypatch)
+    _lock_tokens(monkeypatch)
+    agent = _gate_agent(monkeypatch)
 
     calls: list[tuple] = []
     with patch.object(cli, "_api", side_effect=lambda *a, **k: calls.append(a) or {}):
@@ -4603,7 +4650,15 @@ async def test_web_review_form_with_an_agent_identity_is_guarded_too(
     task_id = await _default_review_task(
         client, db, monkeypatch, {"verdict": "steward"}
     )
-    human, agent = _lock_tokens(monkeypatch)
+    human, plain_agent = _lock_tokens(monkeypatch)
+    agent = _gate_agent(monkeypatch)
+    plain = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved"},
+        follow_redirects=False,
+        **plain_agent,
+    )
+    assert plain.status_code == 303, plain.text  # #1872: текст причины, не запись
     resp = await client.post(
         f"/tasks/{task_id}/web-review-verdict",
         data={"verdict": "approved"},

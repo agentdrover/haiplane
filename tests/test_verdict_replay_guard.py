@@ -126,7 +126,10 @@ async def test_other_verdict_on_same_generation_is_refused(
             f"/api/tasks/{task_id}/review-verdict", json=body, headers=headers
         )
         assert resp.status_code == 409, (label, resp.text)
-        assert "supersedes_revision=1" in resp.text, (label, resp.text)
+        if label == "agent":  # #1872: the agent is stopped before the standing gate
+            assert "approval_reserved_for_human" in resp.text, (label, resp.text)
+        else:
+            assert "supersedes_revision=1" in resp.text, (label, resp.text)
         assert await _snapshot(db, task_id) == before, label
 
 
@@ -552,17 +555,17 @@ def test_review_commands_name_the_generation() -> None:
     text = plugin.build_review_message(
         task_id=42, title="t", description="d", review_cycle=0, max_cycles=3
     )
-    for kind in ("approved", "changes_requested"):
-        assert (
-            f"review-verdict 42 {kind} --agent code-reviewer --expected-generation "
-            in text
-        ), kind
+    # #1872: the order asks an agent for CHANGES_REQUESTED only.
+    assert (
+        "review-verdict 42 changes_requested --agent code-reviewer "
+        "--expected-generation " in text
+    )
     assert "review-brief 42" in text, "an order without the number says where to get it"
     pinned = plugin.build_review_message(
         task_id=42, title="t", description="d", review_cycle=0, max_cycles=3,
         generation=7,
     )  # fmt: skip
-    assert pinned.count("--expected-generation 7 ") == 2, "the order carries the number"
+    assert pinned.count("--expected-generation 7 ") == 1, "the order carries the number"
     reviewer = open("agents/code-reviewer.md", encoding="utf-8").read()
     assert "--expected-generation" in reviewer and "supersedes_revision" in reviewer
 

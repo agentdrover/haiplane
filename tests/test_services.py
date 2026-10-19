@@ -2808,7 +2808,7 @@ async def test_changes_requested_all_out_of_scope_findings_rejected(
     assert exc_info.value.status_code == 422
     detail = exc_info.value.detail
     assert detail["reason"] == "changes_requested_requires_in_scope_finding"
-    assert "approved" in detail["hint"]
+    assert "APPROVED" in detail["hint"]
 
     # The rejected verdict must not have been recorded.
     task = dict(await repo.get_task(db, task_id))

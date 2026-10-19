@@ -211,9 +211,11 @@ def workflow_reference_dict() -> dict[str, Any]:
             "review": {
                 "status": "review",
                 "tool": "hub_submit_review",
-                "actor": "agent",
+                "actor": "human",
                 "rule": "no completed without current APPROVED review "
-                "(auto_review=false is the explicit opt-out)",
+                "(auto_review=false is the explicit opt-out); APPROVED is "
+                "written by a human or the hub policy, an agent reviewer files "
+                "a report or changes_requested",
             },
             "machine_review": {
                 "status": "review",
@@ -276,8 +278,9 @@ def lifecycle_map_lines() -> list[str]:
         ),
         (
             "Reviewer lane, NOT the assigned agent: hub_get_review_brief → "
-            "hub_submit_review. A verdict from the task's own implementer is "
-            "refused."
+            "a report (hub_submit_machine_review) or changes_requested via "
+            "hub_submit_review. APPROVED is a human's or the hub policy's; a verdict from the "
+            "task's own implementer is refused."
         ),
         (
             "State tasks (result_kind=state, #1647): no branch, PR or CI. Submit "
@@ -319,8 +322,9 @@ def mcp_workflow_instruction_section() -> str:
         " Lifecycle map — hierarchy, gates and the full transition list: "
         "hub_my_context(mode=full), section 'Workflow reference'. "
         "Review is two actors: the author submits (hub_submit_for_review or "
-        "hub_report_done) and waits; a DIFFERENT agent runs "
-        "hub_get_review_brief and hub_submit_review."
+        "hub_report_done) and waits; a DIFFERENT agent reads "
+        "hub_get_review_brief and files a report or changes_requested; "
+        "APPROVED is a human's or the policy's."
     )
 
 

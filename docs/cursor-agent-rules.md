@@ -26,9 +26,12 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
    blocker requires a human answer, use `hub_ask_question`.
 6. Pass the Universal Review Gate before completion: submit work with
    `hub_submit_for_review`, have a reviewer (another agent session or a
-   human — never yourself) run `hub_get_review_brief` and
-   `hub_submit_review`, fix `changes_requested` findings by number and
-   resubmit. Only after an APPROVED verdict finish with `hub_report_done`
+   human — never yourself) run `hub_get_review_brief`. An agent reviewer
+   submits a review report or `changes_requested` (`hub_submit_review`); an
+   agent's APPROVED is refused (409 `approval_reserved_for_human`, #1872) —
+   APPROVED comes from a human or the hub's automation. Fix
+   `changes_requested` findings by number and resubmit. Only after an
+   APPROVED verdict finish with `hub_report_done`
    (changed files, behavior change, validation commands with results).
    A done report without a current APPROVED review does not complete the
    task — the server routes it to `review`.
