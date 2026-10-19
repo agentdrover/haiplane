@@ -69,7 +69,8 @@
     "models": {
       "modules": [
         "hub.models",
-        "hub.plain_summary"
+        "hub.plain_summary",
+        "hub.cause_task_view"
       ],
       "trees": []
     },
