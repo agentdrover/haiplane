@@ -141,7 +141,9 @@ async def test_resubmit_without_outcomes_names_open_uids(
     # Тот же список — в записи ленты.
     updates = await repo.get_task_updates(db, task_id)
     alerts = [dict(u)["content"] for u in updates if dict(u)["kind"] == "alert"]
-    assert any(all(uid in text for uid in uids) for text in alerts)
+    assert any(
+        all(uid in text for uid in uids) and hint["text"] in text for text in alerts
+    )
 
     # MCP-ответ несёт те же UID и пример, без нового инструмента.
     with (
@@ -296,3 +298,19 @@ async def test_done_report_without_outcomes_carries_the_hint_in_warnings(
     assert resp.status_code in (200, 201), resp.text
     warnings = resp.json().get("warnings") or []
     assert any(uid in w and "finding_outcomes" in w for w in warnings)
+
+
+async def test_done_report_hint_is_silent_when_the_gate_is_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Режим off молчит и на пути отчёта о готовности."""
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "off")
+    task_id = await _first_generation_sent_back(
+        client, db, "Отчёт при off", [_finding("неотвеченная")]
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    assert not any("finding_outcomes" in w for w in (resp.json().get("warnings") or []))
