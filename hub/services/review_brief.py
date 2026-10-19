@@ -54,7 +54,13 @@ from hub.models import (
     TaskProjectRef,
     TaskStatus,
 )
-from hub.services import call_sites, ci_integrity, path_notices, review_evidence
+from hub.services import (
+    call_sites,
+    ci_contract,
+    ci_integrity,
+    path_notices,
+    review_evidence,
+)
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
@@ -430,9 +436,12 @@ async def _ci_run_report_state(db, task_id: int, task_view) -> CIRunReportState:
         else None
     )
     if stored is not None:
+        from hub.services.ci_contract import fingerprint_for_task
         from hub.services.ci_trust import trust_of
 
-        state.trust, state.trust_reason = trust_of(dict(stored))
+        state.trust, state.trust_reason = trust_of(
+            dict(stored), await fingerprint_for_task(db, task_id)
+        )
         state.provenance = stored_provenance(dict(stored))
         if state.provenance:
             state.provenance_note = PROVENANCE_NOTE
@@ -600,7 +609,11 @@ async def build_review_brief(
     )
 
     # #507: recorded pass/fail of each test-AC for the current generation.
-    ac_result_rows = await timer.run("db_reads", repo.list_ac_test_results(db, task_id))
+    ac_result_rows = await ci_contract.drop_stale_results(
+        db,
+        task_id,
+        await timer.run("db_reads", repo.list_ac_test_results(db, task_id)),
+    )
     ac_test_results = [
         ACTestResultView(**r)
         for r in current_ac_test_results(

@@ -39,7 +39,7 @@ from tests.test_finding_evidence import (
     _sha,
     _task_on_clone,
 )
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 
 
 async def _submit(
@@ -76,7 +76,7 @@ async def _report(
 
 
 async def _green_ci(db: aiosqlite.Connection, task_id: int, sha: str) -> None:
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=sha,

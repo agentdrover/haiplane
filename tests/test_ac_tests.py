@@ -24,7 +24,7 @@ from hub.services.ac_tests import (
     current_ac_test_results,
     run_ac_tests,
 )
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 
 
 async def _task_with_test_acs(db):
@@ -196,7 +196,7 @@ async def test_missing_ci_report_is_unknown_not_fail(db):
 
     # 3. CI reported ANOTHER commit. Still unknown, and the reason distinguishes
     #    "no evidence" from "evidence about different code".
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha="sha-some-other-run",

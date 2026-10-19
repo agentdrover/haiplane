@@ -729,8 +729,9 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict] | None:
-        return None
+        return None  # не поддерживается: без форджа прогонов CI не видно
 
     async def ci_run_artifacts(
         self,
@@ -1039,9 +1040,14 @@ class NoopForge:
         return None
 
     async def ci_runs_for_sha(
-        self, head_sha: str, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None:
-        return None
+        return None  # не поддерживается: без форджа прогонов CI не видно
 
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None

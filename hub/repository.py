@@ -2478,7 +2478,7 @@ async def upsert_ci_report_attempt(
         "provenance=excluded.provenance, submitted=excluded.submitted, "
         "body_version=ci_report_attempts.body_version + 1, "
         "trust='unverified', trust_reason='pending', trust_final=0, "
-        "checked_at=NULL, reported_at=datetime('now')",
+        "contract_fp='', checked_at=NULL, reported_at=datetime('now')",
         (
             task_id,
             head_sha,

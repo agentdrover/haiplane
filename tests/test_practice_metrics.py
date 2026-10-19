@@ -27,7 +27,7 @@ from hub.models import StewardGround, StewardJudgementSubmit, TaskDecide
 from hub.services.steward_judgement import record_steward_judgement
 from hub.db import _MIGRATIONS, _SCHEMA, _migrate  # noqa: F401
 from hub.services.orchestration import practice_metrics
-from tests.ci_trust_support import VERIFIED_ROW
+from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 
 
 def _ts(hours_ago: float) -> str:
@@ -2354,7 +2354,7 @@ async def _pin(db: aiosqlite.Connection, task_id: int, sha: str, ci: str | None)
         db, task_id=task_id, generation=1, sha=sha, base_branch="develop"
     )
     if ci is not None:
-        await repo.upsert_ci_run_report(
+        await upsert_hub_report(
             db,
             task_id=task_id,
             head_sha=sha,

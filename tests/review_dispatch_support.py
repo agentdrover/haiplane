@@ -14,6 +14,7 @@ from pathlib import Path
 import aiosqlite
 from httpx import AsyncClient
 
+from tests.ci_trust_support import upsert_hub_report
 from hub import auth as hub_auth
 from hub import config, services
 from hub import repository as repo
@@ -228,7 +229,7 @@ async def _ci_report(
     validation_status: str = "pass",
     checks: dict[str, str] | None = None,
 ) -> None:
-    await repo.upsert_ci_run_report(
+    await upsert_hub_report(
         db,
         task_id=task_id,
         head_sha=head_sha,

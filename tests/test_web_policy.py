@@ -874,6 +874,10 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
             "note": "до MS-A2",
         },
         "steward_watch": ["needs_decision", "release"],
+        "ci_contract": {
+            "workflow_path": ".github/workflows/tests.yml",
+            "required_checks": ["tests"],
+        },
         "release_artifacts": [
             {
                 "repo_path": "deploy/x.sh",
