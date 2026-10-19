@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
+from hub import cli_owner_minutes as om_cli
 from hub.cli_executor_host import add_executor_host_parsers
 from hub.cli_task_fields import (
     _add_result_kind_args,
@@ -1114,7 +1115,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}")
     _print_json(result)
     _print_verdict_route(result)
+    om_cli.print_line(result)
     return 0
+
+
+cmd_owner_minutes_day = om_cli.cmd_owner_minutes_day
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -3280,6 +3285,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_executor_stop_parser(sub)
     add_executor_host_parsers(sub)
+    om_cli.add_parsers(sub)
 
     p_slots = sub.add_parser(
         "slots", help="Executor channels and slots: which task, since when (#1434)"

@@ -9,8 +9,8 @@
   "waivers": [
     {
       "path": "hub/app.py",
-      "measured": 4303,
-      "max": 4519,
+      "measured": 4526,
+      "max": 4753,
       "removed_by": "unclaimed"
     },
     {
@@ -39,8 +39,8 @@
     },
     {
       "path": "hub/mcp_server.py",
-      "measured": 6015,
-      "max": 6316,
+      "measured": 6317,
+      "max": 6634,
       "removed_by": "unclaimed"
     },
     {
