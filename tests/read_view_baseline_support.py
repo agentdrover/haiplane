@@ -4,15 +4,18 @@
 и hub_project_status не меняет ответов. Здесь снимаются сами ответы на
 фиксированных входах: REST — статус, заголовки, тело; HTML карточки — статус,
 cookie, разметка; MCP — текст и structuredContent. Эталон лежит в
-``tests/golden/read_views_1691.json`` и снят на коде ДО правки.
+``tests/golden/read_views/<поверхность>.json`` (по файлу на поверхность, #1910)
+и снят на коде ДО правки. Поверхность — префикс имени сценария: ``mcp_prepare``,
+``mcp_status``, ``rest``, ``web``. Задача, меняющая одну поверхность, правит
+только её файл; новая поверхность добавляется в ``SURFACES``.
 
 Фиксируется всё, что порождает тест: токен CSRF, время, git и доставка.
 Единственная нормализация — метки времени (ISO) и ``prepared_at``: часы базы и
 MCP идут по настоящему времени, а сами ответы от него зависят только значением.
 
 Обновить эталон намеренно: ``HUB_UPDATE_READ_VIEW_BASELINE=1 uv run pytest
-tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline``.
-Менять его ради зелёного теста нельзя — тест и есть защита от изменения ответов.
+tests/test_api_context.py::test_context_and_views_match_the_pre_refactor_baseline``;
+пересборка пишет только файлы, чьё содержимое изменилось. Менять его ради зелёного теста нельзя — тест и есть защита от изменения ответов.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -32,6 +36,68 @@ _TS = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?"
 )
 _ID_FIXED_CSRF = "csrf-fixed-1691"
+
+BASELINE_DIR = Path(__file__).parent / "golden" / "read_views"
+# Порядок важен: более длинный префикс раньше короткого.
+SURFACES = ("mcp_prepare", "mcp_status", "rest", "web")
+
+
+def surface_of(name: str) -> str:
+    for surface in SURFACES:
+        if name == surface or name.startswith(surface + "_"):
+            return surface
+    raise AssertionError(f"сценарий {name} не относится ни к одной поверхности")
+
+
+def _render(part: dict[str, Any]) -> str:
+    return json.dumps(part, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    dup = sorted({k for k in keys if keys.count(k) > 1})
+    assert not dup, f"ключ повторён в одном файле: {dup}"
+    return dict(pairs)
+
+
+def load_baselines(directory: Path = BASELINE_DIR) -> dict[str, Any]:
+    """Объединение файлов эталона. Дубль ключа или ключ не в своём файле — ошибка.
+
+    Имя файла — поверхность, поэтому один ключ в двух файлах невозможен; дубль
+    бывает только внутри файла, и ``json.loads`` без хука молча берёт последний.
+    """
+    merged: dict[str, Any] = {}
+    for path in sorted(directory.glob("*.json")):
+        part = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys
+        )
+        for name, value in part.items():
+            assert surface_of(name) == path.stem, f"{name} лежит не в {path.name}"
+            merged[name] = value
+    return merged
+
+
+def write_baselines(got: dict[str, Any], directory: Path = BASELINE_DIR) -> list[str]:
+    """Пересобрать эталон; пишутся только файлы, чьё содержимое изменилось.
+
+    Файл поверхности, у которой не осталось сценариев, удаляется.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    parts: dict[str, dict[str, Any]] = {}
+    for name, value in got.items():
+        parts.setdefault(surface_of(name), {})[name] = value
+    written: list[str] = []
+    for surface, part in parts.items():
+        path = directory / f"{surface}.json"
+        text = _render(part)
+        if not path.exists() or path.read_text(encoding="utf-8") != text:
+            path.write_text(text, encoding="utf-8")
+            written.append(path.name)
+    for path in directory.glob("*.json"):
+        if path.stem not in parts:
+            path.unlink()
+            written.append(path.name)
+    return sorted(written)
 
 
 def norm(text: str) -> str:
