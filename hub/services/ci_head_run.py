@@ -375,7 +375,9 @@ async def announce_results(
     """Вторая половина прохода: подтверждённые итоги - в ленту, по разу на попытку."""
     before: int | None = None
     for _page in range(journal.ANNOUNCE_PAGES):
-        rows = await journal.unannounced_verified(db, before_id=before)
+        rows = await journal.unannounced_verified(
+            db, limit=journal.ANNOUNCE_PAGE, before_id=before
+        )
         if not rows:
             return
         heads = await _current_heads(db, rows, known_heads or {})
