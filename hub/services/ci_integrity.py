@@ -120,6 +120,7 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         "scripts/red_test_baseline.py",
         "scripts/complexity_budget.py",
         "scripts/file_size_budget.py",
+        "scripts/layer_rules.py",
         "scripts/mcp_catalog_budget.py",
         "scripts/secret_scan.py",
         "scripts/surface_parity.py",
@@ -129,6 +130,10 @@ CI_SCRIPTS: frozenset[str] = frozenset(
     }
 )
 
+#: The layer table, its forbidden directions and the ledger of today's exceptions
+#: (#1852): editing it moves the line the layer check enforces, so it is a CI input.
+LAYER_RULES_CONFIG = "docs/agent-context/layer-rules.json"
+
 PYTEST_CONFIG_FILES: frozenset[str] = frozenset(
     {"pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg"}
 )
@@ -136,6 +141,7 @@ PYTEST_CONFIG_FILES: frozenset[str] = frozenset(
 RULE_WORKFLOW = "ci_workflow"
 RULE_SCRIPT = "ci_script"
 RULE_MAKEFILE = "ci_makefile"
+RULE_LAYER_RULES = "layer_rules_config"
 RULE_CONFTEST = "conftest"
 RULE_PYTEST_CONFIG = "pytest_config"
 RULE_LOCKFILE = "lockfile"
@@ -152,6 +158,7 @@ RULE_TEXT: dict[str, str] = {
     RULE_WORKFLOW: "входы CI (.github)",
     RULE_SCRIPT: "скрипт, который вызывает CI",
     RULE_MAKEFILE: "Makefile (цели проверок)",
+    RULE_LAYER_RULES: "правила слоёв (layer-rules.json)",
     RULE_CONFTEST: "conftest.py",
     RULE_PYTEST_CONFIG: "настройка pytest",
     RULE_LOCKFILE: "uv.lock",
@@ -373,6 +380,8 @@ def _path_rule(path: str) -> str | None:
         return RULE_SCRIPT
     if path == "Makefile":
         return RULE_MAKEFILE
+    if path == LAYER_RULES_CONFIG:
+        return RULE_LAYER_RULES
     if base == "conftest.py":
         return RULE_CONFTEST
     if base in PYTEST_CONFIG_FILES:  # at ANY depth, like conftest.py
