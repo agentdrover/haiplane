@@ -190,12 +190,49 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
     return None
 
 
+# #1883: a leading ``NAME=VALUE `` environment assignment. Parsed on the RAW
+# line, not on shlex tokens: shlex would strip the quotes of ``'A=1' cmd`` and
+# accept a word the shell takes for a command name. VALUE is a run of plain
+# characters or one-line '...' / "..." groups; a backslash, a backtick, shell
+# operators and an unclosed quote are not supported, so such a line stays "not a
+# command" exactly as before.
+_ENV_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_ENV_VALUE = r"""(?:[^\s'"\\;&|<>()`]|'[^']*'|"[^"\\`]*")*"""
+_ENV_ASSIGNMENT = re.compile(rf"^{_ENV_NAME}=")
+_ENV_PREFIX = re.compile(rf"^(?:{_ENV_NAME}={_ENV_VALUE}[ \t]+)+")
+
+
+def has_env_assignment(entry: str) -> bool:
+    """True when the line starts with ``NAME=`` (a form that was never a command)."""
+    return _ENV_ASSIGNMENT.match(entry.strip()) is not None
+
+
+def _command_head(entry: str) -> str | None:
+    """The line whose first token names the executable, or None.
+
+    Without an environment prefix that is the entry itself (as before). With
+    one it is the REST after ``(NAME=VALUE )+``; a prefix on several lines or
+    without a REST gives None.
+    """
+    if not has_env_assignment(entry):
+        return entry
+    if "\n" in entry or "\r" in entry:
+        return None
+    match = _ENV_PREFIX.match(entry)
+    if match is None:
+        return None
+    return entry[match.end() :].strip() or None
+
+
 def is_command(entry: str) -> bool:
     """True when ``entry`` looks like something a shell can execute."""
     entry = entry.strip()
     if not entry:
         return False
-    first = entry.split()[0]
+    head = _command_head(entry)
+    if head is None:
+        return False
+    first = head.split()[0]
     if not COMMAND_TOKEN.match(first):
         return False
     return shutil.which(first) is not None
@@ -498,6 +535,10 @@ def already_proven(command: str, ran: dict[str, str]) -> tuple[str, str] | None:
     command = command.strip()
     if command in ran:
         return ran[command], command
+    if has_env_assignment(command):
+        # #1883: only the exact line proves it. shlex drops the quoting that
+        # makes ``A='$HOME'`` and ``A="$HOME"`` different values.
+        return None
     key = _selection_key(command)
     if key is None:
         return None

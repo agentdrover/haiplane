@@ -133,6 +133,137 @@ def test_only_resolvable_executables_count_as_commands(script):
     assert script.is_command("&& echo hi") is False
 
 
+def _only_executable_t(monkeypatch, script, names=("T", "ruff", "uv")):
+    """Resolve only ``names`` as executables, whatever the real PATH holds."""
+    monkeypatch.setattr(
+        script.shutil, "which", lambda n: f"/bin/{n}" if n in names else None
+    )
+
+
+def test_env_prefixed_commands_count_as_commands(script, monkeypatch):
+    """#1883 AC-1: ``(NAME=VALUE )+ REST`` is a command, judged on the raw line."""
+    _only_executable_t(monkeypatch, script)
+    for line in (
+        "A=1 T",
+        "A=1 B=2 T",
+        "A=\"x y\" B='p q' T",
+        "A=$HOME T",
+        "  A=1   T -x  ",
+        "A= T",
+    ):
+        assert script.is_command(line) is True, line
+    for line in (
+        "A=1",
+        "A=1 B=2",
+        "'A=1' T",
+        '"A=1" T',
+        "A=1; T",
+        "A=1 && T",
+        "A=1 | T",
+        "A=1\nT",
+        "A=1 T\nT",
+        "1A=2 T",
+        "A=1 nosuch",
+        "A=a\\ b T",
+        'A="x T',
+        "A='x T",
+        "A=`x` T",
+        "A=$(x y) T",
+        "A=1 ;T",
+        "A=1 &T",
+    ):
+        assert script.is_command(line) is False, line
+    # Lines without a prefix are judged exactly as before.
+    assert script.is_command("T -x") is True
+    assert script.is_command("nosuch -x") is False
+
+
+def _count_runs(script, monkeypatch):
+    real = script.subprocess.run
+    calls: list = []
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(script.subprocess, "run", counting)
+    return calls
+
+
+def test_env_prefixed_command_runs_with_its_environment(script, monkeypatch):
+    """#1883 AC-2: the prefix reaches the child, runs once, and keeps the verdicts."""
+    import shlex
+    import sys
+
+    code = "import os,sys; sys.exit(0 if os.environ['A']=='1' else 1)"
+    tail = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    calls = _count_runs(script, monkeypatch)
+
+    status, _log, reason = script.run_validation([f"A=1 {tail}"])
+    assert (status, reason) == ("pass", "")
+    assert len(calls) == 1, "exactly one subprocess call for the prefixed command"
+
+    status, _log, reason = script.run_validation([f"A=2 {tail}"])
+    assert status == "fail"
+    assert "команда упала" in reason
+
+    # Only an assignment and prose: nothing is executable, unknown as before.
+    before = len(calls)
+    status, _log, reason = script.run_validation(["A=1", "Проверь руками на живом PR"])
+    assert status == "unknown"
+    assert "не являются командами (2)" in reason
+    assert len(calls) == before
+
+    # A spent deadline names the prefixed command among those not run.
+    _only_executable_t(monkeypatch, script)
+    monkeypatch.setattr(
+        script, "_STARTED", script.time.monotonic() - script._REPORT_DEADLINE - 1
+    )
+    status, log_tail, reason = script.run_validation(["A=1 ruff --version"])
+    assert status == "unknown"
+    assert "deadline" in reason
+    assert "'A=1 ruff --version'" in reason
+    assert "не выполнена" in log_tail
+    assert len(calls) == before
+
+
+def test_env_prefixed_reuse_needs_the_exact_line(script, monkeypatch):
+    """#1883 AC-3: shlex drops quoting, so a prefixed line is reused only verbatim."""
+    ran = {'A="$HOME" uv run pytest -q -n auto': "pass"}
+    asked = "A='$HOME' uv run pytest -q"
+    assert script.already_proven(asked, ran) is None, (
+        "'$HOME' and \"$HOME\" are different values for the shell"
+    )
+
+    _only_executable_t(monkeypatch, script)
+    executed: list = []
+
+    class Done:
+        returncode = 0
+        stdout = stderr = ""
+
+    monkeypatch.setattr(
+        script.subprocess, "run", lambda cmd, **kw: executed.append(cmd) or Done()
+    )
+    status, _log, reason = script.run_validation([asked], ran)
+    assert (status, reason) == ("pass", "")
+    assert executed == [asked], "the different line must be executed, not reused"
+
+    exact = 'A="$HOME" uv run pytest -q -n auto'
+    assert script.already_proven(f"  {exact}  ", ran) == ("pass", exact)
+    executed.clear()
+    assert script.run_validation([exact], ran)[0] == "pass"
+    assert executed == [], "the exact line is reused"
+
+    # A prefixed request is not proven by an unprefixed run, and vice versa;
+    # lines without a prefix keep the selection-equivalence reuse.
+    assert script.already_proven(asked, {"uv run pytest -q -n auto": "pass"}) is None
+    assert script.already_proven("uv run pytest -q", ran) is None
+    assert script.already_proven(
+        "uv run pytest -q", {"uv run pytest -q -n auto": "pass"}
+    ) == ("pass", "uv run pytest -q -n auto")
+
+
 def test_task_id_comes_from_the_branch_and_missing_is_not_an_error(script, monkeypatch):
     monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/ac-validation-commands-ci")
     assert script.task_id_from_branch() == 546
