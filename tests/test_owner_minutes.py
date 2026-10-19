@@ -829,6 +829,25 @@ async def test_accrual_pass_is_idempotent_and_restartable(
     now = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
     assert now["cursor_event_id"] == cursor_before
 
+    # Успешный пас внутри чужой транзакции: если владелец её откатит, начисления
+    # и курсор откатываются ВМЕСТЕ (никаких начислений без курсора и наоборот).
+    await db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) "
+        "VALUES ('foreign', ?, 'hub', '{}')",
+        (task_id,),
+    )
+    assert db.in_transaction
+    await _pass(db)
+    assert [r["source_event_id"] for r in await _accruals(db)] == [
+        first,
+        second,
+        third,
+    ]
+    await db.rollback()
+    assert [r["source_event_id"] for r in await _accruals(db)] == [first, second]
+    now = (await _rows(db, "SELECT cursor_event_id FROM owner_minutes_state"))[0]
+    assert now["cursor_event_id"] == cursor_before
+
     # Падение паса, затем очистка events, затем восстановление: непрочитанный
     # хвост старше 14 дней пережил очистку и начислен позже.
     await db.execute(
@@ -962,6 +981,12 @@ async def test_sums_by_task_and_local_day(world, db, monkeypatch):
     assert d19["timezone"] == "Europe/Moscow"
     assert d19["status"] == "ok" and d19["caught_up"] is True
     assert d19["tracking_since"] and d19["processed_through_event_id"] > 0
+    for edge in ("0001-01-01", "9999-12-31", "2026-13-40"):
+        bad = await client.get(
+            f"/api/owner-minutes/day?date={edge}&principal_id={world.owner_id}",
+            headers=world.human,
+        )
+        assert bad.status_code == 422, (edge, bad.text)
     nobody = await day("2026-10-20", world.owner_id)
     assert nobody["total_seconds"] is None and nobody["status"] == "no_data"
 

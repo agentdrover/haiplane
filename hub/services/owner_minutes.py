@@ -196,6 +196,10 @@ async def _atomic(db: aiosqlite.Connection) -> AsyncIterator[None]:
     откатывает ничего: частичный пакет без курсора коммитил бы следующий проход
     (находка Codex #1874). Поэтому в чужой транзакции пакет идёт под точкой
     сохранения: сбой откатывает ТОЛЬКО его, а чужие записи остаются владельцу.
+    Успешные пакеты при этом закоммитит владелец транзакции (в тике это ближайший
+    безусловный commit); если он откатит, откатятся вместе и начисления, и курсор -
+    следующий тик пройдёт те же события без дублей. Лок записи в этой ветке уже
+    держит чужая транзакция, пас новых блокировок не добавляет.
     """
     if not db.in_transaction:
         async with write_transaction(db):
@@ -335,12 +339,19 @@ def _utc_text(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
+class DayOutOfRange(ValueError):
+    """Дата, чьи границы дня не представимы (0001-01-01, 9999-12-31 и подобные)."""
+
+
 def local_day_bounds(day: date) -> tuple[str, str]:
     """[начало, конец) локального дня в UTC-строках events.created_at."""
     tz = timezone()
-    start = datetime.combine(day, time.min, tzinfo=tz)
-    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
-    return _utc_text(start), _utc_text(end)
+    try:
+        start = datetime.combine(day, time.min, tzinfo=tz)
+        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
+        return _utc_text(start), _utc_text(end)
+    except OverflowError as exc:
+        raise DayOutOfRange(f"date {day} is outside the supported range") from exc
 
 
 def today_local() -> date:

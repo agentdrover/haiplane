@@ -57,4 +57,7 @@ async def api_owner_minutes_day(
         day = date_type.fromisoformat(date) if date else owner_minutes.today_local()
     except ValueError as exc:
         raise HTTPException(422, "date: ожидается YYYY-MM-DD") from exc
-    return await owner_minutes.day_estimate(_conn(request), int(who), day)
+    try:
+        return await owner_minutes.day_estimate(_conn(request), int(who), day)
+    except owner_minutes.DayOutOfRange as exc:
+        raise HTTPException(422, str(exc)) from exc
