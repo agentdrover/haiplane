@@ -45,6 +45,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "verdict_route",
     "dependencies",
     "worktree_path",
+    "owner_minutes",
     "created_at",
     "updated_at",
 )
@@ -54,6 +55,14 @@ TEXT_FINDINGS_LIMIT = 10
 
 # Lists that the default view reduces to a count.
 _COUNTED_LISTS: tuple[str, ...] = ("scope_in", "scope_out", "validation_commands")
+
+
+def owner_minutes_lines(task: dict[str, Any]) -> list[str]:
+    """#1874: the owner-minutes estimate as the hub built it (``line``), never recomputed."""
+    estimate = task.get("owner_minutes")
+    if isinstance(estimate, dict) and estimate.get("line"):
+        return [f"Owner minutes: {estimate['line']}"]
+    return []
 
 
 def excerpt(text: str, limit: int) -> tuple[str, int]:

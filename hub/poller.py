@@ -1871,6 +1871,15 @@ async def _sweep_stale_arbiter(db) -> None:
             )
 
 
+async def _sweep_owner_minutes(db) -> None:
+    # #1874: начисления минут владельца из событий гейтов. Стоит ДО очистки
+    # events: непрочитанный хвост очистка всё равно не трогает, но читать его
+    # лучше, пока он не состарился. Падение паса наружу: его изолирует тик.
+    from hub.services import owner_minutes
+
+    await owner_minutes.accrual_pass(db)
+
+
 async def _sweep_events_retention(db) -> None:
     # Events feed retention (#349): the feed is a notification
     # channel, not an archive — activity_log keeps the history.
@@ -2506,6 +2515,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),
+    Sweep("owner_minutes", _sweep_owner_minutes),
     Sweep("events_retention", _sweep_events_retention),
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),

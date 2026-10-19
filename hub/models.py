@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
+from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
 _models_log = logging.getLogger("hub")
@@ -3299,6 +3300,8 @@ class TaskView(PlainSummaryView):
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None
+    # #1874: owner-minutes estimate (accruals by norms); None on list paths.
+    owner_minutes: OwnerMinutesView | None = None
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the

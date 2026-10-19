@@ -40,7 +40,7 @@ from fastapi import HTTPException
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
-from hub.services import chat_pair, orchestrator_queue, project_policy
+from hub.services import chat_pair, orchestrator_queue, owner_minutes, project_policy
 from hub.db import fetchall, write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
@@ -549,6 +549,7 @@ async def _reserve(
     pick: Any = None,
     ceilings: tuple[int, float] | None = None,
     admit: Any = None,
+    launch: tuple[str, bool] | None = None,
 ) -> LaunchResult | tuple[dict[str, Any], int, int, str]:
     """Бронь запуска: кандидат, проверка «прогона нет», строка и код — одной
     write-транзакцией, ДО оплаченного заказа (находка ревью #1412, high).
@@ -561,6 +562,10 @@ async def _reserve(
     ``admit`` (#1783) — допуск и переход задачи В ЭТОЙ ЖЕ транзакции: зовётся
     после всех отказов и прямо перед INSERT брони, поэтому переход состоится
     только вместе с бронью, а отказ ничего не оставляет за собой.
+
+    ``launch`` (#1874) — (режим, нажал человек): событие «заказ принят» для учёта
+    минут пишется в ЭТОЙ ЖЕ транзакции (поэтому ``commit=False`` у кода). Только
+    запуск, повтор и слияние; автопродолжения хаба ``launch`` не передают.
     """
     async with write_transaction(db):
         # ``pick`` — кого бронировать: кандидат очереди (#1412) или заданная
@@ -605,7 +610,12 @@ async def _reserve(
             generation,
             issued_by_principal_id=issuer_principal_id,
             executor_run_id=row_id,
+            commit=False,
         )
+        if launch is not None:
+            await owner_minutes.record_order_accepted(
+                db, task_id, row_id, generation, issuer_principal_id, *launch
+            )
     return task, generation, row_id, code
 
 
@@ -734,6 +744,7 @@ async def launch_executor(
     issuer_principal_id: int,
     target: str = "cloud",
     task_id: int | None = None,
+    issuer_human: bool = False,
 ) -> LaunchResult:
     """Запустить исполнителя по нажатию человека: в облако или на слот хоста.
 
@@ -753,6 +764,7 @@ async def launch_executor(
             host=host,
             task_id=task_id,
             issuer_principal_id=issuer_principal_id,
+            issuer_human=issuer_human,
         )
     if task_id is not None:
         return _refused("task_id задаётся только для запуска на слот", task_id)
@@ -760,7 +772,9 @@ async def launch_executor(
     if isinstance(ready, LaunchResult):
         return ready
     model = config.EXECUTOR_MODEL.strip()
-    reserved = await _reserve(db, project, issuer_principal_id, model)
+    reserved = await _reserve(
+        db, project, issuer_principal_id, model, launch=("launch", issuer_human)
+    )
     if isinstance(reserved, LaunchResult):
         return reserved
     return await _order(db, project, reserved, ready)
@@ -973,6 +987,7 @@ async def repair_executor(
     *,
     issuer_principal_id: int,
     issuer: str,
+    issuer_human: bool = False,
 ) -> LaunchResult:
     """Повторный прогон исполнителя по находкам — по нажатию человека (#1444).
 
@@ -1039,7 +1054,13 @@ async def repair_executor(
 
     model = config.EXECUTOR_MODEL.strip()
     reserved = await _reserve(
-        db, project, issuer_principal_id, model, _this_task, admit=_admit
+        db,
+        project,
+        issuer_principal_id,
+        model,
+        _this_task,
+        admit=_admit,
+        launch=("repair", issuer_human),
     )
     if isinstance(reserved, LaunchResult):
         return reserved
@@ -1158,6 +1179,7 @@ async def merge_executor(
     *,
     issuer_principal_id: int,
     issuer: str,
+    issuer_human: bool = False,
 ) -> LaunchResult:
     """Прогон «слей базу и пересдай» — по нажатию человека (#1445, F5.3).
 
@@ -1206,7 +1228,12 @@ async def merge_executor(
 
     model = config.EXECUTOR_MODEL.strip()
     reserved = await _reserve(
-        db, project, issuer_principal_id, model, _still_in_conflict
+        db,
+        project,
+        issuer_principal_id,
+        model,
+        _still_in_conflict,
+        launch=("merge", issuer_human),
     )
     if isinstance(reserved, LaunchResult):
         return reserved
