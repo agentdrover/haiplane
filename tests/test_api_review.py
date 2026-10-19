@@ -430,11 +430,12 @@ async def test_state_approval_is_human_and_bound_to_generation(
         before = await fingerprint(db, task_id)
 
         agent_try = await verdict(task_id, "rev", "approved", expected_generation=1)
-        assert agent_try.status_code == 403, (
+        assert agent_try.status_code == 409, (
             label,
             agent_try.status_code,
             agent_try.text,
         )
+        assert agent_try.json()["detail"]["reason"] == "approval_reserved_for_human"
         for stale in ({}, {"expected_generation": 0}, {"expected_generation": 2}):
             resp = await verdict(task_id, "human", "approved", **stale)
             assert resp.status_code == 409, (label, stale, resp.status_code, resp.text)

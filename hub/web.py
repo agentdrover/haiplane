@@ -3535,7 +3535,9 @@ def _is_verdict_refusal(exc: HTTPException) -> bool:
     detail = exc.detail
     return (
         isinstance(detail, dict)
-        and str(detail.get("reason") or "").startswith(("state_", "verdict_"))
+        and str(detail.get("reason") or "").startswith(
+            ("state_", "verdict_", "approval_")
+        )
         and exc.status_code in (403, 409)
     )
 
