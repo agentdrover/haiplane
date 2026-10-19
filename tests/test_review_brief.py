@@ -2034,6 +2034,17 @@ async def test_the_brief_shows_the_causing_task(client: AsyncClient, db):
         (json.dumps(["hub/a.py", "tests/test_a.py"]), cause),
     )
     task_id = await _submitted_task(client, db, "Fix of a regression")
+    # Блок показывается только внутри одного проекта: обе задачи под одним эпиком.
+    pid = await repo.create_project(
+        db, slug="same-proj", name="same", workspace_path="/tmp/ws"
+    )
+    epic = (
+        await client.post("/api/tasks", json={"title": "e", "task_type": "epic"})
+    ).json()["id"]
+    await repo.update_task(db, epic, project_id=pid)
+    await db.execute(
+        "UPDATE tasks SET parent_id=? WHERE id IN (?, ?)", (epic, cause, task_id)
+    )
     await db.execute(
         "UPDATE tasks SET found_in='prod', cause_kind='regression', "
         "caused_by_task_id=? WHERE id=?",
@@ -2058,10 +2069,55 @@ async def test_the_brief_shows_the_causing_task(client: AsyncClient, db):
     gone = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()["cause_task"]
     assert gone["state"] == "no_data", gone
     assert "нет данных" in gone["note"], gone
-    assert gone["task_id"] == cause
+    assert gone["task_id"] is None, "удалённая причина не называется"
 
     # Не регрессия: блока нет.
     await db.execute("UPDATE tasks SET cause_kind='ops' WHERE id=?", (task_id,))
     await db.commit()
     other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert other["cause_task"] is None
+
+
+async def test_a_cause_in_another_project_is_not_disclosed(client: AsyncClient, db):
+    """#1858 (Codex P1): причина из чужого проекта = та же заглушка, что у удалённой."""
+    from tests.review_dispatch_support import _node
+
+    async def in_project(slug: str, title: str) -> int:
+        pid = await repo.create_project(
+            db, slug=slug, name=slug, workspace_path="/tmp/ws"
+        )
+        epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+        await repo.update_task(db, epic, project_id=pid)
+        task = await _node(db, title=title, task_type="task", parent_id=epic)
+        return task
+
+    secret = await in_project("proj-b", "Секретный заголовок проекта B")
+    await db.execute(
+        "UPDATE tasks SET affected_areas = ? WHERE id = ?",
+        (json.dumps(["secret/b.py"]), secret),
+    )
+    mine = await in_project("proj-a", "Fix in A")
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', cause_kind='regression', "
+        "caused_by_task_id=? WHERE id=?",
+        (secret, mine),
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{mine}/review-brief")
+    block = resp.json()["cause_task"]
+    assert block["state"] == "no_data", block
+    assert block["task_id"] is None and block["title"] == "" and block["link"] == ""
+    assert block["affected_areas"] == []
+    for leaked in ("Секретный", "secret/b.py", f"/tasks/{secret}"):
+        assert leaked not in resp.text, leaked
+
+    # Неотличимо от удалённой причины.
+    deleted = await in_project("proj-c", "to delete")
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.execute("DELETE FROM tasks WHERE id = ?", (deleted,))
+    await db.execute("UPDATE tasks SET caused_by_task_id=? WHERE id=?", (deleted, mine))
+    await db.commit()
+    gone = (await client.get(f"/api/tasks/{mine}/review-brief")).json()["cause_task"]
+    assert gone == block, (gone, block)

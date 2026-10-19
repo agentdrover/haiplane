@@ -797,12 +797,20 @@ async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
     cause_id = task_row.get("caused_by_task_id")
     if not cause_id:
         return CauseTaskView(note="нет данных: задача-причина не названа")
+    # Одна и та же заглушка для удалённой причины и причины в другом проекте:
+    # ответ не должен выдавать ни существование чужой задачи, ни её данные —
+    # читатель брифа может не иметь доступа к тому проекту.
+    unavailable = CauseTaskView(
+        note="нет данных: причина недоступна (удалена или в другом проекте) — "
+        "данные не показываются"
+    )
     cause = await repo.get_task(db, int(cause_id))
     if not cause:
-        return CauseTaskView(
-            task_id=int(cause_id),
-            note=f"нет данных: задача #{cause_id} удалена или недоступна",
-        )
+        return unavailable
+    mine = await repo.resolve_project_for_task(db, int(task_row["id"]))
+    theirs = await repo.resolve_project_for_task(db, int(cause_id))
+    if mine is None or theirs is None or mine["id"] != theirs["id"]:
+        return unavailable
     try:
         areas = [str(a) for a in json.loads(cause["affected_areas"] or "[]")]
     except (ValueError, TypeError):
