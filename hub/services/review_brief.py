@@ -469,6 +469,27 @@ async def _row_after_ci_refresh(db, task_id: int, row):
     return await repo.get_task(db, task_id) or row
 
 
+async def _brief_branch_tip(
+    db, task_id: int, branch: str, submission_sha: str, observe_only: bool, timer
+) -> tuple[str, str]:
+    """Вершина ветки для сверки со сдачей: свежий fetch или последнее наблюдение (#1810).
+
+    ``observe_only`` — путь показа карточки: сеть не трогаем. Без закреплённой
+    сдачи или ветки сверять не с чем — пустая вершина (``unknown``).
+    """
+    if not (submission_sha and branch):
+        return "", ""
+    if observe_only:
+        from hub.services.lifecycle import observed_branch_tip
+
+        return observed_branch_tip(task_id, branch)
+    from hub import services
+
+    return await timer.run(
+        "branch_tip", services.resolve_branch_tip(db, task_id, branch)
+    )
+
+
 async def build_review_brief(
     db,
     task_id: int,
@@ -587,15 +608,9 @@ async def build_review_brief(
     # itself, not as "nothing moved". Costs one fetch, and only when there is
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
-    current_tip, tip_reason = "", ""
-    if submission_sha and task_view.branch and observe_tip_only:
-        from hub.services.lifecycle import observed_branch_tip
-
-        current_tip, tip_reason = observed_branch_tip(task_id, task_view.branch)
-    elif submission_sha and task_view.branch:
-        current_tip, tip_reason = await timer.run(
-            "branch_tip", services.resolve_branch_tip(db, task_id, task_view.branch)
-        )
+    current_tip, tip_reason = await _brief_branch_tip(
+        db, task_id, task_view.branch or "", submission_sha, observe_tip_only, timer
+    )
     # #1334: the classification is one function, shared with the review
     # queue — which feeds it the tip the hub last observed instead of a fetch.
     sha_check, sha_check_reason = review_evidence.sha_check_of(
