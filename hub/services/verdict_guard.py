@@ -131,6 +131,40 @@ def _standing_refusal(st: Standing) -> HTTPException:
     )
 
 
+def ensure_approval_is_human(
+    body: TaskReviewVerdict,
+    *,
+    agent_caller: bool,
+    human_caller: bool,
+    self_approved: bool,
+) -> None:
+    """APPROVED принимает человек или внутренняя автоматика, не внешний агент (#1872).
+
+    19.10.2026 #1867 закрыта APPROVED агента при карточке «вердикт: человек»:
+    запись вердикта маршрут не читает, а принятый APPROVED удовлетворяет
+    review-гейт. Правило не зависит ни от маршрута, ни от статуса: оба флага
+    приходят из аутентифицированной личности (REST и web), а не из тела запроса.
+
+    Внутренние писатели (auto_verdict, steward_applied) ``agent_caller`` не
+    передают и сюда не попадают. Credential с ``tasks.human_gate`` считается
+    человеком. Исключение — solo mode, и только когда сервер сам вычислил
+    ``self_approved`` (ensure_reviewer_independence), а не по флагу конфигурации.
+    Отказ ничего не пишет: проверка стоит до чтения вердикта и до записи.
+    """
+    if body.verdict.value != "approved":
+        return
+    if not agent_caller or human_caller or self_approved:
+        return
+    raise _refusal(
+        409,
+        "approval_reserved_for_human",
+        "APPROVED принимает только человек или автоматика хаба по политике "
+        "проекта; внешний агент approved не записывает. Ничего не записано.",
+        "вердикт за человеком: сдайте отчёт ревью (hub_submit_machine_review) "
+        "или CHANGES_REQUESTED; одобрит владелец.",
+    )
+
+
 async def decide(
     db: Any,
     task: dict[str, Any],

@@ -100,8 +100,8 @@ def compute_next_action(
         return "Propose the work with hub_propose_task and let a human approve it."
     if reason == "self_review_forbidden":
         return (
-            "Hand the verdict to an independent reviewer: another agent "
-            "principal or a human token must call hub_submit_review."
+            "Hand the review to an independent reviewer: another agent "
+            "principal files a report or changes_requested, a human approves."
         )
     if reason == "chat_pair_gate_forbidden":
         return (
@@ -140,8 +140,9 @@ def compute_next_action(
         return "Wait for CI conveyor; poller advances to review when checks pass."
     if awaiting == "review":
         return (
-            "Obtain a review verdict: reviewer runs hub_get_review_brief and "
-            "hub_submit_review; after APPROVED, report done again."
+            "Wait for the review: an agent reviewer files a report "
+            "(hub_submit_machine_review) or changes_requested; APPROVED comes "
+            "from a human or the hub policy. After APPROVED, report done again."
         )
 
     if status == "completed":
@@ -413,9 +414,9 @@ def next_action_of(route: dict[str, Any] | None) -> str | None:
     line = route_line(route)
     if hint == "human":
         return (
-            f"{line}. Вердикт запишет человек или независимый ревьюер "
-            "(hub_get_review_brief, hub_submit_review); после APPROVED "
-            "повторите отчёт о завершении."
+            f"{line}. Одобрение запишет человек или автоматика хаба по политике "
+            "проекта; агент-ревьюер сдаёт отчёт (hub_submit_machine_review) или "
+            "changes_requested. После APPROVED повторите отчёт о завершении."
         )
     return (
         f"{line}. Команда вердикта не нужна: ждите записи вердикта и затем "

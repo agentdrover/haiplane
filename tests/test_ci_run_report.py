@@ -636,7 +636,7 @@ async def test_ci_runner_db_key_reports_and_is_not_human(ci_runner_hub):
         url, json={"verdict": "approved", "agent": "ci"}, headers=hub.ci
     )
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["error"] == "default_verdict_reserved_for_steward"
+    assert refused.json()["detail"]["reason"] == "approval_reserved_for_human"
     task = (await hub.client.get(f"/api/tasks/{foreign}", headers=hub.human)).json()
     assert task["review_verdict"] is None and task["status"] == "review"
     back = await hub.client.post(
