@@ -1,0 +1,631 @@
+{
+  "version": 1,
+  "defect_classes": [
+    "accept_false_positive",
+    "claim_ownership_proof",
+    "empty_resubmit_guard",
+    "env_filter_inconsistent",
+    "final_entry_duplicate",
+    "idempotency_hash_drift",
+    "secret_leak_fallback",
+    "session_revoked_before_host_read"
+  ],
+  "note": "Корпус промахов ревью (#1864): истина — вердикт человека (kind=review) или прод-дефект; авторские finding_outcomes истиной не считаются.",
+  "cases": [
+    {
+      "case_id": "t1783-g1",
+      "task_id": 1783,
+      "submission_generation": 1,
+      "submission_sha": "ff052e3eec350cb763028438bbf5a02fc4dd064d",
+      "expectation": "defect",
+      "defect_class": "claim_ownership_proof",
+      "locators": [
+        {
+          "file": "hub/db.py",
+          "start_line": 2343,
+          "end_line": 2343
+        },
+        {
+          "file": "hub/services/chat_pair.py",
+          "start_line": 1154,
+          "end_line": 1154
+        },
+        {
+          "file": "hub/db.py",
+          "start_line": 2348,
+          "end_line": 2348
+        },
+        {
+          "file": "hub/services/resubmission_guard.py",
+          "start_line": 57,
+          "end_line": 57,
+          "defect_class": "empty_resubmit_guard"
+        },
+        {
+          "file": "hub/services/executor_launch.py",
+          "start_line": 1062,
+          "end_line": 1062
+        },
+        {
+          "file": "hub/services/orchestration.py",
+          "start_line": 6302,
+          "end_line": 6302,
+          "defect_class": "empty_resubmit_guard"
+        },
+        {
+          "file": "hub/services/return_running.py",
+          "start_line": 81,
+          "end_line": 81
+        },
+        {
+          "file": "hub/services/executor_dispatch.py",
+          "start_line": 237,
+          "end_line": 237
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12572,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "3 P1 и 5 P2 на доказательстве владения захватом прогона"
+    },
+    {
+      "case_id": "t1783-g2",
+      "task_id": 1783,
+      "submission_generation": 2,
+      "submission_sha": "0aa4233f86fe3362678619ec8ced6ea3bed48c1c",
+      "expectation": "defect",
+      "defect_class": "claim_ownership_proof",
+      "locators": [
+        {
+          "file": "hub/db.py",
+          "start_line": 2318,
+          "end_line": 2318
+        },
+        {
+          "file": "hub/services/executor_dispatch.py",
+          "start_line": 217,
+          "end_line": 217
+        },
+        {
+          "file": "hub/services/resubmission_guard.py",
+          "start_line": 124,
+          "end_line": 124,
+          "defect_class": "empty_resubmit_guard"
+        },
+        {
+          "file": "hub/services/resubmission_guard.py",
+          "start_line": 77,
+          "end_line": 77,
+          "defect_class": "empty_resubmit_guard"
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12588,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "2 P1 и 2 P2 после исправления круга 1"
+    },
+    {
+      "case_id": "t1783-g3",
+      "task_id": 1783,
+      "submission_generation": 3,
+      "submission_sha": "06235a6acab70a4a3782fb33506274c94d7bef87",
+      "expectation": "defect",
+      "defect_class": "claim_ownership_proof",
+      "locators": [
+        {
+          "file": "hub/services/task_updates.py",
+          "start_line": 208,
+          "end_line": 208
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12636,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "регрессия: done из claimed не снимает захват; две находки вне объёма (существовали до задачи) в локаторы не вошли"
+    },
+    {
+      "case_id": "t1783-g4",
+      "task_id": 1783,
+      "submission_generation": 4,
+      "submission_sha": "acd0e62575cf80362a72eebafadb70b05e05ec22",
+      "expectation": "defect",
+      "defect_class": "session_revoked_before_host_read",
+      "locators": [],
+      "found_by": [
+        "prod"
+      ],
+      "truth": {
+        "kind": "prod_defect",
+        "task_id": 1831,
+        "caused_by_task_id": 1783
+      },
+      "note": "сдача одобрена; регрессия на проде найдена как #1831 (отзыв сессий прогона при сдаче ломал чтение итога хостом); строка кода до выката неизвестна"
+    },
+    {
+      "case_id": "t1810-g1",
+      "task_id": 1810,
+      "submission_generation": 1,
+      "submission_sha": "de044f4855a03cdecd844590fd42c34c0be9f8cf",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 173,
+          "end_line": 173
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 205,
+          "end_line": 205
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 178,
+          "end_line": 178
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 154,
+          "end_line": 154
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 254,
+          "end_line": 254,
+          "defect_class": "secret_leak_fallback"
+        }
+      ],
+      "found_by": [
+        "codex",
+        "machine_review"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13092,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "два P1: справка советует «Принять» при неполном отчёте или дефекте у другого ревьюера"
+    },
+    {
+      "case_id": "t1810-g2",
+      "task_id": 1810,
+      "submission_generation": 2,
+      "submission_sha": "067d383b3cb634b97fead5e4c36741790230c668",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 247,
+          "end_line": 247
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 202,
+          "end_line": 202
+        }
+      ],
+      "found_by": [
+        "codex",
+        "machine_review"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13232,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "два пути к ложному «Принять»: неотвеченные unresolved и отчёт без данных"
+    },
+    {
+      "case_id": "t1810-g3",
+      "task_id": 1810,
+      "submission_generation": 3,
+      "submission_sha": "242cce4e02c7d028d6f8bfad7a69fd1745d79f41",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 220,
+          "end_line": 220
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 230,
+          "end_line": 230
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 234,
+          "end_line": 234
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13299,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "три пути к ложному «Принять» при чистом машинном отчёте; судья одобрил, советник возразил"
+    },
+    {
+      "case_id": "t1811-g1",
+      "task_id": 1811,
+      "submission_generation": 1,
+      "submission_sha": "3b993818c32fe858a2293f2571f87c6939c6a313",
+      "expectation": "defect",
+      "defect_class": "idempotency_hash_drift",
+      "locators": [
+        {
+          "file": "hub/models.py",
+          "start_line": 1077,
+          "end_line": 1077
+        },
+        {
+          "file": "hub/cli.py",
+          "start_line": 443,
+          "end_line": 443
+        },
+        {
+          "file": "hub/mcp_server.py",
+          "start_line": 3748,
+          "end_line": 3748
+        },
+        {
+          "file": "hub/plain_summary.py",
+          "start_line": 51,
+          "end_line": 51
+        },
+        {
+          "file": "hub/plain_summary.py",
+          "start_line": 37,
+          "end_line": 37,
+          "defect_class": "secret_leak_fallback"
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13093,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "четыре P2, машинное ревью находок не дало"
+    },
+    {
+      "case_id": "t1811-g2",
+      "task_id": 1811,
+      "submission_generation": 2,
+      "submission_sha": "3b4d5ad51beaa4000ec619912a7ee3cd4ac172f3",
+      "expectation": "defect",
+      "defect_class": "secret_leak_fallback",
+      "locators": [
+        {
+          "file": "hub/plain_summary.py",
+          "start_line": 43,
+          "end_line": 43
+        },
+        {
+          "file": "hub/plain_summary.py",
+          "start_line": 80,
+          "end_line": 80
+        },
+        {
+          "file": "hub/mcp_server.py",
+          "start_line": 3679,
+          "end_line": 3679
+        }
+      ],
+      "found_by": [
+        "codex",
+        "machine_review"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13194,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "утечка секрета в запасном тексте: ключи вида KEY=значение проходят без маскировки"
+    },
+    {
+      "case_id": "t1811-g3",
+      "task_id": 1811,
+      "submission_generation": 3,
+      "submission_sha": "3ca54edace7f4d85b97c93d84298f77f9f15999a",
+      "expectation": "defect",
+      "defect_class": "secret_leak_fallback",
+      "locators": [
+        {
+          "file": "hub/plain_summary.py",
+          "start_line": 33,
+          "end_line": 33
+        }
+      ],
+      "found_by": [
+        "codex",
+        "machine_review"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13298,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "запасной текст ломается в обе стороны: пропуск секретов и отказ на обычной прозе"
+    },
+    {
+      "case_id": "t1817-g1",
+      "task_id": 1817,
+      "submission_generation": 1,
+      "submission_sha": "c419461802707dbc600f74c686573a798361aa25",
+      "expectation": "defect",
+      "defect_class": "final_entry_duplicate",
+      "locators": [
+        {
+          "file": "hub/services/chat_pair.py",
+          "start_line": 1232,
+          "end_line": 1232
+        },
+        {
+          "file": "hub/services/executor_orders.py",
+          "start_line": 480,
+          "end_line": 480
+        }
+      ],
+      "found_by": [
+        "machine_review",
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12936,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "одна итоговая запись в ленте на заказ не держится на всех путях закрытия"
+    },
+    {
+      "case_id": "t1817-g2",
+      "task_id": 1817,
+      "submission_generation": 2,
+      "submission_sha": "e98aaa774dbf9f44e58da8461bfd8ea8f0e8ffc5",
+      "expectation": "defect",
+      "defect_class": "final_entry_duplicate",
+      "locators": [
+        {
+          "file": "hub/services/executor_orders.py",
+          "start_line": 485,
+          "end_line": 485
+        },
+        {
+          "file": "hub/services/executor_orders.py",
+          "start_line": 1352,
+          "end_line": 1352
+        },
+        {
+          "file": "hub/services/chat_pair.py",
+          "start_line": 1233,
+          "end_line": 1233
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12993,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "четыре P2 того же класса; судья одобрил, советник возразил"
+    },
+    {
+      "case_id": "t1817-g3",
+      "task_id": 1817,
+      "submission_generation": 3,
+      "submission_sha": "393da8f6a83ed47864541dfcc87d081d1dbb0a75",
+      "expectation": "defect",
+      "defect_class": "final_entry_duplicate",
+      "locators": [
+        {
+          "file": "hub/services/executor_orders.py",
+          "start_line": 415,
+          "end_line": 415
+        }
+      ],
+      "found_by": [
+        "machine_review",
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13020,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "при фактической сдаче закрытие по report failed сохраняет close_reason=reported_failed"
+    },
+    {
+      "case_id": "t1851-g1",
+      "task_id": 1851,
+      "submission_generation": 1,
+      "submission_sha": "d6e06aca33e4be215f46a63031db691322873926",
+      "expectation": "defect",
+      "defect_class": "env_filter_inconsistent",
+      "locators": [
+        {
+          "file": "hub/services/validation_run.py",
+          "start_line": 46,
+          "end_line": 46
+        },
+        {
+          "file": "tests/test_manual_deploy_script.py",
+          "start_line": 55,
+          "end_line": 55
+        },
+        {
+          "file": "tests/test_delivery_gate.py",
+          "start_line": 67,
+          "end_line": 76
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13132,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "_safe_env вырезает GIT_CONFIG_KEY_n и оставляет COUNT; автоиспользуемая фикстура скрывает дефект; судья одобрил, советник возразил"
+    },
+    {
+      "case_id": "t1836-g1",
+      "task_id": 1836,
+      "submission_generation": 1,
+      "submission_sha": "ac61badee4c357decd5c3db94f88209b96a390a6",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12969,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 12970,
+        "at": "2026-10-18T18:59"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "доставлена одним кругом; CI-отчёт не подтверждён (no_provenance)"
+    },
+    {
+      "case_id": "t1860-g1",
+      "task_id": 1860,
+      "submission_generation": 1,
+      "submission_sha": "9d8dc9bf30d53052d8cf87db8e844e887ea5455a",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13318,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 13320,
+        "at": "2026-10-19T07:55"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "доставлена одним кругом; окно только началось"
+    },
+    {
+      "case_id": "t1825-g1",
+      "task_id": 1825,
+      "submission_generation": 1,
+      "submission_sha": "6737ed0e5d706057f0562daf9ea5b3b7003e4480",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12821,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 12829,
+        "at": "2026-10-18T05:27"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "доставлена одним кругом; судья эскалировал процедурно (no_grounds)"
+    },
+    {
+      "case_id": "t1833-g1",
+      "task_id": 1833,
+      "submission_generation": 1,
+      "submission_sha": "5718c8ae0c48751ba698bd90ba3a98f71e8e2fbf",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12842,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 12844,
+        "at": "2026-10-18T05:35"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "одобрена до конца ревью в полёте; находка вне объёма вынесена в #1836"
+    },
+    {
+      "case_id": "t1795-g2",
+      "task_id": 1795,
+      "submission_generation": 2,
+      "submission_sha": "5c080c6d7cad6ac17933597fc49a5dd4ce0e60c5",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12816,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 12817,
+        "at": "2026-10-18T05:10"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "остаток P3 вынесен в #1833 (found_in=review, не прод-дефект)"
+    },
+    {
+      "case_id": "t1794-g2",
+      "task_id": 1794,
+      "submission_generation": 2,
+      "submission_sha": "3c4cf65873501765a4651c23ef2de8873dd33053",
+      "expectation": "clean",
+      "truth": {
+        "kind": "human_review",
+        "update_id": 12670,
+        "reviewer": "denis",
+        "verdict": "APPROVED"
+      },
+      "delivery": {
+        "update_id": 12671,
+        "at": "2026-10-17T19:40"
+      },
+      "checked_at": "2026-10-19",
+      "window_days": 14,
+      "note": "остаток P3 не блокировал; окно ближе всех к 14 дням"
+    }
+  ]
+}
