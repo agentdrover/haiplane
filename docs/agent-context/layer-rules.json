@@ -72,7 +72,8 @@
         "hub.models",
         "hub.plain_summary",
         "hub.cause_task_view",
-        "hub.owner_minutes_view"
+        "hub.owner_minutes_view",
+        "hub.outcome_hint"
       ],
       "trees": []
     },
