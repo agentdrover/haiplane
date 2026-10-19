@@ -20,23 +20,20 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
-from hub.models import FindingOutcome
+from hub.models import FindingOutcome, MachineReviewView
 from hub.services import (
     ci_contract,
     ci_integrity,
     ci_trust,
     inbox_decisions,
-    review_evidence,
     state_review,
+    report_fit,
+    review_evidence,
     verdict_evidence,
 )
-from hub.services.auto_verdict import _finding_dicts, text_origin_refusal
 from hub.services.finding_identity import unresolved_uids
 from hub.services.finding_outcome import KIND_UNRESOLVED
-from hub.services.gate_grounds import sibling_mismatch_ground
 from hub.services.readiness import parse_risks_from_row
-from hub.services.orchestration import report_has_evidence
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.verdict_route import DECIDER_HUMAN, DECIDER_STEWARD, verdict_route
@@ -71,6 +68,14 @@ _STEWARD_ACTIONS = {
 CODE_CI = "ci"
 CODE_INTEGRITY = "integrity"
 CODE_REPORT = "report"
+
+
+class UnreadableReport(Exception):
+    """Строка отчёта не разобралась в модель чтения: «неизвестно», а не «чисто»."""
+
+    def __init__(self, report_id: int) -> None:
+        super().__init__(report_id)
+        self.report_id = report_id
 
 
 @dataclass(frozen=True)
@@ -172,14 +177,11 @@ async def _integrity_doubt(
 
 
 async def _unanswered_unresolved(
-    db: aiosqlite.Connection, task_id: int, reports: list[Any]
+    db: aiosqlite.Connection, task_id: int, view: MachineReviewView
 ) -> int:
-    """Неотвеченные unresolved по ВСЕМ отчётам поколения (uid без повторов)."""
-    uids: set[str] = set()
-    for report in reports:
-        uids.update(unresolved_uids(_finding_dicts(report["unresolved"])))
+    """Неотвеченные unresolved ОДНОГО отчёта: исход ищется по тому uid, под которым он пишется."""
     left = 0
-    for uid in sorted(uids):
+    for uid in unresolved_uids(view.unresolved):
         outcome = await repo.finding_outcome_for_uid(
             db, task_id, uid, finding_kind=KIND_UNRESOLVED
         )
@@ -190,100 +192,66 @@ async def _unanswered_unresolved(
     return left
 
 
-async def _generation_reports(
+async def _generation_views(
     db: aiosqlite.Connection, task: dict[str, Any]
-) -> list[Any]:
-    """ВСЕ отчёты текущего поколения: «полный и независимый» — про каждый из них."""
-    return list(
-        await fetchall(
-            db,
-            "SELECT * FROM machine_reviews WHERE task_id=? AND submission_generation=?",
-            (int(task["id"]), int(task.get("submission_generation") or 0)),
-        )
+) -> list[MachineReviewView]:
+    """ВСЕ отчёты текущего поколения как модели чтения: «Принять» — про каждый."""
+    rows = await repo.machine_reviews_of_generation(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
+    views: list[MachineReviewView] = []
+    for row in rows:
+        try:
+            views.append(MachineReviewView(**dict(row)))
+        except (TypeError, ValueError) as exc:  # нечитаемый отчёт — не чистый
+            raise UnreadableReport(int(row["id"])) from exc
+    return views
 
 
-def _report_doubts(review: Any, generation: Any, reports: list[Any]) -> list[Doubt]:
-    if review is None or not review.is_current or not generation.has_review:
+async def _report_doubts(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[list[Doubt], list[MachineReviewView]]:
+    """Сомнения по отчётам поколения: белый список ``report_fit`` на КАЖДЫЙ отчёт."""
+    try:
+        views = await _generation_views(db, task)
+    except UnreadableReport as bad:
+        text = f"Отчёт ревью #{bad.report_id} не читается: проверка не доказана"
+        return [Doubt(CHECK, "high", text, "")], []
+    if not views:
+        generation = await generation_review(db, task)
+        headline = str(generation.headline)
         return [
-            Doubt(
-                CHECK,
-                "high",
-                "Отчёта машинного ревью по этой сдаче нет",
-                str(generation.headline),
-            )
-        ]
-    doubts: list[Doubt] = []
-    # Каждый отчёт обязан доказать, что проверка была: raw_count 0 — «нет данных»
-    # (пустота без доказательства работы не чистота), и улика исполнения нужна
-    # КАЖДОМУ, а не только тому, что взят за поколение.
-    if any(r["raw_count"] < 1 or not report_has_evidence(dict(r)) for r in reports):
-        doubts.append(
-            Doubt(
-                CHECK,
-                "high",
-                "Отчёт без данных: проверка не доказана",
-                "в поколении есть отчёт без кандидатов или без признаков исполнения",
-            )
-        )
-    # incomplete: 0 — заявлено «полный»; NULL («не говорил») и 1 — сомнение.
-    if generation.complete is not True or any(r["incomplete"] != 0 for r in reports):
-        doubts.append(
-            Doubt(CHECK, "high", "Отчёт ревью неполный или не сказал о полноте", "")
-        )
-    origin = text_origin_refusal(review.model_dump())
-    if any(r["self_reviewed"] for r in reports) or origin is not None:
-        why = origin[1] if origin else "ревью сдал сам автор"
-        doubts.append(Doubt(CHECK, "high", "Отчёт — не независимый, а самоотчёт", why))
-    elif any(r["principal_id"] is None for r in reports):
-        doubts.append(
-            Doubt(
-                CHECK,
-                "high",
-                "Независимость ревьюера не подтверждена",
-                "у отчёта нет личности ревьюера: «не самоотчёт» нельзя проверить",
-            )
-        )
-    return doubts
-
-
-async def _finding_doubts(
-    db: aiosqlite.Connection, task_id: int, review: Any, reports: list[Any]
-) -> list[Doubt]:
-    doubts: list[Doubt] = []
-    if review.findings_confirmed:
-        count = len(review.findings_confirmed)
-        doubts.append(
-            Doubt(REWORK, "high", f"Ревьюер подтвердил проблем: {count}", "confirmed")
-        )
-    mismatch = await sibling_mismatch_ground(
-        db, task_id, review.submission_generation, review.id
-    )
-    if mismatch:
-        doubts.append(Doubt(CHECK, "high", "Ревьюеры расходятся", mismatch))
-    left = await _unanswered_unresolved(db, task_id, reports)
-    if left:
-        doubts.append(
-            Doubt(CHECK, "high", f"Находок без проверки и без ответа: {left}", "")
-        )
-    return doubts
+            Doubt(CHECK, "high", "Отчёта машинного ревью по этой сдаче нет", headline)
+        ], views
+    found: dict[str, tuple[str, list[int]]] = {}
+    for view in views:
+        left = await _unanswered_unresolved(db, int(task["id"]), view)
+        for code, text in report_fit.report_gaps(view, left):
+            found.setdefault(code, (text, []))[1].append(view.id)
+    doubts = []
+    for code, (text, ids) in found.items():
+        level = REWORK if code == report_fit.GAP_CONFIRMED else CHECK
+        which = ", ".join(f"#{i}" for i in ids)
+        doubts.append(Doubt(level, "high", text, f"отчёты: {which}", CODE_REPORT))
+    return doubts, views
 
 
 async def _review_doubts(
     db: aiosqlite.Connection, task: dict[str, Any]
-) -> tuple[list[Doubt], Any]:
-    """Все признаки сомнения по задаче в review и отчёт, на котором они стоят."""
-    mr = await repo.get_latest_machine_review(db, int(task["id"]))
-    review = (await review_evidence.report_view(db, task, mr)).machine_review
-    generation = await generation_review(db, task)
-    reports = await _generation_reports(db, task)
-    doubts = _report_doubts(review, generation, reports)
-    if review is not None and review.is_current:
-        doubts += await _finding_doubts(db, int(task["id"]), review, reports)
+) -> tuple[list[Doubt], list[MachineReviewView]]:
+    """Все признаки сомнения по задаче в review и отчёты, на которых они стоят."""
+    doubts, views = await _report_doubts(db, task)
+    # Платный прогон ещё идёт (или должен открыться вторая дверь): отчёт
+    # поколения может измениться, а совет «Принять» опирается на него.
+    flight = await review_evidence.inflight_view(db, task, include_owed=True)
+    if flight is not None:
+        doubts.append(
+            Doubt(CHECK, "high", "Ревью этой сдачи ещё идёт", str(flight.headline))
+        )
     for found in (await _ci_doubt(db, task), await _integrity_doubt(db, task)):
         if found is not None:
             doubts.append(found)
-    return doubts, review
+    return doubts, views
 
 
 def _context_risks(task: dict[str, Any]) -> list[dict[str, str]]:
@@ -363,7 +331,7 @@ def _from_rules(doubts: list[Doubt], route: Any) -> dict[str, Any]:
 async def _review_brief(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    doubts, review = await _review_doubts(db, task)
+    doubts, views = await _review_doubts(db, task)
     route = ctx.get("route") or await verdict_route(db, int(task["id"]))
     judged = await _steward_row(db, task)
     recommend = _from_steward(judged, doubts, route) if judged is not None else None
@@ -378,11 +346,13 @@ async def _review_brief(
         "Нужен ваш вердикт.",
         recommend,
         risks=risks,
-        checks=_review_checks(doubts, review),
+        checks=_review_checks(doubts, views),
     )
 
 
-def _review_checks(doubts: list[Doubt], review: Any) -> list[dict[str, str]]:
+def _review_checks(
+    doubts: list[Doubt], views: list[MachineReviewView]
+) -> list[dict[str, str]]:
     def of(code: str) -> list[Doubt]:
         return [d for d in doubts if d.code == code]
 
@@ -398,7 +368,7 @@ def _review_checks(doubts: list[Doubt], review: Any) -> list[dict[str, str]]:
         ),
         _check(
             "Машинное ревью",
-            "doubt" if report or review is None else "ok",
+            "doubt" if report or not views else "ok",
             "; ".join(d.risk for d in report) or "отчёт текущей сдачи полный",
         ),
     ]

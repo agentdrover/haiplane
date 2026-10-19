@@ -23,7 +23,9 @@ async def test_inbox_and_card_share_brief(
         db, task_id, task["submission_sha"], "clean", "[]", ""
     )
     await db.execute(
-        "UPDATE machine_reviews SET principal_id=9 WHERE task_id=?", (task_id,)
+        "UPDATE machine_reviews SET principal_id=9, provider_tokens=250000 "
+        "WHERE task_id=?",
+        (task_id,),
     )
     await db.commit()
 

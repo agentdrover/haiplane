@@ -45,6 +45,11 @@ async def _clean_scan(db, task_id: int, *, reviewer: bool = True) -> None:
         await db.execute(
             "UPDATE machine_reviews SET principal_id=9 WHERE task_id=?", (task_id,)
         )
+    # Работу ревьюера подтверждает провайдер: без этого «Принять» невозможно.
+    await db.execute(
+        "UPDATE machine_reviews SET provider_tokens=250000 WHERE task_id=?",
+        (task_id,),
+    )
     await db.commit()
 
 
@@ -369,7 +374,7 @@ async def test_every_report_of_the_generation_counts(
     await _clean_scan(db, conflict)
     got = await _brief(db, conflict)
     assert got["recommend"]["action"] != ACCEPT, "дефект у другого ревьюера"
-    assert any("расход" in r["text"].lower() for r in got["risks"])
+    assert any("подтвердил" in r["text"].lower() for r in got["risks"])
 
 
 async def test_reviewer_identity_is_required_for_accept(

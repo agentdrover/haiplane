@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import aiosqlite
@@ -38,6 +39,8 @@ from hub.services.ci_report import (
 from hub.services.review_availability import generation_review
 from hub.services.review_queue import last_stall
 from hub.services.verdict_route import DECIDER_HUMAN, verdict_route
+
+log = logging.getLogger("hub")
 
 ACTION_APPROVE = "approve"
 ACTION_ANSWER = "answer"
@@ -196,9 +199,12 @@ async def _brief_line(
     """Рекомендация справки (#1810): тот же ``build``, что у карточки, без второго пересчёта."""
     from hub.services import decision_brief
 
-    return decision_brief.recommend_line(
-        await decision_brief.build(db, task, {"route": route})
-    )
+    try:
+        brief = await decision_brief.build(db, task, {"route": route})
+    except Exception as exc:  # noqa: BLE001 - входящие рендерятся без справки
+        log.warning("decision brief failed for #%s: %s", task.get("id"), exc)
+        return "Проверить: справка не собрана, откройте карточку"
+    return decision_brief.recommend_line(brief)
 
 
 async def _verdict_rows(
