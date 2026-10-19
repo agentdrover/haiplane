@@ -28,6 +28,9 @@ async def test_inbox_and_card_share_brief(
         (task_id,),
     )
     await db.commit()
+    from tests.test_decision_brief_whitelist import observe_tip
+
+    await observe_tip(db, task_id)
 
     inbox = await services.get_inbox_data(db)
     (row,) = [r for r in inbox["decision_queue"] if r["task_id"] == task_id]

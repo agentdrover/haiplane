@@ -39,6 +39,15 @@ CONDITIONS = {
 }
 
 
+async def observe_tip(db, task_id: int) -> None:
+    """Хаб «видел» вершину ветки (как при сдаче): показ сети не касается, а читает это."""
+    from hub.services.lifecycle import resolve_branch_tip
+
+    task = dict(await repo.get_task(db, task_id) or {})
+    tip, why = await resolve_branch_tip(db, task_id, task["branch"])
+    assert tip, why
+
+
 async def _task(
     client, db, monkeypatch, slug: str, reports: int
 ) -> tuple[int, list[int]]:
@@ -56,6 +65,7 @@ async def _task(
         (task_id,),
     )
     await db.commit()
+    await observe_tip(db, task_id)
     rows = await db.execute_fetchall(
         "SELECT id FROM machine_reviews WHERE task_id=? ORDER BY id", (task_id,)
     )

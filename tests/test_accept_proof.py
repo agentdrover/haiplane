@@ -16,7 +16,7 @@ from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.services import decision_brief
 from hub.services.accept_proof import AcceptProof
-from tests.test_decision_brief_whitelist import ACCEPT, _action, _task
+from tests.test_decision_brief_whitelist import ACCEPT, _action, _task, observe_tip
 
 
 async def test_a_proof_cannot_be_forged_and_accept_needs_one():
@@ -45,24 +45,102 @@ async def test_a_standing_changes_requested_blocks_accept(
     assert (got != ACCEPT) is current
 
 
-@pytest.mark.parametrize("tip", ["b" * 40, ""])
 async def test_branch_must_stand_on_the_submitted_sha(
-    client, db: aiosqlite.Connection, monkeypatch, tip: str
+    client, db: aiosqlite.Connection, monkeypatch
 ):
-    task_id, _ = await _task(client, db, monkeypatch, f"ap-sha-{bool(tip)}", 1)
+    """Совпадение вершины — по последнему НАБЛЮДЕНИЮ хаба; ушла — не «Принять»."""
+    task_id, _ = await _task(client, db, monkeypatch, "ap-sha-diverged", 1)
     assert await _action(db, task_id) == ACCEPT
 
     async def moved(*_a, **_k):
-        return tip
+        return "b" * 40
 
     monkeypatch.setattr(plugins.git_ops, "head_sha", moved)
-    assert await _action(db, task_id) != ACCEPT, "ушла/неизвестна вершина ветки"
+    await observe_tip(db, task_id)  # хаб увидел новую вершину
+    assert await _action(db, task_id) != ACCEPT
+
+
+@pytest.mark.parametrize("age_minutes", [None, 24 * 60])
+async def test_no_fresh_observation_means_tip_not_verified(
+    client, db: aiosqlite.Connection, monkeypatch, age_minutes
+):
+    """Нет наблюдения или оно устарело: «Проверить: вершина не сверена»."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import lifecycle
+
+    task_id, _ = await _task(client, db, monkeypatch, f"ap-obs-{age_minutes}", 1)
+    task = dict(await repo.get_task(db, task_id) or {})
+    key = (task_id, task["branch"])
+    if age_minutes is None:
+        lifecycle._observed_tips.pop(key, None)
+    else:
+        sha, _at = lifecycle._observed_tips[key]
+        lifecycle._observed_tips[key] = (
+            sha,
+            datetime.now(UTC) - timedelta(minutes=age_minutes),
+        )
+    got = await decision_brief.build(db, task)
+    assert got["recommend"]["action"] == "Проверить"
+    assert any("вершина" in r["text"].lower() for r in got["risks"])
+
+
+async def test_showing_the_brief_never_touches_the_network(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Карточка перерисовывается каждые 15 с, входящие — по каждой задаче: без fetch."""
+    from hub import services
+
+    task_id, _ = await _task(client, db, monkeypatch, "ap-nonet", 1)
+    calls: list[str] = []
+
+    async def spy(*_a, **_k):
+        calls.append("fetch_base")
+        return True, ""
+
+    monkeypatch.setattr(plugins.git_ops, "fetch_base", spy)
+    task = dict(await repo.get_task(db, task_id) or {})
+    await decision_brief.build(db, task)
+    assert calls == [], "build зовёт git fetch"
+    await services.get_inbox_data(db)
+    assert calls == [], "входящие зовут git fetch"
+    from hub import web
+
+    assert await web._card_decision_brief(db, task, False) is not None
+    assert calls == [], "блок справки карточки зовёт git fetch"
+
+
+@pytest.mark.parametrize("scope,blocks", [("in_scope", True), ("out_of_scope", False)])
+@pytest.mark.parametrize("verdict", ["approved", "changes_requested"])
+async def test_open_in_scope_findings_block_accept_under_any_verdict(
+    client,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    verdict: str,
+    scope: str,
+    blocks: bool,
+):
+    """Выбрано: in_scope-находки текущего поколения блокируют при ЛЮБОМ вердикте."""
+    task_id, _ = await _task(client, db, monkeypatch, f"ap-find-{verdict}-{scope}", 1)
+    task = dict(await repo.get_task(db, task_id) or {})
+    finding = {"id": 1, "severity": "high", "message": "сломано", "scope": scope}
+    await db.execute(
+        "UPDATE tasks SET review_verdict=?, review_verdict_generation=?, "
+        "review_findings=? WHERE id=?",
+        (verdict, task["submission_generation"], json.dumps([finding]), task_id),
+    )
+    await db.commit()
+    got = await _action(db, task_id)
+    if verdict == "changes_requested":
+        assert got != ACCEPT
+    else:
+        assert (got != ACCEPT) is blocks
 
 
 @pytest.mark.parametrize(
     "section", ["unresolved", "lost_dimensions", "findings_rejected"]
 )
-@pytest.mark.parametrize("broken", ["not json", "{}"])
+@pytest.mark.parametrize("broken", ["not json", "{}", ""])
 async def test_a_broken_report_section_is_unreadable_not_empty(
     client, db: aiosqlite.Connection, monkeypatch, section: str, broken: str
 ):
@@ -146,3 +224,45 @@ def test_accept_has_exactly_one_emitter():
 
     source = re.sub(r"\s+", " ", inspect.getsource(decision_brief))
     assert source.count("_recommend( ACCEPT") + source.count("_recommend(ACCEPT") == 1
+
+
+async def test_a_carried_report_needs_every_report_of_the_source_generation(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """A (unresolved) и чистый B одного поколения; переносится B — всё равно не «Принять»."""
+    task_id, ids = await _task(client, db, monkeypatch, "ap-carry-all", 2)
+    await db.execute(
+        "UPDATE machine_reviews SET unresolved=? WHERE id=?",
+        ('[{"title":"не проверено","why":"x"}]', ids[0]),
+    )
+    task = dict(await repo.get_task(db, task_id) or {})
+    generation = int(task["submission_generation"])
+    # Оба отчёта — поколение «до пересдачи»; в текущее переносится только B.
+    await db.execute(
+        "UPDATE machine_reviews SET submission_generation=? WHERE id IN (?, ?)",
+        (generation - 1, ids[0], ids[1]),
+    )
+    source = dict(await repo.get_machine_review(db, ids[1]) or {})
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill=source["harness_skill"],
+        harness_version=source["harness_version"],
+        agent_count=source["agent_count"],
+        orchestrator=source["orchestrator"],
+        model=source["model"],
+        raw_count=int(source["raw_count"]),
+        findings_confirmed="[]",
+        findings_rejected=source["findings_rejected"],
+        submitted_by=source["submitted_by"],
+        incomplete=False,
+        unresolved="[]",
+        lost_dimensions="[]",
+        profile=source["profile"],
+        principal_id=source["principal_id"],
+        carried_from_review_id=ids[1],
+        ci_integrity=("", ""),
+    )
+    await db.commit()
+    assert await _action(db, task_id) != ACCEPT

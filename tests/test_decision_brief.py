@@ -51,6 +51,9 @@ async def _clean_scan(db, task_id: int, *, reviewer: bool = True) -> None:
         (task_id,),
     )
     await db.commit()
+    from tests.test_decision_brief_whitelist import observe_tip
+
+    await observe_tip(db, task_id)
 
 
 def _shape(brief: dict) -> None:

@@ -107,14 +107,17 @@ class UnreadableReport(Exception):
 
 
 def _strict_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Строка отчёта, у которой каждый раздел — список; иначе UnreadableReport."""
+    """Строка отчёта, у которой каждый раздел — список; иначе UnreadableReport.
+
+    Пусто и ``None`` — тоже нечитаемо: «раздел не записан» не равно «находок нет».
+    """
     out = dict(row)
     for name in _LIST_SECTIONS:
         raw = out.get(name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raise UnreadableReport(int(row["id"]), f"раздел {name}: пусто")
         try:
-            value = (
-                json.loads(raw or "[]") if isinstance(raw, (str, type(None))) else raw
-            )
+            value = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError as exc:
             raise UnreadableReport(int(row["id"]), f"раздел {name}: не JSON") from exc
         if not isinstance(value, list):
@@ -123,42 +126,55 @@ def _strict_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def _evidence_row(
-    db: aiosqlite.Connection, row: dict[str, Any]
-) -> dict[str, Any]:
-    """Строка, по которой судят отчёт: у переноса (#1361) — исходный отчёт.
+async def _judged_rows(
+    db: aiosqlite.Connection, row: dict[str, Any], seen: set[tuple[int, int]]
+) -> list[dict[str, Any]]:
+    """Строки, по которым судят отчёт. У переноса (#1361) — ВСЕ отчёты исходного поколения.
 
     Копия переноса не несёт токенов провайдера по контракту (перенос — не новое
-    чтение), поэтому улика исполнения лежит в исходном отчёте. Нет исходного —
-    отчёт нечитаем.
+    чтение), поэтому улика лежит в исходных отчётах. Судить по одному исходному
+    нельзя: соседний отчёт того же поколения мог нести unresolved или находки, а
+    перенос «чистого» их бы скрыл. Нет исходного — отчёт нечитаем.
     """
     root = row.get("carried_from_review_id")
     if not root:
-        return row
+        return [row]
     source = await repo.get_machine_review(db, int(root))
     if source is None:
         raise UnreadableReport(int(row["id"]), f"исходный отчёт #{root} не найден")
-    source_row = dict(source)
-    source_row["id"] = row["id"]
-    return source_row
+    task_id, generation = (
+        int(row["task_id"]),
+        int(dict(source)["submission_generation"]),
+    )
+    if (task_id, generation) in seen:
+        return []
+    seen.add((task_id, generation))
+    out: list[dict[str, Any]] = []
+    for sibling in await repo.machine_reviews_of_generation(db, task_id, generation):
+        out.extend(await _judged_rows(db, dict(sibling), seen))
+    return out
 
 
 async def generation_views(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[MachineReviewView]:
-    """ВСЕ отчёты текущего поколения, прочитанные строго."""
+    """ВСЕ отчёты текущего поколения (у переноса — исходного), прочитанные строго."""
     rows = await repo.machine_reviews_of_generation(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
-    views: list[MachineReviewView] = []
+    judged: dict[int, dict[str, Any]] = {}
+    seen: set[tuple[int, int]] = set()
     for row in rows:
+        for found in await _judged_rows(db, dict(row), seen):
+            judged.setdefault(int(found["id"]), found)
+    views: list[MachineReviewView] = []
+    for report_id, found in judged.items():
         try:
-            strict = _strict_row(await _evidence_row(db, dict(row)))
-            views.append(MachineReviewView(**strict))
+            views.append(MachineReviewView(**_strict_row(found)))
         except UnreadableReport:
             raise
         except (TypeError, ValueError) as exc:
-            raise UnreadableReport(int(row["id"]), "отчёт не разобрался") from exc
+            raise UnreadableReport(report_id, "отчёт не разобрался") from exc
     return views
 
 
@@ -206,14 +222,18 @@ async def _report_blockers(
 # ---- ветка, вердикт, проверки --------------------------------------------------
 
 
-async def _tip(
-    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
-) -> tuple[str, str]:
+def _tip(task: dict[str, Any], ctx: dict[str, Any]) -> tuple[str, str]:
+    """Вершина ветки из последнего НАБЛЮДЕНИЯ хаба: показ в сеть не ходит.
+
+    Карточка перерисовывается каждые 15 с, а входящие зовут справку по каждой
+    задаче: ``git fetch`` на каждый показ — нагрузка и зависание. Нет свежего
+    наблюдения (его пишут сдача, бриф, гейт, стюард) — «не сверена», а не «совпала».
+    """
     if "branch_tip" in ctx:
         return ctx["branch_tip"]
-    from hub.services.lifecycle import resolve_branch_tip
+    from hub.services.lifecycle import observed_branch_tip
 
-    return await resolve_branch_tip(db, int(task["id"]), str(task.get("branch") or ""))
+    return observed_branch_tip(int(task["id"]), str(task.get("branch") or ""))
 
 
 async def _sha_blocker(
@@ -221,33 +241,38 @@ async def _sha_blocker(
 ) -> Blocker | None:
     branch = str(task.get("branch") or "").strip()
     pinned = str(task.get("submission_sha") or "").strip()
-    tip, reason = await _tip(db, task, ctx) if (pinned and branch) else ("", "")
+    tip, reason = _tip(task, ctx) if (pinned and branch) else ("", "")
     state, why = review_evidence.sha_check_of(pinned, branch, tip, reason)
     if state == "match":
         return None
     risk = (
         "Ветка ушла от сдачи: проверялся не тот код"
         if state == "diverged"
-        else "Вершина ветки не проверена: совпадение со сдачей не доказано"
+        else "Вершина ветки не сверена: совпадение со сдачей не доказано"
     )
     return Blocker(CHECK, "high", risk, why, CODE_SHA)
 
 
 def _verdict_blocker(task: dict[str, Any]) -> Blocker | None:
+    """Действующий вердикт и открытые in_scope-находки ТЕКУЩЕГО поколения.
+
+    «На доработку» блокирует всегда. in_scope-находки блокируют при ЛЮБОМ
+    вердикте: «одобрено» с открытыми находками в рамках задачи — противоречие,
+    которое решает человек, а не справка. out_of_scope — рекомендации, не блок.
+    """
     generation = int(task.get("submission_generation") or 0)
-    if task.get("review_verdict") != "changes_requested":
-        return None
-    if int(task.get("review_verdict_generation") or 0) != generation:
-        return None  # вердикт прошлой сдачи: код с тех пор пересдан
+    verdict = task.get("review_verdict")
+    if not verdict or int(task.get("review_verdict_generation") or 0) != generation:
+        return None  # вердикта нет или он про прошлую сдачу: код с тех пор пересдан
     try:
         raw = json.loads(task.get("review_findings") or "[]")
     except ValueError:
         raw = None
     if not isinstance(raw, list):
         return Blocker(
-            REWORK,
+            REWORK if verdict == "changes_requested" else CHECK,
             "high",
-            "Действует вердикт «на доработку», находки не читаются",
+            "Находки вердикта не читаются",
             "",
             CODE_VERDICT,
         )
@@ -257,9 +282,19 @@ def _verdict_blocker(task: dict[str, Any]) -> Blocker | None:
         if isinstance(f, dict) and f.get("scope", "in_scope") == "in_scope"
     ]
     why = f"открытых находок в рамках задачи: {len(open_in_scope)}"
-    return Blocker(
-        REWORK, "high", "Действует вердикт «на доработку»", why, CODE_VERDICT
-    )
+    if verdict == "changes_requested":
+        return Blocker(
+            REWORK, "high", "Действует вердикт «на доработку»", why, CODE_VERDICT
+        )
+    if open_in_scope:
+        return Blocker(
+            CHECK,
+            "high",
+            f"Вердикт «{verdict}», но есть открытые находки в рамках задачи",
+            why,
+            CODE_VERDICT,
+        )
+    return None
 
 
 async def _ci_blocker(db: aiosqlite.Connection, task: dict[str, Any]) -> Blocker | None:
