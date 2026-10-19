@@ -16,21 +16,22 @@ from typing import NamedTuple
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
 
 
-def _unquote_path(raw: str, *, keep_space: bool = False) -> str | None:
-    """A path as git prints it in a header, or None when it cannot be read.
+def _unquote_path(raw: str) -> str | None:
+    """THE key of a path named in a diff header, or None when it cannot be read.
 
-    ``keep_space`` is for lines that carry nothing but the name (``rename to``,
-    ``copy from``): only the line ending goes, a space at the end of an
-    unquoted name stays part of it. A quoted name is decoded and returned as
-    it is, trailing tab included; nothing may strip it afterwards.
+    One rule for every reader (``changed_paths``, section keys, ``rename to``,
+    ``split_generated``, ``_header_paths``). A quoted name is decoded and
+    returned as it is, a trailing tab included. An unquoted one loses only the
+    line ending and git's service TAB after ``---``/``+++`` names; spaces are
+    part of the name (an unquoted name never ends in a tab: git quotes it).
 
     With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
     or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
     Undecodable means unknown, never documentation.
     """
-    raw = raw.rstrip("\r\n") if keep_space else raw.strip()
+    raw = raw.rstrip("\r\n")
     if not raw.startswith('"'):
-        return raw
+        return raw.rstrip("\t")
     if len(raw) < 2 or not raw.endswith('"'):
         return None
     body, out, i = raw[1:-1], bytearray(), 0
@@ -159,6 +160,7 @@ def scan_diff(diff: str) -> list[Scanned]:
     out: list[Scanned] = []
     hunk = _Hunk()
     broke = False
+    prev = ""
 
     def fresh() -> _FileSpan:
         span = _FileSpan(trusted=not broke)
@@ -171,6 +173,7 @@ def scan_diff(diff: str) -> list[Scanned]:
         if hunk.open:
             if hunk.consume(text):
                 out.append(Scanned(line, text, cur, hunk.parents))
+                prev = ""  # a body line is never half of a header
                 continue
             broke, cur.trusted = True, False
             hunk.reset()
@@ -178,6 +181,10 @@ def scan_diff(diff: str) -> list[Scanned]:
             text.startswith("--- ") and cur.plus_at is not None
         ):
             cur = fresh()
+        elif text.startswith("+++ ") and cur.hunks and not prev.startswith("--- "):
+            # A file header is the pair "--- " + "+++ ". A lone "+++ " after a
+            # hunk is body text the counters undercounted, not a new file.
+            broke, cur.trusted = True, False
         elif text.startswith("+++ "):
             cur = fresh() if cur.plus_at is not None else cur
             cur.plus_at, cur.path = n, _header_path(text)
@@ -188,6 +195,7 @@ def scan_diff(diff: str) -> list[Scanned]:
         elif cur.hunks and text[:1] in ("+", "-", " "):
             broke, cur.trusted = True, False  # counters undercounted the body
         out.append(Scanned(line, text, cur, 0))
+        prev = text
     if hunk.open and out:
         out[-1].span.trusted = False
     return out

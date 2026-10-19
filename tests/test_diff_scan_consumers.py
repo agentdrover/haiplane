@@ -10,11 +10,16 @@ from hub.services.review_dispatch import (
     _inline_diff_lines,
     diff_file_sections,
     author_delta_lines,
+    _header_paths,
     changed_paths,
+    process_surface_reasons,
+    split_generated,
 )
 from hub.services.finding_evidence import _parse_patch_log
 from hub.services.review_evidence import diff_size
 from hub.services.task_diff import split_files
+
+_SUBPROCESS = ["запуск подпроцессов: subprocess.run"]
 
 # A hunk whose first added line reads "+++ b/evil.py" (text "++ b/evil.py").
 _LOOKALIKE = (
@@ -207,3 +212,51 @@ def test_a_quoted_name_keeps_its_trailing_tab_in_the_section_key():
     # An unquoted name keeps a trailing space; only the line ending goes.
     spaced = "diff --git a/o b/n \nrename from o\nrename to n \n"
     assert diff_file_sections(spaced)[0][0] == "n "
+
+
+def test_every_reader_keys_a_path_the_same_way():
+    # ONE key rule: quoted names decode as they are, unquoted ones lose only
+    # the line ending (and git's service TAB on ---/+++), spaces stay.
+    # (name as written in the header, expected key, git's TAB after the name)
+    cases = [
+        ("new.py ", "new.py ", "\t"),
+        ('"new.py\\t"', "new.py\t", ""),
+        ('"\\321\\217.py"', "\u044f.py", ""),
+        ("d b/f.py", "d b/f.py", "\t"),
+        ("node_modules/x b/y.js", "node_modules/x b/y.js", "\t"),
+    ]
+    for written, key, tab in cases:
+        quoted = written.startswith('"')
+        a = '"a/' + written[1:] if quoted else "a/" + written
+        b = '"b/' + written[1:] if quoted else "b/" + written
+        plus = (
+            f"diff --git {a} {b}\nindex 1..2 100644\n--- {a}{tab}\n+++ {b}{tab}\n"
+            "@@ -1 +1 @@\n-a\n+b\n"
+        )
+        same = f"diff --git {a} {b}\nold mode 100644\nnew mode 100755\n"
+        rename = f"diff --git a/o {b}\nrename from o\nrename to {written}\n"
+        assert changed_paths(plus) == [key], written
+        assert diff_file_sections(plus)[0][0] == key, written
+        assert diff_file_sections(same)[0][0] == key, written
+        assert diff_file_sections(rename)[0][0] == key, written
+        assert _header_paths(f"rename to {written}") == [key], written
+        if key.startswith("node_modules/"):
+            assert split_generated(plus)[1] == [key], written
+
+
+def test_a_lone_plus_header_after_a_hunk_is_code_not_a_new_file():
+    # Counters say 1 line, the body has more: "+++ README.md" is NOT a header
+    # (no "--- " before it), so nothing after it is trusted or cut.
+    for name in ("README.md", "uv.lock"):
+        diff = (
+            "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+x\n"
+            f"+++ {name}\n+subprocess.run(1)\n"
+        )
+        assert process_surface_reasons(diff) == _SUBPROCESS, name
+        assert split_generated(diff) == (diff, []), name
+    # A removed line that reads "--- x" is body, not half of a header pair.
+    tricky = "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -1 +0,0 @@\n--- x\n+++ README.md\n+subprocess.run(1)\n"
+    assert process_surface_reasons(tricky) == _SUBPROCESS
+    # A real pair after a hunk still opens a new file.
+    pair = "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+x\n--- a/uv.lock\n+++ b/uv.lock\n@@ -0,0 +1 @@\n+y\n"
+    assert split_generated(pair)[1] == ["uv.lock"]
