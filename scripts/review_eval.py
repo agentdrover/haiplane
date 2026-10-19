@@ -330,6 +330,17 @@ def judge_outcome(judge: dict[str, Any] | None) -> str:
     return "held"
 
 
+def _unresolved_may_touch(item: Any, locators: list[dict[str, Any]]) -> bool:
+    """Нераспознанная находка тревожит, если не называет чужой файл.
+
+    По схеме у неё нет файла (title, why): такая тревожит всегда. Если файл
+    всё же назван и он не из локаторов, это тревога о другом месте.
+    """
+    if isinstance(item, dict) and item.get("file"):
+        return _norm_path(item["file"]) in {_norm_path(loc["file"]) for loc in locators}
+    return True
+
+
 def machine_outcome(case: dict[str, Any], reports: list[dict[str, Any]]) -> str:
     if not reports:
         return "no_report"
@@ -341,9 +352,9 @@ def machine_outcome(case: dict[str, Any], reports: list[dict[str, Any]]) -> str:
         return "no_locator"
     if any(finding_matches(f, locators) for f in confirmed):
         return "detected"
-    if any(r["unresolved"] for r in reports) or any(
-        _names_file_without_line(f, locators) for f in confirmed
-    ):
+    if any(
+        _unresolved_may_touch(u, locators) for r in reports for u in r["unresolved"]
+    ) or any(_names_file_without_line(f, locators) for f in confirmed):
         return "alerted"
     return "missed"
 
@@ -443,9 +454,20 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "judge_clean": _tally(cleans, "judge"),
         "advisor_defect": _tally(defects, "advisor"),
         "advisor_clean": _tally(cleans, "advisor"),
+        "cleans_scored_provisional": sum(
+            1 for r in cleans if r["status"] == STATUS_SCORED and r["provisional"]
+        ),
         "defects_scored": sum(1 for r in defects if r["status"] == STATUS_SCORED),
         "cleans_scored": sum(1 for r in cleans if r["status"] == STATUS_SCORED),
     }
+
+
+def _prov(s: dict[str, Any]) -> str:
+    """Оговорка к долям по чистым: окно наблюдения может быть не истекло."""
+    p = s["cleans_scored_provisional"]
+    if not p:
+        return ""
+    return f"; предварительно: окно не истекло у {p} из {s['cleans_scored']} чистых в счёте"
 
 
 def _machine_lines(s: dict[str, Any]) -> list[str]:
@@ -459,7 +481,8 @@ def _machine_lines(s: dict[str, Any]) -> list[str]:
         f"  насторожился без обнаружения: {d['alerted']}; пропущено: {d['missed']}",
         f"  без отчёта: {d['no_report']}; без локатора: {d['no_locator']}",
         f"  ложные тревоги на чистых: {_rate(c['false_alarm'], with_reports)}"
-        f" (покрытие {_rate(with_reports, s['cleans_scored'])}, без отчёта {c['no_report']})",
+        f" (покрытие {_rate(with_reports, s['cleans_scored'])}, без отчёта {c['no_report']})"
+        f"{_prov(s)}",
     ]
 
 
@@ -474,7 +497,7 @@ def _judge_lines(s: dict[str, Any]) -> list[str]:
         f"  одобрил дефектную: {d['approved']}; процедурная эскалация: {d['procedural']}"
         f"; суждения нет: {d['none']}",
         f"  ложно удержал чистую: {_rate(c['held'], c_total)}"
-        f" (покрытие {_rate(c_total, s['cleans_scored'])})",
+        f" (покрытие {_rate(c_total, s['cleans_scored'])}){_prov(s)}",
         f"  чистые: одобрил {c['approved']}; процедурная эскалация {c['procedural']}"
         f"; суждения нет {c['none']}",
     ]
@@ -489,7 +512,7 @@ def _advisor_lines(s: dict[str, Any]) -> list[str]:
         f"  поймал дефектную: {_rate(d['caught'], d_total)}"
         f" (покрытие {_rate(d_total, s['defects_scored'])})",
         f"  ложные тревоги на чистых: {_rate(c['false_alarm'], c_total)}"
-        f" (покрытие {_rate(c_total, s['cleans_scored'])})",
+        f" (покрытие {_rate(c_total, s['cleans_scored'])}){_prov(s)}",
         "  вне счёта: "
         + ", ".join(
             f"{name} {d[name] + c[name]}"
@@ -606,7 +629,10 @@ def _plan_totals(billed: int, provider: int, unknown: int, left_out: int) -> lis
     total = billed + provider
     exact = not provider and not unknown
     mark = "" if exact else "≥ "
-    lines = [f"  оценка цены: {mark}{total} токенов"]
+    if not total and unknown:
+        lines = [f"  оценка цены: {NO_DATA}"]
+    else:
+        lines = [f"  оценка цены: {mark}{total} токенов"]
     if provider:
         lines.append(f"  из них по provider_tokens (нижняя граница): {provider}")
     if unknown:

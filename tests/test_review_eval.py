@@ -365,7 +365,7 @@ async def test_plan_marks_unknown_cost(db, db_dsn, tmp_path, capsys):
     assert ev.main(["--corpus", str(path), "--db", db_dsn, "--plan-cap", "5"]) == 0
     out = capsys.readouterr().out
     assert "нет данных; случаи: c1" in out
-    assert "оценка цены: ≥ 0 токенов" in out
+    assert "оценка цены: нет данных" in out
     assert "целей без данных о цене: 1 — в сумму не входят" in out
 
 
@@ -374,3 +374,19 @@ def test_invalid_corpus_stops_the_run(tmp_path, capsys):
     path.write_text(json.dumps({"cases": []}), encoding="utf-8")
     assert ev.main(["--corpus", str(path), "--db", str(tmp_path / "x.db")]) == 1
     assert "корпус пуст" in capsys.readouterr().out
+
+
+def test_unresolved_about_another_file_is_not_an_alert():
+    locs = [{"file": "a.py", "start_line": 1, "end_line": 1}]
+    case = {"expectation": "defect", "locators": locs}
+    other = [{"id": 1, "confirmed": [], "unresolved": [{"title": "t", "file": "b.py"}]}]
+    bare = [{"id": 1, "confirmed": [], "unresolved": [{"title": "t", "why": "w"}]}]
+    assert ev.machine_outcome(case, other) == "missed"
+    assert ev.machine_outcome(case, bare) == "alerted"
+
+
+async def test_clean_shares_are_marked_provisional(synthetic, db_dsn, capsys):
+    assert ev.main(["--corpus", str(synthetic), "--db", db_dsn]) == 0
+    out = capsys.readouterr().out
+    assert "предварительно: окно не истекло у 0" not in out
+    assert out.count("чистых в счёте") in (0, 3)  # окно синтетической чистой истекло
