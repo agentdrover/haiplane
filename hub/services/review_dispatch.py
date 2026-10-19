@@ -320,10 +320,12 @@ def _git_section_path(line: str) -> str:
     The key the sections are matched on is the path as ``changed_paths`` and
     ``split_generated`` spell it: unquoted, without ``a/`` and ``b/``.
     """
+    # The line comes from diff_lines with its ending: LF would end up in the key.
+    line = line.rstrip("\r\n")
     named = [p for p in _git_line_paths(line[len("diff --git ") :]) if p]
     if named:
         return named[-1].removeprefix("b/")
-    return line.rstrip("\n").rsplit(" b/", 1)[-1]
+    return line.rsplit(" b/", 1)[-1]
 
 
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:

@@ -116,3 +116,33 @@ def test_a_quoted_path_names_a_section_that_has_no_plus_header():
     )
     ((path, _),) = diff_file_sections(binary)
     assert path == "img/\u044f.png"
+
+
+_NO_PLUS_HEADER = {
+    "new.py": (
+        "diff --git a/old.py b/new.py\nsimilarity index 100%\n"
+        "rename from old.py\nrename to new.py\n"
+    ),
+    "img.png": (
+        "diff --git a/img.png b/img.png\nindex 1..2 100644\n"
+        "Binary files a/img.png and b/img.png differ\n"
+    ),
+    "gone.py": (
+        "diff --git a/gone.py b/gone.py\ndeleted file mode 100644\nindex 1..0\n"
+        "--- a/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+    ),
+    "run.sh": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+}
+
+
+def test_sections_without_a_plus_header_are_attached_on_a_resubmission():
+    # rename-only, binary, deletion and mode change carry no "+++ b/<path>" that
+    # could repair the key: the key must be clean from the "diff --git" line.
+    for path, diff in _NO_PLUS_HEADER.items():
+        ((key, text),) = diff_file_sections(diff)
+        assert key == path and text == diff
+        lines, omitted = _inline_diff_lines(diff, [], [path], 100_000)
+        assert omitted == [] and diff in "".join(lines), path
+    # And CRLF endings leave no CR in the key either.
+    crlf = _NO_PLUS_HEADER["run.sh"].replace("\n", "\r\n")
+    assert diff_file_sections(crlf)[0][0] == "run.sh"
