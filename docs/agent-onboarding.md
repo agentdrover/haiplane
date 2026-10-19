@@ -272,7 +272,7 @@ curl -sS \
 
 ### Reviewer-идентичность: не ревьюй под токеном исполнителя (#432)
 
-Universal Review Gate сравнивает **принципалов**, а не тип токена: вердикт
+Universal Review Gate сравнивает **принципалов** (APPROVED агента хаб не принимает вовсе: 409 `approval_reserved_for_human`, #1872 — одобряет человек или автоматика по политике проекта), а не тип токена: вердикт
 (`hub_submit_review` / `POST /api/tasks/{id}/review-verdict`) от той же
 идентичности, что делала `hub_pair_start`/`hub_claim_task`, отклоняется с
 403 `self_review_forbidden`. Сравнение идёт по `principal_id` (DB-токены),
@@ -559,7 +559,7 @@ uv run pytest -q
 - Используй `uv run pytest`, не `python -m pytest`.
 - Зависимости — через `uv add <package>`.
 - Контрактные изменения: REST + CLI + MCP + Web + тесты в одном проходе.
-- Изменения схемы/persisted данных — миграция в `hub/migrations/` (в конец `part_3.py`).
+- Изменения схемы/persisted данных — миграция в `hub/migrations/` — НОВЫЙ файл `steps/m<YYYYMMDDHHMM>_<задача>_<суть>.py` с `MIGRATIONS: list[tuple[str, str]]`; `part_1..3` заморожены, влитый шаг не правится (#1854). Тесты фичи — в тематический файл, не в `test_db_migrations.py`.
 - Не коммить секреты, реальные `.env`, локальные БД, кэши.
 - Коммиты: `<type>: <короткое описание> (#hub-id)`.
 

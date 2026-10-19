@@ -4327,7 +4327,9 @@ async def _vstep_verdict_matches_its_text(state: VerdictContext) -> None:
         raise HTTPException(
             422,
             detail=verdict_contradicts_its_text_detail(
-                state.body.verdict.value, declared
+                state.body.verdict.value,
+                declared,
+                for_agent=state.agent_caller and not state.human_caller,
             ),
         )
 
@@ -4361,8 +4363,10 @@ async def _vstep_changes_requested_has_in_scope_finding(state: VerdictContext) -
                             "finding; all findings are out_of_scope"
                         ),
                         "hint": (
-                            "If nothing needs fixing in this task, submit "
-                            "verdict=approved and keep out-of-scope findings "
+                            "If nothing needs fixing in this task, file a review "
+                            "report (hub_submit_machine_review or a comment) "
+                            "recommending to approve (APPROVED comes from a human "
+                            "or the hub policy) and keep out-of-scope findings "
                             "as recommendations (linked to follow-up tasks "
                             "via linked_task_id)."
                         ),
@@ -4671,6 +4675,14 @@ async def record_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    # #1872: первым шагом, до state-ветки и до _standing_verdict_gate — отказ
+    # не зависит от маршрута, статуса и стоящего вердикта и ничего не пишет.
+    verdict_guard.ensure_approval_is_human(
+        body,
+        agent_caller=agent_caller,
+        human_caller=human_caller,
+        self_approved=self_approved,
+    )
     task = dict(row)
     if is_state(task):
         # #1647: вердикт по задаче-состоянию — только с поколением, APPROVED

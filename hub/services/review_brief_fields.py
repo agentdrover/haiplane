@@ -61,6 +61,7 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "current_generation_review": (MANDATORY, ""),
     "self_review_warning": (MANDATORY, ""),
     "stacking_warning": (MANDATORY, ""),
+    "cause_task": (MANDATORY, ""),
     "path_notices": (MANDATORY, ""),
     "result_kind": (MANDATORY, ""),
     "state_review": (MANDATORY, ""),

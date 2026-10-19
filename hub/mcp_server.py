@@ -1695,8 +1695,9 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
     if status == "review":
         return (
             f"{base} Universal Review Gate: the done report was routed to "
-            "review, not completion. A reviewer must run hub_get_review_brief "
-            "and hub_submit_review; after an APPROVED verdict, report done again."
+            "review, not completion. An agent reviewer files changes_requested "
+            "(hub_submit_review) or a report (hub_submit_machine_review); "
+            "APPROVED comes from a human or the hub policy, then report done again."
         )
     if status in ("ci_check", "needs_decision"):
         return f"{base} Task entered {status}."
@@ -3025,6 +3026,20 @@ async def _verdict_block(task_id: int, generation: int | None) -> str:
     return verdict_evidence.format_block(evidence)
 
 
+def _brief_notice_parts(brief: dict[str, Any]) -> list[str]:
+    """Стыковка веток, блок задачи-причины (#1858) и ручные шаги по путям."""
+    parts: list[str] = []
+    if brief.get("stacking_warning"):
+        parts.append(f"\n{brief['stacking_warning']}")
+    cause_line = brief_projection.cause_task_line(brief.get("cause_task"))
+    if cause_line:
+        parts.append(f"\n{cause_line}")
+    notices_text = _path_notices_text(brief.get("path_notices"))
+    if notices_text:
+        parts.append(notices_text)
+    return parts
+
+
 def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult:
     """The whole brief: prose text plus the brief in structuredContent (#308)."""
     parts = []
@@ -3083,11 +3098,7 @@ def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult
             parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
     parts.extend(_brief_evidence_lines(brief))
     parts.extend(_brief_ci_integrity_lines(brief))
-    if brief.get("stacking_warning"):
-        parts.append(f"\n{brief['stacking_warning']}")
-    notices_text = _path_notices_text(brief.get("path_notices"))
-    if notices_text:
-        parts.append(notices_text)
+    parts.extend(_brief_notice_parts(brief))
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")
@@ -3112,8 +3123,8 @@ def _full_brief_result(brief: dict[str, Any], block: str = "") -> CallToolResult
         parts.append(f"\n{block}")
     parts.append(
         "\nSubmit the verdict with hub_submit_review "
-        "(verdict=approved|changes_requested, findings for changes_requested; "
-        "changes_requested needs at least one scope=in_scope finding)."
+        "(verdict=changes_requested with findings, at least one scope=in_scope; "
+        "an agent's approved is refused, a positive outcome is a review report)."
     )
     return structured_echo_result("\n".join(parts), brief=brief)
 
@@ -3131,13 +3142,14 @@ async def hub_submit_review(
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
-    Not for the task's own implementer — such a verdict is refused. Binds to
+    Not for the task's own implementer — such a verdict is refused. An agent's
+    APPROVED is refused (409 approval_reserved_for_human). Binds to
     the current submission generation. Commit task: does NOT complete it, it
     returns to running (APPROVED: author takes the done path; CHANGES_REQUESTED:
     back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
-    in_scope one — all-out-of-scope means approve and keep them as linked
+    in_scope one — all-out-of-scope means a positive report and linked
     recommendations. Unlinked out_of_scope findings warn, non-blocking.
 
     Auto-drafts (#436): create_tasks_for_out_of_scope=true opens a DRAFT
@@ -3145,7 +3157,7 @@ async def hub_submit_review(
 
     Args:
         task_id: The task under review
-        verdict: 'approved' or 'changes_requested'
+        verdict: 'changes_requested'; an agent's 'approved' is refused
         comments: Free-text review summary
         agent: Reviewer agent name
         findings: For changes_requested — dicts with id (int, stable within

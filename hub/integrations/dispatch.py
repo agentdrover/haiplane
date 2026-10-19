@@ -164,23 +164,27 @@ class DispatchIntegration:
             "3. Критерии: корректность логики, наличие тестов для новых изменений, "
             "стиль кода, обратная совместимость\n"
             "4. Для каждого замечания укажи severity (high/medium/low) и обоснование\n"
-            "5. ОБЯЗАТЕЛЬНО запиши вердикт СТРУКТУРИРОВАННОЙ командой (#326):\n"
-            f"   oc-hub review-verdict {task_id} approved --agent code-reviewer "
-            f'--expected-generation {gen} --comments "<краткий отчёт>"\n'
-            "   ИЛИ\n"
+            "5. ОБЯЗАТЕЛЬНО запиши итог (#326, #1872). APPROVED агент не пишет: "
+            "хаб отклоняет его (409 approval_reserved_for_human), одобряет человек "
+            "или автоматика хаба. Если работа принимается, оформи положительный "
+            "итог ОТЧЁТОМ ревью с рекомендацией человеку:\n"
+            f"   oc-hub update {task_id} --kind review --agent code-reviewer "
+            '--message "<отчёт: что проверено, рекомендация принять>"\n'
+            "   Если нужны правки, запиши вердикт СТРУКТУРИРОВАННОЙ командой:\n"
             f"   oc-hub review-verdict {task_id} changes_requested --agent code-reviewer "
             f'--expected-generation {gen} --comments "<краткий отчёт>" '
             '--findings-json \'[{"id":1,"severity":"high","message":"..."}]\'\n\n'
             "Без --expected-generation вердикт не принимается: возьмите поколение из "
             f"`oc-hub review-brief {task_id}` (submission_generation). Стоящий "
             "вердикт заменяет только человек.\n\n"
-            "ВАЖНО: Если основная задача выполнена корректно — approved, "
-            "даже если есть мелкие недочёты (low severity). "
+            "ВАЖНО: Если основная задача выполнена корректно, пиши отчёт с "
+            "рекомендацией принять, даже если есть мелкие недочёты (low severity). "
             "changes_requested — только для высокоприоритетных проблем (high), "
             "которые ломают логику, безопасность или обратную совместимость.\n\n"
             "Если review-verdict недоступен в твоей версии oc-hub — fallback:\n"
             f'   oc-hub update {task_id} --kind review --agent code-reviewer --message "<отчёт>"\n'
-            "   с последней строкой ровно APPROVED или CHANGES_REQUESTED.\n"
+            "   с последней строкой CHANGES_REQUESTED или, при положительном итоге, "
+            "рекомендация человеку (последняя строка отчёта — не вердикт).\n"
         )
 
     def build_fix_message(
@@ -331,13 +335,12 @@ class DispatchIntegration:
             "2. Проанализируй каждое замечание ревьюера: какие критичны, какие второстепенны, какие ложные\n"
             "3. Оцени качество исправлений разработчика: решена ли основная задача?\n"
             "4. Напиши нейтральный отчёт\n"
-            "5. ОБЯЗАТЕЛЬНО запиши результат ДВУМЯ командами:\n\n"
-            f'   oc-hub update {task_id} --kind arbitration --agent arbiter --message "<детальный отчёт>"\n\n'
-            f'   oc-hub update {task_id} --kind review --agent arbiter --message "<короткий вердикт>\\nAPPROVED"\n'
-            "   ИЛИ\n"
-            f'   oc-hub update {task_id} --kind review --agent arbiter --message "<короткий вердикт>\\nCHANGES_REQUESTED"\n\n'
-            "Вердикт APPROVED — если основная задача выполнена, можно мержить.\n"
-            "Вердикт CHANGES_REQUESTED — если есть критичные проблемы, задача пойдёт на доработку.\n"
+            "5. ОБЯЗАТЕЛЬНО запиши отчёт арбитража с рекомендацией человеку (#1872):\n\n"
+            f'   oc-hub update {task_id} --kind arbitration --agent arbiter --message "<детальный отчёт и рекомендация: одобрить или вернуть на доработку, с обоснованием>"\n\n'
+            "Команд вердикта не запускай: на этом поколении вердикт уже стоит, "
+            "а APPROVED агент не записывает. После твоего отчёта задача "
+            "остаётся в needs_decision, и решает человек: одобряет или "
+            "возвращает на доработку (REST POST /api/tasks/<id>/decide).\n"
         )
 
         return "\n\n".join(parts)

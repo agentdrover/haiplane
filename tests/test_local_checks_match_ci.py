@@ -65,6 +65,7 @@ SIGNATURES: dict[str, str] = {
     "complexity_budget.py": "complexity_budget.py",
     "file_size_budget.py": "file_size_budget.py",
     "layer_rules.py": "layer_rules.py",
+    "migration_steps_add_only.py": "migration_steps_add_only.py",
     "mcp_catalog_budget.py": "mcp_catalog_budget.py",
     "pytest": "pytest",
     "bandit": "bandit",

@@ -16,6 +16,7 @@ from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
     DEEP,
     LITE,
+    REGRESSION_FIX_REASON_MARK,
     pick_review_model,
     pick_review_profile,
     changed_paths,
@@ -29,10 +30,14 @@ from tests.review_dispatch_support import (
     _DIFF_506,
     _HARMLESS_DIFF,
     _any_dispatch_row,
+    _cap_project,
     _dispatch_row,
     _DispatchRecorder,
+    _dispatch_notes,
     _docs_diff,
+    _node,
     _submitted,
+    _submitted_in,
     _wire,
 )
 
@@ -1358,3 +1363,90 @@ def test_lookalike_lines_in_a_body_do_not_change_what_the_diff_touches():
     # An added line "++ subprocess.run(1)" is code, not a "+++" header.
     code = _added("hub/x.py", "++ subprocess.run(1)")
     assert process_surface_reasons(code) == _SUBPROCESS
+
+
+async def test_a_regression_fix_gets_deep_within_caps(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1858): found_in=prod и cause_kind=regression дают deep.
+
+    Сильнее класса, документации и малой дельты; круг и суточный потолок
+    держат его как держали deep по правилу; без regression выбор прежний.
+    """
+    fix = {
+        "risk_class": "R1",
+        "found_in": "prod",
+        "cause_kind": "regression",
+        "caused_by_task_id": 1600,
+    }
+    plain = {"risk_class": "R1"}
+    docs = _docs_diff("docs/x.md")
+
+    # Класс R1 и дифф из документации: прежде lite, теперь deep с причиной.
+    profile, reasons = pick_review_profile(fix, docs)
+    assert profile == DEEP, reasons
+    assert reasons[0].startswith(REGRESSION_FIX_REASON_MARK), reasons
+    assert "#" not in reasons[0], "номер причины в причину профиля не пишется"
+    assert pick_review_profile(plain, docs)[0] == LITE
+    assert pick_review_profile(plain, _CODE_DIFF)[0] == LITE
+
+    # Малая дельта deep не снижает, а у обычной задачи снижает.
+    code_surface = "+++ b/hub/x.py\n+    subprocess.run(['true'])\n"
+    assert pick_review_profile(fix, _CODE_DIFF, small_delta=(2, 50))[0] == DEEP
+    assert pick_review_profile(plain, code_surface, small_delta=(2, 50))[0] == LITE
+
+    # Не регрессия: другая стадия, другой вид причины, пусто — прежний выбор.
+    for passport in (
+        {"found_in": "staging", "cause_kind": "regression"},
+        {"found_in": "prod", "cause_kind": "ops"},
+        {"found_in": "prod", "cause_kind": None},
+        {"found_in": "unknown", "cause_kind": "regression"},
+    ):
+        assert pick_review_profile({**plain, **passport}, docs)[0] == LITE, passport
+
+    # Круг на пороге остановки ведёт себя по прежнему правилу: lite.
+    stopped, stop_reasons = pick_review_profile(fix, docs, circle_stop=3)
+    assert stopped == LITE, stop_reasons
+    assert any(REGRESSION_FIX_REASON_MARK in r for r in stop_reasons), stop_reasons
+    assert not any("1600" in r for r in stop_reasons), stop_reasons
+
+    # Security и ручной запрос остаются deep как были.
+    security = {**fix, "risks": json.dumps([{"kind": "security", "severity": "low"}])}
+    assert pick_review_profile(security, docs, circle_stop=3)[0] == DEEP
+    human = {**fix, "machine_review_override": "require"}
+    assert pick_review_profile(human, docs, circle_stop=3) == (
+        DEEP,
+        ["ревью запрошено человеком"],
+    )
+
+    # Потолок: место под него занимает и исправление регрессии; сверх потолка
+    # прежнее поведение (lite) с названной причиной, обе причины в ленте.
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-r"}, "run": {"id": "r"}}))
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "regr-cap", {"deep_daily_cap": 1})
+    cause = await _node(db, title="cause", task_type="task", parent_id=None)
+    passport = {
+        "found_in": "prod",
+        "cause_kind": "regression",
+        "caused_by_task_id": cause,
+        # Прод-дефект не сдаётся без вывода (prevention_gate); колонка занята
+        # заранее, потому что тест проверяет профиль, а не этот гейт.
+        "defect_prevention": json.dumps(
+            {"kind": "accepted_risk", "reason": "test", "revisit": "test"}
+        ),
+    }
+    first = await _submitted_in(db, pid, diff=docs, passport=passport)
+    second = await _submitted_in(db, pid, diff=docs, passport=passport)
+
+    assert (await _any_dispatch_row(db, first))["profile"] == "deep"
+    assert (await _any_dispatch_row(db, second))["profile"] == "lite"
+    rows = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (second,),
+    )
+    reasons = json.loads(rows[-1][0])["profile_reasons"]
+    assert any(REGRESSION_FIX_REASON_MARK in r for r in reasons), reasons
+    assert any("суточный потолок 1 исчерпан" in r for r in reasons), reasons
+    assert not any(f"#{cause}" in r for r in reasons), reasons
+    notes = " ".join(await _dispatch_notes(db, second))
+    assert f"#{cause}" not in notes, notes
