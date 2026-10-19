@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
+from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
@@ -3336,6 +3337,8 @@ class TaskView(PlainSummaryView):
     # #1589: the path-notice result of THIS submission, set on submit responses
     # only. None = no rules were configured, nothing to say.
     path_notices: PathNoticesView | None = None
+    # #1909: open findings left without an outcome by this submission (None = none).
+    outcome_hint: OutcomeHintView | None = None
     # #1515: where this task's worktree goes, as a template relative to the
     # caller's clone. Set on claim and pair-start only; the hub cannot know the
     # clone's folder name, so the exact path comes from `hp-hub worktree`.
