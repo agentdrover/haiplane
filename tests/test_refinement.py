@@ -184,15 +184,15 @@ async def test_plain_summary_defect_verify_mcp_one_request_and_300_cap():
 @pytest.mark.parametrize(
     "text",
     [
-        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",  # pragma: allowlist secret
         "sk-abcdefghijklmnopqrstuv вставлен в запрос.",
         "Ключ sk-abc123 в запросе.",
         "Токен ghp_abc123 в логе.",
-        "ghp_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",
-        "gho_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",  # pragma: allowlist secret
+        "gho_abcdefghijklmnopqrstuvwxyz0123456789 в логе.",  # pragma: allowlist secret
         "github_pat_11ABCDEFG0abcdefghijkl в логе.",
-        "xoxb-1234-5678-abcdef в логе.",
-        "AKIAIOSFODNN7EXAMPLE в логе.",
+        "xoxb-1234-5678-abcdef в логе.",  # pragma: allowlist secret
+        "AKIAIOSFODNN7EXAMPLE в логе.",  # pragma: allowlist secret
         "Authorization: Bearer abc123SECRET в запросе.",
         "PASSWORD=hunter2 в конфиге.",
         "Хеш 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 не совпал.",
