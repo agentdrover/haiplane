@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -31,9 +32,12 @@ from hub.services import (
     project_policy,
     review_dispatch,
     steward_dispatch,
+    steward_act_readiness,
     steward_exit,
     steward_shadow,
 )
+
+log = logging.getLogger(__name__)
 
 POLICY_CHANGED_EVENT = "project_gate_policy_changed"
 
@@ -200,6 +204,10 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.steward_watch_of, "project_policy.steward_watch_of"
     ),
     "ci_contract": PolicyEntry(_ci_contract_view, "project_policy.ci_contract_from"),
+    "steward_approve_max_class": PolicyEntry(
+        project_policy.steward_approve_max_class_of,
+        "project_policy.steward_approve_max_class_of",
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
@@ -264,7 +272,17 @@ def _key_row(key: str, entry: PolicyEntry, policy: dict) -> dict[str, Any]:
 
 
 async def _steward_block(db: aiosqlite.Connection) -> dict[str, Any]:
-    return await steward_shadow.mode_report(db)
+    block = await steward_shadow.mode_report(db)
+    # #1855: готовность act — чистое чтение; сбой расчёта называется
+    # «неизвестно» и не роняет сводку, которую читают и при выдаче задачи.
+    try:
+        block["readiness"] = await steward_act_readiness.readiness_report(db, block)
+    except Exception as exc:  # noqa: BLE001 — сводка отвечает при любом сбое отчёта
+        log.warning("act readiness report failed: %s", exc)
+        block["readiness"] = steward_act_readiness.unknown_report(
+            f"{type(exc).__name__}: {exc}"
+        )
+    return block
 
 
 def _server_block() -> dict[str, Any]:
@@ -478,6 +496,44 @@ def _stored_note(row: dict[str, Any]) -> str:
     return ""
 
 
+def _readiness_lines(report: dict[str, Any] | None) -> list[str]:
+    """Строки отчёта готовности act (#1855): те же данные, что в REST."""
+    if not report:
+        return []
+    if report.get("status") != "ok":
+        return [f"  act readiness: unknown — {report.get('reason', '')}"]
+    basis = (
+        "actual"
+        if report["basis"] == "actual"
+        else "hypothetical (as if act requested)"
+    )
+    verdict = "granted" if report["act_would_be_granted"] else "refused"
+    lines = [f"  act readiness [{basis}]: {verdict}"]
+    for refusal in report["act_refusals_v2"]:
+        lines.append(f"    criterion unmet: {refusal['code']} — {refusal['detail']}")
+    for project in report["projects"]:
+        ceiling = project["steward_approve_max_class"] or "none"
+        lines.append(
+            f"    act scope: {project['slug']} (verdict=steward, steward_shadow "
+            f"{_show(project['steward_shadow'])}, ceiling {ceiling})"
+        )
+    if not report["projects"]:
+        lines.append("    act scope: no project delegates the verdict to the steward")
+    counts = report["candidate_counts"]
+    lines.append(
+        f"    candidates: ready {counts['ready']}, blocked {counts['blocked']}, "
+        f"unknown {counts['unknown']}"
+    )
+    for item in report["candidates"]:
+        why = "; ".join(f"{r['code']}: {r['detail']}" for r in item["reasons"])
+        lines.append(
+            f"      #{item['task_id']} gen {item['generation']} {item['state']}"
+            + (f" — {why}" if why else "")
+        )
+    lines.append(f"    ({report['note']})")
+    return lines
+
+
 def format_effective_policy(data: dict[str, Any]) -> list[str]:
     """Строки сводки — общие для CLI и MCP, как у занятости слотов."""
     lines = [f"Effective policy of project {data['slug']}"]
@@ -512,6 +568,7 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
             + f", procedural escalations {contour['procedural_escalations']}"
         )
+    lines.extend(_readiness_lines(steward.get("readiness")))
     server = data["server"]
     reviewer = server["reviewer_model"]
     lines.append(

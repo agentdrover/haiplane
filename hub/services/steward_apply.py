@@ -43,7 +43,9 @@ import aiosqlite
 from hub import config
 from hub.db import fetchall
 from hub.services import gate_grounds as grounds
+from hub.models import RiskClass
 from hub.services.auto_approve import ladder_hits
+from hub.services.project_policy import STEWARD_CEILING_UNREADABLE
 from hub.services.steward_evidence import EvidencePacket, build_evidence_packet
 
 log = logging.getLogger(__name__)
@@ -56,6 +58,9 @@ REFUSED_UNCLOSED = "unclosed_finding"
 # им же названо саморевью в громких основаниях — написание одно.
 REFUSED_SELF_AUTHORED = "self_authored"
 REFUSED_NOT_DELEGATED = "policy_not_delegated"
+# #1855: класс сдачи выше потолка проекта (или не известен при заданном
+# потолке). Код из закрытого словаря #1022 (STEWARD_ESCALATE_REASONS).
+REFUSED_CLASS_CEILING = "class_above_policy_ceiling"
 
 # Типы закрытия из закрытого словаря #1022, и рядом — ЧЕМ каждый
 # подтверждается. Соответствие публичное, потому что его полноту проверяет
@@ -164,6 +169,88 @@ def precondition_refusals(packet: EvidencePacket) -> list[tuple[str, str]]:
         if refusal:
             out.append((REFUSED_PRECONDITION, refusal))
     return out
+
+
+def _class_of(raw: Any) -> RiskClass | None:
+    try:
+        return RiskClass(str(raw))
+    except ValueError:
+        return None
+
+
+def class_ceiling_refusal(ceiling: str | None, fact: Any) -> tuple[str, str] | None:
+    """Потолок класса риска для approve стюарда против факта ``risk_class`` (#1855).
+
+    Таблица решений при заданном потолке:
+
+    * ``raised`` (дифф поднял класс) — прежний отказ предусловия говорит сам,
+      здесь молчим: потолок его не отменяет и не дублирует;
+    * stored и recomputed известны — потолок против max(stored, recomputed) по
+      порядку ``RiskClass``;
+    * факта нет, класс повреждён или recomputed пуст — отказ с названием
+      недостающего факта: неизвестный класс не равен R0;
+    * потолка нет — прежнее поведение (None).
+
+    Нечитаемый потолок (мимо модели в базе) отказывает на любой класс.
+    """
+    if ceiling is None:
+        return None
+    named = f"steward_approve_max_class={ceiling}"
+    if ceiling == STEWARD_CEILING_UNREADABLE:
+        return (
+            REFUSED_CLASS_CEILING,
+            f"{named}: значение потолка нечитаемо, approve не применяется",
+        )
+    if fact is None or fact.state != "present":
+        why = "факта нет в пакете" if fact is None else fact.detail
+        return (
+            REFUSED_CLASS_CEILING,
+            f"{named}: недостающий факт risk_class — {why}",
+        )
+    value = fact.value or {}
+    if value.get("raised"):
+        return None
+    stored = _class_of(value.get("stored"))
+    recomputed = _class_of(value.get("recomputed"))
+    if stored is None or recomputed is None:
+        missing = " и ".join(
+            name
+            for name, known in (("stored", stored), ("recomputed", recomputed))
+            if known is None
+        )
+        return (
+            REFUSED_CLASS_CEILING,
+            f"{named}: недостающий факт risk_class.{missing} — "
+            "неизвестный класс не равен R0",
+        )
+    order = list(RiskClass)
+    limit = _class_of(ceiling.upper())
+    worst = max(stored, recomputed, key=order.index)
+    if limit is not None and order.index(worst) > order.index(limit):
+        return (
+            REFUSED_CLASS_CEILING,
+            f"{named}: класс задачи {stored.value}, по диффу {recomputed.value}"
+            f" — выше потолка {limit.value}",
+        )
+    return None
+
+
+async def ceiling_refusals(
+    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
+) -> list[tuple[str, str]]:
+    """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
+    from hub import repository as repo
+    from hub.services.project_policy import (
+        gate_policy_of,
+        steward_approve_max_class_of,
+    )
+
+    project = await repo.resolve_project_for_task(db, task_id)
+    ceiling = steward_approve_max_class_of(
+        gate_policy_of(project) if project is not None else {}
+    )
+    refusal = class_ceiling_refusal(ceiling, packet.facts.get("risk_class"))
+    return [refusal] if refusal else []
 
 
 async def loud_refusals(
@@ -765,6 +852,7 @@ async def apply_refusals(
     out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(await integrity_refusals(db, task_id))
     out.extend(precondition_refusals(packet))
+    out.extend(await ceiling_refusals(db, task_id, packet))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)

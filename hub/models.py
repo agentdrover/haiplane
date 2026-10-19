@@ -439,6 +439,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # не делегирует. Читатель: project_policy.steward_watch_of.
     "steward_watch",
     "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
+    "steward_approve_max_class",  # #1855: читатель project_policy.steward_approve_max_class_of
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -3488,7 +3489,10 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     # прямо в базу, мимо всех проверок. Значения перечислены здесь и
     # только здесь; делегирующие из них живут в project_policy, и оба
     # перечня сверяются тестом.
-    from hub.services.project_policy import GATE_VALUES
+    from hub.services.project_policy import (
+        GATE_VALUES,
+        validate_steward_approve_max_class,
+    )
     from hub.services.ci_contract import validate_ci_keys
 
     bad = {
@@ -3543,6 +3547,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_release_artifacts(v)
     _validate_freeze(v)
     _validate_steward_watch(v)
+    validate_steward_approve_max_class(v)
     return v
 
 

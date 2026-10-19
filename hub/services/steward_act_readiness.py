@@ -1,0 +1,191 @@
+"""Отчёт готовности act стюарда: чистое чтение (#1855).
+
+Владелец включает act (применение approve стюарда без человека) по цифрам, а
+не на глаз. Отчёт отвечает на три вопроса, ничего не записывая — ни в ленту,
+ни в базу, ни в метки применения:
+
+* какие критерии выхода (``act_refusals_v2``) не выполнены. В режиме ``act``
+  это фактические отказы, в ``shadow``/``off`` — гипотетические «как если бы
+  act был запрошен», посчитанные тем же расчётом;
+* на каких проектах act применит вердикт: поимённо, с потолком класса;
+* какие сдачи применимы «на момент снимка»: готовы, заблокированы (с
+  причиной) или неизвестно.
+
+Кандидаты читаются ТОЛЬКО из сохранённого: суждения, ответ советника, политика
+и сохранённый класс задачи. Пакет доказательств здесь не собирается: его сборка
+обновляет подтверждение CI и скан диффа, то есть пишет. Поэтому «готов» значит
+«читаемые без записи проверки пройдены»; остальные факты (CI, вершина ветки,
+дифф и пересчитанный класс, отчёт ревью, закрытие находок) читает привратник
+``steward_apply.apply_refusals`` в момент применения.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import aiosqlite
+
+from hub import repository as repo
+from hub.db import fetchall
+from hub.models import RiskClass
+from hub.services import project_policy, steward_dispatch, steward_shadow
+from hub.services.result_kind import task_automation_not_applicable
+
+READY = "ready"
+BLOCKED = "blocked"
+UNKNOWN = "unknown"
+
+#: Предел списка кандидатов: отчёт читает человек, а не поллер.
+MAX_CANDIDATES = 50
+
+UNCHECKED_NOTE = (
+    "применимы на момент снимка по сохранённым данным (суждение, ответ советника, "
+    "политика проекта, сохранённый класс); факты пакета — CI, вершину ветки, дифф "
+    "и пересчитанный класс, отчёт ревью, закрытие находок — привратник читает "
+    "в момент применения"
+)
+
+# approve судьи нового контура без исхода применения — те же строки, что берёт
+# поллер (steward_advisor.apply_advisor_outcomes), но без метки.
+_CANDIDATE_SQL = (
+    "SELECT j.task_id, j.generation, t.risk_class "
+    "FROM steward_judgements j JOIN tasks t ON t.id = j.task_id "
+    "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
+    "AND j.advisor_outcome='' AND t.status='review' "
+    "AND t.submission_generation = j.generation "
+    "AND (t.review_verdict_generation IS NULL "
+    "     OR t.review_verdict_generation != j.generation) "
+    "ORDER BY j.task_id LIMIT ?"
+)
+
+
+def _reason(code: str, detail: str) -> dict[str, str]:
+    return {"code": code, "detail": detail}
+
+
+def _ceiling_reason(ceiling: str | None, stored_raw: Any) -> dict[str, str] | None:
+    """Потолок против СОХРАНЁННОГО класса: чего хватает прочитать без записи."""
+    from hub.services.steward_apply import REFUSED_CLASS_CEILING
+
+    if ceiling is None:
+        return None
+    named = f"steward_approve_max_class={ceiling}"
+    if ceiling == project_policy.STEWARD_CEILING_UNREADABLE:
+        return _reason(REFUSED_CLASS_CEILING, f"{named}: значение потолка нечитаемо")
+    try:
+        stored = RiskClass(str(stored_raw or "").strip())
+    except ValueError:
+        return _reason(
+            REFUSED_CLASS_CEILING,
+            f"{named}: недостающий факт risk_class.stored — класс задачи не вычислен",
+        )
+    order = list(RiskClass)
+    if order.index(stored) > order.index(RiskClass(ceiling.upper())):
+        return _reason(
+            REFUSED_CLASS_CEILING,
+            f"{named}: класс задачи {stored.value} выше потолка",
+        )
+    return None
+
+
+def _advisor_reason(state: Any) -> tuple[str, dict[str, str]] | None:
+    """(BLOCKED|UNKNOWN, причина) по состоянию советника, или None, если согласен."""
+    from hub.services import steward_advisor as adv
+
+    detail = f"советник: {state.state} — {state.reason}".rstrip(" —")
+    if state.state == adv.STATE_RECEIVED:
+        if state.answer == adv.ANSWER_CONCUR:
+            return None
+        return BLOCKED, _reason(adv.REFUSED_ADVISOR, "советник возражает")
+    if state.state in (adv.STATE_REFUSED, adv.STATE_TIMEOUT):
+        return BLOCKED, _reason(adv.REFUSED_ADVISOR, detail)
+    return UNKNOWN, _reason(adv.REFUSED_ADVISOR, detail)
+
+
+async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | None:
+    from hub.services.steward_advisor import advisor_state
+    from hub.services.steward_apply import policy_refusal
+
+    task_id, generation = int(row["task_id"]), int(row["generation"])
+    if await task_automation_not_applicable(db, task_id):
+        return None  # задача-state контуру не отдаётся — кандидатом не является
+    blocked: list[dict[str, str]] = []
+    unknown: list[dict[str, str]] = []
+    not_delegated = await policy_refusal(db, task_id)
+    if not_delegated:
+        blocked.append(_reason(*not_delegated))
+    project = await repo.resolve_project_for_task(db, task_id)
+    policy = project_policy.gate_policy_of(project) if project is not None else {}
+    ceiling = _ceiling_reason(
+        project_policy.steward_approve_max_class_of(policy), row["risk_class"]
+    )
+    if ceiling:
+        blocked.append(ceiling)
+    advised = _advisor_reason(await advisor_state(db, task_id, generation))
+    if advised:
+        (blocked if advised[0] == BLOCKED else unknown).append(advised[1])
+    state = BLOCKED if blocked else UNKNOWN if unknown else READY
+    return {
+        "task_id": task_id,
+        "generation": generation,
+        "project": str(project["slug"]) if project is not None else None,
+        "state": state,
+        "reasons": [*blocked, *unknown],
+    }
+
+
+async def candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    rows = await fetchall(db, _CANDIDATE_SQL, (MAX_CANDIDATES,))
+    out = [await _candidate(db, row) for row in rows]
+    return [c for c in out if c is not None]
+
+
+async def delegated_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Проекты, где вердикт отдан стюарду: act применит approve на каждом."""
+    out: list[dict[str, Any]] = []
+    for project in await repo.list_projects(db):
+        if not steward_dispatch.verdict_delegated_to_steward(project):
+            continue
+        policy = project_policy.gate_policy_of(project)
+        out.append(
+            {
+                "slug": str(project["slug"]),
+                "steward_shadow": steward_dispatch.steward_shadow_of(policy),
+                "steward_approve_max_class": (
+                    project_policy.steward_approve_max_class_of(policy)
+                ),
+            }
+        )
+    return sorted(out, key=lambda p: p["slug"])
+
+
+async def readiness_report(
+    db: aiosqlite.Connection, mode: dict[str, Any]
+) -> dict[str, Any]:
+    """Готовность act: критерии, охват, кандидаты. Ничего не пишет."""
+    hypothetical = mode["requested"] != "act"
+    if hypothetical:
+        refusals = [
+            {"code": c, "detail": d} for c, d in await steward_shadow.act_refusals(db)
+        ]
+    else:
+        refusals = list(mode["act_refusals"])
+    found = await candidates(db)
+    return {
+        "status": "ok",
+        "basis": "hypothetical" if hypothetical else "actual",
+        "act_refusals_v2": refusals,
+        "act_would_be_granted": not refusals,
+        "projects": await delegated_projects(db),
+        "candidates": found,
+        "candidate_counts": {
+            state: sum(1 for c in found if c["state"] == state)
+            for state in (READY, BLOCKED, UNKNOWN)
+        },
+        "note": UNCHECKED_NOTE,
+    }
+
+
+def unknown_report(reason: str) -> dict[str, Any]:
+    """Отчёт не посчитан: «неизвестно», а не «пусто» (#762)."""
+    return {"status": "unknown", "reason": reason}

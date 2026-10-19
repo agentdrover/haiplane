@@ -1650,3 +1650,105 @@ async def test_a_judgement_is_never_applied_where_the_verdict_is_not_delegated(
     assert REFUSED_NOT_DELEGATED not in _codes(
         await apply_refusals(db, delegated_task)
     ), "verdict=steward отказом политики не задерживается"
+
+
+# ---------------------------------------------------------------------------
+# #1855 AC-1 — потолок класса риска для approve стюарда
+# ---------------------------------------------------------------------------
+
+
+def _risk_packet(task_id: int, fact):
+    from hub.services.steward_evidence import EvidencePacket
+
+    return EvidencePacket(
+        task_id=task_id,
+        generation=1,
+        brief=None,
+        facts={} if fact is None else {"risk_class": fact},
+    )
+
+
+async def _ceiling_codes(
+    db: aiosqlite.Connection, monkeypatch, project_id: int, task_id: int, fact
+) -> list[tuple[str, str]]:
+    async def _packet(_db, tid, _generation=None):
+        return _risk_packet(tid, fact)
+
+    monkeypatch.setattr("hub.services.steward_apply.build_evidence_packet", _packet)
+    return [
+        r
+        for r in await apply_refusals(db, task_id)
+        if r[0] == "class_above_policy_ceiling"
+    ]
+
+
+async def test_the_approve_ceiling_refuses_above_or_unknown_class(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: потолок против max(stored, recomputed); неизвестное — отказ, не R0."""
+    from hub.services.steward_evidence import absent, present
+    from hub.services.steward_exit import contour_counts
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-ceiling")
+    task_id = await _task(db, project_id)
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=json.dumps(
+            {"verdict": "steward", "steward_approve_max_class": "r1"}
+        ),
+    )
+    await db.commit()
+    before = await contour_counts(db)
+
+    def risk(stored, recomputed, raised=False):
+        return present(
+            "risk_class", "класс", stored=stored, recomputed=recomputed, raised=raised
+        )
+
+    async def codes(fact):
+        return await _ceiling_codes(db, monkeypatch, project_id, task_id, fact)
+
+    # stored=R1/recomputed=R1 — потолок не возражает.
+    assert await codes(risk("R1", "R1")) == []
+    assert await codes(risk("R0", "R1")) == []
+    # stored=R2/recomputed=R1 и stored=R1/recomputed=R2 — оба отказ.
+    above_stored = await codes(risk("R2", "R1"))
+    above_diff = await codes(risk("R1", "R2"))
+    assert len(above_stored) == 1 and "R2" in above_stored[0][1]
+    assert len(above_diff) == 1 and "R2" in above_diff[0][1]
+    # recomputed=None и повреждённый класс — отказ с названием факта, не R0.
+    no_diff = await codes(risk("R1", None))
+    assert len(no_diff) == 1 and "risk_class.recomputed" in no_diff[0][1]
+    broken = await codes(risk("R9", "R1"))
+    assert len(broken) == 1 and "risk_class.stored" in broken[0][1]
+    # Факта нет вовсе или пакет его не собрал.
+    assert "факта нет в пакете" in (await codes(None))[0][1]
+    hole = await codes(absent("risk_class", "no_stored_class", "класс не вычислен"))
+    assert len(hole) == 1 and "класс не вычислен" in hole[0][1]
+    # raised=true — прежний отказ предусловия, потолок его не дублирует.
+    raised_fact = risk("R1", "R3", raised=True)
+    assert await codes(raised_fact) == []
+    all_refusals = await apply_refusals(db, task_id)
+    assert any("выше заявленного" in d or "дифф поднял" in d for _, d in all_refusals)
+    # Нечитаемый потолок (мимо модели) — отказ на любой класс.
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=json.dumps(
+            {"verdict": "steward", "steward_approve_max_class": "R1"}
+        ),
+    )
+    await db.commit()
+    unreadable = await codes(risk("R0", "R0"))
+    assert len(unreadable) == 1 and "нечитаем" in unreadable[0][1]
+    # Потолка нет — прежнее поведение: ни одного отказа по классу.
+    await repo.update_project(
+        db, project_id, gate_policy=json.dumps({"verdict": "steward"})
+    )
+    await db.commit()
+    assert await codes(risk("R3", "R5")) == []
+    assert await codes(None) == []
+    # Суждения судьи и знаменатель калибровки привратник не трогает.
+    assert await contour_counts(db) == before

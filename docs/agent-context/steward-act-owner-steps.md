@@ -1,0 +1,65 @@
+# Потолок класса риска для approve стюарда: шаги владельца (#1855)
+
+Это шаги владельца после выката кода #1855. Код только даёт рычаг и отчёт.
+Политику проектов и режим сервера меняет владелец. Приёмка политики идёт
+отдельно от приёмки кода.
+
+## Что есть в коде
+
+- Ключ проекта `gate_policy.steward_approve_max_class`: `r0`…`r5` строчными.
+  Нет ключа: потолка нет, поведение прежнее. `R1`, `high`, число: PATCH
+  отказывает (422). `null` удаляет ключ. Ключ пишет только человек или админ
+  (PATCH проекта); агент и `ci_runner` получают отказ.
+- Привратник `steward_apply.apply_refusals` при заданном потолке сравнивает
+  его с `max(stored, recomputed)` из факта `risk_class` пакета. Выше потолка:
+  отказ `class_above_policy_ceiling`. Класс неизвестен (факта нет, класс
+  повреждён, `recomputed` пуст): тот же отказ с названием недостающего факта.
+  Неизвестный класс не равен R0. `raised=true`: говорит прежний отказ
+  предусловия. Нечитаемое значение потолка в базе: отказ на любой класс.
+- Отчёт готовности: блок `steward.readiness` в `effective_policy`
+  (REST `GET /api/projects/{slug}/effective-policy`, CLI
+  `oc-hub effective-policy`, MCP `hub_effective_policy`). Чтение, без записи.
+  - `basis=hypothetical` в режиме `shadow`/`off`: критерии выхода
+    `act_refusals_v2` посчитаны «как если бы act был запрошен».
+    `basis=actual` в режиме `act`: те же отказы, что в `steward.act_refusals`.
+  - `projects`: проекты с `verdict=steward` поимённо, с `steward_shadow` и
+    потолком. Режим сервера глобальный: act применяет approve на каждом из них.
+  - `candidates`: сдачи с approve судьи нового контура без исхода. Состояния:
+    `ready`, `blocked` (с причиной), `unknown` (с причиной). Это «применимо на
+    момент снимка» по сохранённым данным. Факты пакета (CI, вершину ветки, дифф и
+    пересчитанный класс, отчёт ревью, закрытие находок) привратник читает при
+    применении, поэтому `ready` не обещает применение.
+
+## Текущее состояние прода (на 20.10.2026)
+
+С 19.10 владелец включил: `default` `verdict=steward`, `steward_shadow=false`,
+`HAIPLANE_STEWARD_MODE=act` (`50-steward.conf`). Потолка нет. Стюард в act
+может применить approve на default и для R3. Шаги 3 и 5 исходного плана уже
+выполнены. Копия `50-steward.conf` в репозитории (`shadow`) отстаёт от сервера.
+
+## Шаги после выката
+
+1. Прочитай отчёт готовности: `oc-hub effective-policy default`. Смотри
+   `act readiness`: критерии выхода, проекты (охват), кандидаты.
+2. Проекты с `verdict=steward`, кроме default (spike-bo, my-home), на время
+   пилота: PATCH `verdict=human, steward_shadow=true`. Иначе act применяет
+   approve и там.
+3. PATCH default: `steward_approve_max_class=r1`. Остальные ключи уже стоят
+   (`verdict=steward`, `steward_shadow=false`). Это первый шаг после выката.
+4. Повтори отчёт готовности. Кандидаты выше потолка должны стать `blocked`
+   с причиной `class_above_policy_ceiling`.
+5. Режим act уже включён. Если нужно включить заново: в `50-steward.conf`
+   `HAIPLANE_STEWARD_MODE=act`, затем `systemctl daemon-reload`, перезапуск
+   службы и проверка `requested`/`effective` в `effective_policy`. Смена
+   переменной окружения без перезапуска не действует.
+6. Откат, два пути.
+   - Без рестарта: PATCH `verdict=human` во ВСЕХ проектах с `verdict=steward`.
+   - Полный: `HAIPLANE_STEWARD_MODE=shadow` в drop-in, `daemon-reload`,
+     перезапуск службы, проверка `effective`.
+   Уже записанные вердикты откат не отменяет.
+
+## Наблюдение 7 дней
+
+Это пилот, не доказательство. Смотри: долю задач default с вердиктом стюарда,
+возвраты и дефекты после доставки по ним, `steward_false_approvals` (должно
+остаться 0).

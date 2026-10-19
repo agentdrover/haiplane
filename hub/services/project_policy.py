@@ -25,6 +25,7 @@ from hub import repository as repo
 from hub.models import (
     DEFAULT_FORGE,
     FORGES,
+    RiskClass,
     STEWARD_WATCH_REASONS,
     parse_freeze_until,
     validated_freeze,
@@ -945,6 +946,39 @@ def steward_watch_of(policy: dict) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return STEWARD_WATCH_REASONS
     return tuple(r for r in STEWARD_WATCH_REASONS if r in raw)
+
+
+# Потолок класса риска для approve стюарда (#1855). Нет ключа — потолка нет
+# (поведение до задачи). Ключ ограничивает ДЕЛЕГИРОВАННОЕ и ничего не
+# делегирует. Читатель терпит то, что попало в базу мимо модели, но не молча:
+# нечитаемое значение читается как ``UNREADABLE`` и привратник отказывает на
+# любой класс — потолок, который не поняли, не равен «потолка нет».
+STEWARD_APPROVE_MAX_CLASS_KEY = "steward_approve_max_class"
+#: Значения потолка: классы риска строчными, r0…r5.
+STEWARD_APPROVE_CLASSES: tuple[str, ...] = tuple(c.value.lower() for c in RiskClass)
+STEWARD_CEILING_UNREADABLE = "unreadable"
+
+
+def validate_steward_approve_max_class(piece: dict) -> None:
+    """Запись ключа: только r0…r5 строчными. ``R1``, ``high``, число — отказ."""
+    value = piece.get(STEWARD_APPROVE_MAX_CLASS_KEY)
+    if STEWARD_APPROVE_MAX_CLASS_KEY in piece and (
+        not isinstance(value, str) or value not in STEWARD_APPROVE_CLASSES
+    ):
+        raise ValueError(
+            f"gate_policy {STEWARD_APPROVE_MAX_CLASS_KEY} must be one of "
+            f"{', '.join(STEWARD_APPROVE_CLASSES)} (lowercase), got: {value!r}"
+        )
+
+
+def steward_approve_max_class_of(policy: dict) -> str | None:
+    """Потолок approve стюарда: r0…r5, None (нет ключа) или ``unreadable``."""
+    if not isinstance(policy, dict) or STEWARD_APPROVE_MAX_CLASS_KEY not in policy:
+        return None
+    value = policy[STEWARD_APPROVE_MAX_CLASS_KEY]
+    if isinstance(value, str) and value in STEWARD_APPROVE_CLASSES:
+        return value
+    return STEWARD_CEILING_UNREADABLE
 
 
 # Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:

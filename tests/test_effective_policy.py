@@ -1351,3 +1351,210 @@ async def test_steward_watch_key_is_read_and_validated(
     third = await ci_check_task(db, (await repo.get_project_by_slug(db, "tw"))["id"])
     await escalate_no_pr(db, third)
     assert [n["data"]["task_id"] for n in await notices(db, "tw")] == [loud]
+
+
+async def test_steward_approve_max_class_is_read_and_validated(ci_runner_hub):
+    # AC-2 (#1855): r0…r5 принимаются; R1, «high», число, True — 422; null
+    # удаляет; без ключа — потолка нет; агент и ci_runner не пишут ключ.
+    hub = ci_runner_hub
+    client, human = hub.client, hub.human
+    read = project_policy.steward_approve_max_class_of
+    assert read({}) is None
+    assert read({"steward_approve_max_class": "r1"}) == "r1"
+    assert read({"steward_approve_max_class": "R1"}) == "unreadable"
+    assert read({"steward_approve_max_class": 1}) == "unreadable"
+    assert "steward_approve_max_class" in GATE_POLICY_KEYS
+    assert effective_policy.unsummarised_keys() == []
+
+    resp = await client.post(
+        "/api/projects", json={"slug": "sam", "name": "Sam"}, headers=human
+    )
+    pid = resp.json()["id"]
+    url = f"/api/projects/{pid}"
+
+    async def rows():
+        got = await client.get("/api/projects/sam/effective-policy", headers=human)
+        return _by_key(got.json())["steward_approve_max_class"]
+
+    for level in ("r0", "r1", "r2", "r3", "r4", "r5"):
+        ok = await client.patch(
+            url,
+            json={"gate_policy": {"steward_approve_max_class": level}},
+            headers=human,
+        )
+        assert ok.status_code == 200, ok.text
+        row = await rows()
+        assert (row["value"], row["source"]) == (level, "project")
+    for bad in ("R1", "high", 1, True, "", "r6", ["r1"]):
+        resp = await client.patch(
+            url, json={"gate_policy": {"steward_approve_max_class": bad}}, headers=human
+        )
+        assert resp.status_code == 422, (bad, resp.text)
+        assert "steward_approve_max_class" in resp.text
+    assert (await rows())["value"] == "r5"
+    reset = await client.patch(
+        url, json={"gate_policy": {"steward_approve_max_class": None}}, headers=human
+    )
+    assert reset.status_code == 200, reset.text
+    row = await rows()
+    assert (row["value"], row["source"]) == (None, "default")
+
+    # Правит только человек или админ: агент и ci_runner получают отказ.
+    agent = {"Authorization": "Bearer unused-env-token"}
+    for who, headers in (("agent", agent), ("ci_runner", hub.ci)):
+        refused = await client.patch(
+            url,
+            json={"gate_policy": {"steward_approve_max_class": "r1"}},
+            headers=headers,
+        )
+        assert refused.status_code in (401, 403), (who, refused.text)
+    assert (await rows())["source"] == "default"
+
+
+async def _everything(db: aiosqlite.Connection) -> dict[str, list]:
+    """Все строки всех таблиц: чистое чтение не меняет ни одной."""
+    tables = [
+        r[0]
+        for r in await (
+            await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ).fetchall()
+    ]
+    out: dict[str, list] = {}
+    for name in sorted(tables):
+        cur = await db.execute(f"SELECT * FROM {name}")  # noqa: S608 — имена из sqlite_master
+        out[name] = [tuple(r) for r in await cur.fetchall()]
+    return out
+
+
+async def _judged_task(
+    db: aiosqlite.Connection, project_id: int, risk: str | None, advisor: str | None
+) -> int:
+    from tests.test_steward_shadow import _task
+
+    task_id = await _task(db, project_id)
+    await repo.update_task(db, task_id, risk_class=risk)
+    judge = await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=1,
+        kind="verdict",
+        submitted_verdict="approve",
+        verdict="approve",
+        contour=2,
+    )
+    if advisor:
+        await repo.insert_steward_judgement(
+            db,
+            task_id=task_id,
+            generation=1,
+            kind="advisor",
+            submitted_verdict="approve",
+            verdict=advisor,
+            judged_id=judge,
+            contour=2,
+        )
+    await db.commit()
+    return task_id
+
+
+async def test_the_act_readiness_report_is_a_pure_read(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    # AC-3 (#1855): в shadow отчёт несёт гипотетический act_refusals_v2 (равный
+    # расчёту при act), охват поимённо и кандидатов; три представления согласны;
+    # чтение ничего не пишет (ни одной строки ни одной таблицы).
+    from tests.test_steward_shadow import _project as _steward_project
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    pilot = await _steward_project(db, "pilot-1855")
+    await repo.update_project(
+        db,
+        pilot,
+        gate_policy=json.dumps(
+            {"verdict": "steward", "steward_approve_max_class": "r1"}
+        ),
+    )
+    human = await _project(db, "human-1855", {"verdict": "human"})
+    ready = await _judged_task(db, pilot, "R1", "concur")
+    above = await _judged_task(db, pilot, "R2", "concur")
+    waiting = await _judged_task(db, pilot, "R1", None)
+    no_class = await _judged_task(db, pilot, None, "concur")
+    objected = await _judged_task(db, pilot, "R0", "object")
+    not_mine = await _judged_task(db, human, "R0", "concur")
+
+    before = await _everything(db)
+    # Любое пишущее предложение на любом соединении за время запроса — провал,
+    # даже если запись потом откатится вместе с соединением запроса.
+    writes: list[str] = []
+    real_execute = aiosqlite.Connection.execute
+
+    def _watch(self, sql, *args, **kwargs):
+        if sql.lstrip().split(" ", 1)[0].upper() in (
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REPLACE",
+        ):
+            writes.append(sql[:80])
+        return real_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", _watch)
+    resp = await client.get("/api/projects/pilot-1855/effective-policy")
+    monkeypatch.setattr(aiosqlite.Connection, "execute", real_execute)
+    assert resp.status_code == 200
+    rest = resp.json()
+    assert writes == [], "отчёт готовности обязан быть чтением"
+    assert await _everything(db) == before, "отчёт готовности обязан быть чтением"
+
+    steward = rest["steward"]
+    report = steward["readiness"]
+    assert steward["requested"] == "shadow" and steward["act_refusals"] == []
+    assert report["status"] == "ok" and report["basis"] == "hypothetical"
+    assert report["act_refusals_v2"], "в пустой базе критерии выхода не выполнены"
+    assert report["act_would_be_granted"] is False
+    # Охват поимённо: только проекты с verdict=steward.
+    assert [p["slug"] for p in report["projects"]] == ["pilot-1855"]
+    assert report["projects"][0]["steward_approve_max_class"] == "r1"
+    by_task = {c["task_id"]: c for c in report["candidates"]}
+    assert by_task[ready]["state"] == "ready"
+    assert by_task[above]["state"] == "blocked"
+    assert by_task[above]["reasons"][0]["code"] == "class_above_policy_ceiling"
+    assert by_task[waiting]["state"] == "unknown"
+    assert by_task[no_class]["state"] == "blocked"
+    assert "risk_class.stored" in by_task[no_class]["reasons"][0]["detail"]
+    assert by_task[objected]["state"] == "blocked"
+    assert by_task[not_mine]["state"] == "blocked"
+    assert by_task[not_mine]["reasons"][0]["code"] == "policy_not_delegated"
+    assert report["candidate_counts"] == {"ready": 1, "blocked": 4, "unknown": 1}
+
+    # Гипотетический расчёт равен фактическому при act.
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    acting = (await client.get("/api/projects/pilot-1855/effective-policy")).json()
+    assert acting["steward"]["readiness"]["basis"] == "actual"
+    assert acting["steward"]["act_refusals"] == report["act_refusals_v2"]
+    assert (
+        acting["steward"]["readiness"]["act_refusals_v2"] == report["act_refusals_v2"]
+    )
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+
+    # MCP и CLI говорят то же, что REST, одним текстом.
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_effective_policy("pilot-1855")
+    assert out.structuredContent["steward"]["readiness"] == report
+    text = _message(out)
+    assert "act readiness [hypothetical (as if act requested)]: refused" in text
+    assert "act scope: pilot-1855 (verdict=steward" in text
+    assert f"#{ready} gen 1 ready" in text
+    assert f"#{above} gen 1 blocked — class_above_policy_ceiling" in text
+    assert "candidates: ready 1, blocked 4, unknown 1" in text
+    argv = ["oc-hub", "effective-policy", "pilot-1855"]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(cli, "_api", return_value=rest),
+    ):
+        cli.main()
+    assert capsys.readouterr().out.strip() == text.strip()
+    assert await _everything(db) == before
