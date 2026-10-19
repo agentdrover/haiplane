@@ -840,6 +840,9 @@ async def test_running_task_no_duplicate_or_foreign_runs(
     cloud.heads["task-1b/waits"] = "9a" * 20
     await _cloud_task(db, slug="waits", branch="task-1b/waits")
     await _cycle(db)
+    assert f"runs:{'9a' * 20}" not in cloud.github.calls, (
+        "в окне grace хаб не ходит к форжу за прогонами"
+    )
     assert [r for r in cloud.requests if r[0] == "task-1b/waits"] == [], (
         "окно grace не истекло - запроса нет"
     )
@@ -1110,3 +1113,27 @@ async def test_a_cycle_serves_a_bounded_number_of_tasks_in_turn(
     assert [r[0] for r in cloud.requests] == branches, (
         "по кругу: хвост очереди не голодает, и никто не получает запрос дважды"
     )
+
+
+async def test_two_announcers_with_the_same_stale_list_write_one_entry(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """#1862: дедуп держит журнал, а не выборка: устаревший список не плодит записи."""
+    from hub import repository_ci_head as journal
+    from hub.services import ci_head_run
+    from hub.services.ci_report import accept_ci_run_report
+
+    task_id = await _cloud_task(db)
+    await _cycle(db)
+    sent = cloud.github.attempt(
+        task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="9001"
+    )
+    await accept_ci_run_report(db, task_id, **sent)
+    stale_list = await journal.unannounced_verified(db)
+    assert len(stale_list) == 1
+    monkeypatch.setattr(
+        journal, "unannounced_verified", AsyncMock(return_value=stale_list)
+    )
+    await ci_head_run.announce_results(db)
+    await ci_head_run.announce_results(db)
+    assert len(await _announced(db, task_id)) == 1
