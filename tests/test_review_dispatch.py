@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import aiosqlite
 from httpx import AsyncClient
@@ -16,6 +17,7 @@ from hub.services.review_dispatch import (
     LITE,
     pick_review_model,
     pick_review_profile,
+    process_surface_reasons,
     sweep_review_dispatches,
 )
 from tests.review_dispatch_support import (
@@ -1075,3 +1077,57 @@ async def test_provider_usage_is_stored_on_the_report(
     assert closed["provider_tokens"] == 6_013_569, (
         "the bill lives on the dispatch too — a failed run has no report row"
     )
+
+
+# --- #1856: documents and pinned prod snapshots name a surface, they run none ---
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "process_surface"
+
+
+def _fixture_diff(name: str) -> str:
+    # Full diffs of real commits, saved so the test does not need git in CI.
+    return (_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _added(path: str, line: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n+{line}\n"
+
+
+def test_docs_and_prod_snapshots_are_not_a_process_surface():
+    # AC-1 (#1856): git diff 991d0d94..edba5db8 (#1849) — CAPTURE.txt and README
+    # only mention worktree.conf — buys no deep.
+    assert process_surface_reasons(_fixture_diff("pr1849_991d0d94_edba5db8.diff")) == []
+    # The same words in a document or a snapshot, one line each.
+    assert process_surface_reasons(_added("docs/notes.md", "uses worktree")) == []
+    assert (
+        process_surface_reasons(
+            _added("deploy/systemd/prod/etc/x.service.d/worktree.conf", "worktree")
+        )
+        == []
+    )
+    # Everything that can run stays a signal.
+    for path, line in (
+        ("hub/services/x.py", "path = workspace_path / 'worktree'"),
+        ("scripts/x.sh", "git worktree add"),
+        (".github/workflows/x.yml", "run: git worktree prune"),
+        ("deploy/review-runner/run.sh", "git worktree add"),
+        ("deploy/systemd/haiplane-x.service", "ExecStart=git worktree add"),
+        ("tests/test_x.py", "worktree = 1"),
+    ):
+        assert process_surface_reasons(_added(path, line)), path
+    # An inert file does not hide a live one beside it.
+    mixed = _added("README.md", "worktree") + _added("scripts/x.sh", "git worktree add")
+    assert process_surface_reasons(mixed) == ["воркспейс и ветки: worktree"]
+
+
+def test_historical_process_diffs_keep_their_signal():
+    # AC-2 (#1856): the original diffs of #506, #509 and #544 keep subprocess
+    # and timeout signals.
+    d506 = process_surface_reasons(_fixture_diff("task506_d2c7b7a0.diff"))
+    d509 = process_surface_reasons(_fixture_diff("task509_ca8ce75a.diff"))
+    d544 = process_surface_reasons(_fixture_diff("task544_4077012a.diff"))
+    assert any(r.startswith("запуск подпроцессов") for r in d506)
+    assert any(r.startswith("таймауты и отмена") for r in d506)
+    assert any(r.startswith("запуск подпроцессов") for r in d509)
+    assert any(r.startswith("таймауты и отмена") for r in d509)
+    assert any(r.startswith("запуск подпроцессов") for r in d544)

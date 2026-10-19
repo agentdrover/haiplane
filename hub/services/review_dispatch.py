@@ -29,7 +29,7 @@ import math
 import re
 import secrets
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -229,7 +229,12 @@ def is_generated(path: str) -> bool:
 
 
 def split_generated(diff: str) -> tuple[str, list[str]]:
-    """``(diff without generated files, names of what was dropped)``.
+    """``(diff without generated files, names of what was dropped)``."""
+    return _split_files(diff, is_generated)
+
+
+def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]]:
+    """``(diff without the files ``drop`` accepts, names of what was dropped)``.
 
     Splits on the ``+++`` headers the same way :func:`changed_paths` reads
     them, so both functions agree on where a file's hunk begins. A diff that
@@ -243,7 +248,7 @@ def split_generated(diff: str) -> tuple[str, list[str]]:
         if line.startswith("+++ "):
             raw = line[4:].strip()
             path = raw[2:] if raw.startswith("b/") else raw
-            skipping = path != "/dev/null" and is_generated(path)
+            skipping = path != "/dev/null" and drop(path)
             if skipping:
                 if path not in dropped:
                     dropped.append(path)
@@ -256,6 +261,20 @@ def split_generated(diff: str) -> tuple[str, list[str]]:
         if not skipping:
             kept.append(line)
     return "".join(kept), dropped
+
+
+# Files whose text names a process surface without operating one (#1856).
+# Documents talk about worktrees; a snapshot of the prod unit files, pinned to
+# its source, copies a drop-in called worktree.conf. Neither runs anything in
+# the diff. Deliberately two entries and no wider: deploy/ and tests/ hold
+# working shell and units, and hub/**.py, scripts, CI YAML stay a signal.
+_INERT_SUFFIXES: tuple[str, ...] = (".md",)
+_INERT_PREFIXES: tuple[str, ...] = ("deploy/systemd/prod/",)
+
+
+def is_inert_for_process(path: str) -> bool:
+    """Is this path a document or a pinned prod snapshot, not an operation?"""
+    return path.endswith(_INERT_SUFFIXES) or path.startswith(_INERT_PREFIXES)
 
 
 def file_line_counts(diff: str) -> list[tuple[str, int]]:
@@ -864,6 +883,7 @@ def process_surface_reasons(diff: str) -> list[str]:
     nobody wrote — the cheapest possible way to lose the saving #807 exists for.
     """
     diff, _ = split_generated(diff)
+    diff, _ = _split_files(diff, is_inert_for_process)
     reasons: list[str] = []
     for group, markers in _PROCESS_SURFACES:
         hits: list[str] = []

@@ -1,0 +1,299 @@
+commit ca8ce75a04d0e48f4023a0e008c5009d25a14ed9
+Author: Denis Pukinov <denis.pukinov@example.com>
+Date:   Sun Jul 19 08:33:07 2026 +0300
+
+    feat: run task.validation_commands and record the result (#509)
+    
+    validation_commands were declared as "the commands that prove the change works"
+    but the hub never ran them. This executes them in the project workspace and
+    records pass/fail stamped with the submission_generation.
+    
+    - db: tasks.validation_generation / validation_status / validation_log
+    - services/validation_run.py: run_validation_commands (runner injectable) runs
+      the commands in order, stops at the first failure, records pass/fail/unknown
+      on the current generation; no commands → skipped, nothing recorded; secret-
+      looking env vars are stripped from the child env; validation_gap() is the
+      policy helper #510 will gate on
+    - app: POST /api/tasks/{id}/run-validation
+    - tests: pass/fail recording on generation, skipped-without-commands, and the
+      secret-env stripping
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/hub/app.py b/hub/app.py
+index cc29b17d..cfa4e7c4 100644
+--- a/hub/app.py
++++ b/hub/app.py
+@@ -103,6 +103,7 @@ from hub.services.diagnostics import (
+     build_whoami,
+ )
+ from hub.services.ac_tests import current_ac_test_results, run_ac_tests
++from hub.services.validation_run import run_validation_commands
+ from hub.services.task_idempotency import resolve_client_request_id
+ from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
+ from hub.services.tree_output import (
+@@ -1061,6 +1062,15 @@ async def api_run_ac_tests(task_id: int, request: Request):
+     return {"results": await run_ac_tests(db, task_id)}
+ 
+ 
++@app.post("/api/tasks/{task_id}/run-validation")
++async def api_run_validation(task_id: int, request: Request):
++    """Run a task's declared validation_commands and record the result (#509)."""
++    db = _db(request)
++    if not await repo.get_task(db, task_id):
++        raise HTTPException(404, "task not found")
++    return await run_validation_commands(db, task_id)
++
++
+ @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
+ async def api_review_brief(
+     task_id: int,
+diff --git a/hub/db.py b/hub/db.py
+index 70868359..9d60ec49 100644
+--- a/hub/db.py
++++ b/hub/db.py
+@@ -576,6 +576,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
+         )
+         """,
+     ),
++    # ---- Verifiable SDD (#509): result of running task.validation_commands,
++    # stamped with the submission_generation. One result per task (the commands
++    # are a single set); current only while the generation matches.
++    (
++        "add_validation_generation_column",
++        "ALTER TABLE tasks ADD COLUMN validation_generation INTEGER",
++    ),
++    ("add_validation_status_column", "ALTER TABLE tasks ADD COLUMN validation_status TEXT"),
++    ("add_validation_log_column", "ALTER TABLE tasks ADD COLUMN validation_log TEXT"),
+ ]
+ 
+ 
+diff --git a/hub/services/validation_run.py b/hub/services/validation_run.py
+new file mode 100644
+index 00000000..38a1e9aa
+--- /dev/null
++++ b/hub/services/validation_run.py
+@@ -0,0 +1,132 @@
++"""Run a task's declared validation_commands and record the result (#509).
++
++validation_commands were declared as "the commands that prove the change works"
++but the hub never ran them. This executes them in the project workspace and
++records pass/fail stamped with the submission_generation, so #510 can gate
++completion on them. The runner is injectable for testing. Secret env vars are
++stripped from the child environment so a command cannot read and echo them into
++the recorded log.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++from typing import Any, Awaitable, Callable
++
++from hub import repository as repo
++from hub.services.orchestration import project_git_context
++
++log = logging.getLogger("hub")
++
++PASS = "pass"
++FAIL = "fail"
++SKIPPED = "skipped"
++UNKNOWN = "unknown"
++
++_RUN_TIMEOUT = 300
++_LOG_TAIL = 4000
++
++# runner(commands, repo_path) -> (returncode, log_tail) or None if it could not run.
++ValidationRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str] | None]]
++
++_SECRET_HINTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
++
++
++def _safe_env() -> dict[str, str]:
++    """Child env with obvious secrets stripped (#509 AC-2, best-effort)."""
++    return {
++        k: v
++        for k, v in os.environ.items()
++        if not any(hint in k.upper() for hint in _SECRET_HINTS)
++    }
++
++
++async def default_validation_runner(
++    commands: list[str], repo_path: str | None
++) -> tuple[int, str] | None:
++    """Run ``commands`` in ``repo_path`` in order, stop at the first failure."""
++    if not commands or not repo_path:
++        return None
++    env = _safe_env()
++    logs: list[str] = []
++    rc = 0
++    for cmd in commands:
++        try:
++            proc = await asyncio.create_subprocess_shell(
++                cmd,
++                cwd=repo_path,
++                stdout=asyncio.subprocess.PIPE,
++                stderr=asyncio.subprocess.STDOUT,
++                env=env,
++            )
++            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_RUN_TIMEOUT)
++        except (OSError, TimeoutError, asyncio.TimeoutError):
++            log.warning("validation command failed to run in %s", repo_path)
++            return None
++        logs.append(f"$ {cmd}\n{out.decode(errors='replace')}")
++        rc = proc.returncode or 0
++        if rc != 0:
++            break
++    return rc, "\n".join(logs)[-_LOG_TAIL:]
++
++
++async def run_validation_commands(
++    db: Any,
++    task_id: int,
++    *,
++    runner: ValidationRunner | None = None,
++) -> dict:
++    """Run a task's validation_commands and record the result (#509).
++
++    Records pass/fail (or unknown when it could not run) stamped with the
++    current submission_generation. When there are no commands the step is
++    skipped and nothing is recorded (AC-3).
++    """
++    runner = runner or default_validation_runner
++    row = await repo.get_task(db, task_id)
++    if not row:
++        return {"status": SKIPPED, "generation": 0}
++    task = dict(row)
++    commands = json.loads(task.get("validation_commands") or "[]")
++    generation = task.get("submission_generation") or 0
++    if not commands:
++        return {"status": SKIPPED, "generation": generation}
++
++    ctx = await project_git_context(db, task_id)
++    result = await runner(commands, ctx.get("repo"))
++    if result is None:
++        status, log_tail = UNKNOWN, ""
++    else:
++        rc, log_tail = result
++        status = PASS if rc == 0 else FAIL
++    await repo.update_task(
++        db,
++        task_id,
++        validation_generation=generation,
++        validation_status=status,
++        validation_log=log_tail,
++    )
++    await db.commit()
++    return {"status": status, "generation": generation}
++
++
++def validation_gap(task: dict) -> str | None:
++    """None when the current validation result is green; else a reason (#510).
++
++    A gap exists when the task has validation_commands but the recorded result
++    is missing / stale (wrong generation) / not ``pass``. No commands ⇒ no gap.
++    """
++    commands = task.get("validation_commands")
++    if isinstance(commands, str):
++        commands = json.loads(commands or "[]")
++    if not commands:
++        return None
++    generation = task.get("submission_generation") or 0
++    if task.get("validation_generation") != generation:
++        return "validation_commands не прогонялись для текущего поколения"
++    if task.get("validation_status") != PASS:
++        return f"validation_commands не прошли: статус {task.get('validation_status')}"
++    return None
+diff --git a/tests/test_validation_run.py b/tests/test_validation_run.py
+new file mode 100644
+index 00000000..21f9ea8e
+--- /dev/null
++++ b/tests/test_validation_run.py
+@@ -0,0 +1,85 @@
++"""Tests for running task.validation_commands and recording results (#509)."""
++
++from __future__ import annotations
++
++import json
++
++from hub import repository as repo
++from hub.services.validation_run import (
++    FAIL,
++    PASS,
++    SKIPPED,
++    _safe_env,
++    run_validation_commands,
++)
++
++
++async def _task(db, *, commands):
++    task_id = await repo.create_task(
++        db,
++        title="t",
++        description="",
++        runtime="auto",
++        source="human",
++        assigned_agent="dev",
++        rationale="",
++        status="running",
++        auto_review=True,
++        task_type="task",
++        parent_id=None,
++        priority="medium",
++    )
++    await repo.bump_submission_generation(db, task_id)  # generation 1
++    await repo.update_task(db, task_id, validation_commands=json.dumps(commands))
++    await db.commit()
++    return task_id
++
++
++async def test_run_validation_records_pass_on_generation(db):
++    # AC-1 (#509): commands executed, result recorded on the current generation.
++    task_id = await _task(db, commands=["echo ok"])
++
++    async def fake(cmds, repo_path):
++        return (0, "all good")
++
++    res = await run_validation_commands(db, task_id, runner=fake)
++    assert res == {"status": PASS, "generation": 1}
++    row = dict(await repo.get_task(db, task_id))
++    assert row["validation_status"] == "pass"
++    assert row["validation_generation"] == 1
++
++
++async def test_run_validation_records_fail(db):
++    task_id = await _task(db, commands=["false"])
++
++    async def fake(cmds, repo_path):
++        return (1, "boom")
++
++    res = await run_validation_commands(db, task_id, runner=fake)
++    assert res["status"] == FAIL
++    assert dict(await repo.get_task(db, task_id))["validation_status"] == "fail"
++
++
++async def test_run_validation_skipped_without_commands(db):
++    # AC-3 (#509): no commands → skipped, nothing recorded, no error.
++    task_id = await _task(db, commands=[])
++
++    async def fake(cmds, repo_path):
++        raise AssertionError("runner must not be called when there are no commands")
++
++    res = await run_validation_commands(db, task_id, runner=fake)
++    assert res["status"] == SKIPPED
++    assert dict(await repo.get_task(db, task_id))["validation_status"] is None
++
++
++def test_safe_env_strips_secrets(monkeypatch):
++    # AC-2 (#509): secret-looking env vars never reach the child environment.
++    monkeypatch.setenv("OPENCLAW_HUB_TOKENS", "s3cret")
++    monkeypatch.setenv("MY_API_KEY", "k")
++    monkeypatch.setenv("DB_PASSWORD", "p")
++    monkeypatch.setenv("SAFE_VAR", "ok")
++    env = _safe_env()
++    assert "OPENCLAW_HUB_TOKENS" not in env
++    assert "MY_API_KEY" not in env
++    assert "DB_PASSWORD" not in env
++    assert env.get("SAFE_VAR") == "ok"
