@@ -2727,6 +2727,8 @@ async def test_the_sweep_order_is_pinned(db):
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",
+        # #1874: начисления минут владельца читают events ДО очистки.
+        "owner_minutes",
         "events_retention",
         "stale_worktrees",
         "sessions_retention",

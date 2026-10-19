@@ -2699,12 +2699,13 @@ EGRESS_KINDS = ("egress_down", "egress_restored")
 async def prune_events(
     db: aiosqlite.Connection, *, keep_days: int = EVENTS_RETENTION_DAYS
 ) -> int:
-    """Delete events older than ``keep_days``. Returns rows removed.
+    """Delete events older than ``keep_days``, never past the minutes cursor (#1874).
 
     The newest event of the egress pair stays whatever its age (#1645).
     """
     cur = await db.execute(
         "DELETE FROM events WHERE created_at < datetime('now', ?) "
+        "AND id <= COALESCE((SELECT cursor_event_id FROM owner_minutes_state), id) "
         "AND NOT (kind IN (?, ?) AND id = "
         "(SELECT MAX(id) FROM events WHERE kind IN (?, ?)))",
         (f"-{keep_days} days", *EGRESS_KINDS, *EGRESS_KINDS),

@@ -81,6 +81,7 @@ async def web_executor_slot(
         issuer_principal_id=int(identity.principal_id),
         target=f"slot:{host}",
         task_id=task_id,
+        issuer_human=identity.is_human,
     )
     if not result.launched:
         return await _web_task_detail_page(

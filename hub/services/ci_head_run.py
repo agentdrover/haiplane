@@ -55,6 +55,12 @@ CYCLE_BUDGET_SECONDS = 25.0
 HEADS_CEILING_SECONDS = 20.0
 PROBE_CEILING_SECONDS = 15.0
 DISPATCH_CEILING_SECONDS = 30.0
+#: Чтение голов только ради пометки «голова уже другая» - любезность, не условие:
+#: на неё уходит не больше этого, а объявление не ждёт.
+LABEL_BUDGET_SECONDS = 3.0
+#: Доля бюджета прохода, которую может съесть половина запросов: остальное -
+#: объявлениям, чтобы медленные клоны их не морили.
+REQUEST_SHARE = 0.7
 #: Жёсткий потолок прохода сверх бюджета: ждать БД и транзакции под дедлайн нельзя
 #: (aiosqlite не знает о нём), поэтому проход целиком ограничен ещё и снаружи.
 HARD_CAP_EXTRA_SECONDS = 5.0
@@ -317,12 +323,12 @@ async def _reserve(db: aiosqlite.Connection, scope: _Scope, sha: str) -> bool:
 
 async def _external_ci_present(
     db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
-) -> bool:
-    """Непосредственно перед dispatch: запускать ли НЕЛЬЗЯ (есть CI или неизвестно).
+) -> str:
+    """Непосредственно перед dispatch: ``present`` | ``unknown`` | ``clear``.
 
     Прогон по sha уже есть или у ветки открытый PR - заявка закрывается как
-    ``observed``. Ответ форжа не получен - заявка остаётся открытой, форж уходит
-    в отступ, dispatch не делается: «не знаю» не равно «нет».
+    ``observed`` (``present``). Ответ форжа не получен - ``unknown``: форж уходит в
+    отступ, dispatch не делается, «не знаю» не равно «нет».
 
     Остаточное окно (его называет отчёт): между этой проверкой и самим запросом
     проходят миллисекунды, а список прогонов GitHub отстаёт на секунды - ручной
@@ -331,29 +337,52 @@ async def _external_ci_present(
     runs = await _runs_exist(scope, sha, dl)
     if runs is None:
         _back_off()
-        return True
+        return "unknown"
     if runs:
         await journal.settle(db, scope.task_id, sha, "observed")
-        return True
+        return "present"
     pr = await _open_pr(scope, dl)
     if pr is None:
         _back_off()
-        return True
+        return "unknown"
     if pr:
         await journal.settle(db, scope.task_id, sha, "observed", note="pr_open")
-        return True
-    return False
+        return "present"
+    return "clear"
+
+
+async def _release(
+    db: aiosqlite.Connection, scope: _Scope, sha: str, before: tuple[Any, ...]
+) -> None:
+    """Dispatch не последовал - попытка возвращается, чтобы «не знаю» её не съедало."""
+    state, attempts, reserved_at = before
+    await journal.release_reservation(
+        db,
+        scope.task_id,
+        sha,
+        state=state,
+        attempts=attempts,
+        reserved_at=reserved_at,
+    )
 
 
 async def _request(
-    db: aiosqlite.Connection, scope: _Scope, sha: str, dl: _Deadline
+    db: aiosqlite.Connection,
+    scope: _Scope,
+    sha: str,
+    dl: _Deadline,
+    before: tuple[Any, ...],
 ) -> bool:
     """Попросить прогон по зарезервированной голове; True - форж принял."""
-    if await _external_ci_present(db, scope, sha, dl):
+    seen = await _external_ci_present(db, scope, sha, dl)
+    if seen != "clear":
+        if seen == "unknown":
+            await _release(db, scope, sha, before)  # dispatch не было: попытка цела
         return False
     if await _fresh_scope(db, scope) is None or not await journal.task_in_scope(
         db, scope.task_id, scope.branch
     ):
+        await _release(db, scope, sha, before)
         return False  # политика или задача сменились, пока шли пробы: запроса нет
     accepted, why = await _ask_forge(scope, dl)
     if accepted:
@@ -423,7 +452,12 @@ async def _handle_head(
         raise _OutOfTime
     if not await _reserve(db, scope, sha):
         return False
-    return await _request(db, scope, sha, dl)
+    before = (row["state"], int(row["attempts"]), row["reserved_at"])
+    try:
+        return await _request(db, scope, sha, dl, before)
+    except _OutOfTime:
+        await _release(db, scope, sha, before)
+        raise
 
 
 async def _verify_after_requests(
@@ -542,7 +576,8 @@ async def _current_heads(
     readable = await _label_scopes(db, rows, known)
     if readable:
         try:
-            found.update(await _read_heads(readable, dl))
+            label_dl = _Deadline(min(LABEL_BUDGET_SECONDS, max(dl.left(), 0.0)))
+            found.update(await _read_heads(readable, label_dl))
         except _OutOfTime:
             pass  # без пометки «голова уже другая»: она - любезность, не условие
     return found
@@ -621,7 +656,7 @@ async def announce_results(
         await journal.set_state(db, journal.ANNOUNCE_CURSOR, start)
 
 
-async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
+async def announce_overdue(db: aiosqlite.Connection) -> None:
     """Итог не пришёл за срок: одна запись в ленту, alert и уведомление ответственному.
 
     Срок ``CI_HEAD_RUN_WAIT_MINUTES`` считается от заявки (или от первого
@@ -629,8 +664,6 @@ async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
     sha, число заявок): повторная заявка - новое ожидание.
     """
     for row in await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES)):
-        if dl.left() <= 0:
-            return
         task_id, sha = int(row["task_id"]), str(row["sha"])
         try:
             run_id = await journal.latest_run_id(db, task_id, sha)
@@ -659,9 +692,10 @@ async def sweep(db: aiosqlite.Connection) -> None:
     Одно общее время на обе половины; сбой одной не отменяет другую.
     """
     dl = _Deadline(float(CYCLE_BUDGET_SECONDS))
+    request_dl = _Deadline(float(CYCLE_BUDGET_SECONDS) * REQUEST_SHARE)
     heads: dict[int, str] = {}
     try:
-        heads = await request_for_new_heads(db, dl)
+        heads = await request_for_new_heads(db, request_dl)
     except Exception:  # noqa: BLE001 - announcing must still happen
         log.exception("CI head run: the request half failed")
     try:
@@ -671,7 +705,7 @@ async def sweep(db: aiosqlite.Connection) -> None:
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the announce half failed")
     try:
-        await announce_overdue(db, dl)
+        await announce_overdue(db)
     except Exception:  # noqa: BLE001
         log.exception("CI head run: the overdue half failed")
 

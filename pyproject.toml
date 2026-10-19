@@ -20,6 +20,7 @@ dependencies = [
     # and no uv.lock, so an already installed 2.13.0 would stay: this floor is
     # what upgrades it past the 2026 JWK/HS256/OKP advisories (#1619).
     "pyjwt[crypto]>=2.15.0",
+    "tzdata>=2026.5",
 ]
 
 [project.scripts]

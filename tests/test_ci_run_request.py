@@ -1575,10 +1575,19 @@ async def test_unknown_is_not_none_before_the_dispatch(
     cloud.on_probe = forge_fails_on_second_probe
     await _cycle(db)
     assert cloud.requests == []
-    assert await _state_of(db, first) == "reserved", "заявка не закрыта догадкой"
+    assert await _state_of(db, first) == "seen", "заявка не закрыта и не потрачена"
+    # два «не знаю» подряд не исчерпывают попытки: dispatch не было ни разу
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    for _ in range(3):
+        ci_head_run.reset_state()
+        cloud.github.down = False
+        cloud.on_probe = forge_fails_on_second_probe
+        before = cloud.probes
+        await _cycle(db)
+    assert cloud.requests == []
+    assert await _state_of(db, first) == "seen"
     cloud.on_probe = None
     cloud.github.down = False
-    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
     ci_head_run.reset_state()
     await _cycle(db)
     assert [r[0] for r in cloud.requests] == ["task-16/runs"]
@@ -1592,12 +1601,12 @@ async def test_unknown_is_not_none_before_the_dispatch(
     ci_head_run.reset_state()
     await _cycle(db)
     assert cloud.requests == []
-    assert await _state_of(db, second) == "reserved"
+    assert await _state_of(db, second) == "seen"
     cloud.pr_errors.clear()
     monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
     ci_head_run.reset_state()
     await _cycle(db)
-    assert [r[0] for r in cloud.requests] == ["task-16/pr"]
+    assert [r[0] for r in cloud.requests if r[0] == "task-16/pr"] == ["task-16/pr"]
 
 
 async def test_the_task_is_rechecked_right_before_the_dispatch(
@@ -1676,3 +1685,64 @@ async def test_a_ci_result_that_never_comes_is_said_aloud_once(
     assert (await cur.fetchone())[0] == 1, "уведомление ответственному - одно"
     assert await _notes(db, answered, "CI не пришёл") == [], "итог пришёл вовремя"
     assert len(await _announced(db, answered)) == 1
+
+
+async def test_overdue_covers_exhausted_requests_and_the_current_head_only(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P2 (Codex): «прогон так и не появился» тоже слышен; ждут ТЕКУЩУЮ голову (A->B->A)."""
+    from hub.services import ci_head_run
+
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 60, raising=False)
+    monkeypatch.setattr(config, "CI_HEAD_RUN_RETRY_SECONDS", 0)
+    task_id = await _cloud_task(db)
+    for sha in (HEAD_A, HEAD_B, HEAD_A):
+        cloud.heads[HEAD_BRANCH] = sha
+        ci_head_run.reset_state()
+        await _cycle(db)
+    for _ in range(4):  # заявки исчерпаны, прогона нет
+        ci_head_run.reset_state()
+        await _cycle(db)
+    assert await _state_of_sha(db, task_id, HEAD_A) == "exhausted"
+    monkeypatch.setattr(config, "CI_HEAD_RUN_WAIT_MINUTES", 0)
+    await _cycle(db)
+    said = await _notes(db, task_id, "CI не пришёл")
+    assert len(said) == 1 and HEAD_A[:12] in said[0], "ждут текущую голову A, не B"
+
+
+async def _state_of_sha(db: aiosqlite.Connection, task_id: int, sha: str) -> str:
+    cur = await db.execute(
+        "SELECT state FROM ci_head_runs WHERE task_id=? AND sha=?", (task_id, sha)
+    )
+    return (await cur.fetchone())[0]
+
+
+async def test_a_slow_clone_cannot_starve_the_announcements(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
+):
+    """P2 (Codex): чтение голов ради пометки ограничено отдельно и объявление не ждёт."""
+    from hub.services import ci_head_run
+    from hub.services.ci_report import accept_ci_run_report
+
+    monkeypatch.setattr(ci_head_run, "LABEL_BUDGET_SECONDS", 0.2)
+    cloud.heads["task-18/slow"] = HEAD_A
+    task_id = await _cloud_task(
+        db, slug="slowlabel", branch="task-18/slow", workspace="/slow"
+    )
+    await _cycle(db)
+    await accept_ci_run_report(
+        db,
+        task_id,
+        **cloud.github.attempt(
+            task_id, HEAD_A, path=SAT_PATH, checks=dict(SAT_CHECKS), run_id="1801"
+        ),
+    )
+    await db.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+    await db.commit()
+    cloud.head_delay = 5.0
+    ci_head_run.reset_state()
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(8):
+        await _cycle(db)
+    assert asyncio.get_running_loop().time() - started < 3.0
+    assert len(await _announced(db, task_id)) == 1

@@ -653,6 +653,10 @@ DIFF_MAX_BYTES = int(env_get("DIFF_MAX_BYTES", str(400 * 1024)))
 MESSAGE_RATE_PER_MINUTE = int(env_get("MESSAGE_RATE_PER_MINUTE", "30"))
 MESSAGE_RETENTION_DAYS = int(env_get("MESSAGE_RETENTION_DAYS", "14"))
 
+# #1874: IANA time zone in which "a day" of the owner's estimated minutes is
+# counted (local date of the accrual's UTC time). Checked at startup.
+OWNER_MINUTES_TIMEZONE = env_get("OWNER_MINUTES_TIMEZONE", "Europe/Moscow")
+
 # MCP usage telemetry (#780, epic #776): the Agent API cannot be trimmed by
 # taste. What every knob below protects is the same property — the record is
 # metadata about a call, never its content. Retention is longer than the

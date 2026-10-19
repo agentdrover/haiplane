@@ -40,6 +40,20 @@ async def running_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+async def _mark_current(db: aiosqlite.Connection, task_id: int, sha: str) -> None:
+    """Сделать sha ТЕКУЩЕЙ головой задачи: наибольший порядок наблюдения.
+
+    Возврат A->B->A снова ставит A последней; повторное наблюдение текущей
+    головы ничего не меняет.
+    """
+    await db.execute(
+        "UPDATE ci_head_runs SET seen_seq=(SELECT COALESCE(MAX(seen_seq), 0) + 1 "
+        "FROM ci_head_runs) WHERE task_id=? AND sha=? AND (seen_seq=0 OR seen_seq < "
+        "(SELECT MAX(seen_seq) FROM ci_head_runs WHERE task_id=?))",
+        (task_id, sha, task_id),
+    )
+
+
 async def observe_head(
     db: aiosqlite.Connection,
     task_id: int,
@@ -56,6 +70,7 @@ async def observe_head(
             "VALUES (?, ?, ?)",
             (task_id, sha, branch),
         )
+        await _mark_current(db, task_id, sha)
     rows = await fetchall(
         db,
         "SELECT *, first_seen_at <= datetime('now', ?) AS grace_over, "
@@ -126,6 +141,28 @@ async def task_in_scope(db: aiosqlite.Connection, task_id: int, branch: str) -> 
     return bool(rows)
 
 
+async def release_reservation(
+    db: aiosqlite.Connection,
+    task_id: int,
+    sha: str,
+    *,
+    state: str,
+    attempts: int,
+    reserved_at: str | None,
+) -> None:
+    """Вернуть резерв, за которым dispatch НЕ последовал: попытка не потрачена.
+
+    Откат к тому, что было до резерва; чужой переход (строка уже не reserved с
+    нашей попыткой) не затирается.
+    """
+    async with write_transaction(db):
+        await db.execute(
+            "UPDATE ci_head_runs SET state=?, attempts=?, reserved_at=? "
+            "WHERE task_id=? AND sha=? AND state='reserved' AND attempts=?",
+            (state, attempts, reserved_at, task_id, sha, attempts + 1),
+        )
+
+
 async def adopt_unplanned(
     db: aiosqlite.Connection, task_id: int, sha: str, branch: str
 ) -> None:
@@ -145,6 +182,7 @@ async def adopt_unplanned(
             "reserved_at=datetime('now') WHERE task_id=? AND sha=? AND state='seen'",
             (task_id, sha),
         )
+        await _mark_current(db, task_id, sha)
 
 
 async def settle(
@@ -237,8 +275,8 @@ async def overdue_waits(
 ) -> list[dict[str, Any]]:
     """Головы, чьего итога ждут дольше срока и о ком ещё не сказано вслух.
 
-    Только заявленные или замеченные (``requested``/``observed``) головы задачи
-    в running, и только ПОСЛЕДНЯЯ голова журнала задачи: прежние перекрыты
+    Только головы задачи в running, по которым ждут итога (всё, кроме ``seen`` и
+    ``declined``), и только ТЕКУЩАЯ голова (наибольший ``seen_seq``): прежние перекрыты
     новыми коммитами и ждать от них нечего. Итог объявлен (любая реальная
     попытка в ``ci_head_announced``) или это ожидание уже названо
     (``timeout:<число заявок>``) - строки нет.
@@ -249,10 +287,11 @@ async def overdue_waits(
         "CAST((julianday('now') - julianday(COALESCE(j.reserved_at, "
         "j.first_seen_at))) * 1440 AS INTEGER) AS waited "
         "FROM ci_head_runs j JOIN tasks t ON t.id=j.task_id "
-        "WHERE j.state IN ('requested', 'observed') AND t.status='running' "
+        "WHERE j.state IN ('reserved', 'requested', 'observed', 'exhausted') "
+        "AND t.status='running' "
         "AND t.archived=0 "
         "AND COALESCE(j.reserved_at, j.first_seen_at) <= datetime('now', ?) "
-        "AND j.rowid = (SELECT MAX(x.rowid) FROM ci_head_runs x "
+        "AND j.seen_seq = (SELECT MAX(x.seen_seq) FROM ci_head_runs x "
         "WHERE x.task_id=j.task_id) "
         "AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
         "WHERE n.task_id=j.task_id AND n.sha=j.sha AND "
