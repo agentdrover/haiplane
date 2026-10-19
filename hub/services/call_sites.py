@@ -28,6 +28,8 @@ distinction between clean and unknown the drift guard makes (#534).
 
 from __future__ import annotations
 
+from hub.services.diff_scan import scan_diff
+
 import ast
 import logging
 import os
@@ -168,7 +170,10 @@ def changed_line_ranges(diff: str) -> dict[str, set[int]]:
     """New-side line numbers touched per file, from ``git diff -U0``."""
     out: dict[str, set[int]] = {}
     current: str | None = None
-    for line in (diff or "").splitlines():
+    for entry in scan_diff(diff or ""):
+        line = entry.text
+        if entry.body:
+            continue
         if line.startswith("+++ b/"):
             current = line[len("+++ b/") :].strip()
             out.setdefault(current, set())

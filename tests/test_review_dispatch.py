@@ -11,14 +11,17 @@ from httpx import AsyncClient
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.services.diff_scan import _diff_lines
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
     DEEP,
     LITE,
     pick_review_model,
     pick_review_profile,
+    changed_paths,
+    is_docs_only_diff,
+    file_line_counts,
     process_surface_reasons,
-    _diff_lines,
     split_generated,
     sweep_review_dispatches,
 )
@@ -1304,3 +1307,54 @@ def test_after_the_first_mismatch_nothing_is_cut():
     ]
     # Before the mismatch the same files are cut as usual.
     assert split_generated(tail)[1] == ["uv.lock"]
+
+
+def test_added_header_lookalike_is_not_a_file_for_counts_and_paths():
+    # #1856 (review gen1): the first added line of hub/x.py reads "+++ counters.md".
+    diff = (
+        "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1,802 @@\n+++ counters.md\n"
+        + "+x\n" * 801
+    )
+    assert file_line_counts(diff) == [("hub/x.py", 802)]
+    assert changed_paths(diff) == ["hub/x.py"]
+    # The same inside a git diff.
+    git = "diff --git a/hub/x.py b/hub/x.py\n" + diff
+    assert file_line_counts(git) == [("hub/x.py", 802)]
+    assert changed_paths(git) == ["hub/x.py"]
+
+
+def test_changed_paths_read_combined_and_quoted_headers():
+    combined = (
+        "diff --cc hub/x.py\n--- a/hub/x.py\n--- a/hub/x.py\n+++ b/hub/x.py\n"
+        "@@@ -1,1 -1,1 +1,2 @@@\n  x\n++y\n"
+    )
+    quoted = (
+        'diff --git "a/docs/\\320\\267.md" "b/docs/\\320\\267.md"\n'
+        '--- "a/docs/\\320\\267.md"\n+++ "b/docs/\\320\\267.md"\n@@ -0,0 +1 @@\n+t\n'
+    )
+    assert changed_paths(_added("README.md", "t") + combined + quoted) == [
+        "README.md",
+        "hub/x.py",
+        "docs/\u0437.md",
+    ]
+    assert file_line_counts(combined) == [("hub/x.py", 1)]
+
+
+def test_counts_do_not_undercount_when_the_hunk_does_not_add_up():
+    # Counters say 1, the body has 3: the path is still listed and every
+    # changed line is counted under it.
+    diff = "--- a/hub/x.py\n+++ b/hub/x.py\n@@ -0,0 +1 @@\n+a\n+b\n+c\n"
+    assert changed_paths(diff) == ["hub/x.py"]
+    assert file_line_counts(diff) == [("hub/x.py", 3)]
+
+
+def test_lookalike_lines_in_a_body_do_not_change_what_the_diff_touches():
+    # A document whose added text reads "+++ b/hub/x.py" is still only a document.
+    doc = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -0,0 +1 @@\n+++ b/hub/x.py\n"
+    )
+    assert is_docs_only_diff(doc)
+    # An added line "++ subprocess.run(1)" is code, not a "+++" header.
+    code = _added("hub/x.py", "++ subprocess.run(1)")
+    assert process_surface_reasons(code) == _SUBPROCESS

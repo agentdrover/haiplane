@@ -9,6 +9,8 @@ Three answers, never two (#762). «Could not look» is not «untouched».
 
 from __future__ import annotations
 
+from hub.services.diff_scan import scan_diff
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -364,7 +366,10 @@ def _parse_patch_log(out: str) -> _PatchLog:
         files[sha] = set()
         current_sha = sha
         current_path = ""
-        for line in rest.splitlines():
+        for entry in scan_diff(rest):
+            line = entry.text
+            if entry.body:
+                continue
             if line.startswith("--- ") or line.startswith("+++ "):
                 parsed_path = _path_from_diff_header(line[4:])
                 if parsed_path:

@@ -34,6 +34,8 @@ So this module answers two questions the brief could not answer before:
 
 from __future__ import annotations
 
+from hub.services.diff_scan import changed_line, scan_diff
+
 import json
 import logging
 import re
@@ -1415,6 +1417,27 @@ async def report_view(
     )
 
 
+def diff_size(diff: str) -> tuple[set[str], int]:
+    """``(files, changed lines)`` of a diff, read by its hunk counters (#1856).
+
+    An added ``+++ x`` is a changed line of the file being edited, not a file
+    header; a line the counters could not place still counts.
+    """
+    files: set[str] = set()
+    lines = 0
+    for entry in scan_diff(diff):
+        line = entry.text
+        if entry.body:
+            lines += changed_line(entry)
+        elif line.startswith("+++ b/"):
+            files.add(line[6:])
+        elif line.startswith("--- a/") and line[6:] != "dev/null":
+            files.add(line[6:])
+        elif changed_line(entry):
+            lines += 1
+    return files, lines
+
+
 async def _measure_diff(
     db: Any, task_row: dict[str, Any], report: "ReviewReport"
 ) -> "ReviewReport":
@@ -1444,15 +1467,7 @@ async def _measure_diff(
         )
         return report
 
-    files: set[str] = set()
-    lines = 0
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            files.add(line[6:])
-        elif line.startswith("--- a/") and line[6:] != "dev/null":
-            files.add(line[6:])
-        elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-            lines += 1
+    files, lines = diff_size(diff)
     report.diff_files = len(files)
     report.diff_lines = lines
     return report

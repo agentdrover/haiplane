@@ -38,6 +38,8 @@ from typing import Any, NamedTuple
 import aiosqlite
 
 from hub.db import deserialize_str_list, fetchall
+from hub.services.diff_scan import _unquote_path as _unquote_path
+from hub.services.diff_scan import changed_line, scan_diff
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -233,131 +235,6 @@ def split_generated(diff: str) -> tuple[str, list[str]]:
     return _split_files(diff, is_generated)
 
 
-_HUNK_RE = re.compile(r"^(@{2,}) ((?:[-+]\d+(?:,\d+)?(?: |$))+)\1")
-_FILE_STARTS = ("diff --git ", "diff --cc ", "diff --combined ")
-
-
-class _Hunk:
-    """Lines still owed to the current hunk, from its ``@@ -a,b +c,d @@`` header.
-
-    The boundary of a hunk is its counters, never the look of a line: inside
-    the body an added ``++ x`` reads exactly like a ``+++ x`` header (#1856).
-    A combined diff (``@@@ -a,b -c,d +e,f @@@``) carries one old counter per
-    parent. A missing counter is 1. ``consume`` is False when the body does
-    not add up; the caller then trusts nothing about where files begin.
-    """
-
-    def __init__(self) -> None:
-        self.parents = 1
-        self.old: list[int] = []
-        self.new = 0
-
-    @property
-    def open(self) -> bool:
-        return self.new > 0 or any(n > 0 for n in self.old)
-
-    def start(self, header: str) -> bool:
-        match = _HUNK_RE.match(header)
-        if match is None:
-            return False
-        counts = [
-            int(tok.split(",")[1]) if "," in tok else 1
-            for tok in match.group(2).split()
-        ]
-        self.parents = len(match.group(1)) - 1
-        if len(counts) != self.parents + 1:
-            return False
-        self.old, self.new = counts[:-1], counts[-1]
-        return True
-
-    def consume(self, line: str) -> bool:
-        if line.startswith("\\"):
-            return True  # "\ No newline at end of file"
-        prefix = line[: self.parents].ljust(self.parents)
-        if any(c not in " +-" for c in prefix):
-            return False
-        # git's columns: on a line the result lost, '-' marks the parents that
-        # had it; on any other line, ' ' marks the parents that had it, '+'
-        # the ones that did not. The result side owns every line not lost.
-        lost = "-" in prefix
-        for i, c in enumerate(prefix):
-            if c == ("-" if lost else " "):
-                self.old[i] -= 1
-        if not lost:
-            self.new -= 1
-        return self.new >= 0 and all(n >= 0 for n in self.old)
-
-    def reset(self) -> None:
-        self.old, self.new = [], 0
-
-
-@dataclasses.dataclass
-class _FileSpan:
-    path: str | None = None
-    plus_at: int | None = None  # index of the "+++ " line: the cut starts there
-    hunks: int = 0
-    trusted: bool = True
-
-
-def _header_path(line: str) -> str:
-    raw = _unquote_path(line[4:]) or line[4:].strip()
-    return raw[2:] if raw.startswith("b/") else raw
-
-
-def _diff_lines(diff: str) -> list[str]:
-    """Lines as git ends them: by LF only, never by VT, FF, U+2028 and the like.
-
-    ``str.splitlines`` would cut a hunk body at a ``\\v`` inside a literal and
-    invent a line the counters never owed (#1856).
-    """
-    return re.findall(r"[^\n]*\n|[^\n]+", diff)
-
-
-def _file_spans(lines: list[str]) -> list[_FileSpan]:
-    """Per line, the file it belongs to.
-
-    After the FIRST place where the counters do not add up nothing is trusted
-    any more, to the end of the diff: once we cannot tell where a hunk ends we
-    cannot tell where the next file starts, and a guess is a hidden signal.
-    """
-    spans = [_FileSpan()]
-    owner: list[_FileSpan] = []
-    hunk = _Hunk()
-    broke = False
-
-    def fresh() -> _FileSpan:
-        span = _FileSpan(trusted=not broke)
-        spans.append(span)
-        return span
-
-    for n, line in enumerate(lines):
-        text = line.rstrip("\n").removesuffix("\r")
-        cur = spans[-1]
-        if hunk.open:
-            if hunk.consume(text):
-                owner.append(cur)
-                continue
-            broke, cur.trusted = True, False
-            hunk.reset()
-        if text.startswith(_FILE_STARTS) or (
-            text.startswith("--- ") and cur.plus_at is not None
-        ):
-            cur = fresh()
-        elif text.startswith("+++ "):
-            cur = fresh() if cur.plus_at is not None else cur
-            cur.plus_at, cur.path = n, _header_path(text)
-        elif text.startswith("@@"):
-            cur.hunks += 1
-            if not hunk.start(text):
-                broke, cur.trusted = True, False
-        elif cur.hunks and text[:1] in ("+", "-", " "):
-            broke, cur.trusted = True, False  # counters undercounted the body
-        owner.append(cur)
-    if hunk.open:
-        owner[-1].trusted = False
-    return owner
-
-
 def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]]:
     """``(diff without the files ``drop`` accepts, names of what was dropped)``.
 
@@ -367,12 +244,11 @@ def _split_files(diff: str, drop: Callable[[str], bool]) -> tuple[str, list[str]
     body is decided by the hunk counters (:class:`_Hunk`). A file whose hunks
     do not add up is NOT dropped: a hidden signal costs more than a deep run.
     """
-    lines = _diff_lines(diff)
-    owner = _file_spans(lines)
+    scanned = scan_diff(diff)
     kept: list[str] = []
     dropped: list[str] = []
-    for n, line in enumerate(lines):
-        span = owner[n]
+    for n, entry in enumerate(scanned):
+        line, span = entry.line, entry.span
         path = span.path
         cut = (
             span.trusted
@@ -415,19 +291,21 @@ def is_inert_for_process(path: str) -> bool:
 
 
 def file_line_counts(diff: str) -> list[tuple[str, int]]:
-    """How many diff lines each changed file carries, biggest first."""
+    """How many diff lines each changed file carries, biggest first.
+
+    Files and body lines come from the hunk counters (:mod:`diff_scan`): an
+    added ``+++ x`` is a line of the file being edited, not a file of its own.
+    A line the counters could not place still counts, under the file it
+    follows; a line before any file counts under no name and is not listed.
+    """
     counts: dict[str, int] = {}
-    current = ""
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            raw = line[4:].strip()
-            path = raw[2:] if raw.startswith("b/") else raw
-            current = "" if path == "/dev/null" else path
-            counts.setdefault(current, 0)
+    for entry in scan_diff(diff):
+        path = entry.span.path
+        if not path or path == "/dev/null":
             continue
-        if current and (line.startswith("+") or line.startswith("-")):
-            counts[current] += 1
-    counts.pop("", None)
+        counts.setdefault(path, 0)
+        if changed_line(entry):
+            counts[path] += 1
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
@@ -1021,11 +899,13 @@ def process_surface_reasons(diff: str) -> list[str]:
     """
     diff, _ = split_generated(diff)
     diff, _ = _split_files(diff, is_inert_for_process)
+    scanned = scan_diff(diff)
     reasons: list[str] = []
     for group, markers in _PROCESS_SURFACES:
         hits: list[str] = []
-        for raw in diff.splitlines():
-            if not raw.startswith("+") or raw.startswith("+++"):
+        for entry in scanned:
+            raw = entry.text
+            if not raw.startswith("+") or (not entry.body and raw.startswith("+++")):
                 continue
             code = raw[1:]
             if _is_comment(code):
@@ -1127,42 +1007,6 @@ def is_documentation(path: str) -> bool:
     return not any(d.startswith(".") or d in _NOT_DOC_DIRS for d in parts[:-1])
 
 
-_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
-
-
-def _unquote_path(raw: str) -> str | None:
-    """A path as git prints it in a header, or None when it cannot be read.
-
-    With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
-    or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
-    Undecodable means unknown, never documentation.
-    """
-    raw = raw.strip()
-    if not raw.startswith('"'):
-        return raw
-    if len(raw) < 2 or not raw.endswith('"'):
-        return None
-    body, out, i = raw[1:-1], bytearray(), 0
-    while i < len(body):
-        ch = body[i]
-        if ch != "\\":
-            out += ch.encode("utf-8")
-            i += 1
-        elif body[i + 1 : i + 4].isdigit() and len(body[i + 1 : i + 4]) == 3:
-            out.append(int(body[i + 1 : i + 4], 8) & 0xFF)
-            i += 4
-        elif i + 1 < len(body):
-            nxt = body[i + 1]
-            out.append(_C_ESCAPES.get(nxt, ord(nxt) if nxt.isascii() else 0))
-            i += 2
-        else:
-            return None
-    try:
-        return out.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
 def _git_line_paths(rest: str) -> list[str | None]:
     """The two sides of ``diff --git <a> <b>``, quoted or not."""
     if rest.startswith('"'):
@@ -1211,17 +1055,13 @@ def _diff_touched_paths(diff: str) -> list[str | None]:
     yields ``None`` — unknown, which the caller must never read as prose.
     """
     paths: list[str | None] = []
-    in_hunk = False
-    for line in diff.splitlines():
+    for entry in scan_diff(diff):
+        if entry.body:
+            continue
+        line = entry.text
         if line.startswith("diff "):
-            in_hunk = False
             found = _header_paths(line)
             paths.extend(found if found is not None else [None])
-            continue
-        if line.startswith("@@"):
-            in_hunk = True
-            continue
-        if in_hunk:
             continue
         found = _header_paths(line)
         if found:
@@ -1806,20 +1646,16 @@ def rules_char_cap() -> int:
 def changed_paths(diff: str) -> list[str]:
     """Repository paths the diff touches, in order of first appearance.
 
-    Taken from the ``+++`` headers, so a deleted file (``+++ /dev/null``) does
-    not contribute a directory whose rules nobody needs.
+    Taken from the ``+++`` headers (read by the hunk counters, so a line of
+    text that looks like one names no file), and a deleted file
+    (``+++ /dev/null``) does not contribute a directory whose rules nobody
+    needs.
     """
     paths: list[str] = []
-    for line in diff.splitlines():
-        if not line.startswith("+++ "):
-            continue
-        raw = line[4:].strip()
-        if not raw or raw == "/dev/null":
-            continue
-        if raw.startswith("b/"):
-            raw = raw[2:]
-        if raw and raw not in paths:
-            paths.append(raw)
+    for entry in scan_diff(diff):
+        path = entry.span.path
+        if path and path != "/dev/null" and path not in paths:
+            paths.append(path)
     return paths
 
 

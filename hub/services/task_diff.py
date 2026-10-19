@@ -27,6 +27,8 @@ Two rules this module exists to keep:
 
 from __future__ import annotations
 
+from hub.services.diff_scan import scan_diff
+
 import logging
 from typing import Any
 
@@ -85,7 +87,8 @@ def split_files(diff: str) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     new_line: int | None = None
-    for line in diff.splitlines():
+    for entry in scan_diff(diff):
+        line, body = entry.text, bool(entry.body)
         if line.startswith("diff --git "):
             path = line.split(" b/", 1)[-1].strip() if " b/" in line else line
             current = {"path": path, "added": 0, "removed": 0, "lines": []}
@@ -102,7 +105,7 @@ def split_files(diff: str) -> list[dict[str, Any]]:
         number: int | None = None
         if line.startswith("@@"):
             new_line = _hunk_start(line)
-        elif new_line is not None and not line.startswith("---"):
+        elif new_line is not None and (body or not line.startswith("---")):
             if line.startswith("+"):
                 number, new_line = new_line, new_line + 1
             elif line.startswith("-"):
@@ -111,9 +114,9 @@ def split_files(diff: str) -> list[dict[str, Any]]:
                 number, new_line = new_line, new_line + 1
 
         current["lines"].append({"text": line, "new_line": number})
-        if line.startswith("+") and not line.startswith("+++"):
+        if line.startswith("+") and (body or not line.startswith("+++")):
             current["added"] += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-") and (body or not line.startswith("---")):
             current["removed"] += 1
     return files
 
