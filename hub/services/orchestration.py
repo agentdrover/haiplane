@@ -6312,6 +6312,12 @@ async def transition_after_agent_done(
     if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
 
+    # #1953: автоматический вход (поллер): сдача без passed критика - hold.
+    from hub.services.critic_orders import automatic_gate
+
+    if has_done and await automatic_gate(db, task):
+        return "needs_decision"
+
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
         # that PR is merged — "completed" must mean delivered, the invariant

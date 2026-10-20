@@ -763,7 +763,13 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     Изменённые намеренно: активированные админом получают черновик, активная
     версия прежняя (человек активирует сам); seed получает новую активную.
     """
-    changed_by_admin = {"local-executor-hub-repo", "hub-submit-task"}
+    # #1953: executor-pair-discipline получил раздел про критика k8 - текст
+    # в коде изменён, активная версия админа остаётся, новая ложится черновиком.
+    changed_by_admin = {
+        "local-executor-hub-repo",
+        "hub-submit-task",
+        "executor-pair-discipline",
+    }
     sources = {
         "local-executor-hub-repo": (REPO / "skills/local-executor-hub-repo/SKILL.md"),
         "hub-review-report-reading": REPO / "skills/hub-review-report-reading/SKILL.md",

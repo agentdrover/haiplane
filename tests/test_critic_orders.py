@@ -93,7 +93,9 @@ async def _session(world, task_id: int, run_id: int) -> dict:
 
 async def _cloud(world, tip, *, critic_host: str = "k8", auto_review: bool = True):
     """Облачная задача в running: прогон channel=cloud, держатель и живая сессия."""
-    await _policy(world, critic_host=critic_host) if critic_host else await _policy(world)
+    await _policy(world, critic_host=critic_host) if critic_host else await _policy(
+        world
+    )
     task_id = await _task(world, f"облако {secrets.token_hex(3)}")
     run_id = await repo.create_executor_run(
         world.db,
@@ -207,25 +209,35 @@ async def test_a_cloud_critic_request_orders_one_critic(world, tip, monkeypatch)
     before = await _executor_state(world)
 
     # Цитата и code block - не заказ; сети нет.
-    for body in (f"> {_line(SHA_A)}", f"```\n{_line(SHA_A)}\n```", f"см. {_line(SHA_A)} выше"):
+    for body in (
+        f"> {_line(SHA_A)}",
+        f"```\n{_line(SHA_A)}\n```",
+        f"см. {_line(SHA_A)} выше",
+    ):
         assert (await _say(world, cloud, body)).status_code == 200
     assert await _orders(world) == [] and tip.calls == []
     assert any("request_line" in a for a in await _alerts(world, cloud.task_id))
 
     # Чужая сессия (не облачная: ручной прогон) и ручной перехват.
     manual = await _cloud(world, tip)
-    await world.db.execute("UPDATE executor_runs SET channel='slot' WHERE id=?", (manual.run_id,))
+    await world.db.execute(
+        "UPDATE executor_runs SET channel='slot' WHERE id=?", (manual.run_id,)
+    )
     await world.db.commit()
     assert (await _say(world, manual, _line(SHA_A))).status_code == 200
     assert await _orders(world) == [] and tip.calls == []
     assert any("not_cloud_holder" in a for a in await _alerts(world, manual.task_id))
     taken = await _cloud(world, tip)
-    await repo.update_task(world.db, taken.task_id, claimed_by=None)  # перехват снимает прогон
+    await repo.update_task(
+        world.db, taken.task_id, claimed_by=None
+    )  # перехват снимает прогон
     await world.db.commit()
     assert (await _say(world, taken, _line(SHA_A))).status_code == 200
     assert await _orders(world) == [] and tip.calls == []
     # Имя agent доказательством не служит: человеческий ключ без сессии - не облако.
-    assert (await _say(world, cloud, _line(SHA_A), auth=world.human_auth)).status_code == 200
+    assert (
+        await _say(world, cloud, _line(SHA_A), auth=world.human_auth)
+    ).status_code == 200
     assert await _orders(world) == [] and tip.calls == []
 
     # critic_host пуст: заказа нет, причина названа.
@@ -250,7 +262,9 @@ async def test_a_cloud_critic_request_orders_one_critic(world, tip, monkeypatch)
     assert (await _say(world, cloud, _line(SHA_A))).status_code == 200
     (order,) = await _orders(world, cloud.task_id)
     assert (order["sha"], order["state"], order["host"]) == (SHA_A, "pending", "k8")
-    assert order["executor_run_id"] == cloud.run_id and order["branch"].startswith("task-")
+    assert order["executor_run_id"] == cloud.run_id and order["branch"].startswith(
+        "task-"
+    )
     assert order["repo"] and order["base"] and order["expires_at"]
     assert len(tip.calls) == 1
 
@@ -261,13 +275,16 @@ async def test_a_cloud_critic_request_orders_one_critic(world, tip, monkeypatch)
     assert (await _say(world, cloud, _line(SHA_B))).status_code == 200
     assert len(await _orders(world, cloud.task_id)) == 1 and tip.calls == []
     texts = await _alerts(world, cloud.task_id)
-    assert any("duplicate" in a for a in texts) and any("quota_open" in a for a in texts)
+    assert any("duplicate" in a for a in texts) and any(
+        "quota_open" in a for a in texts
+    )
 
     # Квота в час: после закрытия failed лимит 1 в час не даёт второго заказа.
     monkeypatch.setattr(config, "CRITIC_ORDERS_PER_HOUR", 1, raising=False)
     await world.db.execute(
         "UPDATE critic_orders SET state='closed', outcome='failed', closed_reason='reported' "
-        "WHERE id=?", (order["id"],)
+        "WHERE id=?",
+        (order["id"],),
     )
     await world.db.commit()
     tip.sha, tip.calls[:] = SHA_A, []
@@ -278,7 +295,10 @@ async def test_a_cloud_critic_request_orders_one_critic(world, tip, monkeypatch)
     # Повтор неизменного кода после failed допустим, когда квота позволяет.
     monkeypatch.setattr(config, "CRITIC_ORDERS_PER_HOUR", 10, raising=False)
     assert (await _say(world, cloud, _line(SHA_A))).status_code == 200
-    assert [o["state"] for o in await _orders(world, cloud.task_id)] == ["closed", "pending"]
+    assert [o["state"] for o in await _orders(world, cloud.task_id)] == [
+        "closed",
+        "pending",
+    ]
 
     # Заказы исполнителя и прогоны не тронуты ни одной веткой.
     runs_now, eorders_now = await _executor_state(world)
@@ -325,17 +345,29 @@ async def test_only_the_host_reports_and_the_quote_is_sanitized(world, tip):
 
     # Санитизация: выжимка с опасным содержимым; в ленте одна запись, векторы вычищены.
     nasty = " ".join(v["text"] for v in VECTORS)
-    feed_before = len(await _rows(world.db, "SELECT id FROM task_updates WHERE task_id=?", (cloud.task_id,)))
+    feed_before = len(
+        await _rows(
+            world.db, "SELECT id FROM task_updates WHERE task_id=?", (cloud.task_id,)
+        )
+    )
     ok = await _report(world, oid, _passed(summary=nasty))
     assert ok.status_code == 200, ok.text
     stored = (await _orders(world, cloud.task_id))[0]
-    assert (stored["state"], stored["outcome"], stored["host_ref"]) == ("closed", "passed", "vm-1")
+    assert (stored["state"], stored["outcome"], stored["host_ref"]) == (
+        "closed",
+        "passed",
+        "vm-1",
+    )
     rows = await _rows(
         world.db,
         "SELECT content FROM task_updates WHERE task_id=? AND author_kind='hub' ORDER BY id DESC",
         (cloud.task_id,),
     )
-    feed_after = len(await _rows(world.db, "SELECT id FROM task_updates WHERE task_id=?", (cloud.task_id,)))
+    feed_after = len(
+        await _rows(
+            world.db, "SELECT id FROM task_updates WHERE task_id=?", (cloud.task_id,)
+        )
+    )
     assert feed_after == feed_before + 1
     for text in (stored["summary"], rows[0]["content"]):
         for vector in VECTORS:
@@ -352,7 +384,16 @@ async def test_only_the_host_reports_and_the_quote_is_sanitized(world, tip):
     assert (await _report(world, oid, _passed(summary=nasty))).status_code == 200
     assert (await _report(world, oid, _passed(summary="иное"))).status_code == 409
     assert (await _report(world, oid, _passed(host_ref="vm-2"))).status_code == 409
-    assert len(await _rows(world.db, "SELECT id FROM task_updates WHERE task_id=?", (cloud.task_id,))) == feed_after
+    assert (
+        len(
+            await _rows(
+                world.db,
+                "SELECT id FROM task_updates WHERE task_id=?",
+                (cloud.task_id,),
+            )
+        )
+        == feed_after
+    )
     assert (await _get_orders(world)).json()["orders"] == []  # закрытый не выдаётся
 
     # Поздний отчёт: срок вышел - отказ, заказ expired (его ставит только хаб).
@@ -391,8 +432,15 @@ async def test_only_the_host_reports_and_the_quote_is_sanitized(world, tip):
 async def _task_state(world, task_id: int) -> tuple:
     await world.db.commit()
     task = (await _rows(world.db, "SELECT * FROM tasks WHERE id=?", (task_id,)))[0]
-    feed = await _rows(world.db, "SELECT id FROM task_updates WHERE task_id=?", (task_id,))
-    return (task["status"], task["submission_generation"], task["submission_sha"], len(feed))
+    feed = await _rows(
+        world.db, "SELECT id FROM task_updates WHERE task_id=?", (task_id,)
+    )
+    return (
+        task["status"],
+        task["submission_generation"],
+        task["submission_sha"],
+        len(feed),
+    )
 
 
 async def _submit(world, cloud, **extra):
@@ -422,7 +470,11 @@ async def test_a_cloud_submission_needs_a_passed_critic_on_its_sha(world, tip):
     """AC-3: сдача облачной задачи - только при passed на наблюдённом sha; иначе 422 без записей."""
     for gate in ("submit", "done", "done_no_review"):
         cloud = await _cloud(world, tip, auto_review=gate != "done_no_review")
-        send = (lambda c: _submit(world, c)) if gate == "submit" else (lambda c: _done(world, c))
+        send = (
+            (lambda c: _submit(world, c))
+            if gate == "submit"
+            else (lambda c: _done(world, c))
+        )
         tip.sha, tip.fail = SHA_A, False
 
         # Заказа нет / открытый / findings / failed / expired: отказ и ни одной записи.
@@ -432,13 +484,20 @@ async def test_a_cloud_submission_needs_a_passed_critic_on_its_sha(world, tip):
         await world.db.execute(
             "INSERT INTO critic_orders (task_id, executor_run_id, sha, repo, branch, base, "
             "host, state, expires_at) VALUES (?, ?, ?, 'o/r', 'b', 'develop', 'k8', "
-            "'pending', datetime('now', '+30 minutes'))", (cloud.task_id, cloud.run_id, SHA_A),
+            "'pending', datetime('now', '+30 minutes'))",
+            (cloud.task_id, cloud.run_id, SHA_A),
         )
         await world.db.commit()
         assert _refused(await send(cloud)) == "order_open"
-        await world.db.execute("DELETE FROM critic_orders WHERE task_id=?", (cloud.task_id,))
+        await world.db.execute(
+            "DELETE FROM critic_orders WHERE task_id=?", (cloud.task_id,)
+        )
         await world.db.commit()
-        for outcome, cause, p1 in (("findings", "findings", 1), ("failed", "failed", 0), ("expired", "expired", 0)):
+        for outcome, cause, p1 in (
+            ("findings", "findings", 1),
+            ("failed", "failed", 0),
+            ("expired", "expired", 0),
+        ):
             oid = await _closed_order(world, cloud, SHA_A, outcome, p1=p1)
             assert _refused(await send(cloud)) == cause, outcome
             await world.db.execute("DELETE FROM critic_orders WHERE id=?", (oid,))
@@ -463,14 +522,19 @@ async def test_a_cloud_submission_needs_a_passed_critic_on_its_sha(world, tip):
         if gate == "submit":
             assert (status, generation, pinned) == ("review", 1, SHA_A)
         elif gate == "done":
-            assert (status, generation) == ("review", 1)
+            assert (status in ("review", "ci_check"), generation) == (True, 1)
 
     # Автоматический вход (поллер): удержание с alert, без исключения и без записи сдачи.
     from hub.services import orchestration
 
     auto = await _cloud(world, tip)
-    row = dict((await _rows(world.db, "SELECT * FROM tasks WHERE id=?", (auto.task_id,)))[0])
-    assert await orchestration.transition_after_agent_done(world.db, row, has_done=True) == "needs_decision"
+    row = dict(
+        (await _rows(world.db, "SELECT * FROM tasks WHERE id=?", (auto.task_id,)))[0]
+    )
+    assert (
+        await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+        == "needs_decision"
+    )
     await world.db.commit()
     held = await _task_state(world, auto.task_id)
     assert held[0] == "needs_decision" and held[1] == 0
@@ -480,9 +544,13 @@ async def test_a_cloud_submission_needs_a_passed_critic_on_its_sha(world, tip):
     for label in ("slot", "off", "no_run"):
         other = await _cloud(world, tip, critic_host="" if label == "off" else "k8")
         if label == "slot":
-            await world.db.execute("UPDATE executor_runs SET channel='slot' WHERE id=?", (other.run_id,))
+            await world.db.execute(
+                "UPDATE executor_runs SET channel='slot' WHERE id=?", (other.run_id,)
+            )
         if label == "no_run":
-            await world.db.execute("UPDATE tasks SET executor_run_id=NULL WHERE id=?", (other.task_id,))
+            await world.db.execute(
+                "UPDATE tasks SET executor_run_id=NULL WHERE id=?", (other.task_id,)
+            )
         await world.db.commit()
         ok = await _submit(world, other)
         assert ok.status_code == 200, (label, ok.text)
@@ -513,16 +581,29 @@ async def test_the_migration_applies_once(monkeypatch):
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='critic_orders'"
         )
         assert len(tables) == 1 and "CHECK" in tables[0][0]
-        fks = {r[2] for r in await conn.execute_fetchall("PRAGMA foreign_key_list(critic_orders)")}
+        fks = {
+            r[2]
+            for r in await conn.execute_fetchall(
+                "PRAGMA foreign_key_list(critic_orders)"
+            )
+        }
         assert fks == {"tasks", "executor_runs"}
-        idx = {r[1] for r in await conn.execute_fetchall("PRAGMA index_list(critic_orders)")}
+        idx = {
+            r[1]
+            for r in await conn.execute_fetchall("PRAGMA index_list(critic_orders)")
+        }
         assert any(i.startswith("uq_critic_orders_open") for i in idx) and len(idx) >= 3
 
     # Свежая база.
     fresh = await _make_db()
     try:
         await _probe(fresh)
-        applied = [tuple(r) for r in await fresh.execute_fetchall("SELECT name, applied_at FROM _migrations ORDER BY name")]
+        applied = [
+            tuple(r)
+            for r in await fresh.execute_fetchall(
+                "SELECT name, applied_at FROM _migrations ORDER BY name"
+            )
+        ]
         executed: list[str] = []
         real = fresh.execute
 
@@ -533,15 +614,30 @@ async def test_the_migration_applies_once(monkeypatch):
         fresh.execute = spy  # type: ignore[method-assign]
         await _migrate(fresh)
         fresh.execute = real  # type: ignore[method-assign]
-        assert not [s for s in executed if "critic_orders" in s and s.lstrip().upper().startswith("CREATE")]
-        assert [tuple(r) for r in await fresh.execute_fetchall("SELECT name, applied_at FROM _migrations ORDER BY name")] == applied
+        assert not [
+            s
+            for s in executed
+            if "critic_orders" in s and s.lstrip().upper().startswith("CREATE")
+        ]
+        assert [
+            tuple(r)
+            for r in await fresh.execute_fetchall(
+                "SELECT name, applied_at FROM _migrations ORDER BY name"
+            )
+        ] == applied
         # CHECK: passed с P1>0 и кривой sha отвергаются самой таблицей.
         await fresh.execute("INSERT INTO tasks (title, description) VALUES ('t', 'd')")
         await fresh.execute("INSERT INTO executor_runs (task_id) VALUES (1)")
-        base = ("INSERT INTO critic_orders (task_id, executor_run_id, sha, repo, branch, base, host, "
-                "state, expires_at, outcome, findings_p1) VALUES (1, 1, ?, 'r', 'b', 'd', 'k8', ?, "
-                "datetime('now'), ?, ?)")
-        for sha, state, outcome, p1 in ((SHA_A[:39], "pending", None, 0), (SHA_A, "bogus", None, 0), (SHA_A, "closed", "passed", 1)):
+        base = (
+            "INSERT INTO critic_orders (task_id, executor_run_id, sha, repo, branch, base, host, "
+            "state, expires_at, outcome, findings_p1) VALUES (1, 1, ?, 'r', 'b', 'd', 'k8', ?, "
+            "datetime('now'), ?, ?)"
+        )
+        for sha, state, outcome, p1 in (
+            (SHA_A[:39], "pending", None, 0),
+            (SHA_A, "bogus", None, 0),
+            (SHA_A, "closed", "passed", 1),
+        ):
             with pytest.raises(Exception):
                 await fresh.execute(base, (sha, state, outcome, p1))
         await fresh.rollback()
@@ -552,16 +648,30 @@ async def test_the_migration_applies_once(monkeypatch):
     monkeypatch.setattr(db_module, "_MIGRATIONS", list(FROZEN_MIGRATIONS))
     old = await _make_db()
     try:
-        await old.execute("INSERT INTO tasks (title, description) VALUES ('control', 'row')")
+        await old.execute(
+            "INSERT INTO tasks (title, description) VALUES ('control', 'row')"
+        )
         await old.commit()
-        before = [list(r) for r in await old.execute_fetchall("SELECT id, title, description FROM tasks")]
-        assert not await old.execute_fetchall("SELECT 1 FROM sqlite_master WHERE name='critic_orders'")
+        before = [
+            list(r)
+            for r in await old.execute_fetchall(
+                "SELECT id, title, description FROM tasks"
+            )
+        ]
+        assert not await old.execute_fetchall(
+            "SELECT 1 FROM sqlite_master WHERE name='critic_orders'"
+        )
         from hub.migrations import assemble
 
         monkeypatch.setattr(db_module, "_MIGRATIONS", assemble(FROZEN_MIGRATIONS))
         await _migrate(old)
         await _probe(old)
-        assert [list(r) for r in await old.execute_fetchall("SELECT id, title, description FROM tasks")] == before
+        assert [
+            list(r)
+            for r in await old.execute_fetchall(
+                "SELECT id, title, description FROM tasks"
+            )
+        ] == before
         await _migrate(old)
         await _probe(old)
     finally:

@@ -840,6 +840,12 @@
                     {% elif task.last_executor_order.after_failed_run %}
                     <dt>После неудачного прогона</dt>
                     <dd data-after-failed-run="{{ task.last_executor_order.class }}">класс {{ task.last_executor_order.class }} ({{ task.last_executor_order.class_name }}); заказ #{{ task.last_executor_order.order_id }}, {{ task.last_executor_order.outcome }}</dd>
+                    {% endif %}{% endif %}{# #1953: последний заказ критика облачной сдачи; sha, состояние, срок и шаг собирает хаб (services/critic_orders). #}{% if task.critic_order %}{% if task.critic_order.unavailable %}
+                    <dt>Заказ критика</dt>
+                    <dd data-critic-unavailable="1">{{ task.critic_order.unavailable }}</dd>
+                    {% else %}
+                    <dt>Заказ критика</dt>
+                    <dd data-critic-order="{{ task.critic_order.order_id }}">#{{ task.critic_order.order_id }} {{ task.critic_order.sha[:12] }}: {{ task.critic_order.state }}/{{ task.critic_order.outcome or '-' }}, до {{ task.critic_order.expires_at }}. {{ task.critic_order.next_step }}</dd>
                     {% endif %}{% endif %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
