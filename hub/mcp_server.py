@@ -3212,6 +3212,10 @@ async def hub_submit_review(
             " WARNING: no expected_generation — the hub cannot tell which "
             "submission you judged; pass the generation of hub_get_review_brief."
         )
+    if task.get("lifecycle_hint"):
+        # #1696: the verdict's warnings (tip moved, sha_note, undisposed and
+        # in-flight notes) reach the agent as in the sibling tools.
+        message += f"\nLifecycle: {task['lifecycle_hint']}"
     return await _task_mutation_response(
         task_id,
         message,

@@ -520,6 +520,92 @@ def test_ci_installs_the_tools_and_forbids_skips():
     assert "continue-on-error" not in step and "|| true" not in step
 
 
+def test_install_step_has_no_or_true_in_all_jobs():
+    """#1923 AC-2: the install step is the same in every job that has it.
+
+    Install first on the package lists of the image, update and retry only when
+    that fails, and the tool checks stay the last word. No `|| true`, no
+    `continue-on-error`, and a second failure is the failure of the step.
+    """
+    import yaml
+
+    doc = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text()
+    )
+    name = "Install age and openssh-server (backup tests)"
+    steps = [
+        (job, step)
+        for job, body in doc["jobs"].items()
+        for step in body.get("steps", [])
+        if step.get("name") == name
+    ]
+    assert {job for job, _ in steps} == {"pytest", "mutation_legs", "baseline", "test"}
+    runs = {step["run"] for _, step in steps}
+    assert len(runs) == 1, "the four copies of the step drifted apart"
+    run = runs.pop()
+    assert "|| true" not in run and "||" not in run
+    for _, step in steps:
+        assert "continue-on-error" not in step
+    install = "sudo apt-get install -y --no-install-recommends age openssh-server"
+    update = "sudo apt-get update"
+    assert run.count(install) == 2, "install, and once more after the update"
+    assert run.index(install) < run.index(update) < run.rindex(install)
+    assert run.startswith("if ! " + install + "; then")
+    tail = run.split("\nfi\n", 1)[1]
+    assert tail.splitlines() == [
+        "command -v age && command -v age-keygen && test -x /usr/sbin/sshd",
+        "sudo -n true",
+    ]
+    # the shell semantics, executed: a first failure retries once after the
+    # update, a second failure fails the step, a first success never updates
+    import os
+    import subprocess
+
+    def run_with(first_ok: bool, second_ok: bool) -> tuple[int, list[str]]:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp) / "calls"
+            attempts = Path(tmp) / "attempts"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            sudo = bin_dir / "sudo"
+            sudo.write_text(
+                "#!/bin/bash\n"
+                f'echo "$*" >> {calls}\n'
+                'if [ "$1" = apt-get ] && [ "$2" = install ]; then\n'
+                f"  n=$(cat {attempts} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {attempts}\n"
+                f'  if [ "$n" = 1 ]; then exit {0 if first_ok else 1}; fi\n'
+                f"  exit {0 if second_ok else 1}\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            sudo.chmod(0o755)
+            for tool in ("age", "age-keygen"):
+                (bin_dir / tool).write_text("#!/bin/sh\nexit 0\n")
+                (bin_dir / tool).chmod(0o755)
+            # the real step checks /usr/sbin/sshd: test the branches with a run
+            # that stops before the tool checks
+            head = run.split("\nfi\n", 1)[0] + "\nfi\n"
+            done = subprocess.run(  # nosec B603 B607
+                ["bash", "-e", "-c", head],
+                env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+            )
+            seen = calls.read_text().splitlines() if calls.exists() else []
+            return done.returncode, seen
+
+    rc, seen = run_with(first_ok=True, second_ok=False)
+    assert rc == 0 and not any("update" in c for c in seen), seen
+    rc, seen = run_with(first_ok=False, second_ok=True)
+    assert rc == 0 and sum("update" in c for c in seen) == 1, seen
+    rc, seen = run_with(first_ok=False, second_ok=False)
+    assert rc != 0 and sum("update" in c for c in seen) == 1, (rc, seen)
+
+
 def test_sshd_is_reloaded_on_every_run_and_before_the_key_appears():
     """A run that failed after writing the drop-in must not leave sshd on the old config.
 

@@ -31,6 +31,22 @@ permissions:
   contents: read
   actions: read
 
+# #1923: a new push to a pull request makes the run of the previous push of THAT
+# pull request pointless, and it holds runners (the executors of k8 run several
+# tasks at once). Only a `synchronize` run joins a group and only a `synchronize`
+# run cancels: its group is the pull request, and it can only meet the runs of
+# older pushes of the same pull request.
+# Every other run (push to develop/main, a manual dispatch, opened, reopened) gets
+# a group of its own, named by its run id, so it is never cancelled and never
+# replaces a waiting run: the delivery gate reads EVERY run on a sha, and one
+# cancelled run on it is `failed` for good (hub/integrations/forge/github.py),
+# so a dispatch of the executor, the run of a merge or a deploy must not be a
+# victim. The deploy job keeps its own group below.
+# Known limit: a head that goes A -> B -> A by force-push leaves a cancelled run on A.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+
 jobs:
   # #1767: the dedup decision lives in a job of its own so that the parts of
   # the suite can wait for it and `test` can read it. Same code as before: the
@@ -243,8 +259,11 @@ jobs:
       - name: Install age and openssh-server (backup tests)
         if: ${{ needs.treedup.outputs.skip != 'true' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
+          if ! sudo apt-get install -y --no-install-recommends age openssh-server; then
+            echo "::warning::apt-get install failed on the package lists of the image; updating them and trying once more"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends age openssh-server
+          fi
           command -v age && command -v age-keygen && test -x /usr/sbin/sshd
           sudo -n true
 
@@ -322,8 +341,11 @@ jobs:
       # #1707: see the same step in job test; no `|| true`.
       - name: Install age and openssh-server (backup tests)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
+          if ! sudo apt-get install -y --no-install-recommends age openssh-server; then
+            echo "::warning::apt-get install failed on the package lists of the image; updating them and trying once more"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends age openssh-server
+          fi
           command -v age && command -v age-keygen && test -x /usr/sbin/sshd
           sudo -n true
 
@@ -412,8 +434,11 @@ jobs:
       # #1707: see the same step in job test; no `|| true`.
       - name: Install age and openssh-server (backup tests)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
+          if ! sudo apt-get install -y --no-install-recommends age openssh-server; then
+            echo "::warning::apt-get install failed on the package lists of the image; updating them and trying once more"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends age openssh-server
+          fi
           command -v age && command -v age-keygen && test -x /usr/sbin/sshd
           sudo -n true
 
@@ -732,10 +757,17 @@ jobs:
       # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
       # encrypts with real age. No continue-on-error and no `|| true`: if a tool
       # is missing this step is red, the tests are never skipped.
+      # #1923: install FIRST, on the package lists of the image; only when that
+      # fails (a list gone stale, a 404) the lists are updated and the install is
+      # tried once more. A second failure is the failure of the step; the tool
+      # checks below stay the last word. The same lines are in every job.
       - name: Install age and openssh-server (backup tests)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
+          if ! sudo apt-get install -y --no-install-recommends age openssh-server; then
+            echo "::warning::apt-get install failed on the package lists of the image; updating them and trying once more"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends age openssh-server
+          fi
           command -v age && command -v age-keygen && test -x /usr/sbin/sshd
           sudo -n true
 
