@@ -95,9 +95,9 @@ def test_the_whole_procedure_is_one_safe_step(monkeypatch):
     def boom(*a, **k):
         raise RecursionError("deep")
 
-    monkeypatch.setattr(mod, "_resolve", boom, raising=False)
-    monkeypatch.setattr(mod, "_scan_scope", boom, raising=False)
-    assert _span(_GOOD).unreadable or _span(_GOOD).found
+    monkeypatch.setattr(mod, "_resolve", boom)
+    span = _span(_GOOD)
+    assert span.unreadable and not span.found
 
 
 def test_a_full_diff_that_fits_beats_a_cutout_that_does_not():
