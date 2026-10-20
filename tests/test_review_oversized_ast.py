@@ -160,3 +160,22 @@ async def test_a_foreign_ref_does_not_raise_incomplete_or_buy_a_top_up(
     assert resp.status_code == 200, resp.text
     assert resp.json()["incomplete"] is False
     assert len(recorder.calls) == calls, "добор лестницы не заказан"
+
+
+async def test_a_truncated_missing_or_failing_read_is_unknown():
+    from hub.services.review_oversized import read_sources
+
+    class Git:
+        async def read_file_at_ref(self, repo, ref, path, *, limit_chars=0):
+            if path == "boom.py":
+                raise RuntimeError("git down")
+            return {
+                "ok.py": {"state": "present", "content": "x = 1\n", "truncated": False},
+                "cut.py": {"state": "present", "content": "x = 1", "truncated": True},
+            }.get(path, {"state": "missing", "content": ""})
+
+    refs = [f"{p}::test_a" for p in ("ok.py", "cut.py", "gone.py", "boom.py")]
+    got = await read_sources(Git(), "/repo", "a" * 40, refs)
+    assert got == {"ok.py": "x = 1\n", "cut.py": None, "gone.py": None, "boom.py": None}
+    assert await read_sources(Git(), "/repo", "", refs) is None
+    assert await read_sources(Git(), None, "a" * 40, refs) is None
