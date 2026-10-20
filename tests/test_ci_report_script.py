@@ -816,6 +816,37 @@ def test_the_mutation_report_is_sent_under_its_own_key(script, monkeypatch, tmp_
     assert "mutation" not in payload["checks"], "a warning is not a check outcome"
 
 
+def test_adopted_evidence_block_passes_the_reporter(
+    script, trusted, monkeypatch, tmp_path
+):
+    """#1919: a block that says where it came from is carried by both reporters.
+
+    The key sits at the top of the BLOCK: inside ``provenance`` it would be
+    overwritten by the stamp of the reporting run, and at the top of results.json
+    the trusted reporter refuses the whole report as having unexpected keys.
+    """
+    report = {"state": "ran", "survivors": [], "adopted_from_run": 777}
+    path = tmp_path / "mutations.json"
+    path.write_text(json.dumps(report))
+    monkeypatch.setenv("HAIPLANE_HUB_CI_MUTATIONS", str(path))
+
+    payload = _capture_payload(script, monkeypatch)
+    assert payload["mutations"]["adopted_from_run"] == 777
+
+    facts = {"head_sha": SHA, "run_id": "9001", "event": "pull_request"}
+    provenance = trusted.block_provenance(facts, "https://github.com", REPO)
+    raw = json.dumps(_results(mutations=report)).encode()
+    body = trusted.parse_results(raw, facts, 1686, provenance)
+    assert body["mutations"]["adopted_from_run"] == 777
+    assert body["mutations"]["provenance"]["run_id"] == "9001", (
+        "the provenance stays that of the run that reported"
+    )
+
+    top_level = json.dumps(_results(adopted_from_run=777)).encode()
+    with pytest.raises(trusted.Refused, match="unexpected keys"):
+        trusted.parse_results(top_level, facts, 1686, provenance)
+
+
 def test_a_missing_or_unreadable_mutation_report_is_not_sent(
     script, monkeypatch, tmp_path, capsys
 ):
