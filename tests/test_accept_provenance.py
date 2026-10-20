@@ -694,7 +694,38 @@ async def s_ghost_mark_on_a_changes_requested_verdict(w, _m):
     return []
 
 
+async def _raw_verdict_generation(w, value: str) -> None:
+    await w.db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+        "('review_verdict_recorded', ?, 'denis', ?)",
+        (
+            w.task_id,
+            '{"verdict":"approved","open_in_scope_findings":0,'
+            f'"submission_generation":{value}}}',
+        ),
+    )
+    await w.db.commit()
+
+
+async def s_approval_with_a_boolean_generation(w, _m):
+    root = await w.report(1)
+    await _raw_verdict_generation(w, "true")
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_approval_with_a_float_generation(w, _m):
+    root = await w.report(1)
+    await _raw_verdict_generation(w, "1.0")
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
 UNAPPROVED = {
+    "approval_with_a_boolean_generation",
+    "approval_with_a_float_generation",
     "generation_raised_by_a_done_report",
     "poller_changes_requested_without_an_event",
     "steward_changes_requested_on_an_unmarked_generation",

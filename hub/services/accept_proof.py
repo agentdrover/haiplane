@@ -172,7 +172,7 @@ def _approval_gap(
         (event_id, payload)
         for event_id, kind, payload in events
         if kind == "review_verdict_recorded"
-        and payload.get("submission_generation") == generation
+        and _event_generation(payload) == generation
     ]
     if not verdicts:
         return f"поколение {generation}: вердикта нет"
@@ -252,6 +252,12 @@ async def _carried_approvals(
     return [_history_blocker("; ".join(gaps))] if gaps else []
 
 
+def _event_generation(payload: dict[str, Any]) -> int | None:
+    """Поколение из события вердикта; не целое (bool, float, строка) — ``None``."""
+    value = payload.get("submission_generation")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _marked_ghosts(events: list[tuple[int, str, dict[str, Any]]]) -> set[int]:
     """Поколения, поднятые вердиктом при ушедшей вершине (#572): метка в событии.
 
@@ -267,7 +273,7 @@ def _marked_ghosts(events: list[tuple[int, str, dict[str, Any]]]) -> set[int]:
         and payload.get("verdict") == "approved"
         and isinstance(payload.get("ghost_generation"), int)
         and not isinstance(payload.get("ghost_generation"), bool)
-        and payload.get("submission_generation") == payload["ghost_generation"] - 1
+        and _event_generation(payload) == payload["ghost_generation"] - 1
     }
 
 
@@ -278,7 +284,7 @@ async def _is_empty_generation(
     events: list[tuple[int, str, dict[str, Any]]],
 ) -> bool:
     """Нет строки сдачи, отчётов и событий вердикта этого поколения."""
-    if any(p.get("submission_generation") == generation for _, _, p in events):
+    if any(_event_generation(p) == generation for _, _, p in events):
         return False
     rows = await fetchall(
         db,
