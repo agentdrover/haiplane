@@ -156,7 +156,7 @@ async def _steward_route(
 ) -> VerdictRoute:
     """Автопилот молчит, а проект просит стюарда: судит ли он и применяется ли суждение."""
     from hub import config
-    from hub.services import steward_apply, steward_shadow
+    from hub.services import steward_apply, steward_cap, steward_shadow
 
     if stance.code in _UNKNOWN_CODES:
         return _human(stance.code, stance.reason)
@@ -217,6 +217,10 @@ async def _steward_route(
             "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
             "дифф при показе не читался)"
         )
+    handoff = await steward_cap.cap_handoff(db, int(task["id"]), generation)
+    if handoff is not None:
+        # #1915: одно условие с диспетчером, заказом советника и применением.
+        return _human(steward_cap.CODE_DAILY_CAP, handoff.reason, mode)
     return VerdictRoute(
         DECIDER_STEWARD,
         DECIDER_STEWARD,

@@ -53,6 +53,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
+from hub.services import steward_cap
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS
 from hub.services.project_policy import gate_policy_of, gate_value_of
 from hub.services.result_kind import (
@@ -109,7 +110,7 @@ PENDING_PREFIX = "pending:"
 # already closes over (#1022), so a refusal here and an escalation there mean
 # the same thing by name rather than by resemblance.
 REFUSED_MODE_OFF = "steward_off"
-REFUSED_DAILY_CAP = "daily_cap"
+REFUSED_DAILY_CAP = steward_cap.REFUSED_DAILY_CAP  # #1915: одно слово на два модуля
 REFUSED_ALREADY_ORDERED = "already_ordered"
 REFUSED_NO_GENERATION = "no_generation"
 REFUSED_NO_NEW_INFORMATION = "no_new_information"
@@ -121,7 +122,7 @@ REFUSED_STATE_TASK = AUTOMATION_REFUSAL_CODE
 REFUSED_REVIEW_IN_FLIGHT = "review_in_flight"
 
 EVENT_ORDERED = "steward_run_ordered"
-EVENT_REFUSED = "steward_run_refused"
+EVENT_REFUSED = steward_cap.EVENT_REFUSED
 EVENT_CLOSED = "steward_run_closed"
 # Своё слово, а не steward_run_refused (#1289). Отказ РЕШАЕТ генерацию:
 # рядом с ним стоит строка steward_runs, и второго заказа не будет никогда.
@@ -178,6 +179,7 @@ async def _refuse(
     *,
     generation: int,
     kind: str,
+    project_id: int | None = None,
 ) -> None:
     """Say no in the feed. A silent refusal is indistinguishable from a bug.
 
@@ -188,42 +190,61 @@ async def _refuse(
     что у временного отказа прогона (#1290): второго механизма дедупа нет.
 
     Ключ — задача, поколение, вид заказа и UTC-сутки. Сутки нужны потолку:
-    исчерпанный вчера и исчерпанный сегодня — два факта, не один.
+    исчерпанный вчера и исчерпанный сегодня — два факта, не один. Отказ по
+    потолку (#1915) пишет steward_cap: событие с project_id и alert в ленту
+    одной транзакцией, дедуп по наличию такого отказа за сутки.
     """
     from hub.services.steward_shadow import _last_event_payload
 
-    previous = await _last_event_payload(
-        db, EVENT_REFUSED, task_id=task_id, order=(generation, kind), today=True
-    )
-    if previous.get("reason") == reason:
-        return
-    await repo.insert_event(
-        db,
-        kind=EVENT_REFUSED,
-        task_id=task_id,
-        actor="hub",
-        payload={
-            "reason": reason,
-            "detail": detail,
-            "generation": generation,
-            "kind": kind,
-        },
-    )
+    if reason == REFUSED_DAILY_CAP:
+        if not await steward_cap.record_refusal(
+            db, task_id, project_id, generation, kind, detail
+        ):
+            return
+    else:
+        previous = await _last_event_payload(
+            db, EVENT_REFUSED, task_id=task_id, order=(generation, kind), today=True
+        )
+        if previous.get("reason") == reason:
+            return
+        await repo.insert_event(
+            db,
+            kind=EVENT_REFUSED,
+            task_id=task_id,
+            project_id=project_id,
+            actor="hub",
+            payload={
+                "reason": reason,
+                "detail": detail,
+                "generation": generation,
+                "kind": kind,
+            },
+        )
     await db.commit()
 
 
-async def runs_today(db: aiosqlite.Connection, project_id: int | None) -> int:
-    """Orders placed for this project within the current UTC day.
+async def runs_today(
+    db: aiosqlite.Connection,
+    project_id: int | None,
+    group: str = steward_cap.GROUP_VERDICT_DOR,
+) -> int:
+    """Orders of one cap group placed for this project within the current UTC day.
+
+    Группы две (#1915): ``verdict_dor`` — суждения о сдаче и постановке,
+    ``advisor`` — советник; потолок у каждой свой. Границу суток ставят часы
+    хаба (``steward_cap.utcnow``), строка заказа получает ту же метку.
 
     A refusal (#1150) is not an order: it bought nothing and must not spend
     the cap that exists to bound what is bought.
     """
+    kinds = steward_cap.kinds_of(group)
+    marks = ",".join("?" for _ in kinds)
     rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM steward_runs "
-        "WHERE project_id IS ? AND date(created_at) = date('now') "
+        "SELECT COUNT(*) AS n FROM steward_runs "  # nosec B608 - placeholders only
+        f"WHERE project_id IS ? AND date(created_at) = ? AND kind IN ({marks}) "
         "AND status != ?",
-        (project_id, RUN_REFUSED),
+        (project_id, steward_cap.utc_day(), *kinds, RUN_REFUSED),
     )
     return int(dict(rows[0]).get("n") or 0) if rows else 0
 
@@ -298,6 +319,8 @@ async def order_run(
     nothing to do either way, because a refusal is not a failure: it is the
     human route continuing to work exactly as it does today.
     """
+    project = await repo.resolve_project_for_task(db, task_id)
+    project_id = dict(project)["id"] if project is not None else None
     if not dispatcher_enabled():
         await _refuse(
             db,
@@ -306,6 +329,7 @@ async def order_run(
             f"STEWARD_MODE={config.STEWARD_MODE!r} — контур закрыт",
             generation=generation,
             kind=kind,
+            project_id=project_id,
         )
         return None
     if kind != KIND_DOR and await task_automation_not_applicable(db, task_id):
@@ -319,6 +343,7 @@ async def order_run(
             AUTOMATION_REFUSAL,
             generation=generation,
             kind=kind,
+            project_id=project_id,
         )
         return None
     missing = await _revision_missing(db, task_id, generation, kind)
@@ -330,21 +355,23 @@ async def order_run(
             missing,
             generation=generation,
             kind=kind,
+            project_id=project_id,
         )
         return None
 
-    project = await repo.resolve_project_for_task(db, task_id)
-    project_id = dict(project)["id"] if project is not None else None
-    used = await runs_today(db, project_id)
-    if used >= config.STEWARD_DAILY_CAP:
+    group = steward_cap.group_of(kind)
+    cap = steward_cap.cap_of(group)
+    used = await runs_today(db, project_id, group)
+    if used >= cap:
         await _refuse(
             db,
             task_id,
             REFUSED_DAILY_CAP,
-            f"суточный потолок исчерпан: {used}/{config.STEWARD_DAILY_CAP} "
+            f"суточный потолок исчерпан ({group}): {used}/{cap} "
             "прогонов на проект за UTC-сутки — задача идёт человеческим маршрутом",
             generation=generation,
             kind=kind,
+            project_id=project_id,
         )
         return None
 
@@ -354,8 +381,8 @@ async def order_run(
     try:
         cursor = await db.execute(
             "INSERT INTO steward_runs "
-            "(task_id, generation, kind, status, model, project_id, deadline_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, "
+            "(task_id, generation, kind, status, model, project_id, created_at, "
+            "deadline_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
             "datetime('now', ?))",
             (
                 task_id,
@@ -364,6 +391,7 @@ async def order_run(
                 RUN_OPEN,
                 ordered_model,
                 project_id,
+                steward_cap.stamp(steward_cap.utcnow()),
                 # Пока заказ не начат, срок отмеряет ожидание ВОЗМОЖНОСТИ, а не
                 # работу судьи. Рабочее окно поставит захват слота (#1181).
                 # У советника срок один на старт и работу (#1601).
@@ -1011,6 +1039,8 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         project = await repo.resolve_project_for_task(db, task_id)
         if not _policy_wants_steward(project):
             continue
+        if await steward_cap.cap_handoff(db, task_id, generation) is not None:
+            continue  # #1915: до reset_at сдача у человека, повторного заказа нет
         if await open_run(db, task_id, generation) is not None:
             continue
         if await _settled(db, task_id, generation):
