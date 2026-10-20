@@ -76,12 +76,13 @@ from hub.services.diff_scan import git_header_path
 from hub.services.diff_scan import scan_diff as scan_diff_lines
 
 import ast
+import hashlib
 import json
 import logging
 import posixpath
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -117,6 +118,9 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         # #1919: decides which evidence a PR run takes from the dispatch run;
         # changing it can swap what the red-test gate reads.
         "scripts/adopt_evidence.py",
+        # #1921: puts the reports of the mutation legs together; a changed merge
+        # can turn a missing leg into "ran".
+        "scripts/merge_mutation_legs.py",
         # #1767: a plugin loaded by the command of each test part
         # (``-p scripts.pytest_shard``); changing it can hide tests.
         "scripts/pytest_shard.py",
@@ -220,7 +224,7 @@ QUESTION = (
 ANSWER_SHAPE = (
     '"ci_integrity": {"verdict": "explained|suspicious", "explanation_ru": '
     f'"≤{CI_INTEGRITY_NOTE_LIMIT} знаков: что меняется, зачем, риск '
-    '(низкий/высокий)"}'
+    '(низкий/высокий)", "scan_hash": "<scan_hash из этого блока, как есть>"}'
 )
 NO_ANSWER_NOTE = "ревьюер не ответил"
 
@@ -585,17 +589,35 @@ async def _read_text(git: Any, repo_path: str, ref: str, path: str) -> str | Non
     return str(got.get("content") or "")
 
 
-async def _scan_now(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan:
-    """Read the diff of the pinned commit and scan it. NETWORK: never inside a write transaction."""
-    from hub.integrations.registry import plugins
+async def _scan_now(
+    db: aiosqlite.Connection, task_id: int, sha: str, net: Any = None
+) -> Scan:
+    """Read the diff of the pinned commit and scan it. NETWORK: never inside a write transaction.
+
+    ``net`` (#1913) оборачивает только чтение клона; чтение контекста проекта
+    из базы идёт снаружи него.
+    """
     from hub.services.orchestration import project_git_context
 
     try:
         ctx = await project_git_context(db, task_id)
-        workspace = (ctx.get("repo") or "").strip()
-        base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
-        if not workspace or not base:
-            return Scan(UNREADABLE, reason="клон проекта на хабе не настроен")
+    except Exception as exc:  # noqa: BLE001 - an unreadable diff is the answer
+        log.warning("ci integrity: no project context for #%s: %s", task_id, exc)
+        return Scan(UNREADABLE, reason="дифф не получен: ошибка чтения")
+    workspace = (ctx.get("repo") or "").strip()
+    base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
+    if not workspace or not base:
+        return Scan(UNREADABLE, reason="клон проекта на хабе не настроен")
+    if net is None:
+        return await _scan_clone(task_id, workspace, base, sha)
+    return await net(lambda: _scan_clone(task_id, workspace, base, sha))
+
+
+async def _scan_clone(task_id: int, workspace: str, base: str, sha: str) -> Scan:
+    """Сетевая половина скана: дифф и тексты файлов из клона."""
+    from hub.integrations.registry import plugins
+
+    try:
         git = plugins.git_ops
         material = await git.integrity_read(workspace, base, sha)
         if material is None:
@@ -630,12 +652,20 @@ async def _stored(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan | No
     return _from_row(row) if row else None
 
 
-async def ensure_scan(db: aiosqlite.Connection, task_id: int) -> Scan:
+async def ensure_scan(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    net: Callable[[Callable[[], Awaitable[Scan]]], Awaitable[Scan]] | None = None,
+) -> Scan:
     """The scan of the commit the task is submitted at; made now when missing.
 
     Asks the clone (network) BEFORE its own short write, so call it outside a
     write transaction: inside one it only reads what is stored and otherwise
     answers ``unscanned``. An unreadable result is retried on the next call.
+
+    ``net`` (#1913): обёртка, через которую идёт ТОЛЬКО сетевое чтение клона
+    (дедлайн прохода поллера); чтения и запись базы остаются снаружи неё.
     """
     task = dict(await repo.get_task(db, task_id) or {})
     sha = (task.get("submission_sha") or "").strip()
@@ -649,7 +679,7 @@ async def ensure_scan(db: aiosqlite.Connection, task_id: int) -> Scan:
             "ci integrity: scan of task #%s asked inside a transaction", task_id
         )
         return stored or Scan(UNSCANNED)
-    scan = await _scan_now(db, task_id, sha)
+    scan = await _scan_now(db, task_id, sha, net)
     async with write_transaction(db):
         await store.save_ci_integrity_scan(
             db,
@@ -669,6 +699,12 @@ class Standing:
     scan: Scan
     answer: str = ""
     explanation: str = ""
+    sha: str = ""
+
+    @property
+    def scan_hash(self) -> str:
+        """Хеш скана, который ревьюер возвращает в ответе (#1913); пусто без признаков."""
+        return scan_hash_of(self.sha, self.scan)
 
     @property
     def clean(self) -> bool:
@@ -724,16 +760,17 @@ async def standing_of(db: aiosqlite.Connection, task: dict[str, Any]) -> Standin
         return Standing(Scan(UNREADABLE, reason="коммит сдачи не закреплён"))
     scan = await _stored(db, int(task["id"]), sha) or Scan(UNSCANNED)
     if scan.state != SIGNS:
-        return Standing(scan)
+        return Standing(scan, sha=sha)
     answer = await store.get_ci_integrity_answer(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
     if answer is None:
-        return Standing(scan)
+        return Standing(scan, sha=sha)
     return Standing(
         scan,
         answer["ci_integrity_verdict"],
         answer["ci_integrity_explanation"],
+        sha,
     )
 
 
@@ -809,10 +846,60 @@ async def verdict_gate(state: Any) -> None:
         raise HTTPException(422, f"ci_integrity: {gap}")
 
 
+def scan_hash_of(sha: str, scan: Scan) -> str:
+    """Хеш (коммит + признаки) скана с признаками; ``""`` для любого другого скана.
+
+    Ревьюер возвращает его в ответе: ответ принимается, только если хеш равен
+    хешу СОХРАНЁННОГО скана текущего коммита (``answer_for_report``). Это
+    положительная привязка со стороны отчёта: хаб не судит по своим действиям
+    (кто собрал бриф), о чём ревьюер знал, когда отвечал (#1913).
+    """
+    if scan.state != SIGNS:
+        return ""
+    signs = sorted(f"{x.path}:{x.line}:{x.rule}" for x in scan.signs)
+    body = json.dumps([sha.lower(), signs], ensure_ascii=False)
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
 def stored_answer(body: MachineReviewSubmit) -> tuple[str, str]:
     """(verdict, explanation) as stored; ("", "") when the reviewer did not answer."""
     answer = body.ci_integrity
     return (answer.verdict, answer.explanation_ru) if answer else ("", "")
+
+
+async def answer_for_report(
+    db: aiosqlite.Connection, task: dict[str, Any], body: MachineReviewSubmit
+) -> tuple[str, str]:
+    """Ответ ревьюера о целостности CI, который можно хранить (#1913).
+
+    Ответ относится к признакам, которые ревьюеру показали. Если скана коммита
+    сдачи с признаками на момент отчёта в базе нет (бриф без скана говорил
+    «unscanned»), ревьюер отвечал вслепую: такой ответ не хранится и не снимет
+    отказ автоматики на признаках, найденных потом.
+    """
+    answer = stored_answer(body)
+    if not answer[0] and not answer[1]:
+        return answer
+    sha = (task.get("submission_sha") or "").strip()
+    scan = await _stored(db, int(task["id"]), sha) if sha else None
+    # Ответ принимается, только если ревьюер вернул хеш скана с признаками, и он
+    # равен хешу сохранённого скана текущего коммита: ревьюер отвечал о ТЕХ
+    # признаках, что сейчас в базе (#1913). Бриф «unscanned», скан позже,
+    # другой коммит, ответ без хеша — отбрасываются.
+    given = (body.ci_integrity.scan_hash if body.ci_integrity else "").strip().lower()
+    current = scan_hash_of(sha, scan) if scan is not None else ""
+    if current and given == current:
+        return answer
+    log.warning(
+        "ci integrity: answer of the report on task #%s dropped (%s)",
+        task["id"],
+        "нет скана с признаками"
+        if not current
+        else (
+            "в ответе нет scan_hash" if not given else "scan_hash не совпал со сканом"
+        ),
+    )
+    return ("", "")
 
 
 # --- surfaces: reviewer order, brief ------------------------------------
@@ -838,7 +925,9 @@ def section_for(standing: Standing) -> str:
     return (
         "## Целостность CI (механическая проверка диффа)\n"
         "Хаб нашёл признаки, что дифф трогает входы CI:\n"
-        f"{listing}\n\n"
+        f"{listing}\n"
+        + (f"scan_hash: {standing.scan_hash}\n" if standing.scan_hash else "")
+        + "\n"
         f"Вопрос: {QUESTION}\n"
         f"Ответь в отчёте (и в текстовом блоке тоже) ключом верхнего уровня {ANSWER_SHAPE}. «explained» — изменение законно "
         "для задачи; «suspicious» — похоже на подделку результатов (тогда это "
@@ -851,13 +940,24 @@ async def order_section(db: aiosqlite.Connection, task_id: int) -> str:
     """The reviewer-order section for this submission; "" when the diff is clean."""
     await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
-    section = section_for(await standing_of(db, task))
+    standing = await standing_of(db, task)
+    section = section_for(standing)
     return f"{section}\n\n" if section else ""
 
 
-async def brief_state(db: aiosqlite.Connection, task_id: int) -> dict[str, Any] | None:
-    """The brief's block: None when there are no signs (the brief reads as before)."""
-    await ensure_scan(db, task_id)
+async def brief_state(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    offline: bool = False,
+) -> dict[str, Any] | None:
+    """The brief's block: None when there are no signs (the brief reads as before).
+
+    ``offline`` (#1913): путь показа читает сохранённый скан и сам его не делает
+    (скан — это fetch и запись в базу); нет скана — стояние называет пробел.
+    """
+    if not offline:
+        await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
     if standing.clean:
@@ -870,4 +970,5 @@ async def brief_state(db: aiosqlite.Connection, task_id: int) -> dict[str, Any] 
         "answer": standing.answer,
         "note": standing.note,
         "gap": standing.gap or "",
+        "scan_hash": standing.scan_hash,
     }
