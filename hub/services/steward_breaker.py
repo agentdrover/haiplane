@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -70,7 +71,9 @@ CHECK_INTERVAL = 300  # секунд между тиками сборщика
 #: «This reverts commit <sha>» с начала строки; короче 12 знаков не принимается.
 _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{12,40})\b", re.MULTILINE)
 
-_FAILED = ("failure", "cancelled", "timed_out", "startup_failure", "action_required")
+#: Красный - только failure и timed_out. cancelled (ручная отмена, concurrency),
+#: startup_failure и action_required про исход кода ничего не говорят: unknown.
+_FAILED = ("failure", "timed_out")
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +305,9 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
             return 0
         tripped = 0
         for sha in shas:
-            tripped += await _trip_revert(db, project, sha, facts[sha]["message"])
+            fact = facts[sha]
+            text = f"{fact['message']}\n{fact.get('second_parent_message') or ''}"
+            tripped += await _trip_revert(db, project, sha, text)
         if shas:
             await _set_cursor(db, pid, shas[-1])
         await db.commit()
@@ -319,7 +324,9 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
 
 
 def _push_state(
-    runs: list[dict[str, Any]] | None, contract: ci_contract_mod.CiContract
+    runs: list[dict[str, Any]] | None,
+    contract: ci_contract_mod.CiContract,
+    branch: str = "",
 ) -> str:
     """``green`` | ``red`` | ``unknown`` по push-прогонам workflow контракта.
 
@@ -334,6 +341,7 @@ def _push_state(
         if r.get("event") == "push"
         and str(r.get("status") or "") == "completed"
         and (not r.get("path") or ci_contract_mod.path_matches(contract, r["path"]))
+        and (not branch or not r.get("head_branch") or r["head_branch"] == branch)
     ]
     if not finished:
         return "unknown"
@@ -354,7 +362,7 @@ async def _contract_state(
         forge=forge_of(project),
         workflow_path=contract.workflow_path,
     )
-    return _push_state(runs, contract)
+    return _push_state(runs, contract, base_branch_of(project))
 
 
 async def _first_parent(project: dict[str, Any], sha: str) -> str:
@@ -364,6 +372,13 @@ async def _first_parent(project: dict[str, Any], sha: str) -> str:
     facts = await plugins.git_ops.commit_facts(workspace, [sha])
     parents = (facts or {}).get(sha, {}).get("parents") or []
     return str(parents[0]) if parents else ""
+
+
+#: Отрицательный кэш в памяти процесса: (проект, red_sha) -> до какого момента не
+#: спрашивать git и форж снова. Пока база красная, тик идёт каждые 3 минуты, а
+#: ответ «не доказано/неизвестно» редко меняется.
+NEGATIVE_TTL_SECONDS = 1800
+_negative: dict[tuple[int, str], float] = {}
 
 
 async def on_base_red(
@@ -376,9 +391,12 @@ async def on_base_red(
     """
     try:
         pid = int(project["id"])
+        if _negative.get((pid, red_sha), 0.0) > time.monotonic():
+            return False
         proof = await steward_delivery(db, pid, red_sha)
         if proof is None:
             return False
+        _negative[(pid, red_sha)] = time.monotonic() + NEGATIVE_TTL_SECONDS
         task_id, generation = proof
         known = await fetchall(
             db,

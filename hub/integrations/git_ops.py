@@ -3310,6 +3310,10 @@ class GitOpsIntegration:
             log.info("squash_branch: %s has <=1 commit, skip squash", branch)
             return True
 
+        # #1865: строки отката переживают сжатие (до reset коммиты ещё видны).
+        trailer = await git_history.revert_lines(
+            partial(_git, repo=repo, check=False), f"{merge_base.strip()}..HEAD"
+        )
         rc, _, err = await _git(
             "reset",
             "--soft",
@@ -3330,6 +3334,7 @@ class GitOpsIntegration:
             "commit",
             "-m",
             msg,
+            *(["-m", trailer] if trailer else []),
             "--no-verify",
             repo=repo,
             check=False,
