@@ -95,12 +95,51 @@ def test_a_function_called_from_scripts_has_callers(repo: Path):
     assert by_file == {"scripts/a.py", "scripts/b.py"}, helper.statement()
 
 
+def test_a_namespace_package_import_of_a_script_is_recognized_too(repo: Path):
+    """``scripts/`` ships no ``__init__.py``, but it is still a valid implicit
+    namespace package: ``import scripts.a`` works exactly like ``import a``
+    when run from the repo root. A caller spelled that way must not read as
+    "did not import it" — that would be the same false no_callers this task
+    exists to remove, just for a different import style."""
+    (repo / "scripts" / "a.py").write_text(
+        "def helper(value):\n    return value\n\n\ndef run():\n    return helper(1)\n"
+    )
+    _commit(repo)
+
+    (repo / "scripts" / "a.py").write_text(
+        "def helper(value):\n"
+        "    return value + 1\n"
+        "\n"
+        "\n"
+        "def run():\n"
+        "    return helper(1)\n"
+    )
+    (repo / "scripts" / "b.py").write_text(
+        "import scripts.a\n\n\ndef main():\n    return scripts.a.helper(2)\n"
+    )
+
+    report = call_sites.analyse(str(repo), _diff(repo))
+
+    helper = next(s for s in report.symbols if s.symbol == "helper")
+    assert helper.state != call_sites.NO_CALLERS, helper.statement()
+    by_file = {s.file for s in helper.sites}
+    assert "scripts/b.py" in by_file, (
+        "import scripts.a (namespace package spelling) must count as an "
+        f"import of scripts/a.py, not just bare 'import a': {helper.statement()}"
+    )
+
+
 # ---- AC-3: a name match alone is not an import, and hub/'s only_tests is unchanged ----
 
 
 def test_scripts_sites_need_an_import_and_hub_only_tests_is_kept(repo: Path):
     (repo / "scripts" / "a.py").write_text("def main():\n    return 'a'\n")
-    (repo / "scripts" / "b.py").write_text("def main():\n    return 'b'\n")
+    # b.py's own main() is CALLED, by b.py itself — a real nominal-name
+    # candidate for the "main" index entry, same as a.py's. Without the
+    # import filter this reads as a call site of scripts/a.py:main too.
+    (repo / "scripts" / "b.py").write_text(
+        "def main():\n    return 'b'\n\n\ndef run():\n    return main()\n"
+    )
     (repo / "hub" / "core.py").write_text("def guard(value):\n    return bool(value)\n")
     (repo / "scripts" / "c.py").write_text(
         "from hub.core import guard\n\n\ndef run():\n    return guard(1)\n"
@@ -115,6 +154,13 @@ def test_scripts_sites_need_an_import_and_hub_only_tests_is_kept(repo: Path):
         "def guard(value):\n    return bool(value) and value != 0\n"
     )
 
+    # Fixture sanity: the raw index must actually carry b.py's self-call
+    # under the "main" name, or the filter below would pass vacuously.
+    raw_index, _ = call_sites.build_call_index(str(repo))
+    assert any(s.file == "scripts/b.py" for s in raw_index.get("main", [])), (
+        "fixture is broken: scripts/b.py must produce a nominal 'main' site"
+    )
+
     report = call_sites.analyse(str(repo), _diff(repo))
 
     main_report = next(
@@ -124,8 +170,8 @@ def test_scripts_sites_need_an_import_and_hub_only_tests_is_kept(repo: Path):
     )
     assert main_report.state == call_sites.NO_CALLERS, main_report.statement()
     assert all(s.file != "scripts/b.py" for s in main_report.sites), (
-        "scripts/b.py:main defines its own main() without importing a — it "
-        "must not read as a call site of scripts/a.py:main"
+        "scripts/b.py:main calls itself via run() but never imports a — a "
+        "name match alone must not read as a call site of scripts/a.py:main"
     )
 
     guard_report = next(s for s in report.symbols if s.symbol == "guard")
@@ -147,10 +193,12 @@ def test_a_dirty_script_misses_the_cache(repo: Path, monkeypatch):
     diff = "+++ b/hub/core.py\n@@ -1,1 +1,1 @@\n+x\n"
     call_sites.analyse(str(repo), diff)
     assert len(call_sites._index_cache) == 1, "a clean tree is cached"
-    call_sites.clear_index_cache()
 
-    # An uncommitted change under scripts/ must make the tree dirty for the
-    # purposes of the cache, exactly as an uncommitted change under hub/ does.
+    # The warm entry from the clean HEAD is left in place — not cleared —
+    # because AC-4 is about a lookup that must NOT be served, not about an
+    # empty cache: an uncommitted change under scripts/ must defeat even an
+    # already-populated cache entry for this HEAD, exactly as it would for
+    # an uncommitted change under hub/.
     (repo / "scripts" / "x.py").write_text("def new_thing():\n    return 1\n")
 
     real = call_sites.build_call_index
@@ -166,6 +214,9 @@ def test_a_dirty_script_misses_the_cache(repo: Path, monkeypatch):
     call_sites.analyse(str(repo), diff)
     assert len(calls) == 2, (
         "an uncommitted scripts/ file must defeat the cache on every call, "
-        "not just the first"
+        "not just the first — the pre-existing warm entry must not be served"
     )
-    assert call_sites._index_cache == {}, "a dirty tree is never cached"
+    assert len(call_sites._index_cache) == 1, (
+        "the stale warm entry is untouched: a dirty-tree read never consults "
+        "or overwrites the cache, it just builds directly"
+    )

@@ -550,17 +550,23 @@ def _is_touched(site: CallSite, changed: set[int]) -> bool:
     return site.line in changed
 
 
-def _script_module_name(rel: str) -> str:
-    """Bare module name a file under ``scripts/`` is imported by (#1935).
+def _script_module_names(rel: str) -> set[str]:
+    """Every dotted spelling a file under ``scripts/`` is imported by (#1935).
 
-    ``scripts/`` ships no ``__init__.py``; a script run or imported from a
-    sibling addresses it by its bare name (``import complexity_budget``,
-    ``from complexity_budget import ...``), never by a ``scripts.`` prefix.
+    ``scripts/`` ships no ``__init__.py``, so a sibling script most commonly
+    imports it by its bare name (``import complexity_budget``, ``from
+    complexity_budget import ...``) — run with ``scripts/`` itself on
+    ``sys.path``. But ``scripts/`` is still a valid implicit namespace
+    package: ``import scripts.complexity_budget`` or ``from
+    scripts.complexity_budget import ...`` works too, with no ``__init__.py``
+    required. A caller using that spelling must not read as "no import", or
+    a real call falls back into the false no_callers this task removes.
     """
     name = rel[len(_SCRIPTS_PREFIX) :] if rel.startswith(_SCRIPTS_PREFIX) else rel
     if name.endswith(".py"):
         name = name[: -len(".py")]
-    return name.replace("/", ".")
+    bare = name.replace("/", ".")
+    return {bare, f"scripts.{bare}"}
 
 
 def _imported_modules(root: str, rel: str) -> set[str]:
@@ -583,7 +589,7 @@ def _imported_modules(root: str, rel: str) -> set[str]:
 def _counts_as_call(
     site: CallSite,
     defined_in: str,
-    module: str,
+    modules: set[str],
     imports_of: Callable[[str], set[str]],
 ) -> bool:
     """Does this candidate site count toward the symbol defined at ``defined_in``?
@@ -593,11 +599,12 @@ def _counts_as_call(
     call when nothing imports the other side.
 
     A symbol defined in ``scripts/`` counts a call from another script only
-    when that script is the same file or imports the defining module — two
-    scripts can each define their own ``main()`` with no relation at all.
-    A symbol defined in ``hub/`` does not count a call from ``scripts/`` at
-    all: #1254's only_tests meaning (is this reached by product code) is
-    unchanged by scripts/ joining the index.
+    when that script is the same file or imports the defining module (any of
+    its ``modules`` spellings) — two scripts can each define their own
+    ``main()`` with no relation at all. A symbol defined in ``hub/`` does not
+    count a call from ``scripts/`` at all: #1254's only_tests meaning (is
+    this reached by product code) is unchanged by scripts/ joining the
+    index.
     """
     if not defined_in.startswith(_SCRIPTS_PREFIX):
         return not site.file.startswith(_SCRIPTS_PREFIX)
@@ -605,7 +612,7 @@ def _counts_as_call(
         return True
     if site.file == defined_in:
         return True
-    return module in imports_of(site.file)
+    return bool(modules & imports_of(site.file))
 
 
 def analyse(
@@ -640,7 +647,7 @@ def analyse(
     for symbol, defined_in, decorators in changed_symbols(
         root, ranges, test_dirs=test_dirs
     ):
-        module = _script_module_name(defined_in)
+        modules = _script_module_names(defined_in)
         sites = [
             CallSite(
                 file=s.file,
@@ -654,7 +661,7 @@ def analyse(
             # A recursive call inside the function itself is not a call site
             # anyone needs to review.
             if not (s.file == defined_in and s.caller == symbol)
-            and _counts_as_call(s, defined_in, module, imports_of)
+            and _counts_as_call(s, defined_in, modules, imports_of)
         ]
 
         if not sites:
