@@ -179,8 +179,8 @@
     },
     {
       "path": "tests/test_auto_approve.py",
-      "measured": 989,
-      "max": 1039,
+      "measured": 1083,
+      "max": 1138,
       "removed_by": "unclaimed"
     },
     {
@@ -209,8 +209,8 @@
     },
     {
       "path": "tests/test_ci_report_script.py",
-      "measured": 1980,
-      "max": 2079,
+      "measured": 1984,
+      "max": 2084,
       "removed_by": "unclaimed"
     },
     {
@@ -233,8 +233,8 @@
     },
     {
       "path": "tests/test_ci_workflow_contract.py",
-      "measured": 1377,
-      "max": 1446,
+      "measured": 1496,
+      "max": 1571,
       "removed_by": "unclaimed"
     },
     {
@@ -263,8 +263,8 @@
     },
     {
       "path": "tests/test_db_migrations.py",
-      "measured": 1905,
-      "max": 2001,
+      "measured": 1926,
+      "max": 2023,
       "removed_by": "unclaimed"
     },
     {
@@ -293,8 +293,8 @@
     },
     {
       "path": "tests/test_dor.py",
-      "measured": 1184,
-      "max": 1244,
+      "measured": 1187,
+      "max": 1247,
       "removed_by": "unclaimed"
     },
     {
@@ -407,8 +407,8 @@
     },
     {
       "path": "tests/test_readiness.py",
-      "measured": 888,
-      "max": 933,
+      "measured": 1009,
+      "max": 1060,
       "removed_by": "unclaimed"
     },
     {
@@ -551,8 +551,8 @@
     },
     {
       "path": "tests/test_state_task.py",
-      "measured": 1483,
-      "max": 1558,
+      "measured": 1485,
+      "max": 1560,
       "removed_by": "unclaimed"
     },
     {
@@ -581,8 +581,8 @@
     },
     {
       "path": "tests/test_steward_dispatch.py",
-      "measured": 3594,
-      "max": 3774,
+      "measured": 3603,
+      "max": 3784,
       "removed_by": "unclaimed"
     },
     {
