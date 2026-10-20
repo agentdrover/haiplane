@@ -19,6 +19,7 @@ import socket
 import tarfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from hub.actionable_errors import (
@@ -27,7 +28,7 @@ from hub.actionable_errors import (
 )
 from hub.config import PAIR_BASE_BRANCH
 from hub.integrations import forge as forge_registry
-from hub.integrations import proc
+from hub.integrations import git_history, proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     BaseFreshness,
@@ -2792,6 +2793,22 @@ class GitOpsIntegration:
             check=False,
         )
         return out if rc == 0 else None
+
+    async def first_parent_after(
+        self, repo: str, base: str, since: str, limit: int
+    ) -> dict[str, Any] | None:
+        """Oldest ``limit`` first-parent commits of origin/``base`` after ``since`` (#1865)."""
+        return await git_history.first_parent_after(
+            partial(_git, repo=repo, check=False), base, since, limit
+        )
+
+    async def commit_facts(
+        self, repo: str, shas: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Parents and FULL message per commit, or None when unreadable (#1865)."""
+        return await git_history.commit_facts(
+            partial(_git, repo=repo, check=False), shas
+        )
 
     def worktree_path(self, task_id: int, repo: str | None = None) -> str:
         """Deterministic worktree path for a task (#459); where its branch lives."""

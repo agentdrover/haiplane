@@ -68,6 +68,10 @@
 {% for c in decision_cycles %}
 <div class="task-action-note task-action-note--warning inbox-decision-cycle" role="status">{{ c.reason }}</div>
 {% endfor %}
+{# #1865: откат или красная база после доставки стюарда; снимает только человек. #}
+{% for b in steward_breaker_banner|default([]) %}
+<div class="task-action-note task-action-note--warning inbox-steward-breaker" role="status" data-steward-breaker-task="{{ b.task_id }}" data-steward-breaker-source="{{ b.source }}">{{ b.line }}. Снять: oc-hub steward-false-approve-clear {{ b.task_id }}.</div>
+{% endfor %}
 
 {% if drafts %}
 <details class="inbox-group inbox-drafts inbox-drafts--collapsible" id="inbox-proposals" open>

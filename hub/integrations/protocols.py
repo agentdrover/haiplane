@@ -679,6 +679,12 @@ class GitOpsPlugin(Protocol):
     async def first_parent_log(
         self, repo: str, base: str, limit: int
     ) -> str | None: ...
+    async def first_parent_after(
+        self, repo: str, base: str, since: str, limit: int
+    ) -> dict[str, Any] | None: ...
+    async def commit_facts(
+        self, repo: str, shas: list[str]
+    ) -> dict[str, dict[str, Any]] | None: ...
     async def pr_for_branch(
         self,
         branch: str,

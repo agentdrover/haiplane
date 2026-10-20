@@ -2814,7 +2814,7 @@ def start_poller(app: FastAPI) -> asyncio.Task[None]:
     with ``HAIPLANE_EGRESS_WATCH=off``). The caller stops them all under one
     limit on shutdown (``hub.app.lifespan``).
     """
-    from hub.services import egress_watch
+    from hub.services import egress_watch, steward_breaker
 
     # A handle for EVERY task (#1667): the stop cancels and awaits them under
     # one limit and names the one that stays. A task with no handle cannot be
@@ -2834,6 +2834,7 @@ def start_poller(app: FastAPI) -> asyncio.Task[None]:
     spawn("hub-session-reaper", _session_reaper(app))
     spawn("hub-drift-watch", _drift_watch(app))
     spawn("hub-red-base-watch", _red_base_watch(app))
+    spawn("hub-steward-breaker", steward_breaker.run_loop(lambda: _own_connection(app)))
     spawn("hub-arm-workspace-hooks", arm_workspace_hooks(app.state.db))
     app.state.background_tasks = handles
     log.info(
