@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
+from hub.expected_sha import ExpectedShaMixin
 from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
@@ -1274,7 +1275,7 @@ class DefectPrevention(BaseModel):
     revisit: str = Field("", max_length=500)
 
 
-class TaskSubmitReview(BaseModel):
+class TaskSubmitReview(ExpectedShaMixin):
     """Submit the current work of a pair task for review (#305)."""
 
     agent: str = Field("", max_length=100)

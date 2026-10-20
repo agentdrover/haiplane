@@ -14,6 +14,7 @@ from typing import Any
 
 from hub import config
 from hub import cli_owner_minutes as om_cli
+from hub import expected_sha as expected_sha_cli
 from hub.cli_executor_host import add_executor_host_parsers
 from hub.cli_task_fields import (
     _add_result_kind_args,
@@ -906,6 +907,8 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
     if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
         return 2
     if not _put_mutations(body, args) or not _put_evidence(body, args):
+        return 2
+    if not expected_sha_cli.put_expected_sha_cli(body, args):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
@@ -2646,6 +2649,7 @@ def build_parser() -> argparse.ArgumentParser:
             '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
         ),
     )
+    expected_sha_cli.add_expected_sha_option(p_submit_review)
     _done_report_options(p_submit_review)
     _add_state_submit_args(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
