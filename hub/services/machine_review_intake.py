@@ -381,7 +381,7 @@ async def record_machine_review(
         # which stays the caller's self-description. The dispatch sweep
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
-        ci_integrity=ci_integrity.stored_answer(body),
+        ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу

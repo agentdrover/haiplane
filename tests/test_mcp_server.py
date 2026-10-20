@@ -225,7 +225,7 @@ async def test_hub_task_detail(
     assert structured is not None
     assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
     assert structured["task"]["id"] == 42
-    mock_api_post.assert_awaited_once_with("/api/tasks/42/refresh")
+    mock_api_post.assert_not_awaited()  # #1913: чтение не будит refresh
     mock_api_get.assert_awaited_once_with("/api/tasks/42")
 
 

@@ -128,12 +128,18 @@ async def test_verdict_on_moved_branch_is_not_current_and_returns_task_to_runnin
 
 
 async def test_review_brief_reports_submission_sha_and_divergence(
-    client: AsyncClient, git, monkeypatch
+    client: AsyncClient, db, git, monkeypatch
 ):
+    from hub import repository as repo
+    from hub.services.lifecycle import resolve_branch_tip
+
     _patch_workspace(monkeypatch)
     g = git("oldsha111")
     task_id = await _submitted_task(client)
     g.tip = "newsha222"
+    # #1913: бриф читает наблюдение хаба; ветка ушла — его освежает поллер/гейт.
+    branch = dict(await repo.get_task(db, task_id) or {})["branch"]
+    await resolve_branch_tip(db, task_id, branch)
 
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
 

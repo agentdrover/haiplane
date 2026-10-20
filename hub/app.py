@@ -3307,6 +3307,7 @@ async def api_review_brief(
     brief = await build_review_brief(
         db,
         task_id,
+        observe_only=True,  # #1913: чтение не ходит в сеть, наблюдения — с возрастом
         self_review_warning=services.self_review_brief_warning(
             dict(row),
             is_agent=identity.is_agent,

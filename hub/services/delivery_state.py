@@ -234,7 +234,7 @@ def _in_prod(check: _GitCheck, text: str, style: str) -> dict[str, Any]:
 
 
 async def delivery_state(
-    db: Any, task_id: int, *, release: Any = _UNSET
+    db: Any, task_id: int, *, release: Any = _UNSET, fetch: bool = True
 ) -> dict[str, Any]:
     """Whether this task's merge is part of what production is running.
 
@@ -244,7 +244,7 @@ async def delivery_state(
     prepared = await prepare_delivery(db, task_id, release=release)
     if isinstance(prepared, dict):
         return prepared
-    return await git_delivery_state(prepared)
+    return await git_delivery_state(prepared, fetch=fetch)
 
 
 async def prepare_delivery(
@@ -334,15 +334,15 @@ async def prepare_delivery(
     )
 
 
-async def git_delivery_state(check: _GitCheck) -> dict[str, Any]:
+async def git_delivery_state(check: _GitCheck, *, fetch: bool = True) -> dict[str, Any]:
     """The git half of the answer, cached when — and only when — it is IN_PROD."""
     cached = _in_prod_cache.get(_cache_key(check))
     if cached is not None:
         return _answer(IN_PROD, _in_prod_reason(check, *cached), **check.known)
-    return await _decide_with_git(check)
+    return await _decide_with_git(check, fetch=fetch)
 
 
-async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
+async def _decide_with_git(check: _GitCheck, *, fetch: bool = True) -> dict[str, Any]:
     merge_sha, deployed_sha = check.merge_sha, check.deployed_sha
     workspace = check.workspace
     known = check.known
@@ -352,6 +352,15 @@ async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
     # for every task on this installation. Checked first, and only fetched
     # when missing: a present commit must cost no network at all.
     if await plugins.git_ops.commit_exists(workspace, deployed_sha) is False:
+        if not fetch:
+            # #1913: показ не тянет сеть. Коммит подтягивает запись выката
+            # (ensure_commit_available) и явные проверки доставки.
+            return _answer(
+                UNKNOWN,
+                f"коммита {deployed_sha[:12]} нет в рабочей копии, а показ в сеть "
+                "не ходит — не сверено. Это не «не раскатано»",
+                **known,
+            )
         miss_age = _fetch_miss_fresh(workspace, deployed_sha)
         if miss_age is not None:
             return _answer(
