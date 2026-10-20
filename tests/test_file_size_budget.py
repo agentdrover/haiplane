@@ -331,8 +331,9 @@ _COMMAND = "uv run python scripts/file_size_budget.py"
 
 
 def _ci_test_job() -> str:
+    # #1920: the static checks run in job `static`, beside the parts of the suite.
     text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    body = text.split("\n  test:\n", 1)[1]
+    body = text.split("\n  static:\n", 1)[1]
     return re.split(r"\n  [A-Za-z0-9_-]+:\n", body, maxsplit=1)[0]
 
 
@@ -387,7 +388,7 @@ def test_repository_is_green_under_the_size_budget():
     step = re.search(
         r"- name: File size budget\n(?:(?!\n      - name:).)*", _ci_test_job(), re.S
     )
-    assert step, "нет шага File size budget в job test"
+    assert step, "нет шага File size budget в job static"
     assert re.search(rf"run: {re.escape(_COMMAND)}\s*$", step.group(0), re.M)
     assert "--update" not in step.group(0)
     assert "!cancelled()" in step.group(0)

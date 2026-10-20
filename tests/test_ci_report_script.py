@@ -847,6 +847,46 @@ def test_adopted_evidence_block_passes_the_reporter(
         trusted.parse_results(top_level, facts, 1686, provenance)
 
 
+def test_static_job_artifact_is_not_a_results_artifact(trusted):
+    """#1920 AC-3: the audit file travels under a name the trusted report ignores.
+
+    The trusted report reads ONLY artifacts named ``hub-ci-results-<attempt>``
+    from job test. Job static hands its audit file over under another name; job
+    test puts it into the directory it uploads, after the collector wrote its own
+    file there. Neither the name nor the order may drift.
+    """
+    import yaml
+
+    doc = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+    )
+    static, test = doc["jobs"]["static"], doc["jobs"]["test"]
+    uploads = [s for s in static["steps"] if "upload-artifact" in str(s.get("uses"))]
+    assert len(uploads) == 1
+    name = uploads[0]["with"]["name"]
+    assert not name.startswith(trusted.ARTIFACT_PREFIX)
+    assert uploads[0]["with"]["path"] == "hub-ci-static/audit.json"
+    audit = next(
+        s for s in static["steps"] if s["name"] == "Dependency vulnerability audit"
+    )
+    assert "hub-ci-static/audit.json" in audit["run"]
+    assert "hub-ci-results" not in audit["run"], "the audit no longer writes there"
+    assert audit["continue-on-error"] is True
+
+    names = [s["name"] for s in test["steps"]]
+    fetch = test["steps"][names.index("Fetch the audit file of job static")]
+    assert fetch["with"] == {"name": name, "path": "hub-ci-results"}
+    assert fetch["continue-on-error"] is True
+    collect = names.index("Collect AC test and validation results for the Hub")
+    upload = names.index("Upload results for the trusted report")
+    assert collect < names.index("Fetch the audit file of job static") < upload
+    # the member the trusted report accepts next to results.json is this very name
+    assert trusted.AUDIT_MEMBER == "audit.json"
+    assert test["steps"][upload]["with"]["name"].startswith(trusted.ARTIFACT_PREFIX)
+
+
 def test_a_missing_or_unreadable_mutation_report_is_not_sent(
     script, monkeypatch, tmp_path, capsys
 ):
