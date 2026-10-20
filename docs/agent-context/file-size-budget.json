@@ -3,7 +3,9 @@
     "Бюджет размера файла (#1669). Пороги — в pyproject.toml",
     "([tool.haiplane.file_size]). Проверку гоняет scripts/file_size_budget.py и CI.",
     "Здесь ledger файлов выше порога: потолок = замер + headroom_pct.",
-    "removed_by: task:#NNNN, permanent с причиной или unclaimed."
+    "removed_by: task:#NNNN, permanent с причиной или unclaimed.",
+    "Дерево tests (#1932): порог 800 = REVIEW_FILE_LINE_CAP; записи tests внесены разово,",
+    "ledger tests только сокращается (проверка против базы, --update записи tests не поднимает)."
   ],
   "headroom_pct": 5.0,
   "waivers": [
@@ -116,9 +118,165 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/review_dispatch_support.py",
+      "measured": 1187,
+      "max": 1247,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_accept_provenance.py",
+      "measured": 1130,
+      "max": 1187,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_accept_without_delivery.py",
+      "measured": 1955,
+      "max": 2053,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_agent_approval_reserved.py",
+      "measured": 895,
+      "max": 940,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_agent_eval_runner.py",
+      "measured": 835,
+      "max": 877,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_agent_eval_scenarios.py",
+      "measured": 801,
+      "max": 842,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_api.py",
       "measured": 5131,
       "max": 5388,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_api_decide.py",
+      "measured": 1209,
+      "max": 1270,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_api_refine.py",
+      "measured": 1342,
+      "max": 1410,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_auth.py",
+      "measured": 1468,
+      "max": 1542,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_auto_approve.py",
+      "measured": 989,
+      "max": 1039,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_auto_verdict.py",
+      "measured": 905,
+      "max": 951,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_call_sites.py",
+      "measured": 963,
+      "max": 1012,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_chat_pair.py",
+      "measured": 2335,
+      "max": 2452,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_integrity.py",
+      "measured": 925,
+      "max": 972,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_report_script.py",
+      "measured": 1940,
+      "max": 2037,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_run_report.py",
+      "measured": 1429,
+      "max": 1501,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_run_request.py",
+      "measured": 2561,
+      "max": 2690,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_trust.py",
+      "measured": 2905,
+      "max": 3051,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_ci_workflow_contract.py",
+      "measured": 1233,
+      "max": 1295,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_cli.py",
+      "measured": 804,
+      "max": 845,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_csrf.py",
+      "measured": 947,
+      "max": 995,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_csrf_templates.py",
+      "measured": 958,
+      "max": 1006,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_cursor_cloud.py",
+      "measured": 851,
+      "max": 894,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_db_migrations.py",
+      "measured": 1905,
+      "max": 2001,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_defect_cause_kind.py",
+      "measured": 908,
+      "max": 954,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_delivery_discrepancies.py",
+      "measured": 974,
+      "max": 1023,
       "removed_by": "unclaimed"
     },
     {
@@ -128,9 +286,51 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/test_delivery_state.py",
+      "measured": 1354,
+      "max": 1422,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_dor.py",
+      "measured": 1184,
+      "max": 1244,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_effective_policy.py",
+      "measured": 1670,
+      "max": 1754,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_executor_dispatch.py",
       "measured": 3704,
       "max": 3890,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_executor_orders.py",
+      "measured": 1998,
+      "max": 2098,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_finding_disposition.py",
+      "measured": 826,
+      "max": 868,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_finding_queue.py",
+      "measured": 1408,
+      "max": 1479,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_gate_policy.py",
+      "measured": 1835,
+      "max": 1927,
       "removed_by": "unclaimed"
     },
     {
@@ -140,15 +340,51 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/test_hub_wait_hook.py",
+      "measured": 1115,
+      "max": 1171,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_lifecycle.py",
+      "measured": 2366,
+      "max": 2485,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_local_reviewer.py",
       "measured": 3233,
       "max": 3395,
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/test_mcp_catalog_budget.py",
+      "measured": 848,
+      "max": 891,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_mcp_server.py",
       "measured": 5826,
       "max": 6118,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_orchestrator_queue.py",
+      "measured": 1373,
+      "max": 1442,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_owner_minutes.py",
+      "measured": 1187,
+      "max": 1247,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_pair_merge_gate.py",
+      "measured": 2106,
+      "max": 2212,
       "removed_by": "unclaimed"
     },
     {
@@ -164,9 +400,183 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/test_prod_unit_snapshot.py",
+      "measured": 1024,
+      "max": 1076,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_readiness.py",
+      "measured": 888,
+      "max": 933,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_recommendations.py",
+      "measured": 1100,
+      "max": 1155,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_repair_after_changes_requested.py",
+      "measured": 2065,
+      "max": 2169,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_brief.py",
+      "measured": 2244,
+      "max": 2357,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_brief_projection.py",
+      "measured": 1724,
+      "max": 1811,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch.py",
+      "measured": 1452,
+      "max": 1525,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_circles.py",
+      "measured": 895,
+      "max": 940,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_dedup_and_caps.py",
+      "measured": 1245,
+      "max": 1308,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_deploy_doc.py",
+      "measured": 1260,
+      "max": 1323,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_incremental.py",
+      "measured": 1255,
+      "max": 1318,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_local_prompt.py",
+      "measured": 2162,
+      "max": 2271,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_local_reviewer.py",
+      "measured": 1621,
+      "max": 1703,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_non_convergence.py",
+      "measured": 1556,
+      "max": 1634,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_orders_and_lots.py",
+      "measured": 1196,
+      "max": 1256,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_pin_and_deploy_doc.py",
+      "measured": 1520,
+      "max": 1596,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_report_contract.py",
+      "measured": 1102,
+      "max": 1158,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_second_door.py",
+      "measured": 1850,
+      "max": 1943,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_dispatch_usage_ladder.py",
+      "measured": 1271,
+      "max": 1335,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_disposition.py",
+      "measured": 925,
+      "max": 972,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_review_drain.py",
+      "measured": 993,
+      "max": 1043,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_services.py",
       "measured": 6057,
       "max": 6360,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_skill_publish_visibility.py",
+      "measured": 1699,
+      "max": 1784,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_skill_seeding.py",
+      "measured": 967,
+      "max": 1016,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_stack_advisory.py",
+      "measured": 1636,
+      "max": 1718,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_state_task.py",
+      "measured": 1483,
+      "max": 1558,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_steward_advisor.py",
+      "measured": 2651,
+      "max": 2784,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_steward_applied.py",
+      "measured": 1454,
+      "max": 1527,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_steward_apply.py",
+      "measured": 1849,
+      "max": 1942,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_steward_corridor.py",
+      "measured": 817,
+      "max": 858,
       "removed_by": "unclaimed"
     },
     {
@@ -176,9 +586,69 @@
       "removed_by": "unclaimed"
     },
     {
+      "path": "tests/test_steward_dor_packet.py",
+      "measured": 1401,
+      "max": 1472,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_steward_identity.py",
+      "measured": 1048,
+      "max": 1101,
+      "removed_by": "unclaimed"
+    },
+    {
       "path": "tests/test_steward_shadow.py",
       "measured": 4799,
       "max": 5039,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_submit_gates.py",
+      "measured": 1959,
+      "max": 2057,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_task_dependencies.py",
+      "measured": 1085,
+      "max": 1140,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_verdict_replay_guard.py",
+      "measured": 1913,
+      "max": 2009,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_web.py",
+      "measured": 1302,
+      "max": 1368,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_web_policy.py",
+      "measured": 1344,
+      "max": 1412,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_web_projects.py",
+      "measured": 1156,
+      "max": 1214,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_web_queue.py",
+      "measured": 1384,
+      "max": 1454,
+      "removed_by": "unclaimed"
+    },
+    {
+      "path": "tests/test_web_review_evidence.py",
+      "measured": 836,
+      "max": 878,
       "removed_by": "unclaimed"
     }
   ]
