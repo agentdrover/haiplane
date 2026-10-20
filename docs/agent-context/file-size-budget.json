@@ -155,8 +155,8 @@
     },
     {
       "path": "tests/test_api.py",
-      "measured": 5131,
-      "max": 5388,
+      "measured": 5356,
+      "max": 5624,
       "removed_by": "unclaimed"
     },
     {
@@ -209,8 +209,8 @@
     },
     {
       "path": "tests/test_ci_report_script.py",
-      "measured": 1940,
-      "max": 2037,
+      "measured": 1980,
+      "max": 2079,
       "removed_by": "unclaimed"
     },
     {
@@ -233,8 +233,8 @@
     },
     {
       "path": "tests/test_ci_workflow_contract.py",
-      "measured": 1233,
-      "max": 1295,
+      "measured": 1377,
+      "max": 1446,
       "removed_by": "unclaimed"
     },
     {
@@ -281,8 +281,8 @@
     },
     {
       "path": "tests/test_delivery_gate.py",
-      "measured": 5015,
-      "max": 5266,
+      "measured": 5070,
+      "max": 5324,
       "removed_by": "unclaimed"
     },
     {
@@ -305,8 +305,8 @@
     },
     {
       "path": "tests/test_executor_dispatch.py",
-      "measured": 3704,
-      "max": 3890,
+      "measured": 3869,
+      "max": 4063,
       "removed_by": "unclaimed"
     },
     {
@@ -335,8 +335,8 @@
     },
     {
       "path": "tests/test_git_ops.py",
-      "measured": 3753,
-      "max": 3941,
+      "measured": 3820,
+      "max": 4011,
       "removed_by": "unclaimed"
     },
     {
@@ -353,8 +353,8 @@
     },
     {
       "path": "tests/test_local_reviewer.py",
-      "measured": 3233,
-      "max": 3395,
+      "measured": 3257,
+      "max": 3420,
       "removed_by": "unclaimed"
     },
     {
@@ -365,8 +365,8 @@
     },
     {
       "path": "tests/test_mcp_server.py",
-      "measured": 5826,
-      "max": 6118,
+      "measured": 5982,
+      "max": 6282,
       "removed_by": "unclaimed"
     },
     {
@@ -389,14 +389,14 @@
     },
     {
       "path": "tests/test_poller.py",
-      "measured": 3917,
-      "max": 4113,
+      "measured": 4040,
+      "max": 4242,
       "removed_by": "unclaimed"
     },
     {
       "path": "tests/test_practice_metrics.py",
-      "measured": 3620,
-      "max": 3801,
+      "measured": 3792,
+      "max": 3982,
       "removed_by": "unclaimed"
     },
     {
@@ -527,8 +527,8 @@
     },
     {
       "path": "tests/test_services.py",
-      "measured": 6057,
-      "max": 6360,
+      "measured": 6100,
+      "max": 6405,
       "removed_by": "unclaimed"
     },
     {
@@ -581,8 +581,8 @@
     },
     {
       "path": "tests/test_steward_dispatch.py",
-      "measured": 3448,
-      "max": 3621,
+      "measured": 3594,
+      "max": 3774,
       "removed_by": "unclaimed"
     },
     {
@@ -599,8 +599,8 @@
     },
     {
       "path": "tests/test_steward_shadow.py",
-      "measured": 4799,
-      "max": 5039,
+      "measured": 4836,
+      "max": 5078,
       "removed_by": "unclaimed"
     },
     {
