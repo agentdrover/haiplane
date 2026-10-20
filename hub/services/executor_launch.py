@@ -1138,10 +1138,13 @@ async def _base_conflict_detail(db: aiosqlite.Connection, task: dict[str, Any]) 
 
 def _conflict_block(task: dict[str, Any], base: str, detail: str) -> str:
     """Задание прогона слияния — и отказ гейта рамкой данных (#1445)."""
+    from hub.services.orchestration import BASE_UPDATE_CONFLICT_PREFIX as upd
+
+    cause = "конфликт" if detail.startswith(upd) else "конфликт вне класса автомержа"
     return "\n".join(
         [
             f"СЛИЯНИЕ БАЗЫ. Задача одобрена, но гейт не смог влить ветку "
-            f"{task.get('branch')} в {base}: конфликт вне класса автомержа. Твоя "
+            f"{task.get('branch')} в {base}: {cause}. Твоя "
             f"работа — только слияние: git checkout {task.get('branch')}, слей "
             f"origin/{base}, разреши конфликты, сохранив смысл обеих сторон, "
             "прогони проверки по дисциплине, запушь ветку полным refspec и "

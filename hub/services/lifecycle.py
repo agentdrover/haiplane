@@ -2669,7 +2669,8 @@ async def _require_base_conflict_entry(state: SubmitContext) -> None:
         "can only submit running or under-review pair tasks for review, "
         f"current status: needs_decision ({cause}{': ' + detail if detail else ''}). "
         "From needs_decision the author resubmits only after merge_failed on a "
-        "conflict with the base branch; this cause is a human decision "
+        "conflict with the base branch or a base_update_conflict when the gate "
+        "updated the PR branch; this cause is a human decision "
         "(REST POST /api/tasks/<id>/decide).",
     )
 
@@ -3718,8 +3719,9 @@ def _submission_update_text(
         )
     if state.resubmitted_after_base_conflict:
         content += (
-            " Пересдача из needs_decision после merge_failed: конфликт с базой "
-            "слит автором, без решения человека (#1362)."
+            " Пересдача из needs_decision после конфликта с базой (merge_failed "
+            "или base_update_conflict): слит автором, без решения человека "
+            "(#1362, #1917)."
         )
     if adopted and adopted.get("not_adopted"):
         # #1687: a report GitHub did not confirm is not evidence, and the feed
