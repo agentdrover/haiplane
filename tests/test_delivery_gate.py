@@ -2179,16 +2179,9 @@ async def test_the_limit_does_not_cut_off_the_oldest_live_row(
     """
     fresh = await _live_row(db, title="#1138 eslint", pr=3, age_hours=165)
     fossil = await _live_row(db, title="#878 маховик", pr=443, age_hours=467)
-    # checked_at пишется с точностью до секунды: на границе секунды fresh
-    # получает меньшее значение и порядок ``checked_at ASC`` решает за
-    # тай-брейк. Симулирую границу (fresh на секунду раньше)...
-    await db.execute(
-        "UPDATE delivery_discrepancies SET checked_at = datetime('now','-1 seconds') "
-        "WHERE task_id = ?",
-        (fresh,),
-    )
-    # ...и явно выравниваю обе строки: тест проверяет тай-брейк по
-    # completed_at, а не секунду создания.
+    # #1714: checked_at пишется с точностью до секунды, и на границе секунды
+    # порядок ``checked_at ASC`` решал за тай-брейк. Обе строки выровнены
+    # явно: тест проверяет тай-брейк по completed_at, а не секунду создания.
     await db.execute(
         "UPDATE delivery_discrepancies SET checked_at = datetime('now','-1 hours') "
         "WHERE task_id IN (?, ?)",
