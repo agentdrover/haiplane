@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from hub import repository as repo
-from hub.models import AcceptanceCriterion
+from hub.models import AcceptanceCriterion, TaskSubmitReview
 from hub.services import (
     ci_artifact,
     ci_contract,
@@ -1450,6 +1450,7 @@ async def test_the_pin_step_does_not_ask_github_from_inside_a_transaction(
             task={"branch": "b"},
             submission_sha="",
             sha_reason="",
+            body=TaskSubmitReview(),
         )
 
     GH.calls.clear()
@@ -1681,6 +1682,7 @@ async def test_a_different_tip_pinned_inside_the_transaction_is_unconfirmed(
             task={**task, lifecycle.PREPARED_CI_SHA: prepared},
             submission_sha="",
             sha_reason="",
+            body=TaskSubmitReview(),
         )
 
     async with write_transaction(db):  # the commit asked about is the one pinned
