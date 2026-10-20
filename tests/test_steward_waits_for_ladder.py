@@ -406,6 +406,19 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
     await _cascade_event(db, answered, dispatch_id=answered_dispatch, after=before)
     cases["axis_incomplete"] = (answered, WHY_AXIS_INCOMPLETE)
 
+    # (г3) маркер попытки есть, события попытки нет — исход не известен.
+    _, bare = await _lite_incomplete(db, "why-axis-unrecorded")
+    await _dispatch_row(db, bare, status="done", profile="deep")
+    await _report_row(db, bare, incomplete=True, profile="deep")
+    await repo.add_task_update(
+        db,
+        bare,
+        "hub",
+        "alert",
+        dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
+    )
+    cases["axis_unrecorded"] = (bare, "second_axis_unrecorded")
+
     # (д) отказ среды — по заявлению самого отчёта.
     _, env = await _lite_incomplete(db, "why-environment")
     await db.execute(
