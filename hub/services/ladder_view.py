@@ -173,9 +173,25 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     view = await inflight_view(db, task, include_owed=True)
     if view is None:
         return ""
-    if any(_placed(act) for act in acts):
+    if await _order_was_placed(db, task_id, generation, acts):
         return view.headline
     return ""
+
+
+async def _order_was_placed(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    acts: list[dict[str, Any]],
+) -> bool:
+    """Лестница ПОСТАВИЛА заказ: попытка оси с заказом или закрытие «поставлен».
+
+    Начало поступка заказа не доказывает: отказанный добор оставляет начало, и
+    активный исходный прогон (лаг свипа) не должен сойти за добор.
+    """
+    if any(a["kind"] == dispatcher.MODEL_CASCADE_EVENT and _placed(a) for a in acts):
+        return True
+    return bool(await _placed_dispatches(db, task_id, generation))
 
 
 async def _preparing(
@@ -190,24 +206,20 @@ async def _preparing(
     возврата, а предыдущий заказ уже закрыт: без этого окна читатель
     объявлял бы отчёт готовым, и судья тратил бы суждение на неполные данные.
 
-    Начало и закрытие — события одной таблицы, и закрытие принадлежит началу
-    по порядку записи: закрывает то событие (запись «поставлен/отказан» или
-    событие попытки оси) с тем же ``after_review_id``, у которого id БОЛЬШЕ
-    id начала. Закрытие прошлой попытки по тому же отчёту следующую не
-    закрывает, а пришедший чужой отчёт подготовку не отменяет. Решает только
-    последнее начало: ушедшая вперёд лестница не держится за давний сбой.
+    Начала и закрытия — события одной таблицы; считаются по порядку записи
+    на каждый ``after_review_id``: начало +1, закрытие (запись «поставлен/
+    отказан» или событие попытки оси) −1. Закрытие чужого, конкурирующего
+    вызова, отказанного бронью, закрывает своё начало, а не начало вызова,
+    который ещё готовит заказ; пришедший чужой отчёт подготовку не отменяет.
+    Упавший вызов оставляет начало открытым — держит срок ожидания.
     """
-    starts = [
-        a
+    events = [
+        (int(a["id"]), int(a["data"].get("after_review_id") or 0), 1)
         for a in acts
         if a["data"] is not None and a["kind"] == dispatcher.LADDER_TOP_UP_EVENT
     ]
-    if not starts:
-        return False
-    start = starts[-1]
-    after = int(start["data"].get("after_review_id") or 0)
-    closers = [
-        (int(a["id"]), a["data"])
+    events += [
+        (int(a["id"]), int(a["data"].get("after_review_id") or 0), -1)
         for a in acts
         if a["data"] is not None and a["kind"] == dispatcher.MODEL_CASCADE_EVENT
     ]
@@ -219,13 +231,14 @@ async def _preparing(
     )
     for row in rows:
         try:
-            closers.append((int(row["id"]), json.loads(row["payload"] or "{}")))
-        except ValueError:
+            after = int(json.loads(row["payload"] or "{}")["after_review_id"])
+        except (ValueError, KeyError, TypeError):
             continue  # нечитаемое закрытие не закрывает: ждём, срок остановит
-    return not any(
-        closer_id > int(start["id"]) and int(data.get("after_review_id") or 0) == after
-        for closer_id, data in closers
-    )
+        events.append((int(row["id"]), after, -1))
+    open_starts: dict[int, int] = {}
+    for _id, after, step in sorted(events):
+        open_starts[after] = max(0, open_starts.get(after, 0) + step)
+    return any(open_starts.values())
 
 
 async def wait_with_report(db, task: dict[str, Any]) -> ReviewWait:

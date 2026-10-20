@@ -664,3 +664,48 @@ async def test_a_foreign_report_does_not_cancel_the_preparation(
     monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _slow)
     assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
     assert seen[0] and seen[1] == "0"
+
+
+async def test_a_competing_call_refused_by_the_reservation_does_not_end_the_wait(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 7, П1: B отказан бронью и закрылся, а A всё ещё готовит заказ."""
+    _, task_id = await _lite_incomplete(db, "round7-competing-call")
+    task = await _task_dict(db, task_id)
+    seen: list[str] = []
+
+    async def _refuse(_db, _task_id, **_kwargs):
+        return False
+
+    async def _outer(_db, _task_id, **_kwargs):
+        monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refuse)
+        assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+        seen.append(await top_up_in_flight(db, task))
+        seen.append(str(await order_due_runs(db)))
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _outer)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert seen[0] and seen[1] == "0", "A ещё готовит заказ"
+    assert await top_up_in_flight(db, task) == ""
+
+
+async def test_a_refused_top_up_does_not_make_the_original_run_a_top_up(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 7, П2: исходный прогон active (лаг свипа), добор отказан — это не добор."""
+    _, task_id = await _lite_incomplete(db, "round7-refused-top-up")
+    await db.execute(
+        "UPDATE review_dispatches SET status='active' WHERE task_id=?", (task_id,)
+    )
+    await db.commit()
+
+    async def _refuse(_db, _task_id, **_kwargs):
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refuse)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    task = await _task_dict(db, task_id)
+    assert await top_up_in_flight(db, task) == ""
+    why = await ladder_why(db, task)
+    assert why is not None and why.code != "top_up_in_flight", why
