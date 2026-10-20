@@ -20,7 +20,7 @@ import json
 PLACEHOLDER_DETAILS: tuple[str, ...] = ("<факт пакета: значение, число, sha или поле>",)
 PLACEHOLDER_FINDING_UID = "<finding_uid находки из пакета>"
 _VERDICT_HINT = "<approve|changes_requested|escalate>"
-_CONFIDENCE_HINT = "<high | medium | low>"
+_CONFIDENCE_HINT = "<high|medium|low>"
 _CLOSURE_TYPE_HINT = "<тип закрытия из закрытого множества>"
 _SOURCE_HINT = "<источник из закрытого множества>"
 
