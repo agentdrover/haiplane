@@ -100,7 +100,8 @@ async def test_clean_delegated_submission_routes_to_policy(
     assert "Команда вердикта не нужна" in envelope["next_action"]
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert brief["verdict_route"]["decider"] == "policy"
-    assert brief["verdict_route"]["condition"] == ""
+    # #1913: бриф — путь показа; сетевые проверки он называет, а не делает.
+    assert "при показе не делалась" in brief["verdict_route"]["condition"]
     assert mcp_server._verdict_route_line(card) == card["verdict_route"]["line"]
     rest = (await client.get(f"/api/tasks/{task_id}/verdict-route")).json()
     assert rest["decider"] == "policy"

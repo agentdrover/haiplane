@@ -852,9 +852,16 @@ async def order_section(db: aiosqlite.Connection, task_id: int) -> str:
     return f"{section}\n\n" if section else ""
 
 
-async def brief_state(db: aiosqlite.Connection, task_id: int) -> dict[str, Any] | None:
-    """The brief's block: None when there are no signs (the brief reads as before)."""
-    await ensure_scan(db, task_id)
+async def brief_state(
+    db: aiosqlite.Connection, task_id: int, *, offline: bool = False
+) -> dict[str, Any] | None:
+    """The brief's block: None when there are no signs (the brief reads as before).
+
+    ``offline`` (#1913): путь показа читает сохранённый скан и сам его не делает
+    (скан — это fetch и запись в базу); нет скана — стояние называет пробел.
+    """
+    if not offline:
+        await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
     if standing.clean:

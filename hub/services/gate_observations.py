@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +64,11 @@ def forget_all() -> None:
     _seen.clear()
 
 
+def stacking_key(branch: str, sha: str) -> str:
+    """Стыковка относится к ветке на сданном коммите, а не к имени ветки вообще."""
+    return f"{branch}@{sha}"
+
+
 def age_phrase(minutes: int) -> str:
     """Возраст словами для причины: «менее минуты назад» или «N мин назад»."""
     return "менее минуты назад" if minutes < 1 else f"{minutes} мин назад"
@@ -71,6 +77,7 @@ def age_phrase(minutes: int) -> str:
 #: Как часто проход поллера освежает наблюдения одной задачи, и сколько задач за тик.
 REFRESH_EVERY_MINUTES = 5
 MAX_TASKS_PER_TICK = 3
+TASK_DEADLINE_SECONDS = 45
 
 _refreshed_at: dict[int, datetime] = {}
 
@@ -83,24 +90,42 @@ async def run_sweep(db: Any) -> None:
         log.exception("gate observations sweep failed")
 
 
+async def _gate_tasks(db: Any) -> list[int]:
+    """Задачи на гейте с веткой и закреплённым коммитом: их карточки читают люди."""
+    from hub.db import fetchall
+
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE status IN ('review', 'fix_requested') "
+        "AND COALESCE(branch, '') != '' AND COALESCE(submission_sha, '') != '' "
+        "ORDER BY id",
+    )
+    return [int(r["id"]) for r in rows]
+
+
 async def sweep(db: Any) -> None:
     """Проход поллера (#1913): освежить наблюдения задач на гейте, раз в 5 минут.
 
     Показ в сеть не ходит и потому видит только это. Здесь сеть разрешена:
     вершина ветки, расхождение PR с базой и стыковка — те же вызовы, что у
     гейтов. Бюджет мал и честен: не больше ``MAX_TASKS_PER_TICK`` задач за тик,
-    у каждой не чаще ``REFRESH_EVERY_MINUTES``; остальные ждут следующего тика.
-    Стояние CI освежает ``ci_trust.sweep`` — его здесь не дублируем.
+    у каждой не чаще ``REFRESH_EVERY_MINUTES`` и не дольше ``TASK_DEADLINE_SECONDS``;
+    пока GitHub недавно не отвечал, проход не спрашивает его вовсе. Стояние CI
+    освежает ``ci_trust.sweep`` — его здесь не дублируем.
     """
     from hub import repository as repo
     from hub import services
-    from hub.services import lifecycle
+    from hub.services import ci_trust, lifecycle
     from hub.services.review_brief import base_merge_section
 
+    if ci_trust.forge_recently_down():
+        return
     now = datetime.now(UTC)
+    ids = await _gate_tasks(db)
+    for stale in set(_refreshed_at) - set(ids):
+        del _refreshed_at[stale]
     done = 0
-    for row in await repo.tasks_in_review_with_sha(db):
-        task_id = int(row["id"])
+    for task_id in ids:
         last = _refreshed_at.get(task_id)
         if (
             last is not None
@@ -116,11 +141,10 @@ async def sweep(db: Any) -> None:
             continue
         view = services.row_to_task(task_row)
         branch = (view.branch or "").strip()
-        if not branch:
-            continue
         try:
-            await lifecycle.resolve_branch_tip(db, task_id, branch)
-            await base_merge_section(db, view)
-            await services.detect_branch_stacking(db, task_id, branch)
+            async with asyncio.timeout(TASK_DEADLINE_SECONDS):
+                await lifecycle.resolve_branch_tip(db, task_id, branch)
+                await base_merge_section(db, view)
+                await services.detect_branch_stacking(db, task_id, branch)
         except Exception:  # noqa: BLE001 - наблюдение не должно ронять проход
             log.exception("gate observation of task %s failed", task_id)

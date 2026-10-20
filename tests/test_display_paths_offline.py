@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import socket
 from typing import Any
 from unittest.mock import AsyncMock
@@ -27,6 +29,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 
+from hub import config
 from hub import repository as repo
 from hub.integrations import proc
 from hub.integrations.git_ops import GitOpsIntegration
@@ -131,16 +134,41 @@ def arm(monkeypatch) -> list[str]:
     return calls
 
 
-def arm_process(monkeypatch, calls: list[str]) -> None:
-    """Настоящий GitOpsIntegration на фальшивом процессе: любая сетевая команда — нарушение."""
+def _is_network_cmd(cmd: tuple[str, ...]) -> bool:
+    """Сетевая команда: git fetch/ls-remote/…, gh, либо та же строка внутри ``sh -c``."""
+    if _argv_is_network(cmd):
+        return True
+    return bool(_NETWORK_WORDS.search(" ".join(cmd)))
 
-    async def fake_run(*cmd: str, **_kw: Any) -> tuple[int, str, str]:
-        if _argv_is_network(cmd):
-            calls.append("proc.run " + " ".join(cmd[:5]))
-        # Локальный git «ничего не знает»: показ обязан пережить пустые ответы.
+
+_NETWORK_WORDS = re.compile(r"\b(fetch|ls-remote|pull|push|clone)\b|(^|\s)gh\s")
+
+
+def arm_process(monkeypatch, calls: list[str]) -> None:
+    """Настоящий GitOpsIntegration на фальшивом процессе: любая сетевая команда — нарушение.
+
+    Локальное чтение ссылок отвечает успехом (вершина — 40 символов ``a``), чтобы
+    пути не обрывались до сетевого шага, а шли так далеко, как идут в проде.
+    """
+
+    def answer(cmd: tuple[str, ...]) -> tuple[int, str, str]:
+        if _is_network_cmd(cmd):
+            calls.append("proc " + " ".join(cmd[:6]))
+            return 1, "", "offline"
+        if "rev-parse" in cmd:
+            return 0, "a" * 40, ""
         return 1, "", "offline"
 
+    async def fake_run(*cmd: str, **_kw: Any) -> tuple[int, str, str]:
+        return answer(cmd)
+
+    async def fake_bytes(*cmd: str, **_kw: Any) -> tuple[int, bytes, str]:
+        rc, out, err = answer(cmd)
+        return rc, out.encode(), err
+
     monkeypatch.setattr(proc, "run", fake_run)
+    monkeypatch.setattr(proc, "run_bytes", fake_bytes)
+    monkeypatch.setattr(proc, "run_capped", fake_bytes, raising=False)
     plugins.git_ops = NetSpy(GitOpsIntegration(), "git_ops", calls)  # type: ignore[assignment]
 
 
@@ -149,6 +177,14 @@ async def _world(client, db: aiosqlite.Connection, monkeypatch) -> dict[str, int
     review_id, _ = await _task(client, db, monkeypatch, "offline-review", 1)
     review = dict(await repo.get_task(db, review_id) or {})
     await db.execute("UPDATE tasks SET pr_number=77 WHERE id=?", (review_id,))
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    # Путь реального проекта: вердикт делегирован (автопилот), скана целостности CI
+    # нет — раньше оба условия вели карточку в сеть мимо остальных блоков.
+    project_row = dict(await repo.resolve_project_for_task(db, review_id) or {})
+    await repo.update_project(
+        db, project_row["id"], gate_policy=json.dumps({"verdict": "auto"})
+    )
+    await db.execute("DELETE FROM ci_integrity_scans WHERE task_id=?", (review_id,))
     # Отчёт CI ещё не подтверждён GitHub: обновление стояния ходило бы за прогонами.
     await repo.upsert_ci_report_attempt(
         db,
@@ -248,9 +284,9 @@ async def _display_paths(client, ids: dict[str, int], monkeypatch, walk: Walk) -
         brief = await walk.step(
             f"brief rest {name}", client.get(f"/api/tasks/{task_id}/review-brief")
         )
-        assert brief.status_code in (200, 404)
+        assert brief.status_code == 200, brief.text
     diff = await walk.step("diff page", client.get(f"/tasks/{review}/diff"))
-    assert diff.status_code in (200, 404)
+    assert diff.status_code == 200, diff.text
     # Входящие.
     inbox = await walk.step("inbox partial", client.get("/partials/inbox"))
     assert inbox.status_code == 200
@@ -436,7 +472,10 @@ async def test_poller_sweep_feeds_the_display(
     gate_observations.record(
         gate_observations.STACKING,
         review,
-        dict(await repo.get_task(db, review) or {})["branch"],
+        gate_observations.stacking_key(
+            dict(await repo.get_task(db, review) or {})["branch"],
+            dict(await repo.get_task(db, review) or {})["submission_sha"],
+        ),
         {"message": "ADVISORY branch stacking: пример", "outcome": "stacked"},
     )
     stacked = await build_review_brief(db, review, observe_only=True)
@@ -473,5 +512,5 @@ async def test_diff_base_freshness_is_not_asked_when_offline(
     assert asked == ["base_freshness"] and live["reason"] == ""
     # Страница диффа (/tasks/{id}/diff) — тот же запрет.
     page = await client.get(f"/tasks/{review}/diff")
-    assert page.status_code in (200, 404)
+    assert page.status_code == 200, page.text
     assert asked == ["base_freshness"], "страница диффа спросила свежесть базы"

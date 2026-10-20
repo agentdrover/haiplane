@@ -3166,10 +3166,13 @@ async def detect_branch_stacking(
     if assessment.outcome in (STACK_STACKED, STACK_CLEAR):
         from hub.services import gate_observations
 
+        sha = str(
+            dict(await repo.get_task(db, task_id) or {}).get("submission_sha") or ""
+        )
         gate_observations.record(
             gate_observations.STACKING,
             task_id,
-            branch,
+            gate_observations.stacking_key(branch, sha),
             {
                 "message": (advisory or {}).get("message", ""),
                 "outcome": assessment.outcome,

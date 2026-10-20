@@ -251,16 +251,21 @@ async def base_merge_section(
         gate_observations.record(
             gate_observations.BASE_MERGE,
             task_view.id,
-            str(task_view.pr_number),
+            _base_key(task_view),
             state.model_dump(),
         )
     return state
 
 
+def _base_key(task_view) -> str:
+    """Наблюдение держится за PR И за сданный коммит: новый пуш — новый вопрос."""
+    return f"{task_view.pr_number}@{task_view.submission_sha or ''}"
+
+
 def _observed_base_merge(task_view) -> BaseMergeState:
     """Ответ показа: последнее наблюдение хаба с возрастом, иначе «не сверено» (#1913)."""
     seen = gate_observations.recall(
-        gate_observations.BASE_MERGE, task_view.id, str(task_view.pr_number)
+        gate_observations.BASE_MERGE, task_view.id, _base_key(task_view)
     )
     if seen is None:
         return BaseMergeState(
@@ -448,17 +453,20 @@ async def profile_downgrade_of(
     )
 
 
-async def _brief_verdict_route(db, task_view) -> dict | None:
+async def _brief_verdict_route(
+    db, task_view, observe_only: bool = False
+) -> dict | None:
     """#1440: тот же маршрут, что в карточке, но с проверками по сети.
 
     Бриф и так наблюдает вершину ветки, и ревьюеру нужен ответ решателя,
-    а не «если».
+    а не «если». На пути показа (#1913) проверки по сети выключены: маршрут
+    называет то, что видно без них, как в карточке.
     """
     if task_view.status != TaskStatus.review:
         return None
     from hub.services.verdict_route import verdict_route
 
-    return (await verdict_route(db, task_view.id, observe=True)).as_dict()
+    return (await verdict_route(db, task_view.id, observe=not observe_only)).as_dict()
 
 
 HARNESS_SKILL_NAME = "multi-agent-review"
@@ -556,13 +564,13 @@ async def _brief_branch_tip(
 
 
 async def _stacking_warning(
-    db, task_id: int, branch: str, observe_only: bool, timer
+    db, task_id: int, branch: str, observe_only: bool, timer, sha: str = ""
 ) -> str:
     """Предупреждение о стыковке: свежая проверка или (показ) последнее наблюдение."""
     if not branch:
         return ""
     if observe_only:
-        return _observed_stacking_warning(task_id, branch)
+        return _observed_stacking_warning(task_id, branch, sha)
     from hub import services
 
     stacking = await timer.run(
@@ -584,12 +592,14 @@ def _tip_age_note(task_id: int, branch: str) -> str:
     )
 
 
-def _observed_stacking_warning(task_id: int, branch: str) -> str:
+def _observed_stacking_warning(task_id: int, branch: str, sha: str = "") -> str:
     """Стыковка веток по последнему наблюдению хаба (#1913); без него — «не сверено».
 
     Пустая строка означала бы «стыковки нет», а хаб мог просто не смотреть.
     """
-    seen = gate_observations.recall(gate_observations.STACKING, task_id, branch)
+    seen = gate_observations.recall(
+        gate_observations.STACKING, task_id, gate_observations.stacking_key(branch, sha)
+    )
     if seen is None:
         return (
             "Стыковка с чужими ветками не сверена: хаб в последние "
@@ -598,6 +608,7 @@ def _observed_stacking_warning(task_id: int, branch: str) -> str:
         )
     message = str(seen.value.get("message") or "")
     if not message:
+        # Наблюдённое «стыковки нет» — тоже с возрастом, а не молчание.
         return ""
     return f"{message} [сверено {gate_observations.age_phrase(seen.age_minutes)}]"
 
@@ -689,7 +700,12 @@ async def build_review_brief(
     # the diff includes another task's unmerged work. Best-effort — no repo
     # access means no warning, never an error.
     stacking_warning = await _stacking_warning(
-        db, task_id, task_view.branch or "", observe_only, timer
+        db,
+        task_id,
+        task_view.branch or "",
+        observe_only,
+        timer,
+        task_view.submission_sha or "",
     )
 
     # #506/#1650: resolve each verifiable_by=test AC's locator by READING the
@@ -863,7 +879,7 @@ async def build_review_brief(
         if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
     ]
 
-    late = await _late_reads(db, task_row, task_view, mr_row, timer)
+    late = await _late_reads(db, task_row, task_view, mr_row, timer, observe_only)
 
     brief = ReviewBrief(
         **late,
@@ -990,7 +1006,12 @@ async def cause_task_view(db, task_row: dict[str, Any]) -> CauseTaskView | None:
 
 
 async def _late_reads(
-    db, task_row: dict[str, Any], task_view, mr_row, timer: _BriefTimer
+    db,
+    task_row: dict[str, Any],
+    task_view,
+    mr_row,
+    timer: _BriefTimer,
+    observe_only: bool = False,
 ) -> dict[str, Any]:
     """The reads that only feed the final object, as ``ReviewBrief`` fields.
 
@@ -1037,14 +1058,18 @@ async def _late_reads(
         "cause_task": cause_task,
     }
     late["verdict_route"] = (
-        await timer.run("verdict_route", _brief_verdict_route(db, task_view))
+        await timer.run(
+            "verdict_route", _brief_verdict_route(db, task_view, observe_only)
+        )
         if task_view.status == TaskStatus.review
         else None
     )
     # #1688: signs that the diff touches CI inputs, with the question to the
     # reviewer and the owner's note. Only for a pinned commit; None = no signs.
     late["ci_integrity"] = (
-        await timer.run("ci_integrity", ci_integrity.brief_state(db, task_id))
+        await timer.run(
+            "ci_integrity", ci_integrity.brief_state(db, task_id, offline=observe_only)
+        )
         if (task_view.submission_sha or "").strip()
         else None
     )
