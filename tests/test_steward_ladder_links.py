@@ -366,6 +366,13 @@ async def test_a_local_replacement_report_is_not_called_a_missing_report(
     await db.commit()
     why = await ladder_why(db, await _task_dict(db, task_id))
     assert why is not None and why.code == "local_deep_no_cloud", why
+    # Без алерта остаётся одно: у замены свой отчёт, «заказ без отчёта» — неправда.
+    await db.execute(
+        "DELETE FROM task_updates WHERE task_id=? AND kind='alert'", (task_id,)
+    )
+    await db.commit()
+    again = await ladder_why(db, await _task_dict(db, task_id))
+    assert again is not None and again.code == WHY_UNKNOWN, again
 
 
 async def test_a_complete_axis_report_is_not_turned_into_an_incomplete_one(
