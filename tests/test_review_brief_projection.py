@@ -765,9 +765,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # (условие «проверка по сети при показе не делалась»), ci_integrity («unscanned»:
 # скан делает проход поллера, не показ). Пакет стюарда: REST-чтение
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
-# нет «Справка по CI: … не проверена»; packet_hash прежний.
+# нет «Справка по CI: … не проверена»; scan_hash в блоке ci_integrity; packet_hash прежний.
 GOLDEN_REST_BRIEF = "6f7b0d8ae96649e0665c96e471d6de2f45e8c69b3a9dbd1a289426c0ac2d3df4"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "149ec84ec411e5bedf3bc29ee7ebde00ad227c436a2778c185c689b486056a90"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "8acce84aafa35c2814e1eed4e57974cebbb8dac6f36cb9ac8d7d76018403afbb"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
