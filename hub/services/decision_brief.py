@@ -196,6 +196,14 @@ def _from_rules(
     return _recommend(action, verdict, [b.risk for b in blockers], alt)
 
 
+def _escalated_as_incomplete(judged: Any) -> bool:
+    """Судья передал решение по неполному отчёту (#1925): справка назовёт причину."""
+    return (
+        str(judged["verdict"]) == "escalate"
+        and str(judged["escalate_reason"] or "") == "report_incomplete"
+    )
+
+
 async def _review_brief(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
@@ -203,6 +211,10 @@ async def _review_brief(
     route = ctx.get("route") or await verdict_route(db, int(task["id"]))
     judged = await _steward_row(db, task)
     recommend = _from_steward(judged, route) if judged is not None else None
+    if recommend is not None and _escalated_as_incomplete(judged):
+        from hub.services.ladder_view import incomplete_escalation_line
+
+        recommend["why"].append(await incomplete_escalation_line(db, task))
     if recommend is None:
         recommend = _from_rules(proof, blockers, route)
         if judged is not None and proof is None:
