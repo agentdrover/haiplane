@@ -834,7 +834,13 @@
                     <dt>Минуты владельца</dt>
                     <dd data-owner-minutes="{{ task.owner_minutes.status }}">{{ task.owner_minutes.line }}</dd>
                     {% endif %}
-                    {% if task.ci_fix_cycle > 0 %}
+                    {# #1941: проекцию последнего host-заказа собирает хаб (services/executor_triage); блок без вывода, когда сказать нечего. #}{% if task.last_executor_order %}{% if task.last_executor_order.unavailable %}
+                    <dt>Заказ хоста</dt>
+                    <dd data-order-unavailable="1">{{ task.last_executor_order.unavailable }}</dd>
+                    {% elif task.last_executor_order.after_failed_run %}
+                    <dt>После неудачного прогона</dt>
+                    <dd data-after-failed-run="{{ task.last_executor_order.class }}">класс {{ task.last_executor_order.class }} ({{ task.last_executor_order.class_name }}); заказ #{{ task.last_executor_order.order_id }}, {{ task.last_executor_order.outcome }}</dd>
+                    {% endif %}{% endif %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
                     {% endif %}
