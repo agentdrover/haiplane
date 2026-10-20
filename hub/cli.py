@@ -2744,12 +2744,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_steward_judgement.add_argument(
         "--grounds-json",
         default="",
-        help=(
-            'JSON list of grounds: [{"source":"ci_pinned_sha",'
-            '"detail":"__ЗАПОЛНИ_ФАКТ_7Q__ concrete fact of the packet"}] '
-            "(replace the whole __ЗАПОЛНИ_ФАКТ_7Q__ marker with the fact); approve and "
-            "changes_requested need one with a non-empty detail (422 otherwise)"
-        ),
+        help='JSON grounds: [{"source":"ci_pinned_sha","detail":"fact"}], detail needed',
     )
     p_steward_judgement.add_argument(
         "--closures-json",

@@ -625,10 +625,12 @@ async def ci_evidence_state(db, task: dict):
             baseline=CIEvidenceBlock(reason=text),
         )
     stored = dict(row) if row is not None else {}
-    return CIEvidenceState(
-        mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
-        baseline=_evidence_block("baseline", stored.get("baseline"), pinned),
+    from hub.services.ci_evidence_other import blocks_of_the_commit
+
+    mutations, baseline = await blocks_of_the_commit(
+        db, int(task.get("id") or 0), pinned, stored
     )
+    return CIEvidenceState(mutations=mutations, baseline=baseline)
 
 
 async def prepass_state(db, task: dict):
@@ -1199,6 +1201,7 @@ TERMINAL_NOT_REQUESTED = "review_not_requested"
 TERMINAL_NOT_DISPATCHABLE = "not_dispatchable"
 TERMINAL_FAILED_NO_RETRY = "failed_without_ask_again"
 TERMINAL_FINISHED_NO_REPORT = "finished_without_report"
+WAIT_KIND_TOP_UP = "top_up"
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1217,9 @@ class ReviewWait:
     reason: str
     detail: str
     since: datetime | None = None
+    #: Что именно ждём (#1925): пусто — отчёт ревью; ``WAIT_KIND_TOP_UP`` —
+    #: добор неполного отчёта. Отсрочка в ленте — одна на (поколение, вид).
+    kind: str = ""
 
     @property
     def pending(self) -> bool:
@@ -1224,9 +1230,7 @@ def _wait_terminal(reason: str, detail: str) -> ReviewWait:
     return ReviewWait(WAIT_TERMINAL, reason, detail)
 
 
-async def _generation_submitted_at(
-    db, task_id: int, generation: int
-) -> datetime | None:
+async def generation_submitted_at(db, task_id: int, generation: int) -> datetime | None:
     from hub.db import fetchall
 
     rows = await fetchall(
@@ -1317,12 +1321,14 @@ async def review_wait_view(db, task_row: dict[str, Any]) -> ReviewWait:
     full = await repo_module.get_task(db, task_id)
     task = dict(full) if full is not None else dict(task_row)
     generation = int(task.get("submission_generation") or 0)
-    since = await _generation_submitted_at(db, task_id, generation)
+    since = await generation_submitted_at(db, task_id, generation)
     if await repo_module.machine_reviews_of_generation(db, task_id, generation):
-        wait = _wait_terminal(TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
+        from hub.services.ladder_view import wait_with_report
+
+        wait = await wait_with_report(db, task)
     else:
         wait = await _wait_without_report(db, task)
-    return ReviewWait(wait.state, wait.reason, wait.detail, since)
+    return ReviewWait(wait.state, wait.reason, wait.detail, since, wait.kind)
 
 
 async def _wait_without_report(db, task: dict[str, Any]) -> ReviewWait:

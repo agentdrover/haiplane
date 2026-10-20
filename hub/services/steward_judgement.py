@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -415,6 +416,9 @@ async def record_steward_judgement(
         principal_id=identity.principal_id,
         author_kind="steward",
     )
+    await _note_ladder_for_incomplete(
+        db, dict(row), body, effective_verdict, effective_reason
+    )
     await _emit_events(db, task_id, body, effective_verdict, judged_id)
     await _close_the_order(db, task_id, body.generation, body.kind)
     # Запись суждения судьи САМА вердикта не ставит ни в одном пути (#1601):
@@ -426,6 +430,36 @@ async def record_steward_judgement(
             f"steward judgement {inserted} missing after insert for task #{task_id}"
         )
     return StewardJudgementView(**dict(saved))
+
+
+async def _note_ladder_for_incomplete(
+    db,
+    task: dict[str, Any],
+    body: StewardJudgementSubmit,
+    verdict: str,
+    reason: str,
+) -> None:
+    """Эскалация report_incomplete называет в ленте, почему добор не помог (#1925).
+
+    Только суждение судьи о ТЕКУЩЕЙ сдаче: об отчёте другой сдачи лестница
+    ничего не говорит, а советник отчёт не судит.
+    """
+    if body.kind != "verdict" or verdict != "escalate":
+        return
+    if reason != "report_incomplete":
+        return
+    if int(task.get("submission_generation") or 0) != body.generation:
+        return
+    from hub.services.ladder_view import incomplete_escalation_line
+
+    await repo.add_task_update(
+        db,
+        int(task["id"]),
+        "hub",
+        "alert",
+        "Стюард передал решение владельцу: report_incomplete. "
+        + await incomplete_escalation_line(db, task),
+    )
 
 
 async def _cost_of_the_run(
