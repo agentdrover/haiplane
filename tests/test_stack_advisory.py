@@ -254,7 +254,7 @@ async def test_review_brief_stacking_warning_empty_without_repo_access(
     # #1913: показ в сеть не ходит — без наблюдения он говорит «не сверена»,
     # а не «чисто» и не советует стыковку.
     shown = resp.json()["stacking_warning"]
-    assert "не сверена" in shown and "ADVISORY" not in shown
+    assert "не определена" in shown and "ADVISORY" not in shown
     # Свежая сборка (стюард, гейты) при недоступном репозитории молчит, как раньше.
     from hub.services.review_brief import build_review_brief
 

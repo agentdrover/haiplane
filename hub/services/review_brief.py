@@ -245,9 +245,10 @@ async def base_merge_section(
     if observe_only:
         return _observed_base_merge(task_view)
     state = await _ask_base_merge(db, task_view, net)
-    if state.state in ("clean", "conflicting"):
+    if state.state != "not_applicable":
         # Ответ, за который заплачено сетью, не пропадает: следующий показ
-        # скажет его с возрастом (#1913). «Не удалось спросить» не запоминается.
+        # скажет его с возрастом (#1913) — и «спросили, ответа не было» тоже,
+        # иначе показ соврал бы «не проверял».
         gate_observations.record(
             gate_observations.BASE_MERGE,
             task_view.id,
@@ -277,10 +278,12 @@ def _observed_base_merge(task_view) -> BaseMergeState:
             ),
         )
     value = seen.value
+    state = str(value.get("state") or "unknown")
+    verb = "спрашивали, ответа не было" if state == "unknown" else "сверено"
     return BaseMergeState(
-        state=str(value.get("state") or "unknown"),
+        state=state,
         reason=(
-            f"{value.get('reason') or ''} [сверено "
+            f"{value.get('reason') or ''} [{verb} "
             f"{gate_observations.age_phrase(seen.age_minutes)}, показ в сеть не ходит]"
         ).strip(),
         files=list(value.get("files") or []),
@@ -610,6 +613,11 @@ def _observed_stacking_warning(task_id: int, branch: str, sha: str = "") -> str:
         )
     message = str(seen.value.get("message") or "")
     age = gate_observations.age_phrase(seen.age_minutes)
+    if seen.value.get("outcome") not in ("stacked", "clear"):
+        return (
+            f"Стыковка не определена: хаб спрашивал {age}, ответа не было "
+            f"({seen.value.get('reason') or 'причина не названа'}); показ в сеть не ходит"
+        )
     if not message:
         # Наблюдённое «стыковки нет» — тоже с возрастом, а не молчание.
         return f"Стыковки с чужими ветками нет [сверено {age}, показ в сеть не ходит]"

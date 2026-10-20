@@ -468,7 +468,7 @@ async def test_poller_sweep_feeds_the_display(
     assert brief.base_merge.state == "clean"
     # Стыковку mock-адаптер не умеет (probe_unsupported) — это незнание, и оно
     # не запоминается как «чисто».
-    assert "не сверена" in brief.stacking_warning
+    assert "не определена" in brief.stacking_warning  # спрашивали, ответа не было
     gate_observations.record(
         gate_observations.STACKING,
         review,
@@ -602,3 +602,20 @@ async def test_the_deadline_wraps_only_the_network_not_the_database(
     monkeypatch.setattr(gate_observations._Deadline, "run", watch)
     await gate_observations.sweep(db)
     assert inside == [], f"чтение базы под дедлайном: {inside}"
+
+
+async def test_a_question_asked_without_an_answer_is_not_shown_as_never_asked(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Спросили, ответа не было: показ говорит «спрашивали», а не «не проверял»."""
+    from hub.services import gate_observations
+    from hub.services.review_brief import build_review_brief
+
+    ids = await _world(client, db, monkeypatch)
+    gate_observations._refreshed_at.clear()
+    await gate_observations.sweep(db)  # mock-адаптер: PR против базы — unknown
+    shown = await build_review_brief(db, ids["review"], observe_only=True)
+    assert shown is not None
+    assert shown.base_merge.state == "unknown"
+    assert "спрашивали, ответа не было" in shown.base_merge.reason
+    assert "не проверял" not in shown.base_merge.reason
