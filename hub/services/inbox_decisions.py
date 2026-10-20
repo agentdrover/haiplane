@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import aiosqlite
@@ -38,6 +39,8 @@ from hub.services.ci_report import (
 from hub.services.review_availability import generation_review
 from hub.services.review_queue import last_stall
 from hub.services.verdict_route import DECIDER_HUMAN, verdict_route
+
+log = logging.getLogger("hub")
 
 ACTION_APPROVE = "approve"
 ACTION_ANSWER = "answer"
@@ -190,6 +193,20 @@ async def _verdict_grounds(
     )
 
 
+async def _brief_line(
+    db: aiosqlite.Connection, task: dict[str, Any], route: Any
+) -> str:
+    """Рекомендация справки (#1810): тот же ``build``, что у карточки, без второго пересчёта."""
+    from hub.services import decision_brief
+
+    try:
+        brief = await decision_brief.build(db, task, {"route": route})
+    except Exception as exc:  # noqa: BLE001 - входящие рендерятся без справки
+        log.warning("decision brief failed for #%s: %s", task.get("id"), exc)
+        return "Проверить: справка не собрана, откройте карточку"
+    return decision_brief.recommend_line(brief)
+
+
 async def _verdict_rows(
     db: aiosqlite.Connection, rows: list[Any]
 ) -> tuple[list[Any], list[dict[str, Any]]]:
@@ -208,6 +225,8 @@ async def _verdict_rows(
                 "action": ACTION_VERDICT,
                 "grounds": grounds,
                 "offer": offer,
+                # Справка дорога: строится после обрезки, только для показанных.
+                "_route": route,
             }
         )
     return kept, entries
@@ -270,6 +289,10 @@ async def collect(db: aiosqlite.Connection, scoped: dict[str, Any]) -> dict[str,
     }
     drafts, asked, decide = _cap(drafts), _cap(asked), _cap(decide)
     reviewing, verdicts = _cap(reviewing), _cap(verdicts)
+    for row, entry in zip(reviewing, verdicts, strict=True):
+        entry["brief_line"] = await _brief_line(db, dict(row), entry["_route"])
+    for entry in verdicts:
+        entry.pop("_route", None)
     shown = {
         "черновики": len(drafts),
         "вопросы": len(asked),

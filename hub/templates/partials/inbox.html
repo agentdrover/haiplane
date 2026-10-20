@@ -14,6 +14,7 @@
 <div class="inbox-decision" data-decision-action="{{ d.action }}" data-decision-order="{{ d.order }}">
     <span class="badge badge-needs_decision">№{{ d.order }} · {{ action_labels[d.action] }}</span>
     <span class="inbox-decision-grounds">Основание: {{ d.grounds }}</span>
+    {% if d.brief_line %}<span class="inbox-decision-brief">Рекомендация: {{ d.brief_line }}</span>{% endif %}
 </div>
 {% endif %}
 {% endmacro %}
