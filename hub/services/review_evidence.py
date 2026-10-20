@@ -1321,30 +1321,12 @@ async def review_wait_view(db, task_row: dict[str, Any]) -> ReviewWait:
     generation = int(task.get("submission_generation") or 0)
     since = await generation_submitted_at(db, task_id, generation)
     if await repo_module.machine_reviews_of_generation(db, task_id, generation):
-        wait = await _wait_with_report(db, task)
+        from hub.services.ladder_view import wait_with_report
+
+        wait = await wait_with_report(db, task)
     else:
         wait = await _wait_without_report(db, task)
     return ReviewWait(wait.state, wait.reason, wait.detail, since, wait.kind)
-
-
-async def _wait_with_report(db, task: dict[str, Any]) -> ReviewWait:
-    """Отчёт есть. Неполный отчёт при доборе в полёте — ещё не готовый (#1925).
-
-    Заказанный добор отдаст отчёт, который судья должен прочитать; заказать
-    его раньше значит получить report_incomplete на данных, которые вот-вот
-    дополнятся (#1910 g1). Срок тот же — STEWARD_REVIEW_WAIT_MAX от сдачи.
-    """
-    from hub.services.ladder_view import top_up_in_flight
-
-    flight = await top_up_in_flight(db, task)
-    if flight:
-        return ReviewWait(
-            WAIT_PENDING,
-            "",
-            f"ждёт добора ревью: отчёт неполон, {flight}",
-            kind=WAIT_KIND_TOP_UP,
-        )
-    return _wait_terminal(TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
 
 
 async def _wait_without_report(db, task: dict[str, Any]) -> ReviewWait:

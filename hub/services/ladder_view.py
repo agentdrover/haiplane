@@ -28,6 +28,11 @@ from hub.db import fetchall
 from hub.services import review_dispatch as dispatcher
 from hub.services.gate_grounds import LADDER_WHY_UNKNOWN
 from hub.services.review_evidence import (
+    TERMINAL_REPORT_READY,
+    WAIT_KIND_TOP_UP,
+    WAIT_PENDING,
+    WAIT_TERMINAL,
+    ReviewWait,
     generation_submitted_at,
     inflight_view,
     parse_stamp,
@@ -136,6 +141,24 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     if dispatch is None or answered:
         return ""
     return view.headline
+
+
+async def wait_with_report(db, task: dict[str, Any]) -> ReviewWait:
+    """Отчёт есть. Неполный отчёт при доборе в полёте — ещё не готовый (#1925).
+
+    Заказанный добор отдаст отчёт, который судья должен прочитать; заказать
+    его раньше значит получить report_incomplete на данных, которые вот-вот
+    дополнятся (#1910 g1). Срок тот же — STEWARD_REVIEW_WAIT_MAX от сдачи.
+    """
+    flight = await top_up_in_flight(db, task)
+    if flight:
+        return ReviewWait(
+            WAIT_PENDING,
+            "",
+            f"ждёт добора ревью: отчёт неполон, {flight}",
+            kind=WAIT_KIND_TOP_UP,
+        )
+    return ReviewWait(WAIT_TERMINAL, TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
 
 
 async def _recorded_outcome(
