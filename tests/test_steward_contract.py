@@ -75,7 +75,9 @@ def _payload(**overrides):
         "kind": "verdict",
         "verdict": "approve",
         "confidence": "high",
-        "grounds": [{"source": "ci_pinned_sha"}],
+        "grounds": [
+            {"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}
+        ],
     }
     body.update(overrides)
     return body

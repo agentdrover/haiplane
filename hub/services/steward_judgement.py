@@ -14,6 +14,7 @@ from hub.actionable_errors import (
     steward_closed_vocabulary_detail,
     steward_escalate_reason_required_detail,
     steward_judgement_exists_detail,
+    steward_judgement_incomplete_detail,
     steward_unknown_finding_uid_detail,
     steward_verdict_required_detail,
 )
@@ -31,6 +32,7 @@ from hub.models import (
     StewardJudgementView,
 )
 from hub.services.finding_identity import finding_uids, unresolved_uids
+from hub.services.steward_judgement_sample import steward_judgement_body_sample
 from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicable
 from hub.services.gate_events import (
     STEWARD_APPLIED,
@@ -68,6 +70,7 @@ def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
 #: Вид заказа и событие советника (#1601). Событие своё, чтобы ответ критика не
 #: считался судейским суждением в дайджесте и в приписывании отмен.
 KIND_ADVISOR = "advisor"
+KIND_VERDICT = "verdict"
 EVENT_ADVISOR_RECORDED = "steward_advisor_recorded"
 
 
@@ -172,7 +175,7 @@ def _effective_verdict(
         submitted_verdict,
         confidence,
         body.grounds,
-        detail_required=body.kind == KIND_ADVISOR,
+        detail_required=body.kind in (KIND_ADVISOR, KIND_VERDICT),
     )
     if body.kind == KIND_ADVISOR:
         object_ = submitted_verdict == "object" or bool(downgrade)
@@ -192,6 +195,37 @@ def _effective_verdict(
     if escalate_reason:
         _require_member("escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS)
     return submitted_verdict, escalate_reason
+
+
+def _require_complete_judgement(
+    body: StewardJudgementSubmit, submitted_verdict: str, confidence: str
+) -> None:
+    """422, а не запись: approve/возврат судьи без оснований или уверенности (#1924).
+
+    Прежде такой ответ хранился эскалацией ``no_grounds`` и уходил человеку
+    (8 из 17 передач за 17-20.10). Теперь судья получает отказ с образцом в
+    том же прогоне и исправляет тело. Ничего не пишется, слот и заказ
+    открыты; не исправил до дедлайна — прогон закрывает свип, решение у
+    человека. ``low`` уверенность и escalate проходят как раньше. Страховка
+    :func:`_downgrade_reason` остаётся: ответ без оснований не применяется
+    ни по какому пути.
+    """
+    if body.kind != KIND_VERDICT or submitted_verdict == "escalate":
+        return
+    if confidence == "low":
+        return
+    missing: list[str] = []
+    if not _counted_grounds(body.grounds, detail_required=True):
+        missing.append("grounds[].detail" if body.grounds else "grounds")
+    if not confidence:
+        missing.append("confidence")
+    if missing:
+        raise HTTPException(
+            422,
+            detail=steward_judgement_incomplete_detail(
+                missing, steward_judgement_body_sample(body.generation)
+            ),
+        )
 
 
 async def _emit_events(
@@ -285,6 +319,7 @@ async def record_steward_judgement(
     for closure in body.closures:
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
+    _require_complete_judgement(body, submitted_verdict, confidence)
     effective_verdict, effective_reason = _effective_verdict(
         body, submitted_verdict, confidence
     )

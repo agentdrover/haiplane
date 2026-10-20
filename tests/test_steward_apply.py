@@ -541,7 +541,9 @@ async def _judged_with(
             kind="verdict",
             verdict="approve",
             confidence="high",
-            grounds=[{"source": "ci_pinned_sha"}],
+            grounds=[
+                {"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}
+            ],
             closures=closures,
             model="gpt-5.3-codex",
         ),
@@ -1347,7 +1349,11 @@ async def _dor_judged(
     как escalate/no_grounds, и тест проверял бы понижение, а не одобрение.
     """
     if grounds is None:
-        grounds = [] if verdict == "escalate" else [{"source": "ci_pinned_sha"}]
+        grounds = (
+            []
+            if verdict == "escalate"
+            else [{"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}]
+        )
     from hub.config import TokenIdentity
     from hub.models import StewardJudgementSubmit
     from hub.services.steward_judgement import record_steward_judgement

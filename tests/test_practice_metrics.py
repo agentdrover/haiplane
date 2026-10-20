@@ -1800,7 +1800,7 @@ async def test_steward_records_are_never_human(db: aiosqlite.Connection):
             kind="verdict",
             verdict="approve",
             confidence="high",
-            grounds=[StewardGround(source="ci_pinned_sha")],
+            grounds=[StewardGround(source="ci_pinned_sha", detail="ci_run 1 success")],
         ),
         TokenIdentity("steward-bot", "steward"),
     )
@@ -1829,7 +1829,7 @@ async def test_steward_records_are_never_human(db: aiosqlite.Connection):
             kind="verdict",
             verdict="approve",
             confidence="low",
-            grounds=[StewardGround(source="ci_pinned_sha")],
+            grounds=[StewardGround(source="ci_pinned_sha", detail="ci_run 1 success")],
         ),
         TokenIdentity("steward-bot", "steward"),
     )

@@ -447,7 +447,9 @@ async def test_a_late_judgement_is_recorded_but_changes_nothing(
             kind="verdict",
             verdict="changes_requested",
             confidence="high",
-            grounds=[{"source": "ci_pinned_sha"}],
+            grounds=[
+                {"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}
+            ],
             model="gpt-5.3-codex",
         ),
         TokenIdentity("steward-bot", "steward", principal_id=42),
@@ -1903,7 +1905,7 @@ async def test_a_waiting_refusal_is_said_once_and_still_read(
 
     from hub.services import steward_shadow as sh
 
-    async def _delivery(_db, _task_id, _generation, _base_url):
+    async def _delivery(_db, _task_id, _generation, _base_url, **_kw):
         return "код доступа: ABC-123"
 
     monkeypatch.setattr(sh, "identity_delivery", _delivery)
@@ -2039,7 +2041,7 @@ def _start_env(monkeypatch, *, configured: bool = True) -> None:
     """Всё, что нужно прогону, чтобы дойти до провайдера."""
     from hub.services import steward_shadow as sh
 
-    async def _delivery(_db, _task_id, _generation, _base_url):
+    async def _delivery(_db, _task_id, _generation, _base_url, **_kw):
         return "код доступа: ABC-123"
 
     monkeypatch.setattr(sh, "identity_delivery", _delivery)

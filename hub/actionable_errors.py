@@ -266,6 +266,34 @@ def steward_escalate_reason_required_detail(
     )
 
 
+def steward_judgement_incomplete_detail(
+    missing: list[str], sample: str
+) -> dict[str, Any]:
+    """422 (#1924): approve/changes_requested без оснований или уверенности.
+
+    Ничего не записано и прогон остаётся открытым: судья исправляет тело в
+    той же сессии. Ответ без оснований и без уверенности не применяется.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_judgement_incomplete",
+            "actor_hint": "agent",
+            "missing": list(missing),
+            "sample": sample,
+            "message": (
+                "approve and changes_requested need counted grounds and a "
+                f"confidence; missing: {', '.join(missing)}. Nothing was stored."
+            ),
+            "hint": (
+                "Resend the whole judgement with every missing field filled. "
+                "Each ground needs a source and a non-empty detail naming a "
+                "concrete fact of the packet. See `sample` for the body shape."
+            ),
+            "suggested_tool": None,
+        }
+    )
+
+
 def steward_unknown_finding_uid_detail(uid: str) -> dict[str, Any]:
     """422: a closure named a finding that is not in this generation's report."""
     return enrich_error_payload(
