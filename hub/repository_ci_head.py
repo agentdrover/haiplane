@@ -29,15 +29,27 @@ ANNOUNCE_CURSOR = "announce_cursor"
 ANNOUNCE_TOP = "announce_top"
 
 
-async def running_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
-    """Задачи в running с веткой, без PR и без сдачи, по возрастанию id."""
+async def running_candidates(
+    db: aiosqlite.Connection,
+    *,
+    after_id: int = 0,
+    up_to_id: int | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Задачи в running с веткой, без PR и без сдачи, по возрастанию id.
+
+    Выборка ограничена В SQL: ``id > after_id`` (и ``id <= up_to_id``, если
+    задано) и не больше ``limit`` строк. Проход идёт по кругу страницами, а не
+    читает все задачи за раз.
+    """
     rows = await fetchall(
         db,
         "SELECT id, branch FROM tasks WHERE status='running' AND archived=0 "
         "AND COALESCE(branch, '') != '' AND submission_generation=0 "
         "AND COALESCE(submission_sha, '') = '' "
-        "AND (pr_number IS NULL OR pr_number=0) ORDER BY id",
-        (),
+        "AND (pr_number IS NULL OR pr_number=0) AND id > ? "
+        "AND (? IS NULL OR id <= ?) ORDER BY id LIMIT ?",
+        (int(after_id), up_to_id, up_to_id, int(limit)),
     )
     return [dict(r) for r in rows]
 
@@ -195,14 +207,20 @@ async def settle(
     *,
     note: str = "",
     only_from: tuple[str, ...] = OPEN_STATES,
+    attempts: int | None = None,
 ) -> bool:
-    """Перевести строку в итоговое состояние; True, если перевод сделан этим вызовом."""
+    """Перевести строку в итоговое состояние; True, если перевод сделан этим вызовом.
+
+    ``attempts`` - вернуть счётчик попыток к этому значению (отказ до отправки
+    не тратит попытку и в итоговом состоянии).
+    """
     marks = ",".join("?" for _ in only_from)
     async with write_transaction(db):
         cur = await db.execute(
-            "UPDATE ci_head_runs SET state=?, note=? WHERE task_id=? AND sha=? "  # nosec B608 - placeholders only
+            "UPDATE ci_head_runs SET state=?, note=?, "  # nosec B608 - placeholders only
+            "attempts=COALESCE(?, attempts) WHERE task_id=? AND sha=? "
             f"AND state IN ({marks})",
-            (state, note, task_id, sha, *only_from),
+            (state, note, attempts, task_id, sha, *only_from),
         )
         return (cur.rowcount or 0) == 1
 
@@ -213,24 +231,28 @@ ANNOUNCE_PAGES = 4
 
 
 async def unannounced_verified(
-    db: aiosqlite.Connection, limit: int = ANNOUNCE_PAGE, before_id: int | None = None
+    db: aiosqlite.Connection,
+    limit: int = ANNOUNCE_PAGE,
+    before_id: int | None = None,
+    after_id: int = 0,
 ) -> list[dict[str, Any]]:
     """Подтверждённые попытки отчёта по головам журнала, ещё не объявленные.
 
     Новые первыми и постранично (``before_id``): строка, которую нельзя
     объявить (контракт сменился после подтверждения), остаётся в выборке, и
     пачка таких не должна вытеснять объявляемые за границу страницы.
+    ``after_id`` - нижняя граница (строго выше): так читаются только НОВЫЕ строки.
     """
     rows = await fetchall(
         db,
         "SELECT a.* FROM ci_report_attempts a JOIN ci_head_runs j "
         "ON j.task_id=a.task_id AND j.sha=a.head_sha "
-        "WHERE a.trust='verified' AND (? IS NULL OR a.id < ?) "
+        "WHERE a.trust='verified' AND (? IS NULL OR a.id < ?) AND a.id > ? "
         "AND NOT EXISTS (SELECT 1 FROM ci_head_announced n "
         "WHERE n.task_id=a.task_id AND n.sha=a.head_sha "
         "AND n.attempt_key = a.run_id || ':' || a.run_attempt) "
         "ORDER BY a.id DESC LIMIT ?",
-        (before_id, before_id, limit),
+        (before_id, before_id, int(after_id), limit),
     )
     return [dict(r) for r in rows]
 
@@ -273,7 +295,11 @@ async def set_state(db: aiosqlite.Connection, key: str, value: int) -> None:
 
 
 async def overdue_waits(
-    db: aiosqlite.Connection, minutes: int, limit: int = 20
+    db: aiosqlite.Connection,
+    minutes: int,
+    limit: int = 20,
+    only: tuple[int, str] | None = None,
+    after_task_id: int = 0,
 ) -> list[dict[str, Any]]:
     """Головы, чьего итога ждут дольше срока и о ком ещё не сказано вслух.
 
@@ -281,8 +307,14 @@ async def overdue_waits(
     ``declined``), и только ТЕКУЩАЯ голова (наибольший ``seen_seq``): прежние перекрыты
     новыми коммитами и ждать от них нечего. Итог объявлен (любая реальная
     попытка в ``ci_head_announced``) или это ожидание уже названо
-    (``timeout:<число заявок>``) - строки нет.
+    (``timeout:<число заявок>``) - строки нет. ``only`` - (задача, sha): то же
+    условие для ОДНОЙ строки, чтобы перепроверить его внутри транзакции записи.
+
+    Область задачи (ветка головы, нет сдачи и PR) проверяется В SQL: задачи вне
+    неё не занимают окно ``limit``. ``after_task_id`` - круговой курсор вызывающего
+    для фильтров, что остаются в Python (политика, голова).
     """
+    pin_task, pin_sha = only if only else (None, None)
     rows = await fetchall(
         db,
         "SELECT j.task_id, j.sha, j.branch, j.attempts, "
@@ -291,7 +323,10 @@ async def overdue_waits(
         "FROM ci_head_runs j JOIN tasks t ON t.id=j.task_id "
         "WHERE j.state IN ('reserved', 'requested', 'observed', 'exhausted') "
         "AND t.status='running' "
-        "AND t.archived=0 "
+        "AND t.archived=0 AND (? IS NULL OR (j.task_id=? AND j.sha=?)) "
+        "AND t.branch=j.branch AND t.submission_generation=0 "
+        "AND COALESCE(t.submission_sha, '')='' "
+        "AND (t.pr_number IS NULL OR t.pr_number=0) AND j.task_id > ? "
         "AND COALESCE(j.reserved_at, j.first_seen_at) <= datetime('now', ?) "
         "AND j.seen_seq = (SELECT MAX(x.seen_seq) FROM ci_head_runs x "
         "WHERE x.task_id=j.task_id) "
@@ -300,7 +335,14 @@ async def overdue_waits(
         "(n.attempt_key NOT LIKE 'timeout:%' "
         "OR n.attempt_key = 'timeout:' || j.attempts)) "
         "ORDER BY j.task_id LIMIT ?",
-        (f"-{int(minutes)} minutes", limit),
+        (
+            pin_task,
+            pin_task,
+            pin_sha,
+            int(after_task_id),
+            f"-{int(minutes)} minutes",
+            limit,
+        ),
     )
     return [dict(r) for r in rows]
 
@@ -324,32 +366,42 @@ async def top_attempt_id(db: aiosqlite.Connection) -> int:
     return int(rows[0]["top"])
 
 
-async def prune_finished(db: aiosqlite.Connection, *, days: int) -> int:
-    """Убрать строки журналов задач, завершённых или архивных дольше ``days`` суток."""
-    removed = 0
-    marks = f"-{int(days)} days"
-    async with write_transaction(db):
-        for table in ("ci_head_announced", "ci_head_runs"):
-            cur = await db.execute(
-                f"DELETE FROM {table} WHERE task_id IN (SELECT id FROM tasks "  # nosec B608 - fixed names
-                "WHERE (status IN ('completed', 'failed', 'rejected') OR archived=1) "
-                "AND updated_at < datetime('now', ?))",
-                (marks,),
-            )
-            removed += cur.rowcount or 0
-    return removed
+#: Задач, журналы которых очистка убирает за вызов (бюджет SQL).
+PRUNE_BATCH = 200
 
 
-async def reset_announce_queue(db: aiosqlite.Connection, top: int) -> None:
-    """Новая вершина очереди и курсор с вершины - ОДНОЙ транзакцией.
+async def prune_finished(
+    db: aiosqlite.Connection, *, days: int, batch: int = PRUNE_BATCH
+) -> int:
+    """Убрать журналы задач, ЗАВЕРШЁННЫХ дольше ``days`` суток, порцией задач.
 
-    Порознь прерывание между ними сохранило бы новую вершину при старом курсоре:
-    следующий проход счёл бы вершину обработанной и пропустил свежий итог.
+    Архивность сама по себе не повод: архив обратим, а журнал держит
+    идемпотентность (число запросов CI на sha, объявленные прогоны). Задача,
+    разархивированная после очистки, иначе заказала бы CI заново и объявила
+    тот же прогон второй раз. Завершённая (терминальная) задача из архива не
+    возвращается в работу, поэтому её журнал уходит независимо от архива.
+
+    Порция - целые ЗАДАЧИ, обе таблицы сразу: маркер объявления не может уйти
+    раньше своей головы, иначе отчёт по оставшейся голове объявился бы снова.
     """
     async with write_transaction(db):
-        for key, value in ((ANNOUNCE_TOP, top), (ANNOUNCE_CURSOR, 0)):
-            await db.execute(
-                "INSERT INTO ci_head_state (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, int(value)),
-            )
+        rows = await fetchall(
+            db,
+            "SELECT t.id FROM tasks t WHERE t.status IN "
+            "('completed', 'failed', 'rejected') AND t.updated_at < datetime('now', ?) "
+            "AND (EXISTS (SELECT 1 FROM ci_head_runs r WHERE r.task_id=t.id) "
+            "OR EXISTS (SELECT 1 FROM ci_head_announced n WHERE n.task_id=t.id)) "
+            "LIMIT ?",
+            (f"-{int(days)} days", int(batch)),
+        )
+        ids = [int(r["id"]) for r in rows]
+        removed = 0
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            for table in ("ci_head_announced", "ci_head_runs"):
+                cur = await db.execute(
+                    f"DELETE FROM {table} WHERE task_id IN ({marks})",  # nosec B608 - fixed names, placeholders
+                    ids,
+                )
+                removed += cur.rowcount or 0
+    return removed
