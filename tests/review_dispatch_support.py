@@ -21,7 +21,7 @@ from hub import repository as repo
 from hub.integrations import cursor_cloud, local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import TaskRefine, TaskSubmitReview
+from hub.models import AcceptanceCriterion, TaskRefine, TaskSubmitReview
 from hub.services.review_dispatch import (
     maybe_dispatch_review,
 )
@@ -166,6 +166,7 @@ async def _submitted(
     validation_commands: list[str] | None = None,
     ci_reports: list[dict] | None = None,
     override: str = "",
+    acs: list[dict] | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -198,6 +199,8 @@ async def _submitted(
             validation_commands=validation_commands,
         ),
     )
+    for ac in acs or []:
+        await repo.add_acceptance_criterion(db, task_id, AcceptanceCriterion(**ac))
     if clear_risk_class:
         # A task whose class was never computed: the state #582 calls
         # "not computed", which must never be read as low risk. NULL is that

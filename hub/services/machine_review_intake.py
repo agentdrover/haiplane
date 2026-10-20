@@ -32,6 +32,7 @@ from hub.models import (
     claims_text_origin,
 )
 from hub.services import ci_integrity, watch_notices
+from hub.services.review_oversized import names_unread_ac_test
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -311,6 +312,17 @@ async def record_machine_review(
     # audit signal (#828), where it belongs — beside the numbers, not
     # pretending to bound them.
     incomplete = body.incomplete
+    # #1933: ревьюер назвал непрочитанный тест AC строкой lost_dimensions - а
+    # сам сказал incomplete=false. Непрочитанное доказательство AC не бывает
+    # полным отчётом; признак поднимается, как raw_count выше, а не отвергается:
+    # находки такого отчёта настоящие.
+    if not incomplete and names_unread_ac_test(body.lost_dimensions):
+        log.warning(
+            "machine review for task #%s names an unread AC test but says "
+            "incomplete=false; stored as incomplete",
+            task_id,
+        )
+        incomplete = True
     # #728: the twin of the human path's guard. hub_submit_review refuses a
     # verdict from the implementer and the brief warns before the effort is
     # spent, while this door had no check at all — so the rule was bypassable
