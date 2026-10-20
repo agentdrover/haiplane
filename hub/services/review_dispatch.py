@@ -2493,20 +2493,34 @@ async def _record_top_up(
     generation: int,
     report: Mapping[str, Any],
 ) -> None:
-    """Записать: добор поставлен после ЭТОГО неполного отчёта (#1925)."""
-    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    """Записать: лестница пошла на добор после ЭТОГО неполного отчёта (#1925).
+
+    Пишется ДО обращения к диспетчеру: заказ или долг второй двери
+    коммитятся там раньше, чем вызов вернётся, и упавший вызов не должен
+    оставить заказ без записи, ради которой его ждут. Исход обращения
+    (отказ, заказ, замена) к записи не относится — его говорят заказы и алерты.
+    """
     await repo.insert_event(
         db,
         kind=LADDER_TOP_UP_EVENT,
         task_id=task_id,
         actor="policy",
-        payload={
-            "generation": generation,
-            "dispatch_id": dict(row)["id"] if row is not None else None,
-            "after_review_id": report.get("id"),
-        },
+        payload={"generation": generation, "after_review_id": report.get("id")},
     )
     await db.commit()
+
+
+async def _refused_by_name_since(
+    db: aiosqlite.Connection, task_id: int, after_update_id: int
+) -> bool:
+    """Отказ принудительного deep (потолок, круг) уже назван своим алертом после метки."""
+    rows = await fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id = ? AND id > ? "
+        "AND kind = 'alert' AND (instr(content, ?) > 0 OR instr(content, ?) > 0)",
+        (task_id, after_update_id, FORCED_DEEP_CAP_MARK, FORCED_DEEP_CIRCLE_MARK),
+    )
+    return bool(rows)
 
 
 async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
@@ -2608,8 +2622,10 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
         await db.commit()
         return False
 
+    await _record_top_up(db, task_id, generation, report)
+    feed_mark = await _last_update_id(db, task_id)
     dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
-    if not dispatched:
+    if not dispatched and not await _refused_by_name_since(db, task_id, feed_mark):
         # maybe_dispatch_review already alerted when policy asked and the call
         # failed; when policy never asked, silence there is correct. Either
         # way the human is the next reader, and the cause is on the card.
@@ -2623,8 +2639,6 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             + ladder_generation_tag(generation),
         )
         await db.commit()
-    else:
-        await _record_top_up(db, task_id, generation, report)
     return dispatched
 
 

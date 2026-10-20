@@ -354,19 +354,6 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
     assert await dispatcher._forced_deep_past_circle(db, task, "deep", "") is True
     cases["circle"] = (circle, WHY_CIRCLE)
 
-    # (а') и круг, и потолок deep — с общим алертом лестницы ПОСЛЕ конкретного
-    # (maybe_top_up_incomplete пишет его всегда): конкретная причина не теряется.
-    for name in ("cap", "circle"):
-        await repo.add_task_update(
-            db,
-            cases[name][0],
-            "hub",
-            "alert",
-            "Дешёвый прогон сдал неполный отчёт, а добор тяжёлым профилем "
-            f"{dispatcher.LADDER_ORDER_FAILED_MARK}. Решение за человеком (#879)."
-            + dispatcher.ladder_generation_tag(1),
-        )
-
     # (в) потолок лестницы: настоящий maybe_top_up_incomplete на двух платных
     # прогонах и неполном deep-отчёте (вторая ось выключена).
     monkeypatch.setattr(config, "REVIEW_MODEL_CASCADE_MAX", 0)

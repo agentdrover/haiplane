@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 from hub.services import review_dispatch as dispatcher
@@ -22,6 +23,7 @@ from tests.test_steward_waits_for_ladder import (  # noqa: F401 - автоисп
     _last_report_id,
     _lite_incomplete,
     _report_row,
+    _alerts,
     _task_dict,
     steward_env,
 )
@@ -285,7 +287,6 @@ async def test_the_ladder_records_the_top_up_it_places(
     assert len(events) == 1
     payload = __import__("json").loads(events[0]["payload"])
     assert payload["after_review_id"] == report_id and payload["generation"] == 1
-    assert payload["dispatch_id"], "связь с заказом записана"
     assert await top_up_in_flight(db, await _task_dict(db, task_id))
 
 
@@ -298,3 +299,137 @@ async def test_an_act_that_already_produced_a_report_is_not_its_absence(
     await _report_row(db, task_id, incomplete=True, profile="deep")
     why = await ladder_why(db, await _task_dict(db, task_id))
     assert why is not None and why.code == WHY_UNKNOWN, why
+
+
+# ---------------------------------------------------------------------------
+# Круг 3 (Codex поверх): записанная связь переживает сбои, замены и смешение
+# отчётов; следующая попытка не прячется за исходом прежней.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_debt_left_by_a_crash_mid_order_is_still_waited_for(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 3, П1: долг второй двери остался, диспетчер упал — поступок уже записан."""
+    _, task_id = await _lite_incomplete(db, "round3-crash-mid-order")
+
+    async def _crash(_db, _task_id, **_kwargs):
+        await _dispatch_row(
+            db,
+            task_id,
+            status="second_door",
+            profile="deep",
+            agent_id="",
+            principal=None,
+        )
+        raise RuntimeError("подготовка локальной замены упала")
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _crash)
+    with pytest.raises(RuntimeError):
+        await dispatcher.maybe_top_up_incomplete(db, task_id)
+    task = await _task_dict(db, task_id)
+    assert await top_up_in_flight(db, task), "долг есть и поступок записан"
+    assert await order_due_runs(db) == 0
+
+
+async def test_a_local_replacement_report_is_not_called_a_missing_report(
+    db: aiosqlite.Connection,
+):
+    """Круг 3, П2: облачный заказ заменён локальным, у замены свой неполный отчёт."""
+    _, task_id = await _lite_incomplete(db, "round3-local-replacement")
+    await _dispatch_row(db, task_id, status="failed", profile="deep", top_up=True)
+    await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id) "
+        "VALUES (?, 1, 'local:1', 'r', 'qwen', 'deep', 'done', 'local', 9)",
+        (task_id,),
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="qwen",
+        raw_count=1,
+        incomplete=True,
+        incomplete_reason="profile",
+        profile="deep",
+        principal_id=9,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Неполный отчёт профиля «deep»: {dispatcher.NO_CLOUD_AFTER_LOCAL_MARK} — x"
+        + dispatcher.ladder_generation_tag(1),
+    )
+    await db.commit()
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None and why.code == "local_deep_no_cloud", why
+
+
+async def test_a_complete_axis_report_is_not_turned_into_an_incomplete_one(
+    db: aiosqlite.Connection,
+):
+    """Круг 3, П3: ось дала ПОЛНЫЙ отчёт, позже пришёл чужой неполный."""
+    _, task_id = await _lite_incomplete(db, "round3-complete-then-foreign")
+    await _dispatch_row(db, task_id, status="done", profile="deep")
+    await _report_row(db, task_id, incomplete=True, profile="deep")
+    after = await _last_report_id(db, task_id)
+    axis = await _dispatch_row(
+        db, task_id, status="done", profile="deep", agent_id="r2"
+    )
+    await _cascade_event(db, task_id, dispatch_id=axis, after=after)
+    await _report_row(db, task_id, incomplete=False, profile="deep")
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="other",
+        raw_count=1,
+        incomplete=True,
+        incomplete_reason="profile",
+        profile="lite",
+        principal_id=PRINCIPAL + 1,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
+    )
+    await db.commit()
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None and why.code == WHY_UNKNOWN, why
+
+
+async def test_a_new_failed_attempt_is_not_hidden_behind_an_old_refusal(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 3, П4: первая попытка упёрлась в потолок deep, вторая — в конфигурацию."""
+    _, task_id = await _lite_incomplete(db, "round3-old-refusal")
+    task = await _task_dict(db, task_id)
+
+    async def _cap_exhausted(_db, _task, _generation):
+        return 3
+
+    monkeypatch.setattr(dispatcher, "deep_cap_exhausted", _cap_exhausted)
+
+    async def _refuse_by_cap(_db, _task_id, **_kwargs):
+        return not await dispatcher._forced_deep_over_cap(db, task, 1, "deep", "")
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refuse_by_cap)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    cap_feed = "\n".join(await _alerts(db, task_id))
+    assert dispatcher.LADDER_ORDER_FAILED_MARK not in cap_feed, (
+        "конкретный отказ сам называет причину; общий алерт поверх него не нужен"
+    )
+    assert (await ladder_why(db, task)).code == "deep_cap"
+
+    async def _refuse_by_config(_db, _task_id, **_kwargs):
+        return False  # молчаливый отказ: конкретного алерта нет
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refuse_by_config)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert (await ladder_why(db, task)).code == "top_up_not_ordered"

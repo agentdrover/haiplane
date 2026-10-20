@@ -225,21 +225,14 @@ async def _recorded_outcome(
         "ORDER BY id DESC",
         (task_id,),
     )
-    generic = ""
     for row in rows:
         text = str(row["content"] or "")
         if tag not in text:
             continue  # алерт другой сдачи (или без хвоста) — не наш
         for mark, code in marks:
             if mark in text:
-                if code == WHY_ORDER_FAILED:
-                    # Общий алерт «поставить не удалось» лестница пишет ПОСЛЕ
-                    # конкретного отказа (потолок deep, круг): конкретный
-                    # старше, но он и есть причина.
-                    generic = generic or code
-                    break
                 return code
-    return generic
+    return ""
 
 
 async def ladder_why(
@@ -248,9 +241,10 @@ async def ladder_why(
     """Почему лестница не довела отчёт текущей сдачи до полного; None — отчёта нет.
 
     Порядок: заявленный отказ среды (по самому отчёту); добор ещё в полёте
-    (значит, судью заказал срок ожидания); иначе новейший алерт лестницы за
-    эту сдачу. Ничего из этого — «причина не установлена». Читает только то,
-    что лестница записала сама, и новых решений не принимает.
+    (значит, судью заказал срок ожидания); исход ПОСЛЕДНЕГО поступка лестницы
+    по его записи; новейший алерт лестницы за эту сдачу; заказ добора, не
+    давший отчёта. Ничего из этого — «причина не установлена». Читает только
+    то, что лестница записала сама, и новых решений не принимает.
     """
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
@@ -266,13 +260,19 @@ async def ladder_why(
     if await top_up_in_flight(db, task):
         return LadderWhy(WHY_IN_FLIGHT)
     acts = await _ladder_acts(db, task_id, generation)
-    acted = await _last_act_outcome(db, acts)
-    if acted is not None:
-        return acted
+    verdict, silent_top_up = await _last_act_outcome(db, acts)
+    if verdict is not None:
+        return verdict
     code = await _recorded_outcome(db, task_id, generation)
     if code in (WHY_AXIS_NO_REPORT, WHY_AXIS_EXHAUSTED):
         return _axis_code(acts, code)
-    return LadderWhy(code or WHY_UNKNOWN)
+    if code:
+        return LadderWhy(code)
+    if silent_top_up:
+        row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+        status = str(dict(row)["status"] or "") if row is not None else "нет заказа"
+        return LadderWhy(WHY_TOP_UP_NO_REPORT, status)
+    return LadderWhy(WHY_UNKNOWN)
 
 
 def _axis_code(acts: list[dict[str, Any]], alert_code: str) -> LadderWhy:
@@ -298,29 +298,38 @@ def _axis_code(acts: list[dict[str, Any]], alert_code: str) -> LadderWhy:
 
 async def _last_act_outcome(
     db: aiosqlite.Connection, acts: list[dict[str, Any]]
-) -> LadderWhy | None:
-    """Исход ПОСЛЕДНЕГО поступка лестницы по его записи, если он ничего не дал.
+) -> tuple[LadderWhy | None, bool]:
+    """Исход ПОСЛЕДНЕГО поступка лестницы по его записи: (причина, добор молчит).
 
-    Отказанная попытка не
-    запускалась (причина — в её записи), поставленный заказ кончился без отчёта
-    (связь — ``after_review_id`` и принципал заказа, ``cascade_outcome``).
+    Отказанная попытка второй оси не запускалась — причина в её записи. Иначе
+    смотрим на отчёты ПОСЛЕ ``after_review_id`` поступка, любого принципала:
+    заказ мог быть заменён (вторая дверь), и отчёт замены — тоже отчёт этого
+    поступка. Их нет — поступок ничего не дал (ось называется сразу, добор —
+    вторым вопросом ``silent_top_up``: его отказы названы своими алертами).
+    Первый отчёт после поступка полный — неполнота последнего отчёта пришла
+    не от него, и приписывать её поступку нельзя.
     """
     if not acts or acts[-1]["data"] is None:
-        return None
+        return None, False
     last = acts[-1]
     if not _placed(last):
-        return LadderWhy(WHY_AXIS_NOT_PLACED, str(last["data"].get("reason") or ""))
-    if await dispatcher.cascade_outcome(db, last) != "pending":
-        return None
-    if last["kind"] == dispatcher.MODEL_CASCADE_EVENT:
-        return LadderWhy(WHY_AXIS_NO_REPORT)
-    rows = await fetchall(
-        db,
-        "SELECT status FROM review_dispatches WHERE id=?",
-        (int(last["data"].get("dispatch_id") or 0),),
+        return LadderWhy(
+            WHY_AXIS_NOT_PLACED, str(last["data"].get("reason") or "")
+        ), False
+    after = int(last["data"].get("after_review_id") or 0)
+    reports = await repo.machine_reviews_of_generation(
+        db, int(last["task_id"]), int(last["data"].get("generation") or 0)
     )
-    status = str(dict(rows[0])["status"] or "") if rows else ""
-    return LadderWhy(WHY_TOP_UP_NO_REPORT, status)
+    later = [dict(r) for r in reports if int(dict(r)["id"]) > after]
+    if later:
+        return (
+            (None, False)
+            if later[0].get("incomplete")
+            else (LadderWhy(WHY_UNKNOWN), False)
+        )
+    if last["kind"] == dispatcher.MODEL_CASCADE_EVENT:
+        return LadderWhy(WHY_AXIS_NO_REPORT), False
+    return None, True
 
 
 async def incomplete_escalation_line(
