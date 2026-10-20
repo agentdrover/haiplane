@@ -3165,7 +3165,25 @@ async def detect_branch_stacking(
     Advisory by design: a stack can be a deliberate decision, so this never
     blocks and never raises.
     """
-    return (await assess_branch_stacking(db, task_id, branch)).as_advisory()
+    assessment = await assess_branch_stacking(db, task_id, branch)
+    advisory = assessment.as_advisory()
+    # #1913: за этот ответ заплачено сетью — показ скажет его с возрастом.
+    # Запоминается и «спросили, ответа не было» — с причиной: иначе показ
+    # соврал бы «хаб не проверял».
+    from hub.services import gate_observations
+
+    sha = str(dict(await repo.get_task(db, task_id) or {}).get("submission_sha") or "")
+    gate_observations.record(
+        gate_observations.STACKING,
+        task_id,
+        gate_observations.stacking_key(branch, sha),
+        {
+            "message": (advisory or {}).get("message", ""),
+            "outcome": assessment.outcome,
+            "reason": str(getattr(assessment, "reason", "") or ""),
+        },
+    )
+    return advisory
 
 
 async def _stack_ancestry(

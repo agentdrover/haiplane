@@ -1424,8 +1424,12 @@ def _brief_ci_integrity_lines(brief: dict[str, Any]) -> list[str]:
     lines = [f"\nCI integrity: {block.get('gap') or block.get('state')}"]
     lines.extend(
         f"  {s.get('path')}:{s.get('line')} [{s.get('rule')}]"
-        for s in (block.get("signs") or [])[:20]
+        for s in (block.get("signs") or [])  # все: scan_hash покрывает каждый признак
     )
+    if block.get("scan_hash"):
+        lines.append(
+            f"  scan_hash (return it in your ci_integrity answer): {block['scan_hash']}"
+        )
     lines.append(f"  Question: {block.get('question', '')}")
     if block.get("note"):
         lines.append(f"  Note: {block['note']}")
@@ -1593,11 +1597,9 @@ async def hub_task_status(
                 "hint": "hub_task_status(task_id, updates=-1) reads the whole feed; full=true the whole task.",
             }
         )
-    # refresh syncs the task with its dispatch job — a state transition, not a
-    # read. A read-only caller (watcher, #1556) gets the stored state instead;
-    # opening that POST to it would be a hole in the role, not a convenience.
-    if identity_context_get()[1] != "watcher":
-        await _api_post(f"/api/tasks/{task_id}/refresh")
+    # #1913: чтение не будит refresh. Он переводит задачу по завершённому job
+    # через гейты (с fetch) — это переход, а не чтение; его делает поллер
+    # (poller.py, transition_after_agent_done), у наблюдателя (#1556) его нет.
     task = await _api_get(f"/api/tasks/{task_id}")
     if full:
         return structured_tool_result(
@@ -3883,8 +3885,8 @@ async def hub_submit_machine_review(
         orchestrator: Client name (e.g. claude-code-workflow).
         model: Model id used by review agents.
         agent: Submitting agent name.
-        ci_integrity: {verdict: explained|suspicious, explanation_ru} — only
-            when the brief carries a ci_integrity block (#1688).
+        ci_integrity: {verdict, explanation_ru, scan_hash} — scan_hash from
+            the brief's ci_integrity block, else the answer is dropped.
     """
     body: dict[str, Any] = {
         "raw_count": raw_count,
