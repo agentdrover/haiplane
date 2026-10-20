@@ -1202,32 +1202,6 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     return BranchUpdateOutcome.unavailable
 
 
-async def _diff_of_resolved(
-    repo: str,
-    base: str,
-    branch: str,
-    base_sha: str | None,
-    branch_sha: str | None,
-    context: int,
-) -> str | None:
-    """``git diff -U<context> base...branch`` по уже разрешённым sha, или None."""
-    if base_sha is None or branch_sha is None:
-        log.warning(
-            "branch_diff: %r not found in %s",
-            base if base_sha is None else branch,
-            repo,
-        )
-        return None
-    rc, out, _ = await _git(
-        "diff",
-        f"-U{max(0, int(context))}",
-        f"{base_sha}...{branch_sha}",
-        repo=repo,
-        check=False,
-    )
-    return out if rc == 0 else None
-
-
 class GitOpsIntegration:
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
@@ -2157,28 +2131,41 @@ class GitOpsIntegration:
         becomes None. A sha passed instead of a branch name still resolves:
         ``origin/<sha>`` misses, the bare sha hits.
         """
+        return await self._branch_diff(repo, base, branch, context, fetch=True)
+
+    async def branch_diff_local(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
+        """``branch_diff`` без сети (#1913): ref не нашёлся — ``None``, а не fetch."""
+        return await self._branch_diff(repo, base, branch, context, fetch=False)
+
+    async def _branch_diff(
+        self, repo: str, base: str, branch: str, context: int, *, fetch: bool
+    ) -> str | None:
         base_sha = await _resolve_ref_remote_first(base, repo)
         branch_sha = await _resolve_ref_remote_first(branch, repo)
-        if base_sha is None or branch_sha is None:
+        if fetch and (base_sha is None or branch_sha is None):
             # Best effort, exactly as in branch_diff_paths: a workspace that
             # cannot reach origin still has refs, and a network blip must not
             # turn a readable diff into an unreadable one.
             await _git("fetch", "origin", base, branch, repo=repo, check=False)
             base_sha = base_sha or await _resolve_ref_remote_first(base, repo)
             branch_sha = branch_sha or await _resolve_ref_remote_first(branch, repo)
-        return await _diff_of_resolved(
-            repo, base, branch, base_sha, branch_sha, context
+        if base_sha is None or branch_sha is None:
+            log.warning(
+                "branch_diff: %r not found in %s",
+                base if base_sha is None else branch,
+                repo,
+            )
+            return None
+        rc, out, _ = await _git(
+            "diff",
+            f"-U{max(0, int(context))}",
+            f"{base_sha}...{branch_sha}",
+            repo=repo,
+            check=False,
         )
-
-    async def branch_diff_local(
-        self, repo: str, base: str, branch: str, context: int = 0
-    ) -> str | None:
-        """``branch_diff`` без сети (#1913): ref не нашёлся — ``None``, а не fetch."""
-        base_sha = await _resolve_ref_remote_first(base, repo)
-        branch_sha = await _resolve_ref_remote_first(branch, repo)
-        return await _diff_of_resolved(
-            repo, base, branch, base_sha, branch_sha, context
-        )
+        return out if rc == 0 else None
 
     async def integrity_read(
         self, repo: str, base: str, sha: str
