@@ -305,6 +305,7 @@ async def get_inbox_data(
         "decision_cycles": decisions["cycles"],
         # #1865: предохранитель стюарда сработал - заметно и без steward_watch.
         "steward_breaker_banner": await steward_breaker.banner_rows(db),
+        "steward_cap_banner": decisions["cap_banner"],
         "review_tasks": [row_to_task(r) for r in decisions["reviewing"]],
         "drafts": [row_to_task(r) for r in draft_rows],
         "questions": questions,

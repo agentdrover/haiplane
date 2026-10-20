@@ -6,6 +6,7 @@
 {% set review_tasks = review_tasks if review_tasks is defined else [] %}
 {% set decision_note = decision_note if decision_note is defined else "" %}
 {% set decision_cycles = decision_cycles if decision_cycles is defined else [] %}
+{% set steward_cap_banner = steward_cap_banner if steward_cap_banner is defined else [] %}
 {% set action_labels = {"approve": "Одобрить", "answer": "Ответить", "verdict": "Вердикт", "decide": "Решить"} %}
 {% macro decision_line(task_id) %}
 {% set d = decision_by_task.get(task_id) %}
@@ -65,6 +66,9 @@
 {% if decision_note %}
 <div class="task-action-note task-action-note--warning inbox-decision-note" role="status">Показаны не все решения — {{ decision_note }}.</div>
 {% endif %}
+{% for b in steward_cap_banner %}
+<div class="task-action-note task-action-note--warning inbox-steward-cap" role="status" data-steward-cap-project="{{ b.slug }}" data-steward-cap-group="{{ b.kind_group }}">{{ b.line }}.</div>
+{% endfor %}
 {% for c in decision_cycles %}
 <div class="task-action-note task-action-note--warning inbox-decision-cycle" role="status">{{ c.reason }}</div>
 {% endfor %}
