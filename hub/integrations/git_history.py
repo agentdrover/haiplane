@@ -8,9 +8,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+log = logging.getLogger("hub.git_history")
 
 GitRun = Callable[..., Awaitable[tuple[int, str, str]]]
 
@@ -108,7 +111,12 @@ async def commit_facts(
             if len(parents) > 1:
                 got = await _second_parent_message(run, parents)
                 if got is None:
-                    return None
+                    # Сбой merge-base не вправе вечно держать курсор: второй
+                    # родитель этого коммита пропущен, остальное читается.
+                    log.warning(
+                        "second parent of %s unreadable; skipped", parts[0][:12]
+                    )
+                    got = ""
                 second = got
             facts[parts[0].strip()] = {
                 "parents": parents,

@@ -136,3 +136,34 @@ async def test_revert_on_the_second_parent_of_a_merge_is_read(repo):
     assert facts is not None
     assert "This reverts" not in facts[merge]["message"]
     assert f"This reverts commit {target}" in facts[merge]["second_parent_message"]
+
+
+async def test_squash_message_is_unchanged_without_revert_lines(repo):
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    commit(repo, "b", "feat: b")
+    sh(repo, "remote", "add", "origin", str(repo))
+    sh(repo, "config", "user.email", "t@t")
+    sh(repo, "config", "user.name", "t")
+    sh(repo, "update-ref", "refs/remotes/origin/develop", "develop")
+    sh(repo, "checkout", "-q", "-b", "task-8/plain")
+    commit(repo, "c", "work one\n\nThis reverts nothing, reverts commit text inline")
+    commit(repo, "d", "work two")
+    assert await GitOpsIntegration().squash_branch(
+        8, "Plain work", "task-8/plain", repo=str(repo), base_branch="develop"
+    )
+    assert sh(repo, "log", "-1", "--format=%B") == "feat(task): plain-work (#8)"
+
+
+async def test_unreadable_second_parent_is_skipped_not_fatal():
+    calls = []
+
+    async def run(*args, **kw):
+        calls.append(args[0])
+        if args[0] == "log" and "--no-walk=unsorted" in args:
+            return 0, f"{'a' * 40}\x1f{'b' * 40} {'c' * 40}\x1fmsg\x1e", ""
+        return 1, "", "merge-base failed"
+
+    facts = await git_history.commit_facts(run, ["a" * 40])
+    assert facts is not None
+    assert facts["a" * 40]["second_parent_message"] == ""

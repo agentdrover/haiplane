@@ -263,7 +263,7 @@ async def test_revert_of_steward_approved_merge_trips_breaker(
     head = git.history[-1]["sha"]
     assert await cursor(db, pid) == head, "первый тик ставит курсор и ничего не судит"
 
-    r_a = git.commit("revert-a", revert_message(m_a))
+    git.commit("revert-a", revert_message(m_a))
     git.commit("revert-b", revert_message(m_b))
     # Без строки «This reverts commit» в теле: тема и упоминание sha - не откат.
     git.commit("revert-c", f'Revert "feat: c"\n\nОткат вручную, см. {m_c}.\n')
@@ -271,9 +271,7 @@ async def test_revert_of_steward_approved_merge_trips_breaker(
     git.commit("revert-e", revert_message(m_e))
     git.commit("revert-f", revert_message(m_f))
     # Откат через PR, влитый merge-коммитом: строка лежит в теле второго родителя.
-    r_g = git.commit(
-        "merge-pr", "Merge pull request #5", second=revert_message(m_g, "pr")
-    )
+    git.commit("merge-pr", "Merge pull request #5", second=revert_message(m_g, "pr"))
     git.commit("revert-unknown", revert_message(sha_of("never-merged")))
 
     # Падение после записи случая, до коммита: нет ни строки, ни уведомления.
@@ -290,7 +288,7 @@ async def test_revert_of_steward_approved_merge_trips_breaker(
     assert await cursor(db, pid) == head, "курсор не двинулся"
 
     assert await steward_breaker.collect_reverts(db, project) == 2
-    expected = [(task_a, "reverted", r_a), (task_g, "reverted", r_g)]
+    expected = [(task_a, "reverted", m_a), (task_g, "reverted", m_g)]
     assert await cases(db) == expected
     assert await effective_mode(db) == "shadow"
     assert await notices(db, task_a) == (1, 1)
@@ -309,6 +307,28 @@ async def test_revert_of_steward_approved_merge_trips_breaker(
     assert await steward_breaker.collect_reverts(db, project) == 0
     assert await cases(db) == expected
     assert await notices(db, task_a) == (1, 1)
+
+    # Возврат релиза: main->develop приходит merge-коммитом, второй родитель
+    # несёт те же тела (сквош с COMMIT_MESSAGES). Ключ случая - доставка, поэтому
+    # ни строки, ни уведомления не прибавилось, в том числе после снятия.
+    git.commit(
+        "release-return-1", "Merge main into develop", second=revert_message(m_a)
+    )
+    assert await steward_breaker.collect_reverts(db, project) == 0
+    assert await clear_false_approval(db, task_a, "denis", "разобрано") == 1
+    git.commit(
+        "release-return-2", "Merge main into develop", second=revert_message(m_a)
+    )
+    assert await steward_breaker.collect_reverts(db, project) == 0
+    assert await cases(db) == expected
+    assert await notices(db, task_a) == (1, 1)
+    assert [f.task_id for f in await sticky_false_approvals(db)] == [task_g]
+    await db.execute(
+        "UPDATE steward_false_approvals SET cleared_at=NULL, cleared_by=NULL "
+        "WHERE task_id=?",
+        (task_a,),
+    )
+    await db.commit()
 
     banner = await steward_breaker.banner_rows(db)
     assert [(b["task_id"], b["source"]) for b in banner] == [
@@ -380,9 +400,9 @@ async def test_a_revert_names_a_delivery_by_a_unique_prefix_only(
     await steward_breaker.collect_reverts(db, project)
     git.commit("short-ambiguous", f"This reverts commit {'ab' * 6}")
     git.commit("short-too-short", f"This reverts commit {m_solo[:8]}")
-    r_ok = git.commit("short-unique", f"This reverts commit {m_solo[:12]}")
+    git.commit("short-unique", f"This reverts commit {m_solo[:12]}")
     assert await steward_breaker.collect_reverts(db, project) == 1
-    assert await cases(db) == [(task_solo, "reverted", r_ok)]
+    assert await cases(db) == [(task_solo, "reverted", m_solo)]
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +463,31 @@ async def test_base_red_after_steward_merge_trips_breaker(
     await tick(branch_run(m2, "failure"))
     assert await cases(db) == []
 
+    # Переходный unknown не кэшируется: прогон ещё идёт, потом стал красным.
+    g5 = git.commit("g5", "chore: parent")
+    m5 = git.commit("m5", "feat: fifth delivery")
+    task_m5 = await delivered(db, project, m5, steward_approval())
+    git.runs[g5] = [ci_run("success")]
+    running = ci_run("failure") | {"status": "in_progress", "conclusion": ""}
+    git.runs[m5] = [running]
+    await tick(branch_run(m5, "failure"))
+    assert await cases(db) == []
+    git.runs[m5] = [ci_run("failure")]
+    git.runs[g5] = [running]  # родитель ещё идёт: снова unknown
+    git.branch_runs = [branch_run(m5, "failure")]
+    project_row = await repo.get_project(db, int(project["id"]))
+    await red_base.check_project(db, project_row)
+    assert await cases(db) == []
+    git.runs[g5] = [ci_run("success")]
+    await red_base.check_project(db, project_row)
+    assert [c[:2] for c in await cases(db)] == [(task_m5, "base_red_after_merge")]
+    await db.execute("DELETE FROM steward_false_approvals")
+    await db.commit()
+    # Кэш ограничен по размеру.
+    for i in range(steward_breaker._NEGATIVE_MAX + 5):
+        steward_breaker._remember_negative((1, str(i)))
+    assert len(steward_breaker._negative) <= steward_breaker._NEGATIVE_MAX
+
     # Отменённый прогон (ручная отмена, concurrency) красным не считается, ни у
     # доставки, ни у родителя; прогон чужой ветки тоже.
     g4 = git.commit("g4", "chore: parent")
@@ -460,7 +505,7 @@ async def test_base_red_after_steward_merge_trips_breaker(
     assert await cases(db) == []
 
     # Отрицательный кэш: пока не истёк, ответ git и форжа заново не спрашивается.
-    git.runs[g4] = None
+    git.runs[g4] = [ci_run("failure")]  # устойчивый ответ: родитель красный
     await red_base.check_project(db, await repo.get_project(db, int(project["id"])))
     git.runs[g4] = [ci_run("success")]
     await red_base.check_project(db, await repo.get_project(db, int(project["id"])))
@@ -493,25 +538,36 @@ async def test_base_red_after_steward_merge_trips_breaker(
 async def test_new_sources_clear_and_report_like_existing(
     db: aiosqlite.Connection, git: FakeGit, client
 ):
-    """Два отката одного коммита; снятие первого не гасит второй; счётчик за 14 дней."""
+    """Два отката (двух доставок одной задачи); снятие первого не гасит второй; счётчик за 14 дней.
+
+    Ключ случая - откатанная доставка (P2-A): второй откат ТОЙ ЖЕ доставки был
+    бы тем же случаем, поэтому два случая дают два разных слияния.
+    """
     project = await project_with_workspace(db, "brk-clear")
-    pid = int(project["id"])
-    m = sha_of("merge-t")
-    task_t = await delivered(db, project, m, steward_approval())
+    m1, m2 = sha_of("merge-t1"), sha_of("merge-t2")
+    task_t = await delivered(db, project, m1, steward_approval())
+    await repo.record_pipeline_merge(
+        db,
+        pr_number=next(_PR),
+        merge_sha=m2,
+        project_id=int(project["id"]),
+        task_id=task_t,
+        merged_at="2026-10-20 12:00:00",
+    )
     git.commit("base-0")
     await steward_breaker.collect_reverts(db, project)
 
-    r1 = git.commit("revert-1", revert_message(m, "first"))
+    git.commit("revert-1", revert_message(m1, "first"))
     await steward_breaker.collect_reverts(db, project)
     assert await clear_false_approval(db, task_t, "denis", "разобрано") == 1
     assert await sticky_false_approvals(db) == []
 
-    r2 = git.commit("revert-2", revert_message(m, "second"))
+    git.commit("revert-2", revert_message(m2, "second"))
     await steward_breaker.collect_reverts(db, project)
     active = [(f.task_id, f.source, f.ref) for f in await sticky_false_approvals(db)]
-    assert active == [(task_t, "reverted", r2)], "второй случай остаётся активным"
-    assert [c[2] for c in await cases(db)] == [r1, r2]
-    assert [b["ref"] for b in await steward_breaker.banner_rows(db)] == [r2]
+    assert active == [(task_t, "reverted", m2)], "второй случай остаётся активным"
+    assert [c[2] for c in await cases(db)] == [m1, m2]
+    assert [b["ref"] for b in await steward_breaker.banner_rows(db)] == [m2]
 
     # Случай старше окна в счёт не входит; снятый входит.
     await db.execute(
@@ -526,7 +582,6 @@ async def test_new_sources_clear_and_report_like_existing(
     assert data["steward"]["contour"]["false_approve_events_14d"] == {"reverted": 2}
     text = "\n".join(effective_policy.format_effective_policy(data))
     assert "false_approve_events_14d: reverted 2" in text
-    assert pid  # проект тот же, что у случаев
 
 
 # --------------------------------------------------------------------------

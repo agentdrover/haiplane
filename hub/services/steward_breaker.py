@@ -234,7 +234,18 @@ async def _reverted_delivery(
 async def _trip_revert(
     db: aiosqlite.Connection, project: dict[str, Any], sha: str, message: str
 ) -> int:
-    """Случаи из одного коммита первой линии; число вставленных строк."""
+    """Случаи из одного коммита первой линии; число вставленных строк.
+
+    Ключ случая (``ref``) - sha откатанной ДОСТАВКИ, а не revert-коммита: тот же
+    откат возвращается в базу ещё раз (релиз сквошит develop в main с телами
+    коммитов, возврат main->develop приходит merge-коммитом), и ключ по revert
+    воскресил бы случай и снятое человеком. Следствие: второй откат той же
+    доставки - тот же случай; новый случай даёт откат другой доставки.
+
+    Ограничения: откат отката внутри ветки (P3-1) строкой не отличается от
+    отката; находка зависит от того, что squash репозитория сохраняет тела
+    коммитов или их строки отката (P3-5, настройка форжа).
+    """
     tripped = 0
     for prefix in dict.fromkeys(_REVERTS.findall(message)):
         merge_sha = await _reverted_delivery(db, int(project["id"]), prefix)
@@ -248,7 +259,7 @@ async def _trip_revert(
             task_id=task_id,
             source=SOURCE_REVERTED,
             generation=generation,
-            ref=sha,
+            ref=merge_sha,
             detail=(
                 f"откат слияния {merge_sha[:12]} (поколение {generation}, "
                 f"одобрено стюардом) коммитом {sha[:12]}"
@@ -379,6 +390,18 @@ async def _first_parent(project: dict[str, Any], sha: str) -> str:
 #: ответ «не доказано/неизвестно» редко меняется.
 NEGATIVE_TTL_SECONDS = 1800
 _negative: dict[tuple[int, str], float] = {}
+_NEGATIVE_MAX = 1000
+
+
+def _remember_negative(key: tuple[int, str]) -> None:
+    """Устойчивый отрицательный ответ - в кэш; размер ограничен."""
+    now = time.monotonic()
+    if len(_negative) >= _NEGATIVE_MAX:
+        for stale in [k for k, until in _negative.items() if until <= now]:
+            del _negative[stale]
+        if len(_negative) >= _NEGATIVE_MAX:
+            _negative.clear()
+    _negative[key] = now + NEGATIVE_TTL_SECONDS
 
 
 async def on_base_red(
@@ -396,7 +419,6 @@ async def on_base_red(
         proof = await steward_delivery(db, pid, red_sha)
         if proof is None:
             return False
-        _negative[(pid, red_sha)] = time.monotonic() + NEGATIVE_TTL_SECONDS
         task_id, generation = proof
         known = await fetchall(
             db,
@@ -405,6 +427,7 @@ async def on_base_red(
             (task_id, SOURCE_BASE_RED, red_sha),
         )
         if known:
+            _remember_negative((pid, red_sha))
             return False
         contract = project_policy.ci_contract_of(project)
         if not contract.workflow_path:
@@ -412,9 +435,21 @@ async def on_base_red(
         parent = await _first_parent(project, red_sha)
         if not parent:
             return False
-        if await _contract_state(project, contract, red_sha) != "red":
+        # Кэшируется только устойчивый ответ: оба прогона завершены и пары
+        # «зелёный родитель -> красная доставка» нет. Переходный unknown
+        # (прогона ещё нет, red_sha не дошёл до клона) не кэшируется - иначе
+        # fix-forward за окно кэша теряет случай навсегда.
+        red_state = await _contract_state(project, contract, red_sha)
+        if red_state == "unknown":
             return False
-        if await _contract_state(project, contract, parent) != "green":
+        if red_state != "red":
+            _remember_negative((pid, red_sha))
+            return False
+        parent_state = await _contract_state(project, contract, parent)
+        if parent_state == "unknown":
+            return False
+        if parent_state != "green":
+            _remember_negative((pid, red_sha))
             return False
         written = await record_case(
             db,
