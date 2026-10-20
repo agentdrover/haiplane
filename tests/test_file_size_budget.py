@@ -565,37 +565,59 @@ def test_update_never_raises_a_tests_entry(tmp_path):
     assert entry["measured"] == 1700
 
 
-def test_files_already_long_on_the_base_are_grandfathered_once(tmp_path):
-    """Бутстрап: PR, вводящий порог, вносит файлы, что уже были выше него на базе."""
-    _make_tree(tmp_path, tests=3000)
-    _write_lines(tmp_path, "tests/long.py", 1000)
-    _git(tmp_path, "init", "-q")
-    _git(tmp_path, "add", "-A")
-    _git(tmp_path, "commit", "-q", "-m", "base")
-
-    (tmp_path / "pyproject.toml").write_text(
+def _bootstrap_repo(root: Path) -> None:
+    """База без правила (tests=3000) с длинным файлом; рабочее дерево вводит 800."""
+    _make_tree(root, tests=3000)
+    _write_lines(root, "tests/long.py", 1000)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+    (root / "pyproject.toml").write_text(
         "[tool.haiplane.file_size]\nhub = 1500\nscripts = 1500\ntests = 800\n"
         "near_pct = 90\n",
         encoding="utf-8",
     )
-    assert _run(tmp_path, "--update").returncode == 0
+
+
+def test_a_base_without_the_rule_lets_the_tests_ledger_be_introduced(tmp_path):
+    """База с порогом выше нынешнего правила не знала: записи вносятся по замеру.
+
+    Так PR, вводящий порог, и PR/релиз, чья база старше правила, не краснеют зря;
+    после влития правила порог на базе 800 и этот путь закрыт сам.
+    """
+    _bootstrap_repo(tmp_path)
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    assert _run(tmp_path, "--base", "HEAD").returncode == 0
+    # База поменялась под ногами (ветка влила develop, файл вырос): --update
+    # перемеряет запись вверх, потому что база её потолком не связана.
+    _write_lines(tmp_path, "tests/long.py", 1377)
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    (entry,) = _ledger_waivers(tmp_path)
+    assert entry["measured"] == 1377
     assert _run(tmp_path, "--base", "HEAD").returncode == 0
 
-    _write_lines(tmp_path, "tests/long.py", 1010)  # рост запрещён и тут
-    _set_waivers(
-        tmp_path,
-        [
-            {
-                "path": "tests/long.py",
-                "measured": 1010,
-                "max": 1061,
-                "removed_by": "unclaimed",
-            }
-        ],
-    )
+
+def test_update_clamps_to_the_base_ledger_not_to_the_working_one(tmp_path):
+    """Правило действует на базе: --update зажимает по ledger базы."""
+    _tests_repo(tmp_path, waivers=[_old_tests_waiver()])
+    _write_lines(tmp_path, "tests/old.py", 900)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "old file")
+    # Рабочий ledger подогнан вверх руками; --update по базе возвращает потолок.
+    _write_lines(tmp_path, "tests/old.py", 930)
+    _set_waivers(tmp_path, [_old_tests_waiver(measured=930, max_=977)])
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    (entry,) = _ledger_waivers(tmp_path)
+    assert (entry["measured"], entry["max"]) == (900, 945)
+
+
+def test_a_malformed_base_ledger_entry_is_unreadable_not_a_traceback(tmp_path):
+    _tests_repo(tmp_path, waivers=[{"path": "tests/old.py", "removed_by": "unclaimed"}])
+    _write_lines(tmp_path, "tests/old.py", 900)
+    _set_waivers(tmp_path, [_old_tests_waiver()])
     proc = _run(tmp_path, "--base", "HEAD")
-    assert proc.returncode != 0
-    assert "tests/long.py" in proc.stdout
+    assert proc.returncode == 2
+    assert "Traceback" not in proc.stderr
 
 
 def test_unreadable_base_is_not_green(tmp_path):

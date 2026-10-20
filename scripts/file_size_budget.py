@@ -195,6 +195,20 @@ class BaseView:
     ledger: dict[str, dict]
     lines: Callable[[str], int | None]
     headroom_pct: float = DEFAULT_HEADROOM_PCT
+    thresholds: dict[str, int] = field(default_factory=dict)  # пороги на базе
+
+    def ratchet_in_force(self, tree: str, current: int) -> bool:
+        """Порог дерева на базе не выше нынешнего: правило «только сокращается» уже
+        действовало. База с более высоким порогом (до #1932 у tests 3000) его не знала:
+        там ledger ещё не нёс записей tests, и вносить их можно по нынешним замерам."""
+        return self.thresholds.get(tree, current + 1) <= current
+
+
+def _base_number(entry: dict, key: str) -> int:
+    try:
+        return int(entry[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompareError(f"запись ledger базы {entry!r}: нет числа {key}") from exc
 
 
 def _ratchet_problems(
@@ -205,26 +219,22 @@ def _ratchet_problems(
     for path, entry in sorted(ledger.items()):
         if _tree(path) not in RATCHET_TREES:
             continue
+        if not base.ratchet_in_force(_tree(path), thresholds[_tree(path)]):
+            continue
         prior = base.ledger.get(path)
         if prior is not None:
-            top_measured, top_max = int(prior["measured"]), int(prior["max"])
+            top_measured, top_max = (
+                _base_number(prior, "measured"),
+                _base_number(prior, "max"),
+            )
         else:
             on_base = base.lines(path)
-            limit = _threshold(path, thresholds)
             if on_base is None:
-                found.append((path, "новая запись: файла не было на базе"))
-                continue
-            if on_base <= limit:
-                found.append(
-                    (
-                        path,
-                        f"новая запись: на базе файл {on_base} строк, он перерос порог",
-                    )
-                )
-                continue
-            # Файл уже был выше порога до изменения: один раз вносится как есть.
-            top_measured = on_base
-            top_max = ceiling(on_base, base.headroom_pct)
+                reason = "файла не было на базе"
+            else:
+                reason = f"на базе файл {on_base} строк, в её ledger записи нет"
+            found.append((path, f"новая запись: {reason}"))
+            continue
         if int(entry["measured"]) > top_measured or int(entry["max"]) > top_max:
             found.append(
                 (
@@ -376,12 +386,14 @@ def load_ledger(path: Path) -> dict[str, dict]:
     return {w["path"]: w for w in _read_ledger(path)["waivers"]}
 
 
-def _waiver_entry(path: str, lines: int, prior: dict | None, headroom: float) -> dict:
-    """Запись ledger; у деревьев RATCHET_TREES существующая запись только опускается."""
+def _waiver_entry(
+    path: str, lines: int, prior: dict | None, clamp: dict | None, headroom: float
+) -> dict:
+    """Запись ledger; у деревьев RATCHET_TREES запись только опускается (от ``clamp``)."""
     measured, top = lines, ceiling(lines, headroom)
-    if prior is not None and _tree(path) in RATCHET_TREES:
-        measured = min(measured, int(prior["measured"]))
-        top = min(top, int(prior["max"]))
+    if clamp is not None and _tree(path) in RATCHET_TREES:
+        measured = min(measured, int(clamp["measured"]))
+        top = min(top, int(clamp["max"]))
     return {
         "path": path,
         "measured": measured,
@@ -390,13 +402,25 @@ def _waiver_entry(path: str, lines: int, prior: dict | None, headroom: float) ->
     }
 
 
-def write_ledger(sizes: dict[str, int], thresholds: dict[str, int], path: Path) -> int:
-    """Перезаписать ledger по факту; removed_by существующих записей сохраняется."""
+def write_ledger(
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    path: Path,
+    clamp: dict[str, dict] | None = None,
+) -> int:
+    """Перезаписать ledger по факту; removed_by существующих записей сохраняется.
+
+    ``clamp`` - записи, выше которых tests не поднимается: ledger базы (CI
+    сверяет с ней), пустой - зажима нет (база правила не знала), None - текущий
+    ledger (базу получить не удалось).
+    """
     raw = _read_ledger(path)
     headroom = float(raw.get("headroom_pct", DEFAULT_HEADROOM_PCT))
     prior = {w["path"]: w for w in raw["waivers"]}
     waivers = [
-        _waiver_entry(p, n, prior.get(p), headroom)
+        _waiver_entry(
+            p, n, prior.get(p), (prior if clamp is None else clamp).get(p), headroom
+        )
         for p, n in sorted(sizes.items())
         if n > _threshold(p, thresholds)
     ]
@@ -455,7 +479,54 @@ def load_base(root: Path, base: str, exact: bool) -> BaseView:
             return None
         return count_lines(bytes(_git(["show", f"{snap}:{path}"], root, text=False)))
 
-    return BaseView(ledger=ledger, lines=lines, headroom_pct=headroom)
+    try:
+        text = str(_git(["show", f"{snap}:pyproject.toml"], root))
+        base_thresholds = {
+            str(t): int(v)
+            for t, v in tomllib.loads(text)["tool"]["haiplane"]["file_size"].items()
+            if t != NEAR_KEY
+        }
+    except (CompareError, ValueError, KeyError, TypeError) as exc:
+        raise CompareError(
+            f"пороги базы {base} ({snap[:12]}) не прочитаны: {exc}"
+        ) from exc
+    return BaseView(
+        ledger=ledger, lines=lines, headroom_pct=headroom, thresholds=base_thresholds
+    )
+
+
+def _update(
+    root: Path,
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    ledger_path: Path,
+    base: BaseView | None,
+) -> int:
+    """--update: перезапись ledger; tests не поднимаются выше ledger базы."""
+    forced = base is not None and base.ratchet_in_force("tests", thresholds["tests"])
+    if base is None:
+        clamp = None
+    else:
+        clamp = base.ledger if forced else {}
+    before = load_ledger(ledger_path)
+    count = write_ledger(sizes, thresholds, ledger_path, clamp)
+    print(f"ledger перезаписан: {count} исключений")
+    known = before if clamp is None else clamp
+    added = sorted(
+        w["path"]
+        for w in load_ledger(ledger_path).values()
+        if _tree(w["path"]) in RATCHET_TREES and w["path"] not in known
+    )
+    if clamp == {}:
+        added = []  # база правила не знала: записи tests вносятся разово
+    for path in added[:ADDED_SHOWN]:
+        print(
+            f"  внимание: новая запись {path}; CI отвергнет её, если файл не был "
+            "выше порога на базе - разбейте файл"
+        )
+    if len(added) > ADDED_SHOWN:
+        print(f"  и ещё {len(added) - ADDED_SHOWN} новых записей tests")
+    return 0
 
 
 def main() -> int:
@@ -481,25 +552,8 @@ def main() -> int:
     sizes = measure(root, list(thresholds))
     ledger_path = root / LEDGER_REL
 
-    if args.update:
-        before = load_ledger(ledger_path)
-        count = write_ledger(sizes, thresholds, ledger_path)
-        print(f"ledger перезаписан: {count} исключений")
-        added = sorted(
-            w["path"]
-            for w in load_ledger(ledger_path).values()
-            if _tree(w["path"]) in RATCHET_TREES and w["path"] not in before
-        )
-        for path in added[:ADDED_SHOWN]:
-            print(
-                f"  внимание: новая запись {path}; CI отвергнет её, если файл не был "
-                "выше порога на базе - разбейте файл"
-            )
-        if len(added) > ADDED_SHOWN:
-            print(f"  и ещё {len(added) - ADDED_SHOWN} новых записей tests")
-        return 0
-
     base = None
+    base_error = ""
     if not args.no_base:
         name, exact = (
             (args.base, False) if args.base else base_from_environment(os.environ)
@@ -507,11 +561,18 @@ def main() -> int:
         try:
             base = load_base(root, name, exact)
         except CompareError as exc:
-            print(
-                f"file size: сравнить с базой {name} не удалось: {exc}", file=sys.stderr
-            )
-            return BASE_UNREADABLE
-    report = check(sizes, thresholds, load_ledger(ledger_path), near_pct, base)
+            base_error = f"file size: сравнить с базой {name} не удалось: {exc}"
+
+    if args.update:
+        return _update(root, sizes, thresholds, ledger_path, base)
+    if base_error:
+        print(base_error, file=sys.stderr)
+        return BASE_UNREADABLE
+    try:
+        report = check(sizes, thresholds, load_ledger(ledger_path), near_pct, base)
+    except CompareError as exc:  # ленивое чтение базы упало уже внутри проверки
+        print(f"file size: сравнить с базой не удалось: {exc}", file=sys.stderr)
+        return BASE_UNREADABLE
     if args.json:
         print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     else:
