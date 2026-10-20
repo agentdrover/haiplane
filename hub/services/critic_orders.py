@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import contextlib
 import hashlib
 import re
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ REPORT_OUTCOMES = ("passed", "findings", "failed")
 #: Ключ, под которым вход done оставляет на задаче sha, по которому прошёл гейт:
 #: закрепление sha внутри транзакции сверяется с ним (то же наблюдение).
 CHECKED_KEY = "_critic_checked_sha"
+#: Метка автоматического входа (поллер): savepoint вокруг bump и закрепления sha.
+AUTO_KEY = "_critic_auto_entry"
 #: Открытых заказов на задачу.
 MAX_OPEN_PER_TASK = 1
 SUBMITTABLE = ("running", "claimed", "pending_report")
@@ -252,11 +255,16 @@ async def request_from_feed(
     history = await _same_sha_history(db, task_id, sha)
     if history:
         return await _refuse_request(db, task_id, history)
-    return await _create_order(db, task_id, sha, host, caller_run)
+    return await _create_order(db, task_id, sha, host, caller_run, session_token)
 
 
 async def _create_order(
-    db: aiosqlite.Connection, task_id: int, sha: str, host: str, caller_run: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    sha: str,
+    host: str,
+    caller_run: int,
+    session_token: str,
 ) -> str:
     from hub.services import lifecycle
     from hub.services.orchestration import project_git_context
@@ -282,7 +290,8 @@ async def _create_order(
         # Всё, что проверено до сети, проверяется заново под блокировкой записи:
         # держатель мог смениться, а параллельный заказ - закрыться passed.
         other_open, last_hour, same_open = await _open_orders_for(db, task_id, sha)
-        if await cloud_holder(db, task_id) != caller_run:
+        live = await chat_pair.run_of_session(db, session_token, task_id)
+        if live != caller_run or await cloud_holder(db, task_id) != caller_run:
             blocked = "not_cloud_holder"
         elif other_open >= MAX_OPEN_PER_TASK:
             blocked = "quota_open"
@@ -604,19 +613,12 @@ def assert_pin_matches(task: dict[str, Any], pinned_sha: str) -> None:
         )
 
 
-async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
-    """Автоматический вход (поллер, без HTTP): True - сдача удержана, задача в needs_decision."""
+async def _hold(
+    db: aiosqlite.Connection, task: dict[str, Any], verdict: Verdict
+) -> None:
+    """Удержать автоматическую сдачу: needs_decision, alert, событие. Коммитит вызывающий."""
     from hub.services import watch_notices
-    from hub.services.lifecycle import PREPARED_CI_SHA
-    from hub.services.orchestration import review_approved_for_current_submission
 
-    if CHECKED_KEY in task or review_approved_for_current_submission(task):
-        return False
-    verdict = await evaluate(db, task, str(task.get(PREPARED_CI_SHA) or ""))
-    if verdict.applicable and not verdict.cause:
-        task[CHECKED_KEY] = verdict.sha  # то же наблюдение сверит закрепление sha
-    if not (verdict.applicable and verdict.cause):
-        return False
     task_id = int(task["id"])
     await repo.update_task(db, task_id, status="needs_decision")
     await repo.add_task_update(
@@ -634,7 +636,65 @@ async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool
         actor="hub",
         payload={"reason": "critic_not_passed", "cause": verdict.cause},
     )
+
+
+async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Автоматический вход (поллер, без HTTP): True - сдача удержана, задача в needs_decision."""
+    from hub.services.lifecycle import PREPARED_CI_SHA
+    from hub.services.orchestration import review_approved_for_current_submission
+
+    if CHECKED_KEY in task or review_approved_for_current_submission(task):
+        return False
+    verdict = await evaluate(db, task, str(task.get(PREPARED_CI_SHA) or ""))
+    if verdict.applicable and not verdict.cause:
+        # То же наблюдение сверит закрепление sha; savepoint pin_guard вернёт
+        # bump, если закрепление увидит другую голову.
+        task[CHECKED_KEY] = verdict.sha
+        task[AUTO_KEY] = True
+    if not (verdict.applicable and verdict.cause):
+        return False
+    await _hold(db, task, verdict)
     return True
+
+
+class PinGuard:
+    """Итог ``pin_guard``: сдача удержана (True) или прошла."""
+
+    refused = False
+
+
+@contextlib.asynccontextmanager
+async def pin_guard(db: aiosqlite.Connection, task: dict[str, Any]):
+    """Автоматический вход: bump и закрепление sha - в savepoint (#1953).
+
+    Без него отказ ``sha_changed`` после bump оставил бы поколение без
+    закрепления в транзакции поллера, и её закоммитила бы СЛЕДУЮЩАЯ задача
+    прохода. Отказ откатывает bump и удерживает задачу; прочие входы (HTTP: свой
+    savepoint ``done_flow``) и любые другие исключения проходят как были.
+    """
+    guard = PinGuard()
+    if not task.get(AUTO_KEY):
+        yield guard
+        return
+    await db.execute("SAVEPOINT critic_pin")
+    try:
+        yield guard
+    except HTTPException as exc:
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
+        if detail.get("reason") != "critic_not_passed":
+            await db.execute("RELEASE critic_pin")
+            raise
+        await db.execute("ROLLBACK TO critic_pin")
+        await db.execute("RELEASE critic_pin")
+        await _hold(
+            db, task, Verdict(True, str(detail.get("cause")), str(detail.get("sha")))
+        )
+        guard.refused = True
+    except BaseException:
+        await db.execute("RELEASE critic_pin")
+        raise
+    else:
+        await db.execute("RELEASE critic_pin")
 
 
 # ---------------------------------------------------------------------------

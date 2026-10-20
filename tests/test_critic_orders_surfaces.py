@@ -209,8 +209,6 @@ async def test_the_order_is_rechecked_under_the_write_lock(world, tip):
 
 async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
     """pending_report и автоматический вход закрепляют/сверяют проверенный sha."""
-    from fastapi import HTTPException
-
     from hub.services import orchestration
 
     # pending_report: ревью привязано к sha, по которому прошёл критик, а не к старому.
@@ -244,11 +242,14 @@ async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
         (await co._rows(world.db, "SELECT * FROM tasks WHERE id=?", (auto.task_id,)))[0]
     )
     before = await co._task_state(world, auto.task_id)
-    with pytest.raises(HTTPException) as refused:
-        await orchestration.transition_after_agent_done(world.db, row, has_done=True)
-    assert refused.value.detail["cause"] == "sha_changed"
-    await world.db.rollback()
-    assert await co._task_state(world, auto.task_id) == before
+    held = await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    await world.db.commit()
+    assert held == "needs_decision"
+    status, generation, pinned, _feed = await co._task_state(world, auto.task_id)
+    assert (status, generation, pinned) == ("needs_decision", before[1], before[2])
+    assert any("sha_changed" in a for a in await co._alerts(world, auto.task_id))
+    # Ничего не протекло: у соседней задачи прохода поколение не тронуто.
+    assert (await co._task_state(world, cloud.task_id))[1] == 1
 
 
 async def test_a_plain_key_gets_a_reason_but_a_bare_mention_stays_text(world, tip):
@@ -269,3 +270,22 @@ async def test_a_plain_key_gets_a_reason_but_a_bare_mention_stays_text(world, ti
         )
     ).status_code == 200
     assert len(await co._alerts(world, cloud.task_id)) == before
+
+
+async def test_a_session_revoked_during_the_network_step_orders_nothing(world, tip):
+    """Сессия вызывающего отозвана, пока шла сеть: под write-локом доказательство перечитано."""
+    cloud = await co._cloud(world, tip)
+    real = lifecycle.resolve_branch_tip
+
+    async def _revoke(db, task_id, branch):
+        await db.execute("UPDATE chat_pair_sessions SET revoked_at = datetime('now')")
+        await db.commit()
+        return co.SHA_A, ""
+
+    lifecycle.resolve_branch_tip = _revoke
+    try:
+        assert (await co._say(world, cloud, co._line(co.SHA_A))).status_code == 200
+    finally:
+        lifecycle.resolve_branch_tip = real
+    assert await co._orders(world, cloud.task_id) == []
+    assert any("not_cloud_holder" in a for a in await co._alerts(world, cloud.task_id))

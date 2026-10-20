@@ -6313,9 +6313,9 @@ async def transition_after_agent_done(
         return halted
 
     # #1953: автоматический вход (поллер): сдача без passed критика - hold.
-    from hub.services.critic_orders import automatic_gate
+    from hub.services import critic_orders
 
-    if has_done and await automatic_gate(db, task):
+    if has_done and await critic_orders.automatic_gate(db, task):
         return "needs_decision"
 
     if has_done and not completion_requires_review(task):
@@ -6381,7 +6381,6 @@ async def transition_after_agent_done(
     if has_done:
         # Unreviewed done report = a work submission (#305): bumping the
         # generation invalidates any APPROVED verdict from earlier work.
-        await repo.bump_submission_generation(db, task_id)
         # #1122: гейты сдачи для headless-пути — ЗДЕСЬ, до развилки маршрутов.
         # Headless уходит в ревью двумя путями: конвейером auto-review
         # (dispatch_review, с review_job_id) и Universal Review Gate ниже. Оба
@@ -6392,7 +6391,12 @@ async def transition_after_agent_done(
         #
         # Ни один шаг не отказывает: решение владельца — warn (матрица в #1122).
         # Отказ здесь оставил бы headless-задачу стоять без человека рядом.
-        await _run_headless_submit_gates(db, task_id, task)
+        # #1953: bump и закрепление sha автоматического входа - один savepoint.
+        async with critic_orders.pin_guard(db, task) as guard:
+            await repo.bump_submission_generation(db, task_id)
+            await _run_headless_submit_gates(db, task_id, task)
+        if guard.refused:
+            return "needs_decision"
 
     if (
         task.get("auto_review")
