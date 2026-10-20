@@ -3592,3 +3592,12 @@ async def test_a_daily_cap_refusal_is_shown_once_to_the_owner(
     await db.execute("UPDATE projects SET gate_policy='{}' WHERE id=?", (project_id,))
     await db.commit()
     assert await steward_cap.banner_rows(db) == []
+
+
+async def test_the_poller_door_checks_the_persisted_dor_evidence(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1611 AC-4: дверь поллера сверяет отпечаток под локом, а не верит dor_passed."""
+    from tests.dor_evidence_support import check_poller_door
+
+    await check_poller_door(db, monkeypatch, _project_with_policy, _ready_draft)
