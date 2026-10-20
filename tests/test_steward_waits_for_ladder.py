@@ -98,6 +98,16 @@ async def _dispatch_row(
             actor="policy",
             payload={
                 "generation": 1,
+                "after_review_id": after,
+            },
+        )
+        await repo.insert_event(
+            db,
+            kind=dispatcher.LADDER_TOP_UP_PLACED_EVENT,
+            task_id=task_id,
+            actor="policy",
+            payload={
+                "generation": 1,
                 "dispatch_id": dispatch_id,
                 "after_review_id": after,
             },

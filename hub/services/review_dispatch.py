@@ -2365,6 +2365,10 @@ LADDER_ORDER_FAILED_MARK = "поставить не удалось"
 #: generation, dispatch_id, after_review_id. Связь добора с отчётом и заказом —
 #: записью, а не выводом из времени и порядка строк. Читает ladder_view.
 LADDER_TOP_UP_EVENT = "review_ladder_top_up"
+#: Событие «заказ добора поставлен»: generation, after_review_id, dispatch_id —
+#: пишется ПОСЛЕ возврата диспетчера. Без него заказ поступка неизвестен, и
+#: читатель исхода ничего про отчёт заказа не утверждает.
+LADDER_TOP_UP_PLACED_EVENT = "review_ladder_top_up_placed"
 
 
 def ladder_generation_tag(generation: int) -> str:
@@ -2510,6 +2514,30 @@ async def _record_top_up(
     await db.commit()
 
 
+async def _record_top_up_placed(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> None:
+    """Записать, какой заказ поставил добор после ЭТОГО неполного отчёта (#1925)."""
+    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if row is None:
+        return
+    await repo.insert_event(
+        db,
+        kind=LADDER_TOP_UP_PLACED_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "generation": generation,
+            "after_review_id": report.get("id"),
+            "dispatch_id": dict(row)["id"],
+        },
+    )
+    await db.commit()
+
+
 async def _refused_by_name_since(
     db: aiosqlite.Connection, task_id: int, after_update_id: int
 ) -> bool:
@@ -2639,6 +2667,8 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             + ladder_generation_tag(generation),
         )
         await db.commit()
+    if dispatched:
+        await _record_top_up_placed(db, task_id, generation, report)
     return dispatched
 
 
@@ -2868,6 +2898,10 @@ async def _ask_a_stronger_model(
         f"{implementer or 'не заявлено'}). Модель взята из наблюдённых "
         "запусков, а не из каталога (#1237, #1243).",
     )
+    # Поступок записывается ДО обращения к диспетчеру (как у добора): долг
+    # второй двери коммитится там раньше возврата, и упавший вызов не должен
+    # оставить заказ без записи, ради которой его ждут (#1925).
+    await _record_top_up(db, task_id, generation, report)
     feed_mark = await _last_update_id(db, task_id)
     if not await maybe_dispatch_review(
         db, task_id, force_profile=DEEP, force_model=model
