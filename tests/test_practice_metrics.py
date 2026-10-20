@@ -1767,6 +1767,7 @@ def test_gate_event_vocabulary_is_single_source():
             "steward_judgement",
             "steward_applied",
             "steward_escalated",
+            "steward_judgement_refused",
         }
     )
     assert "unknown" not in HUMAN_GATE_EVENT_KINDS
@@ -1800,7 +1801,7 @@ async def test_steward_records_are_never_human(db: aiosqlite.Connection):
             kind="verdict",
             verdict="approve",
             confidence="high",
-            grounds=[StewardGround(source="ci_pinned_sha")],
+            grounds=[StewardGround(source="ci_pinned_sha", detail="ci 1 ok")],
         ),
         TokenIdentity("steward-bot", "steward"),
     )
@@ -1829,7 +1830,7 @@ async def test_steward_records_are_never_human(db: aiosqlite.Connection):
             kind="verdict",
             verdict="approve",
             confidence="low",
-            grounds=[StewardGround(source="ci_pinned_sha")],
+            grounds=[StewardGround(source="ci_pinned_sha", detail="ci 1 ok")],
         ),
         TokenIdentity("steward-bot", "steward"),
     )
