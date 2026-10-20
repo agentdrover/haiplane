@@ -23,9 +23,9 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.db import fetchall
-from hub.models import StewardJudgementSubmit
+from hub.models import StewardGround, StewardJudgementSubmit
 from hub.services.steward_judgement_sample import (
-    PLACEHOLDER_DETAILS,
+    DETAIL_MARKER,
     steward_judgement_body_sample,
 )
 from hub.services import steward_shadow
@@ -215,29 +215,34 @@ async def test_the_sample_is_not_executable_as_it_stands(
     assert await _stored(db, task_id) is None
 
 
+_MARKER = DETAIL_MARKER
+
+
 @pytest.mark.parametrize(
-    "hint",
+    "detail",
     [
-        *PLACEHOLDER_DETAILS,
-        "факт пакета: значение, число, sha или поле",
-        "<concrete fact of the packet>",
-        "<суждение по контракту>",
-        "<что угодно в скобках>",
+        _MARKER,
+        f"{_MARKER} проверено",
+        f"ci_run 1 {_MARKER}.",
+        f"  {_MARKER}\n",
+        _MARKER.lower(),
+        "__ЗАПОЛНИ\u200b__",
+        "__\u200bЗАПОЛНИ__\u200b",
+        "__ЗАПОЛНИ__\u00a0факт",
+        "\u00a0__ЗАПОЛНИ__\u00a0",
+        "＿＿ЗАПОЛНИ＿＿",
+        "__ЗА ПОЛНИ__",
     ],
 )
-@pytest.mark.parametrize("shape", ["same", "padded", "upper"])
-async def test_a_sample_placeholder_detail_is_not_a_ground(
-    db: aiosqlite.Connection, monkeypatch, hint, shape
+async def test_a_hint_marker_is_not_a_ground_in_any_spelling(
+    db: aiosqlite.Connection, monkeypatch, detail
 ):
-    """Класс: подсказка образца в detail. Судья правит verdict/confidence/
-    source, убирает closures и оставляет detail-подсказку: 422, не одобрение."""
-    task_id = await _started_run(db, monkeypatch, f"c1924-ph-{shape}")
-    detail = {"same": hint, "padded": f"  {hint}\n", "upper": hint.upper()}[shape]
+    """Класс: маркер образца в detail. Содержание, а не вид: любая запись."""
+    task_id = await _started_run(db, monkeypatch, f"c1924-ph-{abs(hash(detail))}")
     body = _body_from_sample(
         verdict="approve",
         confidence="high",
         grounds=[{"source": "ci_pinned_sha", "detail": detail}],
-        closures=[],
     )
     with pytest.raises(HTTPException) as err:
         await record_steward_judgement(
@@ -247,6 +252,40 @@ async def test_a_sample_placeholder_detail_is_not_a_ground(
     assert err.value.detail["reason"] == "steward_judgement_incomplete"
     assert err.value.detail["missing"] == ["grounds[].detail"]
     assert await _stored(db, task_id) is None
+
+
+_REAL_FACTS = [
+    "<none>",
+    "<ci_run=1234, conclusion=success, sha=abc123>",
+    "<none> is the actual output <exit=0>",
+    "факт пакета: значение, число, sha или поле",
+    "concrete fact of the packet",
+]
+
+
+@pytest.mark.parametrize("detail", _REAL_FACTS)
+async def test_real_facts_count_for_the_judge(
+    db: aiosqlite.Connection, monkeypatch, detail
+):
+    task_id = await _started_run(db, monkeypatch, f"c1924-fact-{abs(hash(detail))}")
+    view = await _post(
+        db,
+        task_id,
+        verdict="approve",
+        confidence="high",
+        grounds=[{"source": "ci_pinned_sha", "detail": detail}],
+    )
+    assert view.verdict == "approve"
+
+
+def test_real_facts_count_for_the_advisor():
+    from hub.services.steward_judgement import _downgrade_reason
+
+    for detail in _REAL_FACTS:
+        ground = StewardGround(source="ci_pinned_sha", detail=detail)
+        assert (
+            _downgrade_reason("concur", "high", [ground], detail_required=True) == ""
+        ), detail
 
 
 async def test_refusals_are_counted_next_to_escalations(

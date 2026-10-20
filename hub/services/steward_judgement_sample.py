@@ -6,8 +6,8 @@
 
 Образец НЕИСПОЛНИМ как есть. Каждое поле, где судья обязан выбрать или
 назвать факт, несёт текст-подсказку, а не допустимое значение: verdict,
-confidence и type закрытых словарей не пройдут разбор, а detail-заглушка не
-засчитывается как основание (:func:`is_placeholder_detail`). Иначе судья,
+confidence и source закрытых словарей не пройдут разбор, а detail с маркером
+``__ЗАПОЛНИ__`` не засчитывается как основание (:func:`is_placeholder_detail`). Иначе судья,
 скопировавший образец и убравший лишнее, получил бы «применимое» одобрение с
 подсказкой вместо факта.
 """
@@ -15,38 +15,40 @@ confidence и type закрытых словарей не пройдут раз�
 from __future__ import annotations
 
 import json
+import unicodedata
 
-#: Подсказки образца. Любая из них в ``detail`` основания — не факт пакета.
-PLACEHOLDER_DETAILS: tuple[str, ...] = ("<факт пакета: значение, число, sha или поле>",)
-PLACEHOLDER_FINDING_UID = "<finding_uid находки из пакета>"
+#: Служебный маркер: в образце им заменён каждый заполняемый ``detail``.
+#: Распознаётся по СОДЕРЖАНИЮ после нормализации, а не по виду текста:
+#: чёрный список «как выглядит подсказка» не сходится (приписки, точки,
+#: невидимые символы, другие скобки) и совпадает с настоящими фактами вроде
+#: ``<none>`` (#1924, возвраты gen1 и gen2).
+DETAIL_MARKER = "__ЗАПОЛНИ__"
 _VERDICT_HINT = "<approve|changes_requested|escalate>"
 _CONFIDENCE_HINT = "<high|medium|low>"
-_CLOSURE_TYPE_HINT = "<тип закрытия из закрытого множества>"
 _SOURCE_HINT = "<источник из закрытого множества>"
 
-_HINTS = (
-    *PLACEHOLDER_DETAILS,
-    PLACEHOLDER_FINDING_UID,
-    _SOURCE_HINT,
-    _CLOSURE_TYPE_HINT,
-    _VERDICT_HINT,
-    _CONFIDENCE_HINT,
-    "<суждение по контракту>",
-    "<одна причина из закрытого множества>",
-)
-_BARE_HINTS = frozenset(h.strip("<>").strip().casefold() for h in _HINTS)
+
+def _squash(text: str) -> str:
+    """NFKC, без пробельных и невидимых символов, casefold."""
+    kept = (
+        ch
+        for ch in unicodedata.normalize("NFKC", text or "")
+        if unicodedata.category(ch) not in _DROPPED
+    )
+    return "".join(kept).casefold()
+
+
+_DROPPED = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp"})
+_MARKER_KEY = _squash(DETAIL_MARKER)
 
 
 def is_placeholder_detail(detail: str) -> bool:
-    """True, если detail — подсказка образца, а не факт пакета.
+    """True, если в detail остался служебный маркер образца.
 
-    Подсказка — это любая строка в угловых скобках целиком, а также текст
-    любой подсказки образца без скобок (судья убрал скобки и оставил слова).
+    Только маркер: общие слова без факта и форма записи (``<none>``,
+    ``<ci_run=1234>``) основание не отменяют.
     """
-    text = (detail or "").strip()
-    if len(text) >= 2 and text.startswith("<") and text.endswith(">"):
-        return True
-    return text.strip("<>").strip().casefold() in _BARE_HINTS
+    return _MARKER_KEY in _squash(detail)
 
 
 def steward_judgement_body_sample(generation: int) -> str:
@@ -60,7 +62,7 @@ def steward_judgement_body_sample(generation: int) -> str:
             "kind": "verdict",
             "verdict": _VERDICT_HINT,
             "confidence": _CONFIDENCE_HINT,
-            "grounds": [{"source": _SOURCE_HINT, "detail": PLACEHOLDER_DETAILS[0]}],
+            "grounds": [{"source": _SOURCE_HINT, "detail": DETAIL_MARKER}],
             "closures": [],
         },
         ensure_ascii=False,

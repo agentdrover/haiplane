@@ -129,7 +129,9 @@ async def _served_packet_hash(db, task_id: int, generation: int, kind: str) -> s
     return str(dict(rows[0]).get("packet_hash") or "") if rows else ""
 
 
-def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
+def _counted_grounds(
+    grounds: list, *, detail_required: bool, reject_marker: bool = False
+) -> list:
     """Основания, которые засчитываются. У советника (#1671) — только с detail.
 
     Источник без конкретного факта пакета человек и хаб проверить не могут,
@@ -140,12 +142,18 @@ def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
     return [
         g
         for g in grounds
-        if (g.detail or "").strip() and not is_placeholder_detail(g.detail)
+        if (g.detail or "").strip()
+        and not (reject_marker and is_placeholder_detail(g.detail))
     ]
 
 
 def _downgrade_reason(
-    verdict: str, confidence: str, grounds: list, *, detail_required: bool = False
+    verdict: str,
+    confidence: str,
+    grounds: list,
+    *,
+    detail_required: bool = False,
+    reject_marker: bool = False,
 ) -> str:
     """Why a verdict is stored as an escalation, or "" when it stands.
 
@@ -161,7 +169,9 @@ def _downgrade_reason(
         return "low_confidence"
     if verdict == "escalate":
         return ""
-    if not _counted_grounds(grounds, detail_required=detail_required):
+    if not _counted_grounds(
+        grounds, detail_required=detail_required, reject_marker=reject_marker
+    ):
         return "no_grounds"
     if not confidence:
         return "no_confidence"
@@ -184,6 +194,7 @@ def _effective_verdict(
         confidence,
         body.grounds,
         detail_required=body.kind in (KIND_ADVISOR, KIND_VERDICT),
+        reject_marker=body.kind == KIND_VERDICT,
     )
     if body.kind == KIND_ADVISOR:
         object_ = submitted_verdict == "object" or bool(downgrade)
@@ -229,7 +240,7 @@ async def _require_complete_judgement(
     if confidence == "low":
         return
     missing: list[str] = []
-    if not _counted_grounds(body.grounds, detail_required=True):
+    if not _counted_grounds(body.grounds, detail_required=True, reject_marker=True):
         missing.append("grounds[].detail" if body.grounds else "grounds")
     if not confidence:
         missing.append("confidence")
