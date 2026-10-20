@@ -1026,6 +1026,7 @@ async def test_approve_records_workspace_missing_alert_once(
     from hub.services.dor import STATEMENT_PATHS_MARK
     from hub.services.lifecycle import approve_task
     from hub.services.readiness import calculate_readiness
+    from tests.dor_evidence_support import seal_evidence
 
     def paths_check(path: str) -> DoRCheckItem:
         return DoRCheckItem(
@@ -1078,6 +1079,7 @@ async def test_approve_records_workspace_missing_alert_once(
     auto = await _ws_task(db, project_id=pid)
     await repo.update_task(db, auto, dor_passed=1, risk_class="R0")
     await db.commit()
+    await seal_evidence(db, auto)
     assert await maybe_auto_approve(db, auto, dor_checks=[paths_check("tests/auto.py")])
     paths, workspace = approve_lines(
         await repo.get_task_updates(db, auto), "tests/auto.py"
@@ -1090,6 +1092,7 @@ async def test_approve_records_workspace_missing_alert_once(
     steward = await _ws_task(db, project_id=pid)
     await repo.update_task(db, steward, dor_passed=1, risk_class="R0")
     await db.commit()
+    await seal_evidence(db, steward)
     assert await maybe_auto_approve(db, steward)
     _, workspace = approve_lines(
         await repo.get_task_updates(db, steward), "tests/none.py"

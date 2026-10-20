@@ -1903,3 +1903,24 @@ async def test_plain_summary_boundary_is_the_max_id_at_migration(tmp_path, monke
         assert await is_new_task(conn, 2) is True
     finally:
         await conn.close()
+
+
+async def test_readiness_evidence_column_fresh_install_and_reapply():
+    """#1611 (R3): колонка отпечатка готовности есть на свежей базе, пуста по умолчанию,
+    а повторное применение миграций её не ломает и значение не стирает."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "readiness_evidence" in cols
+        assert cols["readiness_evidence"]["notnull"] == 1
+        assert cols["readiness_evidence"]["dflt_value"] == "''"
+        await conn.execute("INSERT INTO tasks (title) VALUES ('t')")
+        await conn.execute("UPDATE tasks SET readiness_evidence='abc'")
+        await conn.commit()
+        await _migrate(conn)
+        row = await (
+            await conn.execute("SELECT readiness_evidence FROM tasks")
+        ).fetchone()
+        assert row["readiness_evidence"] == "abc"
+    finally:
+        await conn.close()
