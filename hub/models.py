@@ -4030,9 +4030,8 @@ CI_INTEGRITY_NOTE_LIMIT = 600
 class CIIntegrityAnswer(BaseModel):
     """What the reviewer says about a diff that touches CI inputs (#1688).
 
-    ``explained`` — the change is legitimate for the task, and the note tells
-    the owner what changes, why, and the risk (low/high). ``suspicious`` — it
-    looks like tampering with how CI obtains or passes results.
+    ``explained`` — the change is legitimate for the task, the note says what, why
+    and the risk (low/high). ``suspicious`` — it looks like tampering with CI results.
 
     Lenient on purpose, like ``incomplete_reason``: the only path the cloud
     reviewer has is the text block, and ``parse_report_block`` drops a report
