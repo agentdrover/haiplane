@@ -582,17 +582,35 @@ async def _read_text(git: Any, repo_path: str, ref: str, path: str) -> str | Non
     return str(got.get("content") or "")
 
 
-async def _scan_now(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan:
-    """Read the diff of the pinned commit and scan it. NETWORK: never inside a write transaction."""
-    from hub.integrations.registry import plugins
+async def _scan_now(
+    db: aiosqlite.Connection, task_id: int, sha: str, net: Any = None
+) -> Scan:
+    """Read the diff of the pinned commit and scan it. NETWORK: never inside a write transaction.
+
+    ``net`` (#1913) оборачивает только чтение клона; чтение контекста проекта
+    из базы идёт снаружи него.
+    """
     from hub.services.orchestration import project_git_context
 
     try:
         ctx = await project_git_context(db, task_id)
-        workspace = (ctx.get("repo") or "").strip()
-        base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
-        if not workspace or not base:
-            return Scan(UNREADABLE, reason="клон проекта на хабе не настроен")
+    except Exception as exc:  # noqa: BLE001 - an unreadable diff is the answer
+        log.warning("ci integrity: no project context for #%s: %s", task_id, exc)
+        return Scan(UNREADABLE, reason="дифф не получен: ошибка чтения")
+    workspace = (ctx.get("repo") or "").strip()
+    base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
+    if not workspace or not base:
+        return Scan(UNREADABLE, reason="клон проекта на хабе не настроен")
+    if net is None:
+        return await _scan_clone(task_id, workspace, base, sha)
+    return await net(lambda: _scan_clone(task_id, workspace, base, sha))
+
+
+async def _scan_clone(task_id: int, workspace: str, base: str, sha: str) -> Scan:
+    """Сетевая половина скана: дифф и тексты файлов из клона."""
+    from hub.integrations.registry import plugins
+
+    try:
         git = plugins.git_ops
         material = await git.integrity_read(workspace, base, sha)
         if material is None:
@@ -654,9 +672,7 @@ async def ensure_scan(
             "ci integrity: scan of task #%s asked inside a transaction", task_id
         )
         return stored or Scan(UNSCANNED)
-    scan = await (
-        net(lambda: _scan_now(db, task_id, sha)) if net else _scan_now(db, task_id, sha)
-    )
+    scan = await _scan_now(db, task_id, sha, net)
     async with write_transaction(db):
         await store.save_ci_integrity_scan(
             db,
@@ -822,6 +838,22 @@ def stored_answer(body: MachineReviewSubmit) -> tuple[str, str]:
     return (answer.verdict, answer.explanation_ru) if answer else ("", "")
 
 
+#: Коммиты, чьи признаки целостности CI хаб уже показал ревьюеру (бриф, заказ).
+#: В памяти процесса: после рестарта ответ без повторного показа не принимается
+#: (отказ автоматики остаётся — безопасная сторона).
+_shown: set[tuple[int, str]] = set()
+
+
+def forget_shown() -> None:
+    """Забыть показы (тесты; рестарт делает то же)."""
+    _shown.clear()
+
+
+def _note_shown(task: dict[str, Any], standing: "Standing") -> None:
+    if standing.scan.state == SIGNS:
+        _shown.add((int(task["id"]), (task.get("submission_sha") or "").strip()))
+
+
 async def answer_for_report(
     db: aiosqlite.Connection, task: dict[str, Any], body: MachineReviewSubmit
 ) -> tuple[str, str]:
@@ -837,7 +869,10 @@ async def answer_for_report(
         return answer
     sha = (task.get("submission_sha") or "").strip()
     scan = await _stored(db, int(task["id"]), sha) if sha else None
-    if scan is not None and scan.state == SIGNS:
+    # Нужны оба: скан с признаками И показ этих признаков (бриф или заказ
+    # ревьюера). Скан, сделанный проходом поллера ПОСЛЕ брифа «unscanned», не
+    # делает ответ осмысленным: ревьюер признаков не видел.
+    if scan is not None and scan.state == SIGNS and (int(task["id"]), sha) in _shown:
         return answer
     log.warning(
         "ci integrity: answer of the report on task #%s dropped, no scan with signs",
@@ -882,7 +917,9 @@ async def order_section(db: aiosqlite.Connection, task_id: int) -> str:
     """The reviewer-order section for this submission; "" when the diff is clean."""
     await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
-    section = section_for(await standing_of(db, task))
+    standing = await standing_of(db, task)
+    _note_shown(task, standing)
+    section = section_for(standing)
     return f"{section}\n\n" if section else ""
 
 
@@ -898,6 +935,7 @@ async def brief_state(
         await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
+    _note_shown(task, standing)
     if standing.clean:
         return None
     return {

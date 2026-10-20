@@ -62,9 +62,9 @@ def recall(kind: str, task_id: int, key: str) -> Observation | None:
 
 def forget_all() -> None:
     """Забыть всё (тесты; рестарт делает то же)."""
-    global _down_until
     _seen.clear()
-    _down_until = 0.0
+    _down_until.clear()
+    _refreshed_at.clear()
 
 
 def stacking_key(branch: str, sha: str) -> str:
@@ -133,7 +133,7 @@ class _Deadline:
             return await make()
 
 
-_down_until = 0.0
+_down_until: dict[str, float] = {}
 
 
 async def sweep(db: Any) -> None:
@@ -147,14 +147,13 @@ async def sweep(db: Any) -> None:
     упал (``FETCH_BACKOFF_SECONDS``), проход молчит. Стояние CI освежает
     ``ci_trust.sweep`` — его здесь не дублируем.
     """
-    global _down_until
     from hub import repository as repo
     from hub import services
     from hub.services import ci_integrity, ci_trust, lifecycle
     from hub.services.orchestration import project_git_context
     from hub.services.review_brief import base_merge_section
 
-    if ci_trust.forge_recently_down() or time.monotonic() < _down_until:
+    if ci_trust.forge_recently_down():
         return
     deadline = _Deadline(SWEEP_BUDGET_SECONDS)
     now = datetime.now(UTC)
@@ -178,16 +177,19 @@ async def sweep(db: Any) -> None:
             continue
         view = services.row_to_task(task_row)
         branch = (view.branch or "").strip()
+        workspace = ""
         try:
             ctx = await project_git_context(db, task_id)
             workspace = (ctx.get("repo") or "").strip()
+            if time.monotonic() < _down_until.get(workspace, 0.0):
+                continue  # клон этого проекта недавно не отвечал; другие проекты идут
             if workspace:
                 tip, why = await deadline.run(
                     lambda: lifecycle.observe_tip_at(workspace, task_id, branch)
                 )
                 if not tip and why.startswith("could not fetch"):
-                    _down_until = time.monotonic() + FETCH_BACKOFF_SECONDS
-                    return
+                    _down_until[workspace] = time.monotonic() + FETCH_BACKOFF_SECONDS
+                    continue
             await ci_integrity.ensure_scan(db, task_id, net=deadline.run)
             await base_merge_section(db, view, net=deadline.run)
             if deadline.left() <= 0:
@@ -196,7 +198,10 @@ async def sweep(db: Any) -> None:
             # границу ставят таймауты git самого адаптера.
             await services.detect_branch_stacking(db, task_id, branch)
         except _OutOfTime:
-            _refreshed_at.pop(task_id, None)  # не успели — следующий тик начнёт с неё
-            return
+            return  # пометка остаётся: задачи за ней не голодают, эта вернётся через 5 мин
+        except TimeoutError:
+            # Зависший fetch/скан: тот же откат, что и у упавшего fetch.
+            _down_until[workspace] = time.monotonic() + FETCH_BACKOFF_SECONDS
+            log.warning("gate observation of task %s timed out", task_id)
         except Exception:  # noqa: BLE001 - наблюдение не должно ронять проход
             log.exception("gate observation of task %s failed", task_id)

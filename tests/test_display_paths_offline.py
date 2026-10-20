@@ -530,7 +530,8 @@ async def test_poller_sweep_scans_integrity_and_shows_clear_stacking_with_age(
     assert await store.get_ci_integrity_scan(db, review, task["submission_sha"]) is None
     gate_observations._refreshed_at.clear()
     await gate_observations.sweep(db)
-    assert await store.get_ci_integrity_scan(db, review, task["submission_sha"])
+    row = await store.get_ci_integrity_scan(db, review, task["submission_sha"])
+    assert row and dict(row)["state"] in ("clean", "signs"), row
 
     gate_observations.record(
         gate_observations.STACKING,
@@ -569,3 +570,35 @@ async def test_poller_sweep_keeps_to_its_budget_and_backs_off_on_a_dead_fetch(
     gate_observations._refreshed_at.clear()
     await gate_observations.sweep(db)
     assert len(calls) == attempts, "в окне отката проход не ходит в сеть"
+
+
+async def test_the_deadline_wraps_only_the_network_not_the_database(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Таймаут ставится на сетевые вызовы; чтения базы (контекст проекта) снаружи него."""
+    from hub.services import gate_observations
+
+    await _world(client, db, monkeypatch)
+    gate_observations._refreshed_at.clear()
+    inside: list[str] = []
+    original = gate_observations._Deadline.run
+
+    async def watch(self, make, ceiling=gate_observations.CALL_CEILING_SECONDS):
+        # Внутри обёртки не должно быть чтения проекта из базы.
+        import hub.services.orchestration as orch
+
+        real = orch.project_git_context
+
+        async def spy(*a, **k):
+            inside.append("project_git_context")
+            return await real(*a, **k)
+
+        monkeypatch.setattr(orch, "project_git_context", spy)
+        try:
+            return await original(self, make, ceiling)
+        finally:
+            monkeypatch.setattr(orch, "project_git_context", real)
+
+    monkeypatch.setattr(gate_observations._Deadline, "run", watch)
+    await gate_observations.sweep(db)
+    assert inside == [], f"чтение базы под дедлайном: {inside}"

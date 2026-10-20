@@ -2538,8 +2538,11 @@ def forget_observed_tips() -> None:
     """Drop every remembered observation (tests; a restart does the same)."""
     from hub.services import gate_observations
 
+    from hub.services import ci_integrity
+
     _observed_tips.clear()
     gate_observations.forget_all()
+    ci_integrity.forget_shown()
 
 
 def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
