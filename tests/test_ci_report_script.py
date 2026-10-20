@@ -917,21 +917,24 @@ def test_a_long_survivor_list_is_trimmed_and_says_so(script):
 
 
 def test_ci_workflow_runs_mutations_beside_the_tests_and_cannot_fail_the_job():
-    """#1270 AC-3 (static half): warning step, PR only, its JSON reaches the reporter.
+    """#1270 AC-3 (static half): warning step, its JSON reaches the reporter.
 
-    #1785: the step lives in job `evidence`, next to the parts of the suite; the
-    reporter stays in job `test`, and the file travels between them.
+    #1785/#1921: the step lives in the legs of job `mutation_legs`, next to the
+    parts of the suite; job `evidence` puts the legs together; the reporter stays
+    in job `test`, and the file travels between them.
     """
     import yaml
 
     workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    legs = doc["jobs"]["mutation_legs"]
     evidence = doc["jobs"]["evidence"]
-    mutation = next(s for s in evidence["steps"] if s.get("id") == "mutations")
+    mutation = next(s for s in legs["steps"] if s.get("id") == "mutations")
 
+    assert legs["continue-on-error"] is True
     assert evidence["continue-on-error"] is True
     assert mutation["continue-on-error"] is True
-    assert "needs.treedup.outputs.evidence_run" in mutation["if"], "#1606: by event"
+    assert "needs.treedup.outputs.evidence_run" in legs["if"], "#1606: by event"
     assert "timeout-minutes" in mutation
     assert "scripts/mutation_changed.py" in mutation["run"]
     assert not [s for s in doc["jobs"]["test"]["steps"] if s.get("id") == "mutations"]
@@ -941,6 +944,7 @@ def test_ci_workflow_runs_mutations_beside_the_tests_and_cannot_fail_the_job():
     )
     json_out = re.search(r"--json-out\s+(\S+)", mutation["run"]).group(1)
     assert reporter["with"]["mutations-file"] == json_out.strip("\"'")
+    # the merged file has the name the reporter reads
     upload = next(
         s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
     )
