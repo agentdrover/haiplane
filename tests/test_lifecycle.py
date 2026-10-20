@@ -1395,10 +1395,50 @@ async def test_a_base_conflict_after_approval_is_resubmitted_by_the_author(
         "SELECT id FROM events WHERE task_id=? AND kind='task_decided'", (task_id,)
     )
     assert not decided, "между merge_failed и пересдачей решения человека нет"
-    feed = " ".join(
-        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
-    )
-    assert "конфликт с базой" in feed, "лента называет, откуда пришла пересдача"
+    line = await _resubmission_line(db, task_id)
+    assert "после merge_failed" in line, "строка пересдачи называет писателя"
+    assert "base_update_conflict" not in line
+
+
+async def _resubmission_line(db: aiosqlite.Connection, task_id: int) -> str:
+    """Последняя запись сдачи в ленте — строка «Submitted for review»."""
+    lines = [
+        dict(u)["content"] or ""
+        for u in await repo.get_task_updates(db, task_id)
+        if (dict(u)["content"] or "").startswith(repo.SUBMISSION_UPDATE_PREFIX)
+    ]
+    return lines[-1]
+
+
+async def test_a_base_update_conflict_is_resubmitted_by_the_author(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1917 AC-1: конфликт обновления ветки PR (#1419) — тоже работа автора."""
+    from hub import services
+    from hub.models import TaskSubmitReview
+    from tests.test_pair_merge_gate import base_update_conflicted
+
+    for pr, via in ((77, "report_done"), (78, "poller")):
+        task_id = await base_update_conflicted(db, monkeypatch, via=via, pr_number=pr)
+        before = dict(await repo.get_task(db, task_id))
+
+        view = await services.submit_for_review(
+            db, task_id, TaskSubmitReview(agent="dev", branch=before["branch"] or "")
+        )
+
+        assert view.status.value == "review", via
+        after = dict(await repo.get_task(db, task_id))
+        assert after["submission_generation"] == before["submission_generation"] + 1
+        assert after["submission_sha"] == "tip0after0author0merge", via
+        assert not view.review_approved_current, "#1286: старое одобрение не текущее"
+        decided = await db.execute_fetchall(
+            "SELECT id FROM events WHERE task_id=? AND kind='task_decided'",
+            (task_id,),
+        )
+        assert not decided, f"{via}: решения человека между конфликтом и пересдачей нет"
+        line = await _resubmission_line(db, task_id)
+        assert "после base_update_conflict" in line, via
+        assert "merge_failed" not in line, via
 
 
 async def test_other_needs_decision_causes_still_need_a_human(
@@ -1460,6 +1500,53 @@ async def test_other_needs_decision_causes_still_need_a_human(
             [
                 {"reason": "merge_gate", "detail": conflict_detail},
                 {"reason": "review_cycle_limit"},
+            ],
+        ),
+        (
+            "обновление ветки отказано",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "base_update_refused: нет права обновить ветку",
+                }
+            ],
+        ),
+        (
+            "красный CI на свежей базе",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "fresh_base_ci_failed: CI красный на свежей базе",
+                }
+            ],
+        ),
+        (
+            "конфликт обновления, но причина другая",
+            [
+                {
+                    "reason": "ci_fix_cycle_limit",
+                    "detail": "base_update_conflict: конфликт в hub/a.py",
+                }
+            ],
+        ),
+        (
+            "префикс не в начале",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "x. base_update_conflict: конфликт в hub/a.py",
+                }
+            ],
+        ),
+        (
+            # Синтетическая строка: до needs_decision она не доходит
+            # (TRANSIENT_GATE_PREFIXES), тест лишь фиксирует отказ читателя.
+            "повтор обновления (синтетическая строка)",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "base_update_retry: обновление не состоялось",
+                }
             ],
         ),
         ("события нет вовсе", []),
