@@ -85,33 +85,27 @@ class _Spies:
             monkeypatch.setattr(owner, name, spy)
 
 
-async def _snapshot(db: aiosqlite.Connection, task_id: int) -> dict:
+async def _snapshot(db: aiosqlite.Connection) -> dict[str, list[str]]:
+    """Содержимое ВСЕХ таблиц: правка существующей строки видна, а не только рост."""
     await db.commit()
-    tables = [
+    names = [
         r[0]
         for r in await (
             await db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
         ).fetchall()
     ]
-    counts = {}
-    for name in tables:
-        cur = await db.execute(f'SELECT COUNT(*) FROM "{name}"')
-        counts[name] = (await cur.fetchone())[0]
-    row = dict(await repo.get_task(db, task_id))
-    row.pop("updated_at", None)
-    return {"counts": counts, "task": row}
+    dump: dict[str, list[str]] = {}
+    for name in names:
+        cur = await db.execute(f'SELECT * FROM "{name}"')
+        dump[name] = sorted(repr(tuple(row)) for row in await cur.fetchall())
+    return dump
 
 
-def _only_one_alert_added(before: dict, after: dict) -> list[str]:
-    grew = {
-        t: after["counts"][t] - before["counts"][t]
-        for t in after["counts"]
-        if after["counts"][t] != before["counts"][t]
-    }
-    return [f"{t}:{n}" for t, n in sorted(grew.items())]
+def _changed_tables(before: dict, after: dict) -> list[str]:
+    return [name for name in after if after[name] != before[name]]
 
 
 async def test_matching_expected_sha_is_pinned(db: aiosqlite.Connection, monkeypatch):
@@ -142,14 +136,20 @@ async def test_a_moved_or_unverified_head_refuses_the_submission(
     )
 
     async def refused(task_id: int, reason: str):
-        before = await _snapshot(db, task_id)
+        before = await _snapshot(db)
+        spies.calls.clear()
         with pytest.raises(HTTPException) as err:
             await lifecycle.submit_for_review(db, task_id, body)
         assert err.value.status_code == 409
         assert err.value.detail["reason"] == reason
-        after = await _snapshot(db, task_id)
-        assert after["task"] == before["task"], "карточка не изменилась"
-        assert _only_one_alert_added(before, after) == ["task_updates:1"]
+        assert spies.calls == [], f"отказ дошёл до {spies.calls}"
+        after = await _snapshot(db)
+        assert _changed_tables(before, after) == ["task_updates"]
+        added = set(after["task_updates"]) - set(before["task_updates"])
+        assert (
+            len(added) == 1
+            and len(after["task_updates"]) == len(before["task_updates"]) + 1
+        ), "единственная запись — один alert"
         updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
         assert updates[-1]["kind"] == "alert"
         return err.value.detail, updates[-1]["content"]
@@ -180,9 +180,10 @@ async def test_a_moved_or_unverified_head_refuses_the_submission(
         db, task.id, models.TaskSubmitReview(agent="dev", expected_sha=X)
     )
     assert first.submission_generation == 1
-    spies.calls.clear()
     await refused(task.id, "head_moved")
-    assert spies.calls == [], f"отказ дошёл до {spies.calls}"
+    git.fetch_ok = False
+    await refused(task.id, "head_unverified")
+    git.fetch_ok = True
     row = dict(await repo.get_task(db, task.id))
     assert (row["status"], row["submission_generation"], row["submission_sha"]) == (
         "review",
