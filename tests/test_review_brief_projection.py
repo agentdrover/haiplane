@@ -762,10 +762,11 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # #1858: REST-бриф получил cause_task (null здесь); переснят он и пакет стюарда.
 # #1913: REST-бриф читает наблюдения без сети — изменились только sha_check_reason
 # («вершину хаб не наблюдал»), stacking_warning («не сверена») и verdict_route
-# (условие «проверка по сети при показе не делалась»). Пакет стюарда: REST-чтение
+# (условие «проверка по сети при показе не делалась»), ci_integrity («unscanned»:
+# скан делает проход поллера, не показ). Пакет стюарда: REST-чтение
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
 # нет «Справка по CI: … не проверена»; packet_hash прежний.
-GOLDEN_REST_BRIEF = "814a5e7a2e6adc0f4d4eb30040dbb5e5ccab301872bf4af9415d8f7241d82c87"  # pragma: allowlist secret
+GOLDEN_REST_BRIEF = "903df35b5a4f2e73db2758129e5a72b09bbc00a5b7289f369e2a1c7d4725a6f3"  # pragma: allowlist secret
 GOLDEN_STEWARD_PACKET = "149ec84ec411e5bedf3bc29ee7ebde00ad227c436a2778c185c689b486056a90"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
