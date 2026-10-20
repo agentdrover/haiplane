@@ -763,7 +763,12 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     Изменённые намеренно: активированные админом получают черновик, активная
     версия прежняя (человек активирует сам); seed получает новую активную.
     """
-    changed_by_admin = {"local-executor-hub-repo", "hub-submit-task"}
+    # executor-pair-discipline: текст сида менял #1866 (три правила ревью).
+    changed_by_admin = {
+        "local-executor-hub-repo",
+        "hub-submit-task",
+        "executor-pair-discipline",
+    }
     sources = {
         "local-executor-hub-repo": (REPO / "skills/local-executor-hub-repo/SKILL.md"),
         "hub-review-report-reading": REPO / "skills/hub-review-report-reading/SKILL.md",
@@ -871,6 +876,49 @@ def test_codex_second_review_rule_lives_in_one_skill():
     for banned in ("на ядре", "только ядро", "критик на ядре"):
         assert banned not in ref.lower(), banned
     assert "второе ревью (правило — local-executor-hub-repo" in ref
+
+
+#: Три правила ревью (#1866): заголовки одинаковы в навыке исполнителя и в
+#: сиде облачного исполнителя, чтобы один тест держал оба текста.
+REVIEW_RULE_HEADINGS = (
+    "Свежий взгляд до пуша",
+    "Класс ошибки на доработке",
+    "С третьего возврата",
+)
+
+
+async def test_executor_skills_carry_review_rules(db: aiosqlite.Connection):
+    """AC-1: три правила в сиде и в SKILL.md; человеческая версия не тронута."""
+    name = "executor-pair-discipline"
+    # Чистая база: активен новый текст, повторный сид дублей не плодит.
+    await _install(db, name, [])
+    await seed_default_skills(db)
+    await seed_default_skills(db)
+    clean = await _versions(db, name)
+    assert [(v["version"], v["status"]) for v in clean] == [(1, "active")]
+    for heading in REVIEW_RULE_HEADINGS:
+        assert heading in clean[0]["content"], heading
+    assert clean[0]["content"] == EXECUTOR_PAIR_DISCIPLINE_SKILL
+    assert "чистом контексте" in EXECUTOR_PAIR_DISCIPLINE_SKILL
+    # База с активной версией от человека: новый текст — draft, активная цела.
+    human = "версия, опубликованная человеком"
+    await _install(db, name, [(5, human, "active", "seed", "admin")])
+    await seed_default_skills(db)
+    await seed_default_skills(db)
+    rows = await _versions(db, name)
+    assert [(v["version"], v["status"], v["content"]) for v in rows] == [
+        (5, "active", human),
+        (6, "draft", EXECUTOR_PAIR_DISCIPLINE_SKILL),
+    ]
+    assert await _served(db, name) == human
+    # SKILL.md: три правила внутри ЕДИНСТВЕННОГО правила второго ревью.
+    rule = (REPO / "skills/local-executor-hub-repo/SKILL.md").read_text("utf-8")
+    assert rule.count("Второй ревьюер Codex") == 1
+    section = _between(rule, "6. **Второй ревьюер Codex", "## Этап 3.")
+    for heading in REVIEW_RULE_HEADINGS:
+        assert heading in section, heading
+    for needle in ("чистом контексте", "out_of_scope", "review_cycle"):
+        assert needle in section, needle
 
 
 def test_machine_review_cycle_describes_both_decisions():
