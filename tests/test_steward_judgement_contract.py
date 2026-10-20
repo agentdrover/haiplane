@@ -232,6 +232,10 @@ _MARKER = DETAIL_MARKER
         "\u00a0__ЗАПОЛНИ__\u00a0",
         "＿＿ЗАПОЛНИ＿＿",
         "__ЗА ПОЛНИ__",
+        "__ЗА\u034fПОЛНИ__",
+        "__ЗАП\ufe0fОЛНИ__",
+        "__ЗА\u3164ПОЛНИ__",
+        "__ЗА.ПОЛНИ__",
     ],
 )
 async def test_a_hint_marker_is_not_a_ground_in_any_spelling(
@@ -320,3 +324,37 @@ async def test_the_sample_needs_only_hint_replacement_to_be_accepted(
         db, task_id, StewardJudgementSubmit(**body), _STEWARD
     )
     assert view.verdict == "approve"
+
+
+@pytest.mark.parametrize(
+    "detail", ["\u200b", "\u034f", "\u3164", "...", "\u00a0\u200b"]
+)
+async def test_an_invisible_detail_is_not_a_ground_for_the_judge(
+    db: aiosqlite.Connection, monkeypatch, detail
+):
+    task_id = await _started_run(db, monkeypatch, f"c1924-inv-{abs(hash(detail))}")
+    with pytest.raises(HTTPException) as err:
+        await _post(
+            db,
+            task_id,
+            verdict="approve",
+            confidence="high",
+            grounds=[{"source": "ci_pinned_sha", "detail": detail}],
+        )
+    assert err.value.status_code == 422
+    assert await _stored(db, task_id) is None
+
+
+def test_the_advisor_keeps_its_1671_rule_marker_or_not():
+    """Советник возвращён к gen1: только strip, ни маркера, ни «видимости»."""
+    from hub.services.steward_judgement import _effective_verdict
+
+    for detail in (DETAIL_MARKER, "​", "..."):
+        body = StewardJudgementSubmit(
+            generation=1,
+            kind="advisor",
+            verdict="concur",
+            confidence="high",
+            grounds=[{"source": "ci_pinned_sha", "detail": detail}],
+        )
+        assert _effective_verdict(body, "concur", "high") == ("concur", ""), detail

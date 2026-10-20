@@ -33,6 +33,7 @@ from hub.models import (
 )
 from hub.services.finding_identity import finding_uids, unresolved_uids
 from hub.services.steward_judgement_sample import (
+    has_visible_content,
     is_placeholder_detail,
     steward_judgement_body_sample,
 )
@@ -143,7 +144,10 @@ def _counted_grounds(
         g
         for g in grounds
         if (g.detail or "").strip()
-        and not (reject_marker and is_placeholder_detail(g.detail))
+        and not (
+            reject_marker
+            and (is_placeholder_detail(g.detail) or not has_visible_content(g.detail))
+        )
     ]
 
 

@@ -28,18 +28,30 @@ _CONFIDENCE_HINT = "<high|medium|low>"
 _SOURCE_HINT = "<источник из закрытого множества>"
 
 
-def _squash(text: str) -> str:
-    """NFKC, без пробельных и невидимых символов, casefold."""
-    kept = (
+#: Буквы-невидимки: категория L, но на экране пусто (Hangul filler и т.п.).
+_BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0")
+
+
+def _visible(text: str) -> str:
+    """Только буквы и цифры после NFKC, casefold: проекция «что видно».
+
+    Пробелы, знаки, подчёркивания, форматные и комбинирующие символы
+    (U+200B, U+034F, U+FE0F, NBSP) в проекцию не попадают, поэтому вставка
+    любого из них не прячет маркер и не делает пустую строку «непустой».
+    """
+    return "".join(
         ch
-        for ch in unicodedata.normalize("NFKC", text or "")
-        if unicodedata.category(ch) not in _DROPPED
+        for ch in unicodedata.normalize("NFKC", text or "").casefold()
+        if unicodedata.category(ch)[0] in ("L", "N") and ch not in _BLANK_LETTERS
     )
-    return "".join(kept).casefold()
 
 
-_DROPPED = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp"})
-_MARKER_KEY = _squash(DETAIL_MARKER)
+_MARKER_KEY = _visible(DETAIL_MARKER)
+
+
+def has_visible_content(detail: str) -> bool:
+    """True, если в detail есть хоть одна видимая буква или цифра."""
+    return bool(_visible(detail))
 
 
 def is_placeholder_detail(detail: str) -> bool:
@@ -48,7 +60,7 @@ def is_placeholder_detail(detail: str) -> bool:
     Только маркер: общие слова без факта и форма записи (``<none>``,
     ``<ci_run=1234>``) основание не отменяют.
     """
-    return _MARKER_KEY in _squash(detail)
+    return _MARKER_KEY in _visible(detail)
 
 
 def steward_judgement_body_sample(generation: int) -> str:
