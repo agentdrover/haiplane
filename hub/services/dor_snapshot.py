@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,8 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import fetchall
 from hub.plain_summary import is_new_task
+
+log = logging.getLogger(__name__)
 
 #: Входы, которых нет в строке задачи: считаются при снятии снимка (#1811).
 DERIVED_TASK_FIELDS: tuple[str, ...] = ("plain_summary_required",)
@@ -187,3 +190,21 @@ async def load_dor_snapshot(db: aiosqlite.Connection, task_id: int) -> DorSnapsh
             "source_id": source_id,
         }
     return DorSnapshot(task_id=task_id, task=task, acs=acs, project=project)
+
+
+async def persisted_dor_is_current(db: aiosqlite.Connection, row: Any) -> bool:
+    """Записан ли сохранённый DoR из тех входов, что в БД сейчас (#1611).
+
+    Только БД, без git: зовётся под write-локом автоодобрения. Пустой отпечаток
+    (строка записана до колонки) и любой сбой чтения - «нет»: решение «открыть»
+    при сомнении остаётся за человеком.
+    """
+    stored = str(row["readiness_evidence"] or "")
+    if not stored:
+        return False
+    try:
+        snapshot = await load_dor_snapshot(db, int(row["id"]))
+    except Exception:  # noqa: BLE001 - отказ в сторону человека, причина в логе
+        log.exception("readiness evidence check failed for task %s", row["id"])
+        return False
+    return snapshot.fingerprint() == stored
