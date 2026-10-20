@@ -289,6 +289,16 @@ async def test_the_ladder_records_the_top_up_it_places(
     assert len(events) == 1
     payload = __import__("json").loads(events[0]["payload"])
     assert payload["after_review_id"] == report_id and payload["generation"] == 1
+    placed = [
+        e
+        for e in await repo.list_events(db, since=0)
+        if e["task_id"] == task_id
+        and e["kind"] == dispatcher.LADDER_TOP_UP_PLACED_EVENT
+    ]
+    assert len(placed) == 1, "заказ поступка записан после возврата диспетчера"
+    assert (
+        __import__("json").loads(placed[0]["payload"])["after_review_id"] == report_id
+    )
     assert await top_up_in_flight(db, await _task_dict(db, task_id))
 
 
