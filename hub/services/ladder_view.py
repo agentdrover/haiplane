@@ -276,10 +276,10 @@ async def ladder_why(
 
 
 def _axis_code(acts: list[dict[str, Any]], alert_code: str) -> LadderWhy:
-    """Исход второй оси: ПОСЛЕДНЯЯ попытка (событие) важнее любого алерта о ней.
+    """Исход второй оси по алерту при поставленной (и ответившей) попытке.
 
-    Отказанная попытка не запускалась: ни «тоже не дочитала», ни «такой же
-    неполный отчёт» про неё сказать нельзя, как бы ни звучал алерт после.
+    Отказанную последнюю попытку разбирает ``_last_act_outcome`` раньше любого
+    алерта: она не запускалась, и «тоже не дочитала» про неё сказать нельзя.
     """
     axis = [a for a in acts if a["kind"] == dispatcher.MODEL_CASCADE_EVENT]
     if not axis:
@@ -291,9 +291,6 @@ def _axis_code(acts: list[dict[str, Any]], alert_code: str) -> LadderWhy:
         )
     if axis[-1]["data"] is None:
         return LadderWhy(WHY_UNKNOWN)
-    last = axis[-1]
-    if not _placed(last):
-        return LadderWhy(WHY_AXIS_NOT_PLACED, str(last["data"].get("reason") or ""))
     if alert_code == WHY_AXIS_EXHAUSTED:
         return LadderWhy(WHY_AXIS_EXHAUSTED)
     return LadderWhy(WHY_AXIS_INCOMPLETE)
