@@ -236,6 +236,7 @@ _MARKER = DETAIL_MARKER
         "__ЗАП\ufe0fОЛНИ__",
         "__ЗА\u3164ПОЛНИ__",
         "__ЗА.ПОЛНИ__",
+        "__ЗА\u0345ПОЛНИ__",
     ],
 )
 async def test_a_hint_marker_is_not_a_ground_in_any_spelling(
@@ -327,7 +328,7 @@ async def test_the_sample_needs_only_hint_replacement_to_be_accepted(
 
 
 @pytest.mark.parametrize(
-    "detail", ["\u200b", "\u034f", "\u3164", "...", "\u00a0\u200b"]
+    "detail", ["\u200b", "\u034f", "\u3164", "...", "\u00a0\u200b", "\u0345"]
 )
 async def test_an_invisible_detail_is_not_a_ground_for_the_judge(
     db: aiosqlite.Connection, monkeypatch, detail

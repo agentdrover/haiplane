@@ -32,18 +32,25 @@ _SOURCE_HINT = "<источник из закрытого множества>"
 _BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0")
 
 
+def _letters_and_digits(text: str) -> str:
+    return "".join(
+        ch
+        for ch in text
+        if unicodedata.category(ch)[0] in ("L", "N") and ch not in _BLANK_LETTERS
+    )
+
+
 def _visible(text: str) -> str:
-    """Только буквы и цифры после NFKC, casefold: проекция «что видно».
+    """Только буквы и цифры после NFKC и casefold: проекция «что видно».
 
     Пробелы, знаки, подчёркивания, форматные и комбинирующие символы
     (U+200B, U+034F, U+FE0F, NBSP) в проекцию не попадают, поэтому вставка
     любого из них не прячет маркер и не делает пустую строку «непустой».
+    Фильтр стоит ДО и ПОСЛЕ casefold: сам casefold превращает комбинирующий
+    U+0345 в букву, и одного прохода после него мало.
     """
-    return "".join(
-        ch
-        for ch in unicodedata.normalize("NFKC", text or "").casefold()
-        if unicodedata.category(ch)[0] in ("L", "N") and ch not in _BLANK_LETTERS
-    )
+    folded = _letters_and_digits(unicodedata.normalize("NFKC", text or ""))
+    return _letters_and_digits(unicodedata.normalize("NFKC", folded.casefold()))
 
 
 _MARKER_KEY = _visible(DETAIL_MARKER)
