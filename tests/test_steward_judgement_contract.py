@@ -24,7 +24,10 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import StewardJudgementSubmit
-from hub.services.steward_judgement_sample import steward_judgement_body_sample
+from hub.services.steward_judgement_sample import (
+    PLACEHOLDER_DETAILS,
+    steward_judgement_body_sample,
+)
 from hub.services import steward_shadow
 from hub.services.steward_dispatch import (
     RUN_OPEN,
@@ -190,3 +193,61 @@ async def test_judge_prompt_carries_a_body_sample(
         assert f'"{key}"' in prompt, key
     assert '"detail"' in prompt and '"source"' in prompt
     assert "422" in prompt
+    assert '"verdict": "escalate"' in prompt, "образец эскалации в промпте"
+
+
+def _body_from_sample(**over) -> dict:
+    body = json.loads(steward_judgement_body_sample(1))
+    body.update(over)
+    return body
+
+
+async def test_the_sample_is_not_executable_as_it_stands(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Образец как есть не проходит: подсказки не допустимые значения."""
+    task_id = await _started_run(db, monkeypatch, "c1924-sample-verbatim")
+    with pytest.raises(HTTPException) as err:
+        await record_steward_judgement(
+            db, task_id, StewardJudgementSubmit(**_body_from_sample()), _STEWARD
+        )
+    assert err.value.status_code == 422
+    assert await _stored(db, task_id) is None
+
+
+@pytest.mark.parametrize("hint", PLACEHOLDER_DETAILS)
+@pytest.mark.parametrize("shape", ["same", "padded", "upper"])
+async def test_a_sample_placeholder_detail_is_not_a_ground(
+    db: aiosqlite.Connection, monkeypatch, hint, shape
+):
+    """Класс: подсказка образца в detail. Судья правит verdict/confidence/
+    source, убирает closures и оставляет detail-подсказку: 422, не одобрение."""
+    task_id = await _started_run(db, monkeypatch, f"c1924-ph-{shape}")
+    detail = {"same": hint, "padded": f"  {hint}\n", "upper": hint.upper()}[shape]
+    body = _body_from_sample(
+        verdict="approve",
+        confidence="high",
+        grounds=[{"source": "ci_pinned_sha", "detail": detail}],
+        closures=[],
+    )
+    with pytest.raises(HTTPException) as err:
+        await record_steward_judgement(
+            db, task_id, StewardJudgementSubmit(**body), _STEWARD
+        )
+    assert err.value.status_code == 422
+    assert err.value.detail["reason"] == "steward_judgement_incomplete"
+    assert err.value.detail["missing"] == ["grounds[].detail"]
+    assert await _stored(db, task_id) is None
+
+
+async def test_refusals_are_counted_next_to_escalations(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from hub.services.orchestration import practice_metrics
+
+    task_id = await _started_run(db, monkeypatch, "c1924-counter")
+    with pytest.raises(HTTPException):
+        await _post(db, task_id, verdict="approve")
+    rows = (await practice_metrics(db))["human_gates"]
+    steward = [r for r in rows if r.get("gate") == "steward"]
+    assert steward and sum(r["refused"] for r in steward) == 1

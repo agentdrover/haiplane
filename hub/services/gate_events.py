@@ -23,6 +23,7 @@ HUMAN_GATE_EVENT_KINDS: frozenset[str] = frozenset(
         "steward_judgement",
         "steward_applied",
         "steward_escalated",
+        "steward_judgement_refused",
     }
 )
 

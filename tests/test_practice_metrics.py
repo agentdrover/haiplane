@@ -1767,6 +1767,7 @@ def test_gate_event_vocabulary_is_single_source():
             "steward_judgement",
             "steward_applied",
             "steward_escalated",
+            "steward_judgement_refused",
         }
     )
     assert "unknown" not in HUMAN_GATE_EVENT_KINDS

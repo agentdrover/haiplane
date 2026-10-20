@@ -42,7 +42,10 @@ from hub.integrations import cursor_cloud
 from hub.services import project_policy
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 from hub.services.model_family import same_family
-from hub.services.steward_judgement_sample import steward_judgement_body_sample
+from hub.services.steward_judgement_sample import (
+    steward_escalate_body_sample,
+    steward_judgement_body_sample,
+)
 from hub.services.steward_exit import (  # noqa: F401 — re-export for consumers
     ACT_ESCALATION_CEILING,
     ACT_ESCALATION_FLOOR,
@@ -400,7 +403,11 @@ def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
         "одно основание, у которого detail назван конкретным фактом пакета "
         "(значение, число, sha, поле). Без них хаб вернёт 422 и ничего не "
         "запишет — исправь тело и отправь снова в этом же прогоне. Образец "
-        "тела — в команде ниже; escalate оснований не требует.\n\n"
+        "тела — в команде ниже (в угловых скобках подсказки: замени их своими "
+        "значениями, подсказка в detail основанием не считается). Эскалация "
+        "оснований не требует, её тело: "
+        + steward_escalate_body_sample(generation)
+        + "\n\n"
         "Сомневаешься — эскалируй: эскалация возвращает решение человеку, то "
         "есть к сегодняшнему поведению, и стоит дёшево.\n\n" + delivery
     )

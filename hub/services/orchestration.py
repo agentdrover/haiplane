@@ -68,6 +68,7 @@ from hub.services.gate_events import (
     NON_HUMAN_GATE_ACTORS,
     STEWARD_APPLIED,
     STEWARD_ESCALATED,
+    STEWARD_JUDGEMENT_REFUSED,
     STEWARD_OVERRIDE_WINDOW_DAYS,
     sql_in,
 )
@@ -1884,6 +1885,7 @@ def _steward_gate_rows(
                 "project": project,
                 "applied": 0,
                 "escalated": 0,
+                "refused": 0,
                 "overridden_by_human": 0,
             },
         )
@@ -1903,6 +1905,10 @@ def _steward_gate_rows(
             applied.append(row)
         elif row["kind"] == STEWARD_ESCALATED:
             entry_for(project)["escalated"] += 1
+        elif row["kind"] == STEWARD_JUDGEMENT_REFUSED:
+            # #1924: 422 вместо записанной эскалации no_grounds; без этой
+            # строки счётчик escalated падает ложно.
+            entry_for(project)["refused"] += 1
 
     window = timedelta(days=STEWARD_OVERRIDE_WINDOW_DAYS)
     for applied_row in applied:

@@ -32,7 +32,10 @@ from hub.models import (
     StewardJudgementView,
 )
 from hub.services.finding_identity import finding_uids, unresolved_uids
-from hub.services.steward_judgement_sample import steward_judgement_body_sample
+from hub.services.steward_judgement_sample import (
+    is_placeholder_detail,
+    steward_judgement_body_sample,
+)
 from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicable
 from hub.services.gate_events import (
     STEWARD_APPLIED,
@@ -134,7 +137,11 @@ def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
     """
     if not detail_required:
         return list(grounds)
-    return [g for g in grounds if (g.detail or "").strip()]
+    return [
+        g
+        for g in grounds
+        if (g.detail or "").strip() and not is_placeholder_detail(g.detail)
+    ]
 
 
 def _downgrade_reason(
