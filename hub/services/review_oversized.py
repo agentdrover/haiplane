@@ -60,7 +60,7 @@ class AcTestSpan:
         if self.found:
             return f"ЧИТАТЬ ПЕРВЫМИ: {self.path}:{self.start}–{self.end} ({self.ref})"
         why = UNREADABLE if self.unreadable else NOT_FOUND
-        return f"ЧИТАТЬ ПЕРВЫМИ: {self.ref} — {why}"
+        return f"ЧИТАТЬ ПЕРВЫМИ: {why} ({self.ref})"
 
 
 def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:

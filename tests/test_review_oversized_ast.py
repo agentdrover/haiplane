@@ -115,7 +115,7 @@ def test_an_unreadable_pinned_file_is_not_a_range_from_the_branch():
     block, _ = diff_plan(_new(F, _big()), "develop", "b", ac_test_refs=[ref],
                          ac_sources={F: None})  # fmt: skip
     first = [ln for ln in block.splitlines() if ln.startswith("ЧИТАТЬ ПЕРВЫМИ")]
-    assert first == [f"ЧИТАТЬ ПЕРВЫМИ: {ref} — {UNREADABLE}"]
+    assert first == [f"ЧИТАТЬ ПЕРВЫМИ: {UNREADABLE} ({ref})"]
 
 
 def test_ac_cutouts_get_their_budget_before_the_other_files():
@@ -222,7 +222,7 @@ def test_an_unreadable_pinned_diff_still_states_the_block_as_unknown():
     branch = _new(F, ["def test_ac():", "    pass"])
     block, _ = diff_plan(branch, "develop", "b", ac_test_refs=[ref], ac_sources=None,
                          ac_block=True)  # fmt: skip
-    assert block.startswith(f"ЧИТАТЬ ПЕРВЫМИ: {ref} — {UNREADABLE}")
+    assert block.startswith(f"ЧИТАТЬ ПЕРВЫМИ: {UNREADABLE} ({ref})")
     assert "НЕ ПОМЕСТЯТСЯ" not in block
 
 
@@ -305,3 +305,20 @@ async def test_an_unread_pin_makes_the_block_mandatory_and_a_missing_pin_does_no
     )
     assert await _ac_inputs(db, {"id": 1}, ctx, refs, "x", False) == (None, None, False)
     assert await _ac_inputs(db, task, ctx, [], "x", False) == (None, None, False)
+
+
+def test_every_label_carries_the_test_ref_in_trailing_parentheses():
+    """Находка ревью 2: промт велит копировать test_ref «из скобок блока» - они нужны всегда."""
+    import re
+
+    from hub.services.review_oversized import unread_ac_tests
+
+    src = "def test_ac():\n    pass\n"
+    refs = [f"{F}::test_ac", f"{F}::test_gone", "web/src/panel.test.ts::still toggles"]
+    spans = ac_test_spans({F: src}, refs) + ac_test_spans({F: None}, [f"{F}::test_ac"])
+    for span in spans:
+        copied = re.search(r"\((.*)\)$", span.label())
+        assert copied and copied.group(1) == span.ref, span.label()
+        assert unread_ac_tests([f"ac_test_unread: {copied.group(1)}"], [span.ref]) == [
+            span.ref
+        ]
