@@ -56,6 +56,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.integrations.cursor_cloud import scrub_secrets
 from hub.integrations.registry import plugins
 from hub.services import ci_contract as ci_contract_mod
 from hub.services import project_policy
@@ -280,13 +281,31 @@ async def _trip_revert(
     return tripped
 
 
+_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
+_CREDENTIAL = re.compile(r"\S*@\S*")
+
+
+def _safe(text: str, limit: int = 200) -> str:
+    """Первая строка stderr без URL, учётных данных и известных секретов хаба.
+
+    stderr ``git fetch`` печатает URL remote, а в нём бывает токен: такой текст
+    не вправе попасть ни в баннер, ни в событие, ни в журнал.
+    """
+    first = (str(text or "").strip().splitlines() or [""])[0]
+    first = _CREDENTIAL.sub("[redacted]", _URL.sub("[url]", first))
+    return scrub_secrets(first)[:limit]
+
+
 async def _walk(project: dict[str, Any], cursor: str) -> dict[str, Any]:
     """Свежая история базы после курсора; ``{"error": причина}``, если не прочли."""
     workspace = str(project.get("workspace_path") or "").strip()
     base = base_branch_of(project)
     ok, detail = await plugins.git_ops.fetch_base(workspace, base)
     if not ok:
-        return {"error": f"fetch: {detail}"}
+        log.warning(
+            "revert watch %s: fetch: %s", project.get("slug"), _safe(detail, 500)
+        )
+        return {"error": f"fetch: {_safe(detail)}"}
     walk = await plugins.git_ops.first_parent_after(
         workspace, base, cursor, REVERT_BATCH
     )
@@ -370,7 +389,6 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
         if facts is None or any(s not in facts for s in shas):
             await _note_unchecked(db, project, "сообщения коммитов не прочитаны")
             return 0
-        _checked(project)
         tripped = 0
         for sha in shas:
             fact = facts[sha]
@@ -379,10 +397,13 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
         if shas:
             await _set_cursor(db, pid, shas[-1])
         await db.commit()
+        _checked(project)
         return tripped
-    except Exception:  # noqa: BLE001 - сборщик не роняет поллер; откат и повтор
+    except Exception as exc:  # noqa: BLE001 - сборщик не роняет поллер; откат и повтор
         log.exception("revert watch %s failed", project.get("slug"))
         await db.rollback()
+        # Сбой тоже «не проверено»; в причине только тип: в тексте может быть секрет.
+        await _note_unchecked(db, project, f"исключение {type(exc).__name__}")
         return 0
 
 

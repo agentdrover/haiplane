@@ -2796,8 +2796,10 @@ class GitOpsIntegration:
 
     async def first_parent_after(
         self, repo: str, base: str, since: str, limit: int
-    ) -> dict[str, Any] | None:
-        """Oldest ``limit`` first-parent commits of origin/``base`` after ``since`` (#1865)."""
+    ) -> dict[str, Any]:
+        """Oldest ``limit`` first-parent commits of origin/``base`` after ``since`` (#1865).
+
+        ``{"error": "<step> rc=<code>"}`` when a git step did not answer."""
         return await git_history.first_parent_after(
             partial(_git, repo=repo, check=False), base, since, limit
         )

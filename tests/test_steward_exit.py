@@ -47,6 +47,7 @@ class FakeGit:
         self.fetch_ok = True
         self.facts_ok = True
         self.walk_error = ""
+        self.fetch_detail = "network down"
 
     def commit(
         self, label: str, message: str = "", parent: str | None = None, second: str = ""
@@ -66,7 +67,7 @@ class FakeGit:
         return sha
 
     async def fetch_base(self, repo_path: str, base: str):
-        return (self.fetch_ok, "" if self.fetch_ok else "network down")
+        return (self.fetch_ok, "" if self.fetch_ok else self.fetch_detail)
 
     async def first_parent_after(
         self, repo_path: str, base: str, since: str, limit: int
@@ -662,3 +663,63 @@ async def test_unreadable_history_is_said_not_silent(
     await steward_breaker.collect_reverts(db, project)
     assert await steward_breaker.banner_rows(db) == []
     assert pid not in steward_breaker._failures
+
+
+_SCHEME = "https" + "://"
+LEAK = (
+    f"fatal: unable to access '{_SCHEME}x-access-token:SECRET"
+    + "@github.com/o/r.git/': "
+    "Could not resolve host\n"
+    f"second line {_SCHEME}other:SECRET2" + "@host/x"
+)
+
+
+async def test_the_unchecked_signal_leaks_no_remote_url_or_secret(
+    db: aiosqlite.Connection, git: FakeGit, caplog, monkeypatch
+):
+    monkeypatch.setenv("HUB_TEST_API_KEY", "SUPERSECRETVALUE123")
+    project = await project_with_workspace(db, "brk-leak")
+    git.commit("base-0")
+    await steward_breaker.collect_reverts(db, project)
+    git.fetch_ok = False
+    git.fetch_detail = "fatal: SUPERSECRETVALUE123 " + LEAK
+    for _ in range(steward_breaker.UNCHECKED_AFTER):
+        await steward_breaker.collect_reverts(db, project)
+    banner = (await steward_breaker.banner_rows(db))[0]["line"]
+    events = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=?",
+        (steward_breaker.EVENT_UNCHECKED,),
+    )
+    assert len(events) == 1
+    for text in (banner, events[0]["payload"], caplog.text):
+        for forbidden in ("SECRET", "https://", "github.com", "x-access-token"):
+            assert forbidden not in text, (forbidden, text)
+    assert "fetch" in banner and len(banner) < 400
+
+
+async def test_an_exception_on_every_tick_is_a_signal_and_names_only_its_type(
+    db: aiosqlite.Connection, git: FakeGit, monkeypatch
+):
+    project = await project_with_workspace(db, "brk-raise")
+    git.commit("base-0")
+    await steward_breaker.collect_reverts(db, project)
+    git.commit("next", "chore: next")
+
+    async def boom(*_a: Any, **_k: Any) -> int:
+        raise RuntimeError("token ghp_SECRETTEXT")
+
+    monkeypatch.setattr(steward_breaker, "_trip_revert", boom)
+    for tick in range(1, steward_breaker.UNCHECKED_AFTER):
+        assert await steward_breaker.collect_reverts(db, project) == 0
+        assert await steward_breaker.banner_rows(db) == []
+    await steward_breaker.collect_reverts(db, project)
+    banner = await steward_breaker.banner_rows(db)
+    assert [b["source"] for b in banner] == ["unchecked"]
+    assert "RuntimeError" in banner[0]["line"] and "SECRETTEXT" not in banner[0]["line"]
+    events = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=?",
+        (steward_breaker.EVENT_UNCHECKED,),
+    )
+    assert len(events) == 1 and "SECRETTEXT" not in events[0]["payload"]
