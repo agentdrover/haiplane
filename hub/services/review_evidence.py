@@ -625,9 +625,56 @@ async def ci_evidence_state(db, task: dict):
             baseline=CIEvidenceBlock(reason=text),
         )
     stored = dict(row) if row is not None else {}
+    task_id = int(task.get("id") or 0)
     return CIEvidenceState(
-        mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
-        baseline=_evidence_block("baseline", stored.get("baseline"), pinned),
+        mutations=await _block_of_the_commit(
+            db, task_id, pinned, stored, "mutations", "мутации"
+        ),
+        baseline=await _block_of_the_commit(
+            db, task_id, pinned, stored, "baseline", "baseline"
+        ),
+    )
+
+
+def _block_is_empty(raw: str | None) -> bool:
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return True
+    return not isinstance(data, dict) or not data
+
+
+async def _block_of_the_commit(
+    db, task_id: int, pinned: str, stored: dict, column: str, label: str
+):
+    """The current attempt's block, or — if it has none — the one another attempt counted (#1936).
+
+    A current block of any content wins. A block of another attempt of the same
+    commit is SHOWN with its source; the projection and the gates do not see it.
+    """
+    from hub.services.ci_trust import borrowed_evidence_block
+
+    raw = stored.get(column)
+    if stored and _block_is_empty(raw):
+        found = await borrowed_evidence_block(db, task_id, pinned, column, stored)
+        if found is not None:
+            return _signed(
+                _evidence_block(label, found.raw, pinned),
+                found.run_id,
+                found.run_attempt,
+                column,
+            )
+    return _evidence_block(label, raw, pinned)
+
+
+def _signed(block, run_id: str, run_attempt: str, column: str):
+    """The block, saying in ``run`` and in ``reason`` which attempt counted it."""
+    source = f"из попытки {run_id}/{run_attempt} того же коммита"
+    reason = f"{source}: {block.reason}" if block.reason else source
+    if column == "baseline":
+        reason += " (гейт red-test багов его не учитывает)"
+    return block.model_copy(
+        update={"run": f"{block.run}; {source} (не текущая попытка)", "reason": reason}
     )
 
 

@@ -2458,6 +2458,9 @@ async def upsert_ci_report_attempt(
     overwrite a newer one. Within one attempt a block the report did not carry
     (``None``) keeps what that attempt stored before (#1606); across attempts
     nothing is inherited (#1687): the latest attempt must carry its own blocks.
+    The one reader that looks at another attempt's blocks is the brief
+    (``ci_trust.borrowed_evidence_block``, #1936); the projection and the gates
+    do not.
     A replaced report starts unverified again — it is a new claim — and its
     ``body_version`` moves.
     """

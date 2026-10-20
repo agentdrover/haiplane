@@ -11,7 +11,10 @@ exist and say what the report says.
 report is kept and shown, but it is not evidence: it writes no AC result and no
 validation result, and it opens no gate. The same holds for a report whose
 attempt is no longer the current one: the evidence belongs to the attempt that
-produced it and is withdrawn when another attempt takes over.
+produced it and is withdrawn when another attempt takes over. One exception, for
+SHOWING only (#1936): the brief may name the mutations and baseline that another
+verified attempt of the same commit counted (``borrowed_evidence_block``); the
+projection and every gate stay on the current attempt.
 
 Three things are deliberately NOT guessed:
 
@@ -405,6 +408,85 @@ def reported_body(row: Any) -> dict[str, Any]:
         if block:
             body[key] = block
     return body
+
+
+# ---- evidence of ANOTHER attempt of the same commit (#1936) -----------------
+
+#: What a block must say to be borrowed: a step that really counted, not one that
+#: failed or found nothing to run against. Per column of ``ci_report_attempts``.
+BORROWABLE_STATES: dict[str, frozenset[str]] = {
+    "mutations": frozenset({"ran", "no_changed_functions", "no_tests"}),
+    "baseline": frozenset({"ran", "no_tests"}),
+}
+
+
+@dataclass(frozen=True)
+class BorrowedBlock:
+    """A mutations/baseline block counted by another attempt of the commit."""
+
+    raw: str
+    run_id: str
+    run_attempt: str
+
+
+def _order(row: Mapping[str, Any]) -> tuple[int, int]:
+    def number(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return number(row["run_id"]), number(row["run_attempt"])
+
+
+def _usable_block(
+    row: Mapping[str, Any], column: str, head_sha: str, fingerprint: str
+) -> dict[str, Any] | None:
+    """The block of a confirmed, successful attempt that was counted on ``head_sha``."""
+    if trust_of(row, fingerprint)[0] != VERIFIED or not run_succeeded(
+        {"provenance": row["provenance"]}
+    ):
+        return None
+    block = _json_map(row[column])
+    if block.get("head") != head_sha:  # no ``head`` = not counted on this commit
+        return None
+    return block if block.get("state") in BORROWABLE_STATES[column] else None
+
+
+async def borrowed_evidence_block(
+    db: Any, task_id: int, head_sha: str, column: str, current: Mapping[str, Any]
+) -> BorrowedBlock | None:
+    """The block ``column`` of another verified attempt of this commit, for the brief only.
+
+    The projection (``ci_run_reports``) stays the row of the current attempt and
+    the gates read it, so nothing here lets a gate lean on another attempt
+    (#1687). This is the READ for the brief: a ``pull_request:synchronize`` run
+    does not count mutations and baseline and starts after the executor's
+    dispatch run, so it is the current attempt and its empty blocks used to hide
+    what was counted on the same commit.
+
+    ``current`` is the confirmed projection row; the current attempt must be
+    verified AND have succeeded, otherwise nothing is borrowed (incomplete,
+    unreachable GitHub, changed contract and failure keep the answer they had).
+    Each candidate is checked again NOW (verified under the current contract,
+    run succeeded, block ``head`` == ``head_sha``, informative state). Of several
+    the newest wins by ``(run_id, run_attempt)``.
+    """
+    if not head_sha or not run_succeeded(current):
+        return None
+    fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
+    best: tuple[tuple[int, int], BorrowedBlock] | None = None
+    for candidate in await repo.list_ci_report_attempts(db, task_id, head_sha):
+        row = dict(candidate)
+        if _usable_block(row, column, head_sha, fingerprint) is None:
+            continue
+        order = _order(row)
+        if best is None or order > best[0]:
+            best = (
+                order,
+                BorrowedBlock(row[column], row["run_id"], row["run_attempt"]),
+            )
+    return best[1] if best else None
 
 
 # ---- which attempt is current ----------------------------------------------
