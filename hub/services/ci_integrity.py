@@ -117,6 +117,9 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         # #1919: decides which evidence a PR run takes from the dispatch run;
         # changing it can swap what the red-test gate reads.
         "scripts/adopt_evidence.py",
+        # #1921: puts the reports of the mutation legs together; a changed merge
+        # can turn a missing leg into "ran".
+        "scripts/merge_mutation_legs.py",
         # #1767: a plugin loaded by the command of each test part
         # (``-p scripts.pytest_shard``); changing it can hide tests.
         "scripts/pytest_shard.py",

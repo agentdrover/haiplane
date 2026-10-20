@@ -5,10 +5,11 @@ The executor dispatches CI before submitting; the hub opens the PR at submission
 Both runs sit on the same head sha, and both used to count the mutations and the
 red-test baseline from scratch (~10 min). This script decides, in job ``treedup``,
 whether the PR run may take the evidence artifact of the dispatch run instead, and
-stamps the adopted files with the source run.
+writes the adopted files, stamped with the source run, into ``--out-dir``; the job
+then uploads them as the artifact of THIS run (#1921: the decision and the files
+come from one step, so a doubt after the decision cannot leave a run without them).
 
-    decide  --head-sha SHA --base-ref develop --github-output FILE
-    stamp   --run-id N --dir DIR
+    decide  --head-sha SHA --base-ref develop --github-output FILE --out-dir DIR
 
 Rules of ``decide`` (anything else is a recount, never a red job):
 
@@ -97,8 +98,13 @@ def find_source(
     head_sha: str,
     parent1: str,
     base_ref: str,
+    keep: Callable[[int, dict, dict], None] | None = None,
 ) -> tuple[int, str]:
-    """(run id, '') of the newest adoptable dispatch run, or (0, reason)."""
+    """(run id, '') of the newest adoptable dispatch run, or (0, reason).
+
+    ``keep(run_id, mutations, baseline)`` is called once, with the documents of
+    the chosen run, before the answer is returned.
+    """
     listing = api(
         f"repos/{repo}/actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch"
         f"&head_sha={head_sha}&status=success&per_page={_CANDIDATES}"
@@ -140,6 +146,8 @@ def find_source(
         if why:
             reason = f"run {run_id}: {why}"
             continue
+        if keep is not None:
+            keep(run_id, mutations, baseline)
         return run_id, ""
     return 0, reason
 
@@ -161,8 +169,13 @@ def decide(
     repo: str,
     head_sha: str,
     base_ref: str,
+    out_dir: Path | None = None,
 ) -> tuple[int, str]:
-    """(run id to adopt, '') or (0, reason). Never raises."""
+    """(run id to adopt, '') or (0, reason). Never raises.
+
+    With ``out_dir`` the adopted documents are written there, stamped; a failure
+    to write them is a recount, so ``adopt`` never promises files that are not there.
+    """
     try:
         parent1, why = merge_facts(git, head_sha)
         if why:
@@ -174,19 +187,23 @@ def decide(
             head_sha=head_sha,
             parent1=parent1,
             base_ref=base_ref,
+            keep=None
+            if out_dir is None
+            else lambda *args: write_adopted(out_dir, *args),
         )
     except Exception as exc:  # noqa: BLE001 - any failure is a recount
         return 0, f"{exc.__class__.__name__}: {str(exc)[:200]}"
 
 
-def stamp(directory: Path, run_id: int) -> None:
-    """Record the source run inside both evidence files (the block, not provenance)."""
-    for name in (MUTATIONS_FILE, BASELINE_FILE):
-        path = directory / name
-        document = json.loads(path.read_text(encoding="utf-8"))
-        document[ADOPTED_KEY] = run_id
-        path.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
+def write_adopted(
+    directory: Path, run_id: int, mutations: dict, baseline: dict
+) -> None:
+    """Write both documents, with the source run inside the block (not provenance)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, document in ((MUTATIONS_FILE, mutations), (BASELINE_FILE, baseline)):
+        stamped = {**document, ADOPTED_KEY: run_id}
+        (directory / name).write_text(
+            json.dumps(stamped, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
 
@@ -220,14 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     decide_cmd.add_argument("--head-sha", required=True)
     decide_cmd.add_argument("--base-ref", required=True)
     decide_cmd.add_argument("--github-output", required=True)
-    stamp_cmd = sub.add_parser("stamp")
-    stamp_cmd.add_argument("--run-id", type=int, required=True)
-    stamp_cmd.add_argument("--dir", default=".")
+    decide_cmd.add_argument("--out-dir", required=True)
     args = parser.parse_args(argv)
 
-    if args.command == "stamp":
-        stamp(Path(args.dir), args.run_id)
-        return 0
     run_id, reason = decide(
         _real_api,
         _real_zip,
@@ -235,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         repo=os.environ.get("GITHUB_REPOSITORY", ""),
         head_sha=args.head_sha,
         base_ref=args.base_ref,
+        out_dir=Path(args.out_dir),
     )
     with open(args.github_output, "a", encoding="utf-8") as out:
         out.write(f"adopt={'true' if run_id else 'false'}\n")

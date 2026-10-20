@@ -47,7 +47,9 @@ jobs:
       evidence_run: ${{ steps.evidence.outputs.run }}
       # #1919: whether job `evidence` takes the evidence of the dispatch run on
       # this same head instead of counting it again, and from which run.
-      adopt: ${{ steps.adopt.outputs.adopt }}
+      # #1921: "true" only when the files are there, i.e. the decision AND the
+      # upload of the adopted evidence succeeded; anything else is a recount.
+      adopt: ${{ steps.adopt.outputs.adopt == 'true' && steps.adopt_upload.outcome == 'success' && 'true' || 'false' }}
       adopted_run_id: ${{ steps.adopt.outputs.adopted_run_id }}
 
     steps:
@@ -115,7 +117,26 @@ jobs:
         run: |
           python3 -I scripts/adopt_evidence.py decide \
             --head-sha "$HEAD_SHA" --base-ref "$BASE_REF" \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$GITHUB_OUTPUT" --out-dir adopted-evidence
+
+      # #1921: the adopted files become the artifact of THIS run right here, so
+      # the legs of the mutation matrix and the baseline have nothing to compute
+      # and job test downloads the same name it always did. The name has no attempt
+      # number and `overwrite` is set for the reason given at the upload in job
+      # `evidence`. Failure of this step makes the output `adopt` false: a recount.
+      - name: Keep the adopted evidence as the artifact of this run
+        id: adopt_upload
+        if: ${{ steps.adopt.outputs.adopt == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-evidence
+          overwrite: true
+          path: |
+            adopted-evidence/mutation-report.json
+            adopted-evidence/red-test-baseline.json
+          if-no-files-found: error
+          retention-days: 3
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -246,29 +267,35 @@ jobs:
         timeout-minutes: 25
         run: HAIPLANE_TEST_SHARD=${{ matrix.shard }}/${{ strategy.job-total }} uv run pytest -p scripts.pytest_shard -q -n auto --durations=30
 
-  # #1785: the mutations and the red-test baseline do not depend on the outcome
-  # of the parts (the script runs the changed files' tests itself, after a green
-  # baseline of its own), so they run NEXT to the parts instead of after them.
-  # Measured on #1767 (0545c6ac, d674d0d5): 552 s + 78 s sequentially after the
-  # parts.
+  # #1921: the mutations run as a matrix of legs. The series was sequential under
+  # one 540 s budget that was nearly always spent (570-690 s on the critical path
+  # of every dispatch and first PR run). Each leg takes the mutants whose rank in
+  # one global order is its number mod N (scripts/mutation_changed.py --shard), so
+  # the legs are a partition, and the series budget of a leg is 540/N seconds
+  # (at least 60): the same total work, 1/N of the wall time. N is the matrix.
   #
-  # `continue-on-error` at the JOB level: a red evidence job must not make the
-  # workflow red (ci_trust requires run_conclusion=success). The job holds no
-  # environment, no secret and no report key (#1686): it runs the branch's code.
-  # Its files travel to job `test` in an intermediate artifact whose name does
-  # NOT start with `hub-ci-results-`: the trusted report reads only that prefix
-  # (scripts/ci_trusted_report.py), and the files reach it through the AC
-  # collection of job `test`, as before.
+  # `continue-on-error` at the JOB level: a red leg must not make the workflow red
+  # (ci_trust requires run_conclusion=success), and job `evidence` says in the
+  # merged report what a failed leg cost.
   #
-  # Whether the evidence is EXPECTED is decided once, in job treedup. A run that
-  # does not expect it skips this job entirely (nothing is installed).
-  evidence:
-    name: Mutations and red-test baseline
+  # The legs hold no environment, no secret and no report key (#1686): they run
+  # the branch's code. Their reports travel as intermediate artifacts whose names
+  # do not start with `hub-ci-results-`; job `evidence` below puts them together.
+  # The step keeps its name: the hub names the minutes of a step by that name and
+  # adds them up over every job (ci_trusted_report.TIMING_STEPS, ci_timing).
+  # A run that adopted the dispatch run's evidence (job treedup) skips the legs.
+  mutation_legs:
+    name: Mutations leg ${{ matrix.leg }}/${{ strategy.job-total }}
     needs: treedup
-    if: ${{ needs.treedup.outputs.evidence_run == 'true' }}
+    if: ${{ needs.treedup.outputs.evidence_run == 'true' && needs.treedup.outputs.adopt != 'true' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # The number of legs is set HERE and nowhere else.
+        leg: [1, 2, 3]
     # Same as in job test: a missing tool or root is a red test, not a skip.
     env:
       CI_REQUIRE_ROOT_TESTS: "1"
@@ -277,49 +304,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # The mutations and the baseline diff against the base branch, and
-          # merge-base needs history that a depth-1 checkout does not have.
+          # The mutations diff against the base branch, and merge-base needs
+          # history that a depth-1 checkout does not have.
           fetch-depth: 0
 
-      # #1919: the evidence of the dispatch run on this head (see job treedup).
-      # Downloaded and stamped FIRST: when both steps succeed, nothing below runs
-      # (no install, no mutations, no baseline); when either fails, the job
-      # recounts as before. Only `github.token` with `actions: read` is used.
-      - name: Download the evidence of the dispatch run (adopt)
-        id: adopt_download
-        if: ${{ needs.treedup.outputs.adopt == 'true' }}
-        continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: hub-ci-evidence
-          run-id: ${{ needs.treedup.outputs.adopted_run_id }}
-          github-token: ${{ github.token }}
-          path: .
-
-      - name: Stamp the adopted evidence with its source run
-        id: adopt_stamp
-        if: ${{ steps.adopt_download.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          ADOPTED_RUN_ID: ${{ needs.treedup.outputs.adopted_run_id }}
-        run: python3 -I scripts/adopt_evidence.py stamp --run-id "$ADOPTED_RUN_ID" --dir .
-
       - name: Install uv
-        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.12.18"
           enable-cache: true
 
       - name: Set up Python
-        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       # #1707: see the same step in job test; no `|| true`.
       - name: Install age and openssh-server (backup tests)
-        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends age openssh-server
@@ -327,7 +328,6 @@ jobs:
           sudo -n true
 
       - name: Install dependencies
-        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: uv sync --locked --dev
 
       # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
@@ -338,33 +338,90 @@ jobs:
       # red one is reported as "the series did not run", never as "no
       # survivors". Warning only, like Surface parity: the script exits 0,
       # continue-on-error keeps a crash out of the delivery gate, and the
-      # timeout caps the cost (outcome revisit condition: 10 minutes).
+      # timeout caps the cost.
       # The base is the PR base, develop for a manual run (as for the baseline).
+      # #1921: the baseline has a ceiling of its own (540 s, as before); the
+      # series budget is the leg's share of 540 s, never below 60 s.
       - name: Mutations of changed functions (warning only)
         id: mutations
-        if: ${{ needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 15
+        env:
+          LEG: ${{ matrix.leg }}
+          LEGS: ${{ strategy.job-total }}
         run: |
+          budget=$((540 / LEGS))
+          if [ "$budget" -lt 60 ]; then budget=60; fi
           uv run python scripts/mutation_changed.py \
             --base "origin/${{ github.base_ref || 'develop' }}" \
-            --budget-seconds 540 \
+            --shard "$LEG/$LEGS" \
+            --baseline-timeout 540 \
+            --budget-seconds "$budget" \
             --json-out mutation-report.json
 
-      # #913: the red-test gate for bugs needs proof that the AC test failed
-      # BEFORE the fix, and the hub accepts CI reports only about the pinned
-      # commit. So the proof travels in that same report: the branch's changed
-      # tests/** are laid over the merge-base code in a separate worktree and
-      # run with junitxml — failed (assert) / passed / error (collection,
-      # ImportError, fixture). A test failing on the base is DATA, not an
-      # error: the script always exits 0 and continue-on-error keeps a crash
-      # out of the delivery gate. task-* branches only (PR and manual runs);
-      # the base is the PR base, develop for a manual run.
+      # The name carries the leg, not an attempt number: "Re-run failed jobs"
+      # reruns only the failed legs, and the others must still be found. A rerun
+      # replaces the file (`overwrite`).
+      - name: Hand the mutation report of this leg over
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-mutations-leg-${{ matrix.leg }}
+          overwrite: true
+          path: mutation-report.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # #913: the red-test gate for bugs needs proof that the AC test failed BEFORE
+  # the fix, and the hub accepts CI reports only about the pinned commit. So the
+  # proof travels in that same report: the branch's changed tests/** are laid
+  # over the merge-base code in a separate worktree and run with junitxml —
+  # failed (assert) / passed / error (collection, ImportError, fixture). A test
+  # failing on the base is DATA, not an error: the script always exits 0 and
+  # continue-on-error keeps a crash out of the delivery gate. task-* branches
+  # only (PR and manual runs); the base is the PR base, develop for a manual run.
+  # #1921: a job of its own, beside the legs (it used to follow the whole series).
+  baseline:
+    name: Red-test baseline
+    needs: treedup
+    if: ${{ needs.treedup.outputs.evidence_run == 'true' && needs.treedup.outputs.adopt != 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # #1707: see the same step in job test; no `|| true`.
+      - name: Install age and openssh-server (backup tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
       - name: Red-test baseline on merge-base (data only)
         id: baseline
-        # !cancelled(): the proof is about the base, not about the mutations
-        # step above.
-        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 10
         run: |
@@ -372,15 +429,63 @@ jobs:
             --base "origin/${{ github.base_ref || 'develop' }}" \
             --json-out red-test-baseline.json
 
-      # The name has NO attempt number: "Re-run failed jobs" does not rerun this
-      # job, and job test of attempt 2 must still find the files of attempt 1
-      # (same run, same commit). `overwrite: true`: a full rerun replaces them.
-      # The job-level `if` above also skips the installs when nothing is expected.
-      # The hand-over to job test: whatever files exist, even after a red step.
-      # No files at all ⇒ no artifact (ignore), and job test reports the
-      # missing file as an error with its cause.
+      - name: Hand the baseline report over
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-baseline
+          overwrite: true
+          path: red-test-baseline.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # The one place that puts the evidence of this run together, under the job name
+  # and the artifact name the rest of the pipeline (and a later PR run that adopts
+  # this one, #1919) knows. Standard library only: nothing is installed.
+  # `!cancelled()`: legs that failed or were skipped must still produce a report
+  # that SAYS so (state=error with the reason), never silence. A run that adopted
+  # the evidence (treedup) has nothing to put together and skips this job.
+  # The name has NO attempt number: "Re-run failed jobs" does not rerun this job
+  # unless it failed, and job test of attempt 2 must still find the files of
+  # attempt 1 (same run, same commit). `overwrite: true`: a full rerun replaces them.
+  evidence:
+    name: Mutations and red-test baseline
+    needs: [treedup, mutation_legs, baseline]
+    if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' && needs.treedup.outputs.adopt != 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the mutation reports of the legs
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: hub-ci-mutations-leg-*
+          path: legs
+
+      - name: Download the baseline report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-ci-baseline
+          path: .
+
+      - name: Put the legs together
+        run: |
+          mkdir -p legs
+          python3 -I scripts/merge_mutation_legs.py \
+            --legs-dir legs --out mutation-report.json
+
+      # The hand-over to job test: whatever files exist. No files at all ⇒ no
+      # artifact (ignore), and job test reports the missing file as an error with
+      # its cause.
       - name: Upload the evidence files for job test
-        if: ${{ always() && needs.treedup.outputs.evidence_run == 'true' }}
+        if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

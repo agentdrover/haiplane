@@ -221,3 +221,191 @@ def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
         if m.operator_name.startswith("core/ReplaceBinaryOperator_Mul_")
     ]
     assert stars and all(m.start_pos[0] == 5 for m in stars)
+
+
+# ---- #1921: the series is split into legs by the mutant itself ----------------
+
+_MANY_BASE = """\
+def score(a, b, c):
+    return 0
+"""
+
+_MANY_HEAD = """\
+def score(a, b, c):
+    if a > b:
+        return a + b - c
+    return a * c + b
+"""
+
+_MANY_TEST = """\
+from many import score
+
+
+def test_score_one_branch():
+    assert score(5, 1, 2) == 4
+
+
+def test_score_other_branch_weakly():
+    assert score(1, 5, 2) is not None
+"""
+
+
+def _import_script():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mutation_changed_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look the module up by name
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Spec:
+    """The five attributes of a cosmic-ray MutationSpec the key is built from."""
+
+    def __init__(self, start, end, operator="core/ReplaceBinaryOperator_Add_Sub", n=0):
+        self.start_pos, self.end_pos = start, end
+        self.operator_name, self.occurrence = operator, n
+
+
+def test_mutants_split_by_sorted_index_is_a_partition():
+    """AC-1: the legs are a partition, and the owner does not depend on input order."""
+    import random
+
+    script = _import_script()
+    function = script.Function("m.py", "f", 1, 99)
+    other = script.Function("m.py", "g", 100, 200)
+    specs = [
+        _Spec((line, col), (line, col + 1), operator=op, n=n)
+        for line in range(2, 9)
+        for col in (0, 4)
+        for op, n in (("core/A", 0), ("core/B", 1))
+    ]
+
+    def build(order_seed: int | None):
+        items = list(specs)
+        if order_seed is not None:
+            random.Random(order_seed).shuffle(items)
+        half = len(items) // 2
+        return [
+            script._Target(function, items[:half], []),
+            script._Target(other, items[half:], []),
+        ]
+
+    def owners(total: int, order_seed: int | None) -> dict:
+        owned: dict = {}
+        for index in range(1, total + 1):
+            for target in script.shard_targets(build(order_seed), index, total):
+                for mutation in target.mutations:
+                    key = script.mutation_key(target.function.path, mutation)
+                    assert key not in owned or total == 1
+                    owned.setdefault(key, set()).add(index)
+        return owned
+
+    for total in (1, 2, 3, 4, 7):
+        baseline = owners(total, None)
+        # a partition: every mutant has exactly one owner leg, none is lost
+        assert all(len(legs) == 1 for legs in baseline.values())
+        assert len(baseline) == len(specs)
+        # the same owner whatever order the targets list their mutations in
+        for seed in (1, 2, 3):
+            assert owners(total, seed) == baseline, (total, seed)
+        sizes = [
+            sum(len(t.mutations) for t in script.shard_targets(build(None), i, total))
+            for i in range(1, total + 1)
+        ]
+        assert sum(sizes) == len(specs) and max(sizes) - min(sizes) <= 1, sizes
+    # leg 1 of 1 is the whole series, untouched
+    whole = build(None)
+    assert script.shard_targets(whole, 1, 1) is whole
+
+
+def test_parse_shard_refuses_what_it_does_not_understand():
+    script = _import_script()
+    assert script.parse_shard("2/3") == (2, 3)
+    for bad in ("", "3", "0/3", "4/3", "1/0", "a/b", "1/2/3"):
+        try:
+            script.parse_shard(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} must be refused")
+
+
+def _many_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "base")
+    (repo / "many.py").write_text(_MANY_BASE)
+    (repo / "tests" / "test_many.py").write_text(_MANY_TEST)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "many.py").write_text(_MANY_HEAD)
+    _git(repo, "commit", "-q", "-am", "change score")
+    return repo
+
+
+def _run_leg(repo: Path, shard: str, name: str) -> dict:
+    out = repo.parent / name
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--base",
+            "base",
+            "--repo",
+            str(repo),
+            "--shard",
+            shard,
+            "--baseline-timeout",
+            "120",
+            "--budget-seconds",
+            "300",
+            "--json-out",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(out.read_text())
+
+
+def test_merged_legs_equal_the_sequential_series(tmp_path):
+    """AC-2: three legs, merged, say what one sequential run says (budget not hit)."""
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location(
+        "merge_mutation_legs", SCRIPT.parent / "merge_mutation_legs.py"
+    )
+    merger = module_from_spec(spec)
+    spec.loader.exec_module(merger)
+
+    repo = _many_repo(tmp_path)
+    whole = _run_leg(repo, "1/1", "whole.json")
+    assert whole["state"] == "ran" and whole["mutants"] >= 6, whole
+    assert whole["survived"] >= 1 and whole["killed"] >= 1, whole
+
+    legs = [_run_leg(repo, f"{i}/3", f"leg{i}.json") for i in (1, 2, 3)]
+    assert [leg["shard"] for leg in legs] == ["1/3", "2/3", "3/3"]
+    assert sum(leg["mutants"] for leg in legs) == whole["mutants"]
+    merged = merger.merge([(f"leg{i}", leg) for i, leg in enumerate(legs, 1)])
+
+    assert merged["state"] == "ran", merged
+    # not_run may differ (the per-mutant timeout depends on the runner); what was
+    # judged must not
+    for key in ("mutants", "killed", "survived"):
+        assert merged[key] == whole[key], (key, merged, whole)
+    assert merged["functions"] == whole["functions"]
+    assert merged["untested"] == whole["untested"]
+
+    def named(report):
+        return sorted(
+            (s["file"], s["line"], s["operator"]) for s in report["survivors"]
+        )
+
+    assert named(merged) == named(whole)
+    # the legs share no survivor
+    seen = [tuple(x) for leg in legs for x in named(leg)]
+    assert len(seen) == len(set(seen))
