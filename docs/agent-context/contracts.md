@@ -154,9 +154,35 @@ Host key (`slot_runner`), exactly six routes of its OWN host:
   is 409, a foreign order is 403, an unknown phase 422, over 30/min per host 429.
   Phases are never written to the task feed. Old hosts that send none keep working.
 - `POST …/orders/{id}/report {outcome: submitted|rescued|failed, sha?, branch?,
-  note?, reason_code?, reason?}` — NO feed entry (#1817: a host report only stores outcome, sha, branch, note and reason for the card plaque and `GET …/orders/{id}`; the ONE final feed entry of an order is written by the order's close, in the transaction that sets `state=closed`, from the actual outcome at that moment — the task submitted by this order's run → submission, otherwise the close reason with the host `reason_code`/`reason` as detail; a return of the task to open or a claim release of THIS order's run writes none of its own, any other run writes its normal entry), repeat is a no-op, a different outcome is 409, `note` ≤ 500 chars without codes or tokens (422), never changes the task status; works on a closed order. `reason_code` (#1817): channel_check_failed, setup_failed, redeem_failed, vm_failed, busy, over_budget, agent_failed, critic_failed, timeout, hub_unavailable, stale_token, other (absent on failed/rescued from an old client = `other`; unknown value 422); `reason` ≤ 200 chars passes the same secret and order-code checks as `note`; the reason of the first report is immutable (a repeat with another `reason_code` is 409, an identical repeat is a no-op). `failed`/`rescued` also CLOSE the order (the run ended
+  note?, reason_code?, reason?}` — NO feed entry (#1817: a host report only stores outcome, sha, branch, note and reason for the card plaque and `GET …/orders/{id}`; the ONE final feed entry of an order is written by the order's close, in the transaction that sets `state=closed`, from the actual outcome at that moment — the task submitted by this order's run → submission, otherwise the close reason with the host `reason_code`/`reason` as detail; a return of the task to open or a claim release of THIS order's run writes none of its own, any other run writes its normal entry), repeat is a no-op, a different outcome is 409, `note` ≤ 500 chars without codes or tokens (422), never changes the task status; works on a closed order. `reason_code` (#1817, #1941): channel_check_failed, setup_failed, redeem_failed, vm_failed, busy, over_budget, agent_failed, critic_failed, critic_cycles_exhausted, critic_time_exhausted, critic_unavailable, critic_delivery_failed, no_new_head, integrity_violation, timeout, hub_unavailable, stale_token, other (absent on failed/rescued from an old client = `other`; unknown value 422); `reason` ≤ 200 chars passes the same secret and order-code checks as `note`; the reason of the first report is immutable (a repeat with another `reason_code` is 409, an identical repeat is a no-op). `failed`/`rescued` also CLOSE the order (the run ended
   without a submission: unspent code burnt, run aborted, slot free); `submitted`
   does not (the landed submission closes it). `branch` is a WHITELIST: the task's own `tasks.branch` or `task-<order task id>/rescue-<digits>`, anything else is 422; `sha` is `^[0-9a-f]{7,40}$`; `note` has the secret and long-token checks (no heuristics on branch/sha).
+
+
+Class of a failed or rescued run by `reason_code` (#1941; one table in `hub/services/executor_triage.py` `CODE_CLASS`, a code not in the table — including an unknown STORED code — is class 0 `unclassified`, never an error; an unknown INPUT code stays 422):
+
+| reason_code | class | class_name |
+|---|---|---|
+| `critic_unavailable` | 1 | infra |
+| `critic_delivery_failed` | 1 | infra |
+| `channel_check_failed` | 1 | infra |
+| `setup_failed` | 1 | infra |
+| `redeem_failed` | 1 | infra |
+| `vm_failed` | 1 | infra |
+| `hub_unavailable` | 1 | infra |
+| `stale_token` | 1 | infra |
+| `busy` | 1 | infra |
+| `over_budget` | 1 | infra |
+| `timeout` | 1 | infra |
+| `no_new_head` | 2 | no_new_head |
+| `critic_cycles_exhausted` | 3 | critic_exhausted |
+| `critic_time_exhausted` | 3 | critic_exhausted |
+| `integrity_violation` | 4 | integrity |
+| `critic_failed` | 0 | unclassified |
+| `agent_failed` | 0 | unclassified |
+| `other` | 0 | unclassified |
+
+`last_executor_order` (#1941, task card: REST `GET /api/tasks/{id}`, MCP `hub_task_status` compact and full, `oc-hub status`, card line «После неудачного прогона»): `null` when the task has no host order; otherwise `{order_id, state, outcome, reason_code, class, class_name, after_failed_run}` (no order code, hash or ciphertext; `class`/`class_name` are null unless outcome is failed/rescued). `after_failed_run` is true only when the LAST host order is closed with outcome rescued/failed AND, in the same single SELECT snapshot (`executor_triage._SNAPSHOT_SQL`; never `executor_launch._live_run`, which writes), the task is `open`, not archived, has no holder (`claimed_by`, `claim_session_id`, `implementer_principal_id`), no live implementer session, no running or booked executor run (cloud booking included) and `submission_generation` below the order's generation (a canonical submission beats a later report failed/rescued). A newer order is the last order itself, so it is never "after a failed run". A read failure is `{"unavailable": <reason>}` with NO `after_failed_run` key (unknown is neither false nor true). The state is a read, not a decision: nothing is launched (invariants: a code for a slot only by a human's executor-launch); "reviewed by someone" is #1942.
 
 Host contract: decrypt `code_ciphertext` (RSA-OAEP, SHA-256 in OAEP and MGF1, no
 label, base64url without padding — reference `scripts/executor_host_decrypt.py`),
