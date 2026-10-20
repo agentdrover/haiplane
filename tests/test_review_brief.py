@@ -1635,6 +1635,43 @@ async def test_missing_mutation_evidence_reads_as_not_received(
     assert "прогон неизвестен" in both["baseline"]["run"]
 
 
+async def test_brief_says_when_the_evidence_was_adopted_from_another_run(
+    db, client: AsyncClient, workspace
+):
+    """#1919: provenance names the run that reported; the file names its source."""
+    task_id = await _project_with(db, client, workspace, "main")
+    plugins.git_ops = _RealRefs()
+    await repo.update_task(db, task_id, submission_sha="a" * 40)
+    await db.commit()
+    provenance = {
+        "run_id": "888",
+        "event": "pull_request.opened",
+        "at": "2026-10-20T10:00:00Z",
+        "run_url": "",
+    }
+    await _store_report(
+        db,
+        task_id,
+        mutations={
+            "state": "ran",
+            "survivors": [],
+            "provenance": provenance,
+            "adopted_from_run": 777,
+        },
+        baseline={"state": "ran", "tests": {}, "provenance": provenance},
+    )
+
+    both = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()[
+        "ci_evidence"
+    ]
+
+    assert "888" in both["mutations"]["run"]
+    assert "усыновлено из dispatch-прогона 777" in both["mutations"]["run"]
+    assert "со слов прогона" in both["mutations"]["run"]
+    # A block counted by the run itself does not claim an adoption.
+    assert "усыновлено" not in both["baseline"]["run"]
+
+
 async def test_brief_rejects_foreign_evidence_and_keeps_error_reasons(
     db, client: AsyncClient, workspace
 ):

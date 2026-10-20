@@ -589,6 +589,12 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
             run += f", {prov['run_url']}"
     else:
         run = "прогон неизвестен"
+    adopted = data.get("adopted_from_run")
+    if adopted:
+        # #1919: the provenance above is the run that REPORTED; the numbers were
+        # counted by the dispatch run on the same head. The file says so itself,
+        # so this is the run's own word, not something the hub verified.
+        run += f"; усыновлено из dispatch-прогона {adopted} (со слов прогона)"
     return CIEvidenceBlock(
         state="received",
         result=str(data.get("state") or ""),

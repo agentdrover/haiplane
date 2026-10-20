@@ -70,8 +70,8 @@ async def test_accept_only_when_all_evidence_clean(
     brief = await _brief(db, clean)
     _shape(brief)
     assert brief["accept_proven"]
-    assert brief["recommend"]["action"] == "Проверить"
-    assert brief["recommend"]["verdict"] == ""
+    assert brief["recommend"]["action"] == "Принять"
+    assert brief["recommend"]["verdict"] == "approved"
 
     doubts: dict[str, int] = {}
     doubts["unresolved"] = await _review_task(
@@ -192,8 +192,8 @@ async def test_steward_vocabulary_mapping(
     await _judgement(db, third, gen3, "approve")
     ok = await _brief(db, third)
     assert ok["accept_proven"]
-    assert ok["recommend"]["action"] == "Проверить"
-    assert ok["recommend"]["verdict"] == ""
+    assert ok["recommend"]["action"] == "Принять"
+    assert ok["recommend"]["verdict"] == "approved"
     # Вердикт за человеком по маршруту — справка так и говорит.
     assert "вам" in " ".join(ok["recommend"]["why"]).lower() or ok["need"]
 

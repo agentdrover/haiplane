@@ -45,6 +45,10 @@ jobs:
       # in THIS run. Decided once, here, and read by job `evidence` (to run) and
       # by job `test` (to know what a missing file means).
       evidence_run: ${{ steps.evidence.outputs.run }}
+      # #1919: whether job `evidence` takes the evidence of the dispatch run on
+      # this same head instead of counting it again, and from which run.
+      adopt: ${{ steps.adopt.outputs.adopt }}
+      adopted_run_id: ${{ steps.adopt.outputs.adopted_run_id }}
 
     steps:
       # #1606: мутации (~9,5 мин) и baseline (~2-3 мин) считаются там, где их
@@ -89,6 +93,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # #1919: the executor dispatches CI before submitting and the hub opens the
+      # PR at submission: both runs sit on the same head sha, and the mutations
+      # and the red-test baseline (~10 min) were counted twice. Only the opened
+      # and reopened runs of a task branch look for a source; the script
+      # (standard library, no install) answers adopt=true only when the dispatch
+      # run's evidence was measured against the base of THIS merge commit
+      # (HEAD^1, not the event's base.sha, which may lag) and the merge tree equals
+      # the head tree. Any doubt or failure is adopt=false: a recount, never a
+      # red job. The token is the read-only one of this workflow (actions: read).
+      - name: Adopt the evidence of the dispatch run on the same head
+        id: adopt
+        if: ${{ github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened') && startsWith(github.head_ref, 'task-') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 -I scripts/adopt_evidence.py decide \
+            --head-sha "$HEAD_SHA" --base-ref "$BASE_REF" \
+            --github-output "$GITHUB_OUTPUT"
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -254,19 +281,45 @@ jobs:
           # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
 
+      # #1919: the evidence of the dispatch run on this head (see job treedup).
+      # Downloaded and stamped FIRST: when both steps succeed, nothing below runs
+      # (no install, no mutations, no baseline); when either fails, the job
+      # recounts as before. Only `github.token` with `actions: read` is used.
+      - name: Download the evidence of the dispatch run (adopt)
+        id: adopt_download
+        if: ${{ needs.treedup.outputs.adopt == 'true' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-ci-evidence
+          run-id: ${{ needs.treedup.outputs.adopted_run_id }}
+          github-token: ${{ github.token }}
+          path: .
+
+      - name: Stamp the adopted evidence with its source run
+        id: adopt_stamp
+        if: ${{ steps.adopt_download.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          ADOPTED_RUN_ID: ${{ needs.treedup.outputs.adopted_run_id }}
+        run: python3 -I scripts/adopt_evidence.py stamp --run-id "$ADOPTED_RUN_ID" --dir .
+
       - name: Install uv
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.12.18"
           enable-cache: true
 
       - name: Set up Python
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       # #1707: see the same step in job test; no `|| true`.
       - name: Install age and openssh-server (backup tests)
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends age openssh-server
@@ -274,6 +327,7 @@ jobs:
           sudo -n true
 
       - name: Install dependencies
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: uv sync --locked --dev
 
       # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
@@ -288,7 +342,7 @@ jobs:
       # The base is the PR base, develop for a manual run (as for the baseline).
       - name: Mutations of changed functions (warning only)
         id: mutations
-        if: ${{ needs.treedup.outputs.evidence_run == 'true' }}
+        if: ${{ needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 15
         run: |
@@ -310,7 +364,7 @@ jobs:
         id: baseline
         # !cancelled(): the proof is about the base, not about the mutations
         # step above.
-        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' }}
+        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 10
         run: |
@@ -336,7 +390,9 @@ jobs:
             mutation-report.json
             red-test-baseline.json
           if-no-files-found: ignore
-          retention-days: 1
+          # #1919: a PR run opened after a dispatch run adopts these files; one
+          # day was shorter than the gap between a dispatch and a late PR.
+          retention-days: 3
 
   test:
     name: Ruff and pytest

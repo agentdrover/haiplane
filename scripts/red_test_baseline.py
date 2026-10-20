@@ -207,6 +207,9 @@ def build_baseline(
     try:
         report["head"] = git(repo, "rev-parse", head)
         report["merge_base"] = git(repo, "merge-base", base, report["head"])
+        # #1919: with merge_base and head it tells a PR run whether it may adopt
+        # this file (scripts/adopt_evidence.py).
+        report["base_tip"] = git(repo, "rev-parse", base)
         copied = changed_test_files(repo, report["merge_base"], report["head"])
         report["copied"] = copied
         report["ran_files"] = [p for p in copied if is_test_module(p)]
