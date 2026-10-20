@@ -2916,6 +2916,15 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
     return "incomplete" if later[0].get("incomplete") else "complete"
 
 
+async def cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> str:
+    """Исход одной попытки второй оси по её событию: complete | incomplete | pending.
+
+    Публичное имя ``_cascade_outcome`` для читателей лестницы (#1925): связь
+    исхода с КОНКРЕТНОЙ попыткой одна, второй копии не заводим.
+    """
+    return await _cascade_outcome(db, event)
+
+
 def cascade_failed(payload: str | None) -> bool:
     try:
         return json.loads(payload or "{}").get("outcome") == MODEL_CASCADE_FAILED

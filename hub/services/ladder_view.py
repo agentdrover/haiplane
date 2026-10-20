@@ -51,6 +51,9 @@ WHY_AXIS_EXHAUSTED = "second_axis_exhausted"
 WHY_AXIS_NO_REPORT = "second_axis_no_report"
 WHY_AXIS_INCOMPLETE = "second_axis_incomplete"
 WHY_AXIS_UNAVAILABLE = "second_axis_unavailable"
+WHY_AXIS_NOT_PLACED = "second_axis_not_placed"
+WHY_AXIS_UNRECORDED = "second_axis_unrecorded"
+WHY_TOP_UP_NO_REPORT = "top_up_no_report"
 WHY_LOCAL_DEEP = "local_deep_no_cloud"
 WHY_NOT_INCOMPLETE = "report_not_incomplete"
 WHY_UNKNOWN = "unknown"
@@ -76,6 +79,9 @@ _TEXTS = {
     "(#1243)",
     WHY_AXIS_NO_REPORT: "вторая ось заказана, но её отчёта нет (#1243)",
     WHY_AXIS_INCOMPLETE: "вторая ось дала такой же неполный отчёт (#1243)",
+    WHY_AXIS_NOT_PLACED: "вторая ось не поставлена: {detail} (#1243)",
+    WHY_AXIS_UNRECORDED: "попытка второй оси начата, исхода в записях нет (#1243)",
+    WHY_TOP_UP_NO_REPORT: "заказ добора кончился без отчёта (статус {detail})",
     WHY_AXIS_UNAVAILABLE: "вторая ось недоступна: нет подходящей модели или форжа "
     "(#1243)",
     WHY_LOCAL_DEEP: "неполный отчёт локального deep облаком не лечится (#1587)",
@@ -89,10 +95,12 @@ class LadderWhy:
     """Почему добор не помог: код и фраза для ленты и справки."""
 
     code: str
+    #: Подробность, взятая из записи о КОНКРЕТНОМ заказе или попытке.
+    detail: str = ""
 
     @property
     def text(self) -> str:
-        return _TEXTS[self.code]
+        return _TEXTS[self.code].format(detail=self.detail or UNKNOWN_TEXT)
 
     def line(self) -> str:
         return f"{self.code}: {self.text}"
@@ -105,24 +113,47 @@ async def _latest_report(
     return dict(reports[-1]) if reports else None
 
 
+async def _answered(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    dispatch: dict[str, Any],
+) -> bool | None:
+    """Отдал ли ЭТОТ заказ свой отчёт: True / False / None — связь неизвестна.
+
+    Заказ с принципалом — по правилу диспетчера (``report_of_dispatch``,
+    ступени одного принципала и канала). Заказ без принципала (открытый
+    режим, долг второй двери: ``agent_id=''``) счёту платных ступеней не
+    поддаётся — долг ступенью не считается. Его отчёт — отчёт поколения,
+    созданный строго ПОСЛЕ самого заказа: добор ставится после неполного
+    отчёта, и отчёт той же секунды, но раньше заказа ответом не считается.
+    Нечитаемая метка — «неизвестно», а не «не отдал» и не «отдал».
+    """
+    if dispatch.get("reviewer_principal_id") is not None:
+        own = await dispatcher.report_of_dispatch(db, task_id, generation, dispatch)
+        return own is not None
+    ordered = parse_stamp(str(dispatch.get("created_at") or ""))
+    if ordered is None:
+        return None
+    reports = await repo.machine_reviews_of_generation(db, task_id, generation)
+    for report in reports:
+        stamp = parse_stamp(str(dict(report).get("created_at") or ""))
+        if stamp is None:
+            return None
+        if stamp > ordered:
+            return True
+    return False
+
+
 async def _unanswered_dispatch(
     db: aiosqlite.Connection, task_id: int, generation: int
-) -> tuple[dict[str, Any] | None, bool]:
+) -> tuple[dict[str, Any] | None, bool | None]:
     """Последний заказ поколения и то, что он свой отчёт уже отдал."""
     row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     if row is None:
         return None, False
     dispatch = dict(row)
-    if dispatch.get("reviewer_principal_id") is None:
-        # Заказ без принципала (открытый режим, история): правило «чей отчёт»
-        # отдаёт ему ЛЮБОЙ отчёт поколения, и добор после лёгкого прогона
-        # выглядел бы отвеченным. Здесь ступени считаются, как их считает сама
-        # лестница: платных ступеней больше, чем отчётов, — последняя ещё в пути.
-        steps = await repo.count_review_dispatches(db, task_id, generation)
-        reports = await repo.machine_reviews_of_generation(db, task_id, generation)
-        return dispatch, len(reports) >= steps
-    own = await dispatcher.report_of_dispatch(db, task_id, generation, dispatch)
-    return dispatch, own is not None
+    return dispatch, await _answered(db, task_id, generation, dispatch)
 
 
 async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
@@ -149,7 +180,7 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
         return ""
     dispatch, answered = await _unanswered_dispatch(db, task_id, generation)
     if dispatch is None or answered:
-        return ""
+        return ""  # None (связь неизвестна) — не отвечен: ждём, срок закроет
     return view.headline
 
 
@@ -169,32 +200,6 @@ async def wait_with_report(db, task: dict[str, Any]) -> ReviewWait:
             kind=WAIT_KIND_TOP_UP,
         )
     return ReviewWait(WAIT_TERMINAL, TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
-
-
-async def _order_was_placed_on_a_wait(
-    db: aiosqlite.Connection, task_id: int, generation: int
-) -> bool:
-    """Судья этой сдачи заказан по сроку ожидания добора — основание в записи заказа.
-
-    Добор мог кончиться (упал, отчёт лёг позже) уже после заказа; сохранённое
-    основание не меняется вместе с состоянием заказа добора.
-    """
-    from hub.services.steward_dispatch import EVENT_ORDERED
-
-    rows = await fetchall(
-        db,
-        "SELECT payload FROM events WHERE task_id=? AND kind=? "
-        "AND json_extract(payload, '$.generation')=? "
-        "AND json_extract(payload, '$.kind')='verdict' LIMIT 1",
-        (task_id, EVENT_ORDERED, generation),
-    )
-    if not rows:
-        return False
-    try:
-        why = str(json.loads(rows[0]["payload"]).get("why") or "")
-    except ValueError:
-        return False  # нечитаемая запись — не доказательство ожидания
-    return TOP_UP_WAIT_PHRASE in why
 
 
 async def _recorded_outcome(
@@ -263,19 +268,62 @@ async def ladder_why(
         return LadderWhy(WHY_NOT_INCOMPLETE)
     if dispatcher.is_environment_refusal(report):
         return LadderWhy(WHY_ENVIRONMENT)
-    if await top_up_in_flight(db, task) or await _order_was_placed_on_a_wait(
-        db, task_id, generation
-    ):
+    if await top_up_in_flight(db, task):
         return LadderWhy(WHY_IN_FLIGHT)
     since = await generation_submitted_at(db, task_id, generation)
-    if since is None:
-        return LadderWhy(WHY_UNKNOWN)  # без метки сдачи алерты не отнести к ней
-    code = await _recorded_outcome(db, task_id, generation, since)
+    code = ""
+    if since is not None:  # без метки сдачи алерты не отнести к ней
+        code = await _recorded_outcome(db, task_id, generation, since)
     if code == WHY_AXIS_NO_REPORT:
-        _, answered = await _unanswered_dispatch(db, task_id, generation)
-        if answered:
-            code = WHY_AXIS_INCOMPLETE
-    return LadderWhy(code or WHY_UNKNOWN)
+        # Маркер алерта — только «попытка началась»; исход — в событии ЭТОЙ
+        # попытки (#1925 круг 2), а не в том, что старый отчёт ещё лежит.
+        return await _axis_attempt_outcome(db, task_id, generation)
+    if code:
+        return LadderWhy(code)
+    return await _last_order_outcome(db, task_id, generation)
+
+
+async def _axis_attempt_outcome(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> LadderWhy:
+    """Чем кончилась ПОСЛЕДНЯЯ попытка второй оси этой сдачи (событие попытки)."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? ORDER BY id DESC LIMIT 1",
+        (task_id, dispatcher.MODEL_CASCADE_EVENT, generation),
+    )
+    if not rows:
+        return LadderWhy(WHY_AXIS_UNRECORDED)
+    event = dict(rows[0])
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except ValueError:
+        return LadderWhy(WHY_UNKNOWN)  # запись нечитаема — не доказательство
+    if dispatcher.cascade_failed(event["payload"]):
+        return LadderWhy(WHY_AXIS_NOT_PLACED, str(payload.get("reason") or ""))
+    outcome = await dispatcher.cascade_outcome(db, event)
+    if outcome == "pending":
+        return LadderWhy(WHY_AXIS_NO_REPORT)
+    return LadderWhy(WHY_AXIS_INCOMPLETE if outcome == "incomplete" else WHY_UNKNOWN)
+
+
+async def _last_order_outcome(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> LadderWhy:
+    """Нет записи лестницы: смотрим на строку последнего заказа поколения.
+
+    Заказ, поставленный после неполного отчёта и не давший своего отчёта, —
+    длительный факт: он не зависит от того, каким путём (заказ, старт,
+    продление окна) судья пришёл к эскалации.
+    """
+    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if row is None:
+        return LadderWhy(WHY_UNKNOWN)
+    dispatch = dict(row)
+    if await _answered(db, task_id, generation, dispatch) is False:
+        return LadderWhy(WHY_TOP_UP_NO_REPORT, str(dispatch.get("status") or ""))
+    return LadderWhy(WHY_UNKNOWN)
 
 
 async def incomplete_escalation_line(

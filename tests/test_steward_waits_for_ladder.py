@@ -36,6 +36,7 @@ from hub.services.ladder_view import (
     WHY_IN_FLIGHT,
     WHY_NOT_INCOMPLETE,
     WHY_ORDER_FAILED,
+    WHY_TOP_UP_NO_REPORT,
     WHY_UNKNOWN,
     incomplete_escalation_line,
     ladder_why,
@@ -224,7 +225,7 @@ async def test_the_top_up_wait_ends_at_the_ceiling_with_a_named_reason(
 async def test_the_reason_survives_the_top_up_ending_after_the_order(
     db: aiosqlite.Connection,
 ):
-    """Основание заказа судьи не меняется, когда добор кончился уже после заказа."""
+    """Добор кончился уже после заказа судьи: причина — в строке заказа добора."""
     _, task_id = await _lite_incomplete(db, "ladder-order-basis", minutes=121)
     deep = await _dispatch_row(db, task_id, status="active", profile="deep")
     assert await order_due_runs(db) == 1
@@ -233,7 +234,7 @@ async def test_the_reason_survives_the_top_up_ending_after_the_order(
     task = await _task_dict(db, task_id)
     assert await top_up_in_flight(db, task) == ""
     why = await ladder_why(db, task)
-    assert why is not None and why.code == WHY_IN_FLIGHT, why
+    assert why is not None and why.code == WHY_TOP_UP_NO_REPORT, why
 
 
 async def test_deferral_is_deduplicated_per_generation_and_kind(
@@ -275,6 +276,30 @@ async def test_the_wait_reader_stays_a_reader(db: aiosqlite.Connection):
     assert gate.blocker and gate.wait_kind == "top_up"
     await ladder_why(db, task)
     assert await snapshot() == before
+
+
+async def _cascade_event(
+    db: aiosqlite.Connection, task_id: int, *, dispatch_id: int | None, after: int
+) -> None:
+    """Событие попытки второй оси так, как его пишет _ask_a_stronger_model."""
+    await repo.insert_event(
+        db,
+        kind=dispatcher.MODEL_CASCADE_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "generation": 1,
+            "model": "grok-4.6",
+            "attempt": 1,
+            "dispatch_id": dispatch_id,
+            "after_review_id": after,
+        },
+    )
+    await db.commit()
+
+
+async def _last_report_id(db: aiosqlite.Connection, task_id: int) -> int:
+    return int((await repo.machine_reviews_of_generation(db, task_id, 1))[-1]["id"])
 
 
 async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
@@ -341,7 +366,12 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
         "alert",
         dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
     )
-    await _dispatch_row(db, axis, status="failed", profile="deep", agent_id="rev-2")
+    axis_dispatch = await _dispatch_row(
+        db, axis, status="failed", profile="deep", agent_id="rev-2"
+    )
+    await _cascade_event(
+        db, axis, dispatch_id=axis_dispatch, after=await _last_report_id(db, axis)
+    )
     cases["axis_no_report"] = (axis, WHY_AXIS_NO_REPORT)
 
     # (г') та же ось отдала неполный отчёт, потолок оси исчерпан.
@@ -368,6 +398,12 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
         "alert",
         dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
     )
+    answered_dispatch = await _dispatch_row(
+        db, answered, status="done", profile="deep", agent_id="rev-2"
+    )
+    before = await _last_report_id(db, answered)
+    await _report_row(db, answered, incomplete=True, profile="deep")
+    await _cascade_event(db, answered, dispatch_id=answered_dispatch, after=before)
     cases["axis_incomplete"] = (answered, WHY_AXIS_INCOMPLETE)
 
     # (д) отказ среды — по заявлению самого отчёта.
@@ -517,3 +553,113 @@ async def test_an_unreadable_ladder_is_named_not_hidden(
         )
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# Круг 2 (CHANGES_REQUESTED gen 1): исход читается по СВЯЗИ с заказом или
+# попыткой, а не по косвенному признаку. Коды — строками: тест не должен
+# зависеть от констант, которых на момент RED ещё нет.
+# ---------------------------------------------------------------------------
+
+
+async def test_second_door_debt_is_still_a_top_up_in_flight(db: aiosqlite.Connection):
+    """Находка 1: неоплаченный долг second_door (agent_id='', принципал NULL).
+
+    Платных ступеней одна и отчёт один — счёт ступеней видел «отвечено». Долг
+    поставлен ПОСЛЕ неполного отчёта и своего отчёта не отдал: добор ещё
+    должен прийти, судью заказывать рано.
+    """
+    _, task_id = await _lite_incomplete(db, "round2-second-door-debt")
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now', '-5 seconds') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await _dispatch_row(
+        db, task_id, status="second_door", profile="deep", agent_id="", principal=None
+    )
+    task = await _task_dict(db, task_id)
+    assert await top_up_in_flight(db, task), "долг второй двери — добор в пути"
+    assert await order_due_runs(db) == 0
+
+    # Нечитаемая метка заказа: связь неизвестна — не «отвечен», ждём (срок закроет).
+    await db.execute(
+        "UPDATE review_dispatches SET created_at='мусор' WHERE status='second_door'"
+    )
+    await db.commit()
+    assert await top_up_in_flight(db, task)
+
+    # Отчёт, созданный ПОСЛЕ заказа, — его ответ: ожидание кончается.
+    await db.execute(
+        "UPDATE review_dispatches SET created_at=datetime('now', '-30 seconds') "
+        "WHERE status='second_door'"
+    )
+    await _report_row(db, task_id, incomplete=True, profile="deep")
+    assert await top_up_in_flight(db, task) == ""
+
+
+async def test_a_refused_second_axis_attempt_is_not_the_old_result(
+    db: aiosqlite.Connection,
+):
+    """Находка 2: попытка второй оси отказана (red_ci), старый маркер и старый отчёт.
+
+    Ось не запускалась (dispatch_id пуст, outcome=failed); читатель обязан
+    сказать «не поставлена: <причина>», а не «дала такой же неполный отчёт».
+    """
+    _, task_id = await _lite_incomplete(db, "round2-axis-refused")
+    await _dispatch_row(db, task_id, status="done", profile="deep")
+    await _report_row(db, task_id, incomplete=True, profile="deep")
+    after = (await repo.machine_reviews_of_generation(db, task_id, 1))[-1]["id"]
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
+    )
+    await repo.insert_event(
+        db,
+        kind=dispatcher.MODEL_CASCADE_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "outcome": "failed",
+            "reason": "red_ci",
+            "generation": 1,
+            "model": "grok-4.6",
+            "attempt": 1,
+            "dispatch_id": None,
+            "after_review_id": after,
+        },
+    )
+    await db.commit()
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None
+    assert why.code == "second_axis_not_placed", why
+    assert "red_ci" in why.line()
+
+
+async def test_the_reason_survives_the_window_renewal_path(db: aiosqlite.Connection):
+    """Находка 3: судья заказан без основания в заказе (путь продления окна).
+
+    Основание не живёт в событии заказа: добор кончился без отчёта — это
+    видно по строке его заказа, каким бы путём судью ни заказали и ни стартовали.
+    """
+    from hub.services.steward_dispatch import EVENT_WINDOW_RENEWED, order_run
+
+    _, task_id = await _lite_incomplete(db, "round2-window-renewal", minutes=121)
+    deep = await _dispatch_row(db, task_id, status="active", profile="deep")
+    assert await order_run(db, task_id, 1) is not None  # без why: основания нет
+    await repo.insert_event(
+        db,
+        kind=EVENT_WINDOW_RENEWED,
+        task_id=task_id,
+        actor="hub",
+        payload={"run_id": 1, "generation": 1, "kind": "verdict", "because": "x"},
+    )
+    await db.execute("UPDATE review_dispatches SET status='failed' WHERE id=?", (deep,))
+    await db.commit()
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None
+    assert why.code == "top_up_no_report", why
+    assert "failed" in why.line()
