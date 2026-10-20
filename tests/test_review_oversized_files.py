@@ -55,6 +55,10 @@ def _big_lines() -> list[str]:
     return lines
 
 
+SOURCE = "\n".join(_big_lines()) + "\n"  # файл теста на закреплённом sha
+SRC = {BIG: SOURCE}
+
+
 def _new_file(path: str, lines: list[str]) -> str:
     body = "".join(f"+{line}\n" for line in lines)
     return (
@@ -98,13 +102,20 @@ async def test_ac_tests_are_named_first_in_an_oversized_file(
 ):
     """AC-1: блок «ЧИТАТЬ ПЕРВЫМИ» раньше диффа; облако, локальный путь и заказ."""
     # Облачный путь: функция диффа напрямую, команда git diff — после блока.
-    block, _ = diff_plan(big_diff, "develop", "task-1/x", ac_test_refs=_REFS)
+    block, _ = diff_plan(
+        big_diff, "develop", "task-1/x", ac_test_refs=_REFS, ac_sources=SRC
+    )
     _assert_first_block(block, before="git diff")
 
     # Номера строк облачного блока — строки файла на закреплённом sha сдачи.
     moved = _new_file(BIG, ["# сдвиг ветки"] + _big_lines())
     pinned, _ = diff_plan(
-        moved, "develop", "task-1/x", ac_test_refs=_REFS, ac_diff=big_diff
+        moved,
+        "develop",
+        "task-1/x",
+        ac_test_refs=_REFS,
+        ac_sources=SRC,
+        pinned_diff=big_diff,
     )
     assert f"{BIG}:{ALPHA_AT}–{ALPHA_TO} ({ALPHA})" in pinned, pinned
 
@@ -116,6 +127,7 @@ async def test_ac_tests_are_named_first_in_an_oversized_file(
         "develop",
         "task-1/x",
         ac_test_refs=_REFS,
+        ac_sources=SRC,
         inline_ceiling=ceiling,
     )
     _assert_first_block(local, before="=== ДИФФ")
@@ -142,7 +154,7 @@ async def test_ac_tests_are_named_first_in_an_oversized_file(
         }
         for n, ref in enumerate(_REFS, 1)
     ]
-    await _submitted(client, db, "oversized-order", diff=big_diff, acs=acs)
+    await _submitted(client, db, "oversized-order", diff=big_diff, acs=acs, files=SRC)
     prompt = recorder.calls[0]["prompt_text"]
     _assert_first_block(prompt, before="git diff")
 
@@ -169,7 +181,7 @@ def test_a_diff_without_an_oversized_file_has_no_first_block():
 def test_a_parameter_id_is_dropped_and_a_missing_function_is_named():
     diff = _new_file(BIG, _big_lines())
     refs = [f"{ALPHA}[case-1]", f"{BIG}::test_gone"]
-    block, _ = diff_plan(diff, "develop", "b", ac_test_refs=refs)
+    block, _ = diff_plan(diff, "develop", "b", ac_test_refs=refs, ac_sources=SRC)
     lines = _first_block(block)
     assert f"ЧИТАТЬ ПЕРВЫМИ: {BIG}:{ALPHA_AT}–{ALPHA_TO} ({refs[0]})" in lines
     gone = [ln for ln in lines if refs[1] in ln]
@@ -187,6 +199,7 @@ def test_a_delta_generation_looks_for_the_function_in_the_full_diff():
         delta_paths=["hub/small.py"],
         delta_note="дельта",
         ac_test_refs=[ALPHA],
+        ac_sources=SRC,
     )
     assert f"{BIG}:{ALPHA_AT}–{ALPHA_TO} ({ALPHA})" in block
 
@@ -195,14 +208,20 @@ def test_a_cutout_that_does_not_fit_is_named_unread():
     diff = _new_file(BIG, _big_lines())
     lines, omitted = _inline_diff_lines(diff, [], None, 200)
     assert omitted == [BIG] and "ac_test_unread" not in "\n".join(lines)
-    block, _ = diff_plan(diff, "develop", "b", ac_test_refs=[ALPHA], inline_ceiling=200)
+    block, _ = diff_plan(
+        diff, "develop", "b", ac_test_refs=[ALPHA], ac_sources=SRC, inline_ceiling=200
+    )
     assert "ALPHA_BODY_950" not in block
     assert f"{PREFIX}{ALPHA}" in block, "не влезший тест назван непрочитанным"
 
 
 def test_the_prompt_asks_for_the_unread_line_and_keeps_the_ceiling_wording():
     block, note = diff_plan(
-        _new_file(BIG, _big_lines()), "develop", "b", ac_test_refs=[ALPHA]
+        _new_file(BIG, _big_lines()),
+        "develop",
+        "b",
+        ac_test_refs=[ALPHA],
+        ac_sources=SRC,
     )
     assert f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {REVIEW_FILE_LINE_CAP}" in block
     assert PREFIX.strip() in block and "lost_dimensions" in block

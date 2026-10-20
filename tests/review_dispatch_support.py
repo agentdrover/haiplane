@@ -42,7 +42,9 @@ class _PinnedGitOps(NoopGitOps):
         paths: list[str],
         diff: str | None = None,
         rules: dict[str, str] | None = None,
+        files: dict[str, str] | None = None,
     ) -> None:
+        self._files = files or {}
         self._tip = tip
         self._paths = paths
         # #820: the profile is decided against the diff, so the double must
@@ -63,6 +65,13 @@ class _PinnedGitOps(NoopGitOps):
 
     async def file_at_ref(self, repo, ref, path):
         return self._rules.get(path)
+
+    async def read_file_at_ref(self, repo, ref, path, *, limit_chars=30000):
+        # #1933: файлы теста на закреплённом sha; нет в словаре = missing.
+        text = self._files.get(path)
+        state = "missing" if text is None else "present"
+        return {"state": state, "path": path, "ref": ref, "content": text or "",
+                "truncated": False, "reason": ""}  # fmt: skip
 
     async def fetch_base(self, repo: str, base: str):
         return True, ""
@@ -167,6 +176,7 @@ async def _submitted(
     ci_reports: list[dict] | None = None,
     override: str = "",
     acs: list[dict] | None = None,
+    files: dict[str, str] | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -214,7 +224,7 @@ async def _submitted(
         await repo.update_task(db, task_id, machine_review_override=override)
     await db.commit()
 
-    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules)
+    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules, files)
     started = await services.pair_start_task(db, task_id, caller="dev-agent")
     assert started.status.value == "running"
     view = await services.submit_for_review(

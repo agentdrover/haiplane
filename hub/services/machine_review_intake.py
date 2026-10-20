@@ -32,7 +32,7 @@ from hub.models import (
     claims_text_origin,
 )
 from hub.services import ci_integrity, watch_notices
-from hub.services.review_oversized import names_unread_ac_test
+from hub.services.review_oversized import unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -274,12 +274,13 @@ async def record_machine_review(
     # on the same terms. A harness that invents one would win over the derived
     # value silently, and an id nobody can reproduce identifies nothing.
     services.refuse_supplied_uid(body.unresolved, section="unresolved")
-    # #1933: ревьюер назвал непрочитанный тест AC строкой lost_dimensions - а
+    # #1933: ревьюер назвал непрочитанным тест AC ЭТОЙ задачи (точная сверка с её
+    # test_ref; чужой ref отчёт не меняет) строкой lost_dimensions - а
     # сам сказал incomplete=false. Непрочитанное доказательство AC не бывает
     # полным отчётом; признак поднимается, как raw_count ниже, а не отвергается:
     # находки такого отчёта настоящие. Поднимается в самом body, до первого
     # читателя: исход, событие и журнал читают body.incomplete, не локальную.
-    if not body.incomplete and names_unread_ac_test(body.lost_dimensions):
+    if not body.incomplete and await unread_for_task(db, task_id, body.lost_dimensions):
         log.warning(
             "machine review for task #%s names an unread AC test but says "
             "incomplete=false; stored as incomplete",

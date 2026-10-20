@@ -63,8 +63,10 @@ from hub.services.review_oversized import (
     AcTestSpan,
     ac_test_refs as task_ac_test_refs,
     ac_test_spans,
+    cutout,
     cutouts_within,
     first_block,
+    read_sources,
 )
 from hub.services.result_kind import automation_not_applicable
 from hub.services.orchestration import ORIGINAL_READ_SQL
@@ -375,6 +377,33 @@ def fit_file_sections(
     return "".join(kept), omitted
 
 
+def _fit_with_ac_cutouts(
+    every: list[tuple[str, str]],
+    sections: list[tuple[str, str]],
+    ceiling: int,
+    spans: list[AcTestSpan],
+) -> tuple[str, list[str], set[str], list[str], list[str]]:
+    """Файлы под потолок с БРОНЁЙ под вырезки тестов AC (#1933).
+
+    Вырезки не доедают остаток после других файлов: бюджет под них отведён до
+    заполнения. Бронь считается по тестам файлов, которых в промте нет, и
+    пересчитывается, пока не устоится (больше бюджета — меньше выпавших файлов,
+    значит бронь только убывает).
+    """
+    reserve = sum(len(cutout(span)) for span in spans if span.found)
+    for _ in range(4):
+        text, omitted = fit_file_sections(sections, max(ceiling - reserve, 0))
+        # Файл, которого нет в промте, — не влез в потолок ИЛИ выпал из дельты.
+        present = {path for path, _ in sections} - set(omitted)
+        absent = {path for path, _ in every if path and path not in present}
+        need = sum(len(cutout(s)) for s in spans if s.found and s.path in absent)
+        if need >= reserve:
+            break
+        reserve = need
+    cuts, unread = cutouts_within(spans, absent, ceiling - len(text))
+    return text, omitted, absent, cuts, unread
+
+
 def _inline_diff_lines(
     diff: str,
     dropped: list[str],
@@ -398,11 +427,9 @@ def _inline_diff_lines(
         if not path
         or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
-    text, omitted = fit_file_sections(sections, ceiling)
-    # Файл, которого нет в промте, — не влез в потолок ИЛИ выпал из дельты.
-    present = {path for path, _ in sections} - set(omitted)
-    absent = {path for path, _ in every if path and path not in present}
-    cuts, unread = cutouts_within(ac_spans or [], absent, ceiling - len(text))
+    text, omitted, absent, cuts, unread = _fit_with_ac_cutouts(
+        every, sections, ceiling, ac_spans or []
+    )
     lines = []
     if omitted:
         lines.append(
@@ -794,24 +821,27 @@ def _plan_oversized(
     kept: str,
     lines: list[str],
     ac_test_refs: list[str] | None,
-    ac_diff: str | None = None,
+    pinned_diff: str | None = None,
+    ac_sources: Mapping[str, str | None] | None = None,
 ) -> tuple[list[tuple[str, int]], list[AcTestSpan]]:
     """Файлы выше потолка и тесты AC в них; дописывает блок и абзац в ``lines`` (#1933).
 
     Блок «ЧИТАТЬ ПЕРВЫМИ» встаёт в начало, раньше команды и текста диффа.
-    Диапазоны ищутся в полном ``kept``-диффе, как считается и сам oversized;
-    ``ac_diff`` — дифф на закреплённом sha сдачи (облачный заказ: номера строк
-    должны быть строками файла на коммите сдачи, а не на сдвинувшейся ветке).
+    ``pinned_diff`` — дифф на закреплённом sha сдачи (облако; у локального
+    заказа ``kept`` уже он): если он есть, oversized считается по нему, как и
+    диапазоны, — один источник, а не ветка и sha вперемешку. Диапазоны берутся
+    из файлов на том же sha (``ac_sources``); не прочитан — «не найден», а не
+    откат на ветку.
     """
+    basis = kept if pinned_diff is None else split_generated(pinned_diff)[0]
     oversized = [
         (path, count)
-        for path, count in file_line_counts(kept)
+        for path, count in file_line_counts(basis)
         if count > REVIEW_FILE_LINE_CAP
     ]
     if not oversized:
         return oversized, []
-    source = kept if ac_diff is None else split_generated(ac_diff)[0]
-    spans = ac_test_spans(diff_file_sections(source), ac_test_refs or [])
+    spans = ac_test_spans(ac_sources, ac_test_refs or []) if ac_test_refs else []
     if spans:
         lines.insert(0, first_block(spans))
     lines.append(_oversized_paragraph(oversized, bool(spans)))
@@ -830,7 +860,8 @@ def diff_plan(
     inline_ceiling: int | None = None,
     snapshot_ok: bool = False,
     ac_test_refs: list[str] | None = None,
-    ac_diff: str | None = None,
+    pinned_diff: str | None = None,
+    ac_sources: Mapping[str, str | None] | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -859,7 +890,8 @@ def diff_plan(
     ``snapshot_ok`` (#1599) — у ревьюера есть снимок исходников на sha сдачи:
     «исходников на машине не ищи» тогда неверно, и фраза называет снимок.
 
-    ``ac_test_refs`` (#1933) — ``test_ref`` AC задачи. При файле выше потолка
+    ``ac_test_refs`` (#1933) — ``test_ref`` AC задачи (с ``pinned_diff`` и
+    ``ac_sources`` на закреплённом sha). При файле выше потолка
     блок «ЧИТАТЬ ПЕРВЫМИ» с диапазонами их функций стоит РАНЬШЕ команды и
     текста диффа. Диапазоны ищутся в полном ``kept``-диффе, как и сам
     oversized, — на дельта-поколении тоже.
@@ -941,7 +973,9 @@ def diff_plan(
             "Исключены как сгенерированные (их никто не писал и не будет "
             f"править): {', '.join(dropped)}."
         )
-    oversized, spans = _plan_oversized(kept, lines, ac_test_refs, ac_diff)
+    oversized, spans = _plan_oversized(
+        kept, lines, ac_test_refs, pinned_diff, ac_sources
+    )
     note_bits = []
     if inline_ceiling is not None:
         inline, omitted = _inline_diff_lines(
@@ -3883,7 +3917,9 @@ async def prepare_review_order(
     ac_refs = task_ac_test_refs(
         [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     )
-    ac_diff = None if inline_diff or not ac_refs else await _pinned_diff(db, task)
+    pinned, ac_sources = await _ac_inputs(
+        db, task, ctx, ac_refs, plan_diff, inline_diff
+    )
     diff_block, diff_note = diff_plan(
         plan_diff,
         base,
@@ -3896,7 +3932,8 @@ async def prepare_review_order(
         config.LOCAL_REVIEW_DIFF_CHAR_CEILING if inline_diff else None,
         snapshot_ok=snapshot is not None and snapshot.state == "ok",
         ac_test_refs=ac_refs,
-        ac_diff=ac_diff,
+        pinned_diff=pinned,
+        ac_sources=ac_sources,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -3996,6 +4033,34 @@ def snapshot_note(snapshot: SnapshotArchive | None) -> str:
             f"ревьюеру только для чтения{left_out} (#1599). "
         )
     return f"Снимок исходников не выдан: {snapshot.reason} (#1599). "
+
+
+async def _ac_inputs(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: tuple[str, str] | None,
+    refs: list[str],
+    plan_diff: str | None,
+    inline_diff: bool,
+) -> tuple[str | None, dict[str, str | None] | None]:
+    """``(дифф на sha сдачи, файлы тестов AC на sha сдачи)`` для блока #1933.
+
+    Файлы читаются, только если у задачи есть test_ref и в диффе есть файл выше
+    потолка: иначе блока нет и git читать не за чем. Не прочитанное остаётся
+    ``None`` и в промте называется «не найден» — без отката на ветку.
+    """
+    if not refs:
+        return None, None
+    pinned = None if inline_diff else await _pinned_diff(db, task)
+    basis = plan_diff if pinned is None else pinned
+    if basis is None or not any(
+        count > REVIEW_FILE_LINE_CAP
+        for _, count in file_line_counts(split_generated(basis)[0])
+    ):
+        return pinned, None
+    sha = (task.get("submission_sha") or "").strip()
+    sources = await read_sources(plugins.git_ops, ctx[0] if ctx else None, sha, refs)
+    return pinned, sources
 
 
 async def _pinned_diff(db: aiosqlite.Connection, task: dict[str, Any]) -> str | None:

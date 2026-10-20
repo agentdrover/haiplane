@@ -14,50 +14,41 @@
 карточки задачи, после фиксированного префикса, по равенству. Подстрока,
 другой регистр префикса и чужое имя не засчитываются.
 
-Диапазон, который дифф показывает не целиком (функция обрывается на границе
-ханка, а файл не новый), помечен ``partial``: «нашли начало» не выдаётся за
-«нашли функцию».
+Границы функций берутся НЕ из текста ханков (это чёрный список случаев:
+литералы, вложенность, переносы между ханками), а из ``ast`` файла теста на
+ЗАКРЕПЛЁННОМ sha сдачи: ``lineno``, ``end_lineno``, ``decorator_list``, класс —
+по дереву. Файл не прочитан или не разобран — «не найден», без отката на ветку.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any
 
 from hub.services.test_locator import PYTEST, runner_of
 
 #: Префикс строки ``lost_dimensions``, которой ревьюер называет непрочитанный тест AC.
 UNREAD_PREFIX = "ac_test_unread: "
 
-_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
-_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)\s*\(")
-_CLASS = re.compile(r"^(\s*)class\s+(\w+)\b")
 _PARAM = re.compile(r"\[.*\]$")
 
 NOT_FOUND = "не найден в диффе"
-PARTIAL = "в диффе виден не весь тест"
-
-
-class Row(NamedTuple):
-    """Строка новой стороны диффа: номер в файле, текст, заголовок её ханка."""
-
-    no: int
-    text: str
-    ctx: str  # то, что git пишет после ``@@``: ближайшая строка без отступа
-    eof: bool  # ханк нового файла: конец ханка — конец файла
+UNREADABLE = "не найден: файл на закреплённом коммите не прочитан"
+READ_LIMIT = 2_000_000
 
 
 @dataclass(frozen=True)
 class AcTestSpan:
-    """Где в диффе лежит тест AC: ``start``/``end`` — строки файла, или ``None``."""
+    """Где лежит тест AC: ``start``/``end`` — строки файла на sha сдачи, или ``None``."""
 
     ref: str
     path: str
     start: int | None = None
     end: int | None = None
-    partial: bool = False
+    unreadable: bool = False
     lines: tuple[tuple[int, str], ...] = ()
 
     @property
@@ -66,10 +57,10 @@ class AcTestSpan:
 
     def label(self) -> str:
         """Строка блока «ЧИТАТЬ ПЕРВЫМИ» для этого теста."""
-        if not self.found:
-            return f"ЧИТАТЬ ПЕРВЫМИ: {self.ref} — {NOT_FOUND}"
-        tail = f" — {PARTIAL}" if self.partial else ""
-        return f"ЧИТАТЬ ПЕРВЫМИ: {self.path}:{self.start}–{self.end} ({self.ref}){tail}"
+        if self.found:
+            return f"ЧИТАТЬ ПЕРВЫМИ: {self.path}:{self.start}–{self.end} ({self.ref})"
+        why = UNREADABLE if self.unreadable else NOT_FOUND
+        return f"ЧИТАТЬ ПЕРВЫМИ: {self.ref} — {why}"
 
 
 def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -80,191 +71,6 @@ def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:
         if str(row.get("verifiable_by") or "") == "test" and ref and ref not in seen:
             seen.append(ref)
     return seen
-
-
-def _new_side(section: str) -> list[Row]:
-    """Строки новой стороны секции файла.
-
-    Тело ханка читается по его счётчикам, как у ``diff_scan``: строка ``+++``
-    внутри тела — добавленная строка, а не заголовок.
-    """
-    out: list[Row] = []
-    lines = section.splitlines()
-    i = 0
-    while i < len(lines):
-        m = _HUNK.match(lines[i])
-        i += 1
-        if not m:
-            continue
-        old = int(m.group(2)) if m.group(2) is not None else 1
-        new = int(m.group(4)) if m.group(4) is not None else 1
-        eof = m.group(1) == "0" and old == 0
-        at, ctx = int(m.group(3)), m.group(5)
-        while i < len(lines) and (old > 0 or new > 0):
-            line = lines[i]
-            i += 1
-            tag, text = line[:1], line[1:]
-            if tag == "+":
-                out.append(Row(at, text, ctx, eof))
-                at += 1
-                new -= 1
-            elif tag == "-":
-                old -= 1
-            elif tag != "\\":
-                out.append(Row(at, text, ctx, eof))
-                at += 1
-                old -= 1
-                new -= 1
-    return out
-
-
-def _indent(text: str) -> int:
-    return len(text) - len(text.lstrip())
-
-
-def _scan(text: str, depth: int) -> tuple[int, bool]:
-    """``(глубина скобок в конце строки, был ли двоеточие вне скобок)``.
-
-    Строки в одинарных кавычках и ``#``-комментарий скобок и двоеточий не дают.
-    """
-    quote, colon = "", False
-    prev = ""
-    for ch in text:
-        if quote:
-            if ch == quote and prev != "\\":
-                quote = ""
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "#":
-            break
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == ":" and depth <= 0:
-            colon = True
-        prev = ch
-    return depth, colon
-
-
-def _header_end(rows: Sequence[Row], at: int) -> int:
-    """Индекс последней строки заголовка ``def``/``class``, начатого в ``at``."""
-    depth = 0
-    for k in range(at, len(rows)):
-        if k > at and rows[k].no != rows[k - 1].no + 1:
-            return k - 1
-        depth, colon = _scan(rows[k].text, depth)
-        if depth <= 0 and colon:
-            return k
-    return len(rows) - 1
-
-
-def _balanced(rows: Sequence[Row]) -> bool:
-    depth = 0
-    for row in rows:
-        depth, _ = _scan(row.text, depth)
-    return depth == 0
-
-
-def _first_line(rows: Sequence[Row], at: int) -> int:
-    """Индекс первой строки блока с его декораторами (в том числе многострочными)."""
-    base, start, k = _indent(rows[at].text), at, at - 1
-    while k >= 0 and rows[k].no == rows[k + 1].no - 1:
-        text = rows[k].text
-        if _indent(text) == base and text.lstrip().startswith("@"):
-            if _balanced(rows[k:at]):
-                start = k
-        elif (
-            text.strip() and _indent(text) <= base and not text.lstrip().startswith(")")
-        ):
-            break
-        elif not text.strip():
-            break
-        k -= 1
-    return start
-
-
-def _block_end(rows: Sequence[Row], at: int, module_level: bool) -> tuple[int, bool]:
-    """``(индекс последней строки блока, показан ли он дифф-ом не целиком)``.
-
-    Блок кончается строкой без отступа глубже его заголовка. Разрыв между ханками
-    пересекается только у функции верхнего уровня, когда git назвал её же
-    заголовком следующего ханка; иначе блок обрывается и считается частичным.
-    Целым он считается, когда его закрыла видимая строка с меньшим отступом или
-    когда ханк — целый новый файл.
-    """
-    base = _indent(rows[at].text)
-    name = _DEF.match(rows[at].text)
-    last = _header_end(rows, at)
-    own = rows[at].text.strip().split("(")[0]
-    for k in range(last + 1, len(rows)):
-        row = rows[k]
-        if row.no != rows[k - 1].no + 1:
-            if not (module_level and row.ctx.startswith(own) and name):
-                return last, True
-        if row.text.strip():
-            if _indent(row.text) <= base:
-                return last, False
-            last = k
-    return last, not rows[last].eof
-
-
-def _body_indent(rows: Sequence[Row], header_last: int) -> int:
-    for row in rows[header_last + 1 :]:
-        if row.text.strip():
-            return _indent(row.text)
-    return 0
-
-
-def _find_def(
-    rows: Sequence[Row], lo: int, hi: int, name: str, indent: int | None
-) -> int | None:
-    for k in range(lo, hi):
-        m = _DEF.match(rows[k].text)
-        if m and m.group(2) == name and (indent is None or len(m.group(1)) == indent):
-            return k
-    return None
-
-
-def _find(rows: Sequence[Row], owner: str, name: str) -> tuple[int, int, bool] | None:
-    """``(индекс начала с декораторами, индекс конца, частично ли)`` или ``None``."""
-    if not owner:
-        at = _find_def(rows, 0, len(rows), name, 0)
-        if at is None:
-            return None
-        end, partial = _block_end(rows, at, True)
-        return _first_line(rows, at), end, partial
-    for k, row in enumerate(rows):
-        m = _CLASS.match(row.text)
-        if m and m.group(2) == owner and not m.group(1):
-            head = _header_end(rows, k)
-            hi = len(rows)
-            for j in range(head + 1, len(rows)):
-                if rows[j].text.strip() and _indent(rows[j].text) == 0:
-                    hi = j
-                    break
-            at = _find_def(rows, head + 1, hi, name, _body_indent(rows, head))
-            break
-    else:
-        # Класса в диффе нет, но git назвал его заголовком ханка (-U0).
-        cls = [
-            j
-            for j, row in enumerate(rows)
-            if (m := _CLASS.match(row.ctx)) and m.group(2) == owner and not m.group(1)
-        ]
-        at = next(
-            (
-                found
-                for j in cls
-                if (found := _find_def(rows, j, j + 1, name, None)) is not None
-                and _indent(rows[found].text) > 0
-            ),
-            None,
-        )
-    if at is None:
-        return None
-    end, partial = _block_end(rows, at, False)
-    return _first_line(rows, at), end, partial
 
 
 def _parse_ref(ref: str) -> tuple[str, str, str] | None:
@@ -278,30 +84,100 @@ def _parse_ref(ref: str) -> tuple[str, str, str] | None:
     return path, (parts[0] if len(parts) == 2 else ""), parts[-1]
 
 
-def ac_test_spans(
-    sections: Sequence[tuple[str, str]], refs: Sequence[str]
-) -> list[AcTestSpan]:
-    """Диапазоны тестов AC в диффе, в порядке ``refs``; не найденное — без диапазона.
+def ac_test_paths(refs: Iterable[str]) -> list[str]:
+    """Файлы pytest-ссылок, без повторов, в порядке ссылок."""
+    out: list[str] = []
+    for ref in refs:
+        parsed = _parse_ref(ref)
+        if parsed and parsed[0] not in out:
+            out.append(parsed[0])
+    return out
 
-    ``sections`` — ``[(путь, текст файла в диффе)]``. Ссылка не pytest (vitest) и
-    функция, которой в диффе нет, остаются в ответе без диапазона: молчание
-    выглядело бы как «ревьюеру читать нечего».
+
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _locate(
+    tree: ast.Module, owner: str, name: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Функция ``name`` верхнего уровня или прямой метод класса ``owner`` верхнего уровня.
+
+    Как Python: при повторном определении действует последнее.
     """
-    by_path = {path: text for path, text in sections if path}
+    scope: list[ast.stmt] = tree.body
+    if owner:
+        classes = [
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner
+        ]
+        if not classes:
+            return None
+        scope = classes[-1].body
+    found = [n for n in scope if isinstance(n, _DEFS) and n.name == name]
+    return found[-1] if found else None
+
+
+def ac_test_spans(
+    sources: Mapping[str, str | None] | None, refs: Sequence[str]
+) -> list[AcTestSpan]:
+    """Диапазоны тестов AC по файлам на закреплённом sha, в порядке ``refs``.
+
+    ``sources`` — ``{путь: текст файла на sha}``; ``None`` вместо текста (или
+    ``sources=None``) — файл не прочитан, это «неизвестно», а не «теста нет».
+    Ссылка не pytest (vitest) и функция, которой в файле нет, — без диапазона:
+    молчание выглядело бы как «ревьюеру читать нечего».
+    """
+    trees: dict[str, tuple[ast.Module, list[str]] | None] = {}
     out: list[AcTestSpan] = []
     for ref in refs:
         parsed = _parse_ref(ref)
-        text = by_path.get(parsed[0]) if parsed else None
-        rows = _new_side(text) if parsed and text else []
-        hit = _find(rows, parsed[1], parsed[2]) if parsed and rows else None
-        if hit is None or parsed is None:
-            out.append(AcTestSpan(ref, parsed[0] if parsed else ""))
+        if parsed is None:
+            out.append(AcTestSpan(ref, ""))
             continue
-        begin, end, partial = hit
-        body = tuple((r.no, r.text) for r in rows[begin : end + 1])
-        out.append(
-            AcTestSpan(ref, parsed[0], rows[begin].no, rows[end].no, partial, body)
-        )
+        path, owner, name = parsed
+        if path not in trees:
+            text = (sources or {}).get(path)
+            try:
+                trees[path] = (
+                    (ast.parse(text), text.splitlines()) if text is not None else None
+                )
+            except (SyntaxError, ValueError):
+                trees[path] = None
+        got = trees[path]
+        if got is None:
+            out.append(AcTestSpan(ref, path, unreadable=True))
+            continue
+        node = _locate(got[0], owner, name)
+        if node is None:
+            out.append(AcTestSpan(ref, path))
+            continue
+        decorated = [d.lineno for d in getattr(node, "decorator_list", [])]
+        start, end = min([node.lineno, *decorated]), node.end_lineno or node.lineno
+        body = tuple((n, got[1][n - 1]) for n in range(start, end + 1))
+        out.append(AcTestSpan(ref, path, start, end, lines=body))
+    return out
+
+
+async def read_sources(
+    git: Any, repo: str | None, sha: str, refs: Iterable[str]
+) -> dict[str, str | None] | None:
+    """Тексты файлов тестов AC на закреплённом sha; ``None`` вместо текста — не прочитан.
+
+    Нет sha или клона — ``None`` целиком. Усечённое чтение не разбирается: обрезанный
+    файл мог бы дать чужие границы.
+    """
+    paths = ac_test_paths(refs)
+    if not paths:
+        return {}
+    if not sha or not repo:
+        return None
+    out: dict[str, str | None] = {}
+    for path in paths:
+        try:
+            got = await git.read_file_at_ref(repo, sha, path, limit_chars=READ_LIMIT)
+        except Exception:  # noqa: BLE001 - "could not look" is an answer, not a crash
+            got = {}
+        ok = got.get("state") == "present" and not got.get("truncated")
+        out[path] = got.get("content", "") if ok else None
     return out
 
 
@@ -311,18 +187,11 @@ def first_block(spans: Sequence[AcTestSpan]) -> str:
 
 
 def cutout(span: AcTestSpan) -> str:
-    """Функция теста AC вырезкой: строки файла с номерами, разрывы названы."""
-    out: list[str] = []
-    prev = None
-    for number, text in span.lines:
-        if prev is not None and number != prev + 1:
-            out.append("…")
-        out.append(f"{number}: {text}")
-        prev = number
-    tail = f" [{PARTIAL}]" if span.partial else ""
+    """Функция теста AC вырезкой: строки файла с номерами."""
+    body = "\n".join(f"{number}: {text}" for number, text in span.lines)
     return (
-        f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end})"
-        f"{tail} ===\n" + "\n".join(out) + "\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
+        f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end}) ===\n"
+        f"{body}\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
     )
 
 
@@ -373,18 +242,22 @@ def names_unread_ac_test(lost_dimensions: Iterable[str]) -> bool:
     )
 
 
-async def attach_ac_tests_unread(db: Any, view: Any) -> None:
-    """Заполнить ``view.ac_tests_unread`` из ``lost_dimensions`` и AC задачи.
+async def unread_for_task(
+    db: Any, task_id: int, lost_dimensions: Iterable[str]
+) -> list[str]:
+    """Тесты AC задачи, названные непрочитанными: точная сверка с её test_ref (#1933).
 
-    Запрос к БД делается только когда в отчёте есть строка с префиксом: у
-    остальных отчётов поле честно пустое, и очередь ревью не платит за него.
+    Запрос к БД делается только когда в отчёте есть строка с префиксом.
     """
-    if not names_unread_ac_test(view.lost_dimensions):
-        view.ac_tests_unread = []
-        return
+    lost = list(lost_dimensions)
+    if not names_unread_ac_test(lost):
+        return []
     from hub import repository as repo
 
-    rows = await repo.list_acceptance_criteria(db, view.task_id)
-    view.ac_tests_unread = unread_ac_tests(
-        view.lost_dimensions, ac_test_refs([dict(r) for r in rows])
-    )
+    rows = await repo.list_acceptance_criteria(db, task_id)
+    return unread_ac_tests(lost, ac_test_refs([dict(r) for r in rows]))
+
+
+async def attach_ac_tests_unread(db: Any, view: Any) -> None:
+    """Заполнить ``view.ac_tests_unread`` из ``lost_dimensions`` и AC задачи."""
+    view.ac_tests_unread = await unread_for_task(db, view.task_id, view.lost_dimensions)
