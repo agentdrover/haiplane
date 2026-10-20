@@ -1425,7 +1425,8 @@ async def _forced_deep_past_circle(
         "hub",
         "alert",
         f"{FORCED_DEEP_CIRCLE_MARK}: {circle_stop_reason(stop[0])} — "
-        f"{what} не куплен (#1432).",
+        f"{what} не куплен (#1432)."
+        + ladder_generation_tag(int(task.get("submission_generation") or 0)),
     )
     await db.commit()
     return True
@@ -1618,7 +1619,8 @@ async def _forced_deep_over_cap(
         "hub",
         "alert",
         f"{FORCED_DEEP_CAP_MARK}: {DEEP_CAP_REASON_MARK} deep "
-        f"исчерпан — {what} не куплен (потолок {cap} в сутки на проект, #1414).",
+        f"исчерпан — {what} не куплен (потолок {cap} в сутки на проект, #1414)."
+        + ladder_generation_tag(generation),
     )
     await db.commit()
     return True
@@ -2359,6 +2361,17 @@ REVIEW_LADDER_MAX_STEPS = 2
 LADDER_CEILING_MARK = "потолок лестницы"
 LADDER_NO_TOP_UP_MARK = "добор не положен"
 LADDER_ORDER_FAILED_MARK = "поставить не удалось"
+#: Событие «лестница поставила добор после ЭТОГО неполного отчёта» (#1925):
+#: generation, dispatch_id, after_review_id. Связь добора с отчётом и заказом —
+#: записью, а не выводом из времени и порядка строк. Читает ladder_view.
+LADDER_TOP_UP_EVENT = "review_ladder_top_up"
+
+
+def ladder_generation_tag(generation: int) -> str:
+    """Хвост алерта лестницы: чьей сдачи он. Алерты поколения не несут — несёт хвост."""
+    return f" [сдача {generation}]"
+
+
 #: Слова алертов второй оси (#1243, #1587): оси нет вовсе / облако после
 #: локального deep запрещено.
 SECOND_AXIS_UNAVAILABLE_MARK = "вторая ось (другая модель) недоступна"
@@ -2474,6 +2487,28 @@ async def count_environment_refusals(
     }
 
 
+async def _record_top_up(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> None:
+    """Записать: добор поставлен после ЭТОГО неполного отчёта (#1925)."""
+    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    await repo.insert_event(
+        db,
+        kind=LADDER_TOP_UP_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "generation": generation,
+            "dispatch_id": dict(row)["id"] if row is not None else None,
+            "after_review_id": report.get("id"),
+        },
+    )
+    await db.commit()
+
+
 async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
     """Buy the heavy profile when the cheap run said it did not finish (#879).
 
@@ -2549,7 +2584,9 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             f"Неполный отчёт после {steps} прогон(ов): {LADDER_CEILING_MARK} "
             f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
             "Ревью этой сдачи так и не состоялось полностью — решение за "
-            "человеком (#879)." + _ladder_cause_note(report),
+            "человеком (#879)."
+            + _ladder_cause_note(report)
+            + ladder_generation_tag(generation),
         )
         await db.commit()
         return False
@@ -2566,7 +2603,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             f"Неполный отчёт, {LADDER_NO_TOP_UP_MARK}: профиль "
             + (f"«{profile}»" if profile else "не заявлен")
             + " — выше дешёвого подниматься некуда. Решение за человеком "
-            "(#879)." + _ladder_cause_note(report),
+            "(#879)." + _ladder_cause_note(report) + ladder_generation_tag(generation),
         )
         await db.commit()
         return False
@@ -2582,9 +2619,12 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             "hub",
             "alert",
             "Дешёвый прогон сдал неполный отчёт, а добор тяжёлым профилем "
-            f"{LADDER_ORDER_FAILED_MARK}. Решение за человеком (#879).",
+            f"{LADDER_ORDER_FAILED_MARK}. Решение за человеком (#879)."
+            + ladder_generation_tag(generation),
         )
         await db.commit()
+    else:
+        await _record_top_up(db, task_id, generation, report)
     return dispatched
 
 
@@ -2785,7 +2825,8 @@ async def _ask_a_stronger_model(
             f"— {no_cloud}. Вторая ось переспрашивает другой "
             "моделью только неполный ОБЛАЧНЫЙ отчёт: неполнота локального "
             "deep не оплачивается облачным прогоном (#1587)."
-            + _ladder_cause_note(report),
+            + _ladder_cause_note(report)
+            + ladder_generation_tag(generation),
         )
         return False
     implementer = (task.get("submission_model") or "").strip()
@@ -2797,7 +2838,9 @@ async def _ask_a_stronger_model(
             task_id,
             "Неполный отчёт профиля «deep»: выше дешёвого подниматься некуда, "
             f"а {SECOND_AXIS_UNAVAILABLE_MARK} — {blocked}. Решение "
-            "за человеком (#879, #1243)." + _ladder_cause_note(report),
+            "за человеком (#879, #1243)."
+            + _ladder_cause_note(report)
+            + ladder_generation_tag(generation),
         )
         return False
     await _alert(
