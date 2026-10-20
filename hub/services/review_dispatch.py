@@ -54,7 +54,9 @@ from hub.models import (
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
 )
-from hub.services import call_sites, ci_integrity, project_policy, review_ci_gate
+from hub.services import call_sites, ci_integrity, ladder_attempts, project_policy
+from hub.services import report_binding
+from hub.services import review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
@@ -2497,13 +2499,20 @@ async def _record_top_up(
     task_id: int,
     generation: int,
     report: Mapping[str, Any],
-) -> None:
+    *,
+    kind: str = ladder_attempts.KIND_TOP_UP,
+    model: str = "",
+) -> int:
     """Записать: лестница пошла на добор после ЭТОГО неполного отчёта (#1925).
 
     Пишется ДО обращения к диспетчеру: заказ или долг второй двери
     коммитятся там раньше, чем вызов вернётся, и упавший вызов не должен
     оставить заказ без записи, ради которой его ждут. Исход обращения
     (отказ, заказ, замена) к записи не относится — его говорят заказы и алерты.
+
+    #1946: попытка пишется ещё и строкой ``ladder_attempts`` (без retention);
+    возвращает её id, по которому попытку закроет ``_close_top_up`` или вторая
+    ось. Событие остаётся историей.
     """
     await repo.insert_event(
         db,
@@ -2512,7 +2521,9 @@ async def _record_top_up(
         actor="policy",
         payload={"generation": generation, "after_review_id": report.get("id")},
     )
-    await db.commit()
+    return await ladder_attempts.open_attempt(
+        db, task_id, generation, kind, report.get("id"), model=model
+    )
 
 
 async def _close_top_up(
@@ -2522,6 +2533,7 @@ async def _close_top_up(
     report: Mapping[str, Any],
     *,
     placed: bool,
+    attempt_id: int,
 ) -> None:
     """Закрыть запись поступка: что вернул диспетчер (#1925).
 
@@ -2531,6 +2543,7 @@ async def _close_top_up(
     алерты. Упавший вызов закрытия не оставляет: ожидание держит срок.
     """
     row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    dispatch_id = dict(row)["id"] if placed and row is not None else None
     await repo.insert_event(
         db,
         kind=LADDER_TOP_UP_PLACED_EVENT,
@@ -2540,10 +2553,10 @@ async def _close_top_up(
             "generation": generation,
             "after_review_id": report.get("id"),
             "outcome": "placed" if placed else "refused",
-            "dispatch_id": dict(row)["id"] if placed and row is not None else None,
+            "dispatch_id": dispatch_id,
         },
     )
-    await db.commit()
+    await ladder_attempts.close_attempt(db, attempt_id, dispatch_id=dispatch_id)
 
 
 async def _refused_by_name_since(
@@ -2658,10 +2671,12 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
         await db.commit()
         return False
 
-    await _record_top_up(db, task_id, generation, report)
+    attempt_id = await _record_top_up(db, task_id, generation, report)
     feed_mark = await _last_update_id(db, task_id)
     dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
-    await _close_top_up(db, task_id, generation, report, placed=bool(dispatched))
+    await _close_top_up(
+        db, task_id, generation, report, placed=bool(dispatched), attempt_id=attempt_id
+    )
     if not dispatched and not await _refused_by_name_since(db, task_id, feed_mark):
         # maybe_dispatch_review already alerted when policy asked and the call
         # failed; when policy never asked, silence there is correct. Either
@@ -2908,11 +2923,19 @@ async def _ask_a_stronger_model(
     # Поступок записывается ДО обращения к диспетчеру (как у добора): долг
     # второй двери коммитится там раньше возврата, и упавший вызов не должен
     # оставить заказ без записи, ради которой его ждут (#1925).
-    await _record_top_up(db, task_id, generation, report)
+    attempt_id = await _record_top_up(
+        db,
+        task_id,
+        generation,
+        report,
+        kind=ladder_attempts.KIND_SECOND_AXIS,
+        model=model,
+    )
     feed_mark = await _last_update_id(db, task_id)
     if not await maybe_dispatch_review(
         db, task_id, force_profile=DEEP, force_model=model
     ):
+        reason = await _refusal_reason_since(db, task_id, feed_mark)
         # #1566: отказ тоже попытка — иначе метрика молчит, пока механизм
         # ломается. dispatch_id пуст: прогона нет, и читатели события
         # (_runs, count_model_cascade_outcomes) обязаны это знать.
@@ -2923,13 +2946,16 @@ async def _ask_a_stronger_model(
             actor="policy",
             payload={
                 "outcome": MODEL_CASCADE_FAILED,
-                "reason": await _refusal_reason_since(db, task_id, feed_mark),
+                "reason": reason,
                 "generation": generation,
                 "model": model,
                 "attempt": attempts + 1,
                 "dispatch_id": None,
                 "after_review_id": report.get("id"),
             },
+        )
+        await ladder_attempts.close_attempt(
+            db, attempt_id, dispatch_id=None, reason=reason
         )
         await _alert(
             db,
@@ -2952,7 +2978,9 @@ async def _ask_a_stronger_model(
             "after_review_id": report.get("id"),
         },
     )
-    await db.commit()
+    await ladder_attempts.close_attempt(
+        db, attempt_id, dispatch_id=dict(row)["id"] if row is not None else None
+    )
     return True
 
 
@@ -3003,11 +3031,17 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
     reviews = await repo.machine_reviews_of_generation(
         db, int(event["task_id"]), int(payload.get("generation") or 0)
     )
-    later = [
-        dict(r)
-        for r in reviews
-        if int(dict(r)["id"]) > after
-        and (expected is None or dict(r).get("principal_id") == expected)
+    # #1946: отчёт, привязанный к заказу попытки, и есть её отчёт; чужой
+    # привязанный (отчёт другого заказа) в догадку по порядку не попадает.
+    reports = [dict(r) for r in reviews]
+    own_id = payload.get("dispatch_id")
+    later = [r for r in reports if own_id and r.get("dispatch_id") == own_id]
+    later = later or [
+        r
+        for r in reports
+        if int(r["id"]) > after
+        and r.get("dispatch_id") is None
+        and (expected is None or r.get("principal_id") == expected)
     ]
     if not later:
         return "pending"
@@ -4689,7 +4723,7 @@ async def maybe_dispatch_review(
             "matches its report by task+generation only",
             task_id,
         )
-    await repo.create_review_dispatch(
+    placed_id = await repo.create_review_dispatch(
         db,
         task_id=task_id,
         submission_generation=generation,
@@ -4701,6 +4735,16 @@ async def maybe_dispatch_review(
         reviewer_principal_id=expected_principal,
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
+    )
+    # #1946: код ревьюера выписан до строки заказа - привязываем его (и сессию,
+    # которую агент успел выкупить) к заказу в той же транзакции.
+    await report_binding.bind_code_to_dispatch(
+        db,
+        order.access_code,
+        dispatch_id=placed_id,
+        task_id=task_id,
+        generation=generation,
+        principal_id=expected_principal,
     )
     # #1399: строка заказа и снятие брони — одна транзакция (коммит ниже).
     await _release_the_order(
@@ -5449,6 +5493,14 @@ async def _insert_local_dispatch(
             second_door_reason=why,
             only_tests=order.only_tests,
         )
+        await report_binding.bind_code_to_dispatch(  # #1946
+            db,
+            order.access_code,
+            dispatch_id=dispatch_id,
+            task_id=task_id,
+            generation=generation,
+            principal_id=principal_id,
+        )
         await repo.add_task_update(
             db,
             task_id,
@@ -5956,6 +6008,7 @@ async def _prompt_at_slot(
     task_id: int,
     generation: int,
     principal_id: int | None,
+    dispatch_id: int | None = None,
 ) -> str:
     """Промт с ЗАНОВО выписанным кодом доступа — в момент, когда слот взят.
 
@@ -6022,6 +6075,16 @@ async def _prompt_at_slot(
                 task_id,
             )
             return prompt
+        if dispatch_id is not None:  # #1946: свежий код - тому же заказу
+            await report_binding.bind_code_to_dispatch(
+                target,
+                fresh,
+                dispatch_id=dispatch_id,
+                task_id=task_id,
+                generation=generation,
+                principal_id=principal_id,
+            )
+            await target.commit()
         return prompt.replace(stale, _delivery_block(task_id, fresh, hub_base), 1)
     except Exception:  # noqa: BLE001 - фон не имеет права уронить прогон
         log.exception("could not mint the access code of the local review")
@@ -6056,6 +6119,7 @@ async def _supervise_local_run(
             task_id=task_id,
             generation=generation,
             principal_id=principal_id,
+            dispatch_id=dispatch_id,
         ),
         **extra,
     )
@@ -6307,6 +6371,15 @@ async def _dispatch_report(
     a 36x discrepancy of a run that had submitted nothing).
     """
     expected = _expected_principal(dispatch)
+    reports = [
+        dict(r)
+        for r in await repo.machine_reviews_of_generation(db, task_id, generation)
+    ]
+    # #1946: отчёт, привязанный к этому заказу по коду сессии, отвечает ему и
+    # никому другому; порядок ступеней ниже — только для отчётов без привязки.
+    for report in reports:
+        if dispatch is not None and report.get("dispatch_id") == dispatch.get("id"):
+            return report
     if dispatch is None or expected is None:
         row = await repo.get_latest_machine_review(db, task_id)
         if row is None:
@@ -6314,9 +6387,12 @@ async def _dispatch_report(
         review = dict(row)
         if (review.get("submission_generation") or 0) != generation:
             return None
+        if dispatch is not None and review.get("dispatch_id") is not None:
+            return None  # #1946: отчёт уже отвечает другому заказу
         return review
-    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
-    own = [dict(r) for r in rows if dict(r).get("principal_id") == expected]
+    own = [r for r in reports if r.get("principal_id") == expected]
+    taken = {r["dispatch_id"] for r in own if r.get("dispatch_id") is not None}
+    own = [r for r in own if r.get("dispatch_id") is None]
     # The ladder (#879) runs two SAME-principal dispatches on one generation,
     # so principal+generation alone still matched the lite report to the deep
     # dispatch — settled 'done' before its run reported, grace alert
@@ -6351,7 +6427,8 @@ async def _dispatch_report(
         "AND channel = ? AND replaces_dispatch_id IS NOT NULL) ORDER BY id",
         (task_id, generation, expected, channel, task_id, generation, channel),
     )
-    order = [int(dict(r)["id"]) for r in dispatch_ids]
+    # #1946: заказ, у которого есть свой привязанный отчёт, ступени не занимает.
+    order = [int(dict(r)["id"]) for r in dispatch_ids if dict(r)["id"] not in taken]
     try:
         rung = order.index(int(dispatch["id"]))
     except (ValueError, KeyError, TypeError):
@@ -6781,6 +6858,7 @@ async def _store_report(
             username=(dispatch.get("model") or "cursor-cloud-reviewer"),
             origin=origin,
             expected_generation=int(dispatch["submission_generation"]),
+            dispatch_id=int(dispatch["id"]),  # #1946: отчёт этого заказа
         )
     except HTTPException as exc:
         detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}

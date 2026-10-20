@@ -2682,6 +2682,13 @@ async def api_submit_machine_review(
             if identity.chat_pair_kind == "reviewer"
             else None
         ),
+        # #1946: заказ, под который выдан код этой сессии; принимается интейком
+        # только после сверки задачи, поколения и принципала заказа.
+        dispatch_id=(
+            identity.chat_pair_dispatch_id
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
     )
 
 

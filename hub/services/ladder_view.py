@@ -26,6 +26,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import ladder_attempts
 from hub.services import review_dispatch as dispatcher
 from hub.services.gate_grounds import LADDER_WHY_UNKNOWN
 from hub.services.review_evidence import (
@@ -52,6 +53,7 @@ WHY_AXIS_UNAVAILABLE = "second_axis_unavailable"
 WHY_AXIS_NOT_PLACED = "second_axis_not_placed"
 WHY_AXIS_UNRECORDED = "second_axis_unrecorded"
 WHY_TOP_UP_NO_REPORT = "top_up_no_report"
+WHY_TOP_UP_UNFINISHED = "top_up_unfinished"
 WHY_LOCAL_DEEP = "local_deep_no_cloud"
 WHY_NOT_INCOMPLETE = "report_not_incomplete"
 WHY_UNKNOWN = "unknown"
@@ -80,6 +82,8 @@ _TEXTS = {
     WHY_AXIS_NOT_PLACED: "вторая ось не поставлена: {detail} (#1243)",
     WHY_AXIS_UNRECORDED: "попытка второй оси начата, исхода в записях нет (#1243)",
     WHY_TOP_UP_NO_REPORT: "заказ добора кончился без отчёта (статус {detail})",
+    WHY_TOP_UP_UNFINISHED: "добор не завершился: попытка записана, а ответа "
+    "диспетчера (заказа или отказа) в записи нет (#1946)",
     WHY_AXIS_UNAVAILABLE: "вторая ось недоступна: нет подходящей модели или форжа "
     "(#1243)",
     WHY_LOCAL_DEEP: "неполный отчёт локального deep облаком не лечится (#1587)",
@@ -119,7 +123,14 @@ async def _ladder_acts(
     Каждый поступок — событие с ``after_review_id`` (после КАКОГО отчёта он
     совершён) и ``dispatch_id``: связь записью, а не выводом из времени и
     порядка строк (#1925, круг 2).
+
+    #1946: источник - таблица ``ladder_attempts`` (без retention); события - только
+    для поколений, у которых строк попыток нет (сдача до миграции). Сбой чтения
+    таблицы поднимается, а не читается как «попыток нет».
     """
+    attempts = await ladder_attempts.attempts_of_generation(db, task_id, generation)
+    if attempts:
+        return [_act_of_attempt(a) for a in attempts]
     rows = await fetchall(
         db,
         "SELECT * FROM events WHERE task_id=? AND kind IN (?, ?) "
@@ -140,6 +151,39 @@ async def _ladder_acts(
             act["data"] = None  # запись нечитаема — не доказательство
         acts.append(act)
     return acts
+
+
+def _act_of_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    """Строка попытки в форме поступка, которую читают остальные функции.
+
+    Закрытая попытка второй оси - поступок вида ``review_model_cascade`` (отказ
+    несёт ``outcome=failed`` и причину); всё остальное, включая открытую
+    попытку любого вида, - начало поступка добора.
+    """
+    axis_done = attempt[
+        "kind"
+    ] == ladder_attempts.KIND_SECOND_AXIS and not ladder_attempts.is_open(attempt)
+    data: dict[str, Any] = {
+        "generation": attempt["generation"],
+        "after_review_id": attempt["after_review_id"],
+    }
+    if axis_done:
+        data["model"] = attempt["model"]
+        data["dispatch_id"] = attempt["dispatch_id"]
+        if attempt["outcome"] == ladder_attempts.OUTCOME_REFUSED:
+            data["outcome"] = dispatcher.MODEL_CASCADE_FAILED
+            data["reason"] = attempt["reason"]
+    return {
+        "id": attempt["id"],
+        "kind": (
+            dispatcher.MODEL_CASCADE_EVENT
+            if axis_done
+            else dispatcher.LADDER_TOP_UP_EVENT
+        ),
+        "payload": json.dumps(data),
+        "data": data,
+        "attempt": attempt,
+    }
 
 
 def _placed(act: dict[str, Any]) -> bool:
@@ -212,7 +256,12 @@ async def _preparing(
     вызова, отказанного бронью, закрывает своё начало, а не начало вызова,
     который ещё готовит заказ; пришедший чужой отчёт подготовку не отменяет.
     Упавший вызов оставляет начало открытым — держит срок ожидания.
+
+    #1946: по таблице попыток всё проще и точнее - «готовится» значит, что есть
+    открытая попытка (``closed_at`` пуст); каждый вызов закрывает свою строку.
     """
+    if acts and "attempt" in acts[0]:
+        return any(ladder_attempts.is_open(a["attempt"]) for a in acts)
     events = [
         (int(a["id"]), int(a["data"].get("after_review_id") or 0), 1)
         for a in acts
@@ -306,7 +355,8 @@ async def ladder_why(
 ) -> LadderWhy | None:
     """Почему лестница не довела отчёт текущей сдачи до полного; None — отчёта нет.
 
-    Порядок: заявленный отказ среды (по самому отчёту); добор ещё в полёте
+    Порядок: заявленный отказ среды (по самому отчёту); открытая попытка
+    (#1946: «добор не завершился»); добор ещё в полёте
     (значит, судью заказал срок ожидания); исход ПОСЛЕДНЕГО поступка лестницы
     по его записи; новейший алерт лестницы за эту сдачу; заказ добора, не
     давший отчёта. Ничего из этого — «причина не установлена». Читает только
@@ -323,9 +373,13 @@ async def ladder_why(
         return LadderWhy(WHY_NOT_INCOMPLETE)
     if dispatcher.is_environment_refusal(report):
         return LadderWhy(WHY_ENVIRONMENT)
+    acts = await _ladder_acts(db, task_id, generation)
+    if any(ladder_attempts.is_open(a["attempt"]) for a in acts if "attempt" in a):
+        # #1946: попытка открыта, ответа диспетчера в записи нет - а судью
+        # заказал срок ожидания. Это «не завершился», а не «готовится».
+        return LadderWhy(WHY_TOP_UP_UNFINISHED)
     if await top_up_in_flight(db, task):
         return LadderWhy(WHY_IN_FLIGHT)
-    acts = await _ladder_acts(db, task_id, generation)
     outcome = await _last_act_outcome(db, task_id, generation, acts)
     if outcome.verdict is not None:
         return outcome.verdict
@@ -378,6 +432,16 @@ async def _placed_dispatches(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> dict[int, int]:
     """after_review_id -> заказ, поставленный поступком добора (запись хаба)."""
+    attempts = await ladder_attempts.attempts_of_generation(db, task_id, generation)
+    if attempts:
+        return {
+            int(a["after_review_id"]): int(a["dispatch_id"])
+            for a in attempts
+            if a["kind"] == ladder_attempts.KIND_TOP_UP
+            and a["outcome"] == ladder_attempts.OUTCOME_PLACED
+            and a["after_review_id"] is not None
+            and a["dispatch_id"] is not None
+        }
     rows = await fetchall(
         db,
         "SELECT payload FROM events WHERE task_id=? AND kind=? "
@@ -397,11 +461,13 @@ async def _placed_dispatches(
 
 async def _principals_of_order(
     db: aiosqlite.Connection, dispatch_id: int
-) -> set[int] | None:
-    """Принципалы заказа и всех его замен (``replaces_dispatch_id``); None — любой.
+) -> tuple[set[int] | None, set[int]]:
+    """(принципалы, id) заказа и всех его замен (``replaces_dispatch_id``).
 
-    Заказ без принципала (открытый режим, история) или не найденный в таблице
-    отчёту не сопоставить: фильтра нет, и это сторона «отчёт был».
+    Принципалы None - любой: заказ без принципала (открытый режим, история) или
+    не найденный в таблице отчёту не сопоставить, фильтра нет, и это сторона
+    «отчёт был». id - цепочка заказов: отчёт, привязанный (#1946) к любому из
+    них, - отчёт поступка.
     """
     seen = {dispatch_id}
     principals: set[int] = set()
@@ -417,12 +483,12 @@ async def _principals_of_order(
         frontier = []
         for row in rows:
             if row["reviewer_principal_id"] is None:
-                return None
+                return None, seen
             principals.add(int(row["reviewer_principal_id"]))
             if int(row["id"]) not in seen:
                 seen.add(int(row["id"]))
                 frontier.append(int(row["id"]))
-    return principals if dispatch_id in seen and principals else None
+    return (principals if dispatch_id in seen and principals else None), seen
 
 
 async def _last_act_outcome(
@@ -457,13 +523,19 @@ async def _last_act_outcome(
         dispatch_id = (await _placed_dispatches(db, task_id, generation)).get(after)
     if dispatch_id is None:
         return _ActOutcome()
-    principals = await _principals_of_order(db, int(dispatch_id))
-    reports = await repo.machine_reviews_of_generation(db, task_id, generation)
-    later = [
+    principals, chain = await _principals_of_order(db, int(dispatch_id))
+    reports = [
         dict(r)
+        for r in await repo.machine_reviews_of_generation(db, task_id, generation)
+    ]
+    # #1946: привязанный к заказу отчёт - его отчёт; иначе прежняя догадка, но
+    # только среди отчётов без привязки (чужой привязанный заказ не закрывает).
+    later = [r for r in reports if r.get("dispatch_id") in chain] or [
+        r
         for r in reports
-        if int(dict(r)["id"]) > after
-        and (principals is None or dict(r).get("principal_id") in principals)
+        if int(r["id"]) > after
+        and r.get("dispatch_id") is None
+        and (principals is None or r.get("principal_id") in principals)
     ]
     if later:
         # Первый отчёт заказа полный: неполнота последнего — не от поступка.

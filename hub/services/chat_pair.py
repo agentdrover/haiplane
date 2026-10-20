@@ -598,8 +598,8 @@ async def _spend_code(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
         " bound_generation, token_hash, expires_at, channel, slot, "
-        " executor_run_id, claimed_session) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL)",
+        " executor_run_id, claimed_session, dispatch_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL, ?)",
         (
             row["principal_id"],
             acting_id,
@@ -611,6 +611,7 @@ async def _spend_code(
             row.get("channel") or "",
             row.get("slot") or "",
             row.get("executor_run_id"),
+            row.get("dispatch_id"),
         ),
     )
     if row.get("channel") == "slot":
@@ -677,7 +678,7 @@ async def redeem_code_explained(
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, c.channel, c.slot, c.executor_run_id, "
+        "c.bound_generation, c.channel, c.slot, c.executor_run_id, c.dispatch_id, "
         "c.redeemed_at IS NOT NULL AS spent, "
         "c.expires_at <= datetime('now') AS expired, "
         "p.username, p.status "
@@ -1001,7 +1002,7 @@ async def resolve_session(
     rows = await fetchall(
         db,
         "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
-        "s.bound_generation, s.first_used_at, "
+        "s.bound_generation, s.first_used_at, s.dispatch_id, "
         "p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
@@ -1060,6 +1061,7 @@ async def resolve_session(
                 if row.get("bound_generation") is not None
                 else None
             ),
+            chat_pair_dispatch_id=row.get("dispatch_id"),
         )
     if kind in config.STEWARD_PAIR_KINDS:
         # #1601: тот же допуск стюарда, но вид сессии сохраняется — по нему
