@@ -8,9 +8,10 @@
 
 Условия:
 
-* все отчёты текущего поколения СТРОГО читаются (битый раздел — нечитаемый
-  отчёт, а не пустой список) и проходят белый список ``report_fit``; отчёт,
-  перенесённый на пересдачу (#1361), читается через исходный отчёт;
+* все узлы графа происхождения (``report_provenance``: отчёты текущего
+  поколения, источники переносов #1361 и все отчёты поколений между ними)
+  СТРОГО читаются (битый раздел или битая связь — «не доказано», а не пусто)
+  и проходят один и тот же белый список ``report_fit``;
 * вершина ветки наблюдена сейчас и равна ``submission_sha``;
 * нет действующего (текущего поколения) ``changes_requested`` и открытых
   in_scope-находок;
@@ -32,18 +33,19 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
 from hub.models import FindingOutcome, MachineReviewView
 from hub.services import (
     ci_contract,
     ci_integrity,
     ci_trust,
     report_fit,
+    report_provenance,
     review_evidence,
     state_review,
 )
 from hub.services.finding_identity import unresolved_uids
 from hub.services.finding_outcome import KIND_UNRESOLVED
+from hub.services.report_provenance import UnreadableReport
 from hub.services.review_availability import generation_review
 
 CHECK = "Проверить"
@@ -55,16 +57,6 @@ CODE_REPORT = "report"
 CODE_SHA = "sha"
 CODE_VERDICT = "verdict"
 CODE_STATE = "state"
-
-#: Разделы отчёта, обязанные быть списками. Битый JSON или объект вместо
-#: массива мягкий декодер модели превращает в [] — а пустой список читается
-#: как «находок нет».
-_LIST_SECTIONS = (
-    "findings_confirmed",
-    "findings_rejected",
-    "unresolved",
-    "lost_dimensions",
-)
 
 _MINT = object()
 
@@ -95,118 +87,6 @@ class AcceptProof:
             )
 
 
-class UnreadableReport(Exception):
-    """Отчёт не разобрался строго: «неизвестно», а не «чисто»."""
-
-    def __init__(self, report_id: int, why: str) -> None:
-        super().__init__(f"#{report_id}: {why}")
-        self.report_id = report_id
-        self.why = why
-
-
-# ---- строгое чтение отчётов ---------------------------------------------------
-
-
-def _strict_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Строка отчёта, у которой каждый раздел — список; иначе UnreadableReport.
-
-    Пустая строка и ``None`` — тоже нечитаемо (json.loads("") падает, None не
-    список): «раздел не записан» не равно «находок нет».
-    """
-    out = dict(row)
-    for name in _LIST_SECTIONS:
-        raw = out.get(name)
-        try:
-            value = json.loads(raw) if isinstance(raw, str) else raw
-        except ValueError as exc:
-            raise UnreadableReport(int(row["id"]), f"раздел {name}: не JSON") from exc
-        if not isinstance(value, list):
-            raise UnreadableReport(int(row["id"]), f"раздел {name}: не список")
-        out[name] = value
-    return out
-
-
-async def _earlier_generation(
-    db: aiosqlite.Connection, task_id: int, generation: int
-) -> int | None:
-    """Ближайшее более раннее поколение, в котором есть отчёты: из него и переносят."""
-    rows = await fetchall(
-        db,
-        "SELECT MAX(submission_generation) AS g FROM machine_reviews "
-        "WHERE task_id=? AND submission_generation<?",
-        (task_id, generation),
-    )
-    value = dict(rows[0]).get("g") if rows else None
-    return int(value) if value is not None else None
-
-
-async def _judged_rows(
-    db: aiosqlite.Connection, row: dict[str, Any], seen: set[tuple[int, int]]
-) -> list[dict[str, Any]]:
-    """Строки, по которым судят отчёт. ЕДИНЫЙ разворот переносов (#1361).
-
-    Копия переноса стоит за ВСЕМИ отчётами ближайшего более раннего поколения
-    (ссылка ``carried_from_review_id`` схлопывается до корня и промежуточные
-    поколения теряет, поэтому по ней цепочку не развернуть). Разворот
-    рекурсивный: копия в том поколении разворачивается дальше, и каждый
-    отчёт на каждом шаге проверяется.
-
-    Сама копия — тоже отчёт: её разделы читаются строго и проходят белый
-    список. Единственное, что берётся у корня, — ``provider_tokens``: перенос не
-    чтение и токенов по контракту не несёт. Нет корня или нет более раннего
-    поколения — отчёт нечитаем.
-    """
-    root = row.get("carried_from_review_id")
-    if not root:
-        return [row]
-    source = await repo.get_machine_review(db, int(root))
-    if source is None:
-        raise UnreadableReport(int(row["id"]), f"исходный отчёт #{root} не найден")
-    copy = dict(row)
-    copy["provider_tokens"] = dict(source).get("provider_tokens")
-    task_id, generation = int(row["task_id"]), int(row["submission_generation"])
-    earlier = await _earlier_generation(db, task_id, generation)
-    if earlier is None:
-        raise UnreadableReport(int(row["id"]), "перенос без более раннего поколения")
-    # Копия стоит за ближайшим более ранним поколением И за поколением корня:
-    # ближайшее может содержать самостоятельный чистый отчёт, и обход, который
-    # на нём остановился бы, потерял бы исходное поколение.
-    origin = int(dict(source)["submission_generation"])
-    out = [copy]
-    for source_generation in sorted({earlier, origin}):
-        if (task_id, source_generation) in seen:
-            continue
-        seen.add((task_id, source_generation))
-        for sibling in await repo.machine_reviews_of_generation(
-            db, task_id, source_generation
-        ):
-            out.extend(await _judged_rows(db, dict(sibling), seen))
-    return out
-
-
-async def generation_views(
-    db: aiosqlite.Connection, task: dict[str, Any]
-) -> list[MachineReviewView]:
-    """ВСЕ отчёты текущего поколения (и за копиями переноса), прочитанные строго."""
-    rows = await repo.machine_reviews_of_generation(
-        db, int(task["id"]), int(task.get("submission_generation") or 0)
-    )
-    judged: dict[int, dict[str, Any]] = {}
-    seen: set[tuple[int, int]] = set()
-    for row in rows:
-        for found in await _judged_rows(db, dict(row), seen):
-            judged.setdefault(int(found["id"]), found)
-    views: list[MachineReviewView] = []
-    for report_id, found in judged.items():
-        try:
-            views.append(MachineReviewView(**_strict_row(found)))
-        except UnreadableReport:
-            raise
-        except (TypeError, ValueError) as exc:
-            raise UnreadableReport(report_id, "отчёт не разобрался") from exc
-    return views
-
-
 async def _unanswered(
     db: aiosqlite.Connection, task_id: int, view: MachineReviewView
 ) -> int:
@@ -222,30 +102,37 @@ async def _unanswered(
     return left
 
 
+def _unreadable_blocker(bad: UnreadableReport) -> Blocker:
+    if bad.broken_link:
+        text = f"Происхождение отчёта ревью #{bad.report_id} нарушено: проверка не доказана"
+    else:
+        text = f"Отчёт ревью #{bad.report_id} не читается: проверка не доказана"
+    return Blocker(CHECK, "high", text, bad.why)
+
+
 async def _report_blockers(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[list[Blocker], list[MachineReviewView]]:
+    """Каждый узел графа происхождения проходит один предикат; причины называют узлы."""
     try:
-        views = await generation_views(db, task)
+        nodes = await report_provenance.provenance_graph(db, task)
     except UnreadableReport as bad:
-        text = f"Отчёт ревью #{bad.report_id} не читается: проверка не доказана"
-        return [Blocker(CHECK, "high", text, bad.why)], []
-    if not views:
+        return [_unreadable_blocker(bad)], []
+    if not nodes:
         headline = str((await generation_review(db, task)).headline)
         return [
             Blocker(CHECK, "high", "Отчёта машинного ревью по этой сдаче нет", headline)
         ], []
-    found: dict[str, tuple[str, list[int]]] = {}
-    for view in views:
-        left = await _unanswered(db, int(task["id"]), view)
-        for code, text in report_fit.report_gaps(view, left):
-            found.setdefault(code, (text, []))[1].append(view.id)
+    found: dict[str, tuple[str, list[str]]] = {}
+    for node in nodes:
+        left = await _unanswered(db, int(task["id"]), node.view)
+        for code, text in report_fit.report_gaps(node.view, left):
+            found.setdefault(code, (text, []))[1].append(node.label)
     blockers = []
-    for code, (text, ids) in found.items():
+    for code, (text, labels) in found.items():
         level = REWORK if code == report_fit.GAP_CONFIRMED else CHECK
-        which = ", ".join(f"#{i}" for i in ids)
-        blockers.append(Blocker(level, "high", text, f"отчёты: {which}"))
-    return blockers, views
+        blockers.append(Blocker(level, "high", text, "отчёты: " + ", ".join(labels)))
+    return blockers, [n.view for n in nodes]
 
 
 # ---- ветка, вердикт, проверки --------------------------------------------------

@@ -7,12 +7,11 @@
 справка собирается на запрос, поэтому у карточки и у входящих один текст.
 
 Правило безопасности одно: ложное «Принять» хуже ложного «Проверить».
-Решение владельца по #1810 (20.10): в этой задаче справка «Принять» НЕ ВЫДАЁТ
-вообще. Максимум — «Проверить» с причиной «доказательство принятия — отдельная
-задача», иначе «На доработку». Предикат ``accept_proof.prove_accept`` остаётся и
-его итог лежит в ``brief["accept_proven"]`` (для следующей задачи), но в
-рекомендацию он не попадает. Отсутствие данных — не данные: непрочитанное
-называется «неизвестно», а не «чисто».
+«Принять» выдаётся только из ``accept_proof.prove_accept`` — доказательства по
+графу происхождения отчётов (#1912; в #1810 оно было выключено после семи
+кругов частных правок). Нет доказательства — «Проверить» или «На доработку».
+Отсутствие данных — не данные: непрочитанное называется «неизвестно», а не
+«чисто».
 """
 
 from __future__ import annotations
@@ -39,6 +38,7 @@ from hub.services.readiness import parse_risks_from_row
 from hub.services.result_kind import automation_not_applicable, state_accepted
 from hub.services.verdict_route import DECIDER_HUMAN, DECIDER_STEWARD, verdict_route
 
+ACCEPT = "Принять"
 CHECK = "Проверить"
 REWORK = "На доработку"
 HUMAN_CALL = "Решить вам"
@@ -52,6 +52,7 @@ NO_ACTION = "Действий нет"
 
 #: Словарь формы вердикта (то, что принимает карточка).
 VERDICT_CHANGES = "changes_requested"
+VERDICT_APPROVED = "approved"
 
 MAX_RISKS = 3
 _WEIGHT = {"high": 3, "medium": 2, "low": 1}
@@ -148,12 +149,12 @@ def _ground_sources(raw: Any) -> list[str]:
     return names
 
 
-NOT_THIS_TASK = "доказательство принятия — отдельная задача"
+STATE_NOT_ACCEPTED = "для задачи-состояния «Принять» не выдаётся: решает человек"
 
 
-def _proven_but_capped(why: list[str]) -> dict[str, Any]:
-    """Условия доказаны, но «Принять» здесь не выдаётся: максимум — «Проверить»."""
-    return _recommend(CHECK, "", [NOT_THIS_TASK, *why])
+def _state_proven_but_capped(why: list[str]) -> dict[str, Any]:
+    """Задача-состояние: комплект доказан, но совет остаётся «Проверить»."""
+    return _recommend(CHECK, "", [STATE_NOT_ACCEPTED, *why])
 
 
 def _from_steward(judged: Any, route: Any) -> dict[str, Any] | None:
@@ -170,8 +171,8 @@ def _from_steward(judged: Any, route: Any) -> dict[str, Any] | None:
         why.append(tail)
     why = why or ["стюард без пояснений"]
     if action == CHECK and word == "approve":
-        # Суждение стюарда «approve» — не доказательство и в этой задаче не
-        # «Принять»: правила сильнее суждения, итог — «Проверить».
+        # Суждение стюарда «approve» — не доказательство: «Принять» даёт
+        # только prove_accept, правила сильнее суждения.
         return None
     return _recommend(action, verdict, why)
 
@@ -184,10 +185,11 @@ def _from_rules(
             "CI доверенно зелёный на коммите сдачи",
             "отчёты ревью читаются, полные, независимые, находок нет",
             "ветка стоит на сданном коммите, вердикта «на доработку» нет",
+            f"проверено отчётов по графу происхождения: {len(proof.report_ids)}",
         ]
         if tail := _route_why(route):
             why.append(tail)
-        return _proven_but_capped(why)
+        return _recommend(ACCEPT, VERDICT_APPROVED, why)
     rework = any(b.level == REWORK for b in blockers)
     action, verdict = (REWORK, VERDICT_CHANGES) if rework else (CHECK, "")
     alt = "" if rework else "На доработку, если проверка подтвердит сомнение"
@@ -272,7 +274,7 @@ async def _state_brief(
             action, verdict, [view.headline] + [b.risk for b in blockers]
         )
     else:
-        recommend = _proven_but_capped([have, "откат назван, комплект полон"])
+        recommend = _state_proven_but_capped([have, "откат назван, комплект полон"])
     return _brief(
         "Состояние изменено руками, доказательства приложены.",
         "Нужен ваш вердикт.",

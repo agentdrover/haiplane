@@ -215,14 +215,15 @@ async def test_a_carried_report_without_its_source_is_unreadable(
     assert await _action(db, task_id) != ACCEPT
 
 
-def test_the_brief_has_no_accept_emitter_at_all():
-    """Решение владельца (#1810, 20.10): справка «Принять» не выдаёт — эмиттеров нет."""
+def test_the_brief_has_exactly_one_accept_emitter():
+    """«Принять» выдаётся в одном месте — из ветки доказательства (#1912)."""
     import inspect
     import re
 
-    source = re.sub(r"\s+", " ", inspect.getsource(decision_brief))
-    assert "ACCEPT" not in source
-    assert "VERDICT_APPROVED" not in source
+    source = inspect.getsource(decision_brief)
+    emitters = re.findall(r"_recommend\(\s*ACCEPT\b", source)
+    assert len(emitters) == 1
+    assert "proof is not None" in inspect.getsource(decision_brief._from_rules)
 
 
 async def test_a_carried_report_needs_every_report_of_the_source_generation(
