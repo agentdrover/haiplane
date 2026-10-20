@@ -11,7 +11,10 @@ exist and say what the report says.
 report is kept and shown, but it is not evidence: it writes no AC result and no
 validation result, and it opens no gate. The same holds for a report whose
 attempt is no longer the current one: the evidence belongs to the attempt that
-produced it and is withdrawn when another attempt takes over.
+produced it and is withdrawn when another attempt takes over. One exception, for
+SHOWING only (#1936): the brief may name the mutations and baseline that another
+verified attempt of the same commit counted (``borrowed_evidence_blocks``); the
+projection and every gate stay on the current attempt.
 
 Three things are deliberately NOT guessed:
 
@@ -405,6 +408,148 @@ def reported_body(row: Any) -> dict[str, Any]:
         if block:
             body[key] = block
     return body
+
+
+# ---- evidence of ANOTHER attempt of the same commit (#1936) -----------------
+
+#: What a block must say to be borrowed: a step that really counted, not one that
+#: failed or found nothing to run against. Per column of ``ci_report_attempts``.
+BORROWABLE_STATES: dict[str, frozenset[str]] = {
+    "mutations": frozenset({"ran", "no_changed_functions", "no_tests"}),
+    "baseline": frozenset({"ran", "no_tests"}),
+}
+
+_PROJECTION_KEYS = (
+    "attempt_key",
+    "trust",
+    "contract_fp",
+    "mutations",
+    "baseline",
+    "provenance",
+)
+
+# ONE statement reads the attempts of a commit together with its projection, so
+# both are the state of one moment (a statement is atomic; a read transaction on
+# the shared connection would hold other coroutines' writes hostage).
+_SNAPSHOT_SQL = (
+    "SELECT a.*, r.attempt_key AS p_attempt_key, r.trust AS p_trust, "
+    "r.contract_fp AS p_contract_fp, r.mutations AS p_mutations, "
+    "r.baseline AS p_baseline, r.provenance AS p_provenance "
+    "FROM ci_report_attempts a LEFT JOIN ci_run_reports r "
+    "ON r.task_id=a.task_id AND r.head_sha=a.head_sha "
+    "WHERE a.task_id=? AND a.head_sha=?"
+)
+
+
+@dataclass(frozen=True)
+class BorrowedBlock:
+    """A mutations/baseline block counted by another attempt of the commit."""
+
+    raw: str
+    run_id: str
+    run_attempt: str
+
+
+def _order(row: Mapping[str, Any]) -> tuple[int, int]:
+    def number(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return number(row["run_id"]), number(row["run_attempt"])
+
+
+def _usable_block(
+    row: Mapping[str, Any], column: str, head_sha: str, fingerprint: str
+) -> dict[str, Any] | None:
+    """The block of a confirmed, successful attempt that was counted on ``head_sha``."""
+    if trust_of(row, fingerprint)[0] != VERIFIED or not run_succeeded(
+        {"provenance": row["provenance"]}
+    ):
+        return None
+    block = _json_map(row[column])
+    if block.get("head") != head_sha:  # no ``head`` = not counted on this commit
+        return None
+    state = block.get("state")
+    # A state that is not a string (a list, a map) is garbage, not a membership test.
+    ok = isinstance(state, str) and state in BORROWABLE_STATES[column]
+    return block if ok else None
+
+
+def _picks(
+    rows: list[dict[str, Any]],
+    head_sha: str,
+    current: Mapping[str, Any],
+    fingerprint: str,
+) -> dict[str, BorrowedBlock]:
+    """What one snapshot lets the brief borrow, per column. Pure: no read, no await."""
+    if not rows:
+        return {}
+    projection = {k: rows[0][f"p_{k}"] for k in _PROJECTION_KEYS}
+    if any(projection[k] != current.get(k) for k in _PROJECTION_KEYS):
+        return {}  # not the row the brief is showing
+    if trust_of(projection, fingerprint)[0] != VERIFIED or not run_succeeded(
+        projection
+    ):
+        return {}
+    picks: dict[str, BorrowedBlock] = {}
+    for column in BORROWABLE_STATES:
+        if _json_map(projection[column]):
+            continue  # the current attempt carries its own block: it wins
+        best: tuple[tuple[int, int], BorrowedBlock] | None = None
+        for row in rows:
+            if _usable_block(row, column, head_sha, fingerprint) is None:
+                continue
+            order = _order(row)
+            if best is None or order > best[0]:
+                found = BorrowedBlock(row[column], row["run_id"], row["run_attempt"])
+                best = (order, found)
+        if best is not None:
+            picks[column] = best[1]
+    return picks
+
+
+async def borrowed_evidence_blocks(
+    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any]
+) -> dict[str, BorrowedBlock]:
+    """The mutations/baseline blocks another verified attempt of this commit counted.
+
+    For the BRIEF only: the projection (``ci_run_reports``) stays the row of the
+    current attempt and the gates read it, so nothing here lets a gate lean on
+    another attempt (#1687). A ``pull_request:synchronize`` run counts no
+    mutations or baseline and starts after the executor's dispatch run, so it is
+    the current attempt and its empty blocks used to hide what was counted on
+    the same commit.
+
+    ``current`` is the confirmed projection row the brief shows. Both blocks are
+    decided from ONE snapshot (attempts and projection in one statement) that
+    must agree with the row the brief shows: if the projection moved since, no
+    borrowing at all, i.e. the answer the brief gave before. The contract is
+    read on both sides of the statement and must be the same; that interval is
+    the consistency boundary, nothing is awaited after it. A candidate must be
+    verified under the current contract, ``run_conclusion=success``, carry
+    ``head == head_sha`` and an informative state; of several the newest by
+    ``(run_id, run_attempt)`` wins. The projection must be verified and
+    successful too. A block the current attempt carries always wins.
+    """
+    if not head_sha or not current:
+        return {}
+    # The contract lives in another table (the project is resolved through the
+    # task's ancestry), so it cannot join the statement. It is read on both
+    # sides of the snapshot: equal means it did not change while the snapshot
+    # was taken. Known residual: a human PATCH that goes A -> B -> A inside this
+    # interval is not seen (a fingerprint is a hash, not a revision); the cost
+    # is one brief showing evidence the contract of that instant did not confirm.
+    fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
+    rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
+    if await ci_contract.fingerprint_for_task(db, task_id) != fingerprint:
+        return {}
+    # Nothing is awaited from here: the interval above is the consistency
+    # boundary. The answer is the state at that moment; a write after it is a
+    # later moment, and a projection that moved since the brief read its own
+    # copy (``current``) makes the keys differ and borrows nothing.
+    return _picks(rows, head_sha, current, fingerprint)
 
 
 # ---- which attempt is current ----------------------------------------------
