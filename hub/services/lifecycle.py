@@ -935,6 +935,13 @@ async def enrich_task_view(
     # #1874: оценка минут владельца - один объект на карточку, REST, MCP и CLI.
     task_view.owner_minutes = await owner_minutes.task_estimate(db, task_view.id)
 
+    # #1941: последний host-заказ и «после неудачного прогона» - чистое чтение одним снимком.
+    from hub.services import executor_triage
+
+    task_view.last_executor_order = await executor_triage.last_executor_order_view(
+        db, task_view.id
+    )
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(

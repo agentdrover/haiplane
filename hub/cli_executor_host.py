@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,21 @@ def _api(*args: Any, **kwargs: Any) -> Any:
     from hub.cli import _api as api
 
     return api(*args, **kwargs)
+
+
+def print_order_line(result: Any) -> None:
+    """#1941: the line about the last host order for ``oc-hub status``; never recomputed here."""
+    view = result.get("last_executor_order") if isinstance(result, dict) else None
+    if not isinstance(view, dict):
+        return
+    if view.get("unavailable"):
+        print(f"Заказ хоста: {view['unavailable']}", file=sys.stderr)
+    elif view.get("after_failed_run"):
+        print(
+            f"После неудачного прогона: класс {view.get('class')} "
+            f"({view.get('class_name')})",
+            file=sys.stderr,
+        )
 
 
 def cmd_executor_host(args: argparse.Namespace) -> int:
