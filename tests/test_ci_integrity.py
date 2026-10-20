@@ -946,6 +946,11 @@ async def test_a_blind_answer_does_not_lift_the_refusal_on_later_signs(
     # Проход поллера делает скан МЕЖДУ брифом и отчётом: признаки есть, но
     # ревьюер их не видел — его ответ всё равно слепой.
     await ci_integrity.ensure_scan(db, task_id)
+    # Карточка владельца перерисовывается (HTMX, 15 с) и собирает тот же бриф, но
+    # блока целостности не рисует: ревьюеру это признаков не показало.
+    from hub.services.review_brief import build_review_brief
+
+    await build_review_brief(db, task_id, observe_only=True, card=True)
     await _post_review(
         client,
         task_id,

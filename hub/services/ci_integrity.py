@@ -927,7 +927,11 @@ async def order_section(db: aiosqlite.Connection, task_id: int) -> str:
 
 
 async def brief_state(
-    db: aiosqlite.Connection, task_id: int, *, offline: bool = False
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    offline: bool = False,
+    shown_to_reviewer: bool = True,
 ) -> dict[str, Any] | None:
     """The brief's block: None when there are no signs (the brief reads as before).
 
@@ -938,7 +942,9 @@ async def brief_state(
         await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
-    _note_shown(task, standing)
+    if shown_to_reviewer:
+        # Карточка владельца блок не рисует: её сборка ревьюеру ничего не показала.
+        _note_shown(task, standing)
     if standing.clean:
         return None
     return {
