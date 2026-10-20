@@ -3011,10 +3011,11 @@ def test_a_clean_candidate_passes_the_advisor_family_gate():
 async def test_an_advisor_order_carries_its_own_wait_and_costs_the_cap(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """Срок ответа — STEWARD_ADVISOR_WAIT_MAX от заказа; квота одна на всех.
+    """Срок ответа — STEWARD_ADVISOR_WAIT_MAX от заказа; потолок у советника свой.
 
-    Заказ советника — оплаченный прогон, и общий суточный потолок его считает:
-    потолок существует, чтобы ограничить купленное, а не только судей.
+    Заказ советника — оплаченный прогон, и суточный потолок его считает:
+    потолок существует, чтобы ограничить купленное, а не только судей. С #1915
+    считает СВОЙ потолок советника, а не потолок суждений.
     """
     from hub.services.steward_advisor import order_due_advisors
 
@@ -3023,7 +3024,7 @@ async def test_an_advisor_order_carries_its_own_wait_and_costs_the_cap(
         db, "advisor-wait", judge_model="composer-2.5"
     )
     project_id = dict(await repo.get_task(db, task_id))["project_id"]
-    before = await runs_today(db, project_id)
+    before = await runs_today(db, project_id, "advisor")
 
     await order_due_advisors(db)
 
@@ -3037,7 +3038,7 @@ async def test_an_advisor_order_carries_its_own_wait_and_costs_the_cap(
     assert dict(minutes[0])["m"] == 45, (
         "срок ответа — настройка, а не окно старта судьи"
     )
-    assert await runs_today(db, project_id) == before + 1
+    assert await runs_today(db, project_id, "advisor") == before + 1
 
 
 async def test_an_exhausted_daily_cap_defers_the_advisor_without_burning_the_generation(
@@ -3049,12 +3050,12 @@ async def test_an_exhausted_daily_cap_defers_the_advisor_without_burning_the_gen
     task_id = await _approved_by_the_judge(
         db, "advisor-cap", judge_model="composer-2.5"
     )
-    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "0")
 
     assert await order_due_advisors(db) == 0
     assert await _advisor_rows(db, task_id) == []
 
-    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 20)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "20")
     assert await order_due_advisors(db) == 1
 
 
@@ -3461,3 +3462,133 @@ async def test_a_closed_row_with_a_live_job_is_withdrawn_after_a_crash(
 async def _local_events_all(db: aiosqlite.Connection) -> list[dict]:
     rows = await fetchall(db, "SELECT kind, payload FROM events ORDER BY id")
     return [{**json.loads(r["payload"] or "{}"), "event": r["kind"]} for r in rows]
+
+
+async def test_the_advisor_has_its_own_daily_cap(db: aiosqlite.Connection, monkeypatch):
+    """AC-1 (#1915): суждения и советник считаются против РАЗНЫХ потолков.
+
+    Часы стоят до полуночи UTC, потом после неё: «другие сутки» проверяется
+    на настоящей границе, а не подменой даты в строках.
+    """
+    from hub.services import steward_cap
+    from tests.steward_cap_support import AFTER_MIDNIGHT, BEFORE_MIDNIGHT, set_clock
+
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 2)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "1")
+    project_id = await _project(db, "cap-two", steward=True)
+    other_id = await _project(db, "cap-other", steward=True)
+    tasks = [await _submitted_task(db, project_id) for _ in range(4)]
+    foreign = await _submitted_task(db, other_id)
+
+    assert steward_cap.cap_of("verdict_dor") == 2
+    assert steward_cap.cap_of("advisor") == 1
+    assert await order_run(db, tasks[0], 1) is not None
+    assert await order_run(db, tasks[1], 1) is not None
+    assert await order_run(db, tasks[2], 1) is None, "потолок суждений исчерпан"
+    # Суждения исчерпаны, а советник на своём счёте ещё не заказывал ничего.
+    assert await order_run(db, tasks[0], 1, "advisor") is not None
+    assert await order_run(db, tasks[1], 1, "advisor") is None, "свой потолок: 1"
+    assert await runs_today(db, project_id) == 2
+    assert await runs_today(db, project_id, "advisor") == 1
+
+    # Чужой проект считается отдельно.
+    assert await order_run(db, foreign, 1) is not None
+    assert await runs_today(db, other_id) == 1
+
+    # Каждый статус, кроме refused, расходует потолок.
+    verdict_row = (await _runs(db, tasks[0]))[0]
+    for status in (RUN_JUDGED, RUN_TIMEOUT, RUN_SUPERSEDED, RUN_NEVER_STARTED):
+        await db.execute(
+            "UPDATE steward_runs SET status=? WHERE id=?", (status, verdict_row["id"])
+        )
+        await db.commit()
+        assert await runs_today(db, project_id) == 2, status
+    await db.execute(
+        "UPDATE steward_runs SET status=? WHERE id=?", (RUN_REFUSED, verdict_row["id"])
+    )
+    await db.commit()
+    assert await runs_today(db, project_id) == 1, "refused ничего не купил"
+
+    # После полуночи UTC счёт тех же строк — другие сутки.
+    set_clock(monkeypatch, AFTER_MIDNIGHT)
+    assert await runs_today(db, project_id) == 0
+    assert await runs_today(db, project_id, "advisor") == 0
+    assert await order_run(db, tasks[2], 1) is not None
+    assert await order_run(db, tasks[1], 1, "advisor") is not None
+
+
+async def test_a_daily_cap_refusal_is_shown_once_to_the_owner(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1915): баннер входящих в те же сутки, один alert в ленте.
+
+    Причины чередуются daily_cap → steward_off → daily_cap, и тик повторяется:
+    дедуп идёт по НАЛИЧИЮ отказа по потолку, а не по последнему событию.
+    """
+    from hub.services import steward_cap
+    from tests.steward_cap_support import AFTER_MIDNIGHT, BEFORE_MIDNIGHT, set_clock
+
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 0)
+    project_id = await _project(db, "cap-banner", steward=True)
+    task_id = await _submitted_task(db, project_id)
+
+    async def _alerts() -> list[str]:
+        return [
+            dict(u)["content"]
+            for u in await repo.get_task_updates(db, task_id)
+            if dict(u)["kind"] == "alert" and "потолок" in dict(u)["content"]
+        ]
+
+    assert await order_run(db, task_id, 1) is None
+    assert await order_run(db, task_id, 1) is None, "повторный тик"
+    assert len(await _alerts()) == 1
+    (event,) = [
+        e
+        for e in await _events(db, EVENT_REFUSED)
+        if json.loads(e["payload"])["reason"] == REFUSED_DAILY_CAP
+    ]
+    assert event["project_id"] == project_id, "баннер читает проект из события"
+    assert event["created_at"].startswith("2026-10-19")
+    assert await _runs(db, task_id) == [], "строки steward_runs отказ не пишет"
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+    assert await order_run(db, task_id, 1) is None  # другая причина
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    assert await order_run(db, task_id, 1) is None  # снова daily_cap
+    assert await order_run(db, task_id, 1) is None
+    assert len(await _alerts()) == 1, "alert один на (задача, поколение, вид, сутки)"
+    caps = [
+        e
+        for e in await _events(db, EVENT_REFUSED)
+        if json.loads(e["payload"])["reason"] == REFUSED_DAILY_CAP
+    ]
+    assert len(caps) == 1
+
+    # Другой вид заказа той же задачи — свой alert.
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "0")
+    assert await order_run(db, task_id, 1, "advisor") is None
+    assert len(await _alerts()) == 2
+
+    # Баннер: те же сутки, текущие used/cap и reset_at.
+    page = await client.get("/partials/inbox")
+    assert page.status_code == 200
+    assert "были отказы из-за суточного потолка" in page.text
+    assert "cap-banner" in page.text
+    assert "сброс 2026-10-20 00:00:00 UTC" in page.text
+    assert "сейчас 0/0" in page.text
+    rows = await steward_cap.banner_rows(db)
+    assert {r["kind_group"] for r in rows} == {"verdict_dor", "advisor"}
+
+    # Следующие сутки: баннера нет.
+    set_clock(monkeypatch, AFTER_MIDNIGHT)
+    assert await steward_cap.banner_rows(db) == []
+    page = await client.get("/partials/inbox")
+    assert "были отказы из-за суточного потолка" not in page.text
+
+    # Проект без verdict=steward баннера не получает.
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    await db.execute("UPDATE projects SET gate_policy='{}' WHERE id=?", (project_id,))
+    await db.commit()
+    assert await steward_cap.banner_rows(db) == []

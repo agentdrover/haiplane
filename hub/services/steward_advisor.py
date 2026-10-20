@@ -53,6 +53,7 @@ from hub.services.result_kind import (
     automation_not_applicable,
     task_automation_not_applicable,
 )
+from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -222,6 +223,11 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
             continue  # #1647
         project = await repo.resolve_project_for_task(db, task_id)
         if not _policy_wants_steward(project):
+            continue
+        if await steward_cap.cap_handoff(db, task_id, generation) is not None:
+            # #1915: потолок исчерпан — сдача у человека до reset_at. Выбор
+            # модели ниже мог бы закрыть поколение строкой refused и тем самым
+            # лишить завтрашнего заказа.
             continue
         if await _order_one(db, task_id, generation):
             ordered += 1
@@ -570,7 +576,12 @@ async def advisor_state(
         (task_id, generation, KIND_ADVISOR),
     )
     if not runs:
-        return AdvisorState(STATE_NOT_ORDERED, reason="советник не заказан", **base)
+        handoff = await steward_cap.cap_handoff(db, task_id, generation)
+        return AdvisorState(
+            STATE_NOT_ORDERED,
+            reason=handoff.reason if handoff is not None else "советник не заказан",
+            **base,
+        )
     run = dict(runs[0])
     status = str(run.get("status") or "")
     if status == RUN_OPEN:
@@ -662,6 +673,11 @@ async def advisor_refusal(
     """
     from hub.services.steward_evidence import current_packet_hash, packet_hash
 
+    handoff = await steward_cap.cap_handoff(db, task_id, generation)
+    if handoff is not None:
+        # #1915: передано человеку из-за потолка — не применять, даже если
+        # согласие советника лежит в базе. Условие то же, что у маршрута.
+        return (REFUSED_ADVISOR, handoff.reason)
     state = await advisor_state(db, task_id, generation)
     sides = both_sides(state)
     if state.state != STATE_RECEIVED:
@@ -801,6 +817,8 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         state = await advisor_state(db, task_id, generation)
         if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
             continue
+        if await steward_cap.cap_handoff(db, task_id, generation) is not None:
+            continue  # #1915: сдача у человека до reset_at — исход не применяется
         stamp = await _stamp_now(db)
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=?, "
