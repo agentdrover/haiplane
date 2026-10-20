@@ -390,6 +390,7 @@ async def test_start_poller_keeps_a_handle_of_every_background_task():
         patch.object(poller, "_red_base_watch", idle),
         patch.object(poller, "arm_workspace_hooks", idle),
         patch("hub.services.egress_watch.run_loop", idle),
+        patch("hub.services.steward_breaker.run_loop", idle),
     ):
         main = poller.start_poller(app)
         handles = app.state.background_tasks
@@ -402,6 +403,7 @@ async def test_start_poller_keeps_a_handle_of_every_background_task():
                 "hub-session-reaper",
                 "hub-drift-watch",
                 "hub-red-base-watch",
+                "hub-steward-breaker",
                 "hub-arm-workspace-hooks",
             } == set(handles)
             assert all(t.get_name() == n for n, t in handles.items())
