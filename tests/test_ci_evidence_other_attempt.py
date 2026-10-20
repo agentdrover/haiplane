@@ -416,7 +416,7 @@ async def test_a_change_between_the_reads_borrows_nothing(db, monkeypatch):
         await db.execute("UPDATE ci_run_reports SET attempt_key='ci:1003:1'")
         await db.commit()
 
-    _after_read(monkeypatch, "ci_report_attempts", 1, action)
+    _after_read(monkeypatch, "ci_run_reports", 1, action)
     await _check(db, task_id, set())
 
 
@@ -464,7 +464,7 @@ async def test_a_source_replaced_after_it_was_read_is_not_borrowed(db, monkeypat
     async def action():
         await _replace_the_source(db, task_id)
 
-    seen = _after_read(monkeypatch, "ci_report_attempts", 1, action)
+    seen = _after_read(monkeypatch, "ci_run_reports", 1, action)
     await _check(db, task_id, set())
     assert seen["fired"]
     source = [
@@ -487,7 +487,7 @@ async def test_the_projection_invalidated_right_after_its_read_borrows_nothing(
         await store_ci_run_report(db, task_id, **sent)  # a POST: pending again
         await db.commit()
 
-    seen = _after_read(monkeypatch, "ci_run_reports", 2, action)
+    seen = _after_read(monkeypatch, "ci_run_reports", 1, action)
     evidence = await _evidence(db, task_id)
     assert seen["fired"]
     assert await ci_trust.trusted_report(db, task_id, SHA) is None
@@ -502,13 +502,13 @@ async def test_both_blocks_are_decided_from_one_snapshot(db, monkeypatch):
     async def action():
         await _replace_the_source(db, task_id)
 
-    _after_read(monkeypatch, "ci_report_attempts", 1, action)
+    _after_read(monkeypatch, "ci_run_reports", 1, action)
     evidence = await _evidence(db, task_id)
     # Whatever moved, the two blocks agree: never one borrowed and one not.
     assert evidence.mutations.state == evidence.baseline.state == "not_received"
 
 
-async def test_one_snapshot_and_its_recheck_serve_both_blocks(db, monkeypatch):
+async def test_one_snapshot_serves_both_blocks(db, monkeypatch):
     from hub.services import ci_trust as trust_module
 
     task_id = await _task(db)
@@ -528,20 +528,18 @@ async def test_one_snapshot_and_its_recheck_serve_both_blocks(db, monkeypatch):
     evidence = await _evidence(db, task_id)
     assert "из попытки 1001/1" in evidence.mutations.reason
     assert "из попытки 1001/1" in evidence.baseline.reason
-    assert reads["n"] == 2, (
-        "one snapshot and its recheck for BOTH blocks, not per block"
-    )
+    assert reads["n"] == 1, "ONE snapshot serves BOTH blocks, not one per block"
 
 
-async def test_the_second_statement_is_the_consistency_boundary(db, monkeypatch):
-    """A write after the second read is a later moment: the answer is whole, not a mix."""
+async def test_the_snapshot_statement_is_the_consistency_boundary(db, monkeypatch):
+    """A write after the snapshot is a later moment: the answer is whole, not a mix."""
 
     async def action():
         await _replace_the_source(db, task_id)
 
     task_id = await _task(db)
     await _dispatch_then_synchronize(db, task_id)
-    _after_read(monkeypatch, "ci_report_attempts", 2, action)
+    _after_read(monkeypatch, "ci_report_attempts", 1, action)
     evidence = await _evidence(db, task_id)
     assert evidence.mutations.state == evidence.baseline.state == "received"
     assert "из попытки 1001/1" in evidence.mutations.reason

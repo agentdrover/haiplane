@@ -523,11 +523,10 @@ async def borrowed_evidence_blocks(
     the same commit.
 
     ``current`` is the confirmed projection row the brief shows. Both blocks are
-    decided from ONE snapshot (attempts and projection in one statement); the
-    snapshot is read again and the answer stands only if the two agree (the
-    chosen sources and the projection): any movement means no borrowing at all,
-    i.e. the answer the brief gave before. The second statement is the
-    consistency boundary, nothing is awaited after it. A candidate must be
+    decided from ONE snapshot (attempts and projection in one statement) that
+    must agree with the row the brief shows: if the projection moved since, no
+    borrowing at all, i.e. the answer the brief gave before. The statement is
+    the consistency boundary, nothing is awaited after it. A candidate must be
     verified under the current contract, ``run_conclusion=success``, carry
     ``head == head_sha`` and an informative state; of several the newest by
     ``(run_id, run_attempt)`` wins. The projection must be verified and
@@ -535,20 +534,14 @@ async def borrowed_evidence_blocks(
     """
     if not head_sha or not current:
         return {}
-    # The contract is captured BEFORE the snapshots, as a refresh does (#1848).
+    # The contract is captured BEFORE the snapshot, as a refresh does (#1848).
     fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
-    args = (task_id, head_sha)
-    first = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, args)]
-    second = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, args)]
-    # Nothing is awaited from here: the second statement is the consistency
-    # boundary. The answer is the state at that moment, and only if the first
-    # snapshot said the same; a write after it is a later moment.
-    again = _picks(second, head_sha, current, fingerprint)
-    return (
-        again
-        if again and again == _picks(first, head_sha, current, fingerprint)
-        else {}
-    )
+    rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
+    # Nothing is awaited from here: the statement above is the consistency
+    # boundary. The answer is the state at that moment; a write after it is a
+    # later moment, and the projection that moved since the brief read its own
+    # copy (``current``) makes the keys differ and borrows nothing.
+    return _picks(rows, head_sha, current, fingerprint)
 
 
 # ---- which attempt is current ----------------------------------------------
