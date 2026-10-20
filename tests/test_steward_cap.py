@@ -79,3 +79,38 @@ async def test_a_capped_generation_waits_for_reset_or_for_a_raised_cap(
     monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 5)
     assert await steward_cap.cap_handoff(db, task_id, 1) is None
     assert await order_due_runs(db) == 1
+
+
+async def test_a_raise_that_fits_exactly_returns_every_capped_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Потолок N, N отказов, подъём ровно на N: все заказаны и ни одна не у человека.
+
+    Заказанное после отказа поколение возвращается стюарду насовсем, хотя
+    после последнего заказа used == cap и потолок снова «исчерпан».
+    """
+    from hub.services import steward_cap
+    from tests.steward_cap_support import BEFORE_MIDNIGHT, set_clock
+
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 0)
+    project_id = await _project(db, "cap-exact", steward=True)
+    tasks = [await _submitted_task(db, project_id) for _ in range(3)]
+    assert await order_due_runs(db) == 0
+    for task_id in tasks:
+        assert await steward_cap.cap_handoff(db, task_id, 1) is not None
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 3)
+    assert await order_due_runs(db) == 3
+    assert await steward_cap.used_today(db, project_id, "verdict_dor") == 3
+    for task_id in tasks:
+        assert await steward_cap.cap_handoff(db, task_id, 1) is None, task_id
+
+
+def test_the_dor_alert_does_not_promise_a_human_verdict():
+    from hub.services import steward_cap
+
+    assert "вердикт за человеком" in steward_cap.alert_text(
+        "verdict", 1, "д", "2026-10-19"
+    )
+    assert "вердикт" not in steward_cap.alert_text("dor", 0, "д", "2026-10-19")

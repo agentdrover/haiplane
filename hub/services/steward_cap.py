@@ -114,9 +114,16 @@ async def _refusals(
     where = [
         "kind=?",
         "json_extract(payload, '$.reason')=?",
-        "date(created_at)=?",
+        "created_at >= ?",  # диапазон, а не date(): так работает индекс событий
+        "created_at < ?",
     ]
-    params: list[Any] = [EVENT_REFUSED, REFUSED_DAILY_CAP, utc_day()]
+    day = utc_day()
+    params: list[Any] = [
+        EVENT_REFUSED,
+        REFUSED_DAILY_CAP,
+        f"{day} 00:00:00",
+        reset_at(day),
+    ]
     if task_id is not None:
         where.append("task_id=?")
         params.append(task_id)
@@ -131,7 +138,7 @@ async def _refusals(
         params.append(kind)
     rows = await fetchall(
         db,
-        "SELECT task_id, project_id, created_at, "  # nosec B608 - placeholders only
+        "SELECT id, task_id, project_id, created_at, "  # nosec B608 - placeholders only
         "json_extract(payload, '$.kind') AS order_kind "
         f"FROM events WHERE {' AND '.join(where)} ORDER BY id ASC",
         tuple(params),
@@ -217,6 +224,21 @@ class CapHandoff:
         )
 
 
+async def _ordered_since(
+    db: aiosqlite.Connection, task_id: int, generation: int, group: str, since: str
+) -> bool:
+    """Есть ли прогон группы для этого поколения, созданный после отказа."""
+    kinds = kinds_of(group)
+    marks = ",".join("?" for _ in kinds)
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM steward_runs WHERE task_id=? AND generation=? "  # nosec B608
+        f"AND kind IN ({marks}) AND created_at >= ? LIMIT 1",
+        (task_id, generation, *kinds, since),
+    )
+    return bool(rows)
+
+
 async def cap_handoff(
     db: aiosqlite.Connection,
     task_id: int,
@@ -225,9 +247,11 @@ async def cap_handoff(
 ) -> CapHandoff | None:
     """Одно условие «передано человеку из-за потолка до reset_at».
 
-    Верно, когда за текущие UTC-сутки этой сдаче отказали по ``daily_cap`` И
-    потолок группы всё ещё исчерпан. Второе условие нужно владельцу: поднял
-    потолок среди суток — задача возвращается стюарду, а не ждёт полуночи.
+    Верно, когда за текущие UTC-сутки этой сдаче отказали по ``daily_cap``,
+    потолок группы всё ещё исчерпан И после отказа прогон этой группы для
+    этого поколения не заказан. Потолок поднят среди суток — задача
+    возвращается стюарду; а заказанное после отказа поколение возвращается
+    насовсем: исчерпание потолка другими задачами на него уже не действует.
     Чистое чтение; проект берётся по задаче, а не из события (старые события
     его не несут).
     """
@@ -239,6 +263,8 @@ async def cap_handoff(
         project = await repo.resolve_project_for_task(db, task_id)
         project_id = int(project["id"]) if project is not None else None
         group = group_of(kind)
+        if await _ordered_since(db, task_id, generation, group, event["created_at"]):
+            continue
         used = await used_today(db, project_id, group)
         cap = cap_of(group)
         if used >= cap:
@@ -318,8 +344,12 @@ async def banner_rows(
 
 def alert_text(kind: str, generation: int, detail: str, day: str) -> str:
     """Запись ленты задачи на отказ по потолку."""
+    what = (
+        "заказ чтения постановки повторится после сброса"
+        if kind == "dor"
+        else "до тех пор вердикт за человеком"
+    )
     return (
         f"Суточный потолок стюарда исчерпан: прогон «{kind}» для сдачи/ревизии "
-        f"{generation} не заказан. {detail}. Сброс {reset_at(day)} UTC; до тех "
-        "пор вердикт за человеком."
+        f"{generation} не заказан. {detail}. Сброс {reset_at(day)} UTC; {what}."
     )

@@ -2626,6 +2626,8 @@ async def test_a_concur_is_not_applied_while_the_generation_is_with_the_owner(
     project = await repo.resolve_project_for_task(db, task_id)
     assert await advisor_refusal(db, task_id, 1) is None, "контроль: согласие действует"
 
+    # Отказ позже заказов: прогон, созданный ПОСЛЕ отказа, передачу снимает.
+    set_clock(monkeypatch, "2026-10-19T23:59:00+00:00")
     monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)  # суждение уже заняло единицу
     assert await steward_cap.used_today(db, project["id"], "verdict_dor") == 1
     assert await steward_cap.record_refusal(
