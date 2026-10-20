@@ -252,6 +252,26 @@ async def test_after_failed_run_is_derived_from_one_snapshot(
     await world.db.commit()
     await _expect(world, t3, capsys, False, "держатель")
 
+    # 3б. Тот же захват по другим признакам держателя (статус остаётся open).
+    for title, fields in (
+        ("принципал-держатель", {"implementer_principal_id": world.human_id}),
+        ("сессия захвата", {"claim_session_id": "sess-1"}),
+    ):
+        held, _ = await _failed(world, title)
+        await repo.update_task(world.db, held, **fields)
+        await world.db.commit()
+        await _expect(world, held, capsys, False, title)
+
+    # 3в. Прогон, ждущий только цену (cost_wait_since), живым не считается.
+    priced, _ = await _failed(world, "ждёт цену")
+    await world.db.execute(
+        "INSERT INTO executor_runs (task_id, submission_generation, channel, "
+        "outcome, cost_wait_since) VALUES (?, 1, 'cloud', 'running', datetime('now'))",
+        (priced,),
+    )
+    await world.db.commit()
+    await _expect(world, priced, capsys, True, "ждёт цену")
+
     # 4. Живая сессия implementer, привязанная к задаче.
     t4, _ = await _failed(world, "живая сессия")
     await world.db.execute(
@@ -291,6 +311,18 @@ async def test_after_failed_run_is_derived_from_one_snapshot(
     await repo.update_task(world.db, t8, status="running")
     await world.db.commit()
     await _expect(world, t8, capsys, False, "статус")
+
+    # 8б. Заказ не закрыт (вне контракта report, но проекция не должна врать).
+    snap = {
+        "order_id": 1, "state": "redeemed", "generation": 1, "report_outcome": "failed",
+        "report_reason_code": "timeout", "status": "open", "archived": 0,
+        "claimed_by": None, "claim_session_id": None, "implementer_principal_id": None,
+        "submission_generation": 0, "live_session": 0, "live_run": 0,
+    }  # fmt: skip
+    from hub.services import executor_triage as triage
+
+    assert triage.project({**snap, "state": "closed"})["after_failed_run"] is True
+    assert triage.project(snap)["after_failed_run"] is False
 
     # 9. Сбой чтения: поле с причиной, after_failed_run не выставлен (ни true, ни false).
     from hub.services import executor_triage
