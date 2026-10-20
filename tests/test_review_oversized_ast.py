@@ -282,3 +282,26 @@ def test_line_numbers_follow_the_parser_not_str_splitlines():
     assert (span.start, span.end) == (3, 4) and span.lines[1][
         1
     ].strip() == "assert TARGET"
+
+
+async def test_an_unread_pin_makes_the_block_mandatory_and_a_missing_pin_does_not(
+    db, monkeypatch
+):
+    from hub.integrations.registry import plugins
+    from hub.services.review_dispatch import _ac_inputs
+
+    class Git:
+        async def integrity_read(self, repo, base, sha):
+            return None
+
+    monkeypatch.setattr(plugins, "git_ops", Git())
+    refs = [f"{F}::test_ac"]
+    ctx = ("/ws", "develop")
+    task = {"id": 1, "submission_sha": "a" * 40}
+    assert await _ac_inputs(db, task, ctx, refs, "branch diff", False) == (
+        None,
+        None,
+        True,
+    )
+    assert await _ac_inputs(db, {"id": 1}, ctx, refs, "x", False) == (None, None, False)
+    assert await _ac_inputs(db, task, ctx, [], "x", False) == (None, None, False)
