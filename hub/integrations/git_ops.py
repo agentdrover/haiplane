@@ -2146,25 +2146,17 @@ class GitOpsIntegration(git_history.HistoryReads):
         base_sha = await _resolve_ref_remote_first(base, repo)
         branch_sha = await _resolve_ref_remote_first(branch, repo)
         if fetch and (base_sha is None or branch_sha is None):
-            # Best effort, exactly as in branch_diff_paths: a workspace that
-            # cannot reach origin still has refs, and a network blip must not
-            # turn a readable diff into an unreadable one.
+            # Best effort, как в branch_diff_paths: сбой сети не ломает чтение.
             await _git("fetch", "origin", base, branch, repo=repo, check=False)
             base_sha = base_sha or await _resolve_ref_remote_first(base, repo)
             branch_sha = branch_sha or await _resolve_ref_remote_first(branch, repo)
         if base_sha is None or branch_sha is None:
-            log.warning(
-                "branch_diff: %r not found in %s",
-                base if base_sha is None else branch,
-                repo,
-            )
+            name = base if base_sha is None else branch
+            log.warning("branch_diff: %r not found in %s", name, repo)
             return None
+        spec = f"{base_sha}...{branch_sha}"
         rc, out, _ = await _git(
-            "diff",
-            f"-U{max(0, int(context))}",
-            f"{base_sha}...{branch_sha}",
-            repo=repo,
-            check=False,
+            "diff", f"-U{max(0, int(context))}", spec, repo=repo, check=False
         )
         return out if rc == 0 else None
 

@@ -549,7 +549,7 @@ async def test_poller_sweep_keeps_to_its_budget_and_backs_off_on_a_dead_fetch(
     """Общий дедлайн прохода; упавший fetch клона откладывает проход, а не бьётся каждый тик."""
     from hub.services import gate_observations
 
-    ids = await _world(client, db, monkeypatch)
+    await _world(client, db, monkeypatch)
     calls = arm(monkeypatch)
     gate_observations._refreshed_at.clear()
 
