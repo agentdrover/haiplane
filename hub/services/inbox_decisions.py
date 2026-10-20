@@ -28,7 +28,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
-from hub.services import project_path, review_evidence, state_review
+from hub.services import project_path, review_evidence, state_review, steward_cap
 from hub.services.result_kind import automation_not_applicable
 from hub.services import ci_contract, ci_trust
 from hub.services.ci_report import (
@@ -315,4 +315,6 @@ async def collect(db: aiosqlite.Connection, scoped: dict[str, Any]) -> dict[str,
         "queue": _numbered(entries + verdicts),
         "note": "; ".join(cut),
         "cycles": cycles,
+        # #1915: исчерпанный суточный потолок стюарда — из событий отказа.
+        "cap_banner": await steward_cap.banner_rows(db, scoped.get("project_id")),
     }

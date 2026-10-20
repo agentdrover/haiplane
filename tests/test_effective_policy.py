@@ -1590,3 +1590,81 @@ async def test_the_act_readiness_report_is_a_pure_read(
         cli.main()
     assert capsys.readouterr().out.strip() == text.strip()
     assert await _everything(db) == before
+
+
+async def test_the_steward_daily_cap_is_visible(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    # AC-3 (#1915): блок steward проекта несёт used/cap/utc_day/reset_at/
+    # first_refused_at по двум группам; без отказа first_refused_at=null; чтение
+    # чистое; REST, CLI и MCP согласованы.
+    from hub.services.steward_dispatch import order_run
+    from tests.steward_cap_support import BEFORE_MIDNIGHT, set_clock
+    from tests.test_steward_dispatch import _submitted_task
+
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 3)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "1")
+    await _project(db, "cap-quiet", {"verdict": "steward"})
+    busy = await _project(db, "cap-busy", {"verdict": "steward"})
+    first = await _submitted_task(db, busy)
+    second = await _submitted_task(db, busy)
+    assert await order_run(db, first, 1) is not None
+    assert await order_run(db, first, 1, "advisor") is not None
+    assert await order_run(db, second, 1, "advisor") is None  # отказ по потолку
+
+    async def _get(slug: str) -> dict:
+        resp = await client.get(f"/api/projects/{slug}/effective-policy")
+        assert resp.status_code == 200
+        return resp.json()
+
+    snapshot = [
+        tuple(r)
+        for table in ("events", "steward_runs", "task_updates")
+        for r in await (await db.execute(f"SELECT * FROM {table}")).fetchall()  # nosec B608
+    ]
+    rest = await _get("cap-busy")
+    calm = await _get("cap-quiet")
+    assert snapshot == [
+        tuple(r)
+        for table in ("events", "steward_runs", "task_updates")
+        for r in await (await db.execute(f"SELECT * FROM {table}")).fetchall()  # nosec B608
+    ], "чтение ничего не пишет"
+
+    groups = {g["kind_group"]: g for g in rest["steward"]["daily_cap"]}
+    assert set(groups) == {"verdict_dor", "advisor"}
+    assert groups["verdict_dor"] == {
+        "kind_group": "verdict_dor",
+        "used": 1,
+        "cap": 3,
+        "utc_day": "2026-10-19",
+        "reset_at": "2026-10-20 00:00:00",
+        "first_refused_at": None,
+    }
+    assert groups["advisor"]["used"] == 1 and groups["advisor"]["cap"] == 1
+    assert groups["advisor"]["first_refused_at"] == "2026-10-19 23:58:00"
+    quiet_groups = {g["kind_group"]: g for g in calm["steward"]["daily_cap"]}
+    assert quiet_groups["advisor"]["used"] == 0
+    assert quiet_groups["advisor"]["first_refused_at"] is None
+    assert quiet_groups["verdict_dor"]["first_refused_at"] is None
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_effective_policy("cap-busy")
+    assert out.structuredContent["steward"]["daily_cap"] == rest["steward"]["daily_cap"]
+    mcp_text = _message(out)
+    assert "daily cap [verdict_dor]: used 1/3" in mcp_text
+    assert "daily cap [advisor]: used 1/1" in mcp_text
+    assert "first refused 2026-10-19 23:58:00" in mcp_text
+    assert "first refused never today" in mcp_text
+
+    argv = ["oc-hub", "effective-policy", "cap-busy"]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(cli, "_api", return_value=rest),
+    ):
+        assert cli.main() in (0, None)
+    assert capsys.readouterr().out.strip() == mcp_text.strip()
