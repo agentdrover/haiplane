@@ -8,7 +8,10 @@
 
 Workflow: `.github/workflows/ci.yml`, job `deploy`.
 
-1. Job `test` гоняет `ruff check`, `ruff format --check` и `pytest`.
+1. Job `static` (#1920) гоняет `ruff check`, `ruff format --check`, `mypy`,
+   бюджеты, `pip-audit`, `bandit` и скан секретов параллельно частям `pytest`;
+   job `test` ждёт его, краснеет по его результату и остаётся единственной
+   обязательной проверкой «Ruff and pytest» и сборщиком отчёта для хаба.
    Рядом, параллельно, job `compose-smoke` (#1358) поднимает образ из
    `docker-compose.yml` (`deploy/docker/compose_smoke.sh`): `/healthz` с
    демо-сидом и без него, на свежем томе. В `needs` деплоя он не стоит —

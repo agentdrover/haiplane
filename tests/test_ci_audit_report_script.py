@@ -86,7 +86,13 @@ def test_the_audit_step_cannot_block_delivery():
     # steps that judge THIS PR's own code (lint, tests, secrets) still must.
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     job = workflow["jobs"]["test"]
-    steps = {s["name"]: s for s in job["steps"]}
+    # #1920: the static checks (and the audit) run in job `static`; the steps of
+    # both jobs are looked at together, by name.
+    steps = {
+        s["name"]: s
+        for name in ("static", "test")
+        for s in workflow["jobs"][name]["steps"]
+    }
 
     assert job["name"] == "Ruff and pytest", (
         "the delivery gate finds the job by this name (#605/#606)"
@@ -106,6 +112,7 @@ def test_the_audit_step_cannot_block_delivery():
     for blocking in (
         "Lint",
         "Tests outcome of the parts",
+        "Static checks outcome",
         "Secret scan",
         "Static security scan",
     ):

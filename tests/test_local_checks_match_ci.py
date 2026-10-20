@@ -35,6 +35,16 @@ EXCEPTIONS: dict[str, str] = {
         "подготовка окружения для тестов копий (#1707), не проверка"
     ),
     "Fail a cancelled run": ("красит отменённый прогон, локально отмены нет — #1767"),
+    "Static checks outcome": (
+        "итог job static, сам проверок не гоняет — #1920; "
+        "проверки job static покрыты make check, а не этим шагом"
+    ),
+    "Hand the audit file over to job test": (
+        "передача файла аудита из job static в job test, не проверка — #1920"
+    ),
+    "Fetch the audit file of job static": (
+        "приём файла аудита из job static, не проверка — #1920"
+    ),
     "Tests outcome of the parts": (
         "итог частей набора из job pytest, сам тесты не гоняет — #1767; "
         "части покрыты тестом test_a_test_part_is_what_make_test_runs"
@@ -77,7 +87,11 @@ _JOB_HEADER_RE = re.compile(r"^  [A-Za-z0-9_-]+:\n$")
 
 
 def _ci_test_steps(text: str) -> list[tuple[str, str]]:
-    """Пары (имя шага, текст шага) из джоба ``test:`` файла ci.yml.
+    """Пары (имя шага, текст шага) из джобов ``static:`` и ``test:`` файла ci.yml.
+
+    #1920: статические проверки живут в job ``static`` параллельно шардам, а
+    job ``test`` остался сборщиком отчёта; обе половины входят в правило «каждый
+    шаг покрыт make check или назван в EXCEPTIONS».
 
     Джоб ``deploy:`` вне этого правила: он не статическая проверка, а вынос
     в прод, и живёт по собственным гейтам (always()/continue-on-error).
@@ -85,20 +99,23 @@ def _ci_test_steps(text: str) -> list[tuple[str, str]]:
     правку run-блока, а не пересобранное AST.
     """
     lines = text.splitlines(keepends=True)
-    start = next(i for i, line in enumerate(lines) if line == "  test:\n")
-    # Граница — заголовок СЛЕДУЮЩЕГО джоба, а не имя deploy: джоб compose-smoke
-    # (#1358) стоит между ними и в make check не входит — ему нужен Docker.
-    end = next(
-        i for i, line in enumerate(lines) if i > start and _JOB_HEADER_RE.match(line)
-    )
-    body = "".join(lines[start:end])
-
-    matches = list(_STEP_NAME_RE.finditer(body))
     steps: list[tuple[str, str]] = []
-    for i, m in enumerate(matches):
-        chunk_start = m.start()
-        chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-        steps.append((m.group(1), body[chunk_start:chunk_end]))
+    for job in ("static", "test"):
+        start = next(i for i, line in enumerate(lines) if line == f"  {job}:\n")
+        # Граница — заголовок СЛЕДУЮЩЕГО джоба, а не имя deploy: джоб compose-smoke
+        # (#1358) стоит после них и в make check не входит — ему нужен Docker.
+        end = next(
+            i
+            for i, line in enumerate(lines)
+            if i > start and _JOB_HEADER_RE.match(line)
+        )
+        body = "".join(lines[start:end])
+
+        matches = list(_STEP_NAME_RE.finditer(body))
+        for i, m in enumerate(matches):
+            chunk_start = m.start()
+            chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+            steps.append((m.group(1), body[chunk_start:chunk_end]))
     return steps
 
 
@@ -178,6 +195,38 @@ def test_every_ci_static_check_has_a_make_target() -> None:
     ci_text = CI_YML.read_text(encoding="utf-8")
     makefile_text = MAKEFILE.read_text(encoding="utf-8")
     assert _uncovered_steps(ci_text, makefile_text) == []
+
+
+def test_make_check_matches_the_static_job() -> None:
+    """#1920: the checks moved to job `static` are still the ones `make check` runs.
+
+    The reader looks at BOTH jobs and the list of covered tools must not be empty,
+    otherwise a move that hides the checks from this test would pass it silently.
+    """
+    ci_text = CI_YML.read_text(encoding="utf-8")
+    names = [name for name, _ in _ci_test_steps(ci_text)]
+    for moved in (
+        "Lint",
+        "Complexity budget",
+        "File size budget",
+        "Layer rules",
+        "Migration steps add-only",
+        "Check formatting",
+        "Type check",
+        "MCP catalog budget",
+        "Static security scan",
+        "Secret scan",
+    ):
+        assert moved in names, moved
+    check_body = _make_check_body(MAKEFILE.read_text(encoding="utf-8"))
+    covered = {
+        sig
+        for name, chunk in _ci_test_steps(ci_text)
+        for sig in SIGNATURES
+        if sig in chunk and name not in EXCEPTIONS
+    }
+    assert covered
+    assert covered <= {sig for sig in SIGNATURES if sig in check_body}
 
 
 def test_a_new_uncovered_step_breaks_the_build() -> None:
