@@ -23,6 +23,7 @@ HUMAN_GATE_EVENT_KINDS: frozenset[str] = frozenset(
         "steward_judgement",
         "steward_applied",
         "steward_escalated",
+        "steward_judgement_refused",
     }
 )
 
@@ -35,6 +36,8 @@ DISPOSITION_RECORDED = "disposition_recorded"
 STEWARD_JUDGEMENT = "steward_judgement"
 STEWARD_APPLIED = "steward_applied"
 STEWARD_ESCALATED = "steward_escalated"
+#: #1924: судья прислал approve/возврат без оснований или уверенности — 422.
+STEWARD_JUDGEMENT_REFUSED = "steward_judgement_refused"
 STEWARD_ROUTE_REFUSED = "steward_route_refused"
 WATCHER_ROUTE_REFUSED = "watcher_route_refused"
 STEWARD_OVERRIDE_WINDOW_DAYS = 7

@@ -78,7 +78,7 @@ async def _judge(
             kind="verdict",
             verdict=verdict,
             confidence="high",
-            grounds=[{"source": "ci_pinned_sha"}],
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci 1 ok"}],
             escalate_reason="precondition_failed" if verdict == "escalate" else None,
             model="gpt-5.3-codex",
         ),

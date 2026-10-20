@@ -2664,7 +2664,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_steward_judgement.add_argument(
         "--grounds-json",
         default="",
-        help='JSON list of grounds: [{"source":"ci_pinned_sha"}]',
+        help='JSON grounds: [{"source":"ci_pinned_sha","detail":"fact"}], detail needed',
     )
     p_steward_judgement.add_argument(
         "--closures-json",

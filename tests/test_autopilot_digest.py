@@ -272,7 +272,9 @@ async def _steward_judged_task(
             verdict=verdict,
             confidence="high",
             escalate_reason="precondition_failed" if verdict == "escalate" else None,
-            grounds=[{"source": "ci_pinned_sha"}] if grounds is None else grounds,
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci 1 ok"}]
+            if grounds is None
+            else grounds,
             model="gpt-5.3-codex",
         ),
         TokenIdentity("steward-bot", "steward", principal_id=42),
