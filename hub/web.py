@@ -2639,7 +2639,7 @@ async def _card_machine_report(
     if automation_not_applicable(row):
         return True, None, None
     report = await review_report(
-        db, row, await repo.get_latest_machine_review(db, task_id)
+        db, row, await repo.get_latest_machine_review(db, task_id), offline=True
     )
     return False, report, report.machine_review
 
@@ -2691,7 +2691,7 @@ async def _card_delivery(
     from hub.services.delivery_state import delivery_state
 
     try:
-        return await delivery_state(db, task_id)
+        return await delivery_state(db, task_id, fetch=False)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("delivery state failed for #%s: %s", task_id, exc)
         return None
