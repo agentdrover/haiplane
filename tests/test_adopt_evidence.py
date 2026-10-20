@@ -12,6 +12,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -160,6 +161,65 @@ def test_adopts_when_dispatch_and_pr_base_agree(tmp_path: Path) -> None:
         ],
     )
     assert _decide(repo, github) == (9, "")
+
+
+def test_the_allowed_states_are_the_ones_the_writers_emit(monkeypatch) -> None:
+    """The allowlist is cross-checked against the writer, not typed twice.
+
+    The first version listed ``no_changes``; the writer says
+    ``no_changed_functions``, so every run without a changed Python function
+    (a CI-only change, the commonest one for this very task) was recounted.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "mutation_changed", ROOT / "scripts" / "mutation_changed.py"
+    )
+    assert spec is not None and spec.loader is not None
+    writer = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "mutation_changed", writer)  # dataclasses
+    spec.loader.exec_module(writer)
+    informative = {writer.STATE_RAN, writer.STATE_NO_CHANGES, writer.STATE_NO_TESTS}
+    assert adopt.MUTATIONS_STATES == informative
+    # and the states that carry no information are not allowed
+    assert writer.STATE_BASELINE_RED not in adopt.MUTATIONS_STATES
+    assert writer.STATE_ERROR not in adopt.MUTATIONS_STATES
+
+
+def test_the_names_the_script_reads_are_the_names_ci_writes() -> None:
+    """Same class as the state token: a name typed twice drifts without a sound.
+
+    The job, the artifact and the two file names live in ci.yml; the baseline
+    states live in scripts/red_test_baseline.py. A mismatch would not fail
+    anything, it would recount on every run.
+    """
+    import yaml
+
+    doc = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    evidence = doc["jobs"]["evidence"]
+    assert evidence["name"] == adopt.EVIDENCE_JOB
+    upload = next(
+        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
+    )
+    assert upload["with"]["name"] == adopt.ARTIFACT
+    assert upload["with"]["path"].split() == [
+        adopt.MUTATIONS_FILE,
+        adopt.BASELINE_FILE,
+    ]
+    baseline_source = (ROOT / "scripts" / "red_test_baseline.py").read_text()
+    for state in adopt.BASELINE_STATES:
+        assert f'state="{state}"' in baseline_source, state
+    assert adopt.WORKFLOW == "ci.yml"
+
+
+def test_a_run_without_changed_python_functions_is_adopted(tmp_path: Path) -> None:
+    """A CI-only branch: mutations say no_changed_functions, the baseline no_tests."""
+    repo = Repo(tmp_path / "r")
+    mutations, baseline = _documents(
+        repo,
+        mutations={"state": "no_changed_functions"},
+        baseline={"state": "no_tests"},
+    )
+    github = FakeGitHub(_archive(mutations, baseline))
+    assert _decide(repo, github) == (11, "")
 
 
 @pytest.mark.parametrize(

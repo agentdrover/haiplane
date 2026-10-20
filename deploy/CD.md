@@ -623,7 +623,7 @@ Test, AC и validation идут на каждом событии как рань
 `adopt` в job `treedup` (`scripts/adopt_evidence.py decide`, только stdlib,
 `python3 -I`) ищет успешный dispatch-прогон `ci.yml` на том же `head_sha`.
 Условие: job `evidence` источника зелёный, артефакт `hub-ci-evidence` жив,
-состояния файлов несут информацию (мутации `ran`/`no_changes`/`no_tests`,
+состояния файлов несут информацию (мутации `ran`/`no_changed_functions`/`no_tests`,
 baseline `ran`/`no_tests`), и `merge_base == base_tip ==` первому родителю
 merge-коммита PR-прогона (`HEAD^1`; событийный `base.sha` может отставать), а
 дерево merge-коммита равно дереву головы. Любое сомнение или сбой — прежний

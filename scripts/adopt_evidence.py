@@ -42,7 +42,9 @@ EVIDENCE_JOB = "Mutations and red-test baseline"
 ARTIFACT = "hub-ci-evidence"
 MUTATIONS_FILE = "mutation-report.json"
 BASELINE_FILE = "red-test-baseline.json"
-MUTATIONS_STATES = frozenset({"ran", "no_changes", "no_tests"})
+# The names the writer uses (scripts/mutation_changed.py STATE_*): a name the
+# writer never emits would silently turn every such run into a recount.
+MUTATIONS_STATES = frozenset({"ran", "no_changed_functions", "no_tests"})
 BASELINE_STATES = frozenset({"ran", "no_tests"})
 ADOPTED_KEY = "adopted_from_run"
 _ZIP_LIMIT = 5 * 1024 * 1024
