@@ -594,6 +594,12 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
             + f", procedural escalations {contour['procedural_escalations']}"
         )
+        # #1865: случаи за 14 дней по источникам, включая снятые человеком.
+        events = contour.get("false_approve_events_14d") or {}
+        lines.append(
+            "  false_approve_events_14d: "
+            + (", ".join(f"{k} {v}" for k, v in events.items()) or "none")
+        )
     lines.extend(_daily_cap_lines(steward.get("daily_cap")))
     lines.extend(_readiness_lines(steward.get("readiness")))
     server = data["server"]

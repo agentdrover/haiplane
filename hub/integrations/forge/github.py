@@ -1200,6 +1200,7 @@ class GitHubForge:
             "run_attempt": str(run.get("run_attempt") or ""),
             "path": str(run.get("path") or ""),
             "head_sha": str(run.get("head_sha") or ""),
+            "head_branch": str(run.get("head_branch") or ""),
             "status": str(run.get("status") or "").lower(),
             "conclusion": str(run.get("conclusion") or "").lower(),
             "event": str(run.get("event") or ""),

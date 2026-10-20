@@ -37,7 +37,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.registry import plugins
-from hub.services import watch_notices
+from hub.services import steward_breaker, watch_notices
 from hub.services.project_policy import base_branch_of, forge_of
 
 log = logging.getLogger("hub.red_base")
@@ -172,6 +172,9 @@ async def check_project(db: aiosqlite.Connection, project_row: Any) -> BaseCiSta
     state = read_state(branch, runs)
     if state.status != RED:
         return state
+    # #1865: до дедупа объявления - на каждом тике, пока база красная. Не
+    # сеть и не запись, если red_sha не доставка стюарда; повтор идемпотентен.
+    await steward_breaker.on_base_red(db, project, state.red_sha)
     if await already_announced(db, project["id"], state.red_sha):
         return state
     state.met = await _commits_between(project, state.last_green_sha, state.red_sha)
