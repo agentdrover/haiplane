@@ -723,3 +723,42 @@ async def test_an_exception_on_every_tick_is_a_signal_and_names_only_its_type(
         (steward_breaker.EVENT_UNCHECKED,),
     )
     assert len(events) == 1 and "SECRETTEXT" not in events[0]["payload"]
+
+
+def test_a_bare_token_in_the_first_stderr_line_is_masked():
+    token = "ghp_" + "A1b2C3d4E5f6G7h8"
+    pat = "github_pat_" + "11ABCdef_xyz"
+    line = f"fatal: auth failed for {token} and {pat}; Bearer abc.def.ghi"
+    shown = steward_breaker._safe(line)
+    assert token not in shown and pat not in shown and "abc.def.ghi" not in shown
+    assert shown.startswith("fatal: auth failed for")
+
+
+async def test_a_failed_unchecked_record_is_said_on_the_next_tick(
+    db: aiosqlite.Connection, git: FakeGit, monkeypatch
+):
+    project = await project_with_workspace(db, "brk-said")
+    git.commit("base-0")
+    await steward_breaker.collect_reverts(db, project)
+    git.commit("next", "chore: next")
+
+    async def boom(*_a: Any, **_k: Any) -> int:
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(steward_breaker, "_trip_revert", boom)
+    real_insert = repo.insert_event
+    calls = {"n": 0}
+
+    async def flaky_insert(*a: Any, **k: Any):
+        if k.get("kind") == steward_breaker.EVENT_UNCHECKED and calls["n"] == 0:
+            calls["n"] += 1
+            raise aiosqlite.OperationalError("database is locked")
+        return await real_insert(*a, **k)
+
+    monkeypatch.setattr(steward_breaker.repo, "insert_event", flaky_insert)
+    for _ in range(steward_breaker.UNCHECKED_AFTER + 1):
+        assert await steward_breaker.collect_reverts(db, project) == 0
+    events = await fetchall(
+        db, "SELECT id FROM events WHERE kind=?", (steward_breaker.EVENT_UNCHECKED,)
+    )
+    assert len(events) == 1

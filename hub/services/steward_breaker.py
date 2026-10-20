@@ -283,6 +283,10 @@ async def _trip_revert(
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
 _CREDENTIAL = re.compile(r"\S*@\S*")
+# Голые токены без URL: защита в глубину, если они попадут в первую строку stderr.
+_TOKEN = re.compile(
+    r"\b(?:ghp|gho|ghs|ghu|github_pat)_\w+|\bBearer\s+\S+", re.IGNORECASE
+)
 
 
 def _safe(text: str, limit: int = 200) -> str:
@@ -293,6 +297,7 @@ def _safe(text: str, limit: int = 200) -> str:
     """
     first = (str(text or "").strip().splitlines() or [""])[0]
     first = _CREDENTIAL.sub("[redacted]", _URL.sub("[url]", first))
+    first = _TOKEN.sub("[redacted]", first)
     return scrub_secrets(first)[:limit]
 
 
@@ -317,6 +322,8 @@ UNCHECKED_AFTER = 3
 EVENT_UNCHECKED = "steward_breaker_unchecked"
 _failures: dict[int, int] = {}
 _unchecked: dict[int, str] = {}
+# Проекты, о которых событие «не проверяется» уже записано в этой серии.
+_unchecked_said: set[int] = set()
 
 
 async def _note_unchecked(
@@ -338,7 +345,7 @@ async def _note_unchecked(
     if _failures[pid] < UNCHECKED_AFTER:
         return
     _unchecked[pid] = f"{project.get('slug')}: {reason}"
-    if _failures[pid] == UNCHECKED_AFTER:
+    if _failures[pid] >= UNCHECKED_AFTER and pid not in _unchecked_said:
         await repo.insert_event(
             db,
             kind=EVENT_UNCHECKED,
@@ -347,11 +354,13 @@ async def _note_unchecked(
             payload={"project": str(project.get("slug") or ""), "reason": reason},
         )
         await db.commit()
+        _unchecked_said.add(pid)
 
 
 def _checked(project: dict[str, Any]) -> None:
     _failures.pop(int(project["id"]), None)
     _unchecked.pop(int(project["id"]), None)
+    _unchecked_said.discard(int(project["id"]))
 
 
 async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> int:
@@ -403,7 +412,11 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
         log.exception("revert watch %s failed", project.get("slug"))
         await db.rollback()
         # Сбой тоже «не проверено»; в причине только тип: в тексте может быть секрет.
-        await _note_unchecked(db, project, f"исключение {type(exc).__name__}")
+        try:
+            await _note_unchecked(db, project, f"исключение {type(exc).__name__}")
+        except Exception:  # noqa: BLE001 - «Не бросает»: следующий тик повторит
+            log.exception("revert watch %s: signal not recorded", project.get("slug"))
+            await db.rollback()
         return 0
 
 
