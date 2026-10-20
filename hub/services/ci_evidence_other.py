@@ -4,7 +4,7 @@ A ``pull_request:synchronize`` run does not count mutations and baseline and
 starts after the executor's dispatch run, so it is the current attempt and its
 empty blocks used to hide what the dispatch run counted on the same commit. The
 brief now shows the block of another verified attempt of the commit
-(``ci_trust.borrowed_evidence_block``) with its source named. Only the brief:
+(``ci_trust.borrowed_evidence_blocks``) with its source named. Only the brief:
 the projection and every gate stay on the current attempt.
 """
 

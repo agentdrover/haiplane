@@ -13,7 +13,7 @@ validation result, and it opens no gate. The same holds for a report whose
 attempt is no longer the current one: the evidence belongs to the attempt that
 produced it and is withdrawn when another attempt takes over. One exception, for
 SHOWING only (#1936): the brief may name the mutations and baseline that another
-verified attempt of the same commit counted (``borrowed_evidence_block``); the
+verified attempt of the same commit counted (``borrowed_evidence_blocks``); the
 projection and every gate stay on the current attempt.
 
 Three things are deliberately NOT guessed:
