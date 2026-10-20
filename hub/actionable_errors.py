@@ -1053,6 +1053,69 @@ def empty_resubmission_detail(
     )
 
 
+def head_moved_detail(
+    *, task_id: int, expected_sha: str, observed_sha: str
+) -> dict[str, Any]:
+    """Сдача с expected_sha, а голова ветки у хаба другая (#1937).
+
+    Хаб наблюдает голову сам; заявление клиента ничего не закрепляет. Записан
+    только alert в ленте — сдачи, поколения и обращений к CI нет.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "head_moved",
+            "actor_hint": "agent",
+            "retry_by_same_caller": False,
+            "task_id": task_id,
+            "expected_sha": expected_sha,
+            "observed_sha": observed_sha,
+            "message": (
+                f"Task #{task_id}: голова ветки у хаба {observed_sha[:12]}, а сдача "
+                f"заявлена на {expected_sha[:12]} — после проверки в ветку пришёл "
+                "другой коммит."
+            ),
+            "hint": (
+                "Nothing was recorded except an alert in the feed: no "
+                "generation, no review, the status did not change. Проверьте "
+                "новую голову (критик, тесты) и повторите сдачу с её sha."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
+def head_unverified_detail(
+    *, task_id: int, expected_sha: str, observed_sha: str, cause: str
+) -> dict[str, Any]:
+    """Сдача с expected_sha, а голову ветки хаб не смог наблюдать (#1937).
+
+    Не «совпало» и не «пусто — значит можно»: сверять не с чем, сдача на
+    непроверенном коммите не принимается.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "head_unverified",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "task_id": task_id,
+            "expected_sha": expected_sha,
+            "observed_sha": observed_sha,
+            "cause": cause,
+            "message": (
+                f"Task #{task_id}: хаб не смог наблюдать голову ветки ({cause}); "
+                f"сдача на {expected_sha[:12]} не сверена."
+            ),
+            "hint": (
+                "Nothing was recorded except an alert in the feed: no "
+                "generation, no review, the status did not change. Повторите "
+                "сдачу позже; если причина не уходит — ветка не запушена или у "
+                "проекта нет workspace для наблюдения."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
 def claim_area_conflict_detail(
     *, task_id: int, current_status: str, conflict: dict[str, Any]
 ) -> dict[str, Any]:
