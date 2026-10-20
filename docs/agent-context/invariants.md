@@ -32,6 +32,7 @@ These are the rules most likely to be broken by “small” changes.
   Exception (#1265): a resubmit from `review` on the SAME non-empty sha keeps the
   generation, the status and the verdict's currency (`finding_outcomes`,
   `accept_areas` and the decision to order a review may still update).
+- Submit with `expected_sha` (#1937): optional, exactly 40 ASCII hex (case folded; short or non-hex = 422 on REST, a local error in `oc-hub submit-review --expected-sha` and in `hub_submit_for_review` before any network call; state tasks = 422). The value is a CLAIM, never pinned: `_refuse_unless_head_is_expected` runs inside `pin_submission_sha` right after the hub's own `resolve_branch_tip` and BEFORE `ci_trust.refresh_quietly`/`invalidate` and the same-sha no-op (#1265). Observed head != claim = 409 `head_moved` (`expected_sha`, `observed_sha`); no observation or a non-sha one = 409 `head_unverified` (`cause`) — "could not look" is not "matches". The only write on refusal is one `alert` with both shas; no PR, dispatch, generation, outcomes, prevention or areas. `submission_sha` is the single observed tip (no second resolve). Refusal exists on the pair chain only; `HEADLESS_STEPS` pass an empty body. Known window: observation happens before the write transaction, as before.
   Fixes after `changes_requested` reach review only via a resubmit of the SAME
   task on the SAME branch — pushing commits alone does not re-trigger review.
   A review of task A never sees task B's branch; do not base new task branches
