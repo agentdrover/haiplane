@@ -147,6 +147,7 @@ async def test_reading_readiness_is_not_a_statement_edit(db: aiosqlite.Connectio
     «просмотр не покупает стюарду прогон», а ломает её реализация «расти на
     каждом вызове» — на ней тест краснеет.
     """
+    from hub.services.dor_snapshot import load_dor_snapshot
     from hub.services.refinement import _persisted_readiness_stale, get_readiness
     from hub.services.recommendations import calculate_readiness_with_recommendations
 
@@ -162,7 +163,10 @@ async def test_reading_readiness_is_not_a_statement_edit(db: aiosqlite.Connectio
     await db.commit()
     row = await repo.get_task(db, task_id)
     report = await calculate_readiness_with_recommendations(db, task_id)
-    assert _persisted_readiness_stale(row, report), "предусловие: починка сработает"
+    evidence = (await load_dor_snapshot(db, task_id)).fingerprint()
+    assert _persisted_readiness_stale(row, report, evidence), (
+        "предусловие: починка сработает"
+    )
 
     await get_readiness(db, task_id)
     await get_readiness(db, task_id, explain=True)
@@ -186,6 +190,7 @@ async def test_viewing_an_unbaselined_row_buys_no_revision(db: aiosqlite.Connect
     потрачен просмотром, а не правкой. Стюард, уже высказавшийся на нуле,
     потерял бы место для следующего суждения.
     """
+    from hub.services.dor_snapshot import load_dor_snapshot
     from hub.services.refinement import _persisted_readiness_stale, get_readiness
     from hub.services.recommendations import calculate_readiness_with_recommendations
 
@@ -201,7 +206,10 @@ async def test_viewing_an_unbaselined_row_buys_no_revision(db: aiosqlite.Connect
     await db.commit()
     row = await repo.get_task(db, task_id)
     report = await calculate_readiness_with_recommendations(db, task_id)
-    assert _persisted_readiness_stale(row, report), "предусловие: починка сработает"
+    evidence = (await load_dor_snapshot(db, task_id)).fingerprint()
+    assert _persisted_readiness_stale(row, report, evidence), (
+        "предусловие: починка сработает"
+    )
 
     await get_readiness(db, task_id)
 

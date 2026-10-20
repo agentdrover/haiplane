@@ -479,6 +479,7 @@ async def test_dor_auto_approval_never_opens_a_state_draft(
 ):
     from hub import config
     from hub.services.auto_approve import maybe_auto_approve
+    from tests.dor_evidence_support import seal_evidence
 
     monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
     pid = await make_project(db, "st-auto", {"dor": "auto"})
@@ -493,6 +494,7 @@ async def test_dor_auto_approval_never_opens_a_state_draft(
         "UPDATE tasks SET dor_passed=1, risk_class='R0' WHERE id=?", (twin,)
     )
     await db.commit()
+    await seal_evidence(db, task_id, twin)
     assert not await maybe_auto_approve(db, task_id)
     assert dict(await repo.get_task(db, task_id))["status"] == "draft"
     assert await maybe_auto_approve(db, twin), "commit-близнец одобряется как раньше"

@@ -886,3 +886,124 @@ async def test_plain_summary_blocking_only_for_new_tasks(
     assert (
         await client.post(f"/api/tasks/{new_id}/approve", json={})
     ).status_code == 200
+
+
+# --- #1611: сохранённая готовность пишется только из той постановки, из которой посчитана ---
+
+_DOR_READY_1611 = {
+    "work_type": "feature",
+    "user_story": "as a user, I want X so that Y",
+    "problem_statement": "ps",
+    "business_value": "bv",
+    "scope_in": ["module"],
+    "validation_commands": ["uv run pytest -q"],
+    "size": "S",
+    "wip_tag": "feature_work",
+    "affected_areas": ["docs/notes.md"],
+    "acceptance_criteria": [
+        {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"}
+    ],
+}
+
+
+async def _ready_draft_1611(client: AsyncClient) -> int:
+    created = await client.post(
+        "/api/tasks", json={"title": "t", "source": "agent", "agent": "test"}
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    refined = await client.post(f"/api/tasks/{task_id}/refine", json=_DOR_READY_1611)
+    assert refined.status_code == 200, refined.text
+    return task_id
+
+
+async def test_lazy_repair_never_persists_a_dor_from_a_changed_statement(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
+):
+    """#1611 AC-1: A считает проходящий DoR, B (refine) ломает постановку, A пишет."""
+    import asyncio
+
+    from hub.db import connect
+    from hub.services import refinement
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    task_id = await _ready_draft_1611(client)
+    # Строка «устарела» для ленивой починки: поля готовности не записаны.
+    await db.execute(
+        "UPDATE tasks SET dor_passed=NULL, readiness_score=NULL, ready_at=NULL "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    real = refinement.calculate_readiness_with_recommendations
+    computed, release = asyncio.Event(), asyncio.Event()
+    armed = {"on": True}
+
+    async def gated(*args, **kwargs):
+        report = await real(*args, **kwargs)
+        if armed["on"]:
+            armed["on"] = False
+            computed.set()
+            await release.wait()
+        return report
+
+    monkeypatch.setattr(refinement, "calculate_readiness_with_recommendations", gated)
+    conn_a = await connect(db_dsn)
+    conn_b = await connect(db_dsn)
+    try:
+        reader = asyncio.create_task(refinement.get_readiness(conn_a, task_id))
+        await asyncio.wait_for(computed.wait(), 10)
+        await refinement.refine_task(
+            conn_b, task_id, TaskRefine(acceptance_criteria=[])
+        )
+        mid = await repo.get_task(db, task_id)
+        assert not mid["dor_passed"] and mid["ready_at"] is None, (
+            "предусловие: B сбросил"
+        )
+        release.set()
+        report_a = await asyncio.wait_for(reader, 10)
+    finally:
+        release.set()
+        await conn_a.close()
+        await conn_b.close()
+
+    assert report_a.dor_passed is True, "A считал до правки B: гонка действительно была"
+    row = await repo.get_task(db, task_id)
+    assert row["dor_passed"] == 0, "отчёт A не должен перезаписать отчёт B"
+    assert row["ready_at"] is None
+    assert (
+        row["readiness_evidence"]
+        == (await load_dor_snapshot(db, task_id)).fingerprint()
+    ), "в строке остался отпечаток B"
+
+
+async def test_reading_readiness_backfills_evidence_without_side_effects(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1611 AC-5: строка без отпечатка, поля верны; чтение дописывает отпечаток."""
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    task_id = await _ready_draft_1611(client)
+    before = await repo.get_task(db, task_id)
+    assert before["dor_passed"] == 1
+    await db.execute("UPDATE tasks SET readiness_evidence='' WHERE id=?", (task_id,))
+    await db.commit()
+    gen_before = before["statement_generation"]
+    events_before = len(await repo.list_events(db, since=0, kinds=["task_approved"]))
+
+    read = await client.get(f"/api/tasks/{task_id}/readiness")
+    assert read.status_code == 200, read.text
+
+    row = await repo.get_task(db, task_id)
+    assert (
+        row["readiness_evidence"]
+        == (await load_dor_snapshot(db, task_id)).fingerprint()
+    ), "ленивая починка дописала отпечаток"
+    assert row["status"] == "draft", "чтение не автоодобряет"
+    assert row["statement_generation"] == gen_before, "чтение не двигает поколение"
+    assert row["dor_passed"] == 1
+    assert (
+        len(await repo.list_events(db, since=0, kinds=["task_approved"]))
+        == events_before
+    )
