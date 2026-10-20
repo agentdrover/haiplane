@@ -703,6 +703,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_git_ops_requests_nothing"
@@ -1100,6 +1101,7 @@ class NoopForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_forge_requests_nothing"
