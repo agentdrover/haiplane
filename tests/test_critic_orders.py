@@ -641,6 +641,15 @@ async def test_the_migration_applies_once(monkeypatch):
             with pytest.raises(Exception):
                 await fresh.execute(base, (sha, state, outcome, p1))
         await fresh.rollback()
+        # Один открытый заказ на (задача, sha); после закрытия тот же sha допустим.
+        await fresh.execute("INSERT INTO tasks (title, description) VALUES ('t', 'd')")
+        await fresh.execute("INSERT INTO executor_runs (task_id) VALUES (1)")
+        await fresh.execute(base, (SHA_A, "pending", None, 0))
+        with pytest.raises(Exception):
+            await fresh.execute(base, (SHA_A, "delivered", None, 0))
+        await fresh.execute("UPDATE critic_orders SET state='closed', outcome='failed'")
+        await fresh.execute(base, (SHA_A, "pending", None, 0))
+        await fresh.rollback()
     finally:
         await fresh.close()
 
