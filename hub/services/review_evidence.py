@@ -625,10 +625,12 @@ async def ci_evidence_state(db, task: dict):
             baseline=CIEvidenceBlock(reason=text),
         )
     stored = dict(row) if row is not None else {}
-    return CIEvidenceState(
-        mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
-        baseline=_evidence_block("baseline", stored.get("baseline"), pinned),
+    from hub.services.ci_evidence_other import blocks_of_the_commit
+
+    mutations, baseline = await blocks_of_the_commit(
+        db, int(task.get("id") or 0), pinned, stored
     )
+    return CIEvidenceState(mutations=mutations, baseline=baseline)
 
 
 async def prepass_state(db, task: dict):
