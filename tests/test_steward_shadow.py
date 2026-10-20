@@ -72,7 +72,7 @@ def with_identity(monkeypatch):
     в tests/test_steward_identity.py.
     """
 
-    async def _delivery(_db, _task_id, _generation, _base_url):
+    async def _delivery(_db, _task_id, _generation, _base_url, **_kw):
         return _DELIVERY
 
     monkeypatch.setattr(sh, "identity_delivery", _delivery)

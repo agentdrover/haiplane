@@ -25,6 +25,7 @@ import json
 
 import aiosqlite
 import pytest
+from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
@@ -74,46 +75,68 @@ async def _record(db: aiosqlite.Connection, **fields):
     return view, row
 
 
-async def test_an_approval_without_grounds_is_recorded_as_an_escalation(
+async def test_an_approval_without_grounds_is_refused_with_422(
     db: aiosqlite.Connection,
 ):
-    """AC-1: approve, confidence=high, grounds=[] — случай #1271 без одной детали."""
-    view, row = await _record(db, verdict="approve", confidence="high", grounds=[])
-    assert view.verdict == "escalate"
-    assert view.escalate_reason == "no_grounds"
-    assert view.submitted_verdict == "approve"
-    assert row["verdict"] == "escalate"
-    assert row["escalate_reason"] == "no_grounds"
-    assert row["submitted_verdict"] == "approve"
+    """AC-1 (#1327, ужесточено #1924): ответ без оснований не хранится."""
+    with pytest.raises(HTTPException) as err:
+        await _record(db, verdict="approve", confidence="high", grounds=[])
+    assert err.value.status_code == 422
     assert "no_grounds" in STEWARD_ESCALATE_REASONS
 
 
-async def test_a_return_without_grounds_is_recorded_as_an_escalation(
+async def test_a_return_without_grounds_is_refused_with_422(
     db: aiosqlite.Connection,
 ):
-    """AC-1, вторая половина: возврат без оснований понижается так же."""
-    view, _ = await _record(
-        db, verdict="changes_requested", confidence="high", grounds=[]
-    )
-    assert view.verdict == "escalate"
-    assert view.escalate_reason == "no_grounds"
-    assert view.submitted_verdict == "changes_requested"
+    """AC-1, вторая половина: возврат без оснований отклоняется так же."""
+    with pytest.raises(HTTPException) as err:
+        await _record(db, verdict="changes_requested", confidence="high", grounds=[])
+    assert err.value.status_code == 422
 
 
-async def test_an_approval_without_confidence_is_recorded_as_an_escalation(
+async def test_an_approval_without_confidence_is_refused_with_422(
     db: aiosqlite.Connection,
 ):
     """AC-2: основания названы, уверенности нет."""
-    view, row = await _record(
-        db, verdict="approve", grounds=[{"source": "ci_pinned_sha"}]
+    with pytest.raises(HTTPException) as err:
+        await _record(
+            db,
+            verdict="approve",
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci_run 1 success"}],
+        )
+    assert err.value.status_code == 422
+    assert "no_confidence" in STEWARD_ESCALATE_REASONS
+
+
+@pytest.mark.parametrize(
+    ("confidence", "grounds", "reason"),
+    [
+        ("high", [], "no_grounds"),
+        ("", [{"source": "ci_pinned_sha"}], "no_confidence"),
+    ],
+)
+async def test_the_storage_backstop_still_downgrades_a_bare_dor_answer(
+    db: aiosqlite.Connection, confidence, grounds, reason
+):
+    """Страховка #1327 жива там, где 422 не стоит (dor): понижение, не применение."""
+    project_id = await _project(db, f"backstop-{reason}")
+    task_id = await _task(db, project_id)
+    view = await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="dor",
+            verdict="approve",
+            confidence=confidence,
+            grounds=grounds,
+            model="gpt-5.3-codex",
+        ),
+        _STEWARD,
     )
     assert view.verdict == "escalate"
-    assert view.escalate_reason == "no_confidence"
+    assert view.escalate_reason == reason
     assert view.submitted_verdict == "approve"
-    assert row["verdict"] == "escalate"
-    assert row["escalate_reason"] == "no_confidence"
-    assert row["submitted_verdict"] == "approve"
-    assert "no_confidence" in STEWARD_ESCALATE_REASONS
 
 
 async def test_a_grounded_confident_approval_stays_an_approval(
@@ -124,7 +147,7 @@ async def test_a_grounded_confident_approval_stays_an_approval(
         db,
         verdict="approve",
         confidence="medium",
-        grounds=[{"source": "ci_pinned_sha"}],
+        grounds=[{"source": "ci_pinned_sha", "detail": "ci_run 1 success"}],
     )
     assert view.verdict == "approve"
     assert view.escalate_reason == ""
@@ -156,7 +179,7 @@ def _steward_on(monkeypatch) -> None:
     monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", "steward-token")
     monkeypatch.setattr(config, "CURSOR_API_KEY", "cursor-key")
 
-    async def _delivery(_db, _task_id, _generation, _base_url):
+    async def _delivery(_db, _task_id, _generation, _base_url, **_kw):
         return "код доступа: ABC-123"
 
     monkeypatch.setattr(steward_shadow, "identity_delivery", _delivery)
@@ -466,12 +489,15 @@ async def test_an_advisor_concur_without_a_filled_ground_detail_is_stored_as_obj
     ], "присланные основания сохранены как есть"
 
 
-@pytest.mark.parametrize("kind", ["verdict", "dor", "disposition"])
+@pytest.mark.parametrize("kind", ["dor", "disposition"])
 @pytest.mark.parametrize("verdict", ["approve", "changes_requested"])
 async def test_the_judge_rule_for_empty_ground_details_is_unchanged(
     db: aiosqlite.Connection, kind: str, verdict: str
 ):
-    """#1671 AC-2: у судьи основание с пустым detail по-прежнему основание."""
+    """#1671 AC-2: у dor/disposition основание с пустым detail по-прежнему основание.
+
+    Для kind=verdict с #1924 это 422 (tests/test_steward_judgement_contract.py).
+    """
     project_id = await _project(db, f"judge-empty-detail-{kind}-{verdict}")
     task_id = await _task(db, project_id)
 
