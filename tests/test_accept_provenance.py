@@ -84,6 +84,7 @@ class World:
         *,
         open_findings: object = 0,
         self_approved: bool = False,
+        ghost: int | None = None,
     ) -> None:
         await self.db.execute(
             "INSERT INTO events (kind, task_id, actor, payload) VALUES "
@@ -96,6 +97,7 @@ class World:
                         "submission_generation": generation,
                         "open_in_scope_findings": open_findings,
                         "self_approved": self_approved,
+                        **({"ghost_generation": ghost} if ghost is not None else {}),
                     }
                 ),
             ),
@@ -607,7 +609,99 @@ async def s_phantom_generation_with_a_submission_row(w, _m):
     return []
 
 
+async def s_generation_raised_by_a_done_report(w, _m):  # круг 3, проба 1
+    """Поколение 2 поднято done-отчётом: ни сдачи, ни метки; оно не призрак."""
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await repo.bump_submission_generation(w.db, w.task_id)
+    await w.db.commit()
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def s_poller_changes_requested_without_an_event(w, _m):  # круг 3, проба 2
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await repo.bump_submission_generation(w.db, w.task_id)
+    assert await repo.record_review_verdict(
+        w.db, w.task_id, "changes_requested", expected_generation=2
+    )
+    await w.db.commit()
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def _steward_cr(w, generation: int) -> None:
+    await repo.insert_steward_judgement(
+        w.db,
+        task_id=w.task_id,
+        generation=generation,
+        kind="verdict",
+        submitted_verdict="changes_requested",
+        verdict="changes_requested",
+        confidence="high",
+        grounds=json.dumps([{"source": "ci_report", "detail": ""}]),
+    )
+    await w.db.commit()
+
+
+async def s_steward_changes_requested_on_an_unmarked_generation(
+    w, _m
+):  # круг 3, проба 3
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await _steward_cr(w, 2)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def s_steward_changes_requested_on_a_marked_ghost(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1, ghost=2)
+    await _steward_cr(w, 2)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def s_ghost_mark_on_a_generation_with_a_report(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1, ghost=2)
+    await w.report(2)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def s_ghost_mark_that_does_not_follow_its_verdict(w, _m):
+    """Метка призрака на поколении, не следующем за вердиктом, — не метка."""
+    root = await w.report(1)
+    await w.verdict_event(1, ghost=3)
+    await w.verdict_event(2)
+    await w.report(4, copy_of=root)
+    await w.now(4)
+    return []
+
+
+async def s_ghost_mark_on_a_changes_requested_verdict(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1, "changes_requested", ghost=2)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
 UNAPPROVED = {
+    "generation_raised_by_a_done_report",
+    "poller_changes_requested_without_an_event",
+    "steward_changes_requested_on_an_unmarked_generation",
+    "steward_changes_requested_on_a_marked_ghost",
+    "ghost_mark_on_a_generation_with_a_report",
+    "ghost_mark_that_does_not_follow_its_verdict",
+    "ghost_mark_on_a_changes_requested_verdict",
     "carried_approval_with_in_scope_findings",
     "carried_approval_without_findings_data",
     "carried_self_approval",
@@ -716,9 +810,9 @@ async def p_branch_of_copies_and_independent_report(w):
 
 
 async def p_phantom_generation_after_an_approval_with_a_moved_tip(w):
-    """Одобрение при ушедшей вершине подняло номер (#572): поколение 2 пустое."""
+    """Одобрение при ушедшей вершине подняло номер (#572): поколение 2 пустое, помечено."""
     root = await w.report(1)
-    await w.verdict_event(1)
+    await w.verdict_event(1, ghost=2)
     await w.report(3, copy_of=root)
     await w.now(3)
 
@@ -932,3 +1026,74 @@ async def test_a_real_approval_carries_its_findings_count(
         proof, _, _ = await prove_accept(db, await w.task())
         outcomes[label] = proof is not None
     assert outcomes == {"clean": True, "in_scope": False}
+
+
+async def test_a_real_moved_tip_approval_marks_its_ghost_generation(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Настоящее одобрение при ушедшей вершине (#572) помечает поднятое поколение; пересдача и перенос — «Принять»."""
+    w = await _world(client, db, monkeypatch, "prov-real-ghost")
+    root = await w.report(1)
+    pinned = (await w.task())["submission_sha"]
+    plugins.git_ops._tip = "b" * 40
+    try:
+        resp = await client.post(
+            f"/api/tasks/{w.task_id}/review-verdict",
+            json={
+                "verdict": "approved",
+                "agent": "denis",
+                "findings": [],
+                "expected_generation": 1,
+            },
+        )
+    finally:
+        plugins.git_ops._tip = pinned
+    assert resp.status_code == 200, resp.text
+    task = await w.task()
+    assert task["submission_generation"] == 2
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE task_id=? AND kind='review_verdict_recorded'",
+        (w.task_id,),
+    )
+    payload = json.loads(events[-1][0])
+    assert (payload["submission_generation"], payload["ghost_generation"]) == (1, 2)
+    await db.execute(
+        "UPDATE tasks SET status='review', submission_sha=? WHERE id=?",
+        (pinned, w.task_id),
+    )
+    await db.commit()
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    await observe_tip(db, w.task_id)
+    proof, _, _ = await prove_accept(db, await w.task())
+    assert proof is not None
+
+
+async def test_the_event_names_the_generation_the_verdict_was_written_on(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Пересдача между чтением задачи и записью вердикта: событие называет записанную строку."""
+    w = await _world(client, db, monkeypatch, "prov-race")
+    await w.report(1)
+    real_record = repo.record_review_verdict
+
+    async def move_then_record(conn, *args, **kwargs):
+        # пересдача между снимком задачи и записью: вердикт ляжет на поколение 2
+        await repo.bump_submission_generation(conn, w.task_id)
+        return await real_record(conn, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "record_review_verdict", move_then_record)
+    resp = await client.post(
+        f"/api/tasks/{w.task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "denis", "findings": []},
+    )
+    assert resp.status_code == 200, resp.text
+    task = await w.task()
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE task_id=? AND kind='review_verdict_recorded'",
+        (w.task_id,),
+    )
+    assert (
+        json.loads(events[-1][0])["submission_generation"]
+        == (task["review_verdict_generation"])
+    )

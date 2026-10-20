@@ -141,6 +141,29 @@ async def _report_blockers(
 _CLOSING_EVENTS = ("task_returned_to_work", "task_decided")
 
 
+async def _standing_gap(
+    db: aiosqlite.Connection, task: dict[str, Any], generation: int
+) -> str:
+    """Возврат поколения, прочитанный НЕ из ленты: суждение стюарда и колонка вердикта.
+
+    Читается для каждого поколения диапазона до любого пропуска: поллер пишет
+    вердикт «на доработку» без события, а суждение стюарда события не требует.
+    """
+    judged = await repo.get_steward_judgement(
+        db, int(task["id"]), generation, "verdict"
+    )
+    if judged is not None and judged["verdict"] == "changes_requested":
+        return f"поколение {generation}: суждение стюарда «на доработку»"
+    if (
+        task.get("review_verdict_generation") == generation
+        and task.get("review_verdict") != "approved"
+    ):
+        return (
+            f"поколение {generation}: в задаче вердикт «{task.get('review_verdict')}»"
+        )
+    return ""
+
+
 def _approval_gap(
     task: dict[str, Any], events: list[tuple[int, str, dict[str, Any]]], generation: int
 ) -> str:
@@ -215,32 +238,46 @@ async def _carried_approvals(
     events = await _task_events(db, task_id)
     if events is None:
         return [_history_blocker("запись ленты вердиктов не читается")]
+    ghosts = _marked_ghosts(events)
     gaps = []
     for generation in range(first, current):
-        if await _never_submitted(db, task_id, generation, events):
-            continue
-        gap = _approval_gap(task, events, generation)
-        judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
-        if not gap and judged is not None and judged["verdict"] == "changes_requested":
-            gap = f"поколение {generation}: суждение стюарда «на доработку»"
+        gap = await _standing_gap(db, task, generation)
+        if not gap and not (
+            generation in ghosts
+            and await _is_empty_generation(db, task_id, generation, events)
+        ):
+            gap = _approval_gap(task, events, generation)
         if gap:
             gaps.append(gap)
     return [_history_blocker("; ".join(gaps))] if gaps else []
 
 
-async def _never_submitted(
+def _marked_ghosts(events: list[tuple[int, str, dict[str, Any]]]) -> set[int]:
+    """Поколения, поднятые вердиктом при ушедшей вершине (#572): метка в событии.
+
+    Призрак опознаётся ПОЛОЖИТЕЛЬНО: одобрение (вердикт ``approved``) записало
+    ``ghost_generation``. Отсутствие следов призраком не считается: поколения,
+    поднятые отчётом о завершении (done), записью поллера или иначе, следов
+    тоже могут не иметь, а настоящую сдачу пропускать нельзя.
+    """
+    return {
+        int(payload["ghost_generation"])
+        for _, kind, payload in events
+        if kind == "review_verdict_recorded"
+        and payload.get("verdict") == "approved"
+        and isinstance(payload.get("ghost_generation"), int)
+        and not isinstance(payload.get("ghost_generation"), bool)
+        and payload.get("submission_generation") == payload["ghost_generation"] - 1
+    }
+
+
+async def _is_empty_generation(
     db: aiosqlite.Connection,
     task_id: int,
     generation: int,
     events: list[tuple[int, str, dict[str, Any]]],
 ) -> bool:
-    """Поколение-призрак: одобрение при ушедшей вершине только поднимает номер.
-
-    ``_apply_verdict`` при расхождении вершины ветки с закреплённым коммитом
-    двигает поколение (#572): сдачи, отчётов и вердикта у этого номера нет, и
-    одобрения на нём получить нельзя. Пропуск узкий: нет строки сдачи, нет
-    отчётов, нет ни одного события вердикта этого поколения.
-    """
+    """Нет строки сдачи, отчётов и событий вердикта этого поколения."""
     if any(p.get("submission_generation") == generation for _, _, p in events):
         return False
     rows = await fetchall(
