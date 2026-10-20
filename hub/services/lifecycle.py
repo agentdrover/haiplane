@@ -56,6 +56,7 @@ from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     archive_guard,
+    expected_sha_gate,
     prevention_gate,
     project_policy,
     ci_green_proof,
@@ -3191,6 +3192,7 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     state.submission_sha, state.sha_reason = await resolve_branch_tip(
         state.db, state.task_id, state.task.get("branch") or ""
     )
+    await expected_sha_gate.refuse_unless_head_is_expected(state)  # #1937
     # #1687: the CI report for this commit is checked against GitHub NOW, also
     # a rerun nobody reported, so the gates below and the adoption inside the
     # lock read a standing that is current, not the one the last POST left.
@@ -3347,7 +3349,7 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("task_is_submittable", _step_task_is_submittable),
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
-    Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step("pin_submission_sha", _step_pin_submission_sha),
     Step(
         "same_sha_from_review_is_current",
         _step_same_sha_from_review_is_current,
@@ -3514,6 +3516,7 @@ async def submit_for_review(
         # доказательств из идентичности вызывающего.
         from hub.services.state_task import submit_state
 
+        expected_sha_gate.refuse_for_state_task(body)  # #1937
         return await submit_state(db, task_id, task, body, principal_id=principal_id)
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)

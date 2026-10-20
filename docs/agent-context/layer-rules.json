@@ -73,7 +73,8 @@
         "hub.plain_summary",
         "hub.cause_task_view",
         "hub.owner_minutes_view",
-        "hub.outcome_hint"
+        "hub.outcome_hint",
+        "hub.expected_sha"
       ],
       "trees": []
     },
