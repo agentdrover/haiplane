@@ -23,7 +23,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services import decisions as decisions_svc
-from hub.services import inbox_decisions
+from hub.services import inbox_decisions, steward_breaker
 from hub.services.lifecycle import row_to_task
 from hub.services.project_policy import clone_branch_state
 
@@ -170,6 +170,7 @@ def inbox_attention_total(data: dict[str, Any]) -> int:
         + len(data["ci_check_tasks"])
         + len(data["fix_requested_tasks"])
         + len(data["stale_tasks"])
+        + len(data.get("steward_breaker_banner") or [])
         # #1038: находки — счёт, а не статусный список.
         + (1 if unjudged.get("findings") else 0)
         # #897/#1198/#294: признанные расхождения вне счёта, одним определением
@@ -302,6 +303,8 @@ async def get_inbox_data(
         "decision_by_task": {e["task_id"]: e for e in decisions["queue"]},
         "decision_note": decisions["note"],
         "decision_cycles": decisions["cycles"],
+        # #1865: предохранитель стюарда сработал - заметно и без steward_watch.
+        "steward_breaker_banner": await steward_breaker.banner_rows(db),
         "steward_cap_banner": decisions["cap_banner"],
         "review_tasks": [row_to_task(r) for r in decisions["reviewing"]],
         "drafts": [row_to_task(r) for r in draft_rows],
