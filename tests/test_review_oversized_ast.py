@@ -68,7 +68,8 @@ def test_owner_and_boundaries_come_from_the_tree():
     )
     assert (_span(src, f"{F}::TestKit::test_ac").start) == 8
     assert (_span(src, f"{F}::TestOther::test_ac").start) == 2
-    assert (_span(src, f"{F}::test_ac").start) == 14, "последнее определение"
+    dup = _span(src, f"{F}::test_ac")
+    assert dup.unreadable and not dup.found, "повторное определение - неизвестно"
     assert not _span(src, f"{F}::TestKit::test_gone").found
     assert not _span(
         "class A:\n    class B:\n        def t(self): pass\n", f"{F}::A::t"

@@ -597,7 +597,7 @@ async def test_oversized_file_is_named_not_left_to_eat_budget(
     assert "lost_dimensions" in prompt
     # #1933: потолок — порядок чтения, а не предел; без AC блока нет.
     assert "порядок чтения, а не предел" in prompt
-    assert "Второго прохода хаб не заказывает" in prompt
+    assert "Второй проход не гарантирован" in prompt
     assert "ЧИТАТЬ ПЕРВЫМИ" not in prompt, "у задачи нет тестов AC"
     assert "hub/services/small.py" not in prompt.split("НЕ ПОМЕСТЯТСЯ")[1], (
         "the small file is not the one that did not fit"

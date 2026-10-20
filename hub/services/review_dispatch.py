@@ -65,7 +65,6 @@ from hub.services.review_oversized import (
     ac_test_refs as task_ac_test_refs,
     ac_test_spans,
     cutout,
-    cutouts_within,
     shown_in,
     first_block,
     oversized_paragraph,
@@ -384,35 +383,69 @@ def _fit_with_ac_cutouts(
     ceiling: int,
     spans: list[AcTestSpan],
 ) -> tuple[str, list[str], list[str], list[str]]:
-    """Файлы под потолок с БРОНЁЙ под вырезки тестов AC (#1933).
+    """Файлы под потолок; представление файлов с тестами AC выбирается СОВМЕСТНО (#1933).
 
-    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Бюджет под вырезки
-    отведён ДО остальных файлов: иначе файл, влезший целиком, съедал остаток.
-    Вырезка нужна тесту, которого нет в тексте диффа целиком — файл выпал из
-    промта (потолок, дельта) или функция лежит вне ханков. Что после брони
-    осталось, получают файлы, не влезшие в первый проход (порядок AC-первым не
-    нарушается: бронь уже взята).
+    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Файл с тестом AC
+    представлен полным диффом (плюс вырезки того, что вне ханков) или одними
+    вырезками. Шаг 1: каждому такому файлу бронируется дешёвое из двух по
+    РЕАЛЬНОЙ стоимости (вырезки с номерами строк бывают дороже полного диффа);
+    не влезло ни одно - тесты файла названы непрочитанными. Шаг 2: по порядку
+    диффа файлы берут остаток, а AC-файл на вырезках улучшается до полного
+    диффа, если доплата влезает.
     """
+
+    def norm(t: str) -> str:
+        return t if t.endswith("\n") else t + "\n"
+
     found = [sp for sp in spans if sp.found]
-    text, omitted = fit_file_sections(
-        sections, max(ceiling - sum(len(cutout(sp)) for sp in found), 0)
-    )
-    gone = set(omitted)
-    left = [
-        (p, t) for p, t in sections if (p or "(часть диффа без имени файла)") in gone
+    by_path: dict[str, list[AcTestSpan]] = {}
+    for sp in found:
+        by_path.setdefault(sp.path, []).append(sp)
+    texts = {p: t for p, t in sections if p}
+    cut_cost = {p: sum(len(cutout(x)) for x in sps) for p, sps in by_path.items()}
+    unc_cost = {
+        p: sum(len(cutout(x)) for x in sps if not shown_in(texts.get(p), x))
+        for p, sps in by_path.items()
+    }
+    full_cost = {p: len(norm(texts[p])) + unc_cost[p] for p in by_path if p in texts}
+    budget, mode = ceiling, {}
+    for p in by_path:
+        options = [(cut_cost[p], 1, "cut")]
+        if p in full_cost:
+            options.append((full_cost[p], 0, "full"))
+        cost, _, pick = min(options)
+        mode[p] = pick if cost <= budget else ""
+        budget -= cost if mode[p] else 0
+    text, omitted = [], []
+    for path, raw in sections:
+        body = norm(raw)
+        name = path or "(часть диффа без имени файла)"
+        if path in by_path:
+            if (
+                mode[path] == "cut"
+                and len(body) + unc_cost[path] - cut_cost[path] <= budget
+            ):
+                budget -= len(body) + unc_cost[path] - cut_cost[path]
+                mode[path] = "full"
+            if mode[path] == "full":
+                text.append(body)
+            else:
+                omitted.append(name)
+        elif len(body) <= budget:
+            budget -= len(body)
+            text.append(body)
+        else:
+            omitted.append(name)
+    need = [
+        x
+        for p, sps in by_path.items()
+        if mode[p]
+        for x in sps
+        if mode[p] == "cut" or not shown_in(texts.get(p), x)
     ]
-    shown = {p: t for p, t in sections if p and p not in omitted}
-    need = [sp for sp in found if not shown_in(shown.get(sp.path), sp)]
-    extra, still = fit_file_sections(
-        left, max(ceiling - len(text) - sum(len(cutout(sp)) for sp in need), 0)
-    )
-    if extra:
-        text += extra
-        omitted = still
-        shown |= {p: t for p, t in left if p and p not in still}
-        need = [sp for sp in found if not shown_in(shown.get(sp.path), sp)]
-    cuts, unread = cutouts_within(need, ceiling - len(text))
-    return text, omitted, cuts, unread
+    cuts = [cutout(x) for x in need]
+    unread = [x.ref for p, sps in by_path.items() if not mode[p] for x in sps]
+    return "".join(text), omitted, cuts, unread
 
 
 def _inline_diff_lines(
@@ -809,6 +842,8 @@ def _plan_oversized(
     pinned_diff: str | None = None,
     ac_sources: Mapping[str, str | None] | None = None,
     ac_block: bool = False,
+    pin_sha: str = "",
+    inline: bool = False,
 ) -> tuple[list[tuple[str, int]], list[AcTestSpan]]:
     """Файлы выше потолка и тесты AC в них; дописывает блок и абзац в ``lines`` (#1933).
 
@@ -821,7 +856,10 @@ def _plan_oversized(
     из файлов на том же sha (``ac_sources``); не прочитан — «не найден», а не
     откат на ветку.
     """
+    # Закреплённый дифф не прочитан (ac_block): размеры ветки - не размеры коммита
+    # сдачи, на ветку не откатываемся.
     basis = kept if pinned_diff is None else split_generated(pinned_diff)[0]
+    basis = "" if ac_block and pinned_diff is None else basis
     oversized = [
         (path, count)
         for path, count in file_line_counts(basis)
@@ -831,7 +869,7 @@ def _plan_oversized(
         return oversized, []
     spans = ac_test_spans(ac_sources, ac_test_refs or []) if ac_test_refs else []
     if spans:
-        lines.insert(0, first_block(spans))
+        lines.insert(0, first_block(spans, pin_sha, inline))
     if oversized:
         lines.append(oversized_paragraph(oversized, bool(spans), REVIEW_FILE_LINE_CAP))
     return oversized, spans
@@ -852,6 +890,7 @@ def diff_plan(
     pinned_diff: str | None = None,
     ac_sources: Mapping[str, str | None] | None = None,
     ac_block: bool = False,
+    pin_sha: str = "",
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -964,7 +1003,14 @@ def diff_plan(
             f"править): {', '.join(dropped)}."
         )
     oversized, spans = _plan_oversized(
-        kept, lines, ac_test_refs, pinned_diff, ac_sources, ac_block
+        kept,
+        lines,
+        ac_test_refs,
+        pinned_diff,
+        ac_sources,
+        ac_block,
+        pin_sha,
+        inline_ceiling is not None,
     )
     note_bits = []
     if inline_ceiling is not None:
@@ -3925,6 +3971,7 @@ async def prepare_review_order(
         pinned_diff=pinned,
         ac_sources=ac_sources,
         ac_block=ac_block,
+        pin_sha=(task.get("submission_sha") or "").strip(),
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.

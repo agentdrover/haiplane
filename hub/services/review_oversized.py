@@ -95,65 +95,88 @@ def ac_test_paths(refs: Iterable[str]) -> list[str]:
 
 
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
-_COMPOUND = (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)
-_NOT_DEFINED = object()
+_SCOPES = (*_DEFS, ast.ClassDef)
+_MATCH_NAMES = tuple(
+    getattr(ast, n) for n in ("MatchAs", "MatchStar") if hasattr(ast, n)
+)
+MAX_NODES = 200_000  # предел обхода: больше - «не прочитан», а не долгая работа
 
 
-def _rebinds(stmt: ast.stmt, name: str) -> bool:
-    """Связывает ли оператор ``name`` иначе, чем прямым ``def``/``class`` в этом теле."""
-    if isinstance(stmt, ast.Assign):
-        return any(
-            isinstance(n, ast.Name) and n.id == name
-            for t in stmt.targets
-            for n in ast.walk(t)
-        )
-    if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
-        return isinstance(stmt.target, ast.Name) and stmt.target.id == name
-    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-        return any((a.asname or a.name).split(".")[0] == name for a in stmt.names)
-    return False
+class Unknown(Exception):
+    """Имя нельзя свести к ровно одному простому ``def``/``class``: не гадаем."""
 
 
-def _nested_binding(body: Sequence[ast.stmt], name: str) -> bool:
-    """Связано ли ``name`` внутри if/try/with/for/while этого тела (pytest выполнит ЛЮБОЕ)."""
-    for stmt in body:
-        if isinstance(stmt, _COMPOUND):
-            parts = [stmt.body, getattr(stmt, "orelse", [])]
-            parts += [getattr(stmt, "finalbody", [])]
-            parts += [h.body for h in getattr(stmt, "handlers", [])]
-            for part in parts:
-                for inner in part:
-                    named = (
-                        isinstance(inner, (*_DEFS, ast.ClassDef)) and inner.name == name
-                    )
-                    if named or _rebinds(inner, name):
-                        return True
-                if _nested_binding(part, name):
-                    return True
-    return False
+def _binds(node: ast.AST, name: str) -> bool:
+    """Связывает ли узел ``name`` в своей области - ЛЮБЫМ способом, который знает ``ast``."""
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, _SCOPES):
+        return node.name == name
+    if isinstance(node, ast.alias):
+        return node.name == "*" or (node.asname or node.name).split(".")[0] == name
+    if isinstance(node, ast.ExceptHandler):
+        return node.name == name
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    if _MATCH_NAMES and isinstance(node, _MATCH_NAMES):
+        return getattr(node, "name", None) == name
+    return isinstance(node, getattr(ast, "MatchMapping", ())) and node.rest == name  # type: ignore[attr-defined]
 
 
-def _locate(
-    tree: ast.Module, owners: Sequence[str], name: str
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None | object:
-    """Функция ``name`` в теле класса(ов) ``owners`` от верха модуля, прямой потомок.
+def _scan_scope(body: Sequence[ast.stmt], name: str) -> tuple[list[ast.stmt], int]:
+    """``(прямые def/class с этим именем, число прочих связываний)`` в теле области.
 
-    Как Python: при повторном определении действует последнее. Имя, связанное ещё
-    и иначе (присваивание, импорт, def внутри if/try), — неоднозначно:
-    ``_NOT_DEFINED`` вместо достоверного диапазона.
+    Обход итеративный (стек, не рекурсия: глубокая цепочка ``elif`` ломала
+    рекурсивный) и с пределом узлов. Вложенные функции и классы не открываются:
+    их имена - другая область; но ``def``/``class`` внутри ``if``/``match``/``try``
+    этой области - связывание этой области.
     """
-    scope: list[ast.stmt] = tree.body
+    direct: list[ast.stmt] = []
+    others, seen = 0, 0
+    stack: list[ast.AST] = []
+    for stmt in body:
+        if isinstance(stmt, _SCOPES):
+            direct += [stmt] if stmt.name == name else []
+        else:
+            stack.append(stmt)
+    while stack:
+        node = stack.pop()
+        seen += 1
+        if seen > MAX_NODES:
+            raise Unknown("файл слишком велик для разбора")
+        if isinstance(node, _SCOPES):
+            others += node.name == name
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        others += _binds(node, name)
+        stack.extend(ast.iter_child_nodes(node))
+    return direct, others
+
+
+def _resolve(
+    tree: ast.Module, owners: Sequence[str], name: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Функция теста по БЕЛОМУ списку (#1933): имя связано ровно одним простым def.
+
+    Метод - ровно одним ``def`` в теле ровно одного ``class`` (цепочка владельцев
+    от верха модуля). Любое другое связывание имени в той же области - ``Unknown``;
+    ``None`` - имени в области нет вовсе.
+    """
+    scope: Sequence[ast.stmt] = tree.body
     for owner in owners:
-        classes = [n for n in scope if isinstance(n, ast.ClassDef) and n.name == owner]
-        if not classes:
+        direct, others = _scan_scope(scope, owner)
+        if not direct and not others:
             return None
-        if len(classes) > 1 or _nested_binding(scope, owner):
-            return _NOT_DEFINED
-        scope = classes[-1].body
-    if any(_rebinds(s, name) for s in scope) or _nested_binding(scope, name):
-        return _NOT_DEFINED
-    found = [n for n in scope if isinstance(n, _DEFS) and n.name == name]
-    return found[-1] if found else None
+        if len(direct) != 1 or others or not isinstance(direct[0], ast.ClassDef):
+            raise Unknown(owner)
+        scope = direct[0].body
+    direct, others = _scan_scope(scope, name)
+    if not direct and not others:
+        return None
+    if len(direct) != 1 or others or not isinstance(direct[0], _DEFS):
+        raise Unknown(name)
+    return direct[0]
 
 
 def _tree_of(text: str | None) -> tuple[ast.Module, list[str]] | None:
@@ -162,7 +185,7 @@ def _tree_of(text: str | None) -> tuple[ast.Module, list[str]] | None:
     try:
         # Нумерация строк ast — по \n, \r\n, \r; splitlines() режет ещё и по \x0c.
         return ast.parse(text), re.split(r"\r\n|\r|\n", text)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
+    except Exception:  # noqa: BLE001 - любой сбой разбора = «не прочитан»
         return None
 
 
@@ -190,17 +213,17 @@ def ac_test_spans(
         if got is None:
             out.append(AcTestSpan(ref, path, unreadable=True))
             continue
-        node = _locate(got[0], owners, name)
-        if node is _NOT_DEFINED:
+        try:
+            node = _resolve(got[0], owners, name)
+            if node is None:
+                out.append(AcTestSpan(ref, path))
+                continue
+            decorated = [d.lineno for d in node.decorator_list]
+            start, end = min([node.lineno, *decorated]), node.end_lineno or node.lineno
+            body = tuple((n, got[1][n - 1]) for n in range(start, end + 1))
+            out.append(AcTestSpan(ref, path, start, end, lines=body))
+        except Exception:  # noqa: BLE001 - Unknown, RecursionError, IndexError: «не прочитан»
             out.append(AcTestSpan(ref, path, unreadable=True))
-            continue
-        if not isinstance(node, _DEFS):
-            out.append(AcTestSpan(ref, path))
-            continue
-        decorated = [d.lineno for d in node.decorator_list]
-        start, end = min([node.lineno, *decorated]), node.end_lineno or node.lineno
-        body = tuple((n, got[1][n - 1]) for n in range(start, end + 1))
-        out.append(AcTestSpan(ref, path, start, end, lines=body))
     return out
 
 
@@ -266,16 +289,41 @@ def oversized_paragraph(
     return (
         f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {cap} "
         f"строк на файл): {named}. Потолок — порядок чтения, а не предел. "
-        f"{order}Второго прохода хаб не заказывает. Непрочитанный остаток "
+        f"{order}Второй проход не гарантирован (добор лестницы возможен, но на него не рассчитывай). Непрочитанный остаток "
         f"перечисли в lost_dimensions и сдай incomplete=true{unread}. "
         "Один большой файл не имеет права съесть бюджет, которого ждали "
         "остальные."
     )
 
 
-def first_block(spans: Sequence[AcTestSpan]) -> str:
-    """Блок «ЧИТАТЬ ПЕРВЫМИ»: по строке на тест AC; пусто, если читать нечего."""
-    return "\n".join(span.label() for span in spans)
+def first_block(
+    spans: Sequence[AcTestSpan], sha: str = "", inline: bool = False
+) -> str:
+    """Блок «ЧИТАТЬ ПЕРВЫМИ»: шапка с sha сдачи и по строке на тест AC.
+
+    Номера строк - файла на коммите сдачи. Облачный ревьюер читает подвижную
+    ветку командой, поэтому шапка требует сверить HEAD с sha и при расхождении
+    не верить номерам (читать ``git show <sha>:<путь>`` или назвать тест
+    непрочитанным). У локального ревьюера клона нет - сверять нечего.
+    """
+    if not spans:
+        return ""
+    short = sha[:12]
+    if not short:
+        head = ""
+    elif inline:
+        head = (
+            f"ЧИТАТЬ ПЕРВЫМИ — номера строк относятся к файлам на коммите сдачи {short}; "
+            "клона у тебя нет, git не используй.\n"
+        )
+    else:
+        head = (
+            f"ЧИТАТЬ ПЕРВЫМИ — номера строк относятся к коммиту сдачи {short}. "
+            "Перед чтением сверь `git rev-parse HEAD` с ним: при несовпадении номерам "
+            f"не верь — читай тест командой `git show {short}:<путь>` или назови его "
+            f"в lost_dimensions «{UNREAD_PREFIX}<test_ref>».\n"
+        )
+    return head + "\n".join(span.label() for span in spans)
 
 
 def cutout(span: AcTestSpan) -> str:
@@ -285,22 +333,6 @@ def cutout(span: AcTestSpan) -> str:
         f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end}) ===\n"
         f"{body}\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
     )
-
-
-def cutouts_within(
-    spans: Sequence[AcTestSpan], budget: int
-) -> tuple[list[str], list[str]]:
-    """``(вырезки, непрочитанные ref)`` для тестов, которых нет в промте целиком."""
-    taken: list[str] = []
-    unread: list[str] = []
-    for span in spans:
-        text = cutout(span)
-        if len(text) <= budget:
-            taken.append(text)
-            budget -= len(text)
-        else:
-            unread.append(span.ref)
-    return taken, unread
 
 
 def unread_ac_tests(
