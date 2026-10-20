@@ -73,11 +73,19 @@ PROCEDURAL_ESCALATE_REASONS: frozenset[str] = frozenset(
 SOURCE_HUMAN_CHANGES = "human_changes_requested"
 SOURCE_REOPENED = "reopened"
 SOURCE_PROD_DEFECT = "prod_defect"
+#: #1865: откат влитого коммита и красная база после доставки стюарда. Пишет их
+#: не триггер и не опрос ``detect_false_approvals``, а ``steward_breaker``.
+SOURCE_REVERTED = "reverted"
+SOURCE_BASE_RED = "base_red_after_merge"
 FALSE_APPROVE_SOURCES: tuple[str, ...] = (
     SOURCE_HUMAN_CHANGES,
     SOURCE_REOPENED,
     SOURCE_PROD_DEFECT,
+    SOURCE_REVERTED,
+    SOURCE_BASE_RED,
 )
+#: Окно счётчика случаев в сводке политики (дней).
+FALSE_APPROVE_EVENTS_WINDOW_DAYS = 14
 
 #: Контур выборки: суждения, записанные после выката #1601.
 CONTOUR_V2 = 2
@@ -546,6 +554,23 @@ async def actual_steward_verdicts(
     return counts
 
 
+async def false_approve_events(
+    db: aiosqlite.Connection, since_days: int = FALSE_APPROVE_EVENTS_WINDOW_DAYS
+) -> dict[str, int]:
+    """``{источник: число случаев}`` за окно, ВКЛЮЧАЯ снятые человеком (#1865).
+
+    Считаются строки ``steward_false_approvals`` по ``detected_at``; снятие
+    случая счёт не уменьшает. Источники без случаев в словарь не входят.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT source, COUNT(*) AS n FROM steward_false_approvals "
+        "WHERE detected_at >= datetime('now', ?) GROUP BY source ORDER BY source",
+        (f"-{int(since_days)} days",),
+    )
+    return {str(r["source"]): int(r["n"]) for r in rows}
+
+
 async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
     """Сводка нового контура для practice_metrics и сводки политики. Чтение."""
     counts = await contour_counts(db)
@@ -569,6 +594,7 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "substantive_share": counts.share,
         "min_pairs": ACT_MIN_PAIRS,
         "false_approve": len({f.task_id for f in false_approves}),
+        "false_approve_events_14d": await false_approve_events(db),
         "false_approve_tasks": [
             {
                 "task_id": f.task_id,

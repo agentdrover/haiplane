@@ -586,6 +586,8 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> CIProbeResult: ...
+    # #1914: ``on_send`` ОБЯЗАТЕЛЕН для любой реализации с отправкой (POST):
+    # вызвать его ровно перед ней. Всё до вызова - отказ, не тратящий попытку.
     async def request_ci_run(
         self,
         branch: str,
@@ -593,6 +595,7 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult: ...
     # #1862: головы веток одним чтением (ls-remote); None = спросить не удалось.
     async def remote_heads(
@@ -679,6 +682,12 @@ class GitOpsPlugin(Protocol):
     async def first_parent_log(
         self, repo: str, base: str, limit: int
     ) -> str | None: ...
+    async def first_parent_after(
+        self, repo: str, base: str, since: str, limit: int
+    ) -> dict[str, Any] | None: ...
+    async def commit_facts(
+        self, repo: str, shas: list[str]
+    ) -> dict[str, dict[str, Any]] | None: ...
     async def pr_for_branch(
         self,
         branch: str,
@@ -975,6 +984,8 @@ class ForgePlugin(Protocol):
     # #1197: породить прогон на УЖЕ существующем коммите. Форж умеет это
     # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:
     # «отказано осмысленно» и «вызов не долетел» лечатся разными руками.
+    # #1914: ``on_send`` ОБЯЗАТЕЛЕН для любой реализации с отправкой (POST):
+    # вызвать его ровно перед ней. Всё до вызова - отказ, не тратящий попытку.
     async def request_ci_run(
         self,
         branch: str,
@@ -982,6 +993,7 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult: ...
     async def branch_ci_runs(
         self,

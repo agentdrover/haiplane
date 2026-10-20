@@ -447,6 +447,16 @@ class NoopGitOps:
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         return None
 
+    async def first_parent_after(
+        self, repo: str, base: str, since: str, limit: int
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def commit_facts(
+        self, repo: str, shas: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        return None
+
     async def branch_contains_unmerged_commits_of(
         self,
         branch: str,
@@ -697,6 +707,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_git_ops_requests_nothing"
@@ -1094,6 +1105,7 @@ class NoopForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         return CIRunRequestResult(
             CIRunRequestOutcome.unsupported, "noop_forge_requests_nothing"

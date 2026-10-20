@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 from hub import brand
@@ -957,10 +958,17 @@ class GitHubForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         """Ask GitHub for a run on ``branch`` as it stands (#1197).
 
         ``workflow_path`` (#1862): dispatch only this file (the project's CI).
+
+        ``on_send`` (#1914) is called immediately before the POST that
+        dispatches the run, never earlier. The workflow-list GET before it
+        costs nothing: a timeout or failure there is a refusal BEFORE sending,
+        and the caller must be able to tell it from an unknown outcome AFTER
+        the POST started.
 
         Only a workflow the hub KNOWS to be the CI pipeline is dispatched, and
         the reason is not tidiness. The delivery gate reads every run for the
@@ -1022,6 +1030,8 @@ class GitHubForge:
             return CIRunRequestResult(
                 CIRunRequestOutcome.unavailable, "workflow_without_id"
             )
+        if on_send is not None:
+            on_send()
         rc, _out, err = await _gh(
             "api",
             "--method",
@@ -1190,6 +1200,7 @@ class GitHubForge:
             "run_attempt": str(run.get("run_attempt") or ""),
             "path": str(run.get("path") or ""),
             "head_sha": str(run.get("head_sha") or ""),
+            "head_branch": str(run.get("head_branch") or ""),
             "status": str(run.get("status") or "").lower(),
             "conclusion": str(run.get("conclusion") or "").lower(),
             "event": str(run.get("event") or ""),
