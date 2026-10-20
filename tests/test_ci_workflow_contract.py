@@ -46,7 +46,11 @@ def test_report_and_audit_use_canonical_secrets() -> None:
     # READ key. The report key is not an input of this job any more (#1686).
     assert f"hub-url: {URL_SECRET}" in text
     assert "hub-read-token: ${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}" in text
-    assert "hub-token:" not in text
+    import re
+
+    # `github-token:` of the adoption download is the workflow's own read-only
+    # token, not the hub report key; only the bare `hub-token:` input is banned.
+    assert not re.search(r"(?<![\w-])hub-token:", text)
 
 
 def test_no_legacy_names_anywhere() -> None:
@@ -487,6 +491,9 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     assert treedup["outputs"] == {
         "skip": "${{ steps.treedup.outputs.skip }}",
         "evidence_run": "${{ steps.evidence.outputs.run }}",
+        # #1919: the adoption of the dispatch run's evidence (see its own test).
+        "adopt": "${{ steps.adopt.outputs.adopt }}",
+        "adopted_run_id": "${{ steps.adopt.outputs.adopted_run_id }}",
     }
 
     # pytest: three parts, none of which may hide another's failure, and none
@@ -617,6 +624,8 @@ MUTATIONS_STEP = "Mutations of changed functions (warning only)"
 BASELINE_STEP = "Red-test baseline on merge-base (data only)"
 EVIDENCE_GATE = "needs.treedup.outputs.evidence_run == 'true'"
 EVIDENCE_ARTIFACT = "hub-ci-evidence"
+# #1919: an adopted run (download and stamp both succeeded) recounts nothing.
+ADOPT_RECOUNT = "steps.adopt_stamp.outcome != 'success'"
 
 
 def _same_setup(left: dict, right: dict) -> bool:
@@ -649,14 +658,19 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     # The environment is that of job test: the same steps, byte for byte.
     by_name = {s["name"]: s for s in test["steps"]}
     own = {s["name"]: s for s in evidence["steps"]}
+    assert _same_setup(own["Checkout"], by_name["Checkout"])
+    # #1919: the installs are the same as in job test, byte for byte, except that
+    # an adopted run skips them (nothing below needs an environment then).
     for name in (
-        "Checkout",
         "Install uv",
         "Set up Python",
         "Install age and openssh-server (backup tests)",
         "Install dependencies",
     ):
-        assert _same_setup(own[name], by_name[name]), name
+        assert all(
+            own[name].get(k) == by_name[name].get(k) for k in ("uses", "with", "run")
+        ), name
+        assert own[name]["if"] == "${{ " + ADOPT_RECOUNT + " }}", name
     assert own["Checkout"]["with"] == {"fetch-depth": 0}
 
     # The two steps: names, ceilings, budget and the gate are as before.
@@ -667,8 +681,10 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert "--budget-seconds 540" in mutations["run"]
     assert "--json-out mutation-report.json" in mutations["run"]
     assert "--json-out red-test-baseline.json" in baseline["run"]
-    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " }}"
-    assert baseline["if"] == "${{ !cancelled() && " + EVIDENCE_GATE + " }}"
+    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
+    assert baseline["if"] == (
+        "${{ !cancelled() && " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
+    )
 
     # The hand-over: whatever files exist, after a red step too, outside the
     # prefix the trusted report reads.
@@ -682,7 +698,7 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
     assert upload["continue-on-error"] is True
     assert upload["with"]["if-no-files-found"] == "ignore"
-    assert upload["with"]["retention-days"] == 1
+    assert upload["with"]["retention-days"] == 3, "a late PR run still finds it"
     assert upload["with"]["path"].split() == [
         "mutation-report.json",
         "red-test-baseline.json",
@@ -711,6 +727,65 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     collect = "Collect AC test and validation results for the Hub"
     assert names.index(download["name"]) < names.index(collect)
     assert names[-1] == "Fail a cancelled run", "the last step stays the last"
+
+
+def test_evidence_adoption_keeps_artifact_contract() -> None:
+    """#1919 AC-3: how a PR run takes the evidence of the dispatch run."""
+    import json
+
+    from hub.services import ci_integrity
+
+    doc = _doc()
+    jobs = doc["jobs"]
+    treedup, evidence = jobs["treedup"], jobs["evidence"]
+
+    assert treedup["outputs"]["adopt"] == "${{ steps.adopt.outputs.adopt }}"
+    assert (
+        treedup["outputs"]["adopted_run_id"]
+        == "${{ steps.adopt.outputs.adopted_run_id }}"
+    )
+    decide = next(s for s in treedup["steps"] if s.get("id") == "adopt")
+    # Only opened/reopened PR runs of a task branch look for a source.
+    assert decide["if"] == (
+        "${{ github.event_name == 'pull_request' && (github.event.action == "
+        "'opened' || github.event.action == 'reopened') && "
+        "startsWith(github.head_ref, 'task-') }}"
+    )
+    assert decide["continue-on-error"] is True, "a failure here is a recount"
+    assert decide["run"].startswith("python3 -I scripts/adopt_evidence.py decide")
+    assert "secrets." not in json.dumps(decide)
+    # The base of the PR run is what the script reads from git, not an input.
+    assert "base.sha" not in json.dumps(decide)
+    assert "scripts/adopt_evidence.py" in ci_integrity.CI_SCRIPTS
+
+    names = [s["name"] for s in evidence["steps"]]
+    own = {s["name"]: s for s in evidence["steps"]}
+    download = own["Download the evidence of the dispatch run (adopt)"]
+    stamp = own["Stamp the adopted evidence with its source run"]
+    assert "download-artifact" in download["uses"]
+    assert download["if"] == "${{ needs.treedup.outputs.adopt == 'true' }}"
+    assert download["with"] == {
+        "name": EVIDENCE_ARTIFACT,
+        "run-id": "${{ needs.treedup.outputs.adopted_run_id }}",
+        "github-token": "${{ github.token }}",
+        "path": ".",
+    }
+    assert download["continue-on-error"] is stamp["continue-on-error"] is True
+    assert stamp["id"] == "adopt_stamp" and download["id"] == "adopt_download"
+    assert stamp["if"] == "${{ steps.adopt_download.outcome == 'success' }}"
+    assert stamp["run"].startswith("python3 -I scripts/adopt_evidence.py stamp")
+    # Before any install: an adopted run installs nothing.
+    assert names.index(download["name"]) < names.index(stamp["name"])
+    assert names.index(stamp["name"]) < names.index("Install uv")
+    # The token of this workflow is read-only on actions.
+    assert doc["permissions"] == {"contents": "read", "actions": "read"}
+    # The hand-over to job test is unchanged: the same upload, the same name.
+    upload = next(
+        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
+    )
+    assert upload["with"]["name"] == EVIDENCE_ARTIFACT
+    assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
+    assert jobs["test"]["needs"] == ["treedup", "pytest", "evidence"]
 
 
 def _run_reporter_as_the_action_does(

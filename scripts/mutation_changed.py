@@ -97,6 +97,11 @@ class Report:
     state: str
     base: str
     reason: str = ""
+    # #1919: what the series was measured against. A PR run may adopt this file
+    # only when these name the base of its own merge commit (adopt_evidence.py).
+    head: str = ""
+    merge_base: str = ""
+    base_tip: str = ""
     functions: list[str] = field(default_factory=list)
     untested: list[str] = field(default_factory=list)
     mutants: int = 0
@@ -110,6 +115,9 @@ class Report:
         return {
             "state": self.state,
             "base": self.base,
+            "head": self.head,
+            "merge_base": self.merge_base,
+            "base_tip": self.base_tip,
             "reason": self.reason,
             "functions": self.functions,
             "untested": self.untested,
@@ -355,6 +363,9 @@ def _collect_targets(
     repo: Path, base: str, tests_dir: Path, report: Report, scratch: Path
 ) -> list[_Target]:
     merge_base = _git(repo, "merge-base", base, "HEAD").strip()
+    report.head = _git(repo, "rev-parse", "HEAD").strip()
+    report.merge_base = merge_base
+    report.base_tip = _git(repo, "rev-parse", base).strip()
     test_root = repo / tests_dir
     texts = {
         f: f.read_text(encoding="utf-8", errors="replace")

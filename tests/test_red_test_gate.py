@@ -437,6 +437,9 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     assert report["state"] == "ran", report
     assert report["head"] == head
     assert report["merge_base"] == _git(repo_dir, "merge-base", "develop", head)
+    # #1919: the tip of the base is recorded too, so a PR run can tell whether
+    # this file was measured against the base of its own merge commit.
+    assert report["base_tip"] == _git(repo_dir, "rev-parse", "develop")
     tests = report["tests"]
     # Новый тест запущен поверх кода базы (там add ещё вычитает) — failed.
     assert tests["tests/test_calc.py::test_add"] == "failed", tests

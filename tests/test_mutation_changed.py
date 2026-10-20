@@ -123,6 +123,28 @@ def test_a_surviving_mutant_of_a_changed_function_is_named(tmp_path):
     assert (repo / "calc.py").read_text() == _HEAD_CALC
 
 
+def test_the_report_names_what_it_was_measured_against(tmp_path):
+    """#1919: head, merge-base and the tip of the base are in the JSON.
+
+    A PR run adopts this file only when merge_base and base_tip equal the base of
+    its own merge commit, so a report without them can never be adopted.
+    """
+    repo = _fixture_repo(tmp_path, _WEAK_TEST)
+
+    proc, report = _run(repo)
+
+    assert proc.returncode == 0, proc.stderr
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    base = subprocess.check_output(
+        ["git", "rev-parse", "base"], cwd=repo, text=True
+    ).strip()
+    assert report["head"] == head
+    assert report["merge_base"] == base
+    assert report["base_tip"] == base
+
+
 def test_a_red_baseline_is_not_reported_as_no_survivors(tmp_path):
     """AC-2: red tests before the series — the series did not run, and it says so."""
     repo = _fixture_repo(tmp_path, _RED_TEST)
