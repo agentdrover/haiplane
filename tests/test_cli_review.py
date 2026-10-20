@@ -64,6 +64,7 @@ def test_cmd_review_verdict_with_findings() -> None:
         agent="reviewer",
         findings_json=json.dumps(findings),
         expected_generation=3,  # #1706: the brief's generation, never filled in by the CLI
+        json=True,  # #1696: the request body is the subject, not the summary
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_review_verdict(args)
@@ -97,6 +98,7 @@ def test_cmd_review_verdict_forwards_auto_draft_flag() -> None:
         findings_json=json.dumps(findings),
         create_tasks_for_out_of_scope=True,
         expected_generation=3,
+        json=True,
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_review_verdict(args)
@@ -128,6 +130,115 @@ def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
     assert rc == 2
     assert "invalid --findings-json" in capsys.readouterr().err
     mock_api.assert_not_called()
+
+
+def _verdict_args(**over) -> argparse.Namespace:
+    base = dict(
+        task_id=42,
+        verdict="approved",
+        comments="",
+        agent="reviewer",
+        findings_json="",
+        create_tasks_for_out_of_scope=False,
+        expected_generation=2,
+        json=False,
+    )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def _run_verdict(args, posted, fetched):
+    """Настоящий cmd_review_verdict; POST и GET подменены. fetched=None — GET упал."""
+    calls: list[tuple] = []
+
+    def fake_api(method, path, body=None, **_):
+        calls.append((method, path))
+        if method == "POST":
+            return posted
+        if fetched is None:
+            raise SystemExit(1)
+        return fetched
+
+    out = StringIO()
+    with patch.object(cli, "_api", fake_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_review_verdict(args)
+    return rc, out.getvalue(), calls
+
+
+def test_review_verdict_prints_one_line_per_outcome() -> None:
+    """AC-1: одна строка и предупреждения; поколение записанного вердикта."""
+    current = {"verdict": "approved", "submission_generation": 2, "is_current": True}
+    stale = {**current, "is_current": False}
+    cases = [
+        # (verdict, POST-тело, GET-тело, ожидаемые фрагменты строки)
+        (
+            "approved",
+            {"status": "running", "review_verdict_generation": 2,
+             "submission_generation": 9},
+            {"status": "running", "latest_review": current},
+            ["approved", "поколение 2 (текущий)", "статус running",
+             "дальше: Continue implementation"],
+        ),
+        (
+            "changes_requested",
+            {"status": "running", "review_verdict_generation": 2,
+             "submission_generation": 9},
+            {"status": "running", "latest_review": current},
+            ["changes_requested", "поколение 2 (текущий)", "статус running"],
+        ),
+        (
+            "approved",
+            {"status": "completed", "review_verdict_generation": 3,
+             "submission_generation": 9},
+            {"status": "completed", "latest_review": current},
+            ["поколение 3 (текущий)", "статус completed",
+             "дальше: No action required"],
+        ),
+        (
+            "approved",
+            {"status": "needs_decision", "review_verdict_generation": 4,
+             "submission_generation": 9},
+            {"status": "needs_decision", "latest_review": current},
+            ["поколение 4 (текущий)", "статус needs_decision",
+             "дальше: Waiting for a human"],
+        ),
+        (
+            "approved",
+            {"status": "running", "review_verdict_generation": 2,
+             "submission_generation": 9,
+             "lifecycle_hint": "Код ушёл из-под одобрения: вершина 123\nsha_note"},
+            {"status": "running", "latest_review": stale},
+            ["поколение 2 (устарел)", "статус running",
+             "Код ушёл из-под одобрения: вершина 123", "sha_note"],
+        ),
+    ]  # fmt: skip
+    for verdict, posted, fetched, fragments in cases:
+        args = _verdict_args(verdict=verdict)
+        rc, out, calls = _run_verdict(args, posted, fetched)
+        assert rc == 0
+        first = out.splitlines()[0]
+        for fragment in fragments:
+            assert fragment in out, (verdict, posted["status"], fragment, out)
+        assert first.startswith(verdict), first
+        assert "\n  " not in out, "no JSON dump"
+        assert calls == [
+            ("POST", "/api/tasks/42/review-verdict"),
+            ("GET", "/api/tasks/42"),
+        ]
+        # --json: the REST body as before, no second request.
+        rc, out_json, calls = _run_verdict(_verdict_args(verdict=verdict, json=True),
+                                           posted, fetched)  # fmt: skip
+        assert rc == 0 and json.loads(out_json) == posted
+        assert calls == [("POST", "/api/tasks/42/review-verdict")]
+
+
+def test_review_verdict_line_says_unknown_when_the_task_is_unreadable() -> None:
+    """Не прочитали задачу после записи: «неизвестно», а не «устарел»."""
+    posted = {"status": "running", "review_verdict_generation": 2}
+    rc, out, _ = _run_verdict(_verdict_args(), posted, None)
+    assert rc == 0
+    assert "поколение 2 (текущесть неизвестна)" in out
+    assert "устарел" not in out
 
 
 def test_cmd_steward_judgement() -> None:
