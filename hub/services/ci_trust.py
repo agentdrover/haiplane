@@ -432,9 +432,10 @@ _PROJECTION_KEYS = (
 # both are the state of one moment (a statement is atomic; a read transaction on
 # the shared connection would hold other coroutines' writes hostage).
 _SNAPSHOT_SQL = (
-    "SELECT a.*, "
-    + ", ".join(f"r.{k} AS p_{k}" for k in _PROJECTION_KEYS)
-    + " FROM ci_report_attempts a LEFT JOIN ci_run_reports r "
+    "SELECT a.*, r.attempt_key AS p_attempt_key, r.trust AS p_trust, "
+    "r.contract_fp AS p_contract_fp, r.mutations AS p_mutations, "
+    "r.baseline AS p_baseline, r.provenance AS p_provenance "
+    "FROM ci_report_attempts a LEFT JOIN ci_run_reports r "
     "ON r.task_id=a.task_id AND r.head_sha=a.head_sha "
     "WHERE a.task_id=? AND a.head_sha=?"
 )
@@ -476,23 +477,22 @@ def _usable_block(
     return block if ok else None
 
 
-async def _picks(
-    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any]
-) -> tuple[str, dict[str, BorrowedBlock]]:
-    """What the snapshot of this moment lets the brief borrow, per column, and the contract."""
-    rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
-    # The contract lives in another table: read AFTER the snapshot and compared
-    # with it, so a change in between reads as "not confirmed", never as confirmed.
-    fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
+def _picks(
+    rows: list[dict[str, Any]],
+    head_sha: str,
+    current: Mapping[str, Any],
+    fingerprint: str,
+) -> dict[str, BorrowedBlock]:
+    """What one snapshot lets the brief borrow, per column. Pure: no read, no await."""
     if not rows:
-        return fingerprint, {}
+        return {}
     projection = {k: rows[0][f"p_{k}"] for k in _PROJECTION_KEYS}
     if any(projection[k] != current.get(k) for k in _PROJECTION_KEYS):
-        return fingerprint, {}  # not the row the brief is showing
+        return {}  # not the row the brief is showing
     if trust_of(projection, fingerprint)[0] != VERIFIED or not run_succeeded(
         projection
     ):
-        return fingerprint, {}
+        return {}
     picks: dict[str, BorrowedBlock] = {}
     for column in BORROWABLE_STATES:
         if _json_map(projection[column]):
@@ -507,7 +507,7 @@ async def _picks(
                 best = (order, found)
         if best is not None:
             picks[column] = best[1]
-    return fingerprint, picks
+    return picks
 
 
 async def borrowed_evidence_blocks(
@@ -524,9 +524,10 @@ async def borrowed_evidence_blocks(
 
     ``current`` is the confirmed projection row the brief shows. Both blocks are
     decided from ONE snapshot (attempts and projection in one statement); the
-    snapshot is read again and the answer stands only if nothing moved (the
-    chosen sources, the projection, the contract): any movement means no
-    borrowing at all, i.e. the answer the brief gave before. A candidate must be
+    snapshot is read again and the answer stands only if the two agree (the
+    chosen sources and the projection): any movement means no borrowing at all,
+    i.e. the answer the brief gave before. The second statement is the
+    consistency boundary, nothing is awaited after it. A candidate must be
     verified under the current contract, ``run_conclusion=success``, carry
     ``head == head_sha`` and an informative state; of several the newest by
     ``(run_id, run_attempt)`` wins. The projection must be verified and
@@ -534,10 +535,20 @@ async def borrowed_evidence_blocks(
     """
     if not head_sha or not current:
         return {}
-    first = await _picks(db, task_id, head_sha, current)
-    if not first[1]:
-        return {}
-    return first[1] if await _picks(db, task_id, head_sha, current) == first else {}
+    # The contract is captured BEFORE the snapshots, as a refresh does (#1848).
+    fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
+    args = (task_id, head_sha)
+    first = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, args)]
+    second = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, args)]
+    # Nothing is awaited from here: the second statement is the consistency
+    # boundary. The answer is the state at that moment, and only if the first
+    # snapshot said the same; a write after it is a later moment.
+    again = _picks(second, head_sha, current, fingerprint)
+    return (
+        again
+        if again and again == _picks(first, head_sha, current, fingerprint)
+        else {}
+    )
 
 
 # ---- which attempt is current ----------------------------------------------

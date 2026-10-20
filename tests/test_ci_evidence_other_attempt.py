@@ -531,3 +531,18 @@ async def test_one_snapshot_and_its_recheck_serve_both_blocks(db, monkeypatch):
     assert reads["n"] == 2, (
         "one snapshot and its recheck for BOTH blocks, not per block"
     )
+
+
+async def test_the_second_statement_is_the_consistency_boundary(db, monkeypatch):
+    """A write after the second read is a later moment: the answer is whole, not a mix."""
+
+    async def action():
+        await _replace_the_source(db, task_id)
+
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+    _after_read(monkeypatch, "ci_report_attempts", 2, action)
+    evidence = await _evidence(db, task_id)
+    assert evidence.mutations.state == evidence.baseline.state == "received"
+    assert "из попытки 1001/1" in evidence.mutations.reason
+    assert "из попытки 1001/1" in evidence.baseline.reason
