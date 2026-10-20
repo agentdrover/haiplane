@@ -1299,6 +1299,8 @@ CIRCLE_DEEP_STOP_KEY = "circle_deep_stop"
 CIRCLE_STOP_REASON = "deep приостановлен до решения человека"
 #: Событие остановки — одно на поколение; по нему же и дедуп (урок #1330).
 CIRCLE_STOP_EVENT = "review_circle_deep_stopped"
+#: Начало алерта «добор/вторая ось не куплены: круг остановил deep» (#1432).
+FORCED_DEEP_CIRCLE_MARK = "Deep для этой сдачи не заказан"
 
 
 def circle_deep_stop_of(policy: dict[str, Any]) -> int | None:
@@ -1422,7 +1424,7 @@ async def _forced_deep_past_circle(
         task_id,
         "hub",
         "alert",
-        f"Deep для этой сдачи не заказан: {circle_stop_reason(stop[0])} — "
+        f"{FORCED_DEEP_CIRCLE_MARK}: {circle_stop_reason(stop[0])} — "
         f"{what} не куплен (#1432).",
     )
     await db.commit()
@@ -1509,6 +1511,9 @@ async def apply_random_deep_lot(
 DEEP_DAILY_CAP_KEY = "deep_daily_cap"
 #: Слова причины понижения; по ним сводка ревью находит такие сдачи.
 DEEP_CAP_REASON_MARK = "суточный потолок"
+#: Начало алерта «добор/вторая ось не куплены: потолок deep» (#1414). Читает
+#: ``ladder_view.ladder_why`` (#1925): текст и читатель держатся одной константой.
+FORCED_DEEP_CAP_MARK = "Облачный deep для этой сдачи не заказан"
 
 
 def _cap_value(raw: Any) -> int | None:
@@ -1612,7 +1617,7 @@ async def _forced_deep_over_cap(
         int(task["id"]),
         "hub",
         "alert",
-        f"Облачный deep для этой сдачи не заказан: {DEEP_CAP_REASON_MARK} deep "
+        f"{FORCED_DEEP_CAP_MARK}: {DEEP_CAP_REASON_MARK} deep "
         f"исчерпан — {what} не куплен (потолок {cap} в сутки на проект, #1414).",
     )
     await db.commit()
@@ -2349,6 +2354,16 @@ async def _submission_diff(
 # problem for a person to look at, not a reason to keep buying runs.
 REVIEW_LADDER_MAX_STEPS = 2
 
+#: Слова алертов лестницы (#879), по которым ``ladder_view.ladder_why`` (#1925)
+#: находит записанный исход: потолок ступеней и «выше подниматься некуда».
+LADDER_CEILING_MARK = "потолок лестницы"
+LADDER_NO_TOP_UP_MARK = "добор не положен"
+LADDER_ORDER_FAILED_MARK = "поставить не удалось"
+#: Слова алертов второй оси (#1243, #1587): оси нет вовсе / облако после
+#: локального deep запрещено.
+SECOND_AXIS_UNAVAILABLE_MARK = "вторая ось (другая модель) недоступна"
+NO_CLOUD_AFTER_LOCAL_MARK = "облако не заказано, решает человек"
+
 
 #: Окно, за которое считается повторяемость отказов среды (#1238).
 ENVIRONMENT_REFUSAL_WINDOW_DAYS = 30
@@ -2531,7 +2546,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             task_id,
             "hub",
             "alert",
-            f"Неполный отчёт после {steps} прогон(ов): потолок лестницы "
+            f"Неполный отчёт после {steps} прогон(ов): {LADDER_CEILING_MARK} "
             f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
             "Ревью этой сдачи так и не состоялось полностью — решение за "
             "человеком (#879)." + _ladder_cause_note(report),
@@ -2548,7 +2563,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             task_id,
             "hub",
             "alert",
-            "Неполный отчёт, добор не положен: профиль "
+            f"Неполный отчёт, {LADDER_NO_TOP_UP_MARK}: профиль "
             + (f"«{profile}»" if profile else "не заявлен")
             + " — выше дешёвого подниматься некуда. Решение за человеком "
             "(#879)." + _ladder_cause_note(report),
@@ -2567,7 +2582,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             "hub",
             "alert",
             "Дешёвый прогон сдал неполный отчёт, а добор тяжёлым профилем "
-            "поставить не удалось. Решение за человеком (#879).",
+            f"{LADDER_ORDER_FAILED_MARK}. Решение за человеком (#879).",
         )
         await db.commit()
     return dispatched
@@ -2766,8 +2781,8 @@ async def _ask_a_stronger_model(
         await _alert(
             db,
             task_id,
-            "Неполный отчёт профиля «deep»: облако не заказано, решает "
-            f"человек — {no_cloud}. Вторая ось переспрашивает другой "
+            f"Неполный отчёт профиля «deep»: {NO_CLOUD_AFTER_LOCAL_MARK} "
+            f"— {no_cloud}. Вторая ось переспрашивает другой "
             "моделью только неполный ОБЛАЧНЫЙ отчёт: неполнота локального "
             "deep не оплачивается облачным прогоном (#1587)."
             + _ladder_cause_note(report),
@@ -2781,7 +2796,7 @@ async def _ask_a_stronger_model(
             db,
             task_id,
             "Неполный отчёт профиля «deep»: выше дешёвого подниматься некуда, "
-            f"а вторая ось (другая модель) недоступна — {blocked}. Решение "
+            f"а {SECOND_AXIS_UNAVAILABLE_MARK} — {blocked}. Решение "
             "за человеком (#879, #1243)." + _ladder_cause_note(report),
         )
         return False
@@ -6142,6 +6157,17 @@ async def principal_of_token(db: aiosqlite.Connection, raw: str) -> int | None:
         (hash_api_key(token),),
     )
     return int(dict(rows[0])["principal_id"]) if rows else None
+
+
+async def report_of_dispatch(
+    db: aiosqlite.Connection, task_id: int, generation: int, dispatch: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Отчёт, которого ждёт ЭТОТ заказ, или None — заказ ещё без своего отчёта.
+
+    Публичное имя ``_dispatch_report`` для читателей вне диспетчера (#1925):
+    правило «чей отчёт» одно, второй копии не заводим.
+    """
+    return await _dispatch_report(db, task_id, generation, dispatch)
 
 
 def _expected_principal(dispatch: dict[str, Any] | None) -> int | None:
