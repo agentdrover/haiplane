@@ -3456,8 +3456,12 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
         forge: str = "",
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         """Попросить форж о прогоне на вершине ``branch`` (#1197).
+
+        ``on_send`` (#1914) вызывается ровно перед отправкой платного запроса:
+        до него отказ или таймаут не тратят попытку.
 
         Роутинг тот же, что у всех остальных вопросов к форжу: кто умеет,
         тот отвечает, а кто не умеет — говорит об этом словом
@@ -3465,7 +3469,11 @@ class GitOpsIntegration:
         оно жило бы в вызывающем и разъезжалось бы с реализациями.
         """
         return await self._forge_for(forge).request_ci_run(
-            branch, repo=repo, gh_repo=gh_repo, workflow_path=workflow_path
+            branch,
+            repo=repo,
+            gh_repo=gh_repo,
+            workflow_path=workflow_path,
+            on_send=on_send,
         )
 
     async def remote_heads(
