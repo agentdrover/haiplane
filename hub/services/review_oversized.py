@@ -13,6 +13,10 @@
 Второй — не разбор прозы (#1238): строка сверяется с ЗАКРЫТЫМ списком из
 карточки задачи, после фиксированного префикса, по равенству. Подстрока,
 другой регистр префикса и чужое имя не засчитываются.
+
+Диапазон, который дифф показывает не целиком (функция обрывается на границе
+ханка, а файл не новый), помечен ``partial``: «нашли начало» не выдаётся за
+«нашли функцию».
 """
 
 from __future__ import annotations
@@ -20,19 +24,29 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from hub.services.test_locator import PYTEST, runner_of
 
 #: Префикс строки ``lost_dimensions``, которой ревьюер называет непрочитанный тест AC.
 UNREAD_PREFIX = "ac_test_unread: "
 
-_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 _DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)\s*\(")
 _CLASS = re.compile(r"^(\s*)class\s+(\w+)\b")
 _PARAM = re.compile(r"\[.*\]$")
 
 NOT_FOUND = "не найден в диффе"
+PARTIAL = "в диффе виден не весь тест"
+
+
+class Row(NamedTuple):
+    """Строка новой стороны диффа: номер в файле, текст, заголовок её ханка."""
+
+    no: int
+    text: str
+    ctx: str  # то, что git пишет после ``@@``: ближайшая строка без отступа
+    eof: bool  # ханк нового файла: конец ханка — конец файла
 
 
 @dataclass(frozen=True)
@@ -43,6 +57,7 @@ class AcTestSpan:
     path: str
     start: int | None = None
     end: int | None = None
+    partial: bool = False
     lines: tuple[tuple[int, str], ...] = ()
 
     @property
@@ -53,7 +68,8 @@ class AcTestSpan:
         """Строка блока «ЧИТАТЬ ПЕРВЫМИ» для этого теста."""
         if not self.found:
             return f"ЧИТАТЬ ПЕРВЫМИ: {self.ref} — {NOT_FOUND}"
-        return f"ЧИТАТЬ ПЕРВЫМИ: {self.path}:{self.start}–{self.end} ({self.ref})"
+        tail = f" — {PARTIAL}" if self.partial else ""
+        return f"ЧИТАТЬ ПЕРВЫМИ: {self.path}:{self.start}–{self.end} ({self.ref}){tail}"
 
 
 def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -66,13 +82,13 @@ def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:
     return seen
 
 
-def _new_side(section: str) -> list[tuple[int, str]]:
-    """Строки новой стороны секции файла: ``[(номер строки файла, текст)]``.
+def _new_side(section: str) -> list[Row]:
+    """Строки новой стороны секции файла.
 
     Тело ханка читается по его счётчикам, как у ``diff_scan``: строка ``+++``
     внутри тела — добавленная строка, а не заголовок.
     """
-    out: list[tuple[int, str]] = []
+    out: list[Row] = []
     lines = section.splitlines()
     i = 0
     while i < len(lines):
@@ -80,23 +96,22 @@ def _new_side(section: str) -> list[tuple[int, str]]:
         i += 1
         if not m:
             continue
-        old = int(m.group(1)) if m.group(1) is not None else 1
-        new = int(m.group(3)) if m.group(3) is not None else 1
-        at = int(m.group(2))
+        old = int(m.group(2)) if m.group(2) is not None else 1
+        new = int(m.group(4)) if m.group(4) is not None else 1
+        eof = m.group(1) == "0" and old == 0
+        at, ctx = int(m.group(3)), m.group(5)
         while i < len(lines) and (old > 0 or new > 0):
             line = lines[i]
             i += 1
             tag, text = line[:1], line[1:]
             if tag == "+":
-                out.append((at, text))
+                out.append(Row(at, text, ctx, eof))
                 at += 1
                 new -= 1
             elif tag == "-":
                 old -= 1
-            elif tag == "\\":
-                continue
-            else:
-                out.append((at, text))
+            elif tag != "\\":
+                out.append(Row(at, text, ctx, eof))
                 at += 1
                 old -= 1
                 new -= 1
@@ -107,57 +122,149 @@ def _indent(text: str) -> int:
     return len(text) - len(text.lstrip())
 
 
-def _signature_end(rows: Sequence[tuple[int, str]], at: int) -> int:
-    """Индекс последней строки сигнатуры, начатой в ``at`` (скобки могут быть многострочные)."""
+def _scan(text: str, depth: int) -> tuple[int, bool]:
+    """``(глубина скобок в конце строки, был ли двоеточие вне скобок)``.
+
+    Строки в одинарных кавычках и ``#``-комментарий скобок и двоеточий не дают.
+    """
+    quote, colon = "", False
+    prev = ""
+    for ch in text:
+        if quote:
+            if ch == quote and prev != "\\":
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#":
+            break
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ":" and depth <= 0:
+            colon = True
+        prev = ch
+    return depth, colon
+
+
+def _header_end(rows: Sequence[Row], at: int) -> int:
+    """Индекс последней строки заголовка ``def``/``class``, начатого в ``at``."""
     depth = 0
     for k in range(at, len(rows)):
-        if k > at and rows[k][0] != rows[k - 1][0] + 1:
+        if k > at and rows[k].no != rows[k - 1].no + 1:
             return k - 1
-        text = rows[k][1]
-        depth += sum(text.count(c) for c in "([{") - sum(text.count(c) for c in ")]}")
-        if depth <= 0 and text.rstrip().endswith(":"):
+        depth, colon = _scan(rows[k].text, depth)
+        if depth <= 0 and colon:
             return k
     return len(rows) - 1
 
 
-def _block_end(rows: Sequence[tuple[int, str]], at: int) -> int:
-    """Индекс последней непустой строки блока, чей заголовок стоит в ``at``."""
-    base = _indent(rows[at][1])
-    last = _signature_end(rows, at)
-    for k in range(last + 1, len(rows)):
-        number, text = rows[k]
-        if number != rows[k - 1][0] + 1:
-            break  # дальше дифф не видел строк: конец известного
-        if text.strip() and _indent(text) <= base:
+def _balanced(rows: Sequence[Row]) -> bool:
+    depth = 0
+    for row in rows:
+        depth, _ = _scan(row.text, depth)
+    return depth == 0
+
+
+def _first_line(rows: Sequence[Row], at: int) -> int:
+    """Индекс первой строки блока с его декораторами (в том числе многострочными)."""
+    base, start, k = _indent(rows[at].text), at, at - 1
+    while k >= 0 and rows[k].no == rows[k + 1].no - 1:
+        text = rows[k].text
+        if _indent(text) == base and text.lstrip().startswith("@"):
+            if _balanced(rows[k:at]):
+                start = k
+        elif (
+            text.strip() and _indent(text) <= base and not text.lstrip().startswith(")")
+        ):
             break
-        if text.strip():
+        elif not text.strip():
+            break
+        k -= 1
+    return start
+
+
+def _block_end(rows: Sequence[Row], at: int, module_level: bool) -> tuple[int, bool]:
+    """``(индекс последней строки блока, показан ли он дифф-ом не целиком)``.
+
+    Блок кончается строкой без отступа глубже его заголовка. Разрыв между ханками
+    пересекается только у функции верхнего уровня, когда git назвал её же
+    заголовком следующего ханка; иначе блок обрывается и считается частичным.
+    Целым он считается, когда его закрыла видимая строка с меньшим отступом или
+    когда ханк — целый новый файл.
+    """
+    base = _indent(rows[at].text)
+    name = _DEF.match(rows[at].text)
+    last = _header_end(rows, at)
+    own = rows[at].text.strip().split("(")[0]
+    for k in range(last + 1, len(rows)):
+        row = rows[k]
+        if row.no != rows[k - 1].no + 1:
+            if not (module_level and row.ctx.startswith(own) and name):
+                return last, True
+        if row.text.strip():
+            if _indent(row.text) <= base:
+                return last, False
             last = k
-    return last
+    return last, not rows[last].eof
 
 
-def _find(
-    rows: Sequence[tuple[int, str]], owner: str, name: str
-) -> tuple[int, int] | None:
-    """``(индекс def, индекс конца)`` функции ``name`` (в классе ``owner``, если задан)."""
-    lo, hi, floor = 0, len(rows), -1
-    if owner:
-        for k, (_, text) in enumerate(rows):
-            m = _CLASS.match(text)
-            if m and m.group(2) == owner:
-                lo, floor = k + 1, len(m.group(1))
-                hi = len(rows)
-                for j in range(k + 1, len(rows)):
-                    if rows[j][1].strip() and _indent(rows[j][1]) <= floor:
-                        hi = j
-                        break
-                break
-        else:
-            return None
+def _body_indent(rows: Sequence[Row], header_last: int) -> int:
+    for row in rows[header_last + 1 :]:
+        if row.text.strip():
+            return _indent(row.text)
+    return 0
+
+
+def _find_def(
+    rows: Sequence[Row], lo: int, hi: int, name: str, indent: int | None
+) -> int | None:
     for k in range(lo, hi):
-        m = _DEF.match(rows[k][1])
-        if m and m.group(2) == name and (not owner or len(m.group(1)) > floor):
-            return k, _block_end(rows, k)
+        m = _DEF.match(rows[k].text)
+        if m and m.group(2) == name and (indent is None or len(m.group(1)) == indent):
+            return k
     return None
+
+
+def _find(rows: Sequence[Row], owner: str, name: str) -> tuple[int, int, bool] | None:
+    """``(индекс начала с декораторами, индекс конца, частично ли)`` или ``None``."""
+    if not owner:
+        at = _find_def(rows, 0, len(rows), name, 0)
+        if at is None:
+            return None
+        end, partial = _block_end(rows, at, True)
+        return _first_line(rows, at), end, partial
+    for k, row in enumerate(rows):
+        m = _CLASS.match(row.text)
+        if m and m.group(2) == owner and not m.group(1):
+            head = _header_end(rows, k)
+            hi = len(rows)
+            for j in range(head + 1, len(rows)):
+                if rows[j].text.strip() and _indent(rows[j].text) == 0:
+                    hi = j
+                    break
+            at = _find_def(rows, head + 1, hi, name, _body_indent(rows, head))
+            break
+    else:
+        # Класса в диффе нет, но git назвал его заголовком ханка (-U0).
+        cls = [
+            j
+            for j, row in enumerate(rows)
+            if (m := _CLASS.match(row.ctx)) and m.group(2) == owner and not m.group(1)
+        ]
+        at = next(
+            (
+                found
+                for j in cls
+                if (found := _find_def(rows, j, j + 1, name, None)) is not None
+                and _indent(rows[found].text) > 0
+            ),
+            None,
+        )
+    if at is None:
+        return None
+    end, partial = _block_end(rows, at, False)
+    return _first_line(rows, at), end, partial
 
 
 def _parse_ref(ref: str) -> tuple[str, str, str] | None:
@@ -165,7 +272,7 @@ def _parse_ref(ref: str) -> tuple[str, str, str] | None:
     if runner_of(ref) != PYTEST:
         return None
     path, _, node = ref.partition("::")
-    parts = [_PARAM.sub("", part) for part in node.split("::") if part]
+    parts = [part for part in _PARAM.sub("", node).split("::") if part]
     if not parts or len(parts) > 2:
         return None
     return path, (parts[0] if len(parts) == 2 else ""), parts[-1]
@@ -185,20 +292,16 @@ def ac_test_spans(
     for ref in refs:
         parsed = _parse_ref(ref)
         text = by_path.get(parsed[0]) if parsed else None
-        found = None
-        if parsed and text is not None:
-            rows = _new_side(text)
-            hit = _find(rows, parsed[1], parsed[2])
-            if hit is not None:
-                begin, end = hit
-                found = AcTestSpan(
-                    ref,
-                    parsed[0],
-                    rows[begin][0],
-                    rows[end][0],
-                    tuple(rows[begin : end + 1]),
-                )
-        out.append(found or AcTestSpan(ref, parsed[0] if parsed else ""))
+        rows = _new_side(text) if parsed and text else []
+        hit = _find(rows, parsed[1], parsed[2]) if parsed and rows else None
+        if hit is None or parsed is None:
+            out.append(AcTestSpan(ref, parsed[0] if parsed else ""))
+            continue
+        begin, end, partial = hit
+        body = tuple((r.no, r.text) for r in rows[begin : end + 1])
+        out.append(
+            AcTestSpan(ref, parsed[0], rows[begin].no, rows[end].no, partial, body)
+        )
     return out
 
 
@@ -208,22 +311,33 @@ def first_block(spans: Sequence[AcTestSpan]) -> str:
 
 
 def cutout(span: AcTestSpan) -> str:
-    """Функция теста AC вырезкой: строки файла с номерами."""
-    body = "\n".join(f"{number}: {text}" for number, text in span.lines)
+    """Функция теста AC вырезкой: строки файла с номерами, разрывы названы."""
+    out: list[str] = []
+    prev = None
+    for number, text in span.lines:
+        if prev is not None and number != prev + 1:
+            out.append("…")
+        out.append(f"{number}: {text}")
+        prev = number
+    tail = f" [{PARTIAL}]" if span.partial else ""
     return (
-        f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end}) ===\n"
-        f"{body}\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
+        f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end})"
+        f"{tail} ===\n" + "\n".join(out) + "\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
     )
 
 
 def cutouts_within(
-    spans: Sequence[AcTestSpan], omitted: Collection[str], budget: int
+    spans: Sequence[AcTestSpan], absent: Collection[str], budget: int
 ) -> tuple[list[str], list[str]]:
-    """``(вырезки, непрочитанные ref)`` для тестов в файлах, что не вошли в промт."""
+    """``(вырезки, непрочитанные ref)`` для тестов в файлах, которых нет в промте.
+
+    ``absent`` — файлы, что не вошли в потолок или выпали из дельты. Тест, чей
+    файл в промте есть целиком, вырезки не просит.
+    """
     taken: list[str] = []
     unread: list[str] = []
     for span in spans:
-        if not span.found or span.path not in omitted:
+        if not span.found or span.path not in absent:
             continue
         text = cutout(span)
         if len(text) <= budget:

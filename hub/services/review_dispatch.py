@@ -391,14 +391,18 @@ def _inline_diff_lines(
     даёт ревьюеру функции этих тестов вырезкой по остатку потолка; вырезка, что
     не влезла, названа непрочитанным тестом AC.
     """
+    every = diff_file_sections(diff)
     sections = [
         (path, text)
-        for path, text in diff_file_sections(diff)
+        for path, text in every
         if not path
         or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
     text, omitted = fit_file_sections(sections, ceiling)
-    cuts, unread = cutouts_within(ac_spans or [], omitted, ceiling - len(text))
+    # Файл, которого нет в промте, — не влез в потолок ИЛИ выпал из дельты.
+    present = {path for path, _ in sections} - set(omitted)
+    absent = {path for path, _ in every if path and path not in present}
+    cuts, unread = cutouts_within(ac_spans or [], absent, ceiling - len(text))
     lines = []
     if omitted:
         lines.append(
@@ -787,12 +791,17 @@ def _oversized_paragraph(oversized: list[tuple[str, int]], has_ac_tests: bool) -
 
 
 def _plan_oversized(
-    kept: str, lines: list[str], ac_test_refs: list[str] | None
+    kept: str,
+    lines: list[str],
+    ac_test_refs: list[str] | None,
+    ac_diff: str | None = None,
 ) -> tuple[list[tuple[str, int]], list[AcTestSpan]]:
     """Файлы выше потолка и тесты AC в них; дописывает блок и абзац в ``lines`` (#1933).
 
     Блок «ЧИТАТЬ ПЕРВЫМИ» встаёт в начало, раньше команды и текста диффа.
-    Диапазоны ищутся в полном ``kept``-диффе, как считается и сам oversized.
+    Диапазоны ищутся в полном ``kept``-диффе, как считается и сам oversized;
+    ``ac_diff`` — дифф на закреплённом sha сдачи (облачный заказ: номера строк
+    должны быть строками файла на коммите сдачи, а не на сдвинувшейся ветке).
     """
     oversized = [
         (path, count)
@@ -801,9 +810,8 @@ def _plan_oversized(
     ]
     if not oversized:
         return oversized, []
-    spans = (
-        ac_test_spans(diff_file_sections(kept), ac_test_refs) if ac_test_refs else []
-    )
+    source = kept if ac_diff is None else split_generated(ac_diff)[0]
+    spans = ac_test_spans(diff_file_sections(source), ac_test_refs or [])
     if spans:
         lines.insert(0, first_block(spans))
     lines.append(_oversized_paragraph(oversized, bool(spans)))
@@ -822,6 +830,7 @@ def diff_plan(
     inline_ceiling: int | None = None,
     snapshot_ok: bool = False,
     ac_test_refs: list[str] | None = None,
+    ac_diff: str | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -932,7 +941,7 @@ def diff_plan(
             "Исключены как сгенерированные (их никто не писал и не будет "
             f"править): {', '.join(dropped)}."
         )
-    oversized, spans = _plan_oversized(kept, lines, ac_test_refs)
+    oversized, spans = _plan_oversized(kept, lines, ac_test_refs, ac_diff)
     note_bits = []
     if inline_ceiling is not None:
         inline, omitted = _inline_diff_lines(
@@ -3752,6 +3761,7 @@ async def prepare_review_order(
     ac_refs = task_ac_test_refs(
         [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     )
+    ac_diff = None if inline_diff or not ac_refs else await _pinned_diff(db, task)
     diff_block, diff_note = diff_plan(
         plan_diff,
         base,
@@ -3764,6 +3774,7 @@ async def prepare_review_order(
         config.LOCAL_REVIEW_DIFF_CHAR_CEILING if inline_diff else None,
         snapshot_ok=snapshot is not None and snapshot.state == "ok",
         ac_test_refs=ac_refs,
+        ac_diff=ac_diff,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -3863,6 +3874,16 @@ def snapshot_note(snapshot: SnapshotArchive | None) -> str:
             f"ревьюеру только для чтения{left_out} (#1599). "
         )
     return f"Снимок исходников не выдан: {snapshot.reason} (#1599). "
+
+
+async def _pinned_diff(db: aiosqlite.Connection, task: dict[str, Any]) -> str | None:
+    """Дифф на закреплённом sha сдачи для номеров строк облачного блока (#1933).
+
+    ``None`` — закрепления нет или дифф не прочитался: номера тогда берутся из
+    диффа ветки, того же, что читает облачный ревьюер командой.
+    """
+    sha = (task.get("submission_sha") or "").strip()
+    return await _submission_diff(db, int(task["id"]), sha) if sha else None
 
 
 async def _subject_diff(

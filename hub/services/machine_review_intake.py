@@ -274,6 +274,18 @@ async def record_machine_review(
     # on the same terms. A harness that invents one would win over the derived
     # value silently, and an id nobody can reproduce identifies nothing.
     services.refuse_supplied_uid(body.unresolved, section="unresolved")
+    # #1933: ревьюер назвал непрочитанный тест AC строкой lost_dimensions - а
+    # сам сказал incomplete=false. Непрочитанное доказательство AC не бывает
+    # полным отчётом; признак поднимается, как raw_count ниже, а не отвергается:
+    # находки такого отчёта настоящие. Поднимается в самом body, до первого
+    # читателя: исход, событие и журнал читают body.incomplete, не локальную.
+    if not body.incomplete and names_unread_ac_test(body.lost_dimensions):
+        log.warning(
+            "machine review for task #%s names an unread AC test but says "
+            "incomplete=false; stored as incomplete",
+            task_id,
+        )
+        body = body.model_copy(update={"incomplete": True})
     # #1688: a "suspicious" answer about CI integrity is a confirmed high finding.
     body = ci_integrity.with_suspicion_finding(body)
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
@@ -312,17 +324,6 @@ async def record_machine_review(
     # audit signal (#828), where it belongs — beside the numbers, not
     # pretending to bound them.
     incomplete = body.incomplete
-    # #1933: ревьюер назвал непрочитанный тест AC строкой lost_dimensions - а
-    # сам сказал incomplete=false. Непрочитанное доказательство AC не бывает
-    # полным отчётом; признак поднимается, как raw_count выше, а не отвергается:
-    # находки такого отчёта настоящие.
-    if not incomplete and names_unread_ac_test(body.lost_dimensions):
-        log.warning(
-            "machine review for task #%s names an unread AC test but says "
-            "incomplete=false; stored as incomplete",
-            task_id,
-        )
-        incomplete = True
     # #728: the twin of the human path's guard. hub_submit_review refuses a
     # verdict from the implementer and the brief warns before the effort is
     # spent, while this door had no check at all — so the rule was bypassable
