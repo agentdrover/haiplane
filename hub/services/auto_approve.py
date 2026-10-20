@@ -31,6 +31,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import DoRCheckItem, RiskClass
+from hub.services.dor_snapshot import persisted_dor_is_current
 from hub.services.result_kind import automation_not_applicable
 from hub.services.project_policy import (
     freeze_admission,
@@ -143,23 +144,30 @@ def _touches_ladder(areas: list[str]) -> list[str]:
 
 
 _FREEZE_NOTE_PREFIX = "Автоодобрение отклонено заморозкой проекта (dor=auto): "
+_STALE_DOR_NOTE_PREFIX = "Автоодобрение пропущено (dor=auto): "
+
+
+async def _note_refusal(
+    db: aiosqlite.Connection, task_id: int, prefix: str, reason: str
+) -> None:
+    """Строка ленты об отказе; не повторяется, пока причина та же.
+
+    Функция зовётся при каждой записи готовности, и тот же отказ на каждый
+    вызов засорил бы карточку одинаковыми строками.
+    """
+    content = prefix + reason
+    for update in reversed(await repo.get_task_updates(db, task_id)):
+        if str(update["content"]).startswith(prefix):
+            if update["content"] == content:
+                return
+            break
+    await repo.add_task_update(db, task_id, "hub", "status", content, author_kind="hub")
 
 
 async def _note_freeze_refusal(
     db: aiosqlite.Connection, task_id: int, reason: str
 ) -> None:
-    """Строка ленты об отказе заморозки; не повторяется, пока причина та же.
-
-    Функция зовётся при каждой записи готовности, и тот же отказ на каждый
-    вызов засорил бы карточку одинаковыми строками.
-    """
-    content = _FREEZE_NOTE_PREFIX + reason
-    for update in reversed(await repo.get_task_updates(db, task_id)):
-        if str(update["content"]).startswith(_FREEZE_NOTE_PREFIX):
-            if update["content"] == content:
-                return
-            break
-    await repo.add_task_update(db, task_id, "hub", "status", content, author_kind="hub")
+    await _note_refusal(db, task_id, _FREEZE_NOTE_PREFIX, reason)
 
 
 async def maybe_auto_approve(
@@ -191,6 +199,12 @@ async def maybe_auto_approve(
     ``test_reading_a_card_never_opens_a_draft``, not by this paragraph:
     review #313 pointed out that moving the call one floor down left the
     whole suite green, and the measurement agreed (3475 passed).
+
+    ЕЩЁ ОДНО УСЛОВИЕ (#1611): сохранённый ``dor_passed`` принимается, только
+    если записан из нынешних входов - отпечаток в строке
+    (``readiness_evidence``) равен отпечатку снимка, снятого здесь же, под
+    локом вызывающего. Обе двери сверяются одним местом: отдельной проверки
+    «у каждого вызывающего» нет, и третья дверь её не пропустит.
 
     ``dor_checks`` are the checks the caller ALREADY computed and gated on
     (#1456). The statement-path record is written from them: this runs under
@@ -274,6 +288,22 @@ async def maybe_auto_approve(
     refusal = freeze_admission(project, row["work_type"], row["freeze_rationale"] or "")
     if refusal is not None:
         await _note_freeze_refusal(db, task_id, refusal.text)
+        return False
+
+    # #1611: сохранённый dor_passed верен, только пока записан из нынешних
+    # входов. Сверка - тут, под локом вызывающего и только по БД: так её
+    # проходят обе двери (запись готовности и поллер стюарда), а правка
+    # постановки или политики между записью и этим местом открыть задачу не
+    # может. Нет отпечатка (строка до колонки) - то же самое: ждём пересчёта.
+    if not await persisted_dor_is_current(db, row):
+        await _note_refusal(
+            db,
+            task_id,
+            _STALE_DOR_NOTE_PREFIX,
+            "сохранённая готовность посчитана не по нынешней постановке и "
+            "политике проекта; задача остаётся черновиком до пересчёта "
+            "(чтение готовности или refine).",
+        )
         return False
 
     transitioned = await repo.transition_status_if(
