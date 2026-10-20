@@ -1203,7 +1203,7 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     return BranchUpdateOutcome.unavailable
 
 
-class GitOpsIntegration:
+class GitOpsIntegration(git_history.HistoryReads):
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
     ``forge`` is an attribute rather than a module-level singleton so a
@@ -2794,23 +2794,9 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
-    async def first_parent_after(
-        self, repo: str, base: str, since: str, limit: int
-    ) -> dict[str, Any]:
-        """Oldest ``limit`` first-parent commits of origin/``base`` after ``since`` (#1865).
-
-        ``{"error": "<step> rc=<code>"}`` when a git step did not answer."""
-        return await git_history.first_parent_after(
-            partial(_git, repo=repo, check=False), base, since, limit
-        )
-
-    async def commit_facts(
-        self, repo: str, shas: list[str]
-    ) -> dict[str, dict[str, Any]] | None:
-        """Parents and FULL message per commit, or None when unreadable (#1865)."""
-        return await git_history.commit_facts(
-            partial(_git, repo=repo, check=False), shas
-        )
+    def _history_run(self, repo: str) -> git_history.GitRun:
+        """``_git`` on ``repo`` for the history reads of HistoryReads (#1865)."""
+        return partial(_git, repo=repo, check=False)
 
     def worktree_path(self, task_id: int, repo: str | None = None) -> str:
         """Deterministic worktree path for a task (#459); where its branch lives."""
@@ -3314,7 +3300,7 @@ class GitOpsIntegration:
 
         # #1865: строки отката переживают сжатие (до reset коммиты ещё видны).
         trailer = await git_history.revert_lines(
-            partial(_git, repo=repo, check=False), f"{merge_base.strip()}..HEAD"
+            self._history_run(repo), f"{merge_base.strip()}..HEAD"
         )
         rc, _, err = await _git(
             "reset",

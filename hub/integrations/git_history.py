@@ -139,3 +139,26 @@ async def commit_facts(
                 "second_parent_message": second,
             }
     return facts
+
+
+class HistoryReads:
+    """Чтение истории как методы плагина git_ops (#1865): GitOpsIntegration
+    подмешивает этот класс и даёт ``_history_run`` - свой ``_git`` на репозиторий.
+    """
+
+    def _history_run(self, repo: str) -> GitRun:
+        raise NotImplementedError
+
+    async def first_parent_after(
+        self, repo: str, base: str, since: str, limit: int
+    ) -> dict[str, Any]:
+        """Oldest ``limit`` first-parent commits of origin/``base`` after ``since``.
+
+        ``{"error": "<step> rc=<code>"}`` when a git step did not answer."""
+        return await first_parent_after(self._history_run(repo), base, since, limit)
+
+    async def commit_facts(
+        self, repo: str, shas: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Parents and FULL message per commit, or None when unreadable."""
+        return await commit_facts(self._history_run(repo), shas)
