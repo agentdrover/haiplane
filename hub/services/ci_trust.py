@@ -535,8 +535,12 @@ async def borrowed_evidence_blocks(
     """
     if not head_sha or not current:
         return {}
-    # The contract lives in another table, so it is read on both sides of the
-    # snapshot: equal means it did not change while the snapshot was taken.
+    # The contract lives in another table (the project is resolved through the
+    # task's ancestry), so it cannot join the statement. It is read on both
+    # sides of the snapshot: equal means it did not change while the snapshot
+    # was taken. Known residual: a human PATCH that goes A -> B -> A inside this
+    # interval is not seen (a fingerprint is a hash, not a revision); the cost
+    # is one brief showing evidence the contract of that instant did not confirm.
     fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
     rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
     if await ci_contract.fingerprint_for_task(db, task_id) != fingerprint:
