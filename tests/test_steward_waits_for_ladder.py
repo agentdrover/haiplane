@@ -35,6 +35,7 @@ from hub.services.ladder_view import (
     WHY_ENVIRONMENT,
     WHY_IN_FLIGHT,
     WHY_NOT_INCOMPLETE,
+    WHY_ORDER_FAILED,
     WHY_UNKNOWN,
     incomplete_escalation_line,
     ladder_why,
@@ -76,12 +77,13 @@ async def _dispatch_row(
     profile: str,
     agent_id: str = "rev-agent",
     model: str = "gpt-5.2",
+    principal: int | None = PRINCIPAL,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
         "run_id, model, profile, status, channel, reviewer_principal_id) "
         "VALUES (?, 1, ?, 'run-1', ?, ?, ?, 'cloud', ?)",
-        (task_id, agent_id, model, profile, status, PRINCIPAL),
+        (task_id, agent_id, model, profile, status, principal),
     )
     await db.commit()
     return int(cur.lastrowid or 0)
@@ -176,6 +178,19 @@ async def test_steward_waits_for_a_top_up_in_flight(db: aiosqlite.Connection):
     assert await top_up_in_flight(db, await _task_dict(db, failed)) == ""
     assert await order_due_runs(db) == 1
 
+    # Открытый режим: заказ добора без принципала. Прежний lite-отчёт не
+    # считается его ответом — ступеней больше, чем отчётов (Codex P2).
+    _, unpinned = await _lite_incomplete(db, "ladder-unpinned")
+    await db.execute(
+        "UPDATE review_dispatches SET reviewer_principal_id=NULL WHERE task_id=?",
+        (unpinned,),
+    )
+    await _dispatch_row(db, unpinned, status="active", profile="deep", principal=None)
+    assert await top_up_in_flight(db, await _task_dict(db, unpinned))
+    assert await order_due_runs(db) == 0
+    await _report_row(db, unpinned, incomplete=False, profile="deep")
+    assert await top_up_in_flight(db, await _task_dict(db, unpinned)) == ""
+
     # Поле incomplete нечитаемо (NULL) — «неполный» не выдумывается, не ждём.
     _, unknown = await _lite_incomplete(db, "ladder-null-flag")
     await db.execute(
@@ -183,7 +198,8 @@ async def test_steward_waits_for_a_top_up_in_flight(db: aiosqlite.Connection):
     )
     await _dispatch_row(db, unknown, status="active", profile="deep")
     assert await top_up_in_flight(db, await _task_dict(db, unknown)) == ""
-    assert await order_due_runs(db) == 1
+    # Заказаны оба: сдача с NULL-признаком и открытая сдача с лёгшим отчётом.
+    assert await order_due_runs(db) == 2
 
 
 async def test_the_top_up_wait_ends_at_the_ceiling_with_a_named_reason(
@@ -203,6 +219,21 @@ async def test_the_top_up_wait_ends_at_the_ceiling_with_a_named_reason(
     # И судья, дойдя до эскалации, называет: добор не завершился за срок.
     line = await incomplete_escalation_line(db, await _task_dict(db, over))
     assert WHY_IN_FLIGHT in line
+
+
+async def test_the_reason_survives_the_top_up_ending_after_the_order(
+    db: aiosqlite.Connection,
+):
+    """Основание заказа судьи не меняется, когда добор кончился уже после заказа."""
+    _, task_id = await _lite_incomplete(db, "ladder-order-basis", minutes=121)
+    deep = await _dispatch_row(db, task_id, status="active", profile="deep")
+    assert await order_due_runs(db) == 1
+    await db.execute("UPDATE review_dispatches SET status='failed' WHERE id=?", (deep,))
+    await db.commit()
+    task = await _task_dict(db, task_id)
+    assert await top_up_in_flight(db, task) == ""
+    why = await ladder_why(db, task)
+    assert why is not None and why.code == WHY_IN_FLIGHT, why
 
 
 async def test_deferral_is_deduplicated_per_generation_and_kind(
@@ -278,6 +309,18 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
     assert await dispatcher._forced_deep_past_circle(db, task, "deep", "") is True
     cases["circle"] = (circle, WHY_CIRCLE)
 
+    # (а') и круг, и потолок deep — с общим алертом лестницы ПОСЛЕ конкретного
+    # (maybe_top_up_incomplete пишет его всегда): конкретная причина не теряется.
+    for name in ("cap", "circle"):
+        await repo.add_task_update(
+            db,
+            cases[name][0],
+            "hub",
+            "alert",
+            "Дешёвый прогон сдал неполный отчёт, а добор тяжёлым профилем "
+            f"{dispatcher.LADDER_ORDER_FAILED_MARK}. Решение за человеком (#879).",
+        )
+
     # (в) потолок лестницы: настоящий maybe_top_up_incomplete на двух платных
     # прогонах и неполном deep-отчёте (вторая ось выключена).
     monkeypatch.setattr(config, "REVIEW_MODEL_CASCADE_MAX", 0)
@@ -339,6 +382,17 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
     # (е) нет записей лестницы — «причина не установлена», не пусто.
     _, nothing = await _lite_incomplete(db, "why-unknown")
     cases["unknown"] = (nothing, WHY_UNKNOWN)
+
+    # (е'') только общий алерт «поставить не удалось» — он и есть причина.
+    _, failed_order = await _lite_incomplete(db, "why-order-failed")
+    await repo.add_task_update(
+        db,
+        failed_order,
+        "hub",
+        "alert",
+        f"добор тяжёлым профилем {dispatcher.LADDER_ORDER_FAILED_MARK}",
+    )
+    cases["order_failed"] = (failed_order, WHY_ORDER_FAILED)
 
     # (е') алерт лестницы ПРЕЖНЕЙ сдачи (раньше метки этой) — не наш.
     _, stale = await _lite_incomplete(db, "why-stale-alert")

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,8 @@ WHY_NOT_INCOMPLETE = "report_not_incomplete"
 WHY_UNKNOWN = "unknown"
 
 UNKNOWN_TEXT = LADDER_WHY_UNKNOWN
+#: Слова описания ожидания добора: попадают в основание заказа судьи.
+TOP_UP_WAIT_PHRASE = "ждёт добора ревью"
 
 _TEXTS = {
     WHY_ENVIRONMENT: "отказ среды ревьюера (#1238): повтор в той же среде даст "
@@ -110,6 +113,14 @@ async def _unanswered_dispatch(
     if row is None:
         return None, False
     dispatch = dict(row)
+    if dispatch.get("reviewer_principal_id") is None:
+        # Заказ без принципала (открытый режим, история): правило «чей отчёт»
+        # отдаёт ему ЛЮБОЙ отчёт поколения, и добор после лёгкого прогона
+        # выглядел бы отвеченным. Здесь ступени считаются, как их считает сама
+        # лестница: платных ступеней больше, чем отчётов, — последняя ещё в пути.
+        steps = await repo.count_review_dispatches(db, task_id, generation)
+        reports = await repo.machine_reviews_of_generation(db, task_id, generation)
+        return dispatch, len(reports) >= steps
     own = await dispatcher.report_of_dispatch(db, task_id, generation, dispatch)
     return dispatch, own is not None
 
@@ -120,9 +131,8 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     «Идёт» — последний заказ поколения активен (или это долг второй двери) и
     СВОЕГО отчёта не отдал. Активная строка лёгкого прогона, уже отдавшего
     отчёт, не добор: лестница свой заказ ещё только может поставить, и этот
-    случай читатель не ждёт (граница задачи #1925). Заказ без принципала
-    (история, открытый режим) считает любой отчёт поколения «своим» — тогда
-    не ждём, как и до задачи.
+    случай читатель не ждёт (граница задачи #1925). У заказа без принципала
+    (открытый режим, история) «свой» отчёт считается по числу платных ступеней.
 
     Поле ``incomplete`` пусто или нечитаемо — не «неполный»: ждать нечего, так
     же читает его гейт (``bool(None)``).
@@ -155,10 +165,36 @@ async def wait_with_report(db, task: dict[str, Any]) -> ReviewWait:
         return ReviewWait(
             WAIT_PENDING,
             "",
-            f"ждёт добора ревью: отчёт неполон, {flight}",
+            f"{TOP_UP_WAIT_PHRASE}: отчёт неполон, {flight}",
             kind=WAIT_KIND_TOP_UP,
         )
     return ReviewWait(WAIT_TERMINAL, TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
+
+
+async def _order_was_placed_on_a_wait(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> bool:
+    """Судья этой сдачи заказан по сроку ожидания добора — основание в записи заказа.
+
+    Добор мог кончиться (упал, отчёт лёг позже) уже после заказа; сохранённое
+    основание не меняется вместе с состоянием заказа добора.
+    """
+    from hub.services.steward_dispatch import EVENT_ORDERED
+
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? "
+        "AND json_extract(payload, '$.kind')='verdict' LIMIT 1",
+        (task_id, EVENT_ORDERED, generation),
+    )
+    if not rows:
+        return False
+    try:
+        why = str(json.loads(rows[0]["payload"]).get("why") or "")
+    except ValueError:
+        return False  # нечитаемая запись — не доказательство ожидания
+    return TOP_UP_WAIT_PHRASE in why
 
 
 async def _recorded_outcome(
@@ -188,6 +224,7 @@ async def _recorded_outcome(
         "WHERE task_id=? AND kind='alert' ORDER BY id DESC",
         (task_id,),
     )
+    generic = ""
     for row in rows:
         stamp = parse_stamp(str(row["created_at"] or ""))
         if stamp is None or stamp < since:
@@ -195,8 +232,14 @@ async def _recorded_outcome(
         text = str(row["content"] or "")
         for mark, code in marks:
             if mark in text:
+                if code == WHY_ORDER_FAILED:
+                    # Общий алерт «поставить не удалось» лестница пишет ПОСЛЕ
+                    # конкретного отказа (потолок deep, круг): конкретный
+                    # старше, но он и есть причина.
+                    generic = generic or code
+                    break
                 return code
-    return ""
+    return generic
 
 
 async def ladder_why(
@@ -220,7 +263,9 @@ async def ladder_why(
         return LadderWhy(WHY_NOT_INCOMPLETE)
     if dispatcher.is_environment_refusal(report):
         return LadderWhy(WHY_ENVIRONMENT)
-    if await top_up_in_flight(db, task):
+    if await top_up_in_flight(db, task) or await _order_was_placed_on_a_wait(
+        db, task_id, generation
+    ):
         return LadderWhy(WHY_IN_FLIGHT)
     since = await generation_submitted_at(db, task_id, generation)
     if since is None:
