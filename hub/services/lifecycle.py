@@ -127,6 +127,7 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
+    BASE_UPDATE_CONFLICT_PREFIX,
     apply_live_worktree,
     completion_requires_review,
     detect_branch_stacking,
@@ -2561,7 +2562,7 @@ class SubmitContext:
 
     resubmitted_from_review: bool = False
     #: #1362: сдача пришла из needs_decision после конфликта с базой.
-    resubmitted_after_base_conflict: bool = False
+    base_conflict_kind: str = ""  # писатель: merge_failed | base_update_conflict
     replaced_sha: str = ""
     #: #919: вывод прод-дефекта, проверенный шагом и записываемый переходом.
     prevention_record: dict[str, str] | None = None
@@ -2660,7 +2661,10 @@ async def _require_base_conflict_entry(state: SubmitContext) -> None:
     """
     entry = await needs_decision_entry(state.db, state.task)
     if is_base_conflict_entry(entry):
-        state.resubmitted_after_base_conflict = True
+        upd = str(entry.get("detail") or "").startswith(
+            f"{BASE_UPDATE_CONFLICT_PREFIX}:"
+        )
+        state.base_conflict_kind = "base_update_conflict" if upd else "merge_failed"
         return
     cause = str(entry.get("reason") or "причина не записана")
     detail = str(entry.get("detail") or "")
@@ -2669,7 +2673,8 @@ async def _require_base_conflict_entry(state: SubmitContext) -> None:
         "can only submit running or under-review pair tasks for review, "
         f"current status: needs_decision ({cause}{': ' + detail if detail else ''}). "
         "From needs_decision the author resubmits only after merge_failed on a "
-        "conflict with the base branch; this cause is a human decision "
+        "conflict with the base branch or a base_update_conflict when the gate "
+        "updated the PR branch; this cause is a human decision "
         "(REST POST /api/tasks/<id>/decide).",
     )
 
@@ -3716,10 +3721,10 @@ def _submission_update_text(
             f"{state.submission_sha[:12] if state.submission_sha else '—'}; вердикт "
             "по заменённой сдаче больше не текущий."
         )
-    if state.resubmitted_after_base_conflict:
+    if state.base_conflict_kind:
         content += (
-            " Пересдача из needs_decision после merge_failed: конфликт с базой "
-            "слит автором, без решения человека (#1362)."
+            f" Пересдача из needs_decision после {state.base_conflict_kind}: "
+            "конфликт с базой слит автором, без решения человека (#1362, #1917)."
         )
     if adopted and adopted.get("not_adopted"):
         # #1687: a report GitHub did not confirm is not evidence, and the feed
