@@ -340,6 +340,16 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
     _, nothing = await _lite_incomplete(db, "why-unknown")
     cases["unknown"] = (nothing, WHY_UNKNOWN)
 
+    # (е') алерт лестницы ПРЕЖНЕЙ сдачи (раньше метки этой) — не наш.
+    _, stale = await _lite_incomplete(db, "why-stale-alert")
+    await db.execute(
+        "INSERT INTO task_updates (task_id, agent, kind, content, created_at) "
+        "VALUES (?, 'hub', 'alert', ?, datetime('now', '-60 minutes'))",
+        (stale, f"{dispatcher.LADDER_CEILING_MARK} 2 достигнут"),
+    )
+    await db.commit()
+    cases["stale_alert"] = (stale, WHY_UNKNOWN)
+
     # (ж) отчёт заявлен полным: неполнота не от лестницы (#1692).
     _, complete = await _lite_incomplete(db, "why-complete")
     await _report_row(db, complete, incomplete=False, profile="deep")
@@ -353,7 +363,9 @@ async def test_incomplete_escalation_names_why_the_ladder_did_not_help(
         line = await incomplete_escalation_line(db, task)
         assert why.text in line and code in line, name
         seen.add(why.text)
-    assert len(seen) == len(cases), "у каждого исхода своя фраза"
+    assert len(seen) == len({c for _, c in cases.values()}), (
+        "у каждого исхода своя фраза"
+    )
     assert UNKNOWN_TEXT in (await ladder_why(db, await _task_dict(db, nothing))).text
 
 
