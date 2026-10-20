@@ -10,7 +10,7 @@ from hub.services.review_dispatch import (
     _inline_diff_lines,
     diff_plan,
 )
-from hub.services.review_oversized import ac_test_spans
+from hub.services.review_oversized import UNREADABLE, ac_test_spans
 from tests.review_dispatch_support import _DispatchRecorder, _submitted, _wire
 
 F = "tests/test_x.py"
@@ -115,9 +115,7 @@ def test_an_unreadable_pinned_file_is_not_a_range_from_the_branch():
     block, _ = diff_plan(_new(F, _big()), "develop", "b", ac_test_refs=[ref],
                          ac_sources={F: None})  # fmt: skip
     first = [ln for ln in block.splitlines() if ln.startswith("ЧИТАТЬ ПЕРВЫМИ")]
-    assert first == [
-        f"ЧИТАТЬ ПЕРВЫМИ: {ref} — не найден: файл на закреплённом коммите не прочитан"
-    ]
+    assert first == [f"ЧИТАТЬ ПЕРВЫМИ: {ref} — {UNREADABLE}"]
 
 
 def test_ac_cutouts_get_their_budget_before_the_other_files():
@@ -179,3 +177,108 @@ async def test_a_truncated_missing_or_failing_read_is_unknown():
     assert got == {"ok.py": "x = 1\n", "cut.py": None, "gone.py": None, "boom.py": None}
     assert await read_sources(Git(), "/repo", "", refs) is None
     assert await read_sources(Git(), None, "a" * 40, refs) is None
+
+
+def _big_file_diff(path: str, marker: str, size: int) -> tuple[str, str, str]:
+    """``(дифф нового файла, его текст, ref теста в конце)`` примерно ``size`` символов."""
+    rows = ["# " + "x" * 40] * (size // 43) + ["def test_ac():", f"    assert {marker}"]
+    return _new(path, rows), "\n".join(rows) + "\n", f"{path}::test_ac"
+
+
+def test_the_reserve_for_ac_cutouts_is_kept_when_a_plain_file_could_take_it():
+    """Codex 2.1: больше бюджета не должно вытеснять тест AC ранним обычным файлом."""
+    plain = _new("hub/plain.py", [f"p{k} = {k}" + " " * 40 for k in range(26)])
+    mid, mid_src, mid_ref = _big_file_diff("tests/test_mid.py", "AC_MID", 1000)
+    big, big_src, big_ref = _big_file_diff("tests/test_big.py", "AC_BIG", 4400)
+    spans = ac_test_spans({"tests/test_mid.py": mid_src, "tests/test_big.py": big_src},
+                          [mid_ref, big_ref])  # fmt: skip
+    lines, _ = _inline_diff_lines(plain + mid + big, [], None, 1500, spans)
+    text = "\n".join(lines)
+    assert "AC_MID" in text and "AC_BIG" in text
+    assert "ac_test_unread" not in text
+
+
+def test_a_test_outside_the_hunks_of_a_file_in_the_prompt_gets_a_cutout():
+    """Codex 2.2: файл в промте, а тело теста вне ханков - вырезка всё равно нужна."""
+    src = (
+        "\n".join(
+            [f"v{k} = {k}" for k in range(1000)]
+            + ["def test_ac():", "    assert OUTSIDE"]
+        )
+        + "\n"
+    )
+    diff = (
+        f"diff --git a/{F} b/{F}\n--- a/{F}\n+++ b/{F}\n@@ -1,2 +1,2 @@\n"
+        "-v0 = 0\n+v0 = 1\n v1 = 1\n"
+    )
+    spans = ac_test_spans({F: src}, [f"{F}::test_ac"])
+    lines, omitted = _inline_diff_lines(diff, [], None, 100_000, spans)
+    assert omitted == [] and "OUTSIDE" in "\n".join(lines)
+
+
+def test_an_unreadable_pinned_diff_still_states_the_block_as_unknown():
+    """Codex 2.3: ветка сократилась, закреплённый дифф не прочитан - блок есть, всё неизвестно."""
+    ref = f"{F}::test_ac"
+    branch = _new(F, ["def test_ac():", "    pass"])
+    block, _ = diff_plan(branch, "develop", "b", ac_test_refs=[ref], ac_sources=None,
+                         ac_block=True)  # fmt: skip
+    assert block.startswith(f"ЧИТАТЬ ПЕРВЫМИ: {ref} — {UNREADABLE}")
+    assert "НЕ ПОМЕСТЯТСЯ" not in block
+
+
+async def test_the_pinned_diff_is_read_as_a_commit_object_not_by_name(monkeypatch):
+    """Codex 2.5: integrity_read(sha), а не branch_diff, который смотрит origin/<имя>."""
+    from hub.integrations.registry import plugins
+    from hub.services.review_dispatch import _pinned_diff
+
+    calls = []
+
+    class Git:
+        async def integrity_read(self, repo, base, sha):
+            calls.append((repo, base, sha))
+            return {"diff": "THE DIFF"}
+
+        async def branch_diff(self, *a, **k):  # pragma: no cover - не должен звониться
+            raise AssertionError("by name")
+
+    monkeypatch.setattr(plugins, "git_ops", Git())
+    assert await _pinned_diff(("/ws", "develop"), "a" * 40) == "THE DIFF"
+    assert calls == [("/ws", "develop", "a" * 40)]
+    assert await _pinned_diff(None, "a" * 40) is None
+
+    class Broken:
+        async def integrity_read(self, *a):
+            raise RuntimeError("git down")
+
+    monkeypatch.setattr(plugins, "git_ops", Broken())
+    assert await _pinned_diff(("/ws", "develop"), "a" * 40) is None
+
+
+def test_a_deeply_nested_expression_is_unknown_not_a_crash():
+    """Codex 2.6: RecursionError парсера - «не прочитан», заказ не падает."""
+    src = "x = " + "+".join(["1"] * 30000) + "\ndef test_ac():\n    pass\n"
+    assert _span(src, f"{F}::test_ac").unreadable
+
+
+def test_nested_class_refs_and_ambiguous_names():
+    """Codex 2.7-2.8: вложенный класс находится; условное переопределение - неоднозначно."""
+    src = (
+        "class Outer:\n    class Inner:\n        def test_ac(self):\n            pass\n"
+    )
+    assert _span(src, f"{F}::Outer::Inner::test_ac[case]").start == 3
+    for cond in (
+        "def test_ac():\n    pass\nif True:\n    def test_ac():\n        pass\n",
+        "def test_ac():\n    pass\ntest_ac = wrap(test_ac)\n",
+        "from x import test_ac\ndef test_ac():\n    pass\n",
+    ):
+        span = _span(cond, f"{F}::test_ac")
+        assert not span.found and span.unreadable, cond
+
+
+def test_line_numbers_follow_the_parser_not_str_splitlines():
+    """\x0c в тексте режет splitlines, но не ast: номера строк не должны уезжать."""
+    src = "x = 1\x0c\n\ndef test_ac():\n    assert TARGET\n"
+    span = _span(src, f"{F}::test_ac")
+    assert (span.start, span.end) == (3, 4) and span.lines[1][
+        1
+    ].strip() == "assert TARGET"

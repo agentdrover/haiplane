@@ -66,6 +66,12 @@ class _PinnedGitOps(NoopGitOps):
     async def file_at_ref(self, repo, ref, path):
         return self._rules.get(path)
 
+    async def integrity_read(self, repo, base, sha):
+        # #1933: закреплённый дифф коммита; без files - как раньше (Noop: None).
+        if not self._files:
+            return await super().integrity_read(repo, base, sha)
+        return {"diff": self._diff, "base_sha": "b" * 40, "head_sha": sha}
+
     async def read_file_at_ref(self, repo, ref, path, *, limit_chars=30000):
         # #1933: файлы теста на закреплённом sha; нет в словаре = missing.
         text = self._files.get(path)

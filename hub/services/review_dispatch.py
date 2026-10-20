@@ -65,6 +65,7 @@ from hub.services.review_oversized import (
     ac_test_spans,
     cutout,
     cutouts_within,
+    shown_in,
     first_block,
     oversized_paragraph,
     read_sources,
@@ -379,30 +380,39 @@ def fit_file_sections(
 
 
 def _fit_with_ac_cutouts(
-    every: list[tuple[str, str]],
     sections: list[tuple[str, str]],
     ceiling: int,
     spans: list[AcTestSpan],
-) -> tuple[str, list[str], set[str], list[str], list[str]]:
+) -> tuple[str, list[str], list[str], list[str]]:
     """Файлы под потолок с БРОНЁЙ под вырезки тестов AC (#1933).
 
-    Вырезки не доедают остаток после других файлов: бюджет под них отведён до
-    заполнения. Бронь считается по тестам файлов, которых в промте нет, и
-    пересчитывается, пока не устоится (больше бюджета — меньше выпавших файлов,
-    значит бронь только убывает).
+    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Бюджет под вырезки
+    отведён ДО остальных файлов: иначе файл, влезший целиком, съедал остаток.
+    Вырезка нужна тесту, которого нет в тексте диффа целиком — файл выпал из
+    промта (потолок, дельта) или функция лежит вне ханков. Что после брони
+    осталось, получают файлы, не влезшие в первый проход (порядок AC-первым не
+    нарушается: бронь уже взята).
     """
-    reserve = sum(len(cutout(span)) for span in spans if span.found)
-    for _ in range(4):
-        text, omitted = fit_file_sections(sections, max(ceiling - reserve, 0))
-        # Файл, которого нет в промте, — не влез в потолок ИЛИ выпал из дельты.
-        present = {path for path, _ in sections} - set(omitted)
-        absent = {path for path, _ in every if path and path not in present}
-        need = sum(len(cutout(s)) for s in spans if s.found and s.path in absent)
-        if need >= reserve:
-            break
-        reserve = need
-    cuts, unread = cutouts_within(spans, absent, ceiling - len(text))
-    return text, omitted, absent, cuts, unread
+    found = [sp for sp in spans if sp.found]
+    text, omitted = fit_file_sections(
+        sections, max(ceiling - sum(len(cutout(sp)) for sp in found), 0)
+    )
+    gone = set(omitted)
+    left = [
+        (p, t) for p, t in sections if (p or "(часть диффа без имени файла)") in gone
+    ]
+    shown = {p: t for p, t in sections if p and p not in omitted}
+    need = [sp for sp in found if not shown_in(shown.get(sp.path), sp)]
+    extra, still = fit_file_sections(
+        left, max(ceiling - len(text) - sum(len(cutout(sp)) for sp in need), 0)
+    )
+    if extra:
+        text += extra
+        omitted = still
+        shown |= {p: t for p, t in left if p and p not in still}
+        need = [sp for sp in found if not shown_in(shown.get(sp.path), sp)]
+    cuts, unread = cutouts_within(need, ceiling - len(text))
+    return text, omitted, cuts, unread
 
 
 def _inline_diff_lines(
@@ -428,8 +438,8 @@ def _inline_diff_lines(
         if not path
         or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
-    text, omitted, absent, cuts, unread = _fit_with_ac_cutouts(
-        every, sections, ceiling, ac_spans or []
+    text, omitted, cuts, unread = _fit_with_ac_cutouts(
+        sections, ceiling, ac_spans or []
     )
     lines = []
     if omitted:
@@ -798,10 +808,13 @@ def _plan_oversized(
     ac_test_refs: list[str] | None,
     pinned_diff: str | None = None,
     ac_sources: Mapping[str, str | None] | None = None,
+    ac_block: bool = False,
 ) -> tuple[list[tuple[str, int]], list[AcTestSpan]]:
     """Файлы выше потолка и тесты AC в них; дописывает блок и абзац в ``lines`` (#1933).
 
     Блок «ЧИТАТЬ ПЕРВЫМИ» встаёт в начало, раньше команды и текста диффа.
+    ``ac_block`` — закреплённый sha не прочитан: блок обязателен, даже если ветка
+    файла выше потолка не показывает, и говорит «неизвестно».
     ``pinned_diff`` — дифф на закреплённом sha сдачи (облако; у локального
     заказа ``kept`` уже он): если он есть, oversized считается по нему, как и
     диапазоны, — один источник, а не ветка и sha вперемешку. Диапазоны берутся
@@ -814,12 +827,13 @@ def _plan_oversized(
         for path, count in file_line_counts(basis)
         if count > REVIEW_FILE_LINE_CAP
     ]
-    if not oversized:
+    if not oversized and not ac_block:
         return oversized, []
     spans = ac_test_spans(ac_sources, ac_test_refs or []) if ac_test_refs else []
     if spans:
         lines.insert(0, first_block(spans))
-    lines.append(oversized_paragraph(oversized, bool(spans), REVIEW_FILE_LINE_CAP))
+    if oversized:
+        lines.append(oversized_paragraph(oversized, bool(spans), REVIEW_FILE_LINE_CAP))
     return oversized, spans
 
 
@@ -837,6 +851,7 @@ def diff_plan(
     ac_test_refs: list[str] | None = None,
     pinned_diff: str | None = None,
     ac_sources: Mapping[str, str | None] | None = None,
+    ac_block: bool = False,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -949,7 +964,7 @@ def diff_plan(
             f"править): {', '.join(dropped)}."
         )
     oversized, spans = _plan_oversized(
-        kept, lines, ac_test_refs, pinned_diff, ac_sources
+        kept, lines, ac_test_refs, pinned_diff, ac_sources, ac_block
     )
     note_bits = []
     if inline_ceiling is not None:
@@ -3892,7 +3907,7 @@ async def prepare_review_order(
     ac_refs = task_ac_test_refs(
         [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     )
-    pinned, ac_sources = await _ac_inputs(
+    pinned, ac_sources, ac_block = await _ac_inputs(
         db, task, ctx, ac_refs, plan_diff, inline_diff
     )
     diff_block, diff_note = diff_plan(
@@ -3909,6 +3924,7 @@ async def prepare_review_order(
         ac_test_refs=ac_refs,
         pinned_diff=pinned,
         ac_sources=ac_sources,
+        ac_block=ac_block,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -4017,35 +4033,48 @@ async def _ac_inputs(
     refs: list[str],
     plan_diff: str | None,
     inline_diff: bool,
-) -> tuple[str | None, dict[str, str | None] | None]:
-    """``(дифф на sha сдачи, файлы тестов AC на sha сдачи)`` для блока #1933.
+) -> tuple[str | None, dict[str, str | None] | None, bool]:
+    """``(дифф на sha, файлы тестов AC на sha, блок обязателен)`` для блока #1933.
 
-    Файлы читаются, только если у задачи есть test_ref и в диффе есть файл выше
-    потолка: иначе блока нет и git читать не за чем. Не прочитанное остаётся
-    ``None`` и в промте называется «не найден» — без отката на ветку.
+    Один источник — закреплённый sha. Облако: дифф объекта-коммита
+    (``integrity_read``, не имя ветки: ``origin/<sha>`` не подменит его);
+    локальный заказ: ``plan_diff`` уже на sha. Закреплённый дифф не прочитан —
+    блок обязателен и всё в нём «неизвестно»: ветка в расчёт не берётся.
+    Файлы читаются, только если в диффе есть файл выше потолка.
     """
-    if not refs:
-        return None, None
-    pinned = None if inline_diff else await _pinned_diff(db, task)
-    basis = plan_diff if pinned is None else pinned
+    sha = (task.get("submission_sha") or "").strip()
+    if not refs or not sha:
+        return None, None, False
+    if inline_diff:
+        basis = plan_diff
+    else:
+        basis = await _pinned_diff(ctx, sha)
+        if basis is None:
+            return None, None, True
     if basis is None or not any(
         count > REVIEW_FILE_LINE_CAP
         for _, count in file_line_counts(split_generated(basis)[0])
     ):
-        return pinned, None
-    sha = (task.get("submission_sha") or "").strip()
+        return (None if inline_diff else basis), None, False
     sources = await read_sources(plugins.git_ops, ctx[0] if ctx else None, sha, refs)
-    return pinned, sources
+    return (None if inline_diff else basis), sources, False
 
 
-async def _pinned_diff(db: aiosqlite.Connection, task: dict[str, Any]) -> str | None:
-    """Дифф на закреплённом sha сдачи для номеров строк облачного блока (#1933).
+async def _pinned_diff(ctx: tuple[str, str] | None, sha: str) -> str | None:
+    """Дифф коммита сдачи как ОБЪЕКТА (#1933); ``None`` - не прочитан.
 
-    ``None`` — закрепления нет или дифф не прочитался: номера тогда берутся из
-    диффа ветки, того же, что читает облачный ревьюер командой.
+    ``integrity_read`` разрешает sha через ``rev-parse <sha>^{commit}``, поэтому
+    ветка, названная как sha, не подменит его (``branch_diff`` сначала смотрит
+    ``origin/<имя>``).
     """
-    sha = (task.get("submission_sha") or "").strip()
-    return await _submission_diff(db, int(task["id"]), sha) if sha else None
+    if ctx is None:
+        return None
+    try:
+        got = await plugins.git_ops.integrity_read(ctx[0], ctx[1], sha)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not read the pinned diff %s: %s", sha[:12], exc)
+        return None
+    return got.get("diff") if got else None
 
 
 async def _subject_diff(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,7 +36,7 @@ UNREAD_PREFIX = "ac_test_unread: "
 _PARAM = re.compile(r"\[.*\]$")
 
 NOT_FOUND = "не найден в диффе"
-UNREADABLE = "не найден: файл на закреплённом коммите не прочитан"
+UNREADABLE = "не найден: файл на закреплённом коммите не прочитан или имя определено неоднозначно"
 READ_LIMIT = 2_000_000
 
 
@@ -73,15 +73,15 @@ def ac_test_refs(rows: Iterable[Mapping[str, Any]]) -> list[str]:
     return seen
 
 
-def _parse_ref(ref: str) -> tuple[str, str, str] | None:
-    """``(файл, класс или "", функция)`` pytest-ссылки; параметр ``[id]`` отброшен."""
+def _parse_ref(ref: str) -> tuple[str, tuple[str, ...], str] | None:
+    """``(файл, цепочка классов, функция)`` pytest-ссылки; параметр ``[id]`` отброшен."""
     if runner_of(ref) != PYTEST:
         return None
     path, _, node = ref.partition("::")
     parts = [part for part in _PARAM.sub("", node).split("::") if part]
-    if not parts or len(parts) > 2:
+    if not parts:
         return None
-    return path, (parts[0] if len(parts) == 2 else ""), parts[-1]
+    return path, tuple(parts[:-1]), parts[-1]
 
 
 def ac_test_paths(refs: Iterable[str]) -> list[str]:
@@ -95,25 +95,75 @@ def ac_test_paths(refs: Iterable[str]) -> list[str]:
 
 
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_COMPOUND = (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)
+_NOT_DEFINED = object()
+
+
+def _rebinds(stmt: ast.stmt, name: str) -> bool:
+    """Связывает ли оператор ``name`` иначе, чем прямым ``def``/``class`` в этом теле."""
+    if isinstance(stmt, ast.Assign):
+        return any(
+            isinstance(n, ast.Name) and n.id == name
+            for t in stmt.targets
+            for n in ast.walk(t)
+        )
+    if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        return isinstance(stmt.target, ast.Name) and stmt.target.id == name
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return any((a.asname or a.name).split(".")[0] == name for a in stmt.names)
+    return False
+
+
+def _nested_binding(body: Sequence[ast.stmt], name: str) -> bool:
+    """Связано ли ``name`` внутри if/try/with/for/while этого тела (pytest выполнит ЛЮБОЕ)."""
+    for stmt in body:
+        if isinstance(stmt, _COMPOUND):
+            parts = [stmt.body, getattr(stmt, "orelse", [])]
+            parts += [getattr(stmt, "finalbody", [])]
+            parts += [h.body for h in getattr(stmt, "handlers", [])]
+            for part in parts:
+                for inner in part:
+                    named = (
+                        isinstance(inner, (*_DEFS, ast.ClassDef)) and inner.name == name
+                    )
+                    if named or _rebinds(inner, name):
+                        return True
+                if _nested_binding(part, name):
+                    return True
+    return False
 
 
 def _locate(
-    tree: ast.Module, owner: str, name: str
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    """Функция ``name`` верхнего уровня или прямой метод класса ``owner`` верхнего уровня.
+    tree: ast.Module, owners: Sequence[str], name: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None | object:
+    """Функция ``name`` в теле класса(ов) ``owners`` от верха модуля, прямой потомок.
 
-    Как Python: при повторном определении действует последнее.
+    Как Python: при повторном определении действует последнее. Имя, связанное ещё
+    и иначе (присваивание, импорт, def внутри if/try), — неоднозначно:
+    ``_NOT_DEFINED`` вместо достоверного диапазона.
     """
     scope: list[ast.stmt] = tree.body
-    if owner:
-        classes = [
-            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner
-        ]
+    for owner in owners:
+        classes = [n for n in scope if isinstance(n, ast.ClassDef) and n.name == owner]
         if not classes:
             return None
+        if len(classes) > 1 or _nested_binding(scope, owner):
+            return _NOT_DEFINED
         scope = classes[-1].body
+    if any(_rebinds(s, name) for s in scope) or _nested_binding(scope, name):
+        return _NOT_DEFINED
     found = [n for n in scope if isinstance(n, _DEFS) and n.name == name]
     return found[-1] if found else None
+
+
+def _tree_of(text: str | None) -> tuple[ast.Module, list[str]] | None:
+    if text is None:
+        return None
+    try:
+        # Нумерация строк ast — по \n, \r\n, \r; splitlines() режет ещё и по \x0c.
+        return ast.parse(text), re.split(r"\r\n|\r|\n", text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
 
 
 def ac_test_spans(
@@ -133,28 +183,42 @@ def ac_test_spans(
         if parsed is None:
             out.append(AcTestSpan(ref, ""))
             continue
-        path, owner, name = parsed
+        path, owners, name = parsed
         if path not in trees:
-            text = (sources or {}).get(path)
-            try:
-                trees[path] = (
-                    (ast.parse(text), text.splitlines()) if text is not None else None
-                )
-            except (SyntaxError, ValueError):
-                trees[path] = None
+            trees[path] = _tree_of((sources or {}).get(path))
         got = trees[path]
         if got is None:
             out.append(AcTestSpan(ref, path, unreadable=True))
             continue
-        node = _locate(got[0], owner, name)
-        if node is None:
+        node = _locate(got[0], owners, name)
+        if node is _NOT_DEFINED:
+            out.append(AcTestSpan(ref, path, unreadable=True))
+            continue
+        if not isinstance(node, _DEFS):
             out.append(AcTestSpan(ref, path))
             continue
-        decorated = [d.lineno for d in getattr(node, "decorator_list", [])]
+        decorated = [d.lineno for d in node.decorator_list]
         start, end = min([node.lineno, *decorated]), node.end_lineno or node.lineno
         body = tuple((n, got[1][n - 1]) for n in range(start, end + 1))
         out.append(AcTestSpan(ref, path, start, end, lines=body))
     return out
+
+
+def covered_lines(section: str) -> list[tuple[int, int]]:
+    """Диапазоны строк НОВОЙ стороны, которые текст диффа файла показывает (по ``@@ +c,d``)."""
+    out = []
+    for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.M):
+        start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+        if count:
+            out.append((start, start + count - 1))
+    return out
+
+
+def shown_in(section: str | None, span: AcTestSpan) -> bool:
+    """Показан ли тест AC в тексте диффа файла ЦЕЛИКОМ (иначе нужна вырезка)."""
+    if section is None or span.start is None or span.end is None:
+        return False
+    return any(a <= span.start and span.end <= b for a, b in covered_lines(section))
 
 
 async def read_sources(
@@ -224,18 +288,12 @@ def cutout(span: AcTestSpan) -> str:
 
 
 def cutouts_within(
-    spans: Sequence[AcTestSpan], absent: Collection[str], budget: int
+    spans: Sequence[AcTestSpan], budget: int
 ) -> tuple[list[str], list[str]]:
-    """``(вырезки, непрочитанные ref)`` для тестов в файлах, которых нет в промте.
-
-    ``absent`` — файлы, что не вошли в потолок или выпали из дельты. Тест, чей
-    файл в промте есть целиком, вырезки не просит.
-    """
+    """``(вырезки, непрочитанные ref)`` для тестов, которых нет в промте целиком."""
     taken: list[str] = []
     unread: list[str] = []
     for span in spans:
-        if not span.found or span.path not in absent:
-            continue
         text = cutout(span)
         if len(text) <= budget:
             taken.append(text)
