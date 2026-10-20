@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -1102,6 +1103,7 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> CIRunRequestResult:
         """GitVerse не просят о прогоне — граница, а не недоделка (#1197).
 
