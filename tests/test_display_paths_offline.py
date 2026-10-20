@@ -514,3 +514,58 @@ async def test_diff_base_freshness_is_not_asked_when_offline(
     page = await client.get(f"/tasks/{review}/diff")
     assert page.status_code == 200, page.text
     assert asked == ["base_freshness"], "страница диффа спросила свежесть базы"
+
+
+async def test_poller_sweep_scans_integrity_and_shows_clear_stacking_with_age(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Скан целостности CI делает проход поллера; «стыковки нет» показывается с возрастом."""
+    from hub import repository_ci_integrity as store
+    from hub.services import gate_observations
+    from hub.services.review_brief import build_review_brief
+
+    ids = await _world(client, db, monkeypatch)
+    review = ids["review"]
+    task = dict(await repo.get_task(db, review) or {})
+    assert await store.get_ci_integrity_scan(db, review, task["submission_sha"]) is None
+    gate_observations._refreshed_at.clear()
+    await gate_observations.sweep(db)
+    assert await store.get_ci_integrity_scan(db, review, task["submission_sha"])
+
+    gate_observations.record(
+        gate_observations.STACKING,
+        review,
+        gate_observations.stacking_key(task["branch"], task["submission_sha"]),
+        {"message": "", "outcome": "clear"},
+    )
+    shown = await build_review_brief(db, review, observe_only=True)
+    assert shown is not None
+    assert "Стыковки с чужими ветками нет [сверено" in shown.stacking_warning
+
+
+async def test_poller_sweep_keeps_to_its_budget_and_backs_off_on_a_dead_fetch(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Общий дедлайн прохода; упавший fetch клона откладывает проход, а не бьётся каждый тик."""
+    from hub.services import gate_observations
+
+    ids = await _world(client, db, monkeypatch)
+    calls = arm(monkeypatch)
+    gate_observations._refreshed_at.clear()
+
+    monkeypatch.setattr(gate_observations, "SWEEP_BUDGET_SECONDS", 0)
+    await gate_observations.sweep(db)
+    assert calls == [], "бюджета нет — сети нет"
+
+    monkeypatch.setattr(gate_observations, "SWEEP_BUDGET_SECONDS", 25)
+    monkeypatch.setattr(
+        plugins.git_ops._inner,
+        "fetch_base",
+        AsyncMock(return_value=(False, "network down")),
+    )
+    await gate_observations.sweep(db)
+    assert "git_ops.fetch_base" in calls
+    attempts = len(calls)
+    gate_observations._refreshed_at.clear()
+    await gate_observations.sweep(db)
+    assert len(calls) == attempts, "в окне отката проход не ходит в сеть"

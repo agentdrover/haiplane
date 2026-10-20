@@ -81,7 +81,7 @@ import logging
 import posixpath
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -627,12 +627,20 @@ async def _stored(db: aiosqlite.Connection, task_id: int, sha: str) -> Scan | No
     return _from_row(row) if row else None
 
 
-async def ensure_scan(db: aiosqlite.Connection, task_id: int) -> Scan:
+async def ensure_scan(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    net: Callable[[Callable[[], Awaitable[Scan]]], Awaitable[Scan]] | None = None,
+) -> Scan:
     """The scan of the commit the task is submitted at; made now when missing.
 
     Asks the clone (network) BEFORE its own short write, so call it outside a
     write transaction: inside one it only reads what is stored and otherwise
     answers ``unscanned``. An unreadable result is retried on the next call.
+
+    ``net`` (#1913): обёртка, через которую идёт ТОЛЬКО сетевое чтение клона
+    (дедлайн прохода поллера); чтения и запись базы остаются снаружи неё.
     """
     task = dict(await repo.get_task(db, task_id) or {})
     sha = (task.get("submission_sha") or "").strip()
@@ -646,7 +654,9 @@ async def ensure_scan(db: aiosqlite.Connection, task_id: int) -> Scan:
             "ci integrity: scan of task #%s asked inside a transaction", task_id
         )
         return stored or Scan(UNSCANNED)
-    scan = await _scan_now(db, task_id, sha)
+    scan = await (
+        net(lambda: _scan_now(db, task_id, sha)) if net else _scan_now(db, task_id, sha)
+    )
     async with write_transaction(db):
         await store.save_ci_integrity_scan(
             db,
@@ -810,6 +820,30 @@ def stored_answer(body: MachineReviewSubmit) -> tuple[str, str]:
     """(verdict, explanation) as stored; ("", "") when the reviewer did not answer."""
     answer = body.ci_integrity
     return (answer.verdict, answer.explanation_ru) if answer else ("", "")
+
+
+async def answer_for_report(
+    db: aiosqlite.Connection, task: dict[str, Any], body: MachineReviewSubmit
+) -> tuple[str, str]:
+    """Ответ ревьюера о целостности CI, который можно хранить (#1913).
+
+    Ответ относится к признакам, которые ревьюеру показали. Если скана коммита
+    сдачи с признаками на момент отчёта в базе нет (бриф без скана говорил
+    «unscanned»), ревьюер отвечал вслепую: такой ответ не хранится и не снимет
+    отказ автоматики на признаках, найденных потом.
+    """
+    answer = stored_answer(body)
+    if not answer[0] and not answer[1]:
+        return answer
+    sha = (task.get("submission_sha") or "").strip()
+    scan = await _stored(db, int(task["id"]), sha) if sha else None
+    if scan is not None and scan.state == SIGNS:
+        return answer
+    log.warning(
+        "ci integrity: answer of the report on task #%s dropped, no scan with signs",
+        task["id"],
+    )
+    return ("", "")
 
 
 # --- surfaces: reviewer order, brief ------------------------------------

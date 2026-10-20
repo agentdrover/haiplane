@@ -353,6 +353,7 @@ async def test_an_explained_ci_change_goes_to_the_owner_with_a_note(
     """AC-2: signs + explained -> no automated verdict; card and brief carry a note <= 600."""
     ci_diff.value = _WORKFLOW_DIFF
     task_id = await _auto_task(client, db, monkeypatch, "ci-explained")
+    await ci_integrity.ensure_scan(db, task_id)  # #1913: ответ — на показанный скан
     long_note = "Меняется шаг отчёта CI: токен теперь берётся из окружения. " * 20
     await _post_review(
         client,
@@ -527,10 +528,12 @@ async def test_the_integrity_answer_arrives_by_every_path(
 
     # REST
     rest = await _auto_task(client, db, monkeypatch, "ci-path-rest")
+    await ci_integrity.ensure_scan(db, rest)  # #1913: ответ — на показанный скан
     await _post_review(client, rest, ci_integrity=answer)
 
     # MCP: the tool posts to the same route
     mcp = await _auto_task(client, db, monkeypatch, "ci-path-mcp")
+    await ci_integrity.ensure_scan(db, mcp)
 
     async def _post(path: str, body: dict) -> dict:
         resp = await client.post(path, json=body)
@@ -550,6 +553,7 @@ async def test_the_integrity_answer_arrives_by_every_path(
 
     # the text block of a run
     text = await _auto_task(client, db, monkeypatch, "ci-path-text")
+    await ci_integrity.ensure_scan(db, text)
     payload = {**_CLEAN_REVIEW, "ci_integrity": answer}
     report = parse_report_block(f"done\n```{REPORT_FENCE}\n{json.dumps(payload)}\n```")
     assert report is not None
@@ -808,6 +812,7 @@ async def test_the_manual_gate_card_keeps_the_owners_note(
     """P2: verdict=human or a disabled autopilot still shows the stored note on the route line."""
     ci_diff.value = _WORKFLOW_DIFF
     task_id = await _submitted_task(client, db, "ci-manual", {"verdict": "human"})
+    await ci_integrity.ensure_scan(db, task_id)  # #1913: ответ — на показанный скан
     await _post_review(
         client,
         task_id,
@@ -923,3 +928,30 @@ def test_pytest_config_is_a_sign_at_any_depth():
     nested = _diff("pkg/pyproject.toml", ["x = 1"])
     assert ("pkg/pyproject.toml", "pytest_config") in _rules(nested)
     assert _rules(_diff("pkg/setup.py", ["x = 1"])) == set()
+
+
+async def test_a_blind_answer_does_not_lift_the_refusal_on_later_signs(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """#1913: бриф без скана говорит «unscanned»; ответ вслепую не хранится.
+
+    Иначе он «объяснял» бы признаки, найденные стюардом или автопилотом позже, и
+    снимал бы отказ автоматики на входах CI.
+    """
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _auto_task(client, db, monkeypatch, "ci-blind")
+    # Бриф — путь показа: скана не делает.
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["ci_integrity"]["state"] == "unscanned"
+    await _post_review(
+        client,
+        task_id,
+        ci_integrity={"verdict": "explained", "explanation_ru": "вслепую: ок"},
+    )
+    row = dict(await repo.get_latest_machine_review(db, task_id))
+    assert (row["ci_integrity_verdict"], row["ci_integrity_explanation"]) == ("", "")
+    # Признаки находит скан позже (стюард, автопилот, проход поллера).
+    await ci_integrity.ensure_scan(db, task_id)
+    task = dict(await repo.get_task(db, task_id))
+    standing = await ci_integrity.standing_of(db, task)
+    assert standing.answer == "" and standing.gap, "отказ автоматики остаётся"

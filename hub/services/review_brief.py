@@ -220,7 +220,7 @@ async def build_call_sites_section(
 
 
 async def base_merge_section(
-    db, task_view, *, observe_only: bool = False
+    db, task_view, *, observe_only: bool = False, net=None
 ) -> BaseMergeState:
     """Будущий конфликт с базой, названный ДО вердикта (#1233, AC-1).
 
@@ -244,7 +244,7 @@ async def base_merge_section(
         )
     if observe_only:
         return _observed_base_merge(task_view)
-    state = await _ask_base_merge(db, task_view)
+    state = await _ask_base_merge(db, task_view, net)
     if state.state in ("clean", "conflicting"):
         # Ответ, за который заплачено сетью, не пропадает: следующий показ
         # скажет его с возрастом (#1913). «Не удалось спросить» не запоминается.
@@ -287,18 +287,20 @@ def _observed_base_merge(task_view) -> BaseMergeState:
     )
 
 
-async def _ask_base_merge(db, task_view) -> BaseMergeState:
+async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
     """Спросить провайдера, сольётся ли PR чисто: дорогой ответ, только явным операциям."""
     from hub import services
 
     try:
         ctx = await services.project_git_context(db, task_view.id)
-        outcome, detail = await plugins.git_ops.check_pr_mergeable(
+        probe = lambda: plugins.git_ops.check_pr_mergeable(  # noqa: E731
             task_view.pr_number,
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
             forge=ctx.get("forge", ""),
         )
+        # ``net`` (#1913) ставит дедлайн только на сетевой вызов, без чтений базы.
+        outcome, detail = await (net(probe) if net else probe())
     except Exception as exc:  # noqa: BLE001 - блок отвечает причиной, не молчанием
         log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
         return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
@@ -607,9 +609,10 @@ def _observed_stacking_warning(task_id: int, branch: str, sha: str = "") -> str:
             "сеть не ходит. Её проверяют сдача и доставка."
         )
     message = str(seen.value.get("message") or "")
+    age = gate_observations.age_phrase(seen.age_minutes)
     if not message:
         # Наблюдённое «стыковки нет» — тоже с возрастом, а не молчание.
-        return ""
+        return f"Стыковки с чужими ветками нет [сверено {age}, показ в сеть не ходит]"
     return f"{message} [сверено {gate_observations.age_phrase(seen.age_minutes)}]"
 
 

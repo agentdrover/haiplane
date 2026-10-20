@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -61,7 +62,9 @@ def recall(kind: str, task_id: int, key: str) -> Observation | None:
 
 def forget_all() -> None:
     """Забыть всё (тесты; рестарт делает то же)."""
+    global _down_until
     _seen.clear()
+    _down_until = 0.0
 
 
 def stacking_key(branch: str, sha: str) -> str:
@@ -77,7 +80,9 @@ def age_phrase(minutes: int) -> str:
 #: Как часто проход поллера освежает наблюдения одной задачи, и сколько задач за тик.
 REFRESH_EVERY_MINUTES = 5
 MAX_TASKS_PER_TICK = 3
-TASK_DEADLINE_SECONDS = 45
+SWEEP_BUDGET_SECONDS = 25
+CALL_CEILING_SECONDS = 15
+FETCH_BACKOFF_SECONDS = 120
 
 _refreshed_at: dict[int, datetime] = {}
 
@@ -103,23 +108,55 @@ async def _gate_tasks(db: Any) -> list[int]:
     return [int(r["id"]) for r in rows]
 
 
+class _OutOfTime(Exception):
+    """Бюджет прохода исчерпан: остальное ждёт следующего тика."""
+
+
+class _Deadline:
+    """Один дедлайн на проход; на него ставятся ТОЛЬКО сетевые вызовы (как в ci_head_run).
+
+    Чтения и записи базы идут снаружи ``run``: отмена посреди SQL — дыра в
+    инварианте, что операции с базой снаружи не отменяются.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.end = time.monotonic() + seconds
+
+    def left(self) -> float:
+        return self.end - time.monotonic()
+
+    async def run(self, make: Any, ceiling: float = CALL_CEILING_SECONDS) -> Any:
+        allowed = min(ceiling, self.left())
+        if allowed <= 0:
+            raise _OutOfTime
+        async with asyncio.timeout(allowed):
+            return await make()
+
+
+_down_until = 0.0
+
+
 async def sweep(db: Any) -> None:
     """Проход поллера (#1913): освежить наблюдения задач на гейте, раз в 5 минут.
 
     Показ в сеть не ходит и потому видит только это. Здесь сеть разрешена:
-    вершина ветки, расхождение PR с базой и стыковка — те же вызовы, что у
-    гейтов. Бюджет мал и честен: не больше ``MAX_TASKS_PER_TICK`` задач за тик,
-    у каждой не чаще ``REFRESH_EVERY_MINUTES`` и не дольше ``TASK_DEADLINE_SECONDS``;
-    пока GitHub недавно не отвечал, проход не спрашивает его вовсе. Стояние CI
-    освежает ``ci_trust.sweep`` — его здесь не дублируем.
+    вершина ветки, скан целостности CI, расхождение PR с базой и стыковка — те
+    же вызовы, что у гейтов. Бюджет: общий дедлайн ``SWEEP_BUDGET_SECONDS`` на
+    проход, не больше ``MAX_TASKS_PER_TICK`` задач, у каждой не чаще
+    ``REFRESH_EVERY_MINUTES``. Пока GitHub недавно не отвечал или fetch клона
+    упал (``FETCH_BACKOFF_SECONDS``), проход молчит. Стояние CI освежает
+    ``ci_trust.sweep`` — его здесь не дублируем.
     """
+    global _down_until
     from hub import repository as repo
     from hub import services
-    from hub.services import ci_trust, lifecycle
+    from hub.services import ci_integrity, ci_trust, lifecycle
+    from hub.services.orchestration import project_git_context
     from hub.services.review_brief import base_merge_section
 
-    if ci_trust.forge_recently_down():
+    if ci_trust.forge_recently_down() or time.monotonic() < _down_until:
         return
+    deadline = _Deadline(SWEEP_BUDGET_SECONDS)
     now = datetime.now(UTC)
     ids = await _gate_tasks(db)
     for stale in set(_refreshed_at) - set(ids):
@@ -132,7 +169,7 @@ async def sweep(db: Any) -> None:
             and (now - last).total_seconds() < REFRESH_EVERY_MINUTES * 60
         ):
             continue
-        if done >= MAX_TASKS_PER_TICK:
+        if done >= MAX_TASKS_PER_TICK or deadline.left() <= 0:
             return
         done += 1
         _refreshed_at[task_id] = now
@@ -142,9 +179,24 @@ async def sweep(db: Any) -> None:
         view = services.row_to_task(task_row)
         branch = (view.branch or "").strip()
         try:
-            async with asyncio.timeout(TASK_DEADLINE_SECONDS):
-                await lifecycle.resolve_branch_tip(db, task_id, branch)
-                await base_merge_section(db, view)
-                await services.detect_branch_stacking(db, task_id, branch)
+            ctx = await project_git_context(db, task_id)
+            workspace = (ctx.get("repo") or "").strip()
+            if workspace:
+                tip, why = await deadline.run(
+                    lambda: lifecycle.observe_tip_at(workspace, task_id, branch)
+                )
+                if not tip and why.startswith("could not fetch"):
+                    _down_until = time.monotonic() + FETCH_BACKOFF_SECONDS
+                    return
+            await ci_integrity.ensure_scan(db, task_id, net=deadline.run)
+            await base_merge_section(db, view, net=deadline.run)
+            if deadline.left() <= 0:
+                raise _OutOfTime
+            # Стыковка — много вызовов с чтениями базы внутри: дедлайн её не режет,
+            # границу ставят таймауты git самого адаптера.
+            await services.detect_branch_stacking(db, task_id, branch)
+        except _OutOfTime:
+            _refreshed_at.pop(task_id, None)  # не успели — следующий тик начнёт с неё
+            return
         except Exception:  # noqa: BLE001 - наблюдение не должно ронять проход
             log.exception("gate observation of task %s failed", task_id)
