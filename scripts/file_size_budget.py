@@ -201,7 +201,13 @@ class BaseView:
         """Порог дерева на базе не выше нынешнего: правило «только сокращается» уже
         действовало. База с более высоким порогом (до #1932 у tests 3000) его не знала:
         там ledger ещё не нёс записей tests, и вносить их можно по нынешним замерам."""
-        return self.thresholds.get(tree, current + 1) <= current
+        return self.thresholds[tree] <= current
+
+
+def _unknown_base_reason(on_base: int | None) -> str:
+    if on_base is None:
+        return "новая запись: файла не было на базе (новый файл или переименование)"
+    return f"новая запись: на базе файл {on_base} строк, он перерос порог"
 
 
 def _base_number(entry: dict, key: str) -> int:
@@ -219,9 +225,17 @@ def _ratchet_problems(
     for path, entry in sorted(ledger.items()):
         if _tree(path) not in RATCHET_TREES:
             continue
-        if not base.ratchet_in_force(_tree(path), thresholds[_tree(path)]):
-            continue
         prior = base.ledger.get(path)
+        if not base.ratchet_in_force(_tree(path), thresholds[_tree(path)]):
+            # База правила не знала. Вносятся только файлы, что уже были на ней
+            # длиннее порога (нового файла, переименования и файла, выросшего
+            # из короткого, это не касается).
+            on_base = base.lines(path)
+            if prior is None and (
+                on_base is None or on_base <= _threshold(path, thresholds)
+            ):
+                found.append((path, _unknown_base_reason(on_base)))
+            continue
         if prior is not None:
             top_measured, top_max = (
                 _base_number(prior, "measured"),
@@ -442,19 +456,27 @@ def write_ledger(
 
 
 def _event_before(env: Mapping[str, str]) -> str:
-    """``before`` из события push (GITHUB_EVENT_PATH); нечитаемое событие — пусто."""
+    """``before`` из события push (GITHUB_EVENT_PATH); нечитаемое - CompareError.
+
+    Откат на origin/develop тут был бы ложью: после push он равен HEAD, ledger
+    сравнился бы сам с собой и проверка молча стала бы зелёной.
+    """
     try:
         payload = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
-        return str(payload.get("before") or "")
-    except (KeyError, OSError, ValueError, AttributeError):
-        return ""
+        before = str(payload["before"] or "")
+    except (KeyError, OSError, ValueError, TypeError, AttributeError) as exc:
+        raise CompareError(f"push без читаемого before события: {exc!r}") from exc
+    if not before:
+        raise CompareError("push: before события пуст")
+    return before
 
 
 def base_from_environment(env: Mapping[str, str]) -> tuple[str, bool]:
     """База сравнения из окружения CI и признак «ровно этот коммит» (push).
 
-    PR — origin/<ветка PR>; push — состояние ДО события (HEAD уже содержит
-    правку, и сверка с самой веткой молчала бы); остальное — origin/develop.
+    PR - origin/<ветка PR>; push - состояние ДО события (HEAD уже содержит
+    правку, и сверка с самой веткой молчала бы); остальное - origin/develop.
+    Нулевой before читаемого события (новая ветка) - не сбой: база origin/develop.
     """
     event = env.get("GITHUB_EVENT_NAME", "")
     before = _event_before(env) if event == "push" else ""
@@ -462,12 +484,24 @@ def base_from_environment(env: Mapping[str, str]) -> tuple[str, bool]:
     return base, event == "push" and base == before
 
 
+def _parse_ledger(raw: object) -> dict[str, dict]:
+    """Ledger базы по пути; запись без числа measured/max - CompareError."""
+    try:
+        entries = {w["path"]: w for w in raw["waivers"]}  # type: ignore[index]
+        for entry in entries.values():
+            _base_number(entry, "measured")
+            _base_number(entry, "max")
+    except (KeyError, TypeError) as exc:
+        raise CompareError(f"ledger: нет waivers/path: {exc!r}") from exc
+    return entries
+
+
 def load_base(root: Path, base: str, exact: bool) -> BaseView:
     """Ledger базы и размеры файлов на ней. CompareError — сравнить нельзя."""
     snap = _snapshot(root, base, exact, _git)
     try:
         raw = json.loads(str(_git(["show", f"{snap}:{LEDGER_REL.as_posix()}"], root)))
-        ledger = {w["path"]: w for w in raw["waivers"]}
+        ledger = _parse_ledger(raw)
         headroom = float(raw.get("headroom_pct", DEFAULT_HEADROOM_PCT))
     except (CompareError, ValueError, KeyError, TypeError) as exc:
         raise CompareError(
@@ -486,6 +520,9 @@ def load_base(root: Path, base: str, exact: bool) -> BaseView:
             for t, v in tomllib.loads(text)["tool"]["haiplane"]["file_size"].items()
             if t != NEAR_KEY
         }
+        missing = sorted(RATCHET_TREES - set(base_thresholds))
+        if missing:
+            raise KeyError(f"нет порога {', '.join(missing)}")
     except (CompareError, ValueError, KeyError, TypeError) as exc:
         raise CompareError(
             f"пороги базы {base} ({snap[:12]}) не прочитаны: {exc}"
@@ -511,14 +548,19 @@ def _update(
     before = load_ledger(ledger_path)
     count = write_ledger(sizes, thresholds, ledger_path, clamp)
     print(f"ledger перезаписан: {count} исключений")
-    known = before if clamp is None else clamp
-    added = sorted(
-        w["path"]
-        for w in load_ledger(ledger_path).values()
-        if _tree(w["path"]) in RATCHET_TREES and w["path"] not in known
-    )
-    if clamp == {}:
-        added = []  # база правила не знала: записи tests вносятся разово
+    written = load_ledger(ledger_path)
+    ratchet = [p for p in sorted(written) if _tree(p) in RATCHET_TREES]
+    if base is None:
+        added = [p for p in ratchet if p not in before]
+    elif forced:
+        added = [p for p in ratchet if p not in base.ledger]
+    else:  # база правила не знала: CI примет только файлы, длинные уже на ней
+        added = [
+            p
+            for p in ratchet
+            if p not in base.ledger
+            and (base.lines(p) or 0) <= _threshold(p, thresholds)
+        ]
     for path in added[:ADDED_SHOWN]:
         print(
             f"  внимание: новая запись {path}; CI отвергнет её, если файл не был "
@@ -555,19 +597,19 @@ def main() -> int:
     base = None
     base_error = ""
     if not args.no_base:
-        name, exact = (
-            (args.base, False) if args.base else base_from_environment(os.environ)
-        )
+        name = args.base or "из окружения CI"
         try:
+            name, exact = (
+                (args.base, False) if args.base else base_from_environment(os.environ)
+            )
             base = load_base(root, name, exact)
         except CompareError as exc:
             base_error = f"file size: сравнить с базой {name} не удалось: {exc}"
-
-    if args.update:
-        return _update(root, sizes, thresholds, ledger_path, base)
-    if base_error:
+    if base_error:  # до любой записи ledger, и для проверки, и для --update
         print(base_error, file=sys.stderr)
         return BASE_UNREADABLE
+    if args.update:
+        return _update(root, sizes, thresholds, ledger_path, base)
     try:
         report = check(sizes, thresholds, load_ledger(ledger_path), near_pct, base)
     except CompareError as exc:  # ленивое чтение базы упало уже внутри проверки

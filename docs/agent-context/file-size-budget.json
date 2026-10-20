@@ -203,8 +203,8 @@
     },
     {
       "path": "tests/test_ci_integrity.py",
-      "measured": 925,
-      "max": 972,
+      "measured": 1040,
+      "max": 1092,
       "removed_by": "unclaimed"
     },
     {
@@ -281,8 +281,8 @@
     },
     {
       "path": "tests/test_delivery_gate.py",
-      "measured": 5070,
-      "max": 5324,
+      "measured": 5086,
+      "max": 5341,
       "removed_by": "unclaimed"
     },
     {
@@ -389,8 +389,8 @@
     },
     {
       "path": "tests/test_poller.py",
-      "measured": 4040,
-      "max": 4242,
+      "measured": 4042,
+      "max": 4245,
       "removed_by": "unclaimed"
     },
     {
@@ -425,14 +425,14 @@
     },
     {
       "path": "tests/test_review_brief.py",
-      "measured": 2244,
-      "max": 2357,
+      "measured": 2249,
+      "max": 2362,
       "removed_by": "unclaimed"
     },
     {
       "path": "tests/test_review_brief_projection.py",
-      "measured": 1724,
-      "max": 1811,
+      "measured": 1730,
+      "max": 1817,
       "removed_by": "unclaimed"
     },
     {
@@ -545,8 +545,8 @@
     },
     {
       "path": "tests/test_stack_advisory.py",
-      "measured": 1636,
-      "max": 1718,
+      "measured": 1644,
+      "max": 1727,
       "removed_by": "unclaimed"
     },
     {

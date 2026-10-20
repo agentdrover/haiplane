@@ -10,6 +10,7 @@ deep-ревью не дочитывает. Страж проверяется в�
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -57,10 +58,10 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     """Прогон проверки; без явной базы - ``--no-base`` (дерево не git-репозиторий).
 
-    Явная база (``--base``) и ``--update`` оставлены как есть: сравнение с базой
-    в тестах ниже идёт на временных git-репозиториях, а не на настоящем.
+    Явная база (``--base``) оставлена как есть: сравнение с базой в тестах ниже
+    идёт на временных git-репозиториях, а не на настоящем.
     """
-    base = () if {"--base", "--no-base", "--update"} & set(args) else ("--no-base",)
+    base = () if {"--base", "--no-base"} & set(args) else ("--no-base",)
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(root), *base, *args],
         capture_output=True,
@@ -580,22 +581,56 @@ def _bootstrap_repo(root: Path) -> None:
     )
 
 
-def test_a_base_without_the_rule_lets_the_tests_ledger_be_introduced(tmp_path):
-    """База с порогом выше нынешнего правила не знала: записи вносятся по замеру.
-
-    Так PR, вводящий порог, и PR/релиз, чья база старше правила, не краснеют зря;
-    после влития правила порог на базе 800 и этот путь закрыт сам.
-    """
+def test_a_base_without_the_rule_lets_long_files_of_the_base_be_introduced(tmp_path):
+    """База с порогом выше нынешнего правила не знала: файлы, что уже были на ней
+    длиннее порога, вносятся по замеру (первый релиз, PR, вводящий порог)."""
     _bootstrap_repo(tmp_path)
     assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
     assert _run(tmp_path, "--base", "HEAD").returncode == 0
-    # База поменялась под ногами (ветка влила develop, файл вырос): --update
-    # перемеряет запись вверх, потому что база её потолком не связана.
+    # Файл вырос на develop по старым правилам (925 -> 1040 на релизе): --update
+    # перемеряет запись вверх, база её потолком не связана.
     _write_lines(tmp_path, "tests/long.py", 1377)
     assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
     (entry,) = _ledger_waivers(tmp_path)
     assert entry["measured"] == 1377
     assert _run(tmp_path, "--base", "HEAD").returncode == 0
+
+
+def test_old_base_new_file_or_rename_is_red(tmp_path):
+    """Исключение не узаконивает новый длинный файл и переименование."""
+    _bootstrap_repo(tmp_path)
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    _write_lines(tmp_path, "tests/test_new_waiver.py", 1000)
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/test_new_waiver.py" in proc.stdout
+
+    (tmp_path / "tests" / "test_new_waiver.py").unlink()
+    _git(tmp_path, "mv", "tests/long.py", "tests/long_renamed.py")
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/long_renamed.py" in proc.stdout
+
+
+def test_old_base_file_that_was_short_is_red(tmp_path):
+    """Файл был не длиннее порога на базе и перерос его - не бутстрап."""
+    _make_tree(tmp_path, tests=3000)
+    _write_lines(tmp_path, "tests/grows.py", 700)
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.haiplane.file_size]\nhub = 1500\nscripts = 1500\ntests = 800\n"
+        "near_pct = 90\n",
+        encoding="utf-8",
+    )
+    _write_lines(tmp_path, "tests/grows.py", 1000)
+    assert _run(tmp_path, "--update", "--base", "HEAD").returncode == 0
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/grows.py" in proc.stdout
 
 
 def test_update_clamps_to_the_base_ledger_not_to_the_working_one(tmp_path):
@@ -660,5 +695,83 @@ def test_ci_base_is_taken_from_the_ci_environment(tmp_path):
     assert base_from_environment(env) == ("a" * 40, True)
     event.write_text(json.dumps({"before": "0" * 40}), encoding="utf-8")
     assert base_from_environment(env) == ("origin/develop", False)
+
+
+def test_push_without_readable_before_is_rc2(tmp_path):
+    """push без читаемого before - не fallback на origin/develop (== HEAD), а rc 2."""
+    from file_size_budget import CompareError, base_from_environment
+
+    event = tmp_path / "event.json"
+    for text in ("not json", json.dumps({"after": "x"}), json.dumps({"before": ""})):
+        event.write_text(text, encoding="utf-8")
+        env = {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(event)}
+        with pytest.raises(CompareError):
+            base_from_environment(env)
+    with pytest.raises(CompareError):
+        base_from_environment({"GITHUB_EVENT_NAME": "push"})
+    with pytest.raises(CompareError):
+        base_from_environment(
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(tmp_path / "no")}
+        )
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _tests_repo(repo)
     event.write_text("not json", encoding="utf-8")
-    assert base_from_environment(env) == ("origin/develop", False)
+    env = {
+        **os.environ,
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_EVENT_PATH": str(event),
+    }
+    for extra in ((), ("--update",)):  # без --base и --no-base: база из окружения
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(repo), *extra],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert proc.returncode == 2, extra
+        assert "не удалось" in proc.stderr
+
+
+def test_update_with_unresolvable_base_is_rc2_and_writes_nothing(tmp_path):
+    _tests_repo(tmp_path, waivers=[_old_tests_waiver()])
+    _write_lines(tmp_path, "tests/old.py", 900)
+    _write_lines(tmp_path, "tests/new.py", 801)
+    before = (tmp_path / LEDGER_REL).read_bytes()
+    proc = _run(tmp_path, "--update", "--base", "origin/nowhere")
+    assert proc.returncode == 2
+    assert (tmp_path / LEDGER_REL).read_bytes() == before
+
+
+def test_base_pyproject_without_tests_is_rc2(tmp_path):
+    """Нет порога tests в pyproject базы - ограничение не выключается молча."""
+    _make_tree(tmp_path, tests=800)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.haiplane.file_size]\nhub = 1500\nscripts = 1500\nnear_pct = 90\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "base without tests")
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.haiplane.file_size]\nhub = 1500\nscripts = 1500\ntests = 800\n"
+        "near_pct = 90\n",
+        encoding="utf-8",
+    )
+    for extra in ((), ("--update",)):
+        proc = _run(tmp_path, *extra, "--base", "HEAD")
+        assert proc.returncode == 2, extra
+        assert "tests" in proc.stderr
+
+
+def test_base_ledger_entry_without_measured_is_rc2(tmp_path):
+    """Битая запись ledger базы: rc 2 и у проверки, и у --update, а не KeyError."""
+    bad = {"path": "hub/h.py", "max": 1600, "removed_by": "unclaimed"}
+    _tests_repo(tmp_path, waivers=[bad])
+    ledger = (tmp_path / LEDGER_REL).read_bytes()
+    for extra in ((), ("--update",)):
+        proc = _run(tmp_path, *extra, "--base", "HEAD")
+        assert proc.returncode == 2, extra
+        assert "Traceback" not in proc.stderr
+        assert (tmp_path / LEDGER_REL).read_bytes() == ledger
