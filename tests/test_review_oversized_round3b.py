@@ -61,12 +61,13 @@ def test_two_sections_of_one_path_are_paid_for_together():
     diff = gone + one
     spans = ac_test_spans({F: "\n".join(lines) + "\n"}, [REF])
     ceiling = len(one) + 200
-    out, _ = _inline_diff_lines(diff, [], None, ceiling, spans)
-    used = sum(len(x) for x in out if not x.startswith("НЕ ВОШЛИ"))
-    assert used <= ceiling + 400, (
-        "шапки и пометки - малая добавка, но не 1200 лишних символов"
-    )
-    assert "y" * 1200 not in "\n".join(out) or used <= ceiling + 400
+    out, omitted = _inline_diff_lines(diff, [], None, ceiling, spans)
+    text = "\n".join(out)
+    # Оба раздела пути стоят вместе дороже потолка: файл не втискивается вторым
+    # разделом без списания, а тест AC приходит вырезкой.
+    assert omitted == [F] and "y" * 1200 not in text
+    assert "PAY_059" in text and "ВЫРЕЗКА" in text
+    assert len(text) < ceiling + 600
 
 
 def test_an_unreadable_branch_diff_still_gets_the_block_from_the_pin():
