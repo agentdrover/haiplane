@@ -236,8 +236,10 @@ uv run pytest -q
 ## CI/CD и авто-деплой
 
 - CI и CD описаны в `.github/workflows/ci.yml`.
-- Job `test` (`ruff check`, `ruff format --check`, `pytest`, `pip-audit`,
-  `bandit`, `detect-secrets`) запускается на **любой** `pull_request` — база не
+- Job `test` (единственная обязательная проверка «Ruff and pytest») и job `static`
+  (#1920: `ruff check`, `ruff format --check`, `mypy`, бюджеты, `pip-audit`,
+  `bandit`, `detect-secrets`; идёт параллельно частям `pytest`, `test` краснеет, если
+  `static` не зелёный) запускаются на **любой** `pull_request` — база не
   ограничена списком веток (#475) — и на `push` в `main` и `develop`.
   Список баз убран сознательно: гейт доставки (#605/#606) мержит PR, только
   прочитав исход этого job, поэтому база, не попавшая в список, давала «прогона
