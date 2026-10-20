@@ -10,6 +10,7 @@ translation) live in exactly one place.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -34,12 +35,15 @@ from hub.models import (
 )
 from hub.db import write_transaction, deserialize_str_list, fetchall, serialize_str_list
 from hub.services import cause_kind
+from hub.services.dor_snapshot import load_dor_snapshot
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.services.test_locator import validate_test_locators
 from hub.services.live_probe import validate_declared_probe
+
+log = logging.getLogger(__name__)
 
 
 # Statuses where the Definition of Ready gate still applies. DoR is a
@@ -622,8 +626,13 @@ async def refine_tasks_bulk(
     # чинит поля готовности и не трогает гейт.
     async with write_transaction(db):
         for outcome in outcomes:
-            report = await calculate_readiness_with_recommendations(db, outcome.task_id)
-            await _persist_readiness_and_revision(db, outcome.task_id, report)
+            snapshot = await load_dor_snapshot(db, outcome.task_id)
+            report = await calculate_readiness_with_recommendations(
+                db, outcome.task_id, snapshot=snapshot
+            )
+            await _persist_readiness_and_revision(
+                db, outcome.task_id, report, snapshot.fingerprint()
+            )
             outcome.readiness_score = report.score
             outcome.dor_passed = report.dor_passed
         await db.commit()
@@ -635,10 +644,16 @@ async def _persist_readiness_fields(
     db: aiosqlite.Connection,
     task_id: int,
     report: ReadinessReport,
+    evidence: str,
 ) -> None:
     """Write score/dor_passed/ready_at onto the task row (#250). No locking —
     the caller owns the transaction (an ``_atomic`` block or an explicit
     write-lock + commit).
+
+    ``evidence`` - отпечаток снимка, из которого посчитан ``report`` (#1611):
+    он пишется атомарно с результатом и есть единственное свидетельство его
+    происхождения. Писатель один; кто звал без снимка, получил бы готовность
+    без происхождения, поэтому параметр обязательный.
 
     Поколение постановки (#1156) живёт не здесь, а этажом выше — в
     ``_persist_readiness_and_revision``, которую зовут только пути записи.
@@ -668,6 +683,7 @@ async def _persist_readiness_fields(
     fields: dict[str, Any] = {
         "readiness_score": report.score,
         "dor_passed": int(report.dor_passed),
+        "readiness_evidence": evidence,
     }
     if report.dor_passed:
         if not row["ready_at"]:
@@ -689,6 +705,7 @@ async def _persist_readiness_and_revision(
     db: aiosqlite.Connection,
     task_id: int,
     report: ReadinessReport,
+    evidence: str,
 ) -> None:
     """Записать готовность, двинуть поколение постановки и спросить автопилот.
 
@@ -726,7 +743,7 @@ async def _persist_readiness_and_revision(
     ``dor_passed`` из строки и переводит её в open — после него сравнивать
     было бы уже не с чем.
     """
-    await _persist_readiness_fields(db, task_id, report)
+    await _persist_readiness_fields(db, task_id, report, evidence)
     # Импорт локальный по той же причине, что и у автопилота ниже: сервис
     # поколения читает задачу через repository, а refinement импортируется
     # из многих модулей.
@@ -752,7 +769,11 @@ async def recalc_readiness_inline(
 ) -> ReadinessReport:
     """Recompute readiness and persist it — call INSIDE an ``_atomic`` block
     (it must not re-acquire the write lock)."""
-    report = await calculate_readiness_with_recommendations(db, task_id)
+    # Расчёт и отпечаток - из одного снимка, под локом вызывающего (#1611).
+    snapshot = await load_dor_snapshot(db, task_id)
+    report = await calculate_readiness_with_recommendations(
+        db, task_id, snapshot=snapshot
+    )
     # Поколение ПОСТАНОВКИ (#1156) — внутри общего помощника, а не здесь:
     # массовый refine в эту функцию не заходит (он вне ``_atomic``), и
     # счётчик, привязанный к ней, пропускал бы правки пакетом.
@@ -766,14 +787,17 @@ async def recalc_readiness_inline(
     # причине (#1164): пока он висел здесь, массовый refine проходил мимо
     # него, и включённая владельцем политика зависела от того, каким HTTP-
     # вызовом драфт довели до готовности.
-    await _persist_readiness_and_revision(db, task_id, report)
+    await _persist_readiness_and_revision(db, task_id, report, snapshot.fingerprint())
     return report
 
 
-def _persisted_readiness_stale(row: aiosqlite.Row, report: ReadinessReport) -> bool:
+def _persisted_readiness_stale(
+    row: aiosqlite.Row, report: ReadinessReport, evidence: str
+) -> bool:
     stored_passed = row["dor_passed"]
     return (
-        row["readiness_score"] != report.score
+        row["readiness_evidence"] != evidence
+        or row["readiness_score"] != report.score
         or stored_passed is None
         or bool(stored_passed) != report.dor_passed
         or (report.dor_passed and not row["ready_at"])
@@ -973,15 +997,29 @@ async def get_readiness(
     explain: bool = False,
 ) -> ReadinessReport:
     await _ensure_task_exists(db, task_id)
+    # Отчёт и отпечаток - из одного снимка (#1611).
+    snapshot = await load_dor_snapshot(db, task_id)
+    evidence = snapshot.fingerprint()
     report = await calculate_readiness_with_recommendations(
-        db, task_id, explain=explain
+        db, task_id, explain=explain, snapshot=snapshot
     )
     # Lazy repair (#250): reading readiness heals stale persisted values for
     # tasks refined before persistence existed.
     row = await repo.get_task(db, task_id)
-    if row is not None and _persisted_readiness_stale(row, report):
+    if row is not None and _persisted_readiness_stale(row, report, evidence):
         async with write_transaction(db):
-            await _persist_readiness_fields(db, task_id, report)
+            # Под локом снимок перечитывается (только БД, git под локом
+            # запрещён). Постановка с момента расчёта изменилась - отчёт
+            # устарел, и записывать его нельзя: строку уже написал тот, кто
+            # изменил постановку, со своим отчётом и отпечатком (#1611).
+            if (await load_dor_snapshot(db, task_id)).fingerprint() != evidence:
+                log.info(
+                    "lazy repair skipped for task #%s: statement changed since "
+                    "the readiness was computed",
+                    task_id,
+                )
+            else:
+                await _persist_readiness_fields(db, task_id, report, evidence)
             await db.commit()
     return report
 

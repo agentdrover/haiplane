@@ -987,3 +987,97 @@ async def test_freeze_applies_through_default_fallback_and_epic_binding(
         "/api/tasks", json={"title": "e", "task_type": "epic", "project": "free"}
     )
     assert free_epic.status_code == 200, "проект без заморозки не затронут default"
+
+
+# --- #1611: автоодобрение не открывает задачу по устаревшему сохранённому DoR ---
+
+_STALE_NOTE = "Автоодобрение пропущено"
+
+
+async def _draft_ready_with_switch_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, project_id: int
+) -> int:
+    """Драфт с dor_passed=1 и отпечатком, посчитанными при выключенном автоодобрении."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    task_id = await _draft_in_project(client, db, project_id)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == "draft" and body["dor_passed"] is True
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    return task_id
+
+
+async def _ask_autopilot(db: aiosqlite.Connection, task_id: int) -> bool:
+    from hub.db import write_transaction
+    from hub.services.auto_approve import maybe_auto_approve
+
+    async with write_transaction(db):
+        approved = await maybe_auto_approve(db, task_id)
+        await db.commit()
+    return approved
+
+
+async def _stale_notes(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        u["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if str(u["content"]).startswith(_STALE_NOTE)
+    ]
+
+
+async def test_auto_approval_never_opens_on_a_stale_persisted_dor(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1611 AC-2: сохранённый dor_passed=1 с чужим отпечатком не открывает задачу."""
+    pid = await _project(db, "stale-dor", {"dor": "auto"})
+    task_id = await _draft_ready_with_switch_off(client, db, monkeypatch, pid)
+
+    # Постановка изменена в обход пересчёта: отпечаток в строке уже не её.
+    await repo.update_task(db, task_id, business_value="")
+    await db.commit()
+    assert (await repo.get_task(db, task_id))["dor_passed"] == 1
+
+    assert await _ask_autopilot(db, task_id) is False
+    assert (await repo.get_task(db, task_id))["status"] == "draft"
+    assert len(await _stale_notes(db, task_id)) == 1, "одна строка в ленте"
+    assert await _ask_autopilot(db, task_id) is False
+    assert len(await _stale_notes(db, task_id)) == 1, "без дублей"
+
+    # Старая строка без отпечатка: тоже не открывается.
+    other = await _draft_ready_with_switch_off(client, db, monkeypatch, pid)
+    await db.execute("UPDATE tasks SET readiness_evidence='' WHERE id=?", (other,))
+    await db.commit()
+    assert await _ask_autopilot(db, other) is False
+    assert (await repo.get_task(db, other))["status"] == "draft"
+    assert len(await _stale_notes(db, other)) == 1
+
+    # Совпадающий отпечаток: одобряется как раньше.
+    fresh = await _draft_ready_with_switch_off(client, db, monkeypatch, pid)
+    assert await _ask_autopilot(db, fresh) is True
+    assert (await repo.get_task(db, fresh))["status"] == "open"
+    assert await _stale_notes(db, fresh) == []
+
+
+async def test_a_statement_paths_switch_invalidates_the_persisted_dor(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1611 AC-3: режим statement_paths входит в отпечаток; чужие лимиты - нет."""
+    pid = await _project(db, "paths-switch", {"dor": "auto", "statement_paths": "warn"})
+    task_id = await _draft_ready_with_switch_off(client, db, monkeypatch, pid)
+
+    await repo.update_project(
+        db,
+        pid,
+        gate_policy=json.dumps({"dor": "auto", "statement_paths": "require"}),
+    )
+    await db.commit()
+    assert await _ask_autopilot(db, task_id) is False
+    assert (await repo.get_task(db, task_id))["status"] == "draft"
+
+    pid2 = await _project(db, "paths-unrelated", {"dor": "auto", "wip_limit": 5})
+    kept = await _draft_ready_with_switch_off(client, db, monkeypatch, pid2)
+    await repo.update_project(
+        db, pid2, gate_policy=json.dumps({"dor": "auto", "wip_limit": 9})
+    )
+    await db.commit()
+    assert await _ask_autopilot(db, kept) is True, "несвязанный лимит не инвалидирует"
+    assert (await repo.get_task(db, kept))["status"] == "open"
