@@ -569,6 +569,31 @@ def _script_module_names(rel: str) -> set[str]:
     return {bare, f"scripts.{bare}"}
 
 
+def _relative_import_bases(rel: str, level: int) -> set[str]:
+    """Package(s) a relative ``from ... import`` in ``rel`` resolves against.
+
+    Mirrors ``importlib._bootstrap._resolve_name``: ``level`` dots are
+    resolved against the IMPORTING module's own containing package, never
+    against ``node.module`` read as if it were an absolute dotted name.
+    Ignoring ``level`` (the bug this fixes) makes ``from .a import helper``
+    in ``scripts/pkg/b.py`` match the unrelated top-level ``scripts/a.py``,
+    because both happen to be named ``a`` — exactly the nominal false match
+    #1935 removes elsewhere in this module.
+
+    Computed for both dotted spellings of ``rel`` (``_script_module_names``,
+    #1935) since a relative import's resolved package depends on which
+    namespace ``rel`` is considered part of.
+    """
+    bases: set[str] = set()
+    for spelling in _script_module_names(rel):
+        package_parts = spelling.split(".")[:-1]
+        remaining = len(package_parts) - (level - 1)
+        if remaining < 1:
+            continue  # relative import would reach beyond the top-level package
+        bases.add(".".join(package_parts[:remaining]))
+    return bases
+
+
 def _imported_modules(root: str, rel: str) -> set[str]:
     """Dotted module names named by ``import``/``from ... import`` in one file.
 
@@ -580,6 +605,11 @@ def _imported_modules(root: str, rel: str) -> set[str]:
     ``module.name`` for every alias costs nothing when ``name`` is a
     function or class rather than a submodule: that string never equals a
     real file's module name, so it only ever adds noise, never a false match.
+
+    Relative imports (``node.level > 0``) are resolved against ``rel``'s own
+    package via ``_relative_import_bases`` instead of matching ``node.module``
+    verbatim: unresolved, ``from .a import helper`` would be read as if it
+    named the unrelated top-level ``a``.
     """
     try:
         source = open(os.path.join(root, rel), encoding="utf-8").read()
@@ -591,10 +621,19 @@ def _imported_modules(root: str, rel: str) -> set[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
-            for alias in node.names:
-                names.add(f"{node.module}.{alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                for base in _relative_import_bases(rel, node.level):
+                    effective = f"{base}.{node.module}" if node.module else base
+                    if not effective:
+                        continue
+                    names.add(effective)
+                    for alias in node.names:
+                        names.add(f"{effective}.{alias.name}")
+            elif node.module:
+                names.add(node.module)
+                for alias in node.names:
+                    names.add(f"{node.module}.{alias.name}")
     return names
 
 

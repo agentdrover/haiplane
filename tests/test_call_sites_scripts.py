@@ -165,6 +165,65 @@ def test_a_submodule_imported_via_from_package_import_submodule_is_recognized(
     )
 
 
+def test_a_relative_import_resolves_against_the_callers_own_package(repo: Path):
+    """Critic finding on sha 69701899: ``node.level`` was ignored, so a
+    relative import's ``node.module`` (just ``a``, the part after the dots)
+    was matched as if it were an absolute module name. That makes
+    ``scripts/pkg/b.py``'s ``from .a import helper`` match the UNRELATED
+    top-level ``scripts/a.py`` (also named ``a``) instead of its real sibling
+    ``scripts/pkg/a.py`` — recreating the exact nominal false match #1935
+    removes for every other import form."""
+    (repo / "scripts" / "pkg").mkdir()
+    (repo / "scripts" / "pkg" / "__init__.py").write_text("")
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value\n"
+    )
+    (repo / "scripts" / "pkg" / "b.py").write_text(
+        "from .a import helper\n\n\ndef run():\n    return helper(1)\n"
+    )
+    (repo / "scripts" / "a.py").write_text("def helper(value):\n    return value * 2\n")
+    _commit(repo)
+
+    # Changing the real sibling scripts/pkg/a.py:helper must count
+    # scripts/pkg/b.py as a caller.
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value + 1\n"
+    )
+
+    report = call_sites.analyse(str(repo), _diff(repo))
+    pkg_helper = next(
+        s
+        for s in report.symbols
+        if s.symbol == "helper" and s.defined_in == "scripts/pkg/a.py"
+    )
+    assert pkg_helper.state != call_sites.NO_CALLERS, pkg_helper.statement()
+    assert "scripts/pkg/b.py" in {s.file for s in pkg_helper.sites}, (
+        "from .a import helper in scripts/pkg/b.py must resolve to the "
+        f"sibling scripts/pkg/a.py, not the unrelated scripts/a.py: "
+        f"{pkg_helper.statement()}"
+    )
+
+    # Changing the UNRELATED top-level scripts/a.py:helper must NOT pick up
+    # scripts/pkg/b.py as a caller — that would mean node.level was ignored
+    # and ".a" was matched as the absolute, unrelated "a".
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value + 1\n"
+    )
+    _commit(repo)
+    (repo / "scripts" / "a.py").write_text("def helper(value):\n    return value * 3\n")
+
+    report2 = call_sites.analyse(str(repo), _diff(repo))
+    top_helper = next(
+        s
+        for s in report2.symbols
+        if s.symbol == "helper" and s.defined_in == "scripts/a.py"
+    )
+    assert top_helper.state == call_sites.NO_CALLERS, (
+        "scripts/pkg/b.py's relative 'from .a import helper' must not be "
+        f"read as an import of the unrelated scripts/a.py: {top_helper.statement()}"
+    )
+
+
 # ---- AC-3: a name match alone is not an import, and hub/'s only_tests is unchanged ----
 
 
