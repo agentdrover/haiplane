@@ -167,12 +167,54 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     reports = await repo.machine_reviews_of_generation(db, task_id, generation)
     if not reports or not dict(reports[-1]).get("incomplete"):
         return ""
+    acts = await _ladder_acts(db, task_id, generation)
+    if await _preparing(db, task_id, generation, acts, int(dict(reports[-1])["id"])):
+        return "добор готовится: поступок лестницы записан, заказ ещё не поставлен"
     view = await inflight_view(db, task, include_owed=True)
     if view is None:
         return ""
-    if any(_placed(act) for act in await _ladder_acts(db, task_id, generation)):
+    if any(_placed(act) for act in acts):
         return view.headline
     return ""
+
+
+async def _preparing(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    acts: list[dict[str, Any]],
+    latest_report_id: int,
+) -> bool:
+    """Поступок на ТЕКУЩИЙ отчёт записан, а диспетчер ещё не вернул ответ.
+
+    Диспетчер готовит заказ сетевыми вызовами и коммитит долг второй двери до
+    возврата, а предыдущий заказ уже закрыт: без этого окна читатель
+    объявлял бы отчёт готовым, и судья тратил бы суждение на неполные данные.
+    Закрывает поступок запись «поставлен/отказан» или событие попытки оси.
+    """
+    closed = {
+        int(a["data"].get("after_review_id") or 0)
+        for a in acts
+        if a["data"] is not None and a["kind"] == dispatcher.MODEL_CASCADE_EVENT
+    }
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=?",
+        (task_id, dispatcher.LADDER_TOP_UP_PLACED_EVENT, generation),
+    )
+    for row in rows:
+        try:
+            closed.add(int(json.loads(row["payload"] or "{}")["after_review_id"]))
+        except (ValueError, KeyError, TypeError):
+            continue  # нечитаемое закрытие не закрывает: ждём, срок остановит
+    return any(
+        a["data"] is not None
+        and a["kind"] == dispatcher.LADDER_TOP_UP_EVENT
+        and int(a["data"].get("after_review_id") or 0) == latest_report_id
+        and latest_report_id not in closed
+        for a in acts
+    )
 
 
 async def wait_with_report(db, task: dict[str, Any]) -> ReviewWait:
@@ -264,12 +306,13 @@ async def ladder_why(
     if outcome.verdict is not None:
         return outcome.verdict
     code = await _recorded_outcome(db, task_id, generation)
+    if outcome.failed_unnamed and code in ("", WHY_AXIS_NO_REPORT, WHY_AXIS_EXHAUSTED):
+        # Маркер НАЧАЛА попытки и алерт исчерпания не отменяют записанный отказ.
+        return LadderWhy(WHY_AXIS_NOT_PLACED)
     if code in (WHY_AXIS_NO_REPORT, WHY_AXIS_EXHAUSTED):
         return _axis_code(acts, code)
     if code:
         return LadderWhy(code)
-    if outcome.failed_unnamed:
-        return LadderWhy(WHY_AXIS_NOT_PLACED)
     return LadderWhy(WHY_UNKNOWN)
 
 
@@ -321,7 +364,8 @@ async def _placed_dispatches(
     for row in rows:
         try:
             data = json.loads(row["payload"] or "{}")
-            placed[int(data["after_review_id"])] = int(data["dispatch_id"])
+            if data.get("outcome") == "placed":
+                placed[int(data["after_review_id"])] = int(data["dispatch_id"])
         except (ValueError, KeyError, TypeError):
             continue  # нечитаемая запись — связи нет, а не «заказ потерян»
     return placed

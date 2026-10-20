@@ -2365,9 +2365,10 @@ LADDER_ORDER_FAILED_MARK = "поставить не удалось"
 #: generation, dispatch_id, after_review_id. Связь добора с отчётом и заказом —
 #: записью, а не выводом из времени и порядка строк. Читает ladder_view.
 LADDER_TOP_UP_EVENT = "review_ladder_top_up"
-#: Событие «заказ добора поставлен»: generation, after_review_id, dispatch_id —
-#: пишется ПОСЛЕ возврата диспетчера. Без него заказ поступка неизвестен, и
-#: читатель исхода ничего про отчёт заказа не утверждает.
+#: Закрытие поступка добора: generation, after_review_id, outcome
+#: (placed | refused), dispatch_id — пишется ПОСЛЕ возврата диспетчера. Без
+#: него поступок «готовится»; без dispatch_id заказ неизвестен, и читатель
+#: исхода ничего про отчёт заказа не утверждает.
 LADDER_TOP_UP_PLACED_EVENT = "review_ladder_top_up_placed"
 
 
@@ -2514,16 +2515,22 @@ async def _record_top_up(
     await db.commit()
 
 
-async def _record_top_up_placed(
+async def _close_top_up(
     db: aiosqlite.Connection,
     task_id: int,
     generation: int,
     report: Mapping[str, Any],
+    *,
+    placed: bool,
 ) -> None:
-    """Записать, какой заказ поставил добор после ЭТОГО неполного отчёта (#1925)."""
+    """Закрыть запись поступка: что вернул диспетчер (#1925).
+
+    Поступок без закрытия — «готовится»: заказ ещё не поставлен, но уже
+    записан, и судью заказывать рано. С закрытием ``placed`` — известен
+    заказ (``dispatch_id``), с ``refused`` — заказа нет, а причину называют
+    алерты. Упавший вызов закрытия не оставляет: ожидание держит срок.
+    """
     row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
-    if row is None:
-        return
     await repo.insert_event(
         db,
         kind=LADDER_TOP_UP_PLACED_EVENT,
@@ -2532,7 +2539,8 @@ async def _record_top_up_placed(
         payload={
             "generation": generation,
             "after_review_id": report.get("id"),
-            "dispatch_id": dict(row)["id"],
+            "outcome": "placed" if placed else "refused",
+            "dispatch_id": dict(row)["id"] if placed and row is not None else None,
         },
     )
     await db.commit()
@@ -2653,6 +2661,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     await _record_top_up(db, task_id, generation, report)
     feed_mark = await _last_update_id(db, task_id)
     dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    await _close_top_up(db, task_id, generation, report, placed=bool(dispatched))
     if not dispatched and not await _refused_by_name_since(db, task_id, feed_mark):
         # maybe_dispatch_review already alerted when policy asked and the call
         # failed; when policy never asked, silence there is correct. Either
@@ -2667,8 +2676,6 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             + ladder_generation_tag(generation),
         )
         await db.commit()
-    if dispatched:
-        await _record_top_up_placed(db, task_id, generation, report)
     return dispatched
 
 

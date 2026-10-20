@@ -108,6 +108,7 @@ async def _dispatch_row(
             actor="policy",
             payload={
                 "generation": 1,
+                "outcome": "placed",
                 "dispatch_id": dispatch_id,
                 "after_review_id": after,
             },

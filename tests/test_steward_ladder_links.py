@@ -569,6 +569,17 @@ async def test_an_unnamed_axis_refusal_is_named_by_its_own_alert(
     task = await _task_dict(db, task_id)
     bare = await ladder_why(db, task)
     assert bare is not None and bare.code == "second_axis_not_placed", bare
+    # Маркер НАЧАЛА попытки (алерт пишется до вызова) записанный отказ не отменяет.
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        dispatcher.MODEL_CASCADE_MARK.format(generation=1) + " Переспрос 1 из 1",
+    )
+    await db.commit()
+    marked = await ladder_why(db, task)
+    assert marked is not None and marked.code == "second_axis_not_placed", marked
 
     async def _cap_exhausted(_db, _task, _generation):
         return 3
@@ -577,3 +588,24 @@ async def test_an_unnamed_axis_refusal_is_named_by_its_own_alert(
     assert await dispatcher._forced_deep_over_cap(db, task, 1, "deep", "x") is True
     named = await ladder_why(db, task)
     assert named is not None and named.code == "deep_cap", named
+
+
+async def test_the_order_being_prepared_is_not_a_finished_review(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 5, П1: диспетчер готовит заказ, предыдущий уже закрыт — судью заказывать рано."""
+    _, task_id = await _lite_incomplete(db, "round5-preparing")
+    task = await _task_dict(db, task_id)
+    seen: list[str] = []
+
+    async def _slow(_db, _task_id, **_kwargs):
+        seen.append(await top_up_in_flight(db, task))
+        seen.append(str(await order_due_runs(db)))
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _slow)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert seen[0], "поступок записан, закрытия нет — добор готовится"
+    assert seen[1] == "0", "судья в окне подготовки не заказан"
+    assert await top_up_in_flight(db, task) == "", "закрытие «отказан» снимает ожидание"
+    assert await order_due_runs(db) == 1
