@@ -3306,6 +3306,7 @@ class TaskView(PlainSummaryView):
     lifecycle_hint: str | None = None
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
+    last_executor_order: dict[str, Any] | None = None  # #1941: single read only
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the
