@@ -37,6 +37,7 @@ from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicab
 from hub.services.gate_events import (
     STEWARD_APPLIED,
     STEWARD_ESCALATED,
+    STEWARD_JUDGEMENT_REFUSED,
     STEWARD_JUDGEMENT,
 )
 
@@ -197,18 +198,24 @@ def _effective_verdict(
     return submitted_verdict, escalate_reason
 
 
-def _require_complete_judgement(
-    body: StewardJudgementSubmit, submitted_verdict: str, confidence: str
+async def _require_complete_judgement(
+    db,
+    task_id: int,
+    body: StewardJudgementSubmit,
+    submitted_verdict: str,
+    confidence: str,
 ) -> None:
     """422, а не запись: approve/возврат судьи без оснований или уверенности (#1924).
 
     Прежде такой ответ хранился эскалацией ``no_grounds`` и уходил человеку
     (8 из 17 передач за 17-20.10). Теперь судья получает отказ с образцом в
-    том же прогоне и исправляет тело. Ничего не пишется, слот и заказ
+    том же прогоне и исправляет тело. Суждение не пишется, слот и заказ
     открыты; не исправил до дедлайна — прогон закрывает свип, решение у
     человека. ``low`` уверенность и escalate проходят как раньше. Страховка
     :func:`_downgrade_reason` остаётся: ответ без оснований не применяется
-    ни по какому пути.
+    ни по какому пути. Каждый отказ считается событием
+    ``steward_judgement_refused``; исправленное тело потом даёт обычное
+    ``steward_judgement`` на той же задаче и поколении.
     """
     if body.kind != KIND_VERDICT or submitted_verdict == "escalate":
         return
@@ -219,13 +226,26 @@ def _require_complete_judgement(
         missing.append("grounds[].detail" if body.grounds else "grounds")
     if not confidence:
         missing.append("confidence")
-    if missing:
-        raise HTTPException(
-            422,
-            detail=steward_judgement_incomplete_detail(
-                missing, steward_judgement_body_sample(body.generation)
-            ),
-        )
+    if not missing:
+        return
+    await repo.insert_event(
+        db,
+        kind=STEWARD_JUDGEMENT_REFUSED,
+        task_id=task_id,
+        actor="steward",
+        payload={
+            "kind": body.kind,
+            "generation": body.generation,
+            "missing": missing,
+        },
+    )
+    await db.commit()
+    raise HTTPException(
+        422,
+        detail=steward_judgement_incomplete_detail(
+            missing, steward_judgement_body_sample(body.generation)
+        ),
+    )
 
 
 async def _emit_events(
@@ -319,7 +339,7 @@ async def record_steward_judgement(
     for closure in body.closures:
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
-    _require_complete_judgement(body, submitted_verdict, confidence)
+    await _require_complete_judgement(db, task_id, body, submitted_verdict, confidence)
     effective_verdict, effective_reason = _effective_verdict(
         body, submitted_verdict, confidence
     )

@@ -77,6 +77,13 @@ async def test_ungrounded_judge_gets_422_and_can_fix_in_the_same_run(
     assert detail["missing"] == ["grounds", "confidence"]
     assert detail["sample"] == steward_judgement_body_sample(1)
     assert await _stored(db, task_id) is None, "ничего не записано"
+    refused = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind='steward_judgement_refused'",
+        (task_id,),
+    )
+    assert len(refused) == 1
+    assert json.loads(refused[0]["payload"])["missing"] == ["grounds", "confidence"]
     assert await _run_status(db, task_id) == RUN_OPEN, "заказ открыт для исправления"
 
     view = await _post(
