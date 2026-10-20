@@ -578,7 +578,14 @@ async def test_the_deadline_wraps_only_the_network_not_the_database(
     """Таймаут ставится на сетевые вызовы; чтения базы (контекст проекта) снаружи него."""
     from hub.services import gate_observations
 
+    from hub import services
+
     await _world(client, db, monkeypatch)
+    # Стыковка по решению (#1913) идёт целиком под дедлайном, с чтением базы
+    # внутри, — здесь проверяются остальные шаги, поэтому она заглушена.
+    monkeypatch.setattr(
+        services, "detect_branch_stacking", AsyncMock(return_value=None)
+    )
     gate_observations._refreshed_at.clear()
     inside: list[str] = []
     original = gate_observations._Deadline.run
@@ -619,3 +626,58 @@ async def test_a_question_asked_without_an_answer_is_not_shown_as_never_asked(
     assert shown.base_merge.state == "unknown"
     assert "спрашивали, ответа не было" in shown.base_merge.reason
     assert "не проверял" not in shown.base_merge.reason
+
+
+async def test_a_timeout_is_not_recorded_as_an_observation(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Таймаут вопроса о PR — не наблюдение: в «спрашивали, ответа не было» он не идёт."""
+    from hub.services import gate_observations
+    from hub.services.review_brief import build_review_brief
+
+    ids = await _world(client, db, monkeypatch)
+    review = ids["review"]
+
+    async def hang(*_a, **_k):
+        raise TimeoutError
+
+    monkeypatch.setattr(plugins.git_ops, "check_pr_mergeable", hang)
+    gate_observations._refreshed_at.clear()
+    await gate_observations.sweep(db)
+    task = dict(await repo.get_task(db, review) or {})
+    assert (
+        gate_observations.recall(
+            gate_observations.BASE_MERGE,
+            review,
+            f"{task['pr_number']}@{task['submission_sha']}",
+        )
+        is None
+    )
+    shown = await build_review_brief(db, review, observe_only=True)
+    assert shown is not None and "спрашивали" not in shown.base_merge.reason
+
+
+async def test_stacking_in_the_sweep_runs_under_the_deadline(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Стыковка в проходе идёт через дедлайн: зависшая — откат по проекту, не зависание тика."""
+    import asyncio
+
+    from hub import services
+    from hub.services import gate_observations
+
+    await _world(client, db, monkeypatch)
+
+    async def slow(*_a, **_k):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(services, "detect_branch_stacking", slow)
+    monkeypatch.setattr(gate_observations, "CALL_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(
+        gate_observations._Deadline.run,
+        "__defaults__",
+        (0.05,),
+    )
+    gate_observations._refreshed_at.clear()
+    await asyncio.wait_for(gate_observations.sweep(db), timeout=4)
+    assert gate_observations._down_until, "зависшая стыковка должна дать откат"

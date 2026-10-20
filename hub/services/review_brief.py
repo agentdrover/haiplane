@@ -305,6 +305,10 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
         # ``net`` (#1913) ставит дедлайн только на сетевой вызов, без чтений базы.
         outcome, detail = await (net(probe) if net else probe())
     except Exception as exc:  # noqa: BLE001 - блок отвечает причиной, не молчанием
+        if net is not None:
+            # Таймаут и исчерпанный бюджет прохода — не наблюдение (#1913):
+            # в «спросили, ответа не было» они не идут, решает вызывающий.
+            raise
         log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
         return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
     value = getattr(outcome, "value", str(outcome))
@@ -630,7 +634,6 @@ async def build_review_brief(
     *,
     self_review_warning: SelfReviewWarning | None = None,
     observe_only: bool = False,
-    card: bool = False,
 ) -> ReviewBrief | None:
     """Assemble the whole review brief for ``task_id`` (#308, #823).
 
@@ -648,9 +651,6 @@ async def build_review_brief(
     карточка (перерисовка каждые 15 с), REST/MCP-бриф и hub_task_status. Путь
     стюарда и явные гейты зовут сборку без флага: их решение не может опираться
     на память показа, и именно они обновляют наблюдения.
-
-    ``card`` (#1913): сборка для карточки владельца. Блок целостности CI в ней не
-    рисуется, поэтому ревьюеру она признаков «не показала» (см. ``ci_integrity``).
     """
     from hub import services
 
@@ -894,7 +894,7 @@ async def build_review_brief(
         if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
     ]
 
-    late = await _late_reads(db, task_row, task_view, mr_row, timer, observe_only, card)
+    late = await _late_reads(db, task_row, task_view, mr_row, timer, observe_only)
 
     brief = ReviewBrief(
         **late,
@@ -1027,7 +1027,6 @@ async def _late_reads(
     mr_row,
     timer: _BriefTimer,
     observe_only: bool = False,
-    card: bool = False,
 ) -> dict[str, Any]:
     """The reads that only feed the final object, as ``ReviewBrief`` fields.
 
@@ -1085,9 +1084,7 @@ async def _late_reads(
     late["ci_integrity"] = (
         await timer.run(
             "ci_integrity",
-            ci_integrity.brief_state(
-                db, task_id, offline=observe_only, shown_to_reviewer=not card
-            ),
+            ci_integrity.brief_state(db, task_id, offline=observe_only),
         )
         if (task_view.submission_sha or "").strip()
         else None
@@ -1107,9 +1104,7 @@ async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
     if status not in GATE_STATUSES:
         return None
     try:
-        return await build_review_brief(
-            db, int(task_row["id"]), observe_only=True, card=True
-        )
+        return await build_review_brief(db, int(task_row["id"]), observe_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
         return None

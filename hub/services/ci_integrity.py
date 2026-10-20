@@ -76,6 +76,7 @@ from hub.services.diff_scan import git_header_path
 from hub.services.diff_scan import scan_diff as scan_diff_lines
 
 import ast
+import hashlib
 import json
 import logging
 import posixpath
@@ -220,7 +221,7 @@ QUESTION = (
 ANSWER_SHAPE = (
     '"ci_integrity": {"verdict": "explained|suspicious", "explanation_ru": '
     f'"≤{CI_INTEGRITY_NOTE_LIMIT} знаков: что меняется, зачем, риск '
-    '(низкий/высокий)"}'
+    '(низкий/высокий)", "scan_hash": "<scan_hash из этого блока, как есть>"}'
 )
 NO_ANSWER_NOTE = "ревьюер не ответил"
 
@@ -695,6 +696,12 @@ class Standing:
     scan: Scan
     answer: str = ""
     explanation: str = ""
+    sha: str = ""
+
+    @property
+    def scan_hash(self) -> str:
+        """Хеш скана, который ревьюер возвращает в ответе (#1913); пусто без признаков."""
+        return scan_hash_of(self.sha, self.scan)
 
     @property
     def clean(self) -> bool:
@@ -750,16 +757,17 @@ async def standing_of(db: aiosqlite.Connection, task: dict[str, Any]) -> Standin
         return Standing(Scan(UNREADABLE, reason="коммит сдачи не закреплён"))
     scan = await _stored(db, int(task["id"]), sha) or Scan(UNSCANNED)
     if scan.state != SIGNS:
-        return Standing(scan)
+        return Standing(scan, sha=sha)
     answer = await store.get_ci_integrity_answer(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
     if answer is None:
-        return Standing(scan)
+        return Standing(scan, sha=sha)
     return Standing(
         scan,
         answer["ci_integrity_verdict"],
         answer["ci_integrity_explanation"],
+        sha,
     )
 
 
@@ -835,26 +843,25 @@ async def verdict_gate(state: Any) -> None:
         raise HTTPException(422, f"ci_integrity: {gap}")
 
 
+def scan_hash_of(sha: str, scan: Scan) -> str:
+    """Хеш (коммит + признаки) скана с признаками; ``""`` для любого другого скана.
+
+    Ревьюер возвращает его в ответе: ответ принимается, только если хеш равен
+    хешу СОХРАНЁННОГО скана текущего коммита (``answer_for_report``). Это
+    положительная привязка со стороны отчёта: хаб не судит по своим действиям
+    (кто собрал бриф), о чём ревьюер знал, когда отвечал (#1913).
+    """
+    if scan.state != SIGNS:
+        return ""
+    signs = sorted(f"{x.path}:{x.line}:{x.rule}" for x in scan.signs)
+    body = json.dumps([sha.lower(), signs], ensure_ascii=False)
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
 def stored_answer(body: MachineReviewSubmit) -> tuple[str, str]:
     """(verdict, explanation) as stored; ("", "") when the reviewer did not answer."""
     answer = body.ci_integrity
     return (answer.verdict, answer.explanation_ru) if answer else ("", "")
-
-
-#: Коммиты, чьи признаки целостности CI хаб уже показал ревьюеру (бриф, заказ).
-#: В памяти процесса: после рестарта ответ без повторного показа не принимается
-#: (отказ автоматики остаётся — безопасная сторона).
-_shown: set[tuple[int, str]] = set()
-
-
-def forget_shown() -> None:
-    """Забыть показы (тесты; рестарт делает то же)."""
-    _shown.clear()
-
-
-def _note_shown(task: dict[str, Any], standing: "Standing") -> None:
-    if standing.scan.state == SIGNS:
-        _shown.add((int(task["id"]), (task.get("submission_sha") or "").strip()))
 
 
 async def answer_for_report(
@@ -872,14 +879,22 @@ async def answer_for_report(
         return answer
     sha = (task.get("submission_sha") or "").strip()
     scan = await _stored(db, int(task["id"]), sha) if sha else None
-    # Нужны оба: скан с признаками И показ этих признаков (бриф или заказ
-    # ревьюера). Скан, сделанный проходом поллера ПОСЛЕ брифа «unscanned», не
-    # делает ответ осмысленным: ревьюер признаков не видел.
-    if scan is not None and scan.state == SIGNS and (int(task["id"]), sha) in _shown:
+    # Ответ принимается, только если ревьюер вернул хеш скана с признаками, и он
+    # равен хешу сохранённого скана текущего коммита: ревьюер отвечал о ТЕХ
+    # признаках, что сейчас в базе (#1913). Бриф «unscanned», скан позже,
+    # другой коммит, ответ без хеша — отбрасываются.
+    given = (body.ci_integrity.scan_hash if body.ci_integrity else "").strip()
+    current = scan_hash_of(sha, scan) if scan is not None else ""
+    if current and given == current:
         return answer
     log.warning(
-        "ci integrity: answer of the report on task #%s dropped, no scan with signs",
+        "ci integrity: answer of the report on task #%s dropped (%s)",
         task["id"],
+        "нет скана с признаками"
+        if not current
+        else (
+            "в ответе нет scan_hash" if not given else "scan_hash не совпал со сканом"
+        ),
     )
     return ("", "")
 
@@ -907,7 +922,8 @@ def section_for(standing: Standing) -> str:
     return (
         "## Целостность CI (механическая проверка диффа)\n"
         "Хаб нашёл признаки, что дифф трогает входы CI:\n"
-        f"{listing}\n\n"
+        f"{listing}\n"
+        f"scan_hash: {standing.scan_hash}\n\n"
         f"Вопрос: {QUESTION}\n"
         f"Ответь в отчёте (и в текстовом блоке тоже) ключом верхнего уровня {ANSWER_SHAPE}. «explained» — изменение законно "
         "для задачи; «suspicious» — похоже на подделку результатов (тогда это "
@@ -921,7 +937,6 @@ async def order_section(db: aiosqlite.Connection, task_id: int) -> str:
     await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
-    _note_shown(task, standing)
     section = section_for(standing)
     return f"{section}\n\n" if section else ""
 
@@ -931,7 +946,6 @@ async def brief_state(
     task_id: int,
     *,
     offline: bool = False,
-    shown_to_reviewer: bool = True,
 ) -> dict[str, Any] | None:
     """The brief's block: None when there are no signs (the brief reads as before).
 
@@ -942,9 +956,6 @@ async def brief_state(
         await ensure_scan(db, task_id)
     task = dict(await repo.get_task(db, task_id) or {})
     standing = await standing_of(db, task)
-    if shown_to_reviewer:
-        # Карточка владельца блок не рисует: её сборка ревьюеру ничего не показала.
-        _note_shown(task, standing)
     if standing.clean:
         return None
     return {
@@ -955,4 +966,5 @@ async def brief_state(
         "answer": standing.answer,
         "note": standing.note,
         "gap": standing.gap or "",
+        "scan_hash": standing.scan_hash,
     }

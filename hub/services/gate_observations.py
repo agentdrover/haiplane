@@ -192,11 +192,11 @@ async def sweep(db: Any) -> None:
                     continue
             await ci_integrity.ensure_scan(db, task_id, net=deadline.run)
             await base_merge_section(db, view, net=deadline.run)
-            if deadline.left() <= 0:
-                raise _OutOfTime
-            # Стыковка — много вызовов с чтениями базы внутри: дедлайн её не режет,
-            # границу ставят таймауты git самого адаптера.
-            await services.detect_branch_stacking(db, task_id, branch)
+            # Стыковка — много вызовов с чтениями базы внутри: она идёт целиком
+            # через дедлайн (запись в ней — только в памяти процесса).
+            await deadline.run(
+                lambda: services.detect_branch_stacking(db, task_id, branch)
+            )
         except _OutOfTime:
             return  # пометка остаётся: задачи за ней не голодают, эта вернётся через 5 мин
         except TimeoutError:

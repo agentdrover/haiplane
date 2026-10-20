@@ -1426,6 +1426,10 @@ def _brief_ci_integrity_lines(brief: dict[str, Any]) -> list[str]:
         f"  {s.get('path')}:{s.get('line')} [{s.get('rule')}]"
         for s in (block.get("signs") or [])[:20]
     )
+    if block.get("scan_hash"):
+        lines.append(
+            f"  scan_hash (return it in your ci_integrity answer): {block['scan_hash']}"
+        )
     lines.append(f"  Question: {block.get('question', '')}")
     if block.get("note"):
         lines.append(f"  Note: {block['note']}")
@@ -3881,8 +3885,8 @@ async def hub_submit_machine_review(
         orchestrator: Client name (e.g. claude-code-workflow).
         model: Model id used by review agents.
         agent: Submitting agent name.
-        ci_integrity: {verdict: explained|suspicious, explanation_ru} — only
-            when the brief carries a ci_integrity block (#1688).
+        ci_integrity: {verdict, explanation_ru, scan_hash} — scan_hash from
+            the brief's ci_integrity block, else the answer is dropped.
     """
     body: dict[str, Any] = {
         "raw_count": raw_count,
