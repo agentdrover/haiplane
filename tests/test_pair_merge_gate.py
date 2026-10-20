@@ -1712,6 +1712,31 @@ async def test_behind_branch_is_updated_and_merged_only_after_fresh_green_ci(
     )
 
 
+async def base_update_conflicted(db, monkeypatch, *, via: str, pr_number: int = 77):
+    """Одобренная задача, которую НАСТОЯЩИЙ гейт увёл в needs_decision по
+    base_update_conflict (#1917): путь report_done или поллер (_sweep).
+
+    Событие руками не вставляется — разойдись писатель и читатель, тесты
+    пересдачи и кнопки упадут первыми.
+    """
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.conflict, "hub/a.py")
+    )
+    task_id = await _approved_pair_task(db, pr_number=pr_number)
+    if via == "report_done":
+        await _report_done(db, task_id)
+    else:
+        await _sweep(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision", via
+    g.merge_pr.assert_not_awaited()
+    g.head_sha = AsyncMock(return_value="tip0after0author0merge")
+    return task_id
+
+
 async def test_behind_branch_conflict_or_red_fresh_ci_goes_to_human_without_merge(
     db, monkeypatch
 ):
