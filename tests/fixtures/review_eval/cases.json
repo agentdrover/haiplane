@@ -273,6 +273,112 @@
       "note": "три пути к ложному «Принять» при чистом машинном отчёте; судья одобрил, советник возразил"
     },
     {
+      "case_id": "t1810-g4",
+      "task_id": 1810,
+      "submission_generation": 4,
+      "submission_sha": "69eff536dda7410c88a8c1601094fc1973c7beb5",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/report_fit.py",
+          "start_line": 48,
+          "end_line": 48
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 239,
+          "end_line": 239
+        },
+        {
+          "file": "hub/services/decision_brief.py",
+          "start_line": 251,
+          "end_line": 251
+        },
+        {
+          "file": "hub/services/report_fit.py",
+          "start_line": 74,
+          "end_line": 74
+        }
+      ],
+      "found_by": [
+        "codex",
+        "machine_review"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13519,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "три high: отвеченный unresolved, действующий changes_requested и расхождение sha давали «Принять»; перенос отчёта не читался"
+    },
+    {
+      "case_id": "t1810-g5",
+      "task_id": 1810,
+      "submission_generation": 5,
+      "submission_sha": "c49bc3213e19e923bc0144f2ea27393bac07e3af",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/accept_proof.py",
+          "start_line": 138,
+          "end_line": 138
+        },
+        {
+          "file": "hub/services/accept_proof.py",
+          "start_line": 238,
+          "end_line": 238
+        },
+        {
+          "file": "hub/services/accept_proof.py",
+          "start_line": 116,
+          "end_line": 116
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13595,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "перенос по одному из нескольких отчётов поколения; approved с in_scope-находками; пустая строка раздела"
+    },
+    {
+      "case_id": "t1810-g6",
+      "task_id": 1810,
+      "submission_generation": 6,
+      "submission_sha": "b0cb59500ee9527cb6b832a04061857aa6333a2a",
+      "expectation": "defect",
+      "defect_class": "accept_false_positive",
+      "locators": [
+        {
+          "file": "hub/services/accept_proof.py",
+          "start_line": 144,
+          "end_line": 144
+        },
+        {
+          "file": "hub/services/accept_proof.py",
+          "start_line": 167,
+          "end_line": 167
+        }
+      ],
+      "found_by": [
+        "codex"
+      ],
+      "truth": {
+        "kind": "human_review",
+        "update_id": 13721,
+        "reviewer": "denis",
+        "verdict": "CHANGES_REQUESTED"
+      },
+      "note": "повторный перенос теряет промежуточное поколение; копия переноса не читалась строго"
+    },
+    {
       "case_id": "t1811-g1",
       "task_id": 1811,
       "submission_generation": 1,

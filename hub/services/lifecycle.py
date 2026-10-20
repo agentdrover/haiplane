@@ -4856,14 +4856,51 @@ def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
     return agent, content
 
 
-def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
+async def _written_verdict_generation(
+    db: aiosqlite.Connection, task_id: int
+) -> int | None:
+    """Поколение, на которое лёг только что записанный вердикт (из строки, не из снимка)."""
+    rows = await fetchall(
+        db, "SELECT review_verdict_generation FROM tasks WHERE id=?", (task_id,)
+    )
+    value = dict(rows[0]).get("review_verdict_generation") if rows else None
+    return (
+        int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+    )
+
+
+def _verdict_event_payload(
+    state: VerdictContext,
+    self_approved: bool,
+    written_generation: int | None = None,
+    ghost_generation: int | None = None,
+) -> dict:
+    """Событие вердикта. ``written_generation`` — поколение ЗАПИСАННОЙ строки (#1912).
+
+    Снимок задачи сделан до транзакции: пересдача между чтением и записью
+    сдвигает поколение, и событие назвало бы не то, на которое лёг вердикт.
+    ``ghost_generation`` — номер пустого поколения, поднятого этим вердиктом
+    при ушедшей вершине (#572): единственная положительная метка призрака.
+    """
     payload: dict[str, Any] = {
         "verdict": state.body.verdict.value,
-        "submission_generation": state.task.get("submission_generation") or 0,
+        "submission_generation": (
+            written_generation
+            if written_generation is not None
+            else state.task.get("submission_generation") or 0
+        ),
         "self_approved": self_approved,
+        # #1912: открытые находки в рамках задачи у ЭТОГО вердикта. Колонка
+        # review_findings помнит только последний вердикт, а доказательство
+        # «Принять» за переносом отчёта читает одобрение прошлого поколения.
+        "open_in_scope_findings": sum(
+            f.scope != FindingScope.out_of_scope for f in state.body.findings
+        ),
         # #1874: автор для учёта минут; только вызов человека (REST/веб ставят).
         **owner_minutes.stamp_ids(state.principal_id, state.human_caller),
     }
+    if ghost_generation is not None:
+        payload["ghost_generation"] = ghost_generation
     if state.applied_by_steward:
         payload["source"] = STEWARD_APPLIED_SOURCE
     if state.replaced is not None and state.outcome is verdict_guard.Outcome.supersede:
@@ -4936,6 +4973,8 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             # Запись не состоялась ни на какое поколение; транзакция
             # откатывается целиком.
             raise verdict_guard.not_written_refusal(task, expected_generation)
+        written_generation = await _written_verdict_generation(db, task_id)
+        ghost_generation: int | None = None
         agent, content = _verdict_update_text(state)
         # The verdict is authored by a principal — the endpoint already
         # resolved one to check reviewer independence. Without this it would
@@ -4969,7 +5008,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
                 # legal way forward: resubmit and let review see the real
                 # tip (#572). A hard refusal would leave the task locked in
                 # review with no exit — the dead end #547 hit.
-                await repo.bump_submission_generation(db, task_id)
+                ghost_generation = await repo.bump_submission_generation(db, task_id)
                 await repo.update_task(db, task_id, submission_sha="")
             if body.verdict.value == "changes_requested":
                 await repo.update_task(
@@ -4991,7 +5030,9 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             kind="review_verdict_recorded",
             task_id=task_id,
             actor=agent,
-            payload=_verdict_event_payload(state, self_approved),
+            payload=_verdict_event_payload(
+                state, self_approved, written_generation, ghost_generation
+            ),
         )
         await db.commit()
         await log_activity(
