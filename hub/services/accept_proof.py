@@ -156,6 +156,15 @@ def _approval_gap(
     last_id, last = verdicts[-1]
     if last.get("verdict") != "approved":
         return f"поколение {generation}: последний вердикт «{last.get('verdict')}»"
+    open_findings = last.get("open_in_scope_findings")
+    if isinstance(open_findings, bool) or not isinstance(open_findings, int):
+        return f"поколение {generation}: в одобрении нет данных о находках"
+    if open_findings:
+        return (
+            f"поколение {generation}: одобрено с открытыми находками ({open_findings})"
+        )
+    if last.get("self_approved"):
+        return f"поколение {generation}: одобрение автора самому себе"
     if any(kind in _CLOSING_EVENTS and eid > last_id for eid, kind, _ in events):
         return f"поколение {generation}: одобрение закрыто возвратом в работу"
     if task.get("review_verdict_closed_generation") == generation:
@@ -208,6 +217,8 @@ async def _carried_approvals(
         return [_history_blocker("запись ленты вердиктов не читается")]
     gaps = []
     for generation in range(first, current):
+        if await _never_submitted(db, task_id, generation, events):
+            continue
         gap = _approval_gap(task, events, generation)
         judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
         if not gap and judged is not None and judged["verdict"] == "changes_requested":
@@ -215,6 +226,31 @@ async def _carried_approvals(
         if gap:
             gaps.append(gap)
     return [_history_blocker("; ".join(gaps))] if gaps else []
+
+
+async def _never_submitted(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    events: list[tuple[int, str, dict[str, Any]]],
+) -> bool:
+    """Поколение-призрак: одобрение при ушедшей вершине только поднимает номер.
+
+    ``_apply_verdict`` при расхождении вершины ветки с закреплённым коммитом
+    двигает поколение (#572): сдачи, отчётов и вердикта у этого номера нет, и
+    одобрения на нём получить нельзя. Пропуск узкий: нет строки сдачи, нет
+    отчётов, нет ни одного события вердикта этого поколения.
+    """
+    if any(p.get("submission_generation") == generation for _, _, p in events):
+        return False
+    rows = await fetchall(
+        db,
+        "SELECT (SELECT COUNT(*) FROM submissions WHERE task_id=? AND generation=?) "
+        "+ (SELECT COUNT(*) FROM machine_reviews WHERE task_id=? "
+        "AND submission_generation=?) AS n",
+        (task_id, generation, task_id, generation),
+    )
+    return int(dict(rows[0])["n"]) == 0
 
 
 def _history_blocker(why: str) -> Blocker:

@@ -4856,6 +4856,12 @@ def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
         "verdict": state.body.verdict.value,
         "submission_generation": state.task.get("submission_generation") or 0,
         "self_approved": self_approved,
+        # #1912: открытые находки в рамках задачи у ЭТОГО вердикта. Колонка
+        # review_findings помнит только последний вердикт, а доказательство
+        # «Принять» за переносом отчёта читает одобрение прошлого поколения.
+        "open_in_scope_findings": sum(
+            f.scope != FindingScope.out_of_scope for f in state.body.findings
+        ),
         # #1874: автор для учёта минут; только вызов человека (REST/веб ставят).
         **owner_minutes.stamp_ids(state.principal_id, state.human_caller),
     }

@@ -77,13 +77,27 @@ class World:
         )
         await self.db.commit()
 
-    async def verdict_event(self, generation: int, verdict: str = "approved") -> None:
+    async def verdict_event(
+        self,
+        generation: int,
+        verdict: str = "approved",
+        *,
+        open_findings: object = 0,
+        self_approved: bool = False,
+    ) -> None:
         await self.db.execute(
             "INSERT INTO events (kind, task_id, actor, payload) VALUES "
             "('review_verdict_recorded', ?, 'denis', ?)",
             (
                 self.task_id,
-                json.dumps({"verdict": verdict, "submission_generation": generation}),
+                json.dumps(
+                    {
+                        "verdict": verdict,
+                        "submission_generation": generation,
+                        "open_in_scope_findings": open_findings,
+                        "self_approved": self_approved,
+                    }
+                ),
             ),
         )
         await self.db.commit()
@@ -549,12 +563,55 @@ async def s_approved_then_replaced_by_changes_requested(w, _m):
 async def s_middle_generation_without_approval(w, _m):
     root = await w.report(1)
     await w.verdict_event(1)
+    await w.report(2)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+async def s_carried_approval_with_in_scope_findings(w, _m):  # свежий взгляд 2
+    root = await w.report(1)
+    await w.verdict_event(1, open_findings=1)
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_carried_approval_without_findings_data(w, _m):  # событие до #1912
+    root = await w.report(1)
+    await w.verdict_event(1, open_findings=None)
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_carried_self_approval(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1, self_approved=True)
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_phantom_generation_with_a_submission_row(w, _m):
+    """Поколение с настоящей сдачей, но без вердикта — не призрак."""
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.db.execute(
+        "INSERT INTO submissions (task_id, generation, sha) VALUES (?, 2, ?)",
+        (w.task_id, "c" * 40),
+    )
+    await w.db.commit()
     await w.report(3, copy_of=root)
     await w.now(3)
     return []
 
 
 UNAPPROVED = {
+    "carried_approval_with_in_scope_findings",
+    "carried_approval_without_findings_data",
+    "carried_self_approval",
+    "phantom_generation_with_a_submission_row",
     "approval_closed_by_return_to_work",
     "approval_closed_by_decide_rework",
     "approval_closed_only_by_the_column",
@@ -658,6 +715,14 @@ async def p_branch_of_copies_and_independent_report(w):
     await w.now(3)
 
 
+async def p_phantom_generation_after_an_approval_with_a_moved_tip(w):
+    """Одобрение при ушедшей вершине подняло номер (#572): поколение 2 пустое."""
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+
+
 async def p_old_approved_verdict_behind_a_carry(w):
     root = await w.report(1)
     await w.db.execute(
@@ -665,7 +730,13 @@ async def p_old_approved_verdict_behind_a_carry(w):
         "('review_verdict_recorded', ?, 'denis', ?)",
         (
             w.task_id,
-            json.dumps({"verdict": "approved", "submission_generation": 1}),
+            json.dumps(
+                {
+                    "verdict": "approved",
+                    "submission_generation": 1,
+                    "open_in_scope_findings": 0,
+                }
+            ),
         ),
     )
     await w.db.commit()
@@ -680,6 +751,8 @@ async def p_copy_next_to_an_independent_report(w):
     await w.now(2)
 
 
+P_UNSEEDED = {"phantom_generation_after_an_approval_with_a_moved_tip"}
+
 CLEAN = {
     name[2:]: fn for name, fn in sorted(globals().items()) if name.startswith("p_")
 }
@@ -693,7 +766,8 @@ async def test_clean_provenance_accepts(client, db: aiosqlite.Connection):
                 client, db, monkeypatch, f"clean-{name}".replace("_", "-")
             )
         await build(world)
-        await world.seed_approvals()
+        if name not in P_UNSEEDED:
+            await world.seed_approvals()
         task = await world.task()
         brief = await decision_brief.build(db, task)
         rec = brief["recommend"]
@@ -815,3 +889,46 @@ async def test_corpus_defects_never_accept(client, db: aiosqlite.Connection):
             if proof is not None:
                 problems.append(f"{case['case_id']}/{kind}: доказательство выдано")
     assert problems == []
+
+
+async def _real_verdict(client, w, findings: list[dict]) -> None:
+    resp = await client.post(
+        f"/api/tasks/{w.task_id}/review-verdict",
+        json={
+            "verdict": "approved",
+            "agent": "denis",
+            "findings": findings,
+            "expected_generation": 1,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def _resubmitted_with_carry(w, root: int) -> None:
+    await w.db.execute("UPDATE tasks SET status='review' WHERE id=?", (w.task_id,))
+    await w.db.commit()
+    await w.report(2, copy_of=root)
+    await w.now(2)
+
+
+async def test_a_real_approval_carries_its_findings_count(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """Событие настоящего одобрения несёт число открытых находок; чистое — «Принять», с находкой — нет."""
+    outcomes = {}
+    for label, findings in (
+        ("clean", []),
+        (
+            "in_scope",
+            [{"id": 1, "severity": "high", "message": "дефект", "scope": "in_scope"}],
+        ),
+    ):
+        w = await _world(
+            client, db, monkeypatch, f"prov-real-{label}".replace("_", "-")
+        )
+        root = await w.report(1)
+        await _real_verdict(client, w, findings)
+        await _resubmitted_with_carry(w, root)
+        proof, _, _ = await prove_accept(db, await w.task())
+        outcomes[label] = proof is not None
+    assert outcomes == {"clean": True, "in_scope": False}

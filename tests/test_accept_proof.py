@@ -162,7 +162,11 @@ async def _approved(db, task_id: int, *generations: int) -> None:
             (
                 task_id,
                 json.dumps(
-                    {"verdict": "approved", "submission_generation": generation}
+                    {
+                        "verdict": "approved",
+                        "submission_generation": generation,
+                        "open_in_scope_findings": 0,
+                    }
                 ),
             ),
         )
