@@ -45,6 +45,10 @@ jobs:
       # in THIS run. Decided once, here, and read by job `evidence` (to run) and
       # by job `test` (to know what a missing file means).
       evidence_run: ${{ steps.evidence.outputs.run }}
+      # #1919: whether job `evidence` takes the evidence of the dispatch run on
+      # this same head instead of counting it again, and from which run.
+      adopt: ${{ steps.adopt.outputs.adopt }}
+      adopted_run_id: ${{ steps.adopt.outputs.adopted_run_id }}
 
     steps:
       # #1606: мутации (~9,5 мин) и baseline (~2-3 мин) считаются там, где их
@@ -89,6 +93,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # #1919: the executor dispatches CI before submitting and the hub opens the
+      # PR at submission: both runs sit on the same head sha, and the mutations
+      # and the red-test baseline (~10 min) were counted twice. Only the opened
+      # and reopened runs of a task branch look for a source; the script
+      # (standard library, no install) answers adopt=true only when the dispatch
+      # run's evidence was measured against the base of THIS merge commit
+      # (HEAD^1, not the event's base.sha, which may lag) and the merge tree equals
+      # the head tree. Any doubt or failure is adopt=false: a recount, never a
+      # red job. The token is the read-only one of this workflow (actions: read).
+      - name: Adopt the evidence of the dispatch run on the same head
+        id: adopt
+        if: ${{ github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened') && startsWith(github.head_ref, 'task-') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 -I scripts/adopt_evidence.py decide \
+            --head-sha "$HEAD_SHA" --base-ref "$BASE_REF" \
+            --github-output "$GITHUB_OUTPUT"
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -254,19 +281,45 @@ jobs:
           # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
 
+      # #1919: the evidence of the dispatch run on this head (see job treedup).
+      # Downloaded and stamped FIRST: when both steps succeed, nothing below runs
+      # (no install, no mutations, no baseline); when either fails, the job
+      # recounts as before. Only `github.token` with `actions: read` is used.
+      - name: Download the evidence of the dispatch run (adopt)
+        id: adopt_download
+        if: ${{ needs.treedup.outputs.adopt == 'true' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-ci-evidence
+          run-id: ${{ needs.treedup.outputs.adopted_run_id }}
+          github-token: ${{ github.token }}
+          path: .
+
+      - name: Stamp the adopted evidence with its source run
+        id: adopt_stamp
+        if: ${{ steps.adopt_download.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          ADOPTED_RUN_ID: ${{ needs.treedup.outputs.adopted_run_id }}
+        run: python3 -I scripts/adopt_evidence.py stamp --run-id "$ADOPTED_RUN_ID" --dir .
+
       - name: Install uv
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.12.18"
           enable-cache: true
 
       - name: Set up Python
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       # #1707: see the same step in job test; no `|| true`.
       - name: Install age and openssh-server (backup tests)
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends age openssh-server
@@ -274,6 +327,7 @@ jobs:
           sudo -n true
 
       - name: Install dependencies
+        if: ${{ steps.adopt_stamp.outcome != 'success' }}
         run: uv sync --locked --dev
 
       # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
@@ -288,7 +342,7 @@ jobs:
       # The base is the PR base, develop for a manual run (as for the baseline).
       - name: Mutations of changed functions (warning only)
         id: mutations
-        if: ${{ needs.treedup.outputs.evidence_run == 'true' }}
+        if: ${{ needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 15
         run: |
@@ -310,7 +364,7 @@ jobs:
         id: baseline
         # !cancelled(): the proof is about the base, not about the mutations
         # step above.
-        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' }}
+        if: ${{ !cancelled() && needs.treedup.outputs.evidence_run == 'true' && steps.adopt_stamp.outcome != 'success' }}
         continue-on-error: true
         timeout-minutes: 10
         run: |
@@ -336,31 +390,31 @@ jobs:
             mutation-report.json
             red-test-baseline.json
           if-no-files-found: ignore
-          retention-days: 1
+          # #1919: a PR run opened after a dispatch run adopts these files; one
+          # day was shorter than the gap between a dispatch and a late PR.
+          retention-days: 3
 
-  test:
-    name: Ruff and pytest
-    # #1767: the one required check, the one place that collects the AC and
-    # sends the artifact. It runs after the dedup decision, the parts and the
-    # evidence whatever their outcome, and judges the parts in the step `tests`
-    # below. #1785: it waits for job `evidence` only to download its files; the
-    # outcome of that job is read nowhere (it is continue-on-error and a
-    # missing file is reported as an error by the collector).
-    needs: [treedup, pytest, evidence]
-    if: ${{ always() }}
+  # #1920: the static checks do not depend on the tests, yet they used to run in
+  # job `test` AFTER the parts and the evidence (~80-100 s on every critical
+  # path: ruff, mypy, bandit, the budgets, the secret scan at ~44 s, the audit).
+  # They run here, beside the parts. Same steps, same names, same ids, same
+  # conditions; only the place changed. Job `test` stays the one required check
+  # and the one collector: it waits for this job and is red when this job is not
+  # green (the step `Static checks outcome`). The job holds no environment, no
+  # secret and no report key (#1686): it runs the branch's code.
+  # The age/openssh install of job `test` is not here: only the backup tests need
+  # it, and this job runs none.
+  static:
+    name: Static checks
     runs-on: ubuntu-latest
-    # #1666: 90 min = explicit step ceilings plus headroom for the steps that
-    # have no ceiling of their own (install, lint, type check, scans). #1767:
-    # the 25 min of the Test step moved to job `pytest`; #1785: the mutations
-    # (15 min) and the baseline (10 min) moved to job `evidence`. The ceiling of
-    # THIS job stays as it was.
-    timeout-minutes: 90
-    # #1707: the backup tests install a real user and an sshd drop-in on this
-    # disposable runner. With this variable a missing tool or missing root is a
-    # red test, not a skip (tests/backup_support.py::must_have). Job level on
-    # purpose: the AC collector below runs the same tests and must not see a skip.
-    env:
-      CI_REQUIRE_ROOT_TESTS: "1"
+    timeout-minutes: 30
+    # The outcomes the collector of job `test` reports as `checks` (lint, format,
+    # types) and as `ran-commands`; the names are the contract of
+    # ci_contract.CHECK_VOCABULARY and must not grow here.
+    outputs:
+      lint: ${{ steps.lint.outcome }}
+      format: ${{ steps.format.outcome }}
+      types: ${{ steps.types.outcome }}
 
     steps:
       - name: Checkout
@@ -370,10 +424,8 @@ jobs:
           # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
 
-      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
-      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
-      # lock revision, so a floating version would rewrite uv.lock under us. The
-      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
+      # #1620: the same uv version as everywhere, asserted by
+      # tests/test_ci_workflow_contract.py.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -385,19 +437,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # #1707: tests/test_backup_install.py and tests/test_snapshot_serve.py run
-      # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
-      # encrypts with real age. No continue-on-error and no `|| true`: if a tool
-      # is missing this step is red, the tests are never skipped.
-      - name: Install age and openssh-server (backup tests)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends age openssh-server
-          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
-          sudo -n true
-
       - name: Install dependencies
-        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
+        # #1620: --locked: the committed uv.lock is what is checked, a stale lock fails.
         run: uv sync --locked --dev
 
       # #875: these steps get ids so their outcomes can be REPORTED to the
@@ -460,33 +501,6 @@ jobs:
         id: types
         run: uv run mypy hub
 
-      # #1767: the suite itself runs in job `pytest` (the parts in parallel).
-      # THIS step is the only place that turns the results of the parts into one
-      # outcome, and `steps.tests.outcome` below keeps meaning "the suite
-      # passed". It reads `needs.pytest.result`, which GitHub folds from EVERY
-      # matrix leg (failure if one failed, cancelled if one was cancelled), not
-      # an output of the matrix, which carries the value of one leg at random.
-      # It is skipped ONLY when the tree was already green (job treedup) AND the
-      # parts finished without a failure; in every other case it runs and is
-      # red unless the parts succeeded. `always()` is explicit: without a status
-      # function GitHub adds `success()`, and a red earlier step (Lint, install)
-      # would turn this step into "skipped" instead of red. The job `if` is
-      # `always()` WITHOUT `!cancelled()`: a cancelled run must still run this
-      # job and end red, not be skipped (a skipped required check can count as
-      # passed).
-      - name: Tests outcome of the parts
-        id: tests
-        if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
-        env:
-          PARTS_RESULT: ${{ needs.pytest.result }}
-        run: |
-          if [ "$PARTS_RESULT" = "success" ]; then
-            echo "the test parts passed"
-            exit 0
-          fi
-          echo "::error::the test parts did not pass: result is '${PARTS_RESULT:-unknown}'"
-          exit 1
-
       # #780: the tool catalog is a tax every agent pays on every turn, and it
       # grew to its current size because nothing was watching. The check
       # measures the real tools/list — not the source — against the budget
@@ -514,6 +528,154 @@ jobs:
         run: |
           uv run python scripts/surface_parity.py \
             --base "origin/${{ github.base_ref }}"
+
+      # #611: the audit no longer decides whether anything ships. The delivery
+      # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery
+      # for the whole repository without a single commit — and an advisory may
+      # have no fixed version at all, which made that freeze open-ended. It
+      # still runs, still prints, and its findings become hub drafts: a step that
+      # can never fail is a step nobody reads, so the record has to land
+      # somewhere with an owner.
+      # #1686: the drafts are filed by ci-report.yml from this file (push to
+      # develop or main only), with a key of their own; this job sends nothing.
+      - name: Dependency vulnerability audit
+        continue-on-error: true
+        run: |
+          mkdir -p hub-ci-static
+          uv run pip-audit --progress-spinner off -f json -o hub-ci-static/audit.json
+
+
+      # #1920: the audit file reaches job `test` through an artifact whose name
+      # does NOT start with `hub-ci-results-`: the trusted report reads only that
+      # prefix (scripts/ci_trusted_report.py), and the file gets there through job
+      # `test`, which puts it into the directory it uploads under that name.
+      - name: Hand the audit file over to job test
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-ci-static
+          overwrite: true
+          path: hub-ci-static/audit.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Static security scan
+        run: uv run bandit -r hub -q
+
+      # #1080: тело проверки живёт в scripts/secret_scan.py, потому что его
+      # зовёт и `make security` — определение одно, разъехаться нечему.
+      - name: Secret scan
+        run: uv run python scripts/secret_scan.py
+
+  test:
+    name: Ruff and pytest
+    # #1767: the one required check, the one place that collects the AC and
+    # sends the artifact. It runs after the dedup decision, the parts and the
+    # evidence whatever their outcome, and judges the parts in the step `tests`
+    # below. #1785: it waits for job `evidence` only to download its files; the
+    # outcome of that job is read nowhere (it is continue-on-error and a
+    # missing file is reported as an error by the collector).
+    needs: [treedup, pytest, evidence, static]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    # #1666: 90 min = explicit step ceilings plus headroom for the steps that
+    # have no ceiling of their own (install, lint, type check, scans). #1767:
+    # the 25 min of the Test step moved to job `pytest`; #1785: the mutations
+    # (15 min) and the baseline (10 min) moved to job `evidence`. The ceiling of
+    # THIS job stays as it was.
+    timeout-minutes: 90
+    # #1707: the backup tests install a real user and an sshd drop-in on this
+    # disposable runner. With this variable a missing tool or missing root is a
+    # red test, not a skip (tests/backup_support.py::must_have). Job level on
+    # purpose: the AC collector below runs the same tests and must not see a skip.
+    env:
+      CI_REQUIRE_ROOT_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # #833: the surface parity check diffs against the base branch, and
+          # merge-base needs history that a depth-1 checkout does not have.
+          fetch-depth: 0
+
+      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
+      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
+      # lock revision, so a floating version would rewrite uv.lock under us. The
+      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # #1707: tests/test_backup_install.py and tests/test_snapshot_serve.py run
+      # the real install.sh and a real sshd, and tests/test_hub_snapshot.py
+      # encrypts with real age. No continue-on-error and no `|| true`: if a tool
+      # is missing this step is red, the tests are never skipped.
+      - name: Install age and openssh-server (backup tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age openssh-server
+          command -v age && command -v age-keygen && test -x /usr/sbin/sshd
+          sudo -n true
+
+      - name: Install dependencies
+        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
+        run: uv sync --locked --dev
+
+      # #1767: the suite itself runs in job `pytest` (the parts in parallel).
+      # THIS step is the only place that turns the results of the parts into one
+      # outcome, and `steps.tests.outcome` below keeps meaning "the suite
+      # passed". It reads `needs.pytest.result`, which GitHub folds from EVERY
+      # matrix leg (failure if one failed, cancelled if one was cancelled), not
+      # an output of the matrix, which carries the value of one leg at random.
+      # It is skipped ONLY when the tree was already green (job treedup) AND the
+      # parts finished without a failure; in every other case it runs and is
+      # red unless the parts succeeded. `always()` is explicit: without a status
+      # function GitHub adds `success()`, and a red earlier step (Lint, install)
+      # would turn this step into "skipped" instead of red. The job `if` is
+      # `always()` WITHOUT `!cancelled()`: a cancelled run must still run this
+      # job and end red, not be skipped (a skipped required check can count as
+      # passed).
+      - name: Tests outcome of the parts
+        id: tests
+        if: ${{ always() && !(needs.treedup.outputs.skip == 'true' && needs.pytest.result == 'success') }}
+        env:
+          PARTS_RESULT: ${{ needs.pytest.result }}
+        run: |
+          if [ "$PARTS_RESULT" = "success" ]; then
+            echo "the test parts passed"
+            exit 0
+          fi
+          echo "::error::the test parts did not pass: result is '${PARTS_RESULT:-unknown}'"
+          exit 1
+
+      # #1920: the static checks run in job `static`. This job is the ONE required
+      # check, so a red `static` must make it red: without this step a failed
+      # lint would leave "Ruff and pytest" green and a manual merge would pass.
+      # `always()` for the same reason as the step above (a cancelled or skipped
+      # `static` is not a pass), and the steps after it (Download, Collect, Upload,
+      # Fail a cancelled run) carry their own status functions, so a red static
+      # does not stop the report from being collected.
+      - name: Static checks outcome
+        id: static
+        if: ${{ always() }}
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+        run: |
+          if [ "$STATIC_RESULT" = "success" ]; then
+            echo "the static checks passed"
+            exit 0
+          fi
+          echo "::error::the static checks did not pass: result is '${STATIC_RESULT:-unknown}'"
+          exit 1
 
       # #546: the hub has no test runner by design, so the evidence for its two
       # SDD gates is produced here and reported back. Placed AFTER the main test
@@ -576,9 +738,9 @@ jobs:
           # A step that never ran reports its outcome as '' and is dropped by
           # the reporter — silence, not a pass (#875).
           checks: >-
-            lint=${{ steps.lint.outcome }},
-            format=${{ steps.format.outcome }},
-            types=${{ steps.types.outcome }},
+            lint=${{ needs.static.outputs.lint }},
+            format=${{ needs.static.outputs.format }},
+            types=${{ needs.static.outputs.types }},
             tests=${{ steps.tests.outcome }}
           # #1081: the same outcomes keyed by the COMMAND, not the step name, so
           # a validation command this job already ran is not run a second time.
@@ -587,25 +749,22 @@ jobs:
           # strings must stay byte-identical to the run: lines above — a drifted
           # copy silently stops matching and the duplicate run comes back.
           ran-commands: |
-            ${{ steps.lint.outcome }} uv run ruff check hub tests
-            ${{ steps.format.outcome }} uv run ruff format --check hub tests
-            ${{ steps.types.outcome }} uv run mypy hub
+            ${{ needs.static.outputs.lint }} uv run ruff check hub tests
+            ${{ needs.static.outputs.format }} uv run ruff format --check hub tests
+            ${{ needs.static.outputs.types }} uv run mypy hub
             ${{ steps.tests.outcome }} uv run pytest -q -n auto --durations=30
 
-      # #611: the audit no longer decides whether anything ships. The delivery
-      # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery
-      # for the whole repository without a single commit — and an advisory may
-      # have no fixed version at all, which made that freeze open-ended. It
-      # still runs, still prints, and its findings become hub drafts: a step that
-      # can never fail is a step nobody reads, so the record has to land
-      # somewhere with an owner.
-      # #1686: the drafts are filed by ci-report.yml from this file (push to
-      # develop or main only), with a key of their own; this job sends nothing.
-      - name: Dependency vulnerability audit
+      # #1920: the audit file of job `static`, put where ci-report.yml reads it.
+      # After the collector, which writes results.json into the same directory.
+      # Not cancelled-proof on purpose: a missing file is a missing file (the
+      # reporter files no drafts), never a red job (the audit never blocked).
+      - name: Fetch the audit file of job static
+        if: ${{ !cancelled() }}
         continue-on-error: true
-        run: |
-          mkdir -p hub-ci-results
-          uv run pip-audit --progress-spinner off -f json -o hub-ci-results/audit.json
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-ci-static
+          path: hub-ci-results
 
       # #1686: the hand-over to ci-report.yml. The name carries the attempt of
       # THIS run, so a re-run is never confused with the first attempt. The
@@ -619,14 +778,6 @@ jobs:
           path: hub-ci-results/
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Static security scan
-        run: uv run bandit -r hub -q
-
-      # #1080: тело проверки живёт в scripts/secret_scan.py, потому что его
-      # зовёт и `make security` — определение одно, разъехаться нечему.
-      - name: Secret scan
-        run: uv run python scripts/secret_scan.py
 
       # #1767: job test runs on `always()` so that it exists on a cancelled run,
       # but the steps with an implicit success() (Lint, Types, the scans) are

@@ -46,7 +46,11 @@ def test_report_and_audit_use_canonical_secrets() -> None:
     # READ key. The report key is not an input of this job any more (#1686).
     assert f"hub-url: {URL_SECRET}" in text
     assert "hub-read-token: ${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}" in text
-    assert "hub-token:" not in text
+    import re
+
+    # `github-token:` of the adoption download is the workflow's own read-only
+    # token, not the hub report key; only the bare `hub-token:` input is banned.
+    assert not re.search(r"(?<![\w-])hub-token:", text)
 
 
 def test_no_legacy_names_anywhere() -> None:
@@ -487,6 +491,9 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     assert treedup["outputs"] == {
         "skip": "${{ steps.treedup.outputs.skip }}",
         "evidence_run": "${{ steps.evidence.outputs.run }}",
+        # #1919: the adoption of the dispatch run's evidence (see its own test).
+        "adopt": "${{ steps.adopt.outputs.adopt }}",
+        "adopted_run_id": "${{ steps.adopt.outputs.adopted_run_id }}",
     }
 
     # pytest: three parts, none of which may hide another's failure, and none
@@ -510,7 +517,7 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
     # test: the single required check, after both, whatever their outcome.
     test = jobs["test"]
     assert test["name"] == "Ruff and pytest"
-    assert test["needs"] == ["treedup", "pytest", "evidence"]
+    assert test["needs"] == ["treedup", "pytest", "evidence", "static"]
     # A cancelled run must still run job test (and end red): `!cancelled()`
     # would skip it, and a skipped required check can count as passed.
     assert test["if"] == "${{ always() }}"
@@ -531,6 +538,9 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         expected = {
             "test": ["hub-ci-results-${{ github.run_attempt }}"],
             "evidence": ["hub-ci-evidence"],
+            # #1920: the audit file; a name outside the prefix the trusted
+            # report reads (hub-ci-results-)
+            "static": ["hub-ci-static"],
         }.get(name, [])
         assert uploads == expected, name
 
@@ -617,6 +627,8 @@ MUTATIONS_STEP = "Mutations of changed functions (warning only)"
 BASELINE_STEP = "Red-test baseline on merge-base (data only)"
 EVIDENCE_GATE = "needs.treedup.outputs.evidence_run == 'true'"
 EVIDENCE_ARTIFACT = "hub-ci-evidence"
+# #1919: an adopted run (download and stamp both succeeded) recounts nothing.
+ADOPT_RECOUNT = "steps.adopt_stamp.outcome != 'success'"
 
 
 def _same_setup(left: dict, right: dict) -> bool:
@@ -649,14 +661,19 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     # The environment is that of job test: the same steps, byte for byte.
     by_name = {s["name"]: s for s in test["steps"]}
     own = {s["name"]: s for s in evidence["steps"]}
+    assert _same_setup(own["Checkout"], by_name["Checkout"])
+    # #1919: the installs are the same as in job test, byte for byte, except that
+    # an adopted run skips them (nothing below needs an environment then).
     for name in (
-        "Checkout",
         "Install uv",
         "Set up Python",
         "Install age and openssh-server (backup tests)",
         "Install dependencies",
     ):
-        assert _same_setup(own[name], by_name[name]), name
+        assert all(
+            own[name].get(k) == by_name[name].get(k) for k in ("uses", "with", "run")
+        ), name
+        assert own[name]["if"] == "${{ " + ADOPT_RECOUNT + " }}", name
     assert own["Checkout"]["with"] == {"fetch-depth": 0}
 
     # The two steps: names, ceilings, budget and the gate are as before.
@@ -667,8 +684,10 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert "--budget-seconds 540" in mutations["run"]
     assert "--json-out mutation-report.json" in mutations["run"]
     assert "--json-out red-test-baseline.json" in baseline["run"]
-    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " }}"
-    assert baseline["if"] == "${{ !cancelled() && " + EVIDENCE_GATE + " }}"
+    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
+    assert baseline["if"] == (
+        "${{ !cancelled() && " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
+    )
 
     # The hand-over: whatever files exist, after a red step too, outside the
     # prefix the trusted report reads.
@@ -682,7 +701,7 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
     assert upload["continue-on-error"] is True
     assert upload["with"]["if-no-files-found"] == "ignore"
-    assert upload["with"]["retention-days"] == 1
+    assert upload["with"]["retention-days"] == 3, "a late PR run still finds it"
     assert upload["with"]["path"].split() == [
         "mutation-report.json",
         "red-test-baseline.json",
@@ -692,7 +711,7 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
 
     # Job test: waits for the evidence, has none of its steps, and reads nothing
     # from it except the downloaded files.
-    assert test["needs"] == ["treedup", "pytest", "evidence"]
+    assert test["needs"] == ["treedup", "pytest", "evidence", "static"]
     assert test["if"] == "${{ always() }}"
     ids = {s.get("id") for s in test["steps"]}
     assert not ids & {"evidence", "mutations", "baseline"}
@@ -711,6 +730,194 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     collect = "Collect AC test and validation results for the Hub"
     assert names.index(download["name"]) < names.index(collect)
     assert names[-1] == "Fail a cancelled run", "the last step stays the last"
+
+
+def test_evidence_adoption_keeps_artifact_contract() -> None:
+    """#1919 AC-3: how a PR run takes the evidence of the dispatch run."""
+    import json
+
+    from hub.services import ci_integrity
+
+    doc = _doc()
+    jobs = doc["jobs"]
+    treedup, evidence = jobs["treedup"], jobs["evidence"]
+
+    assert treedup["outputs"]["adopt"] == "${{ steps.adopt.outputs.adopt }}"
+    assert (
+        treedup["outputs"]["adopted_run_id"]
+        == "${{ steps.adopt.outputs.adopted_run_id }}"
+    )
+    decide = next(s for s in treedup["steps"] if s.get("id") == "adopt")
+    # Only opened/reopened PR runs of a task branch look for a source.
+    assert decide["if"] == (
+        "${{ github.event_name == 'pull_request' && (github.event.action == "
+        "'opened' || github.event.action == 'reopened') && "
+        "startsWith(github.head_ref, 'task-') }}"
+    )
+    assert decide["continue-on-error"] is True, "a failure here is a recount"
+    assert decide["run"].startswith("python3 -I scripts/adopt_evidence.py decide")
+    assert "secrets." not in json.dumps(decide)
+    # The base of the PR run is what the script reads from git, not an input.
+    assert "base.sha" not in json.dumps(decide)
+    assert "scripts/adopt_evidence.py" in ci_integrity.CI_SCRIPTS
+
+    names = [s["name"] for s in evidence["steps"]]
+    own = {s["name"]: s for s in evidence["steps"]}
+    download = own["Download the evidence of the dispatch run (adopt)"]
+    stamp = own["Stamp the adopted evidence with its source run"]
+    assert "download-artifact" in download["uses"]
+    assert download["if"] == "${{ needs.treedup.outputs.adopt == 'true' }}"
+    assert download["with"] == {
+        "name": EVIDENCE_ARTIFACT,
+        "run-id": "${{ needs.treedup.outputs.adopted_run_id }}",
+        "github-token": "${{ github.token }}",
+        "path": ".",
+    }
+    assert download["continue-on-error"] is stamp["continue-on-error"] is True
+    assert stamp["id"] == "adopt_stamp" and download["id"] == "adopt_download"
+    assert stamp["if"] == "${{ steps.adopt_download.outcome == 'success' }}"
+    assert stamp["run"].startswith("python3 -I scripts/adopt_evidence.py stamp")
+    # Before any install: an adopted run installs nothing.
+    assert names.index(download["name"]) < names.index(stamp["name"])
+    assert names.index(stamp["name"]) < names.index("Install uv")
+    # The token of this workflow is read-only on actions.
+    assert doc["permissions"] == {"contents": "read", "actions": "read"}
+    # The hand-over to job test is unchanged: the same upload, the same name.
+    upload = next(
+        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
+    )
+    assert upload["with"]["name"] == EVIDENCE_ARTIFACT
+    assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
+    assert jobs["test"]["needs"] == ["treedup", "pytest", "evidence", "static"]
+
+
+def _step_runs(
+    condition: str, *, static_result: str, previous_ok: bool, cancelled: bool = False
+) -> bool:
+    """Whether a STEP of job test runs, with the strict evaluator of the job graph.
+
+    The status functions of a step look at the previous steps of the same job:
+    ``success()`` is ``previous_ok``. A condition without a status function gets
+    the implicit ``success()``, exactly as on GitHub.
+    """
+    env: dict[str, object] = {
+        "needs.static.result": static_result,
+        "needs.pytest.result": "success",
+        "needs.treedup.outputs.skip": "",
+        "needs.treedup.outputs.evidence_run": "true",
+    }
+    calls = {
+        "success()": previous_ok,
+        "failure()": not previous_ok,
+        "cancelled()": cancelled,
+        "always()": True,
+    }
+    text = condition.strip()
+    assert text.startswith("${{") and text.endswith("}}"), condition
+    parser = _Condition(_tokenize(text[3:-2]), env, calls)
+    value = bool(parser.parse())
+    return value if parser.status_called else (previous_ok and value)
+
+
+def test_static_failure_turns_test_job_red() -> None:
+    """#1920 AC-1: a red job `static` makes the required check red, and only that.
+
+    The collector, the download of the evidence and the upload of the report
+    still run (they carry their own status functions), so a red static does not
+    cost the hub its report.
+    """
+    import os
+    import subprocess
+
+    test = _doc()["jobs"]["test"]
+    steps = test["steps"]
+    names = [s["name"] for s in steps]
+    judge = steps[names.index("Static checks outcome")]
+    # The judge reads the result of job `static` and nothing else. Without this
+    # the behaviour table below is blind to the wiring: pointing the variable at
+    # another job (needs.pytest.result) kept every case green while a red static
+    # left the required check green. The same lock `_aggregator_rc` puts on
+    # PARTS_RESULT for the parts.
+    assert judge["env"] == {"STATIC_RESULT": "${{ needs.static.result }}"}
+    assert judge["run"].count("$STATIC_RESULT") >= 1
+
+    for result, red in (
+        ("success", False),
+        ("failure", True),
+        ("cancelled", True),
+        ("skipped", True),
+        ("", True),
+    ):
+        assert _step_runs(judge["if"], static_result=result, previous_ok=not red), (
+            result
+        )
+        env = {"PATH": os.environ["PATH"], "STATIC_RESULT": result}
+        done = subprocess.run(
+            ["bash", "-c", judge["run"]], env=env, capture_output=True, text=True
+        )
+        assert (done.returncode != 0) is red, (result, done.stdout, done.stderr)
+
+    # After the judge nothing may depend on the implicit success(): with a red
+    # judge (previous_ok False) these still run, and the last one does not.
+    after = steps[names.index("Static checks outcome") + 1 :]
+    assert [s["name"] for s in after] == [
+        "Download the evidence files of job evidence",
+        "Collect AC test and validation results for the Hub",
+        "Fetch the audit file of job static",
+        "Upload results for the trusted report",
+        "Fail a cancelled run",
+    ]
+    for step in after[:-1]:
+        assert _step_runs(step["if"], static_result="failure", previous_ok=False), step[
+            "name"
+        ]
+    assert not _step_runs(
+        after[-1]["if"], static_result="failure", previous_ok=False
+    ), "only a cancelled run ends in the last step"
+    # A static job in the needs of the one required check; deploy reads test.
+    assert "static" in test["needs"]
+    assert _doc()["jobs"]["deploy"]["needs"] == "test"
+
+
+def test_ran_commands_and_checks_come_from_static() -> None:
+    """#1920 AC-2: the strings the collector matches are those of the real steps."""
+    import re
+
+    doc = _doc()
+    jobs = doc["jobs"]
+    static, test = jobs["static"], jobs["test"]
+    by_id = {s["id"]: s for s in static["steps"] if "id" in s}
+    collect = next(
+        s
+        for s in test["steps"]
+        if s["name"] == "Collect AC test and validation results for the Hub"
+    )["with"]
+
+    # job outputs: the outcome of the step with the same id, nothing else
+    assert static["outputs"] == {
+        key: "${{ steps." + key + ".outcome }}" for key in ("lint", "format", "types")
+    }
+    checks = [part.strip() for part in str(collect["checks"]).split(",")]
+    assert checks == [
+        "lint=${{ needs.static.outputs.lint }}",
+        "format=${{ needs.static.outputs.format }}",
+        "types=${{ needs.static.outputs.types }}",
+        "tests=${{ steps.tests.outcome }}",
+    ]
+    ran = [line.strip() for line in str(collect["ran-commands"]).splitlines() if line]
+    commands = {
+        key: re.sub(r"^\$\{\{ [^}]+ \}\} ", "", line)
+        for key, line in zip(("lint", "format", "types", "tests"), ran)
+    }
+    for key in ("lint", "format", "types"):
+        assert ran[("lint", "format", "types").index(key)].startswith(
+            "${{ needs.static.outputs." + key + " }} "
+        ), key
+        assert commands[key] == by_id[key]["run"], (key, "drifted from the run: line")
+    # the full suite line is the one every task card declares (byte for byte)
+    assert commands["tests"] == "uv run pytest -q -n auto --durations=30"
+    # the vocabulary of the report is closed: no new check key appeared
+    assert [c.split("=")[0] for c in checks] == ["lint", "format", "types", "tests"]
 
 
 def _run_reporter_as_the_action_does(
@@ -767,6 +974,8 @@ def _run_reporter_as_the_action_does(
             )
             text = text.replace("${{ github.event.action }}", "opened")
             text = re.sub(r"\$\{\{ steps\.\w+\.outcome \}\}", "success", text)
+            # #1920: the outcomes of lint/format/types come from job static
+            text = re.sub(r"\$\{\{ needs\.static\.outputs\.\w+ \}\}", "success", text)
             text = text.replace("${{ secrets.HAIPLANE_HUB_URL }}", server_url)
             text = text.replace("${{ secrets.HAIPLANE_HUB_CI_READ_TOKEN }}", "reader")
             text = text.replace(
@@ -1058,7 +1267,12 @@ def _job_condition_holds(
 
 
 def _deploy_cases(condition: str) -> dict[str, bool]:
-    ok = {"treedup": "success", "pytest": "success", "evidence": "skipped"}
+    ok = {
+        "treedup": "success",
+        "pytest": "success",
+        "evidence": "skipped",
+        "static": "success",
+    }
     out: dict[str, bool] = {}
 
     def run(name: str, test: str, event: str, ref: str, cancelled: bool = False):
@@ -1108,7 +1322,12 @@ def test_the_pre_1796_condition_skipped_the_deploy() -> None:
 
 # ---- #1800: the evaluator refuses what GitHub would not mean ------------------
 
-_OK = {"treedup": "success", "pytest": "success", "evidence": "success"}
+_OK = {
+    "treedup": "success",
+    "pytest": "success",
+    "evidence": "success",
+    "static": "success",
+}
 
 
 def _eval(condition: str, test: str = "success", ancestors=None, **kw) -> bool:

@@ -114,6 +114,9 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         "scripts/ci_report_audit_to_hub.py",
         "scripts/ci_trusted_report.py",
         "scripts/mutation_changed.py",
+        # #1919: decides which evidence a PR run takes from the dispatch run;
+        # changing it can swap what the red-test gate reads.
+        "scripts/adopt_evidence.py",
         # #1767: a plugin loaded by the command of each test part
         # (``-p scripts.pytest_shard``); changing it can hide tests.
         "scripts/pytest_shard.py",

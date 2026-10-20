@@ -8,7 +8,10 @@
 
 Workflow: `.github/workflows/ci.yml`, job `deploy`.
 
-1. Job `test` гоняет `ruff check`, `ruff format --check` и `pytest`.
+1. Job `static` (#1920) гоняет `ruff check`, `ruff format --check`, `mypy`,
+   бюджеты, `pip-audit`, `bandit` и скан секретов параллельно частям `pytest`;
+   job `test` ждёт его, краснеет по его результату и остаётся единственной
+   обязательной проверкой «Ruff and pytest» и сборщиком отчёта для хаба.
    Рядом, параллельно, job `compose-smoke` (#1358) поднимает образ из
    `docker-compose.yml` (`deploy/docker/compose_smoke.sh`): `/healthz` с
    демо-сидом и без него, на свежем томе. В `needs` деплоя он не стоит —
@@ -614,6 +617,25 @@ Test, AC и validation идут на каждом событии как рань
 (`needs: test`), Compose и `treedup` не менялись: `treedup` может
 переиспользовать успешный PR-прогон с пропущенными мутациями, потому что `Test`
 в нём выполнен, а красный `Test` не даёт успешный workflow.
+
+### Усыновление evidence dispatch-прогона (#1919)
+
+Исполнитель запускает `workflow_dispatch` до сдачи, хаб открывает PR при сдаче:
+оба прогона стоят на одном `head_sha`, и мутации с baseline считались дважды
+(~10,5 мин). Теперь на `pull_request` `opened`/`reopened` task-ветки шаг
+`adopt` в job `treedup` (`scripts/adopt_evidence.py decide`, только stdlib,
+`python3 -I`) ищет успешный dispatch-прогон `ci.yml` на том же `head_sha`.
+Условие: job `evidence` источника зелёный, артефакт `hub-ci-evidence` жив,
+состояния файлов несут информацию (мутации `ran`/`no_changed_functions`/`no_tests`,
+baseline `ran`/`no_tests`), и `merge_base == base_tip ==` первому родителю
+merge-коммита PR-прогона (`HEAD^1`; событийный `base.sha` может отставать), а
+дерево merge-коммита равно дереву головы. Любое сомнение или сбой — прежний
+пересчёт, джоб не краснеет. При `adopt=true` job `evidence` скачивает артефакт
+(`github.token`, `actions: read`), дописывает ключ `adopted_from_run` внутрь
+обоих JSON (не в `provenance` и не в `results.json`), выкладывает их как
+`hub-ci-evidence` и не ставит окружение; сбой скачивания или записи ключа
+возвращает пересчёт. Брифинг ревью показывает «усыновлено из dispatch-прогона N
+(со слов прогона)». Срок хранения `hub-ci-evidence` — 3 суток.
 
 Как это доходит до хаба. Репортёр получает исходы шагов. Шаг не запускался
 (`skipped`) — ключа `mutations`/`baseline` в отчёте нет, и хаб оставляет то, что
