@@ -61,9 +61,7 @@ def steward_judgement_body_sample(generation: int) -> str:
             "verdict": _VERDICT_HINT,
             "confidence": _CONFIDENCE_HINT,
             "grounds": [{"source": _SOURCE_HINT, "detail": PLACEHOLDER_DETAILS[0]}],
-            "closures": [
-                {"finding_uid": PLACEHOLDER_FINDING_UID, "type": _CLOSURE_TYPE_HINT}
-            ],
+            "closures": [],
         },
         ensure_ascii=False,
     )

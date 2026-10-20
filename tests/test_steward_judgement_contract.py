@@ -260,3 +260,24 @@ async def test_refusals_are_counted_next_to_escalations(
     rows = (await practice_metrics(db))["human_gates"]
     steward = [r for r in rows if r.get("gate") == "steward"]
     assert steward and sum(r["refused"] for r in steward) == 1
+
+
+async def test_the_sample_needs_only_hint_replacement_to_be_accepted(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b860d65c89867fd8: в образце нет подставных uid.
+
+    Судья заменяет подсказки значениями и сдаёт то же тело: никакой строки,
+    которую надо ещё и удалять (closures пуст на чистом пакете).
+    """
+    task_id = await _started_run(db, monkeypatch, "c1924-fillable")
+    body = _body_from_sample(
+        verdict="approve",
+        confidence="high",
+        grounds=[_GOOD],
+    )
+    assert body["closures"] == []
+    view = await record_steward_judgement(
+        db, task_id, StewardJudgementSubmit(**body), _STEWARD
+    )
+    assert view.verdict == "approve"
