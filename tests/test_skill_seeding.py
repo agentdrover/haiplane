@@ -11,6 +11,7 @@ the library walked into it.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import aiosqlite
@@ -878,13 +879,64 @@ def test_codex_second_review_rule_lives_in_one_skill():
     assert "второе ревью (правило — local-executor-hub-repo" in ref
 
 
-#: Три правила ревью (#1866): заголовки одинаковы в навыке исполнителя и в
-#: сиде облачного исполнителя, чтобы один тест держал оба текста.
-REVIEW_RULE_HEADINGS = (
-    "Свежий взгляд до пуша",
-    "Класс ошибки на доработке",
-    "С третьего возврата",
-)
+#: Три правила ревью (#1866): заголовок и обязательства КАЖДОГО правила. Тело
+#: проверяется, а не заголовок: правило с пустым телом ничему не учит.
+_SKILL_RULES = {
+    "Свежий взгляд до пуша": (
+        "чистом контексте",
+        "обязательность Codex определяют только признаки выше",
+        "P1 и P2 исправь до пуша",
+        "все места класса",
+        "проверенный sha",
+    ),
+    "Класс ошибки на доработке": (
+        "все места этого класса",
+        "в пределах области задачи",
+        "out_of_scope",
+    ),
+    "С третьего возврата": (
+        "review_cycle` ≥ 3",
+        "до кода запиши в ленту",
+        "почему подход",
+        "какой другой подход",
+    ),
+}
+_SEED_RULES = {
+    "Свежий взгляд до пуша": (
+        "субагентов нет",
+        "по чек-листу",
+        "P1 и P2 исправь до пуша",
+        "все места класса",
+        "машинное ревью хаба",
+    ),
+    "Класс ошибки на доработке": (
+        "все места класса",
+        "в пределах области задачи",
+        "out_of_scope",
+    ),
+    "С третьего возврата": (
+        "review_cycle ≥ 3",
+        "до кода запиши в ленту",
+        "почему прежний подход",
+        "какой берёшь",
+    ),
+}
+
+
+def _rule_body(text: str, heading: str) -> str:
+    """Тело одного правила: от заголовка до следующего пункта списка."""
+    flat = " ".join(text.split())
+    start = flat.index(heading)
+    nxt = re.search(r" - (?:\*\*)?[А-ЯA-Z]", flat[start + len(heading) :])
+    end = start + len(heading) + nxt.start() if nxt else len(flat)
+    return flat[start:end]
+
+
+def _assert_rules(text: str, rules: dict[str, tuple[str, ...]]) -> None:
+    for heading, needles in rules.items():
+        body = _rule_body(text, heading)
+        for needle in needles:
+            assert needle in body, (heading, needle)
 
 
 async def test_executor_skills_carry_review_rules(db: aiosqlite.Connection):
@@ -896,10 +948,11 @@ async def test_executor_skills_carry_review_rules(db: aiosqlite.Connection):
     await seed_default_skills(db)
     clean = await _versions(db, name)
     assert [(v["version"], v["status"]) for v in clean] == [(1, "active")]
-    for heading in REVIEW_RULE_HEADINGS:
-        assert heading in clean[0]["content"], heading
     assert clean[0]["content"] == EXECUTOR_PAIR_DISCIPLINE_SKILL
-    assert "чистом контексте" in EXECUTOR_PAIR_DISCIPLINE_SKILL
+    _assert_rules(clean[0]["content"], _SEED_RULES)
+    # Облачный исполнитель без субагентов: правило не посылает его к субагенту.
+    assert "Без субагентов" in EXECUTOR_PAIR_DISCIPLINE_SKILL
+    assert "отдай `git diff" not in EXECUTOR_PAIR_DISCIPLINE_SKILL
     # База с активной версией от человека: новый текст — draft, активная цела.
     human = "версия, опубликованная человеком"
     await _install(db, name, [(5, human, "active", "seed", "admin")])
@@ -915,10 +968,9 @@ async def test_executor_skills_carry_review_rules(db: aiosqlite.Connection):
     rule = (REPO / "skills/local-executor-hub-repo/SKILL.md").read_text("utf-8")
     assert rule.count("Второй ревьюер Codex") == 1
     section = _between(rule, "6. **Второй ревьюер Codex", "## Этап 3.")
-    for heading in REVIEW_RULE_HEADINGS:
-        assert heading in section, heading
-    for needle in ("чистом контексте", "out_of_scope", "review_cycle"):
-        assert needle in section, needle
+    _assert_rules(section, _SKILL_RULES)
+    # P3 #1862: блок про автозапрос CI хабом не потерян при переходе к v9.
+    assert "С #1862 на проектах" in rule and "окно grace" in rule
 
 
 def test_machine_review_cycle_describes_both_decisions():

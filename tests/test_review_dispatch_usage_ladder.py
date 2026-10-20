@@ -469,16 +469,26 @@ async def test_review_rules_carry_finding_form(
 
     prompt = recorder.calls[0]["prompt_text"]
     assert "ОБРЕЗАНО" not in prompt, "the section must fit the rules cap"
+    flat = " ".join(prompt.split())
+    start = flat.index("## Форма находки")
+    form = flat[start:]
     for needle in (
-        "## Форма находки",
-        "класс дефекта",
+        "число находок по важности",
+        "находок нет",
+        "назван класс дефекта",
+        "перечислены все места этого класса",
         "существовало до задачи",
-        "out_of_scope",
+        "отдельная информация, а не автоматический `out_of_scope`",
+        "цель, AC и границы задачи",
         "всё ещё открыто",
-        "третьего возврата",
+        "прежним заголовком",
+        "С третьего возврата",
         "сходится ли подход",
+        "предложи другой подход",
     ):
-        assert needle in prompt, needle
+        assert needle in form, needle
+    # Раздел дошёл до конца файла правил, не обрезанным.
+    assert "Только потом перечисляй находки." in form
 
 
 async def test_missing_repo_rules_is_stated_not_silent(
