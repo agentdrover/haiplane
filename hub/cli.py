@@ -14,6 +14,7 @@ from typing import Any
 
 from hub import config
 from hub import cli_owner_minutes as om_cli
+from hub import cli_review_verdict as rv_cli
 from hub import expected_sha as expected_sha_cli
 from hub.cli_executor_host import add_executor_host_parsers
 from hub.cli_task_fields import (
@@ -872,29 +873,6 @@ def _add_state_submit_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--expected-generation",
-        dest="expected_generation",
-        type=int,
-        default=None,
-        help=(
-            "The submission generation you judged, from the review brief "
-            "(required: state task #1647, commit task #1706)"
-        ),
-    )
-    parser.add_argument(
-        "--supersedes-revision",
-        dest="supersedes_revision",
-        type=int,
-        default=None,
-        help=(
-            "Human only (#1706): replace the verdict that stands, naming its "
-            "revision from the task card"
-        ),
-    )
-
-
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
@@ -976,40 +954,6 @@ def cmd_review_brief(args: argparse.Namespace) -> int:
     payload = answer.structuredContent or {}
     _print_json(payload.get("brief") or payload.get("page") or payload)
     return 2 if "reason" in payload else 0
-
-
-def cmd_review_verdict(args: argparse.Namespace) -> int:
-    body: dict[str, Any] = {"verdict": args.verdict}
-    if args.comments:
-        body["comments"] = args.comments
-    if args.agent:
-        body["agent"] = args.agent
-    if args.findings_json:
-        try:
-            findings = json.loads(args.findings_json)
-        except json.JSONDecodeError as exc:
-            print(f"invalid --findings-json: {exc}", file=sys.stderr)
-            return 2
-        body["findings"] = findings
-    if getattr(args, "create_tasks_for_out_of_scope", False):
-        body["create_tasks_for_out_of_scope"] = True
-    if getattr(args, "expected_generation", None) is None:
-        # #1706: the generation is the brief's, never the live one read here —
-        # a CLI that fills it in judges whatever stands now, which is the
-        # stale command this flag exists to stop.
-        print(
-            "--expected-generation is required: read the brief "
-            f"(oc-hub review-brief {args.task_id}) and repeat the command with "
-            "--expected-generation <submission_generation of the brief>",
-            file=sys.stderr,
-        )
-        return 2
-    body["expected_generation"] = args.expected_generation
-    if getattr(args, "supersedes_revision", None) is not None:
-        body["supersedes_revision"] = args.supersedes_revision
-    result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
-    _print_json(result)
-    return 0
 
 
 def cmd_steward_judgement(args: argparse.Namespace) -> int:
@@ -1123,6 +1067,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 cmd_owner_minutes_day = om_cli.cmd_owner_minutes_day
+cmd_review_verdict = rv_cli.cmd_review_verdict
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -2689,38 +2634,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_verdict_evidence.add_argument("task_id", type=int)
     p_verdict_evidence.set_defaults(func=cmd_verdict_evidence)
 
-    p_review_verdict = sub.add_parser(
-        "review-verdict",
-        help="Record a review verdict; never completes the task",
-    )
-    p_review_verdict.add_argument("task_id", type=int)
-    p_review_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
-    p_review_verdict.add_argument("--comments", default="", help="Review summary")
-    p_review_verdict.add_argument("--agent", default="", help="Reviewer agent name")
-    p_review_verdict.add_argument(
-        "--findings-json",
-        dest="findings_json",
-        default="",
-        help=(
-            "JSON list of findings: "
-            '[{"id":1,"severity":"high","message":"...",'
-            '"scope":"in_scope|out_of_scope","linked_task_id":123}]. '
-            "scope defaults to in_scope; changes_requested requires at "
-            "least one in_scope finding; linked_task_id references the "
-            "follow-up task for out_of_scope findings."
-        ),
-    )
-    p_review_verdict.add_argument(
-        "--create-tasks-for-out-of-scope",
-        dest="create_tasks_for_out_of_scope",
-        action="store_true",
-        help=(
-            "Auto-create DRAFT follow-up tasks for out_of_scope findings "
-            "without linked_task_id (#436); drafts still need human approval"
-        ),
-    )
-    _add_state_verdict_args(p_review_verdict)
-    p_review_verdict.set_defaults(func=cmd_review_verdict)
+    rv_cli.add_parsers(sub)
 
     p_steward_judgement = sub.add_parser(
         "steward-judgement",
