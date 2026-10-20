@@ -45,6 +45,7 @@ from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
 from hub.services import (
     chat_pair,
+    executor_triage,
     host_redeem,
     launch_feedback,
     owner_minutes,
@@ -586,7 +587,14 @@ async def settle(db: aiosqlite.Connection, host: str | None = None) -> int:
 async def sweep_executor_orders(db: aiosqlite.Connection) -> int:
     """Проход поллера: закрыть всё, что уже не держится (п.9 постановки)."""
     async with write_transaction(db):
-        return await settle(db)
+        closed = await settle(db)
+    try:
+        # #1942: рекомендации разбора — отдельной транзакцией: их сбой не должен
+        # отменить закрытие заказов выше и не роняет проход.
+        await executor_triage.sweep(db)
+    except Exception:  # noqa: BLE001 - разбор в тени не ломает проход поллера
+        log.exception("executor triage sweep failed")
+    return closed
 
 
 # ---------------------------------------------------------------------------
@@ -898,8 +906,8 @@ async def _issue(
     del code
     cursor = await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
-        "pair_code_id, code_ciphertext, order_text, expires_at, code_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "pair_code_id, code_ciphertext, order_text, expires_at, code_hash, "
+        "statement_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host["name"],
             task_id,
@@ -910,6 +918,9 @@ async def _issue(
             text,
             stored["expires_at"],
             stored["code_hash"],
+            # #1942: поколение ПОСТАНОВКИ на момент выпуска (не путать с generation —
+            # поколением сдачи); по нему считается серия неудач одной постановки.
+            int(task.get("statement_generation") or 0),
         ),
     )
     order_id = int(cursor.lastrowid or 0)
@@ -1401,4 +1412,8 @@ async def report_outcome(
                 RUN_OUTCOME_ABORTED,
                 final_text=text,
             )
+            # #1942: разбор в тени после сохранённого report и возврата задачи — и
+            # когда закрыл этот вызов, и когда заказ закрыт раньше (поздний report).
+            # Свежая строка заказа читается внутри; запуска и смены статуса нет.
+            await executor_triage.recommend_safely(db, int(order["id"]))
     return {"id": order["id"], "outcome": outcome, "duplicate": False}
