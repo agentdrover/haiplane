@@ -883,7 +883,7 @@ async def answer_for_report(
     # равен хешу сохранённого скана текущего коммита: ревьюер отвечал о ТЕХ
     # признаках, что сейчас в базе (#1913). Бриф «unscanned», скан позже,
     # другой коммит, ответ без хеша — отбрасываются.
-    given = (body.ci_integrity.scan_hash if body.ci_integrity else "").strip()
+    given = (body.ci_integrity.scan_hash if body.ci_integrity else "").strip().lower()
     current = scan_hash_of(sha, scan) if scan is not None else ""
     if current and given == current:
         return answer

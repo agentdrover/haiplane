@@ -4044,14 +4044,7 @@ class CIIntegrityAnswer(BaseModel):
 
     verdict: str = ""
     explanation_ru: str = ""
-    # #1913: хеш скана признаков из брифа/заказа (поле ``scan_hash``). Ответ без
-    # него или с чужим хешем не хранится: ревьюер отвечал не о тех признаках.
-    scan_hash: str = ""
-
-    @field_validator("scan_hash", mode="before")
-    @classmethod
-    def _clean_hash(cls, v: Any) -> str:
-        return "" if v is None else str(v).strip().lower()[:64]
+    scan_hash: str = ""  # #1913: хеш скана из брифа/заказа; без него ответ не хранится
 
     @field_validator("verdict", mode="before")
     @classmethod
