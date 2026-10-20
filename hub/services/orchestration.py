@@ -1882,9 +1882,9 @@ def _steward_gate_rows(
             {
                 "gate": "steward",
                 "project": project,
-                "applied": 0,
-                "escalated": 0,
-                "overridden_by_human": 0,
+                **dict.fromkeys(
+                    ("applied", "escalated", "refused", "overridden_by_human"), 0
+                ),
             },
         )
 
@@ -1903,6 +1903,8 @@ def _steward_gate_rows(
             applied.append(row)
         elif row["kind"] == STEWARD_ESCALATED:
             entry_for(project)["escalated"] += 1
+        elif row["kind"] == "steward_judgement_refused":
+            entry_for(project)["refused"] += 1
 
     window = timedelta(days=STEWARD_OVERRIDE_WINDOW_DAYS)
     for applied_row in applied:

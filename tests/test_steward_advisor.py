@@ -91,7 +91,7 @@ def delivery_kinds(monkeypatch) -> list[str]:
     """Канал доставки подменён и записывает, какого ВИДА сессию он выписал."""
     seen: list[str] = []
 
-    async def _delivery(_db, _task_id, _generation, _base_url, kind="steward"):
+    async def _delivery(_db, _task_id, _generation, _base_url, kind="steward", **_kw):
         seen.append(kind)
         return _DELIVERY
 
@@ -2163,7 +2163,7 @@ async def test_the_cloud_advisor_path_is_unchanged_by_the_local_channel(
     monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("gpt-5.3-codex",))
     monkeypatch.setattr(config, "CURSOR_API_KEY", "cursor-key")
 
-    async def _delivery(_db, _task_id, _generation, _base_url, kind="steward"):
+    async def _delivery(_db, _task_id, _generation, _base_url, kind="steward", **_kw):
         return _DELIVERY
 
     monkeypatch.setattr(sh, "identity_delivery", _delivery)

@@ -42,6 +42,10 @@ from hub.integrations import cursor_cloud
 from hub.services import project_policy
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 from hub.services.model_family import same_family
+from hub.services.steward_judgement_sample import (
+    steward_escalate_body_sample,
+    steward_judgement_body_sample,
+)
 from hub.services.steward_exit import (  # noqa: F401 — re-export for consumers
     ACT_ESCALATION_CEILING,
     ACT_ESCALATION_FLOOR,
@@ -129,7 +133,13 @@ async def steward_principal_id(db: aiosqlite.Connection) -> int | None:
 CREDENTIAL_PATH = "~/.haiplane-steward.credential"
 
 
-def delivery_commands(task_id: int, code: str, base_url: str) -> tuple[str, ...]:
+#: Заглушка тела для прогонов, у которых образца нет (советник, DoR).
+BODY_PLACEHOLDER = "<суждение по контракту>"
+
+
+def delivery_commands(
+    task_id: int, code: str, base_url: str, body: str = BODY_PLACEHOLDER
+) -> tuple[str, ...]:
     """Команды, которые прогон выполняет, — каждая самодостаточна (#1194).
 
     Прежняя форма велела «сохранить токен в переменную», а дальше все команды
@@ -171,11 +181,13 @@ def delivery_commands(task_id: int, code: str, base_url: str) -> tuple[str, ...]
         f"curl -sS -X POST {base_url}/api/tasks/{task_id}/steward-judgement "
         f'-H "Authorization: Bearer $(cat {CREDENTIAL_PATH})" '
         "-H 'Content-Type: application/json' "
-        "-d '<суждение по контракту>'",
+        f"-d '{body}'",
     )
 
 
-def delivery_block(task_id: int, code: str, base_url: str) -> str:
+def delivery_block(
+    task_id: int, code: str, base_url: str, body: str = BODY_PLACEHOLDER
+) -> str:
     """How the run reaches the hub without MCP (#1084's lesson, #1120).
 
     Empty when there is no code: an instruction naming a credential the run
@@ -183,7 +195,9 @@ def delivery_block(task_id: int, code: str, base_url: str) -> str:
     """
     if not code or not base_url:
         return ""
-    redeem, check, evidence, judgement = delivery_commands(task_id, code, base_url)
+    redeem, check, evidence, judgement = delivery_commands(
+        task_id, code, base_url, body
+    )
     return (
         "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ. Инструментов MCP у тебя нет, всё "
         "идёт обычным HTTP. Код ниже живёт МИНУТЫ, а прогон дольше — обменяй "
@@ -211,6 +225,7 @@ async def identity_delivery(
     generation: int,
     base_url: str,
     kind: str = "steward",
+    body: str = BODY_PLACEHOLDER,
 ) -> str | None:
     """Mint the run's one-time code and the block telling it what to do.
 
@@ -237,7 +252,7 @@ async def identity_delivery(
     )
     if not code:
         return None
-    return delivery_block(task_id, code, base_url)
+    return delivery_block(task_id, code, base_url, body)
 
 
 async def reviewer_model(
@@ -383,7 +398,19 @@ def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
         "/steward-judgement (curl — в блоке доступа ниже): "
         "verdict (approve | changes_requested | escalate), confidence, "
         "grounds из закрытого множества источников, closures на каждую "
-        "confirmed-находку при approve, escalate_reason при эскалации.\n\n"
+        "confirmed-находку при approve, escalate_reason при эскалации.\n"
+        "5. approve и changes_requested ОБЯЗАНЫ нести confidence и хотя бы "
+        "одно основание, у которого detail назван конкретным фактом пакета "
+        "(значение, число, sha, поле). Без них хаб вернёт 422 и ничего не "
+        "запишет — исправь тело и отправь снова в этом же прогоне. Образец "
+        "тела — в команде ниже (в угловых скобках подсказки: замени их своими "
+        "значениями; detail с маркером __ЗАПОЛНИ_ФАКТ_7Q__ основанием не считается — "
+        "замени маркер целиком фактом; closures в образце "
+        "пуст — на грязном пути впиши в него по одной записи на каждую "
+        "confirmed-находку пакета: finding_uid и type оттуда). Эскалация "
+        "оснований не требует, её тело: "
+        + steward_escalate_body_sample(generation)
+        + "\n\n"
         "Сомневаешься — эскалируй: эскалация возвращает решение человеку, то "
         "есть к сегодняшнему поведению, и стоит дёшево.\n\n" + delivery
     )
@@ -918,7 +945,13 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     from hub.services.review_dispatch import instance_base_url
 
     hub_base = instance_base_url().rstrip("/")
-    delivery = await identity_delivery(db, task_id, generation, hub_base)
+    delivery = await identity_delivery(
+        db,
+        task_id,
+        generation,
+        hub_base,
+        body=steward_judgement_body_sample(generation),
+    )
     if delivery is None:
         await _refuse_transiently(
             db,
