@@ -186,7 +186,17 @@ async def banner_rows(db: aiosqlite.Connection) -> list[dict[str, Any]]:
         f"WHERE cleared_at IS NULL AND source IN ({marks}) ORDER BY id",
         NEW_SOURCES,
     )
-    return [
+    unchecked = [
+        {
+            "task_id": None,
+            "source": "unchecked",
+            "ref": str(pid),
+            "line": "Откаты доставок стюарда НЕ проверяются (git не отвечает "
+            f"{UNCHECKED_AFTER}+ тиков подряд): {reason}",
+        }
+        for pid, reason in _unchecked.items()
+    ]
+    return unchecked + [
         {
             "task_id": int(r["task_id"]),
             "source": str(r["source"]),
@@ -270,17 +280,59 @@ async def _trip_revert(
     return tripped
 
 
-async def _walk(project: dict[str, Any], cursor: str) -> dict[str, Any] | None:
-    """Свежая история базы после курсора, или None, если спросить не удалось."""
+async def _walk(project: dict[str, Any], cursor: str) -> dict[str, Any]:
+    """Свежая история базы после курсора; ``{"error": причина}``, если не прочли."""
     workspace = str(project.get("workspace_path") or "").strip()
     base = base_branch_of(project)
     ok, detail = await plugins.git_ops.fetch_base(workspace, base)
     if not ok:
-        log.warning("revert watch %s: fetch failed: %s", project.get("slug"), detail)
-        return None
-    return await plugins.git_ops.first_parent_after(
+        return {"error": f"fetch: {detail}"}
+    walk = await plugins.git_ops.first_parent_after(
         workspace, base, cursor, REVERT_BATCH
     )
+    return walk if walk is not None else {"error": "git недоступен"}
+
+
+#: Подряд не прочитанных тиков, после которых «не проверено» становится видимым.
+UNCHECKED_AFTER = 3
+EVENT_UNCHECKED = "steward_breaker_unchecked"
+_failures: dict[int, int] = {}
+_unchecked: dict[int, str] = {}
+
+
+async def _note_unchecked(
+    db: aiosqlite.Connection, project: dict[str, Any], reason: str
+) -> None:
+    """Тик не прочитал историю: warning с причиной, счётчик, после N тиков - сигнал.
+
+    Молчаливый ноль читался бы как «откатов нет» (#725). Сигнал - событие
+    (один раз на серию) и строка баннера входящих, пока серия длится.
+    """
+    pid = int(project["id"])
+    _failures[pid] = _failures.get(pid, 0) + 1
+    log.warning(
+        "revert watch %s: not checked (%s), %d in a row",
+        project.get("slug"),
+        reason,
+        _failures[pid],
+    )
+    if _failures[pid] < UNCHECKED_AFTER:
+        return
+    _unchecked[pid] = f"{project.get('slug')}: {reason}"
+    if _failures[pid] == UNCHECKED_AFTER:
+        await repo.insert_event(
+            db,
+            kind=EVENT_UNCHECKED,
+            project_id=pid,
+            actor="hub",
+            payload={"project": str(project.get("slug") or ""), "reason": reason},
+        )
+        await db.commit()
+
+
+def _checked(project: dict[str, Any]) -> None:
+    _failures.pop(int(project["id"]), None)
+    _unchecked.pop(int(project["id"]), None)
 
 
 async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> int:
@@ -295,7 +347,8 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
     try:
         cursor = await _cursor_of(db, pid)
         walk = await _walk(project, cursor)
-        if walk is None:
+        if "error" in walk:
+            await _note_unchecked(db, project, str(walk["error"]))
             return 0
         if not cursor or walk["reset"]:
             if walk["reset"]:
@@ -308,14 +361,16 @@ async def collect_reverts(db: aiosqlite.Connection, project: dict[str, Any]) -> 
                 )
             await _set_cursor(db, pid, walk["head"])
             await db.commit()
+            _checked(project)
             return 0
         shas = list(walk["shas"])
         facts = await plugins.git_ops.commit_facts(
             str(project["workspace_path"]).strip(), shas
         )
         if facts is None or any(s not in facts for s in shas):
-            log.warning("revert watch %s: commit messages unreadable", project["slug"])
+            await _note_unchecked(db, project, "сообщения коммитов не прочитаны")
             return 0
+        _checked(project)
         tripped = 0
         for sha in shas:
             fact = facts[sha]

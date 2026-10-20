@@ -30,30 +30,44 @@ SECOND_PARENT_LIMIT = 100
 
 async def first_parent_after(
     run: GitRun, base: str, since: str, limit: int
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Коммиты первой линии ``origin/<base>`` после ``since``, СТАРЫЕ первыми.
 
     ``{"head": sha, "reset": bool, "shas": [...]}``. ``reset`` - ``since`` не
     предок головы (историю переписали): вызывающий не судит ничего и ставит
     курсор на ``head``. Берутся самые старые ``limit`` коммитов: курсор
     переходит на последний разобранный, остальное - на следующем тике.
+
+    Без ``since`` (первый тик) читается только голова: ни ``rev-list``, ни
+    истории. Любой ``rev-list`` идёт с потолком ``-n``: число коммитов считается
+    отдельно, берётся окно из самых старых ``limit`` через ``--skip``.
+
+    Шаг не ответил (rc вне ожидаемых, в том числе таймаут 124) - ответ
+    ``{"error": "<шаг> rc=<код>"}``: вызывающий называет причину, а не молчит.
     """
     rc, head, _ = await run("rev-parse", "--verify", f"origin/{base}^{{commit}}")
     if rc != 0 or not head.strip():
-        return None
+        return {"error": f"rev-parse rc={rc}"}
     head = head.strip()
-    if since:
-        rc, _, _ = await run("merge-base", "--is-ancestor", since, head)
-        if rc in _NOT_ANCESTOR:
-            return {"head": head, "reset": True, "shas": []}
-        if rc != 0:
-            return None
+    if not since:
+        return {"head": head, "reset": False, "shas": []}
+    rc, _, _ = await run("merge-base", "--is-ancestor", since, head)
+    if rc in _NOT_ANCESTOR:
+        return {"head": head, "reset": True, "shas": []}
+    if rc != 0:
+        return {"error": f"merge-base --is-ancestor rc={rc}"}
+    rng = f"{since}..{head}"
+    rc, counted, _ = await run("rev-list", "--first-parent", "--count", rng)
+    if rc != 0 or not counted.strip().isdigit():
+        return {"error": f"rev-list --count rc={rc}"}
+    window = max(1, int(limit))
+    skip = max(0, int(counted) - window)
     rc, out, _ = await run(
-        "rev-list", "--first-parent", "--reverse", f"{since}..{head}" if since else head
+        "rev-list", "--first-parent", f"--skip={skip}", f"-n{window}", rng
     )
     if rc != 0:
-        return None
-    return {"head": head, "reset": False, "shas": out.split()[: max(1, int(limit))]}
+        return {"error": f"rev-list rc={rc}"}
+    return {"head": head, "reset": False, "shas": list(reversed(out.split()))}
 
 
 async def revert_lines(run: GitRun, rng: str) -> str:

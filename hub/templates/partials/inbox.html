@@ -70,7 +70,7 @@
 {% endfor %}
 {# #1865: откат или красная база после доставки стюарда; снимает только человек. #}
 {% for b in steward_breaker_banner|default([]) %}
-<div class="task-action-note task-action-note--warning inbox-steward-breaker" role="status" data-steward-breaker-task="{{ b.task_id }}" data-steward-breaker-source="{{ b.source }}">{{ b.line }}. Снять: oc-hub steward-false-approve-clear {{ b.task_id }}.</div>
+<div class="task-action-note task-action-note--warning inbox-steward-breaker" role="status" data-steward-breaker-task="{{ b.task_id or '' }}" data-steward-breaker-source="{{ b.source }}">{{ b.line }}.{% if b.task_id %} Снять: oc-hub steward-false-approve-clear {{ b.task_id }}.{% endif %}</div>
 {% endfor %}
 
 {% if drafts %}

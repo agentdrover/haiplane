@@ -74,7 +74,7 @@ async def test_first_parent_after_orders_old_first_and_resets_on_foreign_cursor(
     gone = await git_history.first_parent_after(run, "develop", "0" * 40, 5)
     assert one == {"head": c3, "reset": True, "shas": []}
     assert gone == {"head": c3, "reset": True, "shas": []}
-    assert await git_history.first_parent_after(run, "nope", first, 5) is None
+    assert (await git_history.first_parent_after(run, "nope", first, 5))["error"]
 
 
 async def test_commit_facts_keep_the_full_body_and_separators(repo):
@@ -167,3 +167,39 @@ async def test_unreadable_second_parent_is_skipped_not_fatal():
     facts = await git_history.commit_facts(run, ["a" * 40])
     assert facts is not None
     assert facts["a" * 40]["second_parent_message"] == ""
+
+
+async def test_first_tick_reads_only_the_head_and_every_rev_list_is_capped(repo):
+    first = sh(repo, "rev-parse", "HEAD")
+    for n in "bcde":
+        commit(repo, n, f"c {n}")
+    publish(repo)
+    seen: list[tuple[str, ...]] = []
+    inner = runner(repo)
+
+    async def spy(*args, **kw):
+        seen.append(args)
+        return await inner(*args, **kw)
+
+    walk = await git_history.first_parent_after(spy, "develop", "", 3)
+    assert walk["shas"] == [] and walk["head"] and walk["reset"] is False
+    assert not any(a[0] == "rev-list" for a in seen), "первый тик без rev-list"
+
+    seen.clear()
+    walk = await git_history.first_parent_after(spy, "develop", first, 3)
+    lists = [a for a in seen if a[0] == "rev-list" and "--count" not in a]
+    assert lists and all(any(x.startswith("-n") for x in a) for a in lists)
+    assert len(walk["shas"]) == 3
+    older = sh(
+        repo, "rev-list", "--first-parent", "--reverse", f"{first}..develop"
+    ).split()
+    assert walk["shas"] == older[:3], "окно - самые старые, порядок старые первыми"
+
+
+async def test_a_step_that_does_not_answer_is_named():
+    async def run(*args, **kw):
+        return 124, "", "timed out"
+
+    assert await git_history.first_parent_after(run, "develop", "", 3) == {
+        "error": "rev-parse rc=124"
+    }

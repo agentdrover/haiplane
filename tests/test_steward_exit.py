@@ -46,6 +46,7 @@ class FakeGit:
         self.branch_runs: list[dict[str, Any]] = []
         self.fetch_ok = True
         self.facts_ok = True
+        self.walk_error = ""
 
     def commit(
         self, label: str, message: str = "", parent: str | None = None, second: str = ""
@@ -70,6 +71,8 @@ class FakeGit:
     async def first_parent_after(
         self, repo_path: str, base: str, since: str, limit: int
     ):
+        if self.walk_error:
+            return {"error": self.walk_error}
         shas = [c["sha"] for c in self.history]
         if since and since not in shas:
             return {"head": shas[-1], "reset": True, "shas": []}
@@ -96,9 +99,19 @@ class FakeGit:
 
 @pytest.fixture(autouse=True)
 def _fresh_negative_cache():
-    steward_breaker._negative.clear()
+    for state in (
+        steward_breaker._negative,
+        steward_breaker._failures,
+        steward_breaker._unchecked,
+    ):
+        state.clear()
     yield
-    steward_breaker._negative.clear()
+    for state in (
+        steward_breaker._negative,
+        steward_breaker._failures,
+        steward_breaker._unchecked,
+    ):
+        state.clear()
 
 
 @pytest.fixture
@@ -613,3 +626,39 @@ async def test_cursor_migration_fresh_install_and_reapply(db: aiosqlite.Connecti
     await db.commit()
     await _migrate(db)
     assert await steward_breaker._cursor_of(db, 7) == ""
+
+
+async def test_unreadable_history_is_said_not_silent(
+    db: aiosqlite.Connection, git: FakeGit, caplog
+):
+    """git не ответил после удачного fetch: warning с причиной, через N тиков - сигнал."""
+    project = await project_with_workspace(db, "brk-silent")
+    pid = int(project["id"])
+    git.commit("base-0")
+    await steward_breaker.collect_reverts(db, project)
+    git.walk_error = "rev-list rc=124"
+
+    async def unchecked_events() -> int:
+        return await count(
+            db,
+            "SELECT COUNT(*) FROM events WHERE kind=?",
+            steward_breaker.EVENT_UNCHECKED,
+        )
+
+    for tick in range(1, steward_breaker.UNCHECKED_AFTER):
+        assert await steward_breaker.collect_reverts(db, project) == 0
+        assert "rev-list rc=124" in caplog.text
+        assert await unchecked_events() == 0, f"тик {tick}: рано"
+        assert await steward_breaker.banner_rows(db) == []
+    await steward_breaker.collect_reverts(db, project)
+    assert await unchecked_events() == 1
+    banner = await steward_breaker.banner_rows(db)
+    assert [b["source"] for b in banner] == ["unchecked"]
+    assert "rev-list rc=124" in banner[0]["line"]
+    await steward_breaker.collect_reverts(db, project)
+    assert await unchecked_events() == 1, "одно событие на серию"
+
+    git.walk_error = ""
+    await steward_breaker.collect_reverts(db, project)
+    assert await steward_breaker.banner_rows(db) == []
+    assert pid not in steward_breaker._failures
