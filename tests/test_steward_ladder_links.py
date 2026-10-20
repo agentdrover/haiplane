@@ -262,3 +262,39 @@ async def test_a_failed_first_order_is_not_called_a_top_up(db: aiosqlite.Connect
     assert await top_up_in_flight(db, task) == ""
     why = await ladder_why(db, task)
     assert why is not None and why.code == WHY_UNKNOWN, why
+
+
+async def test_the_ladder_records_the_top_up_it_places(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Поступок записывает сам хаб: настоящий maybe_top_up_incomplete -> событие со связью."""
+    _, task_id = await _lite_incomplete(db, "round2-real-top-up")
+    report_id = await _last_report_id(db, task_id)
+
+    async def _placed(_db, _task_id, **_kwargs):
+        await _dispatch_row(db, task_id, status="active", profile="deep")
+        return True
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _placed)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is True
+    events = [
+        e
+        for e in await repo.list_events(db, since=0)
+        if e["task_id"] == task_id and e["kind"] == dispatcher.LADDER_TOP_UP_EVENT
+    ]
+    assert len(events) == 1
+    payload = __import__("json").loads(events[0]["payload"])
+    assert payload["after_review_id"] == report_id and payload["generation"] == 1
+    assert payload["dispatch_id"], "связь с заказом записана"
+    assert await top_up_in_flight(db, await _task_dict(db, task_id))
+
+
+async def test_an_act_that_already_produced_a_report_is_not_its_absence(
+    db: aiosqlite.Connection,
+):
+    """Добор дал свой неполный отчёт: «заказ кончился без отчёта» про него неверно."""
+    _, task_id = await _lite_incomplete(db, "round2-act-produced-report")
+    await _dispatch_row(db, task_id, status="done", profile="deep", top_up=True)
+    await _report_row(db, task_id, incomplete=True, profile="deep")
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None and why.code == WHY_UNKNOWN, why

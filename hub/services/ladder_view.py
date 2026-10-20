@@ -165,18 +165,13 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
     reports = await repo.machine_reviews_of_generation(db, task_id, generation)
-    incomplete_ids = {int(dict(r)["id"]) for r in reports if dict(r).get("incomplete")}
     if not reports or not dict(reports[-1]).get("incomplete"):
         return ""
     view = await inflight_view(db, task, include_owed=True)
     if view is None:
         return ""
-    for act in await _ladder_acts(db, task_id, generation):
-        if (
-            _placed(act)
-            and int(act["data"].get("after_review_id") or 0) in incomplete_ids
-        ):
-            return view.headline
+    if any(_placed(act) for act in await _ladder_acts(db, task_id, generation)):
+        return view.headline
     return ""
 
 
@@ -271,7 +266,7 @@ async def ladder_why(
     if await top_up_in_flight(db, task):
         return LadderWhy(WHY_IN_FLIGHT)
     acts = await _ladder_acts(db, task_id, generation)
-    acted = await _act_on_this_report(db, acts, report)
+    acted = await _last_act_outcome(db, acts)
     if acted is not None:
         return acted
     code = await _recorded_outcome(db, task_id, generation)
@@ -304,20 +299,18 @@ def _axis_code(acts: list[dict[str, Any]], alert_code: str) -> LadderWhy:
     return LadderWhy(WHY_AXIS_INCOMPLETE)
 
 
-async def _act_on_this_report(
-    db: aiosqlite.Connection, acts: list[dict[str, Any]], report: dict[str, Any]
+async def _last_act_outcome(
+    db: aiosqlite.Connection, acts: list[dict[str, Any]]
 ) -> LadderWhy | None:
-    """Поступок лестницы, совершённый ровно после ТЕКУЩЕГО неполного отчёта.
+    """Исход ПОСЛЕДНЕГО поступка лестницы по его записи, если он ничего не дал.
 
-    Раз отчёт всё ещё последний, поступок ничего не дал: отказанная попытка не
+    Отказанная попытка не
     запускалась (причина — в её записи), поставленный заказ кончился без отчёта
     (связь — ``after_review_id`` и принципал заказа, ``cascade_outcome``).
     """
     if not acts or acts[-1]["data"] is None:
         return None
     last = acts[-1]
-    if int(last["data"].get("after_review_id") or 0) != int(report["id"]):
-        return None
     if not _placed(last):
         return LadderWhy(WHY_AXIS_NOT_PLACED, str(last["data"].get("reason") or ""))
     if await dispatcher.cascade_outcome(db, last) != "pending":
