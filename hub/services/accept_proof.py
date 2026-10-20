@@ -133,52 +133,92 @@ async def _report_blockers(
     for code, (text, labels) in found.items():
         level = REWORK if code == report_fit.GAP_CONFIRMED else CHECK
         blockers.append(Blocker(level, "high", text, "отчёты: " + ", ".join(labels)))
-    blockers += await _returned_generations(db, task, min(n.generation for n in nodes))
+    blockers += await _carried_approvals(db, task, min(n.generation for n in nodes))
     return blockers, [n.view for n in nodes]
 
 
-async def _returned_generations(
+#: События, закрывающие одобрение: человек вернул работу в работу (#1286, #1356).
+_CLOSING_EVENTS = ("task_returned_to_work", "task_decided")
+
+
+def _approval_gap(
+    task: dict[str, Any], events: list[tuple[int, str, dict[str, Any]]], generation: int
+) -> str:
+    """Почему поколение НЕ закончилось действующим одобрением; пусто — закончилось."""
+    verdicts = [
+        (event_id, payload)
+        for event_id, kind, payload in events
+        if kind == "review_verdict_recorded"
+        and payload.get("submission_generation") == generation
+    ]
+    if not verdicts:
+        return f"поколение {generation}: вердикта нет"
+    last_id, last = verdicts[-1]
+    if last.get("verdict") != "approved":
+        return f"поколение {generation}: последний вердикт «{last.get('verdict')}»"
+    if any(kind in _CLOSING_EVENTS and eid > last_id for eid, kind, _ in events):
+        return f"поколение {generation}: одобрение закрыто возвратом в работу"
+    if task.get("review_verdict_closed_generation") == generation:
+        return f"поколение {generation}: одобрение закрыто решением"
+    return ""
+
+
+async def _task_events(
+    db: aiosqlite.Connection, task_id: int
+) -> list[tuple[int, str, dict[str, Any]]] | None:
+    """Вердикты и возвраты задачи по порядку; ``None`` — запись не читается."""
+    rows = await fetchall(
+        db,
+        "SELECT id, kind, payload FROM events WHERE task_id=? AND kind IN "
+        "('review_verdict_recorded','task_returned_to_work','task_decided') "
+        "ORDER BY id",
+        (task_id,),
+    )
+    out: list[tuple[int, str, dict[str, Any]]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload") or "{}")
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        out.append((int(item["id"]), str(item["kind"]), payload))
+    return out
+
+
+async def _carried_approvals(
     db: aiosqlite.Connection, task: dict[str, Any], first: int
 ) -> list[Blocker]:
-    """Возврат «на доработку» на поколении, чей отчёт стоит за сдачей (перенос).
+    """Белый список для переноса (#1912): каждое поколение диапазона — с одобрением.
 
-    Перенос #1361 означает «правка та же»: если код поколения источника уже
-    вернули (человек или стюард), чистая копия его не оправдывает. Действующий
-    вердикт смотрит ``_verdict_blocker`` только для текущего поколения, поэтому
-    прошлые возвраты читаются из ленты вердиктов и суждений стюарда. Нечитаемая
-    запись — «не доказано».
+    Перенос #1361 говорит «правка та же». Чистая копия оправдывает код, только
+    если КАЖДОЕ поколение от самого раннего узла графа до текущего (не
+    включая) закончилось действующим, не закрытым одобрением. Вердикт «на
+    доработку», возврат в работу (``return_to_work``, ``decide`` rework),
+    закрытие одобрения, поколение без вердикта и нечитаемая запись — всё это
+    «не доказано»: чёрный список возвратов пропускал по одному пути за круг.
     """
     current = int(task.get("submission_generation") or 0)
     if first >= current:
         return []
     task_id = int(task["id"])
-    rows = await fetchall(
-        db,
-        "SELECT id, payload FROM events WHERE kind='review_verdict_recorded' "
-        "AND task_id=? ORDER BY id",
-        (task_id,),
-    )
-    returned: set[int] = set()
-    for row in rows:
-        try:
-            payload = json.loads(dict(row).get("payload") or "{}")
-            generation = int(payload.get("submission_generation") or 0)
-        except (ValueError, TypeError, AttributeError):
-            return [_history_blocker("запись вердикта не читается")]
-        if first <= generation < current and payload.get("verdict") != "approved":
-            returned.add(generation)
+    events = await _task_events(db, task_id)
+    if events is None:
+        return [_history_blocker("запись ленты вердиктов не читается")]
+    gaps = []
     for generation in range(first, current):
+        gap = _approval_gap(task, events, generation)
         judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
-        if judged is not None and str(judged["verdict"]) == "changes_requested":
-            returned.add(generation)
-    if not returned:
-        return []
-    names = ", ".join(str(g) for g in sorted(returned))
-    return [_history_blocker(f"на поколении {names} вынесено «на доработку»")]
+        if not gap and judged is not None and judged["verdict"] == "changes_requested":
+            gap = f"поколение {generation}: суждение стюарда «на доработку»"
+        if gap:
+            gaps.append(gap)
+    return [_history_blocker("; ".join(gaps))] if gaps else []
 
 
 def _history_blocker(why: str) -> Blocker:
-    text = "Перенесённый отчёт стоит за кодом, который уже возвращали"
+    text = "Перенесённый отчёт: поколения до этой сдачи не закончились одобрением"
     return Blocker(CHECK, "high", text, why, CODE_VERDICT)
 
 

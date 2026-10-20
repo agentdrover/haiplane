@@ -22,6 +22,7 @@ import pytest
 
 from hub import repository as repo
 from hub import services, web
+from hub.models import TaskDecide, TaskReturnToWork
 from hub.integrations.registry import plugins
 from hub.services import decision_brief, report_provenance
 from hub.services.accept_proof import prove_accept
@@ -75,6 +76,41 @@ class World:
             (generation, self.task_id),
         )
         await self.db.commit()
+
+    async def verdict_event(self, generation: int, verdict: str = "approved") -> None:
+        await self.db.execute(
+            "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+            "('review_verdict_recorded', ?, 'denis', ?)",
+            (
+                self.task_id,
+                json.dumps({"verdict": verdict, "submission_generation": generation}),
+            ),
+        )
+        await self.db.commit()
+
+    async def seed_approvals(self) -> None:
+        """Одобрение на каждом поколении до текущего, где вердикта ещё нет."""
+        task = await self.task()
+        current = int(task["submission_generation"])
+        rows = await self.db.execute_fetchall(
+            "SELECT MIN(submission_generation) FROM machine_reviews WHERE task_id=?",
+            (self.task_id,),
+        )
+        first = rows[0][0]
+        if first is None:
+            return
+        have = {
+            json.loads(r[0]).get("submission_generation")
+            for r in await self.db.execute_fetchall(
+                "SELECT payload FROM events WHERE task_id=? AND "
+                "kind='review_verdict_recorded'",
+                (self.task_id,),
+            )
+            if isinstance(json.loads(r[0]), dict)
+        }
+        for generation in range(int(first), current):
+            if generation not in have:
+                await self.verdict_event(generation)
 
     async def task(self) -> dict:
         return dict(await repo.get_task(self.db, self.task_id) or {})
@@ -444,6 +480,89 @@ async def s_graph_too_large(w, m):
     return []
 
 
+async def _closed_by(w, m, how: str) -> None:
+    """Одобрение поколения 1 закрыто человеком настоящим сервисом; затем перенос."""
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.now(1)
+    if how == "return":
+        await services.return_to_work(
+            w.db, w.task_id, TaskReturnToWork(reason="переделать"), actor="denis"
+        )
+    else:
+        await w.db.execute(
+            "UPDATE tasks SET status='needs_decision' WHERE id=?", (w.task_id,)
+        )
+        await w.db.commit()
+
+        async def submitted(*_a, **_k):
+            return {"job_id": "j1"}
+
+        m.setattr(plugins.dispatch, "submit_task", submitted)
+        await services.decide_task(
+            w.db, w.task_id, TaskDecide(action="rework", instructions="не то"), who=None
+        )
+    await w.db.execute("UPDATE tasks SET status='review' WHERE id=?", (w.task_id,))
+    await w.db.commit()
+    await w.report(2, copy_of=root)
+    await w.now(2)
+
+
+async def s_approval_closed_by_return_to_work(w, m):  # круг 2 ревью #1912
+    await _closed_by(w, m, "return")
+    return []
+
+
+async def s_approval_closed_by_decide_rework(w, m):  # круг 2 ревью #1912
+    await _closed_by(w, m, "decide")
+    return []
+
+
+async def s_approval_closed_only_by_the_column(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.report(2, copy_of=root)
+    await w.db.execute(
+        "UPDATE tasks SET review_verdict_closed_generation=1 WHERE id=?", (w.task_id,)
+    )
+    await w.db.commit()
+    await w.now(2)
+    return []
+
+
+async def s_generation_without_any_verdict(w, _m):
+    root = await w.report(1)
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_approved_then_replaced_by_changes_requested(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.verdict_event(1, "changes_requested")
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_middle_generation_without_approval(w, _m):
+    root = await w.report(1)
+    await w.verdict_event(1)
+    await w.report(3, copy_of=root)
+    await w.now(3)
+    return []
+
+
+UNAPPROVED = {
+    "approval_closed_by_return_to_work",
+    "approval_closed_by_decide_rework",
+    "approval_closed_only_by_the_column",
+    "generation_without_any_verdict",
+    "approved_then_replaced_by_changes_requested",
+    "middle_generation_without_approval",
+}
+
 SCENARIOS: dict[str, Scenario] = {
     name[2:]: fn for name, fn in sorted(globals().items()) if name.startswith("s_")
 }
@@ -477,6 +596,8 @@ async def _refused_in(client, db, monkeypatch, name: str) -> list[str]:
     """Прогон одного сценария: пусто, если «Принять» отказан, иначе — что не так."""
     world = await _world(client, db, monkeypatch, f"prov-{name}".replace("_", "-"))
     bad_ids = await SCENARIOS[name](world, monkeypatch)
+    if name not in UNAPPROVED:
+        await world.seed_approvals()
     task = await world.task()
     proof, blockers, _ = await prove_accept(db, task)
     brief = await decision_brief.build(db, task)
@@ -572,6 +693,7 @@ async def test_clean_provenance_accepts(client, db: aiosqlite.Connection):
                 client, db, monkeypatch, f"clean-{name}".replace("_", "-")
             )
         await build(world)
+        await world.seed_approvals()
         task = await world.task()
         brief = await decision_brief.build(db, task)
         rec = brief["recommend"]
