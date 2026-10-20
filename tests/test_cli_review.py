@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.error
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -157,6 +158,8 @@ def _run_verdict(args, posted, fetched):
             return posted
         if fetched is None:
             raise SystemExit(1)
+        if isinstance(fetched, BaseException):
+            raise fetched
         return fetched
 
     out = StringIO()
@@ -235,10 +238,17 @@ def test_review_verdict_prints_one_line_per_outcome() -> None:
 def test_review_verdict_line_says_unknown_when_the_task_is_unreadable() -> None:
     """Не прочитали задачу после записи: «неизвестно», а не «устарел»."""
     posted = {"status": "running", "review_verdict_generation": 2}
-    rc, out, _ = _run_verdict(_verdict_args(), posted, None)
-    assert rc == 0
-    assert "поколение 2 (текущесть неизвестна)" in out
-    assert "устарел" not in out
+    failures = [
+        None,  # _api printed the error and exited
+        TimeoutError("timed out"),
+        json.JSONDecodeError("bad", "{", 1),
+        urllib.error.URLError("down"),
+    ]
+    for failure in failures:
+        rc, out, _ = _run_verdict(_verdict_args(), posted, failure)
+        assert rc == 0, failure
+        assert "поколение 2 (текущесть неизвестна)" in out, failure
+        assert "устарел" not in out
 
 
 def test_cmd_steward_judgement() -> None:

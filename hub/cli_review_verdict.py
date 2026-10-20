@@ -51,7 +51,10 @@ def _read_task(task_id: int) -> dict[str, Any] | None:
     """
     try:
         task = _api("GET", f"/api/tasks/{task_id}")
-    except SystemExit:
+    except (SystemExit, OSError, ValueError):
+        # SystemExit: _api printed the HTTP/connection error; OSError covers
+        # URLError and TimeoutError while reading the body; ValueError covers
+        # a broken JSON body. KeyboardInterrupt is deliberately not caught.
         return None
     return task if isinstance(task, dict) else None
 
