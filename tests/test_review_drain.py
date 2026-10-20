@@ -971,10 +971,12 @@ async def test_an_advisor_job_obeys_the_drain_and_the_steward_cap(
     assert {p.name for p in spool.glob("job-*")} == dirs_before, "новое задание"
     (spool / "draining").unlink()
 
-    # Общая суточная квота: исчерпана — советник не заказывается, причина названа.
+    # Суточный потолок советника (#1915 — свой): исчерпан — советник не
+    # заказывается, причина названа.
     from tests.test_steward_shadow import _judge, _judge_run, _project, _task
 
     monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "0")
     project_id = await _project(db, "drain-cap")
     task2 = await _task(db, project_id)
     await _judge_run(db, task2, model="composer-2.5")

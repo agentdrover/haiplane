@@ -302,6 +302,7 @@ async def get_inbox_data(
         "decision_by_task": {e["task_id"]: e for e in decisions["queue"]},
         "decision_note": decisions["note"],
         "decision_cycles": decisions["cycles"],
+        "steward_cap_banner": decisions["cap_banner"],
         "review_tasks": [row_to_task(r) for r in decisions["reviewing"]],
         "drafts": [row_to_task(r) for r in draft_rows],
         "questions": questions,

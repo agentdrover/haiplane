@@ -33,6 +33,7 @@ from hub.services import (
     review_dispatch,
     steward_dispatch,
     steward_act_readiness,
+    steward_cap,
     steward_exit,
     steward_shadow,
 )
@@ -275,8 +276,14 @@ def _key_row(key: str, entry: PolicyEntry, policy: dict) -> dict[str, Any]:
     return row
 
 
-async def _steward_block(db: aiosqlite.Connection) -> dict[str, Any]:
+async def _steward_block(
+    db: aiosqlite.Connection, project_id: int | None = None
+) -> dict[str, Any]:
     block = await steward_shadow.mode_report(db)
+    if project_id is not None:
+        # #1915: суточный потолок ЭТОГО проекта — used/cap/reset_at и первый
+        # отказ; чистое чтение, три представления берут один словарь.
+        block["daily_cap"] = await steward_cap.project_report(db, project_id)
     # #1855: готовность act — чистое чтение; сбой расчёта называется
     # «неизвестно» и не роняет сводку, которую читают и при выдаче задачи.
     try:
@@ -462,7 +469,7 @@ async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, 
         "scheduled_refused": [policy_change.view_row(r) for r in refused[-3:]],
         "keys": keys,
         "unknown_keys": {k: v for k, v in policy.items() if k not in REGISTRY},
-        "steward": await _steward_block(db),
+        "steward": await _steward_block(db, int(project["id"])),
         "server": _server_block(),
         "locks": await _locks_block(db, project, policy),
         "steward_verdicts": await _steward_verdicts_block(db, project["slug"]),
@@ -543,6 +550,16 @@ def _readiness_lines(report: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _daily_cap_lines(groups: list[dict[str, Any]] | None) -> list[str]:
+    """Суточный потолок стюарда проекта (#1915): по строке на группу."""
+    return [
+        f"  daily cap [{g['kind_group']}]: used {g['used']}/{g['cap']} "
+        f"(UTC day {g['utc_day']}, reset {g['reset_at']}), first refused "
+        f"{g['first_refused_at'] or 'never today'}"
+        for g in groups or []
+    ]
+
+
 def format_effective_policy(data: dict[str, Any]) -> list[str]:
     """Строки сводки — общие для CLI и MCP, как у занятости слотов."""
     lines = [f"Effective policy of project {data['slug']}"]
@@ -577,6 +594,7 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
             + f", procedural escalations {contour['procedural_escalations']}"
         )
+    lines.extend(_daily_cap_lines(steward.get("daily_cap")))
     lines.extend(_readiness_lines(steward.get("readiness")))
     server = data["server"]
     reviewer = server["reviewer_model"]

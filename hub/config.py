@@ -188,6 +188,10 @@ STEWARD_MODE = env_get("STEWARD_MODE", "off")
 # code `daily_cap` and the task goes down today's human route — it never
 # means "checked and clean".
 STEWARD_DAILY_CAP = int(env_get("STEWARD_DAILY_CAP", "20"))
+# #1915: свой потолок прогонов советника за UTC-сутки на проект. Пусто — равен
+# STEWARD_DAILY_CAP (читается при обращении, steward_cap.cap_of). Суждения
+# (verdict, dor) считаются против STEWARD_DAILY_CAP и советником не тратятся.
+STEWARD_ADVISOR_DAILY_CAP = env_get("STEWARD_ADVISOR_DAILY_CAP", "")
 # Minutes a steward run may hold its slot (#1073). review:client is a
 # human-owned slot with no deadline of its own, so a hung cloud agent would
 # otherwise never escalate — it would just sit there looking ordered.

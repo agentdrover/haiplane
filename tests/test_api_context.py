@@ -504,20 +504,90 @@ async def test_context_and_views_match_the_pre_refactor_baseline(client, db):
 
     Эталон снят на базе до правки; сравнение — по статусу, заголовкам, телу и
     cookie, MCP — по тексту и structuredContent."""
-    import json
     import os
-    from pathlib import Path
 
-    from tests.read_view_baseline_support import snapshot_all
+    from tests.read_view_baseline_support import (
+        load_baselines,
+        snapshot_all,
+        write_baselines,
+    )
 
     # #1829: в слое hub_skill появилось поле delivered_to_session (False) —
     # эталон обновлён осознанно, только этим полем.
-    golden = Path(__file__).parent / "golden" / "read_views_1691.json"
     got = await snapshot_all(client, db)
-    rendered = json.dumps(got, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
     if os.environ.get("HUB_UPDATE_READ_VIEW_BASELINE") == "1":
-        golden.write_text(rendered, encoding="utf-8")
-    want = json.loads(golden.read_text(encoding="utf-8"))
+        write_baselines(got)
+    want = load_baselines()
     assert sorted(got) == sorted(want)
     for name in sorted(want):
         assert got[name] == want[name], f"ответ {name} разошёлся с эталоном"
+
+
+async def test_read_view_baselines_cover_every_scenario_once(client, db):
+    """AC-1 (#1910): файлы эталона вместе покрывают каждый сценарий ровно один
+    раз; лишний, недостающий, повторённый или лежащий не в своём файле ключ —
+    красный тест."""
+    import json
+    import shutil
+
+    import pytest
+
+    from tests import read_view_baseline_support as support
+
+    got = await support.snapshot_all(client, db)
+    assert sorted(support.load_baselines()) == sorted(got)
+
+    # Отрицательные случаи — на копии каталога, настоящий эталон не трогаем.
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "read_views"
+        shutil.copytree(support.BASELINE_DIR, copy)
+        rest = copy / "rest.json"
+        original = json.loads(rest.read_text(encoding="utf-8"))
+
+        rest.write_text(json.dumps({**original, "rest_extra": {}}), encoding="utf-8")
+        assert "rest_extra" in support.load_baselines(copy)
+        assert sorted(support.load_baselines(copy)) != sorted(got)
+
+        missing = dict(original)
+        missing.pop(next(iter(missing)))
+        rest.write_text(json.dumps(missing), encoding="utf-8")
+        assert sorted(support.load_baselines(copy)) != sorted(got)
+
+        rest.write_text(json.dumps(original), encoding="utf-8")
+        web = copy / "web.json"
+        web_part = json.loads(web.read_text(encoding="utf-8"))
+        dup = next(iter(original))
+        web.write_text(json.dumps({**web_part, dup: {}}), encoding="utf-8")
+        with pytest.raises(AssertionError):  # ключ не в своём файле
+            support.load_baselines(copy)
+
+        web.write_text(json.dumps(web_part), encoding="utf-8")
+        body = rest.read_text(encoding="utf-8")
+        rest.write_text(body.replace("{", '{"rest_missing": 0,', 1), encoding="utf-8")
+        with pytest.raises(AssertionError):  # дубль внутри файла
+            support.load_baselines(copy)
+
+
+def test_rebuild_touches_only_changed_surface_files(tmp_path):
+    """AC-2 (#1910): новое поле в ответе REST и пересборка — изменён только
+    файл rest.json; остальные не переписаны."""
+    from tests import read_view_baseline_support as support
+
+    directory = tmp_path / "read_views"
+    got = support.load_baselines()
+    assert support.write_baselines(got, directory) == sorted(
+        p.name for p in support.BASELINE_DIR.glob("*.json")
+    )
+    before = {p.name: p.read_bytes() for p in directory.glob("*.json")}
+
+    changed = dict(got)
+    changed["rest_missing"] = {**got["rest_missing"], "new_field": 1}
+    assert support.write_baselines(changed, directory) == ["rest.json"]
+    after = {p.name: p.read_bytes() for p in directory.glob("*.json")}
+    assert {n for n in after if after[n] != before[n]} == {"rest.json"}
+
+    # Повторная пересборка без изменений не пишет ничего.
+    assert support.write_baselines(changed, directory) == []

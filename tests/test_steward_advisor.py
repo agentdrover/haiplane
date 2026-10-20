@@ -2493,3 +2493,159 @@ async def test_an_unfounded_advisor_concur_flows_as_an_objection_and_details_rea
     assert f"ci_pinned_sha (ci_run 77 success on sha deadbeef {'x' * 166})" in text
     assert "x" * 167 not in text, "обрезка до 200 знаков"
     assert "risk_class (" not in text, "пустой detail скобок не даёт"
+
+
+async def test_an_advisor_over_the_cap_hands_the_generation_to_the_owner_until_reset(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1915): потолок советника исчерпан в act → сдача у человека до reset_at.
+
+    Весь цикл поллера в режиме act: тик заказа советников, маршрут вердикта,
+    входящие владельца, тик применения — до полуночи UTC и после неё. Контроль
+    в конце: штатный concur по-прежнему применяет approve.
+    """
+    from hub.services import inbox_decisions, steward_cap, steward_shadow
+    from hub.services.verdict_route import verdict_route
+    from tests.steward_cap_support import AFTER_MIDNIGHT, BEFORE_MIDNIGHT, set_clock
+    from tests.test_verdict_route import _FINDING, _route_task, _steward_on
+
+    _steward_on(monkeypatch, "act")
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 60)
+    real_mode = steward_shadow.mode_report
+
+    async def _act_mode(_db):
+        return {**await real_mode(_db), "effective": "act"}
+
+    monkeypatch.setattr(steward_shadow, "mode_report", _act_mode)
+    await _act(monkeypatch)
+    await _patched_converged(monkeypatch)
+    _same_packet(monkeypatch)
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "0")
+
+    policy = {"verdict": "steward"}
+    task_id = await _route_task(
+        client,
+        db,
+        monkeypatch,
+        "cap-handoff",
+        policy,
+        ["tests/test_x.py"],
+        findings_confirmed=[_FINDING],
+    )
+    await repo.update_task(db, task_id, submission_model="claude-opus-5")
+    await _judge_run(db, task_id, model="composer-2.5")
+    await _judge(db, task_id)
+    assert (await verdict_route(db, task_id)).code == "steward_act", "до отказа"
+
+    async def _advisor_rows() -> list:
+        return await fetchall(
+            db,
+            "SELECT * FROM steward_runs WHERE task_id=? AND kind='advisor'",
+            (task_id,),
+        )
+
+    async def _cap_events() -> list:
+        return [
+            e
+            for e in await _events(db, "steward_run_refused")
+            if e["task_id"] == task_id
+            and json.loads(e["payload"])["reason"] == "daily_cap"
+        ]
+
+    # Тик заказа: советник отклонён своим потолком, строки заказа нет.
+    assert await order_due_advisors(db) == 0
+    assert await _advisor_rows() == []
+    route = await verdict_route(db, task_id)
+    assert (route.decider, route.final) == ("human", "human")
+    assert route.code == "steward_daily_cap"
+    assert "2026-10-20 00:00:00" in route.reason
+    queue = (await inbox_decisions.collect(db, {}))["queue"]
+    assert [e["action"] for e in queue if e["task_id"] == task_id] == ["verdict"]
+
+    # Повторные тики до полуночи: ни заказа, ни второго события, ни применения;
+    # заказ даже не пробуется (выбор модели мог бы закрыть поколение строкой).
+    from hub.services import steward_advisor
+
+    tried: list[int] = []
+    real_order = steward_advisor.order_run
+
+    async def _counting(*args, **kwargs):
+        tried.append(args[1])
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(steward_advisor, "order_run", _counting)
+    for _ in range(3):
+        assert await order_due_advisors(db) == 0
+        assert await apply_advisor_outcomes(db) == 0
+    assert tried == []
+    monkeypatch.setattr(steward_advisor, "order_run", real_order)
+    assert await _advisor_rows() == [] and len(await _cap_events()) == 1
+    assert await _no_verdict(db, task_id), "approve без concur не записан"
+    state = await advisor_state(db, task_id, 1)
+    assert state.state == STATE_NOT_ORDERED and "потолок" in state.reason
+    refusal = await advisor_refusal(db, task_id, 1)
+    assert refusal is not None and refusal[0] == REFUSED_ADVISOR
+
+    # Полночь UTC: один заказ для того же живого поколения, маршрут снова стюарда.
+    set_clock(monkeypatch, AFTER_MIDNIGHT)
+    assert steward_cap.cap_of("advisor") == 0
+    assert (await verdict_route(db, task_id)).code == "steward_act"
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "1")
+    assert await order_due_advisors(db) == 1
+    assert await order_due_advisors(db) == 0, "второго заказа нет"
+    (order,) = await _advisor_rows()
+    assert order["generation"] == 1 and order["status"] == RUN_OPEN
+
+    # Контроль: штатный concur на том же пакете применяет approve.
+    from tests.test_steward_shadow import _mark_started
+
+    await _mark_started(db, dict(order), model="claude-sonnet-5")
+    await _advise(db, task_id)
+    assert await apply_advisor_outcomes(db) == 1
+    assert dict(await repo.get_task(db, task_id))["review_verdict"] == "approved"
+
+
+async def test_a_concur_is_not_applied_while_the_generation_is_with_the_owner(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1915: применение видит то же условие, что маршрут, и не применяет.
+
+    Согласие советника лежит в базе, но сдаче отказано по потолку суждений и
+    потолок всё ещё исчерпан: approve не записывается, исход остаётся пустым
+    (завтра, после reset_at, применение вернётся к обычному порядку).
+    """
+    from hub.services import steward_cap
+    from hub.services.steward_applied import apply_judgement
+    from tests.steward_cap_support import BEFORE_MIDNIGHT, set_clock
+
+    await _act(monkeypatch)
+    await _patched_converged(monkeypatch)
+    set_clock(monkeypatch, BEFORE_MIDNIGHT)
+    task_id = await _scenario(db, "advisor-cap-apply", "concur")
+    project = await repo.resolve_project_for_task(db, task_id)
+    assert await advisor_refusal(db, task_id, 1) is None, "контроль: согласие действует"
+
+    # Отказ позже заказов: прогон, созданный ПОСЛЕ отказа, передачу снимает.
+    set_clock(monkeypatch, "2026-10-19T23:59:00+00:00")
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)  # суждение уже заняло единицу
+    assert await steward_cap.used_today(db, project["id"], "verdict_dor") == 1
+    assert await steward_cap.record_refusal(
+        db, task_id, project["id"], 1, "verdict", "т"
+    )
+    await db.commit()
+
+    refusal = await advisor_refusal(db, task_id, 1)
+    assert refusal is not None and refusal[0] == REFUSED_ADVISOR
+    assert "потолок" in refusal[1]
+    with pytest.raises(HTTPException) as refused:
+        await apply_judgement(db, task_id, 1)
+    assert refused.value.status_code == 409
+    assert await apply_advisor_outcomes(db) == 0
+    assert await _no_verdict(db, task_id)
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == ""
+
+    # Потолок поднят среди суток — условие снято, применение возвращается.
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 50)
+    assert await advisor_refusal(db, task_id, 1) is None
+    assert await apply_advisor_outcomes(db) == 1

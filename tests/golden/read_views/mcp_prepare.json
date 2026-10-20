@@ -1,0 +1,685 @@
+{
+ "mcp_prepare_apply_all_append": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ],
+   [
+    "POST",
+    "/api/tasks/25/risks",
+    {
+     "description": "d",
+     "kind": "security",
+     "mitigation": "m",
+     "severity": "medium"
+    }
+   ],
+   [
+    "POST",
+    "/api/tasks/25/risks",
+    {
+     "description": "d2",
+     "kind": "performance",
+     "mitigation": "m2",
+     "severity": "low"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=2, risks_added=2, duplicate_risks=1.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\\nProblem: проблема\\nValue: ценность\\nScope in:\\n- a\\nScope out:\\n- b\\nAffected areas: hub/app.py\\nAcceptance criteria:\\n- AC-1: Given g; When w; Then t\\nRisks:\\n- security:medium — d; mitigation: m\\n- performance:low — d2; mitigation: m2\\nValidation:\\n- uv run pytest -q\\nReview checklist:\\n- пункт\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": 2,\n  \"risks_added\": 2,\n  \"duplicate_risks_count\": 1,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"affected_areas\",\n      \"business_value\",\n      \"prepared_at\",\n      \"prepared_by\",\n      \"problem_statement\",\n      \"review_checklist\",\n      \"scope_in\",\n      \"scope_out\",\n      \"size\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": true,\n    \"existing_acceptance_criteria_count\": 1,\n    \"new_acceptance_criteria_count\": 1,\n    \"risk_mode\": \"append\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 2,\n    \"duplicate_risks_count\": 1,\n    \"risks_to_add_count\": 2\n  },\n  \"quality_warnings\": [\n    \"acceptance_criteria replace existing criteria; review before apply\",\n    \"acceptance criterion AC-1 has no test_ref\",\n    \"risks are appended; repeated apply can duplicate risks\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\\nProblem: проблема\\\\nValue: ценность\\\\nScope in:\\\\n- a\\\\nScope out:\\\\n- b\\\\nAffected areas: hub/app.py\\\\nAcceptance criteria:\\\\n- AC-1: Given g; When w; Then t\\\\nRisks:\\\\n- security:medium — d; mitigation: m\\\\n- performance:low — d2; mitigation: m2\\\\nValidation:\\\\n- uv run pytest -q\\\\nReview checklist:\\\\n- пункт\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_all_dedupe": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ],
+   [
+    "POST",
+    "/api/tasks/25/risks",
+    {
+     "description": "d2",
+     "kind": "performance",
+     "mitigation": "m2",
+     "severity": "low"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=2, risks_added=1, duplicate_risks=1.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\\nProblem: проблема\\nValue: ценность\\nScope in:\\n- a\\nScope out:\\n- b\\nAffected areas: hub/app.py\\nAcceptance criteria:\\n- AC-1: Given g; When w; Then t\\nRisks:\\n- security:medium — d; mitigation: m\\n- performance:low — d2; mitigation: m2\\nValidation:\\n- uv run pytest -q\\nReview checklist:\\n- пункт\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": 2,\n  \"risks_added\": 1,\n  \"duplicate_risks_count\": 1,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"affected_areas\",\n      \"business_value\",\n      \"prepared_at\",\n      \"prepared_by\",\n      \"problem_statement\",\n      \"review_checklist\",\n      \"scope_in\",\n      \"scope_out\",\n      \"size\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": true,\n    \"existing_acceptance_criteria_count\": 1,\n    \"new_acceptance_criteria_count\": 1,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 2,\n    \"duplicate_risks_count\": 1,\n    \"risks_to_add_count\": 1\n  },\n  \"quality_warnings\": [\n    \"acceptance_criteria replace existing criteria; review before apply\",\n    \"acceptance criterion AC-1 has no test_ref\",\n    \"risks are deduped by kind/severity/description/mitigation\",\n    \"duplicate risk skipped: security:medium d\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\\nProblem: проблема\\\\nValue: ценность\\\\nScope in:\\\\n- a\\\\nScope out:\\\\n- b\\\\nAffected areas: hub/app.py\\\\nAcceptance criteria:\\\\n- AC-1: Given g; When w; Then t\\\\nRisks:\\\\n- security:medium — d; mitigation: m\\\\n- performance:low — d2; mitigation: m2\\\\nValidation:\\\\n- uv run pytest -q\\\\nReview checklist:\\\\n- пункт\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_all_replace": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "risks": [
+      {
+       "description": "d",
+       "kind": "security",
+       "mitigation": "m",
+       "severity": "medium"
+      },
+      {
+       "description": "d2",
+       "kind": "performance",
+       "mitigation": "m2",
+       "severity": "low"
+      }
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=2, risks_added=0, duplicate_risks=1.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\\nProblem: проблема\\nValue: ценность\\nScope in:\\n- a\\nScope out:\\n- b\\nAffected areas: hub/app.py\\nAcceptance criteria:\\n- AC-1: Given g; When w; Then t\\nRisks:\\n- security:medium — d; mitigation: m\\n- performance:low — d2; mitigation: m2\\nValidation:\\n- uv run pytest -q\\nReview checklist:\\n- пункт\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": 2,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 1,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"affected_areas\",\n      \"business_value\",\n      \"prepared_at\",\n      \"prepared_by\",\n      \"problem_statement\",\n      \"review_checklist\",\n      \"risks\",\n      \"scope_in\",\n      \"scope_out\",\n      \"size\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": true,\n    \"existing_acceptance_criteria_count\": 1,\n    \"new_acceptance_criteria_count\": 1,\n    \"risk_mode\": \"replace\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 2,\n    \"duplicate_risks_count\": 1,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [\n    \"acceptance_criteria replace existing criteria; review before apply\",\n    \"acceptance criterion AC-1 has no test_ref\",\n    \"risks replace existing risk list\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\\nProblem: проблема\\\\nValue: ценность\\\\nScope in:\\\\n- a\\\\nScope out:\\\\n- b\\\\nAffected areas: hub/app.py\\\\nAcceptance criteria:\\\\n- AC-1: Given g; When w; Then t\\\\nRisks:\\\\n- security:medium — d; mitigation: m\\\\n- performance:low — d2; mitigation: m2\\\\nValidation:\\\\n- uv run pytest -q\\\\nReview checklist:\\\\n- пункт\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_empty_current_no_fields": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "validation_commands": [
+      "uv run ruff check hub tests",
+      "uv run ruff format --check hub tests",
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=unchanged, risks_added=0, duplicate_risks=0.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": null,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 0,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 0,\n    \"incoming_risks_count\": 0,\n    \"duplicate_risks_count\": 0,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_empty_validation_explicit": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "validation_commands": [],
+     "wip_tag": "feature_work"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=unchanged, risks_added=0, duplicate_risks=0.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": null,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 0,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 0,\n    \"duplicate_risks_count\": 0,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [\n    \"validation_commands is empty\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_feature_default_wip": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "validation_commands": [
+      "uv run ruff check hub tests",
+      "uv run ruff format --check hub tests",
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=unchanged, risks_added=0, duplicate_risks=0.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": null,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 0,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 0,\n    \"duplicate_risks_count\": 0,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_non_feature_no_wip": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "prepared_at": "<TS>",
+     "prepared_by": "a2",
+     "validation_commands": [
+      "uv run ruff check hub tests",
+      "uv run ruff format --check hub tests",
+      "uv run pytest -q"
+     ],
+     "work_type": "bugfix"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "a2",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=unchanged, risks_added=0, duplicate_risks=0.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": null,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 0,\n  \"readiness_score\": 80,\n  \"dor_passed\": false,\n  \"missing_required\": [\n    \"scope_in\",\n    \"size\"\n  ],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"validation_commands\",\n      \"work_type\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 0,\n    \"duplicate_risks_count\": 0,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"needs_analyst_followup\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_apply_ready": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "work_type": "docs"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=yes, acceptance_criteria=unchanged, risks_added=0, duplicate_risks=0.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"}",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "{\n  \"mode\": \"apply\",\n  \"task_id\": 25,\n  \"updated_columns\": [\n    \"problem_statement\",\n    \"size\"\n  ],\n  \"acceptance_criteria_count\": null,\n  \"risks_added\": 0,\n  \"duplicate_risks_count\": 0,\n  \"readiness_score\": 80,\n  \"dor_passed\": true,\n  \"missing_required\": [],\n  \"recommendations_count\": 2,\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"work_type\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 0,\n    \"duplicate_risks_count\": 0,\n    \"risks_to_add_count\": 0\n  },\n  \"quality_warnings\": [],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"ready_for_developer\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_bad_mode": {
+  "calls": [],
+  "result": "ValueError: mode must be 'apply' or 'preview'"
+ },
+ "mcp_prepare_bad_risk_mode": {
+  "calls": [],
+  "result": "ValueError: risk_mode must be 'dedupe', 'append', or 'replace'"
+ },
+ "mcp_prepare_fail_acceptance_criteria": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ]
+  ],
+  "result": "RuntimeError: отказ /acceptance_criteria"
+ },
+ "mcp_prepare_fail_refine": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ]
+  ],
+  "result": "RuntimeError: отказ /refine"
+ },
+ "mcp_prepare_fail_risks": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ],
+   [
+    "POST",
+    "/api/tasks/25/risks",
+    {
+     "description": "d2",
+     "kind": "performance",
+     "mitigation": "m2",
+     "severity": "low"
+    }
+   ]
+  ],
+  "result": "RuntimeError: отказ /risks"
+ },
+ "mcp_prepare_fail_updates": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/refine",
+    {
+     "affected_areas": [
+      "hub/app.py"
+     ],
+     "business_value": "ценность",
+     "prepared_at": "<TS>",
+     "prepared_by": "analyst-agent",
+     "problem_statement": "проблема",
+     "review_checklist": [
+      "пункт"
+     ],
+     "scope_in": [
+      "a"
+     ],
+     "scope_out": [
+      "b"
+     ],
+     "size": "M",
+     "validation_commands": [
+      "uv run pytest -q"
+     ],
+     "wip_tag": "feature_work",
+     "work_type": "feature"
+    }
+   ],
+   [
+    "PUT",
+    "/api/tasks/25/acceptance_criteria",
+    [
+     {
+      "given": "g",
+      "id": "AC-1",
+      "then": "t",
+      "verifiable_by": "test",
+      "when": "w"
+     }
+    ]
+   ],
+   [
+    "POST",
+    "/api/tasks/25/risks",
+    {
+     "description": "d2",
+     "kind": "performance",
+     "mitigation": "m2",
+     "severity": "low"
+    }
+   ],
+   [
+    "GET",
+    "/api/tasks/25/readiness"
+   ],
+   [
+    "POST",
+    "/api/tasks/25/updates",
+    {
+     "agent": "analyst-agent",
+     "content": "Analyst preparation complete: readiness score=80, dor_passed=no, acceptance_criteria=2, risks_added=1, duplicate_risks=1.\n\nDeveloper handoff:\n{\"message\": \"Developer handoff for task #25\\nProblem: проблема\\nValue: ценность\\nScope in:\\n- a\\nScope out:\\n- b\\nAffected areas: hub/app.py\\nAcceptance criteria:\\n- AC-1: Given g; When w; Then t\\nRisks:\\n- security:medium — d; mitigation: m\\n- performance:low — d2; mitigation: m2\\nValidation:\\n- uv run pytest -q\\nReview checklist:\\n- пункт\", \"instance\": \"local\", \"base_url\": \"http://hub.test\", \"server_id\": \"host-1\"} Missing required: scope_in, size.",
+     "kind": "status"
+    }
+   ]
+  ],
+  "result": "RuntimeError: отказ /updates"
+ },
+ "mcp_prepare_preview_all": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ],
+   [
+    "GET",
+    "/api/tasks/25/acceptance_criteria"
+   ]
+  ],
+  "result": "{\n  \"mode\": \"preview\",\n  \"task_id\": 25,\n  \"planned_operations\": [\n    \"refine_task\",\n    \"replace_acceptance_criteria\",\n    \"add_risk\",\n    \"write_analyst_update\"\n  ],\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"affected_areas\",\n      \"business_value\",\n      \"prepared_at\",\n      \"prepared_by\",\n      \"problem_statement\",\n      \"review_checklist\",\n      \"scope_in\",\n      \"scope_out\",\n      \"size\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": true,\n    \"existing_acceptance_criteria_count\": 1,\n    \"new_acceptance_criteria_count\": 1,\n    \"risk_mode\": \"dedupe\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 2,\n    \"duplicate_risks_count\": 1,\n    \"risks_to_add_count\": 1\n  },\n  \"quality_warnings\": [\n    \"acceptance_criteria replace existing criteria; review before apply\",\n    \"acceptance criterion AC-1 has no test_ref\",\n    \"risks are deduped by kind/severity/description/mitigation\",\n    \"duplicate risk skipped: security:medium d\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\\nProblem: проблема\\\\nValue: ценность\\\\nScope in:\\\\n- a\\\\nScope out:\\\\n- b\\\\nAffected areas: hub/app.py\\\\nAcceptance criteria:\\\\n- AC-1: Given g; When w; Then t\\\\nRisks:\\\\n- security:medium — d; mitigation: m\\\\n- performance:low — d2; mitigation: m2\\\\nValidation:\\\\n- uv run pytest -q\\\\nReview checklist:\\\\n- пункт\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"preview_only\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ },
+ "mcp_prepare_preview_no_ac": {
+  "calls": [
+   [
+    "GET",
+    "/api/tasks/25"
+   ]
+  ],
+  "result": "{\n  \"mode\": \"preview\",\n  \"task_id\": 25,\n  \"planned_operations\": [\n    \"refine_task\",\n    \"add_risk\",\n    \"write_analyst_update\"\n  ],\n  \"diff\": {\n    \"structured_fields_to_change\": [\n      \"prepared_at\",\n      \"prepared_by\",\n      \"validation_commands\",\n      \"wip_tag\"\n    ],\n    \"will_replace_acceptance_criteria\": false,\n    \"existing_acceptance_criteria_count\": 0,\n    \"new_acceptance_criteria_count\": null,\n    \"risk_mode\": \"append\",\n    \"existing_risks_count\": 1,\n    \"incoming_risks_count\": 1,\n    \"duplicate_risks_count\": 1,\n    \"risks_to_add_count\": 1\n  },\n  \"quality_warnings\": [\n    \"risks are appended; repeated apply can duplicate risks\"\n  ],\n  \"developer_handoff_text\": \"{\\\"message\\\": \\\"Developer handoff for task #25\\\\nRisks:\\\\n- security:medium — d; mitigation: m\\\", \\\"instance\\\": \\\"local\\\", \\\"base_url\\\": \\\"http://hub.test\\\", \\\"server_id\\\": \\\"host-1\\\"}\",\n  \"next_action\": \"preview_only\",\n  \"instance\": \"local\",\n  \"base_url\": \"http://hub.test\",\n  \"server_id\": \"host-1\"\n}"
+ }
+}
