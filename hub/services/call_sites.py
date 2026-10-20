@@ -570,7 +570,17 @@ def _script_module_names(rel: str) -> set[str]:
 
 
 def _imported_modules(root: str, rel: str) -> set[str]:
-    """Dotted module names named by ``import``/``from ... import`` in one file."""
+    """Dotted module names named by ``import``/``from ... import`` in one file.
+
+    ``from agent_eval import contract as ct`` (a real pattern in
+    ``scripts/agent_eval/{runner,scenarios}.py``) names the submodule
+    ``agent_eval.contract`` only through the COMBINATION of ``node.module``
+    and the imported name — ``node.module`` alone is just ``agent_eval``,
+    which cannot equal a changed symbol's full module path. Adding
+    ``module.name`` for every alias costs nothing when ``name`` is a
+    function or class rather than a submodule: that string never equals a
+    real file's module name, so it only ever adds noise, never a false match.
+    """
     try:
         source = open(os.path.join(root, rel), encoding="utf-8").read()
         tree = ast.parse(source)
@@ -583,6 +593,8 @@ def _imported_modules(root: str, rel: str) -> set[str]:
                 names.add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
+            for alias in node.names:
+                names.add(f"{node.module}.{alias.name}")
     return names
 
 

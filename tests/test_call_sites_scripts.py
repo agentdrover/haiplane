@@ -129,6 +129,42 @@ def test_a_namespace_package_import_of_a_script_is_recognized_too(repo: Path):
     )
 
 
+def test_a_submodule_imported_via_from_package_import_submodule_is_recognized(
+    repo: Path,
+):
+    """Real pattern in scripts/agent_eval/{runner,scenarios}.py: ``from
+    agent_eval import contract as ct``. ``node.module`` alone is just
+    ``agent_eval`` — it can never equal a changed symbol's full module path
+    (``agent_eval.contract``); only the combination with the imported name
+    does. Without it, a changed scripts/pkg/contract.py function called this
+    way reads as only_tests or no_callers despite the real call."""
+    (repo / "scripts" / "pkg").mkdir()
+    (repo / "scripts" / "pkg" / "__init__.py").write_text("")
+    (repo / "scripts" / "pkg" / "contract.py").write_text(
+        "def build_run(value):\n    return value\n"
+    )
+    (repo / "scripts" / "pkg" / "runner.py").write_text(
+        "from pkg import contract as ct\n\n\ndef main():\n    return ct.build_run(1)\n"
+    )
+    _commit(repo)
+
+    (repo / "scripts" / "pkg" / "contract.py").write_text(
+        "def build_run(value):\n    return value + 1\n"
+    )
+
+    report = call_sites.analyse(str(repo), _diff(repo))
+
+    build_run = next(s for s in report.symbols if s.symbol == "build_run")
+    assert build_run.state not in (call_sites.NO_CALLERS, call_sites.ONLY_TESTS), (
+        build_run.statement()
+    )
+    by_file = {s.file for s in build_run.sites}
+    assert "scripts/pkg/runner.py" in by_file, (
+        "'from pkg import contract as ct' must count as an import of "
+        f"scripts/pkg/contract.py: {build_run.statement()}"
+    )
+
+
 # ---- AC-3: a name match alone is not an import, and hub/'s only_tests is unchanged ----
 
 
