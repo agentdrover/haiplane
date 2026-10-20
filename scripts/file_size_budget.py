@@ -70,6 +70,15 @@ _SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
 RATCHET_TREES = frozenset({"tests"})
 BASE_UNREADABLE = 2
 ADDED_SHOWN = 5
+# Всё, что может выбросить разбор ledger/pyproject базы: в любом случае rc 2.
+_BASE_ERRORS = (
+    CompareError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    OverflowError,
+)
 
 
 def _file_size_section(root: Path) -> dict:
@@ -213,7 +222,7 @@ def _unknown_base_reason(on_base: int | None) -> str:
 def _base_number(entry: dict, key: str) -> int:
     try:
         return int(entry[key])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise CompareError(f"запись ledger базы {entry!r}: нет числа {key}") from exc
 
 
@@ -503,7 +512,7 @@ def load_base(root: Path, base: str, exact: bool) -> BaseView:
         raw = json.loads(str(_git(["show", f"{snap}:{LEDGER_REL.as_posix()}"], root)))
         ledger = _parse_ledger(raw)
         headroom = float(raw.get("headroom_pct", DEFAULT_HEADROOM_PCT))
-    except (CompareError, ValueError, KeyError, TypeError) as exc:
+    except _BASE_ERRORS as exc:
         raise CompareError(
             f"ledger базы {base} ({snap[:12]}) не прочитан: {exc}"
         ) from exc
@@ -523,7 +532,7 @@ def load_base(root: Path, base: str, exact: bool) -> BaseView:
         missing = sorted(RATCHET_TREES - set(base_thresholds))
         if missing:
             raise KeyError(f"нет порога {', '.join(missing)}")
-    except (CompareError, ValueError, KeyError, TypeError) as exc:
+    except _BASE_ERRORS as exc:
         raise CompareError(
             f"пороги базы {base} ({snap[:12]}) не прочитаны: {exc}"
         ) from exc
@@ -532,8 +541,36 @@ def load_base(root: Path, base: str, exact: bool) -> BaseView:
     )
 
 
+def _unaccepted_entries(
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    before: dict[str, dict],
+    base: BaseView | None,
+    forced: bool,
+) -> list[str]:
+    """Записи tests, что --update добавит и что CI на базе не примет.
+
+    Читает базу целиком ДО записи ledger: сбой чтения базы здесь - rc 2 без
+    изменённого файла.
+    """
+    paths = sorted(
+        p
+        for p, n in sizes.items()
+        if _tree(p) in RATCHET_TREES and n > _threshold(p, thresholds)
+    )
+    if base is None:
+        return [p for p in paths if p not in before]
+    if forced:
+        return [p for p in paths if p not in base.ledger]
+    # База правила не знала: CI примет только файлы, длинные уже на ней.
+    return [
+        p
+        for p in paths
+        if p not in base.ledger and (base.lines(p) or 0) <= _threshold(p, thresholds)
+    ]
+
+
 def _update(
-    root: Path,
     sizes: dict[str, int],
     thresholds: dict[str, int],
     ledger_path: Path,
@@ -541,26 +578,11 @@ def _update(
 ) -> int:
     """--update: перезапись ledger; tests не поднимаются выше ledger базы."""
     forced = base is not None and base.ratchet_in_force("tests", thresholds["tests"])
-    if base is None:
-        clamp = None
-    else:
-        clamp = base.ledger if forced else {}
+    clamp = None if base is None else (base.ledger if forced else {})
     before = load_ledger(ledger_path)
+    added = _unaccepted_entries(sizes, thresholds, before, base, forced)  # до записи
     count = write_ledger(sizes, thresholds, ledger_path, clamp)
     print(f"ledger перезаписан: {count} исключений")
-    written = load_ledger(ledger_path)
-    ratchet = [p for p in sorted(written) if _tree(p) in RATCHET_TREES]
-    if base is None:
-        added = [p for p in ratchet if p not in before]
-    elif forced:
-        added = [p for p in ratchet if p not in base.ledger]
-    else:  # база правила не знала: CI примет только файлы, длинные уже на ней
-        added = [
-            p
-            for p in ratchet
-            if p not in base.ledger
-            and (base.lines(p) or 0) <= _threshold(p, thresholds)
-        ]
     for path in added[:ADDED_SHOWN]:
         print(
             f"  внимание: новая запись {path}; CI отвергнет её, если файл не был "
@@ -608,9 +630,9 @@ def main() -> int:
     if base_error:  # до любой записи ledger, и для проверки, и для --update
         print(base_error, file=sys.stderr)
         return BASE_UNREADABLE
-    if args.update:
-        return _update(root, sizes, thresholds, ledger_path, base)
     try:
+        if args.update:
+            return _update(sizes, thresholds, ledger_path, base)
         report = check(sizes, thresholds, load_ledger(ledger_path), near_pct, base)
     except CompareError as exc:  # ленивое чтение базы упало уже внутри проверки
         print(f"file size: сравнить с базой не удалось: {exc}", file=sys.stderr)
