@@ -810,6 +810,41 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert names[-1] == "Fail a cancelled run", "the last step stays the last"
 
 
+def test_rerun_failed_of_a_leg_reruns_the_merge_and_the_reporter() -> None:
+    """#1921: the way a lost leg is put back lives in the `needs` of three jobs.
+
+    "Re-run failed jobs" takes the failed jobs and everything that needs them. A
+    job with a job-level `continue-on-error` that fails has conclusion `failure`
+    in the API while the run stays `success` (measured on a throwaway workflow of
+    this shape, run 39430519486), so the leg is a failed job. The merge and the
+    reporter are rerun with it ONLY while they depend on it: transitively for
+    job test. A change that cuts that chain turns "rerun the leg" into "nothing
+    sends a second report".
+    """
+    jobs = _doc()["jobs"]
+
+    def needs(name: str) -> set[str]:
+        raw = jobs[name].get("needs", [])
+        return {raw} if isinstance(raw, str) else set(raw)
+
+    def dependents(root: str) -> set[str]:
+        found, frontier = set(), {root}
+        while frontier:
+            frontier = {n for n in jobs if needs(n) & frontier} - found
+            found |= frontier
+        return found
+
+    for leg in ("mutation_legs", "baseline"):
+        assert jobs[leg]["continue-on-error"] is True, (
+            "a red leg must not redden the run"
+        )
+        assert {"evidence", "test"} <= dependents(leg), leg
+    # the merge runs after a failed leg too (it says what is missing)
+    assert "!cancelled()" in jobs["evidence"]["if"]
+    # and the reporter is not left behind by a failed merge
+    assert jobs["test"]["if"] == "${{ always() }}"
+
+
 def test_evidence_adoption_keeps_artifact_contract() -> None:
     """#1919/#1921: the adopted files become this run's artifact, in job treedup."""
     import json

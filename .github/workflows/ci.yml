@@ -446,15 +446,17 @@ jobs:
   # `!cancelled()`: legs that failed or were skipped must still produce a report
   # that SAYS so (state=error with the reason), never silence. A run that adopted
   # the evidence (treedup) has nothing to put together and skips this job.
-  # The name has NO attempt number, so a full rerun finds and replaces the files
+  # The name has NO attempt number, so a rerun finds and replaces the files
   # (`overwrite: true`) and job test of attempt 2 finds those of attempt 1 (same
   # run, same commit).
-  # "Re-run failed jobs" does NOT put a lost leg back (#1921, review of gen 1): a
-  # leg that fails is masked by its job-level `continue-on-error`, this job then
-  # ends green with state=error ("leg i of N missing"), and the reporter (job
-  # test) is not a dependent of a failed job, so nothing would send a second
-  # report. The way out of a lost leg is a full re-run ("Re-run all jobs") or a
-  # new dispatch on the same sha; the merged report names the missing leg.
+  # A lost leg is put back by "Re-run failed jobs" (#1921, measured 20.10.2026 on
+  # a throwaway workflow with this very graph shape: run 39430519486): a job with
+  # a job-level `continue-on-error` that fails has conclusion `failure` in the
+  # API while the RUN stays `success`, so the rerun takes the leg and everything
+  # that `needs` it, i.e. this job and then job test. This job downloads the legs
+  # of the run (the new one and the ones of attempt 1), so the merge is complete,
+  # and job test sends a second report. The property lives in the `needs` of the
+  # three jobs; tests/test_ci_workflow_contract.py holds it.
   evidence:
     name: Mutations and red-test baseline
     needs: [treedup, mutation_legs, baseline]
