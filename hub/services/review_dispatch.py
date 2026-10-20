@@ -58,6 +58,7 @@ from hub.services import call_sites, ci_integrity, project_policy, review_ci_gat
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
+from hub.services.review_ac_inputs import ac_inputs
 from hub.services.review_oversized import (
     UNREAD_PREFIX,
     AcTestSpan,
@@ -68,7 +69,6 @@ from hub.services.review_oversized import (
     shown_in,
     first_block,
     oversized_paragraph,
-    read_sources,
 )
 from hub.services.result_kind import automation_not_applicable
 from hub.services.orchestration import ORIGINAL_READ_SQL
@@ -3907,7 +3907,7 @@ async def prepare_review_order(
     ac_refs = task_ac_test_refs(
         [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     )
-    pinned, ac_sources, ac_block = await _ac_inputs(
+    pinned, ac_sources, ac_block = await ac_inputs(
         db, task, ctx, ac_refs, plan_diff, inline_diff
     )
     diff_block, diff_note = diff_plan(
@@ -4024,57 +4024,6 @@ def snapshot_note(snapshot: SnapshotArchive | None) -> str:
             f"ревьюеру только для чтения{left_out} (#1599). "
         )
     return f"Снимок исходников не выдан: {snapshot.reason} (#1599). "
-
-
-async def _ac_inputs(
-    db: aiosqlite.Connection,
-    task: dict[str, Any],
-    ctx: tuple[str, str] | None,
-    refs: list[str],
-    plan_diff: str | None,
-    inline_diff: bool,
-) -> tuple[str | None, dict[str, str | None] | None, bool]:
-    """``(дифф на sha, файлы тестов AC на sha, блок обязателен)`` для блока #1933.
-
-    Один источник — закреплённый sha. Облако: дифф объекта-коммита
-    (``integrity_read``, не имя ветки: ``origin/<sha>`` не подменит его);
-    локальный заказ: ``plan_diff`` уже на sha. Закреплённый дифф не прочитан —
-    блок обязателен и всё в нём «неизвестно»: ветка в расчёт не берётся.
-    Файлы читаются, только если в диффе есть файл выше потолка.
-    """
-    sha = (task.get("submission_sha") or "").strip()
-    if not refs or not sha:
-        return None, None, False
-    if inline_diff:
-        basis = plan_diff
-    else:
-        basis = await _pinned_diff(ctx, sha)
-        if basis is None:
-            return None, None, True
-    if basis is None or not any(
-        count > REVIEW_FILE_LINE_CAP
-        for _, count in file_line_counts(split_generated(basis)[0])
-    ):
-        return (None if inline_diff else basis), None, False
-    sources = await read_sources(plugins.git_ops, ctx[0] if ctx else None, sha, refs)
-    return (None if inline_diff else basis), sources, False
-
-
-async def _pinned_diff(ctx: tuple[str, str] | None, sha: str) -> str | None:
-    """Дифф коммита сдачи как ОБЪЕКТА (#1933); ``None`` - не прочитан.
-
-    ``integrity_read`` разрешает sha через ``rev-parse <sha>^{commit}``, поэтому
-    ветка, названная как sha, не подменит его (``branch_diff`` сначала смотрит
-    ``origin/<имя>``).
-    """
-    if ctx is None:
-        return None
-    try:
-        got = await plugins.git_ops.integrity_read(ctx[0], ctx[1], sha)
-    except Exception as exc:  # noqa: BLE001 - degradation is the contract
-        log.warning("could not read the pinned diff %s: %s", sha[:12], exc)
-        return None
-    return got.get("diff") if got else None
 
 
 async def _subject_diff(

@@ -229,7 +229,7 @@ def test_an_unreadable_pinned_diff_still_states_the_block_as_unknown():
 async def test_the_pinned_diff_is_read_as_a_commit_object_not_by_name(monkeypatch):
     """Codex 2.5: integrity_read(sha), а не branch_diff, который смотрит origin/<имя>."""
     from hub.integrations.registry import plugins
-    from hub.services.review_dispatch import _pinned_diff
+    from hub.services.review_ac_inputs import pinned_diff as _pinned_diff
 
     calls = []
 
@@ -288,7 +288,7 @@ async def test_an_unread_pin_makes_the_block_mandatory_and_a_missing_pin_does_no
     db, monkeypatch
 ):
     from hub.integrations.registry import plugins
-    from hub.services.review_dispatch import _ac_inputs
+    from hub.services.review_ac_inputs import ac_inputs as _ac_inputs
 
     class Git:
         async def integrity_read(self, repo, base, sha):
