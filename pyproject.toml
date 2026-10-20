@@ -115,9 +115,12 @@ max-statements = 60
 # Бюджет размера файла (#1669): строк в одном .py по деревьям. Пороги живут
 # здесь, scripts/file_size_budget.py копии не носит. Файлы выше порога внесены
 # в docs/agent-context/file-size-budget.json с потолком (замер + 5%).
+# tests = REVIEW_FILE_LINE_CAP (hub/services/review_dispatch.py): столько строк
+# файла читает машинное ревью; равенство держит тест (#1932). Ledger tests
+# только сокращается.
 hub = 1500
 scripts = 1500
-tests = 3000
+tests = 800
 # Доля порога (%), с которой файл вне ledger называется «у порога» (#1676).
 # Это не дерево измерения.
 near_pct = 90
