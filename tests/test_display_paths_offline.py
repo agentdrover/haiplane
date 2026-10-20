@@ -638,12 +638,16 @@ async def test_a_timeout_is_not_recorded_as_an_observation(
     ids = await _world(client, db, monkeypatch)
     review = ids["review"]
 
+    asked: list[str] = []
+
     async def hang(*_a, **_k):
+        asked.append("check_pr_mergeable")
         raise TimeoutError
 
     monkeypatch.setattr(plugins.git_ops, "check_pr_mergeable", hang)
     gate_observations._refreshed_at.clear()
     await gate_observations.sweep(db)
+    assert asked, "проход не дошёл до вопроса о PR — тест пуст"
     task = dict(await repo.get_task(db, review) or {})
     assert (
         gate_observations.recall(
@@ -668,7 +672,10 @@ async def test_stacking_in_the_sweep_runs_under_the_deadline(
 
     await _world(client, db, monkeypatch)
 
+    entered: list[str] = []
+
     async def slow(*_a, **_k):
+        entered.append("stacking")
         await asyncio.sleep(5)
 
     monkeypatch.setattr(services, "detect_branch_stacking", slow)
@@ -680,4 +687,5 @@ async def test_stacking_in_the_sweep_runs_under_the_deadline(
     )
     gate_observations._refreshed_at.clear()
     await asyncio.wait_for(gate_observations.sweep(db), timeout=4)
+    assert entered, "проход не дошёл до стыковки — тест пуст"
     assert gate_observations._down_until, "зависшая стыковка должна дать откат"

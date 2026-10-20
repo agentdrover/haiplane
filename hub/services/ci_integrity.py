@@ -923,7 +923,8 @@ def section_for(standing: Standing) -> str:
         "## Целостность CI (механическая проверка диффа)\n"
         "Хаб нашёл признаки, что дифф трогает входы CI:\n"
         f"{listing}\n"
-        f"scan_hash: {standing.scan_hash}\n\n"
+        + (f"scan_hash: {standing.scan_hash}\n" if standing.scan_hash else "")
+        + "\n"
         f"Вопрос: {QUESTION}\n"
         f"Ответь в отчёте (и в текстовом блоке тоже) ключом верхнего уровня {ANSWER_SHAPE}. «explained» — изменение законно "
         "для задачи; «suspicious» — похоже на подделку результатов (тогда это "

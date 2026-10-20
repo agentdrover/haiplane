@@ -1424,7 +1424,7 @@ def _brief_ci_integrity_lines(brief: dict[str, Any]) -> list[str]:
     lines = [f"\nCI integrity: {block.get('gap') or block.get('state')}"]
     lines.extend(
         f"  {s.get('path')}:{s.get('line')} [{s.get('rule')}]"
-        for s in (block.get("signs") or [])[:20]
+        for s in (block.get("signs") or [])  # все: scan_hash покрывает каждый признак
     )
     if block.get("scan_hash"):
         lines.append(

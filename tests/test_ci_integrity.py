@@ -1030,3 +1030,11 @@ async def test_the_answer_survives_a_restart_of_the_hub(
     lifecycle.forget_observed_tips()  # то, что делает рестарт
     row = await _answered(client, db, task_id, scan_hash=seen)
     assert row["ci_integrity_verdict"] == "explained"
+
+
+def test_a_null_or_numeric_scan_hash_does_not_cost_the_report():
+    """Текстовый блок — единственный путь облачного ревьюера: сбой поля не теряет отчёт."""
+    for raw in (None, 12345, " ABC "):
+        answer = CIIntegrityAnswer(verdict="explained", scan_hash=raw)  # type: ignore[arg-type]
+        assert isinstance(answer.scan_hash, str)
+    assert CIIntegrityAnswer(scan_hash=None).scan_hash == ""  # type: ignore[arg-type]
