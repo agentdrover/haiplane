@@ -447,9 +447,7 @@ async def test_a_late_judgement_is_recorded_but_changes_nothing(
             kind="verdict",
             verdict="changes_requested",
             confidence="high",
-            grounds=[
-                {"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}
-            ],
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci 1 ok"}],
             model="gpt-5.3-codex",
         ),
         TokenIdentity("steward-bot", "steward", principal_id=42),

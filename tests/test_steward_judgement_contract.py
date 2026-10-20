@@ -226,17 +226,17 @@ _MARKER = DETAIL_MARKER
         f"ci_run 1 {_MARKER}.",
         f"  {_MARKER}\n",
         _MARKER.lower(),
-        "__ЗАПОЛНИ\u200b__",
-        "__\u200bЗАПОЛНИ__\u200b",
-        "__ЗАПОЛНИ__\u00a0факт",
-        "\u00a0__ЗАПОЛНИ__\u00a0",
-        "＿＿ЗАПОЛНИ＿＿",
-        "__ЗА ПОЛНИ__",
-        "__ЗА\u034fПОЛНИ__",
-        "__ЗАП\ufe0fОЛНИ__",
-        "__ЗА\u3164ПОЛНИ__",
-        "__ЗА.ПОЛНИ__",
-        "__ЗА\u0345ПОЛНИ__",
+        _MARKER.replace("ЗАП", "ЗА\u200bП"),
+        f"\u200b{_MARKER}\u200b",
+        f"{_MARKER}\u00a0факт",
+        f"\u00a0{_MARKER}\u00a0",
+        _MARKER.replace("_", "＿"),
+        _MARKER.replace("ЗАП", "ЗА П"),
+        _MARKER.replace("ЗАП", "ЗА\u034fП"),
+        _MARKER.replace("ЗАП", "ЗА\ufe0fП"),
+        _MARKER.replace("ЗАП", "ЗА\u3164П"),
+        _MARKER.replace("ЗАП", "ЗА.П"),
+        _MARKER.replace("ЗАП", "ЗА\u0345П"),
     ],
 )
 async def test_a_hint_marker_is_not_a_ground_in_any_spelling(
@@ -260,6 +260,7 @@ async def test_a_hint_marker_is_not_a_ground_in_any_spelling(
 
 
 _REAL_FACTS = [
+    "Ревьюер заполнил findings_confirmed: P1=0, P2=0; report_id=123",
     "<none>",
     "<ci_run=1234, conclusion=success, sha=abc123>",
     "<none> is the actual output <exit=0>",

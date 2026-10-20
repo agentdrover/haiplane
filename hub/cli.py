@@ -2742,8 +2742,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             'JSON list of grounds: [{"source":"ci_pinned_sha",'
-            '"detail":"__ЗАПОЛНИ__ concrete fact of the packet"}] '
-            "(replace the whole __ЗАПОЛНИ__ marker with the fact); approve and "
+            '"detail":"__ЗАПОЛНИ_ФАКТ_7Q__ concrete fact of the packet"}] '
+            "(replace the whole __ЗАПОЛНИ_ФАКТ_7Q__ marker with the fact); approve and "
             "changes_requested need one with a non-empty detail (422 otherwise)"
         ),
     )

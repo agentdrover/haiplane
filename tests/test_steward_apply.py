@@ -541,9 +541,7 @@ async def _judged_with(
             kind="verdict",
             verdict="approve",
             confidence="high",
-            grounds=[
-                {"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}
-            ],
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci 1 ok"}],
             closures=closures,
             model="gpt-5.3-codex",
         ),
@@ -1352,7 +1350,7 @@ async def _dor_judged(
         grounds = (
             []
             if verdict == "escalate"
-            else [{"source": "ci_pinned_sha", "detail": "ci_run 1 success on sha abc"}]
+            else [{"source": "ci_pinned_sha", "detail": "ci 1 ok"}]
         )
     from hub.config import TokenIdentity
     from hub.models import StewardJudgementSubmit
