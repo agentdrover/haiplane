@@ -196,6 +196,10 @@ CASES = {
         {"mutations": mutations("baseline_red"), "baseline": baseline("error")},
         set(),
     ),
+    "state_is_a_list": (
+        {"mutations": mutations([]), "baseline": baseline({})},
+        set(),
+    ),
     "state_unknown": (
         {"mutations": mutations("weird"), "baseline": baseline("weird")},
         set(),
@@ -388,3 +392,34 @@ async def test_the_bug_red_test_gate_does_not_borrow(client, db):
     )
     assert evidence.baseline.state == "received"
     assert "гейт red-test багов его не учитывает" in evidence.baseline.reason
+
+
+async def test_a_source_made_pending_while_the_current_report_stays_trusted(db):
+    task_id = await _task(db)
+    first, _ = await _dispatch_then_synchronize(db, task_id)
+    await db.execute(
+        "UPDATE ci_report_attempts SET trust='unverified', trust_reason='pending' "
+        "WHERE run_id=?",
+        (first,),
+    )
+    await db.commit()
+    assert await ci_trust.trusted_report(db, task_id, SHA) is not None
+    await _check(db, task_id, set())
+
+
+async def test_a_change_between_the_reads_borrows_nothing(db, monkeypatch):
+    """The projection moves while the attempts are read: no mix of two moments."""
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+    real = repo.list_ci_report_attempts
+
+    async def then_the_current_attempt_changes(*args, **kwargs):
+        rows = await real(*args, **kwargs)
+        await db.execute("UPDATE ci_run_reports SET attempt_key='ci:1003:1'")
+        await db.commit()
+        return rows
+
+    monkeypatch.setattr(
+        repo, "list_ci_report_attempts", then_the_current_attempt_changes
+    )
+    await _check(db, task_id, set())

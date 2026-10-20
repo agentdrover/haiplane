@@ -450,7 +450,10 @@ def _usable_block(
     block = _json_map(row[column])
     if block.get("head") != head_sha:  # no ``head`` = not counted on this commit
         return None
-    return block if block.get("state") in BORROWABLE_STATES[column] else None
+    state = block.get("state")
+    # A state that is not a string (a list, a map) is garbage, not a membership test.
+    ok = isinstance(state, str) and state in BORROWABLE_STATES[column]
+    return block if ok else None
 
 
 async def borrowed_evidence_block(
@@ -486,7 +489,38 @@ async def borrowed_evidence_block(
                 order,
                 BorrowedBlock(row[column], row["run_id"], row["run_attempt"]),
             )
-    return best[1] if best else None
+    if best is None or not await _unchanged(
+        db, task_id, head_sha, current, fingerprint
+    ):
+        return None
+    return best[1]
+
+
+_PROJECTION_KEYS = (
+    "attempt_key",
+    "trust",
+    "contract_fp",
+    "mutations",
+    "baseline",
+    "provenance",
+)
+
+
+async def _unchanged(
+    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any], fingerprint: str
+) -> bool:
+    """Nothing the borrow stands on moved while the attempts were being read.
+
+    The reads are separate awaits, not one snapshot: a refresh may land between
+    them. The projection is read again and must be the confirmed row the caller
+    saw, under the same contract; if not, nothing is borrowed (the answer the
+    brief gave before) rather than a mix of two moments.
+    """
+    fresh = await trusted_report(db, task_id, head_sha)
+    if fresh is None:
+        return False
+    same = all(dict(fresh).get(k) == current.get(k) for k in _PROJECTION_KEYS)
+    return same and await ci_contract.fingerprint_for_task(db, task_id) == fingerprint
 
 
 # ---- which attempt is current ----------------------------------------------
