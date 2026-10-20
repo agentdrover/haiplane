@@ -215,7 +215,16 @@ async def test_the_sample_is_not_executable_as_it_stands(
     assert await _stored(db, task_id) is None
 
 
-@pytest.mark.parametrize("hint", PLACEHOLDER_DETAILS)
+@pytest.mark.parametrize(
+    "hint",
+    [
+        *PLACEHOLDER_DETAILS,
+        "факт пакета: значение, число, sha или поле",
+        "<concrete fact of the packet>",
+        "<суждение по контракту>",
+        "<что угодно в скобках>",
+    ],
+)
 @pytest.mark.parametrize("shape", ["same", "padded", "upper"])
 async def test_a_sample_placeholder_detail_is_not_a_ground(
     db: aiosqlite.Connection, monkeypatch, hint, shape

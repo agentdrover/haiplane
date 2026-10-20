@@ -24,14 +24,29 @@ _CONFIDENCE_HINT = "<high|medium|low>"
 _CLOSURE_TYPE_HINT = "<тип закрытия из закрытого множества>"
 _SOURCE_HINT = "<источник из закрытого множества>"
 
-_PLACEHOLDERS = frozenset(
-    p.strip().casefold() for p in (*PLACEHOLDER_DETAILS, PLACEHOLDER_FINDING_UID)
+_HINTS = (
+    *PLACEHOLDER_DETAILS,
+    PLACEHOLDER_FINDING_UID,
+    _SOURCE_HINT,
+    _CLOSURE_TYPE_HINT,
+    _VERDICT_HINT,
+    _CONFIDENCE_HINT,
+    "<суждение по контракту>",
+    "<одна причина из закрытого множества>",
 )
+_BARE_HINTS = frozenset(h.strip("<>").strip().casefold() for h in _HINTS)
 
 
 def is_placeholder_detail(detail: str) -> bool:
-    """True, если detail — подсказка образца, а не факт пакета."""
-    return (detail or "").strip().casefold() in _PLACEHOLDERS
+    """True, если detail — подсказка образца, а не факт пакета.
+
+    Подсказка — это любая строка в угловых скобках целиком, а также текст
+    любой подсказки образца без скобок (судья убрал скобки и оставил слова).
+    """
+    text = (detail or "").strip()
+    if len(text) >= 2 and text.startswith("<") and text.endswith(">"):
+        return True
+    return text.strip("<>").strip().casefold() in _BARE_HINTS
 
 
 def steward_judgement_body_sample(generation: int) -> str:
