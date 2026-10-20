@@ -46,6 +46,12 @@ REASON_CODE_TEXT: Final[dict[str, str]] = {
     "over_budget": "превышен бюджет",
     "agent_failed": "агент завершился с ошибкой",
     "critic_failed": "критик отклонил результат",
+    "critic_cycles_exhausted": "кончились круги критика",
+    "critic_time_exhausted": "кончилось время критика",
+    "critic_unavailable": "критик недоступен",
+    "critic_delivery_failed": "сбой доставки работы после критика",
+    "no_new_head": "агент не дал нового коммита",
+    "integrity_violation": "нарушение целостности прогона",
     "timeout": "вышло время",
     "hub_unavailable": "хост не достучался до хаба",
     "stale_token": "остаток токена прошлого заказа не удалось отозвать",  # nosec B105 - текст причины, не секрет
