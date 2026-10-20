@@ -5165,7 +5165,7 @@ async def test_state_fields_evidence_and_verdict_parity_across_surfaces(
         cli.cmd_review_verdict,
         task_id=ids["cli"], verdict="changes_requested", comments="нужно ещё",
         agent="r", findings_json="", create_tasks_for_out_of_scope=False,
-        expected_generation=1,
+        expected_generation=1, json=True,
     )  # fmt: skip
     assert body["expected_generation"] == 1
     verdict_cli = await client.post(path, json=body, headers=headers["human"])

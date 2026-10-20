@@ -516,6 +516,7 @@ def test_cli_and_mcp_carry_the_studied_generation(capsys) -> None:
 
     args.expected_generation = 3
     args.supersedes_revision = 5
+    args.json = True  # #1696: the summary would add a read; the body is the subject
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         assert cli.cmd_review_verdict(args) == 0
     sent = mock_api.call_args.args[2]
