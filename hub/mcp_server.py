@@ -22,6 +22,7 @@ from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
+from hub.expected_sha import put_expected_sha_in
 from hub.mcp_internal_auth import identity_context_get, identity_is_human
 from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
@@ -2673,6 +2674,7 @@ async def hub_submit_for_review(
     mutations: list[dict[str, Any]] | None = None,
     prevention: dict[str, Any] | None = None,
     evidence: Any = None,
+    expected_sha: str = "",
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
@@ -2684,12 +2686,10 @@ async def hub_submit_for_review(
         task_id: The running pair task ID
         agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: Your working branch; one unlike the canonical is refused.
-            Omitted skips the check (#533).
+        branch: Your working branch; a non-canonical one is refused (#533).
         model: Model that wrote this submission (#758), declared; empty
             keeps the verdict with the human.
-        accept_areas: Fold the areas the diff ACTUALLY touched into
-            affected_areas (#890), visibly.
+        accept_areas: Fold the areas the diff TOUCHED into affected_areas (#890).
         finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
             what became of findings sent back over. Confirmed:
             fixed|false_positive|wont_fix|deferred. Unresolved (author judges):
@@ -2700,19 +2700,16 @@ async def hub_submit_for_review(
         prevention: see hub_report_done (#919).
         evidence: State task, required: [{ac_id, action, observed, target,
             observed_at}] per AC; no secrets.
+        expected_sha: Full sha you checked; 409 if tip differs.
     """
+    body: dict[str, Any] = {}
+    if refusal := put_expected_sha_in(body, expected_sha):
+        return _format_hub_api_error(HubApiError(refusal))
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
     prior_generation = prior_task.get("submission_generation") if prior_task else None
-    body: dict[str, Any] = {}
-    if agent:
-        body["agent"] = agent
-    if summary:
-        body["summary"] = summary
-    if branch:
-        body["branch"] = branch
-    if model:
-        body["model"] = model
+    named = (("agent", agent), ("summary", summary), ("branch", branch))
+    body.update({key: val for key, val in (*named, ("model", model)) if val})
     if accept_areas:
         body["accept_areas"] = True
     if finding_outcomes:
