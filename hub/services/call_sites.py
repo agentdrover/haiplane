@@ -37,6 +37,7 @@ import re
 import subprocess  # nosec B404
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 log = logging.getLogger("hub.call_sites")
@@ -254,8 +255,9 @@ def _walk_python(root: str, subdir: str) -> list[str]:
     return sorted(out)
 
 
-INDEX_SUBDIRS: tuple[str, ...] = ("hub", "tests")
+INDEX_SUBDIRS: tuple[str, ...] = ("hub", "tests", "scripts")
 _SKIPPED_DIRS = frozenset({"__pycache__", ".venv", "node_modules"})
+_SCRIPTS_PREFIX = "scripts/"
 
 
 def build_call_index(
@@ -548,6 +550,64 @@ def _is_touched(site: CallSite, changed: set[int]) -> bool:
     return site.line in changed
 
 
+def _script_module_name(rel: str) -> str:
+    """Bare module name a file under ``scripts/`` is imported by (#1935).
+
+    ``scripts/`` ships no ``__init__.py``; a script run or imported from a
+    sibling addresses it by its bare name (``import complexity_budget``,
+    ``from complexity_budget import ...``), never by a ``scripts.`` prefix.
+    """
+    name = rel[len(_SCRIPTS_PREFIX) :] if rel.startswith(_SCRIPTS_PREFIX) else rel
+    if name.endswith(".py"):
+        name = name[: -len(".py")]
+    return name.replace("/", ".")
+
+
+def _imported_modules(root: str, rel: str) -> set[str]:
+    """Dotted module names named by ``import``/``from ... import`` in one file."""
+    try:
+        source = open(os.path.join(root, rel), encoding="utf-8").read()
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def _counts_as_call(
+    site: CallSite,
+    defined_in: str,
+    module: str,
+    imports_of: Callable[[str], set[str]],
+) -> bool:
+    """Does this candidate site count toward the symbol defined at ``defined_in``?
+
+    Two asymmetric rules (#1935), both aimed at the same false alarm: a
+    nominal name match across ``scripts/`` and ``hub/`` reading as a real
+    call when nothing imports the other side.
+
+    A symbol defined in ``scripts/`` counts a call from another script only
+    when that script is the same file or imports the defining module — two
+    scripts can each define their own ``main()`` with no relation at all.
+    A symbol defined in ``hub/`` does not count a call from ``scripts/`` at
+    all: #1254's only_tests meaning (is this reached by product code) is
+    unchanged by scripts/ joining the index.
+    """
+    if not defined_in.startswith(_SCRIPTS_PREFIX):
+        return not site.file.startswith(_SCRIPTS_PREFIX)
+    if not site.file.startswith(_SCRIPTS_PREFIX):
+        return True
+    if site.file == defined_in:
+        return True
+    return module in imports_of(site.file)
+
+
 def analyse(
     root: str,
     diff: str,
@@ -570,10 +630,17 @@ def analyse(
         )
 
     symbols: list[SymbolReport] = []
+    imports_cache: dict[str, set[str]] = {}
+
+    def imports_of(rel: str) -> set[str]:
+        if rel not in imports_cache:
+            imports_cache[rel] = _imported_modules(root, rel)
+        return imports_cache[rel]
 
     for symbol, defined_in, decorators in changed_symbols(
         root, ranges, test_dirs=test_dirs
     ):
+        module = _script_module_name(defined_in)
         sites = [
             CallSite(
                 file=s.file,
@@ -587,6 +654,7 @@ def analyse(
             # A recursive call inside the function itself is not a call site
             # anyone needs to review.
             if not (s.file == defined_in and s.caller == symbol)
+            and _counts_as_call(s, defined_in, module, imports_of)
         ]
 
         if not sites:
