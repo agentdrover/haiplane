@@ -101,6 +101,13 @@ async def test_ac_tests_are_named_first_in_an_oversized_file(
     block, _ = diff_plan(big_diff, "develop", "task-1/x", ac_test_refs=_REFS)
     _assert_first_block(block, before="git diff")
 
+    # Номера строк облачного блока — строки файла на закреплённом sha сдачи.
+    moved = _new_file(BIG, ["# сдвиг ветки"] + _big_lines())
+    pinned, _ = diff_plan(
+        moved, "develop", "task-1/x", ac_test_refs=_REFS, ac_diff=big_diff
+    )
+    assert f"{BIG}:{ALPHA_AT}–{ALPHA_TO} ({ALPHA})" in pinned, pinned
+
     # Локальный путь: файл целиком не влез в потолок, функции вложены вырезкой.
     ceiling = 9000
     assert len(big_diff) > ceiling
@@ -257,6 +264,7 @@ async def test_an_unread_ac_test_is_named_by_exact_match(
     lost = [
         f"{PREFIX}{ALPHA}",
         f"не дочитал {METHOD}, там много строк",  # то же имя без префикса
+        METHOD,  # голое имя без префикса
         f"{PREFIX}{METHOD} и ещё что-то",  # префикс, но не точное совпадение
         f"{PREFIX}{BIG}::test_unknown",  # не test_ref этой задачи
         f"AC_TEST_UNREAD: {METHOD}",  # другой регистр префикса
