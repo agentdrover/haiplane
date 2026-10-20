@@ -207,14 +207,20 @@ async def settle(
     *,
     note: str = "",
     only_from: tuple[str, ...] = OPEN_STATES,
+    attempts: int | None = None,
 ) -> bool:
-    """Перевести строку в итоговое состояние; True, если перевод сделан этим вызовом."""
+    """Перевести строку в итоговое состояние; True, если перевод сделан этим вызовом.
+
+    ``attempts`` - вернуть счётчик попыток к этому значению (отказ до отправки
+    не тратит попытку и в итоговом состоянии).
+    """
     marks = ",".join("?" for _ in only_from)
     async with write_transaction(db):
         cur = await db.execute(
-            "UPDATE ci_head_runs SET state=?, note=? WHERE task_id=? AND sha=? "  # nosec B608 - placeholders only
+            "UPDATE ci_head_runs SET state=?, note=?, "  # nosec B608 - placeholders only
+            "attempts=COALESCE(?, attempts) WHERE task_id=? AND sha=? "
             f"AND state IN ({marks})",
-            (state, note, task_id, sha, *only_from),
+            (state, note, attempts, task_id, sha, *only_from),
         )
         return (cur.rowcount or 0) == 1
 
@@ -345,31 +351,42 @@ async def top_attempt_id(db: aiosqlite.Connection) -> int:
     return int(rows[0]["top"])
 
 
-#: Строк одной таблицы журнала, которые очистка убирает за вызов (бюджет SQL).
-PRUNE_BATCH = 500
+#: Задач, журналы которых очистка убирает за вызов (бюджет SQL).
+PRUNE_BATCH = 200
 
 
 async def prune_finished(
     db: aiosqlite.Connection, *, days: int, batch: int = PRUNE_BATCH
 ) -> int:
-    """Убрать строки журналов задач, ЗАВЕРШЁННЫХ дольше ``days`` суток, порцией.
+    """Убрать журналы задач, ЗАВЕРШЁННЫХ дольше ``days`` суток, порцией задач.
 
     Архивность сама по себе не повод: архив обратим, а журнал держит
     идемпотентность (число запросов CI на sha, объявленные прогоны). Задача,
     разархивированная после очистки, иначе заказала бы CI заново и объявила
     тот же прогон второй раз. Завершённая (терминальная) задача из архива не
     возвращается в работу, поэтому её журнал уходит независимо от архива.
+
+    Порция - целые ЗАДАЧИ, обе таблицы сразу: маркер объявления не может уйти
+    раньше своей головы, иначе отчёт по оставшейся голове объявился бы снова.
     """
-    removed = 0
-    marks = f"-{int(days)} days"
     async with write_transaction(db):
-        for table in ("ci_head_announced", "ci_head_runs"):
-            cur = await db.execute(
-                f"DELETE FROM {table} WHERE rowid IN (SELECT j.rowid FROM {table} j "  # nosec B608 - fixed names
-                "JOIN tasks t ON t.id=j.task_id "
-                "WHERE t.status IN ('completed', 'failed', 'rejected') "
-                "AND t.updated_at < datetime('now', ?) LIMIT ?)",
-                (marks, int(batch)),
-            )
-            removed += cur.rowcount or 0
+        rows = await fetchall(
+            db,
+            "SELECT t.id FROM tasks t WHERE t.status IN "
+            "('completed', 'failed', 'rejected') AND t.updated_at < datetime('now', ?) "
+            "AND (EXISTS (SELECT 1 FROM ci_head_runs r WHERE r.task_id=t.id) "
+            "OR EXISTS (SELECT 1 FROM ci_head_announced n WHERE n.task_id=t.id)) "
+            "LIMIT ?",
+            (f"-{int(days)} days", int(batch)),
+        )
+        ids = [int(r["id"]) for r in rows]
+        removed = 0
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            for table in ("ci_head_announced", "ci_head_runs"):
+                cur = await db.execute(
+                    f"DELETE FROM {table} WHERE task_id IN ({marks})",  # nosec B608 - fixed names, placeholders
+                    ids,
+                )
+                removed += cur.rowcount or 0
     return removed

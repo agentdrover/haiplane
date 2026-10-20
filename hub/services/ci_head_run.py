@@ -165,6 +165,10 @@ async def _fresh_scope(db: aiosqlite.Connection, scope: _Scope) -> _Scope | None
     return fresh if fresh.key() == scope.key() else None
 
 
+#: Доля бюджета половины запросов, которую может съесть просмотр кандидатов: остальное
+#: гарантировано чтению голов и самим запросам, иначе медленный SQL просмотра
+#: оставлял бы проход без работы (и повторял бы тот же префикс каждый тик).
+SCAN_SHARE = 0.4
 #: Сколько кандидатов просматривается за проход на одну задачу цикла: задачи вне
 #: области тоже стоят SQL, поэтому просмотр ограничен, а курсор идёт по ним.
 SCAN_PER_TASK = 4
@@ -345,11 +349,18 @@ async def _settle_noting(
     text: str,
     *,
     note: str = "",
+    attempts: int | None = None,
 ) -> None:
     """Состояние журнала и запись в ленту - ОДНА транзакция: без записи без состояния."""
     async with write_transaction(db):
         if await journal.settle(
-            db, task_id, sha, state, note=note, only_from=journal.OPEN_STATES
+            db,
+            task_id,
+            sha,
+            state,
+            note=note,
+            only_from=journal.OPEN_STATES,
+            attempts=attempts,
         ):
             await repo.add_task_update(db, task_id, "hub", "status", text)
 
@@ -457,6 +468,8 @@ async def _request(
             f"Хаб: запрос CI для ветки {scope.branch} (голова {sha[:12]}) не "
             f"принят: {why}. Запустите CI сами.",
             note=why,
+            # форж отказал, не дойдя до POST: попытка не потрачена и в итоге
+            attempts=None if scope.sent else int(before[1]),
         )
     return accepted
 
@@ -551,7 +564,7 @@ async def request_for_new_heads(
     global _cursor
     if time.monotonic() < _down_until:
         return {}
-    scopes, scanned_to = await _scopes(db, dl)
+    scopes, scanned_to = await _scopes(db, _Deadline(max(dl.left(), 0.0) * SCAN_SHARE))
     if not scopes:
         _cursor = scanned_to  # просмотренное вне области не просматривается снова
         return {}
@@ -716,6 +729,10 @@ async def _announce_pages(
     return progress
 
 
+#: Доля остатка бюджета, которую может взять голова очереди объявлений.
+HEAD_SHARE = 0.5
+
+
 class _ProgressOutOfTime(_OutOfTime):
     """Время вышло посреди очереди; ``progress`` - последняя обработанная строка."""
 
@@ -745,14 +762,17 @@ async def announce_results(
     top = await journal.top_attempt_id(db)
     seen_top = await journal.get_state(db, journal.ANNOUNCE_TOP)
     if top > seen_top:
+        # Голова берёт не больше половины остатка: хвосту всегда остаётся время.
+        head_dl = _Deadline(max(dl.left(), 0.0) * HEAD_SHARE)
         try:
             await _announce_pages(
-                db, 1, before=None, after=seen_top, heads=heads, dl=dl, fps=fps
+                db, 1, before=None, after=seen_top, heads=heads, dl=head_dl, fps=fps
             )
         except _ProgressOutOfTime:
-            return  # голова не дочитана: ANNOUNCE_TOP не сдвигается, повтор
-        # Что в голову не поместилось, дочитает хвост: он идёт по всей очереди.
-        await journal.set_state(db, journal.ANNOUNCE_TOP, top)
+            pass  # голова не дочитана: ANNOUNCE_TOP не сдвигается, повтор в след. проход
+        else:
+            # Что в голову не поместилось, дочитает хвост: он идёт по всей очереди.
+            await journal.set_state(db, journal.ANNOUNCE_TOP, top)
     cursor = await journal.get_state(db, journal.ANNOUNCE_CURSOR)
     progress: int | None = cursor
     try:
