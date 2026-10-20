@@ -32,7 +32,7 @@ from hub.models import (
     claims_text_origin,
 )
 from hub.services import ci_integrity, watch_notices
-from hub.services.review_oversized import unread_for_task
+from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -504,6 +504,7 @@ async def record_machine_review(
         raise HTTPException(404, "machine review not found")
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
+    await attach_ac_tests_unread(db, view)
 
     await _run_report_automation(db, task_id, task)
 

@@ -123,34 +123,62 @@ def _binds(node: ast.AST, name: str) -> bool:
     return isinstance(node, getattr(ast, "MatchMapping", ())) and node.rest == name  # type: ignore[attr-defined]
 
 
+def _header(node: ast.AST) -> list[ast.AST]:
+    """Выражения def/class/lambda, исполняемые во ВНЕШней области (декораторы, значения
+    по умолчанию, аннотации, основания класса): walrus в них связывает имя снаружи."""
+    if isinstance(node, _DEFS):
+        return [
+            *node.decorator_list,
+            node.args,
+            *([node.returns] if node.returns else []),
+        ]
+    if isinstance(node, ast.ClassDef):
+        return [*node.decorator_list, *node.bases, *node.keywords]
+    if isinstance(node, ast.Lambda):
+        return [node.args]
+    return []
+
+
+_COMP = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
 def _scan_scope(body: Sequence[ast.stmt], name: str) -> tuple[list[ast.stmt], int]:
     """``(прямые def/class с этим именем, число прочих связываний)`` в теле области.
 
     Обход итеративный (стек, не рекурсия: глубокая цепочка ``elif`` ломала
-    рекурсивный) и с пределом узлов. Вложенные функции и классы не открываются:
-    их имена - другая область; но ``def``/``class`` внутри ``if``/``match``/``try``
-    этой области - связывание этой области.
+    рекурсивный) и с пределом узлов. Тела вложенных функций, классов и лямбд не
+    открываются (другая область), а их заголовки - открываются; ``def``/``class``
+    внутри ``if``/``match``/``try`` этой области - связывание этой области. Цель
+    comprehension локальна для него, а walrus в нём связывает имя снаружи.
     """
     direct: list[ast.stmt] = []
     others, seen = 0, 0
-    stack: list[ast.AST] = []
+    stack: list[tuple[ast.AST, bool]] = []
     for stmt in body:
         if isinstance(stmt, _SCOPES):
             direct += [stmt] if stmt.name == name else []
+            stack.extend((h, False) for h in _header(stmt))
         else:
-            stack.append(stmt)
+            stack.append((stmt, False))
     while stack:
-        node = stack.pop()
+        node, comp = stack.pop()
         seen += 1
         if seen > MAX_NODES:
             raise Unknown("файл слишком велик для разбора")
-        if isinstance(node, _SCOPES):
-            others += node.name == name
+        if isinstance(node, (*_SCOPES, ast.Lambda)):
+            others += isinstance(node, _SCOPES) and node.name == name
+            stack.extend((h, comp) for h in _header(node))
             continue
-        if isinstance(node, ast.Lambda):
-            continue
-        others += _binds(node, name)
-        stack.extend(ast.iter_child_nodes(node))
+        if comp:
+            others += (
+                isinstance(node, ast.NamedExpr)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == name
+            )
+        else:
+            others += _binds(node, name)
+        inner = comp or isinstance(node, _COMP)
+        stack.extend((c, inner) for c in ast.iter_child_nodes(node))
     return direct, others
 
 
@@ -379,3 +407,77 @@ async def unread_for_task(
 async def attach_ac_tests_unread(db: Any, view: Any) -> None:
     """Заполнить ``view.ac_tests_unread`` из ``lost_dimensions`` и AC задачи."""
     view.ac_tests_unread = await unread_for_task(db, view.task_id, view.lost_dimensions)
+
+
+def fit_with_ac_cutouts(
+    sections: list[tuple[str, str]],
+    ceiling: int,
+    spans: list[AcTestSpan],
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Файлы под потолок; представление файлов с тестами AC выбирается СОВМЕСТНО (#1933).
+
+    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Файл с тестом AC
+    представлен полным диффом (плюс вырезки того, что вне ханков) или одними
+    вырезками. Шаг 1: каждому такому файлу бронируется дешёвое из двух по
+    РЕАЛЬНОЙ стоимости (вырезки с номерами строк бывают дороже полного диффа);
+    не влезло ни одно - тесты файла названы непрочитанными. Шаг 2: по порядку
+    диффа файлы берут остаток, а AC-файл на вырезках улучшается до полного
+    диффа, если доплата влезает.
+    """
+
+    def norm(t: str) -> str:
+        return t if t.endswith("\n") else t + "\n"
+
+    found = [sp for sp in spans if sp.found]
+    by_path: dict[str, list[AcTestSpan]] = {}
+    for sp in found:
+        by_path.setdefault(sp.path, []).append(sp)
+    texts: dict[str, str] = {}
+    for p, t in sections:
+        if p:
+            texts[p] = texts.get(p, "") + norm(t)
+    cut_cost = {p: sum(len(cutout(x)) for x in sps) for p, sps in by_path.items()}
+    unc_cost = {
+        p: sum(len(cutout(x)) for x in sps if not shown_in(texts.get(p), x))
+        for p, sps in by_path.items()
+    }
+    full_cost = {p: len(texts[p]) + unc_cost[p] for p in by_path if p in texts}
+    budget, mode = ceiling, {}
+    for p in by_path:
+        options = [(cut_cost[p], 1, "cut")]
+        if p in full_cost:
+            options.append((full_cost[p], 0, "full"))
+        cost, _, pick = min(options)
+        mode[p] = pick if cost <= budget else ""
+        budget -= cost if mode[p] else 0
+    text, omitted, done = [], [], set()
+    for path, raw in sections:
+        body = norm(raw)
+        name = path or "(часть диффа без имени файла)"
+        if path in by_path:
+            if path in done:  # второй раздел того же пути (symlink -> файл): уже учтён
+                continue
+            done.add(path)
+            extra = len(texts[path]) + unc_cost[path] - cut_cost[path]
+            if mode[path] == "cut" and extra <= budget:
+                budget -= extra
+                mode[path] = "full"
+            if mode[path] == "full":
+                text.append(texts[path])
+            else:
+                omitted.append(name)
+        elif len(body) <= budget:
+            budget -= len(body)
+            text.append(body)
+        else:
+            omitted.append(name)
+    need = [
+        x
+        for p, sps in by_path.items()
+        if mode[p]
+        for x in sps
+        if mode[p] == "cut" or not shown_in(texts.get(p), x)
+    ]
+    cuts = [cutout(x) for x in need]
+    unread = [x.ref for p, sps in by_path.items() if not mode[p] for x in sps]
+    return "".join(text), omitted, cuts, unread

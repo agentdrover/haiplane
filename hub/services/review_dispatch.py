@@ -64,8 +64,7 @@ from hub.services.review_oversized import (
     AcTestSpan,
     ac_test_refs as task_ac_test_refs,
     ac_test_spans,
-    cutout,
-    shown_in,
+    fit_with_ac_cutouts,
     first_block,
     oversized_paragraph,
 )
@@ -378,76 +377,6 @@ def fit_file_sections(
     return "".join(kept), omitted
 
 
-def _fit_with_ac_cutouts(
-    sections: list[tuple[str, str]],
-    ceiling: int,
-    spans: list[AcTestSpan],
-) -> tuple[str, list[str], list[str], list[str]]:
-    """Файлы под потолок; представление файлов с тестами AC выбирается СОВМЕСТНО (#1933).
-
-    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Файл с тестом AC
-    представлен полным диффом (плюс вырезки того, что вне ханков) или одними
-    вырезками. Шаг 1: каждому такому файлу бронируется дешёвое из двух по
-    РЕАЛЬНОЙ стоимости (вырезки с номерами строк бывают дороже полного диффа);
-    не влезло ни одно - тесты файла названы непрочитанными. Шаг 2: по порядку
-    диффа файлы берут остаток, а AC-файл на вырезках улучшается до полного
-    диффа, если доплата влезает.
-    """
-
-    def norm(t: str) -> str:
-        return t if t.endswith("\n") else t + "\n"
-
-    found = [sp for sp in spans if sp.found]
-    by_path: dict[str, list[AcTestSpan]] = {}
-    for sp in found:
-        by_path.setdefault(sp.path, []).append(sp)
-    texts = {p: t for p, t in sections if p}
-    cut_cost = {p: sum(len(cutout(x)) for x in sps) for p, sps in by_path.items()}
-    unc_cost = {
-        p: sum(len(cutout(x)) for x in sps if not shown_in(texts.get(p), x))
-        for p, sps in by_path.items()
-    }
-    full_cost = {p: len(norm(texts[p])) + unc_cost[p] for p in by_path if p in texts}
-    budget, mode = ceiling, {}
-    for p in by_path:
-        options = [(cut_cost[p], 1, "cut")]
-        if p in full_cost:
-            options.append((full_cost[p], 0, "full"))
-        cost, _, pick = min(options)
-        mode[p] = pick if cost <= budget else ""
-        budget -= cost if mode[p] else 0
-    text, omitted = [], []
-    for path, raw in sections:
-        body = norm(raw)
-        name = path or "(часть диффа без имени файла)"
-        if path in by_path:
-            if (
-                mode[path] == "cut"
-                and len(body) + unc_cost[path] - cut_cost[path] <= budget
-            ):
-                budget -= len(body) + unc_cost[path] - cut_cost[path]
-                mode[path] = "full"
-            if mode[path] == "full":
-                text.append(body)
-            else:
-                omitted.append(name)
-        elif len(body) <= budget:
-            budget -= len(body)
-            text.append(body)
-        else:
-            omitted.append(name)
-    need = [
-        x
-        for p, sps in by_path.items()
-        if mode[p]
-        for x in sps
-        if mode[p] == "cut" or not shown_in(texts.get(p), x)
-    ]
-    cuts = [cutout(x) for x in need]
-    unread = [x.ref for p, sps in by_path.items() if not mode[p] for x in sps]
-    return "".join(text), omitted, cuts, unread
-
-
 def _inline_diff_lines(
     diff: str,
     dropped: list[str],
@@ -471,9 +400,7 @@ def _inline_diff_lines(
         if not path
         or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
-    text, omitted, cuts, unread = _fit_with_ac_cutouts(
-        sections, ceiling, ac_spans or []
-    )
+    text, omitted, cuts, unread = fit_with_ac_cutouts(sections, ceiling, ac_spans or [])
     lines = []
     if omitted:
         lines.append(
@@ -934,12 +861,17 @@ def diff_plan(
             "дифф не прочитан, в промт не приложен",
         )
     if diff is None:
-        return (
+        # Дифф ветки не прочитан, а закреплённый sha мог прочитаться (или не
+        # прочитаться): блок тестов AC (#1933) от диффа ветки не зависит.
+        lines = [
             f"ПРЕДМЕТ РЕВЬЮ: дифф {base}...{branch}. Прочитать его хабу не "
             "удалось, поэтому список исключений не составлен — читай дифф "
-            "целиком и сам реши, что в нём сгенерировано.",
-            "дифф не прочитан, исключения не составлены",
+            "целиком и сам реши, что в нём сгенерировано."
+        ]
+        _plan_oversized(
+            "", lines, ac_test_refs, pinned_diff, ac_sources, ac_block, pin_sha
         )
+        return "\n".join(lines), "дифф не прочитан, исключения не составлены"
     kept, dropped = split_generated(diff)
     excludes = "".join(f" ':(exclude){path}'" for path in dropped)
     scope = "".join(f" '{path}'" for path in (delta_paths or []))
