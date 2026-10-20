@@ -153,6 +153,26 @@ async def test_a_broken_report_section_is_unreadable_not_empty(
     assert await _action(db, task_id) != ACCEPT
 
 
+async def _approved(db, task_id: int, *generations: int) -> None:
+    """Одобрение поколений, из которых переносится отчёт (#1912): без него перенос не доказательство."""
+    for generation in generations:
+        await db.execute(
+            "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+            "('review_verdict_recorded', ?, 'denis', ?)",
+            (
+                task_id,
+                json.dumps(
+                    {
+                        "verdict": "approved",
+                        "submission_generation": generation,
+                        "open_in_scope_findings": 0,
+                    }
+                ),
+            ),
+        )
+    await db.commit()
+
+
 async def _carry(db, task_id: int, source_id: int, **over) -> int:
     """Перенос #1361: копия в текущем поколении без токенов, с пометкой источника."""
     task = dict(await repo.get_task(db, task_id) or {})
@@ -192,6 +212,7 @@ async def test_a_carried_report_is_judged_through_its_source(
 ):
     task_id, ids = await _task(client, db, monkeypatch, "ap-carry", 1)
     await _carry(db, task_id, ids[0])
+    await _approved(db, task_id, 0)
     # Копия без токенов, исходный отчёт с provider_tokens>0: перенос годен.
     assert await _action(db, task_id) == ACCEPT
 
@@ -215,14 +236,15 @@ async def test_a_carried_report_without_its_source_is_unreadable(
     assert await _action(db, task_id) != ACCEPT
 
 
-def test_the_brief_has_no_accept_emitter_at_all():
-    """Решение владельца (#1810, 20.10): справка «Принять» не выдаёт — эмиттеров нет."""
+def test_the_brief_has_exactly_one_accept_emitter():
+    """«Принять» выдаётся в одном месте — из ветки доказательства (#1912)."""
     import inspect
     import re
 
-    source = re.sub(r"\s+", " ", inspect.getsource(decision_brief))
-    assert "ACCEPT" not in source
-    assert "VERDICT_APPROVED" not in source
+    source = inspect.getsource(decision_brief)
+    emitters = re.findall(r"_recommend\(\s*ACCEPT\b", source)
+    assert len(emitters) == 1
+    assert "proof is not None" in inspect.getsource(decision_brief._from_rules)
 
 
 async def test_a_carried_report_needs_every_report_of_the_source_generation(
@@ -319,6 +341,7 @@ async def test_a_double_carry_unfolds_every_generation(
     await _copy(db, task_id, 3, a)
     await db.execute("UPDATE tasks SET submission_generation=3 WHERE id=?", (task_id,))
     await db.commit()
+    await _approved(db, task_id, 1, 2)
     assert (await _action(db, task_id) == ACCEPT) is middle_is_clean
 
 

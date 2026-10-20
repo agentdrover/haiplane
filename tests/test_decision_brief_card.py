@@ -18,12 +18,11 @@ async def test_the_card_page_shows_the_brief_block(
     task = dict(await repo.get_task(db, task_id) or {})
     brief = await decision_brief.build(db, task)
     assert brief["accept_proven"]
-    assert brief["recommend"]["action"] == "Проверить"
+    assert brief["recommend"]["action"] == "Принять"
 
     page = (await client.get(f"/tasks/{task_id}")).text
     assert 'id="decision-brief"' in page
-    assert 'data-decision-action="Проверить"' in page
-    assert "отдельная задача" in page
+    assert 'data-decision-action="Принять"' in page
     for why in brief["recommend"]["why"]:
         assert html.escape(why) in page, why
     for check in brief["checks"]:
