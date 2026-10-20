@@ -168,7 +168,7 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
     if not reports or not dict(reports[-1]).get("incomplete"):
         return ""
     acts = await _ladder_acts(db, task_id, generation)
-    if await _preparing(db, task_id, generation, acts, int(dict(reports[-1])["id"])):
+    if await _preparing(db, task_id, generation, acts):
         return "добор готовится: поступок лестницы записан, заказ ещё не поставлен"
     view = await inflight_view(db, task, include_owed=True)
     if view is None:
@@ -183,37 +183,48 @@ async def _preparing(
     task_id: int,
     generation: int,
     acts: list[dict[str, Any]],
-    latest_report_id: int,
 ) -> bool:
-    """Поступок на ТЕКУЩИЙ отчёт записан, а диспетчер ещё не вернул ответ.
+    """Последний поступок лестницы записан, а диспетчер ещё не вернул ответ.
 
     Диспетчер готовит заказ сетевыми вызовами и коммитит долг второй двери до
     возврата, а предыдущий заказ уже закрыт: без этого окна читатель
     объявлял бы отчёт готовым, и судья тратил бы суждение на неполные данные.
-    Закрывает поступок запись «поставлен/отказан» или событие попытки оси.
+
+    Начало и закрытие — события одной таблицы, и закрытие принадлежит началу
+    по порядку записи: закрывает то событие (запись «поставлен/отказан» или
+    событие попытки оси) с тем же ``after_review_id``, у которого id БОЛЬШЕ
+    id начала. Закрытие прошлой попытки по тому же отчёту следующую не
+    закрывает, а пришедший чужой отчёт подготовку не отменяет. Решает только
+    последнее начало: ушедшая вперёд лестница не держится за давний сбой.
     """
-    closed = {
-        int(a["data"].get("after_review_id") or 0)
+    starts = [
+        a
+        for a in acts
+        if a["data"] is not None and a["kind"] == dispatcher.LADDER_TOP_UP_EVENT
+    ]
+    if not starts:
+        return False
+    start = starts[-1]
+    after = int(start["data"].get("after_review_id") or 0)
+    closers = [
+        (int(a["id"]), a["data"])
         for a in acts
         if a["data"] is not None and a["kind"] == dispatcher.MODEL_CASCADE_EVENT
-    }
+    ]
     rows = await fetchall(
         db,
-        "SELECT payload FROM events WHERE task_id=? AND kind=? "
+        "SELECT id, payload FROM events WHERE task_id=? AND kind=? "
         "AND json_extract(payload, '$.generation')=?",
         (task_id, dispatcher.LADDER_TOP_UP_PLACED_EVENT, generation),
     )
     for row in rows:
         try:
-            closed.add(int(json.loads(row["payload"] or "{}")["after_review_id"]))
-        except (ValueError, KeyError, TypeError):
+            closers.append((int(row["id"]), json.loads(row["payload"] or "{}")))
+        except ValueError:
             continue  # нечитаемое закрытие не закрывает: ждём, срок остановит
-    return any(
-        a["data"] is not None
-        and a["kind"] == dispatcher.LADDER_TOP_UP_EVENT
-        and int(a["data"].get("after_review_id") or 0) == latest_report_id
-        and latest_report_id not in closed
-        for a in acts
+    return not any(
+        closer_id > int(start["id"]) and int(data.get("after_review_id") or 0) == after
+        for closer_id, data in closers
     )
 
 

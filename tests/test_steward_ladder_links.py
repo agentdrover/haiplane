@@ -609,3 +609,58 @@ async def test_the_order_being_prepared_is_not_a_finished_review(
     assert seen[1] == "0", "судья в окне подготовки не заказан"
     assert await top_up_in_flight(db, task) == "", "закрытие «отказан» снимает ожидание"
     assert await order_due_runs(db) == 1
+
+
+async def test_a_second_start_on_the_same_report_is_not_closed_by_the_first_close(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 6, П1: закрытие прошлой попытки по тому же отчёту следующую не закрывает."""
+    _, task_id = await _lite_incomplete(db, "round6-second-start")
+    task = await _task_dict(db, task_id)
+
+    async def _refuse(_db, _task_id, **_kwargs):
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refuse)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert await top_up_in_flight(db, task) == ""
+    seen: list[str] = []
+
+    async def _slow(_db, _task_id, **_kwargs):
+        seen.append(await top_up_in_flight(db, task))
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _slow)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert seen[0], "вторая попытка по тому же отчёту готовится"
+    assert await top_up_in_flight(db, task) == ""
+
+
+async def test_a_foreign_report_does_not_cancel_the_preparation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Круг 6, П2: пока готовится заказ после R1, пришёл чужой неполный R2."""
+    _, task_id = await _lite_incomplete(db, "round6-foreign-during-prep")
+    task = await _task_dict(db, task_id)
+    seen: list[str] = []
+
+    async def _slow(_db, _task_id, **_kwargs):
+        await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            model="other",
+            raw_count=1,
+            incomplete=True,
+            incomplete_reason="profile",
+            profile="lite",
+            principal_id=PRINCIPAL + 1,
+        )
+        await db.commit()
+        seen.append(await top_up_in_flight(db, task))
+        seen.append(str(await order_due_runs(db)))
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _slow)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    assert seen[0] and seen[1] == "0"
