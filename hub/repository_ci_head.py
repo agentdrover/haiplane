@@ -299,6 +299,7 @@ async def overdue_waits(
     minutes: int,
     limit: int = 20,
     only: tuple[int, str] | None = None,
+    after_task_id: int = 0,
 ) -> list[dict[str, Any]]:
     """Головы, чьего итога ждут дольше срока и о ком ещё не сказано вслух.
 
@@ -308,6 +309,10 @@ async def overdue_waits(
     попытка в ``ci_head_announced``) или это ожидание уже названо
     (``timeout:<число заявок>``) - строки нет. ``only`` - (задача, sha): то же
     условие для ОДНОЙ строки, чтобы перепроверить его внутри транзакции записи.
+
+    Область задачи (ветка головы, нет сдачи и PR) проверяется В SQL: задачи вне
+    неё не занимают окно ``limit``. ``after_task_id`` - круговой курсор вызывающего
+    для фильтров, что остаются в Python (политика, голова).
     """
     pin_task, pin_sha = only if only else (None, None)
     rows = await fetchall(
@@ -319,6 +324,9 @@ async def overdue_waits(
         "WHERE j.state IN ('reserved', 'requested', 'observed', 'exhausted') "
         "AND t.status='running' "
         "AND t.archived=0 AND (? IS NULL OR (j.task_id=? AND j.sha=?)) "
+        "AND t.branch=j.branch AND t.submission_generation=0 "
+        "AND COALESCE(t.submission_sha, '')='' "
+        "AND (t.pr_number IS NULL OR t.pr_number=0) AND j.task_id > ? "
         "AND COALESCE(j.reserved_at, j.first_seen_at) <= datetime('now', ?) "
         "AND j.seen_seq = (SELECT MAX(x.seen_seq) FROM ci_head_runs x "
         "WHERE x.task_id=j.task_id) "
@@ -327,7 +335,14 @@ async def overdue_waits(
         "(n.attempt_key NOT LIKE 'timeout:%' "
         "OR n.attempt_key = 'timeout:' || j.attempts)) "
         "ORDER BY j.task_id LIMIT ?",
-        (pin_task, pin_task, pin_sha, f"-{int(minutes)} minutes", limit),
+        (
+            pin_task,
+            pin_task,
+            pin_sha,
+            int(after_task_id),
+            f"-{int(minutes)} minutes",
+            limit,
+        ),
     )
     return [dict(r) for r in rows]
 

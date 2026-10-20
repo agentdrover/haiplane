@@ -2499,3 +2499,63 @@ async def test_overdue_and_pruning_wait_for_the_budget_of_the_pass(
     assert await _notes(db, task_id, "CI не пришёл") == []
     await ci_head_run.announce_overdue(db, ci_head_run._Deadline(30.0))
     assert len(await _notes(db, task_id, "CI не пришёл")) == 1
+
+
+@pytest.mark.parametrize("kind", ["submitted", "policy_off"])
+async def test_unfit_overdue_rows_do_not_hide_the_legit_one(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch, kind: str
+):
+    """Вердикт 1, P2: 20 непригодных ожиданий + 1 законное - alert приходит.
+
+    ``submitted`` отсекает SQL; ``policy_off`` - Python, там нужен круговой курсор.
+    """
+    tasks = []
+    for i in range(21):
+        tasks.append(
+            await _requested_overdue(
+                db, cloud, monkeypatch, f"{kind}{i}", f"t37/{kind}{i}"
+            )
+        )
+    for task_id in tasks[:20]:
+        if kind == "submitted":
+            await db.execute(
+                "UPDATE tasks SET submission_generation=1, submission_sha='x' "
+                "WHERE id=?",
+                (task_id,),
+            )
+        else:
+            project = await repo.resolve_project_for_task(db, task_id)
+            await repo.update_project(
+                db,
+                project["id"],
+                gate_policy=json.dumps(
+                    {"ci_contract": SAT_CONTRACT, "ci_before_submit": "off"}
+                ),
+            )
+    await db.commit()
+    for _ in range(4):  # без reset_state: круговой курсор живёт между проходами
+        await _cycle(db)
+        if await _notes(db, tasks[20], "CI не пришёл"):
+            break
+    assert len(await _notes(db, tasks[20], "CI не пришёл")) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "submission_generation=1, submission_sha='x'",
+        "branch='task-38/other'",
+        "pr_number=7",
+    ],
+)
+async def test_overdue_window_is_filtered_by_task_scope_in_sql(
+    db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch, change: str
+):
+    """Вердикт 1, P2: условия области задачи стоят в SQL просрочек, а не в Python."""
+    from hub import repository_ci_head as journal
+
+    task_id = await _requested_overdue(db, cloud, monkeypatch, "sqlscope", "task-38/s")
+    assert len(await journal.overdue_waits(db, 0)) == 1
+    await db.execute(f"UPDATE tasks SET {change} WHERE id=?", (task_id,))  # noqa: S608
+    await db.commit()
+    assert await journal.overdue_waits(db, 0) == []

@@ -97,7 +97,8 @@ class _Deadline:
 
 def reset_state() -> None:
     """Забыть всё, что держится в памяти процесса (рестарт; тесты)."""
-    global _down_until, _cursor, _last_prune
+    global _down_until, _cursor, _last_prune, _overdue_cursor
+    _overdue_cursor = 0
     _down_until = 0.0
     _last_prune = 0.0
     _heads_down.clear()
@@ -845,7 +846,14 @@ async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
     """
     if dl.left() <= 0:
         return  # бюджет прохода вышел: просрочка подождёт следующего тика
-    rows = await journal.overdue_waits(db, int(config.CI_HEAD_RUN_WAIT_MINUTES))
+    global _overdue_cursor
+    minutes = int(config.CI_HEAD_RUN_WAIT_MINUTES)
+    rows = await journal.overdue_waits(db, minutes, after_task_id=_overdue_cursor)
+    if not rows and _overdue_cursor:
+        rows = await journal.overdue_waits(db, minutes)  # круг замкнулся
+    # Окно полное - дальше за последней строкой; нет - следующий круг с начала.
+    full = len(rows) >= OVERDUE_WINDOW
+    _overdue_cursor = int(rows[-1]["task_id"]) if full else 0
     scopes = await _overdue_scopes(db, rows)
     if not scopes:
         return
@@ -885,6 +893,10 @@ async def announce_overdue(db: aiosqlite.Connection, dl: _Deadline) -> None:
             log.exception("CI head run: overdue note for #%s failed", task_id)
 
 
+#: Окно просрочек за проход и круговой курсор по task_id (фильтры в Python -
+#: политика и голова - не должны запирать окно одними и теми же задачами).
+OVERDUE_WINDOW = 20
+_overdue_cursor = 0
 _last_prune = 0.0
 PRUNE_EVERY_SECONDS = 3600.0
 JOURNAL_RETENTION_DAYS = 14
