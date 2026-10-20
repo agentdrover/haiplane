@@ -544,3 +544,30 @@ async def test_the_snapshot_statement_is_the_consistency_boundary(db, monkeypatc
     assert evidence.mutations.state == evidence.baseline.state == "received"
     assert "из попытки 1001/1" in evidence.mutations.reason
     assert "из попытки 1001/1" in evidence.baseline.reason
+
+
+async def test_a_contract_changed_between_its_capture_and_the_snapshot_borrows_nothing(
+    db, monkeypatch
+):
+    """The contract lives in another table: it is read on both sides of the snapshot."""
+    from hub.services import ci_contract
+    from hub.services import ci_trust as trust_module
+
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+    moved = {"after_snapshot_read": False}
+    real_fetch = trust_module.fetchall
+    real_fp = ci_contract.fingerprint_for_task
+
+    async def snapshot_marks_the_move(db_, sql, parameters=()):
+        if "ci_run_reports" in sql and "ci_report_attempts" in sql:
+            moved["after_snapshot_read"] = True  # a human PATCH lands here
+        return await real_fetch(db_, sql, parameters)
+
+    async def contract(db_, task_id_):
+        fingerprint = await real_fp(db_, task_id_)
+        return "another-contract" if moved["after_snapshot_read"] else fingerprint
+
+    monkeypatch.setattr(trust_module, "fetchall", snapshot_marks_the_move)
+    monkeypatch.setattr(ci_contract, "fingerprint_for_task", contract)
+    await _check(db, task_id, set())

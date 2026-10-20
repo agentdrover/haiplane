@@ -525,7 +525,8 @@ async def borrowed_evidence_blocks(
     ``current`` is the confirmed projection row the brief shows. Both blocks are
     decided from ONE snapshot (attempts and projection in one statement) that
     must agree with the row the brief shows: if the projection moved since, no
-    borrowing at all, i.e. the answer the brief gave before. The statement is
+    borrowing at all, i.e. the answer the brief gave before. The contract is
+    read on both sides of the statement and must be the same; that interval is
     the consistency boundary, nothing is awaited after it. A candidate must be
     verified under the current contract, ``run_conclusion=success``, carry
     ``head == head_sha`` and an informative state; of several the newest by
@@ -534,12 +535,15 @@ async def borrowed_evidence_blocks(
     """
     if not head_sha or not current:
         return {}
-    # The contract is captured BEFORE the snapshot, as a refresh does (#1848).
+    # The contract lives in another table, so it is read on both sides of the
+    # snapshot: equal means it did not change while the snapshot was taken.
     fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
     rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
-    # Nothing is awaited from here: the statement above is the consistency
+    if await ci_contract.fingerprint_for_task(db, task_id) != fingerprint:
+        return {}
+    # Nothing is awaited from here: the interval above is the consistency
     # boundary. The answer is the state at that moment; a write after it is a
-    # later moment, and the projection that moved since the brief read its own
+    # later moment, and a projection that moved since the brief read its own
     # copy (``current``) makes the keys differ and borrows nothing.
     return _picks(rows, head_sha, current, fingerprint)
 
