@@ -2692,6 +2692,8 @@ async def test_the_sweep_order_is_pinned(db):
         "running_dispatch",
         # #1687: the CI report's standing is refreshed before review settles.
         "ci_trust",
+        # #1913: наблюдения для путей показа (вершина, PR против базы, стыковка).
+        "gate_observations",
         # #1862: запрос CI на голове ветки и объявление итога — после доверия.
         "ci_head_run",
         "review",

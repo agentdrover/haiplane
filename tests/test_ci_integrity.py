@@ -343,6 +343,13 @@ async def _auto_task(client, db, monkeypatch, slug: str) -> int:
     return await _submitted_task(client, db, slug, {"verdict": "auto"})
 
 
+async def _seen_hash(db: aiosqlite.Connection, task_id: int) -> str:
+    """Хеш скана из блока брифа — то, что ревьюер возвращает в ответе (#1913)."""
+    block = await ci_integrity.brief_state(db, task_id)
+    assert block and block["scan_hash"], block
+    return str(block["scan_hash"])
+
+
 async def _status(client: AsyncClient, task_id: int) -> dict:
     return (await client.get(f"/api/tasks/{task_id}")).json()
 
@@ -353,11 +360,16 @@ async def test_an_explained_ci_change_goes_to_the_owner_with_a_note(
     """AC-2: signs + explained -> no automated verdict; card and brief carry a note <= 600."""
     ci_diff.value = _WORKFLOW_DIFF
     task_id = await _auto_task(client, db, monkeypatch, "ci-explained")
+    seen = await _seen_hash(db, task_id)  # #1913: хеш скана из брифа
     long_note = "Меняется шаг отчёта CI: токен теперь берётся из окружения. " * 20
     await _post_review(
         client,
         task_id,
-        ci_integrity={"verdict": "explained", "explanation_ru": long_note},
+        ci_integrity={
+            "verdict": "explained",
+            "explanation_ru": long_note,
+            "scan_hash": seen,
+        },
     )
 
     body = await _status(client, task_id)
@@ -397,11 +409,15 @@ async def test_the_steward_gate_and_route_name_the_ci_change(
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
     ci_diff.value = _WORKFLOW_DIFF
     task_id = await _submitted_task(client, db, "ci-steward", {"verdict": "steward"})
-    await ci_integrity.ensure_scan(db, task_id)
+    seen = await _seen_hash(db, task_id)
     await _post_review(
         client,
         task_id,
-        ci_integrity={"verdict": "explained", "explanation_ru": "ci.yml по задаче"},
+        ci_integrity={
+            "verdict": "explained",
+            "explanation_ru": "ci.yml по задаче",
+            "scan_hash": seen,
+        },
     )
     refusals = await steward_apply.apply_refusals(db, task_id)
     assert any("входы CI" in detail for _, detail in refusals), refusals
@@ -523,14 +539,19 @@ async def test_the_integrity_answer_arrives_by_every_path(
     from hub.services.review_dispatch import REPORT_FENCE, parse_report_block
 
     ci_diff.value = _WORKFLOW_DIFF
-    answer = {"verdict": "explained", "explanation_ru": "Меняется ci.yml по задаче."}
+    base_answer = {
+        "verdict": "explained",
+        "explanation_ru": "Меняется ci.yml по задаче.",
+    }
 
     # REST
     rest = await _auto_task(client, db, monkeypatch, "ci-path-rest")
+    answer = {**base_answer, "scan_hash": await _seen_hash(db, rest)}
     await _post_review(client, rest, ci_integrity=answer)
 
     # MCP: the tool posts to the same route
     mcp = await _auto_task(client, db, monkeypatch, "ci-path-mcp")
+    answer = {**base_answer, "scan_hash": await _seen_hash(db, mcp)}
 
     async def _post(path: str, body: dict) -> dict:
         resp = await client.post(path, json=body)
@@ -550,6 +571,7 @@ async def test_the_integrity_answer_arrives_by_every_path(
 
     # the text block of a run
     text = await _auto_task(client, db, monkeypatch, "ci-path-text")
+    answer = {**base_answer, "scan_hash": await _seen_hash(db, text)}
     payload = {**_CLEAN_REVIEW, "ci_integrity": answer}
     report = parse_report_block(f"done\n```{REPORT_FENCE}\n{json.dumps(payload)}\n```")
     assert report is not None
@@ -808,12 +830,14 @@ async def test_the_manual_gate_card_keeps_the_owners_note(
     """P2: verdict=human or a disabled autopilot still shows the stored note on the route line."""
     ci_diff.value = _WORKFLOW_DIFF
     task_id = await _submitted_task(client, db, "ci-manual", {"verdict": "human"})
+    seen = await _seen_hash(db, task_id)
     await _post_review(
         client,
         task_id,
         ci_integrity={
             "verdict": "explained",
             "explanation_ru": "Правка ci.yml по задаче.",
+            "scan_hash": seen,
         },
     )
     await ci_integrity.ensure_scan(db, task_id)
@@ -923,3 +947,94 @@ def test_pytest_config_is_a_sign_at_any_depth():
     nested = _diff("pkg/pyproject.toml", ["x = 1"])
     assert ("pkg/pyproject.toml", "pytest_config") in _rules(nested)
     assert _rules(_diff("pkg/setup.py", ["x = 1"])) == set()
+
+
+async def _answered(client, db, task_id: int, **answer) -> dict:
+    await _post_review(
+        client,
+        task_id,
+        ci_integrity={"verdict": "explained", "explanation_ru": "ок", **answer},
+    )
+    return dict(await repo.get_latest_machine_review(db, task_id))
+
+
+async def test_a_blind_answer_does_not_lift_the_refusal_on_later_signs(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """#1913: бриф без скана говорит «unscanned»; ответ вслепую не хранится.
+
+    Привязка положительная, со стороны отчёта: ответ несёт хеш скана, который
+    ревьюер видел. Скан появился после брифа — хеша у ревьюера нет.
+    """
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _auto_task(client, db, monkeypatch, "ci-blind")
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["ci_integrity"]["state"] == "unscanned"
+    assert brief["ci_integrity"]["scan_hash"] == ""
+    await ci_integrity.ensure_scan(db, task_id)  # проход поллера
+    row = await _answered(client, db, task_id, explanation_ru="вслепую: ок")
+    assert (row["ci_integrity_verdict"], row["ci_integrity_explanation"]) == ("", "")
+    task = dict(await repo.get_task(db, task_id))
+    standing = await ci_integrity.standing_of(db, task)
+    assert standing.answer == "" and standing.gap, "отказ автоматики остаётся"
+
+
+async def test_building_the_brief_does_not_open_the_answer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """Сборки брифа (стюард, REST любого читателя, карточка) ответ не открывают."""
+    from hub.services.review_brief import build_review_brief
+
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _auto_task(client, db, monkeypatch, "ci-builds")
+    await ci_integrity.ensure_scan(db, task_id)
+    await build_review_brief(db, task_id)
+    await build_review_brief(db, task_id, observe_only=True)
+    await client.get(f"/api/tasks/{task_id}/review-brief")
+    row = await _answered(client, db, task_id)  # без scan_hash
+    assert row["ci_integrity_verdict"] == ""
+
+
+async def test_an_answer_without_or_for_another_scan_hash_is_dropped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _auto_task(client, db, monkeypatch, "ci-otherhash")
+    seen = await _seen_hash(db, task_id)
+    row = await _answered(client, db, task_id, scan_hash="0" * 16)
+    assert row["ci_integrity_verdict"] == ""
+    # Хеш от другого коммита: тот же скан, другой sha — другой хеш.
+    other = ci_integrity.scan_hash_of(
+        "b" * 40,
+        ci_integrity.Scan(
+            ci_integrity.SIGNS,
+            tuple((await ci_integrity.ensure_scan(db, task_id)).signs),
+        ),
+    )
+    assert other and other != seen
+    row = await _answered(client, db, task_id, scan_hash=other)
+    assert row["ci_integrity_verdict"] == ""
+    row = await _answered(client, db, task_id, scan_hash=seen)
+    assert row["ci_integrity_verdict"] == "explained"
+
+
+async def test_the_answer_survives_a_restart_of_the_hub(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, ci_diff
+):
+    """Хеш считается из базы, не из памяти процесса: рестарт между брифом и отчётом безвреден."""
+    from hub.services import lifecycle
+
+    ci_diff.value = _WORKFLOW_DIFF
+    task_id = await _auto_task(client, db, monkeypatch, "ci-restart")
+    seen = await _seen_hash(db, task_id)
+    lifecycle.forget_observed_tips()  # то, что делает рестарт
+    row = await _answered(client, db, task_id, scan_hash=seen)
+    assert row["ci_integrity_verdict"] == "explained"
+
+
+def test_a_null_or_numeric_scan_hash_does_not_cost_the_report():
+    """Текстовый блок — единственный путь облачного ревьюера: сбой поля не теряет отчёт."""
+    for raw in (None, 12345, " ABC "):
+        answer = CIIntegrityAnswer(verdict="explained", scan_hash=raw)  # type: ignore[arg-type]
+        assert isinstance(answer.scan_hash, str)
+    assert CIIntegrityAnswer(scan_hash=None).scan_hash == ""  # type: ignore[arg-type]
