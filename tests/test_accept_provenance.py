@@ -249,6 +249,58 @@ async def s_copy_with_unreadable_section(w, _m):  # круг 6.3
     return await _dirty_copy(w, unresolved="не json")
 
 
+async def _returned(w, generation: int) -> None:
+    await w.db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+        "('review_verdict_recorded', ?, 'denis', ?)",
+        (
+            w.task_id,
+            json.dumps(
+                {"verdict": "changes_requested", "submission_generation": generation}
+            ),
+        ),
+    )
+    await w.db.commit()
+
+
+async def s_returned_root_generation_then_carry(w, _m):  # свежий взгляд
+    root = await w.report(1)
+    await _returned(w, 1)
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_steward_returned_root_generation_then_carry(w, _m):  # свежий взгляд
+    root = await w.report(1)
+    await repo.insert_steward_judgement(
+        w.db,
+        task_id=w.task_id,
+        generation=1,
+        kind="verdict",
+        submitted_verdict="changes_requested",
+        verdict="changes_requested",
+        confidence="high",
+    )
+    await w.db.commit()
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
+async def s_unreadable_verdict_history_behind_a_carry(w, _m):
+    root = await w.report(1)
+    await w.db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+        "('review_verdict_recorded', ?, 'denis', '[1]')",
+        (w.task_id,),
+    )
+    await w.db.commit()
+    await w.report(2, copy_of=root)
+    await w.now(2)
+    return []
+
+
 async def s_codex_20_10(
     w, _m
 ):  # круг 7: gen1 #1 unresolved + #2 чистый; gen2 #4; gen3 #3 = перенос #2
@@ -483,6 +535,21 @@ async def p_branch_of_copies_and_independent_report(w):
     await w.report(2)
     await w.report(3, copy_of=root)
     await w.now(3)
+
+
+async def p_old_approved_verdict_behind_a_carry(w):
+    root = await w.report(1)
+    await w.db.execute(
+        "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+        "('review_verdict_recorded', ?, 'denis', ?)",
+        (
+            w.task_id,
+            json.dumps({"verdict": "approved", "submission_generation": 1}),
+        ),
+    )
+    await w.db.commit()
+    await w.report(2, copy_of=root)
+    await w.now(2)
 
 
 async def p_copy_next_to_an_independent_report(w):

@@ -33,6 +33,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
 from hub.models import FindingOutcome, MachineReviewView
 from hub.services import (
     ci_contract,
@@ -132,7 +133,53 @@ async def _report_blockers(
     for code, (text, labels) in found.items():
         level = REWORK if code == report_fit.GAP_CONFIRMED else CHECK
         blockers.append(Blocker(level, "high", text, "отчёты: " + ", ".join(labels)))
+    blockers += await _returned_generations(db, task, min(n.generation for n in nodes))
     return blockers, [n.view for n in nodes]
+
+
+async def _returned_generations(
+    db: aiosqlite.Connection, task: dict[str, Any], first: int
+) -> list[Blocker]:
+    """Возврат «на доработку» на поколении, чей отчёт стоит за сдачей (перенос).
+
+    Перенос #1361 означает «правка та же»: если код поколения источника уже
+    вернули (человек или стюард), чистая копия его не оправдывает. Действующий
+    вердикт смотрит ``_verdict_blocker`` только для текущего поколения, поэтому
+    прошлые возвраты читаются из ленты вердиктов и суждений стюарда. Нечитаемая
+    запись — «не доказано».
+    """
+    current = int(task.get("submission_generation") or 0)
+    if first >= current:
+        return []
+    task_id = int(task["id"])
+    rows = await fetchall(
+        db,
+        "SELECT id, payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id",
+        (task_id,),
+    )
+    returned: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(dict(row).get("payload") or "{}")
+            generation = int(payload.get("submission_generation") or 0)
+        except (ValueError, TypeError, AttributeError):
+            return [_history_blocker("запись вердикта не читается")]
+        if first <= generation < current and payload.get("verdict") != "approved":
+            returned.add(generation)
+    for generation in range(first, current):
+        judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+        if judged is not None and str(judged["verdict"]) == "changes_requested":
+            returned.add(generation)
+    if not returned:
+        return []
+    names = ", ".join(str(g) for g in sorted(returned))
+    return [_history_blocker(f"на поколении {names} вынесено «на доработку»")]
+
+
+def _history_blocker(why: str) -> Blocker:
+    text = "Перенесённый отчёт стоит за кодом, который уже возвращали"
+    return Blocker(CHECK, "high", text, why, CODE_VERDICT)
 
 
 # ---- ветка, вердикт, проверки --------------------------------------------------
