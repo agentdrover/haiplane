@@ -18,6 +18,16 @@ docs/agent-context/file-size-budget.json, записи адресуются пу
   * файл из ledger выше собственного потолка (замер + headroom_pct);
   * запись ledger, чей файл удалён или не выше порога, — её надо снять.
 
+Ledger дерева tests только сокращается (#1932): порог tests равен
+REVIEW_FILE_LINE_CAP (сколько строк файла читает ревью), а файл тестов длиннее
+него ревью дочитать не может. Поэтому против БАЗЫ (состояние репозитория до
+изменения) для tests красными становятся ещё два случая: запись, которой нет в
+ledger базы (новый файл или файл, переросший порог), и запись с поднятыми
+measured/max. ``--update`` не поднимает записи tests. База берётся из окружения
+CI (PR — ветка PR, push — ``before``, иначе origin/develop; как у
+migration_steps_add_only), ``--base REF`` задаёт её явно, ``--no-base``
+отключает сравнение. Базу получить не удалось — код возврата 2, не «чисто».
+
 Потолок с запасом, а не точная заморозка — урок #829: две ветки, правящие один
 большой файл, не должны конфликтовать по ledger. Запас оплачивается
 видимостью, и CI она не красит (#1676):
@@ -31,10 +41,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import tomllib
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # соседний скрипт CI
+
+from migration_steps_add_only import (  # noqa: E402
+    DEFAULT_BASE,
+    CompareError,
+    _git,
+    _snapshot,
+    ci_base,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEDGER_REL = Path("docs") / "agent-context" / "file-size-budget.json"
@@ -43,6 +65,20 @@ NEAR_KEY = "near_pct"
 NEAR_SHOWN = 5
 UNCLAIMED = "unclaimed"
 _SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
+# Деревья, чей ledger только сокращается (#1932): порог tests равен тому, сколько
+# строк файла читает ревью; hub и scripts этого правила не получают.
+RATCHET_TREES = frozenset({"tests"})
+BASE_UNREADABLE = 2
+ADDED_SHOWN = 5
+# Всё, что может выбросить разбор ledger/pyproject базы: в любом случае rc 2.
+_BASE_ERRORS = (
+    CompareError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    OverflowError,
+)
 
 
 def _file_size_section(root: Path) -> dict:
@@ -108,10 +144,12 @@ class Report:
     by_reason: dict[str, int]
     grown: tuple[tuple[str, int, int, int], ...] = ()  # путь, строк, замер, потолок
     near: tuple[tuple[str, int, int], ...] = ()  # путь, строк, порог
+    regress: tuple[tuple[str, str], ...] = ()  # путь, причина: ledger tests вырос
+    base_lines: dict[str, int | None] = field(default_factory=dict)  # new -> на базе
 
     @property
     def ok(self) -> bool:
-        return not (self.new or self.over or self.stale)
+        return not (self.new or self.over or self.stale or self.regress)
 
     @property
     def near_ranked(self) -> tuple[tuple[str, int, int], ...]:
@@ -121,7 +159,16 @@ class Report:
     def as_dict(self) -> dict[str, object]:
         return {
             "ok": self.ok,
-            "new": [{"path": p, "lines": n, "threshold": t} for p, n, t in self.new],
+            "new": [
+                {
+                    "path": p,
+                    "lines": n,
+                    "threshold": t,
+                    "lines_on_base": self.base_lines.get(p),
+                }
+                for p, n, t in self.new
+            ],
+            "regress": [{"path": p, "reason": r} for p, r in self.regress],
             "over": [{"path": p, "lines": n, "max": m} for p, n, m in self.over],
             "stale": [{"path": p, "reason": r} for p, r in self.stale],
             "waived_count": len(self.waived),
@@ -142,8 +189,84 @@ class Report:
         }
 
 
+def _tree(path: str) -> str:
+    return path.split("/", 1)[0]
+
+
 def _threshold(path: str, thresholds: dict[str, int]) -> int:
-    return thresholds[path.split("/", 1)[0]]
+    return thresholds[_tree(path)]
+
+
+@dataclass(frozen=True)
+class BaseView:
+    """Что было на базе: её ledger и размер файла на ней (None — файла не было)."""
+
+    ledger: dict[str, dict]
+    lines: Callable[[str], int | None]
+    headroom_pct: float = DEFAULT_HEADROOM_PCT
+    thresholds: dict[str, int] = field(default_factory=dict)  # пороги на базе
+
+    def ratchet_in_force(self, tree: str, current: int) -> bool:
+        """Порог дерева на базе не выше нынешнего: правило «только сокращается» уже
+        действовало. База с более высоким порогом (до #1932 у tests 3000) его не знала:
+        там ledger ещё не нёс записей tests, и вносить их можно по нынешним замерам."""
+        return self.thresholds[tree] <= current
+
+
+def _unknown_base_reason(on_base: int | None) -> str:
+    if on_base is None:
+        return "новая запись: файла не было на базе (новый файл или переименование)"
+    return f"новая запись: на базе файл {on_base} строк, он перерос порог"
+
+
+def _base_number(entry: dict, key: str) -> int:
+    try:
+        return int(entry[key])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise CompareError(f"запись ledger базы {entry!r}: нет числа {key}") from exc
+
+
+def _ratchet_problems(
+    ledger: dict[str, dict], thresholds: dict[str, int], base: BaseView
+) -> list[tuple[str, str]]:
+    """Записи деревьев RATCHET_TREES, которых база не допускает."""
+    found: list[tuple[str, str]] = []
+    for path, entry in sorted(ledger.items()):
+        if _tree(path) not in RATCHET_TREES:
+            continue
+        prior = base.ledger.get(path)
+        if not base.ratchet_in_force(_tree(path), thresholds[_tree(path)]):
+            # База правила не знала. Вносятся только файлы, что уже были на ней
+            # длиннее порога (нового файла, переименования и файла, выросшего
+            # из короткого, это не касается).
+            on_base = base.lines(path)
+            if prior is None and (
+                on_base is None or on_base <= _threshold(path, thresholds)
+            ):
+                found.append((path, _unknown_base_reason(on_base)))
+            continue
+        if prior is not None:
+            top_measured, top_max = (
+                _base_number(prior, "measured"),
+                _base_number(prior, "max"),
+            )
+        else:
+            on_base = base.lines(path)
+            if on_base is None:
+                reason = "файла не было на базе"
+            else:
+                reason = f"на базе файл {on_base} строк, в её ledger записи нет"
+            found.append((path, f"новая запись: {reason}"))
+            continue
+        if int(entry["measured"]) > top_measured or int(entry["max"]) > top_max:
+            found.append(
+                (
+                    path,
+                    f"measured {entry['measured']} / потолок {entry['max']} выше, чем "
+                    f"допускает база ({top_measured} / {top_max})",
+                )
+            )
+    return found
 
 
 def check(
@@ -151,6 +274,7 @@ def check(
     thresholds: dict[str, int],
     ledger: dict[str, dict],
     near_pct: float,
+    base: BaseView | None = None,
 ) -> Report:
     """Свести замеры с ledger. Чистая функция: ни файловой системы, ни конфига."""
     new: list[tuple[str, int, int]] = []
@@ -186,6 +310,10 @@ def check(
             stale.append((path, "файла больше нет"))
         elif lines <= _threshold(path, thresholds):
             stale.append((path, f"{lines} строк, порог {_threshold(path, thresholds)}"))
+    base_lines = {
+        p: base.lines(p) for p, _n, _t in new if base and _tree(p) in RATCHET_TREES
+    }
+    regress = _ratchet_problems(ledger, thresholds, base) if base else []
     return Report(
         new=tuple(sorted(new)),
         over=tuple(sorted(over)),
@@ -194,19 +322,48 @@ def check(
         by_reason=by_reason,
         grown=tuple(sorted(grown)),
         near=tuple(sorted(near)),
+        regress=tuple(regress),
+        base_lines=base_lines,
     )
+
+
+def _new_kind(report: Report, path: str, limit: int) -> str:
+    """Для tests: новый это файл или переросший порог (по размеру на базе)."""
+    if _tree(path) not in RATCHET_TREES or path not in report.base_lines:
+        return ""
+    on_base = report.base_lines[path]
+    if on_base is None:
+        return " (новый файл)"
+    return f" (файл перерос порог {limit}: на базе было {on_base})"
 
 
 def format_report(report: Report) -> str:
     """Отчёт печатается и на зелёном прогоне — молчание читается как «всё под контролем»."""
     lines: list[str] = []
     if report.new:
-        lines.append(f"НОВЫЙ ФАЙЛ ВЫШЕ ПОРОГА ({len(report.new)}):")
+        lines.append(f"ФАЙЛ ВЫШЕ ПОРОГА ВНЕ LEDGER ({len(report.new)}):")
         for path, n, limit in report.new:
-            lines.append(f"  {path} — {n} > порог {limit}")
+            lines.append(
+                f"  {path} — {n} > порог {limit}{_new_kind(report, path, limit)}"
+            )
+        if any(_tree(p) not in RATCHET_TREES for p, _n, _t in report.new):
+            lines.append(
+                "  Разбейте файл или внесите его в "
+                f"{LEDGER_REL.as_posix()} через --update с задачей, которая его снимет."
+            )
+        if any(_tree(p) in RATCHET_TREES for p, _n, _t in report.new):
+            lines.append(
+                "  Файлы tests: разбейте файл на части не длиннее порога (тесты "
+                "разных AC - в разные файлы); ledger тестов не растёт, --update "
+                "здесь не выход."
+            )
+    if report.regress:
+        lines.append(f"LEDGER ТЕСТОВ ВЫРОС ({len(report.regress)}):")
+        for path, reason in report.regress:
+            lines.append(f"  {path} — {reason}")
         lines.append(
-            "  Разбейте файл или внесите его в "
-            f"{LEDGER_REL.as_posix()} через --update с задачей, которая его снимет."
+            "  Ledger tests только сокращается: разбейте файл на части не длиннее "
+            "порога; потолок старого файла не поднимается."
         )
     if report.over:
         lines.append(f"WAIVED-ФАЙЛ ВЫРОС ({len(report.over)}):")
@@ -252,18 +409,41 @@ def load_ledger(path: Path) -> dict[str, dict]:
     return {w["path"]: w for w in _read_ledger(path)["waivers"]}
 
 
-def write_ledger(sizes: dict[str, int], thresholds: dict[str, int], path: Path) -> int:
-    """Перезаписать ledger по факту; removed_by существующих записей сохраняется."""
+def _waiver_entry(
+    path: str, lines: int, prior: dict | None, clamp: dict | None, headroom: float
+) -> dict:
+    """Запись ledger; у деревьев RATCHET_TREES запись только опускается (от ``clamp``)."""
+    measured, top = lines, ceiling(lines, headroom)
+    if clamp is not None and _tree(path) in RATCHET_TREES:
+        measured = min(measured, int(clamp["measured"]))
+        top = min(top, int(clamp["max"]))
+    return {
+        "path": path,
+        "measured": measured,
+        "max": top,
+        "removed_by": (prior or {}).get("removed_by", UNCLAIMED),
+    }
+
+
+def write_ledger(
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    path: Path,
+    clamp: dict[str, dict] | None = None,
+) -> int:
+    """Перезаписать ledger по факту; removed_by существующих записей сохраняется.
+
+    ``clamp`` - записи, выше которых tests не поднимается: ledger базы (CI
+    сверяет с ней), пустой - зажима нет (база правила не знала), None - текущий
+    ledger (базу получить не удалось).
+    """
     raw = _read_ledger(path)
     headroom = float(raw.get("headroom_pct", DEFAULT_HEADROOM_PCT))
     prior = {w["path"]: w for w in raw["waivers"]}
     waivers = [
-        {
-            "path": p,
-            "measured": n,
-            "max": ceiling(n, headroom),
-            "removed_by": prior.get(p, {}).get("removed_by", UNCLAIMED),
-        }
+        _waiver_entry(
+            p, n, prior.get(p), (prior if clamp is None else clamp).get(p), headroom
+        )
         for p, n in sorted(sizes.items())
         if n > _threshold(p, thresholds)
     ]
@@ -284,6 +464,135 @@ def write_ledger(sizes: dict[str, int], thresholds: dict[str, int], path: Path) 
     return len(waivers)
 
 
+def _event_before(env: Mapping[str, str]) -> str:
+    """``before`` из события push (GITHUB_EVENT_PATH); нечитаемое - CompareError.
+
+    Откат на origin/develop тут был бы ложью: после push он равен HEAD, ledger
+    сравнился бы сам с собой и проверка молча стала бы зелёной.
+    """
+    try:
+        payload = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        before = str(payload["before"] or "")
+    except (KeyError, OSError, ValueError, TypeError, AttributeError) as exc:
+        raise CompareError(f"push без читаемого before события: {exc!r}") from exc
+    if not before:
+        raise CompareError("push: before события пуст")
+    return before
+
+
+def base_from_environment(env: Mapping[str, str]) -> tuple[str, bool]:
+    """База сравнения из окружения CI и признак «ровно этот коммит» (push).
+
+    PR - origin/<ветка PR>; push - состояние ДО события (HEAD уже содержит
+    правку, и сверка с самой веткой молчала бы); остальное - origin/develop.
+    Нулевой before читаемого события (новая ветка) - не сбой: база origin/develop.
+    """
+    event = env.get("GITHUB_EVENT_NAME", "")
+    before = _event_before(env) if event == "push" else ""
+    base = ci_base(event, before, env.get("GITHUB_BASE_REF", ""), DEFAULT_BASE)
+    return base, event == "push" and base == before
+
+
+def _parse_ledger(raw: object) -> dict[str, dict]:
+    """Ledger базы по пути; запись без числа measured/max - CompareError."""
+    try:
+        entries = {w["path"]: w for w in raw["waivers"]}  # type: ignore[index]
+        for entry in entries.values():
+            _base_number(entry, "measured")
+            _base_number(entry, "max")
+    except (KeyError, TypeError) as exc:
+        raise CompareError(f"ledger: нет waivers/path: {exc!r}") from exc
+    return entries
+
+
+def load_base(root: Path, base: str, exact: bool) -> BaseView:
+    """Ledger базы и размеры файлов на ней. CompareError — сравнить нельзя."""
+    snap = _snapshot(root, base, exact, _git)
+    try:
+        raw = json.loads(str(_git(["show", f"{snap}:{LEDGER_REL.as_posix()}"], root)))
+        ledger = _parse_ledger(raw)
+        headroom = float(raw.get("headroom_pct", DEFAULT_HEADROOM_PCT))
+    except _BASE_ERRORS as exc:
+        raise CompareError(
+            f"ledger базы {base} ({snap[:12]}) не прочитан: {exc}"
+        ) from exc
+
+    def lines(path: str) -> int | None:
+        if not str(_git(["ls-tree", snap, "--", path], root)).strip():
+            return None
+        return count_lines(bytes(_git(["show", f"{snap}:{path}"], root, text=False)))
+
+    try:
+        text = str(_git(["show", f"{snap}:pyproject.toml"], root))
+        base_thresholds = {
+            str(t): int(v)
+            for t, v in tomllib.loads(text)["tool"]["haiplane"]["file_size"].items()
+            if t != NEAR_KEY
+        }
+        missing = sorted(RATCHET_TREES - set(base_thresholds))
+        if missing:
+            raise KeyError(f"нет порога {', '.join(missing)}")
+    except _BASE_ERRORS as exc:
+        raise CompareError(
+            f"пороги базы {base} ({snap[:12]}) не прочитаны: {exc}"
+        ) from exc
+    return BaseView(
+        ledger=ledger, lines=lines, headroom_pct=headroom, thresholds=base_thresholds
+    )
+
+
+def _unaccepted_entries(
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    before: dict[str, dict],
+    base: BaseView | None,
+    forced: bool,
+) -> list[str]:
+    """Записи tests, что --update добавит и что CI на базе не примет.
+
+    Читает базу целиком ДО записи ledger: сбой чтения базы здесь - rc 2 без
+    изменённого файла.
+    """
+    paths = sorted(
+        p
+        for p, n in sizes.items()
+        if _tree(p) in RATCHET_TREES and n > _threshold(p, thresholds)
+    )
+    if base is None:
+        return [p for p in paths if p not in before]
+    if forced:
+        return [p for p in paths if p not in base.ledger]
+    # База правила не знала: CI примет только файлы, длинные уже на ней.
+    return [
+        p
+        for p in paths
+        if p not in base.ledger and (base.lines(p) or 0) <= _threshold(p, thresholds)
+    ]
+
+
+def _update(
+    sizes: dict[str, int],
+    thresholds: dict[str, int],
+    ledger_path: Path,
+    base: BaseView | None,
+) -> int:
+    """--update: перезапись ledger; tests не поднимаются выше ledger базы."""
+    forced = base is not None and base.ratchet_in_force("tests", thresholds["tests"])
+    clamp = None if base is None else (base.ledger if forced else {})
+    before = load_ledger(ledger_path)
+    added = _unaccepted_entries(sizes, thresholds, before, base, forced)  # до записи
+    count = write_ledger(sizes, thresholds, ledger_path, clamp)
+    print(f"ledger перезаписан: {count} исключений")
+    for path in added[:ADDED_SHOWN]:
+        print(
+            f"  внимание: новая запись {path}; CI отвергнет её, если файл не был "
+            "выше порога на базе - разбейте файл"
+        )
+    if len(added) > ADDED_SHOWN:
+        print(f"  и ещё {len(added) - ADDED_SHOWN} новых записей tests")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="машиночитаемый вывод")
@@ -291,6 +600,14 @@ def main() -> int:
         "--update", action="store_true", help="перезаписать ledger по факту"
     )
     parser.add_argument("--root", default=str(REPO_ROOT), help="корень репозитория")
+    parser.add_argument(
+        "--base",
+        default="",
+        help="база сравнения для ledger tests (иначе из окружения CI, иначе origin/develop)",
+    )
+    parser.add_argument(
+        "--no-base", action="store_true", help="не сравнивать ledger tests с базой"
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -299,12 +616,27 @@ def main() -> int:
     sizes = measure(root, list(thresholds))
     ledger_path = root / LEDGER_REL
 
-    if args.update:
-        count = write_ledger(sizes, thresholds, ledger_path)
-        print(f"ledger перезаписан: {count} исключений")
-        return 0
-
-    report = check(sizes, thresholds, load_ledger(ledger_path), near_pct)
+    base = None
+    base_error = ""
+    if not args.no_base:
+        name = args.base or "из окружения CI"
+        try:
+            name, exact = (
+                (args.base, False) if args.base else base_from_environment(os.environ)
+            )
+            base = load_base(root, name, exact)
+        except CompareError as exc:
+            base_error = f"file size: сравнить с базой {name} не удалось: {exc}"
+    if base_error:  # до любой записи ledger, и для проверки, и для --update
+        print(base_error, file=sys.stderr)
+        return BASE_UNREADABLE
+    try:
+        if args.update:
+            return _update(sizes, thresholds, ledger_path, base)
+        report = check(sizes, thresholds, load_ledger(ledger_path), near_pct, base)
+    except CompareError as exc:  # ленивое чтение базы упало уже внутри проверки
+        print(f"file size: сравнить с базой не удалось: {exc}", file=sys.stderr)
+        return BASE_UNREADABLE
     if args.json:
         print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     else:

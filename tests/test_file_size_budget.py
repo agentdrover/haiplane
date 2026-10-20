@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))  # как tests/test_migration_steps.py
 SCRIPT = REPO_ROOT / "scripts" / "file_size_budget.py"
 LEDGER_REL = Path("docs") / "agent-context" / "file-size-budget.json"
 
@@ -51,11 +52,20 @@ def _make_tree(
     )
 
 
-def _run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    root: Path, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Прогон проверки; без явной базы - ``--no-base`` (дерево не git-репозиторий).
+
+    Явная база (``--base``) оставлена как есть: сравнение с базой в тестах ниже
+    идёт на временных git-репозиториях, а не на настоящем.
+    """
+    base = () if {"--base", "--no-base"} & set(args) else ("--no-base",)
     return subprocess.run(
-        [sys.executable, str(SCRIPT), "--root", str(root), *args],
+        [sys.executable, str(SCRIPT), "--root", str(root), *base, *args],
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -366,13 +376,18 @@ def _reachable_from_check() -> list[str]:
 
 def test_repository_is_green_under_the_size_budget():
     """AC-6: реальное дерево зелёное, шаг есть в ci.yml, Makefile и SIGNATURES."""
+    # Без базы: тест не зависит от того, есть ли в клоне origin/develop. Сравнение
+    # с базой на настоящем дереве делает шаг CI "File size budget" (см. ниже).
     proc = subprocess.run(
-        [sys.executable, str(SCRIPT)], capture_output=True, text=True, cwd=REPO_ROOT
+        [sys.executable, str(SCRIPT), "--no-base"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
     )
     assert proc.returncode == 0, proc.stdout
     data = json.loads(
         subprocess.run(
-            [sys.executable, str(SCRIPT), "--json"],
+            [sys.executable, str(SCRIPT), "--no-base", "--json"],
             capture_output=True,
             text=True,
             cwd=REPO_ROOT,
@@ -399,3 +414,125 @@ def test_repository_is_green_under_the_size_budget():
     assert '"file_size_budget.py"' in parity
     ledger = json.loads((REPO_ROOT / LEDGER_REL).read_text(encoding="utf-8"))
     assert ledger["waivers"]
+
+
+# --- #1932: файлы tests читаются ревью целиком ------------------------------
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _tests_repo(root: Path, waivers: list[dict] | None = None) -> None:
+    """Временный git-репозиторий с порогом tests=800 и одним коммитом-базой."""
+    _make_tree(root, tests=800, waivers=waivers)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+
+
+def _ledger_waivers(root: Path) -> list[dict]:
+    return json.loads((root / LEDGER_REL).read_text(encoding="utf-8"))["waivers"]
+
+
+def _set_waivers(root: Path, waivers: list[dict]) -> None:
+    path = root / LEDGER_REL
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["waivers"] = waivers
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _old_tests_waiver(measured: int = 900, max_: int = 945) -> dict:
+    return {
+        "path": "tests/old.py",
+        "measured": measured,
+        "max": max_,
+        "removed_by": "unclaimed",
+    }
+
+
+def test_tests_threshold_matches_the_review_line_cap():
+    """AC-1: порог tests - то, сколько строк на файл читает ревью (машинная связь)."""
+    from hub.services.review_dispatch import REVIEW_FILE_LINE_CAP
+    from file_size_budget import load_thresholds
+
+    thresholds = load_thresholds(REPO_ROOT)
+    assert thresholds["tests"] == REVIEW_FILE_LINE_CAP
+    # Пороги остальных деревьев задача не трогает.
+    assert thresholds["hub"] == 1500
+    assert thresholds["scripts"] == 1500
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--no-base"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_a_long_test_file_outside_the_ledger_is_red(tmp_path):
+    """AC-2: новый файл на 801 строку и файл, переросший порог, - разные сообщения."""
+    _tests_repo(tmp_path)
+    _write_lines(tmp_path, "tests/test_grows.py", 700)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "700")
+
+    _write_lines(tmp_path, "tests/test_x.py", 801)
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/test_x.py" in proc.stdout
+    assert "порог 800" in proc.stdout
+    assert "разбейте" in proc.stdout
+    assert "новый файл" in proc.stdout.lower()
+    assert "перерос" not in proc.stdout
+
+    (tmp_path / "tests" / "test_x.py").unlink()
+    _write_lines(tmp_path, "tests/test_grows.py", 850)
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/test_grows.py" in proc.stdout
+    assert "порог 800" in proc.stdout
+    assert "разбейте" in proc.stdout
+    assert "перерос порог" in proc.stdout
+    assert "700" in proc.stdout  # сколько было на базе
+    assert "новый файл" not in proc.stdout.lower()
+    # Совет --update для tests - ложный путь: ledger тестов не растёт.
+    assert "через --update" not in proc.stdout
+
+    _write_lines(tmp_path, "tests/test_grows.py", 800)
+    assert _run(tmp_path, "--base", "HEAD").returncode == 0
+
+
+def test_the_tests_ledger_only_shrinks(tmp_path):
+    """AC-3: новая запись tests/ и поднятые measured/max красят проверку базы."""
+    _tests_repo(tmp_path, waivers=[_old_tests_waiver()])
+    _write_lines(tmp_path, "tests/old.py", 900)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "old file")
+
+    # Новый файл внесён через --update: запись появилась, база её отвергает.
+    _write_lines(tmp_path, "tests/new.py", 801)
+    assert _run(tmp_path, "--update").returncode == 0
+    assert "tests/new.py" in {w["path"] for w in _ledger_waivers(tmp_path)}
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/new.py" in proc.stdout
+    assert "tests/old.py" not in proc.stdout
+
+    # Запись со старым файлом и поднятым потолком: файл вырос и ledger подогнан.
+    (tmp_path / "tests" / "new.py").unlink()
+    _write_lines(tmp_path, "tests/old.py", 950)
+    _set_waivers(tmp_path, [_old_tests_waiver(measured=950, max_=998)])
+    proc = _run(tmp_path, "--base", "HEAD")
+    assert proc.returncode != 0
+    assert "tests/old.py" in proc.stdout
+
+    # Ужатие - штатно: меньше строк, меньший потолок.
+    _write_lines(tmp_path, "tests/old.py", 850)
+    _set_waivers(tmp_path, [_old_tests_waiver(measured=850, max_=893)])
+    assert _run(tmp_path, "--base", "HEAD").returncode == 0
