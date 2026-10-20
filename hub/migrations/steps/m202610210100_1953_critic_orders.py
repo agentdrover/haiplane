@@ -34,6 +34,7 @@ MIGRATIONS = [
                             CHECK (findings_p2 BETWEEN 0 AND 1000),
             summary         TEXT    NOT NULL DEFAULT '',
             host_ref        TEXT    NOT NULL DEFAULT '',
+            report_digest   TEXT    NOT NULL DEFAULT '',
             reported_at     TEXT,
             closed_reason   TEXT    NOT NULL DEFAULT '',
             CHECK ((state = 'closed') = (outcome IS NOT NULL)),

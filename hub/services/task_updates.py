@@ -29,6 +29,7 @@ from hub import repository as repo
 from hub.db import write_transaction
 from hub.hub_instance import mutation_activity_detail
 from hub.models import TaskUpdateCreate, TaskUpdateView
+from hub.services import critic_orders
 from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
@@ -160,7 +161,12 @@ async def _route_pending_report(
         # #1589: и этот вход — сдача; без гейтов конвейера он иначе остался бы
         # без предупреждений по путям.
         await lc._record_path_notices_for_done(db, task)
-        await repo.update_task(db, task_id, status="review", review_job_id=None)
+        pin = (
+            {"submission_sha": task[critic_orders.CHECKED_KEY]}
+            if task.get(critic_orders.CHECKED_KEY)
+            else {}
+        )  # #1953: ревью читает код, по которому прошёл критик
+        await repo.update_task(db, task_id, status="review", review_job_id=None, **pin)
         await repo.add_task_update(
             db,
             task_id,

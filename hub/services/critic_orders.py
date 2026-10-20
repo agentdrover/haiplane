@@ -24,8 +24,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
-import sqlite3
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -111,16 +111,32 @@ async def cloud_holder(db: aiosqlite.Connection, task_id: int) -> int | None:
     return int(row["run_id"])
 
 
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+
+
 def parse_request_line(content: str) -> tuple[str | None, str]:
-    """``(sha, '')`` или ``(None, причина)``: строгая грамматика, не цитата и не код."""
+    """``(sha, '')`` или ``(None, причина)``: строгая грамматика, не цитата и не код.
+
+    Ограждение кода разбирается как в CommonMark: до трёх пробелов отступа, три и
+    более обратных кавычек или тильд; закрывает его только тот же символ не короче открывшего.
+    Строка с отступом и строка цитаты - не отдельная строка.
+    """
     found: set[str] = set()
-    in_fence = False
+    fence = ""
     for raw in (content or "").splitlines():
         line = raw.rstrip()
-        if line.startswith(("```", "~~~")):
-            in_fence = not in_fence
+        if fence:
+            closing = re.fullmatch(
+                r" {0,3}(%s{%d,})" % (re.escape(fence[0]), len(fence)), line
+            )
+            if closing:
+                fence = ""
             continue
-        if in_fence or line.startswith((">", " ", "\t")):
+        opening = _FENCE_OPEN.fullmatch(line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)
+            continue
+        if line.startswith((">", " ", "\t")):
             continue
         match = _REQUEST.fullmatch(line)
         if match:
@@ -181,8 +197,8 @@ async def _same_sha_history(db: aiosqlite.Connection, task_id: int, sha: str) ->
 
 async def _holder_proof(
     db: aiosqlite.Connection, task_id: int, session_token: str
-) -> str:
-    """'' - доказано; иначе код отказа."""
+) -> tuple[str, int]:
+    """``('', прогон вызывающего)`` - доказано; иначе ``(код отказа, 0)``."""
     try:
         holder = await cloud_holder(db, task_id)
         caller = (
@@ -192,12 +208,12 @@ async def _holder_proof(
         )
     except Exception as exc:  # noqa: BLE001 - fail closed, не «локальный»
         log.warning("critic proof for #%s unreadable: %s", task_id, exc)
-        return "proof_unreadable"
+        return "proof_unreadable", 0
     if not session_token:
-        return "no_session"
+        return "no_session", 0
     if holder is None or caller is None or caller != holder:
-        return "not_cloud_holder"
-    return ""
+        return "not_cloud_holder", 0
+    return "", caller
 
 
 async def request_from_feed(
@@ -211,7 +227,9 @@ async def request_from_feed(
     """
     if _MENTION not in (content or "").lower():
         return ""
-    refused = await _holder_proof(db, task_id, session_token)
+    if not session_token and parse_request_line(content)[0] is None:
+        return ""  # упоминание фразы без сессии и без строки заказа - обычный текст
+    refused, caller_run = await _holder_proof(db, task_id, session_token)
     if refused:
         return await _refuse_request(db, task_id, refused)
     try:
@@ -234,11 +252,11 @@ async def request_from_feed(
     history = await _same_sha_history(db, task_id, sha)
     if history:
         return await _refuse_request(db, task_id, history)
-    return await _create_order(db, task_id, sha, host)
+    return await _create_order(db, task_id, sha, host, caller_run)
 
 
 async def _create_order(
-    db: aiosqlite.Connection, task_id: int, sha: str, host: str
+    db: aiosqlite.Connection, task_id: int, sha: str, host: str, caller_run: int
 ) -> str:
     from hub.services import lifecycle
     from hub.services.orchestration import project_git_context
@@ -259,25 +277,29 @@ async def _create_order(
             db, task_id, "head_moved", f" Заявлен {sha[:12]}, голова {observed[:12]}."
         )
     ctx = await project_git_context(db, task_id)
-    run_id = await cloud_holder(db, task_id)
-    if run_id is None:
-        return await _refuse_request(db, task_id, "not_cloud_holder")
-    try:
-        async with write_transaction(db):
-            other_open, last_hour, same_open = await _open_orders_for(db, task_id, sha)
-            if (
-                other_open >= MAX_OPEN_PER_TASK
-                or last_hour >= config.CRITIC_ORDERS_PER_HOUR
-                or same_open
-            ):
-                raise sqlite3.IntegrityError("critic order raced")
+    blocked = ""
+    async with write_transaction(db):
+        # Всё, что проверено до сети, проверяется заново под блокировкой записи:
+        # держатель мог смениться, а параллельный заказ - закрыться passed.
+        other_open, last_hour, same_open = await _open_orders_for(db, task_id, sha)
+        if await cloud_holder(db, task_id) != caller_run:
+            blocked = "not_cloud_holder"
+        elif other_open >= MAX_OPEN_PER_TASK:
+            blocked = "quota_open"
+        elif last_hour >= config.CRITIC_ORDERS_PER_HOUR:
+            blocked = "quota_hourly"
+        elif same_open:
+            blocked = "duplicate"
+        else:
+            blocked = await _same_sha_history(db, task_id, sha)
+        if not blocked:
             cursor = await db.execute(
                 "INSERT INTO critic_orders (task_id, executor_run_id, sha, repo, "
                 "branch, base, host, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now', ?))",
                 (
                     task_id,
-                    run_id,
+                    caller_run,
                     sha,
                     ctx.get("gh_repo", ""),
                     branch,
@@ -286,18 +308,17 @@ async def _create_order(
                     f"+{int(config.CRITIC_ORDER_TTL_MIN)} minutes",
                 ),
             )
-            order_id = cursor.lastrowid
             await repo.add_task_update(
                 db,
                 task_id,
                 "hub",
                 "status",
-                f"Заказ критика #{order_id} создан: sha {sha[:12]}, хост {host}, "
-                f"срок {int(config.CRITIC_ORDER_TTL_MIN)} мин. Ждите отчёт хоста в "
-                "ленте; сдавайте после «passed» на этом sha.",
+                f"Заказ критика #{cursor.lastrowid} создан: sha {sha[:12]}, хост "
+                f"{host}, срок {int(config.CRITIC_ORDER_TTL_MIN)} мин. Ждите отчёт "
+                "хоста в ленте; сдавайте после «passed» на этом sha.",
             )
-    except sqlite3.IntegrityError:
-        return await _refuse_request(db, task_id, "race")
+    if blocked:
+        return await _refuse_request(db, task_id, blocked)
     return ""
 
 
@@ -377,15 +398,9 @@ def _next_step(outcome: str | None, sha: str) -> str:
     return "Ждите отчёт хоста критика; сдача до «passed» отказана."
 
 
-def _same_report(row: Any, wanted: tuple[Any, ...]) -> bool:
-    stored = (
-        row["outcome"],
-        row["findings_p1"],
-        row["findings_p2"],
-        row["summary"],
-        row["host_ref"],
-    )
-    return stored == wanted
+def _report_digest(*parts: Any) -> str:
+    """Отпечаток ПРИСЛАННОГО отчёта: усечённая выжимка различия не доказывает."""
+    return hashlib.sha256("\x1f".join(str(p) for p in parts).encode()).hexdigest()
 
 
 def _refuse_report(status: int, reason: str, message: str) -> NoReturn:
@@ -415,7 +430,7 @@ async def report(
     if host_ref and not valid_host_ref(host_ref):
         _refuse_report(422, "critic_host_ref_invalid", "host_ref: короткий токен")
     clean = sanitize_untrusted_quote(summary)
-    wanted = (outcome, findings_p1, findings_p2, clean, host_ref)
+    digest = _report_digest(outcome, findings_p1, findings_p2, summary, host_ref)
     late = False
     async with write_transaction(db):
         rows = await fetchall(
@@ -427,17 +442,17 @@ async def report(
             _refuse_report(404, "critic_order_not_found", "заказа нет у этого хоста")
         row = rows[0]
         if row["state"] == STATE_CLOSED:
-            if row["outcome"] != "expired" and _same_report(row, wanted):
+            if row["outcome"] != "expired" and row["report_digest"] == digest:
                 return {"order_id": order_id, "outcome": outcome, "repeat": True}
             _refuse_report(
                 409, "critic_order_closed", f"заказ закрыт: {row['outcome']}"
             )
         cursor = await db.execute(
             "UPDATE critic_orders SET state = 'closed', outcome = ?, findings_p1 = ?, "
-            "findings_p2 = ?, summary = ?, host_ref = ?, reported_at = datetime('now'), "
-            "closed_reason = 'reported' WHERE id = ? AND state <> 'closed' "
-            "AND expires_at > datetime('now')",
-            (outcome, findings_p1, findings_p2, clean, host_ref, order_id),
+            "findings_p2 = ?, summary = ?, host_ref = ?, report_digest = ?, "
+            "reported_at = datetime('now'), closed_reason = 'reported' "
+            "WHERE id = ? AND state <> 'closed' AND expires_at > datetime('now')",
+            (outcome, findings_p1, findings_p2, clean, host_ref, digest, order_id),
         )
         if cursor.rowcount == 1:
             await repo.add_task_update(
@@ -598,6 +613,8 @@ async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool
     if CHECKED_KEY in task or review_approved_for_current_submission(task):
         return False
     verdict = await evaluate(db, task, str(task.get(PREPARED_CI_SHA) or ""))
+    if verdict.applicable and not verdict.cause:
+        task[CHECKED_KEY] = verdict.sha  # то же наблюдение сверит закрепление sha
     if not (verdict.applicable and verdict.cause):
         return False
     task_id = int(task["id"])

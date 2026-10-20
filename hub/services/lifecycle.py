@@ -6238,7 +6238,7 @@ async def add_update(
     undelivered = await task_updates.finish_update(
         db, task_id, body, deferred_done, undelivered
     )
-    if body.kind != "done" and session_token:
+    if body.kind != "done":
         # #1953: строка «нужен критик: sha …» - заказ, если её написала сессия
         # облачного держателя; после коммита записи, сеть - вне транзакции.
         await critic_orders.request_from_feed(

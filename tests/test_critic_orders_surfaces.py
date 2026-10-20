@@ -117,3 +117,155 @@ async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch
     assert len(seen) >= 2, "закрепление должно наблюдать голову заново"
     assert co._refused(resp) == "sha_changed"
     assert await co._task_state(world, cloud.task_id) == before
+
+
+def test_a_request_line_inside_any_code_fence_is_not_a_request():
+    """Ограждение разбирается как в CommonMark: тип, длина, отступ, незакрытое."""
+    from hub.services.critic_orders import parse_request_line
+
+    line = co._line(co.SHA_A)
+    for text in (
+        f"````\n~~~\n{line}\n````",  # ~~~ внутри обратных кавычек не закрывает блок
+        f"   ```\n{line}\n   ```",  # ограждение с отступом
+        f"```\n{line}",  # блок не закрыт
+        f"~~~~\n{line}\n~~~",  # закрытие короче открытия
+        f"> {line}",
+        f"    {line}",
+        f"{line} и ещё слова",
+    ):
+        assert parse_request_line(text)[0] is None, text
+    assert parse_request_line(f"```\nкод\n```\n{line}")[0] == co.SHA_A
+    assert parse_request_line(f"{co._line(co.SHA_A)}\n{co._line(co.SHA_B)}") == (
+        None,
+        "request_ambiguous",
+    )
+
+
+async def test_a_changed_report_differing_past_the_cut_is_still_a_conflict(world, tip):
+    """Повтор сравнивается с присланным отчётом, а не с усечённой выжимкой."""
+    cloud = await co._cloud(world, tip)
+    assert (await co._say(world, cloud, co._line(co.SHA_A))).status_code == 200
+    oid = (await co._orders(world, cloud.task_id))[0]["id"]
+    head = "x" * 900
+    assert (
+        await co._report(world, oid, co._passed(summary=head + "a"))
+    ).status_code == 200
+    assert (
+        await co._report(world, oid, co._passed(summary=head + "a"))
+    ).status_code == 200
+    assert (
+        await co._report(world, oid, co._passed(summary=head + "b"))
+    ).status_code == 409
+
+
+async def test_the_order_is_rechecked_under_the_write_lock(world, tip):
+    """Держатель сменился или заказ уже passed, пока шла сеть: заказа нет, причина названа."""
+    # Держатель сменился на другой облачный прогон.
+    cloud = await co._cloud(world, tip)
+    other_run = await co.repo.create_executor_run(
+        world.db,
+        task_id=cloud.task_id,
+        submission_generation=0,
+        agent_id="cursor",
+        run_id="bc-other",
+        model="m",
+        channel="cloud",
+    )
+    real = lifecycle.resolve_branch_tip
+
+    async def _swap(db, task_id, branch):
+        await db.execute(
+            "UPDATE tasks SET executor_run_id=? WHERE id=?", (other_run, task_id)
+        )
+        await db.commit()
+        return co.SHA_A, ""
+
+    lifecycle.resolve_branch_tip = _swap
+    try:
+        assert (await co._say(world, cloud, co._line(co.SHA_A))).status_code == 200
+        assert await co._orders(world, cloud.task_id) == []
+        assert any(
+            "not_cloud_holder" in a for a in await co._alerts(world, cloud.task_id)
+        )
+
+        # Параллельный заказ успел закрыться passed, пока второй ждал сеть.
+        second = await co._cloud(world, tip)
+
+        async def _raced(db, task_id, branch):
+            await co._closed_order(world, second, co.SHA_A, "passed")
+            return co.SHA_A, ""
+
+        lifecycle.resolve_branch_tip = _raced
+        assert (await co._say(world, second, co._line(co.SHA_A))).status_code == 200
+        assert [o["outcome"] for o in await co._orders(world, second.task_id)] == [
+            "passed"
+        ]
+        assert any(
+            "already_passed" in a for a in await co._alerts(world, second.task_id)
+        )
+    finally:
+        lifecycle.resolve_branch_tip = real
+
+
+async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
+    """pending_report и автоматический вход закрепляют/сверяют проверенный sha."""
+    from fastapi import HTTPException
+
+    from hub.services import orchestration
+
+    # pending_report: ревью привязано к sha, по которому прошёл критик, а не к старому.
+    cloud = await co._cloud(world, None)
+    await co.repo.update_task(
+        world.db, cloud.task_id, status="pending_report", submission_sha=co.SHA_A
+    )
+    await world.db.commit()
+    await co._closed_order(world, cloud, co.SHA_B, "passed")
+
+    async def _head_b(db, task_id, branch):
+        return co.SHA_B, ""
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _head_b)
+    ok = await co._done(world, cloud)
+    assert ok.status_code == 200, ok.text
+    status, generation, pinned, _ = await co._task_state(world, cloud.task_id)
+    assert (status, generation, pinned) == ("review", 1, co.SHA_B)
+
+    # Автоматический вход: наблюдение гейта A, закрепление B - отказ, не молчаливая сдача.
+    auto = await co._cloud(world, None)
+    await co._closed_order(world, auto, co.SHA_A, "passed")
+    seen: list[int] = []
+
+    async def _moving(db, task_id, branch):
+        seen.append(task_id)
+        return (co.SHA_A if len(seen) == 1 else co.SHA_B), ""
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _moving)
+    row = dict(
+        (await co._rows(world.db, "SELECT * FROM tasks WHERE id=?", (auto.task_id,)))[0]
+    )
+    before = await co._task_state(world, auto.task_id)
+    with pytest.raises(HTTPException) as refused:
+        await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    assert refused.value.detail["cause"] == "sha_changed"
+    await world.db.rollback()
+    assert await co._task_state(world, auto.task_id) == before
+
+
+async def test_a_plain_key_gets_a_reason_but_a_bare_mention_stays_text(world, tip):
+    """Строка заказа от ключа без сессии - alert no_session; просто слова - без записи."""
+    cloud = await co._cloud(world, tip)
+    body = {"agent": "x", "kind": "status", "content": co._line(co.SHA_A)}
+    posted = await world.client.post(
+        f"/api/tasks/{cloud.task_id}/updates", json=body, headers=world.human_auth
+    )
+    assert posted.status_code == 200
+    assert await co._orders(world, cloud.task_id) == []
+    assert any("no_session" in a for a in await co._alerts(world, cloud.task_id))
+    before = len(await co._alerts(world, cloud.task_id))
+    body["content"] = "когда нужен критик, я напишу строку отдельно"
+    assert (
+        await world.client.post(
+            f"/api/tasks/{cloud.task_id}/updates", json=body, headers=world.human_auth
+        )
+    ).status_code == 200
+    assert len(await co._alerts(world, cloud.task_id)) == before
