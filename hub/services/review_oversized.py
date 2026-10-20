@@ -181,6 +181,34 @@ async def read_sources(
     return out
 
 
+def oversized_paragraph(
+    oversized: list[tuple[str, int]], has_ac_tests: bool, cap: int
+) -> str:
+    """Абзац про файлы выше потолка: порядок чтения и что называть непрочитанным (#1933)."""
+    named = ", ".join(f"{path} ({count} строк)" for path, count in oversized)
+    order = (
+        "Порядок: 1) тесты AC, названные выше строками «ЧИТАТЬ ПЕРВЫМИ» "
+        "(номера — строки файла на коммите сдачи; «не найден в диффе» — "
+        "найди сам); 2) остальные файлы диффа; 3) остаток большого файла. "
+        if has_ac_tests
+        else "Порядок: 1) остальные файлы диффа; 2) остаток большого файла. "
+    )
+    unread = (
+        f"; непрочитанный тест AC — отдельной строкой «{UNREAD_PREFIX}"
+        "<test_ref>» (test_ref ровно как в скобках блока)"
+        if has_ac_tests
+        else ""
+    )
+    return (
+        f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {cap} "
+        f"строк на файл): {named}. Потолок — порядок чтения, а не предел. "
+        f"{order}Второго прохода хаб не заказывает. Непрочитанный остаток "
+        f"перечисли в lost_dimensions и сдай incomplete=true{unread}. "
+        "Один большой файл не имеет права съесть бюджет, которого ждали "
+        "остальные."
+    )
+
+
 def first_block(spans: Sequence[AcTestSpan]) -> str:
     """Блок «ЧИТАТЬ ПЕРВЫМИ»: по строке на тест AC; пусто, если читать нечего."""
     return "\n".join(span.label() for span in spans)

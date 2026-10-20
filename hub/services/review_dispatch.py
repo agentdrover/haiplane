@@ -66,6 +66,7 @@ from hub.services.review_oversized import (
     cutout,
     cutouts_within,
     first_block,
+    oversized_paragraph,
     read_sources,
 )
 from hub.services.result_kind import automation_not_applicable
@@ -791,32 +792,6 @@ async def _split_by_origin(
     )
 
 
-def _oversized_paragraph(oversized: list[tuple[str, int]], has_ac_tests: bool) -> str:
-    """Абзац про файлы выше потолка: порядок чтения и что называть непрочитанным (#1933)."""
-    named = ", ".join(f"{path} ({count} строк)" for path, count in oversized)
-    order = (
-        "Порядок: 1) тесты AC, названные выше строками «ЧИТАТЬ ПЕРВЫМИ» "
-        "(номера — строки файла на коммите сдачи; «не найден в диффе» — "
-        "найди сам); 2) остальные файлы диффа; 3) остаток большого файла. "
-        if has_ac_tests
-        else "Порядок: 1) остальные файлы диффа; 2) остаток большого файла. "
-    )
-    unread = (
-        f"; непрочитанный тест AC — отдельной строкой «{UNREAD_PREFIX}"
-        "<test_ref>» (test_ref ровно как в скобках блока)"
-        if has_ac_tests
-        else ""
-    )
-    return (
-        f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {REVIEW_FILE_LINE_CAP} "
-        f"строк на файл): {named}. Потолок — порядок чтения, а не предел. "
-        f"{order}Второго прохода хаб не заказывает. Непрочитанный остаток "
-        f"перечисли в lost_dimensions и сдай incomplete=true{unread}. "
-        "Один большой файл не имеет права съесть бюджет, которого ждали "
-        "остальные."
-    )
-
-
 def _plan_oversized(
     kept: str,
     lines: list[str],
@@ -844,7 +819,7 @@ def _plan_oversized(
     spans = ac_test_spans(ac_sources, ac_test_refs or []) if ac_test_refs else []
     if spans:
         lines.insert(0, first_block(spans))
-    lines.append(_oversized_paragraph(oversized, bool(spans)))
+    lines.append(oversized_paragraph(oversized, bool(spans), REVIEW_FILE_LINE_CAP))
     return oversized, spans
 
 
