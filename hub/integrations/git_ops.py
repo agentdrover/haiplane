@@ -19,6 +19,7 @@ import socket
 import tarfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from hub.actionable_errors import (
@@ -27,7 +28,7 @@ from hub.actionable_errors import (
 )
 from hub.config import PAIR_BASE_BRANCH
 from hub.integrations import forge as forge_registry
-from hub.integrations import proc
+from hub.integrations import git_history, proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     BaseFreshness,
@@ -1202,7 +1203,7 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     return BranchUpdateOutcome.unavailable
 
 
-class GitOpsIntegration:
+class GitOpsIntegration(git_history.HistoryReads):
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
     ``forge`` is an attribute rather than a module-level singleton so a
@@ -2804,6 +2805,10 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    def _history_run(self, repo: str) -> git_history.GitRun:
+        """``_git`` on ``repo`` for the history reads of HistoryReads (#1865)."""
+        return partial(_git, repo=repo, check=False)
+
     def worktree_path(self, task_id: int, repo: str | None = None) -> str:
         """Deterministic worktree path for a task (#459); where its branch lives."""
         return _worktree_path(task_id, repo or _repo_root())
@@ -3304,6 +3309,10 @@ class GitOpsIntegration:
             log.info("squash_branch: %s has <=1 commit, skip squash", branch)
             return True
 
+        # #1865: строки отката переживают сжатие (до reset коммиты ещё видны).
+        trailer = await git_history.revert_lines(
+            self._history_run(repo), f"{merge_base.strip()}..HEAD"
+        )
         rc, _, err = await _git(
             "reset",
             "--soft",
@@ -3324,6 +3333,7 @@ class GitOpsIntegration:
             "commit",
             "-m",
             msg,
+            *(["-m", trailer] if trailer else []),
             "--no-verify",
             repo=repo,
             check=False,

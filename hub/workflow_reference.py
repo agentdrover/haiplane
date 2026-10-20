@@ -100,8 +100,8 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
         "tool": "hub_report_done",
         "actor": "agent",
     },
-    # #1362: only after merge_failed on a conflict with the base branch —
-    # every other needs_decision cause stays with hub_decide_task.
+    # #1362, #1917: only after merge_failed on a conflict with the base branch
+    # or a base_update_conflict — every other cause stays with hub_decide_task.
     {
         "from": "needs_decision",
         "to": "review",

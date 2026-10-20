@@ -4147,8 +4147,8 @@ def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
     return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
 
 
-# #1362: писатель (base_automerge_step, refusal_after_automerge) и читатель
-# (is_base_conflict_entry) делят ОДНИ строки — разойдись они, и конфликт с
+# #1362, #1917: писатели (refusal_after_automerge, _branch_update_refusal) и
+# читатель (is_base_conflict_entry) делят ОДНИ строки — разойдись они, и конфликт с
 # базой молча перестанет узнаваться, а задача снова пойдёт к человеку.
 AUTOMERGE_NOT_APPLIED = "Автомерж не применён: "
 BASE_CONFLICT_CAUSE = "конфликт вне класса автомержа"
@@ -4333,17 +4333,19 @@ def base_conflict_resubmit_hint(reason: str, detail: str) -> str:
 def is_base_conflict_entry(payload: dict[str, Any]) -> bool:
     """Вход в needs_decision — merge_failed по конфликту с базой (#1362).
 
-    Узко и нарочно: гейт доставки (reason=merge_gate), мерж отказал, и
-    автомерж ПОСМОТРЕЛ и увидел конфликт, который не взял (BASE_CONFLICT_CAUSE).
-    Эту связку пишет только ``refusal_after_automerge``, и только после
-    merge_failed — отдельная проверка префикса была бы недостижимой. «Проба не удалась», «конфликта нет», стопка,
-    недоставляемая база, лимит кругов, арбитраж — решения человека, и сюда не
-    попадают. Слить базу — работа автора; остальное — нет.
+    Узко и нарочно: гейт доставки (reason=merge_gate) и один из двух
+    писателей: ``refusal_after_automerge`` (мерж отказал, автомерж ПОСМОТРЕЛ и
+    увидел конфликт, который не взял — BASE_CONFLICT_CAUSE) или
+    ``_branch_update_refusal`` (#1917: обновление отставшей ветки дало
+    конфликт — detail НАЧИНАЕТСЯ с BASE_UPDATE_CONFLICT_PREFIX). «Проба не
+    удалась», «конфликта нет», отказ обновления, красный CI на свежей базе,
+    стопка, недоставляемая база, лимит кругов, арбитраж — решения человека.
     """
     detail = str(payload.get("detail") or "")
-    return (
-        payload.get("reason") == "merge_gate"
-        and f"{AUTOMERGE_NOT_APPLIED}{BASE_CONFLICT_CAUSE}" in detail
+    if payload.get("reason") != "merge_gate":
+        return False
+    return detail.startswith(f"{BASE_UPDATE_CONFLICT_PREFIX}:") or (
+        f"{AUTOMERGE_NOT_APPLIED}{BASE_CONFLICT_CAUSE}" in detail
     )
 
 
@@ -4930,7 +4932,7 @@ def _branch_update_refusal(
         return (
             f"{BASE_UPDATE_CONFLICT_PREFIX}: ветка PR #{pr_num} отстала от базы: "
             f"конфликт в {detail or 'файлах, которые не удалось назвать'} — "
-            "слить базу без человека нельзя, мержа нет"
+            "слить базу в ветку и пересдать может автор, мержа нет"
         )
     if outcome in (BranchUpdateOutcome.refused, BranchUpdateOutcome.unsupported):
         return (

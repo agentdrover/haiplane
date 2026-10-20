@@ -1783,6 +1783,49 @@ async def test_a_base_conflict_orders_a_merge_run(db, monkeypatch):
     )
 
 
+async def test_a_base_update_conflict_orders_a_merge_run(db, monkeypatch):
+    """#1917 AC-3: конфликт обновления ветки PR (#1419), созданный НАСТОЯЩИМ
+    гейтом на обоих путях доставки, — тот же конфликт с базой: подсказка автору,
+    кнопка #1445 и заказ прогона; задание не врёт про «вне класса автомержа»."""
+    from hub.services import orchestration
+    from tests.test_pair_merge_gate import base_update_conflicted
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human = await _human(db)
+    for n, via in enumerate(("report_done", "poller")):
+        task_id = await base_update_conflicted(
+            db, monkeypatch, via=via, pr_number=90 + n
+        )
+        events = [
+            dict(e)
+            for e in await repo.list_events(db, since=0)
+            if e["kind"] == "needs_decision" and e["task_id"] == task_id
+        ]
+        feed = " ".join(
+            dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+        )
+        assert orchestration.BASE_CONFLICT_RESUBMIT_HINT.strip() in feed, via
+        assert events, via
+        project, _ = await _launch_project(db, slug=f"exec-bu-{n}")
+        await repo.update_task(db, task_id, project_id=project["id"])
+        await _spent_run(db, task_id, cents=100.0, tokens=1_000)
+        await db.commit()
+
+        task = dict(await repo.get_task(db, task_id))
+        assert await el.merge_offered(db, task), via
+        result = await el.merge_executor(
+            db, task_id, issuer_principal_id=human, issuer="owner1412"
+        )
+
+        assert result.launched, (via, result)
+        prompt = calls[-1]["prompt_text"]
+        assert "base_update_conflict" in prompt, via
+        assert "вне класса автомержа" not in prompt, via
+        assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    assert len(calls) == 2
+
+
 async def test_a_merge_run_is_refused_outside_a_base_conflict(client, db, monkeypatch):
     """AC-2: другая причина needs_decision, исполнитель не запускался, политика
     не manual, бюджет исчерпан — отказ, провайдер не зван, статус не тронут,
