@@ -88,7 +88,7 @@ COVERAGE_NONE = "none"
 
 
 async def resolve_diff_base(
-    db: Any, task_id: int, branch: str, *, pr_base: str = ""
+    db: Any, task_id: int, branch: str, *, pr_base: str = "", offline: bool = False
 ) -> dict[str, Any]:
     """Which base this task's diff is taken against, and whether it exists.
 
@@ -96,6 +96,9 @@ async def resolve_diff_base(
     its origin instead of being argued about in the brief. Best effort by
     contract: any failure answers ``unverified`` with the cause — a brief must
     not become unreadable because git was unreachable.
+
+    ``offline`` (#1913): путь показа. Сверка свежести базы с remote (``ls-remote``)
+    пропускается и названа в причине: «не сверена» — это не «свежая» и не «протухла».
     """
     from hub.services.orchestration import project_git_context
 
@@ -150,6 +153,12 @@ async def resolve_diff_base(
         # Resolved is not the end of the question (#947). The ref exists here;
         # whether it still stands for anything upstream is a second fact, and
         # the brief that skipped it showed an empty diff as agreement.
+        if offline:
+            out["reason"] = (
+                f"база {out['base']} разрешена, но не сверена с remote: "
+                "показ в сеть не ходит"
+            )
+            return out
         try:
             freshness, why = await plugins.git_ops.base_freshness(
                 workspace, out["base"], detail
@@ -1369,7 +1378,7 @@ async def inflight_verdict_note(
 
 
 async def review_report(
-    db: Any, task_row: dict[str, Any], mr_row: Any = None
+    db: Any, task_row: dict[str, Any], mr_row: Any = None, *, offline: bool = False
 ) -> "ReviewReport":
     """The verdict gate's report, built once for both its readers (#808).
 
@@ -1383,7 +1392,7 @@ async def review_report(
     which would claim the branch changed nothing — #518).
     """
     report = await report_view(db, task_row, mr_row)
-    return await _measure_diff(db, task_row, report)
+    return await _measure_diff(db, task_row, report, offline=offline)
 
 
 async def report_view(
@@ -1458,7 +1467,7 @@ def diff_size(diff: str) -> tuple[set[str], int]:
 
 
 async def _measure_diff(
-    db: Any, task_row: dict[str, Any], report: "ReviewReport"
+    db: Any, task_row: dict[str, Any], report: "ReviewReport", *, offline: bool = False
 ) -> "ReviewReport":
     """Fill the report's diff volume, or say why it could not be read (#518)."""
     branch = report.branch
@@ -1474,7 +1483,12 @@ async def _measure_diff(
         if not workspace:
             report.diff_note = "у проекта нет workspace — объём диффа не измерялся"
             return report
-        diff = await plugins.git_ops.branch_diff(workspace, base, branch)
+        read = (
+            plugins.git_ops.branch_diff_local
+            if offline
+            else plugins.git_ops.branch_diff
+        )
+        diff = await read(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - advisory block, never fatal
         log.warning("review report diff failed for task #%s: %s", task_row["id"], exc)
         report.diff_note = f"объём диффа прочитать не удалось: {exc}"

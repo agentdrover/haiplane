@@ -4030,20 +4030,19 @@ CI_INTEGRITY_NOTE_LIMIT = 600
 class CIIntegrityAnswer(BaseModel):
     """What the reviewer says about a diff that touches CI inputs (#1688).
 
-    ``explained`` — the change is legitimate for the task, and the note tells
-    the owner what changes, why, and the risk (low/high). ``suspicious`` — it
-    looks like tampering with how CI obtains or passes results.
-
-    Lenient on purpose, like ``incomplete_reason``: the only path the cloud
-    reviewer has is the text block, and ``parse_report_block`` drops a report
-    whose fields the contract refuses — a too-long note would then cost the
-    findings too. A verdict outside the vocabulary is read as NO answer (and
-    logged), never mapped to the nearest word; a note over the limit is cut,
-    not refused.
+    ``explained``: legitimate (note: what, why, risk); ``suspicious``: tampering.
+    Lenient (the text block drops a report whole on a refused field): unknown
+    verdict = no answer, long note cut, bad ``scan_hash`` "" (no hash, no answer).
     """
 
     verdict: str = ""
     explanation_ru: str = ""
+    scan_hash: str = ""
+
+    @field_validator("scan_hash", mode="before")
+    @classmethod
+    def _text_hash(cls, v: Any) -> str:
+        return "" if v is None else str(v).strip()[:64]
 
     @field_validator("verdict", mode="before")
     @classmethod

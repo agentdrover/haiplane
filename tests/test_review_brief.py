@@ -171,6 +171,11 @@ async def test_sha_check_match_names_what_it_compared(
     plugins.git_ops = _Tip()
     await repo.update_task(db, task_id, submission_sha="c0ffee" * 6)
     await db.commit()
+    # #1913: бриф читает наблюдение вершины; его делает гейт или проход поллера.
+    from hub.services.lifecycle import resolve_branch_tip
+
+    branch = dict(await repo.get_task(db, task_id) or {})["branch"]
+    await resolve_branch_tip(db, task_id, branch)
 
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
 
