@@ -1395,10 +1395,19 @@ async def test_a_base_conflict_after_approval_is_resubmitted_by_the_author(
         "SELECT id FROM events WHERE task_id=? AND kind='task_decided'", (task_id,)
     )
     assert not decided, "между merge_failed и пересдачей решения человека нет"
-    feed = " ".join(
-        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
-    )
-    assert "конфликт с базой" in feed, "лента называет, откуда пришла пересдача"
+    line = await _resubmission_line(db, task_id)
+    assert "после merge_failed" in line, "строка пересдачи называет писателя"
+    assert "base_update_conflict" not in line
+
+
+async def _resubmission_line(db: aiosqlite.Connection, task_id: int) -> str:
+    """Последняя запись сдачи в ленте — строка «Submitted for review»."""
+    lines = [
+        dict(u)["content"] or ""
+        for u in await repo.get_task_updates(db, task_id)
+        if (dict(u)["content"] or "").startswith(repo.SUBMISSION_UPDATE_PREFIX)
+    ]
+    return lines[-1]
 
 
 async def test_a_base_update_conflict_is_resubmitted_by_the_author(
@@ -1427,6 +1436,9 @@ async def test_a_base_update_conflict_is_resubmitted_by_the_author(
             (task_id,),
         )
         assert not decided, f"{via}: решения человека между конфликтом и пересдачей нет"
+        line = await _resubmission_line(db, task_id)
+        assert "после base_update_conflict" in line, via
+        assert "merge_failed" not in line, via
 
 
 async def test_other_needs_decision_causes_still_need_a_human(
