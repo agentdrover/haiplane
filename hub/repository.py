@@ -2457,7 +2457,7 @@ async def upsert_ci_report_attempt(
     Another attempt is another row, so a late POST of an old attempt cannot
     overwrite a newer one. Within one attempt a block the report did not carry
     (``None``) keeps what that attempt stored before (#1606); across attempts
-    nothing is inherited (#1687): the latest attempt must carry its own blocks.
+    nothing is inherited (#1687, only the brief borrows: #1936).
     A replaced report starts unverified again — it is a new claim — and its
     ``body_version`` moves.
     """
