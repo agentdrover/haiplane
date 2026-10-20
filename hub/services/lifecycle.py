@@ -2461,17 +2461,26 @@ async def resolve_branch_tip(
         workspace = ctx.get("repo")
         if not workspace:
             return "", "project has no workspace to observe the branch from"
-        ok, detail = await plugins.git_ops.fetch_base(workspace, branch)
-        if not ok:
-            return "", f"could not fetch {branch}: {detail or 'fetch failed'}"
-        sha = await plugins.git_ops.head_sha(workspace, branch)
-        if not sha:
-            return "", f"origin/{branch} did not resolve to a commit"
-        _observed_tips[(int(task_id), branch)] = (sha, datetime.now(UTC))
-        return sha, ""
+        return await observe_tip_at(workspace, task_id, branch)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not resolve tip of %s for #%s: %s", branch, task_id, exc)
         return "", f"tip resolution failed: {exc}"
+
+
+async def observe_tip_at(workspace: str, task_id: int, branch: str) -> tuple[str, str]:
+    """Сетевая половина ``resolve_branch_tip``: fetch, вершина, запись наблюдения (#1913).
+
+    Отделена, чтобы проход поллера мог поставить дедлайн ровно на сеть, а чтения
+    базы оставить снаружи.
+    """
+    ok, detail = await plugins.git_ops.fetch_base(workspace, branch)
+    if not ok:
+        return "", f"could not fetch {branch}: {detail or 'fetch failed'}"
+    sha = await plugins.git_ops.head_sha(workspace, branch)
+    if not sha:
+        return "", f"origin/{branch} did not resolve to a commit"
+    _observed_tips[(int(task_id), branch)] = (sha, datetime.now(UTC))
+    return sha, ""
 
 
 #: What ``resolve_branch_tip`` last SAW, per task and branch (#1334). Filled
@@ -2498,13 +2507,16 @@ def observed_branch_tip(task_id: int, branch: str) -> tuple[str, str]:
         return "", "task has no branch"
     seen = _observed_tips.get((int(task_id), branch))
     if seen is None:
-        return "", "вершину ветки хаб с запуска не наблюдал, а очередь в сеть не ходит"
+        return (
+            "",
+            "не сверено: вершину ветки хаб с запуска не наблюдал, а показ в сеть не ходит",
+        )
     sha, at = seen
     age = int((datetime.now(UTC) - at).total_seconds() // 60)
     if age > OBSERVED_TIP_MAX_AGE_MINUTES:
         return "", (
-            f"последнее наблюдение вершины {age} мин назад — старше "
-            f"{OBSERVED_TIP_MAX_AGE_MINUTES} мин, а очередь в сеть не ходит"
+            f"не сверено: последнее наблюдение вершины {age} мин назад — старше "
+            f"{OBSERVED_TIP_MAX_AGE_MINUTES} мин, а показ в сеть не ходит"
         )
     return sha, ""
 
@@ -2524,7 +2536,10 @@ def observed_tip_age_minutes(task_id: int, branch: str) -> int | None:
 
 def forget_observed_tips() -> None:
     """Drop every remembered observation (tests; a restart does the same)."""
+    from hub.services import gate_observations
+
     _observed_tips.clear()
+    gate_observations.forget_all()
 
 
 def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
