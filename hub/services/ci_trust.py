@@ -419,6 +419,26 @@ BORROWABLE_STATES: dict[str, frozenset[str]] = {
     "baseline": frozenset({"ran", "no_tests"}),
 }
 
+_PROJECTION_KEYS = (
+    "attempt_key",
+    "trust",
+    "contract_fp",
+    "mutations",
+    "baseline",
+    "provenance",
+)
+
+# ONE statement reads the attempts of a commit together with its projection, so
+# both are the state of one moment (a statement is atomic; a read transaction on
+# the shared connection would hold other coroutines' writes hostage).
+_SNAPSHOT_SQL = (
+    "SELECT a.*, "
+    + ", ".join(f"r.{k} AS p_{k}" for k in _PROJECTION_KEYS)
+    + " FROM ci_report_attempts a LEFT JOIN ci_run_reports r "
+    "ON r.task_id=a.task_id AND r.head_sha=a.head_sha "
+    "WHERE a.task_id=? AND a.head_sha=?"
+)
+
 
 @dataclass(frozen=True)
 class BorrowedBlock:
@@ -456,71 +476,68 @@ def _usable_block(
     return block if ok else None
 
 
-async def borrowed_evidence_block(
-    db: Any, task_id: int, head_sha: str, column: str, current: Mapping[str, Any]
-) -> BorrowedBlock | None:
-    """The block ``column`` of another verified attempt of this commit, for the brief only.
-
-    The projection (``ci_run_reports``) stays the row of the current attempt and
-    the gates read it, so nothing here lets a gate lean on another attempt
-    (#1687). This is the READ for the brief: a ``pull_request:synchronize`` run
-    does not count mutations and baseline and starts after the executor's
-    dispatch run, so it is the current attempt and its empty blocks used to hide
-    what was counted on the same commit.
-
-    ``current`` is the confirmed projection row; the current attempt must be
-    verified AND have succeeded, otherwise nothing is borrowed (incomplete,
-    unreachable GitHub, changed contract and failure keep the answer they had).
-    Each candidate is checked again NOW (verified under the current contract,
-    run succeeded, block ``head`` == ``head_sha``, informative state). Of several
-    the newest wins by ``(run_id, run_attempt)``.
-    """
-    if not head_sha or not run_succeeded(current):
-        return None
+async def _picks(
+    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any]
+) -> tuple[str, dict[str, BorrowedBlock]]:
+    """What the snapshot of this moment lets the brief borrow, per column, and the contract."""
+    rows = [dict(r) for r in await fetchall(db, _SNAPSHOT_SQL, (task_id, head_sha))]
+    # The contract lives in another table: read AFTER the snapshot and compared
+    # with it, so a change in between reads as "not confirmed", never as confirmed.
     fingerprint = await ci_contract.fingerprint_for_task(db, task_id)
-    best: tuple[tuple[int, int], BorrowedBlock] | None = None
-    for candidate in await repo.list_ci_report_attempts(db, task_id, head_sha):
-        row = dict(candidate)
-        if _usable_block(row, column, head_sha, fingerprint) is None:
-            continue
-        order = _order(row)
-        if best is None or order > best[0]:
-            best = (
-                order,
-                BorrowedBlock(row[column], row["run_id"], row["run_attempt"]),
-            )
-    if best is None or not await _unchanged(
-        db, task_id, head_sha, current, fingerprint
+    if not rows:
+        return fingerprint, {}
+    projection = {k: rows[0][f"p_{k}"] for k in _PROJECTION_KEYS}
+    if any(projection[k] != current.get(k) for k in _PROJECTION_KEYS):
+        return fingerprint, {}  # not the row the brief is showing
+    if trust_of(projection, fingerprint)[0] != VERIFIED or not run_succeeded(
+        projection
     ):
-        return None
-    return best[1]
+        return fingerprint, {}
+    picks: dict[str, BorrowedBlock] = {}
+    for column in BORROWABLE_STATES:
+        if _json_map(projection[column]):
+            continue  # the current attempt carries its own block: it wins
+        best: tuple[tuple[int, int], BorrowedBlock] | None = None
+        for row in rows:
+            if _usable_block(row, column, head_sha, fingerprint) is None:
+                continue
+            order = _order(row)
+            if best is None or order > best[0]:
+                found = BorrowedBlock(row[column], row["run_id"], row["run_attempt"])
+                best = (order, found)
+        if best is not None:
+            picks[column] = best[1]
+    return fingerprint, picks
 
 
-_PROJECTION_KEYS = (
-    "attempt_key",
-    "trust",
-    "contract_fp",
-    "mutations",
-    "baseline",
-    "provenance",
-)
+async def borrowed_evidence_blocks(
+    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any]
+) -> dict[str, BorrowedBlock]:
+    """The mutations/baseline blocks another verified attempt of this commit counted.
 
+    For the BRIEF only: the projection (``ci_run_reports``) stays the row of the
+    current attempt and the gates read it, so nothing here lets a gate lean on
+    another attempt (#1687). A ``pull_request:synchronize`` run counts no
+    mutations or baseline and starts after the executor's dispatch run, so it is
+    the current attempt and its empty blocks used to hide what was counted on
+    the same commit.
 
-async def _unchanged(
-    db: Any, task_id: int, head_sha: str, current: Mapping[str, Any], fingerprint: str
-) -> bool:
-    """Nothing the borrow stands on moved while the attempts were being read.
-
-    The reads are separate awaits, not one snapshot: a refresh may land between
-    them. The projection is read again and must be the confirmed row the caller
-    saw, under the same contract; if not, nothing is borrowed (the answer the
-    brief gave before) rather than a mix of two moments.
+    ``current`` is the confirmed projection row the brief shows. Both blocks are
+    decided from ONE snapshot (attempts and projection in one statement); the
+    snapshot is read again and the answer stands only if nothing moved (the
+    chosen sources, the projection, the contract): any movement means no
+    borrowing at all, i.e. the answer the brief gave before. A candidate must be
+    verified under the current contract, ``run_conclusion=success``, carry
+    ``head == head_sha`` and an informative state; of several the newest by
+    ``(run_id, run_attempt)`` wins. The projection must be verified and
+    successful too. A block the current attempt carries always wins.
     """
-    fresh = await trusted_report(db, task_id, head_sha)
-    if fresh is None:
-        return False
-    same = all(dict(fresh).get(k) == current.get(k) for k in _PROJECTION_KEYS)
-    return same and await ci_contract.fingerprint_for_task(db, task_id) == fingerprint
+    if not head_sha or not current:
+        return {}
+    first = await _picks(db, task_id, head_sha, current)
+    if not first[1]:
+        return {}
+    return first[1] if await _picks(db, task_id, head_sha, current) == first else {}
 
 
 # ---- which attempt is current ----------------------------------------------

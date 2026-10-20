@@ -408,18 +408,126 @@ async def test_a_source_made_pending_while_the_current_report_stays_trusted(db):
 
 
 async def test_a_change_between_the_reads_borrows_nothing(db, monkeypatch):
-    """The projection moves while the attempts are read: no mix of two moments."""
+    """The projection moves between the snapshot and its recheck: nothing is borrowed."""
     task_id = await _task(db)
     await _dispatch_then_synchronize(db, task_id)
-    real = repo.list_ci_report_attempts
 
-    async def then_the_current_attempt_changes(*args, **kwargs):
-        rows = await real(*args, **kwargs)
+    async def action():
         await db.execute("UPDATE ci_run_reports SET attempt_key='ci:1003:1'")
         await db.commit()
-        return rows
 
-    monkeypatch.setattr(
-        repo, "list_ci_report_attempts", then_the_current_attempt_changes
-    )
+    _after_read(monkeypatch, "ci_report_attempts", 1, action)
     await _check(db, task_id, set())
+
+
+# ---- one snapshot (round 2 of #1936) -----------------------------------------
+
+
+def _after_read(monkeypatch, table: str, nth: int, action):
+    """Run ``action`` once, right after the ``nth`` read of ``table`` returns."""
+    from hub.services import ci_trust as trust_module
+
+    seen = {"reads": 0, "fired": False}
+
+    def wrap(real):
+        async def read(db, sql, parameters=()):
+            rows = await real(db, sql, parameters)
+            if table in sql and not seen["fired"]:
+                seen["reads"] += 1
+                if seen["reads"] == nth:
+                    seen["fired"] = True
+                    await action()
+            return rows
+
+        return read
+
+    monkeypatch.setattr(repo, "fetchall", wrap(repo.fetchall))
+    monkeypatch.setattr(trust_module, "fetchall", wrap(trust_module.fetchall))
+    return seen
+
+
+async def _replace_the_source(db, task_id: int) -> None:
+    """A repeated POST of the dispatch run: a new claim whose artifact differs."""
+    started = GH.runs[("1001", "1")]["run_started_at"]  # same run, same start
+    sent = GH.attempt(
+        task_id, SHA, run_id="1001", started=started, mutations=mutations()
+    )
+    await store_ci_run_report(db, task_id, **sent)
+    await db.commit()
+    await ci_trust.refresh(db, task_id, SHA)
+
+
+async def test_a_source_replaced_after_it_was_read_is_not_borrowed(db, monkeypatch):
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+
+    async def action():
+        await _replace_the_source(db, task_id)
+
+    seen = _after_read(monkeypatch, "ci_report_attempts", 1, action)
+    await _check(db, task_id, set())
+    assert seen["fired"]
+    source = [
+        dict(r)
+        for r in await repo.list_ci_report_attempts(db, task_id, SHA)
+        if r["run_id"] == "1001"
+    ][0]
+    assert source["trust"] != "verified", "the interleaving really unconfirmed it"
+    assert (await ci_trust.trusted_report(db, task_id, SHA)) is not None
+
+
+async def test_the_projection_invalidated_right_after_its_read_borrows_nothing(
+    db, monkeypatch
+):
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+
+    async def action():
+        sent = GH.attempt(task_id, SHA, run_id="1002", event="pull_request")
+        await store_ci_run_report(db, task_id, **sent)  # a POST: pending again
+        await db.commit()
+
+    seen = _after_read(monkeypatch, "ci_run_reports", 2, action)
+    evidence = await _evidence(db, task_id)
+    assert seen["fired"]
+    assert await ci_trust.trusted_report(db, task_id, SHA) is None
+    for block in (evidence.mutations, evidence.baseline):
+        assert "из попытки" not in block.reason
+
+
+async def test_both_blocks_are_decided_from_one_snapshot(db, monkeypatch):
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+
+    async def action():
+        await _replace_the_source(db, task_id)
+
+    _after_read(monkeypatch, "ci_report_attempts", 1, action)
+    evidence = await _evidence(db, task_id)
+    # Whatever moved, the two blocks agree: never one borrowed and one not.
+    assert evidence.mutations.state == evidence.baseline.state == "not_received"
+
+
+async def test_one_snapshot_and_its_recheck_serve_both_blocks(db, monkeypatch):
+    from hub.services import ci_trust as trust_module
+
+    task_id = await _task(db)
+    await _dispatch_then_synchronize(db, task_id)
+    reads = {"n": 0}
+
+    def counted(real):
+        async def read(db_, sql, parameters=()):
+            if "ci_report_attempts" in sql and "ci_run_reports" in sql:
+                reads["n"] += 1  # one statement reads attempts AND projection
+            return await real(db_, sql, parameters)
+
+        return read
+
+    monkeypatch.setattr(repo, "fetchall", counted(repo.fetchall))
+    monkeypatch.setattr(trust_module, "fetchall", counted(trust_module.fetchall))
+    evidence = await _evidence(db, task_id)
+    assert "из попытки 1001/1" in evidence.mutations.reason
+    assert "из попытки 1001/1" in evidence.baseline.reason
+    assert reads["n"] == 2, (
+        "one snapshot and its recheck for BOTH blocks, not per block"
+    )

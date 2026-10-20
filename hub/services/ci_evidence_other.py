@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from hub.services.ci_trust import borrowed_evidence_block
+from hub.services.ci_trust import borrowed_evidence_blocks
 
 
 def _is_empty(raw: str | None) -> bool:
@@ -24,27 +24,29 @@ def _is_empty(raw: str | None) -> bool:
     return not isinstance(data, dict) or not data
 
 
-async def block_of_the_commit(
-    db: Any, task_id: int, pinned: str, stored: dict, column: str, label: str
-):
-    """The current attempt's block, or — if it has none — the one another attempt counted.
+async def blocks_of_the_commit(db: Any, task_id: int, pinned: str, stored: dict):
+    """``(mutations, baseline)`` for the brief: the current attempt's block, or — if it has none — the one another attempt counted.
 
     A current block of any content wins. ``stored`` is the confirmed projection
-    row (empty when there is none: nothing is borrowed then).
+    row (empty when there is none: nothing is borrowed then). Both blocks are
+    decided from one snapshot.
     """
     from hub.services.review_evidence import _evidence_block
 
-    raw = stored.get(column)
-    if stored and _is_empty(raw):
-        found = await borrowed_evidence_block(db, task_id, pinned, column, stored)
-        if found is not None:
-            return _signed(
-                _evidence_block(label, found.raw, pinned),
-                found.run_id,
-                found.run_attempt,
+    found = await borrowed_evidence_blocks(db, task_id, pinned, stored)
+    out = []
+    for column, label in (("mutations", "мутации"), ("baseline", "baseline")):
+        block = _evidence_block(label, stored.get(column), pinned)
+        if column in found and _is_empty(stored.get(column)):
+            source = found[column]
+            block = _signed(
+                _evidence_block(label, source.raw, pinned),
+                source.run_id,
+                source.run_attempt,
                 column,
             )
-    return _evidence_block(label, raw, pinned)
+        out.append(block)
+    return out[0], out[1]
 
 
 def _signed(block, run_id: str, run_attempt: str, column: str):
