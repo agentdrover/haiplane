@@ -336,12 +336,61 @@ def test_a_moved_base_changes_the_merge_tree_and_forces_a_recount(
     assert parent1 == "" and "tree" in why
 
 
-def test_stamp_writes_the_source_run_into_both_files(tmp_path: Path) -> None:
-    for name in (adopt.MUTATIONS_FILE, adopt.BASELINE_FILE):
-        (tmp_path / name).write_text(json.dumps({"state": "ran", "mutants": 3}))
-    adopt.stamp(tmp_path, 4242)
-    for name in (adopt.MUTATIONS_FILE, adopt.BASELINE_FILE):
-        document = json.loads((tmp_path / name).read_text())
-        assert document["adopted_from_run"] == 4242
-        assert "provenance" not in document
-    assert json.loads((tmp_path / adopt.MUTATIONS_FILE).read_text())["mutants"] == 3
+def test_the_adopted_files_are_written_stamped_and_only_when_adopting(
+    tmp_path: Path,
+) -> None:
+    """#1921: the decision and the files come from one step."""
+    repo = Repo(tmp_path / "r")
+    mutations, baseline = _documents(repo)
+    github = FakeGitHub(_archive(mutations, baseline))
+    out = tmp_path / "adopted"
+
+    run_id, why = adopt.decide(
+        github.api,
+        github.fetch_zip,
+        repo.git,
+        repo=REPO,
+        head_sha=repo.head,
+        base_ref="develop",
+        out_dir=out,
+    )
+    assert (run_id, why) == (11, "")
+    for name, source in (
+        (adopt.MUTATIONS_FILE, mutations),
+        (adopt.BASELINE_FILE, baseline),
+    ):
+        written = json.loads((out / name).read_text())
+        assert written["adopted_from_run"] == 11
+        assert "provenance" not in written
+        assert {k: v for k, v in written.items() if k != "adopted_from_run"} == source
+
+    # a refusal writes nothing: there is no half-adopted directory to upload
+    refused = tmp_path / "refused"
+    broken = FakeGitHub(_archive(*_documents(repo, mutations={"state": "error"})))
+    run_id, why = adopt.decide(
+        broken.api,
+        broken.fetch_zip,
+        repo.git,
+        repo=REPO,
+        head_sha=repo.head,
+        base_ref="develop",
+        out_dir=refused,
+    )
+    assert run_id == 0 and why and not refused.exists()
+
+
+def test_a_directory_that_cannot_be_written_is_a_recount(tmp_path: Path) -> None:
+    repo = Repo(tmp_path / "r")
+    github = FakeGitHub(_archive(*_documents(repo)))
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("a file where the directory should go")
+    run_id, why = adopt.decide(
+        github.api,
+        github.fetch_zip,
+        repo.git,
+        repo=REPO,
+        head_sha=repo.head,
+        base_ref="develop",
+        out_dir=blocker / "inside",
+    )
+    assert run_id == 0 and why, "adopt must never promise files that are not there"

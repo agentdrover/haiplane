@@ -165,13 +165,13 @@ def test_mutations_and_baseline_skip_branch_sync_and_non_task_prs(tmp_path) -> N
             assert len(lines) == 1, f"the reason is ONE line: {label} {log!r}"
             assert "skipped" in lines[0] and fragment in lines[0], (label, lines)
 
-    # #1785: the two steps live in job `evidence`, gated by the decision of job
-    # treedup (the same answers, moved).
-    steps = _steps("evidence")
+    # #1785/#1921: the mutation legs and the baseline are jobs of their own, gated
+    # by the decision of job treedup (the same answers, moved).
+    steps = {**_steps("mutation_legs"), **_steps("baseline")}
     gate = "needs.treedup.outputs.evidence_run == 'true'"
-    assert gate in steps["mutations"]["if"]
-    assert gate in steps["baseline"]["if"]
-    assert "github.event_name == 'pull_request'" not in steps["mutations"]["if"]
+    for job in ("mutation_legs", "baseline", "evidence"):
+        assert gate in _doc()["jobs"][job]["if"], job
+        assert "github.event_name == 'pull_request'" not in _doc()["jobs"][job]["if"]
 
     # The base argument is the PR base, and develop for a manual run: the
     # ACTUAL argument is evaluated, not just grepped for.
@@ -209,7 +209,10 @@ def test_evidence_decision_survives_a_red_earlier_step() -> None:
     treedup_steps = _doc()["jobs"]["treedup"]["steps"]
     assert treedup_steps[0]["id"] == "evidence"
     assert "if" not in treedup_steps[0]
-    assert "!cancelled()" in _steps("evidence")["baseline"]["if"]
+    # #1921: the baseline is a job that does not wait for the legs, so a red leg
+    # cannot skip it; the merge runs on !cancelled() for the same reason.
+    assert _doc()["jobs"]["baseline"]["needs"] == "treedup"
+    assert "!cancelled()" in _doc()["jobs"]["evidence"]["if"]
     ran, _log = _decide(
         Path(__import__("tempfile").mkdtemp()),
         event="pull_request",
@@ -492,7 +495,7 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         "skip": "${{ steps.treedup.outputs.skip }}",
         "evidence_run": "${{ steps.evidence.outputs.run }}",
         # #1919: the adoption of the dispatch run's evidence (see its own test).
-        "adopt": "${{ steps.adopt.outputs.adopt }}",
+        "adopt": ADOPT_OUTPUT,
         "adopted_run_id": "${{ steps.adopt.outputs.adopted_run_id }}",
     }
 
@@ -538,6 +541,12 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
         expected = {
             "test": ["hub-ci-results-${{ github.run_attempt }}"],
             "evidence": ["hub-ci-evidence"],
+            # #1921: an adopted run keeps the adopted files as the artifact of
+            # THIS run right in treedup; the legs and the baseline hand their
+            # reports to job evidence under names of their own
+            "treedup": ["hub-ci-evidence"],
+            "mutation_legs": ["hub-ci-mutations-leg-${{ matrix.leg }}"],
+            "baseline": ["hub-ci-baseline"],
             # #1920: the audit file; a name outside the prefix the trusted
             # report reads (hub-ci-results-)
             "static": ["hub-ci-static"],
@@ -627,70 +636,138 @@ MUTATIONS_STEP = "Mutations of changed functions (warning only)"
 BASELINE_STEP = "Red-test baseline on merge-base (data only)"
 EVIDENCE_GATE = "needs.treedup.outputs.evidence_run == 'true'"
 EVIDENCE_ARTIFACT = "hub-ci-evidence"
-# #1919: an adopted run (download and stamp both succeeded) recounts nothing.
-ADOPT_RECOUNT = "steps.adopt_stamp.outcome != 'success'"
 
 
 def _same_setup(left: dict, right: dict) -> bool:
     return all(left.get(k) == right.get(k) for k in ("uses", "with", "run", "if"))
 
 
-def test_mutations_and_baseline_run_beside_the_parts() -> None:
-    """AC-1: the layout of job `evidence`, its hand-over, and what job test lost."""
-    import json
-    import re
+# #1921: the adopted run and the recounted run both end in the SAME artifact.
+NOT_ADOPTED = "needs.treedup.outputs.adopt != 'true'"
+ADOPT_OUTPUT = (
+    "${{ steps.adopt.outputs.adopt == 'true' && "
+    "steps.adopt_upload.outcome == 'success' && 'true' || 'false' }}"
+)
 
-    doc = _doc()
-    jobs = doc["jobs"]
-    treedup, evidence, test = jobs["treedup"], jobs["evidence"], jobs["test"]
 
-    # The decision is made once, in treedup.
-    assert treedup["outputs"]["evidence_run"] == "${{ steps.evidence.outputs.run }}"
-
-    # Job evidence: after treedup only, red without consequence, nothing to forge
-    # a report with.
-    assert evidence["name"] == "Mutations and red-test baseline"
-    assert evidence["needs"] == "treedup"
-    assert evidence["continue-on-error"] is True
-    assert "environment" not in evidence
-    dumped = json.dumps(evidence)
-    assert "secrets." not in dumped and "HAIPLANE_HUB" not in dumped
-    assert "hub-ci-report" not in dumped and "hub-read-token" not in dumped
-    assert evidence["env"] == test["env"] == {"CI_REQUIRE_ROOT_TESTS": "1"}
-
-    # The environment is that of job test: the same steps, byte for byte.
-    by_name = {s["name"]: s for s in test["steps"]}
-    own = {s["name"]: s for s in evidence["steps"]}
+def _setup_steps_equal_to_test(job: dict) -> None:
+    by_name = {s["name"]: s for s in _doc()["jobs"]["test"]["steps"]}
+    own = {s["name"]: s for s in job["steps"]}
     assert _same_setup(own["Checkout"], by_name["Checkout"])
-    # #1919: the installs are the same as in job test, byte for byte, except that
-    # an adopted run skips them (nothing below needs an environment then).
     for name in (
         "Install uv",
         "Set up Python",
         "Install age and openssh-server (backup tests)",
         "Install dependencies",
     ):
-        assert all(
-            own[name].get(k) == by_name[name].get(k) for k in ("uses", "with", "run")
-        ), name
-        assert own[name]["if"] == "${{ " + ADOPT_RECOUNT + " }}", name
+        assert _same_setup(own[name], by_name[name]), name
     assert own["Checkout"]["with"] == {"fetch-depth": 0}
 
-    # The two steps: names, ceilings, budget and the gate are as before.
-    mutations, baseline = own[MUTATIONS_STEP], own[BASELINE_STEP]
-    assert (mutations["id"], baseline["id"]) == ("mutations", "baseline")
-    assert mutations["continue-on-error"] is baseline["continue-on-error"] is True
-    assert mutations["timeout-minutes"] == 15 and baseline["timeout-minutes"] == 10
-    assert "--budget-seconds 540" in mutations["run"]
-    assert "--json-out mutation-report.json" in mutations["run"]
-    assert "--json-out red-test-baseline.json" in baseline["run"]
-    assert mutations["if"] == "${{ " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
-    assert baseline["if"] == (
-        "${{ !cancelled() && " + EVIDENCE_GATE + " && " + ADOPT_RECOUNT + " }}"
+
+def test_mutations_and_baseline_run_beside_the_parts() -> None:
+    """#1785/#1921: the legs, the baseline and the merge; gates and hand-over."""
+    import json
+    import re
+
+    doc = _doc()
+    jobs = doc["jobs"]
+    treedup, legs, baseline, evidence, test = (
+        jobs["treedup"],
+        jobs["mutation_legs"],
+        jobs["baseline"],
+        jobs["evidence"],
+        jobs["test"],
     )
 
-    # The hand-over: whatever files exist, after a red step too, outside the
-    # prefix the trusted report reads.
+    # The decision is made once, in treedup.
+    assert treedup["outputs"]["evidence_run"] == "${{ steps.evidence.outputs.run }}"
+
+    # The legs and the baseline: after treedup only, red without consequence,
+    # nothing to forge a report with, and skipped when the evidence was adopted.
+    for job in (legs, baseline):
+        assert job["needs"] == "treedup"
+        assert job["continue-on-error"] is True
+        assert "environment" not in job
+        dumped = json.dumps(job)
+        assert "secrets." not in dumped and "HAIPLANE_HUB" not in dumped
+        assert "hub-ci-report" not in dumped and "hub-read-token" not in dumped
+        assert job["env"] == test["env"] == {"CI_REQUIRE_ROOT_TESTS": "1"}
+        assert job["if"] == "${{ " + EVIDENCE_GATE + " && " + NOT_ADOPTED + " }}"
+        _setup_steps_equal_to_test(job)
+    # a failing leg never skips the baseline: it does not wait for the legs
+    assert baseline["needs"] == "treedup"
+
+    # The legs: one matrix, the number of legs lives only there.
+    assert legs["name"] == "Mutations leg ${{ matrix.leg }}/${{ strategy.job-total }}"
+    assert legs["strategy"]["fail-fast"] is False
+    assert legs["strategy"]["matrix"] == {"leg": [1, 2, 3]}
+    own = {s["name"]: s for s in legs["steps"]}
+    mutations = own[MUTATIONS_STEP]
+    assert mutations["id"] == "mutations"
+    assert mutations["continue-on-error"] is True
+    assert mutations["timeout-minutes"] == 15
+    assert mutations["env"] == {
+        "LEG": "${{ matrix.leg }}",
+        "LEGS": "${{ strategy.job-total }}",
+    }
+    run = mutations["run"]
+    assert "budget=$((540 / LEGS))" in run
+    assert 'if [ "$budget" -lt 60 ]; then budget=60; fi' in run
+    assert '--shard "$LEG/$LEGS"' in run
+    assert "--baseline-timeout 540" in run
+    assert '--budget-seconds "$budget"' in run
+    assert "--json-out mutation-report.json" in run
+    assert "origin/${{ github.base_ref || 'develop' }}" in run
+    hand_over = own["Hand the mutation report of this leg over"]
+    assert hand_over["if"] == "${{ always() }}"
+    assert hand_over["continue-on-error"] is True
+    assert hand_over["with"]["name"] == "hub-ci-mutations-leg-${{ matrix.leg }}"
+    assert not hand_over["with"]["name"].startswith("hub-ci-results-")
+    assert hand_over["with"]["path"] == "mutation-report.json"
+    assert hand_over["with"]["if-no-files-found"] == "ignore"
+    assert hand_over is legs["steps"][-1]
+
+    # The baseline job: the same step as before, its own artifact.
+    steps_b = {s["name"]: s for s in baseline["steps"]}
+    step_b = steps_b[BASELINE_STEP]
+    assert step_b["id"] == "baseline" and step_b["continue-on-error"] is True
+    assert step_b["timeout-minutes"] == 10
+    assert "--json-out red-test-baseline.json" in step_b["run"]
+    assert "origin/${{ github.base_ref || 'develop' }}" in step_b["run"]
+    hand_b = steps_b["Hand the baseline report over"]
+    assert hand_b["with"]["name"] == "hub-ci-baseline"
+    assert hand_b["with"]["path"] == "red-test-baseline.json"
+    assert hand_b["if"] == "${{ always() }}"
+
+    # The merge: the job name and the artifact the rest of the pipeline knows.
+    assert evidence["name"] == "Mutations and red-test baseline"
+    assert evidence["needs"] == ["treedup", "mutation_legs", "baseline"]
+    assert evidence["if"] == (
+        "${{ !cancelled() && " + EVIDENCE_GATE + " && " + NOT_ADOPTED + " }}"
+    )
+    assert evidence["continue-on-error"] is True
+    assert "environment" not in evidence and "env" not in evidence
+    dumped_e = json.dumps(evidence)
+    assert "secrets." not in dumped_e and "HAIPLANE_HUB" not in dumped_e
+    assert "setup-uv" not in dumped_e and "setup-python" not in dumped_e, (
+        "the merge installs nothing: standard library only"
+    )
+    merge = next(
+        s for s in evidence["steps"] if "merge_mutation_legs" in str(s.get("run"))
+    )
+    assert merge["run"].count("python3 -I scripts/merge_mutation_legs.py") == 1
+    assert "--legs-dir legs --out mutation-report.json" in merge["run"].replace(
+        "\\\n", ""
+    ).replace("\n", " ")
+    pulls = [s for s in evidence["steps"] if "download-artifact" in str(s.get("uses"))]
+    assert [s["with"].get("pattern") or s["with"].get("name") for s in pulls] == [
+        "hub-ci-mutations-leg-*",
+        "hub-ci-baseline",
+    ]
+    assert all(s["continue-on-error"] is True for s in pulls)
+
+    # The hand-over to job test: whatever files exist, outside the prefix the
+    # trusted report reads.
     upload = next(
         s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
     )
@@ -698,7 +775,7 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert "run_attempt" not in upload["with"]["name"], "partial reruns find it"
     assert upload["with"]["overwrite"] is True
     assert not upload["with"]["name"].startswith("hub-ci-results-")
-    assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
+    assert upload["if"] == "${{ always() }}"
     assert upload["continue-on-error"] is True
     assert upload["with"]["if-no-files-found"] == "ignore"
     assert upload["with"]["retention-days"] == 3, "a late PR run still finds it"
@@ -707,12 +784,13 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
         "red-test-baseline.json",
     ]
     assert upload is evidence["steps"][-1]
-    assert "hub-ci-results-" in json.dumps(test) and "hub-ci-results-" not in dumped
+    assert "hub-ci-results-" in json.dumps(test) and "hub-ci-results-" not in dumped_e
 
     # Job test: waits for the evidence, has none of its steps, and reads nothing
     # from it except the downloaded files.
     assert test["needs"] == ["treedup", "pytest", "evidence", "static"]
     assert test["if"] == "${{ always() }}"
+    by_name = {s["name"]: s for s in test["steps"]}
     ids = {s.get("id") for s in test["steps"]}
     assert not ids & {"evidence", "mutations", "baseline"}
     assert MUTATIONS_STEP not in by_name and BASELINE_STEP not in by_name
@@ -732,17 +810,54 @@ def test_mutations_and_baseline_run_beside_the_parts() -> None:
     assert names[-1] == "Fail a cancelled run", "the last step stays the last"
 
 
+def test_rerun_failed_of_a_leg_reruns_the_merge_and_the_reporter() -> None:
+    """#1921: the way a lost leg is put back lives in the `needs` of three jobs.
+
+    "Re-run failed jobs" takes the failed jobs and everything that needs them. A
+    job with a job-level `continue-on-error` that fails has conclusion `failure`
+    in the API while the run stays `success` (measured on a throwaway workflow of
+    this shape, run 39430519486), so the leg is a failed job. The merge and the
+    reporter are rerun with it ONLY while they depend on it: transitively for
+    job test. A change that cuts that chain turns "rerun the leg" into "nothing
+    sends a second report".
+    """
+    jobs = _doc()["jobs"]
+
+    def needs(name: str) -> set[str]:
+        raw = jobs[name].get("needs", [])
+        return {raw} if isinstance(raw, str) else set(raw)
+
+    def dependents(root: str) -> set[str]:
+        found, frontier = set(), {root}
+        while frontier:
+            frontier = {n for n in jobs if needs(n) & frontier} - found
+            found |= frontier
+        return found
+
+    for leg in ("mutation_legs", "baseline"):
+        assert jobs[leg]["continue-on-error"] is True, (
+            "a red leg must not redden the run"
+        )
+        assert {"evidence", "test"} <= dependents(leg), leg
+    # the merge runs after a failed leg too (it says what is missing)
+    assert "!cancelled()" in jobs["evidence"]["if"]
+    # and the reporter is not left behind by a failed merge
+    assert jobs["test"]["if"] == "${{ always() }}"
+
+
 def test_evidence_adoption_keeps_artifact_contract() -> None:
-    """#1919 AC-3: how a PR run takes the evidence of the dispatch run."""
+    """#1919/#1921: the adopted files become this run's artifact, in job treedup."""
     import json
 
     from hub.services import ci_integrity
 
     doc = _doc()
     jobs = doc["jobs"]
-    treedup, evidence = jobs["treedup"], jobs["evidence"]
+    treedup = jobs["treedup"]
 
-    assert treedup["outputs"]["adopt"] == "${{ steps.adopt.outputs.adopt }}"
+    assert treedup["outputs"]["adopt"] == ADOPT_OUTPUT, (
+        "adopt is true only when the upload of the files succeeded too"
+    )
     assert (
         treedup["outputs"]["adopted_run_id"]
         == "${{ steps.adopt.outputs.adopted_run_id }}"
@@ -756,38 +871,37 @@ def test_evidence_adoption_keeps_artifact_contract() -> None:
     )
     assert decide["continue-on-error"] is True, "a failure here is a recount"
     assert decide["run"].startswith("python3 -I scripts/adopt_evidence.py decide")
+    assert "--out-dir adopted-evidence" in decide["run"]
     assert "secrets." not in json.dumps(decide)
     # The base of the PR run is what the script reads from git, not an input.
     assert "base.sha" not in json.dumps(decide)
-    assert "scripts/adopt_evidence.py" in ci_integrity.CI_SCRIPTS
+    for script in ("scripts/adopt_evidence.py", "scripts/merge_mutation_legs.py"):
+        assert script in ci_integrity.CI_SCRIPTS, script
 
-    names = [s["name"] for s in evidence["steps"]]
-    own = {s["name"]: s for s in evidence["steps"]}
-    download = own["Download the evidence of the dispatch run (adopt)"]
-    stamp = own["Stamp the adopted evidence with its source run"]
-    assert "download-artifact" in download["uses"]
-    assert download["if"] == "${{ needs.treedup.outputs.adopt == 'true' }}"
-    assert download["with"] == {
-        "name": EVIDENCE_ARTIFACT,
-        "run-id": "${{ needs.treedup.outputs.adopted_run_id }}",
-        "github-token": "${{ github.token }}",
-        "path": ".",
-    }
-    assert download["continue-on-error"] is stamp["continue-on-error"] is True
-    assert stamp["id"] == "adopt_stamp" and download["id"] == "adopt_download"
-    assert stamp["if"] == "${{ steps.adopt_download.outcome == 'success' }}"
-    assert stamp["run"].startswith("python3 -I scripts/adopt_evidence.py stamp")
-    # Before any install: an adopted run installs nothing.
-    assert names.index(download["name"]) < names.index(stamp["name"])
-    assert names.index(stamp["name"]) < names.index("Install uv")
+    steps = treedup["steps"]
+    names = [s["name"] for s in steps]
+    keep = next(s for s in steps if s.get("id") == "adopt_upload")
+    assert "upload-artifact" in keep["uses"]
+    assert keep["if"] == "${{ steps.adopt.outputs.adopt == 'true' }}"
+    assert keep["continue-on-error"] is True
+    assert keep["with"]["name"] == EVIDENCE_ARTIFACT
+    assert keep["with"]["overwrite"] is True
+    assert keep["with"]["if-no-files-found"] == "error"
+    assert keep["with"]["path"].split() == [
+        "adopted-evidence/mutation-report.json",
+        "adopted-evidence/red-test-baseline.json",
+    ]
+    assert names.index(decide["name"]) < names.index(keep["name"])
+    # Nothing downloads another run's artifact any more: the files come from the
+    # one step that decided.
+    assert "run-id:" not in _text()
+
+    # An adopted run computes nothing, and a recounted one computes everything.
+    for name in ("mutation_legs", "baseline", "evidence"):
+        assert NOT_ADOPTED in jobs[name]["if"], name
+    assert NOT_ADOPTED not in jobs["test"]["if"]
     # The token of this workflow is read-only on actions.
     assert doc["permissions"] == {"contents": "read", "actions": "read"}
-    # The hand-over to job test is unchanged: the same upload, the same name.
-    upload = next(
-        s for s in evidence["steps"] if "upload-artifact" in str(s.get("uses"))
-    )
-    assert upload["with"]["name"] == EVIDENCE_ARTIFACT
-    assert upload["if"] == "${{ always() && " + EVIDENCE_GATE + " }}"
     assert jobs["test"]["needs"] == ["treedup", "pytest", "evidence", "static"]
 
 
@@ -1272,6 +1386,9 @@ def _deploy_cases(condition: str) -> dict[str, bool]:
         "pytest": "success",
         "evidence": "skipped",
         "static": "success",
+        # #1921: the ancestors of evidence count for the implicit success() too
+        "mutation_legs": "skipped",
+        "baseline": "skipped",
     }
     out: dict[str, bool] = {}
 
@@ -1327,6 +1444,8 @@ _OK = {
     "pytest": "success",
     "evidence": "success",
     "static": "success",
+    "mutation_legs": "success",
+    "baseline": "success",
 }
 
 
