@@ -317,6 +317,9 @@ def monoculture_ground(implementer_model: str, reviewer_model: str) -> str | Non
 # промолчал»: тихий отказ автовердикта и эскалация стюарда — это одно и то
 # же событие, «вердикт остаётся человеку», и таблица 2x2 считает именно его.
 
+#: Нет данных о причине неполноты (#1925): «неизвестно», а не пустая строка.
+LADDER_WHY_UNKNOWN = "причина не установлена"
+
 VERDICT_APPROVE = "approve"
 VERDICT_CHANGES = "changes_requested"
 VERDICT_ESCALATE = "escalate"
@@ -364,6 +367,8 @@ class PolicyInputs:
     implementer_model: str = ""
     reviewer_model: str = ""
     sibling_mismatch: bool = False
+    #: Почему добор лестницы не помог (#1925); пусто — вызывающий не знает.
+    ladder_why: str = ""
 
 
 @dataclass(frozen=True)
@@ -425,7 +430,12 @@ def _report_stage(
             grounds=seen,
         )
     if blockers:
-        return _escalate("report_incomplete", "прогон харнесса не завершён", seen)
+        return _escalate(
+            "report_incomplete",
+            "прогон харнесса не завершён; почему лестница добора не помогла: "
+            + (inputs.ladder_why or LADDER_WHY_UNKNOWN),
+            seen,
+        )
     if policy.require_raw_count and (report.value.get("raw_count") or 0) < 1:
         return _escalate(
             "precondition_failed",
