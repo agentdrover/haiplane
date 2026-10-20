@@ -833,6 +833,13 @@ def test_static_failure_turns_test_job_red() -> None:
     steps = test["steps"]
     names = [s["name"] for s in steps]
     judge = steps[names.index("Static checks outcome")]
+    # The judge reads the result of job `static` and nothing else. Without this
+    # the behaviour table below is blind to the wiring: pointing the variable at
+    # another job (needs.pytest.result) kept every case green while a red static
+    # left the required check green. The same lock `_aggregator_rc` puts on
+    # PARTS_RESULT for the parts.
+    assert judge["env"] == {"STATIC_RESULT": "${{ needs.static.result }}"}
+    assert judge["run"].count("$STATIC_RESULT") >= 1
 
     for result, red in (
         ("success", False),
