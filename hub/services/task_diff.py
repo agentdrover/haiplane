@@ -213,7 +213,9 @@ async def _resolve_target(
             "",
         )
 
-    diff_base = await review_evidence.resolve_diff_base(db, task_id, branch)
+    diff_base = await review_evidence.resolve_diff_base(
+        db, task_id, branch, offline=True
+    )
     base = str(diff_base.get("base") or "")
     fallback = review_evidence.diff_command_for(diff_base, sha)
 

@@ -248,6 +248,12 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def branch_diff_local(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
+        """Тот же ответ без сети (#1913): здесь сети и нет, значит, это ``branch_diff``."""
+        return await self.branch_diff(repo, base, branch, context)
+
     async def integrity_read(
         self, repo: str, base: str, sha: str
     ) -> dict[str, str] | None:

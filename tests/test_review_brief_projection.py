@@ -760,7 +760,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # #1830: machine_review получил author_answers и undisposed_author_lines (пустые
 # здесь); переснят REST-бриф и пакет стюарда, packet_hash прежний.
 # #1858: REST-бриф получил cause_task (null здесь); переснят он и пакет стюарда.
-GOLDEN_REST_BRIEF = "d32254105fb0900d5f255bd5f238bbde397fdd8e61185dbffaeaa316390e1362"  # pragma: allowlist secret
+# #1913: REST-бриф читает наблюдения без сети — изменились только sha_check_reason
+# («вершину хаб не наблюдал») и stacking_warning («не сверена»); пакет прежний.
+GOLDEN_REST_BRIEF = "d6a7a9da221a7b7db9025e6d375fb3028e3e1eb22a4939952a750bfed84f2945"  # pragma: allowlist secret
 GOLDEN_STEWARD_PACKET = "afa1fe01e601c119f394cb869aa9d3cf9d7239b3ab53f88fefa14c7e48a88ee4"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 

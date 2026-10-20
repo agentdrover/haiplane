@@ -59,6 +59,7 @@ from hub.services import (
     call_sites,
     ci_contract,
     ci_integrity,
+    gate_observations,
     path_notices,
     review_evidence,
 )
@@ -133,7 +134,12 @@ class _BriefTimer:
 
 
 async def build_call_sites_section(
-    db, task_id: int, task_view, diff_base: dict | None = None
+    db,
+    task_id: int,
+    task_view,
+    diff_base: dict | None = None,
+    *,
+    observe_only: bool = False,
 ) -> CallSiteSection:
     """The call-site enumeration for a task's branch (#601).
 
@@ -171,7 +177,14 @@ async def build_call_sites_section(
             return CallSiteSection(
                 status=call_sites.UNKNOWN, reason="project has no workspace"
             )
-        diff = await plugins.git_ops.branch_diff(workspace, base, branch)
+        # Показ читает копию как она есть (#1913): ref не нашёлся — «не удалось
+        # прочитать», а не fetch ради красивого ответа.
+        read = (
+            plugins.git_ops.branch_diff_local
+            if observe_only
+            else plugins.git_ops.branch_diff
+        )
+        diff = await read(workspace, base, branch)
         if diff is None:
             return CallSiteSection(
                 status=call_sites.UNKNOWN,
@@ -206,7 +219,9 @@ async def build_call_sites_section(
     )
 
 
-async def base_merge_section(db, task_view) -> BaseMergeState:
+async def base_merge_section(
+    db, task_view, *, observe_only: bool = False
+) -> BaseMergeState:
     """Будущий конфликт с базой, названный ДО вердикта (#1233, AC-1).
 
     Четыре исхода, и ни один не подменяет другой. ``not_applicable`` — спрашивать
@@ -217,12 +232,58 @@ async def base_merge_section(db, task_view) -> BaseMergeState:
     09.09.2026 человек одобрил #1204 в 05:48 и через четырнадцать секунд узнал
     из отказа доставки, что ветка конфликтует с базой в трёх файлах. Вердикт к
     тому моменту уже был потрачен.
+
+    ``observe_only`` (#1913): путь показа не спрашивает провайдера (``gh pr
+    view``, пробный мерж) — он отвечает последним наблюдением хаба с его
+    возрастом, а без наблюдения — ``unknown`` «не сверено».
     """
     if task_view.status not in GATE_STATUSES or not task_view.pr_number:
         return BaseMergeState(
             state="not_applicable",
             reason="расхождение с базой спрашивается на гейте и только при PR",
         )
+    if observe_only:
+        return _observed_base_merge(task_view)
+    state = await _ask_base_merge(db, task_view)
+    if state.state in ("clean", "conflicting"):
+        # Ответ, за который заплачено сетью, не пропадает: следующий показ
+        # скажет его с возрастом (#1913). «Не удалось спросить» не запоминается.
+        gate_observations.record(
+            gate_observations.BASE_MERGE,
+            task_view.id,
+            str(task_view.pr_number),
+            state.model_dump(),
+        )
+    return state
+
+
+def _observed_base_merge(task_view) -> BaseMergeState:
+    """Ответ показа: последнее наблюдение хаба с возрастом, иначе «не сверено» (#1913)."""
+    seen = gate_observations.recall(
+        gate_observations.BASE_MERGE, task_view.id, str(task_view.pr_number)
+    )
+    if seen is None:
+        return BaseMergeState(
+            state="unknown",
+            reason=(
+                "не сверено: расхождение с базой хаб в последние "
+                f"{gate_observations.MAX_AGE_MINUTES} мин не проверял, а показ "
+                "в сеть не ходит. Свежую проверку делают сдача, вердикт и доставка"
+            ),
+        )
+    value = seen.value
+    return BaseMergeState(
+        state=str(value.get("state") or "unknown"),
+        reason=(
+            f"{value.get('reason') or ''} [сверено "
+            f"{gate_observations.age_phrase(seen.age_minutes)}, показ в сеть не ходит]"
+        ).strip(),
+        files=list(value.get("files") or []),
+    )
+
+
+async def _ask_base_merge(db, task_view) -> BaseMergeState:
+    """Спросить провайдера, сольётся ли PR чисто: дорогой ответ, только явным операциям."""
     from hub import services
 
     try:
@@ -449,19 +510,23 @@ async def _ci_run_report_state(db, task_id: int, task_view) -> CIRunReportState:
     return state
 
 
-async def _row_after_ci_refresh(db, task_id: int, row):
+async def _row_after_ci_refresh(db, task_id: int, row, observe_only: bool = False):
     """The task row, read again after the CI standing was brought up to date.
 
     #1687: which attempt is current is known only by asking, and every block of
     the brief (prepass, mutations, baseline, AC results) reads what the current
     attempt wrote — so the question comes FIRST. A task without a code result,
     or without a pinned commit, has no CI standing to refresh.
+
+    ``observe_only`` (#1913): путь показа читает стояние, которое записал
+    проход поллера (``ci_trust.sweep`` обновляет задачи в review каждый тик) —
+    GitHub за прогонами не спрашивается.
     """
     from hub.services import ci_trust
 
     task_row = dict(row)
     sha = (task_row.get("submission_sha") or "").strip()
-    if automation_not_applicable(task_row) or not sha:
+    if automation_not_applicable(task_row) or not sha or observe_only:
         return row
     await ci_trust.refresh_quietly(
         db, task_id, sha, offline=ci_trust.forge_recently_down()
@@ -490,12 +555,59 @@ async def _brief_branch_tip(
     )
 
 
+async def _stacking_warning(
+    db, task_id: int, branch: str, observe_only: bool, timer
+) -> str:
+    """Предупреждение о стыковке: свежая проверка или (показ) последнее наблюдение."""
+    if not branch:
+        return ""
+    if observe_only:
+        return _observed_stacking_warning(task_id, branch)
+    from hub import services
+
+    stacking = await timer.run(
+        "stacking", services.detect_branch_stacking(db, task_id, branch)
+    )
+    return str(stacking["message"]) if stacking else ""
+
+
+def _tip_age_note(task_id: int, branch: str) -> str:
+    """Возраст наблюдения вершины для причины sha_check (#1913)."""
+    from hub.services.lifecycle import observed_tip_age_minutes
+
+    age = observed_tip_age_minutes(task_id, branch)
+    if age is None:
+        return ""
+    return (
+        f" [по наблюдению хаба {gate_observations.age_phrase(age)}, "
+        "показ в сеть не ходит]"
+    )
+
+
+def _observed_stacking_warning(task_id: int, branch: str) -> str:
+    """Стыковка веток по последнему наблюдению хаба (#1913); без него — «не сверено».
+
+    Пустая строка означала бы «стыковки нет», а хаб мог просто не смотреть.
+    """
+    seen = gate_observations.recall(gate_observations.STACKING, task_id, branch)
+    if seen is None:
+        return (
+            "Стыковка с чужими ветками не сверена: хаб в последние "
+            f"{gate_observations.MAX_AGE_MINUTES} мин её не проверял, а показ в "
+            "сеть не ходит. Её проверяют сдача и доставка."
+        )
+    message = str(seen.value.get("message") or "")
+    if not message:
+        return ""
+    return f"{message} [сверено {gate_observations.age_phrase(seen.age_minutes)}]"
+
+
 async def build_review_brief(
     db,
     task_id: int,
     *,
     self_review_warning: SelfReviewWarning | None = None,
-    observe_tip_only: bool = False,
+    observe_only: bool = False,
 ) -> ReviewBrief | None:
     """Assemble the whole review brief for ``task_id`` (#308, #823).
 
@@ -506,11 +618,13 @@ async def build_review_brief(
     is a statement about the CALLER, and this builder is deliberately blind to
     identity so that both readers get the same evidence.
 
-    ``observe_tip_only`` (#1810): вершина ветки — только из последнего
-    наблюдения хаба, без ``git fetch``. Так собирается карточка: она
-    перерисовывается каждые 15 с, и сеть на каждый показ — нагрузка и
-    зависание. Явный запрос брифа (REST, стюард) по-прежнему идёт со свежим
-    fetch: ради него он и существует.
+    ``observe_only`` (#1810, #1913): сеть на сборку не тратится вовсе. Вершина
+    ветки, расхождение PR с базой и стыковка берутся из последних наблюдений
+    хаба с их возрастом (нет наблюдения — «не сверено»), стояние CI — из базы
+    (его обновляет поллер), дифф — из копии как она есть. Так собираются
+    карточка (перерисовка каждые 15 с), REST/MCP-бриф и hub_task_status. Путь
+    стюарда и явные гейты зовут сборку без флага: их решение не может опираться
+    на память показа, и именно они обновляют наблюдения.
     """
     from hub import services
 
@@ -518,7 +632,7 @@ async def build_review_brief(
     row = await timer.run("db_reads", repo.get_task(db, task_id))
     if not row:
         return None
-    row = await _row_after_ci_refresh(db, task_id, row)
+    row = await _row_after_ci_refresh(db, task_id, row, observe_only)
     task_row = dict(row)
     if automation_not_applicable(task_row):
         # #1648: у задачи-состояния нет ветки, диффа и CI — вычислять нечего.
@@ -554,7 +668,9 @@ async def build_review_brief(
     # unknowns as if each had looked and found nothing.
     diff_base = await timer.run(
         "diff_base",
-        review_evidence.resolve_diff_base(db, task_id, task_view.branch or ""),
+        review_evidence.resolve_diff_base(
+            db, task_id, task_view.branch or "", offline=observe_only
+        ),
     )
     diff_command = review_evidence.diff_command_for(diff_base, task_view.branch or "")
 
@@ -572,13 +688,9 @@ async def build_review_brief(
     # Advisory branch-stacking check (#438): the reviewer should know when
     # the diff includes another task's unmerged work. Best-effort — no repo
     # access means no warning, never an error.
-    stacking_warning = ""
-    if task_view.branch:
-        stacking = await timer.run(
-            "stacking", services.detect_branch_stacking(db, task_id, task_view.branch)
-        )
-        if stacking:
-            stacking_warning = stacking["message"]
+    stacking_warning = await _stacking_warning(
+        db, task_id, task_view.branch or "", observe_only, timer
+    )
 
     # #506/#1650: resolve each verifiable_by=test AC's locator by READING the
     # test file with git at one ref (submission_sha → task branch → project
@@ -609,13 +721,15 @@ async def build_review_brief(
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
     current_tip, tip_reason = await _brief_branch_tip(
-        db, task_id, task_view.branch or "", submission_sha, observe_tip_only, timer
+        db, task_id, task_view.branch or "", submission_sha, observe_only, timer
     )
     # #1334: the classification is one function, shared with the review
     # queue — which feeds it the tip the hub last observed instead of a fetch.
     sha_check, sha_check_reason = review_evidence.sha_check_of(
         submission_sha, task_view.branch or "", current_tip, tip_reason
     )
+    if observe_only and current_tip:
+        sha_check_reason += _tip_age_note(task_id, task_view.branch or "")
 
     # #1233: разойдётся ли ветка с базой при доставке — ДО вердикта, а не
     # после отказа доставки. Спрашивается только на гейте и только при наличии
@@ -625,7 +739,7 @@ async def build_review_brief(
     asks_base_merge = task_view.status in GATE_STATUSES and bool(task_view.pr_number)
     base_merge_state = await timer.run(
         "base_merge" if asks_base_merge else "",
-        base_merge_section(db, task_view),
+        base_merge_section(db, task_view, observe_only=observe_only),
     )
 
     # #601: where else is each changed symbol called, and does this diff touch
@@ -635,7 +749,10 @@ async def build_review_brief(
     # would read as "no other call sites", which is the very mistake the
     # section exists to catch.
     call_sites_section = await timer.run(
-        "call_sites", build_call_sites_section(db, task_id, task_view, diff_base)
+        "call_sites",
+        build_call_sites_section(
+            db, task_id, task_view, diff_base, observe_only=observe_only
+        ),
     )
 
     # #507: recorded pass/fail of each test-AC for the current generation.
@@ -716,7 +833,8 @@ async def build_review_brief(
     # #808: the block the human reads at the gate, built by the same function
     # that feeds the task card. Two readers, one report.
     brief_review_report = await timer.run(
-        "db_reads", review_evidence.review_report(db, task_row, mr_row)
+        "db_reads",
+        review_evidence.review_report(db, task_row, mr_row, offline=observe_only),
     )
     # #1266 (round 2, c0babbdf6d557c91): the top-level field is the SAME
     # object review_report just built — not a second construction of it.
@@ -945,7 +1063,7 @@ async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
     if status not in GATE_STATUSES:
         return None
     try:
-        return await build_review_brief(db, int(task_row["id"]), observe_tip_only=True)
+        return await build_review_brief(db, int(task_row["id"]), observe_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
         return None

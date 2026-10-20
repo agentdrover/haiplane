@@ -1593,11 +1593,9 @@ async def hub_task_status(
                 "hint": "hub_task_status(task_id, updates=-1) reads the whole feed; full=true the whole task.",
             }
         )
-    # refresh syncs the task with its dispatch job — a state transition, not a
-    # read. A read-only caller (watcher, #1556) gets the stored state instead;
-    # opening that POST to it would be a hole in the role, not a convenience.
-    if identity_context_get()[1] != "watcher":
-        await _api_post(f"/api/tasks/{task_id}/refresh")
+    # #1913: чтение не будит refresh. Он переводит задачу по завершённому job
+    # через гейты (с fetch) — это переход, а не чтение; его делает поллер
+    # (poller.py, transition_after_agent_done), у наблюдателя (#1556) его нет.
     task = await _api_get(f"/api/tasks/{task_id}")
     if full:
         return structured_tool_result(

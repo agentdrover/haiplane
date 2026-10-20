@@ -251,7 +251,15 @@ async def test_review_brief_stacking_warning_empty_without_repo_access(
     resp = await client.get(f"/api/tasks/{task_id}/review-brief")
 
     assert resp.status_code == 200
-    assert resp.json()["stacking_warning"] == ""
+    # #1913: показ в сеть не ходит — без наблюдения он говорит «не сверена»,
+    # а не «чисто» и не советует стыковку.
+    shown = resp.json()["stacking_warning"]
+    assert "не сверена" in shown and "ADVISORY" not in shown
+    # Свежая сборка (стюард, гейты) при недоступном репозитории молчит, как раньше.
+    from hub.services.review_brief import build_review_brief
+
+    live = await build_review_brief(db, task_id)
+    assert live is not None and live.stacking_warning == ""
 
 
 # --- which side merges first (#1184) ---

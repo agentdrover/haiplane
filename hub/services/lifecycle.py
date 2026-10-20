@@ -2523,7 +2523,10 @@ def observed_tip_age_minutes(task_id: int, branch: str) -> int | None:
 
 def forget_observed_tips() -> None:
     """Drop every remembered observation (tests; a restart does the same)."""
+    from hub.services import gate_observations
+
     _observed_tips.clear()
+    gate_observations.forget_all()
 
 
 def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
