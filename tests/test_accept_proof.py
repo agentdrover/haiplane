@@ -153,6 +153,22 @@ async def test_a_broken_report_section_is_unreadable_not_empty(
     assert await _action(db, task_id) != ACCEPT
 
 
+async def _approved(db, task_id: int, *generations: int) -> None:
+    """Одобрение поколений, из которых переносится отчёт (#1912): без него перенос не доказательство."""
+    for generation in generations:
+        await db.execute(
+            "INSERT INTO events (kind, task_id, actor, payload) VALUES "
+            "('review_verdict_recorded', ?, 'denis', ?)",
+            (
+                task_id,
+                json.dumps(
+                    {"verdict": "approved", "submission_generation": generation}
+                ),
+            ),
+        )
+    await db.commit()
+
+
 async def _carry(db, task_id: int, source_id: int, **over) -> int:
     """Перенос #1361: копия в текущем поколении без токенов, с пометкой источника."""
     task = dict(await repo.get_task(db, task_id) or {})
@@ -192,6 +208,7 @@ async def test_a_carried_report_is_judged_through_its_source(
 ):
     task_id, ids = await _task(client, db, monkeypatch, "ap-carry", 1)
     await _carry(db, task_id, ids[0])
+    await _approved(db, task_id, 0)
     # Копия без токенов, исходный отчёт с provider_tokens>0: перенос годен.
     assert await _action(db, task_id) == ACCEPT
 
@@ -320,6 +337,7 @@ async def test_a_double_carry_unfolds_every_generation(
     await _copy(db, task_id, 3, a)
     await db.execute("UPDATE tasks SET submission_generation=3 WHERE id=?", (task_id,))
     await db.commit()
+    await _approved(db, task_id, 1, 2)
     assert (await _action(db, task_id) == ACCEPT) is middle_is_clean
 
 
