@@ -466,12 +466,14 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     step = next(s for s in steps if s.get("id") == "baseline")
     assert step["continue-on-error"] is True
     # #1606: «только task-*» теперь решает шаг evidence (см. contract-тест);
-    # #1785: он стоит в job treedup, а baseline идёт в job evidence.
-    assert "needs.treedup.outputs.evidence_run == 'true'" in step["if"]
-    assert "!cancelled()" in step["if"], "красный шаг мутаций не стирает baseline"
+    # #1785: он стоит в job treedup. #1921: baseline — job сам по себе, не ждёт
+    # ног мутаций, поэтому красная нога его не стирает; решение — на уровне job.
+    baseline_job = doc["jobs"]["baseline"]
+    assert "needs.treedup.outputs.evidence_run == 'true'" in baseline_job["if"]
+    assert baseline_job["needs"] == "treedup", "красная нога не стирает baseline"
+    assert step in baseline_job["steps"]
     assert "scripts/red_test_baseline.py" in step["run"]
     reporter_step = next(s for s in steps if "hub-ci-report" in str(s.get("uses")))
-    assert steps.index(step) < steps.index(reporter_step)
     assert reporter_step["with"]["baseline-file"] in step["run"]
     action = yaml.safe_load(
         (_ROOT / ".github" / "actions" / "hub-ci-report" / "action.yml").read_text(

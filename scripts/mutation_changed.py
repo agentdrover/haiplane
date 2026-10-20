@@ -102,6 +102,9 @@ class Report:
     head: str = ""
     merge_base: str = ""
     base_tip: str = ""
+    # #1921: which leg of a matrix run this is ("2/3"); "1/1" is the whole series.
+    # scripts/merge_mutation_legs.py checks that every leg is present.
+    shard: str = "1/1"
     functions: list[str] = field(default_factory=list)
     untested: list[str] = field(default_factory=list)
     mutants: int = 0
@@ -118,6 +121,7 @@ class Report:
             "head": self.head,
             "merge_base": self.merge_base,
             "base_tip": self.base_tip,
+            "shard": self.shard,
             "reason": self.reason,
             "functions": self.functions,
             "untested": self.untested,
@@ -359,6 +363,61 @@ class _Target:
     test_files: list[Path]
 
 
+def mutation_key(path: str, mutation) -> tuple:
+    """A mutant's place in the one global order the legs agree on (#1921).
+
+    cosmic-ray hands the mutants of a file out in RANDOM order
+    (``pending_work_items``), so dividing "by position" in that list would give two
+    legs the same mutant and nobody another. The key is a function of the mutant
+    itself: file, span, operator, occurrence.
+    """
+    return (
+        path,
+        tuple(mutation.start_pos),
+        tuple(mutation.end_pos),
+        mutation.operator_name,
+        mutation.occurrence,
+    )
+
+
+def parse_shard(raw: str) -> tuple[int, int]:
+    """``"2/3"`` -> (2, 3); anything else is a usage error, not a silent full run."""
+    match = re.fullmatch(r"(\d+)/(\d+)", raw.strip())
+    if not match:
+        raise ValueError(f"--shard {raw!r} is not of the form i/N")
+    index, total = int(match.group(1)), int(match.group(2))
+    if total < 1 or not 1 <= index <= total:
+        raise ValueError(f"--shard {raw!r}: i must be in 1..N and N at least 1")
+    return index, total
+
+
+def shard_targets(targets: list["_Target"], index: int, total: int) -> list["_Target"]:
+    """The targets with only the mutants leg ``index`` of ``total`` owns.
+
+    Mutant number r (0-based) of the globally sorted list belongs to leg
+    ``r % total + 1``: the legs are a partition of the mutants, whatever order
+    the targets and their mutations arrive in. ``total == 1`` is the whole series.
+    """
+    if total <= 1:
+        return targets
+    ranked = sorted(
+        (mutation_key(t.function.path, m), ti, mi)
+        for ti, t in enumerate(targets)
+        for mi, m in enumerate(t.mutations)
+    )
+    owned = {
+        (ti, mi) for rank, (_, ti, mi) in enumerate(ranked) if rank % total == index - 1
+    }
+    return [
+        _Target(
+            t.function,
+            [m for mi, m in enumerate(t.mutations) if (ti, mi) in owned],
+            t.test_files,
+        )
+        for ti, t in enumerate(targets)
+    ]
+
+
 def _collect_targets(
     repo: Path, base: str, tests_dir: Path, report: Report, scratch: Path
 ) -> list[_Target]:
@@ -436,10 +495,17 @@ def analyse(
     *,
     tests_dir: Path = Path("tests"),
     budget: float = DEFAULT_BUDGET_SECONDS,
+    shard: tuple[int, int] = (1, 1),
+    baseline_timeout: float | None = None,
 ) -> Report:
-    """Select, baseline, mutate. Never raises for a problem in the work itself."""
+    """Select, baseline, mutate. Never raises for a problem in the work itself.
+
+    ``shard`` (#1921): run only the mutants leg i of N owns. ``baseline_timeout``:
+    when given, the baseline has this ceiling of its own and ``budget`` is the
+    time of the SERIES alone; without it ``budget`` covers both (as before).
+    """
     started = time.monotonic()
-    report = Report(state=STATE_ERROR, base=base)
+    report = Report(state=STATE_ERROR, base=base, shard=f"{shard[0]}/{shard[1]}")
     repo = repo.resolve()
     previous_cwd = Path.cwd()
     os.chdir(repo)  # cosmic-ray resolves module paths against the cwd
@@ -450,7 +516,7 @@ def analyse(
                 t.function.path: (repo / t.function.path).read_bytes() for t in targets
             }
             try:
-                _analyse_targets(repo, targets, report, budget)
+                _analyse_targets(repo, targets, report, budget, shard, baseline_timeout)
             finally:
                 for path, content in snapshots.items():
                     if (repo / path).read_bytes() != content:
@@ -466,7 +532,12 @@ def analyse(
 
 
 def _analyse_targets(
-    repo: Path, targets: list[_Target], report: Report, budget: float
+    repo: Path,
+    targets: list[_Target],
+    report: Report,
+    budget: float,
+    shard: tuple[int, int] = (1, 1),
+    baseline_timeout: float | None = None,
 ) -> None:
     if not report.functions:
         report.state = STATE_NO_CHANGES
@@ -480,7 +551,9 @@ def _analyse_targets(
         return
     test_files = sorted({f for t in targets for f in t.test_files})
     command = _test_command(test_files, repo)
-    rc, seconds, tail = run_baseline(command, repo, budget)
+    rc, seconds, tail = run_baseline(
+        command, repo, budget if baseline_timeout is None else baseline_timeout
+    )
     if rc != 0:
         report.state = STATE_BASELINE_RED
         report.reason = (
@@ -490,7 +563,8 @@ def _analyse_targets(
         return
     timeout = max(MIN_MUTANT_TIMEOUT, 3 * seconds)
     report.state = STATE_RAN
-    _run_series(repo, targets, timeout, max(0.0, budget - seconds), report)
+    series = budget if baseline_timeout is not None else max(0.0, budget - seconds)
+    _run_series(repo, shard_targets(targets, *shard), timeout, series, report)
 
 
 def format_report(report: Report) -> str:
@@ -545,9 +619,25 @@ def main(argv: list[str] | None = None) -> int:
         help="stop starting new mutants after this long; the rest are counted as not run",
     )
     parser.add_argument(
+        "--shard",
+        default="1/1",
+        metavar="I/N",
+        help="run leg I of N: the mutants whose rank in the global order is I-1 mod N",
+    )
+    parser.add_argument(
+        "--baseline-timeout",
+        type=float,
+        default=None,
+        help="ceiling of the unmutated baseline; --budget-seconds is then the series alone",
+    )
+    parser.add_argument(
         "--json-out", metavar="FILE", help="also write the report as JSON"
     )
     args = parser.parse_args(argv)
+    try:
+        shard = parse_shard(args.shard)
+    except ValueError as exc:
+        parser.error(str(exc))
     # A CI step timeout sends SIGTERM. Turning it into SystemExit lets the
     # snapshot restore in analyse() run, so no mutant is left on disk.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
@@ -557,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
         args.base,
         tests_dir=Path(args.tests_dir),
         budget=args.budget_seconds,
+        shard=shard,
+        baseline_timeout=args.baseline_timeout,
     )
     print(format_report(report))
     if args.json_out:
