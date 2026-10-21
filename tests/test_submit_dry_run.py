@@ -411,6 +411,41 @@ async def test_dry_run_ci_refresh_and_expected_sha_match_real(
     assert dry.status_code == real.status_code == 200, (dry.text, real.text)
     assert dry.json()["would_submit"] is True
 
+    # Пока preview ждёт замок, проекцию меняет другая корутина: dry-run видит
+    # то, что в базе сейчас, как настоящий refresh, и замок не захватывает.
+    class CountingLock(asyncio.Lock):
+        acquired = 0
+
+        async def acquire(self):
+            type(self).acquired += 1
+            return await super().acquire()
+
+    flip, tip_f = await sup.ready_task(db, "dr-ci-flip", POLICY)
+    await sup.post_ci(client, w, flip, tip_f)
+    monkeypatch.setattr(ci_trust, "REFRESH_DEADLINE_SECONDS", 0.3)
+    lock = CountingLock()
+    ci_trust._locks[(flip, tip_f)] = lock
+    await lock.acquire()
+    CountingLock.acquired = 0
+    try:
+        with sup.tripwires():
+            waiting = asyncio.ensure_future(
+                sup.submit(client, flip, sup.body(), dry=True)
+            )
+            await asyncio.sleep(0.1)
+            await db.execute(
+                "UPDATE ci_run_reports SET trust='unverified', "
+                "trust_reason='check_failed', attempt_key='' WHERE task_id=?",
+                (flip,),
+            )
+            await db.commit()
+            dry = await waiting
+            assert CountingLock.acquired == 0, "dry-run замок не захватывал"
+            real = await sup.submit(client, flip, sup.body(), dry=False)
+    finally:
+        lock.release()
+    assert dry.status_code == 422 and sup.same(dry, real), (dry.text, real.text)
+
 
 # --------------------------------------------------------------------------
 # Мир заказов k8: заказ, прогон, слот и сессия ahcp_ у задачи (AC-2, AC-9)

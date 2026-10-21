@@ -1299,6 +1299,14 @@ async def _preview_round(
     return projected_row(plan, task_id, head_sha)
 
 
+PREVIEW_POLL_SECONDS = 0.01
+
+
+async def _stored_row(db: Any, task_id: int, head_sha: str) -> dict[str, Any] | None:
+    found = await repo.get_ci_run_report(db, task_id, head_sha)
+    return dict(found) if found is not None else None
+
+
 async def preview_report(db: Any, task_id: int, head_sha: str) -> Computed:
     """The projection ``refresh_quietly`` would leave, computed and never saved (#1975).
 
@@ -1312,30 +1320,33 @@ async def preview_report(db: Any, task_id: int, head_sha: str) -> Computed:
     head_sha = (head_sha or "").strip()
     if not head_sha:
         return Computed(None)
-    found = await repo.get_ci_run_report(db, task_id, head_sha)
-    stored = dict(found) if found is not None else None
+    stored = await _stored_row(db, task_id, head_sha)
     waiting_for_lock = False
     try:
         try:
             async with asyncio.timeout(REFRESH_DEADLINE_SECONDS):
                 # A refresh of this commit in flight is waited for, as the real
-                # one waits, under the same deadline; the lock is not kept.
+                # one waits, under the same deadline. Polled, never acquired:
+                # the preview takes no lock of its own.
                 lock = _locks.get((task_id, head_sha))
-                if lock is not None and lock.locked():
-                    waiting_for_lock = True
-                    async with lock:
-                        pass
-                    waiting_for_lock = False
+                waiting_for_lock = True
+                while lock is not None and lock.locked():
+                    await asyncio.sleep(PREVIEW_POLL_SECONDS)
+                waiting_for_lock = False
+                stored = await _stored_row(
+                    db, task_id, head_sha
+                )  # as the refresh rereads
                 row = await _preview_round(db, task_id, head_sha, stored, offline=False)
         except TimeoutError:
             # Out of time waiting for somebody else's refresh: the real refresh
-            # reserved no version and saves nothing, the stored projection
-            # stands (``_offline_after_timeout`` with ``reserved=None``).
-            row = (
-                stored
-                if waiting_for_lock
-                else await _preview_round(db, task_id, head_sha, stored, offline=True)
-            )
+            # reserved no version and saves nothing, the standing is whatever
+            # the database holds NOW (``_offline_after_timeout`` with
+            # ``reserved=None`` rereads it).
+            if waiting_for_lock:
+                stored = await _stored_row(db, task_id, head_sha)
+                row = stored
+            else:
+                row = await _preview_round(db, task_id, head_sha, stored, offline=True)
     except Exception:  # noqa: BLE001 - mirrors refresh_quietly: fail closed
         log.exception("CI trust preview for task %s failed", task_id)
         row = (
