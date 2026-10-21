@@ -178,3 +178,48 @@ async def test_unknown_bill_stays_open_for_the_deferred_recount(
     assert row["status"] == "done"
     assert row["provider_tokens"] is None, "угаданный ноль не пишется"
     assert row["usage_scope"] == dispatcher.USAGE_OPEN
+
+
+async def test_a_report_landing_during_the_opening_of_the_replacement_is_billed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (вторая половина): отчёт во время открытия замены, агента у заглушки нет."""
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "r"}}))
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    task_id = await _submitted(
+        client,
+        db,
+        "own-race",
+        policy={"review": "dispatch", "local_review_fallback": "on"},
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET agent_id='', run_id='', "
+        "status='second_door', run_status='ERROR' WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    provider = _Provider(monkeypatch, usage=_BILL)
+    real_prepare = dispatcher.prepare_review_order
+    landed: list[int] = []
+
+    async def _report_lands_during_prep(*args, **kwargs):
+        if not landed:
+            landed.append(
+                await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+            )
+        return await real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(dispatcher, "prepare_review_order", _report_lands_during_prep)
+
+    await sweep_review_dispatches(db)
+    await dispatcher.wait_for_local_runs()
+    await db.commit()
+
+    assert landed, "предпосылка: отчёт доехал в окно подготовки замены"
+    assert await _local_dispatches(db, task_id) == []
+    row = await _row(db, task_id)
+    assert row["status"] == "done"
+    assert row["agent_id"] == "bc-found" and row["provider_tokens"] == 424242
+    assert provider.finds >= 1
