@@ -240,6 +240,18 @@ async def test_only_an_enabled_admitted_host_and_no_codes(world):
         else:
             raise AssertionError(f"роль {forbidden!r} принята")
     await _disabled_during_the_long_poll(world)
+    # enabled=0 без отзыва принципала тоже закрывает lease: проверка в транзакции своя.
+    await world.db.execute("UPDATE executor_hosts SET enabled = 0 WHERE name = 'k8'")
+    await world.db.commit()
+    principal = await rows(
+        world.db, "SELECT principal_id FROM executor_hosts WHERE name = 'k8'"
+    )
+    try:
+        await role_orders.lease(world.db, "k8", int(principal[0]["principal_id"]))
+    except role_orders.RoleOrderError as exc:
+        assert exc.status == 403
+    else:
+        raise AssertionError("хост с enabled=0 получил lease")
 
 
 async def _disabled_during_the_long_poll(world) -> None:

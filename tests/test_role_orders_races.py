@@ -127,6 +127,12 @@ async def test_a_lease_goes_to_one_admitted_host(world):
         got = (await poll(world, host)).json()["orders"]
         assert all(o["id"] != third["id"] for o in got), host
     assert (await order_row(world, third["id"]))["state"] == "open"
+    # И сама служба (не только дешёвый предпроверочный запрос long-poll) не выдаёт его.
+    assert (
+        await role_orders.lease(world.db, "k8", await _principal(world, "k8")) is None
+    )
+    await world.db.commit()
+    assert (await order_row(world, third["id"]))["state"] == "open"
 
 
 async def test_no_reissue_after_start_and_stale_reports_refused(world):
