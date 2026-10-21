@@ -173,15 +173,17 @@ def _forget_gate_merges():
     would read as "the gate already merged this PR" in the next. Same shape
     as ``_forget_pair_delivery_waits`` above.
     """
-    from hub.services import orchestration
+    from hub.services import delivery_rerun, orchestration
 
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
     orchestration._gate_branch_updates.clear()
+    delivery_rerun.forget_in_flight()  # #1956: идущие POST перезапуска тоже по (задача)
     yield
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
     orchestration._gate_branch_updates.clear()
+    delivery_rerun.forget_in_flight()
 
 
 @pytest.fixture(autouse=True)

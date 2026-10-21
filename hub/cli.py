@@ -16,6 +16,7 @@ from hub import config
 from hub import cli_owner_minutes as om_cli
 from hub import cli_review_verdict as rv_cli
 from hub import expected_sha as expected_sha_cli
+from hub import cli_delivery_rerun as rerun_cli
 from hub.cli_executor_host import add_executor_host_parsers, print_order_line
 from hub.cli_task_fields import (
     _add_result_kind_args,
@@ -1064,6 +1065,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     _print_verdict_route(result)
     om_cli.print_line(result)
     print_order_line(result)
+    rerun_cli.print_line(result)
     return 0
 
 

@@ -188,6 +188,10 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.local_review_fallback_of,
         "project_policy.local_review_fallback_of",
     ),
+    "delivery_fresh_base_rerun": PolicyEntry(
+        project_policy.delivery_fresh_base_rerun_of,
+        "project_policy.delivery_fresh_base_rerun_of",
+    ),
     "merge_is_delivery": PolicyEntry(
         project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
     ),

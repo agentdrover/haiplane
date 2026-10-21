@@ -359,12 +359,18 @@ async def test_after_a_restart_an_unanswered_reservation_goes_to_the_human(
 
 
 async def test_a_caller_inside_a_transaction_never_posts(db, monkeypatch):
+    from hub.services import delivery_rerun
+
     rig = await rig_after_base_update(db, monkeypatch)
     rig.red_first_attempt()
-    await db.execute(
-        "UPDATE tasks SET updated_at=updated_at WHERE id=?", (rig.task_id,)
-    )
-    assert db.in_transaction
+    real_head = delivery_rerun._pr_head
+
+    async def head_then_dirty(scope, task):
+        found = await real_head(scope, task)
+        await db.execute("UPDATE tasks SET title=title WHERE id=?", (rig.task_id,))
+        return found
+
+    monkeypatch.setattr(delivery_rerun, "_pr_head", head_then_dirty)
     ok, why = await services.merge_before_completion(db, await rig.task())
 
     assert not ok and why.startswith("fresh_base_ci_failed")

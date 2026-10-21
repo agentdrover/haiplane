@@ -865,6 +865,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "bug_red_test": "warn",
         "ci_before_submit": "warn",
         "statement_paths": "require",
+        "delivery_fresh_base_rerun": "on",
         "slot_dead_minutes": 90,
         "merge_is_delivery": True,
         "path_notices": [{"pattern": "deploy/**", "text": "ручной шаг"}],

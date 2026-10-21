@@ -942,6 +942,11 @@ async def enrich_task_view(
         db, task_view.id
     )
 
+    # #1956: история автоперезапуска CI на свежей базе - одна для REST, MCP, web и CLI.
+    from hub.services import delivery_rerun
+
+    task_view.delivery_rerun = await delivery_rerun.card_view(db, task_view.id)
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(

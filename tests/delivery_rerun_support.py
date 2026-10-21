@@ -130,6 +130,7 @@ class Rig:
             status=status,
             conclusion=conclusion,
             event="pull_request",
+            artifact=False,  # отчёт кладёт report_attempt: два артефакта = mismatch
         )
 
     def red_first_attempt(self) -> None:
