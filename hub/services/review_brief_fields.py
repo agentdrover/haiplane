@@ -88,6 +88,7 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "machine_review.incomplete_reason": (MANDATORY, ""),
     "machine_review.unresolved": (MANDATORY, ""),
     "machine_review.lost_dimensions": (MANDATORY, ""),
+    "machine_review.ac_tests_unread": (MANDATORY, ""),
     "machine_review.profile": (MANDATORY, ""),
     "machine_review.submitted_by": (MANDATORY, ""),
     "machine_review.self_reviewed": (MANDATORY, ""),

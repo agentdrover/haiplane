@@ -56,6 +56,7 @@ from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     archive_guard,
+    critic_orders,
     expected_sha_gate,
     prevention_gate,
     project_policy,
@@ -941,6 +942,8 @@ async def enrich_task_view(
     task_view.last_executor_order = await executor_triage.last_executor_order_view(
         db, task_view.id
     )
+    # #1953: последний заказ критика облачной сдачи - sha, состояние, срок, шаг.
+    task_view.critic_order = await critic_orders.card_view(db, task_view.id)
 
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
@@ -3372,6 +3375,8 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
     Step("pin_submission_sha", _step_pin_submission_sha),
+    # #1953: то же наблюдение, что закрепил шаг выше; до bump и записей.
+    Step("critic_passed", critic_orders.submit_step),
     Step(
         "same_sha_from_review_is_current",
         _step_same_sha_from_review_is_current,
@@ -3471,6 +3476,11 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step(
+        "critic_passed",
+        critic_orders.submit_step,
+        inactive_reason="нет облачного держателя; гейт done - add_update (#1953)",
+    ),
     # #1589: после закрепления коммита — пути читаются для него, а не для
     # вершины, которая успела уйти вперёд.
     Step("path_notices", _step_path_notices, refuses=False),
@@ -3493,6 +3503,8 @@ async def run_headless_submit_gates(
     """
     state = SubmitContext(db=db, task_id=task["id"], task=task)
     await run_steps(state, HEADLESS_STEPS)
+    if task.get(critic_orders.CHECKED_KEY):  # пин = принятый sha, не второе наблюдение
+        state.submission_sha = task[critic_orders.CHECKED_KEY]
     return state
 
 
@@ -3611,6 +3623,9 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        await critic_orders.accept_in_transaction(
+            db, state.task, observed=state.submission_sha, always=True
+        )  # #1953
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
@@ -4013,6 +4028,10 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        # #1953: приём облачной сдачи - единая функция, под локом
+        await critic_orders.accept_in_transaction(
+            db, task, observed=state.submission_sha, always=True
+        )
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
@@ -6174,7 +6193,11 @@ async def _task_inside_transaction(
 ) -> dict[str, Any]:
     """The task as the database holds it NOW, with what the caller prepared kept."""
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
-    for key in (PREPARED_CI_SHA, resubmission_guard.UNCOMMITTED_KEY):
+    for key in (
+        PREPARED_CI_SHA,
+        resubmission_guard.UNCOMMITTED_KEY,
+        critic_orders.CHECKED_KEY,
+    ):
         if key in task:
             fresh[key] = task[key]
     return fresh
@@ -6193,6 +6216,7 @@ async def add_update(
     body: TaskUpdateCreate,
     *,
     principal_id: int | None = None,
+    session_token: str = "",
 ) -> TaskUpdateView:
     """Add an update to a task; route done reports through shared post-done logic.
 
@@ -6219,6 +6243,12 @@ async def add_update(
     undelivered = await task_updates.finish_update(
         db, task_id, body, deferred_done, undelivered
     )
+    if body.kind != "done":
+        # #1953: строка «нужен критик: sha …» - заказ, если её написала сессия
+        # облачного держателя; после коммита записи, сеть - вне транзакции.
+        await critic_orders.request_from_feed(
+            db, task_id, body.content, session_token=session_token
+        )
     return await task_updates.view_of_update(db, task, body, update_id, undelivered)
 
 
