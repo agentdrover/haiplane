@@ -1319,7 +1319,8 @@ async def test_gate_card_names_brief_failure_reason(
     page = await client.get(f"/tasks/{task_id}")
 
     assert page.status_code == 200
-    assert "бриф не собран: RuntimeError: git diff застрял" in page.text
+    assert "бриф не собран: RuntimeError (внутренняя ошибка)" in page.text
+    assert "git diff застрял" not in page.text, "exception text stays in the log"
     assert "/web-review-verdict" in page.text, "decision form must stay"
 
     outside = await client.post("/api/tasks", json={"title": "Not at the gate"})
