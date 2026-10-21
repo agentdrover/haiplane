@@ -34,9 +34,11 @@ from hub.services.release_alert import minutes_since
 from hub.services.delivery_state import (
     IN_PROD,
     NOT_IN_PROD,
+    ReleaseCache,
     _GitCheck,
     git_delivery_state,
     prepare_delivery,
+    project_release,
 )
 
 log = logging.getLogger("hub")
@@ -78,7 +80,7 @@ async def _reap(*futures: asyncio.Future[Any]) -> None:
 async def _fill(
     db: Any,
     tasks: list[dict[str, Any]],
-    release: Any,
+    releases: ReleaseCache,
     results: list[dict[str, Any] | None],
 ) -> None:
     """Write one answer per task into ``results``, in place, as they arrive.
@@ -89,7 +91,7 @@ async def _fill(
     """
     pending_checks: list[tuple[int, _GitCheck]] = []
     for i, task in enumerate(tasks):
-        prepared = await prepare_delivery(db, int(task["id"]), release=release)
+        prepared = await prepare_delivery(db, int(task["id"]), releases=releases)
         if isinstance(prepared, dict):
             results[i] = prepared
         else:
@@ -110,11 +112,11 @@ async def _fill(
 
 
 async def _answers(
-    db: Any, tasks: list[dict[str, Any]], release: Any, started: float
+    db: Any, tasks: list[dict[str, Any]], releases: ReleaseCache, started: float
 ) -> list[dict[str, Any] | None]:
     """One answer per task, in task order; ``None`` where the budget ran out."""
     results: list[dict[str, Any] | None] = [None] * len(tasks)
-    work = asyncio.ensure_future(_fill(db, tasks, release, results))
+    work = asyncio.ensure_future(_fill(db, tasks, releases, results))
     left = max(0.0, BUILD_BUDGET_SECONDS - (time.monotonic() - started))
     try:
         await asyncio.wait({work}, timeout=left)
@@ -133,7 +135,10 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
     window = max(1, min(int(limit or DEFAULT_WINDOW), MAX_WINDOW))
 
     started = time.monotonic()
-    release = await repo.latest_successful_release(db)
+    # #1927: «deployed» is the hub's own (default project) deploy; the tasks are
+    # compared with the release of THEIR project, each read once per snapshot.
+    releases: ReleaseCache = {}
+    release = await project_release(db, None, releases)
     deployed = {
         "sha": str(release.get("deployed_sha") or "") if release else "",
         "ref": str(release.get("ref") or "") if release else "",
@@ -150,7 +155,7 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
         "unknown": [],
     }
     unchecked = 0
-    for task, answer in zip(tasks, await _answers(db, tasks, release, started)):
+    for task, answer in zip(tasks, await _answers(db, tasks, releases, started)):
         if answer is None:
             unchecked += 1
             answer = {"state": "unknown", "reason": BUDGET_REASON}
