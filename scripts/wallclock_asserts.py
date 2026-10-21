@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import re
 import sys
@@ -121,6 +122,14 @@ def _binop(op: ast.operator, left: float, right: float) -> float | None:
         return left / right
     if isinstance(op, ast.FloorDiv):
         return float(left // right)
+    if isinstance(op, ast.Mod):
+        return left % right
+    if isinstance(op, ast.Pow):
+        # Ограничение степени: 9 ** 9 ** 9 не должно вешать проверку.
+        if abs(right) > 64 or abs(left) > 1e6:
+            return None
+        result = left**right
+        return result if isinstance(result, float) else None
     return None
 
 
@@ -233,26 +242,66 @@ def _patched_by_args(args: list[ast.expr], imp: Imports) -> str | None:
 
 
 def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
-    """Подмены часов в функции с их областью действия."""
-    in_with: dict[int, tuple[int, int]] = {}
-    for node in _own_nodes(func):
+    """Подмены часов в функции, которые ДЕЙСТВУЮТ, с областью действия.
+
+    Действует: monkeypatch.setattr с момента вызова; ``with patch(...)`` в теле
+    with; декоратор @patch на всю функцию; ``p = patch(...)`` / ``patch(...)``
+    только вместе с ``.start()``. Голый вызов ``patch(...)`` ничего не
+    подменяет.
+    """
+    in_with: dict[int, int] = {}
+    decorators = {
+        id(d) for d in getattr(func, "decorator_list", []) if isinstance(d, ast.Call)
+    }
+    nodes = list(_own_nodes(func))
+    for node in nodes:
         if isinstance(node, (ast.With, ast.AsyncWith)):
-            span = (node.body[0].lineno, node.end_lineno or end_line)
             for item in node.items:
-                in_with[id(item.context_expr)] = span
+                in_with[id(item.context_expr)] = node.end_lineno or end_line
+    pending: dict[str, str] = {}  # имя -> часы из ``p = patch(...)``
+    for node in nodes:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and (clock := _patched_clock(node.value, imp))
+            and not _is_setattr(node.value)
+        ):
+            pending[node.targets[0].id] = clock
     found: list[Patch] = []
-    for node in _own_nodes(func):
+    for node in nodes:
         if not isinstance(node, ast.Call):
             continue
         clock = _patched_clock(node, imp)
-        if clock is None:
+        if clock is not None:
+            if _is_setattr(node):
+                found.append(Patch(clock, node.lineno, end_line))
+            elif id(node) in in_with:
+                found.append(Patch(clock, node.lineno, in_with[id(node)]))
+            elif id(node) in decorators:
+                found.append(Patch(clock, getattr(func, "lineno", 0), end_line))
             continue
-        if id(node) in in_with:
-            start = node.lineno
-            found.append(Patch(clock, start, in_with[id(node)][1]))
-        else:
-            found.append(Patch(clock, node.lineno, end_line))
+        started = _started_clock(node, imp, pending)
+        if started is not None:
+            found.append(Patch(started, node.lineno, end_line))
     return found
+
+
+def _is_setattr(call: ast.Call) -> bool:
+    return isinstance(call.func, ast.Attribute) and call.func.attr == "setattr"
+
+
+def _started_clock(call: ast.Call, imp: Imports, pending: dict[str, str]) -> str | None:
+    """Часы, подмену которых включает ``p.start()`` / ``patch(...).start()``."""
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "start"):
+        return None
+    if isinstance(func.value, ast.Name):
+        return pending.get(func.value.id)
+    if isinstance(func.value, ast.Call):
+        return _patched_clock(func.value, imp)
+    return None
 
 
 class _Flow:
@@ -262,7 +311,8 @@ class _Flow:
         self.imp = imp
         end = getattr(func, "end_lineno", None) or 10**9
         self.patches = _patches(func, imp, end)
-        self.aliases: dict[str, str] = {}
+        # имя -> (часы, строка присваивания, взяты ли с модуля time)
+        self.aliases: dict[str, tuple[str, int, bool]] = {}
         self.warnings: list[tuple[int, str]] = []
         self._own = list(_own_nodes(func))
         self._collect_aliases()
@@ -281,7 +331,10 @@ class _Flow:
             ):
                 clock = _module_clock(node.value, self.imp)
                 if clock:
-                    self.aliases[node.targets[0].id] = clock
+                    on_module = isinstance(node.value, ast.Attribute)
+                    self.aliases.setdefault(
+                        node.targets[0].id, (clock, node.lineno, on_module)
+                    )
 
     def _read_kind(self, call: ast.Call) -> str | None:
         """``"module"`` - чтение через time.X / from-импорт; ``"alias"`` - через
@@ -311,8 +364,18 @@ class _Flow:
 
     def _is_faked(self, call: ast.Call) -> bool:
         func = call.func
-        # Только чтение через сам объект time: from-импорт и сохранённая
-        # ссылка не затронуты подменой атрибута модуля.
+        # Ссылка, сохранённая ПОСЛЕ подмены, указывает на fake; сохранённая до
+        # неё - на настоящие часы.
+        if isinstance(func, ast.Name) and func.id in self.aliases:
+            clock, saved_at, on_module = self.aliases[func.id]
+            return on_module and any(
+                p.clock == clock
+                and p.start < self.first_read
+                and p.start < saved_at <= p.end
+                for p in self.patches
+            )
+        # Только чтение через сам объект time: from-импорт не затронут
+        # подменой атрибута модуля.
         if not (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
@@ -442,7 +505,7 @@ def _scan_compare(
         elif value >= THRESHOLD:
             continue
         elif level == "sure":
-            text = ast.unparse(compare)
+            text = _fingerprint(compare)
             scan.places.append(Place(path, qualname, text, stmt.lineno))
             break
         else:
@@ -454,6 +517,19 @@ def _scan_compare(
                     "часы через атрибут объекта: не прослежены",
                 )
             )
+
+
+class _FStrings(ast.NodeTransformer):
+    """f-строки -> имя с ast.dump: unparse f-строк различается между версиями."""
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
+        return ast.Name(id="f<" + ast.dump(node) + ">", ctx=ast.Load())
+
+
+def _fingerprint(compare: ast.Compare) -> str:
+    """Текст сравнения для отпечатка, одинаковый на Python 3.11 и 3.12+."""
+    clone = _FStrings().visit(copy.deepcopy(compare))
+    return ast.unparse(clone)
 
 
 def _walk_scopes(node: ast.AST, prefix: str = ""):
@@ -477,8 +553,6 @@ def scan_source(source: str, path: str, scan: Scan | None = None) -> Scan:
         scan.unparsed.append(path)
         return scan
     imp = _collect_imports(tree)
-    if not imp.modules and not imp.funcs:
-        return scan
     for func, qualname in _walk_scopes(tree):
         _scan_function(func, qualname, path, imp, scan)
     return scan

@@ -75,6 +75,25 @@ def test_eight_patch_after_the_first_read(monkeypatch, fake, t0):
     time.monotonic()
     monkeypatch.setattr(time, "monotonic", fake)
     assert time.monotonic() - t0 < 0.7
+
+
+def test_nine_bare_patch_call_does_nothing():
+    patch("time.monotonic", return_value=0)
+    t0 = time.monotonic()
+    assert time.monotonic() - t0 < 0.61
+
+
+def test_eleven_reference_saved_before_the_patch(monkeypatch, fake, t0):
+    m = time.monotonic
+    monkeypatch.setattr(time, "monotonic", fake)
+    assert m() - t0 < 0.62
+
+
+def test_ten_every_arithmetic_operator_is_evaluated(t0):
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2 ** -1 - 0.01
+    assert elapsed < 1.5 % 1 + 0.01
+    assert elapsed < 7 // 10 + 0.02
 """
 
 IGNORED_SOURCE = """\
@@ -112,6 +131,33 @@ def test_fake_clock_is_the_source(monkeypatch, fake):
     monkeypatch.setattr(time, "monotonic", fake)
     elapsed = time.monotonic() - 1
     assert elapsed < 0.5
+
+
+def test_patch_as_context_manager():
+    with patch("time.monotonic"):
+        elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+@patch("time.perf_counter")
+def test_patch_as_decorator(fake):
+    import time as tm
+
+    elapsed = tm.perf_counter() - 1
+    assert elapsed < 0.5
+
+
+def test_patch_started():
+    p = patch("time.monotonic")
+    p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+def test_reference_saved_after_the_patch(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake)
+    m = time.monotonic
+    assert m() < 0.5
 
 
 def test_not_a_clock(x):
@@ -214,7 +260,16 @@ def test_subsecond_wallclock_asserts_are_found(tmp_path, capsys):
         line = _line_of(FOUND_SOURCE, needle)
         # Строка нарушения, а не предупреждения: у предупреждения другой префикс.
         assert f"\n  src/mod.py:{line} " in out, (needle, out)
-    assert out.count("\n  src/mod.py:") == 8
+    for needle in (
+        "assert time.monotonic() - t0 < 0.61",
+        "assert m() - t0 < 0.62",
+        "assert elapsed < 2 ** -1 - 0.01",
+        "assert elapsed < 1.5 % 1 + 0.01",
+        "assert elapsed < 7 // 10 + 0.02",
+    ):
+        line = _line_of(FOUND_SOURCE, needle)
+        assert f"\n  src/mod.py:{line} " in out, (needle, out)
+    assert out.count("\n  src/mod.py:") == 13
     assert "ПРЕДУПРЕЖДЕНИЕ" not in out
 
 
@@ -375,3 +430,26 @@ def test_ci_and_make_run_the_wallclock_check():
         )
         == []
     )
+
+
+def test_a_file_without_import_time_is_analysed(tmp_path, capsys):
+    """Часы чужого объекта в файле без ``import time`` - предупреждение."""
+    source = "def test_x(clock):\n    assert clock.monotonic() < 0.5\n"
+    _write(tmp_path, source)
+    _write_ledger(tmp_path, [])
+    code, out = _run(tmp_path, capsys)
+    assert code == 0, out
+    assert "ПРЕДУПРЕЖДЕНИЕ src/mod.py:2 " in out, out
+
+
+def test_fingerprint_does_not_depend_on_fstring_quoting():
+    """Отпечаток f-строки одинаков при любых кавычках (unparse 3.11 != 3.12)."""
+    head = (
+        "import time\n\n\ndef test_a(d, t0):\n    assert time.monotonic() - t0 + len("
+    )
+    tail = ") < 0.3\n"
+    one = wc.scan_source(head + "f\"{d['k']}\"" + tail, "m.py").places
+    two = wc.scan_source(head + "f'{d[\"k\"]}'" + tail, "m.py").places
+    assert len(one) == len(two) == 1
+    assert one[0].text == two[0].text
+    assert "JoinedStr" in one[0].text
