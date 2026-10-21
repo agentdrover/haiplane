@@ -30,7 +30,10 @@ async def _verified(db, monkeypatch):
     return rig
 
 
-@pytest.mark.parametrize("change", ["attempt_three_projection", "contract_changed"])
+@pytest.mark.parametrize(
+    "change",
+    ["attempt_three_projection", "version_bump_only", "contract_changed"],
+)
 async def test_the_decision_is_taken_inside_the_confirming_transaction(
     db, db_dsn, monkeypatch, change
 ):
@@ -45,11 +48,13 @@ async def test_the_decision_is_taken_inside_the_confirming_transaction(
         calls.append(1)
         if len(calls) == 2:  # первый вызов - gate_step, второй - точка мержа
             fired.append(1)
-            if change == "attempt_three_projection":
-                await other.execute(
-                    "UPDATE ci_run_reports SET attempt_key=?", (f"ci:{RUN}:3",)
-                )
-                await repo.bump_ci_state_version(other, task_id, head)
+            if change != "contract_changed":
+                if change == "attempt_three_projection":  # ключ без сдвига версии
+                    await other.execute(
+                        "UPDATE ci_run_reports SET attempt_key=?", (f"ci:{RUN}:3",)
+                    )
+                else:  # чужой писатель сдвинул версию, ключ прежний
+                    await repo.bump_ci_state_version(other, task_id, head)
                 await other.commit()
             else:
                 other_fp = ci_contract.contract_from_raw(

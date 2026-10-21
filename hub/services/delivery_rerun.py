@@ -259,6 +259,19 @@ async def merge_hold(
     return await _open_step(db, task, ctx, row, mode)
 
 
+async def headless_rerun(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any], pr_num: Any
+) -> bool:
+    """Headless: обслужить бронь ДО ветвления по пробе PR; True - проход закончен.
+
+    Срок, терминальный исход и инструкция владельцу не зависят от того, что PR
+    показывает (pending, failed, passed): ожидание ждёт следующего свипа,
+    терминальный исход один раз уходит владельцу.
+    """
+    hold = await merge_hold(db, task, ctx)
+    return bool(hold) and await headless_hold(db, task, "rerun_hold", hold, pr_num)
+
+
 async def headless_hold(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -701,6 +714,9 @@ async def _verify_green(db, task, ctx, scope, row, head, cur, late) -> str:
         if standing is not None:
             gap = f"отчёт не подтверждён: {standing.reason}"
         return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    # Версия состояния CI коммита снимается ПОСЛЕ refresh: любой более поздний
+    # писатель (отчёт, refresh соседа) её сдвинет, и подтверждение это увидит.
+    version = await repo.ci_state_version(db, int(task["id"]), head)
     report = await ci_trust.trusted_report(db, int(task["id"]), head)
     keys = {
         standing.attempt_key,
@@ -731,9 +747,39 @@ async def _verify_green(db, task, ctx, scope, row, head, cur, late) -> str:
         )  # fmt: skip
     # Бронь НЕ закрывается: разрешение живёт, пока держится проверка, и
     # повторяется на каждом проходе; закроет её запись доставки (триггер).
+    if not await _confirm_in_transaction(
+        db, task, row, head, expected_key, scope.contract.fingerprint, version
+    ):
+        # CI или контракт изменились после чтения (или бронь закрыли): мержа нет.
+        return await _settled_answer(db, task, ctx)
+    return ""
+
+
+async def _confirm_in_transaction(
+    db, task, row, head: str, expected_key: str, fingerprint: str, version: int | None
+) -> bool:
+    """Решение о мерже - ВНУТРИ транзакции, держащей write-lock (#1956, круг 3).
+
+    Последовательные чтения до неё видят каждое своё мгновение; между последним
+    из них и lock соседнее соединение могло зафиксировать отчёт попытки 3 или
+    сменить контракт. Здесь, под lock, перечитывается всё, что живёт в базе:
+    версия состояния CI коммита, проекция (ключ попытки, trust, отпечаток
+    контракта), живой отпечаток контракта и сама бронь. Сеть (текущая попытка у
+    форжа) под lock не читается: её перечитал ``merge_hold`` перед транзакцией.
+    """
+    task_id = int(task["id"])
     async with write_transaction(db):
-        still = await journal.confirm_requested(db, row["id"])
-    return "" if still else await _settled_answer(db, task, ctx)
+        shown = await repo.get_ci_run_report(db, task_id, head)
+        return (
+            version is not None
+            and await repo.ci_state_version(db, task_id, head) == version
+            and shown is not None
+            and dict(shown).get("attempt_key") == expected_key
+            and dict(shown).get("trust") == ci_trust.VERIFIED
+            and dict(shown).get("contract_fp") == fingerprint
+            and await ci_contract.fingerprint_for_task(db, task_id) == fingerprint
+            and await journal.confirm_requested(db, row["id"])
+        )
 
 
 async def _wait_or_timeout(db, task, ctx, scope, row, late: bool, why: str) -> str:

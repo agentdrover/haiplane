@@ -603,12 +603,10 @@ async def _with_live_approval(db, task: dict) -> dict:
     return {**task, **{k: dict(live)[k] for k in services.APPROVAL_FIELDS}}
 
 
-async def _explicit_outcome(db, task: dict, what: str) -> bool:
-    """The refusals that are final (#1706): the approval is gone, or no commit is pinned.
-
-    ``what`` is a ``MergeStep`` value or a gate detail. True — the outcome was
-    written through the one writer and the caller stops; neither is a wait.
-    """
+async def _explicit_outcome(
+    db, task: dict, what: str, detail: str = "", pr_num: Any = None
+) -> bool:
+    """Final refusals (#1706) or a held merge (#1956): True - the caller stops."""
     if what.startswith((services.APPROVAL_CHANGED_PREFIX, "approval_gone")):
         await services.record_delivery_outcome(db, task, _nothing_to_write)
     elif what.startswith((services.APPROVAL_HEAD_MOVED_PREFIX, "head_moved")):
@@ -619,6 +617,8 @@ async def _explicit_outcome(db, task: dict, what: str) -> bool:
         await services.record_delivery_outcome(
             db, task, partial(delivery_notes.note_delivery_unpinned, db, task)
         )
+    elif what in ("in_flight", "rerun_hold"):  # wait or hand over (#1956)
+        return await services.headless_hold(db, task, what, detail, pr_num)
     else:
         return False
     return True
@@ -648,10 +648,10 @@ async def _deliver_approved_review(db, task: dict) -> None:
             gh_repo=mgh_repo,
             forge=mctx.get("forge", ""),
         )
+        if await services.headless_rerun(db, task, mctx, pr_num):  # #1956
+            return  # a rerun booking: any probe outcome (wait / deadline / owner)
         if ci.outcome == CIProbeOutcome.passed:
-            # #1186: the pair gate asks this inside merge_before_completion;
-            # this conveyor calls merge_pr itself, so it asks here.
-            #
+            # #1186: the pair gate asks this in merge_before_completion; here too.
             # NOT every refusal is a wait, and this is where that was got
             # wrong — found by the dispatched cross-model review. The comment
             # that stood here said "a stacked base is a WAIT", which was true
@@ -694,10 +694,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
             step, _detail = await services.merge_if_approval_stands(
                 db, task, mctx, checked_sha=(task.get("submission_sha") or "")
             )
-            if await _explicit_outcome(db, task, step.value):
-                return
-            if await services.headless_hold(db, task, step.value, _detail, pr_num):
-                return  # a neighbour merges / a rerun booking holds (#1956): next sweep
+            if await _explicit_outcome(db, task, step.value, _detail, pr_num):
+                return  # also: a neighbour merges / a rerun booking holds (#1956)
             merged = step in (services.MergeStep.MERGED, services.MergeStep.ALREADY)
             if step is services.MergeStep.MERGED:
                 # Record the commit the merge produced, not
