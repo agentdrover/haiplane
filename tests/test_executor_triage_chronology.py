@@ -17,6 +17,7 @@ from tests.test_executor_triage import (
     _followup,
     _recs,
     _relaunch,
+    _sweep,
     _set_task,
     _task,
 )
@@ -66,9 +67,9 @@ async def _sequence(world, *, sweep_between: bool) -> tuple[int, int]:
     second = await _relaunch(world, task_id)
     await _at(world, "executor_orders", second, "created_at", 40)
     if sweep_between:
-        await triage.sweep(world.db)
+        await _sweep(world)
     await _submission(world, task_id, 1, 20)
-    await triage.sweep(world.db)
+    await _sweep(world)
     return task_id, first
 
 
@@ -100,7 +101,7 @@ async def test_followup_is_the_first_action_not_the_state_at_sweep_time(world):
         priority="medium",
     )
     await _at(world, "tasks", child, "created_at", 10)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _action_of(world, o3) == "retry_once"
     assert await _followup(world, o3) == "new_order"
 
@@ -108,10 +109,10 @@ async def test_followup_is_the_first_action_not_the_state_at_sweep_time(world):
     t4 = await _task(world, "повтор после правки")
     o4 = await _fail(world, t4, CLASS1)
     await _set_task(world, t4, statement_generation=1)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, o4) is None  # правка без заказа - ещё не итог
     await _relaunch(world, t4)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, o4) == "new_order"
     got = await triage.agreement(world.db)
     assert got["matched"] == got["total"] == 4, got
@@ -141,11 +142,12 @@ async def test_agent_draft_child_is_not_a_split(world):
     )
     await world.db.commit()
     last = await _last_order(world, task_id)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, last) is None
     await repo.update_task(world.db, draft, status="open")
     await world.db.commit()
-    await triage.sweep(world.db)
+    await _sweep(world)  # первое наблюдение одобрения
+    await _sweep(world)  # секунда наблюдения закрыта
     assert await _followup(world, last) == "split"
     assert oid != last
 
@@ -175,7 +177,7 @@ async def test_missed_recommendation_is_recovered_after_72_hours(world):
         (oid,),
     )
     await world.db.commit()
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _action_of(world, oid) == "retry_after_status"
     assert len(await _recs(world, task_id)) == 1
     # Закрытая задача (сдана) рекомендации не получает и после восстановления.
@@ -186,5 +188,50 @@ async def test_missed_recommendation_is_recovered_after_72_hours(world):
     )
     await world.db.commit()
     await _submission(world, done, 1, 5)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _action_of(world, did) is None
+
+
+async def test_agent_draft_approved_late_does_not_precede_a_new_order(world):
+    """Круг 2, Codex P2: одобрение draft считается с момента одобрения, не создания."""
+    task_id = await _task(world, "позднее одобрение")
+    oid = await _fail(world, task_id, CLASS3)  # retry_once
+    await _rec_at(world, oid, 90)
+    second = await _relaunch(world, task_id)
+    await _at(world, "executor_orders", second, "created_at", 40)
+    draft = await repo.create_task(
+        world.db,
+        title="предложение",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=task_id,
+        priority="medium",
+    )
+    await _at(world, "tasks", draft, "created_at", 80)
+    await repo.update_task(world.db, draft, status="open")  # одобрено ПОСЛЕ заказа
+    await world.db.commit()
+    await _sweep(world)
+    assert await _followup(world, oid) == "new_order"
+
+
+def test_current_second_is_deferred_and_ties_follow_the_rank():
+    """Круг 2, Codex P3: исход текущей секунды откладывается; ничья - по рангу, не по свипу."""
+    now = "2026-10-21 10:00:05"
+    only_split = {"events": [(now, "split")], "now": now}
+    assert triage.classify_followup(only_split) is None  # ещё может прийти заказ
+    both = {
+        "events": [(now, "split"), (now, "new_order")],
+        "now": "2026-10-21 10:00:06",
+    }
+    assert triage.classify_followup(both) == "new_order"
+    earlier = {
+        "events": [("2026-10-21 10:00:04", "split"), (now, "new_order")],
+        "now": now,
+    }
+    assert triage.classify_followup(earlier) == "split"  # прошлая секунда закрыта

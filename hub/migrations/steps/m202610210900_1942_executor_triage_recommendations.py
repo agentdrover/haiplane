@@ -43,6 +43,19 @@ MIGRATIONS: list[tuple[str, str]] = [
         )""",
     ),
     (
+        # Первое наблюдение события, у которого нет долговечной метки времени
+        # (архив, правка постановки без заказа, одобрение агентского draft, сдача
+        # без строки submissions): хронология не должна зависеть от позднего свипа.
+        "create_executor_triage_observations",
+        """CREATE TABLE IF NOT EXISTS executor_triage_observations (
+            rec_id  INTEGER NOT NULL
+                    REFERENCES executor_triage_recommendations(id) ON DELETE CASCADE,
+            kind    TEXT    NOT NULL,
+            seen_at TEXT    NOT NULL,
+            PRIMARY KEY (rec_id, kind)
+        )""",
+    ),
+    (
         "idx_executor_triage_recommendations_task",
         "CREATE INDEX IF NOT EXISTS idx_executor_triage_recommendations_task "
         "ON executor_triage_recommendations(task_id, created_at)",

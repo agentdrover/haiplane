@@ -422,9 +422,14 @@ _LATER_ORDER_SQL: Final[str] = (
 )
 #: Ребёнок - исход, только если его одобрил человек: агентский draft (штатный путь
 #: предложения агента) разделением владельца не считается.
-_CHILD_SQL: Final[str] = (
+_HUMAN_CHILD_SQL: Final[str] = (
     "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
-    "AND (source = 'human' OR status <> 'draft')"
+    "AND source = 'human'"
+)
+#: Агентский ребёнок засчитывается с момента, когда он перестал быть draft (одобрение).
+_APPROVED_AGENT_CHILD_SQL: Final[str] = (
+    "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
+    "AND source <> 'human' AND status <> 'draft'"
 )
 _SUBMISSION_SQL: Final[str] = (
     "SELECT MIN(submitted_at) FROM submissions WHERE task_id = ? AND generation >= ?"
@@ -448,7 +453,8 @@ def classify_followup(f: dict[str, Any]) -> str | None:
     ``f["events"]`` - кандидаты ``(время, исход)``: время события из долговечных
     таблиц (заказы, сдачи, подзадачи) или момент свипа, если события нет в
     хронологии (архив, правка постановки без заказа). Побеждает минимальное время,
-    при равенстве - ``_RANK``; результат не зависит от того, когда прошёл свип.
+    при равенстве - ``_RANK``; события без метки получают время первого наблюдения
+    (``_observed``). Исход текущей секунды откладывается до следующего прохода.
     Для повторов (retry_*) правка постановки сама по себе не итог, а заказ после
     правки - ``new_order``: владелец сделал рекомендованное. Для остальных действий
     заказ с поднятым поколением постановки - ``statement_changed``.
@@ -458,7 +464,10 @@ def classify_followup(f: dict[str, Any]) -> str | None:
     ]
     if not events:
         return None
-    return min(events)[2]
+    first = min(events)
+    # Текущая секунда не закрыта: событие той же секунды ещё может прийти и по
+    # рангу обогнать выбранное, поэтому исход фиксируется на следующем проходе.
+    return None if first[0] >= f["now"] else first[2]
 
 
 def _later_order_events(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
@@ -471,28 +480,61 @@ def _later_order_events(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
     return [(later[0], "new_order")]
 
 
+async def _observed(db: aiosqlite.Connection, rec_id: int, kind: str, now: str) -> str:
+    """Время события, которого нет в долговечной хронологии: первое наблюдение.
+
+    Архив, правка постановки без заказа, одобрение агентского draft и сдача без
+    строки ``submissions`` меток не имеют. Первое наблюдение сохраняется, и поздний
+    свип его не двигает: исход не зависит от того, когда прошёл ПОСЛЕДУЮЩИЙ свип.
+    """
+    await db.execute(
+        "INSERT OR IGNORE INTO executor_triage_observations (rec_id, kind, seen_at) "
+        "VALUES (?, ?, ?)",
+        (rec_id, kind, now),
+    )
+    rows = await fetchall(
+        db,
+        "SELECT seen_at FROM executor_triage_observations WHERE rec_id = ? AND kind = ?",
+        (rec_id, kind),
+    )
+    return str(rows[0][0])
+
+
+async def _child_event(
+    db: aiosqlite.Connection, f: dict[str, Any], now: str
+) -> list[tuple[str, str]]:
+    """Разделение: ребёнок человека - по созданию, одобренный агентский - по наблюдению."""
+    args = (int(f["task_id"]), int(f["child_floor"]))
+    human = (await fetchall(db, _HUMAN_CHILD_SQL, args))[0][0]
+    agent = (await fetchall(db, _APPROVED_AGENT_CHILD_SQL, args))[0][0]
+    seen = await _observed(db, int(f["id"]), "split", now) if agent else None
+    times = [t for t in (human, seen) if t]
+    return [(min(times), "split")] if times else []
+
+
 async def _followup_events(
     db: aiosqlite.Connection, raw: Any, now: str
 ) -> list[tuple[str, str]]:
     f = dict(raw)
-    task_id = int(f["task_id"])
+    task_id, rec_id = int(f["task_id"]), int(f["id"])
     found: list[tuple[str, str]] = []
     later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
     found += _later_order_events(f, later[0] if later else None)
-    if not later and f["action"] not in RETRY_ACTIONS:
-        ordered = f["order_sg"]
-        if ordered is not None and int(f["task_sg"] or 0) > ordered:
-            found.append((now, "statement_changed"))
-    child = (await fetchall(db, _CHILD_SQL, (task_id, int(f["child_floor"]))))[0][0]
-    if child:
-        found.append((child, "split"))
+    ordered = f["order_sg"]
+    edited = ordered is not None and int(f["task_sg"] or 0) > ordered
+    if not later and edited and f["action"] not in RETRY_ACTIONS:
+        found.append(
+            (await _observed(db, rec_id, "statement_changed", now), "statement_changed")
+        )
+    found += await _child_event(db, f, now)
     if int(f["submission_generation"] or 0) >= int(f["order_generation"]):
-        stamp = (
-            await fetchall(db, _SUBMISSION_SQL, (task_id, int(f["order_generation"])))
-        )[0][0]
-        found.append((stamp or now, "submitted"))
+        args = (task_id, int(f["order_generation"]))
+        stamp = (await fetchall(db, _SUBMISSION_SQL, args))[0][0]
+        found.append(
+            (stamp or await _observed(db, rec_id, "submitted", now), "submitted")
+        )
     if f["archived"]:
-        found.append((now, "archived"))
+        found.append((await _observed(db, rec_id, "archived", now), "archived"))
     if f["deadline_at"] <= now:
         found.append((f["deadline_at"], NO_DECISION_FOLLOWUP))
     return found
@@ -503,7 +545,7 @@ async def _resolve_pending(db: aiosqlite.Connection) -> int:
     resolved = 0
     for raw in await fetchall(db, _PENDING_SQL):
         events = await _followup_events(db, raw, now)
-        followup = classify_followup({"events": events})
+        followup = classify_followup({"events": events, "now": now})
         if followup is None:
             continue
         cursor = await db.execute(

@@ -101,6 +101,12 @@ async def _relaunch(world, task_id: int) -> int:
     return oid
 
 
+async def _sweep(world):
+    """Свип после закрытия текущей секунды: исход той же секунды откладывается."""
+    await asyncio.sleep(1.1)
+    return await triage.sweep(world.db)
+
+
 async def _reopen(world, task_id: int) -> None:
     await _set_task(world, task_id, status="open", claimed_by=None)
 
@@ -362,8 +368,8 @@ async def test_one_recommendation_per_order(world, monkeypatch):
     )
     assert saved[0]["report_outcome"] == "rescued"
     # Свип добирает пропущенное одной рекомендацией.
-    await triage.sweep(world.db)
-    await triage.sweep(world.db)
+    await _sweep(world)
+    await _sweep(world)
     assert await totals(fail, fail_oid) == (1, 1, 1)
 
     # События очищены по retention: свип не создаёт вторую рекомендацию и запись.
@@ -371,7 +377,7 @@ async def test_one_recommendation_per_order(world, monkeypatch):
         "DELETE FROM events WHERE kind = ?", (triage.EVENT_RECOMMENDED,)
     )
     await world.db.commit()
-    await triage.sweep(world.db)
+    await _sweep(world)
     recs, events, feed = await totals(fail, fail_oid)
     assert (recs, feed) == (1, 1) and events == 0
 
@@ -476,10 +482,10 @@ async def test_resolution_and_agreement_are_measured(world):
     o_wait = await _fail(world, t_wait, CLASS1)
     await world.db.commit()
 
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, o_ref) is None  # правка без заказа - не итог
     await _relaunch(world, t_ref)
-    await triage.sweep(world.db)
+    await _sweep(world)
 
     expected = {
         o_new: "new_order",
@@ -515,13 +521,13 @@ async def test_resolution_and_agreement_are_measured(world):
     snapshot = await _recs(world)
     for oid in expected:
         await triage.recommend_for_order(world.db, oid)
-    await triage.sweep(world.db)
-    await triage.sweep(world.db)
+    await _sweep(world)
+    await _sweep(world)
     assert await _recs(world) == snapshot
 
     # Первое событие побеждает: у new_order следом архив ничего не меняет.
     await _set_task(world, t_new, archived=1)
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, o_new) == "new_order"
 
     # owner_minutes и человеческие касания не изменились от рекомендаций и свипа.
@@ -614,7 +620,7 @@ async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypa
         patched.setattr(triage, "recommend_safely", nothing)
         assert (await _report(world, oid, CLASS1)).status_code == 200
     assert await _action_of(world, oid) is None
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _action_of(world, oid) == "retry_after_status"
 
     # Подзадача, созданная ДО рекомендации (в ту же секунду), не даёт split.
@@ -636,7 +642,7 @@ async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypa
     )
     await world.db.commit()
     assert (await _report(world, kid_oid, CLASS1)).status_code == 200
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, kid_oid) is None
     await repo.create_task(
         world.db,
@@ -653,7 +659,7 @@ async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypa
         priority="medium",
     )
     await world.db.commit()
-    await triage.sweep(world.db)
+    await _sweep(world)
     assert await _followup(world, kid_oid) == "split"
 
     # Отмена посреди разбора откатывает точку: ни строки, ни события без ленты.
