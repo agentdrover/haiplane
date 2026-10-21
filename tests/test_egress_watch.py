@@ -320,6 +320,9 @@ async def test_open_episode_survives_prune_and_restart(db):
     await seed("something_else", {}, 30)
     await db.commit()
 
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     await repo.prune_events(db)
     await db.commit()
     cur = await db.execute("SELECT kind FROM events ORDER BY id")

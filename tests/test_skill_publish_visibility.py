@@ -1513,6 +1513,9 @@ async def test_a_publication_record_outlives_the_events_sweep(client: AsyncClien
     )
     assert len(await _events(db, "kept")) == 2, "предпосылка: публикации записаны"
 
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     await _age_the_feed(db)
     await poller._sweep_events_retention(db)
 
@@ -1550,6 +1553,9 @@ async def test_the_three_publication_states_survive_the_move(client: AsyncClient
     await _record_publication(db, "legacy-record", version=1, legacy=True)
     await _install(db, "no-record", [(1, OLD, "active", "seed", "seed")])
 
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     await _age_the_feed(db)
     await poller._sweep_events_retention(db)
 
