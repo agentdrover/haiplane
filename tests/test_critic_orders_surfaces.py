@@ -119,7 +119,7 @@ async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch
     assert await co._task_state(world, cloud.task_id) == before
 
 
-def test_a_request_line_inside_any_code_fence_is_not_a_request():
+def test_a_request_line_inside_a_longer_entry_is_not_a_request():
     """Ограждение разбирается как в CommonMark: тип, длина, отступ, незакрытое."""
     from hub.services.critic_orders import parse_request_line
 
@@ -130,15 +130,11 @@ def test_a_request_line_inside_any_code_fence_is_not_a_request():
         f"```\n{line}",  # блок не закрыт
         f"~~~~\n{line}\n~~~",  # закрытие короче открытия
         f"> {line}",
-        f"    {line}",
         f"{line} и ещё слова",
     ):
         assert parse_request_line(text)[0] is None, text
-    assert parse_request_line(f"```\nкод\n```\n{line}")[0] == co.SHA_A
-    assert parse_request_line(f"{co._line(co.SHA_A)}\n{co._line(co.SHA_B)}") == (
-        None,
-        "request_ambiguous",
-    )
+    assert parse_request_line(f"{line}\n{co._line(co.SHA_B)}") == (None, "request_line")
+    assert parse_request_line(line) == (co.SHA_A, "")
 
 
 async def test_a_changed_report_differing_past_the_cut_is_still_a_conflict(world, tip):

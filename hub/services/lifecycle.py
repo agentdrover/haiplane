@@ -4023,6 +4023,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        await critic_orders.submit_step(state)  # #1953: политика и заказы - под локом
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
@@ -6227,10 +6228,6 @@ async def add_update(
         raise HTTPException(404, "task not found")
     task = await _task_with_current_ci(db, dict(row), body.kind)
     body = await task_updates.normalize_done_report(db, task, body)
-    if body.kind == "done":
-        # #1953: гейт критика облачной сдачи - до записей, по наблюдению головы
-        # этого же вызова (PREPARED_CI_SHA); пустое наблюдение блокирует.
-        task = await critic_orders.gate_done_report(db, task)
     undelivered = await task_updates.undelivered_advisory(db, task, body)
     task, deferred_done, update_id = await task_updates.apply_update(
         db, task, body, principal_id

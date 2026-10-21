@@ -64,7 +64,6 @@ REFUSALS: dict[str, str] = {
         "строка должна быть отдельной, без цитаты и code block: "
         "«нужен критик: sha <40 hex>»"
     ),
-    "request_ambiguous": "в записи несколько разных sha: оставьте одну строку",
     "no_session": "строку пишет живая сессия implementer облачного держателя задачи",
     "not_cloud_holder": "задачу держит не облачный прогон (или держатель сменился)",
     "proof_unreadable": "доказательство облачного держателя прочитать не удалось",
@@ -114,39 +113,15 @@ async def cloud_holder(db: aiosqlite.Connection, task_id: int) -> int | None:
     return int(row["run_id"])
 
 
-_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
-
-
 def parse_request_line(content: str) -> tuple[str | None, str]:
-    """``(sha, '')`` или ``(None, причина)``: строгая грамматика, не цитата и не код.
+    """``(sha, '')`` или ``(None, причина)``: командой служит ВСЯ запись из одной строки.
 
-    Ограждение кода разбирается как в CommonMark: до трёх пробелов отступа, три и
-    более обратных кавычек или тильд; закрывает его только тот же символ не короче открывшего.
-    Строка с отступом и строка цитаты - не отдельная строка.
+    Построчный разбор ошибался в контексте: в Markdown строка после ``> цитаты``
+    продолжает цитату (lazy continuation), а строка внутри многострочной записи
+    не отделена от окружающего текста. Строка в записи с чем-либо ещё - не команда.
     """
-    found: set[str] = set()
-    fence = ""
-    for raw in (content or "").splitlines():
-        line = raw.rstrip()
-        if fence:
-            closing = re.fullmatch(
-                r" {0,3}(%s{%d,})" % (re.escape(fence[0]), len(fence)), line
-            )
-            if closing:
-                fence = ""
-            continue
-        opening = _FENCE_OPEN.fullmatch(line)
-        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
-            fence = opening.group(1)
-            continue
-        if line.startswith((">", " ", "\t")):
-            continue
-        match = _REQUEST.fullmatch(line)
-        if match:
-            found.add(match.group(1).lower())
-    if len(found) == 1:
-        return next(iter(found)), ""
-    return None, "request_ambiguous" if found else "request_line"
+    match = _REQUEST.fullmatch((content or "").strip())
+    return (match.group(1).lower(), "") if match else (None, "request_line")
 
 
 # ---------------------------------------------------------------------------
@@ -170,16 +145,16 @@ async def _refuse_request(
 async def _open_orders_for(
     db: aiosqlite.Connection, task_id: int, sha: str
 ) -> tuple[int, int, int]:
-    """(открытых на другой sha, за час, открытых на этот sha)."""
+    """(открытых на другой sha, за час, открытых на этот sha); открыт = не closed И не просрочен."""
     rows = await fetchall(
         db,
         "SELECT "
         "(SELECT COUNT(*) FROM critic_orders WHERE task_id = ?1 AND state <> 'closed' "
-        "AND sha <> ?2), "
+        "AND expires_at > datetime('now') AND sha <> ?2), "
         "(SELECT COUNT(*) FROM critic_orders WHERE task_id = ?1 "
         "AND created_at >= datetime('now', '-1 hour')), "
         "(SELECT COUNT(*) FROM critic_orders WHERE task_id = ?1 AND state <> 'closed' "
-        "AND sha = ?2)",
+        "AND expires_at > datetime('now') AND sha = ?2)",
         (int(task_id), sha),
     )
     return int(rows[0][0]), int(rows[0][1]), int(rows[0][2])
@@ -255,14 +230,13 @@ async def request_from_feed(
     history = await _same_sha_history(db, task_id, sha)
     if history:
         return await _refuse_request(db, task_id, history)
-    return await _create_order(db, task_id, sha, host, caller_run, session_token)
+    return await _create_order(db, task_id, sha, caller_run, session_token)
 
 
 async def _create_order(
     db: aiosqlite.Connection,
     task_id: int,
     sha: str,
-    host: str,
     caller_run: int,
     session_token: str,
 ) -> str:
@@ -289,9 +263,15 @@ async def _create_order(
     async with write_transaction(db):
         # Всё, что проверено до сети, проверяется заново под блокировкой записи:
         # держатель мог смениться, а параллельный заказ - закрыться passed.
+        # Политика - заново, под локом: её могли выключить, пока шла сеть.
+        host = await critic_host_for(db, task_id)
+        # Просроченную строку держит уникальный индекс до свипа: закрыть сейчас.
+        await expire_due(db, task_id)
         other_open, last_hour, same_open = await _open_orders_for(db, task_id, sha)
         live = await chat_pair.run_of_session(db, session_token, task_id)
-        if live != caller_run or await cloud_holder(db, task_id) != caller_run:
+        if not host:
+            blocked = "policy_off"
+        elif live != caller_run or await cloud_holder(db, task_id) != caller_run:
             blocked = "not_cloud_holder"
         elif other_open >= MAX_OPEN_PER_TASK:
             blocked = "quota_open"
@@ -352,12 +332,16 @@ async def has_open(db: aiosqlite.Connection, host: str) -> bool:
     return bool(rows)
 
 
-async def expire_due(db: aiosqlite.Connection) -> None:
-    """Закрыть просроченные открытые заказы исходом expired; одна запись ленты на заказ."""
+async def expire_due(db: aiosqlite.Connection, task_id: int | None = None) -> None:
+    """Закрыть просроченные открытые заказы исходом expired; одна запись ленты на заказ.
+
+    ``task_id`` - только строки этой задачи (создание заказа под write-локом).
+    """
     rows = await fetchall(
         db,
         "SELECT id, task_id, sha FROM critic_orders WHERE state <> 'closed' "
-        "AND expires_at <= datetime('now')",
+        "AND expires_at <= datetime('now') AND (?1 IS NULL OR task_id = ?1)",
+        (task_id,),
     )
     for row in rows:
         async with write_transaction(db):

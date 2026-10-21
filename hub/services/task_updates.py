@@ -240,6 +240,12 @@ async def _route_done(
     # the task is blocked while the current validation run is red/absent. Only
     # completion-bound reports are gated; the poller path is not affected.
     await lc._done_validation_gate(db, task)
+    checked = task.get(critic_orders.CHECKED_KEY)
+    if checked and not lc.completion_requires_review(task):
+        # #1953: завершение без ревью (auto_review=false, pending_report ->
+        # completed) тоже закрепляет sha, по которому прошёл критик.
+        await repo.update_task(db, int(task["id"]), submission_sha=checked)
+        task = {**task, "submission_sha": checked}
     if body.finding_outcomes:  # ответ на находки — не пустая пересдача (#1783)
         task = {**task, "_answered_findings": True}
     if task["status"] == "pending_report":
@@ -256,6 +262,10 @@ async def _inside_savepoint(
     principal_id: int | None,
 ) -> int:
     """Everything the savepoint protects; the ONE ``commit`` here is the original one."""
+    if body.kind == "done":
+        # #1953: гейт критика - под write-локом: политику и заказы читаем здесь,
+        # отказ откатывает савпоинт до строки отчёта.
+        task = await critic_orders.gate_done_report(db, task)
     update_id = await _write_row_and_prevention(db, task, body, principal_id)
     await _record_finding_outcomes(db, task, body)
     await _route_done(db, task, body)
