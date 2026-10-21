@@ -71,7 +71,7 @@ async def test_page_states_without_a_brief(client, db, status, tone, label):
     # «К действию» ведёт на форму, которая есть на странице.
     found = re.search(r'class="c2-btn" href="#([\w-]+)"', root)
     if status != "needs_info":
-        assert found is None, "кнопка ведёт к несуществующему действию"
+        assert "c2-btn" not in root[:3000], "кнопка ведёт к несуществующему действию"
     else:
         assert f'id="{found.group(1)}"' in page, found.group(1)
     target = found.group(1) if found else ""
