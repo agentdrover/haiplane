@@ -236,3 +236,71 @@ def test_a_lone_carriage_return_makes_the_line_numbers_unknown():
     assert not span.found and span.unreadable
     crlf = "x = 1\r\ndef test_ac():\r\n    pass\r\n"
     assert ac_test_spans({F: crlf}, [f"{F}::test_ac"])[0].start == 2
+
+
+# --- #1981: полный дифф AC-файла - самостоятельное покрытие, выбор и оплата до шага B ---
+
+
+def _codex_case(inside_n: int = 900, outside_n: int = 1100):
+    """Сценарий Codex: test_ac целиком в ханке, test_outside вне ханка (виден лишь заголовок)."""
+    inside = ["def test_ac():"] + ["    pass #" + "x" * 153] * inside_n
+    outside = ["def test_outside():"] + ["    pass #" + "y" * 153] * outside_n
+    ac = _modified(F, ["+" + s for s in inside] + [" " + outside[0]])
+    refs = [f"{F}::test_ac", f"{F}::test_outside"]
+    spans = ac_test_spans({F: "\n".join(inside + outside) + "\n"}, refs)
+    return ac, spans
+
+
+def _run(parts, ceiling, spans):
+    out, omitted = _inline_diff_lines("".join(parts), [], None, ceiling, spans)
+    return "\n".join(out), omitted
+
+
+def test_full_diff_covers_its_ac_even_when_a_sibling_cutout_cannot_fit():
+    ac, spans = _codex_case()
+    other = _new("hub/other.py", ["x = 1" + " " * 1500])
+    refs = [s.ref for s in spans]
+    assert len(cutout(spans[0])) > 150_000 and len(cutout(spans[1])) > 153_000
+    for ceiling, other_in in ((150_000, False), (153_000, True)):
+        for parts in ((ac, other), (other, ac)):
+            text, omitted = _run(parts, ceiling, spans)
+            assert "ВЫРЕЗКА ТЕСТА AC" not in text, (ceiling, "дубль диапазона")
+            assert text.count("pass #" + "x" * 153) == 900, ceiling
+            assert f"ac_test_unread: {refs[0]}" not in text
+            assert f"ac_test_unread: {refs[1]}" in text
+            assert ("x = 1" in text) is other_in and (omitted == []) is other_in
+            assert len(text) <= ceiling + 4000, "разделители - малая добавка"
+
+
+def test_budget_properties_hold_over_combinations():
+    """Свойства, не цифра: помещающийся AC читаем до обычного файла, диапазон не дублируется."""
+    for inside_n, outside_n, ceiling_pad in (
+        (900, 1100, -3000),
+        (900, 1100, 0),
+        (40, 600, 500),
+        (40, 5, 100),
+        (300, 300, -50),
+    ):
+        ac, spans = _codex_case(inside_n, outside_n)
+        other = _new("hub/other.py", ["x = 1" + " " * 1500])
+        full = len(ac)
+        ceiling = full + ceiling_pad
+        fits = [
+            s
+            for s in spans
+            if len(cutout(s)) <= ceiling
+            or (s.ref.endswith("test_ac") and full <= ceiling)
+        ]
+        results = []
+        for parts in ((ac, other), (other, ac)):
+            text, omitted = _run(parts, ceiling, spans)
+            results.append((text, omitted))
+            for s in spans:
+                assert text.count(f"{s.path}:{s.start}–{s.end}") <= 1
+            for s in fits:
+                named = f"ac_test_unread: {s.ref}" in text
+                assert not named, (inside_n, outside_n, ceiling_pad, s.ref)
+            if "x = 1" in text:
+                # обычный файл включён - значит каждый помещающийся AC уже включён
+                assert all(f"ac_test_unread: {s.ref}" not in text for s in fits)
+        assert results[0] == results[1], "порядок разделов не меняет состав"
