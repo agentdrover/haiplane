@@ -938,9 +938,13 @@ async def _names(scope: Scope | None, run_id: str, attempt: int) -> list[str] | 
         # GitHub перечисляет ВСЕ job существующей попытки, в том числе зелёные:
         # пустой список - попытки нет, а не «упавших нет».
         return None
+    if any(not str(job.get("conclusion") or "") for job in jobs):
+        # Job ещё идёт (итога нет): список неготов, и «упавших нет» про него
+        # сказать нельзя - это «не прочитан», а не пустой ответ.
+        return None
     named = []
     for job in jobs:
-        if str(job.get("conclusion") or "") in _GREEN + ("",):
+        if str(job.get("conclusion") or "") in _GREEN:
             continue
         steps = ", ".join(job.get("failed_steps") or [])
         named.append(f"{job.get('name')}" + (f" [шаги: {steps}]" if steps else ""))

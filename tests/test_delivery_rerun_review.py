@@ -8,7 +8,12 @@ import pytest
 
 from hub import repository as repo
 from hub import services
-from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    CIRunRequestOutcome,
+    CIRunRequestResult,
+)
 from hub.services import delivery_rerun
 from tests.delivery_rerun_support import RUN, TIP, rig_after_base_update
 
@@ -196,3 +201,17 @@ async def test_a_corrupt_policy_is_unreadable_not_off(db, monkeypatch, stored):
 
     assert not ok, why
     rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_an_unfinished_job_list_is_unread_not_empty(db, monkeypatch):
+    rig = await rig_after_base_update(db, monkeypatch)
+    rig.post_results = [CIRunRequestResult(CIRunRequestOutcome.declined, "no", "403")]
+    rig.jobs[(RUN, "1")] = [
+        {"name": "tests (3.12)", "conclusion": ""},
+        {"name": "lint", "conclusion": "success"},
+    ]
+    rig.red_first_attempt()
+    await rig.sweep()
+
+    feed = await rig.feed()
+    assert "список не прочитан" in feed and "упавших job в списке нет" not in feed
