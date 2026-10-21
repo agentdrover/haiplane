@@ -250,6 +250,9 @@ async def test_the_link_survives_event_retention(db: aiosqlite.Connection):
     await db.execute("UPDATE events SET created_at = datetime('now', '-15 days')")
     await db.execute("UPDATE owner_minutes_state SET cursor_event_id = 1000000")
     await db.commit()
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     assert await repo.prune_events(db) >= 2
     assert not await fetchall(
         db,
