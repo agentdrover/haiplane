@@ -234,6 +234,12 @@ async def _seed_delivery(
         ref="main",
         source="ci",
     )
+    # #1927: «Раскатано» хаба — выкат проекта default, а задача демо-проекта
+    # сверяется с выкатом СВОЕГО проекта. Без строки default панель стенда
+    # осталась бы пустой, хотя демо-задача честно доехала.
+    await repository.record_release(
+        db, deployed_sha=_DEMO_MERGE_SHA, project_id=None, ref="main", source="ci"
+    )
 
 
 async def _amain() -> int:
