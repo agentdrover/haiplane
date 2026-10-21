@@ -181,6 +181,7 @@ from hub.services.diagnostics import (
     build_whoami,
 )
 from hub.services.ac_tests import run_ac_tests
+from hub.services.submit_dry_run import SubmitDryRunView, dry_run_submit
 from hub.services.ci_report import settle_ci_run_report, store_ci_run_report
 from hub.services.ci_timing import CIRunTimingSubmit, store_ci_run_timing
 from hub.services.validation_run import run_validation_commands
@@ -202,6 +203,7 @@ from hub.executor_host_api import (
     refuse_registered_slot,
     router as executor_host_router,
 )
+from hub.role_host_api import router as role_host_router
 from hub.web import router as web_router
 
 logging.basicConfig(
@@ -549,6 +551,7 @@ app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
+app.include_router(role_host_router)
 app.include_router(critic_host_router)
 app.include_router(executor_slot_web_router)
 
@@ -2626,11 +2629,14 @@ async def _validation_error(request: Request, exc: RequestValidationError):
     return await request_validation_exception_handler(request, exc)
 
 
-@app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)
+@app.post(
+    "/api/tasks/{task_id}/submit-review", response_model=TaskView | SubmitDryRunView
+)
 async def api_submit_for_review(
     task_id: int,
     request: Request,
     body: TaskSubmitReview | None = None,
+    dry_run: bool = False,
     identity=Depends(current_identity),
 ):
     """Submit the current work of a pair task for client-driven review (#307).
@@ -2642,7 +2648,13 @@ async def api_submit_for_review(
     State tasks (#1647) are submitted with ``evidence`` — one record per AC —
     and their author is the authenticated principal: ``agent`` in the body is
     only a signature.
+
+    ``?dry_run=1`` (#1975) runs the same checks in the same order and answers
+    with the same refusal, but writes nothing: the 200 body is
+    ``SubmitDryRunView``. A success does not promise the real submission's.
     """
+    if dry_run:
+        return await dry_run_submit(_db(request), task_id, body)
     return await services.submit_for_review(
         _db(request), task_id, body, principal_id=identity.principal_id
     )

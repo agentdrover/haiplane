@@ -198,9 +198,12 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
     # #1645: can the server reach GitHub — stored state, no network here.
     egress = await egress_status(db)
     egress["minutes"] = minutes_since(egress["since"]) if egress["since"] else None
+    from hub.services.role_orders import prod_view
+
     return {
         "egress": egress,
         "release_blocks": await active_release_blocks(db),
+        "role_orders": await prod_view(db),  # #1973
         "deployed": deployed,
         "in_prod": buckets[IN_PROD],
         "not_in_prod": buckets[NOT_IN_PROD],
@@ -209,6 +212,23 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
         "window": window,
         "note": note,
     }
+
+
+def role_order_lines(orders: list[dict[str, Any]]) -> list[str]:
+    """#1973: заказы ролей k8; сбой чтения - «неизвестно», не «заказов нет»."""
+    if any(o.get("unavailable") for o in orders):
+        return ["Заказы ролей: неизвестно — чтение не удалось"]
+    if not orders:
+        return []
+    lines = [f"Заказы ролей: {len(orders)}"]
+    for o in orders[:10]:
+        lines.append(
+            f"  заказ #{o['id']}: роль: {o.get('label') or o.get('role')}, "
+            f"{o.get('state')}, задача #{o.get('task_id')}"
+        )
+    if len(orders) > 10:
+        lines.append(f"  … и ещё {len(orders) - 10}")
+    return lines
 
 
 def format_prod_state(data: dict[str, Any]) -> str:
@@ -231,6 +251,7 @@ def format_prod_state(data: dict[str, Any]) -> str:
     else:
         lines.append("Раскатано: неизвестно — успешных выкатов не записано")
 
+    lines += role_order_lines(list(data.get("role_orders") or []))
     for key, label in (
         ("in_prod", "В проде"),
         ("not_in_prod", "Смёржено, но не раскатано"),

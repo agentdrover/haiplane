@@ -837,6 +837,9 @@
                     {# #1941: проекцию последнего host-заказа собирает хаб (services/executor_triage); блок без вывода, когда сказать нечего. #}{% if task.last_executor_order %}{% if task.last_executor_order.unavailable %}
                     <dt>Заказ хоста</dt>
                     <dd data-order-unavailable="1">{{ task.last_executor_order.unavailable }}</dd>
+                    {% elif task.last_executor_order.waiting_memory %}
+                    <dt>Заказ хоста</dt>
+                    <dd data-waiting-memory="1">{{ task.last_executor_order.waiting_memory.line }}</dd>
                     {% elif task.last_executor_order.after_failed_run %}
                     <dt>После неудачного прогона</dt>
                     <dd data-after-failed-run="{{ task.last_executor_order.class }}">класс {{ task.last_executor_order.class }} ({{ task.last_executor_order.class_name }}); заказ #{{ task.last_executor_order.order_id }}, {{ task.last_executor_order.outcome }}</dd>
@@ -846,7 +849,13 @@
                     {% else %}
                     <dt>Заказ критика</dt>
                     <dd data-critic-order="{{ task.critic_order.order_id }}">#{{ task.critic_order.order_id }} {{ task.critic_order.sha[:12] }}: {{ task.critic_order.state }}/{{ task.critic_order.outcome or '-' }}, до {{ task.critic_order.expires_at }}. {{ task.critic_order.next_step }}</dd>
-                    {% endif %}{% endif %}{% if task.ci_fix_cycle > 0 %}
+                    {% endif %}{% endif %}{# #1973: заказы ролей k8 по задаче #}{% for ro in task.role_orders or [] %}{% if ro.unavailable %}
+                    <dt>Роль</dt>
+                    <dd data-role-order-unavailable="1">{{ ro.unavailable }}</dd>
+                    {% else %}
+                    <dt>Роль</dt>
+                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
+                    {% endif %}{% endfor %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
                     {% endif %}

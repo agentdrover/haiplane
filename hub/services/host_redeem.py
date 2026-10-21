@@ -32,6 +32,7 @@ from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import executor_orders as orders
+from hub.services import memory_wait
 
 log = logging.getLogger("hub.services.host_redeem")
 
@@ -237,5 +238,7 @@ async def redeem_for_host(
         order = await orders._own_order(db, host, order_id)
         if order is None or not order["first_redeemed_at"]:
             reason = refusal.reason if refusal is not None else "refused"
-            raise _refuse(409, "redeem_refused", f"код не принят: {reason}")
+            # #1972: предел ожидания и срок называются своими словами, не spent.
+            named = reason if reason in memory_wait.SPEND_REASONS else "redeem_refused"
+            raise _refuse(409, named, f"код не принят: {reason}")
     return await _retry(db, host, order_id)
