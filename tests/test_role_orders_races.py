@@ -32,6 +32,7 @@ world = _support.world
 keys = _support.keys
 _clean_limiter = _support._clean_limiter
 _no_cloud = _support._no_cloud
+_cursor_ready = _support._cursor_ready
 
 
 async def _one_order(world, title: str = "заказ") -> int:

@@ -840,7 +840,13 @@
                     {% elif task.last_executor_order.after_failed_run %}
                     <dt>После неудачного прогона</dt>
                     <dd data-after-failed-run="{{ task.last_executor_order.class }}">класс {{ task.last_executor_order.class }} ({{ task.last_executor_order.class_name }}); заказ #{{ task.last_executor_order.order_id }}, {{ task.last_executor_order.outcome }}</dd>
-                    {% endif %}{% endif %}{% if task.ci_fix_cycle > 0 %}
+                    {% endif %}{% endif %}{# #1973: заказы ролей k8 по задаче #}{% for ro in task.role_orders or [] %}{% if ro.unavailable %}
+                    <dt>Роль</dt>
+                    <dd data-role-order-unavailable="1">{{ ro.unavailable }}</dd>
+                    {% else %}
+                    <dt>Роль</dt>
+                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
+                    {% endif %}{% endfor %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
                     {% endif %}

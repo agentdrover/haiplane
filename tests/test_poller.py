@@ -2731,6 +2731,8 @@ async def test_the_sweep_order_is_pinned(db):
         "stale_arbiter",
         # #1874: начисления минут владельца читают events ДО очистки.
         "owner_minutes",
+        # #1973: заказы ролей читают events ДО очистки.
+        "role_orders",
         "events_retention",
         "stale_worktrees",
         "sessions_retention",

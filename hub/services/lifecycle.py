@@ -942,6 +942,10 @@ async def enrich_task_view(
         db, task_view.id
     )
 
+    from hub.services import role_orders
+
+    task_view.role_orders = await role_orders.card_view(db, task_view.id)  # #1973
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(

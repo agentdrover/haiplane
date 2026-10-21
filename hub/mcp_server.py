@@ -59,6 +59,7 @@ from hub.mcp_task_card import (
     build_compact_view,
     executor_order_lines,
     owner_minutes_lines,
+    role_order_lines,
 )
 from hub.services import review_brief_projection as brief_projection
 from hub.services import verdict_evidence
@@ -1420,6 +1421,7 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(filter(None, [_verdict_route_line(task)]))
     parts.extend(owner_minutes_lines(task))
     parts.extend(executor_order_lines(task))
+    parts.extend(role_order_lines(task))
     return parts
 
 

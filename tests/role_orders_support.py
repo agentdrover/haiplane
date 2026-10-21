@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from hub import repository as repo
 from hub.services import role_orders, watch_notices
 from tests import test_executor_orders as _eo
@@ -17,6 +19,13 @@ keys = _eo.keys
 _clean_limiter = _eo._clean_limiter
 _no_cloud = _eo._no_cloud
 task_in_project = _eo._task
+
+
+@pytest.fixture(autouse=True)
+async def _cursor_ready(world):
+    """Курсор заводится первым свипом на конце ленты; тест начинает с готового."""
+    await role_orders.sweep_sources(world.db)
+    await world.db.commit()
 
 
 async def rows(db, sql: str, params: tuple = ()) -> list[dict[str, Any]]:

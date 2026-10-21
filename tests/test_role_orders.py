@@ -40,6 +40,7 @@ world = _support.world
 keys = _support.keys
 _clean_limiter = _support._clean_limiter
 _no_cloud = _support._no_cloud
+_cursor_ready = _support._cursor_ready
 
 ROLE_FILES = ("hub/services/role_orders.py", "hub/role_host_api.py")
 REPO = Path(__file__).resolve().parent.parent
@@ -303,7 +304,9 @@ async def test_role_orders_do_not_touch_executor_readers(world):
         db = world.db
         return {
             "busy": await executor_orders._task_busy(db, task_id),
-            "outcome": await executor_orders.read_order_outcome(db, "k8", order_id),
+            "outcome": _without_status(
+                await executor_orders.read_order_outcome(db, "k8", order_id)
+            ),
             "plaque": await launch_feedback.plaque(db, task_id),
             "live": await executor_launch._live_run(db, task_id),
             "budget": repr(await executor_dispatch.task_budget(db, task_id)),
@@ -332,6 +335,11 @@ async def test_role_orders_do_not_touch_executor_readers(world):
         source = (REPO / rel).read_text(encoding="utf-8")
         for word in ("executor_orders", "executor_runs", "chat_pair"):
             assert word not in source, f"{rel} упоминает {word}"
+
+
+def _without_status(view):
+    """Статус задачи сменил сам вход в needs_decision, а не заказ роли."""
+    return {k: v for k, v in (view or {}).items() if k != "task_status"}
 
 
 async def _eo_launch(world, task_id):

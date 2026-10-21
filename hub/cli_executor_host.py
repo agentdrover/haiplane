@@ -21,8 +21,22 @@ def _api(*args: Any, **kwargs: Any) -> Any:
     return api(*args, **kwargs)
 
 
+def _print_role_orders(result: Any) -> None:
+    """#1973: role orders of the task as the hub built them; never recomputed here."""
+    for view in (result.get("role_orders") if isinstance(result, dict) else None) or []:
+        if view.get("unavailable"):
+            print(f"Заказы ролей: {view['unavailable']}", file=sys.stderr)
+        else:
+            print(
+                f"Роль: вызван {view.get('label')} (заказ {view.get('id')}, "
+                f"{view.get('state')})",
+                file=sys.stderr,
+            )
+
+
 def print_order_line(result: Any) -> None:
     """#1941: the line about the last host order for ``oc-hub status``; never recomputed here."""
+    _print_role_orders(result)
     view = result.get("last_executor_order") if isinstance(result, dict) else None
     if not isinstance(view, dict):
         return
