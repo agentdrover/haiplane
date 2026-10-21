@@ -137,23 +137,63 @@ async def test_probe_follows_no_redirect():
 
 
 async def test_probe_is_bounded_and_never_blocks_the_loop(client, db):
-    async def hang(request):
-        await asyncio.sleep(30)
-        return httpx.Response(200)
+    """Рабочая ветка без transport: проба в потоке, цикл отвечает, дедлайн отменяет.
 
-    transport = httpx.MockTransport(hang)
-    started = time.monotonic()
-    probing = asyncio.create_task(ew.probe(transport=transport, deadline=0.4))
-    # The hub keeps answering while the probe waits for its whole deadline.
-    slowest = 0.0
-    while not probing.done():
-        t0 = time.monotonic()
-        assert (await client.get("/healthz")).status_code == 200
-        slowest = max(slowest, time.monotonic() - t0)
-        await asyncio.sleep(0.02)
-    assert await probing == "timeout"
-    assert time.monotonic() - started < 0.4 + 0.5
-    assert slowest < 0.3
+    Время стенных часов не сравнивается ни с каким порогом: пробу держит барьер
+    ``threading.Event`` вместо ``_head_in_thread``, а всё остальное - порядок
+    событий. ``SAFETY`` - только страховка от зависания теста, не утверждение.
+    """
+    import threading
+
+    safety = 5.0  # страховка от зависания, не порог поведения
+    release = threading.Event()
+    entered = threading.Event()
+
+    def held(_url, _deadline):
+        entered.set()
+        release.wait(safety)  # блокирует ТОТ поток, где вызван
+        return ""
+
+    ticks = 0
+
+    async def tick():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ew._probe_thread = None
+    ticker = asyncio.create_task(tick())
+    try:
+        with patch.object(ew, "_head_in_thread", held):
+            # 1. Пока барьер держит пробу, задачи цикла идут и /healthz отвечает.
+            probing = asyncio.create_task(ew.probe(deadline=safety))
+            async with asyncio.timeout(safety):
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+                before = ticks
+                for _ in range(3):
+                    assert (await client.get("/healthz")).status_code == 200
+                while ticks < before + 3:
+                    await asyncio.sleep(0)
+            assert not probing.done(), "проба вернулась, хотя барьер её держит"
+            release.set()
+            async with asyncio.timeout(safety):
+                assert await probing == ""
+            if ew._probe_thread is not None:
+                ew._probe_thread.join(safety)
+
+            # 2. Барьер держит и дальше: проба отменяется по своему дедлайну.
+            release.clear()
+            async with asyncio.timeout(safety):
+                assert await ew.probe(deadline=0.05) == "timeout"
+            assert ew._probe_thread is not None and ew._probe_thread.is_alive()
+    finally:
+        release.set()
+        ticker.cancel()
+        if ew._probe_thread is not None:
+            ew._probe_thread.join(safety)
+        ew._probe_thread = None
 
     # No overlap, and shutdown cancels the watcher.
     running = 0
