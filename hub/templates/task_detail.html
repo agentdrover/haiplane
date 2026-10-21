@@ -846,7 +846,13 @@
                     {% else %}
                     <dt>Заказ критика</dt>
                     <dd data-critic-order="{{ task.critic_order.order_id }}">#{{ task.critic_order.order_id }} {{ task.critic_order.sha[:12] }}: {{ task.critic_order.state }}/{{ task.critic_order.outcome or '-' }}, до {{ task.critic_order.expires_at }}. {{ task.critic_order.next_step }}</dd>
-                    {% endif %}{% endif %}{# #1956: история автоперезапуска CI на свежей базе - собрана хабом (services/delivery_rerun.card_view). #}{% if task.delivery_rerun %}
+                    {% endif %}{% endif %}{# #1973: заказы ролей k8 по задаче #}{% for ro in task.role_orders or [] %}{% if ro.unavailable %}
+                    <dt>Роль</dt>
+                    <dd data-role-order-unavailable="1">{{ ro.unavailable }}</dd>
+                    {% else %}
+                    <dt>Роль</dt>
+                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
+                    {% endif %}{% endfor %}{# #1956: история автоперезапуска CI на свежей базе - собрана хабом (services/delivery_rerun.card_view). #}{% if task.delivery_rerun %}
                     <dt>Перезапуск CI</dt>
                     <dd data-delivery-rerun="{{ task.delivery_rerun.state }}">{{ task.delivery_rerun.state }}{% if task.delivery_rerun.outcome %} / {{ task.delivery_rerun.outcome }}{% endif %}; run {{ task.delivery_rerun.run_id }}, после попытки {{ task.delivery_rerun.attempt_before }}; с {{ task.delivery_rerun.requested_at }}{% if task.delivery_rerun.failed_jobs %}; упали: {{ task.delivery_rerun.failed_jobs | join(', ') }}{% endif %}
                       <ul>{% for h in task.delivery_rerun.history %}<li>{{ h.at }} · {{ h.actor }} · {{ h.text }}</li>{% endfor %}</ul>

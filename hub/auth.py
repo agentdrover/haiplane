@@ -487,6 +487,10 @@ SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/phase"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/report"),
+    # #1973: заказ роли k8 - lease, старт, отчёт; кода implementer здесь нет.
+    ("GET", "/api/executor-hosts/{name}/role-orders"),
+    ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/started"),
+    ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/report"),
     # #1953: заказы критика k8 для облачной сдачи - выдача и отчёт.
     ("GET", "/api/executor-hosts/{name}/critic-orders"),
     ("POST", "/api/executor-hosts/{name}/critic-orders/{order_id}/report"),
@@ -527,7 +531,7 @@ def _slot_runner_forbidden(method: str, path: str) -> Response:
                     "message": (
                         f"{method} {path}: ключ хоста исполнителя читает заказы "
                         "своего хоста, подтверждает их и сообщает итог прогона, "
-                        "больше ничего."
+                        "а также берёт заказы ролей, больше ничего."
                     ),
                 }
             },

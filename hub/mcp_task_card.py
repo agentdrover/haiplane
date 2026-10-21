@@ -48,6 +48,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "owner_minutes",
     "last_executor_order",
     "delivery_rerun",
+    "role_orders",
     "critic_order",
     "created_at",
     "updated_at",
@@ -100,6 +101,20 @@ def delivery_rerun_lines(task: dict[str, Any]) -> list[str]:
         f"attempt {view.get('attempt_before')}+1 (since {view.get('requested_at')})"
         f"{named}"
     ]
+
+
+def role_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1973: role orders of the task as the hub built them; nothing when none."""
+    out: list[str] = []
+    for view in task.get("role_orders") or []:
+        if view.get("unavailable"):
+            out.append(f"Role orders: unavailable ({view['unavailable']})")
+        else:
+            out.append(
+                f"Role order: вызван {view.get('label') or view.get('role')} "
+                f"(заказ {view.get('id')}, {view.get('state')})"
+            )
+    return out
 
 
 def critic_order_lines(task: dict[str, Any]) -> list[str]:
