@@ -231,18 +231,18 @@ async def test_agent_draft_approved_late_does_not_precede_a_new_order(world):
 def test_current_second_is_deferred_and_ties_follow_the_rank():
     """Круг 2, Codex P3: исход текущей секунды откладывается; ничья - по рангу, не по свипу."""
     now = "2026-10-21 10:00:05"
-    only_split = {"events": [(now, "split")], "now": now}
+    only_split = {"events": [(now, "submitted")], "now": now}
     assert triage.classify_followup(only_split) is None  # ещё может прийти заказ
     both = {
-        "events": [(now, "split"), (now, "new_order")],
+        "events": [(now, "submitted"), (now, "new_order")],
         "now": "2026-10-21 10:00:06",
     }
     assert triage.classify_followup(both) == "new_order"
     earlier = {
-        "events": [("2026-10-21 10:00:04", "split"), (now, "new_order")],
+        "events": [("2026-10-21 10:00:04", "submitted"), (now, "new_order")],
         "now": now,
     }
-    assert triage.classify_followup(earlier) == "split"  # прошлая секунда закрыта
+    assert triage.classify_followup(earlier) == "submitted"  # прошлая секунда закрыта
 
 
 # ---------------------------------------------------------------------------

@@ -1387,7 +1387,7 @@ async def report_outcome(
             # #1942: граница включения разбора закрепляется ДО закрытия заказа и вне
             # SAVEPOINT рекомендации: откат разбора её не уносит, а закрытие этого
             # заказа не может оказаться «историей» из-за ленивого создания.
-            await executor_triage.activated_at(db)
+            await executor_triage.pin_activation_safely(db)
         refusal = await _branch_refusal(db, order, branch)
         if refusal:
             raise HostError(422, refusal)

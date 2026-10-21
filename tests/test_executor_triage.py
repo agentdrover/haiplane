@@ -107,6 +107,15 @@ async def _sweep(world):
     return await triage.sweep(world.db)
 
 
+async def _pin_old_activation(world) -> None:
+    """Граница включения давно позади: позднее закрытие заказа - не «история»."""
+    await world.db.execute(
+        "INSERT OR REPLACE INTO executor_triage_state (id, activated_at) "
+        "VALUES (1, datetime('now', '-1 day'))"
+    )
+    await world.db.commit()
+
+
 async def _reopen(world, task_id: int) -> None:
     await _set_task(world, task_id, status="open", claimed_by=None)
 
@@ -252,6 +261,7 @@ async def test_each_class_gets_its_recommendation_and_nothing_is_launched(
 
 async def test_one_recommendation_per_order(world, monkeypatch):
     """AC-2: ровно одна рекомендация и одна запись ленты на заказ."""
+    await _pin_old_activation(world)
 
     async def totals(task_id: int, oid: int) -> tuple[int, int, int]:
         recs = await _count(
@@ -496,14 +506,14 @@ async def test_resolution_and_agreement_are_measured(world):
     expected = {
         o_new: "new_order",
         o_stmt: None,  # повтор + только правка постановки: ещё не итог
-        o_split: "split",
+        o_split: None,  # подзадача - не измеримый исход (ребёнок удаляем)
         o_sub: "submitted",
         o_arch: None,  # архив без долговечной метки: исход только по сроку (unclear)
         o_72: "none_72h",
         o_c4: None,  # правка постановки без заказа: без метки, вне замера
         o_c0: "new_order",
         o_ref: "new_order",
-        o_rw: "split",
+        o_rw: None,
         o_rw1: "new_order",  # заказ раньше подзадачи: первое действие побеждает
         o_wait: None,
     }
@@ -512,17 +522,17 @@ async def test_resolution_and_agreement_are_measured(world):
 
     # Формула: знаменатель - только с followup, кроме устарела и без решения.
     got = await triage.agreement(world.db)
-    assert (got["total"], got["matched"]) == (6, 4), got
-    assert got["rate"] == 4 / 6
+    assert (got["total"], got["matched"]) == (4, 3), got
+    assert got["rate"] == 3 / 4
     assert (got["stale"], got["no_decision"], got["pending"], got["unclear"]) == (
         1,
         1,
-        4,
+        6,
         0,
     )
-    assert got["by_class"][1] == {"total": 2, "matched": 1, "rate": 0.5}
+    assert got["by_class"][1] == {"total": 1, "matched": 1, "rate": 1.0}
     assert got["by_class"][2] == {"total": 1, "matched": 1, "rate": 1.0}
-    assert got["by_class"][3] == {"total": 2, "matched": 2, "rate": 1.0}
+    assert got["by_class"][3] == {"total": 1, "matched": 1, "rate": 1.0}
     assert 4 not in got["by_class"] and got["by_class"][0]["matched"] == 0
     assert got["accepted_share"] is None
 
@@ -608,6 +618,7 @@ async def test_schema_generation_column_and_poller_sweep_repairs(world):
 
 async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypatch):
     """Находки Codex: давний заказ с поздним report, старая подзадача, отмена."""
+    await _pin_old_activation(world)
     # Заказ закрыт 73 часа назад, report пришёл только что: свип всё равно добирает.
     old = await _task(world, "давний заказ")
     lived = await _launch_redeem(world, old)
@@ -675,7 +686,7 @@ async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypa
     )
     await world.db.commit()
     await _sweep(world)
-    assert await _followup(world, kid_oid) == "split"
+    assert await _followup(world, kid_oid) is None  # подзадача - не исход
 
     # Отмена посреди разбора откатывает точку: ни строки, ни события без ленты.
     can = await _task(world, "отмена")

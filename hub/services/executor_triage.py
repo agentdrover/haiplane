@@ -392,7 +392,6 @@ async def recommend_safely(
 FOLLOWUPS: Final[tuple[str, ...]] = (
     "new_order",
     "statement_changed",
-    "split",
     "submitted",
     "none_72h",
     "unclear",
@@ -406,8 +405,8 @@ MATCHING: Final[dict[str, frozenset[str]]] = {
     ACTION_RETRY_AFTER_STATUS: frozenset({"new_order"}),
     ACTION_RETRY_ONCE: frozenset({"new_order"}),
     ACTION_REFINE_AND_RETRY: frozenset({"new_order"}),
-    ACTION_REWRITE_OR_SPLIT: frozenset({"statement_changed", "split"}),
-    ACTION_TO_OWNER: frozenset({"statement_changed", "split"}),
+    ACTION_REWRITE_OR_SPLIT: frozenset({"statement_changed"}),
+    ACTION_TO_OWNER: frozenset({"statement_changed"}),
 }
 
 _PENDING_SQL: Final[str] = """
@@ -426,16 +425,12 @@ _LATER_ORDER_SQL: Final[str] = (
     "SELECT created_at, statement_generation FROM executor_orders "
     "WHERE task_id = ? AND id > ? ORDER BY id LIMIT 1"
 )
-#: Разделение - ТОЛЬКО подзадача, созданная человеком: у неё есть долговечная метка
-#: (``created_at``) и она сама есть решение. Агентский ребёнок в любом статусе (draft,
-#: одобрен, отклонён) предложением остаётся, а когда его одобрили - в данных нет.
-_HUMAN_CHILD_SQL: Final[str] = (
-    "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
-    "AND source = 'human'"
-)
-_AGENT_CHILD_SQL: Final[str] = (
-    "SELECT 1 FROM tasks WHERE parent_id = ? AND id > ? AND source <> 'human' LIMIT 1"
-)
+#: Разделение в замер НЕ входит: подзадача удаляется физически (``DELETE``), и её
+#: ``created_at`` не долговечный факт - свип между созданием и удалением увидел бы
+#: действие, поздний свип - нет. Любая подзадача после рекомендации (``id`` выше
+#: ``child_floor``, любой автор и статус) - действие, видимое только свипу: ``unclear``
+#: на сроке, пока нет неизменяемого факта создания подзадачи.
+_CHILD_SQL: Final[str] = "SELECT 1 FROM tasks WHERE parent_id = ? AND id > ? LIMIT 1"
 _SUBMISSION_SQL: Final[str] = (
     "SELECT MIN(submitted_at) FROM submissions WHERE task_id = ? AND generation >= ?"
 )
@@ -446,7 +441,6 @@ UNCLEAR_FOLLOWUP: Final[str] = "unclear"
 _RANK: Final[dict[str, int]] = {
     "statement_changed": 0,
     "new_order": 1,
-    "split": 2,
     "submitted": 3,
     NO_DECISION_FOLLOWUP: 5,
     UNCLEAR_FOLLOWUP: 5,
@@ -485,11 +479,6 @@ async def _durable_events(
     task_id = int(f["task_id"])
     later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
     found = _later_order_event(f, later[0] if later else None)
-    child = (await fetchall(db, _HUMAN_CHILD_SQL, (task_id, int(f["child_floor"]))))[0][
-        0
-    ]
-    if child:
-        found.append((child, "split"))
     sub = (await fetchall(db, _SUBMISSION_SQL, (task_id, int(f["order_generation"]))))[
         0
     ][0]
@@ -501,7 +490,7 @@ async def _durable_events(
 async def _only_swept(db: aiosqlite.Connection, f: dict[str, Any]) -> bool:
     """Есть ли действие, видимое только свипу (без долговечной метки времени).
 
-    Архив, правка постановки без заказа, агентский ребёнок и сдача без строки
+    Архив, правка постановки без заказа, подзадача (удаляема) и сдача без строки
     ``submissions``. Они не входят в замер: срок рекомендации кончается исходом
     ``unclear`` вместо ``none_72h``.
     """
@@ -511,7 +500,7 @@ async def _only_swept(db: aiosqlite.Connection, f: dict[str, Any]) -> bool:
     if ordered is not None and int(f["task_sg"] or 0) > ordered:
         return True
     args = (int(f["task_id"]), int(f["child_floor"]))
-    if await fetchall(db, _AGENT_CHILD_SQL, args):
+    if await fetchall(db, _CHILD_SQL, args):
         return True
     return int(f["submission_generation"] or 0) >= int(f["order_generation"])
 
@@ -558,6 +547,26 @@ async def activated_at(db: aiosqlite.Connection) -> str:
     )
     rows = await fetchall(db, "SELECT activated_at FROM executor_triage_state")
     return str(rows[0][0])
+
+
+async def pin_activation_safely(db: aiosqlite.Connection) -> None:
+    """``activated_at`` под защитным правилом ``recommend_safely``: сбой не блокирует report.
+
+    Теневая подсистема не должна мешать принять итог хоста: при ошибке точка
+    откатывается, ошибка уходит в лог, граница остаётся незакреплённой (её закрепит
+    следующий свип или report).
+    """
+    await db.execute(f"SAVEPOINT {_SAVEPOINT}_pin")
+    try:
+        await activated_at(db)
+    except BaseException as exc:
+        await db.execute(f"ROLLBACK TO {_SAVEPOINT}_pin")
+        await db.execute(f"RELEASE {_SAVEPOINT}_pin")
+        if not isinstance(exc, Exception):
+            raise
+        log.exception("executor triage activation failed")
+        return
+    await db.execute(f"RELEASE {_SAVEPOINT}_pin")
 
 
 async def _recover_missing(db: aiosqlite.Connection) -> int:

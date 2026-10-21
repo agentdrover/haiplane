@@ -8,7 +8,7 @@
   держит «одна рекомендация на заказ» при гонке, рестарте и после очистки
   событий (они живут 14 дней). ``owner_verdict`` пишет кнопка #1943,
   ``followup`` - свип хаба; ``child_floor`` - наибольший id подзадачи на момент
-  рекомендации (подзадача человека с большим id = «разделение»). ``unclear`` -
+  рекомендации (подзадача с большим id - действие без долговечного факта: подзадачи удаляются). ``unclear`` -
   действие без долговечной метки времени (архив, правка без заказа, агентский
   ребёнок): вне знаменателя замера; совпадение считается по ним в docs/agent-context.
 """
@@ -37,7 +37,7 @@ MIGRATIONS: list[tuple[str, str]] = [
                                  OR owner_verdict IN ('accepted', 'rejected')),
             owner_verdict_at TEXT,
             followup         TEXT    CHECK (followup IS NULL OR followup IN (
-                                 'new_order', 'statement_changed', 'split',
+                                 'new_order', 'statement_changed',
                                  'submitted', 'none_72h', 'unclear')),
             followup_at      TEXT,
             resolved_by      TEXT    NOT NULL DEFAULT '',
