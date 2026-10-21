@@ -1428,6 +1428,9 @@ async def report_view(
         from hub.services.author_answers import attach_author_answers
 
         await attach_author_answers(db, machine_review)
+        from hub.services.review_oversized import attach_ac_tests_unread
+
+        await attach_ac_tests_unread(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
     return ReviewReport(

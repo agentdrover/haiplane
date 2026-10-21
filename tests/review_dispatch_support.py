@@ -21,7 +21,7 @@ from hub import repository as repo
 from hub.integrations import cursor_cloud, local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import TaskRefine, TaskSubmitReview
+from hub.models import AcceptanceCriterion, TaskRefine, TaskSubmitReview
 from hub.services.review_dispatch import (
     maybe_dispatch_review,
 )
@@ -42,7 +42,9 @@ class _PinnedGitOps(NoopGitOps):
         paths: list[str],
         diff: str | None = None,
         rules: dict[str, str] | None = None,
+        files: dict[str, str] | None = None,
     ) -> None:
+        self._files = files or {}
         self._tip = tip
         self._paths = paths
         # #820: the profile is decided against the diff, so the double must
@@ -63,6 +65,19 @@ class _PinnedGitOps(NoopGitOps):
 
     async def file_at_ref(self, repo, ref, path):
         return self._rules.get(path)
+
+    async def integrity_read(self, repo, base, sha):
+        # #1933: закреплённый дифф коммита; без files - как раньше (Noop: None).
+        if not self._files:
+            return await super().integrity_read(repo, base, sha)
+        return {"diff": self._diff, "base_sha": "b" * 40, "head_sha": sha}
+
+    async def read_file_at_ref(self, repo, ref, path, *, limit_chars=30000):
+        # #1933: файлы теста на закреплённом sha; нет в словаре = missing.
+        text = self._files.get(path)
+        state = "missing" if text is None else "present"
+        return {"state": state, "path": path, "ref": ref, "content": text or "",
+                "truncated": False, "reason": ""}  # fmt: skip
 
     async def fetch_base(self, repo: str, base: str):
         return True, ""
@@ -166,6 +181,8 @@ async def _submitted(
     validation_commands: list[str] | None = None,
     ci_reports: list[dict] | None = None,
     override: str = "",
+    acs: list[dict] | None = None,
+    files: dict[str, str] | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -198,6 +215,8 @@ async def _submitted(
             validation_commands=validation_commands,
         ),
     )
+    for ac in acs or []:
+        await repo.add_acceptance_criterion(db, task_id, AcceptanceCriterion(**ac))
     if clear_risk_class:
         # A task whose class was never computed: the state #582 calls
         # "not computed", which must never be read as low risk. NULL is that
@@ -211,7 +230,7 @@ async def _submitted(
         await repo.update_task(db, task_id, machine_review_override=override)
     await db.commit()
 
-    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules)
+    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules, files)
     started = await services.pair_start_task(db, task_id, caller="dev-agent")
     assert started.status.value == "running"
     view = await services.submit_for_review(
