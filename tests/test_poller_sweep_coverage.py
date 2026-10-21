@@ -30,7 +30,9 @@ def test_every_sweep_has_scenarios_or_a_reasoned_exception():
 
 def test_the_checker_names_every_kind_of_defect(tmp_path: Path):
     """Проверка краснеет на каждом из трёх дефектов реестра и не краснеет зря."""
-    (tmp_path / "t.py").write_text("async def test_real():\n    pass\n")
+    (tmp_path / "t.py").write_text(
+        "async def test_real():\n    pass\n\n\ndef helper():\n    pass\n"
+    )
     good = {n: Coverage(removed_by=OK) for n in NAMES}
     good[NAMES[0]] = Coverage(scenarios=("t.py::test_real",))
     assert check_registry(NAMES, good, tmp_path) == []
@@ -40,6 +42,13 @@ def test_the_checker_names_every_kind_of_defect(tmp_path: Path):
 
     dangling = dict(good, **{NAMES[0]: Coverage(scenarios=("t.py::test_gone",))})
     assert any("сценария" in p for p in check_registry(NAMES, dangling, tmp_path))
+    helper = dict(good, **{NAMES[0]: Coverage(scenarios=("t.py::helper",))})
+    assert any("сценария" in p for p in check_registry(NAMES, helper, tmp_path))
+    real_helper = dict(
+        good,
+        **{NAMES[0]: Coverage(scenarios=("tests/poller_sweep_support.py::utc",))},
+    )
+    assert any("сценария" in p for p in check_registry(NAMES, real_helper))
     no_file = dict(good, **{NAMES[0]: Coverage(scenarios=("gone.py::test_real",))})
     assert any("сценария" in p for p in check_registry(NAMES, no_file, tmp_path))
 

@@ -40,6 +40,7 @@ from tests.poller_sweep_support import (
     configure_steward_env,
     expect,
     freeze_hub_clock,
+    frozen_sql_date,
     make_project,
     provider_probe,
     retire_scenario,
@@ -156,6 +157,10 @@ async def _spend_the_cap(db: aiosqlite.Connection, project_id: int) -> None:
 
 
 async def _scenario_c_daily_cap(db: aiosqlite.Connection, monkeypatch) -> None:
+    # Независимость двух замков от повтора отказа по потолку (cap_handoff в
+    # order_due_runs и дедуп record_refusal) здесь не проверяется: каждый
+    # отдельно перекрыт другим. Её держат tests/test_steward_cap.py и
+    # tests/test_steward_dispatch.py (прямые вызовы каждого замка).
     clock = freeze_hub_clock(monkeypatch, utc(2026, 10, 20))
     monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
     project_id = await make_project(db, "runs-c")
@@ -196,9 +201,13 @@ async def _scenario_c_daily_cap(db: aiosqlite.Connection, monkeypatch) -> None:
         # Смена причины на том же заказе: отказ режима вместо потолка — новая
         # запись, повторы молчат. Через свип эта причина недостижима (диспетчер
         # при выключенном режиме не заходит в order_run), поэтому вызов прямой.
+        # Дедуп этого отказа отсекает прошлые сутки по date('now') SQLite, а не
+        # по часам хаба, поэтому день в SQL зафиксирован (иначе реальная
+        # полночь UTC посреди шага давала бы флак).
         monkeypatch.setattr(config, "STEWARD_MODE", "off")
-        for _ in range(PASSES):
-            assert await order_run(db, task_id, 2) is None
+        with frozen_sql_date():
+            for _ in range(PASSES):
+                assert await order_run(db, task_id, 2) is None
         monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
         assert await _refusals(db, task_id, "steward_off") == 1
 

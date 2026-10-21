@@ -23,9 +23,10 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
+import subprocess
+import sys
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -166,6 +167,28 @@ def provider_probe(
         yield mock
 
 
+@contextmanager
+def frozen_sql_date() -> Iterator[str]:
+    """Дедуп steward_shadow видит ``date('now')`` как день, снятый при входе.
+
+    Дедуп отказов отсекает прошлые сутки по ``date('now')`` SQLite, а не по
+    часам хаба; тест, перешагнувший реальную полночь UTC между двумя вызовами,
+    видел бы «вчерашний» отказ. SQLite не даёт подменить встроенную функцию,
+    поэтому подменяется чтение запросов в steward_shadow: литерал заменяется
+    на дату, снятую один раз. Код хаба не меняется.
+    """
+    from hub.services import steward_shadow
+
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    original = steward_shadow.fetchall
+
+    async def _fetchall(db: Any, sql: str, parameters: Any = ()) -> Any:
+        return await original(db, sql.replace("date('now')", f"'{day}'"), parameters)
+
+    with patch.object(steward_shadow, "fetchall", _fetchall):
+        yield day
+
+
 def sweep_named(name: str):
     from hub.poller import SWEEPS
 
@@ -207,16 +230,19 @@ def expect(
     actual: Channels,
     *,
     events: dict[str, int] | None = None,
+    ignore_events: frozenset[str] = frozenset(),
     notifications: int = 0,
     orders: int = 0,
     provider_calls: int = 0,
 ) -> None:
-    """Количества по каналам. События — только названные виды: шум других видов
-    (коридор эскалаций и т.п.) не есть предмет сценария."""
-    for kind, want in (events or {}).items():
-        assert actual.event(kind) == want, (
-            f"{label}: событий {kind} {actual.event(kind)}, ожидалось {want}"
-        )
+    """Количества по каналам. События сравниваются ПОЛНЫМ набором видов: любой
+    вид, которого нет в ``events``, обязан быть нулём. Фоновые виды, которые
+    не есть предмет сценария, называются явно в ``ignore_events``."""
+    want = Counter({k: v for k, v in (events or {}).items() if v})
+    got = Counter({k: v for k, v in actual.events.items() if k not in ignore_events})
+    assert got == want, (
+        f"{label}: события {dict(sorted(got.items()))}, ожидалось {dict(sorted(want.items()))}"
+    )
     assert actual.notifications == notifications, (
         f"{label}: записей в ленте {actual.notifications}, ожидалось {notifications}"
     )
@@ -447,21 +473,51 @@ def validate_removed_by(text: object) -> str | None:
     return f"неизвестный формат {raw!r}"
 
 
-def scenario_exists(ref: str, root: Path = REPO_ROOT) -> bool:
-    """Есть ли в файле ссылки ``путь::имя`` функция верхнего уровня с таким именем.
+_COLLECTED: dict[tuple[str, str], frozenset[str]] = {}
 
-    Файл не импортируется: проверка не должна зависеть от того, что собирается
-    pytest, и не исполняет чужой код.
+
+def collected_tests(path_text: str, root: Path = REPO_ROOT) -> frozenset[str]:
+    """Имена функций, которые pytest СОБИРАЕТ как тесты в файле (без параметров).
+
+    Сбор настоящий (`--collect-only` в отдельном процессе), а не разбор имён:
+    вспомогательная функция того же файла тестом не является. Результат
+    кэшируется на файл: сбор test_poller.py стоит секунд.
     """
+    key = (str(root), path_text)
+    if key in _COLLECTED:
+        return _COLLECTED[key]
+    names: set[str] = set()
+    if (root / path_text).is_file():
+        run = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-o",
+                "addopts=",
+                path_text,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in run.stdout.splitlines():
+            head, sep, name = line.strip().partition("::")
+            if sep and head == path_text and "::" not in name:
+                names.add(name.split("[", 1)[0])
+    _COLLECTED[key] = frozenset(names)
+    return _COLLECTED[key]
+
+
+def scenario_exists(ref: str, root: Path = REPO_ROOT) -> bool:
+    """Собирает ли pytest тест по ссылке ``путь::имя``."""
     path_text, sep, name = ref.partition("::")
-    path = root / path_text
-    if not sep or not name or not path.is_file():
-        return False
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    return any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
-        for node in tree.body
-    )
+    return bool(sep and name) and name in collected_tests(path_text, root)
 
 
 def check_registry(
