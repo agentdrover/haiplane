@@ -246,6 +246,7 @@ async def test_the_route_stamps_the_dispatch_of_the_reviewer_session(
 
     rows = await repo.machine_reviews_of_generation(db, task_id, 1)
     assert [r["dispatch_id"] for r in rows] == [lite, lite]
+    assert all(r["code_id"] is not None for r in rows), "код сессии записан на отчёте"
     deep_row = dict(
         (await fetchall(db, "SELECT * FROM review_dispatches WHERE id=?", (deep,)))[0]
     )
