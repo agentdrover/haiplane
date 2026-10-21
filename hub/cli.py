@@ -888,7 +888,9 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
         return 2
     if not expected_sha_cli.put_expected_sha_cli(body, args):
         return 2
-    result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
+    dry = bool(getattr(args, "dry_run", False))
+    path = f"/api/tasks/{args.task_id}/submit-review" + ("?dry_run=1" if dry else "")
+    result = _api("POST", path, body)
     _print_json(result)
     return 0
 
@@ -2593,6 +2595,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "JSON list, one per AC with verifiable_by=test (#1436): "
             '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
+        ),
+    )
+    p_submit_review.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help=(
+            "Check the submission without recording it (#1975): the same refusal "
+            "as the real one (rc != 0) or would_submit and passed_steps (rc 0). "
+            "A success does not promise that the real submission passes."
         ),
     )
     expected_sha_cli.add_expected_sha_option(p_submit_review)
