@@ -598,13 +598,23 @@ async def accept_in_transaction(
     from hub.services.orchestration import review_approved_for_current_submission
 
     task_id = int(task["id"])
-    async with write_transaction(db):
+    # Своя транзакция - как прежний bump: открытой остаётся для вызывающего (он
+    # коммитит), так что ошибка следующего шага откатывает и bump.
+    began = not db.in_transaction
+    if began:
+        await db.execute("BEGIN IMMEDIATE")
+    try:
         row = await repo.get_task(db, task_id)
         fresh = dict(row) if row is not None else task
         verdict = Verdict()
-        if always or (
-            fresh.get("status") in SUBMITTABLE
-            and not review_approved_for_current_submission(fresh)
+        # Новая сдача (bump) проверяется всегда: пропуск проверки не открывает её.
+        if (
+            always
+            or bump
+            or (
+                fresh.get("status") in SUBMITTABLE
+                and not review_approved_for_current_submission(fresh)
+            )
         ):
             verdict = await evaluate(db, fresh, _observation(task, observed))
         if verdict.applicable and verdict.cause:
@@ -620,6 +630,10 @@ async def accept_in_transaction(
                 await repo.update_task(db, task_id, submission_sha=verdict.sha)
                 task["submission_sha"] = verdict.sha
         return task
+    except BaseException:
+        if began:
+            await db.rollback()
+        raise
 
 
 async def accept_done(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:

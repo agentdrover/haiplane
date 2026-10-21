@@ -91,8 +91,10 @@ async def test_a_delivery_rebind_survives_the_completion(world, tip, monkeypatch
 
 
 async def test_a_held_task_does_not_start_an_external_review(world, tip):
-    """Удержанная приёмом задача не доходит до dispatch_review: платное ревью не запущено."""
+    """Удержанная приёмом задача: ни bump, ни пина, ни внешнего ревью; со `passed` - идёт дальше."""
     cloud = await co._cloud(world, tip)
+    await repo.update_task(world.db, cloud.task_id, submission_sha=co.SHA_B)
+    await world.db.commit()
     submit = AsyncMock(return_value={"job_id": "j-1"})
     plugins.dispatch.submit_task = submit  # type: ignore[method-assign]
     row = await _row(world, cloud.task_id)
@@ -100,9 +102,63 @@ async def test_a_held_task_does_not_start_an_external_review(world, tip):
         world.db, row, has_done=True
     )
     await world.db.commit()
-    assert outcome == "needs_decision"
-    assert submit.await_count == 0
-    assert (await _row(world, cloud.task_id))["review_job_id"] in (None, "")
+    held = await _row(world, cloud.task_id)
+    assert outcome == "needs_decision" and submit.await_count == 0
+    assert (held["review_job_id"] or "") == ""
+    assert (held["submission_generation"], held["submission_sha"]) == (0, co.SHA_B)
+
+    # Контроль: со `passed` тот же вход принимает сдачу - bump и пин приёмом.
+    await co._closed_order(world, cloud, co.SHA_A, "passed")
+    await repo.update_task(world.db, cloud.task_id, status="running")
+    await world.db.commit()
+    row = await _row(world, cloud.task_id)
+    await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    await world.db.commit()
+    accepted = await _row(world, cloud.task_id)
+    assert (accepted["submission_generation"], accepted["submission_sha"]) == (
+        1,
+        co.SHA_A,
+    )
+
+
+async def test_a_new_submission_is_never_bumped_without_the_check(world, tip):
+    """Re-entry из ci_check/needs_decision: bump без проверки критика не бывает."""
+    for status in ("ci_check", "needs_decision"):
+        cloud = await co._cloud(world, tip)
+        await repo.update_task(
+            world.db, cloud.task_id, status=status, submission_sha=co.SHA_B
+        )
+        await world.db.commit()
+        row = await _row(world, cloud.task_id)
+        outcome = await orchestration.transition_after_agent_done(
+            world.db, row, has_done=True
+        )
+        await world.db.commit()
+        after = await _row(world, cloud.task_id)
+        assert after["submission_generation"] == 0, status
+        assert (outcome, after["submission_sha"]) == ("needs_decision", co.SHA_B), (
+            status
+        )
+
+
+async def test_a_local_submission_error_after_the_bump_rolls_the_bump_back(
+    world, monkeypatch
+):
+    """Не-облачная автоматическая сдача: ошибка гейтов после приёма откатывает и bump."""
+    task_id = await co._task(world, "локальная")
+    await repo.update_task(world.db, task_id, status="running", auto_review=1)
+    await world.db.commit()
+
+    async def _boom(db, tid, task):
+        raise RuntimeError("гейт упал")
+
+    monkeypatch.setattr(orchestration, "_run_headless_submit_gates", _boom)
+    row = await _row(world, task_id)
+    try:
+        await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    except RuntimeError:
+        await world.db.rollback()
+    assert (await _row(world, task_id))["submission_generation"] == 0
 
 
 async def test_a_completion_never_writes_over_a_hold(world, tip):
