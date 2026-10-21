@@ -84,8 +84,26 @@ async def test_at_most_one_rerun_and_no_stale_apply(db, db_dsn, monkeypatch, cas
         rig.git.rerun_failed_jobs = AsyncMock(side_effect=post)
 
         if case.startswith("concurrent"):
-            order = [db, other] if case.endswith("first_second") else [other, db]
-            results = await asyncio.gather(*(_pass(c, rig.task_id) for c in order))
+            from hub.services import delivery_rerun
+
+            winner, loser = (
+                (db, other) if case.endswith("first_second") else (other, db)
+            )
+            barrier = asyncio.Barrier(2)
+            real_reserve = delivery_rerun._reserve
+
+            async def meet_then_reserve(conn, *args):
+                # Оба прохода прочитали armed и дошли до брони одновременно:
+                # исход решает только условный UPDATE, а не порядок чтения.
+                await barrier.wait()
+                if conn is loser:
+                    await asyncio.sleep(0.1)
+                return await real_reserve(conn, *args)
+
+            monkeypatch.setattr(delivery_rerun, "_reserve", meet_then_reserve)
+            results = await asyncio.gather(
+                *(_pass(c, rig.task_id) for c in (winner, loser))
+            )
             reasons = sorted(r[1].split(":")[0] for r in results)
             assert reasons == ["fresh_base_ci_rerun", "fresh_base_ci_rerun"]
             assert rig.posts == 1

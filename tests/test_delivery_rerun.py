@@ -21,7 +21,7 @@ from hub.integrations.protocols import (
     CIRunRequestResult,
 )
 from hub.services import ci_contract
-from tests.ci_trust_support import SAT_CONTRACT, SAT_PATH, satellite_task
+from tests.ci_trust_support import CI_PATH, SAT_CONTRACT, SAT_PATH, satellite_task
 from tests.delivery_rerun_support import (
     POLICY_KEY,
     RUN,
@@ -299,8 +299,10 @@ async def test_a_satellite_needs_an_explicit_contract(db, monkeypatch):
         rig.fake.attempt(
             tid,
             "head-sat",
-            run_id="777",
-            path=SAT_PATH,
+            run_id=str(700 + expected_posts),
+            # Без явного контракта действует контракт хаба (ci.yml): красный
+            # именно он, так что POST останавливает только правило о контракте.
+            path=SAT_PATH if contract else CI_PATH,
             status="completed",
             conclusion="failure",
             event="pull_request",
