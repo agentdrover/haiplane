@@ -130,6 +130,7 @@ CI_SCRIPTS: frozenset[str] = frozenset(
         "scripts/layer_rules.py",
         "scripts/migration_steps_add_only.py",
         "scripts/mcp_catalog_budget.py",
+        "scripts/wallclock_asserts.py",
         "scripts/secret_scan.py",
         "scripts/surface_parity.py",
         "deploy/review-drain.sh",

@@ -542,7 +542,7 @@ def _label(key: tuple[str, str, str]) -> str:
 def check(places: list[Place], entries: list[dict]) -> Report:
     """Свести найденные места с ledger. Чистая функция."""
     found = Counter(p.key for p in places)
-    first_place = {}
+    first_place: dict[tuple[str, str, str], Place] = {}
     for p in places:
         first_place.setdefault(p.key, p)
     seen: Counter[tuple[str, str, str]] = Counter()

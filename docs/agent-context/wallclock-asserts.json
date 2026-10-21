@@ -1,28 +1,6 @@
 {
   "_comment": [
-    "Ledger мест, где assert сравнивает настенное время с порогом < 1 с (#1989). Проверка: scripts/wallclock_asserts.py; --update добавляет новые места с пустым removed_by и сохраняет существующие. removed_by: task:#NNNN | permanent: <причина> | unclaimed: <причина>. Запись снимается удалением, когда места больше нет."
+    "Ledger мест, где assert сравнивает настенное время с порогом < 1 с (#1989). Проверка: scripts/wallclock_asserts.py; --update добавляет новые места с пустым removed_by и сохраняет существующие. removed_by: task:#NNNN | permanent: <причина> | unclaimed: <причина>. Запись снимается удалением, когда места больше нет. На момент задачи (после #1984, 22.10) мест в грамматике нет: ledger пуст, три места до #1984 переведены ею."
   ],
-  "entries": [
-    {
-      "path": "tests/test_ci_run_request.py",
-      "function": "test_sql_of_the_pass_stays_inside_the_budget",
-      "assert": "elapsed < 0.02 + 0.1",
-      "count": 1,
-      "removed_by": "unclaimed: существовало до #1989, перевод отдельной задачей"
-    },
-    {
-      "path": "tests/test_egress_watch.py",
-      "function": "test_probe_is_bounded_and_never_blocks_the_loop",
-      "assert": "slowest < 0.3",
-      "count": 1,
-      "removed_by": "unclaimed: существовало до #1989, перевод отдельной задачей"
-    },
-    {
-      "path": "tests/test_egress_watch.py",
-      "function": "test_probe_is_bounded_and_never_blocks_the_loop",
-      "assert": "time.monotonic() - started < 0.4 + 0.5",
-      "count": 1,
-      "removed_by": "unclaimed: существовало до #1989, перевод отдельной задачей"
-    }
-  ]
+  "entries": []
 }
