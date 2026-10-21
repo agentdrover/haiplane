@@ -338,20 +338,12 @@ async def prepare_delivery(
             **known,
         )
 
-    # #937: the release the hub records is a deploy of the HUB's repository.
-    # For a task whose project lives in a different repo, that sha cannot
-    # exist in the project's workspace — asking git (and then the network)
-    # was a guaranteed miss paid on every dashboard render.
-    project_repo = (ctx.get("gh_repo") or "").strip().lower()
-    hub_repo = (config.REPO_NAME or "").strip().lower()
-    if project_repo and hub_repo and project_repo != hub_repo:
-        return _answer(
-            UNKNOWN,
-            f"релиз хаба ({hub_repo}) не применим к проекту в {project_repo} — "
-            "у этого проекта свой репозиторий, факт его выката хаб не записывает",
-            **known,
-        )
-
+    # #1927: no repository cut-off here. The release was chosen by the task's
+    # OWN project above, so its sha belongs to that project's repository, and
+    # every git question below runs in the project's workspace (``ctx``), not
+    # the hub's. The #937 cut-off compared the project's repo with the hub's
+    # AFTER that choice and answered unknown for a project that has its own
+    # deploys — and for a merge that IS an ancestor of them.
     base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
     return _GitCheck(
         task_id=task_id,

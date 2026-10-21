@@ -263,19 +263,8 @@ async def test_in_prod_answer_is_cached_per_full_key_only(
     await repo.record_release(db, deployed_sha="e" * 40, ref="main", source="ci")
     await prod_state(db)
     assert fake.calls > after_base
-    after_release = fake.calls
-
-    # чужой gh_repo — применимость проверена заново, кэш не отвечает
-    from hub import config
-
-    monkeypatch.setattr(config, "REPO_NAME", "agentdrover/haiplane")
-    ctx["gh_repo"] = "agentdrover/other"
-    snapshot = await prod_state(db)
-    assert fake.calls == after_release
-    assert snapshot["in_prod"] == [] and len(snapshot["unknown"]) == 1
 
     # NOT_IN_PROD не кэшируется
-    del ctx["gh_repo"]
     fake.ancestor = False
     ctx["base_branch"] = "other-base"
     await prod_state(db)
@@ -491,3 +480,54 @@ async def test_deployed_is_default_project_release_not_newest_of_any(
     assert snapshot["deployed"]["sha"] == history["released"]
     assert snapshot["deployed"]["source"] == "ci"
     assert shipped in [e["task_id"] for e in snapshot["in_prod"]]
+
+
+async def test_mixed_snapshot_reads_each_projects_release_once_and_reuses_none(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1927: два проекта в одном снимке. Выкат у default есть, у spike-bo нет:
+    # каждый проект читается один раз, закэшированное «выката нет» (None)
+    # переиспользуется для всех задач spike-bo и не подменяется выкатом default.
+    from tests.test_delivery_state_projects import _default_project_id
+
+    fake = _FakeGit()
+    _wire_fake_git(monkeypatch, fake)
+    await _default_project_id(db)
+    pid = await repo.create_project(db, slug="spike-bo", name="spike-bo")
+    epic = (
+        await client.post("/api/tasks", json={"title": "E", "task_type": "epic"})
+    ).json()["id"]
+    await repo.update_task(db, epic, project_id=pid)
+    foreign: list[int] = []
+    for i in range(3):
+        task_id = (
+            await client.post(
+                "/api/tasks",
+                json={"title": f"S{i}", "task_type": "task", "parent_id": epic},
+            )
+        ).json()["id"]
+        await db.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+            "VALUES (?, ?, ?, ?)",
+            (pid, 4700 + task_id, task_id, f"{i + 100:040x}"),
+        )
+        await repo.update_task(db, task_id, status="completed")
+        foreign.append(task_id)
+    await db.commit()
+    own = await _board(client, db, 3)
+
+    reads: list[int | None] = []
+    real_latest = defect_release.latest_release_in_scope
+
+    async def counting(db_, project_id):
+        reads.append(project_id)
+        return await real_latest(db_, project_id)
+
+    monkeypatch.setattr(defect_release, "latest_release_in_scope", counting)
+
+    snapshot = await prod_state(db, limit=50)
+
+    assert len(reads) == 2 and len(set(reads)) == 2, reads
+    assert sorted(e["task_id"] for e in snapshot["in_prod"]) == sorted(own)
+    assert sorted(e["task_id"] for e in snapshot["unknown"]) == sorted(foreign)
+    assert snapshot["deployed"]["sha"] == "f" * 40
