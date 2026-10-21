@@ -46,11 +46,14 @@ async def _dump(conn: aiosqlite.Connection) -> dict:
     )
     master = [tuple(r) for r in await cursor.fetchall()]
     dump: dict = {"master": master}
-    for pragma in ("user_version", "journal_mode"):
+    for pragma in ("user_version", "journal_mode", "foreign_keys", "busy_timeout"):
         cursor = await conn.execute(f"PRAGMA {pragma}")
         dump[pragma] = tuple((await cursor.fetchone()))
     for kind, name, _tbl, _sql in master:
-        if kind != "table" or name.startswith("sqlite_"):
+        # sqlite_sequence — счётчики AUTOINCREMENT: от них зависит следующий id.
+        if kind != "table" or (
+            name.startswith("sqlite_") and name != "sqlite_sequence"
+        ):
             continue
         cursor = await conn.execute(f'SELECT * FROM "{name}"')
         columns = [d[0] for d in cursor.description]
@@ -80,6 +83,7 @@ async def test_template_copy_equals_full_build(tmp_path, tmp_path_factory):
     assert want["roles"] and want["principals"] and want["plain_summary_boundary"]
     assert want["plain_summary_boundary"] == [(1, 999999999)]
     assert want["journal_mode"] == ("wal",)
+    assert want["foreign_keys"] == (1,) and want["busy_timeout"] == (5000,)
 
 
 async def test_pristine_requests_copy_one_template(
@@ -209,3 +213,35 @@ async def test_db_fixture_after_patch_in_a_fixture_sees_the_patch(extra_migratio
         "SELECT name FROM sqlite_master WHERE name = 'zz_probe_1958'"
     )
     assert await cursor.fetchone() is not None
+
+
+async def test_a_replaced_chat_pair_agent_is_seen(
+    tmp_path, tmp_path_factory, warm_template, monkeypatch
+):
+    """Вход seed (имя агента чат-пары) подменён до ``db`` — база его видит."""
+    await warm_template(tmp_path)
+    monkeypatch.setattr(hub_db, "CHAT_PAIR_AGENT", "zz-agent-1958")
+    conn = await support.open_test_db(
+        str(tmp_path / "patched.db"), tmp_path_factory.mktemp("tpl")
+    )
+    try:
+        cursor = await conn.execute(
+            "SELECT username FROM principals WHERE username = 'zz-agent-1958'"
+        )
+        assert await cursor.fetchone() is not None
+    finally:
+        await conn.close()
+
+
+async def test_the_dump_sees_autoincrement_counters(tmp_path):
+    """Канарейка сравнивает и счётчики ``sqlite_sequence`` (следующий id)."""
+    one = await _reference_build(str(tmp_path / "one.db"))
+    two = await _reference_build(str(tmp_path / "two.db"))
+    try:
+        await two.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('zz_1958', 999)"
+        )
+        assert await _dump(one) != await _dump(two)
+    finally:
+        await one.close()
+        await two.close()

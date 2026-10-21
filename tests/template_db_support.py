@@ -42,6 +42,9 @@ def fingerprint() -> tuple:
     return (
         _digest(hub_db._SCHEMA),
         _digest(repr([(name, sql) for name, sql in hub_db._MIGRATIONS])),
+        # Входы seed: имя агента чат-пары и системные роли.
+        hub_db.CHAT_PAIR_AGENT,
+        _digest(repr(hub_db.SYSTEM_ROLES)),
         tuple(
             id(f)
             for f in (
