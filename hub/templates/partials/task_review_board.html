@@ -584,6 +584,9 @@
         {% if machine_review.lost_dimensions %}
         <span class="badge badge-failed">потеряно измерений: {{ machine_review.lost_dimensions|join(', ') }}</span>
         {% endif %}
+        {%- if machine_review.ac_tests_unread %}
+        <span class="badge badge-failed">тест AC не прочитан: {{ machine_review.ac_tests_unread|join(', ') }}</span>
+        {%- endif %}
         {% if machine_review.unresolved %}
         <details>
             <summary class="project-edit-summary">unresolved — НЕ опровергнуты, никто не смог судить</summary>
