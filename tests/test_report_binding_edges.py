@@ -21,7 +21,7 @@ from hub.models import MachineReviewSubmit
 from hub.services import chat_pair, report_binding
 from hub.services import review_dispatch as dispatcher
 from hub.services.machine_review_intake import record_machine_review
-from tests.test_report_binding import _mint, _redeem, _reviewer_task
+from tests.test_report_binding import OTHER, _mint, _redeem, _reviewer_task
 from tests.test_steward_waits_for_ladder import PRINCIPAL, _dispatch_row
 
 
@@ -152,3 +152,118 @@ async def test_the_stub_of_a_refused_call_survives_the_real_second_door(
     )
     assert stub is not None and stub["channel"] == "cloud"
     assert chat_pair  # модуль нужен тесту: код выкупает облако позже
+
+
+# ---------------------------------------------------------------------------
+# Круг Codex 2 (#1946): устаревший None при приёме, профиль и восстановление
+# при поздней привязке, оставленная заглушка в порядке ступеней
+# ---------------------------------------------------------------------------
+
+
+async def _bound_later(db: aiosqlite.Connection, slug: str):
+    """Код выкуплен до заказов: личность несёт dispatch_id=None."""
+    task_id = await _reviewer_task(db, slug)
+    code = await _mint(db, task_id)
+    identity = await _redeem(db, code)
+    assert identity.chat_pair_dispatch_id is None
+    return task_id, code, identity.chat_pair_code_id
+
+
+async def _bind(db, code, order, task_id):
+    await report_binding.bind_code_to_dispatch(
+        db,
+        code,
+        dispatch_id=order,
+        task_id=task_id,
+        generation=1,
+        principal_id=PRINCIPAL,
+    )
+    await db.commit()
+
+
+async def test_a_report_stamped_after_the_binding_landed_is_not_left_unbound(
+    db: aiosqlite.Connection,
+):
+    """Codex 1: запрос прочитал dispatch_id=None, привязка легла, потом отчёт сохранён."""
+    task_id, code, code_id = await _bound_later(db, "stale-none")
+    deep = await _dispatch_row(db, task_id, status="active", profile="deep")
+    await _bind(db, code, deep, task_id)
+    await record_machine_review(
+        db, task_id, _body(), principal_id=PRINCIPAL, username="rev", code_id=code_id
+    )
+    (report,) = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert report["dispatch_id"] == deep and report["profile"] == "deep"
+
+
+async def test_a_late_binding_corrects_the_profile_of_a_caught_up_report(
+    db: aiosqlite.Connection,
+):
+    """Codex 4: ранний отчёт получил профиль последнего заказа - привязка его исправляет."""
+    task_id, code, code_id = await _bound_later(db, "late-profile")
+    await _dispatch_row(db, task_id, status="active", profile="lite")
+    await record_machine_review(
+        db, task_id, _body(), principal_id=PRINCIPAL, username="rev", code_id=code_id
+    )
+    (early,) = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert early["profile"] == "lite"
+    deep = await _dispatch_row(db, task_id, status="active", profile="deep")
+    await _bind(db, code, deep, task_id)
+    (fixed,) = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert fixed["dispatch_id"] == deep and fixed["profile"] == "deep"
+
+
+async def test_a_late_binding_reopens_a_refused_stub_whose_report_came_first(
+    db: aiosqlite.Connection,
+):
+    """Codex 2: отчёт пришёл до заглушки отказа; привязка кода к ней оживляет заказ."""
+    task_id, code, code_id = await _bound_later(db, "early-then-stub")
+    await record_machine_review(
+        db,
+        task_id,
+        _body(False),
+        principal_id=PRINCIPAL,
+        username="rev",
+        code_id=code_id,
+    )
+    cur = await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id) "
+        "VALUES (?, 1, '', '', 'grok-4.6', 'lite', 'failed', 'cloud', ?)",
+        (task_id, PRINCIPAL),
+    )
+    stub = int(cur.lastrowid or 0)
+    await _bind(db, code, stub, task_id)
+    rows = await fetchall(
+        db, "SELECT status FROM review_dispatches WHERE id=?", (stub,)
+    )
+    assert dict(rows[0])["status"] == "active"
+
+
+async def test_a_kept_stub_with_a_replacement_does_not_take_a_rung(
+    db: aiosqlite.Connection,
+):
+    """Codex 3: заглушка с локальной заменой не занимает ступень облачных заказов."""
+    from tests.test_ladder_attempts import _report
+
+    task_id = await _reviewer_task(db, "kept-stub-rung")
+    cur = await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id) "
+        "VALUES (?, 1, '', '', 'm', 'lite', 'failed', 'cloud', ?)",
+        (task_id, PRINCIPAL),
+    )
+    stub = int(cur.lastrowid or 0)
+    await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id, "
+        "replaces_dispatch_id) VALUES (?, 1, 'local:1', 'r', 'm', 'lite', 'done', "
+        "'local', ?, ?)",
+        (task_id, OTHER, stub),
+    )
+    deep = await _dispatch_row(db, task_id, status="active", profile="deep")
+    unbound = await _report(db, task_id, incomplete=False, profile="deep")
+    deep_row = dict(
+        (await fetchall(db, "SELECT * FROM review_dispatches WHERE id=?", (deep,)))[0]
+    )
+    own = await dispatcher.report_of_dispatch(db, task_id, 1, deep_row)
+    assert own is not None and own["id"] == unbound
