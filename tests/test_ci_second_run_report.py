@@ -75,7 +75,7 @@ class _Hub:
         self.calls += 1
         answer = self.answers[min(self.calls, len(self.answers)) - 1]
         if isinstance(answer, int):
-            body = io.BytesIO(b"<html><h1>%d</h1></html>" % answer)
+            body = io.BytesIO(b"<html><h1>%d</h1> secret-project-slug</html>" % answer)
             raise urllib.error.HTTPError(req.full_url, answer, "x", {}, body)
         if isinstance(answer, Exception):
             raise answer
@@ -133,6 +133,9 @@ def test_the_collector_never_leaves_a_green_artifact_without_results(
     assert module.main() == 0
     assert hub.calls == 1
     assert "403" in _results(module)["reason"]
+    # The body of the refusal names projects: it is not logged, at any code.
+    shown = capsys.readouterr().out
+    assert "403" in shown and "secret-project-slug" not in shown
 
     # 4. The network breaks (no HTTP answer at all): the same, repeated.
     module.results_path.unlink()

@@ -194,9 +194,11 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - https URL from env
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")[:400]
+        # The code only, never the body: a 403 body names the project of the
+        # task and the projects of the key (hub/services/ci_scope.py), and this
+        # log is readable by everyone who can read the run.
         LAST_FAILURE = f"HTTP {exc.code}"
-        log(f"hub said {exc.code}: {body}")
+        log(f"hub said {exc.code}")
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         cause = getattr(exc, "reason", None)
         kind = type(cause if isinstance(cause, BaseException) else exc).__name__
