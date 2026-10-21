@@ -368,6 +368,8 @@ async def test_the_pin_lock_covers_only_the_intake_not_the_automation(
 
     async def spy(conn, tid, task) -> None:
         seen.append(conn.in_transaction)
+        # Шаг автоматики записал и не закоммитил (его ошибку она перехватывает).
+        await repo.add_task_update(conn, tid, "hub", "alert", "partial automation")
 
     monkeypatch.setattr(intake, "_run_report_automation", spy)
     conn = await db_module.connect(db_dsn)
@@ -385,6 +387,10 @@ async def test_the_pin_lock_covers_only_the_intake_not_the_automation(
         await conn.close()
     assert view.pin_verified is True
     assert seen == [False]
+    leftovers = await fetchall(
+        db, "SELECT 1 FROM task_updates WHERE content='partial automation'"
+    )
+    assert leftovers == [], "незакоммиченное автоматикой не фиксируется приёмом"
 
 
 async def test_a_pin_before_the_first_submission_is_a_mismatch_not_a_400(
