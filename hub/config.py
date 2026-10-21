@@ -201,6 +201,10 @@ STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
 # закрыть прогон без неё — выдать непрочитанную цену за окончательную. По
 # истечении срока строка закрывается с названной причиной, центы — NULL.
 EXECUTOR_COST_WAIT_MIN = int(env_get("EXECUTOR_COST_WAIT_MIN", "30"))
+# #1953: срок заказа критика k8 для облачной сдачи (минуты) и лимит заказов
+# критика на задачу в час. Хост, не успевший за срок, получает expired.
+CRITIC_ORDER_TTL_MIN = int(env_get("CRITIC_ORDER_TTL_MIN", "45"))
+CRITIC_ORDERS_PER_HOUR = int(env_get("CRITIC_ORDERS_PER_HOUR", "6"))
 # #1411 (F2.3): потолки прогона исполнителя по умолчанию — ставятся в строку
 # при заказе, если заказ не назвал свои. Цифры — смета F0: 8M токенов и около
 # $35; в F0 первый превысили, и остановить прогон было некому.
@@ -938,7 +942,7 @@ class TokenIdentity:
 
     @property
     def is_slot_runner(self) -> bool:
-        """The key of an executor host (#1712): six routes of its own host (SLOT_RUNNER_ALLOWLIST)."""
+        """The key of an executor host (#1712): six order routes and two critic routes (#1953) of its own host (SLOT_RUNNER_ALLOWLIST)."""
         return self.role == "slot_runner"
 
     @property

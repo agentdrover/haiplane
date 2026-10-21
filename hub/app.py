@@ -196,6 +196,7 @@ from hub.decisions_api import router as decisions_router
 from hub.owner_minutes_api import router as owner_minutes_router
 from hub.verdict_evidence_api import router as verdict_evidence_router
 from hub.web_executor_slot import router as executor_slot_web_router
+from hub.critic_host_api import router as critic_host_router
 from hub.executor_host_api import (
     launch_request,
     refuse_registered_slot,
@@ -548,6 +549,7 @@ app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
+app.include_router(critic_host_router)
 app.include_router(executor_slot_web_router)
 
 
@@ -3738,6 +3740,7 @@ async def api_add_task_update(task_id: int, body: TaskUpdateCreate, request: Req
         task_id,
         body,
         principal_id=current_identity(request).principal_id,
+        session_token=_implementer_token(request, current_identity(request)),
     )
 
 

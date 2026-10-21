@@ -764,7 +764,9 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     Изменённые намеренно: активированные админом получают черновик, активная
     версия прежняя (человек активирует сам); seed получает новую активную.
     """
-    # executor-pair-discipline: текст сида менял #1866 (три правила ревью).
+    # executor-pair-discipline: текст сида менял #1866 (три правила ревью) и
+    # #1953 (раздел про критика k8); активная версия админа остаётся, новая
+    # ложится черновиком.
     changed_by_admin = {
         "local-executor-hub-repo",
         "hub-submit-task",
