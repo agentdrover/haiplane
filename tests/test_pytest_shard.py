@@ -232,3 +232,117 @@ def test_the_spec_parser_and_the_split_are_pure() -> None:
         "tests/a.py", 3
     )
     assert {pytest_shard.shard_of(f"tests/f{i}.py", 3) for i in range(60)} == {1, 2, 3}
+
+
+# --- #1987: a part does not collect the files of the other parts -------------
+
+# Every module that gets imported leaves a mark named after itself.
+_MARKING_MODULE = """
+import os
+from pathlib import Path
+
+Path(os.environ["IMPORT_MARKS"], {name!r}.replace("/", "__")).write_text("x")
+
+
+def test_it():
+    pass
+"""
+
+
+def _make_marking_suite(pytester: pytest.Pytester, names: list[str]) -> None:
+    for name in names:
+        path = pytester.path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_MARKING_MODULE.format(name=name), encoding="utf-8")
+
+
+def _passed(output: str) -> list[str]:
+    """Ids of passed tests, serial (``id PASSED``) and xdist (``PASSED id``)."""
+    serial = re.findall(r"^(\S+::\S+) PASSED", output, flags=re.MULTILINE)
+    return serial or _executed(output)
+
+
+def _marks(directory: Path) -> set[str]:
+    return {p.name.replace("__", "/") for p in directory.iterdir()}
+
+
+def test_a_part_does_not_collect_the_files_of_other_parts(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-1: only the files of the part are imported, serial and under xdist."""
+    names = [f"test_m{n:02d}.py" for n in range(12)]
+    _make_marking_suite(pytester, names)
+    owned = {p: {n for n in names if pytest_shard.shard_of(n, 3) == p} for p in PARTS}
+    assert all(owned.values()), owned  # the check below must be able to see a leak
+    for extra in ([], ["-n", "2"]):
+        for part in PARTS:
+            marks = tmp_path / f"marks-{part}-{len(extra)}"
+            marks.mkdir()
+            monkeypatch.setenv("IMPORT_MARKS", str(marks))
+            _env(monkeypatch, f"{part}/3", None)
+            ret, out = _run(pytester, *extra)
+            assert ret == 0, f"part {part} {extra}\n{out}"
+            assert _marks(marks) == owned[part], (part, extra, out)
+
+
+def test_the_hook_assigns_files_like_the_nodeid_does(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-4: directories, one basename twice, ``*_test.py``, a symlink, explicit files."""
+    names = [
+        "sub1/test_same.py",
+        "sub2/test_same.py",
+        "sub1/deep/test_deep.py",
+        "x_test.py",
+        "test_top.py",
+    ]
+    _make_marking_suite(pytester, names)
+    for package in ("sub1", "sub2", "sub1/deep"):
+        (pytester.path / package / "__init__.py").write_text("", encoding="utf-8")
+    (pytester.path / "target_impl.py").write_text(
+        _MARKING_MODULE.format(name="test_link.py"), encoding="utf-8"
+    )
+    (pytester.path / "test_link.py").symlink_to("target_impl.py")
+    everything = [*names, "test_link.py"]
+
+    executed: list[str] = []
+    for part in PARTS:
+        marks = tmp_path / f"marks-{part}"
+        marks.mkdir()
+        monkeypatch.setenv("IMPORT_MARKS", str(marks))
+        _env(monkeypatch, f"{part}/3", None)
+        for extra in ([], ["-n", "2"]):
+            ret, out = _run(pytester, *extra)
+            # An empty part is code 5; the others pass. Never anything else.
+            assert ret in (0, 5), f"{part} {extra}\n{out}"
+            for nodeid in _passed(out):
+                # The hook and the nodeid agree on whose file it is.
+                assert pytest_shard.shard_of(nodeid.split("::")[0], 3) == part, nodeid
+            if extra == []:
+                executed += _passed(out)
+    files = sorted(n.split("::")[0] for n in executed)
+    assert files == sorted(everything), files  # each file once, none lost
+
+    # A pattern with a directory: pytest's own match decides what is a test file.
+    monkeypatch.setenv("IMPORT_MARKS", str(tmp_path / "marks-1"))
+    narrowed: list[str] = []
+    for part in PARTS:
+        _env(monkeypatch, f"{part}/3", None)
+        ret, out = _run(pytester, "-o", "python_files=sub1/test_*.py")
+        assert ret in (0, 5), out
+        narrowed += [n.split("::")[0] for n in _passed(out)]
+    assert sorted(narrowed) == ["sub1/test_same.py"], narrowed
+
+    # An explicit file of another part: imported (the hook never sees it), its
+    # items dropped, nothing runs, code 5. Same for ``file::test``.
+    foreign = next(n for n in everything if pytest_shard.shard_of(n, 3) != 1)
+    marks = tmp_path / "marks-explicit"
+    marks.mkdir()
+    monkeypatch.setenv("IMPORT_MARKS", str(marks))
+    _env(monkeypatch, "1/3", None)
+    for target in (foreign, f"{foreign}::test_it"):
+        for extra in ([], ["-n", "2"]):
+            ret, out = _run(pytester, target, *extra)
+            assert ret == 5, f"{target} {extra}\n{out}"
+            assert "PASSED" not in out, out
+    assert foreign in _marks(marks)  # imported, then dropped
