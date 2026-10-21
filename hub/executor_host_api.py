@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
-from hub.services import executor_orders, host_redeem, launch_feedback
+from hub.services import executor_orders, host_redeem, launch_feedback, memory_wait
 
 router = APIRouter()
 
@@ -61,6 +61,10 @@ class ExecutorOrderRedeem(BaseModel):
 
 class ExecutorOrderPhase(BaseModel):
     phase: str
+    # #1972: цифры памяти для фазы waiting_memory; тип не приводится, строгая
+    # проверка целых - в memory_wait.validate_mib (строка, boolean, дробь - 422).
+    need_mib: object = None
+    free_mib: object = None
 
 
 class ExecutorOrderReport(BaseModel):
@@ -198,7 +202,7 @@ async def _host_caller(request: Request, name: str) -> None:
 async def _has_unredeemed(db: Any, host: str) -> bool:
     cursor = await db.execute(
         "SELECT 1 FROM executor_orders WHERE host = ? "
-        "AND state IN ('pending', 'delivered') LIMIT 1",
+        f"AND state IN {memory_wait.UNREDEEMED_IN_SQL} LIMIT 1",  # nosec B608 - constant
         (host,),
     )
     return await cursor.fetchone() is not None
@@ -306,6 +310,8 @@ async def api_executor_order_phase(
 
     Повтор той же — 200 без изменений; назад, до redeemed, после report или
     закрытия — 409; сверх квоты хоста — 429. В ленту задачи фаза не пишется.
+    Исключение (#1972): ``waiting_memory`` с ``need_mib``/``free_mib`` - ДО выкупа,
+    повтор - heartbeat, продлевающий заказ и код (предел 6 ч).
     """
     await _host_caller(request, name)
     _phase_limiter._max_attempts = PHASE_MAX
@@ -320,7 +326,12 @@ async def api_executor_order_phase(
     _phase_limiter.record(name)
     try:
         return await launch_feedback.record_phase(
-            _db(request), name, order_id, body.phase
+            _db(request),
+            name,
+            order_id,
+            body.phase,
+            need_mib=body.need_mib,
+            free_mib=body.free_mib,
         )
     except executor_orders.HostError as exc:
         raise _as_http(exc) from exc

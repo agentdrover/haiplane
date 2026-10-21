@@ -40,8 +40,11 @@ def print_order_line(result: Any) -> None:
     view = result.get("last_executor_order") if isinstance(result, dict) else None
     if not isinstance(view, dict):
         return
+    waiting = view.get("waiting_memory")
     if view.get("unavailable"):
         print(f"Заказ хоста: {view['unavailable']}", file=sys.stderr)
+    elif isinstance(waiting, dict) and waiting.get("line"):
+        print(f"Заказ хоста {waiting['line']}", file=sys.stderr)  # #1972: строка хаба
     elif view.get("after_failed_run"):
         print(
             f"После неудачного прогона: класс {view.get('class')} "
