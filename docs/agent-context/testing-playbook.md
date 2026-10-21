@@ -67,6 +67,17 @@ tasks (`tests/test_web.py::name`) are not rewritten (variant 1); find a test by
 name with `grep -rn "def <name>" tests/test_web*.py`. Each file stays under
 2000 lines and 200 000 bytes so the AC locator can read it (256 KB limit).
 
+## База теста — копия шаблона (#1958)
+
+Фикстура `db` отдаёт копию базы, собранной один раз на воркер
+(`tests/template_db_support.py`): подготовка стоила ~0,5–1,4 с на тест против
+~0,05–0,1 с самого теста. Новый seed или шаг подготовки базы добавляется в
+`apply_build` (одна функция и для шаблона, и для полного пути), а не в
+фикстуру. Тест, подменяющий `hub.db._MIGRATIONS`, `_SCHEMA` или функции
+сборки до запроса `db`, получает полный путь автоматически. Сходство шаблона с
+прежней сборкой держит `tests/test_template_db.py` (эталон там записан
+отдельно): при расхождении краснеет он.
+
 ## Бюджет сложности (#1066, #1693)
 
 - `uv run python scripts/complexity_budget.py` красит CI при исключении `unclaimed`, у которого живой замер от 90% своего `max`, и при `removed_by` не по формату (`task:#N`, `permanent — <причина>`, `unclaimed — <причина>`). Лечение: назначить задачу или объявить постоянным с причиной.
