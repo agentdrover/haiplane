@@ -537,7 +537,7 @@ async def test_a_cloud_submission_needs_a_passed_critic_on_its_sha(world, tip):
     )
     await world.db.commit()
     held = await _task_state(world, auto.task_id)
-    assert held[0] == "needs_decision" and held[1] == 0
+    assert held[0] == "needs_decision" and held[2] == ""
     assert any("critic_not_passed" in a for a in await _alerts(world, auto.task_id))
 
     # k8-, локальная сдача и выключенная политика: как до правки.

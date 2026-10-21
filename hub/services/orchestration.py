@@ -5722,7 +5722,6 @@ async def _complete_without_review(
 
     Всегда возвращает исход: ни один путь внутри не проваливается наружу.
     """
-    # #1953: приём до доставки; снимок task обновлён проверенным sha
     if not await critic_orders.accept_in_transaction(db, task, pin=True, hold=True):
         return "needs_decision"
     task_id = task["id"]
@@ -6393,11 +6392,9 @@ async def transition_after_agent_done(
         #
         # Ни один шаг не отказывает: решение владельца — warn (матрица в #1122).
         # Отказ здесь оставил бы headless-задачу стоять без человека рядом.
-        # #1953: bump и закрепление sha автоматического входа - один savepoint.
-        async with critic_orders.pin_guard(db, task) as guard:
-            await repo.bump_submission_generation(db, task_id)
-            await _run_headless_submit_gates(db, task_id, task)
-        if guard.refused:
+        await repo.bump_submission_generation(db, task_id)
+        await _run_headless_submit_gates(db, task_id, task)
+        if task.get(critic_orders.HELD_KEY):  # #1953: приём удержал сдачу
             return "needs_decision"
 
     if (
@@ -6455,14 +6452,16 @@ async def transition_after_agent_done(
             dict(task_row).get("submission_generation", 0) if task_row else 0
         )
 
-        await repo.update_task(
+        if not await critic_orders.accept_in_transaction(  # #1953
             db,
-            task_id,
-            status="review",
+            task,
+            "review",
+            hold=True,
             review_job_id=None,
             exit_code=exit_code,
             result_text=result_text,
-        )
+        ):
+            return "needs_decision"
         await repo.add_task_update(
             db,
             task_id,
@@ -6565,9 +6564,10 @@ async def dispatch_review(
     )
     review_job_id = result.get("job_id")
     if review_job_id:
-        await repo.update_task(
-            db, task_id, status="review", review_job_id=review_job_id
-        )
+        if not await critic_orders.accept_in_transaction(  # #1953: ci_check -> review
+            db, task, "review", always=True, hold=True, review_job_id=review_job_id
+        ):
+            return
         log.info(
             "Poll: task #%d → review (job=%s, agent=%s, cycle=%d)",
             task_id,

@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import logging
-import contextlib
 import hashlib
 import re
 from dataclasses import dataclass
@@ -50,6 +49,8 @@ REPORT_OUTCOMES = ("passed", "findings", "failed")
 #: Ключ, под которым вход done оставляет на задаче sha, по которому прошёл гейт:
 #: закрепление sha внутри транзакции сверяется с ним (то же наблюдение).
 CHECKED_KEY = "_critic_checked_sha"
+#: Метка на снимке: приём удержал сдачу (needs_decision), вызывающий возвращается.
+HELD_KEY = "_critic_held"
 #: Открытых заказов на задачу.
 MAX_OPEN_PER_TASK = 1
 SUBMITTABLE = ("running", "claimed", "pending_report")
@@ -566,7 +567,7 @@ async def accept_in_transaction(
     task: dict[str, Any],
     target_status: str = "",
     *,
-    observed: str = "",
+    observed: str | None = None,
     pin: bool = False,
     always: bool = False,
     hold: bool = False,
@@ -601,15 +602,20 @@ async def accept_in_transaction(
             fresh.get("status") in SUBMITTABLE
             and not review_approved_for_current_submission(fresh)
         ):
-            sha_in = observed or str(
-                task[PREPARED_CI_SHA]
-                if PREPARED_CI_SHA in task
-                else task.get(CHECKED_KEY) or task.get("submission_sha") or ""
+            sha_in = (
+                observed
+                if observed is not None
+                else str(
+                    task[PREPARED_CI_SHA]
+                    if PREPARED_CI_SHA in task
+                    else task.get(CHECKED_KEY) or task.get("submission_sha") or ""
+                )
             )
             verdict = await evaluate(db, fresh, sha_in)
         if verdict.applicable and verdict.cause:
             if hold:
                 await _hold(db, task, verdict)
+                task[HELD_KEY] = True
                 return None
             refuse(task_id, verdict)
         write = dict(fields)
@@ -625,6 +631,13 @@ async def accept_in_transaction(
         )  # снимок вызывающего обновляется на месте: его читает доставка
         task.update(extra)
         return task
+
+
+def automatic() -> bool:
+    """Вход без HTTP done-flow (поллер, refresh, ci_check): отказ - удержание, не 422."""
+    from hub.services.orchestration import _deferred_completions
+
+    return _deferred_completions.get() is None
 
 
 async def _hold(
@@ -650,48 +663,6 @@ async def _hold(
         actor="hub",
         payload={"reason": "critic_not_passed", "cause": verdict.cause},
     )
-
-
-class PinGuard:
-    """Итог ``pin_guard``: сдача удержана (True) или прошла."""
-
-    refused = False
-
-
-@contextlib.asynccontextmanager
-async def pin_guard(db: aiosqlite.Connection, task: dict[str, Any]):
-    """Автоматический вход: bump и закрепление sha - в savepoint (#1953).
-
-    Без него отказ ``sha_changed`` после bump оставил бы поколение без
-    закрепления в транзакции поллера, и её закоммитила бы СЛЕДУЮЩАЯ задача
-    прохода. Отказ откатывает bump и удерживает задачу; прочие входы (HTTP: свой
-    savepoint ``done_flow``) и любые другие исключения проходят как были.
-    """
-    from hub.services.orchestration import _deferred_completions
-
-    guard = PinGuard()
-    if _deferred_completions.get() is not None:  # HTTP done-flow: 422 из савпоинта
-        yield guard
-        return
-    await db.execute("SAVEPOINT critic_pin")
-    try:
-        yield guard
-    except HTTPException as exc:
-        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
-        if detail.get("reason") != "critic_not_passed":
-            await db.execute("RELEASE critic_pin")
-            raise
-        await db.execute("ROLLBACK TO critic_pin")
-        await db.execute("RELEASE critic_pin")
-        await _hold(
-            db, task, Verdict(True, str(detail.get("cause")), str(detail.get("sha")))
-        )
-        guard.refused = True
-    except BaseException:
-        await db.execute("RELEASE critic_pin")
-        raise
-    else:
-        await db.execute("RELEASE critic_pin")
 
 
 # ---------------------------------------------------------------------------

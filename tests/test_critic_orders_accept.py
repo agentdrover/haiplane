@@ -81,8 +81,10 @@ async def test_pending_report_completes_with_its_sha_in_one_commit(
     monkeypatch.setattr(lifecycle, "log_activity", _spy)
     resp = await co._done(world, cloud)
     assert resp.status_code == 200, resp.text
-    assert seen, "коммитящий вызов не наблюдён"
-    assert all(sha == co.SHA_A for status, sha in seen if status == "completed"), seen
+    completed = [sha for status, sha in seen if status == "completed"]
+    assert completed, f"завершение не наблюдено ни одним коммитящим вызовом: {seen}"
+    assert set(completed) == {co.SHA_A}, seen
+    assert (await _row(world, cloud.task_id))["status"] == "completed"
 
 
 # --- настоящая конкуренция: два соединения, ожидание write-lock ----------------
@@ -137,12 +139,14 @@ async def _enter(world, cloud, entry: str, done: dict, delay: float):
     return outcome
 
 
-@pytest.mark.parametrize("entry", ["submit", "automatic"])
+@pytest.mark.parametrize("entry", ["submit", "automatic", "automatic_review"])
 async def test_policy_committed_first_refuses_the_entry_that_waited(
     world, tip, monkeypatch, entry
 ):
     """Политика включена и закоммичена до записи входа: вход ждал лок и отказал."""
-    cloud = await co._cloud(world, tip, critic_host="", auto_review=entry == "submit")
+    cloud = await co._cloud(
+        world, tip, critic_host="", auto_review=entry != "automatic"
+    )
     _slow_inside_lock(monkeypatch)
     done: dict = {}
     _, outcome = await asyncio.gather(
@@ -150,17 +154,19 @@ async def test_policy_committed_first_refuses_the_entry_that_waited(
         _enter(world, cloud, entry, done, delay=0.15),
     )
     assert outcome == "refused"
-    assert (await _row(world, cloud.task_id))["status"] not in ("review", "completed")
+    assert (await _row(world, cloud.task_id))["status"] in ("running", "needs_decision")
 
 
-@pytest.mark.parametrize("entry", ["submit", "automatic"])
+@pytest.mark.parametrize("entry", ["submit", "automatic", "automatic_review"])
 async def test_entry_committed_first_is_accepted_and_the_policy_waits(
     world, tip, monkeypatch, entry
 ):
     """Вход взял лок первым при выключенной политике: принят, включение ждёт его коммита."""
-    cloud = await co._cloud(world, tip, critic_host="", auto_review=entry == "submit")
+    cloud = await co._cloud(
+        world, tip, critic_host="", auto_review=entry != "automatic"
+    )
     # Пауза сразу после чтения политики: кто не держит лок, даёт политике обогнать запись.
-    _slow_inside_lock(monkeypatch, always=entry == "automatic")
+    _slow_inside_lock(monkeypatch, always=entry.startswith("automatic"))
     done: dict = {}
     _, outcome = await asyncio.gather(
         _policy_writer(world, "k8", delay=0.25, hold=0.0, done=done),
@@ -170,4 +176,42 @@ async def test_entry_committed_first_is_accepted_and_the_policy_waits(
     assert done["policy_at"] >= done["entry_at"] - 0.05, (
         "политика закоммитилась раньше входа"
     )
-    assert (await _row(world, cloud.task_id))["status"] in ("review", "completed")
+    assert (await _row(world, cloud.task_id))["status"] in (
+        "review",
+        "completed",
+        "ci_check",
+    )
+
+
+async def test_an_empty_second_observation_is_never_replaced_by_an_earlier_sha(
+    world, monkeypatch
+):
+    """Закрепление не увидело голову (пусто): принимается пустое, а не прежний sha - 422."""
+    cloud = await co._cloud(world, None)
+    await co._closed_order(world, cloud, co.SHA_A, "passed")
+    seen: list[int] = []
+
+    async def _blink(db, task_id, branch):
+        seen.append(task_id)
+        return (co.SHA_A if len(seen) == 1 else ""), ""
+
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", _blink)
+    before = await co._task_state(world, cloud.task_id)
+    assert co._refused(await co._done(world, cloud)) == "head_unobserved"
+    assert await co._task_state(world, cloud.task_id) == before
+
+
+async def test_ci_check_to_review_goes_through_the_acceptance(world, tip):
+    """ci_check -> review (dispatch_review): политику включили за время CI - удержание."""
+    cloud = await co._cloud(world, tip, critic_host="")
+    await repo.update_task(
+        world.db, cloud.task_id, status="ci_check", submission_sha=co.SHA_A
+    )
+    await world.db.commit()
+    await _policy_writer(world, "k8", delay=0.0, hold=0.0, done={})
+    row = await _row(world, cloud.task_id)
+    await orchestration.dispatch_review(world.db, row)
+    await world.db.commit()
+    final = await _row(world, cloud.task_id)
+    assert final["status"] == "needs_decision"
+    assert any("critic_not_passed" in a for a in await co._alerts(world, cloud.task_id))
