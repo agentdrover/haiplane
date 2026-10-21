@@ -298,3 +298,96 @@ async def test_merge_is_delivery_project_keeps_its_own_release_answer(
 
     assert answer["state"] == IN_PROD, answer
     assert answer["deployed_sha"] == history["released"]
+
+
+# --- a project workspace that is not on this host (#1927, Codex r2) ----------
+
+
+def _plain_git_ops(monkeypatch) -> None:
+    """The real git adapter: its subprocess is what raises on a missing cwd."""
+    real = GitOpsIntegration()
+    for name in ("is_ancestor", "commit_exists", "commit_with_same_tree"):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(real, name), raising=False)
+
+
+async def _task_in_project_with_workspace(client, db, workspace: str, slug: str):
+    pid = await repo.create_project(
+        db,
+        slug=slug,
+        name=slug,
+        repo_name=f"agentdrover/{slug}",
+        workspace_path=workspace,
+    )
+    epic = (
+        await client.post("/api/tasks", json={"title": "E", "task_type": "epic"})
+    ).json()["id"]
+    await repo.update_task(db, epic, project_id=pid)
+    task_id = (
+        await client.post(
+            "/api/tasks", json={"title": "T", "task_type": "task", "parent_id": epic}
+        )
+    ).json()["id"]
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (?, ?, ?, ?)",
+        (pid, 4500 + task_id, task_id, "a" * 40),
+    )
+    await repo.update_task(db, task_id, status="completed")
+    await repo.record_release(
+        db, deployed_sha="b" * 40, project_id=pid, ref="main", source="ci"
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_missing_project_workspace_is_unknown_not_an_exception(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path, monkeypatch
+):
+    # #1927 r2 (1): workspace configured, directory absent on this host.
+    _plain_git_ops(monkeypatch)
+    task_id = await _task_in_project_with_workspace(
+        client, db, str(tmp_path / "no-such-dir"), "ghost"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == UNKNOWN, answer
+    assert "недоступен на хосте хаба" in answer["reason"]
+
+
+async def test_snapshot_survives_one_project_without_a_directory(
+    client: AsyncClient, db: aiosqlite.Connection, history, tmp_path, monkeypatch
+):
+    # #1927 r2 (2): one task of a ghost project does not take the snapshot down;
+    # the other answers stay right.
+    from hub.services.prod_state import prod_state
+
+    _plain_git_ops(monkeypatch)
+    await _default_project_id(db)
+    ghost = await _task_in_project_with_workspace(
+        client, db, str(tmp_path / "no-such-dir"), "ghost"
+    )
+    good = await _task_merged_at(client, db, history["shipped"])
+    await repo.update_task(db, good, status="completed")
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+    await db.commit()
+    from unittest.mock import AsyncMock
+
+    from hub import app as hub_app
+
+    real_ctx = hub_app.services.project_git_context
+
+    async def ctx(db_, task_id):
+        found = await real_ctx(db_, task_id)
+        return found if task_id == ghost else {**found, "repo": history["repo"]}
+
+    monkeypatch.setattr(
+        hub_app.services, "project_git_context", AsyncMock(side_effect=ctx)
+    )
+
+    snapshot = await prod_state(db)
+
+    assert good in [e["task_id"] for e in snapshot["in_prod"]]
+    assert ghost in [e["task_id"] for e in snapshot["unknown"]]

@@ -362,7 +362,22 @@ async def git_delivery_state(check: _GitCheck, *, fetch: bool = True) -> dict[st
     cached = _in_prod_cache.get(_cache_key(check))
     if cached is not None:
         return _answer(IN_PROD, _in_prod_reason(check, *cached), **check.known)
-    return await _decide_with_git(check, fetch=fetch)
+    # #1927: with release choice per project, the workspace is now the
+    # PROJECT's, and one that is configured but absent on this host (or
+    # unreadable) makes the first git call raise OSError (``cwd`` missing).
+    # That is "could not look", never an exception for the caller: a snapshot
+    # of fifty tasks must not die of one project's missing directory.
+    try:
+        return await _decide_with_git(check, fetch=fetch)
+    except OSError as exc:
+        log.warning("delivery state for #%s: git unavailable: %s", check.task_id, exc)
+        return _answer(
+            UNKNOWN,
+            "репозиторий проекта недоступен на хосте хаба "
+            f"({check.workspace}: {exc.__class__.__name__}) — сверить с выкатом "
+            "нечем. Это не «не раскатано»",
+            **check.known,
+        )
 
 
 async def _decide_with_git(check: _GitCheck, *, fetch: bool = True) -> dict[str, Any]:
