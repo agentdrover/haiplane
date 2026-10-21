@@ -63,7 +63,8 @@ async def test_missing_brief_card_is_gray_not_calm(client, db):
 
 def test_css_keeps_phone_and_desktop_promises():
     css = (STATIC / "card_c2.css").read_text()
-    assert "overflow-wrap: anywhere" in css
+    assert ".c2 *, .c2-details * { min-width: 0; overflow-wrap: anywhere; }" in css
+    assert ".task-hero-title" in css and css.count("overflow-wrap: anywhere") >= 2
     assert ":focus-visible" in css
     assert "env(safe-area-inset" in css
     for width in ("1100px", "768px"):
