@@ -444,9 +444,11 @@ def hub_post(url: str, token: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - https URL from env
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        log(f"hub said {exc.code}: {exc.read().decode(errors='replace')[:300]}")
+        # The code only: a refusal body names projects (hub/services/ci_scope.py)
+        # and the log of a run is readable by everyone who can read the run.
+        log(f"hub said {exc.code}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        log(f"hub unreachable: {exc}")
+        log(f"hub unreachable ({type(exc).__name__})")
     return None
 
 

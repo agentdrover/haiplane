@@ -64,10 +64,11 @@ def hub_post(base: str, token: str, path: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - https from env
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")[:300]
-        log(f"hub said {exc.code}: {body}")
+        # The code only, never the body (it names projects; the log is public
+        # to everyone who can read the run).
+        log(f"hub said {exc.code}")
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        log(f"hub unreachable: {exc}")
+        log(f"hub unreachable ({type(exc).__name__})")
     return None
 
 

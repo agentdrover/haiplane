@@ -208,6 +208,42 @@ def test_the_collector_never_leaves_a_green_artifact_without_results(
     assert "Collect AC test" in text
 
 
+# ---- every hub-facing script logs the code of a refusal, never its body ------
+
+
+@pytest.mark.parametrize(
+    ("name", "call"),
+    [
+        ("ci_report_to_hub", lambda m: m.hub_request("https://h/x", "t")),
+        ("ci_trusted_report", lambda m: m.hub_post("https://h/x", "t", {})),
+        (
+            "ci_report_audit_to_hub",
+            lambda m: m.hub_post("https://h", "t", "/x", {}),
+        ),
+    ],
+)
+def test_no_script_logs_the_body_of_a_hub_refusal(name, call, monkeypatch, capsys):
+    module = _load(name)
+    leak = "ochk_SECRET123"
+
+    def refuse(req, timeout=0):
+        body = io.BytesIO(b"projects of the key: secret-project-slug")
+        raise urllib.error.HTTPError(req.full_url, 403, "no", {}, body)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", refuse)
+    assert call(module) is None
+    shown = capsys.readouterr().out
+    assert "403" in shown and "secret-project-slug" not in shown
+
+    def broken(req, timeout=0):
+        raise OSError(leak)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", broken)
+    assert call(module) is None
+    shown = capsys.readouterr().out
+    assert "OSError" in shown and leak not in shown
+
+
 # ---- the refusal says why -----------------------------------------------------
 
 GH: FakeGitHub = FakeGitHub()
