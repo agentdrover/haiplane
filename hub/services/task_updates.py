@@ -261,10 +261,6 @@ async def _inside_savepoint(
     principal_id: int | None,
 ) -> int:
     """Everything the savepoint protects; the ONE ``commit`` here is the original one."""
-    if body.kind == "done":
-        # #1953: гейт критика - под write-локом: политику и заказы читаем здесь,
-        # отказ откатывает савпоинт до строки отчёта.
-        task = await critic_orders.accept_in_transaction(db, task) or task
     update_id = await _write_row_and_prevention(db, task, body, principal_id)
     await _record_finding_outcomes(db, task, body)
     await _route_done(db, task, body)

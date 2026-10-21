@@ -587,7 +587,7 @@ async def accept_in_transaction(
     """ЕДИНСТВЕННЫЙ приём облачной сдачи (#1953): проверка, статус и sha - одной операцией.
 
     Каждый вход в review и completed зовёт её в той пишущей транзакции, что
-    меняет статус. Первой записью берётся write-lock, и только потом, под ним,
+    меняет статус. Транзакция берёт write-lock (BEGIN IMMEDIATE; соединения хаба открыты с isolation_level IMMEDIATE), и только потом, под ним,
     перечитываются политика ``critic_host``, держатель и заказы; проверяется
     ``passed`` на наблюдённом sha (``observed``, иначе ``PREPARED_CI_SHA``
     вызова, иначе проверенный раньше или закреплённый). Если гейт применим,
@@ -602,9 +602,6 @@ async def accept_in_transaction(
 
     task_id = int(task["id"])
     async with write_transaction(db):
-        await db.execute(
-            "UPDATE tasks SET updated_at = updated_at WHERE id = ?", (task_id,)
-        )
         row = await repo.get_task(db, task_id)
         fresh = dict(row) if row is not None else task
         verdict = Verdict()
@@ -628,9 +625,8 @@ async def accept_in_transaction(
         if write:
             await repo.update_task(db, task_id, **write)
         extra = {CHECKED_KEY: verdict.sha} if verdict.applicable else {}
-        task.update(
-            write
-        )  # снимок вызывающего обновляется на месте: его читает доставка
+        # Снимок вызывающего обновляется на месте: его читает доставка.
+        task.update(write)
         task.update(extra)
         return task
 
