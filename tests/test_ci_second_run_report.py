@@ -512,3 +512,19 @@ async def test_a_newer_red_or_running_attempt_still_blocks(client, db):
     assert detail["cause"] == "unverified"
     assert "current_attempt_incomplete" in detail["message"]
     dispatch.assert_not_awaited()
+
+
+def test_the_shared_failure_module_is_watched_by_ci_integrity():
+    """#1988: the collector imports scripts/ci_safe_failure.py from the branch.
+
+    A change to that module alone must raise the ``ci_script`` sign, or a
+    branch could put raw exception text back into reports past the check.
+    """
+    from hub.services.ci_integrity import scan_diff
+
+    path = "scripts/ci_safe_failure.py"
+    diff = (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        "@@ -1,0 +1,1 @@\n+def safe_failure(exc): return str(exc)\n"
+    )
+    assert (path, "ci_script") in {(s.path, s.rule) for s in scan_diff(diff)}
