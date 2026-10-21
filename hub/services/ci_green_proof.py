@@ -86,6 +86,25 @@ def _red_acs(
     return out
 
 
+def _collector_reason(report: Mapping[str, Any]) -> str:
+    """The reason the CI collector left in the report, flattened to one line (#1988).
+
+    It comes from the CI artifact (data, not instruction): clipped, never trusted.
+    """
+    return " ".join(str(report.get("reason") or "").split())[:200]
+
+
+def _no_results_text(why: str) -> str:
+    return f"CI-отчёт без результатов: сборщик не дал результатов ({why})"
+
+
+def _not_pass_text(status: str, report: Mapping[str, Any]) -> str:
+    why = _collector_reason(report)
+    if status == "unknown" and why:
+        return _no_results_text(why) + "; нужен validation_status=pass"
+    return f"validation_status={status or 'пусто'}, нужен pass"
+
+
 def proof_gap(
     report: Mapping[str, Any] | None,
     ac_rows: Iterable[Mapping[str, Any]],
@@ -115,13 +134,16 @@ def proof_gap(
         )
     red = [f"проверка {k}" for k, v in sorted(checks.items()) if v == CHECK_FAIL]
     red += [f"AC {item}" for item in _red_acs(ac_rows, ac_results)]
-    if red:
-        return Gap(RED, red)
     status = str(report.get("validation_status") or "").strip()
+    if red:
+        # #1988: a collector that failed reports no AC results at all, so the
+        # missing results are the symptom; say the cause first.
+        why = _collector_reason(report)
+        if status == "unknown" and why:
+            red.insert(0, _no_results_text(why))
+        return Gap(RED, red)
     if status != VALIDATION_PASS:
-        return Gap(
-            VALIDATION_NOT_PASS, [f"validation_status={status or 'пусто'}, нужен pass"]
-        )
+        return Gap(VALIDATION_NOT_PASS, [_not_pass_text(status, report)])
     # #1687: green is the run ending in success with lint, format, types and
     # tests each pass; an absent key or a skip is not a pass.
     not_green = ci_trust.green_gap(report, contract)

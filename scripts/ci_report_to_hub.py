@@ -174,8 +174,10 @@ def reported_commit() -> str:
     return fallback
 
 
-# #1988: why the last hub_request returned None — "HTTP 502: ..." or "unreachable:
-# ...". The collector writes it into results.json instead of leaving no file.
+# #1988: why the last hub_request returned None — "HTTP 502" or "unreachable
+# (URLError)". A CODE and an exception TYPE only: the text of an exception can
+# carry anything the environment holds, and this goes into results.json, which
+# is reported onward, and into the log.
 LAST_FAILURE = ""
 
 
@@ -196,8 +198,10 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
         LAST_FAILURE = f"HTTP {exc.code}"
         log(f"hub said {exc.code}: {body}")
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        LAST_FAILURE = f"unreachable: {exc}"
-        log(f"hub unreachable: {exc}")
+        cause = getattr(exc, "reason", None)
+        kind = type(cause if isinstance(cause, BaseException) else exc).__name__
+        LAST_FAILURE = f"unreachable ({kind})"
+        log(f"hub unreachable: {kind}")
     return None
 
 
@@ -949,11 +953,13 @@ def _write_failed(task_id: int, head_sha: str, reason: str) -> int:
     try:
         path = write_results(failed_results(head_sha, reason), task_id)
     except OSError as exc:
+        # The one case that turns the step red: nothing is left to report.
         print(
-            f"::error title=hub-report::results.json could not be written: {exc}",
+            "::error title=hub-report::results.json could not be written "
+            f"({type(exc).__name__}) — the run has no report",
             flush=True,
         )
-        return 0
+        return 1
     log(f"collection failed; wrote an unknown result to {path}")
     return 0
 
@@ -991,7 +997,7 @@ def main() -> int:
             return _write_failed(
                 task_id,
                 head_sha,
-                f"сборщик не прочёл карточку задачи #{task_id}: {why}",
+                f"card_read_failed: {why}",
             )
         return 0
 
@@ -1003,7 +1009,7 @@ def main() -> int:
         return _write_failed(
             task_id,
             head_sha,
-            f"сборщик упал: {type(exc).__name__}: {exc}",
+            f"collector_crashed: {type(exc).__name__}",
         )
     if read_token:
         path = write_results(payload, task_id)
