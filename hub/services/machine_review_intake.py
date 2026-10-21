@@ -226,15 +226,12 @@ async def _dispatch_of_report(
     Привязка (id) есть только когда сессия назвала заказ и сверка задачи,
     поколения и принципала его приняла: тогда профиль берётся у ЭТОГО заказа, а
     не у последнего заказа поколения. Иначе прежнее правило - последний заказ
-    поколения, привязки нет. Сбой чтения заказа отчёт не отменяет.
+    поколения, привязки нет. Сбой чтения заказа НЕ выдаётся за «заказа нет»:
+    он поднимается, а не отдаёт отчёт чужому заказу с чужим профилем.
     """
-    try:
-        accepted = await report_binding.accepted_dispatch(
-            db, task_id, generation, principal_id, claimed_id
-        )
-    except Exception:  # noqa: BLE001 - привязка не стоит принятого отчёта
-        log.exception("could not read the order a report claims, task #%s", task_id)
-        accepted = None
+    accepted = await report_binding.accepted_dispatch(
+        db, task_id, generation, principal_id, claimed_id
+    )
     if accepted is not None:
         return accepted, int(accepted["id"])
     latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)

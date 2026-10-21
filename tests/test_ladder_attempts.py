@@ -26,6 +26,7 @@ from hub.services import review_dispatch as dispatcher
 from hub.services.ladder_view import (
     UNKNOWN_TEXT,
     WHY_AXIS_NOT_PLACED,
+    WHY_ORDER_REFUSED,
     WHY_TOP_UP_NO_REPORT,
     WHY_TOP_UP_UNFINISHED,
     incomplete_escalation_line,
@@ -294,6 +295,9 @@ async def test_an_open_attempt_after_the_ceiling_reads_as_unfinished(
     assert "готовится" in await top_up_in_flight(db, task)
     # Срок вышел: судья заказан, и объяснение - «не завершился».
     assert await order_due_runs(db) == 1
+    basis = (await _why_of_orders(db))[task_id]
+    assert "ждали отчёт 121 мин" in basis
+    assert "добор не завершился" in basis and "готовится" not in basis
     why = await ladder_why(db, task)
     assert why is not None and why.code == WHY_TOP_UP_UNFINISHED
     assert "добор не завершился" in why.text
@@ -344,6 +348,37 @@ async def test_a_refused_top_up_is_closed_as_refused(
     (done,) = await _attempts(db, task_id)
     assert done["outcome"] == ladder_attempts.OUTCOME_REFUSED
     assert done["dispatch_id"] is None and done["closed_at"] is not None
+
+
+async def test_a_refused_top_up_keeps_and_reads_its_reason(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ добора называет причину в записи, и объяснение читает её без алертов."""
+    _, task_id = await _due_task(db, "refused-reason")
+    await _submitted_minutes_ago(db, task_id, 3)
+    lite = await _dispatch_row(db, task_id, status="done", profile="lite")
+    await _report(db, task_id, incomplete=True, profile="lite", dispatch_id=lite)
+
+    async def _refused(_db, _task_id, **_kwargs):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Кросс-модельное ревью НЕ вызвано: provider_quota. Вердикт остаётся человеку",
+        )
+        return False
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _refused)
+    assert await dispatcher.maybe_top_up_incomplete(db, task_id) is False
+    (done,) = await _attempts(db, task_id)
+    assert done["outcome"] == ladder_attempts.OUTCOME_REFUSED
+    assert done["reason"] == "provider_quota"
+    await db.execute("DELETE FROM task_updates WHERE task_id = ?", (task_id,))
+    await db.commit()  # алертов нет - остаётся одна запись попытки
+    why = await ladder_why(db, await _task_dict(db, task_id))
+    assert why is not None and why.code == WHY_ORDER_REFUSED
+    assert "provider_quota" in why.text
 
 
 async def test_a_failing_dispatcher_leaves_the_attempt_open(

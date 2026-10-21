@@ -38,11 +38,12 @@ async def bind_code_to_dispatch(
 ) -> None:
     """Привязать выписанный заказу код (и уже выкупленную им сессию) к заказу.
 
-    Код выкупается агентом, пока хаб вставляет строку заказа, — тогда сессия уже
-    есть: её догоняет второй UPDATE (сессии этого принципала, задачи и поколения,
-    рождённые не раньше кода и ещё без заказа). Не коммитит: транзакция вставки
-    заказа общая. Пустой код (открытый режим, отозванный токен) — привязывать
-    нечего.
+    Код выкупается агентом, пока хаб вставляет строку заказа. Выкуп после
+    привязки копирует её в сессию тем же INSERT (``chat_pair._spend_code``);
+    выкуп до привязки оставил сессию без заказа - её догоняет второй UPDATE по
+    ``code_id`` (сессия именно из ЭТОГО кода, чужие не задеваются). Не
+    коммитит: транзакция вставки заказа общая. Пустой код (открытый режим,
+    отозванный токен) - привязывать нечего.
     """
     if not access_code or principal_id is None:
         return
@@ -54,11 +55,9 @@ async def bind_code_to_dispatch(
         (dispatch_id, code_hash, task_id, generation),
     )
     await db.execute(
-        "UPDATE chat_pair_sessions SET dispatch_id = ? WHERE kind = 'reviewer' "
-        "AND principal_id = ? AND bound_task_id = ? AND bound_generation = ? "
-        "AND dispatch_id IS NULL AND created_at >= "
-        "(SELECT created_at FROM chat_pair_codes WHERE code_hash = ?)",
-        (dispatch_id, principal_id, task_id, generation, code_hash),
+        "UPDATE chat_pair_sessions SET dispatch_id = ? WHERE dispatch_id IS NULL "
+        "AND code_id = (SELECT id FROM chat_pair_codes WHERE code_hash = ?)",
+        (dispatch_id, code_hash),
     )
 
 
@@ -105,3 +104,52 @@ async def stamp_report(
         "UPDATE machine_reviews SET dispatch_id = ? WHERE id = ?",
         (int(dispatch_id), int(review_id)),
     )
+
+
+async def dispatch_of_report(
+    db: aiosqlite.Connection, review_id: int | None
+) -> dict[str, Any] | None:
+    """Заказ, к которому отчёт ПРИВЯЗАН, или None - привязки нет (или отчёта нет)."""
+    if review_id is None:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT d.* FROM machine_reviews r JOIN review_dispatches d "
+        "ON d.id = r.dispatch_id WHERE r.id = ?",
+        (int(review_id),),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def order_chain(
+    db: aiosqlite.Connection, dispatch_id: int
+) -> tuple[set[int] | None, set[int]]:
+    """(принципалы, id) заказа и всех его замен (``replaces_dispatch_id``).
+
+    Принципалы None - любой: заказ без принципала (открытый режим, история) или
+    не найденный в таблице отчёту не сопоставить, фильтра нет, и это сторона
+    «отчёт был». id - цепочка заказов: отчёт, привязанный (#1946) к любому из
+    них, - отчёт поступка.
+    """
+    seen = {dispatch_id}
+    principals: set[int] = set()
+    unpinned = False
+    frontier = [dispatch_id]
+    while frontier:
+        marks = ",".join("?" for _ in frontier)
+        rows = await fetchall(
+            db,
+            "SELECT id, reviewer_principal_id FROM review_dispatches "  # nosec B608 - только "?"
+            f"WHERE id IN ({marks}) OR replaces_dispatch_id IN ({marks})",
+            (*frontier, *frontier),
+        )
+        frontier = []
+        for row in rows:
+            if row["reviewer_principal_id"] is None:
+                unpinned = True  # фильтра по принципалу нет, но цепочку досматриваем
+            else:
+                principals.add(int(row["reviewer_principal_id"]))
+            if int(row["id"]) not in seen:
+                seen.add(int(row["id"]))
+                frontier.append(int(row["id"]))
+    return (None if unpinned or not principals else principals), seen

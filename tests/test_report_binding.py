@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 import aiosqlite
+import pytest
 
 from hub import config
 from hub import repository as repo
@@ -342,3 +343,180 @@ async def test_the_local_channel_binds_the_code_of_its_order(
     assert fresh_prompt != prompt, "блок доставки переписан свежим кодом"
     rows = await fetchall(db, "SELECT dispatch_id FROM chat_pair_codes")
     assert [dict(r)["dispatch_id"] for r in rows] == [dispatch_id]
+
+
+# ---------------------------------------------------------------------------
+# Круг Codex (#1946): гонки привязки, обратный поиск, заглушка, цепочка замен
+# ---------------------------------------------------------------------------
+
+
+async def _mint(db: aiosqlite.Connection, task_id: int) -> str:
+    code, _ = await chat_pair.issue_code(
+        db, PRINCIPAL, kind="reviewer", bound_task_id=task_id, bound_generation=1
+    )
+    return code
+
+
+async def test_two_codes_redeemed_before_the_binding_stay_apart(
+    db: aiosqlite.Connection,
+):
+    """P1: привязка догоняет сессию ИМЕННО своего кода, а не любую непривязанную."""
+    task_id = await _reviewer_task(db, "two-codes")
+    first_order = await _dispatch_row(db, task_id, status="done", profile="lite")
+    second_order = await _dispatch_row(db, task_id, status="active", profile="deep")
+    first_code = await _mint(db, task_id)
+    await _redeem(db, first_code)
+    second_code = await _mint(db, task_id)  # первый уже выкуплен - не сгорает
+    await _redeem(db, second_code)
+    for code, order in ((first_code, first_order), (second_code, second_order)):
+        await report_binding.bind_code_to_dispatch(
+            db,
+            code,
+            dispatch_id=order,
+            task_id=task_id,
+            generation=1,
+            principal_id=PRINCIPAL,
+        )
+    rows = await fetchall(db, "SELECT dispatch_id FROM chat_pair_sessions ORDER BY id")
+    assert [dict(r)["dispatch_id"] for r in rows] == [first_order, second_order]
+
+
+async def test_a_binding_between_the_code_read_and_the_session_insert_is_kept(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2: привязка легла между чтением кода и вставкой сессии - сессия её несёт."""
+    task_id = await _reviewer_task(db, "binding-race")
+    order = await _dispatch_row(db, task_id, status="active", profile="deep")
+    code = await _mint(db, task_id)
+    real = chat_pair._spend_code
+
+    async def _bind_first(conn, row, **kwargs):
+        await report_binding.bind_code_to_dispatch(
+            conn,
+            code,
+            dispatch_id=order,
+            task_id=task_id,
+            generation=1,
+            principal_id=PRINCIPAL,
+        )
+        return await real(conn, row, **kwargs)
+
+    monkeypatch.setattr(chat_pair, "_spend_code", _bind_first)
+    identity = await _redeem(db, code)
+    assert identity.chat_pair_dispatch_id == order
+
+
+async def test_every_report_of_an_order_finds_its_order_and_channel(
+    db: aiosqlite.Connection,
+):
+    """P3: второй привязанный отчёт заказа тоже называет свой заказ и канал."""
+    from tests.test_ladder_attempts import _report
+
+    task_id = await _reviewer_task(db, "inverse-lookup")
+    lite = await _dispatch_row(db, task_id, status="done", profile="lite")
+    await _dispatch_row(db, task_id, status="active", profile="deep")
+    first = await _report(
+        db, task_id, incomplete=True, profile="lite", dispatch_id=lite
+    )
+    second = await _report(
+        db, task_id, incomplete=True, profile="lite", dispatch_id=lite
+    )
+    for review_id in (first, second):
+        owner = await dispatcher.dispatch_for_report(db, task_id, 1, {"id": review_id})
+        assert owner is not None and owner["id"] == lite
+        row = dict(await repo.get_machine_review(db, review_id))
+        channel = await dispatcher._channel_of_report_order(db, task_id, 1, row)
+        assert channel == "cloud"
+
+
+async def test_a_refused_cloud_call_binds_the_code_to_its_stub(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P4: заглушка синхронного отказа тоже отвечает за выписанный код."""
+    task_id = await _reviewer_task(db, "refused-stub")
+    task = await _task_dict(db, task_id)
+    code = await _mint(db, task_id)
+
+    async def _nothing(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(dispatcher, "_settle_second_door", _nothing)
+
+    async def _not_opened(*_a, **_k):
+        return False
+
+    monkeypatch.setattr(dispatcher, "_second_door_already_opened", _not_opened)
+    await dispatcher._owe_the_refused_call(
+        db,
+        task,
+        "HTTP 429",
+        model="grok-4.6",
+        profile="lite",
+        principal_id=PRINCIPAL,
+        replaces_dispatch_id=None,
+        only_tests=None,
+        access_code=code,
+    )
+    stub = dict(await repo.get_review_dispatch_for_generation(db, task_id, 1))
+    rows = await fetchall(db, "SELECT dispatch_id FROM chat_pair_codes")
+    assert [dict(r)["dispatch_id"] for r in rows] == [stub["id"]]
+
+
+async def test_the_outcome_of_a_replaced_order_reads_the_replacement_report(
+    db: aiosqlite.Connection,
+):
+    """P7: заказ заменён второй дверью - полный привязанный отчёт замены закрывает попытку."""
+    from tests.test_ladder_attempts import _report
+
+    task_id = await _reviewer_task(db, "replaced-chain")
+    cloud = await _dispatch_row(
+        db, task_id, status="failed", profile="deep", principal=None
+    )
+    cur = await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id, "
+        "replaces_dispatch_id) VALUES (?, 1, 'local:1', 'r', 'm', 'deep', 'done', "
+        "'local', ?, ?)",
+        (task_id, OTHER, cloud),
+    )
+    local = int(cur.lastrowid or 0)
+    event = {
+        "task_id": task_id,
+        "payload": json.dumps(
+            {"generation": 1, "after_review_id": 0, "dispatch_id": cloud}
+        ),
+    }
+    assert await dispatcher.cascade_outcome(db, event) == "pending"
+    await _report(
+        db,
+        task_id,
+        incomplete=False,
+        profile="deep",
+        dispatch_id=local,
+        principal=OTHER,
+    )
+    assert await dispatcher.cascade_outcome(db, event) == "complete"
+
+
+async def test_an_unreadable_order_does_not_fall_back_to_the_latest_order(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P5: сбой чтения заказа отчёта поднимается; отчёт не уходит чужому заказу."""
+    from hub.services.machine_review_intake import record_machine_review
+
+    task_id = await _reviewer_task(db, "unreadable-order")
+    lite = await _dispatch_row(db, task_id, status="active", profile="lite")
+    await _dispatch_row(db, task_id, status="active", profile="deep")
+
+    async def _broken(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(report_binding, "accepted_dispatch", _broken)
+    body = MachineReviewSubmit(
+        raw_count=0, incomplete=False, findings_confirmed=[], findings_rejected=[]
+    )
+    with pytest.raises(RuntimeError):
+        await record_machine_review(
+            db, task_id, body, principal_id=PRINCIPAL, username="rev", dispatch_id=lite
+        )
+    assert await repo.machine_reviews_of_generation(db, task_id, 1) == []

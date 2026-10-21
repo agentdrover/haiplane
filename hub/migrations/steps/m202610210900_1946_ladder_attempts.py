@@ -10,6 +10,7 @@
 при приёме по коду сессии ревьюера: ``chat_pair_codes.dispatch_id`` ->
 ``chat_pair_sessions.dispatch_id``. NULL - отчёт без привязки (история, ключ API,
 открытый режим): сопоставление с заказом по прежнему порядку ступеней.
+``chat_pair_sessions.code_id`` - код, из которого выкуплена сессия.
 """
 
 MIGRATIONS = [
@@ -45,5 +46,11 @@ MIGRATIONS = [
     (
         "add_chat_pair_sessions_dispatch_id",
         "ALTER TABLE chat_pair_sessions ADD COLUMN dispatch_id INTEGER",
+    ),
+    (
+        # Код, из которого выкуплена сессия: по нему привязка заказа догоняет
+        # сессию, выкупленную до привязки кода, не задевая чужие сессии.
+        "add_chat_pair_sessions_code_id",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN code_id INTEGER",
     ),
 ]

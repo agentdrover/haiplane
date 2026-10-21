@@ -598,8 +598,9 @@ async def _spend_code(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
         " bound_generation, token_hash, expires_at, channel, slot, "
-        " executor_run_id, claimed_session, dispatch_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL, ?)",
+        " executor_run_id, claimed_session, dispatch_id, code_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL, "
+        "(SELECT dispatch_id FROM chat_pair_codes WHERE id = ?), ?)",
         (
             row["principal_id"],
             acting_id,
@@ -611,7 +612,8 @@ async def _spend_code(
             row.get("channel") or "",
             row.get("slot") or "",
             row.get("executor_run_id"),
-            row.get("dispatch_id"),
+            row["id"],  # #1946: привязку кода читает ЭТА транзакция, не прежний SELECT
+            row["id"],
         ),
     )
     if row.get("channel") == "slot":
@@ -678,7 +680,7 @@ async def redeem_code_explained(
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, c.channel, c.slot, c.executor_run_id, c.dispatch_id, "
+        "c.bound_generation, c.channel, c.slot, c.executor_run_id, "
         "c.redeemed_at IS NOT NULL AS spent, "
         "c.expires_at <= datetime('now') AS expired, "
         "p.username, p.status "

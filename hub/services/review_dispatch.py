@@ -2534,6 +2534,7 @@ async def _close_top_up(
     *,
     placed: bool,
     attempt_id: int,
+    reason: str = "",
 ) -> None:
     """Закрыть запись поступка: что вернул диспетчер (#1925).
 
@@ -2556,7 +2557,9 @@ async def _close_top_up(
             "dispatch_id": dispatch_id,
         },
     )
-    await ladder_attempts.close_attempt(db, attempt_id, dispatch_id=dispatch_id)
+    await ladder_attempts.close_attempt(
+        db, attempt_id, dispatch_id=dispatch_id, reason=reason
+    )
 
 
 async def _refused_by_name_since(
@@ -2675,7 +2678,15 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     feed_mark = await _last_update_id(db, task_id)
     dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
     await _close_top_up(
-        db, task_id, generation, report, placed=bool(dispatched), attempt_id=attempt_id
+        db,
+        task_id,
+        generation,
+        report,
+        placed=bool(dispatched),
+        attempt_id=attempt_id,
+        reason=""
+        if dispatched
+        else await _refusal_reason_since(db, task_id, feed_mark),
     )
     if not dispatched and not await _refused_by_name_since(db, task_id, feed_mark):
         # maybe_dispatch_review already alerted when policy asked and the call
@@ -2807,6 +2818,9 @@ async def _channel_of_report_order(
         (task_id, generation),
     )
     orders = [dict(r) for r in rows]
+    for order in orders:  # #1946: привязанный отчёт называет свой заказ сам
+        if report.get("dispatch_id") == order["id"]:
+            return order.get("channel") or CLOUD_CHANNEL
     principal = report.get("principal_id")
     channels: set[str] = set()
     if principal is not None:
@@ -3020,28 +3034,25 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
     """
     payload = json.loads(event.get("payload") or "{}")
     after = int(payload.get("after_review_id") or 0)
-    expected = None
-    if payload.get("dispatch_id"):
-        rows = await fetchall(
-            db,
-            "SELECT reviewer_principal_id FROM review_dispatches WHERE id = ?",
-            (payload["dispatch_id"],),
-        )
-        expected = dict(rows[0])["reviewer_principal_id"] if rows else None
-    reviews = await repo.machine_reviews_of_generation(
-        db, int(event["task_id"]), int(payload.get("generation") or 0)
-    )
-    # #1946: отчёт, привязанный к заказу попытки, и есть её отчёт; чужой
-    # привязанный (отчёт другого заказа) в догадку по порядку не попадает.
-    reports = [dict(r) for r in reviews]
     own_id = payload.get("dispatch_id")
-    later = [r for r in reports if own_id and r.get("dispatch_id") == own_id]
+    # #1946: отчёт, привязанный к заказу попытки (или к его замене второй
+    # дверью), и есть её отчёт; чужой привязанный в догадку по порядку не попадает.
+    principals, chain = (
+        await report_binding.order_chain(db, int(own_id)) if own_id else (None, set())
+    )
+    reports = [
+        dict(r)
+        for r in await repo.machine_reviews_of_generation(
+            db, int(event["task_id"]), int(payload.get("generation") or 0)
+        )
+    ]
+    later = [r for r in reports if r.get("dispatch_id") in chain]
     later = later or [
         r
         for r in reports
         if int(r["id"]) > after
         and r.get("dispatch_id") is None
-        and (expected is None or r.get("principal_id") == expected)
+        and (principals is None or r.get("principal_id") in principals)
     ]
     if not later:
         return "pending"
@@ -4701,6 +4712,7 @@ async def maybe_dispatch_review(
             principal_id=expected_principal,
             replaces_dispatch_id=replaces_dispatch_id,
             only_tests=order.only_tests,
+            access_code=order.access_code,
         )
         # #1399 (находка 6d0bd1c790fb24eb): бронь снимается только ПОСЛЕ
         # того, как долг второй двери записан и разобран. Раньше — и
@@ -4830,6 +4842,7 @@ async def _owe_the_refused_call(
     principal_id: int | None,
     replaces_dispatch_id: int | None,
     only_tests: tuple[str, ...] | None,
+    access_code: str = "",
 ) -> bool:
     """Синхронный отказ облака: долг второй двери и след для переспроса.
 
@@ -4870,6 +4883,15 @@ async def _owe_the_refused_call(
         channel=CLOUD_CHANNEL,
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=only_tests,
+    )
+    # #1946: агент мог всё же появиться (#1408) - его код отвечает этой заглушке.
+    await report_binding.bind_code_to_dispatch(
+        db,
+        access_code,
+        dispatch_id=stub_id,
+        task_id=task_id,
+        generation=generation,
+        principal_id=principal_id,
     )
     await repo.owe_second_door(db, stub_id, detail)
     await db.commit()
@@ -6458,6 +6480,8 @@ async def dispatch_for_report(
     report_id = report.get("id")
     if report_id is None:
         return None
+    if (bound := await report_binding.dispatch_of_report(db, report_id)) is not None:
+        return bound  # #1946: привязанный отчёт сам называет свой заказ
     rows = await fetchall(
         db,
         "SELECT * FROM review_dispatches WHERE task_id=? "

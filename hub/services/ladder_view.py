@@ -26,7 +26,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
-from hub.services import ladder_attempts
+from hub.services import ladder_attempts, report_binding
 from hub.services import review_dispatch as dispatcher
 from hub.services.gate_grounds import LADDER_WHY_UNKNOWN
 from hub.services.review_evidence import (
@@ -54,6 +54,7 @@ WHY_AXIS_NOT_PLACED = "second_axis_not_placed"
 WHY_AXIS_UNRECORDED = "second_axis_unrecorded"
 WHY_TOP_UP_NO_REPORT = "top_up_no_report"
 WHY_TOP_UP_UNFINISHED = "top_up_unfinished"
+WHY_ORDER_REFUSED = "top_up_refused"
 WHY_LOCAL_DEEP = "local_deep_no_cloud"
 WHY_NOT_INCOMPLETE = "report_not_incomplete"
 WHY_UNKNOWN = "unknown"
@@ -61,6 +62,16 @@ WHY_UNKNOWN = "unknown"
 UNKNOWN_TEXT = LADDER_WHY_UNKNOWN
 #: Слова описания ожидания добора: попадают в основание заказа судьи.
 TOP_UP_WAIT_PHRASE = "ждёт добора ревью"
+#: Открытая попытка внутри окна ожидания - «готовится»; когда окно вышло, а
+#: попытка так и не закрыта, - «не завершился» (#1946).
+PREPARING_PHRASE = "добор готовится"
+UNFINISHED_PHRASE = "добор не завершился"
+
+
+def after_ceiling(detail: str) -> str:
+    """Описание ожидания добора, когда потолок вышел: «готовится» уже неправда."""
+    return detail.replace(PREPARING_PHRASE, UNFINISHED_PHRASE)
+
 
 _TEXTS = {
     WHY_ENVIRONMENT: "отказ среды ревьюера (#1238): повтор в той же среде даст "
@@ -82,8 +93,9 @@ _TEXTS = {
     WHY_AXIS_NOT_PLACED: "вторая ось не поставлена: {detail} (#1243)",
     WHY_AXIS_UNRECORDED: "попытка второй оси начата, исхода в записях нет (#1243)",
     WHY_TOP_UP_NO_REPORT: "заказ добора кончился без отчёта (статус {detail})",
-    WHY_TOP_UP_UNFINISHED: "добор не завершился: попытка записана, а ответа "
+    WHY_TOP_UP_UNFINISHED: f"{UNFINISHED_PHRASE}: попытка записана, а ответа "
     "диспетчера (заказа или отказа) в записи нет (#1946)",
+    WHY_ORDER_REFUSED: "добор не поставлен: {detail} (#879, #1946)",
     WHY_AXIS_UNAVAILABLE: "вторая ось недоступна: нет подходящей модели или форжа "
     "(#1243)",
     WHY_LOCAL_DEEP: "неполный отчёт локального deep облаком не лечится (#1587)",
@@ -213,7 +225,7 @@ async def top_up_in_flight(db: aiosqlite.Connection, task: dict[str, Any]) -> st
         return ""
     acts = await _ladder_acts(db, task_id, generation)
     if await _preparing(db, task_id, generation, acts):
-        return "добор готовится: поступок лестницы записан, заказ ещё не поставлен"
+        return f"{PREPARING_PHRASE}: поступок лестницы записан, заказ ещё не поставлен"
     view = await inflight_view(db, task, include_owed=True)
     if view is None:
         return ""
@@ -459,38 +471,6 @@ async def _placed_dispatches(
     return placed
 
 
-async def _principals_of_order(
-    db: aiosqlite.Connection, dispatch_id: int
-) -> tuple[set[int] | None, set[int]]:
-    """(принципалы, id) заказа и всех его замен (``replaces_dispatch_id``).
-
-    Принципалы None - любой: заказ без принципала (открытый режим, история) или
-    не найденный в таблице отчёту не сопоставить, фильтра нет, и это сторона
-    «отчёт был». id - цепочка заказов: отчёт, привязанный (#1946) к любому из
-    них, - отчёт поступка.
-    """
-    seen = {dispatch_id}
-    principals: set[int] = set()
-    frontier = [dispatch_id]
-    while frontier:
-        marks = ",".join("?" for _ in frontier)
-        rows = await fetchall(
-            db,
-            "SELECT id, reviewer_principal_id FROM review_dispatches "  # nosec B608 - только "?"
-            f"WHERE id IN ({marks}) OR replaces_dispatch_id IN ({marks})",
-            (*frontier, *frontier),
-        )
-        frontier = []
-        for row in rows:
-            if row["reviewer_principal_id"] is None:
-                return None, seen
-            principals.add(int(row["reviewer_principal_id"]))
-            if int(row["id"]) not in seen:
-                seen.add(int(row["id"]))
-                frontier.append(int(row["id"]))
-    return (principals if dispatch_id in seen and principals else None), seen
-
-
 async def _last_act_outcome(
     db: aiosqlite.Connection,
     task_id: int,
@@ -518,12 +498,21 @@ async def _last_act_outcome(
         return _ActOutcome(LadderWhy(WHY_AXIS_NOT_PLACED, reason))
     after = int(data.get("after_review_id") or 0)
     axis = last["kind"] == dispatcher.MODEL_CASCADE_EVENT
+    attempt = last.get("attempt")
+    if (
+        attempt is not None
+        and not axis
+        and attempt["outcome"] == ladder_attempts.OUTCOME_REFUSED
+        and attempt["reason"] not in ("", "unknown")
+    ):
+        # #1946: отказ добора назвал причину в записи - читаем её, не алерт.
+        return _ActOutcome(LadderWhy(WHY_ORDER_REFUSED, attempt["reason"]))
     dispatch_id = data.get("dispatch_id") if axis else None
     if dispatch_id is None:
         dispatch_id = (await _placed_dispatches(db, task_id, generation)).get(after)
     if dispatch_id is None:
         return _ActOutcome()
-    principals, chain = await _principals_of_order(db, int(dispatch_id))
+    principals, chain = await report_binding.order_chain(db, int(dispatch_id))
     reports = [
         dict(r)
         for r in await repo.machine_reviews_of_generation(db, task_id, generation)
