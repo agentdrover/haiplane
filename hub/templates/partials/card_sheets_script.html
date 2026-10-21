@@ -27,6 +27,27 @@
         root.setProperty("--c2-nav-h", fixed ? nav.offsetHeight + "px" : "0px");
         root.setProperty("--c2-side-w", fixed ? "0px" : nav.offsetWidth + "px");
     }
+    // Панель обновилась, а листы остались от первой загрузки (сменился статус,
+    // поколение, набор действий): листы пересобирает только перезагрузка страницы.
+    // Она не идёт, пока лист открыт или в полях есть ввод; после закрытия листа
+    // сверка повторяется.
+    function outdated() {
+        var live = byId("c2-live");
+        var holder = byId("c2-sheets");
+        if (!live || !holder) { return false; }
+        for (var k = 0; k < KEYS.length; k++) {
+            if (holder.getAttribute("data-built-" + KEYS[k]) !== live.getAttribute("data-" + KEYS[k])) { return true; }
+        }
+        var openers = live.querySelectorAll("[data-sheet]");
+        for (var i = 0; i < openers.length; i++) {
+            if (!byId(openers[i].getAttribute("data-sheet"))) { return true; }
+        }
+        return false;
+    }
+    function reloadIfIdle() {
+        var typing = window.hubHasUnsavedInput && window.hubHasUnsavedInput();
+        if (outdated() && !openSheet() && !typing) { window.location.reload(); }
+    }
     function sync() {
         navHeight();
         var live = byId("c2-live");
@@ -42,6 +63,7 @@
             if (note) { note.hidden = !stale; }
         }
         watchRecommend();
+        reloadIfIdle();
     }
     var watcher = null;
     function watchRecommend() {
@@ -57,7 +79,7 @@
     }
     function open(id) {
         var sheet = byId(id);
-        if (!sheet) { return; }
+        if (!sheet) { window.location.reload(); return; }
         var prev = openSheet();
         if (prev && prev !== sheet) { prev.classList.remove("is-open"); }
         sheet.classList.add("is-open");
@@ -73,6 +95,7 @@
         }
         var opener = document.querySelector('[data-sheet="' + sheet.id + '"]');
         if (opener && opener.focus) { opener.focus(); }
+        reloadIfIdle();
     }
     function trap(e) {
         var sheet = openSheet();

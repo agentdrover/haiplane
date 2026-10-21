@@ -58,6 +58,7 @@ from hub.services import (
     archive_guard,
     critic_orders,
     expected_sha_gate,
+    expected_state,
     prevention_gate,
     project_policy,
     ci_green_proof,
@@ -1261,6 +1262,8 @@ async def _open_draft_under_lock(
         fresh = await repo.get_task(db, task_id)
         if fresh is None or fresh["status"] != "draft":
             raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+        # #1813: поколение постановки с листа сверяется под тем же write-локом.
+        expected_state.refuse_if_statement_moved(fresh)
         if (
             await load_dor_snapshot(db, task_id)
         ).fingerprint() != snapshot.fingerprint():

@@ -142,3 +142,80 @@ async def test_reject_sheet_pins_statement_generation_too(client, db):
     )
     assert ok.status_code == 200 and "data-c2-done" in ok.text
     assert await _status(db, task_id) == "rejected"
+
+
+async def test_guard_and_write_share_one_write_lock(client, db, monkeypatch):
+    """Сверка ожиданий и запись - в одной транзакции, а не друг за другом."""
+    from hub import services as svc_pkg
+    from hub import web
+
+    task_id = await _draft_with_readiness(client, "lock probe", ready=True)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-reject")
+    seen: dict[str, bool] = {}
+    original = web.services.reject_task
+
+    async def spy(conn, *args, **kwargs):
+        seen["in_transaction"] = bool(conn.in_transaction)
+        return await original(conn, *args, **kwargs)
+
+    monkeypatch.setattr(web.services, "reject_task", spy)
+    resp = await client.post(form.attrs["action"], data=data, headers=SHEET_HEADERS)
+    assert resp.status_code == 200, resp.text
+    assert seen == {"in_transaction": True}
+    assert svc_pkg  # импорт нужен только для явности зависимости
+
+
+async def test_approve_checks_the_generation_where_it_writes(client, db):
+    """Ожидание поколения сверяется в сервисе, под тем же локом, что и переход."""
+    import pytest
+    from fastapi import HTTPException
+
+    from hub import services
+    from hub.models import TaskApprove
+    from hub.services import expected_state
+
+    task_id = await _draft_with_readiness(client, "atomic approve", ready=True)
+    live = int((await repo.get_task(db, task_id))["statement_generation"] or 0)
+    with expected_state.expecting_statement_generation(live + 1):
+        with pytest.raises(HTTPException) as moved:
+            await services.approve_task(db, task_id, TaskApprove())
+    assert moved.value.status_code == 409
+    assert await _status(db, task_id) == "draft"
+    with expected_state.expecting_statement_generation(live):
+        await services.approve_task(db, task_id, TaskApprove())
+    assert await _status(db, task_id) != "draft"
+
+
+async def test_sheet_is_for_a_human_only(client, db, monkeypatch):
+    from hub import config
+    from tests.web_support import _web_project_tokens, _web_task_in_review
+
+    task_id = await _web_task_in_review(client)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-cr")
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    resp = await client.post(
+        form.attrs["action"],
+        data={**data, "verdict": "changes_requested", "comments": "агент"},
+        headers={**SHEET_HEADERS, "Authorization": "Bearer agent-token"},
+    )
+    assert resp.status_code == 403
+    assert 'class="c2-sheet-note"' in resp.text
+    row = await repo.get_task(db, task_id)
+    assert row["review_verdict"] is None
+
+
+async def test_repeating_the_same_verdict_is_named_a_repeat(client, db):
+    from tests.web_support import _web_task_in_review
+
+    task_id = await _web_task_in_review(client)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-cr")
+    body = {**data, "verdict": "changes_requested", "comments": "первый"}
+    first = await client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS)
+    assert first.status_code == 200 and "data-c2-done" in first.text
+    again = await client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS)
+    assert again.status_code == 409, again.text
+    assert "data-c2-done" not in again.text and "уже стоит" in again.text

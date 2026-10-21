@@ -7,7 +7,7 @@
 {% from "partials/pr_disposition.html" import pr_disposition_select %}
 {% if card_actions.sheets %}
 <link rel="stylesheet" href="/static/card_actions.css?v={{ asset_version|default('20260421a') }}">
-<div id="c2-sheets">
+<div id="c2-sheets" data-built-status="{{ card_actions.live.status }}" data-built-submission-generation="{{ card_actions.live.submission_generation }}" data-built-statement-generation="{{ card_actions.live.statement_generation }}">
 {% for s in card_actions.sheets %}
 <section class="c2-sheet" id="{{ s.id }}" role="dialog" aria-modal="true" aria-labelledby="{{ s.id }}-h" data-sheet-kind="{{ s.kind }}" data-built-status="{{ s.built.status }}" data-built-submission-generation="{{ s.built.submission_generation }}" data-built-statement-generation="{{ s.built.statement_generation }}">
     <div class="c2-sheet-panel">

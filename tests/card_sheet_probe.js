@@ -20,9 +20,11 @@ const sheet = {
   querySelectorAll: () => [field],
 };
 const live = { attrs: { "data-submission-generation": "3", "data-status": "review" },
-  getAttribute(n) { return this.attrs[n] ?? null; } };
+  getAttribute(n) { return this.attrs[n] ?? null; }, querySelectorAll: () => [] };
+const holder = { getAttribute: (n) => ({ "data-built-submission-generation": "3", "data-built-status": "review" })[n] ?? null };
+let reloads = 0;
 const document = {
-  getElementById: (id) => (id === "c2-live" ? live : id === "sh-cr" ? sheet : null),
+  getElementById: (id) => (id === "c2-live" ? live : id === "c2-sheets" ? holder : id === "sh-cr" ? sheet : null),
   querySelector: (sel) => {
     if (sel === ".c2-sheet.is-open") return classes.has("is-open") ? sheet : null;
     if (sel.includes("data-sheet=")) return opener;
@@ -32,7 +34,7 @@ const document = {
   addEventListener: (n, f) => { (listeners[n] = listeners[n] || []).push(f); },
   activeElement: null,
 };
-const window = { location: { hash: "#sh-cr", pathname: "/tasks/1", search: "" }, history: { replaceState() {} }, addEventListener() {} };
+const window = { location: { hash: "#sh-cr", pathname: "/tasks/1", search: "", reload() { reloads += 1; } }, history: { replaceState() {} }, addEventListener() {} };
 new Function("window", "document", src)(window, document);
 const fire = (n, ev) => (listeners[n] || []).forEach((f) => f(ev));
 const out = {};
@@ -47,8 +49,10 @@ fire("htmx:afterSwap", {});
 out.typed_text_after_swap = field.value;
 out.warning_shown_after_generation_change = warn.hidden === false;
 out.submit_stays_enabled = !("disabled" in sheet);
+out.no_reload_while_open = reloads === 0;
 
 fire("keydown", { key: "Escape" });
 out.escape_closes_and_returns_focus = !classes.has("is-open") && focused === "opener";
+out.reload_after_close_when_panel_moved_on = reloads === 1;
 out.storage_free = !/sessionStorage|localStorage/.test(src);
 console.log(JSON.stringify(out));

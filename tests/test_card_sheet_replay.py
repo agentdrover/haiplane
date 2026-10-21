@@ -34,6 +34,9 @@ async def test_sheet_survives_refresh_and_refuses_stale_generation(
     assert not [n for n in live.walk() if n.tag in {"textarea", "input", "select"}]
     form, data = sheet_form(page, "sh-cr")
     assert not inside(root, form, "c2-live")
+    holder = next(n for n in root.walk() if n.attrs.get("id") == "c2-sheets")
+    for key in ("status", "submission-generation", "statement-generation"):
+        assert holder.attrs[f"data-built-{key}"] == live.attrs[f"data-{key}"]
     # 2. Раньше 15-секундный триггер заменял всю .main: теперь так не делает никто.
     for node in root.walk():
         trigger = node.attrs.get("hx-trigger", "")
@@ -89,4 +92,7 @@ def test_sheet_script_keeps_typed_text_and_warns_about_a_new_submission():
     assert got["warning_shown_after_generation_change"] is True
     assert got["submit_stays_enabled"] is True
     assert got["escape_closes_and_returns_focus"] is True
+    # Панель ушла вперёд, а листы остались старыми: перезагрузка только без листа.
+    assert got["no_reload_while_open"] is True
+    assert got["reload_after_close_when_panel_moved_on"] is True
     assert got["storage_free"] is True

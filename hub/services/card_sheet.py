@@ -5,16 +5,25 @@
 Новых маршрутов нет: декоратор ``sheet_action`` оборачивает обработчик и делает
 две вещи.
 
-1. Перед вызовом сверяет то, что человек видел на экране (поля ``expected_*``
-   формы листа), с живой задачей. Расхождение - 409 с текстом, записей нет.
-   Формы «Подробностей» этих полей не несут и ведут себя как раньше. Окно между
-   сверкой и записью узкое; записывающие сервисы сами проверяют статус внутри
-   своей транзакции, а сервис вердикта - поколение сдачи.
+1. Сверяет то, что человек видел на экране (поля ``expected_*`` формы листа),
+   с живой задачей. Сверка стоит РЯДОМ с записью, а не до неё: reject, decide и
+   return-to-work идут целиком внутри одного write-лока (``write_transaction``;
+   сервисы уже умеют вложенный вызов и коммитят сами), approve кладёт ожидание
+   в ``expected_state`` и сверяет его там, где сам сервис читает строку под
+   локом (расчёт DoR с git под локом держать нельзя), вердикт сверяет
+   ``expected_generation`` в своём сервисе (``verdict_guard``). Расхождение -
+   409 с текстом, записей нет. Формы «Подробностей» полей ``expected_*`` не
+   несут и ведут себя как раньше.
 2. Для запроса листа (заголовки ``HX-Request`` и ``X-Hub-Sheet``) называет
    исход ФАКТОМ: «Отправлено» лист пишет только когда обработчик ответил
    фрагментом выполненного действия, и называет статус, который сейчас у
    задачи. Отказ (409, 422, DoR, заморозка) идёт текстом в лист с тем же кодом
    ответа; ввод на листе не трогается.
+
+Лист - только для человека: запрос листа (заголовок или поле ``c2_sheet``)
+от агентской личности получает 403, в том числе на маршруте вердикта.
+Повтор вердикта, который ничего не записал (ревизия не выросла), листом
+называется повтором, а не «Отправлено».
 
 Весь текст, пришедший не из этого файла, экранируется.
 """
@@ -30,7 +39,10 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from hub import repository as repo
+from hub.auth import current_identity
+from hub.db import write_transaction
 from hub.mcp_envelope import compute_awaiting
+from hub.services import expected_state
 
 SHEET_HEADER = "x-hub-sheet"
 #: Признак выполненного действия в ответе обработчиков (``_task_done_html``).
@@ -146,6 +158,56 @@ def _as_refusal(response: Response) -> Response:
     return HTMLResponse(wrapped, status_code=status)
 
 
+def _has_expectations(form: Any) -> bool:
+    return any(str(key).startswith("expected_") for key in form)
+
+
+def _same_verdict(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    keys = ("review_verdict", "review_verdict_revision", "review_verdict_generation")
+    return bool(before.get("review_verdict")) and all(
+        before.get(k) == after.get(k) for k in keys
+    )
+
+
+async def _guarded(
+    db: Any, action: str, task_id: int, form: Any, call: Callable[[], Awaitable[Any]]
+) -> tuple[str, Any]:
+    """Сверка ожиданий и запись под одним write-локом; ``(причина, ответ)``."""
+    async with write_transaction(db):
+        row = await repo.get_task(db, task_id)
+        reason = stale_reason(action, dict(row), form) if row else ""
+        if reason:
+            return reason, None
+        return "", await call()
+
+
+async def _dispatch(
+    db: Any, action: str, task_id: int, form: Any, call: Callable[[], Awaitable[Any]]
+) -> tuple[str, Any]:
+    if not _has_expectations(form):
+        return "", await call()
+    if action == "approve":
+        row = await repo.get_task(db, task_id)
+        reason = stale_reason(action, dict(row), form) if row else ""
+        if reason:
+            return reason, None
+        seen = str(form.get("expected_statement_generation", ""))
+        expected = int(seen) if seen.isdigit() else None
+        with expected_state.expecting_statement_generation(expected):
+            return "", await call()
+    if action in ("reject", "decide", "return"):
+        return await _guarded(db, action, task_id, form, call)
+    return "", await call()
+
+
+def _refuse(request: Request, task_id: int, message: str, status: int) -> Response:
+    if is_sheet(request):
+        return _note(message, status)
+    return RedirectResponse(
+        f"/tasks/{task_id}?review_error={quote(message)}", status_code=303
+    )
+
+
 def sheet_action(action: str, *, note: Note | None = None):
     """Обернуть обработчик маршрута, к которому ведёт лист (см. модуль)."""
 
@@ -154,24 +216,41 @@ def sheet_action(action: str, *, note: Note | None = None):
         async def wrapper(*args: Any, **kwargs: Any) -> Response:
             request: Request = kwargs["request"]
             task_id = int(kwargs["task_id"])
+            db = _db(request)
+            sheet = is_sheet(request)
             form = await request.form()
-            row = await repo.get_task(_db(request), task_id)
-            reason = stale_reason(action, dict(row), form) if row else ""
-            if reason:
-                if is_sheet(request):
-                    return _note(reason, 409)
-                return RedirectResponse(
-                    f"/tasks/{task_id}?review_error={quote(reason)}", status_code=303
+            if (sheet or "c2_sheet" in form) and not current_identity(request).is_human:
+                return _refuse(
+                    request, task_id, "Лист действий доступен только человеку.", 403
                 )
-            if not is_sheet(request):
+            before = dict(await repo.get_task(db, task_id) or {})
+
+            async def call() -> Response:
                 return await fn(*args, **kwargs)
+
             try:
-                response = await fn(*args, **kwargs)
+                reason, response = await _dispatch(db, action, task_id, form, call)
             except HTTPException as exc:
-                return _note(_detail_text(exc.detail), exc.status_code)
+                if sheet:
+                    return _note(_detail_text(exc.detail), exc.status_code)
+                if exc.status_code == 409 and _has_expectations(form):
+                    return _refuse(request, task_id, _detail_text(exc.detail), 409)
+                raise
+            if reason:
+                return _refuse(request, task_id, reason, 409)
+            if not sheet:
+                return response
             if response.status_code < 300 and DONE_MARK in _body_text(response):
-                extra = await note(_db(request), task_id, form) if note else ""
-                return await done_response(_db(request), task_id, extra)
+                after = dict(await repo.get_task(db, task_id) or {})
+                if action == "verdict" and _same_verdict(before, after):
+                    return _note(
+                        "Этот вердикт уже стоит на карточке (ревизия "
+                        f"{after.get('review_verdict_revision')}): повтор ничего не "
+                        "записал.",
+                        409,
+                    )
+                extra = await note(db, task_id, form) if note else ""
+                return await done_response(db, task_id, extra)
             return _as_refusal(response)
 
         return wrapper

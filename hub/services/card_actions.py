@@ -87,7 +87,8 @@ def _sheet(
         "action": action,
         "submit_label": submit,
         "submit_tone": tone,
-        "hidden": hidden,
+        # c2_sheet: запрос пришёл с листа (даже без скрипта) - только человеку.
+        "hidden": {**hidden, "c2_sheet": "1"},
         "fields": fields,
         "confirm": confirm,
     }
@@ -352,7 +353,9 @@ def for_page(
 ) -> dict[str, Any]:
     """Панель и листы для страницы: рекомендация и риски берутся у вида C2."""
     recommend = str((view.get("recommend") or {}).get("action") or "")
-    confirmed = _get(machine_review, "findings_confirmed") or []
+    # Находки прошлой сдачи листу не предлагаются: вердикт пишется на новую.
+    current = bool(_get(machine_review, "is_current"))
+    confirmed = (_get(machine_review, "findings_confirmed") or []) if current else []
     findings = [
         {k: _get(f, k) for k in ("severity", "title", "file", "line")}
         for f in confirmed

@@ -152,3 +152,23 @@ def test_live_marker_carries_the_generations_the_sheets_were_built_on():
         "submission_generation": "3",
         "statement_generation": "2",
     }
+
+
+def test_findings_of_an_earlier_submission_are_not_offered():
+    from types import SimpleNamespace
+
+    finding = SimpleNamespace(severity="high", title="старая", file="a.py", line=1)
+    stale = SimpleNamespace(is_current=False, findings_confirmed=[finding])
+    fresh = SimpleNamespace(is_current=True, findings_confirmed=[finding])
+    view = {"recommend": None, "risks": []}
+    for report, expected in ((stale, 0), (fresh, 1), (None, 0)):
+        got = card_actions.for_page(_task("review"), view, report)
+        sheet = next(s for s in got["sheets"] if s["id"] == "sh-cr")
+        picks = [f for f in sheet["fields"] if f["type"] == "findings"]
+        assert (len(picks[0]["options"]) if picks else 0) == expected
+
+
+def test_every_sheet_form_says_it_came_from_a_sheet():
+    for status in ("draft", "review", "needs_decision"):
+        for sheet in card_actions.build(_task(status))["sheets"]:
+            assert sheet["hidden"]["c2_sheet"] == "1"
