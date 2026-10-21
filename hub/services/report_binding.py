@@ -149,12 +149,14 @@ async def reopen_if_refused(
     """Отчёт пришёл к заказу, записанному отказом (failed, без агента): оживить (#1408).
 
     Привязка доказывает, что агент этого кода существует, поэтому адресуется
-    конкретный id, а не «последняя заглушка поколения». Не коммитит.
+    конкретный id, а не «последняя заглушка поколения». Оживляется ТОЛЬКО
+    ``failed``: ``done`` без агента - окончательно разобранный заказ (поиск агента
+    исчерпан, итоговый алерт записан), новый отчёт его не открывает. Не коммитит.
     """
     if (
         dispatch.get("agent_id") == ""
         and dispatch.get("channel") == "cloud"
-        and dispatch.get("status") in ("failed", "done")
+        and dispatch.get("status") == "failed"
     ):
         await db.execute(
             "UPDATE review_dispatches SET status='active' WHERE id = ?",
