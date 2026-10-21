@@ -202,6 +202,7 @@ from hub.executor_host_api import (
     refuse_registered_slot,
     router as executor_host_router,
 )
+from hub.role_host_api import router as role_host_router
 from hub.web import router as web_router
 
 logging.basicConfig(
@@ -549,6 +550,7 @@ app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
+app.include_router(role_host_router)
 app.include_router(critic_host_router)
 app.include_router(executor_slot_web_router)
 

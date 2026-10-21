@@ -945,6 +945,10 @@ async def enrich_task_view(
     # #1953: последний заказ критика облачной сдачи - sha, состояние, срок, шаг.
     task_view.critic_order = await critic_orders.card_view(db, task_view.id)
 
+    from hub.services import role_orders
+
+    task_view.role_orders = await role_orders.card_view(db, task_view.id)  # #1973
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(
