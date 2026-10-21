@@ -3,6 +3,7 @@
    ═══════════════════════════════════════════════════════════════ */
 
 :root {
+    color-scheme: dark;
     /* ─── Core palette ─── */
     --bg: #0c0e14;
     --bg-elevated: #111318;
@@ -36,6 +37,26 @@
     --yellow: #fdcb6e;
     --yellow-dim: rgba(253, 203, 110, 0.10);
     --purple: #7c3aed;
+
+    --accent-hover: #c4bfff;
+    --c2-on-accent: #ffffff;
+
+    /* ─── Карточка C2 (#1812): статус = цвет + форма значка + слово ─── */
+    --c2-red: #f0605d;
+    --c2-red-bg: rgba(240, 96, 93, 0.14);
+    --c2-red-ink: #ffb3b0;
+    --c2-amber: #f0a73a;
+    --c2-amber-bg: rgba(240, 167, 58, 0.14);
+    --c2-amber-ink: #ffd48a;
+    --c2-blue: #5b8cff;
+    --c2-blue-bg: rgba(91, 140, 255, 0.14);
+    --c2-blue-ink: #b4ccff;
+    --c2-green: #3fbf7a;
+    --c2-green-bg: rgba(63, 191, 122, 0.14);
+    --c2-green-ink: #9be3bd;
+    --c2-gray: #8a91a3;
+    --c2-gray-bg: rgba(138, 145, 163, 0.14);
+    --c2-gray-ink: #c3c8d4;
 
     /* ─── Spacing scale (4px base) ─── */
     --sp-1: 4px;
@@ -71,6 +92,116 @@
     --duration-md: 0.25s;
 }
 
+/* ─── Светлая тема (#1812) ───
+   Тёмная — умолчание (:root выше). Светлая включается системной настройкой, если
+   страница не закрепила тёмную атрибутом data-theme, либо data-theme="light".
+   Оба набора переопределяют одни и те же токены: цвет только в одной теме
+   ловит tests/test_web.py::test_style_tokens_both_themes. */
+@media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+        color-scheme: light;
+        --bg: #f4f5f8;
+        --bg-elevated: #ffffff;
+        --surface: #ffffff;
+        --surface-hover: #f1f2f6;
+        --surface-active: #e6e8ef;
+        --border: #d5d9e2;
+        --border-subtle: #e6e8ee;
+        --border-focus: #4a3fd0;
+        --text: #14171c;
+        --text-secondary: #4a525c;
+        --text-muted: #5f6775;
+        --text-inverse: #ffffff;
+        --accent: #5b4bd6;
+        --accent-light: #4637b8;
+        --accent-dim: rgba(91, 75, 214, 0.10);
+        --accent-glow: rgba(91, 75, 214, 0.20);
+        --green: #1d7f3e;
+        --green-dim: rgba(29, 127, 62, 0.10);
+        --red: #c62828;
+        --red-dim: rgba(198, 40, 40, 0.10);
+        --orange: #b06a00;
+        --orange-dim: rgba(176, 106, 0, 0.12);
+        --blue: #1b5fc9;
+        --blue-dim: rgba(27, 95, 201, 0.10);
+        --yellow: #8a6100;
+        --yellow-dim: rgba(138, 97, 0, 0.12);
+        --purple: #6d28d9;
+        --accent-hover: #2f2499;
+    --c2-on-accent: #ffffff;
+        --c2-red: #c62828;
+        --c2-red-bg: #fdeceb;
+        --c2-red-ink: #8a1a1a;
+        --c2-amber: #b06a00;
+        --c2-amber-bg: #fff2d4;
+        --c2-amber-ink: #683e00;
+        --c2-blue: #1d62d6;
+        --c2-blue-bg: #e5eeff;
+        --c2-blue-ink: #143e88;
+        --c2-green: #1d7f3e;
+        --c2-green-bg: #e1f4e7;
+        --c2-green-ink: #114f28;
+        --c2-gray: #6a737e;
+        --c2-gray-bg: #eaecef;
+        --c2-gray-ink: #39414a;
+        --shadow-sm: 0 1px 2px rgba(15, 18, 28, 0.10);
+        --shadow-md: 0 2px 8px rgba(15, 18, 28, 0.12);
+        --shadow-lg: 0 4px 16px rgba(15, 18, 28, 0.14);
+        --shadow-glow: 0 0 16px rgba(91, 75, 214, 0.12);
+    }
+}
+:root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f4f5f8;
+    --bg-elevated: #ffffff;
+    --surface: #ffffff;
+    --surface-hover: #f1f2f6;
+    --surface-active: #e6e8ef;
+    --border: #d5d9e2;
+    --border-subtle: #e6e8ee;
+    --border-focus: #4a3fd0;
+    --text: #14171c;
+    --text-secondary: #4a525c;
+    --text-muted: #5f6775;
+    --text-inverse: #ffffff;
+    --accent: #5b4bd6;
+    --accent-light: #4637b8;
+    --accent-dim: rgba(91, 75, 214, 0.10);
+    --accent-glow: rgba(91, 75, 214, 0.20);
+    --green: #1d7f3e;
+    --green-dim: rgba(29, 127, 62, 0.10);
+    --red: #c62828;
+    --red-dim: rgba(198, 40, 40, 0.10);
+    --orange: #b06a00;
+    --orange-dim: rgba(176, 106, 0, 0.12);
+    --blue: #1b5fc9;
+    --blue-dim: rgba(27, 95, 201, 0.10);
+    --yellow: #8a6100;
+    --yellow-dim: rgba(138, 97, 0, 0.12);
+    --purple: #6d28d9;
+    --accent-hover: #2f2499;
+    --c2-on-accent: #ffffff;
+    --c2-red: #c62828;
+    --c2-red-bg: #fdeceb;
+    --c2-red-ink: #8a1a1a;
+    --c2-amber: #b06a00;
+    --c2-amber-bg: #fff2d4;
+    --c2-amber-ink: #683e00;
+    --c2-blue: #1d62d6;
+    --c2-blue-bg: #e5eeff;
+    --c2-blue-ink: #143e88;
+    --c2-green: #1d7f3e;
+    --c2-green-bg: #e1f4e7;
+    --c2-green-ink: #114f28;
+    --c2-gray: #6a737e;
+    --c2-gray-bg: #eaecef;
+    --c2-gray-ink: #39414a;
+    --shadow-sm: 0 1px 2px rgba(15, 18, 28, 0.10);
+    --shadow-md: 0 2px 8px rgba(15, 18, 28, 0.12);
+    --shadow-lg: 0 4px 16px rgba(15, 18, 28, 0.14);
+    --shadow-glow: 0 0 16px rgba(91, 75, 214, 0.12);
+}
+
 
 /* ═══════════════════════════════════════════════════════════════
    Reset & Base
@@ -88,7 +219,7 @@ body {
 }
 
 a { color: var(--accent-light); text-decoration: none; transition: color var(--duration) var(--ease); }
-a:hover { color: #c4bfff; text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: none; }
 
 code, pre { font-family: var(--font-mono); }
 code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius: var(--radius-sm); }
@@ -381,7 +512,7 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
 .login-error {
     background: rgba(220, 38, 38, 0.1);
     border: 1px solid rgba(220, 38, 38, 0.3);
-    color: #f87171;
+    color: var(--red);
     padding: var(--sp-3) var(--sp-4);
     border-radius: var(--radius-sm);
     font-size: 12px;
