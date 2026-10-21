@@ -210,6 +210,35 @@ async def verdict(db: aiosqlite.Connection, order: dict[str, Any]) -> str:
     return VERDICT_EXPIRED if rows[0]["lapsed"] else ""
 
 
+#: Причины отказа траты кода, названные по условиям допуска (не ``spent``).
+SPEND_REASONS: Final[tuple[str, ...]] = ("memory_wait_limit", "expired")
+
+
+async def spend_refusal(db: aiosqlite.Connection, code_row: dict[str, Any]) -> str:
+    """Почему не прошёл UPDATE траты кода: ``spent`` | ``memory_wait_limit`` | ``expired``.
+
+    Те же условия, что в ``REDEEMABLE_SQL``, и ОДНО чтение (один ``datetime('now')``):
+    предел 6 ч не называется ``spent``, когда граница пересеклась между первичным
+    SELECT выкупа и UPDATE. Порядок: потрачен, предел, срок; всё прочее - ``spent``
+    (как было: чужой выкуп успел первым).
+    """
+    rows = await fetchall(
+        db,
+        "SELECT c.redeemed_at IS NOT NULL AS spent, "
+        "c.expires_at <= datetime('now') AS code_lapsed, o.state AS state, "
+        f"(o.waiting_since IS NOT NULL AND o.waiting_since <= {_LIMIT_SQL}) AS over, "
+        "o.expires_at <= datetime('now') AS lapsed "
+        "FROM chat_pair_codes c LEFT JOIN executor_orders o ON o.pair_code_id = c.id "
+        "WHERE c.id = ?",  # nosec B608 - constant
+        (int(code_row["id"]),),
+    )
+    if not rows or rows[0]["spent"] or rows[0]["state"] != STATE_WAITING_MEMORY:
+        return "spent"
+    if rows[0]["over"]:
+        return "memory_wait_limit"
+    return "expired" if rows[0]["code_lapsed"] or rows[0]["lapsed"] else "spent"
+
+
 async def notify_timeout(db: aiosqlite.Connection, order: dict[str, Any]) -> None:
     """Сигнал владельцу о конце предела: alert в ленте и событие; один раз.
 

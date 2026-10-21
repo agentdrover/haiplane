@@ -726,7 +726,7 @@ async def redeem_code_explained(
         db, row, kind=kind, acting_id=acting_id, acting_username=acting_username
     )
     if session is None:
-        return None, _row_refusal(row, "spent")
+        return None, _row_refusal(row, await memory_wait.spend_refusal(db, row))
     return session, None
 
 

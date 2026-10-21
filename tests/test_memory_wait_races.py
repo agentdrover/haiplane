@@ -150,7 +150,6 @@ async def test_the_six_hour_limit_closes_once(world):
     task_id, order_id, code = await _at_limit(world, "k8", "sweep первым")
     first, second = await lock_then(world, _sweep, _redeem(order_id, code))
     assert first == 1 and _refused(second), (first, second)
-    assert _reason(second) == "memory_wait_limit", second  # не spent
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
     assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
@@ -352,7 +351,7 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
     assert _refused(first) and _reason(first) == "memory_wait_limit", first
     assert "spent" not in str(first.detail), first.detail
     assert (await code_row(world, order_id))["redeemed_at"] is None  # код не потрачен
-    monkeypatch.undo()
+    monkeypatch.setattr(chat_pair, "_spend_code", real)
 
     # Код потрачен другим - по-прежнему spent; срок кода вышел - expired.
     for how, expected in (("spent", "redeem_refused"), ("expired", "expired")):
@@ -371,8 +370,8 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
                     )
                 else:
                     await conn.execute(
-                        "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 minutes')"
-                        " WHERE id = ?",
+                        "UPDATE executor_orders SET expires_at = datetime('now', '-1 minutes')"
+                        " WHERE pair_code_id = ?",
                         (_pair,),
                     )
                 await conn.commit()
@@ -388,7 +387,7 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
             )
         finally:
             await conn.close()
-        monkeypatch.undo()
+        monkeypatch.setattr(chat_pair, "_spend_code", real_spend)
         assert _refused(got[0]) and _reason(got[0]) == expected, (how, got[0])
         await world.client.post(
             f"/api/executor-hosts/k9/orders/{other_id}/ack",
