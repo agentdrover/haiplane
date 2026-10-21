@@ -483,7 +483,7 @@ async def test_resolution_and_agreement_are_measured(world):
 
     expected = {
         o_new: "new_order",
-        o_stmt: "statement_changed",
+        o_stmt: None,  # повтор + только правка постановки: ещё не итог
         o_split: "split",
         o_sub: "submitted",
         o_arch: "archived",
@@ -492,7 +492,7 @@ async def test_resolution_and_agreement_are_measured(world):
         o_c0: "new_order",
         o_ref: "new_order",
         o_rw: "split",
-        o_rw1: "split",  # подзадача создана после обеих рекомендаций: split сильнее new_order
+        o_rw1: "new_order",  # заказ раньше подзадачи: первое действие побеждает
         o_wait: None,
     }
     for oid, followup in expected.items():
@@ -500,12 +500,12 @@ async def test_resolution_and_agreement_are_measured(world):
 
     # Формула: знаменатель - только с followup, кроме устарела и без решения.
     got = await triage.agreement(world.db)
-    assert (got["total"], got["matched"]) == (8, 4), got
-    assert got["rate"] == 4 / 8
-    assert (got["stale"], got["no_decision"], got["pending"]) == (2, 1, 1)
+    assert (got["total"], got["matched"]) == (7, 5), got
+    assert got["rate"] == 5 / 7
+    assert (got["stale"], got["no_decision"], got["pending"]) == (2, 1, 2)
     assert got["by_class"][1] == {"total": 2, "matched": 1, "rate": 0.5}
     assert got["by_class"][2] == {"total": 1, "matched": 1, "rate": 1.0}
-    assert got["by_class"][3] == {"total": 3, "matched": 1, "rate": 1 / 3}
+    assert got["by_class"][3] == {"total": 2, "matched": 2, "rate": 1.0}
     assert got["by_class"][4]["matched"] == 1 and got["by_class"][0]["matched"] == 0
     assert got["accepted_share"] is None
 

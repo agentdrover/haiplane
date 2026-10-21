@@ -405,61 +405,105 @@ MATCHING: Final[dict[str, frozenset[str]]] = {
 }
 
 _PENDING_SQL: Final[str] = """
-SELECT r.id, r.order_id, r.task_id, r.action,
+SELECT r.id, r.order_id, r.task_id, r.action, r.child_floor,
+       datetime(r.created_at, '+72 hours') AS deadline_at,
        o.generation AS order_generation,
        o.statement_generation AS order_sg,
        t.statement_generation AS task_sg,
-       t.archived, t.submission_generation,
-       (julianday('now') - julianday(r.created_at)) * 24 AS age_hours,
-       r.created_at,
-       (SELECT n.statement_generation FROM executor_orders n
-         WHERE n.task_id = r.task_id AND n.id > r.order_id
-         ORDER BY n.id LIMIT 1) AS later_sg,
-       EXISTS (SELECT 1 FROM executor_orders n
-                WHERE n.task_id = r.task_id AND n.id > r.order_id) AS later_order,
-       EXISTS (SELECT 1 FROM tasks c
-                WHERE c.parent_id = r.task_id
-                  AND c.id > r.child_floor) AS has_children
+       t.archived, t.submission_generation
 FROM executor_triage_recommendations r
 JOIN executor_orders o ON o.id = r.order_id
 JOIN tasks t ON t.id = r.task_id
 WHERE r.followup IS NULL
 """
+_LATER_ORDER_SQL: Final[str] = (
+    "SELECT created_at, statement_generation FROM executor_orders "
+    "WHERE task_id = ? AND id > ? ORDER BY id LIMIT 1"
+)
+#: Ребёнок - исход, только если его одобрил человек: агентский draft (штатный путь
+#: предложения агента) разделением владельца не считается.
+_CHILD_SQL: Final[str] = (
+    "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
+    "AND (source = 'human' OR status <> 'draft')"
+)
+_SUBMISSION_SQL: Final[str] = (
+    "SELECT MIN(submitted_at) FROM submissions WHERE task_id = ? AND generation >= ?"
+)
+
+#: Ничья по секунде: логический порядок действий владельца. Правка постановки
+#: раньше заказа, заказ раньше разделения, сдача и архив - после; срок 72 часа - последним.
+_RANK: Final[dict[str, int]] = {
+    "statement_changed": 0,
+    "new_order": 1,
+    "split": 2,
+    "submitted": 3,
+    "archived": 4,
+    NO_DECISION_FOLLOWUP: 5,
+}
 
 
 def classify_followup(f: dict[str, Any]) -> str | None:
-    """Что случилось в задаче после рекомендации; ``None`` - пока ничего.
+    """Первое по времени действие после рекомендации; ``None`` - пока ничего.
 
-    Первое по приоритету событие побеждает и больше не меняется. Для
-    ``refine_hints_and_retry`` правка постановки без нового заказа - ещё не итог
-    (ждём новый заказ), а новый заказ после правки - ``new_order``.
+    ``f["events"]`` - кандидаты ``(время, исход)``: время события из долговечных
+    таблиц (заказы, сдачи, подзадачи) или момент свипа, если события нет в
+    хронологии (архив, правка постановки без заказа). Побеждает минимальное время,
+    при равенстве - ``_RANK``; результат не зависит от того, когда прошёл свип.
+    Для повторов (retry_*) правка постановки сама по себе не итог, а заказ после
+    правки - ``new_order``: владелец сделал рекомендованное. Для остальных действий
+    заказ с поднятым поколением постановки - ``statement_changed``.
     """
-    refine = f["action"] == ACTION_REFINE_AND_RETRY
-    ordered = f["order_sg"]
-    if f["archived"]:
-        return "archived"
+    events: list[tuple[str, int, str]] = [
+        (when, _RANK[kind], kind) for when, kind in f["events"]
+    ]
+    if not events:
+        return None
+    return min(events)[2]
+
+
+def _later_order_events(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
+    if later is None:
+        return []
+    ordered, retry = f["order_sg"], f["action"] in RETRY_ACTIONS
+    bumped = ordered is not None and later[1] is not None and later[1] > ordered
+    if bumped and not retry:
+        return [(later[0], "statement_changed")]
+    return [(later[0], "new_order")]
+
+
+async def _followup_events(
+    db: aiosqlite.Connection, raw: Any, now: str
+) -> list[tuple[str, str]]:
+    f = dict(raw)
+    task_id = int(f["task_id"])
+    found: list[tuple[str, str]] = []
+    later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
+    found += _later_order_events(f, later[0] if later else None)
+    if not later and f["action"] not in RETRY_ACTIONS:
+        ordered = f["order_sg"]
+        if ordered is not None and int(f["task_sg"] or 0) > ordered:
+            found.append((now, "statement_changed"))
+    child = (await fetchall(db, _CHILD_SQL, (task_id, int(f["child_floor"]))))[0][0]
+    if child:
+        found.append((child, "split"))
     if int(f["submission_generation"] or 0) >= int(f["order_generation"]):
-        return "submitted"
-    if f["has_children"]:
-        return "split"
-    if f["later_order"]:
-        bumped = (
-            ordered is not None
-            and f["later_sg"] is not None
-            and f["later_sg"] > ordered
-        )
-        return "statement_changed" if bumped and not refine else "new_order"
-    if not refine and ordered is not None and int(f["task_sg"] or 0) > ordered:
-        return "statement_changed"
-    if float(f["age_hours"] or 0) >= NO_DECISION_HOURS:
-        return NO_DECISION_FOLLOWUP
-    return None
+        stamp = (
+            await fetchall(db, _SUBMISSION_SQL, (task_id, int(f["order_generation"])))
+        )[0][0]
+        found.append((stamp or now, "submitted"))
+    if f["archived"]:
+        found.append((now, "archived"))
+    if f["deadline_at"] <= now:
+        found.append((f["deadline_at"], NO_DECISION_FOLLOWUP))
+    return found
 
 
 async def _resolve_pending(db: aiosqlite.Connection) -> int:
+    now = (await fetchall(db, "SELECT datetime('now')"))[0][0]
     resolved = 0
     for raw in await fetchall(db, _PENDING_SQL):
-        followup = classify_followup(dict(raw))
+        events = await _followup_events(db, raw, now)
+        followup = classify_followup({"events": events})
         if followup is None:
             continue
         cursor = await db.execute(
@@ -473,17 +517,21 @@ async def _resolve_pending(db: aiosqlite.Connection) -> int:
 
 
 async def _recover_missing(db: aiosqlite.Connection) -> int:
-    """Закрытые неудачей заказы без рекомендации (сбой при report, рестарт)."""
+    """Закрытые неудачей заказы без рекомендации (сбой при report, рестарт).
+
+    Без верхней границы по давности: срок ожидания действия владельца (72 часа) и
+    срок восстановления отсутствующей записи - разные вещи. Берётся последний
+    заказ открытой задачи; остальное решает ``recommend_for_order``.
+    """
     rows = await fetchall(
         db,
-        "SELECT o.id FROM executor_orders o "
+        "SELECT o.id FROM executor_orders o JOIN tasks t ON t.id = o.task_id "
         "WHERE o.state = 'closed' AND o.report_outcome IN ('rescued', 'failed') "
-        "AND o.reported_at > datetime('now', ?) "
+        "AND t.status = 'open' AND t.archived = 0 "
         "AND NOT EXISTS (SELECT 1 FROM executor_triage_recommendations r "
         "                WHERE r.order_id = o.id) "
         "AND o.id = (SELECT MAX(n.id) FROM executor_orders n "
         "            WHERE n.task_id = o.task_id)",
-        (f"-{NO_DECISION_HOURS} hours",),
     )
     made = 0
     for row in rows:
