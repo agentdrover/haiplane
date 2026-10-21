@@ -488,6 +488,9 @@ async def _reap_leases(db: aiosqlite.Connection) -> None:
         "WHERE state = 'leased' AND lease_deadline <= datetime('now')",
     )
     for order in due:
+        if not await _is_admitted(db, str(order["host"]), order):
+            await _release_to_open(db, int(order["id"]))  # допуск снят: без расхода
+            continue
         if int(order["attempt"]) <= MAX_REISSUES:
             await db.execute(
                 "UPDATE role_orders SET state = 'open', attempt = attempt + 1, "
@@ -616,6 +619,16 @@ async def _claim_first(db: aiosqlite.Connection, host: str) -> dict[str, Any] | 
         )
         leased = await _order(db, int(order["id"]))
         if cursor.rowcount == 1 and leased is not None:
+            await db.execute(
+                "INSERT OR IGNORE INTO role_order_attempts "
+                "(order_id, attempt, host, lease_id) VALUES (?, ?, ?, ?)",
+                (
+                    int(leased["id"]),
+                    int(leased["attempt"]),
+                    host,
+                    leased["lease_id"],
+                ),
+            )
             return _lease_view(leased)
     return None
 
@@ -651,13 +664,31 @@ async def lease(
         return await _claim_first(db, host)
 
 
-def _own_or_refuse(order: aiosqlite.Row | None, host: str) -> aiosqlite.Row:
-    """Заказ есть и не чужого хоста; чужой и несуществующий - один 404."""
+async def _own_or_refuse(
+    db: aiosqlite.Connection,
+    order: aiosqlite.Row | None,
+    host: str,
+    lease_id: str,
+) -> aiosqlite.Row:
+    """Заказ свой; прежнему держателю (host, lease_id) - 409; постороннему - 404.
+
+    Чужой и несуществующий заказ неотличимы: хост не перебирает номера и не
+    узнаёт, какие заказы есть. Прежняя попытка подтверждается журналом
+    ``role_order_attempts``, а не догадкой.
+    """
     if order is None:
         _refuse(404, "role_order_not_found", "такого заказа нет")
-    if order["host"] not in (None, host):
-        _refuse(409, "role_order_reassigned", "заказ уже выдан другому хосту")
-    return order
+    if order["host"] == host:
+        return order
+    former = await fetchall(
+        db,
+        "SELECT 1 FROM role_order_attempts "
+        "WHERE order_id = ? AND host = ? AND lease_id = ?",
+        (int(order["id"]), host, lease_id),
+    )
+    if not former:
+        _refuse(404, "role_order_not_found", "такого заказа нет")
+    _refuse(409, "role_order_reassigned", "заказ уже выдан другому хосту или снят")
 
 
 async def started(
@@ -684,7 +715,9 @@ async def started(
             "AND a.role = role_orders.role AND a.project_id = role_orders.project_id)",
             (int(order_id), host, lease_id),
         )
-        order = _own_or_refuse(await _order(db, int(order_id)), host)
+        order = await _own_or_refuse(
+            db, await _order(db, int(order_id)), host, lease_id
+        )
         if cursor.rowcount == 1:
             return {"id": int(order_id), "state": "started", "repeat": False}
         if order["state"] == "started" and order["lease_id"] == lease_id:
@@ -778,7 +811,9 @@ async def report(
     late = False
     async with write_transaction(db):
         await check_host(db, host, principal_id)
-        order = _own_or_refuse(await _order(db, int(order_id)), host)
+        order = await _own_or_refuse(
+            db, await _order(db, int(order_id)), host, lease_id
+        )
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}
         if await _close_by_report(

@@ -53,6 +53,18 @@ MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_role_orders_task ON role_orders(task_id)",
     ),
     (
+        # Кто и с каким lease держал заказ: отличает прежнего держателя (409) от
+        # постороннего хоста (404, как будто заказа нет).
+        "create_role_order_attempts",
+        """CREATE TABLE IF NOT EXISTS role_order_attempts (
+            order_id INTEGER NOT NULL REFERENCES role_orders(id) ON DELETE CASCADE,
+            attempt  INTEGER NOT NULL,
+            host     TEXT    NOT NULL,
+            lease_id TEXT    NOT NULL,
+            PRIMARY KEY (order_id, lease_id)
+        )""",
+    ),
+    (
         "create_role_orders_cursor",
         """CREATE TABLE IF NOT EXISTS role_orders_cursor (
             id              INTEGER PRIMARY KEY CHECK (id = 1),
