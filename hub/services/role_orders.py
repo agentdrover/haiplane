@@ -56,6 +56,8 @@ RUN_MAX_MINUTES = 60
 NOTE_MAX = 500
 #: Событий за один проход источника: остаток доберёт следующий тик.
 SWEEP_BATCH = 100
+#: Открытых заказов за страницу обхода устаревших.
+REAP_BATCH = 200
 REPORT_OUTCOMES = ("done", "failed")
 ACTIVE_STATES = ("open", "leased", "started")
 
@@ -287,8 +289,25 @@ async def sweep_sources(db: aiosqlite.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 
+async def _has_newer_entry(
+    db: aiosqlite.Connection, task_id: int, event_id: int
+) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id = ? AND kind = 'needs_decision' "
+        "AND id > ? LIMIT 1",
+        (task_id, event_id),
+    )
+    return bool(rows)
+
+
 async def _is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
-    """Задача всё ещё в ТОМ ЖЕ заходе в needs_decision, что породил заказ."""
+    """Задача всё ещё в ТОМ ЖЕ заходе в needs_decision, что породил заказ.
+
+    «Новее» ищется среди событий входа, а не «то же самое событие найдено»:
+    очистка лент удаляет старое событие, и заказ, чья задача никуда не уходила,
+    не должен от этого стать устаревшим.
+    """
     rows = await fetchall(
         db,
         "SELECT status, status_entered_at, submission_generation, archived "
@@ -301,8 +320,9 @@ async def _is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
     return (
         str(task["status_entered_at"] or "") == str(order["entered_at"] or "")
         and int(task["submission_generation"] or 0) == int(order["generation"])
-        and await _newest_entry_event(db, int(order["task_id"]))
-        == int(order["source_event_id"] or 0)
+        and not await _has_newer_entry(
+            db, int(order["task_id"]), int(order["source_event_id"] or 0)
+        )
     )
 
 
@@ -315,18 +335,10 @@ async def _expire_stale(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
     return cursor.rowcount == 1
 
 
-async def _notify_failure(
+async def _message_steward(
     db: aiosqlite.Connection, order: aiosqlite.Row, outcome: str
 ) -> None:
-    """Лента задачи и сообщение стюарду проекта; закрытые поля, текст хоста не нужен."""
-    await repo.add_task_update(
-        db,
-        int(order["task_id"]),
-        "hub",
-        "alert",
-        f"Заказ роли #{order['id']} ({label_of(order['role'])}) не выполнен: "
-        f"{outcome}. Роль не перезапускается сама после старта; решение за стюардом.",
-    )
+    """Закрытые поля в ящик steward@<проект>; текста хоста и ленты здесь нет."""
     project = (
         await repo.get_project(db, int(order["project_id"]))
         if order["project_id"] is not None
@@ -374,6 +386,21 @@ async def _notify_failure(
             "for_session": "",
         },
     )
+
+
+async def _notify_failure(
+    db: aiosqlite.Connection, order: aiosqlite.Row, outcome: str
+) -> None:
+    """Сбой без отчёта хоста: запись в ленту задачи и сообщение стюарду."""
+    await repo.add_task_update(
+        db,
+        int(order["task_id"]),
+        "hub",
+        "alert",
+        f"Заказ роли #{order['id']} ({label_of(order['role'])}) не выполнен: "
+        f"{outcome}. Роль не перезапускается сама после старта; решение за стюардом.",
+    )
+    await _message_steward(db, order, outcome)
 
 
 async def _reap_leases(db: aiosqlite.Connection) -> None:
@@ -424,11 +451,21 @@ async def _reap_runs(db: aiosqlite.Connection) -> None:
 
 
 async def _reap_stale_open(db: aiosqlite.Connection) -> None:
-    for order in await fetchall(
-        db, "SELECT * FROM role_orders WHERE state = 'open' ORDER BY id LIMIT 200"
-    ):
-        if not await _is_fresh(db, order):
-            await _expire_stale(db, order)
+    """Устаревшие открытые заказы; обход постраничный, чтобы хвост очереди не голодал."""
+    last = 0
+    while True:
+        batch = await fetchall(
+            db,
+            "SELECT * FROM role_orders WHERE state = 'open' AND id > ? "
+            "ORDER BY id LIMIT ?",
+            (last, REAP_BATCH),
+        )
+        for order in batch:
+            if not await _is_fresh(db, order):
+                await _expire_stale(db, order)
+        if len(batch) < REAP_BATCH:
+            return
+        last = int(batch[-1]["id"])
 
 
 async def reap(db: aiosqlite.Connection) -> None:
@@ -611,6 +648,8 @@ async def _close_by_report(
         f"Заказ роли #{order['id']} ({label_of(order['role'])}, {host}): {outcome}. "
         f"Заметка роли (недоверенная цитата): {note or '—'}",
     )
+    if outcome == "failed":
+        await _message_steward(db, order, "reported_failed")
     return True
 
 

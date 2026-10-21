@@ -153,6 +153,16 @@ async def test_no_reissue_after_start_and_stale_reports_refused(world):
     late = await started(world, "k8", order_id, lease_ids[0])
     assert late.status_code == 409
 
+    # 1a. Срок lease вышел, свип ещё не шёл: старт отказан самим UPDATE, не свипом.
+    await _clear(world)
+    quick = await _one_order(world, "старт после срока")
+    quick_lease = await leased(world, "k8")
+    await _expire_lease(world, quick)
+    refused = await started(world, "k8", quick, quick_lease["lease_id"])
+    assert refused.status_code == 409
+    assert (await order_row(world, quick))["state"] == "leased"
+    await _clear(world)
+
     # 2. Старт, потом истечение срока работы: перевыдачи НЕТ, failed + уведомление стюарду.
     second = await _one_order(world, "стартовал")
     lease = await leased(world, "k8")
@@ -184,6 +194,16 @@ async def test_no_reissue_after_start_and_stale_reports_refused(world):
     late_report = await report(world, "k8", second, lease["lease_id"])
     assert late_report.status_code == 409
     assert (await order_row(world, second))["state"] == "failed"
+
+    # 2a. Срок работы вышел, свип ещё не шёл: report отказан, сбой при этом фиксируется.
+    await _clear(world)
+    slow = await _one_order(world, "отчёт после срока")
+    slow_lease = await leased(world, "k8")
+    await started(world, "k8", slow, slow_lease["lease_id"])
+    await age(world, slow, started_at=f"-{role_orders.RUN_MAX_MINUTES + 1} minutes")
+    too_late = await report(world, "k8", slow, slow_lease["lease_id"])
+    assert too_late.status_code == 409
+    assert (await order_row(world, slow))["outcome"] == "run_timeout"
 
     # 3. Поздний report прежней попытки: заказ перевыдан другому хосту.
     await _clear(world)
@@ -286,5 +306,10 @@ async def test_report_repeats_are_noops_and_changes_are_refused(world):
     assert row["state"] == "failed" and row["closed_at"] == closed_at
     updates = await repo.get_task_updates(world.db, row["task_id"])
     assert sum(f"#{order_id}" in dict(u)["content"] for u in updates) == 1
+    notices = await rows(
+        world.db,
+        "SELECT body FROM agent_messages WHERE body LIKE '%role_order_failed%'",
+    )
+    assert len(notices) == 1 and "reported_failed" in notices[0]["body"]
     bad = await report(world, "k8", order_id, lease["lease_id"], "maybe", "x")
     assert bad.status_code == 422

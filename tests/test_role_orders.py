@@ -239,15 +239,16 @@ async def test_only_an_enabled_admitted_host_and_no_codes(world):
             assert exc.status == 422
         else:
             raise AssertionError(f"роль {forbidden!r} принята")
+    await _disabled_during_the_long_poll(world)
 
 
-async def test_a_host_disabled_during_the_long_poll_gets_nothing(world):
-    """AC-5: хост выключен, пока висит long-poll, - 403 из пишущей транзакции, заказ открыт."""
-    await admit(world)
-    waiting = asyncio.ensure_future(poll(world, wait=5))
+async def _disabled_during_the_long_poll(world) -> None:
+    """Хост выключен, пока висит long-poll, - 403, заказ остаётся открытым."""
+    await admit(world, "k9")
+    waiting = asyncio.ensure_future(poll(world, "k9", wait=5))
     await asyncio.sleep(0.4)
     disabled = await world.client.post(
-        "/api/admin/executor-hosts/k8/disable", headers=world.human_auth
+        "/api/admin/executor-hosts/k9/disable", headers=world.human_auth
     )
     assert disabled.status_code == 200, disabled.text
     task_id = await task_in_project(world, "выключен")
@@ -255,17 +256,18 @@ async def test_a_host_disabled_during_the_long_poll_gets_nothing(world):
     assert await sweep(world) == 1
     answer = await asyncio.wait_for(waiting, 10)
     assert answer.status_code == 403, answer.text
-    assert (await order_rows(world))[0]["state"] == "open"
-    # И прямой вызов службы после выключения даёт тот же отказ, а не пустой ответ.
+    assert (await order_rows(world))[-1]["state"] == "open"
+    # Прямой вызов службы после выключения даёт тот же отказ: проверка в транзакции lease.
     principal = await rows(
-        world.db, "SELECT principal_id FROM executor_hosts WHERE name = 'k8'"
+        world.db, "SELECT principal_id FROM executor_hosts WHERE name = 'k9'"
     )
     try:
-        await role_orders.lease(world.db, "k8", int(principal[0]["principal_id"]))
+        await role_orders.lease(world.db, "k9", int(principal[0]["principal_id"]))
     except role_orders.RoleOrderError as exc:
         assert exc.status == 403
     else:
         raise AssertionError("выключенный хост получил lease")
+    assert (await order_rows(world))[-1]["state"] == "open"
 
 
 async def test_admission_is_set_by_a_human_only(world):
@@ -439,3 +441,36 @@ async def test_report_note_is_sanitised_and_bounded(world):
     feed = await repo.get_task_updates(world.db, task_id)
     text = " ".join(str(dict(u)["content"]) for u in feed)
     assert secret not in text and f"#{got['id']}" in text
+
+
+async def test_pruning_the_source_event_does_not_stale_an_open_order(world):
+    """Codex P2: очистка ленты удаляет старое событие, но заказ неизменной задачи остаётся годным."""
+    await admit(world)
+    task_id = await task_in_project(world, "старое событие")
+    event = await enter_needs_decision(world, task_id)
+    assert await sweep(world) == 1
+    await world.db.execute(
+        "UPDATE events SET created_at = datetime('now', '-30 days') WHERE id = ?",
+        (event,),
+    )
+    await world.db.commit()
+    await repo.prune_events(world.db)
+    await world.db.commit()
+    gone = await rows(world.db, "SELECT 1 FROM events WHERE id = ?", (event,))
+    assert not gone, "событие должно было уйти по сроку"
+    got = await leased(world)
+    assert got["source_key"] == f"needs_decision:{event}"
+
+
+async def test_the_stale_sweep_walks_every_page_of_open_orders(world, monkeypatch):
+    """Codex P3: устаревшие заказы за пределами первой страницы тоже закрываются."""
+    monkeypatch.setattr(role_orders, "REAP_BATCH", 2)
+    tasks = [await task_in_project(world, f"хвост {n}") for n in range(5)]
+    for task_id in tasks:
+        await enter_needs_decision(world, task_id)
+    assert await sweep(world) == 5
+    for task_id in tasks:
+        await leave_needs_decision(world, task_id)
+    await role_orders.reap(world.db)
+    await world.db.commit()
+    assert {r["state"] for r in await order_rows(world)} == {"expired"}
