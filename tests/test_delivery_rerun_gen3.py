@@ -111,3 +111,64 @@ async def test_headless_failed_new_attempt_ends_as_rerun_red_with_an_instruction
     assert (await rig.row())["outcome"] == "rerun_red"
     feed = await rig.feed()
     assert "tests (3.12)" in feed and "decide rework" in feed
+
+
+async def test_a_version_taken_by_a_neighbour_is_not_credited_to_an_older_projection(
+    db, db_dsn, monkeypatch
+):
+    from hub.services import ci_trust
+
+    rig = await _verified(db, monkeypatch)
+    other = await connect(db_dsn)
+    real = ci_trust.refresh_quietly
+
+    async def refresh_then_the_neighbour_starts_checking(conn, task_id, head, **kw):
+        found = await real(conn, task_id, head, **kw)
+        # Сосед начал проверку попытки 3: версия сдвинута, проекция ещё прежняя.
+        await repo.bump_ci_state_version(other, task_id, head)
+        await other.commit()
+        return found
+
+    monkeypatch.setattr(
+        ci_trust, "refresh_quietly", refresh_then_the_neighbour_starts_checking
+    )
+    try:
+        ok, why = await services.merge_before_completion(db, await rig.task())
+    finally:
+        await other.close()
+
+    assert not ok, why
+    rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_a_fresh_reservation_without_a_flag_is_not_a_stalled_post(
+    db, monkeypatch
+):
+    rig = await rig_after_base_update(db, monkeypatch)
+    rig.red_first_attempt()
+    await rig.sweep()
+    await db.execute("UPDATE delivery_reruns SET state='reserved'")
+    await db.commit()
+    rig.fake.runs.pop((RUN, "2"), None)
+    delivery_rerun.forget_in_flight()
+
+    await rig.sweep()
+
+    assert not await rig.needs_decision()
+    assert (await rig.row())["outcome"] == ""
+
+
+async def test_the_post_flag_is_held_until_the_answer_is_written(db, monkeypatch):
+    rig = await rig_after_base_update(db, monkeypatch)
+    rig.red_first_attempt()
+    seen = []
+    real = delivery_rerun._after_post
+
+    async def check_flag(db_, task, ctx, ci, scope, row_id, *args):
+        seen.append(row_id in delivery_rerun._in_flight)
+        return await real(db_, task, ctx, ci, scope, row_id, *args)
+
+    monkeypatch.setattr(delivery_rerun, "_after_post", check_flag)
+    await rig.sweep()
+
+    assert seen == [True]

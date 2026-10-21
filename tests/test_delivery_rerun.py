@@ -352,6 +352,7 @@ async def test_after_a_restart_an_unanswered_reservation_goes_to_the_human(
     await db.commit()
     rig.fake.runs.pop((RUN, "2"), None)
     delivery_rerun.forget_in_flight()  # рестарт: памяти о идущем POST нет
+    await rig.age_request(10)  # старше окна POST: это оборванный, а не идущий
 
     await rig.sweep()
 

@@ -478,17 +478,24 @@ async def _reserve_and_post(
         return _wait_text(task, why)
     _in_flight.add(row_id)
     try:
-        result = await plugins.git_ops.rerun_failed_jobs(
-            run_id, repo=scope.repo, gh_repo=scope.gh_arg, forge=scope.forge
-        )
-    except Exception as exc:  # noqa: BLE001 - исход POST неизвестен, повторять нельзя
-        log.exception("rerun of run %s failed to answer", run_id)
-        result = CIRunRequestResult(
-            CIRunRequestOutcome.unavailable, "rerun_call_raised", details=str(exc)[:200]
+        try:
+            result = await plugins.git_ops.rerun_failed_jobs(
+                run_id, repo=scope.repo, gh_repo=scope.gh_arg, forge=scope.forge
+            )
+        except Exception as exc:  # noqa: BLE001 - исход POST неизвестен, повторять нельзя
+            log.exception("rerun of run %s failed to answer", run_id)
+            result = CIRunRequestResult(
+                CIRunRequestOutcome.unavailable,
+                "rerun_call_raised",
+                details=str(exc)[:200],
+            )
+        # Флаг держится, пока ответ не записан: сосед не должен принять
+        # принятый POST за оборванный рестартом.
+        return await _after_post(
+            db, task, ctx, ci, scope, row_id, run_id, attempt, result
         )
     finally:
         _in_flight.discard(row_id)
-    return await _after_post(db, task, ctx, ci, scope, row_id, run_id, attempt, result)
 
 
 async def _reserve(
@@ -645,7 +652,8 @@ async def _open_step(
 
 async def _reserved_step(db, task, ctx, scope, row, cur) -> str:
     """Бронь без ответа POST: идёт ли он в этом процессе, или оборван рестартом."""
-    if row["id"] in _in_flight:
+    if row["id"] in _in_flight or not _stalled(row):
+        # POST идёт, либо бронь только что зарезервирована и флаг ещё не виден.
         return _wait_text(
             task, "POST перезапуска ещё идёт", row["run_id"], row["attempt_before"]
         )
@@ -666,7 +674,7 @@ async def _reserved_step(db, task, ctx, scope, row, cur) -> str:
     return await _to_human(
         db, task, ctx, scope, row, "stalled_after_restart",
         "после рестарта бронь без ответа POST, а новая попытка не появилась; "
-        "повторять платный запрос нельзя",
+        "повторять платный запрос нельзя", only_reserved=True,
     )  # fmt: skip
 
 
@@ -714,9 +722,10 @@ async def _verify_green(db, task, ctx, scope, row, head, cur, late) -> str:
         if standing is not None:
             gap = f"отчёт не подтверждён: {standing.reason}"
         return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
-    # Версия состояния CI коммита снимается ПОСЛЕ refresh: любой более поздний
-    # писатель (отчёт, refresh соседа) её сдвинет, и подтверждение это увидит.
-    version = await repo.ci_state_version(db, int(task["id"]), head)
+    # Версию берём у самой проекции (``standing.version``), а не отдельным чтением
+    # после refresh: иначе чужая версия соседа, начавшего проверку попытки 3,
+    # приписалась бы старой проекции попытки 2.
+    version = standing.version  # версия, при которой записана ЭТА проекция
     report = await ci_trust.trusted_report(db, int(task["id"]), head)
     keys = {
         standing.attempt_key,
@@ -791,6 +800,22 @@ async def _wait_or_timeout(db, task, ctx, scope, row, late: bool, why: str) -> s
     return _wait_text(
         task, why, row["run_id"], row["attempt_before"], row["requested_at"]
     )
+
+
+#: Сколько бронь ``reserved`` без видимого флага POST считается «идущей»: окно
+#: между коммитом резерва и регистрацией флага плюс таймаут самого POST.
+STALL_GRACE_SECONDS = 180
+
+
+def _stalled(row: dict[str, Any]) -> bool:
+    """Бронь ``reserved`` старше окна POST: флага нет, значит POST оборван."""
+    try:
+        at = datetime.strptime(str(row["requested_at"]), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=UTC
+        )
+    except ValueError:
+        return True
+    return (datetime.now(UTC) - at).total_seconds() > STALL_GRACE_SECONDS
 
 
 def _deadline_passed(row: dict[str, Any]) -> bool:
@@ -870,7 +895,14 @@ async def _close_by_id(
 
 
 async def _to_human(
-    db, task, ctx, scope: Scope | None, row: dict[str, Any], outcome: str, why: str
+    db,
+    task,
+    ctx,
+    scope: Scope | None,
+    row: dict[str, Any],
+    outcome: str,
+    why: str,
+    **kw: Any,
 ) -> str:
     """Закрыть бронь исходом к человеку и вернуть причину с готовой инструкцией."""
     # Имена - из попытки, которая УЖЕ шла: после принятого POST это before+1,
@@ -881,7 +913,7 @@ async def _to_human(
     ci = CIProbeResult(
         CIProbeOutcome.failed, "checks_failed", details=f"run {row['run_id']}"
     )
-    closed = await _close_by_id(db, task, row["id"], outcome, why, names)
+    closed = await _close_by_id(db, task, row["id"], outcome, why, names, **kw)
     if closed is None:
         return await _settled_answer(db, task, ctx)
     return human_text(task, ctx, ci, closed, _history_of(closed))
