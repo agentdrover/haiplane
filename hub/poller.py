@@ -696,8 +696,8 @@ async def _deliver_approved_review(db, task: dict) -> None:
             )
             if await _explicit_outcome(db, task, step.value):
                 return
-            if step is services.MergeStep.IN_FLIGHT:
-                return  # a neighbour path is merging this PR: next sweep looks again
+            if await services.headless_hold(db, task, step.value, _detail, pr_num):
+                return  # a neighbour merges / a rerun booking holds (#1956): next sweep
             merged = step in (services.MergeStep.MERGED, services.MergeStep.ALREADY)
             if step is services.MergeStep.MERGED:
                 # Record the commit the merge produced, not

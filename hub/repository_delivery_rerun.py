@@ -228,3 +228,33 @@ async def confirm_requested(db: aiosqlite.Connection, row_id: int) -> bool:
         (int(row_id),),
     )
     return cur.rowcount == 1
+
+
+async def report_in_time(
+    db: aiosqlite.Connection,
+    task_id: int,
+    head_sha: str,
+    run_id: str,
+    attempt: str,
+    requested_at: str,
+    wait_minutes: int,
+) -> bool | None:
+    """Пришёл ли отчёт попытки не позже ``requested_at + wait_minutes``; None - отчёта нет.
+
+    Время - ``reported_at`` строки попытки (когда хаб принял отчёт), а не время
+    прохода, который его читает.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT reported_at <= datetime(?, ?) FROM ci_report_attempts "
+        "WHERE task_id=? AND head_sha=? AND run_id=? AND run_attempt=?",
+        (
+            requested_at,
+            f"+{int(wait_minutes)} minutes",
+            int(task_id),
+            head_sha,
+            run_id,
+            attempt,
+        ),
+    )
+    return bool(rows[0][0]) if rows else None

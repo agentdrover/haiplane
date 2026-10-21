@@ -3960,15 +3960,12 @@ BASE_UPDATED_PREFIX = "base_updated"
 BASE_UPDATE_PENDING_PREFIX = "base_update_pending"
 BASE_UPDATE_RETRY_PREFIX = "base_update_retry"
 BASE_FETCH_PENDING_PREFIX = "base_fetch_pending"
-# Терминальные — к человеку с причиной: конфликт при слиянии базы, отказ
-# форжа (права, защита ветки), красный CI на свежей базе. Последний нарочно
-# НЕ начинается с "ci_fail": это не красный CI автора, который он чинит на
-# конвейере (#1030), а семантический конфликт с чужой доставкой.
+# Терминальные — к человеку: конфликт слияния базы, отказ форжа, красный CI на
+# свежей базе (fresh_base_ci_failed; не "ci_fail": не красный CI автора, #1030).
 BASE_UPDATE_CONFLICT_PREFIX = "base_update_conflict"
 BASE_UPDATE_REFUSED_PREFIX = "base_update_refused"
-# Событие «гейт слил базу в ветку с головы X в поколении сдачи N». По нему
-# следующий цикл узнаёт и красный CI на свежей базе, и уже потраченное
-# обновление (не больше одного без нового прогона CI).
+# Событие «гейт слил базу в ветку с головы X в поколении сдачи N»: по нему цикл
+# узнаёт красный CI на свежей базе и потраченное обновление (одно на прогон CI).
 GATE_BRANCH_UPDATE_EVENT = "gate_branch_update"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
@@ -4416,6 +4413,7 @@ class MergeStep(enum.Enum):
     APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
     UNPINNED = "unpinned"  # коммит одобренной сдачи не закреплён — форж не вызывался
     HEAD_MOVED = "head_moved"  # закрепление ушло с головы, на которой смотрели проверки
+    RERUN_HOLD = "rerun_hold"  # бронь перезапуска CI не пускает мерж (#1956)
 
 
 def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
@@ -4469,6 +4467,8 @@ async def merge_if_approval_stands(
     базу. Закрепление сменилось — отказ без вызова форжа (``HEAD_MOVED``).
     """
     key = (int(task["id"]), int(task["pr_number"]))
+    if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956
+        return MergeStep.RERUN_HOLD, hold
     while True:
         row = await repo.get_task(db, key[0])
         # --- ниже до регистрации Future нет ни одного await ---
@@ -4555,8 +4555,6 @@ async def _gate_merge_step(
     разрешается однозначно. Оба вопроса задаются ТОЛЬКО после отказа мержа:
     у зелёной доставки нет причины за них платить.
     """
-    if late := await delivery_rerun.recheck_before_merge(db, task, ctx):  # #1956
-        return (False, late), ""
     step, merge_detail = await merge_if_approval_stands(
         db,
         task,
@@ -4564,6 +4562,8 @@ async def _gate_merge_step(
         checked_sha=(task.get("_checked_sha") or task.get("submission_sha") or ""),
     )
     key = (int(task["id"]), int(task["pr_number"]))
+    if step is MergeStep.RERUN_HOLD:  # #1956: деталь - причина брони
+        return (False, merge_detail), ""
     if step is MergeStep.ALREADY:
         return (True, "already delivered"), ""
     if step is MergeStep.IN_FLIGHT:

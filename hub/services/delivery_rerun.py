@@ -79,6 +79,7 @@ _HUMAN_OUTCOMES = (
     "rerun_not_current",
 )
 
+IDENTITY_CHANGED = "проект или контракт CI сменились после выбора области"
 #: Брони, чей POST идёт ВНУТРИ этого процесса. Бронь ``reserved`` вне этого
 #: множества - POST оборван рестартом: ответ неизвестен, повторять нельзя.
 _in_flight: set[int] = set()
@@ -100,6 +101,23 @@ class Scope:
     gh_arg: str | None
     forge: str
     base: str
+    identity: tuple[str, str, str, str] = ("", "", "", "")
+
+
+async def _identity(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str, str, str] | None:
+    """Куда уйдёт запрос: репозиторий, форж, workflow и отпечаток контракта ЖИВОГО проекта."""
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return None
+    contract = await ci_contract.contract_for_task(db, task_id)
+    return (
+        str(project["repo"] or ""),
+        project_policy.forge_of(project),
+        contract.workflow_path,
+        contract.fingerprint,
+    )
 
 
 def base_text(task: dict[str, Any], ci: CIProbeResult) -> str:
@@ -198,6 +216,11 @@ async def gate_step(
     enabled = mode is True
     await _supersede_foreign(db, task)
     row = await journal.get(db, task_id, generation)
+    if mode is False:
+        # off: бронь ЛЮБОГО состояния на доставку не влияет; открытую снимаем.
+        if row is not None and row["state"] in journal.OPEN_STATES:
+            await _close(db, task, row, "superseded", "политика выключена")
+        return ""
     if row is not None and row["state"] in journal.OPEN_STATES:
         if row["pr_number"] != int(task.get("pr_number") or 0):
             # Снимок вызывающего - старый PR того же поколения: чужую бронь он не
@@ -213,25 +236,57 @@ async def gate_step(
     return await _first_failure(db, task, ctx, ci)
 
 
-async def recheck_before_merge(
+async def merge_hold(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> str:
-    """Последний взгляд на бронь прямо перед мержем: "" - мерж не запрещён.
+    """Бронь в ЕДИНОЙ точке мержа (``merge_if_approval_stands``): "" - мерж не запрещён.
 
-    Между ``gate_step`` и мержем проход ходит в сеть (стопка, свежесть базы,
-    черновик), и соседний проход мог закрыть бронь терминально. Окно остаётся
-    только на сам вызов мержа (его держит ``merge_if_approval_stands``).
+    Через эту точку идут все пути: ``merge_before_completion`` и headless-конвейер.
+    Проверка стоит непосредственно перед вызовом форжа и перечитывает всё одним
+    снимком (текущая попытка, отчёт, срок), а не верит прошлому проходу.
     """
     row = await journal.get(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
-    if row is None or row["state"] == journal.ARMED:
+    mode = await policy_mode(db, int(task["id"]))
+    if row is None or row["state"] == journal.ARMED or mode is False:
         return ""
     if row["state"] == journal.CLOSED:
-        return await _settled_answer(db, task, ctx)
-    async with write_transaction(db):
-        still = await journal.confirm_requested(db, row["id"])
-    return "" if still else await _settled_answer(db, task, ctx)
+        seen = CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+        return await _closed_step(db, task, ctx, seen, row)
+    if row["pr_number"] != int(task.get("pr_number") or 0):
+        return _wait_text(task, "бронь относится к другому PR, проход устарел")
+    return await _open_step(db, task, ctx, row, mode)
+
+
+async def headless_hold(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    step_value: str,
+    detail: str,
+    pr_num: Any,
+) -> bool:
+    """Headless-конвейер: чем кончился ``merge_if_approval_stands``; True - проход всё.
+
+    ``in_flight`` - соседний путь мержит: следующий цикл посмотрит снова.
+    ``rerun_hold`` - бронь перезапуска не пускает мерж: ожидание ждёт следующего
+    цикла, исход к человеку записывается один раз и уводит задачу из свипа.
+    """
+    if step_value == "in_flight":
+        return True
+    if step_value != "rerun_hold":
+        return False
+    if detail.startswith(FAILED_PREFIX):
+        from hub.services import delivery_writes, orchestration
+
+        async def hand_over() -> None:
+            await repo.add_task_update(db, int(task["id"]), "hub", "alert", detail)
+            await delivery_writes.hand_headless_to_human(
+                db, task, pr_num, FAILED_PREFIX
+            )
+
+        await orchestration.record_delivery_outcome(db, task, hand_over)
+    return True
 
 
 async def _supersede_foreign(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
@@ -299,6 +354,12 @@ async def _scope(
             gh_arg=ctx.get("gh_repo"),
             forge=ctx.get("forge", ""),
             base=git_ops_mod._resolve_base(ctx.get("base_branch")),
+            identity=(
+                str(project["repo"] or ""),
+                project_policy.forge_of(project),
+                contract.workflow_path,
+                contract.fingerprint,
+            ),
         ),
         "",
     )
@@ -395,6 +456,8 @@ async def _reserve_and_post(
     run_id = str(cur["run_id"])
     note = f"бронь: run {run_id}, попытка {attempt} красная ({cur['conclusion']}), голова {head[:12]}"
     row_id, why = await _reserve(db, task, scope, head, run_id, attempt, note)
+    if row_id is None and why == IDENTITY_CHANGED:
+        return human_text(task, ctx, ci, None, f"не выполнен: {why}")
     if row_id is None:
         return _wait_text(task, why)
     _in_flight.add(row_id)
@@ -440,6 +503,8 @@ async def _reserve(
             or not await policy_on(db, task_id)
         ):
             return None, "условия брони изменились"
+        if await _identity(db, task_id) != scope.identity:
+            return None, IDENTITY_CHANGED
         base_from = await _base_from(db, task)
         row_id = await journal.reserve(
             db, task_id, generation, pr_number=pr, base_from_sha=base_from,
@@ -613,38 +678,54 @@ async def _requested_step(db, task, ctx, scope, row, cur, head) -> str:
             db, task, ctx, scope, row, "rerun_red",
             f"попытка {expected} закончилась как {cur['conclusion']}",
         )  # fmt: skip
-    return await _verify_green(db, task, ctx, scope, row, head, late)
+    return await _verify_green(db, task, ctx, scope, row, head, cur, late)
 
 
-async def _verify_green(db, task, ctx, scope, row, head, late) -> str:
-    """Зелёная текущая попытка: мерж только при verified-отчёте именно этой попытки."""
+async def _verify_green(db, task, ctx, scope, row, head, cur, late) -> str:
+    """Зелёная текущая попытка: мерж только при verified-отчёте именно этой попытки.
+
+    Один снимок: ключ попытки у форжа (``cur``), у проекции (``standing``), у
+    самого прочитанного отчёта и ожидаемый ``before+1`` обязаны совпасть; зелёность
+    и срок считаются по ЭТОМУ отчёту. Срок - по времени прихода отчёта, а не
+    прохода: отчёт в срок мержится и поздним проходом, поздний - не мержится.
+    """
     expected_key = ci_trust.attempt_key(
         row["run_id"], str(int(row["attempt_before"]) + 1)
     )
     standing = await ci_trust.refresh_quietly(db, int(task["id"]), head)
     gap = "доверенный отчёт новой попытки не пришёл"
-    if standing is not None and standing.verified:
-        if standing.attempt_key != expected_key:
-            gap = f"отчёт относится к {standing.attempt_key or 'другой попытке'}, нужен {expected_key}"
-        else:
-            report = await ci_trust.trusted_report(db, int(task["id"]), head)
-            problem = (
-                "отчёт не подтверждён под действующим контрактом"
-                if report is None
-                else ci_trust.green_gap(dict(report), scope.contract)
-            )
-            if problem is None and row["workflow"] == scope.workflow:
-                # Бронь НЕ закрывается: разрешение на мерж живёт ровно столько,
-                # сколько держится проверка, и повторяется на каждом проходе
-                # (следующая ручная попытка и смена контракта его отзывают).
-                # Закроет её запись доставки (триггер на pipeline_merges).
-                async with write_transaction(db):
-                    still = await journal.confirm_requested(db, row["id"])
-                return "" if still else await _settled_answer(db, task, ctx)
-            gap = problem or "контракт CI изменился с момента брони"
-    elif standing is not None:
-        gap = f"отчёт не подтверждён: {standing.reason}"
-    return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    if standing is None or not standing.verified:
+        if standing is not None:
+            gap = f"отчёт не подтверждён: {standing.reason}"
+        return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    report = await ci_trust.trusted_report(db, int(task["id"]), head)
+    keys = {
+        standing.attempt_key,
+        (dict(report).get("attempt_key") if report is not None else None),
+        ci_trust.attempt_key(str(cur["run_id"]), str(cur["run_attempt"])),
+        expected_key,
+    }
+    if report is None or len(keys) != 1:
+        gap = f"отчёт и текущая попытка не совпадают с ожидаемой {expected_key}"
+        return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    problem = ci_trust.green_gap(dict(report), scope.contract)
+    if problem is not None or row["workflow"] != scope.workflow:
+        gap = problem or "контракт CI изменился с момента брони"
+        return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    in_time = await journal.report_in_time(
+        db, int(task["id"]), head, row["run_id"], str(int(row["attempt_before"]) + 1),
+        row["requested_at"], WAIT_MINUTES,
+    )  # fmt: skip
+    if in_time is False:
+        return await _to_human(
+            db, task, ctx, scope, row, "timeout",
+            f"доверенный отчёт новой попытки пришёл позже {WAIT_MINUTES} мин от брони",
+        )  # fmt: skip
+    # Бронь НЕ закрывается: разрешение живёт, пока держится проверка, и
+    # повторяется на каждом проходе; закроет её запись доставки (триггер).
+    async with write_transaction(db):
+        still = await journal.confirm_requested(db, row["id"])
+    return "" if still else await _settled_answer(db, task, ctx)
 
 
 async def _wait_or_timeout(db, task, ctx, scope, row, late: bool, why: str) -> str:

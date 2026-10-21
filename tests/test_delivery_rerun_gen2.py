@@ -176,3 +176,16 @@ async def test_a_report_after_the_deadline_is_late_whenever_the_pass_looks(
     assert not ok and why.startswith("fresh_base_ci_failed"), why
     assert (await rig.row())["outcome"] == "timeout"
     rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_the_headless_path_hands_a_red_rerun_to_the_owner_once(db, monkeypatch):
+    rig = await _booked(db, monkeypatch)
+    rig.start_attempt("2", status="completed", conclusion="failure")
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+
+    await poller._deliver_approved_review(db, await rig.task())
+
+    assert await rig.needs_decision()
+    assert "fresh_base_ci_failed" in await rig.feed()
+    rig.git.merge_pr.assert_not_awaited()
+    assert rig.posts == 1

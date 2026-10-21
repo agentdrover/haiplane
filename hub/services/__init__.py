@@ -141,6 +141,7 @@ from hub.services.lifecycle import (
     unarchive_task,
     withdraw_own_draft,
 )
+from hub.services.delivery_rerun import headless_hold
 from hub.services.orchestration import (
     APPROVAL_CHANGED_PREFIX,
     APPROVAL_FIELDS,
@@ -318,6 +319,7 @@ __all__ = [
     "approval_stands",
     "merge_before_completion",
     "merge_if_approval_stands",
+    "headless_hold",
     "record_delivery_outcome",
     "DeliveryPR",
     "pr_for_delivery",
