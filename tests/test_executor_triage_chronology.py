@@ -391,3 +391,101 @@ async def test_edit_without_order_is_unclear_for_retry_and_activation_is_pinned(
     assert len(state) == 1
     await _sweep(world)
     assert await _action_of(world, lived["order"]["id"]) == "retry_after_status"
+
+
+# ---------------------------------------------------------------------------
+# Круг 4: split не измеряется (ребёнок удаляем); сбой разбора не блокирует report
+# ---------------------------------------------------------------------------
+
+
+async def test_deleted_child_does_not_make_the_outcome_depend_on_the_sweep(world):
+    """Ребёнок удаляется физически: split - unclear, свипы в разных местах дают одно."""
+
+    async def run(sweep_between: bool) -> int:
+        task_id = await _task(world, f"удалённый ребёнок {sweep_between}")
+        oid = await _fail(world, task_id, CLASS3)  # retry_once
+        await _rec_at(world, oid, 60)
+        child = await repo.create_task(
+            world.db,
+            title="часть",
+            description="",
+            runtime="auto",
+            source="human",
+            assigned_agent="",
+            rationale="",
+            status="open",
+            auto_review=True,
+            task_type="task",
+            parent_id=task_id,
+            priority="medium",
+        )
+        await _at(world, "tasks", child, "created_at", 50)
+        if sweep_between:
+            await _sweep(world)
+            await _sweep(world)
+        await world.db.execute("DELETE FROM tasks WHERE id = ?", (child,))
+        await world.db.commit()
+        second = await _relaunch(world, task_id)
+        await _at(world, "executor_orders", second, "created_at", 30)
+        await _sweep(world)
+        await _sweep(world)
+        return oid
+
+    between, at_end = await run(True), await run(False)
+    assert await _followup(world, between) == "new_order"
+    assert await _followup(world, at_end) == "new_order"
+    got = await triage.agreement(world.db)
+    assert (got["total"], got["matched"]) == (2, 2), got
+
+    # Подзадача человека без заказа: на сроке unclear, а не split.
+    task_id = await _task(world, "ребёнок без заказа")
+    oid = await _fail(world, task_id, CLASS3)
+    await repo.create_task(
+        world.db,
+        title="часть",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=task_id,
+        priority="medium",
+    )
+    await world.db.commit()
+    await _rec_at(world, oid, 73 * 60)
+    await _sweep(world)
+    await _sweep(world)
+    assert await _followup(world, oid) == "unclear"
+
+
+async def test_triage_state_failure_does_not_block_the_host_report(world, monkeypatch):
+    """Сбой закрепления границы: report принят, заказ закрыт, сессия отозвана, граница нет."""
+    task_id = await _task(world, "сбой границы")
+    lived = await _launch_redeem(world, task_id)
+    oid = lived["order"]["id"]
+    await world.db.execute("DELETE FROM executor_triage_state")
+    await world.db.commit()
+
+    async def broken(db):
+        raise RuntimeError("состояние недоступно")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(triage, "activated_at", broken)
+        resp = await _report(world, oid, CLASS1)
+    assert resp.status_code == 200, resp.text
+    order = (
+        await _rows(world.db, "SELECT * FROM executor_orders WHERE id = ?", (oid,))
+    )[0]
+    assert order["state"] == "closed" and order["report_outcome"] == "rescued"
+    live = await _rows(
+        world.db,
+        "SELECT COUNT(*) AS n FROM chat_pair_sessions "
+        "WHERE executor_run_id = ? AND revoked_at IS NULL",
+        (order["executor_run_id"],),
+    )
+    assert live[0]["n"] == 0
+    assert await _rows(world.db, "SELECT 1 FROM executor_triage_state") == []
+    assert await _action_of(world, oid) is None
