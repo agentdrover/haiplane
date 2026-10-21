@@ -267,3 +267,38 @@ async def test_a_kept_stub_with_a_replacement_does_not_take_a_rung(
     )
     own = await dispatcher.report_of_dispatch(db, task_id, 1, deep_row)
     assert own is not None and own["id"] == unbound
+
+
+async def test_a_stale_identity_report_resolved_to_a_refused_stub_restores_it(
+    db: aiosqlite.Connection,
+):
+    """CR gen 2: личность с dispatch_id=None, затем заглушка S, замена L, отчёт S."""
+    task_id, code, code_id = await _bound_later(db, "stale-then-stub")
+    cur = await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id) "
+        "VALUES (?, 1, '', '', 'grok-4.6', 'lite', 'failed', 'cloud', ?)",
+        (task_id, PRINCIPAL),
+    )
+    stub = int(cur.lastrowid or 0)
+    await _bind(db, code, stub, task_id)
+    await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id, "
+        "replaces_dispatch_id) VALUES (?, 1, 'local:1', 'r', 'm', 'lite', 'active', "
+        "'local', ?, ?)",
+        (task_id, OTHER, stub),
+    )
+    await db.commit()
+    await record_machine_review(
+        db,
+        task_id,
+        _body(False),
+        principal_id=PRINCIPAL,
+        username="rev",
+        code_id=code_id,
+    )
+    (report,) = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert report["dispatch_id"] == stub
+    active = {dict(r)["id"] for r in await repo.list_active_review_dispatches(db)}
+    assert stub in active, "заглушка S восстановлена и видна свипу"
