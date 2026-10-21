@@ -213,7 +213,8 @@ def _resolve(
 
 
 def _tree_of(text: str | None) -> tuple[ast.Module, list[str]] | None:
-    if text is None:
+    if text is None or re.search(r"\r(?!\n)", text):
+        # Одиночный \r: ast считает его концом строки, git и дифф - нет, номера разойдутся.
         return None
     try:
         # Нумерация строк ast — по \n, \r\n, \r; splitlines() режет ещё и по \x0c.

@@ -227,3 +227,12 @@ def test_the_step_b_docstring_tells_the_real_order():
     doc = fit_with_ac_cutouts.__doc__ or ""
     assert "от меньшего к большему, затем по пути" in doc
     assert "по порядку диффа, из остатка" not in doc
+
+
+def test_a_lone_carriage_return_makes_the_line_numbers_unknown():
+    """Codex 5: ast и git считают одиночный CR по-разному - диапазон не выдаётся."""
+    src = "x = 1\rdef test_ac():\n    pass\n"
+    (span,) = ac_test_spans({F: src}, [f"{F}::test_ac"])
+    assert not span.found and span.unreadable
+    crlf = "x = 1\r\ndef test_ac():\r\n    pass\r\n"
+    assert ac_test_spans({F: crlf}, [f"{F}::test_ac"])[0].start == 2
