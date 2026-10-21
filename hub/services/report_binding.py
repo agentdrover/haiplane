@@ -223,3 +223,14 @@ async def order_chain(
                 seen.add(int(row["id"]))
                 frontier.append(int(row["id"]))
     return (None if unpinned or not principals else principals), seen
+
+
+async def reopen_order_of_report(db: aiosqlite.Connection, review_id: int) -> None:
+    """Оживить отказанный заказ, к которому отчёт привязан окончательно (#1408).
+
+    Одна точка для обеих привязок - по ``dispatch_id`` сессии и по ``code_id``
+    (``stamp_report`` мог найти заказ позже, чем его выбрал приём). Не коммитит.
+    """
+    bound = await dispatch_of_report(db, review_id)
+    if bound is not None:
+        await reopen_if_refused(db, bound)

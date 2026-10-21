@@ -233,9 +233,6 @@ async def _dispatch_of_report(
         db, task_id, generation, principal_id, claimed_id
     )
     if accepted is not None:
-        # #1946: найденный по привязке заказ проходит то же восстановление
-        # отказанного заказа (#1408), что и найденный по последнему заказу.
-        accepted = await report_binding.reopen_if_refused(db, accepted)
         return accepted, int(accepted["id"])
     latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     return latest, None
@@ -416,6 +413,9 @@ async def record_machine_review(
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
     await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
+    # #1946: восстановление отказанного заказа (#1408) - в ОДНОЙ точке, для
+    # заказа, к которому отчёт привязан окончательно (ранней или поздней привязкой).
+    await report_binding.reopen_order_of_report(db, new_review_id)
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу
     # dispatch_for_report; свипы такую строку уже не видят.
