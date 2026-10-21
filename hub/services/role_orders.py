@@ -36,6 +36,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
+from hub.services.untrusted_quote import sanitize_untrusted_quote
 
 log = logging.getLogger("hub.services.role_orders")
 
@@ -64,7 +65,6 @@ ACTIVE_STATES = ("open", "leased", "started")
 _SECRETISH = re.compile(
     r"\b(?:ahcp|ochk|ghp|gho|sk)[_-][A-Za-z0-9_\-]{12,}|\b[A-Za-z0-9_\-.]{32,}\b"
 )
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 class RoleOrderError(Exception):
@@ -739,9 +739,10 @@ async def started(
 
 
 def sanitize_note(text: str) -> str:
-    """Заметка роли: без управляющих символов и секретоподобных строк; ≤ NOTE_MAX."""
-    clean = _SECRETISH.sub("[скрыто]", _CONTROL.sub(" ", text))
-    return " ".join(clean.split())[:NOTE_MAX]
+    """Заметка роли: секретоподобное вычищено, дальше общее сито недоверенной цитаты (#1953)."""
+    return sanitize_untrusted_quote(
+        _SECRETISH.sub("[скрыто]", text), out_limit=NOTE_MAX
+    )
 
 
 def _digest(outcome: str, lease_id: str, note: str) -> str:
