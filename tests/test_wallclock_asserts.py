@@ -532,3 +532,78 @@ def test_context_scope_and_and_stay_violations(tmp_path, capsys):
         line = _line_of(BOUNDED_SOURCE, needle)
         assert f"\n  src/mod.py:{line} " in out, (needle, out)
     assert out.count("\n  src/mod.py:") == 2, out
+
+
+STAR_SOURCE = """\
+from time import *
+
+
+def test_star():
+    t0 = monotonic()
+    assert monotonic() - t0 < 0.31
+"""
+
+SECOND_PATCH_REAL = """\
+import time
+from unittest.mock import patch
+
+
+def test_a_last_patch_is_not_the_clock_one():
+    p = patch("time.monotonic")
+    p = patch("time.perf_counter")
+    p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+def test_d_last_patch_is_not_a_clock_at_all():
+    p = patch("time.monotonic")
+    p = patch("os.getcwd")
+    p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.51
+"""
+
+SECOND_PATCH_FAKE = """\
+import time
+from unittest.mock import patch
+
+
+def test_b_last_patch_is_the_clock_one():
+    p = patch("time.perf_counter")
+    p = patch("time.monotonic")
+    p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+def test_c_assignment_after_start_does_not_count():
+    p = patch("time.monotonic")
+    p.start()
+    p = patch("time.perf_counter")
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+"""
+
+
+def test_star_import_of_time_gives_clocks(tmp_path, capsys):
+    _write(tmp_path, STAR_SOURCE)
+    _write_ledger(tmp_path, [])
+    code, out = _run(tmp_path, capsys)
+    assert code != 0, out
+    line = _line_of(STAR_SOURCE, "assert monotonic()")
+    assert f"\n  src/mod.py:{line} " in out, out
+
+
+def test_start_enables_the_last_assigned_patch(tmp_path, capsys):
+    _write(tmp_path, SECOND_PATCH_REAL)
+    _write_ledger(tmp_path, [])
+    code, out = _run(tmp_path, capsys)
+    assert code != 0, out
+    for needle in ("assert elapsed < 0.5\n", "assert elapsed < 0.51"):
+        line = _line_of(SECOND_PATCH_REAL, needle.strip())
+        assert f"\n  src/mod.py:{line} " in out, out
+    _write(tmp_path, SECOND_PATCH_FAKE)
+    code, out = _run(tmp_path, capsys)
+    assert code == 0, out
+    assert "ПРЕДУПРЕЖДЕНИЕ" not in out, out

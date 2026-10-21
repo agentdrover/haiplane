@@ -155,6 +155,9 @@ def _collect_imports(tree: ast.AST) -> Imports:
             for alias in node.names:
                 if alias.name in CLOCKS:
                     found.funcs[alias.asname or alias.name] = alias.name
+                elif alias.name == "*":
+                    # from time import *: голые monotonic/perf_counter/time - часы
+                    found.funcs.update({name: name for name in CLOCKS})
     return found
 
 
@@ -185,13 +188,18 @@ class Patch:
 
 def _own_nodes(func: ast.AST):
     """Узлы тела функции без вложенных функций и классов (у них свой разбор)."""
+    found: list[ast.AST] = []
     stack = list(ast.iter_child_nodes(func))
     while stack:
         node = stack.pop()
-        yield node
+        found.append(node)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         stack.extend(ast.iter_child_nodes(node))
+    # В порядке исходника: стек отдаёт узлы в обратном порядке, а решения
+    # «последнее присваивание перед p.start()» зависят от порядка.
+    found.sort(key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+    yield from found
 
 
 def _patched_clock(call: ast.Call, imp: Imports) -> str | None:
@@ -276,17 +284,21 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
         ):
             for inner in ast.walk(node):
                 context_end[id(inner)] = node.end_lineno or end_line
-    pending: dict[str, str] = {}  # имя -> часы из ``p = patch(...)``
+    # имя -> присваивания (строка, часы или None): ``p.start()`` включает
+    # подмену из ПОСЛЕДНЕГО присваивания этого имени перед вызовом.
+    pending: dict[str, list[tuple[int, str | None]]] = {}
     for node in nodes:
         if (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Call)
-            and (clock := _patched_clock(node.value, imp))
-            and not _is_setattr(node.value)
         ):
-            pending[node.targets[0].id] = clock
+            clock = (
+                _patched_clock(node.value, imp)
+                if isinstance(node.value, ast.Call) and not _is_setattr(node.value)
+                else None
+            )
+            pending.setdefault(node.targets[0].id, []).append((node.lineno, clock))
     found: list[Patch] = []
     for node in nodes:
         if not isinstance(node, ast.Call):
@@ -320,13 +332,16 @@ def _is_setattr(call: ast.Call) -> bool:
     return isinstance(call.func, ast.Attribute) and call.func.attr == "setattr"
 
 
-def _started_clock(call: ast.Call, imp: Imports, pending: dict[str, str]) -> str | None:
+def _started_clock(
+    call: ast.Call, imp: Imports, pending: dict[str, list[tuple[int, str | None]]]
+) -> str | None:
     """Часы, подмену которых включает ``p.start()`` / ``patch(...).start()``."""
     func = call.func
     if not (isinstance(func, ast.Attribute) and func.attr == "start"):
         return None
     if isinstance(func.value, ast.Name):
-        return pending.get(func.value.id)
+        before = [a for a in pending.get(func.value.id, []) if a[0] < call.lineno]
+        return max(before, key=lambda a: a[0], default=(0, None))[1]
     if isinstance(func.value, ast.Call):
         return _patched_clock(func.value, imp)
     return None
