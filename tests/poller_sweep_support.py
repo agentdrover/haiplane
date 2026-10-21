@@ -448,6 +448,11 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
     "machine_deadlines": Coverage(removed_by=_NONE_YET),
     "stale_arbiter": Coverage(removed_by=_NONE_YET),
     "owner_minutes": Coverage(removed_by=_NONE_YET),
+    "role_orders": Coverage(
+        scenarios=(
+            "tests/test_role_orders.py::test_one_role_order_per_needs_decision_event",
+        )
+    ),
     "events_retention": Coverage(removed_by=_NONE_YET),
     "stale_worktrees": Coverage(removed_by=_NONE_YET),
     "sessions_retention": Coverage(removed_by=_NONE_YET),
