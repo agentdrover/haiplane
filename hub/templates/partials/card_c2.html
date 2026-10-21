@@ -1,0 +1,67 @@
+{# Карточка решения, компоновка C2 (#1812). Содержание — справка #1810 и
+   plain_summary #1811 через hub/services/card_c2.py; здесь только разметка.
+   Весь недоверенный текст идёт через автоэкранирование, без |safe.
+   Порядок блоков закреплён data-c2-section: header, recommend, about,
+   happened, risks, checks; «Подробности» (data-c2-section="details") стоят
+   в task_detail.html и несут прежние блоки. Факт печатается один раз: доска
+   ревью остаётся в подробностях, справка на неё не копирует таблицы. #}
+{% set c = card_c2 %}
+{% set rec = c.recommend %}
+<link rel="stylesheet" href="/static/card_c2.css?v={{ asset_version|default('20260421a') }}">
+<div class="c2" id="decision-brief" data-tone="{{ c.tone }}" data-decision-action="{{ rec.action if rec else '' }}">
+    <section class="c2-header" data-c2-section="header" aria-label="Шапка карточки">
+        <span class="c2-id">#{{ c.number }}</span>
+        {% if c.project %}<span class="c2-project">{{ c.project }}</span>{% endif %}
+        {% if c.lights %}
+        <span class="c2-lights" role="img" aria-label="Проверки: {{ c.lights_summary }}">
+            {% for l in c.lights %}<span class="c2-light" data-tone="{{ l.tone }}" data-shape="{{ l.shape }}"><span aria-hidden="true">{{ l.shape }}</span></span>{% endfor %}
+            <span class="c2-lights-sum">{{ c.lights_summary }}</span>
+        </span>
+        {% endif %}
+    </section>
+
+    {% if brief_failure and not review_board %}<div class="task-action-note task-action-note--warning" id="brief-failure">бриф не собран: {{ brief_failure }}</div>{% endif %}
+
+    <section class="c2-block c2-recommend" data-c2-section="recommend" aria-labelledby="c2-rec-h">
+        <h2 class="c2-label" id="c2-rec-h">Рекомендую</h2>
+        {% if rec %}
+        <p class="c2-rec-action decision-brief-action">{{ rec.action }}</p>
+        {% if rec.why %}<ul class="c2-why decision-brief-why">{% for w in rec.why %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+        {% if rec.alt %}<p class="c2-alt decision-brief-alt">Иначе: {{ rec.alt }}</p>{% endif %}
+        <p class="c2-act"><a class="c2-btn" href="{{ '#review-verdict-form' if review_board else '#task-controls' }}">К действию</a></p>
+        {% else %}
+        <p class="c2-rec-action">Рекомендации нет</p>
+        <p class="c2-alt">Справка не собрана или для этого статуса не строится: решайте по подробностям ниже.</p>
+        {% endif %}
+    </section>
+
+    <section class="c2-block c2-about" data-c2-section="about" aria-labelledby="c2-about-h">
+        <h2 class="c2-label" id="c2-about-h">О чём</h2>
+        <p class="c2-about-text{% if c.about_missing %} c2-muted{% endif %}">{{ c.about }}</p>
+        <details class="c2-orig">
+            <summary>Исходное название</summary>
+            <p class="c2-orig-title">{{ c.original_title }}</p>
+        </details>
+    </section>
+
+    <section class="c2-block c2-happened" data-c2-section="happened" data-tone="{{ c.tone }}" aria-labelledby="c2-happened-h">
+        <h2 class="c2-label" id="c2-happened-h">Что произошло</h2>
+        <p class="c2-status"><span class="c2-badge" data-tone="{{ c.tone }}" data-shape="{{ c.shape }}"><span class="c2-shape" aria-hidden="true">{{ c.shape }}</span> {{ c.tone_label }}</span></p>
+        {% if c.happened %}<p class="c2-happened-text">{{ c.happened }}</p>{% endif %}
+        {% if c.from_you %}<p class="c2-from-you"><strong>От вас:</strong> {{ c.from_you }}</p>{% endif %}
+    </section>
+
+    {% if c.risks %}
+    <section class="c2-block c2-risks" data-c2-section="risks" aria-labelledby="c2-risks-h">
+        <h2 class="c2-label" id="c2-risks-h">Риски</h2>
+        <ul>{% for r in c.risks %}<li data-severity="{{ r.severity }}" data-tone="{{ r.tone }}"><span class="c2-shape" aria-hidden="true">{{ r.shape }}</span> <span>{{ r.text }}{% if r.detail %} <small>{{ r.detail }}</small>{% endif %}</span></li>{% endfor %}</ul>
+    </section>
+    {% endif %}
+
+    <details class="c2-block c2-checks" id="c2-checks" data-c2-section="checks">
+        <summary><span class="c2-label">Проверки</span> <span class="c2-lights-sum">{{ c.lights_summary }}</span></summary>
+        {% if c.checks %}
+        <ul>{% for ch in c.checks %}<li data-state="{{ ch.state }}" data-tone="{{ ch.tone }}"><span class="c2-shape" aria-hidden="true">{{ ch.shape }}</span> <span>{{ ch.name }}: {{ ch.detail }}</span></li>{% endfor %}</ul>
+        {% else %}<p class="c2-muted">Проверок справка не назвала.</p>{% endif %}
+    </details>
+</div>

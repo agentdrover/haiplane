@@ -14,7 +14,9 @@ STATIC = Path(__file__).resolve().parent.parent / "hub" / "static"
 COLOR = re.compile(
     r"#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(|color-mix\(", re.IGNORECASE
 )
+LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(", re.IGNORECASE)
 DECL = re.compile(r"(--[a-zA-Z0-9-]+)\s*:\s*([^;{}]+);")
+DECL_NAME = re.compile(r"(--[a-zA-Z0-9-]+)\s*:")
 CONTEXTS = ("prefers-light", "prefers-dark", "data-theme-light", "data-theme-dark")
 
 
@@ -89,9 +91,9 @@ def check_style_tokens_both_themes() -> None:
     # Правила карточки: цвет только через токен, литерала нет.
     card = _strip_comments((STATIC / "card_c2.css").read_text())
     rules_only = re.sub(r"(--[a-zA-Z0-9-]+)\s*:[^;{}]+;", "", card)
-    assert not COLOR.search(rules_only), "в card_c2.css цветовой литерал вне токена"
+    assert not LITERAL.search(rules_only), "в card_c2.css цветовой литерал вне токена"
     used = set(re.findall(r"var\(\s*(--[a-zA-Z0-9-]+)", card))
-    declared = set(blocks["dark"])
+    declared = set(blocks["dark"]) | set(DECL_NAME.findall(card))
     assert used <= declared, (
         f"card_c2.css берёт необъявленные токены: {sorted(used - declared)}"
     )

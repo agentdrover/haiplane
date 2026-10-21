@@ -29,6 +29,27 @@
 {% endif %}
 {% endmacro %}
 
+{% macro timeline_item(u) %}
+                    <article class="task-timeline-item task-timeline-{{ u.kind }}">
+                        <div class="task-timeline-marker"></div>
+                        <div class="task-timeline-body">
+                            <div class="task-timeline-meta">
+                                <span class="badge badge--xs badge-{{ u.kind }}">{{ u.kind }}</span>
+                                {% if u.agent %}<span>{{ u.agent }}</span>{% endif %}
+                                {# Authorship next to the display name (#559):
+                                   the name is whatever the client sent, the
+                                   principal is the fact. #}
+                                {% if u.principal_id %}<span class="badge badge--xs" title="Записано аутентифицированным принципалом">principal #{{ u.principal_id }}</span>
+                                {% elif u.author_kind == 'hub' %}<span class="badge badge--xs" title="Запись сделал сам хаб — принципала нет по природе">hub</span>
+                                {% elif u.author_kind == 'anonymous' %}<span class="badge badge--xs" title="Запрос без аутентификации — принципал неизвестен">без принципала</span>
+                                {% elif u.author_kind == 'legacy' %}<span class="badge badge--xs" title="Записано до появления поля авторства">до учёта авторства</span>{% endif %}
+                                <time>{{ u.created_at }}</time>
+                            </div>
+                            <div class="task-timeline-content u-pre-wrap">{{ u.content }}</div>
+                        </div>
+                    </article>
+{% endmacro %}
+
 <article class="task-detail-page">
     {% if task.breadcrumb %}
     <nav class="breadcrumb task-detail-breadcrumb">
@@ -82,12 +103,16 @@
     </div>
     {% endif %}
 
+    {% include "partials/card_c2.html" %}
+
+    <details class="c2-details" id="card-details" data-c2-section="details">
+    <summary>Подробности</summary>
     <div class="task-detail-layout">
         <main class="task-detail-main">
             {% if task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
             {% include "partials/task_verdict_replace.html" %}
             {% endif %}
-            {% if brief_failure and not review_board %}<div class="task-action-note task-action-note--warning" id="brief-failure">бриф не собран: {{ brief_failure }}</div>{% endif %}{% if decision_brief %}{% include "partials/decision_brief.html" %}{% endif %}{% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
+            {% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
             {% include "partials/task_review_board.html" %}
 
             <section class="task-content-card task-statement">
@@ -393,28 +418,23 @@
                     {% if task.updates %}<span class="section-count">{{ task.updates | length }}</span>{% endif %}
                 </div>
                 {% if task.updates %}
+                {# #1812: новые сверху; последние 3 видны, остальное в «вся лента». #}
+                {% set feed = task.updates | reverse | list %}
                 <div class="task-timeline">
-                    {% for u in task.updates %}
-                    <article class="task-timeline-item task-timeline-{{ u.kind }}">
-                        <div class="task-timeline-marker"></div>
-                        <div class="task-timeline-body">
-                            <div class="task-timeline-meta">
-                                <span class="badge badge--xs badge-{{ u.kind }}">{{ u.kind }}</span>
-                                {% if u.agent %}<span>{{ u.agent }}</span>{% endif %}
-                                {# Authorship next to the display name (#559):
-                                   the name is whatever the client sent, the
-                                   principal is the fact. #}
-                                {% if u.principal_id %}<span class="badge badge--xs" title="Записано аутентифицированным принципалом">principal #{{ u.principal_id }}</span>
-                                {% elif u.author_kind == 'hub' %}<span class="badge badge--xs" title="Запись сделал сам хаб — принципала нет по природе">hub</span>
-                                {% elif u.author_kind == 'anonymous' %}<span class="badge badge--xs" title="Запрос без аутентификации — принципал неизвестен">без принципала</span>
-                                {% elif u.author_kind == 'legacy' %}<span class="badge badge--xs" title="Записано до появления поля авторства">до учёта авторства</span>{% endif %}
-                                <time>{{ u.created_at }}</time>
-                            </div>
-                            <div class="task-timeline-content u-pre-wrap">{{ u.content }}</div>
-                        </div>
-                    </article>
+                    {% for u in feed[:3] %}
+                    {{ timeline_item(u) }}
                     {% endfor %}
                 </div>
+                {% if feed | length > 3 %}
+                <details class="c2-feed-all" id="task-feed-all">
+                    <summary>Вся лента ({{ feed | length }})</summary>
+                    <div class="task-timeline">
+                        {% for u in feed[3:] %}
+                    {{ timeline_item(u) }}
+                        {% endfor %}
+                    </div>
+                </details>
+                {% endif %}
                 {% else %}
                 <div class="empty empty-sm">
                     <div class="empty-text">No updates yet</div>
@@ -583,7 +603,7 @@
 
         <aside class="task-detail-sidebar">
             {% if not review_board %}
-            <section class="task-sidebar-card task-actions-card">
+            <section class="task-sidebar-card task-actions-card" id="task-controls">
                 <div class="task-sidebar-title">Task Controls</div>
 
                 {% if implementer_error %}
@@ -1048,5 +1068,7 @@
             </nav>
         </aside>
     </div>
+    </details>
 </article>
+{% include "partials/card_c2_script.html" %}
 {% endblock %}

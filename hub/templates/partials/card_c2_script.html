@@ -1,0 +1,23 @@
+{# #1812: «Подробности» свёрнуты на телефоне и планшете, на широком экране
+   открыты (двухколоночная раскладка цела). Переход по якорю к форме внутри
+   свёрнутого блока раскрывает его: без этого «К действию» вело бы в пустоту. #}
+<script>
+(function () {
+    var box = document.getElementById("card-details");
+    if (!box) { return; }
+    function openFor(hash) {
+        var target = hash && hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
+        for (var el = target; el; el = el.parentElement) {
+            if (el.tagName === "DETAILS") { el.open = true; }
+        }
+        if (target) { target.scrollIntoView(); }
+    }
+    if (window.matchMedia && window.matchMedia("(min-width: 1101px)").matches) { box.open = true; }
+    window.addEventListener("hashchange", function () { openFor(location.hash); });
+    document.addEventListener("click", function (e) {
+        var link = e.target.closest ? e.target.closest("a.c2-btn") : null;
+        if (link) { openFor(link.getAttribute("href")); e.preventDefault(); }
+    });
+    openFor(location.hash);
+})();
+</script>
