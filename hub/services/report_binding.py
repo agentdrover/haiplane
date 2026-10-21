@@ -30,7 +30,6 @@ from hub.services import chat_pair
 async def bind_code_to_dispatch(
     db: aiosqlite.Connection,
     access_code: str,
-    *,
     dispatch_id: int,
     task_id: int,
     generation: int,
@@ -253,3 +252,29 @@ async def dispatch_id_of_code(
         (code_id, code_id),
     )
     return int(rows[0]["dispatch_id"]) if rows else None
+
+
+async def reports_of_attempt(
+    db: aiosqlite.Connection, task_id: int, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Отчёты попытки второй оси по её событию: привязанные к заказу (или его замене)
+    второй дверью, иначе непривязанные после ``after_review_id`` от принципалов
+    заказа (#1946). Первый - ответ попытки; пусто - ещё нет."""
+    from hub import repository as repo
+
+    own_id = payload.get("dispatch_id")
+    principals, chain = await order_chain(db, int(own_id)) if own_id else (None, set())
+    reports = [
+        dict(r)
+        for r in await repo.machine_reviews_of_generation(
+            db, task_id, int(payload.get("generation") or 0)
+        )
+    ]
+    after = int(payload.get("after_review_id") or 0)
+    return [r for r in reports if r.get("dispatch_id") in chain] or [
+        r
+        for r in reports
+        if int(r["id"]) > after
+        and r.get("dispatch_id") is None
+        and (principals is None or r.get("principal_id") in principals)
+    ]

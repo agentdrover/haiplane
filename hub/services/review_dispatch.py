@@ -2581,7 +2581,6 @@ async def _record_top_up(
     task_id: int,
     generation: int,
     report: Mapping[str, Any],
-    *,
     kind: str = ladder_attempts.KIND_TOP_UP,
     model: str = "",
 ) -> int:
@@ -2613,7 +2612,6 @@ async def _close_top_up(
     task_id: int,
     generation: int,
     report: Mapping[str, Any],
-    *,
     placed: bool,
     attempt_id: int,
     reason: str = "",
@@ -2759,16 +2757,9 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     attempt_id = await _record_top_up(db, task_id, generation, report)
     feed_mark = await _last_update_id(db, task_id)
     dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    why = "" if dispatched else await _refusal_reason_since(db, task_id, feed_mark)
     await _close_top_up(
-        db,
-        task_id,
-        generation,
-        report,
-        placed=bool(dispatched),
-        attempt_id=attempt_id,
-        reason=""
-        if dispatched
-        else await _refusal_reason_since(db, task_id, feed_mark),
+        db, task_id, generation, report, bool(dispatched), attempt_id, why
     )
     if not dispatched and not await _refused_by_name_since(db, task_id, feed_mark):
         # maybe_dispatch_review already alerted when policy asked and the call
@@ -3020,12 +3011,7 @@ async def _ask_a_stronger_model(
     # второй двери коммитится там раньше возврата, и упавший вызов не должен
     # оставить заказ без записи, ради которой его ждут (#1925).
     attempt_id = await _record_top_up(
-        db,
-        task_id,
-        generation,
-        report,
-        kind=ladder_attempts.KIND_SECOND_AXIS,
-        model=model,
+        db, task_id, generation, report, ladder_attempts.KIND_SECOND_AXIS, model
     )
     feed_mark = await _last_update_id(db, task_id)
     if not await maybe_dispatch_review(
@@ -3115,27 +3101,7 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
     неполной — по отчёту, который её и купил.
     """
     payload = json.loads(event.get("payload") or "{}")
-    after = int(payload.get("after_review_id") or 0)
-    own_id = payload.get("dispatch_id")
-    # #1946: отчёт, привязанный к заказу попытки (или к его замене второй
-    # дверью), и есть её отчёт; чужой привязанный в догадку по порядку не попадает.
-    principals, chain = (
-        await report_binding.order_chain(db, int(own_id)) if own_id else (None, set())
-    )
-    reports = [
-        dict(r)
-        for r in await repo.machine_reviews_of_generation(
-            db, int(event["task_id"]), int(payload.get("generation") or 0)
-        )
-    ]
-    later = [r for r in reports if r.get("dispatch_id") in chain]
-    later = later or [
-        r
-        for r in reports
-        if int(r["id"]) > after
-        and r.get("dispatch_id") is None
-        and (principals is None or r.get("principal_id") in principals)
-    ]
+    later = await report_binding.reports_of_attempt(db, int(event["task_id"]), payload)
     if not later:
         return "pending"
     return "incomplete" if later[0].get("incomplete") else "complete"
@@ -4842,15 +4808,9 @@ async def maybe_dispatch_review(
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
     )
-    # #1946: код ревьюера выписан до строки заказа - привязываем его (и сессию,
-    # которую агент успел выкупить) к заказу в той же транзакции.
+    # #1946: код выписан до строки заказа - привязать его к заказу.
     await report_binding.bind_code_to_dispatch(
-        db,
-        order.access_code,
-        dispatch_id=placed_id,
-        task_id=task_id,
-        generation=generation,
-        principal_id=expected_principal,
+        db, order.access_code, placed_id, task_id, generation, expected_principal
     )
     # #1399: строка заказа и снятие брони — одна транзакция (коммит ниже).
     await _release_the_order(
@@ -4978,14 +4938,9 @@ async def _owe_the_refused_call(
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=only_tests,
     )
-    # #1946: агент мог всё же появиться (#1408) - его код отвечает этой заглушке.
+    # #1946: агент мог появиться (#1408) - его код отвечает заглушке.
     await report_binding.bind_code_to_dispatch(
-        db,
-        access_code,
-        dispatch_id=stub_id,
-        task_id=task_id,
-        generation=generation,
-        principal_id=principal_id,
+        db, access_code, stub_id, task_id, generation, principal_id
     )
     await repo.owe_second_door(db, stub_id, detail)
     await db.commit()
@@ -5013,8 +4968,7 @@ async def _owe_the_refused_call(
     # #1252 уточнено этим: локального прогона по-прежнему нет, строка —
     # облачная и ничего не стоившая.
     if opened:
-        # #1946: на заглушку указывает код облачного ревьюера - поздний отчёт
-        # агента, всё же созданного, должен найти заказ; строка остаётся закрытой.
+        # #1946: на заглушку указывает код - поздний отчёт найдёт заказ.
         if not await report_binding.is_addressed(db, stub["id"]):
             await repo.delete_review_dispatch(db, stub["id"])
         await db.commit()
@@ -5612,13 +5566,8 @@ async def _insert_local_dispatch(
             second_door_reason=why,
             only_tests=order.only_tests,
         )
-        await report_binding.bind_code_to_dispatch(  # #1946
-            db,
-            order.access_code,
-            dispatch_id=dispatch_id,
-            task_id=task_id,
-            generation=generation,
-            principal_id=principal_id,
+        await report_binding.bind_code_to_dispatch(
+            db, order.access_code, dispatch_id, task_id, generation, principal_id
         )
         await repo.add_task_update(
             db,
@@ -6196,12 +6145,7 @@ async def _prompt_at_slot(
             return prompt
         if dispatch_id is not None:  # #1946: свежий код - тому же заказу
             await report_binding.bind_code_to_dispatch(
-                target,
-                fresh,
-                dispatch_id=dispatch_id,
-                task_id=task_id,
-                generation=generation,
-                principal_id=principal_id,
+                target, fresh, dispatch_id, task_id, generation, principal_id
             )
             await target.commit()
         return prompt.replace(stale, _delivery_block(task_id, fresh, hub_base), 1)
@@ -6494,8 +6438,7 @@ async def _dispatch_report(
         dict(r)
         for r in await repo.machine_reviews_of_generation(db, task_id, generation)
     ]
-    # #1946: отчёт, привязанный к этому заказу по коду сессии, отвечает ему и
-    # никому другому; порядок ступеней ниже — только для отчётов без привязки.
+    # #1946: привязанный отчёт отвечает своему заказу; ступени - для непривязанных.
     for report in reports:
         if dispatch is not None and report.get("dispatch_id") == dispatch.get("id"):
             return report
@@ -6544,7 +6487,6 @@ async def _dispatch_report(
         "AND channel = ? AND id NOT IN (SELECT replaces_dispatch_id "
         "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
         "AND channel = ? AND replaces_dispatch_id IS NOT NULL) "
-        # #1946: сохранённая заглушка (без агента) с любой заменой ступень не занимает
         "AND NOT (agent_id = '' AND id IN (SELECT replaces_dispatch_id "
         "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
         "AND replaces_dispatch_id IS NOT NULL)) ORDER BY id",
