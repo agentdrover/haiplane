@@ -201,6 +201,28 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 - Signatures: `ci_trust.trust_of(report, current_fp)`, `is_verified(report, current_fp)`, `can_testify_pass(report, current_fp)`, `green_gap(report, contract)`, `ci_green_proof.proof_gap(report, ac_rows, sha, contract)`, `check_attempt(row, gh_args, contract)`; forge `ci_runs_for_sha(head_sha, ..., workflow_path=".github/workflows/ci.yml")`. The REST/CLI/MCP surfaces carry no new field: the fingerprint is seen in `effective-policy` only.
 - Sender: `scripts/ci_trusted_report.py` reports the workflow named by `HAIPLANE_CI_WORKFLOW_PATH` (set by the default-branch sender workflow through the `workflow-path` input of `.github/actions/hub-ci-send`), else `ci.yml`. Templates: `hub/workflow_templates/satellite-ci-producer.yml` (branch code, read key only) and `satellite-ci-report.yml` (`workflow_run`, environment `hub-report`); rendered by `hub.services.satellite_ci`. Setup, rollback and the acceptance evidence: `docs/satellite-ci-report.md`.
 
+### Executor autonomy in practice metrics (#1980)
+
+`GET /api/metrics/practices` (also `oc-hub practice-metrics --json`, `hub_practice_metrics` `metrics`) carries `executor_autonomy`, JSON only (no text summary, no new argument). Code: `hub/services/executor_autonomy.py`; the section is in `MODEL_INDEPENDENT` (window and project apply, the reviewer-model filter does not), not in `UNFILTERED`.
+
+```json
+"executor_autonomy": {
+  "target": 0.9,
+  "definition": "autonomous = report_outcome 'submitted' AND close_reason 'submitted' ...",
+  "hosts": {"k8": {"weeks": [
+    {"week": "2026-W43", "start": "2026-10-19", "partial": false,
+     "orders_closed": 5, "autonomous": 2, "rate": 0.4,
+     "by_outcome": {"submitted": 3, "rescued": 1, "failed": 1},
+     "by_reason_code": {"agent_failed": 2, "unknown": 1}}
+  ]}}
+}
+```
+
+- Sample: `executor_orders` with `state='closed'` and `closed_at` not NULL, windowed and project-scoped by `scope.where("o.closed_at", task_column="o.task_id")` (project comes from the epic). One host = one key; hosts are never mixed. The unit is an order, not a task.
+- `autonomous` = `report_outcome='submitted'` AND `close_reason='submitted'`. It is a PROXY for "without a human", not proof. A late report (`reported_at` after `closed_at`) recounts the week of closing, so a past week can change.
+- Weeks are ISO (Monday), UTC; the key carries the ISO year (`2026-W53`, `2027-W01`). Every week of the window is present, zero weeks with `orders_closed=0` and `rate=null`; the edge weeks cut by the window are `partial=true`. A window longer than 104 weeks starts at the first closed order. `rate` is rounded to 3 digits.
+- `by_outcome` covers all orders (empty `report_outcome` = `none`); `by_reason_code` only the non-autonomous ones (empty = `unknown`), no truncation, order: count descending, then code.
+
 ## Contract-Smell Checklist
 
 - Does the same concept have different names across API, CLI, MCP, and DB?

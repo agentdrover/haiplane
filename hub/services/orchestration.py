@@ -60,7 +60,7 @@ from hub.integrations.protocols import (
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
-from hub.services.ci_timing import ci_minutes_metrics
+from hub.services.executor_autonomy import statistics_sections
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
@@ -1224,8 +1224,8 @@ async def practice_metrics(
         date_to=date_to,
     )
     result = await _practice_sections(db, scope)
-    # #1700: minutes of CI per task and class; statistics, outside compare/series.
-    result["ci_minutes"] = await ci_minutes_metrics(db, scope)
+    # #1700 ci_minutes, #1980 executor_autonomy: statistics outside compare/series.
+    result.update(await statistics_sections(db, scope))
     # #1621: always present — a 30-day number read as 14 days of events is the
     # silent case, and it has no flag that would announce it.
     result["events_history"] = events_history(
