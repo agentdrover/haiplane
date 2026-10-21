@@ -21,6 +21,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
+from hub.services import memory_wait
 
 PHASES: Final[tuple[str, ...]] = (
     "vm_starting",
@@ -71,6 +72,8 @@ CLOSE_REASON_TEXT: Final[dict[str, str]] = {
     "redeem_lost": "Ответ на выкуп потерян, запуск не восстановлен",
     "reported_failed": "Прогон на хосте упал",
     "reported_rescued": "Хост спас работу в отдельную ветку",
+    memory_wait.CLOSE_TIMEOUT: "Хост не дождался памяти: ожидание длилось "
+    f"{memory_wait.MEMORY_WAIT_MAX_HOURS} ч, заказ закрыт",
 }
 _UNKNOWN_CLOSE = "Заказ закрыт"
 
@@ -111,11 +114,23 @@ def close_text(order: dict[str, Any], reason: str) -> str:
 
 
 async def record_phase(
-    db: aiosqlite.Connection, host: str, order_id: int, phase: str
+    db: aiosqlite.Connection,
+    host: str,
+    order_id: int,
+    phase: str,
+    *,
+    need_mib: Any = None,
+    free_mib: Any = None,
 ) -> dict[str, Any]:
-    """Фаза хоста: только свой фактически выкупленный незакрытый заказ без report."""
+    """Фаза хоста: только свой фактически выкупленный незакрытый заказ без report.
+
+    ``waiting_memory`` (#1972) - единственная фаза ДО выкупа: её принимает
+    ``memory_wait``, а колонка ``phase`` остаётся пустой.
+    """
     from hub.services.executor_orders import STATE_REDEEMED, HostError, _own_order
 
+    if phase == memory_wait.PHASE_WAITING_MEMORY:
+        return await memory_wait.record_waiting(db, host, order_id, need_mib, free_mib)
     if phase not in PHASES:
         raise HostError(422, f"phase: одна из {', '.join(PHASES)}")
     async with write_transaction(db):
@@ -193,7 +208,12 @@ async def _slot_plaque(
     ]
     if outcome and saved and not landed:
         outcome = f"{outcome} ({', '.join(saved)})"
-    if state in ("pending", "delivered"):
+    if state == memory_wait.STATE_WAITING_MEMORY:
+        # #1972: ожидание памяти до выкупа - не «код выкуплен»; строку собирает memory_wait.
+        headline = f"Заказ #{number}: {memory_wait.line(host, order)}"
+        step = "ждёт памяти"
+        steps.insert(2, _step("ждёт памяти", order["waiting_since"], True))
+    elif state in ("pending", "delivered"):
         headline = f"Заказ #{number} создан, ждёт {host}"
         step = "отправлен хосту" if state == "delivered" else "создан, ждёт хоста"
     elif not active:
