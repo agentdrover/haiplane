@@ -220,6 +220,7 @@ async def _dispatch_of_report(
     generation: int,
     principal_id: int | None,
     claimed_id: int | None,
+    code_id: int | None = None,
 ) -> tuple[Any, int | None]:
     """Заказ отчёта: (строка заказа, id привязки) (#1946).
 
@@ -229,6 +230,8 @@ async def _dispatch_of_report(
     поколения, привязки нет. Сбой чтения заказа НЕ выдаётся за «заказа нет»:
     он поднимается, а не отдаёт отчёт чужому заказу с чужим профилем.
     """
+    if claimed_id is None:  # личность прочитана до привязки кода (#1946)
+        claimed_id = await report_binding.dispatch_id_of_code(db, code_id)
     accepted = await report_binding.accepted_dispatch(
         db, task_id, generation, principal_id, claimed_id
     )
@@ -318,7 +321,7 @@ async def record_machine_review(
     # #750 showed to be worthless. No dispatch behind the report leaves the
     # profile empty, which reads as "unknown", not as "cheap".
     dispatch, bound_id = await _dispatch_of_report(
-        db, task_id, generation, principal_id, dispatch_id
+        db, task_id, generation, principal_id, dispatch_id, code_id
     )
     if dispatch is None and principal_id is not None:
         # #1408: заказ записан отказом, а его ревьюер отчитался — заказ был.

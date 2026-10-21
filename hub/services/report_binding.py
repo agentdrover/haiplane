@@ -234,3 +234,20 @@ async def reopen_order_of_report(db: aiosqlite.Connection, review_id: int) -> No
     bound = await dispatch_of_report(db, review_id)
     if bound is not None:
         await reopen_if_refused(db, bound)
+
+
+async def dispatch_id_of_code(
+    db: aiosqlite.Connection, code_id: int | None
+) -> int | None:
+    """Заказ, к которому привязан код (или его сессия, если код уже вычищен)."""
+    if code_id is None:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT dispatch_id FROM chat_pair_codes WHERE id = ? "
+        "AND dispatch_id IS NOT NULL UNION ALL "
+        "SELECT dispatch_id FROM chat_pair_sessions WHERE code_id = ? "
+        "AND dispatch_id IS NOT NULL LIMIT 1",
+        (code_id, code_id),
+    )
+    return int(rows[0]["dispatch_id"]) if rows else None
