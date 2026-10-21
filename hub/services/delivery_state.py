@@ -370,11 +370,18 @@ async def git_delivery_state(check: _GitCheck, *, fetch: bool = True) -> dict[st
     try:
         return await _decide_with_git(check, fetch=fetch)
     except OSError as exc:
-        log.warning("delivery state for #%s: git unavailable: %s", check.task_id, exc)
+        # The path stays in the server log: the reason reaches HTML, REST and
+        # the CLI, and a server path is no business of theirs.
+        log.warning(
+            "delivery state for #%s: git unavailable in %s: %s",
+            check.task_id,
+            check.workspace,
+            exc,
+        )
         return _answer(
             UNKNOWN,
             "репозиторий проекта недоступен на хосте хаба "
-            f"({check.workspace}: {exc.__class__.__name__}) — сверить с выкатом "
+            f"({exc.__class__.__name__}) — сверить с выкатом "
             "нечем. Это не «не раскатано»",
             **check.known,
         )

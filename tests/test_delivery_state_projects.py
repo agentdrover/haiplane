@@ -353,6 +353,9 @@ async def test_missing_project_workspace_is_unknown_not_an_exception(
 
     assert answer["state"] == UNKNOWN, answer
     assert "недоступен на хосте хаба" in answer["reason"]
+    # The server path stays in the log, not in the public reason (#1927 r3).
+    assert str(tmp_path) not in answer["reason"]
+    assert "no-such-dir" not in answer["reason"]
 
 
 async def test_snapshot_survives_one_project_without_a_directory(
