@@ -60,6 +60,16 @@ from hub.services import review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
+from hub.services.review_ac_inputs import ac_inputs
+from hub.services.review_oversized import (
+    UNREAD_PREFIX,
+    AcTestSpan,
+    ac_test_refs as task_ac_test_refs,
+    ac_test_spans,
+    fit_with_ac_cutouts,
+    first_block,
+    oversized_paragraph,
+)
 from hub.services.result_kind import automation_not_applicable
 from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -370,20 +380,29 @@ def fit_file_sections(
 
 
 def _inline_diff_lines(
-    diff: str, dropped: list[str], delta_paths: list[str] | None, ceiling: int
+    diff: str,
+    dropped: list[str],
+    delta_paths: list[str] | None,
+    ceiling: int,
+    ac_spans: list[AcTestSpan] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Блок ``(lines, omitted)``: текст диффа для ревьюера без клона (#1582).
 
     Выбор файлов — тот же, что у команды: без сгенерированных (``dropped``) и,
     на пересдаче, только дельта. Остальное решает потолок.
+
+    ``ac_spans`` (#1933) — тесты AC задачи в диффе. Файл, что не влез, всё равно
+    даёт ревьюеру функции этих тестов вырезкой по остатку потолка; вырезка, что
+    не влезла, названа непрочитанным тестом AC.
     """
+    every = diff_file_sections(diff)
     sections = [
         (path, text)
-        for path, text in diff_file_sections(diff)
+        for path, text in every
         if not path
         or (path not in dropped and (not delta_paths or path in delta_paths))
     ]
-    text, omitted = fit_file_sections(sections, ceiling)
+    text, omitted, cuts, unread = fit_with_ac_cutouts(sections, ceiling, ac_spans or [])
     lines = []
     if omitted:
         lines.append(
@@ -392,6 +411,15 @@ def _inline_diff_lines(
             "их негде: назови их в lost_dimensions и сдай incomplete=true — "
             "ноль находок по ним значит «не проверено», а не «чисто»."
         )
+    if unread:
+        lines.append(
+            "ТЕСТЫ AC, КОТОРЫХ У ТЕБЯ НЕТ (вырезка не влезла в потолок): "
+            + "; ".join(unread)
+            + ". Каждый назови отдельной строкой lost_dimensions: "
+            + "; ".join(f"«{UNREAD_PREFIX}{ref}»" for ref in unread)
+            + " и сдай incomplete=true."
+        )
+    lines.extend(c.rstrip("\n") for c in cuts)  # разделитель join = их \n
     lines.append("=== ДИФФ (приложен хабом) ===\n" + text + "=== КОНЕЦ ДИФФА ===")
     return lines, omitted
 
@@ -736,6 +764,46 @@ async def _split_by_origin(
     )
 
 
+def _plan_oversized(
+    kept: str,
+    lines: list[str],
+    ac_test_refs: list[str] | None,
+    pinned_diff: str | None = None,
+    ac_sources: Mapping[str, str | None] | None = None,
+    ac_block: bool = False,
+    pin_sha: str = "",
+    inline: bool = False,
+) -> tuple[list[tuple[str, int]], list[AcTestSpan]]:
+    """Файлы выше потолка и тесты AC в них; дописывает блок и абзац в ``lines`` (#1933).
+
+    Блок «ЧИТАТЬ ПЕРВЫМИ» встаёт в начало, раньше команды и текста диффа.
+    ``ac_block`` — закреплённый sha не прочитан: блок обязателен, даже если ветка
+    файла выше потолка не показывает, и говорит «неизвестно».
+    ``pinned_diff`` — дифф на закреплённом sha сдачи (облако; у локального
+    заказа ``kept`` уже он): если он есть, oversized считается по нему, как и
+    диапазоны, — один источник, а не ветка и sha вперемешку. Диапазоны берутся
+    из файлов на том же sha (``ac_sources``); не прочитан — «не найден», а не
+    откат на ветку.
+    """
+    # Закреплённый дифф не прочитан (ac_block): размеры ветки - не размеры коммита
+    # сдачи, на ветку не откатываемся.
+    basis = kept if pinned_diff is None else split_generated(pinned_diff)[0]
+    basis = "" if ac_block and pinned_diff is None else basis
+    oversized = [
+        (path, count)
+        for path, count in file_line_counts(basis)
+        if count > REVIEW_FILE_LINE_CAP
+    ]
+    if not oversized and not ac_block:
+        return oversized, []
+    spans = ac_test_spans(ac_sources, ac_test_refs or []) if ac_test_refs else []
+    if spans:
+        lines.insert(0, first_block(spans, pin_sha, inline))
+    if oversized:
+        lines.append(oversized_paragraph(oversized, bool(spans), REVIEW_FILE_LINE_CAP))
+    return oversized, spans
+
+
 def diff_plan(
     diff: str | None,
     base: str,
@@ -747,6 +815,11 @@ def diff_plan(
     deferred_findings: list[str] | None = None,
     inline_ceiling: int | None = None,
     snapshot_ok: bool = False,
+    ac_test_refs: list[str] | None = None,
+    pinned_diff: str | None = None,
+    ac_sources: Mapping[str, str | None] | None = None,
+    ac_block: bool = False,
+    pin_sha: str = "",
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -774,6 +847,12 @@ def diff_plan(
 
     ``snapshot_ok`` (#1599) — у ревьюера есть снимок исходников на sha сдачи:
     «исходников на машине не ищи» тогда неверно, и фраза называет снимок.
+
+    ``ac_test_refs`` (#1933) — ``test_ref`` AC задачи (с ``pinned_diff`` и
+    ``ac_sources`` на закреплённом sha). При файле выше потолка
+    блок «ЧИТАТЬ ПЕРВЫМИ» с диапазонами их функций стоит РАНЬШЕ команды и
+    текста диффа. Диапазоны ищутся в полном ``kept``-диффе, как и сам
+    oversized, — на дельта-поколении тоже.
     """
     if diff is None and inline_ceiling is not None:
         return (
@@ -784,12 +863,17 @@ def diff_plan(
             "дифф не прочитан, в промт не приложен",
         )
     if diff is None:
-        return (
+        # Дифф ветки не прочитан, а закреплённый sha мог прочитаться (или не
+        # прочитаться): блок тестов AC (#1933) от диффа ветки не зависит.
+        lines = [
             f"ПРЕДМЕТ РЕВЬЮ: дифф {base}...{branch}. Прочитать его хабу не "
             "удалось, поэтому список исключений не составлен — читай дифф "
-            "целиком и сам реши, что в нём сгенерировано.",
-            "дифф не прочитан, исключения не составлены",
+            "целиком и сам реши, что в нём сгенерировано."
+        ]
+        _plan_oversized(
+            "", lines, ac_test_refs, pinned_diff, ac_sources, ac_block, pin_sha
         )
+        return "\n".join(lines), "дифф не прочитан, исключения не составлены"
     kept, dropped = split_generated(diff)
     excludes = "".join(f" ':(exclude){path}'" for path in dropped)
     scope = "".join(f" '{path}'" for path in (delta_paths or []))
@@ -852,23 +936,21 @@ def diff_plan(
             "Исключены как сгенерированные (их никто не писал и не будет "
             f"править): {', '.join(dropped)}."
         )
-    oversized = [
-        (path, count)
-        for path, count in file_line_counts(kept)
-        if count > REVIEW_FILE_LINE_CAP
-    ]
-    if oversized:
-        named = ", ".join(f"{path} ({count} строк)" for path, count in oversized)
-        lines.append(
-            f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {REVIEW_FILE_LINE_CAP} "
-            f"строк на файл): {named}. Прочитай сколько успеешь, остальные "
-            "файлы всё равно прочитай, а непрочитанный остаток перечисли в "
-            "lost_dimensions и сдай incomplete=true. Один большой файл не "
-            "имеет права съесть бюджет, которого ждали остальные."
-        )
+    oversized, spans = _plan_oversized(
+        kept,
+        lines,
+        ac_test_refs,
+        pinned_diff,
+        ac_sources,
+        ac_block,
+        pin_sha,
+        inline_ceiling is not None,
+    )
     note_bits = []
     if inline_ceiling is not None:
-        inline, omitted = _inline_diff_lines(diff, dropped, delta_paths, inline_ceiling)
+        inline, omitted = _inline_diff_lines(
+            diff, dropped, delta_paths, inline_ceiling, spans
+        )
         lines.extend(inline)
         note_bits.append(
             "дифф приложен к промту"
@@ -3844,6 +3926,13 @@ async def prepare_review_order(
     prior, deferred = await previous_findings(db, task_id, generation)
     plan_diff, plan_branch = await _subject_diff(db, task, branch, diff, inline_diff)
     snapshot = await _order_snapshot(task, ctx, branch) if inline_diff else None
+    # #1933: тесты AC задачи — ревьюеру о них говорится раньше диффа.
+    ac_refs = task_ac_test_refs(
+        [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
+    )
+    pinned, ac_sources, ac_block = await ac_inputs(
+        db, task, ctx, ac_refs, plan_diff, inline_diff
+    )
     diff_block, diff_note = diff_plan(
         plan_diff,
         base,
@@ -3855,6 +3944,11 @@ async def prepare_review_order(
         deferred,
         config.LOCAL_REVIEW_DIFF_CHAR_CEILING if inline_diff else None,
         snapshot_ok=snapshot is not None and snapshot.state == "ok",
+        ac_test_refs=ac_refs,
+        pinned_diff=pinned,
+        ac_sources=ac_sources,
+        ac_block=ac_block,
+        pin_sha=(task.get("submission_sha") or "").strip(),
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.

@@ -31,6 +31,11 @@ _clean_limiter = _eo._clean_limiter
 _no_cloud = _eo._no_cloud
 
 
+#: Запись разбора (#1942, тень) - не итоговая запись закрытия: эти тесты считают
+#: именно итоговые записи, поэтому разбор из подсчёта исключён.
+_NOT_TRIAGE = "content NOT LIKE 'Разбор прогона k8 (тень%'"
+
+
 async def _cookie(world):
     session = await admin_svc.create_browser_session(world.db, world.human_id)
     await world.db.commit()
@@ -146,11 +151,15 @@ async def test_outcome_table_and_single_feed_entry(world):
     oid = lived["order"]["id"]
     url = f"/api/executor-hosts/k8/orders/{oid}/report"
     body = {"outcome": "failed", "note": "упал", "reason_code": "vm_failed"}
-    feed0 = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+    feed0 = len(
+        await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE)
+    )
     first = await world.client.post(url, json=body, headers=world.k8_auth)
     assert first.status_code == 200, first.text
     await world.db.commit()
-    feed1 = await _rows(world.db, "SELECT content FROM task_updates")
+    feed1 = await _rows(
+        world.db, "SELECT content FROM task_updates WHERE " + _NOT_TRIAGE
+    )
     assert len(feed1) - feed0 == 1, [r["content"] for r in feed1[feed0:]]
     assert "vm_failed" in feed1[-1]["content"] or "ВМ" in feed1[-1]["content"]
     # Дубль — без записи; другой reason_code — 409 и причина прежняя.
@@ -162,7 +171,9 @@ async def test_outcome_table_and_single_feed_entry(world):
     assert other.status_code == 409
     row = await _order_row(world, oid)
     assert row["report_reason_code"] == "vm_failed"
-    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) == len(feed1)
+    assert len(
+        await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE)
+    ) == len(feed1)
 
     # Старый клиент без reason_code → other.
     old_task = await _task(world, "старый клиент")
@@ -188,7 +199,9 @@ async def test_outcome_table_and_single_feed_entry(world):
     )
     await world.db.commit()
     await _close(world, lid, "session_gone")
-    entries = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+    entries = len(
+        await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE)
+    )
     refined = await world.client.post(
         f"/api/executor-hosts/k8/orders/{lid}/report",
         json={"outcome": "failed", "note": "поздно", "reason_code": "timeout"},
@@ -196,7 +209,10 @@ async def test_outcome_table_and_single_feed_entry(world):
     )
     assert refined.status_code == 200, refined.text
     await world.db.commit()
-    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) == entries
+    assert (
+        len(await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE))
+        == entries
+    )
     plaque = await launch_feedback.plaque(world.db, late_task)
     assert plaque is not None and not plaque["active"]
     assert launch_feedback.reason_code_text("timeout") in plaque["outcome"]
@@ -301,7 +317,9 @@ async def test_reaper_return_writes_one_feed_entry(world):
     task_id = await _task(world, "возврат reaper")
     lived = await _launch_redeem(world, task_id)
     await _eo._claim_and_start(world, task_id, lived["session"])
-    before = len(await _rows(world.db, "SELECT 1 FROM task_updates"))
+    before = len(
+        await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE)
+    )
     await world.db.execute(
         "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 minute') "
         "WHERE bound_task_id = ?",
@@ -317,9 +335,11 @@ async def test_reaper_return_writes_one_feed_entry(world):
         "SELECT agent, content FROM task_updates WHERE content LIKE '%закрыт%' "
         "OR content LIKE '%возвращена%'",
     )
-    assert len(await _rows(world.db, "SELECT 1 FROM task_updates")) - before == 1, (
-        entries
-    )
+    assert (
+        len(await _rows(world.db, "SELECT 1 FROM task_updates WHERE " + _NOT_TRIAGE))
+        - before
+        == 1
+    ), entries
 
 
 async def test_plaque_fragment_refreshes_page_when_launch_ends(world):
@@ -381,7 +401,10 @@ async def _feed(world) -> list[str]:
     await world.db.commit()
     return [
         r["content"]
-        for r in await _rows(world.db, "SELECT content FROM task_updates ORDER BY id")
+        for r in await _rows(
+            world.db,
+            "SELECT content FROM task_updates WHERE " + _NOT_TRIAGE + " ORDER BY id",
+        )
     ]
 
 
