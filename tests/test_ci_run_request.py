@@ -13,7 +13,6 @@ ci_missing_run, задача принята решением человека и
 
 from __future__ import annotations
 
-import time
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -2139,7 +2138,15 @@ async def test_a_failed_top_save_loses_no_result_and_announces_nothing_twice(
 async def test_sql_of_the_pass_stays_inside_the_budget(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ):
-    """AC-1: 1001 пригодная задача, бюджет 20 мс - проход укладывается с допуском одной операции."""
+    """AC-1: 1001 пригодная задача, бюджет исчерпан - новые операции не начинаются.
+
+    Часы - локальные и поддельные: каждое чтение ``monotonic`` продвигает их на
+    шаг, поэтому бюджет кончается за известное число операций, а настенное время
+    теста ничего не решает.
+    """
+    from types import SimpleNamespace
+
+    from hub import repository as repository
     from hub.services import ci_head_run
 
     first = await _cloud_task(db, slug="many", branch="task-27/0")
@@ -2155,12 +2162,34 @@ async def test_sql_of_the_pass_stays_inside_the_budget(
     await db.commit()
     cur = await db.execute("SELECT COUNT(*) FROM tasks WHERE status='running'")
     assert (await cur.fetchone())[0] == 1001
+    budget, step = 10.0, 0.1
+    now = [1000.0]
+
+    def fake_monotonic() -> float:
+        now[0] += step  # время идёт только от операций
+        return now[0]
+
+    started_ops: list[int] = []
+    real_resolve = repository.resolve_project_for_task
+
+    async def counting_resolve(conn, task_id):
+        started_ops.append(task_id)
+        return await real_resolve(conn, task_id)
+
     monkeypatch.setattr(config, "CI_HEAD_RUN_TASKS_PER_CYCLE", 1000)
-    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.02)
-    started = time.monotonic()
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", budget)
+    monkeypatch.setattr(ci_head_run, "time", SimpleNamespace(monotonic=fake_monotonic))
+    monkeypatch.setattr(repository, "resolve_project_for_task", counting_resolve)
     await _cycle(db)
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.02 + 0.1, f"проход {elapsed:.3f} с при бюджете 0.02 с"
+    # Просмотр кандидатов получает SCAN_SHARE от REQUEST_SHARE бюджета, а каждая
+    # проверенная задача стоит минимум один шаг часов: больше операций начаться
+    # не могло. Без проверки остатка их было бы 1001.
+    scan_budget = budget * ci_head_run.REQUEST_SHARE * ci_head_run.SCAN_SHARE
+    limit = int(scan_budget / step) + 2
+    assert started_ops, "проход не начал ни одной операции"
+    assert len(started_ops) <= limit, (
+        f"после исчерпания бюджета начато {len(started_ops)} операций (предел {limit})"
+    )
     assert not db.in_transaction, "после прохода соединение поллера не в транзакции"
 
 

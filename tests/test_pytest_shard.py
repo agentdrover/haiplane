@@ -205,7 +205,7 @@ def test_a_bad_or_empty_shard_fails(
     # A part that keeps no file: no tests collected (5), serial and under xdist.
     owner = pytest_shard.shard_of("test_one.py", 3)
     empty = next(p for p in PARTS if p != owner)
-    for extra in ([], ["-n", "2"]):
+    for extra in ([], ["-n", "2"], ["--collect-only"]):
         _env(monkeypatch, f"{empty}/3", None)
         ret, out = _run(pytester, *extra)
         assert ret == 5, f"{extra}\n{out}"
@@ -232,3 +232,197 @@ def test_the_spec_parser_and_the_split_are_pure() -> None:
         "tests/a.py", 3
     )
     assert {pytest_shard.shard_of(f"tests/f{i}.py", 3) for i in range(60)} == {1, 2, 3}
+
+
+# --- #1987: a part does not collect the files of the other parts -------------
+
+# Every module that gets imported leaves a mark named after itself.
+_MARKING_MODULE = """
+import os
+from pathlib import Path
+
+Path(os.environ["IMPORT_MARKS"], {name!r}.replace("/", "__")).write_text("x")
+
+
+def test_it():
+    pass
+"""
+
+
+def _make_marking_suite(pytester: pytest.Pytester, names: list[str]) -> None:
+    for name in names:
+        path = pytester.path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_MARKING_MODULE.format(name=name), encoding="utf-8")
+
+
+def _passed(output: str) -> list[str]:
+    """Ids of passed tests, serial (``id PASSED``) and xdist (``PASSED id``)."""
+    serial = re.findall(r"^(\S+::\S+) PASSED", output, flags=re.MULTILINE)
+    return serial or _executed(output)
+
+
+def _marks(directory: Path) -> set[str]:
+    return {p.name.replace("__", "/") for p in directory.iterdir()}
+
+
+def test_a_part_does_not_collect_the_files_of_other_parts(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-1: only the files of the part are imported, serial and under xdist."""
+    names = [f"test_m{n:02d}.py" for n in range(12)]
+    _make_marking_suite(pytester, names)
+    owned = {p: {n for n in names if pytest_shard.shard_of(n, 3) == p} for p in PARTS}
+    assert all(owned.values()), owned  # the check below must be able to see a leak
+    for extra in ([], ["-n", "2"]):
+        for part in PARTS:
+            marks = tmp_path / f"marks-{part}-{len(extra)}"
+            marks.mkdir()
+            monkeypatch.setenv("IMPORT_MARKS", str(marks))
+            _env(monkeypatch, f"{part}/3", None)
+            ret, out = _run(pytester, *extra)
+            assert ret == 0, f"part {part} {extra}\n{out}"
+            assert _marks(marks) == owned[part], (part, extra, out)
+
+
+def test_the_hook_assigns_files_like_the_nodeid_does(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-4: directories, one basename twice, ``*_test.py``, a symlink, explicit files."""
+    names = [
+        "sub1/test_same.py",
+        "sub2/test_same.py",
+        "sub1/deep/test_deep.py",
+        "x_test.py",
+        "test_top.py",
+    ]
+    _make_marking_suite(pytester, names)
+    for package in ("sub1", "sub2", "sub1/deep"):
+        (pytester.path / package / "__init__.py").write_text("", encoding="utf-8")
+    (pytester.path / "target_impl.py").write_text(
+        _MARKING_MODULE.format(name="test_link.py"), encoding="utf-8"
+    )
+    (pytester.path / "test_link.py").symlink_to("target_impl.py")
+    everything = [*names, "test_link.py"]
+
+    # Each file runs exactly once, in the part the nodeid assigns it to - serial,
+    # under xdist, from a subdirectory of the rootdir, and with an absolute path.
+    subdir = pytester.path / "sub1" / "deep"
+    for label, extra, cwd, args in (
+        ("serial", [], pytester.path, []),
+        ("xdist", ["-n", "2"], pytester.path, []),
+        ("subdir", [], subdir, ["--rootdir", str(pytester.path), str(pytester.path)]),
+    ):
+        executed: list[str] = []
+        monkeypatch.chdir(cwd)
+        for part in PARTS:
+            marks = tmp_path / f"marks-{label}-{part}"
+            marks.mkdir()
+            monkeypatch.setenv("IMPORT_MARKS", str(marks))
+            _env(monkeypatch, f"{part}/3", None)
+            ret, out = _run(pytester, *extra, *args)
+            # An empty part is code 5; the others pass. Never anything else.
+            assert ret in (0, 5), f"{label} {part}\n{out}"
+            if label != "subdir":  # there the verbose ids are relative to the cwd
+                for nodeid in _passed(out):
+                    # The hook and the nodeid agree on whose file it is.
+                    shard = pytest_shard.shard_of(nodeid.split("::")[0], 3)
+                    assert shard == part, nodeid
+            else:  # the files that were imported are exactly the part's own
+                owned = {n for n in everything if pytest_shard.shard_of(n, 3) == part}
+                assert _marks(marks) == owned, (part, _marks(marks), owned)
+            executed += _passed(out)
+        files = sorted(n.split("::")[0] for n in executed)
+        if label == "subdir":
+            # Verbose ids are spelled relative to the starting directory here:
+            # count and uniqueness only; the marks above name the files.
+            assert len(files) == len(set(files)) == len(everything), (label, files)
+        else:
+            assert files == sorted(everything), (label, files)  # once, none lost
+    monkeypatch.chdir(pytester.path)
+
+    # A pattern with a directory: pytest's own match decides what is a test file.
+    (tmp_path / "marks-pattern").mkdir()
+    monkeypatch.setenv("IMPORT_MARKS", str(tmp_path / "marks-pattern"))
+    narrowed: list[str] = []
+    for part in PARTS:
+        _env(monkeypatch, f"{part}/3", None)
+        ret, out = _run(pytester, "-o", "python_files=sub1/test_*.py")
+        assert ret in (0, 5), out
+        narrowed += [n.split("::")[0] for n in _passed(out)]
+    assert sorted(narrowed) == ["sub1/test_same.py"], narrowed
+
+    # An explicit file of another part: imported (the hook never sees it), its
+    # items dropped, nothing runs, code 5. Same for ``file::test``.
+    foreign = next(n for n in everything if pytest_shard.shard_of(n, 3) != 1)
+    marks = tmp_path / "marks-explicit"
+    marks.mkdir()
+    monkeypatch.setenv("IMPORT_MARKS", str(marks))
+    _env(monkeypatch, "1/3", None)
+    for target in (foreign, f"{foreign}::test_it"):
+        for extra in ([], ["-n", "2"]):
+            ret, out = _run(pytester, target, *extra)
+            assert ret == 5, f"{target} {extra}\n{out}"
+            assert "PASSED" not in out, out
+    assert foreign in _marks(marks)  # imported, then dropped
+
+
+class _Config:
+    """What the hook reads from ``pytest.Config``: stash, rootpath, python_files."""
+
+    def __init__(self, rootpath: Path, spec: tuple[int, int] | None) -> None:
+        self.rootpath = rootpath
+        self.stash = {} if spec is None else {pytest_shard._STASH_KEY: spec}
+
+    def getini(self, name: str) -> list[str]:
+        assert name == "python_files"
+        return ["test_*.py", "*_test.py"]
+
+
+def test_the_hook_says_true_only_for_a_test_file_of_another_part(
+    tmp_path: Path,
+) -> None:
+    """Any doubt is None: the file is collected as before."""
+    root = tmp_path / "root"
+    (root / "dir").mkdir(parents=True)
+    own = next(
+        f"test_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"test_{n}.py", 3) == 1
+    )
+    other = next(
+        f"test_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"test_{n}.py", 3) != 1
+    )
+    helper = next(  # not a test module by name, and another part's by hash
+        f"helper_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"helper_{n}.py", 3) != 1
+    )
+    for name in (own, other, helper):
+        (root / name).write_text("", encoding="utf-8")
+    outside = tmp_path / other
+    outside.write_text("", encoding="utf-8")
+    config = _Config(root, (1, 3))
+
+    def ask(path: Path, cfg: _Config = config) -> bool | None:
+        return pytest_shard.pytest_ignore_collect(path, cfg)  # type: ignore[arg-type]
+
+    assert ask(root / other) is True  # a test file of another part
+    assert ask(root / own) is None  # its own part's file
+    assert ask(root / helper) is None  # not a test module: pytest's own match says no
+    assert ask(root / "dir") is None  # a directory
+    assert ask(root / "missing.py") is None  # not a file
+    assert ask(outside) is None  # outside the rootdir: no nodeid rule to apply
+    assert ask(root / other, _Config(root, None)) is None  # no spec: never skip
+    # A name the nodeid spells differently (backslash -> "/", "::" splits it):
+    # no answer, the late filter decides with the nodeid itself.
+    odd = root / "dir\\name"
+    odd.mkdir()
+    (odd / other).write_text("", encoding="utf-8")
+    assert ask(odd / other) is None
+    colon = root / "a::b"
+    colon.mkdir()
+    (colon / other).write_text("", encoding="utf-8")
+    assert ask(colon / other) is None

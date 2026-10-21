@@ -164,6 +164,36 @@ def _section(review: dict[str, Any], column: str) -> list[Any]:
     return parsed if isinstance(parsed, list) else []
 
 
+async def items_still_to_plan(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    open_items: list[dict[str, Any]],
+    items: list[FindingOutcomeItem],
+) -> list[FindingOutcomeItem]:
+    """Исходы повтора того же sha без уже отвеченных (#1265, #1975).
+
+    uid, уже отвеченный на ЭТОМ поколении, пропускается: повтор тела, чьи исходы
+    записал прежний такой же вызов, не становится ошибкой. uid, которого у
+    поколения нет вовсе (опечатка), остаётся в списке: ``plan_outcomes`` ответит
+    на него так же, как на обычной сдаче. Отчёты — те же, из которых собран
+    ``open_items`` (#1331): у поколения без ревью это отчёты последнего
+    поколения, где ревью было. Один код для настоящего повтора и пробной сдачи.
+    """
+    answered: set[str] = set()
+    for report in await reports_owed_an_answer(db, task_id, generation):
+        answered.update(
+            str(dict(row)["finding_uid"])
+            for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
+        )
+    open_uids = {str(found["finding_uid"]) for found in open_items}
+    return [
+        item
+        for item in items
+        if not (item.finding_uid in answered and item.finding_uid not in open_uids)
+    ]
+
+
 def plan_outcomes(
     open_items: list[dict[str, Any]], items: list[FindingOutcomeItem]
 ) -> tuple[list[tuple[dict[str, Any], FindingOutcomeItem]], list[dict[str, Any]]]:

@@ -1,7 +1,7 @@
 """Split one pytest run into N parts by test FILE (#1767).
 
-CI runs the full suite as three parallel parts (``.github/workflows/ci.yml``,
-job ``pytest``). The split lives here, in a plugin loaded only by the command of
+CI runs the full suite as parallel parts (``.github/workflows/ci.yml``,
+job ``pytest``; the number of parts is the matrix there). The split lives here, in a plugin loaded only by the command of
 a part (``-p scripts.pytest_shard``), and NOT in ``tests/conftest.py``: any
 ``pytest_collection_modifyitems`` in a conftest moves the AC locators under
 ``tests/`` to "unknown" (``hub/services/locator_worker.py``, ``_conftest_issue``).
@@ -18,6 +18,14 @@ Rules:
   silently ran nothing would be a green part with no tests.
 * A part that keeps no file collects nothing, and pytest ends with code 5
   (no tests collected), which CI treats as a failure.
+* A part does not COLLECT the test files of the other parts (#1987):
+  ``pytest_ignore_collect`` skips them before their modules are imported, which
+  is most of the cost of a part's start (every xdist worker repeats it). It does
+  not stop an import that a test of the part makes itself (a test file importing
+  a sibling), and it never runs for a file named on the command line: such a file
+  is imported and ``pytest_collection_modifyitems`` drops its items, so the part
+  ends with code 5 as before. ``pytest_collection_modifyitems`` is unchanged and
+  stays the filter for everything the hook did not skip.
 """
 
 from __future__ import annotations
@@ -25,9 +33,19 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+_matches_python_files: Callable[[Path, Iterable[str]], bool] | None
+try:  # pytest's own match of a file against ``python_files`` (same rules, #1987)
+    from _pytest.python import path_matches_patterns
+
+    _matches_python_files = path_matches_patterns
+except ImportError:  # pragma: no cover - a pytest without it: the hook stays off
+    _matches_python_files = None
 
 ENV_VAR = "HAIPLANE_TEST_SHARD"
 _SPEC = re.compile(r"^(\d+)/(\d+)$")
@@ -65,6 +83,33 @@ def _file_of(item: Any) -> str:
     return str(item.nodeid).split("::", 1)[0]
 
 
+def _in_other_part(rel_path: str, spec: tuple[int, int]) -> bool:
+    """Whether the file belongs to a part other than ``spec``: THE one rule.
+
+    Both hooks ask this, with the same kind of path (relative to the rootdir,
+    with ``/``), so they cannot assign a file differently.
+    """
+    index, total = spec
+    return shard_of(rel_path, total) != index
+
+
+def _lexical_rel_path(path: Path, rootpath: Path) -> str | None:
+    """``path`` relative to ``rootpath`` as the nodeid spells it, or None.
+
+    Lexical on purpose: no ``resolve()``, pytest keeps the path of a symlink. A
+    file outside the rootdir has its own nodeid rules, so there is no answer.
+    """
+    try:
+        rel = path.relative_to(rootpath).as_posix()
+    except ValueError:
+        return None
+    # pytest rewrites a backslash to ``/`` in a nodeid and ``::`` splits it, so
+    # for such a name the nodeid spells another path: no answer, never a guess.
+    if "\\" in rel or "::" in rel:
+        return None
+    return rel
+
+
 def pytest_configure(config: pytest.Config) -> None:
     # Runs on the controller and in every xdist worker: each one validates the
     # spec itself, so none of them can drift into running a different split.
@@ -74,13 +119,34 @@ def pytest_configure(config: pytest.Config) -> None:
         raise pytest.UsageError(f"pytest_shard: {exc}") from exc
 
 
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Skip a test file of another part before its module is imported (#1987).
+
+    True only for a file that pytest would collect as a test module
+    (``python_files``, pytest's own matcher) and that another part owns. Any
+    doubt - no spec, no matcher, a file outside the
+    rootdir, a name the nodeid spells differently, not a file - is None:
+    the file is collected as before and ``pytest_collection_modifyitems`` decides.
+    """
+    spec = config.stash.get(_STASH_KEY, None)
+    if spec is None or _matches_python_files is None:
+        return None
+    if collection_path.suffix != ".py" or not collection_path.is_file():
+        return None
+    if not _matches_python_files(collection_path, config.getini("python_files")):
+        return None
+    rel = _lexical_rel_path(collection_path, config.rootpath)
+    if rel is None:
+        return None
+    return True if _in_other_part(rel, spec) else None
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> None:
     spec = config.stash.get(_STASH_KEY, None)
     if spec is None:  # configure was skipped: fail, never run everything
         raise pytest.UsageError("pytest_shard: the shard spec was never read")
-    index, total = spec
-    kept = [i for i in items if shard_of(_file_of(i), total) == index]
-    dropped = [i for i in items if shard_of(_file_of(i), total) != index]
+    kept = [i for i in items if not _in_other_part(_file_of(i), spec)]
+    dropped = [i for i in items if _in_other_part(_file_of(i), spec)]
     if dropped:
         config.hook.pytest_deselected(items=dropped)
     items[:] = kept

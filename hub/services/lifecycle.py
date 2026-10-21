@@ -2651,6 +2651,10 @@ class SubmitContext:
     red_test_kind: str = ""
     #: #1629: запись «CI до сдачи не доказан» при warn; пусто — доказан или off.
     ci_before_alert: str = ""
+    #: #1975: пробная сдача — шаги ничего не пишут; CI-проекция вычислена, а не
+    #: прочитана из базы (``ci_computed``), гейты читают её.
+    dry_run: bool = False
+    ci_computed: Any = None
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -3135,7 +3139,9 @@ async def _step_bug_red_test(state: SubmitContext) -> None:
         return
     sha = state.submission_sha
     # #1687: the baseline counts only from a report GitHub confirmed.
-    report = await ci_trust.trusted_report(state.db, state.task_id, sha)
+    report = await ci_trust.trusted_report(
+        state.db, state.task_id, sha, state.ci_computed
+    )
     baseline = (
         red_test_gate.parse_baseline(dict(report).get("baseline"))
         if report is not None
@@ -3182,7 +3188,11 @@ async def _step_ci_before_submit(state: SubmitContext) -> None:
     if mode == RED_TEST_OFF:
         return
     sha = state.submission_sha
-    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    report = (
+        await ci_trust.report_row(state.db, state.task_id, sha, state.ci_computed)
+        if sha
+        else None
+    )
     ac_rows = [
         dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
     ]
@@ -3219,7 +3229,12 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     # tip there): the stored standing is what such a path reads, and the
     # network refresh is done by the caller BEFORE it opens the transaction.
     prepared = state.task.get(PREPARED_CI_SHA)
-    if state.submission_sha and not state.db.in_transaction:
+    if getattr(state, "dry_run", False):
+        # #1975: the same question to GitHub, answered in memory; the gates read it.
+        state.ci_computed = await ci_trust.preview_report(
+            state.db, state.task_id, state.submission_sha
+        )
+    elif state.submission_sha and not state.db.in_transaction:
         await ci_trust.refresh_quietly(state.db, state.task_id, state.submission_sha)
     elif (
         state.submission_sha
@@ -3635,23 +3650,9 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # Отчёты — те же, из которых собран open_items (#1331): у поколения
         # без ревью это отчёты последнего поколения, где ревью было. Свой
         # перебор поколения здесь развёл бы «отвечено» и «открыто».
-        already_answered: set[str] = set()
-        for report in await finding_outcome.reports_owed_an_answer(
-            db, task_id, generation
-        ):
-            already_answered.update(
-                str(dict(row)["finding_uid"])
-                for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
-            )
-        open_uids = {str(found["finding_uid"]) for found in open_items}
-        pending = [
-            item
-            for item in body.finding_outcomes
-            if not (
-                item.finding_uid in already_answered
-                and item.finding_uid not in open_uids
-            )
-        ]
+        pending = await finding_outcome.items_still_to_plan(
+            db, task_id, generation, open_items, body.finding_outcomes
+        )
         try:
             outcome_writes, still_open = finding_outcome.plan_outcomes(
                 open_items, pending

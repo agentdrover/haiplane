@@ -76,6 +76,9 @@ def executor_order_lines(task: dict[str, Any]) -> list[str]:
         return []
     if view.get("unavailable"):
         return [f"Last executor order: unavailable ({view['unavailable']})"]
+    waiting = view.get("waiting_memory")
+    if isinstance(waiting, dict) and waiting.get("line"):
+        return [f"Waiting for memory: {waiting['line']}"]  # #1972: built by the hub
     if not view.get("after_failed_run"):
         return []
     return [

@@ -66,6 +66,7 @@ MODEL_INDEPENDENT: tuple[str, ...] = (
     "review_model_cascade",
     "steward_shadow",
     "ci_minutes",
+    "executor_autonomy",
     "review_economy.deep_cap",
     "review_economy.small_delta",
     "review_economy.escapes",
@@ -167,6 +168,10 @@ class Scope:
             # "now" would add a sliver bucket to a series.
             return start, start + timedelta(days=self.window_days)
         return start, datetime.now(UTC).replace(tzinfo=None)
+
+    def bounds(self) -> tuple[datetime, datetime]:
+        """Window start and end; an open end is "now" (UTC, naive)."""
+        return self._bounds()
 
     def _length(self) -> timedelta:
         start, end = self._bounds()
