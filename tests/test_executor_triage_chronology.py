@@ -236,3 +236,110 @@ def test_current_second_is_deferred_and_ties_follow_the_rank():
         "now": now,
     }
     assert triage.classify_followup(earlier) == "split"  # прошлая секунда закрыта
+
+
+# ---------------------------------------------------------------------------
+# Круг 3: только долговечные метки в замере; unclear; граница включения
+# ---------------------------------------------------------------------------
+
+
+async def test_sweep_placement_does_not_change_the_followup_or_agreement(world):
+    """Одна последовательность (архив, снятие архива, новый заказ), свипы в разных местах."""
+
+    async def run(sweep_between: bool) -> int:
+        task_id = await _task(world, f"архив и заказ {sweep_between}")
+        first = await _fail(world, task_id, CLASS1)
+        await _rec_at(world, first, 60)
+        await _set_task(world, task_id, archived=1)
+        if sweep_between:
+            await _sweep(world)
+            await _sweep(world)
+        await _set_task(world, task_id, archived=0)
+        second = await _relaunch(world, task_id)
+        await _at(world, "executor_orders", second, "created_at", 40)
+        await _sweep(world)
+        await _sweep(world)
+        return first
+
+    between, at_end = await run(True), await run(False)
+    assert await _followup(world, between) == "new_order"
+    assert await _followup(world, at_end) == "new_order"
+    got = await triage.agreement(world.db)
+    assert (got["total"], got["matched"]) == (2, 2), got
+
+
+async def test_rejected_agent_draft_is_unclear_and_outside_the_denominator(world):
+    """Агентский ребёнок в любом статусе (в том числе отклонённый) - не split."""
+    task_id = await _task(world, "отклонённый draft")
+    await _fail(world, task_id, CLASS3)
+    await _set_task(world, task_id, status="open", claimed_by=None)
+    oid = await _fail(world, task_id, CLASS3)
+    assert await _action_of(world, oid) == "rewrite_or_split"
+    child = await repo.create_task(
+        world.db,
+        title="предложение",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=task_id,
+        priority="medium",
+    )
+    await repo.update_task(world.db, child, status="rejected")
+    await world.db.commit()
+    await _sweep(world)
+    await _sweep(world)
+    assert (
+        await _followup(world, oid) is None
+    )  # исход без долговечной метки не фиксируется
+    await _rec_at(world, oid, 73 * 60)
+    await _sweep(world)
+    await _sweep(world)
+    assert await _followup(world, oid) == "unclear"
+    got = await triage.agreement(world.db)
+    assert got["total"] == 0 and got["unclear"] == 1, got
+
+
+async def test_activation_boundary_skips_history_and_recovers_after_it(world):
+    """Заказ, закрытый до активации, рекомендации не получает; пропуск после неё - бессрочно."""
+    old_task = await _task(world, "давняя неудача")
+    old = await _fail(world, old_task, CLASS1)
+    await world.db.execute("DELETE FROM executor_triage_recommendations")
+    await world.db.execute("DELETE FROM executor_triage_state")
+    await world.db.execute(
+        "UPDATE executor_orders SET closed_at = datetime('now', '-100 hours'), "
+        "reported_at = datetime('now', '-100 hours') WHERE id = ?",
+        (old,),
+    )
+    await world.db.commit()
+    await _sweep(world)  # первый свип запоминает момент активации
+    assert await _action_of(world, old) is None
+    state = await _rows(world.db, "SELECT activated_at FROM executor_triage_state")
+    assert len(state) == 1
+
+    await world.db.execute(
+        "UPDATE executor_triage_state SET activated_at = datetime('now', '-200 hours')"
+    )
+    await world.db.execute(
+        "UPDATE executor_orders SET closed_at = datetime('now', '-300 hours') WHERE id = ?",
+        (old,),
+    )
+    await world.db.commit()
+    new_task = await _task(world, "пропуск после активации")
+    missed = await _fail(world, new_task, CLASS1)
+    await world.db.execute(
+        "DELETE FROM executor_triage_recommendations WHERE order_id = ?", (missed,)
+    )
+    await world.db.execute(
+        "UPDATE executor_orders SET closed_at = datetime('now', '-100 hours'), "
+        "reported_at = datetime('now', '-100 hours') WHERE id = ?",
+        (missed,),
+    )
+    await world.db.commit()
+    await _sweep(world)
+    assert await _action_of(world, missed) == "retry_after_status"
+    assert await _action_of(world, old) is None
