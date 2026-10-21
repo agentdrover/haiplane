@@ -95,6 +95,12 @@ def _refused(outcome, status: int = 409) -> bool:
     return isinstance(outcome, orders.HostError) and outcome.status == status
 
 
+def _reason(outcome) -> str:
+    """Слово причины отказа хосту (detail.reason); пусто, если это не HostError."""
+    detail = getattr(outcome, "detail", None)
+    return detail.get("reason", "") if isinstance(detail, dict) else ""
+
+
 async def _closed_once(world, task_id: int, order_id: int, reason: str):
     got = await row(world, order_id)
     assert got["state"] == "closed" and got["close_reason"] == reason, got
@@ -117,6 +123,7 @@ async def test_the_six_hour_limit_closes_once(world):
     task_id, order_id, code = await _at_limit(world, "k8", "порядок 1")
     alone = await wait_for_memory(world, order_id)
     assert alone.status_code == 409, alone.text  # граница: отказ и без гонки
+    assert alone.json()["detail"]["reason"] == "memory_wait_limit"
     assert (await row(world, order_id))["state"] == "waiting_memory"
     first, second = await lock_then(world, _sweep, _heartbeat(order_id))
     assert first == 1 and _refused(second), (first, second)
@@ -135,7 +142,7 @@ async def test_the_six_hour_limit_closes_once(world):
     # Выкуп на границе: отклонён в обоих порядках, код не потрачен до закрытия.
     task_id, order_id, code = await _at_limit(world, "k8", "выкуп первым")
     first, second = await lock_then(world, _redeem(order_id, code), _sweep)
-    assert _refused(first), first
+    assert _refused(first) and _reason(first) == "memory_wait_limit", first
     assert second == 1
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
     assert await _timeout_counts(world, task_id) == (1, 1, 1)
@@ -143,6 +150,7 @@ async def test_the_six_hour_limit_closes_once(world):
     task_id, order_id, code = await _at_limit(world, "k8", "sweep первым")
     first, second = await lock_then(world, _sweep, _redeem(order_id, code))
     assert first == 1 and _refused(second), (first, second)
+    assert _reason(second) == "memory_wait_limit", second  # не spent
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
     assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
@@ -308,3 +316,82 @@ async def test_limit_and_term_are_read_in_one_snapshot(world):
     assert await sweep(world) == 1
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
     assert await _timeout_counts(world, task_id) == (1, 1, 1)
+
+
+async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
+    world, monkeypatch
+):
+    """CR gen 2: граница 6 ч между первичным SELECT выкупа и UPDATE траты - memory_wait_limit, не spent."""
+    from hub.services import chat_pair
+
+    _t, order_id, code = await _waiting(world, "k8", "граница между чтением и тратой")
+    real = chat_pair._spend_code
+
+    async def crossing(db, row, **kwargs):
+        # первичный SELECT уже видел живой код; предел наступает до UPDATE траты
+        other = await hub_db.connect(world.dsn)
+        try:
+            await other.execute(
+                "UPDATE executor_orders SET waiting_since = datetime('now', '-6 hours')"
+                " WHERE id = ?",
+                (order_id,),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+        return await real(db, row, **kwargs)
+
+    monkeypatch.setattr(chat_pair, "_spend_code", crossing)
+    conn = await hub_db.connect(world.dsn)
+    try:
+        (first,) = await asyncio.gather(
+            _redeem(order_id, code)(conn), return_exceptions=True
+        )
+    finally:
+        await conn.close()
+    assert _refused(first) and _reason(first) == "memory_wait_limit", first
+    assert "spent" not in str(first.detail), first.detail
+    assert (await code_row(world, order_id))["redeemed_at"] is None  # код не потрачен
+    monkeypatch.undo()
+
+    # Код потрачен другим - по-прежнему spent; срок кода вышел - expired.
+    for how, expected in (("spent", "redeem_refused"), ("expired", "expired")):
+        task_id, other_id, code2 = await _waiting(world, "k9", f"причина {how}")
+        pair = (await row(world, other_id))["pair_code_id"]
+        real_spend = chat_pair._spend_code
+
+        async def race(db, row_, _how=how, _pair=pair, _real=real_spend, **kwargs):
+            conn = await hub_db.connect(world.dsn)
+            try:
+                if _how == "spent":
+                    await conn.execute(
+                        "UPDATE chat_pair_codes SET redeemed_at = datetime('now')"
+                        " WHERE id = ?",
+                        (_pair,),
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 minutes')"
+                        " WHERE id = ?",
+                        (_pair,),
+                    )
+                await conn.commit()
+            finally:
+                await conn.close()
+            return await _real(db, row_, **kwargs)
+
+        monkeypatch.setattr(chat_pair, "_spend_code", race)
+        conn = await hub_db.connect(world.dsn)
+        try:
+            got = await asyncio.gather(
+                _redeem(other_id, code2, "k9")(conn), return_exceptions=True
+            )
+        finally:
+            await conn.close()
+        monkeypatch.undo()
+        assert _refused(got[0]) and _reason(got[0]) == expected, (how, got[0])
+        await world.client.post(
+            f"/api/executor-hosts/k9/orders/{other_id}/ack",
+            json={"result": "redeem_failed"},
+            headers=world.k9_auth,
+        )
