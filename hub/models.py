@@ -420,6 +420,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
     # Читатель: project_policy.local_review_fallback_of.
     "local_review_fallback",
+    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
+    "critic_host",
     # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
     # отдельного выката): срок исхода считается от даты мержа. Не гейт и
     # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
@@ -3307,6 +3309,7 @@ class TaskView(PlainSummaryView):
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
+    critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the
@@ -3539,6 +3542,9 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
+    from hub.services.project_policy import validate_critic_host
+
+    validate_critic_host(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
