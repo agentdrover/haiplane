@@ -57,6 +57,7 @@ from mcp.types import CallToolResult
 from hub.mcp_task_card import (
     bounds_lines,
     build_compact_view,
+    critic_order_lines,
     executor_order_lines,
     owner_minutes_lines,
 )
@@ -1420,6 +1421,7 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(filter(None, [_verdict_route_line(task)]))
     parts.extend(owner_minutes_lines(task))
     parts.extend(executor_order_lines(task))
+    parts.extend(critic_order_lines(task))
     return parts
 
 

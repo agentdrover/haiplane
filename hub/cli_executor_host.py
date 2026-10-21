@@ -36,6 +36,21 @@ def print_order_line(result: Any) -> None:
         )
 
 
+def print_critic_line(result: Any) -> None:
+    """#1953: the last critic order line for ``oc-hub status``; never recomputed here."""
+    view = result.get("critic_order") if isinstance(result, dict) else None
+    if not isinstance(view, dict):
+        return
+    if view.get("unavailable"):
+        print(f"Заказ критика: {view['unavailable']}", file=sys.stderr)
+        return
+    print(
+        f"Заказ критика #{view.get('order_id')}: sha {str(view.get('sha'))[:12]} "
+        f"{view.get('state')}/{view.get('outcome') or '-'}; {view.get('next_step')}",
+        file=sys.stderr,
+    )
+
+
 def cmd_executor_host(args: argparse.Namespace) -> int:
     """add | disable | list — реестр хостов исполнителя."""
     if args.host_cmd == "list":
