@@ -28,6 +28,7 @@ from typing import Any, Final
 import aiosqlite
 
 from hub.db import fetchall
+from hub.services import memory_wait
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +69,8 @@ FAILED_OUTCOMES: Final[tuple[str, ...]] = ("rescued", "failed")
 #: облачная бронь без агента; прогон, ждущий только цену, не считается).
 _SNAPSHOT_SQL: Final[str] = """
 SELECT o.id AS order_id, o.state, o.generation, o.report_outcome,
-       o.report_reason_code,
+       o.report_reason_code, o.host, o.waiting_since, o.last_seen_at,
+       o.need_mib, o.free_mib,
        t.status, t.archived, t.claimed_by, t.claim_session_id,
        t.implementer_principal_id, t.submission_generation,
        EXISTS (SELECT 1 FROM chat_pair_sessions s
@@ -119,7 +121,7 @@ def project(snap: dict[str, Any]) -> dict[str, Any]:
     failed = outcome in FAILED_OUTCOMES
     code = snap["report_reason_code"] or ""
     number, name = class_of(code) if failed else (None, None)
-    return {
+    view = {
         "order_id": int(snap["order_id"]),
         "state": snap["state"],
         "outcome": outcome,
@@ -128,6 +130,10 @@ def project(snap: dict[str, Any]) -> dict[str, Any]:
         "class_name": name,
         "after_failed_run": bool(failed and snap["state"] == "closed" and _quiet(snap)),
     }
+    if snap["state"] == memory_wait.STATE_WAITING_MEMORY:
+        # #1972: ключ есть только у ждущего заказа; остальные виды проекции прежние.
+        view["waiting_memory"] = memory_wait.projection(snap["host"], snap)
+    return view
 
 
 async def last_executor_order_view(

@@ -23,6 +23,7 @@ import aiosqlite
 
 from hub import config
 from hub.db import fetchall
+from hub.services import memory_wait
 
 log = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ async def session_ttl(db: aiosqlite.Connection, row: dict[str, Any]) -> int:
     rows = await fetchall(
         db,
         "SELECT run_seconds FROM executor_orders WHERE pair_code_id = ? "
-        "AND state IN ('pending', 'delivered')",
+        f"AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608 - constant
         (row["id"],),
     )
     if not rows:

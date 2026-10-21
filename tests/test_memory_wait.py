@@ -11,6 +11,7 @@ import re
 
 from tests import test_executor_orders as _eo
 from tests.memory_wait_support import (
+    clean_host_limiters,  # noqa: F401 - autouse-фикстура
     FREE,
     NEED,
     age,
@@ -65,7 +66,9 @@ async def _expect_visible(world, task_id: int, order_id: int, host: str, capsys)
     assert line in seen["cli_err"]
     assert line in seen["page"] and 'data-waiting-memory="1"' in seen["page"]
     # Плашка запуска говорит об ожидании, а не «код выкуплен».
-    assert "ждёт памяти" in seen["plaque"] and "код выкуплен" not in seen["plaque"]
+    headline = re.search(r"<strong>(.*?)</strong>", seen["plaque"], re.S)
+    assert headline and line in headline.group(1)
+    assert "код выкуплен" not in headline.group(1)
 
 
 async def _one_waiting_order(world, host: str, delivered: bool, capsys):
@@ -106,9 +109,23 @@ async def _one_waiting_order(world, host: str, delivered: bool, capsys):
     after = await row(world, order_id)
     assert after["waiting_since"] == before and after["state"] == "waiting_memory"
 
+    # Срок сессии - run_seconds заказа, а не общий TTL (#1960 для выкупа из ожидания).
+    await world.db.execute(
+        "UPDATE executor_orders SET run_seconds = 3600 WHERE id = ?", (order_id,)
+    )
+    await world.db.commit()
     redeemed = await _redeem(world, _code_of(world, again, host))
     assert redeemed.status_code == 200, redeemed.text
     assert (await row(world, order_id))["state"] == "redeemed"
+    run_id = (await row(world, order_id))["executor_run_id"]
+    ttl = await _eo._rows(
+        world.db,
+        "SELECT expires_at > datetime('now', '+3500 seconds') AS long_enough, "
+        "expires_at <= datetime('now', '+3700 seconds') AS short_enough "
+        "FROM chat_pair_sessions WHERE executor_run_id = ?",
+        (run_id,),
+    )
+    assert ttl and ttl[0]["long_enough"] and ttl[0]["short_enough"], ttl
 
 
 async def test_a_waiting_order_keeps_its_code_and_is_visible(world, capsys):
@@ -243,8 +260,8 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
     from hub.migrations.steps import load_steps
     from tests.test_db_migrations import _SCHEMA
 
-    steps = [(n, s) for n, s in load_steps() if "1972" in n]
-    assert steps, "нет шага миграции #1972"
+    steps = load_steps()  # все шаги по порядку: #1972 опирается на run_seconds (#1960)
+    assert any("1972" in n for n, _ in steps), "нет шага миграции #1972"
     monkeypatch.setattr(db_module, "_MIGRATIONS", list(FROZEN_MIGRATIONS))
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
@@ -256,6 +273,9 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
             "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
             "state, expires_at, order_text) VALUES ('k8', 7, 1, 9, 'delivered', "
             "'2030-01-01 00:00:00', 'text')"
+        )
+        await conn.execute(
+            "UPDATE sqlite_sequence SET seq = 50 WHERE name = 'executor_orders'"
         )
         await conn.commit()
         try:
@@ -278,6 +298,10 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
             "free_mib = 0 WHERE id = 1"
         )
         await conn.commit()
+        seq = await conn.execute_fetchall(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'executor_orders'"
+        )
+        assert seq and seq[0][0] >= 50  # номера не откатываются назад
         names = {
             r[0]
             for r in await conn.execute_fetchall(
@@ -308,3 +332,42 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
         assert [r[0] for r in again] == ["waiting_memory"]
     finally:
         await conn.close()
+
+
+async def test_a_waiting_order_closes_like_any_unredeemed_order(world):
+    """Закрытие по слову хоста и отключение хоста берут и ждущий заказ: код сожжён, слот свободен."""
+    # ack redeem_failed
+    task_a, order_a = await launch_order(world, "k8", title="ack")
+    assert (await wait_for_memory(world, order_a)).status_code == 200
+    ack = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order_a}/ack",
+        json={"result": "redeem_failed"},
+        headers=world.k8_auth,
+    )
+    assert ack.status_code == 200, ack.text
+    got = await row(world, order_a)
+    assert (got["state"], got["close_reason"]) == ("closed", "redeem_failed")
+    assert await code_row(world, order_a) is None
+    # итог failed от хоста
+    task_b, order_b = await launch_order(world, "k8", title="report")
+    assert (await wait_for_memory(world, order_b)).status_code == 200
+    report = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order_b}/report",
+        json={"outcome": "failed", "reason_code": "busy", "reason": "нет памяти"},
+        headers=world.k8_auth,
+    )
+    assert report.status_code == 200, report.text
+    assert (await row(world, order_b))["state"] == "closed"
+    # отключение хоста
+    task_c, order_c = await launch_order(world, "k9", title="disable")
+    assert (await wait_for_memory(world, order_c, "k9")).status_code == 200
+    off = await world.client.post(
+        "/api/admin/executor-hosts/k9/disable", headers=world.human_auth
+    )
+    assert off.status_code == 200, off.text
+    got = await row(world, order_c)
+    assert (got["state"], got["close_reason"]) == ("closed", "host_disabled")
+    assert await code_row(world, order_c) is None
+    # слот k8 свободен для нового заказа
+    _t, fresh = await launch_order(world, "k8", title="после")
+    assert (await row(world, fresh))["state"] == "pending"

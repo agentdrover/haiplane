@@ -47,6 +47,7 @@ from hub.services import (
     chat_pair,
     host_redeem,
     launch_feedback,
+    memory_wait,
     order_deadline,
     owner_minutes,
     project_policy,
@@ -59,9 +60,10 @@ PAIR_CODE_PLACEHOLDER: Final[str] = "{{PAIR_CODE}}"
 
 STATE_PENDING = "pending"
 STATE_DELIVERED = "delivered"
+STATE_WAITING_MEMORY = memory_wait.STATE_WAITING_MEMORY  # #1972
 STATE_REDEEMED = "redeemed"
 STATE_CLOSED = "closed"
-_UNREDEEMED = (STATE_PENDING, STATE_DELIVERED)
+_UNREDEEMED = (STATE_PENDING, STATE_DELIVERED, STATE_WAITING_MEMORY)
 
 #: Исходы прогона слота. ``finished`` берётся у облачного опроса.
 RUN_OUTCOME_FINISHED = "finished"
@@ -73,6 +75,7 @@ CLOSE_EXPIRED = "expired"
 CLOSE_SESSION_GONE = "session_gone"
 CLOSE_HOST_DISABLED = "host_disabled"
 CLOSE_RUN_FINISHED = "run_finished"
+CLOSE_MEMORY_WAIT_TIMEOUT = memory_wait.CLOSE_TIMEOUT  # #1972
 
 ACK_REDEEMED = "redeemed"
 ACK_REDEEM_FAILED = "redeem_failed"
@@ -428,7 +431,7 @@ async def close_order(
     )
     if landed:
         reason, run_outcome = CLOSE_SUBMITTED, RUN_OUTCOME_FINISHED
-    states = only_states or (STATE_PENDING, STATE_DELIVERED, STATE_REDEEMED)
+    states = only_states or (*_UNREDEEMED, STATE_REDEEMED)
     marks = ", ".join("?" for _ in states)
     cursor = await db.execute(
         "UPDATE executor_orders SET state = 'closed', closed_at = datetime('now'), "
@@ -498,6 +501,8 @@ async def close_order(
         commit=False,
     )
     await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+    if reason == CLOSE_MEMORY_WAIT_TIMEOUT:  # #1972: сигнал владельцу, один раз
+        await memory_wait.notify_timeout(db, order)
     await db.execute(
         "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
         (int(order["id"]),),
@@ -554,6 +559,10 @@ async def _settled_reason(
     run = await repo.get_executor_run(db, int(order["executor_run_id"]))
     if run is not None and dict(run)["outcome"] != "running":
         return CLOSE_RUN_FINISHED, dict(run)["outcome"], None
+    if order["state"] == STATE_WAITING_MEMORY and await memory_wait.over_limit(
+        db, order
+    ):  # #1972: предел ожидания сильнее обычного срока
+        return CLOSE_MEMORY_WAIT_TIMEOUT, RUN_OUTCOME_EXPIRED, (STATE_WAITING_MEMORY,)
     if order["state"] in _UNREDEEMED:
         gone = await fetchall(
             db,
@@ -976,7 +985,7 @@ async def deliver_orders(db: aiosqlite.Connection, host: str) -> list[dict[str, 
             for r in await fetchall(
                 db,
                 "SELECT * FROM executor_orders WHERE host = ? "
-                "AND state IN ('pending', 'delivered') ORDER BY id",
+                f"AND state IN {memory_wait.UNREDEEMED_IN_SQL} ORDER BY id",  # nosec B608 - constant
                 (host,),
             )
         ]

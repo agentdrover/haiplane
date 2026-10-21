@@ -13,6 +13,7 @@ from hub.services import executor_dispatch, executor_orders as orders
 from hub.services import host_redeem, launch_feedback, run_claim
 from tests import test_executor_orders as _eo
 from tests.memory_wait_support import (
+    clean_host_limiters,  # noqa: F401 - autouse-фикстура
     FREE,
     NEED,
     age,
@@ -101,9 +102,11 @@ async def _closed_once(world, task_id: int, order_id: int, reason: str):
     return got
 
 
-async def _timeout_counts(world, task_id: int) -> tuple[int, int]:
+async def _timeout_counts(world, task_id: int) -> tuple[int, int, int]:
+    """(запись ленты о закрытии, сигнал владельцу alert, событие) - каждого по одному."""
     return (
         len(await feed(world, task_id, TIMEOUT_NEEDLE)),
+        len(await feed(world, task_id, "Ожидание памяти на", kind="alert")),
         len(await events(world, TIMEOUT_EVENT, task_id)),
     )
 
@@ -118,16 +121,16 @@ async def test_the_six_hour_limit_closes_once(world):
     first, second = await lock_then(world, _sweep, _heartbeat(order_id))
     assert first == 1 and _refused(second), (first, second)
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
     assert await sweep(world) == 0  # повторный sweep: ничего нового
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
     # Порядок 2: heartbeat держит lock первым (отказ), sweep ждёт и закрывает один раз.
     task_id, order_id, code = await _at_limit(world, "k8", "порядок 2")
     first, second = await lock_then(world, _heartbeat(order_id), _sweep)
     assert _refused(first) and second == 1, (first, second)
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
     # Выкуп на границе: отклонён в обоих порядках, код не потрачен до закрытия.
     task_id, order_id, code = await _at_limit(world, "k8", "выкуп первым")
@@ -135,13 +138,13 @@ async def test_the_six_hour_limit_closes_once(world):
     assert _refused(first), first
     assert second == 1
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
     task_id, order_id, code = await _at_limit(world, "k8", "sweep первым")
     first, second = await lock_then(world, _sweep, _redeem(order_id, code))
     assert first == 1 and _refused(second), (first, second)
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
     # Все три сразу на трёх соединениях и два sweep подряд: исход один.
     task_id, order_id, code = await _at_limit(world, "k8", "все сразу")
@@ -162,9 +165,21 @@ async def test_the_six_hour_limit_closes_once(world):
         _refused(r) for r in results if isinstance(r, BaseException)
     ), results
     await _closed_once(world, task_id, order_id, "memory_wait_timeout")
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
     assert await sweep(world) == 0
-    assert await _timeout_counts(world, task_id) == (1, 1)
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
+
+    # Предел и обычный срок вышли вместе (heartbeat давно нет): причина - предел.
+    task_id, order_id, code = await _waiting(world, "k8", "оба срока")
+    await world.db.execute(
+        "UPDATE executor_orders SET waiting_since = datetime('now', '-7 hours'), "
+        "expires_at = datetime('now', '-1 minutes') WHERE id = ?",
+        (order_id,),
+    )
+    await world.db.commit()
+    assert await sweep(world) == 1
+    await _closed_once(world, task_id, order_id, "memory_wait_timeout")
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
 
 
 async def test_heartbeat_and_sweep_race_in_both_orders(world):

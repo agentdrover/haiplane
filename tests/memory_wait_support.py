@@ -13,12 +13,29 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from hub import cli, config, mcp_server
 from hub.services import admin as admin_svc
+from hub.services import host_redeem
 from tests import test_executor_orders as eo
 from tests.test_executor_orders import _launch, _orders, _rows, _task
 
 HUB_URL = eo.HUB_URL
+
+
+@pytest.fixture(autouse=True)
+def clean_host_limiters():
+    """Квоты фаз и выкупа живут в процессе: тест не наследует чужой расход."""
+    from hub import executor_host_api
+
+    executor_host_api._phase_limiter._buckets.clear()
+    host_redeem.host_redeem_limiter._buckets.clear()
+    yield
+    executor_host_api._phase_limiter._buckets.clear()
+    host_redeem.host_redeem_limiter._buckets.clear()
+
+
 NEED, FREE = 6144, 3072  # 6 ГиБ нужно, 3 ГиБ свободно
 
 
@@ -114,12 +131,12 @@ async def sweep(world) -> int:
     return closed
 
 
-async def feed(world, task_id: int, needle: str) -> list[dict]:
+async def feed(world, task_id: int, needle: str, kind: str = "status") -> list[dict]:
     await world.db.commit()
     return await _rows(
         world.db,
-        "SELECT * FROM task_updates WHERE task_id = ? AND content LIKE ?",
-        (task_id, f"%{needle}%"),
+        "SELECT * FROM task_updates WHERE task_id = ? AND kind = ? AND content LIKE ?",
+        (task_id, kind, f"%{needle}%"),
     )
 
 
