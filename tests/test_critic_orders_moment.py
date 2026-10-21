@@ -171,3 +171,20 @@ async def test_a_completion_never_writes_over_a_hold(world, tip):
     await world.db.commit()
     assert written is None
     assert (await _row(world, cloud.task_id))["status"] == "needs_decision"
+
+
+async def test_a_refusal_inside_the_acceptance_leaves_no_open_transaction(world, tip):
+    """422 из приёма вне чужой транзакции: свою транзакцию он откатывает, лок не висит."""
+    import pytest
+    from fastapi import HTTPException
+
+    from hub.services import critic_orders
+
+    cloud = await co._cloud(world, tip)
+    row = await _row(world, cloud.task_id)
+    row["_ci_prepared_sha"] = co.SHA_A
+    assert not world.db.in_transaction
+    with pytest.raises(HTTPException):
+        await critic_orders.accept_in_transaction(world.db, row, bump=True)
+    assert not world.db.in_transaction
+    assert (await _row(world, cloud.task_id))["submission_generation"] == 0
