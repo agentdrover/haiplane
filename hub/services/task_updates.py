@@ -240,12 +240,6 @@ async def _route_done(
     # the task is blocked while the current validation run is red/absent. Only
     # completion-bound reports are gated; the poller path is not affected.
     await lc._done_validation_gate(db, task)
-    checked = task.get(critic_orders.CHECKED_KEY)
-    if checked and not lc.completion_requires_review(task):
-        # #1953: завершение без ревью (auto_review=false, pending_report ->
-        # completed) тоже закрепляет sha, по которому прошёл критик.
-        await repo.update_task(db, int(task["id"]), submission_sha=checked)
-        task = {**task, "submission_sha": checked}
     if body.finding_outcomes:  # ответ на находки — не пустая пересдача (#1783)
         task = {**task, "_answered_findings": True}
     if task["status"] == "pending_report":
@@ -253,6 +247,21 @@ async def _route_done(
     elif task["status"] in ("running", "claimed") and not task.get("job_id"):
         await _route_pair_or_claimed(db, task, (body.agent or "").strip())
     # open + done without pair-start: rejected before insert (AC-2)
+    await _pin_checked_sha(db, task)
+
+
+async def _pin_checked_sha(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
+    """#1953: завершение без ревью закрепляет sha критика - ПОСЛЕ проверок маршрута.
+
+    Раньше пин сломал бы «пустую пересдачу» (она читает прежний sha из базы) и
+    остался бы у удержанной по блокеру сдачи; отказ маршрута откатывает всё.
+    """
+    checked = task.get(critic_orders.CHECKED_KEY)
+    if not checked or lc.completion_requires_review(task):
+        return
+    row = await repo.get_task(db, int(task["id"]))
+    if row is not None and dict(row)["status"] != "needs_decision":
+        await repo.update_task(db, int(task["id"]), submission_sha=checked)
 
 
 async def _inside_savepoint(

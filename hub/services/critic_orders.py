@@ -625,7 +625,10 @@ async def _hold(
 async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
     """Автоматический вход (поллер, без HTTP): True - сдача удержана, задача в needs_decision."""
     from hub.services.lifecycle import PREPARED_CI_SHA
-    from hub.services.orchestration import review_approved_for_current_submission
+    from hub.services.orchestration import (
+        completion_requires_review,
+        review_approved_for_current_submission,
+    )
 
     if CHECKED_KEY in task or review_approved_for_current_submission(task):
         return False
@@ -635,6 +638,8 @@ async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool
         # bump, если закрепление увидит другую голову.
         task[CHECKED_KEY] = verdict.sha
         task[AUTO_KEY] = True
+        if not completion_requires_review(task):  # завершение без ревью: пин здесь
+            await repo.update_task(db, int(task["id"]), submission_sha=verdict.sha)
     if not (verdict.applicable and verdict.cause):
         return False
     await _hold(db, task, verdict)

@@ -3607,6 +3607,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        await critic_orders.submit_step(state)  # #1953: политика и заказы - под локом
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
