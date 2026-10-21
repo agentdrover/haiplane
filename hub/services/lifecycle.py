@@ -3217,7 +3217,7 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     # tip there): the stored standing is what such a path reads, and the
     # network refresh is done by the caller BEFORE it opens the transaction.
     prepared = state.task.get(PREPARED_CI_SHA)
-    if state.dry_run:
+    if getattr(state, "dry_run", False):
         # #1975: the same question to GitHub, answered in memory; the gates read it.
         state.ci_computed = await ci_trust.preview_report(
             state.db, state.task_id, state.submission_sha
