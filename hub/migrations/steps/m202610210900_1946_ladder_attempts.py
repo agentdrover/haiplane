@@ -53,4 +53,10 @@ MIGRATIONS = [
         "add_chat_pair_sessions_code_id",
         "ALTER TABLE chat_pair_sessions ADD COLUMN code_id INTEGER",
     ),
+    (
+        # Код сессии, приславшей отчёт: поздняя привязка кода догоняет и уже
+        # принятые непривязанные отчёты именно этого кода.
+        "add_machine_reviews_code_id",
+        "ALTER TABLE machine_reviews ADD COLUMN code_id INTEGER",
+    ),
 ]

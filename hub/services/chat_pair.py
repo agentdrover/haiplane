@@ -1004,7 +1004,7 @@ async def resolve_session(
     rows = await fetchall(
         db,
         "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
-        "s.bound_generation, s.first_used_at, s.dispatch_id, "
+        "s.bound_generation, s.first_used_at, s.dispatch_id, s.code_id, "
         "p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
@@ -1064,6 +1064,7 @@ async def resolve_session(
                 else None
             ),
             chat_pair_dispatch_id=row.get("dispatch_id"),
+            chat_pair_code_id=row.get("code_id"),
         )
     if kind in config.STEWARD_PAIR_KINDS:
         # #1601: тот же допуск стюарда, но вид сессии сохраняется — по нему

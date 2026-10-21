@@ -4919,7 +4919,10 @@ async def _owe_the_refused_call(
     # #1252 уточнено этим: локального прогона по-прежнему нет, строка —
     # облачная и ничего не стоившая.
     if opened:
-        await repo.delete_review_dispatch(db, stub["id"])
+        # #1946: на заглушку указывает код облачного ревьюера - поздний отчёт
+        # агента, всё же созданного, должен найти заказ; строка остаётся закрытой.
+        if not await report_binding.is_addressed(db, stub["id"]):
+            await repo.delete_review_dispatch(db, stub["id"])
         await db.commit()
     return opened
 

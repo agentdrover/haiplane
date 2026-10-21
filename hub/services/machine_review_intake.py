@@ -233,6 +233,9 @@ async def _dispatch_of_report(
         db, task_id, generation, principal_id, claimed_id
     )
     if accepted is not None:
+        # #1946: найденный по привязке заказ проходит то же восстановление
+        # отказанного заказа (#1408), что и найденный по последнему заказу.
+        accepted = await report_binding.reopen_if_refused(db, accepted)
         return accepted, int(accepted["id"])
     latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     return latest, None
@@ -248,6 +251,7 @@ async def record_machine_review(
     origin: str = ORIGIN_MCP,
     expected_generation: int | None = None,
     dispatch_id: int | None = None,
+    code_id: int | None = None,
 ) -> MachineReviewView:
     """Store one report and run everything that hangs off it (#381, #1036).
 
@@ -411,7 +415,7 @@ async def record_machine_review(
         principal_id=principal_id,
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
-    await report_binding.stamp_report(db, new_review_id, bound_id)
+    await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу
     # dispatch_for_report; свипы такую строку уже не видят.

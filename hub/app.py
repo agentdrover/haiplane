@@ -2689,6 +2689,11 @@ async def api_submit_machine_review(
             if identity.chat_pair_kind == "reviewer"
             else None
         ),
+        code_id=(
+            identity.chat_pair_code_id
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
     )
 
 

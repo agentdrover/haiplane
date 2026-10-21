@@ -59,6 +59,12 @@ async def bind_code_to_dispatch(
         "AND code_id = (SELECT id FROM chat_pair_codes WHERE code_hash = ?)",
         (dispatch_id, code_hash),
     )
+    # Отчёты, принятые от этого кода до привязки, тоже отвечают заказу.
+    await db.execute(
+        "UPDATE machine_reviews SET dispatch_id = ? WHERE dispatch_id IS NULL "
+        "AND code_id = (SELECT id FROM chat_pair_codes WHERE code_hash = ?)",
+        (dispatch_id, code_hash),
+    )
 
 
 async def accepted_dispatch(
@@ -95,15 +101,55 @@ async def accepted_dispatch(
 
 
 async def stamp_report(
-    db: aiosqlite.Connection, review_id: int, dispatch_id: int | None
+    db: aiosqlite.Connection,
+    review_id: int,
+    dispatch_id: int | None,
+    code_id: int | None = None,
 ) -> None:
-    """Записать на отчёте заказ, которому он отвечает. Не коммитит."""
-    if dispatch_id is None:
+    """Записать на отчёте заказ, которому он отвечает, и код его сессии.
+
+    Код нужен, пока заказ неизвестен: поздняя привязка этого кода догонит и
+    отчёт (``bind_code_to_dispatch``). Не коммитит.
+    """
+    if dispatch_id is None and code_id is None:
         return
     await db.execute(
-        "UPDATE machine_reviews SET dispatch_id = ? WHERE id = ?",
-        (int(dispatch_id), int(review_id)),
+        "UPDATE machine_reviews SET dispatch_id = ?, code_id = ? WHERE id = ?",
+        (dispatch_id, code_id, int(review_id)),
     )
+
+
+async def reopen_if_refused(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> dict[str, Any]:
+    """Отчёт пришёл к заказу, записанному отказом (failed, без агента): оживить (#1408).
+
+    Привязка доказывает, что агент этого кода существует, поэтому адресуется
+    конкретный id, а не «последняя заглушка поколения». Не коммитит.
+    """
+    if (
+        dispatch.get("agent_id") == ""
+        and dispatch.get("channel") == "cloud"
+        and dispatch.get("status") in ("failed", "done")
+    ):
+        await db.execute(
+            "UPDATE review_dispatches SET status='active' WHERE id = ?",
+            (int(dispatch["id"]),),
+        )
+        return {**dispatch, "status": "active"}
+    return dispatch
+
+
+async def is_addressed(db: aiosqlite.Connection, dispatch_id: int) -> bool:
+    """На заказ указывает код, сессия или отчёт: строку нельзя удалять (#1946)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM chat_pair_codes WHERE dispatch_id = ? UNION ALL "
+        "SELECT 1 FROM chat_pair_sessions WHERE dispatch_id = ? UNION ALL "
+        "SELECT 1 FROM machine_reviews WHERE dispatch_id = ? LIMIT 1",
+        (dispatch_id, dispatch_id, dispatch_id),
+    )
+    return bool(rows)
 
 
 async def dispatch_of_report(
