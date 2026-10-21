@@ -160,7 +160,8 @@ from hub.mcp_catalog import (
 )
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
-from hub.services import owner_minutes, policy_change, project_policy
+from hub.services import owner_minutes, policy_change, project_policy, triage_inbox
+from hub.services.triage_inbox import TriageVerdictBody
 from hub.services.steward_evidence import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -1419,6 +1420,32 @@ async def api_digest_audit(
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"digest_id": digest_id, "audit_results": payload.get("audit_results", {})}
+
+
+@app.post("/api/executor-triage/{recommendation_id}/verdict")
+async def api_executor_triage_verdict(
+    recommendation_id: int,
+    body: TriageVerdictBody,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Owner's «triage accepted / rejected» on a k8 run recommendation (#1943).
+
+    Human-only by dependency (agents, the steward and host keys get 403): the
+    recommendation measures the hub against the owner, and a machine answering
+    it would close the loop with itself. Writes ``owner_verdict`` once; it never
+    launches, retries or moves the task.
+    """
+    try:
+        return await triage_inbox.record_owner_verdict(
+            _db(request),
+            recommendation_id,
+            body.verdict,
+            who=identity.username,
+            principal_id=identity.principal_id,
+        )
+    except triage_inbox.VerdictError as exc:
+        raise HTTPException(exc.status, detail=exc.text) from exc
 
 
 @app.get("/api/events")

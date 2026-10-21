@@ -133,7 +133,7 @@ async def test_triage_item_appears_and_resolves(owner):
     page = await world.client.get("/partials/inbox", headers=world.human_auth)
     assert page.status_code == 200
     assert f"#{accept}" in page.text and "Разбор принят" in page.text
-    assert 'name="csrf_token"' in page.text
+    assert f"/triage/{one['recommendation_id']}/web-verdict" in page.text
 
     # Агент, стюард и ключ хоста не разбирают.
     rid = _rec_id(recs, o_acc)
