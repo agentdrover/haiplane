@@ -82,6 +82,7 @@ EXCLUDED: dict[str, str] = {
     "steward_judgement": "стюард - не человек",
     "steward_applied": "стюард - не человек",
     "steward_escalated": "стюард - не человек",
+    "steward_judgement_refused": "стюард - не человек",
 }
 
 #: Сколько событий пас берёт за одну транзакцию (потолок list_events - 200).

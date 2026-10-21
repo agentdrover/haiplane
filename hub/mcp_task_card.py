@@ -46,6 +46,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "dependencies",
     "worktree_path",
     "owner_minutes",
+    "last_executor_order",
     "created_at",
     "updated_at",
 )
@@ -63,6 +64,21 @@ def owner_minutes_lines(task: dict[str, Any]) -> list[str]:
     if isinstance(estimate, dict) and estimate.get("line"):
         return [f"Owner minutes: {estimate['line']}"]
     return []
+
+
+def executor_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1941: the last host order as the hub built it; nothing when it says nothing."""
+    view = task.get("last_executor_order")
+    if not isinstance(view, dict):
+        return []
+    if view.get("unavailable"):
+        return [f"Last executor order: unavailable ({view['unavailable']})"]
+    if not view.get("after_failed_run"):
+        return []
+    return [
+        f"After failed run: class {view.get('class')} ({view.get('class_name')}), "
+        f"order #{view.get('order_id')} {view.get('outcome')} {view.get('reason_code')}"
+    ]
 
 
 def excerpt(text: str, limit: int) -> tuple[str, int]:
