@@ -346,3 +346,54 @@ def test_the_hook_assigns_files_like_the_nodeid_does(
             assert ret == 5, f"{target} {extra}\n{out}"
             assert "PASSED" not in out, out
     assert foreign in _marks(marks)  # imported, then dropped
+
+
+class _Config:
+    """What the hook reads from ``pytest.Config``: stash, rootpath, python_files."""
+
+    def __init__(self, rootpath: Path, spec: tuple[int, int] | None) -> None:
+        self.rootpath = rootpath
+        self.stash = {} if spec is None else {pytest_shard._STASH_KEY: spec}
+
+    def getini(self, name: str) -> list[str]:
+        assert name == "python_files"
+        return ["test_*.py", "*_test.py"]
+
+
+def test_the_hook_says_true_only_for_a_test_file_of_another_part(
+    tmp_path: Path,
+) -> None:
+    """Any doubt is None: the file is collected as before."""
+    root = tmp_path / "root"
+    (root / "dir").mkdir(parents=True)
+    own = next(
+        f"test_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"test_{n}.py", 3) == 1
+    )
+    other = next(
+        f"test_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"test_{n}.py", 3) != 1
+    )
+    helper = next(  # not a test module by name, and another part's by hash
+        f"helper_{n}.py"
+        for n in range(99)
+        if pytest_shard.shard_of(f"helper_{n}.py", 3) != 1
+    )
+    for name in (own, other, helper):
+        (root / name).write_text("", encoding="utf-8")
+    outside = tmp_path / other
+    outside.write_text("", encoding="utf-8")
+    config = _Config(root, (1, 3))
+
+    def ask(path: Path, cfg: _Config = config) -> bool | None:
+        return pytest_shard.pytest_ignore_collect(path, cfg)  # type: ignore[arg-type]
+
+    assert ask(root / other) is True  # a test file of another part
+    assert ask(root / own) is None  # its own part's file
+    assert ask(root / helper) is None  # not a test module: pytest's own match says no
+    assert ask(root / "dir") is None  # a directory
+    assert ask(root / "missing.py") is None  # not a file
+    assert ask(outside) is None  # outside the rootdir: no nodeid rule to apply
+    assert ask(root / other, _Config(root, None)) is None  # no spec: never skip
