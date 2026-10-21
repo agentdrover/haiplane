@@ -4467,9 +4467,9 @@ async def merge_if_approval_stands(
     базу. Закрепление сменилось — отказ без вызова форжа (``HEAD_MOVED``).
     """
     key = (int(task["id"]), int(task["pr_number"]))
-    if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956
-        return MergeStep.RERUN_HOLD, hold
     while True:
+        if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956, каждый круг
+            return MergeStep.RERUN_HOLD, hold
         row = await repo.get_task(db, key[0])
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):

@@ -189,3 +189,87 @@ async def test_the_headless_path_hands_a_red_rerun_to_the_owner_once(db, monkeyp
     assert "fresh_base_ci_failed" in await rig.feed()
     rig.git.merge_pr.assert_not_awaited()
     assert rig.posts == 1
+
+
+async def test_the_hold_is_asked_again_after_waiting_for_a_neighbour_merge(
+    db, monkeypatch
+):
+    import asyncio
+
+    rig = await _booked(db, monkeypatch)
+    rig.start_attempt("2", status="completed", conclusion="success")
+    await rig.report_attempt("2")
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    key = (rig.task_id, 77)
+    neighbour: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    orchestration._gate_merges[key] = neighbour  # соседний путь мержит этот PR
+
+    waiting = asyncio.create_task(
+        services.merge_before_completion(db, await rig.task())
+    )
+    await asyncio.sleep(0.5)
+    rig.start_attempt("3", status="in_progress")  # пока ждали соседа
+    orchestration._gate_merges.pop(key, None)
+    neighbour.set_result(False)  # сосед получил отказ
+    ok, why = await asyncio.wait_for(waiting, 30)
+
+    assert not ok, why
+    rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_the_post_goes_where_the_checked_identity_points_not_to_a_stale_ctx(
+    db, monkeypatch
+):
+    rig = await rig_after_base_update(db, monkeypatch)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(
+            return_value={
+                "repo": "/stale/ws",
+                "gh_repo": "stale/repository",
+                "forge": "github",
+                "base_branch": "develop",
+            }
+        ),
+    )
+    rig.red_first_attempt()
+    await services.merge_before_completion(db, await rig.task())
+
+    assert rig.posts == 1
+    sent = rig.git.rerun_failed_jobs.await_args
+    assert sent.kwargs["gh_repo"] != "stale/repository"
+
+
+async def test_a_contract_tightened_during_the_check_does_not_pass_on_the_old_one(
+    db, monkeypatch
+):
+    from hub.services import ci_contract
+
+    rig = await _booked(db, monkeypatch)
+    rig.start_attempt("2", status="completed", conclusion="success")
+    await rig.report_attempt("2")
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    real = ci_trust.trusted_report
+    stricter = ci_contract.contract_from_raw(
+        {
+            "workflow_path": ".github/workflows/ci.yml",
+            "required_checks": ["lint", "tests"],
+        },
+        "sat",
+    )
+
+    async def report_read_while_the_contract_tightens(*args, **kwargs):
+        found = await real(*args, **kwargs)
+        monkeypatch.setattr(
+            ci_contract, "contract_for_task", AsyncMock(return_value=stricter)
+        )
+        return found
+
+    monkeypatch.setattr(
+        ci_trust, "trusted_report", report_read_while_the_contract_tightens
+    )
+    ok, why = await services.merge_before_completion(db, await rig.task())
+
+    assert not ok, why
+    rig.git.merge_pr.assert_not_awaited()

@@ -345,14 +345,17 @@ async def _scope(
     contract = await ci_contract.contract_for_task(db, task_id)
     if not contract.workflow_path or not contract.fingerprint:
         return None, "контракт CI проекта не прочитан"
+    # Адрес запроса берётся из ТОГО ЖЕ чтения проекта, что и identity: ctx мог
+    # устареть, а POST должен уйти туда, куда указывает сверяемая identity.
+    gh_arg = str(project["repo"] or "").strip() or None
     return (
         Scope(
-            gh_repo=str(ctx.get("gh_repo") or config.REPO_NAME),
+            gh_repo=str(gh_arg or config.REPO_NAME),
             workflow=contract.workflow_path,
             contract=contract,
-            repo=ctx.get("repo"),
-            gh_arg=ctx.get("gh_repo"),
-            forge=ctx.get("forge", ""),
+            repo=str(project["workspace_path"] or "").strip() or None,
+            gh_arg=gh_arg,
+            forge=project_policy.forge_of(project) if gh_arg else "",
             base=git_ops_mod._resolve_base(ctx.get("base_branch")),
             identity=(
                 str(project["repo"] or ""),
@@ -708,7 +711,12 @@ async def _verify_green(db, task, ctx, scope, row, head, cur, late) -> str:
     if report is None or len(keys) != 1:
         gap = f"отчёт и текущая попытка не совпадают с ожидаемой {expected_key}"
         return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
+    live = await ci_contract.contract_for_task(db, int(task["id"]))
     problem = ci_trust.green_gap(dict(report), scope.contract)
+    if {dict(report).get("contract_fp"), scope.contract.fingerprint} != {
+        live.fingerprint
+    }:
+        problem = "контракт CI менялся, пока проверялся отчёт"
     if problem is not None or row["workflow"] != scope.workflow:
         gap = problem or "контракт CI изменился с момента брони"
         return await _wait_or_timeout(db, task, ctx, scope, row, late, gap)
