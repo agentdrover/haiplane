@@ -223,6 +223,23 @@ async def test_run_seconds_is_snapshotted_at_issue(world, monkeypatch):
     assert abs(span - 10800) <= 5
 
 
+@pytest.mark.parametrize(("stored", "shared_ttl"), [(99999, 20000), (100, 1000)])
+async def test_a_broken_order_row_falls_back_to_the_old_slot_term(
+    world, monkeypatch, stored, shared_ttl
+):
+    """Битый run_seconds в заказе даёт 7200, а не общий TTL вне границ."""
+    monkeypatch.setattr(config, "CHAT_PAIR_TTL_SECONDS", shared_ttl)
+    row = await _issue(world, "M")
+    await world.db.execute(
+        "UPDATE executor_orders SET run_seconds = ? WHERE id = ?", (stored, row["id"])
+    )
+    await world.db.commit()
+    order = (await _orders(world)).json()["orders"][0]
+    assert (await _redeem(world, _code_of(world, order))).status_code == 200
+    span = await _span(world, row["id"], "first_redeemed_at", "expires_at")
+    assert abs(span - 7200) <= 5, span
+
+
 async def _span_retry(world, order_id: int) -> int:
     rows = await _rows(
         world.db,

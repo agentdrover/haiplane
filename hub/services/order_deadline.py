@@ -139,7 +139,11 @@ async def session_ttl(db: aiosqlite.Connection, row: dict[str, Any]) -> int:
         "AND state IN ('pending', 'delivered')",
         (row["id"],),
     )
-    seconds = rows[0]["run_seconds"] if rows else None
+    if not rows:
+        return config.CHAT_PAIR_TTL_SECONDS
+    seconds = rows[0]["run_seconds"]
     if isinstance(seconds, int) and RUN_SECONDS_FLOOR <= seconds <= RUN_SECONDS_CEILING:
         return seconds
-    return config.CHAT_PAIR_TTL_SECONDS
+    # Битая строка заказа: прежний срок слота, а не общий TTL — тот не ограничен
+    # потолком 14400 и может оказаться выше него.
+    return RUN_SECONDS_DEFAULT
