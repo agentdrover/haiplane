@@ -423,6 +423,18 @@ async def attach_ac_tests_unread(db: Any, view: Any) -> None:
 RangeKey = tuple[str, int, int]
 
 
+def _take_fitting(
+    keys: Sequence[RangeKey], cost: dict[RangeKey, int], budget: int
+) -> tuple[int, set[RangeKey]]:
+    """Вырезки по порядку: каждая, что помещается в остаток; не поместившаяся не блокирует следующие."""
+    taken: set[RangeKey] = set()
+    for k in keys:
+        if cost[k] <= budget:
+            taken.add(k)
+            budget -= cost[k]
+    return budget, taken
+
+
 def _reserve_ac(
     ranges: dict[RangeKey, list[AcTestSpan]],
     cost: dict[RangeKey, int],
@@ -430,35 +442,33 @@ def _reserve_ac(
     ac_paths: list[str],
     budget: int,
 ) -> tuple[int, set[RangeKey], set[str], set[RangeKey]]:
-    """Шаг A: представление каждого AC-файла - ДЕШЁВОЕ из двух, до файлов без AC.
+    """Шаг A: представление каждого AC-файла выбрано и оплачено ДО файлов без AC (#1981).
 
-    Полный дифф файла (плюс непокрытые ханками диапазоны) против НАБОРА его
-    вырезок. Полный дифф берётся, когда он не дороже всех вырезок и влезает; иначе
-    - помещающееся подмножество вырезок. Так обычный файл не вытесняет более
-    дешёвое представление AC и не остаётся без места рядом с ним.
+    Два плана на файл. Вырезки: помещающееся подмножество вырезок. Полный дифф:
+    файл целиком (он САМ покрывает показанные ханками диапазоны) плюс те
+    непокрытые вырезки, что поместились в остаток; не поместившаяся вырезка
+    полный дифф не запрещает - непрочитанными названы только её ссылки. Берётся
+    план, где прочитано больше ссылок AC, при равенстве - дешевле, затем вырезки.
     """
     placed: set[RangeKey] = set()
     full: set[str] = set()
     covered_all: set[RangeKey] = set()
     for path in ac_paths:
         keys = [k for k in ranges if k[0] == path]
-        covered = {
-            k for k in keys if path in texts and shown_in(texts[path], ranges[k][0])
-        }
-        cuts_total = sum(cost[k] for k in keys)
-        full_cost = len(texts.get(path, "")) + sum(
-            cost[k] for k in keys if k not in covered
-        )
-        if path in texts and full_cost <= cuts_total and full_cost <= budget:
-            budget -= full_cost
-            full.add(path)
-            covered_all |= covered
-            placed |= {k for k in keys if k not in covered}
-            continue
-        for k in keys:
-            if cost[k] <= budget:
-                placed.add(k)
-                budget -= cost[k]
+        left, cuts = _take_fitting(keys, cost, budget)
+        best = (sum(len(ranges[k]) for k in cuts), left - budget, False)
+        plan: tuple[int, set[RangeKey], set[RangeKey]] = (left, cuts, set())
+        if path in texts and len(texts[path]) <= budget:
+            covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
+            rest = [k for k in keys if k not in covered]
+            left_f, extra = _take_fitting(rest, cost, budget - len(texts[path]))
+            read = sum(len(ranges[k]) for k in covered | extra)
+            if (read, left_f - budget, True) > best:
+                plan = (left_f, extra, covered)
+                full.add(path)
+        budget, taken, covered_here = plan
+        placed |= taken
+        covered_all |= covered_here
     return budget, placed, full, covered_all
 
 
@@ -524,11 +534,11 @@ def fit_with_ac_cutouts(
     отдельно (parametrize даёт много ссылок на один диапазон и платится он один
     раз). Приоритеты по шагам, порядок разделов диффа результат не меняет:
 
-    A) представление каждого AC-файла - ДЕШЁВОЕ из двух (полный дифф файла плюс
-       непокрытые ханками диапазоны, либо набор его вырезок), выбранное и
-       оплаченное ДО шага B; вырезки - помещающееся подмножество (не
-       поместившийся диапазон не блокирует остальные: непрочитанными названы
-       только его ссылки);
+    A) представление каждого AC-файла выбрано и оплачено ДО шага B: полный дифф
+       (сам покрывает показанные ханками диапазоны, плюс помещающиеся вырезки
+       остальных; не поместившаяся вырезка полный дифф не запрещает) либо набор
+       помещающихся вырезок - где прочитано больше ссылок AC, при равенстве
+       дешевле; непрочитанными названы только не поместившиеся ссылки;
     B) все файлы без тестов AC - от меньшего к большему, затем по пути, из остатка;
     C) последним шагом - только расширение AC-файла (вырезки -> полный дифф) с
        неотрицательной доплатой из остатка; покрытые ханками диапазоны тогда

@@ -273,7 +273,7 @@ def test_full_diff_covers_its_ac_even_when_a_sibling_cutout_cannot_fit():
 
 
 def test_budget_properties_hold_over_combinations():
-    """Свойства, не цифра: помещающийся AC читаем до обычного файла, диапазон не дублируется."""
+    """Свойства, не цифра: обычный файл не вытесняет AC, диапазон не дублируется, порядок не важен."""
     for inside_n, outside_n, ceiling_pad in (
         (900, 1100, -3000),
         (900, 1100, 0),
@@ -283,24 +283,18 @@ def test_budget_properties_hold_over_combinations():
     ):
         ac, spans = _codex_case(inside_n, outside_n)
         other = _new("hub/other.py", ["x = 1" + " " * 1500])
-        full = len(ac)
-        ceiling = full + ceiling_pad
-        fits = [
-            s
-            for s in spans
-            if len(cutout(s)) <= ceiling
-            or (s.ref.endswith("test_ac") and full <= ceiling)
-        ]
+        ceiling = len(ac) + ceiling_pad
         results = []
         for parts in ((ac, other), (other, ac)):
             text, omitted = _run(parts, ceiling, spans)
             results.append((text, omitted))
             for s in spans:
                 assert text.count(f"{s.path}:{s.start}–{s.end}") <= 1
-            for s in fits:
-                named = f"ac_test_unread: {s.ref}" in text
-                assert not named, (inside_n, outside_n, ceiling_pad, s.ref)
             if "x = 1" in text:
-                # обычный файл включён - значит каждый помещающийся AC уже включён
-                assert all(f"ac_test_unread: {s.ref}" not in text for s in fits)
+                # обычный файл включён: ни одна непрочитанная вырезка не влезла бы
+                # в бюджет, занятый им
+                room = ceiling - (len(text) - len(other))
+                for s in spans:
+                    if f"ac_test_unread: {s.ref}" in text:
+                        assert len(cutout(s)) > room, (inside_n, ceiling_pad, s.ref)
         assert results[0] == results[1], "порядок разделов не меняет состав"
