@@ -189,3 +189,54 @@ async def test_a_stale_attempt_gets_exactly_409(world):
     # Несуществующий заказ по-прежнему 404, а не 409.
     assert (await started(world, "k8", 999999, "x")).status_code == 404
     assert repo is not None
+
+
+async def test_a_stranger_gets_404_and_a_former_holder_409(world):
+    """Codex P2: чужой хост без прежней попытки не узнаёт о заказе - 404; прежний держатель - 409."""
+    await admit(world, "k8")
+    await admit(world, "k9")
+    order = await _lease_one(world, "k8")
+    # Заказ у k8 в lease: k9 с произвольным lease_id - как будто заказа нет.
+    assert (await started(world, "k9", order["id"], "guess")).status_code == 404
+    assert (await report(world, "k9", order["id"], "guess")).status_code == 404
+    # Заказ вернулся в open (host пуст): посторонний k9 всё равно 404, прежний k8 - 409.
+    await age(world, order["id"], lease_deadline="-1 minute")
+    await role_orders.run_sweep(world.db)
+    await world.db.commit()
+    assert (await order_row(world, order["id"]))["state"] == "open"
+    assert (
+        await started(world, "k9", order["id"], order["lease_id"])
+    ).status_code == 404
+    assert (await report(world, "k9", order["id"], "guess")).status_code == 404
+    assert (
+        await started(world, "k8", order["id"], order["lease_id"])
+    ).status_code == 409
+    assert (
+        await report(world, "k8", order["id"], order["lease_id"])
+    ).status_code == 409
+
+
+async def test_an_expired_lease_without_admission_costs_no_reissue(world):
+    """Codex P2: допуск удалён, lease истёк - open с прежним attempt, не перевыдача и не lease_exhausted."""
+    await admit(world, "k8")
+    order = await _lease_one(world, "k8")
+    await world.db.execute("DELETE FROM role_host_admissions WHERE host = 'k8'")
+    await age(world, order["id"], lease_deadline="-1 minute")
+    await role_orders.run_sweep(world.db)
+    await world.db.commit()
+    row = await order_row(world, order["id"])
+    assert row["state"] == "open" and row["attempt"] == 1
+    # На последней попытке допуск тоже не превращает истечение в failed.
+    await admit(world, "k8")
+    again = await leased(world, "k8")
+    await world.db.execute(
+        "UPDATE role_orders SET attempt = ? WHERE id = ?",
+        (role_orders.MAX_REISSUES + 1, order["id"]),
+    )
+    await world.db.execute("DELETE FROM role_host_admissions WHERE host = 'k8'")
+    await age(world, order["id"], lease_deadline="-1 minute")
+    await role_orders.run_sweep(world.db)
+    await world.db.commit()
+    last = await order_row(world, order["id"])
+    assert again["id"] == order["id"]
+    assert last["state"] == "open" and last["attempt"] == role_orders.MAX_REISSUES + 1
