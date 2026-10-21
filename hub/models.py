@@ -420,6 +420,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
     # Читатель: project_policy.local_review_fallback_of.
     "local_review_fallback",
+    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
+    "critic_host",
     # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
     # отдельного выката): срок исхода считается от даты мержа. Не гейт и
     # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
@@ -3307,6 +3309,7 @@ class TaskView(PlainSummaryView):
     owner_minutes: OwnerMinutesView | None = None
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
     role_orders: list[dict[str, Any]] = Field(default_factory=list)  # #1973: card read
+    critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the
@@ -3539,6 +3542,9 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
+    from hub.services.project_policy import validate_critic_host
+
+    validate_critic_host(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
@@ -4383,8 +4389,7 @@ class MachineReviewView(BaseModel):
     findings_confirmed: list[MachineFinding] = Field(default_factory=list)
     findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
     # None means "never stated", not "complete" — reports written before this
-    # field existed made no such claim, and back-filling false would put words
-    # in their mouth (#549).
+    # field existed made no such claim; back-filling false would invent one (#549).
     incomplete: bool | None = None
     # #1238. Empty means the reviewer never said why — which is where every
     # report written before this field existed sits, and which must never be
@@ -4393,6 +4398,7 @@ class MachineReviewView(BaseModel):
     incomplete_reason: str = ""
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
+    ac_tests_unread: list[str] = Field(default_factory=list)  # #1933, review_oversized
     # Which profile produced this report (#807). Set by the hub from the
     # dispatch, never by the report about itself; empty means no dispatch was
     # behind it, which is NOT the same as a cheap run.

@@ -491,6 +491,9 @@ SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/role-orders"),
     ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/started"),
     ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/report"),
+    # #1953: заказы критика k8 для облачной сдачи - выдача и отчёт.
+    ("GET", "/api/executor-hosts/{name}/critic-orders"),
+    ("POST", "/api/executor-hosts/{name}/critic-orders/{order_id}/report"),
 )
 #: ``executor-host-<name>`` — the username of the principal a host registration
 #: creates; the gate compares the path to it without touching the database.

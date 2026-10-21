@@ -766,8 +766,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # скан делает проход поллера, не показ). Пакет стюарда: REST-чтение
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
 # нет «Справка по CI: … не проверена»; scan_hash в блоке ci_integrity; packet_hash прежний.
-GOLDEN_REST_BRIEF = "6f7b0d8ae96649e0665c96e471d6de2f45e8c69b3a9dbd1a289426c0ac2d3df4"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "8acce84aafa35c2814e1eed4e57974cebbb8dac6f36cb9ac8d7d76018403afbb"  # pragma: allowlist secret
+# #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
+GOLDEN_REST_BRIEF = "cb57484176328823c7d2dcce1c0f4777f62d76b38a38b35c32fe600503a5be4e"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "319b47245fb39f6951ce99c46e26395ddc0df5ffb575ce2f27e222093e25b4d4"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
@@ -1342,6 +1343,7 @@ _BAD: dict[str, tuple[str, Any]] = {
         [{"title": "u"}, {"title": "u2"}],
     ),
     "machine_review.lost_dimensions": ("machine_review.lost_dimensions", ["security"]),
+    "machine_review.ac_tests_unread": ("machine_review.ac_tests_unread", ["t.py::t"]),
     "machine_review.profile": ("machine_review.profile", "lite"),
     "machine_review.submitted_by": ("machine_review.submitted_by", "author"),
     "machine_review.self_reviewed": ("machine_review.self_reviewed", True),

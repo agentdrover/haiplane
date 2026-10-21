@@ -112,6 +112,7 @@ EXPECTED_SUBMIT_ORDER = (
     "canonical_branch",
     "branch_matches",
     "pin_submission_sha",
+    "critic_passed",  # #1953
     "same_sha_from_review_is_current",
     "empty_resubmission",
     "submission_contract",
@@ -213,6 +214,7 @@ EXPECTED_HEADLESS_ORDER = (
     "finding_outcomes",
     "submit_rules",
     "pin_submission_sha",
+    "critic_passed",  # #1953: объявлен, на headless не выполняется
     "path_notices",
     "delivery_pr",
 )
@@ -260,6 +262,7 @@ def test_the_two_pipelines_are_compared_by_their_lists():
         "submission_contract",
         "bug_red_test",
         "ci_before_submit",
+        "critic_passed",  # #1953: нет облачного держателя, гейт done - в add_update
     }, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"

@@ -439,6 +439,11 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
     "executor_runs": Coverage(removed_by=_NONE_YET),
     "executor_slots": Coverage(removed_by=_NONE_YET),
     "executor_orders": Coverage(removed_by=_NONE_YET),
+    "critic_orders": Coverage(
+        scenarios=(
+            "tests/test_critic_orders_moment.py::test_the_critic_orders_sweep_is_idempotent",
+        )
+    ),
     "expired_claims": Coverage(removed_by=_NONE_YET),
     "machine_deadlines": Coverage(removed_by=_NONE_YET),
     "stale_arbiter": Coverage(removed_by=_NONE_YET),

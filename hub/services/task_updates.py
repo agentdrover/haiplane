@@ -29,6 +29,7 @@ from hub import repository as repo
 from hub.db import write_transaction
 from hub.hub_instance import mutation_activity_detail
 from hub.models import TaskUpdateCreate, TaskUpdateView
+from hub.services import critic_orders
 from hub.services import lifecycle as lc
 from hub.services.done_hold import hold_done_report
 from hub.services.orchestration import defer_completions
@@ -156,6 +157,8 @@ async def _route_pending_report(
     if lc.completion_requires_review(task):
         # Universal Review Gate (#306): even the pending_report path may not
         # complete unreviewed work — the done report becomes a submission.
+        # #1953: приём облачной сдачи - до bump, в этой же транзакции (422 откатит).
+        await critic_orders.accept_in_transaction(db, task, pin=True)
         generation = await repo.bump_submission_generation(db, task_id)
         # #1589: и этот вход — сдача; без гейтов конвейера он иначе остался бы
         # без предупреждений по путям.
@@ -179,6 +182,8 @@ async def _route_pending_report(
             detail=mutation_activity_detail(),
         )
         return
+    # #1953: done без ревью - приём в момент принятия отчёта (bump тут нет).
+    await critic_orders.accept_in_transaction(db, task, pin=True)
     await repo.update_task(db, task_id, status="completed")
     await lc.log_activity(
         db,

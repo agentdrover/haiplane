@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
-from hub.services import gate_observations, role_orders
+from hub.services import critic_orders, gate_observations, role_orders
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
@@ -2516,6 +2516,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
     Sweep("executor_orders", _sweep_executor_orders),
+    Sweep("critic_orders", critic_orders.expire_due),  # #1953: срок заказа критика
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),
