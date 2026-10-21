@@ -422,6 +422,45 @@ async def attach_ac_tests_unread(db: Any, view: Any) -> None:
 RangeKey = tuple[str, int, int]
 
 
+def _reserve_ac(
+    ranges: dict[RangeKey, list[AcTestSpan]],
+    cost: dict[RangeKey, int],
+    texts: dict[str, str],
+    ac_paths: list[str],
+    budget: int,
+) -> tuple[int, set[RangeKey], set[str], set[RangeKey]]:
+    """Шаг A: представление каждого AC-файла - ДЕШЁВОЕ из двух, до файлов без AC.
+
+    Полный дифф файла (плюс непокрытые ханками диапазоны) против НАБОРА его
+    вырезок. Полный дифф берётся, когда он не дороже всех вырезок и влезает; иначе
+    - помещающееся подмножество вырезок. Так обычный файл не вытесняет более
+    дешёвое представление AC и не остаётся без места рядом с ним.
+    """
+    placed: set[RangeKey] = set()
+    full: set[str] = set()
+    covered_all: set[RangeKey] = set()
+    for path in ac_paths:
+        keys = [k for k in ranges if k[0] == path]
+        covered = {
+            k for k in keys if path in texts and shown_in(texts[path], ranges[k][0])
+        }
+        cuts_total = sum(cost[k] for k in keys)
+        full_cost = len(texts.get(path, "")) + sum(
+            cost[k] for k in keys if k not in covered
+        )
+        if path in texts and full_cost <= cuts_total and full_cost <= budget:
+            budget -= full_cost
+            full.add(path)
+            covered_all |= covered
+            placed |= {k for k in keys if k not in covered}
+            continue
+        for k in keys:
+            if cost[k] <= budget:
+                placed.add(k)
+                budget -= cost[k]
+    return budget, placed, full, covered_all
+
+
 def _upgrade_to_full(
     ranges: dict[RangeKey, list[AcTestSpan]],
     cost: dict[RangeKey, int],
@@ -429,19 +468,23 @@ def _upgrade_to_full(
     placed: set[RangeKey],
     budget: int,
     ac_paths: list[str],
+    done: set[str],
 ) -> tuple[int, set[str], set[RangeKey]]:
-    """Шаг C: AC-файл на полный дифф, если доплата влезает в остаток (``placed`` меняется)."""
+    """Шаг C: только РАСШИРЕНИЕ с неотрицательной доплатой, из остатка (``placed`` меняется).
+
+    Файлы, чьё представление выбрано на шаге A (``done``), не трогаются.
+    """
     upgraded: set[str] = set()
     read_by_diff: set[RangeKey] = set()
     for path in ac_paths:
-        if path not in texts:
+        if path not in texts or path in done:
             continue
         keys = [k for k in ranges if k[0] == path]
         covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
         kept = [k for k in keys if k not in covered and k in placed]
         need = len(texts[path]) + sum(cost[k] for k in kept)
         delta = need - sum(cost[k] for k in keys if k in placed)
-        if delta <= budget:
+        if 0 <= delta <= budget:
             budget -= delta
             upgraded.add(path)
             read_by_diff |= covered
@@ -480,13 +523,15 @@ def fit_with_ac_cutouts(
     отдельно (parametrize даёт много ссылок на один диапазон и платится он один
     раз). Приоритеты по шагам, порядок разделов диффа результат не меняет:
 
-    A) каждый диапазон AC, который ПОМЕЩАЕТСЯ в остаток, - вырезкой (по порядку;
-       не поместившийся не блокирует остальные: непрочитанными названы только
-       его ссылки);
-    B) все файлы без тестов AC - по порядку диффа, из остатка;
-    C) последним шагом AC-файл улучшается до полного диффа (плюс вырезки того,
-       что вне ханков), если доплата влезает в остаток; покрытые ханками
-       диапазоны тогда прочитаны через дифф.
+    A) представление каждого AC-файла - ДЕШЁВОЕ из двух (полный дифф файла плюс
+       непокрытые ханками диапазоны, либо набор его вырезок), выбранное и
+       оплаченное ДО шага B; вырезки - помещающееся подмножество (не
+       поместившийся диапазон не блокирует остальные: непрочитанными названы
+       только его ссылки);
+    B) все файлы без тестов AC - от меньшего к большему, затем по пути, из остатка;
+    C) последним шагом - только расширение AC-файла (вырезки -> полный дифф) с
+       неотрицательной доплатой из остатка; покрытые ханками диапазоны тогда
+       прочитаны через дифф.
     """
 
     def norm(t: str) -> str:
@@ -509,13 +554,10 @@ def fit_with_ac_cutouts(
         return cutout(ranges[key][0], [x.ref for x in ranges[key]])
 
     cost = {k: len(rtext(k)) for k in ranges}
-    budget = ceiling
-    placed: set[tuple[str, int, int]] = set()
-    for k in ranges:  # A
-        if cost[k] <= budget:
-            placed.add(k)
-            budget -= cost[k]
     ac_paths = list(dict.fromkeys(k[0] for k in ranges))
+    budget, placed, upgraded, read_by_diff = _reserve_ac(
+        ranges, cost, texts, ac_paths, ceiling
+    )
     shown_plain: set[str] = set()
     # B: файлы без AC - от меньшего к большему (порядок разделов состав не меняет)
     for key in sorted(
@@ -524,9 +566,11 @@ def fit_with_ac_cutouts(
         if len(texts[key]) <= budget:
             shown_plain.add(key)
             budget -= len(texts[key])
-    budget, upgraded, read_by_diff = _upgrade_to_full(
-        ranges, cost, texts, placed, budget, ac_paths
+    budget, more, more_read = _upgrade_to_full(
+        ranges, cost, texts, placed, budget, ac_paths, set(upgraded)
     )
+    upgraded |= more
+    read_by_diff |= more_read
     text, omitted = _assemble(texts, names, ac_paths, upgraded, shown_plain)
     cuts = [rtext(k) for k in ranges if k in placed]
     unread = [
