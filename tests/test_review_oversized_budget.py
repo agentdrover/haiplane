@@ -331,3 +331,19 @@ def test_a_tie_between_a_full_diff_and_cutouts_goes_to_the_cutouts(monkeypatch):
         ranges, cost, {F: "T" * 100}, [F], 100
     )
     assert (left, placed, full, covered) == (0, {b}, set(), set())
+
+
+def test_a_full_diff_keeps_the_fitting_cutout_of_an_uncovered_ac():
+    """Полный дифф покрывает test_ac; test_outside вне ханка влезает вырезкой рядом - прочитан."""
+    inside = _fn("test_ac", "INS", 60)
+    outside = _fn("test_outside", "OUT", 3)
+    ac = _modified(F, ["+" + s for s in inside] + [" " + outside[0]])
+    refs = [f"{F}::test_ac", f"{F}::test_outside"]
+    spans = ac_test_spans({F: "\n".join(inside + outside) + "\n"}, refs)
+    ceiling = len(ac) + len(cutout(spans[1])) + 5
+    assert (
+        len(cutout(spans[0])) + len(cutout(spans[1])) > ceiling
+    )  # одни вырезки не вмещают оба
+    text, omitted = _run((ac,), ceiling, spans)
+    assert omitted == [] and "INS_0059" in text and "OUT_0002" in text
+    assert "ac_test_unread" not in text
