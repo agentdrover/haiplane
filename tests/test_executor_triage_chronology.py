@@ -143,6 +143,7 @@ async def test_agent_draft_child_is_not_a_split(world):
     await world.db.commit()
     last = await _last_order(world, task_id)
     await _sweep(world)
+    await _sweep(world)  # вторая секунда: засчитанный draft успел бы разрешиться
     assert await _followup(world, last) is None
     await repo.update_task(world.db, draft, status="open")
     await world.db.commit()
