@@ -362,3 +362,37 @@ async def test_rework_action_is_accepted_by_old_and_fresh_schema(world):
     )
     assert REWORK in fresh[0]["sql"]
     assert hub_db  # модуль подключён теми же шагами, что и прод
+
+
+async def test_rework_child_floor_ignores_children_made_before_the_recommendation(
+    world, _no_cloud
+):
+    """Подзадача, созданная ДО рекомендации, не делает исход unclear."""
+    await _pin_old_activation(world)
+    tid, _ = await _k8_review(world, "с подзадачей")
+    await repo.create_task(
+        world.db,
+        title="подзадача до рекомендации",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=tid,
+        priority="medium",
+    )
+    await world.db.commit()
+    await _return_to_work(world, tid)
+    rec = (await _recs(world, tid))[0]
+    assert rec["child_floor"] > 0
+    await world.db.execute(
+        "UPDATE executor_triage_recommendations SET created_at = "
+        "datetime('now', '-73 hours') WHERE task_id = ?",
+        (tid,),
+    )
+    await world.db.commit()
+    await triage.sweep(world.db)
+    assert (await _recs(world, tid))[0]["followup"] == "none_72h"

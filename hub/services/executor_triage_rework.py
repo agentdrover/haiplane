@@ -83,7 +83,8 @@ async def recommend_for_task(
     cursor = await db.execute(
         "INSERT OR IGNORE INTO executor_triage_recommendations "
         "(order_id, task_id, triage_class, class_name, action, reason, child_floor, "
-        "verdict_revision, findings_count) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        "verdict_revision, findings_count) VALUES (?, ?, ?, ?, ?, ?, "
+        "COALESCE((SELECT MAX(id) FROM tasks WHERE parent_id = ?), 0), ?, ?)",
         (
             int(snap["order_id"]),
             int(task_id),
@@ -91,6 +92,7 @@ async def recommend_for_task(
             CLASS_REWORK_NAME,
             triage.ACTION_REWORK_ON_HOST,
             "задача вернулась с ревью на доработку",
+            int(task_id),
             revision,
             count,
         ),
