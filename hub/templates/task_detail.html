@@ -87,6 +87,8 @@
             {% if task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
             {% include "partials/task_verdict_replace.html" %}
             {% endif %}
+            {# #1622: fix_requested and review with a live review job have no board; the cause still shows. #}
+            {% if brief_failure and not review_board %}<div class="task-action-note task-action-note--warning" id="brief-failure">бриф не собран: {{ brief_failure }}</div>{% endif %}
             {% if decision_brief %}{% include "partials/decision_brief.html" %}{% endif %}{% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
             {% include "partials/task_review_board.html" %}
 

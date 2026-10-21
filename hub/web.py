@@ -2882,7 +2882,8 @@ async def _web_task_detail_page(
     # the coverage verdict over them — assembled by the SAME builder that
     # answers /review-brief. Two readers, one assembly: the card and the brief
     # cannot drift apart because there is nothing to keep in step.
-    from hub.services.review_brief import BriefFailure, gate_evidence
+    from hub.services.brief_failure import BriefFailure
+    from hub.services.review_brief import gate_evidence
 
     evidence = await gate_evidence(db, dict(row))
     # #1622: a failed assembly says why; it is not the same as "no gate".

@@ -26,7 +26,6 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any, Awaitable, Iterator
 
 from hub import commit_scope, config
@@ -65,6 +64,7 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
+from hub.services.brief_failure import BriefFailure, failure_from
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
@@ -1093,13 +1093,6 @@ async def _late_reads(
     return late
 
 
-@dataclass(frozen=True)
-class BriefFailure:
-    """The brief of a gate task could not be assembled (#1622): the cause."""
-
-    reason: str
-
-
 async def gate_evidence(
     db, task_row: dict[str, Any]
 ) -> ReviewBrief | BriefFailure | None:
@@ -1119,7 +1112,4 @@ async def gate_evidence(
         return await build_review_brief(db, int(task_row["id"]), observe_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
-        text = str(exc).strip()
-        return BriefFailure(
-            f"{type(exc).__name__}: {text}"[:300] if text else type(exc).__name__
-        )
+        return failure_from(exc)
