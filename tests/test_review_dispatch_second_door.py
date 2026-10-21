@@ -1265,7 +1265,8 @@ async def test_a_deep_top_up_is_not_silenced_by_an_earlier_lite_debt(
     deep_cloud = dict(
         (
             await db.execute_fetchall(
-                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud' "
+                "AND agent_id != ''",  # #1946: заглушка с адресованным кодом осталась
                 (task_id,),
             )
         )[0]

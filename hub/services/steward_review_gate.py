@@ -145,6 +145,17 @@ async def _ci_wait_gate(
     return ReviewGate(because=gate.because or note, ci_note=note)
 
 
+def _wait_detail(wait: Any) -> str:
+    """Описание ожидания для основания заказа судьи, когда потолок вышел (#1946)."""
+    from hub.services.review_evidence import WAIT_KIND_TOP_UP
+
+    if wait.kind != WAIT_KIND_TOP_UP:
+        return str(wait.detail)
+    from hub.services.ladder_view import after_ceiling
+
+    return after_ceiling(str(wait.detail))
+
+
 def _review_blocker(wait: Any) -> str:
     """Фраза отсрочки: что именно ждём, и чем кончился бы ранний прогон."""
     from hub.services.review_evidence import WAIT_KIND_TOP_UP
@@ -177,13 +188,13 @@ async def _review_report_gate(
             return ReviewGate(
                 because="метка отсрочки нечитаема: сколько ждали, неизвестно, "
                 f"потолок {config.STEWARD_REVIEW_WAIT_MAX} мин считаем "
-                f"достигнутым: {wait.detail}"
+                f"достигнутым: {_wait_detail(wait)}"
             )
         if waited < config.STEWARD_REVIEW_WAIT_MAX:
             return ReviewGate(blocker=_review_blocker(wait), wait_kind=wait.kind)
         return ReviewGate(
             because=f"ждали отчёт {waited} мин (потолок "
-            f"{config.STEWARD_REVIEW_WAIT_MAX}): {wait.detail}"
+            f"{config.STEWARD_REVIEW_WAIT_MAX}): {_wait_detail(wait)}"
         )
     if wait.reason == "report_ready":
         return ReviewGate()
