@@ -188,3 +188,27 @@ async def test_a_refusal_inside_the_acceptance_leaves_no_open_transaction(world,
         await critic_orders.accept_in_transaction(world.db, row, bump=True)
     assert not world.db.in_transaction
     assert (await _row(world, cloud.task_id))["submission_generation"] == 0
+
+
+async def test_the_critic_orders_sweep_is_idempotent(world, tip):
+    """Свип critic_orders: просроченный заказ закрыт исходом expired один раз, повтор тих."""
+    from hub.poller import SWEEPS
+
+    sweep = next(s for s in SWEEPS if s.name == "critic_orders")
+    cloud = await co._cloud(world, tip)
+    assert (await co._say(world, cloud, co._line(co.SHA_A))).status_code == 200
+    await world.db.execute(
+        "UPDATE critic_orders SET expires_at = datetime('now', '-1 minute')"
+    )
+    await world.db.commit()
+    for _ in range(3):
+        await sweep.run(world.db)
+        await world.db.commit()
+    (order,) = await co._orders(world, cloud.task_id)
+    assert (order["state"], order["outcome"], order["closed_reason"]) == (
+        "closed",
+        "expired",
+        "ttl",
+    )
+    alerts = [a for a in await co._alerts(world, cloud.task_id) if "истёк" in a]
+    assert len(alerts) == 1
