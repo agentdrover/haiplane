@@ -167,15 +167,19 @@ async def close(
     text: str,
     *,
     failed_jobs: Any = NOT_APPLICABLE,
-    from_states: tuple[str, ...] = OPEN_STATES,
+    only_reserved: bool = False,
 ) -> bool:
-    """Закрыть открытую бронь исходом; уже закрытая не перезаписывается."""
-    marks = ", ".join("?" for _ in from_states)
+    """Закрыть открытую бронь исходом; уже закрытая не перезаписывается.
+
+    ``only_reserved`` - ответ POST: он закрывает только бронь, которой ещё нет
+    ответа, а ``requested`` (её принял соседний проход) не трогает.
+    """
     cur = await db.execute(
         "UPDATE delivery_reruns SET state='closed', outcome=?, "
         "closed_at=datetime('now'), failed_jobs=?, "
         "history=json_insert(history, '$[#]', json(?)) "
-        f"WHERE id=? AND state IN ({marks})",
+        "WHERE id=? AND state IN ('reserved', 'requested') "
+        "AND (? = 0 OR state = 'reserved')",
         (
             outcome,
             "[]"
@@ -183,7 +187,7 @@ async def close(
             else json.dumps(failed_jobs, ensure_ascii=False),  # None -> 'null'
             _event(text, outcome),
             int(row_id),
-            *from_states,
+            1 if only_reserved else 0,
         ),
     )
     return cur.rowcount == 1

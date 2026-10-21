@@ -490,7 +490,7 @@ async def _after_post(
     names = await _names(scope, run_id, attempt)
     row = await _close_by_id(
         db, task, row_id, outcome, f"форж не принял перезапуск ({detail})", names,
-        from_states=(journal.RESERVED,),
+        only_reserved=True,
     )  # fmt: skip
     if row is None:
         return await _settled_answer(db, task, ctx)
