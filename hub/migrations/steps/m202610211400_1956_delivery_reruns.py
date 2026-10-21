@@ -46,7 +46,8 @@ MIGRATIONS = [
                        'at', datetime('now'), 'actor', 'hub',
                        'event', 'rerun_green',
                        'text', 'доставлено: PR влит гейтом'))
-             WHERE task_id = NEW.task_id AND state = 'requested';
+             WHERE task_id = NEW.task_id AND pr_number = NEW.pr_number
+               AND state = 'requested';
         END""",
     ),
 ]

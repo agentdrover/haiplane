@@ -124,12 +124,14 @@ async def policy_mode(db: aiosqlite.Connection, task_id: int) -> bool | None:
     """
     try:
         project = await repo.resolve_project_for_task(db, task_id)
+        if project is None:
+            return False
+        policy = json.loads(project["gate_policy"] or "{}")
     except Exception:  # noqa: BLE001 - «не прочиталось» не равно «выключено»
         log.exception("policy of task #%s unreadable", task_id)
         return None
-    if project is None:
-        return False
-    policy = project_policy.gate_policy_of(project)
+    if not isinstance(policy, dict):
+        return None  # битая политика - тоже «не прочиталось», а не «off»
     return (
         project_policy.delivery_fresh_base_rerun_of(policy)
         == project_policy.DELIVERY_FRESH_BASE_RERUN_ON
@@ -197,6 +199,10 @@ async def gate_step(
     await _supersede_foreign(db, task)
     row = await journal.get(db, task_id, generation)
     if row is not None and row["state"] in journal.OPEN_STATES:
+        if row["pr_number"] != int(task.get("pr_number") or 0):
+            # Снимок вызывающего - старый PR того же поколения: чужую бронь он не
+            # судит и не закрывает, мержа по ней в этом проходе нет.
+            return _wait_text(task, "бронь относится к другому PR, проход устарел")
         return await _open_step(db, task, ctx, row, mode)
     if row is not None and row["state"] == journal.CLOSED:
         return await _closed_step(db, task, ctx, ci, row)
@@ -205,6 +211,27 @@ async def gate_step(
     if not await is_fresh_base(db, task, row):
         return ""
     return await _first_failure(db, task, ctx, ci)
+
+
+async def recheck_before_merge(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> str:
+    """Последний взгляд на бронь прямо перед мержем: "" - мерж не запрещён.
+
+    Между ``gate_step`` и мержем проход ходит в сеть (стопка, свежесть базы,
+    черновик), и соседний проход мог закрыть бронь терминально. Окно остаётся
+    только на сам вызов мержа (его держит ``merge_if_approval_stands``).
+    """
+    row = await journal.get(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    if row is None or row["state"] == journal.ARMED:
+        return ""
+    if row["state"] == journal.CLOSED:
+        return await _settled_answer(db, task, ctx)
+    async with write_transaction(db):
+        still = await journal.confirm_requested(db, row["id"])
+    return "" if still else await _settled_answer(db, task, ctx)
 
 
 async def _supersede_foreign(db: aiosqlite.Connection, task: dict[str, Any]) -> None:

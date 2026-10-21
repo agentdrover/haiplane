@@ -3966,7 +3966,6 @@ BASE_FETCH_PENDING_PREFIX = "base_fetch_pending"
 # конвейере (#1030), а семантический конфликт с чужой доставкой.
 BASE_UPDATE_CONFLICT_PREFIX = "base_update_conflict"
 BASE_UPDATE_REFUSED_PREFIX = "base_update_refused"
-FRESH_BASE_CI_FAILED_PREFIX = delivery_rerun.FAILED_PREFIX
 # Событие «гейт слил базу в ветку с головы X в поколении сдачи N». По нему
 # следующий цикл узнаёт и красный CI на свежей базе, и уже потраченное
 # обновление (не больше одного без нового прогона CI).
@@ -4556,6 +4555,8 @@ async def _gate_merge_step(
     разрешается однозначно. Оба вопроса задаются ТОЛЬКО после отказа мержа:
     у зелёной доставки нет причины за них платить.
     """
+    if late := await delivery_rerun.recheck_before_merge(db, task, ctx):  # #1956
+        return (False, late), ""
     step, merge_detail = await merge_if_approval_stands(
         db,
         task,
@@ -4839,8 +4840,7 @@ async def _red_ci_detail(
     """Красный CI: авторский (чинит исполнитель) или на свежей базе (человек, #1419).
 
     Гейт слил базу в ветку этого поколения, а CI после этого красный — это
-    конфликт с чужой доставкой, а не недоделка автора: авторская правка та же
-    (иначе сверка #612/#1361 выше уже отказала бы). Решать человеку.
+    конфликт с чужой доставкой, а не недоделка автора. Решать человеку.
     """
     if await delivery_rerun.fresh_base_origin(db, task):
         return delivery_rerun.base_text(task, ci)

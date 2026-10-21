@@ -120,3 +120,79 @@ async def test_the_instruction_names_the_jobs_of_the_attempt_that_ran(
     assert not ok and why.startswith("fresh_base_ci_failed")
     assert "старая попытка" not in why, "устаревшие имена из первой попытки"
     assert (await rig.row())["outcome"] == "timeout"
+
+
+async def test_a_booking_closed_while_the_pass_waits_on_the_network_blocks_the_merge(
+    db, db_dsn, monkeypatch
+):
+    from hub.db import connect
+    from hub.services import orchestration
+
+    rig = await _booked_and_verified(db, monkeypatch)
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    other = await connect(db_dsn)
+    try:
+        real = orchestration.stacking_gate_step
+
+        async def stacking_while_a_neighbour_closes(conn, task):
+            # Соседний проход закрыл бронь, пока этот ходил по сети перед мержем.
+            await other.execute(
+                "UPDATE delivery_reruns SET state='closed', outcome='rerun_not_current'"
+            )
+            await other.commit()
+            return await real(conn, task)
+
+        monkeypatch.setattr(
+            orchestration, "stacking_gate_step", stacking_while_a_neighbour_closes
+        )
+        ok, why = await services.merge_before_completion(db, await rig.task())
+    finally:
+        await other.close()
+
+    assert not ok and why.startswith("fresh_base_ci_failed"), why
+    rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_a_delivery_of_another_pr_of_the_task_does_not_close_the_booking(
+    db, monkeypatch
+):
+    rig = await _booked_and_verified(db, monkeypatch)
+    await repo.record_pipeline_merge(
+        db, pr_number=12, merge_sha="old0merge", task_id=rig.task_id
+    )
+    await db.commit()
+    assert (await rig.row())["state"] == "requested", "чужой PR той же задачи"
+
+    await repo.record_pipeline_merge(
+        db, pr_number=77, merge_sha="own0merge", task_id=rig.task_id
+    )
+    await db.commit()
+    row = await rig.row()
+    assert (row["state"], row["outcome"]) == ("closed", "rerun_green")
+
+
+async def test_a_snapshot_of_another_pr_cannot_judge_or_close_the_booking(
+    db, monkeypatch
+):
+    rig = await _booked_and_verified(db, monkeypatch)
+    old_pr = {**await rig.task(), "pr_number": 12}
+
+    answer = await delivery_rerun.gate_step(db, old_pr, {}, PASSED)
+
+    assert answer.startswith("fresh_base_ci_rerun")
+    assert (await rig.row())["state"] == "requested"
+
+
+@pytest.mark.parametrize("stored", ["{broken", "[1]"], ids=["not-json", "not-a-map"])
+async def test_a_corrupt_policy_is_unreadable_not_off(db, monkeypatch, stored):
+    rig = await _booked_and_verified(db, monkeypatch)
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE slug='default'", (stored,)
+    )
+    await db.commit()
+
+    ok, why = await services.merge_before_completion(db, await rig.task())
+
+    assert not ok, why
+    rig.git.merge_pr.assert_not_awaited()
