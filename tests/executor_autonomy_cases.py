@@ -322,3 +322,26 @@ async def test_executor_autonomy_open_start_skips_empty_history(
     result = await practice_metrics(db, date_to="2026-10-25")
     weeks = result["executor_autonomy"]["hosts"]["k8"]["weeks"]
     assert [w["week"] for w in weeks] == ["2026-W43"]
+
+
+async def test_executor_autonomy_needs_both_signals_and_rounds(
+    db: aiosqlite.Connection,
+):
+    """#1980: the report AND the closing both say submitted; rate has 3 digits."""
+    await _autonomy_host(db)
+    task = await _task(db, title="both signals")
+    at = "2026-10-21 10:00:00"
+    for outcome, reason in (
+        ("submitted", "submitted"),
+        ("submitted", "reported_rescued"),
+        ("", "submitted"),
+    ):
+        await _autonomy_order(
+            db, task, closed_at=at, outcome=outcome, close_reason=reason
+        )
+    await db.commit()
+    week = (await practice_metrics(db, **_AUTONOMY_WINDOW))["executor_autonomy"][
+        "hosts"
+    ]["k8"]["weeks"][0]
+    assert (week["orders_closed"], week["autonomous"], week["rate"]) == (3, 1, 0.333)
+    assert week["by_outcome"] == {"submitted": 2, "none": 1}
