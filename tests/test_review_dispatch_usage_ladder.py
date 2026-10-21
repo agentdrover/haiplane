@@ -448,6 +448,52 @@ async def test_repo_rules_collected_up_the_tree(
     assert "СМОТРИ ШИРЕ" in prompt
 
 
+async def test_review_rules_carry_finding_form(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1866): the repository's own rules file, read from the base branch,
+    # reaches the order with the "Форма находки" section whole.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-form"}, "run": {"id": "r-form"}})
+    _wire(monkeypatch, recorder)
+    rules = (Path(__file__).resolve().parents[1] / ".hub/REVIEW_RULES.md").read_text(
+        "utf-8"
+    )
+
+    await _submitted(
+        client,
+        db,
+        "spike-form",
+        diff=_RULES_DIFF,
+        rules={".hub/REVIEW_RULES.md": rules},
+    )
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "ОБРЕЗАНО" not in prompt, "the section must fit the rules cap"
+    flat = " ".join(prompt.split())
+    start = flat.index("## Форма находки")
+    form = flat[start:]
+    for needle in (
+        "число находок по важности",
+        "исправлять нечего",
+        "проверено не всё",
+        "отсутствие данных не равно чистому результату",
+        "`review_cycle` ≥ 3",
+        "назван класс дефекта",
+        "перечислены все места этого класса",
+        "существовало до задачи",
+        "отдельная информация, а не автоматический `out_of_scope`",
+        "цель, AC и границы задачи",
+        "всё ещё открыто",
+        "прежним заголовком",
+        "С третьего возврата",
+        "сходится ли подход",
+        "предложи другой подход",
+    ):
+        assert needle in form, needle
+    # Раздел дошёл до конца файла правил, не обрезанным.
+    assert "Только потом перечисляй находки." in form
+
+
 async def test_missing_repo_rules_is_stated_not_silent(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
