@@ -22,7 +22,7 @@ from hub import cli, config
 from hub import repository as repo
 from hub.services import chat_pair as cp
 from hub.services import executor_orders as orders
-from hub.services import finding_outcome, orchestration
+from hub.services import finding_outcome, lifecycle, orchestration
 from tests import test_executor_orders as _eo
 from tests import submit_dry_run_support as sup
 from tests.cli_support import _run_main
@@ -36,21 +36,13 @@ _clean_limiter = _eo._clean_limiter
 _no_cloud = _eo._no_cloud
 
 POLICY = {"ci_before_submit": "require", "submission_contract": "require"}
-PIPELINE = (
-    "task_is_submittable",
-    "canonical_branch",
-    "branch_matches",
-    "pin_submission_sha",
-    "same_sha_from_review_is_current",
-    "empty_resubmission",
-    "submission_contract",
-    "bug_red_test",
-    "ci_before_submit",
-    "resolve_diff",
-    "surfaces",
-    "finding_outcomes",
-    "submit_rules",
-    "path_notices",
+PIPELINE = tuple(
+    step.name
+    for step in (
+        *lifecycle.SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK,
+        *lifecycle.SUBMIT_STEPS_AFTER_SAME_SHA_CHECK,
+    )
+    if step.name != "delivery_pr"
 )
 
 
@@ -442,12 +434,11 @@ async def test_dry_run_writes_nothing(world, monkeypatch):
     refused = sup.body(finding_outcomes=[{"finding_uid": sup.UID, "outcome": "fixed"}])
     await dry(refused, status=422)
 
-    before = await sup.snapshot(db, sup.AUTH_BOOKKEEPING)
+    skip = (*sup.AUTH_BOOKKEEPING, "executor_triage_state")  # учёт самого sweep
+    before = await sup.snapshot(db, skip)
     await orders.sweep_executor_orders(db)
     await orders.settle(db)
-    assert sup.changed(before, await sup.snapshot(db, sup.AUTH_BOOKKEEPING)) == [], (
-        "sweep ничего не закрыл"
-    )
+    assert sup.changed(before, await sup.snapshot(db, skip)) == [], "sweep не закрыл"
     me = await world.client.get("/api/whoami", headers=session)
     assert me.status_code == 200, "токен жив после sweep"
     assert (await _eo._order_row(world, slot["order"]["id"]))["state"] != "closed"
