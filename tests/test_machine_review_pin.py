@@ -97,7 +97,7 @@ async def test_a_pinned_report_is_recorded_as_verified(
 
 
 async def test_a_stale_or_partial_pin_is_refused(
-    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
 ) -> None:
     """AC-2: чужое поколение, чужой sha, гонка с пересдачей -> 409; одно поле -> 422."""
     task_id = await _task(client, db, "pin-stale")
@@ -129,9 +129,10 @@ async def test_a_stale_or_partial_pin_is_refused(
     assert resp.status_code == 409
     assert resp.json()["detail"]["reason"] == "review_pin_mismatch"
     assert await _rows(db, task_id) == []
+    await _the_resubmission_race(client, db, db_dsn, monkeypatch)
 
 
-async def test_a_resubmission_cannot_land_between_the_check_and_the_write(
+async def _the_resubmission_race(
     client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
 ) -> None:
     """Гонка на двух соединениях: сверка и INSERT держат один write-лок.
@@ -309,6 +310,18 @@ async def test_text_reports_and_carried_copies_never_claim_a_pin(
         origin="run_text",
     )
     assert stored.pin_verified is False
+    # Пин в теле, пришедшем не по контракту (origin текстового канала), не засчитан.
+    pinned_text = await intake.record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(
+            **{**_CLEAN_REVIEW, "expected_generation": 1, "reviewed_sha": _TIP}
+        ),
+        principal_id=None,
+        username="x",
+        origin="run_text",
+    )
+    assert (pinned_text.pin_verified, pinned_text.reviewed_sha) == (False, "")
 
     copied = await repo.insert_machine_review(
         db, task_id=task_id, submission_generation=1, carried_from_review_id=stored.id
@@ -338,3 +351,52 @@ async def test_the_mcp_tool_forwards_the_pin_and_omits_it_when_absent(
     await mcp_server.hub_submit_machine_review(7, raw_count=0, incomplete=False)
     _, sent = post.await_args.args
     assert "expected_generation" not in sent and "reviewed_sha" not in sent
+
+
+async def test_the_pin_lock_covers_only_the_intake_not_the_automation(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
+) -> None:
+    """Автоматика после отчёта идёт вне транзакции пина и со своими коммитами.
+
+    Иначе упавший шаг автоматики, перехваченный ею же, был бы зафиксирован
+    завершающим commit пина, а без пина откатился бы с соединением (Codex P2).
+    Заодно: вызов с именованными аргументами работает.
+    """
+    task_id = await _task(client, db, "pin-scope")
+    await db.commit()
+    seen: list[bool] = []
+
+    async def spy(conn, tid, task) -> None:
+        seen.append(conn.in_transaction)
+
+    monkeypatch.setattr(intake, "_run_report_automation", spy)
+    conn = await db_module.connect(db_dsn)
+    try:
+        view = await intake.record_machine_review(
+            db=conn,
+            task_id=task_id,
+            body=MachineReviewSubmit(
+                **{**_CLEAN_REVIEW, "expected_generation": 1, "reviewed_sha": _TIP}
+            ),
+            principal_id=None,
+            username="reviewer-x",
+        )
+    finally:
+        await conn.close()
+    assert view.pin_verified is True
+    assert seen == [False]
+
+
+async def test_a_pin_before_the_first_submission_is_a_mismatch_not_a_400(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    """До первой сдачи: с пином 409 (заявленной сдачи нет), без пина прежний 400."""
+    created = await client.post(
+        "/api/tasks", json={"title": "no submit", "task_type": "task"}
+    )
+    task_id = created.json()["id"]
+
+    pinned = await _post(client, task_id, expected_generation=1, reviewed_sha=_TIP)
+    assert pinned.status_code == 409, pinned.text
+    assert pinned.json()["detail"]["reason"] == "review_pin_mismatch"
+    assert (await _post(client, task_id)).status_code == 400

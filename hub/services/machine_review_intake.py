@@ -263,19 +263,22 @@ async def _intake_alerts(
 
 
 @review_pin.under_pin_lock
-async def record_machine_review(
+async def _store_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
     body: MachineReviewSubmit,
     *,
     principal_id: int | None,
     username: str,
-    origin: str = ORIGIN_MCP,
-    expected_generation: int | None = None,
-    dispatch_id: int | None = None,
-    code_id: int | None = None,
-) -> MachineReviewView:
-    """Store one report and run everything that hangs off it (#381, #1036).
+    origin: str,
+    expected_generation: int | None,
+    dispatch_id: int | None,
+    code_id: int | None,
+) -> tuple[MachineReviewView, dict]:
+    """Store one report and what hangs off its row (#381, #1036).
+
+    Only this part runs under the pin's write lock (#1985): the automation after
+    it keeps its own transactions and failure handling, pinned or not.
 
     ``principal_id`` is the OWNER of the report, always taken from a token or
     from the dispatch row — never from what the report says about itself
@@ -305,14 +308,14 @@ async def record_machine_review(
                 ),
             },
         )
+    # #1985: пин тела сверяется ПОСЛЕ ограничения сессии (403 выше) и не заменяет
+    # его; под write-локом, взятым декоратором до чтения задачи.
+    await review_pin.verify(db, task_id, generation, body)
     if generation == 0:
         raise HTTPException(
             400,
             "no submission to review: submit_for_review must run at least once",
         )
-    # #1985: пин тела сверяется ПОСЛЕ ограничения сессии (403 выше) и не заменяет
-    # его; под write-локом, взятым декоратором до чтения задачи.
-    await review_pin.verify(db, task_id, generation, body)
     # raw_count is self-reported and was stored unchecked, so reports arrived
     # claiming fewer raw findings than the findings they themselves listed —
     # on production one had raw_count=0 alongside two confirmed findings
@@ -565,9 +568,39 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
     await attach_ac_tests_unread(db, view)
+    return view, task
 
+
+async def record_machine_review(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    *,
+    principal_id: int | None,
+    username: str,
+    origin: str = ORIGIN_MCP,
+    expected_generation: int | None = None,
+    dispatch_id: int | None = None,
+    code_id: int | None = None,
+) -> MachineReviewView:
+    """Store one report and run everything that hangs off it (#381, #1036).
+
+    ``principal_id`` is the OWNER of the report, always taken from a token or
+    from the dispatch row - never from what the report says about itself
+    (#893, #1025). ``origin`` records how it reached us.
+    """
+    view, task = await _store_machine_review(
+        db,
+        task_id,
+        body,
+        principal_id=principal_id,
+        username=username,
+        origin=origin,
+        expected_generation=expected_generation,
+        dispatch_id=dispatch_id,
+        code_id=code_id,
+    )
     await _run_report_automation(db, task_id, task)
-
     return view
 
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Awaitable, Callable
-from typing import ParamSpec, TypeVar
+from typing import Any, TypeVar
 
 import aiosqlite
 from fastapi import HTTPException
@@ -26,21 +26,28 @@ from hub.models import MachineReviewSubmit
 PIN_MISMATCH = "review_pin_mismatch"
 _MCP_ORIGIN = "mcp"
 
-P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def under_pin_lock(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-    """Пинованный отчёт принимается под write-локом, взятым до первого чтения."""
+def under_pin_lock(
+    fn: Callable[..., Awaitable[R]],
+) -> Callable[..., Awaitable[R]]:
+    """Пинованный отчёт принимается под write-локом, взятым до первого чтения.
+
+    Оборачивает ТОЛЬКО приём отчёта; вызывается позиционно ``(db, task_id, body)``.
+    """
 
     @functools.wraps(fn)
-    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        db: aiosqlite.Connection = args[0]  # type: ignore[assignment]
-        body = kwargs.get("body", args[2] if len(args) > 2 else None)
-        if getattr(body, "reviewed_sha", None) is None:
-            return await fn(*args, **kwargs)
+    async def wrapper(
+        db: aiosqlite.Connection,
+        task_id: int,
+        body: MachineReviewSubmit,
+        **kwargs: Any,
+    ) -> R:
+        if body.reviewed_sha is None:
+            return await fn(db, task_id, body, **kwargs)
         async with db_module.write_transaction(db):
-            return await fn(*args, **kwargs)
+            return await fn(db, task_id, body, **kwargs)
 
     return wrapper
 
