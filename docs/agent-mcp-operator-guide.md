@@ -282,7 +282,10 @@ curl -sS -X POST https://<hub>/api/tasks -H "Authorization: Bearer $TOKEN" \
 Настройки на сервере (drop-in, все с разумными дефолтами):
 `HAIPLANE_CHAT_PAIR_CODE_SECONDS` (300), `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200),
 `HAIPLANE_CHAT_PAIR_REDEEM_MAX` / `HAIPLANE_CHAT_PAIR_REDEEM_WINDOW_SECONDS`
-(10 / 300). В open mode (хаб без принципалов и `HAIPLANE_HUB_TOKENS`) канал
+(10 / 300). Срок сессии заказа хосту (#1960) — `HAIPLANE_EXECUTOR_RUN_SECONDS`
+(`XS=7200,S=7200,M=10800,L=14400,XL=14400,none=7200`; по умолчанию 7200 всем,
+пол 3600, потолок 14400 — константа кода; плохая строка отвергается целиком,
+см. `hub_effective_policy`). В open mode (хаб без принципалов и `HAIPLANE_HUB_TOKENS`) канал
 отвечает 503 `chat_pair_auth_required`: без auth нет и личности, которую мог бы
 нести код.
 
@@ -355,7 +358,8 @@ curl -sS https://<hub>/api/whoami -H "Authorization: Bearer $TOKEN"
 5. Повторный / неизвестный / просроченный код — 401 `chat_pair_invalid`, как
    у intake. Нет действующего агента-принципала — 503 на выдаче кода.
 
-TTL сессии тот же `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200), что у intake.
+TTL сессии тот же `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200), что у intake;
+исключение — заказ хосту: срок из `run_seconds` заказа (#1960).
 **Продления нет:** новый маршрут не добавляется в implementer allowlist.
 Если последняя живая implementer-сессия истекла или отозвана, пока bound-задача
 ещё `running` или `claimed`, reaper хаба возвращает её в `open` и пишет

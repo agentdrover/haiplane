@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
+from hub.services import order_deadline
 
 log = logging.getLogger("hub.services.chat_pair")
 
@@ -593,7 +594,7 @@ async def _spend_code(
             return None
 
     token = generate_session_token()
-    ttl = config.CHAT_PAIR_TTL_SECONDS
+    ttl = await order_deadline.session_ttl(db, row)  # #1960
     inserted = await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
