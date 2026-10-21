@@ -4640,6 +4640,9 @@ async def test_the_fact_survives_the_event_retention(
         (task_id,),
     )
     await db.commit()
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     assert await repo.prune_events(db, keep_days=14) >= 1
     await db.commit()
     rows = await fetchall(
