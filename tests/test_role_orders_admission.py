@@ -240,3 +240,18 @@ async def test_an_expired_lease_without_admission_costs_no_reissue(world):
     last = await order_row(world, order["id"])
     assert again["id"] == order["id"]
     assert last["state"] == "open" and last["attempt"] == role_orders.MAX_REISSUES + 1
+
+
+async def test_the_report_note_passes_the_shared_untrusted_quote_sieve(world):
+    """Находка 7c16ad71: note роли проходит то же сито, что выжимка критика (#1953)."""
+    await admit(world, "k8")
+    order = await _lease_one(world, "k8")
+    await started(world, "k8", order["id"], order["lease_id"])
+    note = "ok <script>x</script> ‮evil `code` [link](http://x)"
+    done = await report(world, "k8", order["id"], order["lease_id"], note=note)
+    assert done.status_code == 200, done.text
+    stored = (await order_row(world, order["id"]))["note"]
+    assert "<script>" not in stored and "‮" not in stored and "`" not in stored
+    from hub.services.untrusted_quote import sanitize_untrusted_quote
+
+    assert stored == sanitize_untrusted_quote(note, out_limit=role_orders.NOTE_MAX)
