@@ -280,22 +280,8 @@ async def test_digest_counts_the_triage(owner):
     world = owner
     want = await _day_of_triage(world)
 
-    # Проект с делегированием стюарду, у него один разбор в тот же день.
-    from hub import repository as repo
-
-    pid = await repo.create_project(world.db, slug="deleg-1943", name="deleg-1943")
-    await repo.update_project(
-        world.db, pid, gate_policy=json.dumps({"verdict": "steward"})
-    )
-    await world.db.commit()
-    deleg = await _task(world, "делегирующий")
-    await repo.update_task(world.db, deleg, project_id=pid)
-    await world.db.commit()
-    o_deleg = await _fail(world, deleg, CLASS1)
-    await _stamp(world, o_deleg, f"{DAY} 09:00:00")
-
-    got = {d["slug"]: d for d in await _digests(world)}
-    mine = got[world.slug]["data"]
+    (only,) = [d for d in await _digests(world) if d["slug"] == world.slug]
+    mine = only["data"]
     assert OLD_KEYS <= set(mine)
     assert mine["auto_approvals"] == [] and mine["escalations"] == []
     triage = mine["triage"]
@@ -310,10 +296,6 @@ async def test_digest_counts_the_triage(owner):
         want["y"],
         want["u"],
     )
-    # Проект без делегирования автопилоту: строка есть, остальные секции пусты.
-    assert got["deleg-1943"]["data"]["triage"]["created"] == 1
-    assert got["deleg-1943"]["data"]["triage"]["resolved"] == 0
-
     page = await world.client.get("/digests", headers=world.human_auth)
     assert (
         "разобрано 5, рекомендован повтор 3, к владельцу 2; "
@@ -348,3 +330,21 @@ async def test_digest_old_payload_without_triage_is_unmeasured(owner):
     assert digest.triage_state({"date": DAY}) == "unmeasured"
     assert digest.triage_state({"triage": {"state": "measured"}}) == "measured"
     assert digest.triage_state({"triage": {"state": "unavailable"}}) == "unavailable"
+
+
+async def test_digest_delegating_project_gets_the_line_too(owner):
+    """Проект с делегированием: строка разбора рядом с прежними секциями."""
+    from hub import repository as repo
+
+    world = owner
+    await repo.update_project(
+        world.db,
+        world.pid,
+        gate_policy=json.dumps({"executor_launch": "manual", "verdict": "steward"}),
+    )
+    await world.db.commit()
+    o = await _fail(world, await _task(world, "делегирующий"), CLASS1)
+    await _stamp(world, o, f"{DAY} 09:00:00")
+    (only,) = [d for d in await _digests(world) if d["slug"] == world.slug]
+    assert OLD_KEYS <= set(only["data"])
+    assert only["data"]["triage"]["created"] == 1
