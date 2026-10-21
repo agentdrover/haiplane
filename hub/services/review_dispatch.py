@@ -6449,8 +6449,13 @@ async def _dispatch_report(
         "AND submission_generation = ? AND reviewer_principal_id = ? "
         "AND channel = ? AND id NOT IN (SELECT replaces_dispatch_id "
         "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
-        "AND channel = ? AND replaces_dispatch_id IS NOT NULL) ORDER BY id",
-        (task_id, generation, expected, channel, task_id, generation, channel),
+        "AND channel = ? AND replaces_dispatch_id IS NOT NULL) "
+        # #1946: сохранённая заглушка (без агента) с любой заменой ступень не занимает
+        "AND NOT (agent_id = '' AND id IN (SELECT replaces_dispatch_id "
+        "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
+        "AND replaces_dispatch_id IS NOT NULL)) ORDER BY id",
+        (task_id, generation, expected, channel, task_id, generation, channel)
+        + (task_id, generation),
     )
     # #1946: заказ, у которого есть свой привязанный отчёт, ступени не занимает.
     order = [int(dict(r)["id"]) for r in dispatch_ids if dict(r)["id"] not in taken]

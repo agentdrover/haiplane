@@ -59,12 +59,21 @@ async def bind_code_to_dispatch(
         "AND code_id = (SELECT id FROM chat_pair_codes WHERE code_hash = ?)",
         (dispatch_id, code_hash),
     )
-    # Отчёты, принятые от этого кода до привязки, тоже отвечают заказу.
-    await db.execute(
-        "UPDATE machine_reviews SET dispatch_id = ? WHERE dispatch_id IS NULL "
+    # Отчёты, принятые от этого кода до привязки, тоже отвечают заказу и
+    # несут его профиль (при приёме профиль взят у последнего заказа).
+    caught = await db.execute(
+        "UPDATE machine_reviews SET dispatch_id = ?, "
+        "profile = (SELECT profile FROM review_dispatches WHERE id = ?) "
+        "WHERE dispatch_id IS NULL "
         "AND code_id = (SELECT id FROM chat_pair_codes WHERE code_hash = ?)",
-        (dispatch_id, code_hash),
+        (dispatch_id, dispatch_id, code_hash),
     )
+    if caught.rowcount:  # отчёт заказа-отказа есть: агент существует (#1408)
+        await db.execute(
+            "UPDATE review_dispatches SET status = 'active' WHERE id = ? "
+            "AND agent_id = '' AND channel = 'cloud' AND status = 'failed'",
+            (dispatch_id,),
+        )
 
 
 async def accepted_dispatch(
@@ -113,6 +122,21 @@ async def stamp_report(
     """
     if dispatch_id is None and code_id is None:
         return
+    if dispatch_id is None:
+        # Привязка могла лечь между чтением личности и этой записью.
+        late = await fetchall(
+            db,
+            "SELECT d.id, d.profile FROM chat_pair_codes c JOIN review_dispatches d "
+            "ON d.id = c.dispatch_id WHERE c.id = ?",
+            (code_id,),
+        )
+        if late:
+            await db.execute(
+                "UPDATE machine_reviews SET dispatch_id = ?, code_id = ?, "
+                "profile = ? WHERE id = ?",
+                (late[0]["id"], code_id, late[0]["profile"], int(review_id)),
+            )
+            return
     await db.execute(
         "UPDATE machine_reviews SET dispatch_id = ?, code_id = ? WHERE id = ?",
         (dispatch_id, code_id, int(review_id)),
