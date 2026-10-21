@@ -573,7 +573,12 @@ def send_report(
 ) -> None:
     raw = members.get(RESULTS_MEMBER)
     if raw is None:
-        log("no results.json in the artifact — no task report")
+        held = ", ".join(sorted(members)) or "nothing"
+        log(
+            f"no results.json in the artifact (it holds: {held}) — no task "
+            "report. The collector step 'Collect AC test and validation results "
+            "for the Hub' of the run writes it; read that step's log for why not"
+        )
         return
     match = TASK_BRANCH.match(facts["head_branch"])
     if match is None:
