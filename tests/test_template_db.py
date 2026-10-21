@@ -245,3 +245,22 @@ async def test_the_dump_sees_autoincrement_counters(tmp_path):
     finally:
         await one.close()
         await two.close()
+
+
+async def test_a_replaced_system_role_list_is_seen(
+    tmp_path, tmp_path_factory, warm_template, monkeypatch
+):
+    """Вход seed (список системных ролей) подменён до ``db`` — база его видит."""
+    await warm_template(tmp_path)
+    extra = ("zz-role-1958", "ZZ", "probe", ("tasks.read",))
+    monkeypatch.setattr(hub_db, "SYSTEM_ROLES", (*hub_db.SYSTEM_ROLES, extra))
+    conn = await support.open_test_db(
+        str(tmp_path / "patched.db"), tmp_path_factory.mktemp("tpl")
+    )
+    try:
+        cursor = await conn.execute(
+            "SELECT slug FROM roles WHERE slug = 'zz-role-1958'"
+        )
+        assert await cursor.fetchone() is not None
+    finally:
+        await conn.close()
