@@ -426,9 +426,12 @@ RangeKey = tuple[str, int, int]
 def _take_fitting(
     keys: Sequence[RangeKey], cost: dict[RangeKey, int], budget: int
 ) -> tuple[int, set[RangeKey]]:
-    """Вырезки по порядку: каждая, что помещается в остаток; не поместившаяся не блокирует следующие."""
+    """Вырезки от меньшей к большей (ничья - порядок файла): каждая, что помещается в остаток.
+
+    Так в остаток входит наибольшее число вырезок, а не поместившаяся не блокирует остальные.
+    """
     taken: set[RangeKey] = set()
-    for k in keys:
+    for k in sorted(keys, key=lambda x: cost[x]):
         if cost[k] <= budget:
             taken.add(k)
             budget -= cost[k]
@@ -456,14 +459,14 @@ def _reserve_ac(
     for path in ac_paths:
         keys = [k for k in ranges if k[0] == path]
         left, cuts = _take_fitting(keys, cost, budget)
-        best = (sum(len(ranges[k]) for k in cuts), left - budget, False)
+        best = (sum(len(ranges[k]) for k in cuts), left - budget, 1)
         plan: tuple[int, set[RangeKey], set[RangeKey]] = (left, cuts, set())
         if path in texts and len(texts[path]) <= budget:
             covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
             rest = [k for k in keys if k not in covered]
             left_f, extra = _take_fitting(rest, cost, budget - len(texts[path]))
             read = sum(len(ranges[k]) for k in covered | extra)
-            if (read, left_f - budget, True) > best:
+            if (read, left_f - budget, 0) > best:
                 plan = (left_f, extra, covered)
                 full.add(path)
         budget, taken, covered_here = plan
