@@ -97,3 +97,73 @@ def test_the_locator_is_declared_syntactic():
     assert SYNTACTIC in (review_oversized.__doc__ or "")
     root = Path(__file__).resolve().parent.parent
     assert SYNTACTIC in (root / "docs/agent-context/invariants.md").read_text()
+
+
+def _modified(path: str, rows: list[str]) -> str:
+    """Дифф существующего файла: один ханк в начале (``rows`` с префиксами)."""
+    old = sum(1 for r in rows if r[0] != "+")
+    new = sum(1 for r in rows if r[0] != "-")
+    return (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        f"@@ -1,{old} +1,{new} @@\n" + "".join(f"{r}\n" for r in rows)
+    )
+
+
+def test_a_skipped_cutout_does_not_block_a_fitting_full_diff():
+    """Codex 4.1: полный дифф влезает, лишняя большая вырезка не влезла - она непрочитана, дифф есть."""
+    src_lines = [
+        "x = 0",
+        *_fn("test_small", "SMALLX", 1),
+        *_fn("test_large", "LARGEX", 300),
+    ]
+    src = "\n".join(src_lines) + "\n"
+    diff = _modified(F, ["-x = 1", "+x = 0"])
+    refs = [f"{F}::test_small", f"{F}::test_large"]
+    spans = ac_test_spans({F: src}, refs)
+    small, large = len(cutout(spans[0])), len(cutout(spans[1]))
+    ceiling = small + len(diff) + 200
+    assert large > ceiling
+    out, omitted = _inline_diff_lines(diff, [], None, ceiling, spans)
+    text = "\n".join(out)
+    assert omitted == [] and "+x = 0" in text and "SMALLX_0000" in text
+    assert (
+        f"ac_test_unread: {refs[1]}" in text
+        and f"ac_test_unread: {refs[0]}" not in text
+    )
+
+
+def test_plain_files_are_chosen_the_same_whatever_the_order_of_sections():
+    """Codex 4.2: из двух обычных файлов помещается один - выбор не зависит от порядка."""
+    a = _new("hub/a.py", [f"a{k} = {k}" for k in range(40)])
+    b = _new("hub/b.py", [f"b{k} = {k}" for k in range(10)])
+    ceiling = len(a) - 20
+    assert len(b) < ceiling < len(a) + len(b)
+    picked = []
+    for diff in (a + b, b + a):
+        out, omitted = _inline_diff_lines(diff, [], None, ceiling, [])
+        picked.append((omitted, "b9 = 9" in "\n".join(out)))
+    assert picked[0] == picked[1] == (["hub/a.py"], True)
+
+
+def test_a_repeated_plain_path_is_shown_whole_or_not_at_all():
+    """Codex 4.3: смена symlink на файл (удаление+добавление одного пути) - файл целиком или никак."""
+    gone = (
+        "diff --git a/hub/l.py b/hub/l.py\ndeleted file mode 120000\n--- a/hub/l.py\n"
+        "+++ /dev/null\n@@ -1 +0,0 @@\n-target\n"
+    )
+    added = _new("hub/l.py", [f"n{k} = {k}" for k in range(60)])
+    ceiling = len(gone) + 20
+    out, omitted = _inline_diff_lines(gone + added, [], None, ceiling, [])
+    text = "\n".join(out)
+    assert omitted == ["hub/l.py"] and "-target" not in text and "n59 = 59" not in text
+
+
+def test_cutouts_joined_for_the_prompt_do_not_exceed_the_ceiling():
+    """Codex 4.4: разделитель join не должен добавлять символы сверх рассчитанного."""
+    src = "\n".join([*_fn("test_a", "AA", 3), *_fn("test_b", "BB", 3)]) + "\n"
+    spans = ac_test_spans({F: src}, [f"{F}::test_a", f"{F}::test_b"])
+    total = sum(len(cutout(s)) for s in spans)
+    out, _ = _inline_diff_lines(_new(F, src.splitlines() * 40), [], None, total, spans)
+    cuts = [x for x in out if x.startswith("=== ВЫРЕЗКА")]
+    assert len(cuts) == 2
+    assert len("\n".join(cuts)) + 1 <= total

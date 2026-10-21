@@ -438,40 +438,33 @@ def _upgrade_to_full(
             continue
         keys = [k for k in ranges if k[0] == path]
         covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
-        need = len(texts[path]) + sum(cost[k] for k in keys if k not in covered)
+        kept = [k for k in keys if k not in covered and k in placed]
+        need = len(texts[path]) + sum(cost[k] for k in kept)
         delta = need - sum(cost[k] for k in keys if k in placed)
         if delta <= budget:
             budget -= delta
             upgraded.add(path)
             read_by_diff |= covered
             placed -= covered
-            placed |= {k for k in keys if k not in covered}
     return budget, upgraded, read_by_diff
 
 
 def _assemble(
-    sections: list[tuple[str, str]],
-    texts: dict[str, str],
+    units: dict[str, str],
+    names: dict[str, str],
     ac_paths: list[str],
     upgraded: set[str],
-    shown_plain: set[int],
+    shown_plain: set[str],
 ) -> tuple[list[str], list[str]]:
-    """Текст диффа по порядку разделов и имена не вошедших файлов."""
+    """Текст диффа по порядку разделов (файл целиком) и имена не вошедших файлов."""
     text: list[str] = []
     omitted: list[str] = []
-    done: set[str] = set()
-    for i, (path, raw) in enumerate(sections):
-        name = path or "(часть диффа без имени файла)"
-        if path in ac_paths:
-            if path not in done:
-                done.add(path)
-                (text if path in upgraded else omitted).append(
-                    texts[path] if path in upgraded else name
-                )
-        elif i in shown_plain:
-            text.append(raw if raw.endswith("\n") else raw + "\n")
+    for key, body in units.items():
+        if key in ac_paths:
+            keep = key in upgraded
         else:
-            omitted.append(name)
+            keep = key in shown_plain
+        (text if keep else omitted).append(body if keep else names[key])
     return text, omitted
 
 
@@ -503,10 +496,14 @@ def fit_with_ac_cutouts(
     for sp in spans:
         if sp.found and sp.start is not None and sp.end is not None:
             ranges.setdefault((sp.path, sp.start, sp.end), []).append(sp)
-    texts: dict[str, str] = {}
-    for p, t in sections:
-        if p:
-            texts[p] = texts.get(p, "") + norm(t)
+    texts: dict[
+        str, str
+    ] = {}  # раздел = ФАЙЛ целиком: повтор пути (symlink -> файл) склеен
+    names: dict[str, str] = {}
+    for i, (p, t) in enumerate(sections):
+        key = p or f"\0{i}"
+        texts[key] = texts.get(key, "") + norm(t)
+        names[key] = p or "(часть диффа без имени файла)"
 
     def rtext(key: tuple[str, int, int]) -> str:
         return cutout(ranges[key][0], [x.ref for x in ranges[key]])
@@ -519,15 +516,18 @@ def fit_with_ac_cutouts(
             placed.add(k)
             budget -= cost[k]
     ac_paths = list(dict.fromkeys(k[0] for k in ranges))
-    shown_plain: set[int] = set()
-    for i, (path, raw) in enumerate(sections):  # B
-        if path not in ac_paths and len(norm(raw)) <= budget:
-            shown_plain.add(i)
-            budget -= len(norm(raw))
+    shown_plain: set[str] = set()
+    # B: файлы без AC - от меньшего к большему (порядок разделов состав не меняет)
+    for key in sorted(
+        (k for k in texts if k not in ac_paths), key=lambda k: (len(texts[k]), k)
+    ):
+        if len(texts[key]) <= budget:
+            shown_plain.add(key)
+            budget -= len(texts[key])
     budget, upgraded, read_by_diff = _upgrade_to_full(
         ranges, cost, texts, placed, budget, ac_paths
     )
-    text, omitted = _assemble(sections, texts, ac_paths, upgraded, shown_plain)
+    text, omitted = _assemble(texts, names, ac_paths, upgraded, shown_plain)
     cuts = [rtext(k) for k in ranges if k in placed]
     unread = [
         x.ref

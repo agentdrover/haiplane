@@ -417,7 +417,7 @@ def _inline_diff_lines(
             + "; ".join(f"«{UNREAD_PREFIX}{ref}»" for ref in unread)
             + " и сдай incomplete=true."
         )
-    lines.extend(cuts)
+    lines.extend(c.rstrip("\n") for c in cuts)  # разделитель join = их \n
     lines.append("=== ДИФФ (приложен хабом) ===\n" + text + "=== КОНЕЦ ДИФФА ===")
     return lines, omitted
 
