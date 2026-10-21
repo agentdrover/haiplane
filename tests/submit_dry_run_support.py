@@ -170,9 +170,10 @@ async def post_ci(
     return resp
 
 
-#: Учёт самой аутентификации (последнее использование ключа человека): не часть
-#: сдачи, и в мире заказов, где зовёт ключ человека, меняется по времени.
-AUTH_BOOKKEEPING = ("api_keys", "principals")
+#: Время последнего использования ключа и принципала — учёт самой
+#: аутентификации (ключ человека в мире заказов), меняется по времени и не часть
+#: сдачи. Остальные колонки этих таблиц сравниваются: отзыв ключа будет виден.
+USE_TIMES = {"api_keys": ("last_used_at",), "principals": ("last_seen_at",)}
 
 
 async def snapshot(
@@ -188,8 +189,13 @@ async def snapshot(
     for (name,) in await cur.fetchall():
         if name in skip:
             continue
-        rows = await (await db.execute(f'SELECT * FROM "{name}"')).fetchall()
-        dump[name] = sorted(repr(tuple(r)) for r in rows)
+        cursor = await db.execute(f'SELECT * FROM "{name}"')
+        cols = [d[0] for d in cursor.description]
+        masked = USE_TIMES.get(name, ())
+        dump[name] = sorted(
+            repr(tuple(None if c in masked else v for c, v in zip(cols, row)))
+            for row in await cursor.fetchall()
+        )
     return dump
 
 

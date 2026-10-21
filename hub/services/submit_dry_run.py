@@ -120,7 +120,8 @@ async def _same_sha(state: lifecycle.SubmitContext, passed: list[str]) -> None:
         passed.append("resolve_diff")
         state.gate_mode = ""  # вне конвейера: читай политику (как у настоящего повтора)
         await lifecycle._step_surfaces(state)
-        passed.append("surfaces")
+        if gate_pipeline.policy("SDD_SURFACES")() != gate_pipeline.OFF:
+            passed.append("surfaces")
     open_items = await finding_outcome.open_findings(db, task_id, generation)
     pending = await finding_outcome.items_still_to_plan(
         db, task_id, generation, open_items, body.finding_outcomes
@@ -129,7 +130,8 @@ async def _same_sha(state: lifecycle.SubmitContext, passed: list[str]) -> None:
         _, still_open = finding_outcome.plan_outcomes(open_items, pending)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    passed.append("finding_outcomes")
+    if gate_pipeline.policy("FINDING_OUTCOME")() != gate_pipeline.OFF:
+        passed.append("finding_outcomes")
     if (config.FINDING_OUTCOME or "warn").strip().lower() != "off":
         state.outcome_hint = finding_outcome.build_hint(still_open)
 

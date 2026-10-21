@@ -9,6 +9,7 @@ Launcher k8 узнавал, что payload сдачи не сходится с �
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sys
@@ -22,7 +23,7 @@ from hub import cli, config
 from hub import repository as repo
 from hub.services import chat_pair as cp
 from hub.services import executor_orders as orders
-from hub.services import finding_outcome, lifecycle, orchestration
+from hub.services import ci_trust, finding_outcome, lifecycle, orchestration
 from tests import test_executor_orders as _eo
 from tests import submit_dry_run_support as sup
 from tests.cli_support import _run_main
@@ -47,10 +48,7 @@ PIPELINE = tuple(
 
 
 async def _unchanged(db, before, label: str) -> None:
-    after = await sup.snapshot(
-        db, tuple(t for t in sup.AUTH_BOOKKEEPING if t not in before)
-    )
-    assert sup.changed(before, after) == [], label
+    assert sup.changed(before, await sup.snapshot(db)) == [], label
 
 
 # --------------------------------------------------------------------------
@@ -149,7 +147,7 @@ async def test_real_submit_after_dry_run_unchanged(client: AsyncClient, db):
 # --------------------------------------------------------------------------
 
 
-async def test_dry_run_same_sha_matches_real(client: AsyncClient, db):
+async def test_dry_run_same_sha_matches_real(client: AsyncClient, db, monkeypatch):
     w = sup.world()
     tid, tip = await sup.ready_task(db, "dr-same", POLICY)
     await sup.post_ci(client, w, tid, tip)
@@ -210,6 +208,14 @@ async def test_dry_run_same_sha_matches_real(client: AsyncClient, db):
         assert dry.status_code == 200, dry.text
         assert dry.json()["same_sha_noop"] is True
         assert {"resolve_diff", "surfaces"} <= set(dry.json()["passed_steps"])
+        with monkeypatch.context() as off:
+            off.setattr(config, "SDD_SURFACES", "off")
+            off.setattr(config, "FINDING_OUTCOME", "off")
+            quiet = await sup.submit(client, tid, sup.body(accept_areas=True), dry=True)
+        steps = quiet.json()["passed_steps"]
+        assert "resolve_diff" in steps and not {"surfaces", "finding_outcomes"} & set(
+            steps
+        )
         await _unchanged(db, before, "(г) область и риск не сохранены")
         real = await sup.submit(client, tid, sup.body(accept_areas=True), dry=False)
         assert real.status_code == 200
@@ -327,7 +333,9 @@ async def test_dry_run_response_model(client: AsyncClient, db, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-async def test_dry_run_ci_refresh_and_expected_sha_match_real(client: AsyncClient, db):
+async def test_dry_run_ci_refresh_and_expected_sha_match_real(
+    client: AsyncClient, db, monkeypatch
+):
     w = sup.world()
     stale, tip_s = await sup.ready_task(db, "dr-ci-stale", POLICY)
     rerun, tip_r = await sup.ready_task(db, "dr-ci-rerun", POLICY)
@@ -384,6 +392,25 @@ async def test_dry_run_ci_refresh_and_expected_sha_match_real(client: AsyncClien
             "настоящая сдача пишет alert — значит, проверка на dry-run что-то мерила"
         )
 
+    # Чужой refresh держит CI-замок, проекция старая зелёная, дедлайн короткий:
+    # настоящий refresh ничего не сохраняет и оставляет проекцию как есть.
+    w.git.fetch_ok = True
+    held, tip_h = await sup.ready_task(db, "dr-ci-lock", POLICY)
+    await sup.post_ci(client, w, held, tip_h)
+    monkeypatch.setattr(ci_trust, "REFRESH_DEADLINE_SECONDS", 0.05)
+    lock = ci_trust._locks.setdefault((held, tip_h), asyncio.Lock())
+    await lock.acquire()
+    try:
+        before = await sup.snapshot(db)
+        with sup.tripwires():
+            dry = await sup.submit(client, held, sup.body(), dry=True)
+            await _unchanged(db, before, "замок занят: ничего не записано")
+            real = await sup.submit(client, held, sup.body(), dry=False)
+    finally:
+        lock.release()
+    assert dry.status_code == real.status_code == 200, (dry.text, real.text)
+    assert dry.json()["would_submit"] is True
+
 
 # --------------------------------------------------------------------------
 # Мир заказов k8: заказ, прогон, слот и сессия ahcp_ у задачи (AC-2, AC-9)
@@ -419,7 +446,7 @@ async def test_dry_run_writes_nothing(world, monkeypatch):
     prevention = {"kind": "accepted_risk", "reason": "r", "revisit": "v"}
 
     async def dry(payload, headers=None, status=200):
-        before = await sup.snapshot(db, sup.AUTH_BOOKKEEPING)
+        before = await sup.snapshot(db)
         with sup.tripwires() as calls:
             resp = await sup.submit(
                 world.client, tid, payload, dry=True, headers=headers or session
@@ -434,7 +461,7 @@ async def test_dry_run_writes_nothing(world, monkeypatch):
     refused = sup.body(finding_outcomes=[{"finding_uid": sup.UID, "outcome": "fixed"}])
     await dry(refused, status=422)
 
-    skip = (*sup.AUTH_BOOKKEEPING, "executor_triage_state")  # учёт самого sweep
+    skip = ("executor_triage_state",)  # учёт самого sweep
     before = await sup.snapshot(db, skip)
     await orders.sweep_executor_orders(db)
     await orders.settle(db)
@@ -479,6 +506,13 @@ async def test_dry_run_writes_nothing(world, monkeypatch):
     await dry(
         sup.body(finding_outcomes=deferred, prevention=prevention), world.human_auth
     )
+
+    # Сравнение видит отзыв ключа, но не время его последнего использования.
+    mark = await sup.snapshot(db)
+    await db.execute("UPDATE api_keys SET last_used_at = '2000-01-01'")
+    assert sup.changed(mark, await sup.snapshot(db)) == []
+    await db.execute("UPDATE api_keys SET revoked_at = datetime('now')")
+    assert sup.changed(mark, await sup.snapshot(db)) == ["api_keys"]
 
 
 # --------------------------------------------------------------------------

@@ -1305,20 +1305,37 @@ async def preview_report(db: Any, task_id: int, head_sha: str) -> Computed:
     A dry run reads GitHub like the refresh does, and the gates then read this
     row instead of the table. The refresh's own outcomes are mirrored: past the
     deadline the answer is the offline one, and a check that breaks leaves the
-    stored row shown as unverified(check_failed). No lock, no version bump, no
-    transaction: nothing here may write.
+    stored row shown as unverified(check_failed). A refresh in flight is waited
+    for (and, past the deadline, the stored projection stands), but no lock is
+    taken, no version bumped, no transaction opened: nothing here may write.
     """
     head_sha = (head_sha or "").strip()
     if not head_sha:
         return Computed(None)
     found = await repo.get_ci_run_report(db, task_id, head_sha)
     stored = dict(found) if found is not None else None
+    waiting_for_lock = False
     try:
         try:
             async with asyncio.timeout(REFRESH_DEADLINE_SECONDS):
+                # A refresh of this commit in flight is waited for, as the real
+                # one waits, under the same deadline; the lock is not kept.
+                lock = _locks.get((task_id, head_sha))
+                if lock is not None and lock.locked():
+                    waiting_for_lock = True
+                    async with lock:
+                        pass
+                    waiting_for_lock = False
                 row = await _preview_round(db, task_id, head_sha, stored, offline=False)
         except TimeoutError:
-            row = await _preview_round(db, task_id, head_sha, stored, offline=True)
+            # Out of time waiting for somebody else's refresh: the real refresh
+            # reserved no version and saves nothing, the stored projection
+            # stands (``_offline_after_timeout`` with ``reserved=None``).
+            row = (
+                stored
+                if waiting_for_lock
+                else await _preview_round(db, task_id, head_sha, stored, offline=True)
+            )
     except Exception:  # noqa: BLE001 - mirrors refresh_quietly: fail closed
         log.exception("CI trust preview for task %s failed", task_id)
         row = (
