@@ -354,7 +354,11 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
     monkeypatch.setattr(chat_pair, "_spend_code", real)
 
     # Код потрачен другим - по-прежнему spent; срок кода вышел - expired.
-    for how, expected in (("spent", "redeem_refused"), ("expired", "expired")):
+    for how, expected in (
+        ("spent", "redeem_refused"),
+        ("spent_late", "redeem_refused"),  # потрачен И предел: потрачен сильнее
+        ("expired", "expired"),
+    ):
         task_id, other_id, code2 = await _waiting(world, "k9", f"причина {how}")
         pair = (await row(world, other_id))["pair_code_id"]
         real_spend = chat_pair._spend_code
@@ -362,7 +366,13 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
         async def race(db, row_, _how=how, _pair=pair, _real=real_spend, **kwargs):
             conn = await hub_db.connect(world.dsn)
             try:
-                if _how == "spent":
+                if _how == "spent_late":
+                    await conn.execute(
+                        "UPDATE executor_orders SET waiting_since = "
+                        "datetime('now', '-6 hours') WHERE pair_code_id = ?",
+                        (_pair,),
+                    )
+                if _how.startswith("spent"):
                     await conn.execute(
                         "UPDATE chat_pair_codes SET redeemed_at = datetime('now')"
                         " WHERE id = ?",
