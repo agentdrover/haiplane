@@ -199,11 +199,41 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 `slot=<host>`, bound to the task and generation), ack, then claim/pair-start with
 `git_mode=remote`. The host key never enters the executor VM.
 
+### Dry-run submission: `submit-review?dry_run=1` (#1975)
+
+- REST `POST /api/tasks/{id}/submit-review?dry_run=1` (same route, same auth allowlist and same permissions as a real submission) runs the SAME steps in the SAME order — `SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK`, then `SUBMIT_STEPS_AFTER_SAME_SHA_CHECK` without `delivery_pr` — and refuses with the same code and `detail` as a real submission. The pydantic body check happens first, as always. Success is 200 `SubmitDryRunView` (`hub/services/submit_dry_run.py`, not `hub/models.py`): `dry_run`, `would_submit`, `same_sha_noop`, `passed_steps` (executed steps in pipeline order; a step in mode off — by the pipeline or by the project policy of `submission_contract`/`bug_red_test`/`ci_before_submit` — is not listed), `outcome_hint` (`OutcomeHintView`), `notices` (warn gates and the `path_notices` compute). The route's `response_model` is `TaskView | SubmitDryRunView`; OpenAPI names both. CLI: `oc-hub submit-review --dry-run` sends `dry_run=1`, prints the JSON body (rc 0) or the refusal (rc != 0). MCP is out of scope (catalog headroom; the launcher uses REST), so `surface_parity` warns about `hub/mcp_server.py`/`hub/models.py` on purpose.
+- What it writes: nothing in the hub tables — no generation, `submission_sha`, status, feed row, event, `finding_outcomes`, `path_notice_results`, CI tables, no executor order/run/slot change, no defect draft; the pair session is not closed (#1783 closes it only on a real submission); no push or PR (`delivery_pr` is not run), no review order. There is NO `BEGIN`/`ROLLBACK` around the real pipeline: the CI refresh runs only outside a transaction and `BEGIN IMMEDIATE` under the network would hold the shared lock. Instead the writes were separated from the computation: `ci_trust.preview_report` asks GitHub like `refresh` and returns the projection the refresh would leave (`ci_trust.plan_projection`/`projected_row`, the same plan `_project` saves); `bug_red_test` and `ci_before_submit` read it through `SubmitContext.ci_computed`; `expected_sha_gate.head_refusal` computes the 409, `refuse_unless_head_is_expected` writes the alert only outside a dry run. A real submission saves exactly as before.
+- Same SHA from `review` (#1265): the answered-uid filter (`finding_outcome.items_still_to_plan`), `plan_outcomes`, and with `accept_areas` `resolve_diff` + `surfaces` repeat `_same_sha_noop_response` without its writes; area and risk are computed, not saved; `path_notices` shows the stored result of the generation. State tasks (`result_kind=state`): 422 `dry_run_unsupported_for_state`, no writes.
+- Allowed side effects (named, not hidden): `first_used_at` of a new `ahcp_` session token (authentication), `git fetch` and the refs cache, the in-process `_observed_tips`, GitHub reads. Sources of `notices`: `surface_note`, `outcome_note`, `rule_lines`, `unchecked_lines`, `contract_alert`, `ci_before_alert`, `risk_alert`, an `alert`-kind red-test record, and `path_notices.compute` (never `record`).
+- Guarantee boundary: a successful dry run does NOT promise that the real submission passes. The real one re-reads the state and the CI standing under the lock (`recheck_in_transaction`, the critic acceptance `critic_orders.accept_in_transaction`), and the world may move between the two calls. The read-only `critic_passed` step (#1953) is part of the dry run like any other step of the pipeline.
+
 ### CI contract of a project (#1848)
 
 - `gate_policy.ci_contract = {"workflow_path": ".github/workflows/<file>.yml|yaml", "required_checks": [<subset of lint, format, types, tests>]}`; sorted on write, extra fields refused, project `default` and `policy-schedule` refused, human PATCH only (`models.validated_gate_policy` -> `ci_contract.validated_ci_contract`; reader `project_policy.ci_contract_from`; shown by `effective-policy` as `ci_contract` with `fingerprint`). Storage: `ci_report_attempts.contract_fp` and `ci_run_reports.contract_fp` (migration `add_ci_*_contract_fp`, DEFAULT = the hub contract's fingerprint; `''` = no fingerprint).
 - Signatures: `ci_trust.trust_of(report, current_fp)`, `is_verified(report, current_fp)`, `can_testify_pass(report, current_fp)`, `green_gap(report, contract)`, `ci_green_proof.proof_gap(report, ac_rows, sha, contract)`, `check_attempt(row, gh_args, contract)`; forge `ci_runs_for_sha(head_sha, ..., workflow_path=".github/workflows/ci.yml")`. The REST/CLI/MCP surfaces carry no new field: the fingerprint is seen in `effective-policy` only.
 - Sender: `scripts/ci_trusted_report.py` reports the workflow named by `HAIPLANE_CI_WORKFLOW_PATH` (set by the default-branch sender workflow through the `workflow-path` input of `.github/actions/hub-ci-send`), else `ci.yml`. Templates: `hub/workflow_templates/satellite-ci-producer.yml` (branch code, read key only) and `satellite-ci-report.yml` (`workflow_run`, environment `hub-report`); rendered by `hub.services.satellite_ci`. Setup, rollback and the acceptance evidence: `docs/satellite-ci-report.md`.
+
+### Executor autonomy in practice metrics (#1980)
+
+`GET /api/metrics/practices` (also `oc-hub practice-metrics`, `hub_practice_metrics` `metrics`) carries `executor_autonomy`, JSON only (no text summary, no new argument). Code: `hub/services/executor_autonomy.py`; the section is in `MODEL_INDEPENDENT` (window and project apply, the reviewer-model filter does not), not in `UNFILTERED`.
+
+```json
+"executor_autonomy": {
+  "target": 0.9,
+  "definition": "autonomous = report_outcome 'submitted' AND close_reason 'submitted' ...",
+  "hosts": {"k8": {"weeks": [
+    {"week": "2026-W43", "start": "2026-10-19", "partial": false,
+     "orders_closed": 5, "autonomous": 2, "rate": 0.4,
+     "by_outcome": {"submitted": 3, "rescued": 1, "failed": 1},
+     "by_reason_code": {"agent_failed": 2, "unknown": 1}}
+  ]}}
+}
+```
+
+- Sample: `executor_orders` with `state='closed'` and `closed_at` not NULL, windowed and project-scoped by `scope.where("o.closed_at", task_column="o.task_id")` (project comes from the epic). One host = one key; hosts are never mixed. The unit is an order, not a task.
+- `autonomous` = `report_outcome='submitted'` AND `close_reason='submitted'`. It is a PROXY for "without a human", not proof. A late report (`reported_at` after `closed_at`) recounts the week of closing, so a past week can change.
+- Weeks are ISO (Monday), UTC; the key carries the ISO year (`2026-W53`, `2027-W01`). Every week of the window is present, zero weeks with `orders_closed=0` and `rate=null`; the edge weeks cut by the window are `partial=true`. A window longer than 104 weeks starts at the first closed order. `rate` is rounded to 3 digits.
+- `by_outcome` covers all orders (empty `report_outcome` = `none`); `by_reason_code` only the non-autonomous ones (empty = `unknown`), no truncation, order: count descending, then code.
 
 ## Contract-Smell Checklist
 
