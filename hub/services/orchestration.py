@@ -5722,8 +5722,6 @@ async def _complete_without_review(
 
     Всегда возвращает исход: ни один путь внутри не проваливается наружу.
     """
-    if not await critic_orders.accept_in_transaction(db, task, pin=True, hold=True):
-        return "needs_decision"
     task_id = task["id"]
     branch = task.get("branch")
     pr_note = ""
@@ -5835,19 +5833,20 @@ async def _write_completed(
             return False
         if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
             return None
+        row = await repo.get_task(db, task_id)
+        if row is not None and dict(row)["status"] == "needs_decision":
+            return None  # другой вход удержал задачу: завершение поверх удержания запрещено
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 
             await _done_validation_gate(db, task)
-        if not await critic_orders.accept_in_transaction(
+        await repo.update_task(
             db,
-            task,
-            "completed",
-            hold=True,
+            task_id,
+            status="completed",
             exit_code=exit_code,
             result_text=result_text,
-        ):
-            return None
+        )
         await repo.insert_event(
             db,
             kind="task_completed",
@@ -6319,6 +6318,10 @@ async def transition_after_agent_done(
     if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
 
+    # #1953: приём облачной сдачи - в момент принятия, до bump (он внутри приёма)
+    if has_done and not await critic_orders.accept_done(db, task):
+        return "needs_decision"
+
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
         # that PR is merged — "completed" must mean delivered, the invariant
@@ -6392,10 +6395,7 @@ async def transition_after_agent_done(
         #
         # Ни один шаг не отказывает: решение владельца — warn (матрица в #1122).
         # Отказ здесь оставил бы headless-задачу стоять без человека рядом.
-        await repo.bump_submission_generation(db, task_id)
         await _run_headless_submit_gates(db, task_id, task)
-        if task.get(critic_orders.HELD_KEY):  # #1953: приём удержал сдачу
-            return "needs_decision"
 
     if (
         task.get("auto_review")
@@ -6452,16 +6452,14 @@ async def transition_after_agent_done(
             dict(task_row).get("submission_generation", 0) if task_row else 0
         )
 
-        if not await critic_orders.accept_in_transaction(  # #1953
+        await repo.update_task(
             db,
-            task,
-            "review",
-            hold=True,
+            task_id,
+            status="review",
             review_job_id=None,
             exit_code=exit_code,
             result_text=result_text,
-        ):
-            return "needs_decision"
+        )
         await repo.add_task_update(
             db,
             task_id,
@@ -6564,10 +6562,9 @@ async def dispatch_review(
     )
     review_job_id = result.get("job_id")
     if review_job_id:
-        if not await critic_orders.accept_in_transaction(  # #1953: ci_check -> review
-            db, task, "review", always=True, hold=True, review_job_id=review_job_id
-        ):
-            return
+        await repo.update_task(
+            db, task_id, status="review", review_job_id=review_job_id
+        )
         log.info(
             "Poll: task #%d → review (job=%s, agent=%s, cycle=%d)",
             task_id,

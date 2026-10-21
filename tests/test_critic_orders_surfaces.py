@@ -101,8 +101,8 @@ async def test_the_card_shows_the_last_order_and_computes_overdue_without_writin
     )  # читатель не пишет
 
 
-async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch):
-    """done: гейт прошёл на A, а при закреплении голова B - 422 (на B passed нет), записей нет."""
+async def test_done_pins_the_accepted_sha_not_a_later_observation(world, monkeypatch):
+    """done: приняли A (passed), потом голова B: пин - принятый A; второе наблюдение не пин."""
     cloud = await co._cloud(world, None)
     await co._closed_order(world, cloud, co.SHA_A, "passed")
     seen: list[str] = []
@@ -112,11 +112,10 @@ async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch
         return (co.SHA_A if len(seen) == 1 else co.SHA_B), ""
 
     monkeypatch.setattr(lifecycle, "resolve_branch_tip", _moving)
-    before = await co._task_state(world, cloud.task_id)
     resp = await co._done(world, cloud)
-    assert len(seen) >= 2, "закрепление должно наблюдать голову заново"
-    assert co._refused(resp) == "no_order"
-    assert await co._task_state(world, cloud.task_id) == before
+    assert resp.status_code == 200, resp.text
+    status, generation, pinned, _ = await co._task_state(world, cloud.task_id)
+    assert (status in ("review", "ci_check"), generation, pinned) == (True, 1, co.SHA_A)
 
 
 def test_a_request_line_inside_a_longer_entry_is_not_a_request():
@@ -204,7 +203,7 @@ async def test_the_order_is_rechecked_under_the_write_lock(world, tip):
 
 
 async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
-    """pending_report и автоматический вход закрепляют/сверяют проверенный sha."""
+    """pending_report и автоматический вход закрепляют принятый sha."""
     from hub.services import orchestration
 
     # pending_report: ревью привязано к sha, по которому прошёл критик, а не к старому.
@@ -224,7 +223,7 @@ async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
     status, generation, pinned, _ = await co._task_state(world, cloud.task_id)
     assert (status, generation, pinned) == ("review", 1, co.SHA_B)
 
-    # Автоматический вход: наблюдение гейта A, закрепление B - отказ, не молчаливая сдача.
+    # Автоматический вход: принят A; второе наблюдение (B) в пин не попадает.
     auto = await co._cloud(world, None)
     await co._closed_order(world, auto, co.SHA_A, "passed")
     seen: list[int] = []
@@ -237,13 +236,10 @@ async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
     row = dict(
         (await co._rows(world.db, "SELECT * FROM tasks WHERE id=?", (auto.task_id,)))[0]
     )
-    before = await co._task_state(world, auto.task_id)
-    held = await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    await orchestration.transition_after_agent_done(world.db, row, has_done=True)
     await world.db.commit()
-    assert held == "needs_decision"
     status, generation, pinned, _feed = await co._task_state(world, auto.task_id)
-    assert (status, pinned) == ("needs_decision", before[2])  # bump остаётся, пин нет
-    assert any("no_order" in a for a in await co._alerts(world, auto.task_id))
+    assert (status != "needs_decision", generation, pinned) == (True, 1, co.SHA_A)
 
 
 async def test_a_plain_key_gets_a_reason_but_a_bare_mention_stays_text(world, tip):

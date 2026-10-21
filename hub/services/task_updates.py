@@ -157,14 +157,13 @@ async def _route_pending_report(
     if lc.completion_requires_review(task):
         # Universal Review Gate (#306): even the pending_report path may not
         # complete unreviewed work — the done report becomes a submission.
+        # #1953: приём облачной сдачи - до bump, в этой же транзакции (422 откатит).
+        await critic_orders.accept_in_transaction(db, task, pin=True)
         generation = await repo.bump_submission_generation(db, task_id)
         # #1589: и этот вход — сдача; без гейтов конвейера он иначе остался бы
         # без предупреждений по путям.
         await lc._record_path_notices_for_done(db, task)
-        # #1953: статус и проверенный sha - одной записью, до коммитящих вызовов.
-        await critic_orders.accept_in_transaction(
-            db, task, "review", review_job_id=None
-        )
+        await repo.update_task(db, task_id, status="review", review_job_id=None)
         await repo.add_task_update(
             db,
             task_id,
@@ -183,7 +182,9 @@ async def _route_pending_report(
             detail=mutation_activity_detail(),
         )
         return
-    await critic_orders.accept_in_transaction(db, task, "completed")  # #1953
+    # #1953: done без ревью - приём в момент принятия отчёта (bump тут нет).
+    await critic_orders.accept_in_transaction(db, task, pin=True)
+    await repo.update_task(db, task_id, status="completed")
     await lc.log_activity(
         db,
         "task_completed",
@@ -244,13 +245,6 @@ async def _route_done(
         await _route_pending_report(db, task, body)
     elif task["status"] in ("running", "claimed") and not task.get("job_id"):
         await _route_pair_or_claimed(db, task, (body.agent or "").strip())
-        row = await repo.get_task(db, int(task["id"]))
-        if row is not None and dict(row)["status"] in ("running", "claimed"):
-            # #1953: завершение без ревью отложено за коммит; sha критика
-            # закрепляется ЗДЕСЬ единой функцией приёма, после проверок маршрута
-            # (пустая пересдача, блокер) и до коммита done-flow.
-            if not lc.completion_requires_review(task):
-                await critic_orders.accept_in_transaction(db, task, pin=True)
     # open + done without pair-start: rejected before insert (AC-2)
 
 

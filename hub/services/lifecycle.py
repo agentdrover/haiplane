@@ -3488,15 +3488,8 @@ async def run_headless_submit_gates(
     """
     state = SubmitContext(db=db, task_id=task["id"], task=task)
     await run_steps(state, HEADLESS_STEPS)
-    # #1953: закрепляемый sha принимается той же единой функцией, под локом bump
-    if not await critic_orders.accept_in_transaction(
-        db,
-        task,
-        observed=state.submission_sha,
-        always=True,
-        hold=critic_orders.automatic(),
-    ):
-        state.submission_sha = ""  # удержано: ничего не закрепляем
+    if task.get(critic_orders.CHECKED_KEY):  # пин = принятый sha, не второе наблюдение
+        state.submission_sha = task[critic_orders.CHECKED_KEY]
     return state
 
 

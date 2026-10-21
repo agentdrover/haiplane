@@ -49,8 +49,6 @@ REPORT_OUTCOMES = ("passed", "findings", "failed")
 #: Ключ, под которым вход done оставляет на задаче sha, по которому прошёл гейт:
 #: закрепление sha внутри транзакции сверяется с ним (то же наблюдение).
 CHECKED_KEY = "_critic_checked_sha"
-#: Метка на снимке: приём удержал сдачу (needs_decision), вызывающий возвращается.
-HELD_KEY = "_critic_held"
 #: Открытых заказов на задачу.
 MAX_OPEN_PER_TASK = 1
 SUBMITTABLE = ("running", "claimed", "pending_report")
@@ -576,27 +574,26 @@ def _observation(task: dict[str, Any], observed: str | None) -> str:
 async def accept_in_transaction(
     db: aiosqlite.Connection,
     task: dict[str, Any],
-    target_status: str = "",
     *,
     observed: str | None = None,
     pin: bool = False,
+    bump: bool = False,
     always: bool = False,
     hold: bool = False,
-    **fields: Any,
 ) -> dict[str, Any] | None:
-    """ЕДИНСТВЕННЫЙ приём облачной сдачи (#1953): проверка, статус и sha - одной операцией.
+    """Приём облачной сдачи (#1953) - РОВНО в момент принятия, до bump.
 
-    Каждый вход в review и completed зовёт её в той пишущей транзакции, что
-    меняет статус. Транзакция берёт write-lock (BEGIN IMMEDIATE; соединения хаба открыты с isolation_level IMMEDIATE), и только потом, под ним,
-    перечитываются политика ``critic_host``, держатель и заказы; проверяется
+    Зовётся там, где растёт ``submission_generation`` (и где принимается done без
+    ревью, и same-sha повтор), в той же транзакции. Она берёт write-lock
+    (BEGIN IMMEDIATE; соединения хаба открыты с isolation_level IMMEDIATE), под
+    ним перечитывает политику ``critic_host``, держателя и заказы и проверяет
     ``passed`` на наблюдённом sha (``observed``, иначе ``PREPARED_CI_SHA``
-    вызова, иначе проверенный раньше или закреплённый). Если гейт применим,
-    ``target_status`` и ``submission_sha`` пишутся ОДНИМ ``update_task``; без
-    ``target_status`` sha пишется только при ``pin``. Других записей пина критика
-    в хабе нет. Снимок ``task`` обновляется на месте и возвращается: дальнейший маршрут
-    (доставка) читает его, а не базу. Отказ - 422, а при ``hold`` - задача уходит в
-    needs_decision, возвращается ``None``. Не применимо (политика выключена,
-    держатель не облачный) - статус и ``fields`` пишутся как есть.
+    вызова, иначе проверенный раньше или закреплённый). Только при успехе: пин
+    (``pin``) и bump (``bump``) - в этой же транзакции, после проверки. Отказ -
+    422, а при ``hold`` задача уходит в needs_decision БЕЗ bump и без пина,
+    возвращается ``None``. Снимок ``task`` обновляется на месте. Ниже по течению
+    (dispatch_review, завершение, доставка) критика нет: принятое поколение не
+    пересматривается, а законную перепривязку sha доставкой приём не трогает.
     """
     from hub.services.orchestration import review_approved_for_current_submission
 
@@ -609,26 +606,34 @@ async def accept_in_transaction(
             fresh.get("status") in SUBMITTABLE
             and not review_approved_for_current_submission(fresh)
         ):
-            sha_in = _observation(task, observed)
-            verdict = await evaluate(db, fresh, sha_in)
+            verdict = await evaluate(db, fresh, _observation(task, observed))
         if verdict.applicable and verdict.cause:
             if hold:
                 await _hold(db, task, verdict)
-                task[HELD_KEY] = True
                 return None
             refuse(task_id, verdict)
-        write = dict(fields)
-        if target_status:
-            write["status"] = target_status
-        if verdict.applicable and (target_status or pin):
-            write["submission_sha"] = verdict.sha
-        if write:
-            await repo.update_task(db, task_id, **write)
-        extra = {CHECKED_KEY: verdict.sha} if verdict.applicable else {}
-        # Снимок вызывающего обновляется на месте: его читает доставка.
-        task.update(write)
-        task.update(extra)
+        if bump:
+            await repo.bump_submission_generation(db, task_id)
+        if verdict.applicable:
+            task[CHECKED_KEY] = verdict.sha
+            if pin:
+                await repo.update_task(db, task_id, submission_sha=verdict.sha)
+                task["submission_sha"] = verdict.sha
         return task
+
+
+async def accept_done(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Приём done-отчёта в ``transition_after_agent_done``: bump только на review-маршруте."""
+    from hub.services.orchestration import completion_requires_review
+
+    accepted = await accept_in_transaction(
+        db,
+        task,
+        pin=True,
+        bump=completion_requires_review(task),
+        hold=automatic(),
+    )
+    return accepted is not None
 
 
 def automatic() -> bool:

@@ -183,17 +183,16 @@ async def test_entry_committed_first_is_accepted_and_the_policy_waits(
     )
 
 
-async def test_an_empty_second_observation_is_never_replaced_by_an_earlier_sha(
+async def test_an_empty_first_observation_is_refused_not_replaced_by_the_pin(
     world, monkeypatch
 ):
-    """Закрепление не увидело голову (пусто): принимается пустое, а не прежний sha - 422."""
+    """Наблюдение при приёме пусто: отказ head_unobserved, а не прежний sha; bump нет."""
     cloud = await co._cloud(world, None)
     await co._closed_order(world, cloud, co.SHA_A, "passed")
-    seen: list[int] = []
+    await _set_pin(world, cloud.task_id, co.SHA_A)
 
     async def _blink(db, task_id, branch):
-        seen.append(task_id)
-        return (co.SHA_A if len(seen) == 1 else ""), ""
+        return "", "boom"
 
     monkeypatch.setattr(lifecycle, "resolve_branch_tip", _blink)
     before = await co._task_state(world, cloud.task_id)
@@ -201,8 +200,13 @@ async def test_an_empty_second_observation_is_never_replaced_by_an_earlier_sha(
     assert await co._task_state(world, cloud.task_id) == before
 
 
-async def test_ci_check_to_review_goes_through_the_acceptance(world, tip):
-    """ci_check -> review (dispatch_review): политику включили за время CI - удержание."""
+async def _set_pin(world, task_id: int, sha: str) -> None:
+    await repo.update_task(world.db, task_id, submission_sha=sha)
+    await world.db.commit()
+
+
+async def test_ci_check_to_review_trusts_the_accepted_generation(world, tip):
+    """ci_check -> review (dispatch_review): критика нет, принятое поколение не пересматривается."""
     cloud = await co._cloud(world, tip, critic_host="")
     await repo.update_task(
         world.db, cloud.task_id, status="ci_check", submission_sha=co.SHA_A
@@ -212,6 +216,4 @@ async def test_ci_check_to_review_goes_through_the_acceptance(world, tip):
     row = await _row(world, cloud.task_id)
     await orchestration.dispatch_review(world.db, row)
     await world.db.commit()
-    final = await _row(world, cloud.task_id)
-    assert final["status"] == "needs_decision"
-    assert any("critic_not_passed" in a for a in await co._alerts(world, cloud.task_id))
+    assert (await _row(world, cloud.task_id))["status"] == "review"
