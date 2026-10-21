@@ -33,6 +33,11 @@
 }
 .c2-id { font-family: var(--font-mono); font-weight: 500; color: var(--accent-light); }
 .c2-project { color: var(--text-secondary); font-size: 13px; }
+.c2-status-chip {
+    padding: 2px 8px; border-radius: 6px; font-family: var(--font-mono); font-size: 11px;
+    background: var(--cb); color: var(--ci); box-shadow: inset 0 0 0 1px var(--c);
+}
+.c2-next small { font-size: 12px; }
 .c2-lights { margin-left: auto; display: inline-flex; align-items: center; gap: var(--sp-1); }
 .c2-light {
     display: inline-flex; align-items: center; justify-content: center;
@@ -125,8 +130,8 @@
 @media (max-width: 768px) {
     .c2 { padding-left: max(var(--sp-1), env(safe-area-inset-left)); padding-right: max(var(--sp-1), env(safe-area-inset-right)); }
     .c2-details { padding-bottom: env(safe-area-inset-bottom); }
-    /* Первый экран на 375px отдан рекомендации: значки и время обновления героя
-       живут в «Подробностях» (метаданные) и в блоке «Что произошло». */
+    /* Первый экран на 375px отдан рекомендации: значки героя скрыты; статус
+       назван словом в шапке C2 (c2-status-chip), остальные значки - в метаданных. */
     .task-hero-badges, .task-hero-status, .task-detail-breadcrumb { display: none; }
     .task-hero { padding-bottom: var(--sp-2); }
     .task-hero-title { font-size: 1.15rem; }

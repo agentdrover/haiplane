@@ -1,23 +1,61 @@
-{# #1812: «Подробности» свёрнуты на телефоне и планшете, на широком экране
-   открыты (двухколоночная раскладка цела). Переход по якорю к форме внутри
-   свёрнутого блока раскрывает его: без этого «К действию» вело бы в пустоту. #}
+{# #1812: раскрытие блоков карточки. Состояние каждого <details> с id хранится в
+   sessionStorage по id блока и возвращается после каждой замены .main HTMX
+   (обновление раз в 15 с): ручное раскрытие и закрытие не сбрасываются.
+   Ширина >=1101px задаёт только начальное значение «Подробностей»: если
+   записанного состояния нет. «К действию» не отменяет переход - фрагмент
+   пишется в адрес, а блок с целью раскрывается. Хранилище может быть
+   недоступно (приватный режим): всё в try/catch, страница работает без него.
+   Скрипт приходит и с каждой заменой .main, поэтому обработчики ставятся один
+   раз (флаг window.hubC2), а каждый запуск лишь восстанавливает состояние. #}
 <script>
 (function () {
-    var box = document.getElementById("card-details");
-    if (!box) { return; }
-    function openFor(hash) {
-        var target = hash && hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
-        for (var el = target; el; el = el.parentElement) {
-            if (el.tagName === "DETAILS") { el.open = true; }
-        }
-        if (target) { target.scrollIntoView(); }
+    var KEY = "hub-c2-open";
+    function read() {
+        try { return JSON.parse(window.sessionStorage.getItem(KEY) || "{}") || {}; }
+        catch (e) { return {}; }
     }
-    if (window.matchMedia && window.matchMedia("(min-width: 1101px)").matches) { box.open = true; }
-    window.addEventListener("hashchange", function () { openFor(location.hash); });
-    document.addEventListener("click", function (e) {
-        var link = e.target.closest ? e.target.closest("a.c2-btn") : null;
-        if (link) { openFor(link.getAttribute("href")); e.preventDefault(); }
-    });
-    openFor(location.hash);
+    function write(state) {
+        try { window.sessionStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* без хранилища */ }
+    }
+    function openFor(hash) {
+        var id = hash && hash.length > 1 ? decodeURIComponent(hash.slice(1)) : "";
+        var target = id ? document.getElementById(id) : null;
+        for (var el = target; el; el = el.parentElement) {
+            if (el.tagName === "DETAILS" && !el.open) { el.open = true; }
+        }
+    }
+    function restore() {
+        var state = read();
+        var wide = window.matchMedia && window.matchMedia("(min-width: 1101px)").matches;
+        var boxes = document.querySelectorAll(".main details[id]");
+        for (var i = 0; i < boxes.length; i++) {
+            var box = boxes[i];
+            var saved = state[box.id];
+            if (saved === undefined) {
+                // Начальное значение: только «Подробности» и только на широком экране.
+                if (box.id === "card-details" && wide) { box.open = true; }
+            } else if (!box.hasAttribute("data-c2-forced")) {
+                box.open = !!saved;
+            }
+        }
+        openFor(window.location.hash);
+    }
+    if (!window.hubC2) {
+        window.hubC2 = { restore: restore };
+        document.addEventListener("toggle", function (e) {
+            var box = e.target;
+            if (!box || box.tagName !== "DETAILS" || !box.id || box.hasAttribute("data-c2-forced")) { return; }
+            var state = read();
+            state[box.id] = box.open;
+            write(state);
+        }, true);
+        document.addEventListener("htmx:afterSwap", function () { window.hubC2.restore(); });
+        window.addEventListener("hashchange", function () { openFor(window.location.hash); });
+        document.addEventListener("click", function (e) {
+            var link = e.target.closest ? e.target.closest("a.c2-btn") : null;
+            if (link) { openFor(link.getAttribute("href")); }
+        });
+    }
+    window.hubC2.restore();
 })();
 </script>

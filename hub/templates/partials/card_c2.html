@@ -12,6 +12,8 @@
     <section class="c2-header" data-c2-section="header" aria-label="Шапка карточки">
         <span class="c2-id">#{{ c.number }}</span>
         {% if c.project %}<span class="c2-project">{{ c.project }}</span>{% endif %}
+        {# Слово статуса: на телефоне бейджи героя скрыты, и это его замена. #}
+        <span class="c2-status-chip" data-tone="{{ c.tone }}">{{ c.status }}</span>
         {% if c.lights %}
         <span class="c2-lights" role="img" aria-label="Проверки: {{ c.lights_summary }}">
             {% for l in c.lights %}<span class="c2-light" data-tone="{{ l.tone }}" data-shape="{{ l.shape }}"><span aria-hidden="true">{{ l.shape }}</span></span>{% endfor %}
@@ -32,15 +34,16 @@
         {% set verdict_stands = task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
         <a class="c2-btn" href="{{ '#review-replace-form' if verdict_stands else ('#review-verdict-form' if review_board else ('#executor-repair-form' if repair_offered else '#task-controls')) }}">К действию</a></p>
         {% else %}
-        <p class="c2-rec-action">Рекомендации нет</p>
-        <p class="c2-alt">Справка не собрана или для этого статуса не строится: решайте по подробностям ниже.</p>
+        <p class="c2-rec-action">{{ c.tone_label }}</p>
+        <p class="c2-alt">Справки для решения нет: ниже названо состояние и что от вас нужно.</p>
+        <p class="c2-act"><a class="c2-btn" href="#{{ c.action_target }}">К действию</a></p>
         {% endif %}
     </section>
 
     <section class="c2-block c2-about" data-c2-section="about" aria-labelledby="c2-about-h">
         <h2 class="c2-label" id="c2-about-h">О чём</h2>
         <p class="c2-about-text{% if c.about_missing %} c2-muted{% endif %}">{{ c.about }}</p>
-        <details class="c2-orig">
+        <details class="c2-orig" id="c2-orig">
             <summary>Исходное название</summary>
             <p class="c2-orig-title">{{ c.original_title }}</p>
         </details>
@@ -51,6 +54,7 @@
         <p class="c2-status"><span class="c2-badge" data-tone="{{ c.tone }}" data-shape="{{ c.shape }}"><span class="c2-shape" aria-hidden="true">{{ c.shape }}</span> {{ c.tone_label }}</span></p>
         {% if c.happened %}<p class="c2-happened-text">{{ c.happened }}</p>{% endif %}
         {% if c.from_you %}<p class="c2-from-you"><strong>От вас:</strong> {{ c.from_you }}</p>{% endif %}
+        {% if c.next_action %}<p class="c2-next c2-muted"><small>{{ c.next_action }}</small></p>{% endif %}
     </section>
 
     {% if c.risks %}

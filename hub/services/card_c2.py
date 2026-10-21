@@ -16,6 +16,8 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.mcp_envelope import compute_awaiting, compute_next_action
+from hub.services import inbox_decisions
 from hub.services.decision_brief import (  # noqa: F401 - словарь действий один
     ACCEPT,
     APPROVE_DRAFT,
@@ -51,6 +53,79 @@ _BY_ACTION: dict[str, tuple[str, str]] = {
     RERUN: (BLUE, "Нужен повторный прогон"),
     WORKING: (BLUE, "Идёт работа"),
 }
+
+
+# Статус без справки -> (тон, слово, «От вас», форма). Справка для них не строится
+# (decision_brief отвечает «действий нет»), но молчать карточка не вправе.
+_NO_BRIEF: dict[str, tuple[str, str, str, str]] = {
+    "needs_info": (
+        AMBER,
+        "Нужен ваш ответ",
+        "Ответьте на вопрос агента.",
+        "web-answer-form",
+    ),
+    "open": (
+        GRAY,
+        "Не начато",
+        "От вас ничего не нужно: задача ждёт исполнителя.",
+        "task-controls",
+    ),
+    "ci_check": (
+        BLUE,
+        "Идёт проверка CI",
+        "От вас ничего не нужно: ждём конвейер CI.",
+        "task-controls",
+    ),
+    "pending_report": (
+        AMBER,
+        "Ждёт отчёта и решения",
+        "Нужен отчёт или ваше решение.",
+        "task-controls",
+    ),
+    "failed": (
+        RED,
+        "Задача не выполнена",
+        "Решите, что делать дальше: перезапуск или архив.",
+        "task-controls",
+    ),
+    "rejected": (
+        RED,
+        "Отклонено",
+        "От вас ничего не нужно: задача отклонена.",
+        "task-controls",
+    ),
+}
+
+
+def no_brief_notice(task: dict[str, Any], question: str = "") -> dict[str, str]:
+    """Явное состояние и действие, когда справки нет (#1812, возврат gen1).
+
+    Статус, ``awaiting`` и ``next_action`` берутся у общих читателей
+    (``mcp_envelope``), вопрос агента - из ленты тем же читателем, что у
+    входящих. Статус, у которого справка должна быть, но не собралась, - серый
+    «Справка не собрана»: сбой не выдаётся за известное состояние.
+    """
+    status = str(task.get("status") or "")
+    known = _NO_BRIEF.get(status)
+    if known is None:
+        return {
+            "tone": GRAY,
+            "label": BRIEF_MISSING,
+            "need": "Справка не собралась: решайте по подробностям ниже.",
+            "target": "task-controls",
+            "next_action": "",
+        }
+    tone, label, need, target = known
+    if status == "needs_info" and question:
+        need = f"{need} Вопрос: {question}"
+    awaiting = compute_awaiting(status, task)
+    return {
+        "tone": tone,
+        "label": label,
+        "need": need,
+        "target": target,
+        "next_action": compute_next_action(status, awaiting),
+    }
 
 
 def _doubts(brief: dict[str, Any]) -> bool:
@@ -167,9 +242,13 @@ def card_view(
     in_flight: bool = False,
     project_name: str = "",
     plain_summary: str = "",
+    question: str = "",
 ) -> dict[str, Any]:
     """Всё, что нужно шаблону C2. Чистая функция: ничего не читает и не пишет."""
     tone, label = tone_for(task, brief, delivery, in_flight)
+    notice = no_brief_notice(task, question) if brief is None else None
+    if notice is not None and not in_flight:
+        tone, label = notice["tone"], notice["label"]
     brief = _by_reference(brief, delivery)
     risks, deduped = _dedupe(brief)
     lights = [_light(c) for c in deduped]
@@ -187,11 +266,19 @@ def card_view(
         "about_missing": not about,
         "original_title": str(task.get("title") or ""),
         "happened": (brief or {}).get("happened", ""),
-        "from_you": (brief or {}).get("need", ""),
+        "from_you": (brief or {}).get("need") or (notice or {}).get("need", ""),
+        "next_action": (notice or {}).get("next_action", ""),
+        "action_target": _target(task, notice),
+        "status": str(task.get("status") or ""),
         "recommend": (brief or {}).get("recommend"),
         "risks": [_risk_view(r) for r in risks],
         "checks": lights,
     }
+
+
+def _target(task: dict[str, Any], notice: dict[str, str] | None) -> str:
+    """Форма для «К действию» без справки; со справкой цель выбирает шаблон."""
+    return notice["target"] if notice else ""
 
 
 async def card_context(
@@ -204,6 +291,9 @@ async def card_context(
 ) -> dict[str, Any]:
     """Вид C2 для страницы (#1812): проект читается здесь, остальное уже посчитано."""
     project = await repo.resolve_project_for_task(db, int(row["id"]))
+    question = ""
+    if brief is None and str(row.get("status")) == "needs_info":
+        question = (await inbox_decisions._question_grounds(db, row)).strip()
     return card_view(
         row,
         brief,
@@ -211,4 +301,5 @@ async def card_context(
         in_flight=bool(in_flight),
         project_name=str(project["name"]) if project is not None else "",
         plain_summary=str(getattr(task_view, "plain_summary_shown", "") or ""),
+        question=question,
     )
