@@ -53,7 +53,8 @@ MIGRATIONS = [
             waiting_since   TEXT,
             last_seen_at    TEXT,
             need_mib        INTEGER,
-            free_mib        INTEGER
+            free_mib        INTEGER,
+            statement_generation INTEGER
         )""",
     ),
     (
@@ -64,13 +65,14 @@ MIGRATIONS = [
         "ack_result, acked_at, report_outcome, report_sha, report_branch, "
         "report_note, reported_at, code_hash, first_redeemed_at, retry_until, "
         "session_id, redeem_rotations, phase, phase_at, report_reason_code, "
-        "report_reason, final_entry_at, run_seconds) "
+        "report_reason, final_entry_at, run_seconds, statement_generation) "
         "SELECT id, host, task_id, generation, executor_run_id, pair_code_id, "
         "code_ciphertext, order_text, state, created_at, expires_at, delivered_at, "
         "redeemed_at, closed_at, close_reason, ack_result, acked_at, report_outcome, "
         "report_sha, report_branch, report_note, reported_at, code_hash, "
         "first_redeemed_at, retry_until, session_id, redeem_rotations, phase, "
-        "phase_at, report_reason_code, report_reason, final_entry_at, run_seconds "
+        "phase_at, report_reason_code, report_reason, final_entry_at, run_seconds, "
+        "statement_generation "
         "FROM executor_orders",
     ),
     (
@@ -79,6 +81,14 @@ MIGRATIONS = [
         "UPDATE sqlite_sequence SET seq = max(seq, COALESCE((SELECT seq FROM "
         "sqlite_sequence WHERE name = 'executor_orders'), 0)) "
         "WHERE name = 'executor_orders_mw'",
+    ),
+    (
+        # #1942: рекомендации ссылаются на заказ с ON DELETE CASCADE, а DROP TABLE
+        # при включённых внешних ключах удалил бы их вместе со старой таблицей.
+        # Копия живёт до восстановления после RENAME.
+        "backup_executor_triage_recommendations_1972",
+        "CREATE TABLE IF NOT EXISTS _executor_triage_recommendations_bak_1972 AS "
+        "SELECT * FROM executor_triage_recommendations",
     ),
     (
         "drop_old_executor_orders_1972",
@@ -97,5 +107,14 @@ MIGRATIONS = [
         "idx_executor_orders_task_1972",
         "CREATE INDEX IF NOT EXISTS idx_executor_orders_task "
         "ON executor_orders(task_id)",
+    ),
+    (
+        "restore_executor_triage_recommendations_1972",
+        "INSERT OR IGNORE INTO executor_triage_recommendations "
+        "SELECT * FROM _executor_triage_recommendations_bak_1972",
+    ),
+    (
+        "drop_executor_triage_recommendations_bak_1972",
+        "DROP TABLE IF EXISTS _executor_triage_recommendations_bak_1972",
     ),
 ]

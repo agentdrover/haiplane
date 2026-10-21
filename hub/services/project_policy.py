@@ -825,6 +825,37 @@ def local_review_fallback_of(policy: dict) -> str:
     return LOCAL_REVIEW_FALLBACK_OFF
 
 
+# Хост критика для облачной сдачи (#1953). Имя зарегистрированного хоста
+# исполнителя (k8), чей ключ забирает заказы критика. Пусто или нет ключа -
+# выключено: сдача облачной задачи идёт как до задачи. Нечитаемое значение
+# читается как выключено, а его запись отвергает валидация политики.
+CRITIC_HOST_KEY = "critic_host"
+
+
+def validate_critic_host(policy: dict) -> None:
+    """Refuse a critic host the reader would read as off by accident (#1953)."""
+    from hub.models import _SLOT_NAME
+
+    if CRITIC_HOST_KEY not in policy:
+        return
+    value = policy[CRITIC_HOST_KEY]
+    if value != "" and not (isinstance(value, str) and _SLOT_NAME.fullmatch(value)):
+        raise ValueError(
+            "gate_policy critic_host must be an executor host name "
+            f"(lowercase letters, digits, hyphen) or empty, got: {value!r}"
+        )
+
+
+def critic_host_of(policy: dict) -> str:
+    """Хост критика; нет ключа или нечитаемое значение - пусто (выключено)."""
+    from hub.models import _SLOT_NAME
+
+    value = policy.get(CRITIC_HOST_KEY) if isinstance(policy, dict) else None
+    if isinstance(value, str) and _SLOT_NAME.fullmatch(value):
+        return value
+    return ""
+
+
 # «Мерж = доставка» (#1572). У проекта без релиз-PR (ветка работы совпадает с
 # релизной) released_sha не появляется, и срок исхода по его задачам не
 # вычислить. Выводить «мерж = доставка» из конфигурации веток нельзя: у

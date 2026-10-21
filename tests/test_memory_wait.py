@@ -314,17 +314,33 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
 
     steps = load_steps()  # все шаги по порядку: #1972 опирается на run_seconds (#1960)
     assert any("1972" in n for n, _ in steps), "нет шага миграции #1972"
-    monkeypatch.setattr(db_module, "_MIGRATIONS", list(FROZEN_MIGRATIONS))
+    before = [
+        (n, q) for n, q in steps if "1972" not in n
+    ]  # шаги до #1972 (#1960, #1942)
+    monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     try:
         await conn.executescript(_SCHEMA)
         await db_module._migrate(conn)
         await conn.execute("PRAGMA foreign_keys = OFF")
+        # настоящие родители заказа: с включёнными ключами копия не пройдёт сиротой
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (7, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO executor_hosts (name, principal_id, public_key_pem) "
+            "VALUES ('k8', 1, 'pem')"
+        )
+        await conn.execute("INSERT INTO executor_runs (id, task_id) VALUES (9, 7)")
         await conn.execute(
             "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
-            "state, expires_at, order_text) VALUES ('k8', 7, 1, 9, 'delivered', "
-            "'2030-01-01 00:00:00', 'text')"
+            "state, expires_at, order_text, statement_generation) VALUES ('k8', 7, "
+            "1, 9, 'delivered', '2030-01-01 00:00:00', 'text', 5)"
+        )
+        await conn.execute(
+            "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+            "triage_class, action) VALUES (1, 7, 1, 'to_owner')"
         )
         await conn.execute(
             "UPDATE sqlite_sequence SET seq = 50 WHERE name = 'executor_orders'"
@@ -338,12 +354,22 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
         except aiosqlite.IntegrityError:
             await conn.rollback()
 
+        await conn.execute("PRAGMA foreign_keys = ON")  # как на проде: DROP каскадит
         monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *steps])
         await db_module._migrate(conn)
+        recs = await conn.execute_fetchall(
+            "SELECT order_id, action FROM executor_triage_recommendations"
+        )
+        assert [tuple(r) for r in recs] == [(1, "to_owner")]  # не унесены каскадом
+        left = await conn.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE name LIKE '%bak_1972'"
+        )
+        assert not left
         kept = await conn.execute_fetchall("SELECT * FROM executor_orders")
         assert [dict(r)["order_text"] for r in kept] == ["text"]
         assert dict(kept[0])["state"] == "delivered"
         assert dict(kept[0])["waiting_since"] is None
+        assert dict(kept[0])["statement_generation"] == 5  # колонка #1942 цела
         await conn.execute(
             "UPDATE executor_orders SET state = 'waiting_memory', waiting_since = "
             "datetime('now'), last_seen_at = datetime('now'), need_mib = 1, "

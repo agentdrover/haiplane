@@ -47,6 +47,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "worktree_path",
     "owner_minutes",
     "last_executor_order",
+    "critic_order",
     "created_at",
     "updated_at",
 )
@@ -81,6 +82,20 @@ def executor_order_lines(task: dict[str, Any]) -> list[str]:
     return [
         f"After failed run: class {view.get('class')} ({view.get('class_name')}), "
         f"order #{view.get('order_id')} {view.get('outcome')} {view.get('reason_code')}"
+    ]
+
+
+def critic_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1953: the last critic order as the hub built it; nothing when there is none."""
+    view = task.get("critic_order")
+    if not isinstance(view, dict):
+        return []
+    if view.get("unavailable"):
+        return [f"Critic order: unavailable ({view['unavailable']})"]
+    return [
+        f"Critic order #{view.get('order_id')}: sha {str(view.get('sha'))[:12]} "
+        f"{view.get('state')}/{view.get('outcome') or '-'} until "
+        f"{view.get('expires_at')}. Next: {view.get('next_step')}"
     ]
 
 
