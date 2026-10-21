@@ -115,7 +115,7 @@ def test_an_unreadable_pinned_file_is_not_a_range_from_the_branch():
     ref = f"{F}::test_ac"
     block, _ = diff_plan(_new(F, _big()), "develop", "b", ac_test_refs=[ref],
                          ac_sources={F: None})  # fmt: skip
-    first = [ln for ln in block.splitlines() if ln.startswith("ЧИТАТЬ ПЕРВЫМИ")]
+    first = [ln for ln in block.splitlines() if ln.startswith("ЧИТАТЬ ПЕРВЫМИ:")]
     assert first == [f"ЧИТАТЬ ПЕРВЫМИ: {UNREADABLE} ({ref})"]
 
 
@@ -223,7 +223,7 @@ def test_an_unreadable_pinned_diff_still_states_the_block_as_unknown():
     branch = _new(F, ["def test_ac():", "    pass"])
     block, _ = diff_plan(branch, "develop", "b", ac_test_refs=[ref], ac_sources=None,
                          ac_block=True)  # fmt: skip
-    assert block.startswith(f"ЧИТАТЬ ПЕРВЫМИ: {UNREADABLE} ({ref})")
+    assert f"ЧИТАТЬ ПЕРВЫМИ: {UNREADABLE} ({ref})" in block
     assert "НЕ ПОМЕСТЯТСЯ" not in block
 
 

@@ -18,6 +18,11 @@
 литералы, вложенность, переносы между ханками), а из ``ast`` файла теста на
 ЗАКРЕПЛЁННОМ sha сдачи: ``lineno``, ``end_lineno``, ``decorator_list``, класс —
 по дереву. Файл не прочитан или не разобран — «не найден», без отката на ветку.
+
+Локатор СИНТАКСИЧЕСКИЙ: диапазон — по тексту файла, не по исполнению; global в
+теле класса, присваивание атрибуту класса, exec/globals() не учитываются
+(граница анализа, решение владельца по #1933: перечислением способов связывания
+Python она не закрывается).
 """
 
 from __future__ import annotations
@@ -336,6 +341,10 @@ def first_block(
     """
     if not spans:
         return ""
+    syntactic = (
+        "ЧИТАТЬ ПЕРВЫМИ — диапазон — по тексту файла, не по исполнению; global в теле "
+        "класса, присваивание атрибуту класса, exec/globals() не учитываются.\n"
+    )
     short = sha[:12]
     if not short:
         head = ""
@@ -351,14 +360,15 @@ def first_block(
             f"не верь — читай тест командой `git show {short}:<путь>` или назови его "
             f"в lost_dimensions «{UNREAD_PREFIX}<test_ref>».\n"
         )
-    return head + "\n".join(span.label() for span in spans)
+    return head + syntactic + "\n".join(span.label() for span in spans)
 
 
-def cutout(span: AcTestSpan) -> str:
-    """Функция теста AC вырезкой: строки файла с номерами."""
+def cutout(span: AcTestSpan, refs: Sequence[str] = ()) -> str:
+    """Функция теста AC вырезкой: строки файла с номерами; ``refs`` - все ссылки диапазона."""
+    names = "; ".join(refs) if refs else span.ref
     body = "\n".join(f"{number}: {text}" for number, text in span.lines)
     return (
-        f"=== ВЫРЕЗКА ТЕСТА AC {span.ref} ({span.path}:{span.start}–{span.end}) ===\n"
+        f"=== ВЫРЕЗКА ТЕСТА AC {names} ({span.path}:{span.start}–{span.end}) ===\n"
         f"{body}\n=== КОНЕЦ ВЫРЕЗКИ ===\n"
     )
 
@@ -409,75 +419,120 @@ async def attach_ac_tests_unread(db: Any, view: Any) -> None:
     view.ac_tests_unread = await unread_for_task(db, view.task_id, view.lost_dimensions)
 
 
+RangeKey = tuple[str, int, int]
+
+
+def _upgrade_to_full(
+    ranges: dict[RangeKey, list[AcTestSpan]],
+    cost: dict[RangeKey, int],
+    texts: dict[str, str],
+    placed: set[RangeKey],
+    budget: int,
+    ac_paths: list[str],
+) -> tuple[int, set[str], set[RangeKey]]:
+    """Шаг C: AC-файл на полный дифф, если доплата влезает в остаток (``placed`` меняется)."""
+    upgraded: set[str] = set()
+    read_by_diff: set[RangeKey] = set()
+    for path in ac_paths:
+        if path not in texts:
+            continue
+        keys = [k for k in ranges if k[0] == path]
+        covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
+        need = len(texts[path]) + sum(cost[k] for k in keys if k not in covered)
+        delta = need - sum(cost[k] for k in keys if k in placed)
+        if delta <= budget:
+            budget -= delta
+            upgraded.add(path)
+            read_by_diff |= covered
+            placed -= covered
+            placed |= {k for k in keys if k not in covered}
+    return budget, upgraded, read_by_diff
+
+
+def _assemble(
+    sections: list[tuple[str, str]],
+    texts: dict[str, str],
+    ac_paths: list[str],
+    upgraded: set[str],
+    shown_plain: set[int],
+) -> tuple[list[str], list[str]]:
+    """Текст диффа по порядку разделов и имена не вошедших файлов."""
+    text: list[str] = []
+    omitted: list[str] = []
+    done: set[str] = set()
+    for i, (path, raw) in enumerate(sections):
+        name = path or "(часть диффа без имени файла)"
+        if path in ac_paths:
+            if path not in done:
+                done.add(path)
+                (text if path in upgraded else omitted).append(
+                    texts[path] if path in upgraded else name
+                )
+        elif i in shown_plain:
+            text.append(raw if raw.endswith("\n") else raw + "\n")
+        else:
+            omitted.append(name)
+    return text, omitted
+
+
 def fit_with_ac_cutouts(
     sections: list[tuple[str, str]],
     ceiling: int,
     spans: list[AcTestSpan],
 ) -> tuple[str, list[str], list[str], list[str]]:
-    """Файлы под потолок; представление файлов с тестами AC выбирается СОВМЕСТНО (#1933).
+    """Файлы под потолок; бюджет тестов AC считается ПО УНИКАЛЬНЫМ ДИАПАЗОНАМ (#1933).
 
-    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Файл с тестом AC
-    представлен полным диффом (плюс вырезки того, что вне ханков) или одними
-    вырезками. Шаг 1: каждому такому файлу бронируется дешёвое из двух по
-    РЕАЛЬНОЙ стоимости (вырезки с номерами строк бывают дороже полного диффа);
-    не влезло ни одно - тесты файла названы непрочитанными. Шаг 2: по порядку
-    диффа файлы берут остаток, а AC-файл на вырезках улучшается до полного
-    диффа, если доплата влезает.
+    ``(текст, не вошли, вырезки, непрочитанные тесты AC)``. Единица учёта -
+    диапазон ``(путь, начало, конец)``; ссылки ``test_ref`` хранятся при нём
+    отдельно (parametrize даёт много ссылок на один диапазон и платится он один
+    раз). Приоритеты по шагам, порядок разделов диффа результат не меняет:
+
+    A) каждый диапазон AC, который ПОМЕЩАЕТСЯ в остаток, - вырезкой (по порядку;
+       не поместившийся не блокирует остальные: непрочитанными названы только
+       его ссылки);
+    B) все файлы без тестов AC - по порядку диффа, из остатка;
+    C) последним шагом AC-файл улучшается до полного диффа (плюс вырезки того,
+       что вне ханков), если доплата влезает в остаток; покрытые ханками
+       диапазоны тогда прочитаны через дифф.
     """
 
     def norm(t: str) -> str:
         return t if t.endswith("\n") else t + "\n"
 
-    found = [sp for sp in spans if sp.found]
-    by_path: dict[str, list[AcTestSpan]] = {}
-    for sp in found:
-        by_path.setdefault(sp.path, []).append(sp)
+    ranges: dict[RangeKey, list[AcTestSpan]] = {}
+    for sp in spans:
+        if sp.found and sp.start is not None and sp.end is not None:
+            ranges.setdefault((sp.path, sp.start, sp.end), []).append(sp)
     texts: dict[str, str] = {}
     for p, t in sections:
         if p:
             texts[p] = texts.get(p, "") + norm(t)
-    cut_cost = {p: sum(len(cutout(x)) for x in sps) for p, sps in by_path.items()}
-    unc_cost = {
-        p: sum(len(cutout(x)) for x in sps if not shown_in(texts.get(p), x))
-        for p, sps in by_path.items()
-    }
-    full_cost = {p: len(texts[p]) + unc_cost[p] for p in by_path if p in texts}
-    budget, mode = ceiling, {}
-    for p in by_path:
-        options = [(cut_cost[p], 1, "cut")]
-        if p in full_cost:
-            options.append((full_cost[p], 0, "full"))
-        cost, _, pick = min(options)
-        mode[p] = pick if cost <= budget else ""
-        budget -= cost if mode[p] else 0
-    text, omitted, done = [], [], set()
-    for path, raw in sections:
-        body = norm(raw)
-        name = path or "(часть диффа без имени файла)"
-        if path in by_path:
-            if path in done:  # второй раздел того же пути (symlink -> файл): уже учтён
-                continue
-            done.add(path)
-            extra = len(texts[path]) + unc_cost[path] - cut_cost[path]
-            if mode[path] == "cut" and extra <= budget:
-                budget -= extra
-                mode[path] = "full"
-            if mode[path] == "full":
-                text.append(texts[path])
-            else:
-                omitted.append(name)
-        elif len(body) <= budget:
-            budget -= len(body)
-            text.append(body)
-        else:
-            omitted.append(name)
-    need = [
-        x
-        for p, sps in by_path.items()
-        if mode[p]
-        for x in sps
-        if mode[p] == "cut" or not shown_in(texts.get(p), x)
+
+    def rtext(key: tuple[str, int, int]) -> str:
+        return cutout(ranges[key][0], [x.ref for x in ranges[key]])
+
+    cost = {k: len(rtext(k)) for k in ranges}
+    budget = ceiling
+    placed: set[tuple[str, int, int]] = set()
+    for k in ranges:  # A
+        if cost[k] <= budget:
+            placed.add(k)
+            budget -= cost[k]
+    ac_paths = list(dict.fromkeys(k[0] for k in ranges))
+    shown_plain: set[int] = set()
+    for i, (path, raw) in enumerate(sections):  # B
+        if path not in ac_paths and len(norm(raw)) <= budget:
+            shown_plain.add(i)
+            budget -= len(norm(raw))
+    budget, upgraded, read_by_diff = _upgrade_to_full(
+        ranges, cost, texts, placed, budget, ac_paths
+    )
+    text, omitted = _assemble(sections, texts, ac_paths, upgraded, shown_plain)
+    cuts = [rtext(k) for k in ranges if k in placed]
+    unread = [
+        x.ref
+        for k in ranges
+        if k not in placed and k not in read_by_diff
+        for x in ranges[k]
     ]
-    cuts = [cutout(x) for x in need]
-    unread = [x.ref for p, sps in by_path.items() if not mode[p] for x in sps]
     return "".join(text), omitted, cuts, unread
