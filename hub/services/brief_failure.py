@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import subprocess
+import subprocess  # nosec B404 - only for isinstance on SubprocessError
 from dataclasses import dataclass
 
 _HINT = "подробности в логе хаба"

@@ -11,7 +11,7 @@ from hub import repository as repo
 
 from tests.web_support import _web_task_in_review
 
-PASSWORD = "hunter2pass"  # fake values for the leak check
+PASSWORD = "hunter2pass"  # fake values for the leak check  # pragma: allowlist secret
 B64 = "dXNlcjpodW50ZXIycGFzcw=="
 LEAKY = (
     "fatal: https://user:" + PASSWORD + "@github.com/x/y.git?token=tok-abc123 "
@@ -19,7 +19,7 @@ LEAKY = (
     "{'password': '" + PASSWORD + "'} "
     "git.internal:8443/x?access_token=at-777 10.1.2.3:2222 "
     "at /Users/denis/secret-dir/repo ghp_ZZZ111 line1\\nline2 "
-    "eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop"
+    "eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop"  # pragma: allowlist secret
 )
 SECRETS = [
     PASSWORD,
