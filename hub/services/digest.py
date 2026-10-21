@@ -706,7 +706,13 @@ async def generate_due_digests(
                 "auto_approvals": len(approvals),
                 "auto_verdicts": len(verdicts),
                 "escalations": len(escalations),
-                "triage_created": triage_section["created"],
+                "triage_state": triage_section["state"],
+                # Нечитаемый разбор - не ноль: счётчик остаётся пустым (#1943).
+                "triage_created": (
+                    triage_section["created"]
+                    if triage_section["state"] == triage_inbox.MEASURED
+                    else None
+                ),
                 "steward_judgements": len(steward),
                 "steward_self_approvals": len(self_approvals),
                 "audit_sample": sample,

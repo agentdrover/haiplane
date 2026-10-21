@@ -348,3 +348,22 @@ async def test_digest_delegating_project_gets_the_line_too(owner):
     (only,) = [d for d in await _digests(world) if d["slug"] == world.slug]
     assert OLD_KEYS <= set(only["data"])
     assert only["data"]["triage"]["created"] == 1
+
+
+async def test_digest_unreadable_triage_is_not_zero(owner, monkeypatch):
+    """Сбой чтения разбора: дайджест создан, раздел unavailable, событие без нуля."""
+    from hub.services import triage_inbox
+
+    world = owner
+    monkeypatch.setattr(triage_inbox, "_DIGEST_ROWS_SQL", "SELECT * FROM no_such")
+    got = await _digests(world)
+    mine = [d for d in got if d["slug"] == world.slug]
+    assert mine and mine[0]["data"]["triage"]["state"] == "unavailable"
+    assert mine[0]["data"]["triage"]["reason"]
+    events = await _rows(
+        world.db, "SELECT payload FROM events WHERE kind = 'digest_created'"
+    )
+    sent = json.loads(events[0]["payload"])
+    assert sent["triage_state"] == "unavailable" and sent["triage_created"] is None
+    page = await world.client.get("/digests", headers=world.human_auth)
+    assert "разбор не прочитан" in page.text

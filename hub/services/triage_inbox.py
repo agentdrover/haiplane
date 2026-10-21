@@ -238,9 +238,15 @@ def empty_section() -> dict[str, Any]:
 
 
 def section_active(section: dict[str, Any]) -> bool:
-    """В сутках что-то создано или решено: день стоит дайджеста."""
+    """В сутках что-то создано, решено или разбор не прочитан: день стоит дайджеста.
+
+    Нечитаемый разбор - не «пусто»: без дайджеста владелец не узнал бы о сбое.
+    """
     return bool(
-        section.get("created") or section.get("resolved") or section.get("unmeasured")
+        section.get("state") == UNAVAILABLE
+        or section.get("created")
+        or section.get("resolved")
+        or section.get("unmeasured")
     )
 
 
