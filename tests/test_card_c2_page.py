@@ -69,3 +69,26 @@ def test_css_keeps_phone_and_desktop_promises():
     for width in ("1100px", "768px"):
         assert f"max-width: {width}" in css or f"min-width: {width}" in css
     assert "overflow-x" in css
+
+
+def _details_tag(page: str) -> str:
+    return re.search(r'<details[^>]*id="card-details"[^>]*>', page).group(0)
+
+
+async def test_feedback_opens_the_details(client, db):
+    task_id = await _task_in(db, "running")
+    quiet = (await client.get(f"/tasks/{task_id}")).text
+    assert " open" not in _details_tag(quiet)
+    loud = (await client.get(f"/tasks/{task_id}?approve_error=ошибка")).text
+    assert " open" in _details_tag(loud), "ответ на действие спрятан в свёрнутом блоке"
+
+
+async def test_action_link_points_at_the_form_that_exists(client, db):
+    review = await _task_in(db, "review")
+    page = (await client.get(f"/tasks/{review}")).text
+    assert 'class="c2-btn" href="#review-verdict-form"' in page
+    assert 'id="review-verdict-form"' in page
+    running = await _task_in(db, "running")
+    page = (await client.get(f"/tasks/{running}")).text
+    assert 'class="c2-btn" href="#task-controls"' in page
+    assert 'id="task-controls"' in page

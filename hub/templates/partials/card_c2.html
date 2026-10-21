@@ -28,7 +28,9 @@
         <p class="c2-rec-action decision-brief-action">{{ rec.action }}</p>
         {% if rec.why %}<ul class="c2-why decision-brief-why">{% for w in rec.why %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
         {% if rec.alt %}<p class="c2-alt decision-brief-alt">Иначе: {{ rec.alt }}</p>{% endif %}
-        <p class="c2-act"><a class="c2-btn" href="{{ '#review-verdict-form' if review_board else '#task-controls' }}">К действию</a></p>
+        <p class="c2-act">{# Цель - форма, которая есть именно сейчас: замена стоящего вердикта, первый вердикт, повторный прогон, иначе блок действий. #}
+        {% set verdict_stands = task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
+        <a class="c2-btn" href="{{ '#review-replace-form' if verdict_stands else ('#review-verdict-form' if review_board else ('#executor-repair-form' if repair_offered else '#task-controls')) }}">К действию</a></p>
         {% else %}
         <p class="c2-rec-action">Рекомендации нет</p>
         <p class="c2-alt">Справка не собрана или для этого статуса не строится: решайте по подробностям ниже.</p>

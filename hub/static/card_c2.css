@@ -14,6 +14,8 @@
     font-family: var(--font);
 }
 .c2 *, .c2-details * { min-width: 0; overflow-wrap: anywhere; }
+.task-hero, .task-hero-main { min-width: 0; }
+.task-hero-title, .task-detail-breadcrumb { overflow-wrap: anywhere; }
 
 .c2 [data-tone="red"]   { --c: var(--c2-red);   --cb: var(--c2-red-bg);   --ci: var(--c2-red-ink); }
 .c2 [data-tone="amber"] { --c: var(--c2-amber); --cb: var(--c2-amber-bg); --ci: var(--c2-amber-ink); }
@@ -37,7 +39,7 @@
     width: 20px; height: 20px; border-radius: 6px; font-size: 11px; line-height: 1;
     background: var(--cb); color: var(--ci); box-shadow: inset 0 0 0 1px var(--c);
 }
-.c2-lights-sum { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.c2-lights-sum { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
 
 .c2-block {
     background: var(--surface);
@@ -55,11 +57,11 @@
     font-weight: 500;
     letter-spacing: 0.09em;
     text-transform: uppercase;
-    color: var(--text-muted);
+    color: var(--text-secondary);
 }
 .c2 p { margin: 0 0 var(--sp-2); font-size: 15px; line-height: 1.5; }
 .c2 p:last-child { margin-bottom: 0; }
-.c2-muted { color: var(--text-muted); }
+.c2-muted { color: var(--text-secondary); }
 
 .c2-recommend { border-color: var(--border-focus); background: linear-gradient(180deg, var(--accent-dim), var(--surface) 80%); }
 .c2-rec-action { font-size: 19px; line-height: 1.25; font-weight: 700; letter-spacing: -0.01em; }
@@ -94,7 +96,7 @@
     min-height: 44px; cursor: pointer; list-style: none;
 }
 .c2 summary::-webkit-details-marker, .c2-details > summary::-webkit-details-marker { display: none; }
-.c2 summary::before, .c2-details > summary::before { content: "▸"; color: var(--text-muted); transition: transform 0.15s var(--ease); }
+.c2 summary::before, .c2-details > summary::before { content: "▸"; color: var(--text-secondary); transition: transform 0.15s var(--ease); }
 .c2 details[open] > summary::before, .c2-details[open] > summary::before { transform: rotate(90deg); }
 .c2-checks > summary .c2-label { margin: 0; }
 .c2-orig > summary { min-height: 32px; font-size: 13px; color: var(--accent-light); }

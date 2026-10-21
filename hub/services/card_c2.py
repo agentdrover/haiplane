@@ -115,12 +115,23 @@ def _dedupe(
     printed = {str(w) for w in brief["recommend"].get("why") or []}
     risks = []
     for risk in brief.get("risks") or []:
-        if str(risk.get("text")) in printed:
+        text, detail = str(risk.get("text")), str(risk.get("detail") or "")
+        if text in printed:
+            # Текст риска назван в рекомендации; уникальное пояснение и тяжесть
+            # остаются (потеряться может только повтор, не факт).
+            if detail and detail not in printed:
+                printed.add(detail)
+                risks.append({**risk, "text": detail, "detail": ""})
             continue
-        printed.add(str(risk.get("text")))
+        printed.add(text)
         risks.append(risk)
     # Риск, ушедший в «почему», уже назван: у проверки на него ссылка, не повтор.
-    named = printed | {str(r.get("text")) for r in brief.get("risks") or []}
+    named = printed | {
+        str(x)
+        for r in brief.get("risks") or []
+        for x in (r.get("text"), r.get("detail"))
+        if x
+    }
     checks = []
     for check in brief.get("checks") or []:
         parts = [p for p in str(check.get("detail") or "").split("; ") if p]

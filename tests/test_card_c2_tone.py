@@ -142,3 +142,23 @@ def test_header_has_number_and_human_project_name():
 def test_the_module_uses_the_brief_vocabulary():
     # Словарь действий один: справка владеет им, карточка его не копирует.
     assert card_c2.DELIVERED is decision_brief.DELIVERED
+
+
+def test_dedupe_keeps_the_unique_detail_of_a_risk_named_in_the_recommendation():
+    brief = _brief(
+        CHECK,
+        why=["ветка не сверена"],
+        risks=[
+            {
+                "severity": "high",
+                "text": "ветка не сверена",
+                "detail": "tip не закреплён",
+            }
+        ],
+        checks=[{"name": "Ветка", "state": "doubt", "detail": "ветка не сверена"}],
+    )
+    got = _view(brief)
+    assert [r["text"] for r in got["risks"]] == ["tip не закреплён"]
+    assert got["risks"][0]["severity"] == "high"
+    # Факт «ветка не сверена» напечатан один раз - в рекомендации.
+    assert got["checks"][0]["detail"] == card_c2.SEE_ABOVE

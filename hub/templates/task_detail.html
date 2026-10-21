@@ -63,10 +63,8 @@
 
     <header class="task-hero">
         <div class="task-hero-main">
-            <div class="task-kicker">
-                <span>Task #{{ task.id }}</span>
-                {% if task.parent_id %}<a href="/tasks/{{ task.parent_id }}">Parent #{{ task.parent_id }}</a>{% endif %}
-            </div>
+            {# Номер задачи стоит в шапке C2 (#1812): здесь он был бы второй печатью факта. #}
+            {% if task.parent_id %}<div class="task-kicker"><a href="/tasks/{{ task.parent_id }}">Parent #{{ task.parent_id }}</a></div>{% endif %}
             <h1 class="task-hero-title">
                 {% if task.archived %}<span class="badge badge-type-subtask">Archived</span>{% endif %}
                 {{ task.title }}
@@ -105,7 +103,10 @@
 
     {% include "partials/card_c2.html" %}
 
-    <details class="c2-details" id="card-details" data-c2-section="details">
+    {# #1812: ответ на действие (ошибка, одноразовый код, отказ, плашка запуска)
+       не должен прятаться в свёрнутом блоке: с обратной связью он раскрыт. #}
+    {% set has_feedback = implementer_error or implementer_code or approve_error or approve_message or review_error or archive_refusal or launch_plaque %}
+    <details class="c2-details" id="card-details" data-c2-section="details"{% if has_feedback %} open{% endif %}>
     <summary>Подробности</summary>
     <div class="task-detail-layout">
         <main class="task-detail-main">
@@ -894,7 +895,7 @@
                 {% endif %}
                 {# #1444: круг починки — повторный прогон по находкам ревью. #}
                 {% if repair_offered %}
-                <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form" id="executor-repair-form">
                   {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Вернуть задачу #{{ task.id }} в работу и заказать повторный прогон исполнителя по находкам ревью? Это платный прогон.')">Повторный прогон исполнителя</button>
