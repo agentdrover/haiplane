@@ -334,3 +334,63 @@ async def test_only_the_stub_of_the_reports_code_is_restored(
         first: "active",
         second: "failed",
     }
+
+
+async def test_a_finally_closed_order_is_not_reopened_by_the_next_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """CR gen 3: S восстановлена, свип закрыл done без агента - новый отчёт её не оживляет."""
+    from types import SimpleNamespace
+
+    from hub.integrations import cursor_cloud
+
+    async def _no_agent(_marker):
+        return SimpleNamespace(agent_id="", run_id="", asked=True)
+
+    async def _usage(_db, _dispatch):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _no_agent)
+    monkeypatch.setattr(dispatcher, "_stamp_dispatch_usage", _usage)
+    task_id = await _reviewer_task(db, "final-done")
+    cur = await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id, "
+        "run_id, model, profile, status, channel, reviewer_principal_id) "
+        "VALUES (?, 1, '', '', 'm', 'lite', 'failed', 'cloud', ?)",
+        (task_id, PRINCIPAL),
+    )
+    stub = int(cur.lastrowid or 0)
+    await db.commit()
+
+    async def _report_to_stub():
+        await record_machine_review(
+            db,
+            task_id,
+            _body(False),
+            principal_id=PRINCIPAL,
+            username="rev",
+            dispatch_id=stub,
+        )
+
+    async def _status() -> str:
+        rows = await fetchall(
+            db, "SELECT status FROM review_dispatches WHERE id=?", (stub,)
+        )
+        return str(dict(rows[0])["status"])
+
+    async def _alerts() -> int:
+        updates = await repo.get_task_updates(db, task_id)
+        return sum("Счёт прогона по заказу" in dict(u)["content"] for u in updates)
+
+    await _report_to_stub()
+    assert await _status() == "active", "первый отчёт оживляет отказанную заглушку"
+    await db.execute(
+        "UPDATE review_dispatches SET created_at=datetime('now','-2 days')"
+    )
+    await db.commit()
+    await dispatcher.sweep_review_dispatches(db)
+    assert await _status() == "done" and await _alerts() == 1
+    await _report_to_stub()
+    assert await _status() == "done", "окончательно разобранный заказ не оживает"
+    await dispatcher.sweep_review_dispatches(db)
+    assert await _alerts() == 1, "второго итогового алерта нет"
