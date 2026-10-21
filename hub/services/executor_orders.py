@@ -48,6 +48,7 @@ from hub.services import (
     executor_triage,
     host_redeem,
     launch_feedback,
+    order_deadline,
     owner_minutes,
     project_policy,
 )
@@ -902,12 +903,14 @@ async def _issue(
         commit=False,
     )
     stored = await _code_row(db, code)
+    run_seconds = order_deadline.run_seconds_for(task)  # #1960: снимок срока
     sealed = encrypt_code(host["public_key_pem"], code)
     del code
     cursor = await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
         "pair_code_id, code_ciphertext, order_text, expires_at, code_hash, "
-        "statement_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "run_seconds, statement_generation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host["name"],
             task_id,
@@ -918,6 +921,7 @@ async def _issue(
             text,
             stored["expires_at"],
             stored["code_hash"],
+            run_seconds,
             # #1942: поколение ПОСТАНОВКИ на момент выпуска (не путать с generation —
             # поколением сдачи); по нему считается серия неудач одной постановки.
             int(task.get("statement_generation") or 0),
@@ -942,7 +946,8 @@ async def _issue(
         "hub",
         "status",
         f"Исполнитель заказан хабом на слот {host['name']} по нажатию человека "
-        f"(#1712): заказ #{order_id}, сдача {generation}, от {starting_ref}.",
+        f"(#1712): заказ #{order_id}, сдача {generation}, от {starting_ref}, "
+        f"срок прогона {order_deadline.hours_text(run_seconds)}.",
     )
     return order_id, row_id
 
@@ -966,6 +971,7 @@ def _order_view(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "delivered_at": row["delivered_at"],
+        "run_seconds": row["run_seconds"],
     }
 
 
