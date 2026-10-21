@@ -8,7 +8,9 @@
   держит «одна рекомендация на заказ» при гонке, рестарте и после очистки
   событий (они живут 14 дней). ``owner_verdict`` пишет кнопка #1943,
   ``followup`` - свип хаба; ``child_floor`` - наибольший id подзадачи на момент
-  рекомендации (подзадача с большим id = «разделение», без сравнения секунд); совпадение считается по ним в docs/agent-context.
+  рекомендации (подзадача человека с большим id = «разделение»). ``unclear`` -
+  действие без долговечной метки времени (архив, правка без заказа, агентский
+  ребёнок): вне знаменателя замера; совпадение считается по ним в docs/agent-context.
 """
 
 MIGRATIONS: list[tuple[str, str]] = [
@@ -36,23 +38,19 @@ MIGRATIONS: list[tuple[str, str]] = [
             owner_verdict_at TEXT,
             followup         TEXT    CHECK (followup IS NULL OR followup IN (
                                  'new_order', 'statement_changed', 'split',
-                                 'submitted', 'archived', 'none_72h')),
+                                 'submitted', 'none_72h', 'unclear')),
             followup_at      TEXT,
             resolved_by      TEXT    NOT NULL DEFAULT '',
             child_floor      INTEGER NOT NULL DEFAULT 0
         )""",
     ),
     (
-        # Первое наблюдение события, у которого нет долговечной метки времени
-        # (архив, правка постановки без заказа, одобрение агентского draft, сдача
-        # без строки submissions): хронология не должна зависеть от позднего свипа.
-        "create_executor_triage_observations",
-        """CREATE TABLE IF NOT EXISTS executor_triage_observations (
-            rec_id  INTEGER NOT NULL
-                    REFERENCES executor_triage_recommendations(id) ON DELETE CASCADE,
-            kind    TEXT    NOT NULL,
-            seen_at TEXT    NOT NULL,
-            PRIMARY KEY (rec_id, kind)
+        # Момент включения разбора: одна строка (как owner_minutes_state). Заказы,
+        # закрытые до него, - история и рекомендации не получают.
+        "create_executor_triage_state",
+        """CREATE TABLE IF NOT EXISTS executor_triage_state (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            activated_at TEXT    NOT NULL
         )""",
     ),
     (

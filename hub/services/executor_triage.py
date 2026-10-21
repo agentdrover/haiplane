@@ -306,9 +306,15 @@ async def recommend_for_order(
     после выпуска заказа, тоже снимает рекомендацию: владелец уже решил.
     """
     ref = await fetchall(
-        db, "SELECT task_id FROM executor_orders WHERE id = ?", (int(order_id),)
+        db,
+        "SELECT task_id, closed_at FROM executor_orders WHERE id = ?",
+        (int(order_id),),
     )
     if not ref:
+        return None
+    # Граница включения (#1942): заказ, закрытый до активации, - история, а не
+    # свежая неудача; рекомендации на него нет, и свип её не создаёт.
+    if str(ref[0]["closed_at"] or "") < await activated_at(db):
         return None
     snap = await _read_snapshot(db, int(ref[0]["task_id"]))
     if (
@@ -388,11 +394,11 @@ FOLLOWUPS: Final[tuple[str, ...]] = (
     "statement_changed",
     "split",
     "submitted",
-    "archived",
     "none_72h",
+    "unclear",
 )
 #: Вне знаменателя совпадения: «устарела» (сдача, архив) и «без решения».
-STALE_FOLLOWUPS: Final[frozenset[str]] = frozenset({"submitted", "archived"})
+STALE_FOLLOWUPS: Final[frozenset[str]] = frozenset({"submitted"})
 NO_DECISION_FOLLOWUP: Final[str] = "none_72h"
 #: action -> follow-up, который считается совпадением. owner_verdict на совпадение
 #: не влияет: доля принятых считается отдельно.
@@ -420,123 +426,105 @@ _LATER_ORDER_SQL: Final[str] = (
     "SELECT created_at, statement_generation FROM executor_orders "
     "WHERE task_id = ? AND id > ? ORDER BY id LIMIT 1"
 )
-#: Ребёнок - исход, только если его одобрил человек: агентский draft (штатный путь
-#: предложения агента) разделением владельца не считается.
+#: Разделение - ТОЛЬКО подзадача, созданная человеком: у неё есть долговечная метка
+#: (``created_at``) и она сама есть решение. Агентский ребёнок в любом статусе (draft,
+#: одобрен, отклонён) предложением остаётся, а когда его одобрили - в данных нет.
 _HUMAN_CHILD_SQL: Final[str] = (
     "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
     "AND source = 'human'"
 )
-#: Агентский ребёнок засчитывается с момента, когда он перестал быть draft (одобрение).
-_APPROVED_AGENT_CHILD_SQL: Final[str] = (
-    "SELECT MIN(created_at) FROM tasks WHERE parent_id = ? AND id > ? "
-    "AND source <> 'human' AND status <> 'draft'"
+_AGENT_CHILD_SQL: Final[str] = (
+    "SELECT 1 FROM tasks WHERE parent_id = ? AND id > ? AND source <> 'human' LIMIT 1"
 )
 _SUBMISSION_SQL: Final[str] = (
     "SELECT MIN(submitted_at) FROM submissions WHERE task_id = ? AND generation >= ?"
 )
+UNCLEAR_FOLLOWUP: Final[str] = "unclear"
 
-#: Ничья по секунде: логический порядок действий владельца. Правка постановки
-#: раньше заказа, заказ раньше разделения, сдача и архив - после; срок 72 часа - последним.
+#: Ничья по секунде: логический порядок действий владельца. Заказ раньше
+#: разделения, сдача - после; срок 72 часа - последним.
 _RANK: Final[dict[str, int]] = {
     "statement_changed": 0,
     "new_order": 1,
     "split": 2,
     "submitted": 3,
-    "archived": 4,
     NO_DECISION_FOLLOWUP: 5,
+    UNCLEAR_FOLLOWUP: 5,
 }
 
 
 def classify_followup(f: dict[str, Any]) -> str | None:
-    """Первое по времени действие после рекомендации; ``None`` - пока ничего.
+    """Первое по времени действие с ДОЛГОВЕЧНОЙ меткой; ``None`` - пока ничего.
 
-    ``f["events"]`` - кандидаты ``(время, исход)``: время события из долговечных
-    таблиц (заказы, сдачи, подзадачи) или момент свипа, если события нет в
-    хронологии (архив, правка постановки без заказа). Побеждает минимальное время,
-    при равенстве - ``_RANK``; события без метки получают время первого наблюдения
-    (``_observed``). Исход текущей секунды откладывается до следующего прохода.
-    Для повторов (retry_*) правка постановки сама по себе не итог, а заказ после
-    правки - ``new_order``: владелец сделал рекомендованное. Для остальных действий
-    заказ с поднятым поколением постановки - ``statement_changed``.
+    ``f["events"]`` - кандидаты ``(время, исход)`` только из таблиц, где время
+    записано самим действием: заказ (``executor_orders.created_at``), сдача
+    (``submissions.submitted_at``), подзадача человека (``tasks.created_at``) и
+    срок 72 часа. Время свипа в хронологию не входит, поэтому исход не зависит от
+    того, когда прошёл свип. При равенстве - ``_RANK``; исход текущей секунды
+    откладывается до следующего прохода (событие той же секунды ещё может прийти).
     """
-    events: list[tuple[str, int, str]] = [
-        (when, _RANK[kind], kind) for when, kind in f["events"]
-    ]
+    events = [(when, _RANK[kind], kind) for when, kind in f["events"]]
     if not events:
         return None
     first = min(events)
-    # Текущая секунда не закрыта: событие той же секунды ещё может прийти и по
-    # рангу обогнать выбранное, поэтому исход фиксируется на следующем проходе.
     return None if first[0] >= f["now"] else first[2]
 
 
-def _later_order_events(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
+def _later_order_event(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
+    """Заказ после рекомендации; поколение постановки записано в самом заказе."""
     if later is None:
         return []
     ordered, retry = f["order_sg"], f["action"] in RETRY_ACTIONS
     bumped = ordered is not None and later[1] is not None and later[1] > ordered
-    if bumped and not retry:
-        return [(later[0], "statement_changed")]
-    return [(later[0], "new_order")]
+    return [(later[0], "statement_changed" if bumped and not retry else "new_order")]
 
 
-async def _observed(db: aiosqlite.Connection, rec_id: int, kind: str, now: str) -> str:
-    """Время события, которого нет в долговечной хронологии: первое наблюдение.
-
-    Архив, правка постановки без заказа, одобрение агентского draft и сдача без
-    строки ``submissions`` меток не имеют. Первое наблюдение сохраняется, и поздний
-    свип его не двигает: исход не зависит от того, когда прошёл ПОСЛЕДУЮЩИЙ свип.
-    """
-    await db.execute(
-        "INSERT OR IGNORE INTO executor_triage_observations (rec_id, kind, seen_at) "
-        "VALUES (?, ?, ?)",
-        (rec_id, kind, now),
-    )
-    rows = await fetchall(
-        db,
-        "SELECT seen_at FROM executor_triage_observations WHERE rec_id = ? AND kind = ?",
-        (rec_id, kind),
-    )
-    return str(rows[0][0])
-
-
-async def _child_event(
-    db: aiosqlite.Connection, f: dict[str, Any], now: str
+async def _durable_events(
+    db: aiosqlite.Connection, f: dict[str, Any]
 ) -> list[tuple[str, str]]:
-    """Разделение: ребёнок человека - по созданию, одобренный агентский - по наблюдению."""
+    task_id = int(f["task_id"])
+    later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
+    found = _later_order_event(f, later[0] if later else None)
+    child = (await fetchall(db, _HUMAN_CHILD_SQL, (task_id, int(f["child_floor"]))))[0][
+        0
+    ]
+    if child:
+        found.append((child, "split"))
+    sub = (await fetchall(db, _SUBMISSION_SQL, (task_id, int(f["order_generation"]))))[
+        0
+    ][0]
+    if sub:
+        found.append((sub, "submitted"))
+    return found
+
+
+async def _only_swept(db: aiosqlite.Connection, f: dict[str, Any]) -> bool:
+    """Есть ли действие, видимое только свипу (без долговечной метки времени).
+
+    Архив, правка постановки без заказа, агентский ребёнок и сдача без строки
+    ``submissions``. Они не входят в замер: срок рекомендации кончается исходом
+    ``unclear`` вместо ``none_72h``.
+    """
+    if f["archived"]:
+        return True
+    ordered = f["order_sg"]
+    if f["action"] not in RETRY_ACTIONS and ordered is not None:
+        if int(f["task_sg"] or 0) > ordered:
+            return True
     args = (int(f["task_id"]), int(f["child_floor"]))
-    human = (await fetchall(db, _HUMAN_CHILD_SQL, args))[0][0]
-    agent = (await fetchall(db, _APPROVED_AGENT_CHILD_SQL, args))[0][0]
-    seen = await _observed(db, int(f["id"]), "split", now) if agent else None
-    times = [t for t in (human, seen) if t]
-    return [(min(times), "split")] if times else []
+    if await fetchall(db, _AGENT_CHILD_SQL, args):
+        return True
+    return int(f["submission_generation"] or 0) >= int(f["order_generation"])
 
 
 async def _followup_events(
     db: aiosqlite.Connection, raw: Any, now: str
 ) -> list[tuple[str, str]]:
     f = dict(raw)
-    task_id, rec_id = int(f["task_id"]), int(f["id"])
-    found: list[tuple[str, str]] = []
-    later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
-    found += _later_order_events(f, later[0] if later else None)
-    ordered = f["order_sg"]
-    edited = ordered is not None and int(f["task_sg"] or 0) > ordered
-    if not later and edited and f["action"] not in RETRY_ACTIONS:
-        found.append(
-            (await _observed(db, rec_id, "statement_changed", now), "statement_changed")
-        )
-    found += await _child_event(db, f, now)
-    if int(f["submission_generation"] or 0) >= int(f["order_generation"]):
-        args = (task_id, int(f["order_generation"]))
-        stamp = (await fetchall(db, _SUBMISSION_SQL, args))[0][0]
-        found.append(
-            (stamp or await _observed(db, rec_id, "submitted", now), "submitted")
-        )
-    if f["archived"]:
-        found.append((await _observed(db, rec_id, "archived", now), "archived"))
+    found = await _durable_events(db, f)
     if f["deadline_at"] <= now:
-        found.append((f["deadline_at"], NO_DECISION_FOLLOWUP))
+        kind = UNCLEAR_FOLLOWUP if await _only_swept(db, f) else NO_DECISION_FOLLOWUP
+        found.append((f["deadline_at"], kind))
     return found
 
 
@@ -558,22 +546,38 @@ async def _resolve_pending(db: aiosqlite.Connection) -> int:
     return resolved
 
 
+async def activated_at(db: aiosqlite.Connection) -> str:
+    """Момент включения разбора: одна строка состояния, пишется один раз.
+
+    Первый вызов (свип или первая рекомендация) запоминает его; дальше он не
+    меняется. Рекомендации получают только заказы, закрытые после него, так что
+    выкат не публикует историю как свежие неудачи.
+    """
+    await db.execute(
+        "INSERT OR IGNORE INTO executor_triage_state (id, activated_at) "
+        "VALUES (1, datetime('now'))"
+    )
+    rows = await fetchall(db, "SELECT activated_at FROM executor_triage_state")
+    return str(rows[0][0])
+
+
 async def _recover_missing(db: aiosqlite.Connection) -> int:
     """Закрытые неудачей заказы без рекомендации (сбой при report, рестарт).
 
-    Без верхней границы по давности: срок ожидания действия владельца (72 часа) и
-    срок восстановления отсутствующей записи - разные вещи. Берётся последний
-    заказ открытой задачи; остальное решает ``recommend_for_order``.
+    Нижняя граница - момент активации, верхней нет: срок ожидания действия
+    владельца (72 часа) и срок восстановления отсутствующей записи - разные
+    вещи. Берётся последний заказ открытой задачи.
     """
     rows = await fetchall(
         db,
         "SELECT o.id FROM executor_orders o JOIN tasks t ON t.id = o.task_id "
         "WHERE o.state = 'closed' AND o.report_outcome IN ('rescued', 'failed') "
-        "AND t.status = 'open' AND t.archived = 0 "
+        "AND o.closed_at >= ? AND t.status = 'open' AND t.archived = 0 "
         "AND NOT EXISTS (SELECT 1 FROM executor_triage_recommendations r "
         "                WHERE r.order_id = o.id) "
         "AND o.id = (SELECT MAX(n.id) FROM executor_orders n "
         "            WHERE n.task_id = o.task_id)",
+        (await activated_at(db),),
     )
     made = 0
     for row in rows:
@@ -594,7 +598,7 @@ async def agreement(db: aiosqlite.Connection) -> dict[str, Any]:
     """Замер совпадения рекомендации с действием владельца (формула - в docs).
 
     Знаменатель - рекомендации с followup, кроме «устарела» (submitted, archived) и
-    «без решения» (none_72h). Совпадение - followup из ``MATCHING[action]``.
+    «без решения» (none_72h) и unclear. Совпадение - followup из ``MATCHING[action]``.
     ``accepted_share`` - доля принятых среди рекомендаций с owner_verdict и от
     совпадения не зависит.
     """
@@ -603,7 +607,7 @@ async def agreement(db: aiosqlite.Connection) -> dict[str, Any]:
         "SELECT triage_class, action, followup, owner_verdict "
         "FROM executor_triage_recommendations",
     )
-    total = matched = pending = no_decision = stale = 0
+    total = matched = pending = no_decision = stale = unclear = 0
     by_class: dict[int, list[int]] = {}
     accepted = rejected = 0
     for row in rows:
@@ -615,6 +619,8 @@ async def agreement(db: aiosqlite.Connection) -> dict[str, Any]:
             pending += 1
         elif followup == NO_DECISION_FOLLOWUP:
             no_decision += 1
+        elif followup == UNCLEAR_FOLLOWUP:
+            unclear += 1
         elif followup in STALE_FOLLOWUPS:
             stale += 1
         else:
@@ -635,6 +641,7 @@ async def agreement(db: aiosqlite.Connection) -> dict[str, Any]:
         },
         "pending": pending,
         "no_decision": no_decision,
+        "unclear": unclear,
         "stale": stale,
         "accepted_share": (accepted / judged) if judged else None,
     }

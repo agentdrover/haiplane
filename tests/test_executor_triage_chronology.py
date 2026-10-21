@@ -119,7 +119,7 @@ async def test_followup_is_the_first_action_not_the_state_at_sweep_time(world):
 
 
 async def test_agent_draft_child_is_not_a_split(world):
-    """Находка 2: split - только ребёнок, одобренный человеком."""
+    """Находка 2: split - только подзадача, созданная человеком; агентский - никогда."""
     task_id = await _task(world, "разделение")
     oid = await _fail(world, task_id, CLASS3)
     await _reopen_and_second_fail(world, task_id)
@@ -145,11 +145,13 @@ async def test_agent_draft_child_is_not_a_split(world):
     await _sweep(world)
     await _sweep(world)  # вторая секунда: засчитанный draft успел бы разрешиться
     assert await _followup(world, last) is None
-    await repo.update_task(world.db, draft, status="open")
+    await repo.update_task(
+        world.db, draft, status="open"
+    )  # одобрен: всё равно не split
     await world.db.commit()
-    await _sweep(world)  # первое наблюдение одобрения
-    await _sweep(world)  # секунда наблюдения закрыта
-    assert await _followup(world, last) == "split"
+    await _sweep(world)
+    await _sweep(world)
+    assert await _followup(world, last) is None
     assert oid != last
 
 
@@ -172,6 +174,10 @@ async def test_missed_recommendation_is_recovered_after_72_hours(world):
     task_id = await _task(world, "давний пропуск")
     oid = await _fail(world, task_id, CLASS1)
     await world.db.execute("DELETE FROM executor_triage_recommendations")
+    await world.db.execute(
+        "INSERT OR REPLACE INTO executor_triage_state (id, activated_at) "
+        "VALUES (1, datetime('now', '-500 hours'))"
+    )
     await world.db.execute(
         "UPDATE executor_orders SET closed_at = datetime('now', '-100 hours'), "
         "reported_at = datetime('now', '-100 hours') WHERE id = ?",
@@ -301,7 +307,9 @@ async def test_rejected_agent_draft_is_unclear_and_outside_the_denominator(world
     await _sweep(world)
     assert await _followup(world, oid) == "unclear"
     got = await triage.agreement(world.db)
-    assert got["total"] == 0 and got["unclear"] == 1, got
+    assert got["unclear"] == 1 and got["total"] == 1, (
+        got
+    )  # total - первая рекомендация (заказ)
 
 
 async def test_activation_boundary_skips_history_and_recovers_after_it(world):

@@ -433,6 +433,12 @@ async def test_resolution_and_agreement_are_measured(world):
     t_sub = await _task(world, "сдача")
     o_sub = await _fail(world, t_sub, CLASS2)
     await _submit(world, t_sub, generation=1)
+    await world.db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch, submitted_at) "
+        "VALUES (?, 1, '', 'develop', datetime('now', '-5 minutes'))",
+        (t_sub,),
+    )
+    await world.db.commit()
     # архив -> archived (устарела).
     t_arch = await _task(world, "архив")
     o_arch = await _fail(world, t_arch, CLASS1)
@@ -492,9 +498,9 @@ async def test_resolution_and_agreement_are_measured(world):
         o_stmt: None,  # повтор + только правка постановки: ещё не итог
         o_split: "split",
         o_sub: "submitted",
-        o_arch: "archived",
+        o_arch: None,  # архив без долговечной метки: исход только по сроку (unclear)
         o_72: "none_72h",
-        o_c4: "statement_changed",
+        o_c4: None,  # правка постановки без заказа: без метки, вне замера
         o_c0: "new_order",
         o_ref: "new_order",
         o_rw: "split",
@@ -506,13 +512,18 @@ async def test_resolution_and_agreement_are_measured(world):
 
     # Формула: знаменатель - только с followup, кроме устарела и без решения.
     got = await triage.agreement(world.db)
-    assert (got["total"], got["matched"]) == (7, 5), got
-    assert got["rate"] == 5 / 7
-    assert (got["stale"], got["no_decision"], got["pending"]) == (2, 1, 2)
+    assert (got["total"], got["matched"]) == (6, 4), got
+    assert got["rate"] == 4 / 6
+    assert (got["stale"], got["no_decision"], got["pending"], got["unclear"]) == (
+        1,
+        1,
+        4,
+        0,
+    )
     assert got["by_class"][1] == {"total": 2, "matched": 1, "rate": 0.5}
     assert got["by_class"][2] == {"total": 1, "matched": 1, "rate": 1.0}
     assert got["by_class"][3] == {"total": 2, "matched": 2, "rate": 1.0}
-    assert got["by_class"][4]["matched"] == 1 and got["by_class"][0]["matched"] == 0
+    assert 4 not in got["by_class"] and got["by_class"][0]["matched"] == 0
     assert got["accepted_share"] is None
 
     # Разобранная не воскресает: задача снова open, свипы и повторные вызовы - то же самое.
@@ -606,6 +617,10 @@ async def test_late_report_recovery_child_floor_and_cancellation(world, monkeypa
     ]
     assert await orders.close_order(
         world.db, row, orders.CLOSE_SESSION_GONE, orders.RUN_OUTCOME_ABORTED
+    )
+    await world.db.execute(
+        "INSERT OR REPLACE INTO executor_triage_state (id, activated_at) "
+        "VALUES (1, datetime('now', '-500 hours'))"
     )
     await world.db.execute(
         "UPDATE executor_orders SET closed_at = datetime('now', '-73 hours') WHERE id = ?",
