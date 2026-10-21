@@ -50,6 +50,7 @@ from hub import repository as repo
 # они разошлись (находка 80fcb9c9).
 from hub.db import MIN_EVIDENCE_CHARS, MIN_SHA_CHARS
 from hub.integrations.registry import plugins
+from hub.services import defect_release
 from hub.services.result_kind import is_state, state_accepted
 
 log = logging.getLogger("hub")
@@ -170,9 +171,6 @@ async def ensure_commit_available(
     return fetched
 
 
-_UNSET: Any = object()
-
-
 @dataclass(frozen=True)
 class _GitCheck:
     """Everything the git phase needs, read from the database beforehand (#1603).
@@ -233,22 +231,52 @@ def _in_prod(check: _GitCheck, text: str, style: str) -> dict[str, Any]:
     return _answer(IN_PROD, _in_prod_reason(check, text, style), **check.known)
 
 
+# One snapshot answers for many tasks and reads each project's release once:
+# key = project id (the default project's key also covers the project-less rows
+# written before 28.09, #915), value = that project's newest successful deploy
+# or ``None`` when it has none. ``None`` as a value is an answer, not a miss.
+ReleaseCache = dict[int | None, dict[str, Any] | None]
+
+
+async def project_release(
+    db: Any, project_id: int | None, cache: ReleaseCache | None = None
+) -> dict[str, Any] | None:
+    """The newest successful deploy of THIS project's history (#1927).
+
+    Not the newest of any project: a deploy of spike-bo is no evidence about
+    what the hub itself runs. ``None`` project means the default one.
+    """
+    if project_id is None:
+        default = await repo.get_project_by_slug(db, "default")
+        project_id = int(default["id"]) if default is not None else None
+    if cache is not None and project_id in cache:
+        return cache[project_id]
+    release = await defect_release.latest_release_in_scope(db, project_id)
+    if cache is not None:
+        cache[project_id] = release
+    return release
+
+
 async def delivery_state(
-    db: Any, task_id: int, *, release: Any = _UNSET, fetch: bool = True
+    db: Any,
+    task_id: int,
+    *,
+    releases: ReleaseCache | None = None,
+    fetch: bool = True,
 ) -> dict[str, Any]:
     """Whether this task's merge is part of what production is running.
 
-    ``release`` lets a caller that answers for many tasks read the release once
-    (``None`` means "none recorded"); the answer does not depend on who read it.
+    ``releases`` lets a caller that answers for many tasks read each project's
+    release once; the answer does not depend on who read it.
     """
-    prepared = await prepare_delivery(db, task_id, release=release)
+    prepared = await prepare_delivery(db, task_id, releases=releases)
     if isinstance(prepared, dict):
         return prepared
     return await git_delivery_state(prepared, fetch=fetch)
 
 
 async def prepare_delivery(
-    db: Any, task_id: int, *, release: Any = _UNSET
+    db: Any, task_id: int, *, releases: ReleaseCache | None = None
 ) -> dict[str, Any] | _GitCheck:
     """Every SQL-backed step of the answer; a final answer, or the git work left."""
     from hub import services
@@ -261,8 +289,11 @@ async def prepare_delivery(
             "Это не значит, что работа не доехала: значит, что факта мержа у хаба нет",
         )
 
-    if release is _UNSET:
-        release = await repo.latest_successful_release(db)
+    # #1927: the yardstick is the release of the TASK'S project.
+    project = await repo.resolve_project_for_task(db, task_id)
+    release = await project_release(
+        db, int(project["id"]) if project is not None else None, releases
+    )
     if release is None:
         return _answer(
             UNKNOWN,

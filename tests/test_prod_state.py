@@ -21,6 +21,7 @@ from httpx import AsyncClient
 from hub import repository as repo
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
+from hub.services import defect_release
 from hub.services.prod_state import format_prod_state, prod_state
 from tests.test_delivery_state import _task_merged_at, _use_real_git
 
@@ -210,16 +211,19 @@ async def test_prod_state_checks_tasks_with_bounded_parallelism(
 
     fake = _FakeGit(delay=0.02)
     _wire_fake_git(monkeypatch, fake)
+    from tests.test_delivery_state_projects import _default_project_id
+
+    await _default_project_id(db)  # a real install always has it
     ids = await _board(client, db, 50)
     reads = 0
-    real_latest = repo.latest_successful_release
+    real_latest = defect_release.latest_release_in_scope
 
     async def counting(*args, **kwargs):
         nonlocal reads
         reads += 1
         return await real_latest(*args, **kwargs)
 
-    monkeypatch.setattr(repo, "latest_successful_release", counting)
+    monkeypatch.setattr(defect_release, "latest_release_in_scope", counting)
 
     snapshot = await prod_state(db, limit=50)
 
@@ -231,7 +235,7 @@ async def test_prod_state_checks_tasks_with_bounded_parallelism(
     ]
     assert [e["task_id"] for e in snapshot["in_prod"]] == listed
     assert sorted(listed) == sorted(ids)
-    assert reads == 1, f"latest_successful_release read {reads} times"
+    assert reads == 1, f"the project's release was read {reads} times"
 
 
 async def test_in_prod_answer_is_cached_per_full_key_only(
@@ -449,3 +453,41 @@ async def test_cached_answer_carries_the_current_deploy_date(
 
     assert second["deployed_at"].startswith("2026-02-02")
     assert "2026-02-02" in second["reason"] and "2026-01-01" not in second["reason"]
+
+
+async def test_deployed_is_default_project_release_not_newest_of_any(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-1 (#1927): after spike-bo deployed last, «Раскатано» of the hub
+    # showed spike-bo's sha for 25 minutes. The snapshot is the default
+    # project's: its own newest deploy, whoever deployed after it.
+    from tests.test_delivery_state_projects import (
+        _default_project_id,
+        _foreign_project,
+        _orphan_commit,
+    )
+
+    _use_real_git(monkeypatch, history["repo"])
+    default_id = await _default_project_id(db)
+    shipped = await _completed(client, db, history["shipped"])
+    await repo.record_release(
+        db,
+        deployed_sha=history["released"],
+        project_id=default_id,
+        ref="main",
+        source="ci",
+    )
+    foreign = _orphan_commit(history["repo"])
+    await repo.record_release(
+        db,
+        deployed_sha=foreign,
+        project_id=await _foreign_project(db),
+        ref="main",
+        source="spike-bo-ci",
+    )
+
+    snapshot = await prod_state(db)
+
+    assert snapshot["deployed"]["sha"] == history["released"]
+    assert snapshot["deployed"]["source"] == "ci"
+    assert shipped in [e["task_id"] for e in snapshot["in_prod"]]
