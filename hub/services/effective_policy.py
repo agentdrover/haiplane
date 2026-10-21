@@ -28,6 +28,7 @@ from hub.services import (
     executor_dispatch,
     executor_launch,
     executor_slots,
+    order_deadline,
     policy_change,
     project_policy,
     review_dispatch,
@@ -305,6 +306,7 @@ def _server_block() -> dict[str, Any]:
             "override": (config.CURSOR_REVIEW_MODEL or "").strip(),
             "default_pick": review_dispatch.pick_review_model(""),
         },
+        "executor_run": order_deadline.summary(),
         "secrets_configured": {
             "steward_hub_token": bool(config.STEWARD_HUB_TOKEN),
             "cursor_reviewer_hub_token": bool(config.CURSOR_REVIEWER_HUB_TOKEN),
@@ -610,6 +612,8 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
         f"{reviewer['override'] or reviewer['default_pick']}"
         f"{' (override)' if reviewer['override'] else ' (default pick)'}"
     )
+    if server.get("executor_run"):
+        lines.append(order_deadline.summary_line(server["executor_run"]))
     secrets = server["secrets_configured"]
     lines.append(
         "Secrets: "
