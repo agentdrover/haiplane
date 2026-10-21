@@ -177,6 +177,58 @@ async def test_heartbeat_extends_but_never_revives(world):
     assert await sweep(world) >= 1
     assert (await row(world, late))["close_reason"] == "expired"
 
+    # (e) срок заказа вышел, а код жив (записи разошлись), и наоборот: оба условия по отдельности.
+    for column in ("order", "code"):
+        _t, split = await launch_order(world, "k9", title=f"расхождение {column}")
+        assert (await wait_for_memory(world, split, "k9")).status_code == 200
+        if column == "order":
+            await world.db.execute(
+                "UPDATE executor_orders SET expires_at = datetime('now', '-1 minutes') "
+                "WHERE id = ?",
+                (split,),
+            )
+        else:
+            await world.db.execute(
+                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 minutes') "
+                "WHERE id = (SELECT pair_code_id FROM executor_orders WHERE id = ?)",
+                (split,),
+            )
+        await world.db.commit()
+        before = await row(world, split)
+        refused = await wait_for_memory(world, split, "k9", need=1, free=0)
+        assert refused.status_code == 409, (column, refused.text)
+        assert await row(world, split) == before, column
+        closed = await world.client.post(
+            f"/api/executor-hosts/k9/orders/{split}/ack",
+            json={"result": "redeem_failed"},
+            headers=world.k9_auth,
+        )
+        assert closed.status_code == 200, closed.text
+
+    # (d) кода нет (очистка) или он потрачен: heartbeat не продлевает заказ.
+    for how in ("deleted", "spent"):
+        _t, bare = await launch_order(world, "k9", title=f"код {how}")
+        assert (await wait_for_memory(world, bare, "k9")).status_code == 200
+        pair = (await row(world, bare))["pair_code_id"]
+        if how == "deleted":
+            await world.db.execute("DELETE FROM chat_pair_codes WHERE id = ?", (pair,))
+        else:
+            await world.db.execute(
+                "UPDATE chat_pair_codes SET redeemed_at = datetime('now') WHERE id = ?",
+                (pair,),
+            )
+        await world.db.commit()
+        before = await row(world, bare)
+        refused = await wait_for_memory(world, bare, "k9", need=1, free=0)
+        assert refused.status_code == 409, (how, refused.text)
+        assert await row(world, bare) == before, how
+        closed = await world.client.post(
+            f"/api/executor-hosts/k9/orders/{bare}/ack",
+            json={"result": "redeem_failed"},
+            headers=world.k9_auth,
+        )
+        assert closed.status_code == 200, closed.text
+
 
 async def test_only_the_host_of_an_unredeemed_order_may_wait(world):
     """AC-4: чужой хост и заказ, ключ агента, выкупленный заказ, плохие цифры — отказ без записи."""

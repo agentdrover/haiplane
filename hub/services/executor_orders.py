@@ -559,10 +559,14 @@ async def _settled_reason(
     run = await repo.get_executor_run(db, int(order["executor_run_id"]))
     if run is not None and dict(run)["outcome"] != "running":
         return CLOSE_RUN_FINISHED, dict(run)["outcome"], None
-    if order["state"] == STATE_WAITING_MEMORY and await memory_wait.over_limit(
-        db, order
-    ):  # #1972: предел ожидания сильнее обычного срока
-        return CLOSE_MEMORY_WAIT_TIMEOUT, RUN_OUTCOME_EXPIRED, (STATE_WAITING_MEMORY,)
+    if order["state"] == STATE_WAITING_MEMORY:
+        # #1972: предел ожидания сильнее обычного срока; оба - одним снимком времени.
+        what = await memory_wait.verdict(db, order)
+        if what == memory_wait.VERDICT_TIMEOUT:
+            return CLOSE_MEMORY_WAIT_TIMEOUT, RUN_OUTCOME_EXPIRED, (order["state"],)
+        if what == memory_wait.VERDICT_EXPIRED:
+            return CLOSE_EXPIRED, RUN_OUTCOME_EXPIRED, _UNREDEEMED
+        return "", "", None
     if order["state"] in _UNREDEEMED:
         gone = await fetchall(
             db,

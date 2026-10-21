@@ -183,13 +183,31 @@ async def record_waiting(
     }
 
 
-async def over_limit(db: aiosqlite.Connection, order: dict[str, Any]) -> bool:
-    """Ожидание заказа достигло предела (граница включена: ровно 6 ч - уже предел)."""
-    since = order.get("waiting_since")
-    if not since:
-        return False
-    rows = await fetchall(db, f"SELECT ? <= {_LIMIT_SQL}", (since,))
-    return bool(rows and rows[0][0])
+VERDICT_TIMEOUT: Final[str] = "timeout"
+VERDICT_EXPIRED: Final[str] = "expired"
+
+
+async def verdict(db: aiosqlite.Connection, order: dict[str, Any]) -> str:
+    """Что делать ``settle`` с ждущим заказом: ``timeout`` | ``expired`` | пусто.
+
+    Предел и обычный срок читаются ОДНИМ оператором, то есть при одном и том же
+    ``datetime('now')``: срок заказа у предела равен ``waiting_since + 6 ч``, и две
+    проверки в разные моменты закрыли бы заказ ``expired`` без сигнала владельцу.
+    Граница включена: ровно 6 ч - уже предел, и он сильнее обычного срока.
+    """
+    rows = await fetchall(
+        db,
+        f"SELECT (? IS NOT NULL AND ? <= {_LIMIT_SQL}) AS over, "
+        "(? <= datetime('now')) AS lapsed",
+        (
+            order.get("waiting_since"),
+            order.get("waiting_since"),
+            order["expires_at"],
+        ),
+    )
+    if rows[0]["over"]:
+        return VERDICT_TIMEOUT
+    return VERDICT_EXPIRED if rows[0]["lapsed"] else ""
 
 
 async def notify_timeout(db: aiosqlite.Connection, order: dict[str, Any]) -> None:

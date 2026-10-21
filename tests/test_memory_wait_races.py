@@ -270,3 +270,41 @@ async def test_waiting_does_not_change_existing_readers(world):
     busy_slot = await _launch(world, other, "k8")
     assert busy_slot.status_code != 200, busy_slot.text
     assert await alive(world, order_id)
+
+
+async def test_limit_and_term_are_read_in_one_snapshot(world):
+    """Codex P2: срок заказа у предела равен waiting_since + 6 ч; обе границы - одним оператором.
+
+    Две проверки в разные моменты закрывали заказ ``expired`` без сигнала: первая
+    ещё не видела предел, вторая уже видела срок. Оператор со временем один.
+    """
+    task_id, order_id, _code = await _at_limit(world, "k8", "один снимок")
+    # срок заказа ровно на пределе, как после heartbeat у границы
+    await world.db.execute(
+        "UPDATE executor_orders SET expires_at = datetime(waiting_since, '+6 hours') "
+        "WHERE id = ?",
+        (order_id,),
+    )
+    await world.db.commit()
+    seen: list[str] = []
+    real = world.db.execute_fetchall
+
+    async def spy(sql, *args, **kwargs):
+        if "datetime('now'" in str(sql):
+            seen.append(str(sql))
+        return await real(sql, *args, **kwargs)
+
+    world.db.execute_fetchall = spy  # type: ignore[method-assign]
+    try:
+        reason = await orders._settled_reason(world.db, await row(world, order_id))
+    finally:
+        world.db.execute_fetchall = real  # type: ignore[method-assign]
+    assert reason[0] == "memory_wait_timeout", reason
+    limit_reads = [q for q in seen if "hours" in q]
+    assert len(limit_reads) == 1 and "datetime('now')" in limit_reads[0]
+    assert "AS lapsed" in limit_reads[0] and "AS over" in limit_reads[0]
+    # ни одного отдельного чтения срока рядом с пределом
+    assert len([q for q in seen if "datetime('now'" in q]) == 1, seen
+    assert await sweep(world) == 1
+    await _closed_once(world, task_id, order_id, "memory_wait_timeout")
+    assert await _timeout_counts(world, task_id) == (1, 1, 1)
