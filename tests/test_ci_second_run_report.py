@@ -363,8 +363,8 @@ def _github(monkeypatch):
     GH = install_fake_github(monkeypatch)
 
 
-async def test_a_report_without_results_names_the_collectors_reason(db, _github):
-    """A collector that failed says why in the refusal, not only "unknown"."""
+async def _report_row(db, reason: str, status: str, ac: dict[str, str], acs: bool):
+    """A confirmed report with this reason, and the gap proof_gap finds in it."""
     from hub.services import ci_contract
 
     task_id = await repo.create_task(
@@ -381,45 +381,70 @@ async def test_a_report_without_results_names_the_collectors_reason(db, _github)
         parent_id=None,
         priority="medium",
     )
-    await repo.replace_acceptance_criteria(
-        db,
-        task_id,
-        [
-            AcceptanceCriterion(
-                id="AC-1",
-                given="g",
-                when="w",
-                then="t",
-                verifiable_by="test",
-                test_ref="tests/test_x.py::test_a",
-            )
-        ],
-    )
+    if acs:
+        await repo.replace_acceptance_criteria(
+            db,
+            task_id,
+            [
+                AcceptanceCriterion(
+                    id="AC-1",
+                    given="g",
+                    when="w",
+                    then="t",
+                    verifiable_by="test",
+                    test_ref="tests/test_x.py::test_a",
+                )
+            ],
+        )
     await repo.bump_submission_generation(db, task_id)
     await repo.update_task(db, task_id, submission_sha=SHA)
     await db.commit()
-    sent = GH.attempt(task_id, SHA, ac_results={}, validation_status="unknown")
-    sent["reason"] = "card_read_failed: HTTP 502"
+    sent = GH.attempt(task_id, SHA, ac_results=ac, validation_status=status)
+    sent["reason"] = reason
     await accept_ci_run_report(db, task_id, **sent)
     rows = [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     report = await repo.get_ci_run_report(db, task_id, SHA)
-    gap = ci_green_proof.proof_gap(
+    return ci_green_proof.proof_gap(
         dict(report), rows, SHA, await ci_contract.contract_for_task(db, task_id)
     )
-    # The task has a bound AC test, so the missing result is "red"; the cause
-    # the collector gave leads the violations either way.
+
+
+_PHRASE = "CI-отчёт без результатов"
+
+
+async def test_a_report_without_results_names_the_collectors_reason(db, _github):
+    """Only the collector's own failure says "no results" (and why)."""
+    # card_read_failed: no AC results at all -> red, the cause leads.
+    gap = await _report_row(db, "card_read_failed: HTTP 502", "unknown", {}, True)
     assert gap is not None and gap.cause == ci_green_proof.RED
-    assert "CI-отчёт без результатов" in gap.violations[0]
+    assert _PHRASE in gap.violations[0]
     assert "card_read_failed: HTTP 502" in gap.violations[0]
 
-    # A task with no bound AC test: the same words on the validation cause.
-    await repo.replace_acceptance_criteria(db, task_id, [])
-    rows = [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
-    gap = ci_green_proof.proof_gap(
-        dict(report), rows, SHA, await ci_contract.contract_for_task(db, task_id)
-    )
+    # ... the same on a task with no bound AC test: the validation cause.
+    gap = await _report_row(db, "collector_crashed: RuntimeError", "unknown", {}, False)
     assert gap is not None and gap.cause == ci_green_proof.VALIDATION_NOT_PASS
-    assert "card_read_failed: HTTP 502" in gap.violations[0]
+    assert _PHRASE in gap.violations[0] and "collector_crashed" in gap.violations[0]
+
+    # Prose in validation_commands: AC are resolved, validation is unknown. The
+    # results exist; the refusal must not say they do not.
+    prose = "команда не распознана: проверить на живом PR"
+    gap = await _report_row(db, prose, "unknown", {"AC-1": "pass"}, True)
+    assert gap is not None and gap.cause == ci_green_proof.VALIDATION_NOT_PASS
+    assert _PHRASE not in " ".join(gap.violations)
+
+    # A timed-out validation command next to a red AC: red, no such phrase.
+    gap = await _report_row(
+        db, "команда прервана: TimeoutExpired", "unknown", {"AC-1": "fail"}, True
+    )
+    assert gap is not None and gap.cause == ci_green_proof.RED
+    assert _PHRASE not in " ".join(gap.violations)
+
+
+def test_the_hub_and_the_collector_agree_on_the_failure_reasons():
+    """The prefixes the hub looks for are the ones the collector writes."""
+    source = (_SCRIPTS / "ci_report_to_hub.py").read_text(encoding="utf-8")
+    for prefix in ci_green_proof.COLLECTOR_FAILURE_PREFIXES:
+        assert f'f"{prefix} ' in source, prefix
 
 
 # ---- AC-2 / AC-3: the real submission with two runs on one sha -----------------

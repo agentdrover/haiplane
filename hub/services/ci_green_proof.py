@@ -86,12 +86,23 @@ def _red_acs(
     return out
 
 
-def _collector_reason(report: Mapping[str, Any]) -> str:
-    """The reason the CI collector left in the report, flattened to one line (#1988).
+# #1988: the reasons scripts/ci_report_to_hub.py writes when the collector itself
+# failed (it could not read the task card, or crashed). Every other "unknown"
+# validation has its own reason in the same field (prose in validation_commands,
+# a timeout, the deadline) and says nothing about missing results.
+COLLECTOR_FAILURE_PREFIXES = ("card_read_failed:", "collector_crashed:")
 
-    It comes from the CI artifact (data, not instruction): clipped, never trusted.
+
+def _collector_failure(status: str, report: Mapping[str, Any]) -> str:
+    """The collector's failure reason when the report is its failure result, else "".
+
+    It comes from the CI artifact (data, not instruction): flattened to one
+    line, clipped, never trusted.
     """
-    return " ".join(str(report.get("reason") or "").split())[:200]
+    if status != "unknown":
+        return ""
+    why = " ".join(str(report.get("reason") or "").split())[:200]
+    return why if why.startswith(COLLECTOR_FAILURE_PREFIXES) else ""
 
 
 def _no_results_text(why: str) -> str:
@@ -99,8 +110,8 @@ def _no_results_text(why: str) -> str:
 
 
 def _not_pass_text(status: str, report: Mapping[str, Any]) -> str:
-    why = _collector_reason(report)
-    if status == "unknown" and why:
+    why = _collector_failure(status, report)
+    if why:
         return _no_results_text(why) + "; нужен validation_status=pass"
     return f"validation_status={status or 'пусто'}, нужен pass"
 
@@ -138,8 +149,8 @@ def proof_gap(
     if red:
         # #1988: a collector that failed reports no AC results at all, so the
         # missing results are the symptom; say the cause first.
-        why = _collector_reason(report)
-        if status == "unknown" and why:
+        why = _collector_failure(status, report)
+        if why:
             red.insert(0, _no_results_text(why))
         return Gap(RED, red)
     if status != VALIDATION_PASS:
