@@ -1377,6 +1377,11 @@ async def report_outcome(
                     f"итог по заказу уже записан: {order['report_outcome']}",
                 )
             return {"id": order["id"], "outcome": outcome, "duplicate": True}
+        if outcome in ("failed", "rescued"):
+            # #1942: граница включения разбора закрепляется ДО закрытия заказа и вне
+            # SAVEPOINT рекомендации: откат разбора её не уносит, а закрытие этого
+            # заказа не может оказаться «историей» из-за ленивого создания.
+            await executor_triage.activated_at(db)
         refusal = await _branch_refusal(db, order, branch)
         if refusal:
             raise HostError(422, refusal)

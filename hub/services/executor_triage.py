@@ -508,9 +508,8 @@ async def _only_swept(db: aiosqlite.Connection, f: dict[str, Any]) -> bool:
     if f["archived"]:
         return True
     ordered = f["order_sg"]
-    if f["action"] not in RETRY_ACTIONS and ordered is not None:
-        if int(f["task_sg"] or 0) > ordered:
-            return True
+    if ordered is not None and int(f["task_sg"] or 0) > ordered:
+        return True
     args = (int(f["task_id"]), int(f["child_floor"]))
     if await fetchall(db, _AGENT_CHILD_SQL, args):
         return True
@@ -642,6 +641,9 @@ async def agreement(db: aiosqlite.Connection) -> dict[str, Any]:
         "pending": pending,
         "no_decision": no_decision,
         "unclear": unclear,
+        # none_72h и unclear - «исхода с долговечной меткой нет». Их разбивка
+        # зависит от того, что свип видел на сроке, поэтому устойчивая цифра - сумма.
+        "unmeasured": no_decision + unclear,
         "stale": stale,
         "accepted_share": (accepted / judged) if judged else None,
     }

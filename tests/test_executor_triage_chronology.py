@@ -17,12 +17,13 @@ from tests.test_executor_triage import (
     _followup,
     _recs,
     _relaunch,
+    _report,
     _sweep,
     _set_task,
     _task,
 )
 from tests import test_executor_orders as _eo
-from tests.test_executor_orders import _rows
+from tests.test_executor_orders import _launch_redeem, _rows
 
 world = _eo.world
 keys = _eo.keys
@@ -351,3 +352,42 @@ async def test_activation_boundary_skips_history_and_recovers_after_it(world):
     await _sweep(world)
     assert await _action_of(world, missed) == "retry_after_status"
     assert await _action_of(world, old) is None
+
+
+async def test_edit_without_order_is_unclear_for_retry_and_activation_is_pinned(
+    world, monkeypatch
+):
+    """Круг 3, Codex: правка при retry - тоже unclear; граница не откатывается с разбором."""
+    task_id = await _task(world, "правка при повторе")
+    oid = await _fail(world, task_id, CLASS1)  # retry_after_status
+    await _set_task(world, task_id, statement_generation=1)
+    await _rec_at(world, oid, 73 * 60)
+    await _sweep(world)
+    await _sweep(world)
+    assert await _followup(world, oid) == "unclear"
+    got = await triage.agreement(world.db)
+    assert (
+        got["unclear"] == 1 and got["unmeasured"] == got["unclear"] + got["no_decision"]
+    )
+
+    # Граница включения переживает откат рекомендации (сбой записи ленты разбора).
+    await world.db.execute("DELETE FROM executor_triage_state")
+    await world.db.commit()
+    real = repo.add_task_update
+
+    async def selective(db, task_id, agent, kind, content, *a, **kw):
+        if str(content).startswith("Разбор прогона"):
+            raise RuntimeError("лента недоступна")
+        return await real(db, task_id, agent, kind, content, *a, **kw)
+
+    other = await _task(world, "сбой ленты")
+    lived = await _launch_redeem(world, other)
+    with monkeypatch.context() as patched:
+        patched.setattr(repo, "add_task_update", selective)
+        resp = await _report(world, lived["order"]["id"], CLASS1)
+    assert resp.status_code == 200
+    assert await _action_of(world, lived["order"]["id"]) is None
+    state = await _rows(world.db, "SELECT activated_at FROM executor_triage_state")
+    assert len(state) == 1
+    await _sweep(world)
+    assert await _action_of(world, lived["order"]["id"]) == "retry_after_status"
