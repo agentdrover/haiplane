@@ -114,7 +114,8 @@ Human-only (a person, CSRF for cookies):
 Host key (`slot_runner`), exactly six order routes of its OWN host (plus the two critic routes below, #1953):
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
-  generation, executor_run_id, state, code_ciphertext, order_text, expires_at}]}`:
+  generation, executor_run_id, state, code_ciphertext, order_text, expires_at,
+  run_seconds}]}` (#1960: the run deadline snapshotted at issue):
   every unclosed unredeemed order, repeated until acked or closed (stable `id`,
   dedupe on it); the first delivery sets `delivered_at`.
 - `POST …/orders/{id}/redeem {code}` (#1825) → the `chat-pair/redeem` answer plus
@@ -122,7 +123,7 @@ Host key (`slot_runner`), exactly six order routes of its OWN host (plus the two
   code of THAT order (any mismatch of host, order or code: one 403
   `order_unavailable`). The first call spends the code (same `_spend_code`, same
   session, `first_redeemed_at` and `retry_until` = first redeem + 600 s,
-  `HAIPLANE_HOST_REDEEM_RETRY_SECONDS`, never extended, capped by the session TTL).
+  `HAIPLANE_HOST_REDEEM_RETRY_SECONDS`, never extended, capped by the order's `run_seconds`).
   A repeat inside the window while the token was NEVER presented replaces the token
   hash of the SAME session (rotation, `token_version`+1, original session expiry,
   old token dead) — this is the safe retry after a lost answer (network, 502 during
