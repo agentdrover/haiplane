@@ -65,14 +65,15 @@ async def _autonomy_order(
     code: str = "",
     state: str = "closed",
     reported_at: str | None = None,
+    created_at: str = "2026-10-01 00:00:00",
 ) -> None:
     """One executor order with explicit UTC strings (never the Python clock)."""
     run = await db.execute("INSERT INTO executor_runs (task_id) VALUES (?)", (task_id,))
     await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
         "state, expires_at, closed_at, close_reason, report_outcome, "
-        "report_reason_code, reported_at) "
-        "VALUES (?, ?, 1, ?, ?, '2030-01-01 00:00:00', ?, ?, ?, ?, ?)",
+        "report_reason_code, reported_at, created_at) "
+        "VALUES (?, ?, 1, ?, ?, '2030-01-01 00:00:00', ?, ?, ?, ?, ?, ?)",
         (
             host,
             task_id,
@@ -83,6 +84,7 @@ async def _autonomy_order(
             outcome,
             code,
             reported_at,
+            created_at,
         ),
     )
 
@@ -105,7 +107,15 @@ async def _autonomy_week_fixture(db: aiosqlite.Connection) -> int:
             outcome=outcome,
             close_reason=reason,
         )
-    await _autonomy_order(db, task, closed_at=None, state="pending")
+    # Not closed, yet closed_at is filled: only the state excludes it.
+    await _autonomy_order(
+        db,
+        task,
+        closed_at="2026-10-21 11:00:00",
+        outcome="submitted",
+        close_reason="submitted",
+        state="pending",
+    )
     await _autonomy_order(db, task, closed_at=None, outcome="submitted")
     await db.commit()
     return task
@@ -232,16 +242,18 @@ async def test_executor_autonomy_week_boundaries(db: aiosqlite.Connection):
     await _autonomy_host(db)
     task = await _task(db, title="boundaries")
     done = {"outcome": "submitted", "close_reason": "submitted"}
-    for closed_at in (
-        "2026-10-13 23:59:59",  # before the window
-        "2026-10-14 08:00:00",  # inside; the order was made before the window
-        "2026-10-18 23:59:00",  # Sunday: week 42
-        "2026-10-19 00:00:00",  # Monday: week 43
-        "2026-10-22 00:00:00",  # on the end bound: outside
-        "2026-12-28 00:00:00",
-        "2027-01-04 00:00:00",
+    for created_at, closed_at in (
+        ("2026-10-01 00:00:00", "2026-10-13 23:59:59"),  # before the window
+        ("2026-10-01 00:00:00", "2026-10-14 08:00:00"),  # made before, closed inside
+        ("2026-10-15 00:00:00", "2026-10-18 23:59:00"),  # Sunday: week 42
+        ("2026-10-15 00:00:00", "2026-10-19 00:00:00"),  # Monday: week 43
+        ("2026-10-15 00:00:00", "2026-10-22 00:00:00"),  # made inside, closed after
+        ("2026-12-01 00:00:00", "2026-12-28 00:00:00"),
+        ("2026-12-01 00:00:00", "2027-01-04 00:00:00"),
     ):
-        await _autonomy_order(db, task, closed_at=closed_at, **done)
+        await _autonomy_order(
+            db, task, closed_at=closed_at, created_at=created_at, **done
+        )
     await db.commit()
 
     result = await practice_metrics(db, date_from="2026-10-14", date_to="2026-10-21")
@@ -345,3 +357,43 @@ async def test_executor_autonomy_needs_both_signals_and_rounds(
     ]["k8"]["weeks"][0]
     assert (week["orders_closed"], week["autonomous"], week["rate"]) == (3, 1, 0.333)
     assert week["by_outcome"] == {"submitted": 2, "none": 1}
+
+
+async def test_executor_autonomy_long_window_starts_at_first_order(
+    db: aiosqlite.Connection,
+):
+    """#1980: a window over 104 weeks starts at the first closed order's week."""
+    await _autonomy_host(db)
+    task = await _task(db, title="long window")
+    await _autonomy_order(
+        db,
+        task,
+        closed_at="2025-01-08 10:00:00",
+        outcome="submitted",
+        close_reason="submitted",
+    )
+    await db.commit()
+    result = await practice_metrics(db, date_from="2024-01-01", date_to="2026-12-31")
+    weeks = result["executor_autonomy"]["hosts"]["k8"]["weeks"]
+    assert weeks[0]["week"] == "2025-W02" and weeks[0]["orders_closed"] == 1
+    assert len(weeks) == 104  # 2025-W02 .. 2026-W53
+
+
+async def test_executor_autonomy_future_closed_at_is_in_a_week(
+    db: aiosqlite.Connection,
+):
+    """#1980: a relative window selects a closed_at after now; its week exists."""
+    from datetime import UTC, datetime, timedelta
+
+    await _autonomy_host(db)
+    task = await _task(db, title="future")
+    future = (datetime.now(UTC) + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+    await _autonomy_order(
+        db, task, closed_at=future, outcome="submitted", close_reason="submitted"
+    )
+    await db.commit()
+    weeks = (await practice_metrics(db, since_days=30))["executor_autonomy"]["hosts"][
+        "k8"
+    ]["weeks"]
+    assert sum(w["orders_closed"] for w in weeks) == 1
+    assert weeks[-1]["orders_closed"] == 1 and weeks[-1]["partial"] is True

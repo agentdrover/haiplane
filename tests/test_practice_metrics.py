@@ -30,6 +30,8 @@ from hub.services.orchestration import practice_metrics
 from tests.ci_trust_support import upsert_hub_report, VERIFIED_ROW
 from tests.executor_autonomy_cases import (  # noqa: F401 - collected here (#1980)
     test_executor_autonomy_counts_orders_per_host,
+    test_executor_autonomy_future_closed_at_is_in_a_week,
+    test_executor_autonomy_long_window_starts_at_first_order,
     test_executor_autonomy_needs_both_signals_and_rounds,
     test_executor_autonomy_open_start_skips_empty_history,
     test_executor_autonomy_project_scope_via_epic,
