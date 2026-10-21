@@ -87,7 +87,11 @@ async def test_feedback_opens_the_details(client, db):
 async def test_action_link_points_at_the_form_that_exists(client, db):
     review = await _task_in(db, "review")
     page = (await client.get(f"/tasks/{review}")).text
-    assert 'class="c2-btn" href="#review-verdict-form"' in page
+    # #1813: при наличии панели «К действию» открывает главный лист; форма
+    # «Подробностей» остаётся запасным путём без скрипта.
+    found = re.search(r'class="c2-btn" href="#(sh-[a-z-]+)" data-sheet="\1"', page)
+    assert found, "«К действию» ведёт на лист панели"
+    assert f'id="{found.group(1)}"' in page
     assert 'id="review-verdict-form"' in page
     running = await _task_in(db, "running")
     page = (await client.get(f"/tasks/{running}")).text

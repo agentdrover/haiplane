@@ -120,3 +120,25 @@ async def test_old_forms_without_expectations_still_work(client, db):
     )
     assert resp.status_code == 303
     assert await _status(db, task_id) != "draft"
+
+
+async def test_reject_sheet_pins_statement_generation_too(client, db):
+    task_id = await _draft_with_readiness(client, "reject me", ready=True)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-reject")
+    assert form.attrs["action"] == f"/tasks/{task_id}/web-reject"
+    await db.execute(
+        "UPDATE tasks SET statement_generation = statement_generation + 1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    stale = await client.post(form.attrs["action"], data=data, headers=SHEET_HEADERS)
+    assert stale.status_code == 409
+    assert await _status(db, task_id) == "draft"
+    fresh = (await client.get(f"/tasks/{task_id}")).text
+    _, fresh_data = sheet_form(fresh, "sh-reject")
+    ok = await client.post(
+        f"/tasks/{task_id}/web-reject", data=fresh_data, headers=SHEET_HEADERS
+    )
+    assert ok.status_code == 200 and "data-c2-done" in ok.text
+    assert await _status(db, task_id) == "rejected"

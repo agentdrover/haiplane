@@ -32,7 +32,7 @@ const document = {
   addEventListener: (n, f) => { (listeners[n] = listeners[n] || []).push(f); },
   activeElement: null,
 };
-const window = { location: { hash: "#sh-cr", pathname: "/tasks/1", search: "" }, history: { replaceState() {} } };
+const window = { location: { hash: "#sh-cr", pathname: "/tasks/1", search: "" }, history: { replaceState() {} }, addEventListener() {} };
 new Function("window", "document", src)(window, document);
 const fire = (n, ev) => (listeners[n] || []).forEach((f) => f(ev));
 const out = {};
