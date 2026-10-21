@@ -133,16 +133,16 @@ def test_a_skipped_cutout_does_not_block_a_fitting_full_diff():
 
 
 def test_plain_files_are_chosen_the_same_whatever_the_order_of_sections():
-    """Codex 4.2: из двух обычных файлов помещается один - выбор не зависит от порядка."""
-    a = _new("hub/a.py", [f"a{k} = {k}" for k in range(40)])
-    b = _new("hub/b.py", [f"b{k} = {k}" for k in range(10)])
-    ceiling = len(a) - 20
-    assert len(b) < ceiling < len(a) + len(b)
+    """Codex 4.2: оба файла влезают поодиночке, вместе нет - выбор не зависит от порядка."""
+    big = _new("hub/c.py", [f"c{k} = {k}" for k in range(40)])
+    small = _new("hub/b.py", [f"b{k} = {k}" for k in range(10)])
+    ceiling = len(big) + 5
+    assert len(small) < len(big) < ceiling < len(big) + len(small)
     picked = []
-    for diff in (a + b, b + a):
+    for diff in (big + small, small + big):
         out, omitted = _inline_diff_lines(diff, [], None, ceiling, [])
         picked.append((omitted, "b9 = 9" in "\n".join(out)))
-    assert picked[0] == picked[1] == (["hub/a.py"], True)
+    assert picked[0] == picked[1] == (["hub/c.py"], True)
 
 
 def test_a_repeated_plain_path_is_shown_whole_or_not_at_all():
