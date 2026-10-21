@@ -219,3 +219,58 @@ async def test_repeating_the_same_verdict_is_named_a_repeat(client, db):
     again = await client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS)
     assert again.status_code == 409, again.text
     assert "data-c2-done" not in again.text and "уже стоит" in again.text
+
+
+async def test_double_tap_on_rework_dispatches_once(client, db, monkeypatch):
+    """Сервис коммитит до сети: второй запрос не проходит тот же гард."""
+    import asyncio
+
+    from hub.services import lifecycle
+
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-rework")
+    calls: list[int] = []
+
+    async def slow_dispatch(conn, tid, task, instructions):
+        calls.append(tid)
+        await asyncio.sleep(0.05)
+        await repo.update_task(conn, tid, status="open")
+        await conn.commit()
+
+    monkeypatch.setattr(lifecycle, "_dispatch_rework", slow_dispatch)
+    body = {**data, "action": "rework", "instructions": "починить"}
+    first, second = await asyncio.gather(
+        client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS),
+        client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS),
+    )
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    assert calls == [task_id]
+
+
+async def test_parallel_identical_verdicts_say_which_one_wrote(client, db):
+    import asyncio
+
+    from tests.web_support import _web_task_in_review
+
+    task_id = await _web_task_in_review(client)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-cr")
+    body = {**data, "verdict": "changes_requested", "comments": "двойной тап"}
+    got = await asyncio.gather(
+        *[
+            client.post(form.attrs["action"], data=body, headers=SHEET_HEADERS)
+            for _ in range(2)
+        ]
+    )
+    assert sorted(r.status_code for r in got) == [200, 409]
+    assert sum("data-c2-done" in r.text for r in got) == 1
+
+
+async def test_sheets_container_exists_even_when_no_sheet_is_offered(client, db):
+    """Страница в ci_check: после перехода в review лист должен уже ждать место."""
+    task_id = await _task_in(db, "ci_check")
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert 'id="c2-sheets"' in page and "window.hubSheets" in page
+    assert "data-built-review-verdict-revision" in page
+    assert "data-review-verdict-revision" in page

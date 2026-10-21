@@ -337,6 +337,7 @@ def build(
         "status": status,
         "submission_generation": str(task.get("submission_generation") or 0),
         "statement_generation": str(task.get("statement_generation") or 0),
+        "review_verdict_revision": str(task.get("review_verdict_revision") or 0),
     }
     for sheet in sheets:
         sheet["built"] = dict(live)

@@ -5,11 +5,10 @@
    сверяет их с живой задачей и отвечает 409 на устаревшее). Весь недоверенный
    текст экранируется автоматически, без |safe. #}
 {% from "partials/pr_disposition.html" import pr_disposition_select %}
-{% if card_actions.sheets %}
 <link rel="stylesheet" href="/static/card_actions.css?v={{ asset_version|default('20260421a') }}">
-<div id="c2-sheets" data-built-status="{{ card_actions.live.status }}" data-built-submission-generation="{{ card_actions.live.submission_generation }}" data-built-statement-generation="{{ card_actions.live.statement_generation }}">
+<div id="c2-sheets" data-built-status="{{ card_actions.live.status }}" data-built-submission-generation="{{ card_actions.live.submission_generation }}" data-built-statement-generation="{{ card_actions.live.statement_generation }}" data-built-review-verdict-revision="{{ card_actions.live.review_verdict_revision }}">
 {% for s in card_actions.sheets %}
-<section class="c2-sheet" id="{{ s.id }}" role="dialog" aria-modal="true" aria-labelledby="{{ s.id }}-h" data-sheet-kind="{{ s.kind }}" data-built-status="{{ s.built.status }}" data-built-submission-generation="{{ s.built.submission_generation }}" data-built-statement-generation="{{ s.built.statement_generation }}">
+<section class="c2-sheet" id="{{ s.id }}" role="dialog" aria-modal="true" aria-labelledby="{{ s.id }}-h" data-sheet-kind="{{ s.kind }}" data-built-status="{{ s.built.status }}" data-built-submission-generation="{{ s.built.submission_generation }}" data-built-statement-generation="{{ s.built.statement_generation }}" data-built-review-verdict-revision="{{ s.built.review_verdict_revision }}">
     <div class="c2-sheet-panel">
         <div class="c2-sheet-head">
             <h2 id="{{ s.id }}-h">{{ s.title }}</h2>
@@ -49,4 +48,3 @@
 {% endfor %}
 </div>
 {% include "partials/card_sheets_script.html" %}
-{% endif %}

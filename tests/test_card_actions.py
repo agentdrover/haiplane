@@ -151,6 +151,7 @@ def test_live_marker_carries_the_generations_the_sheets_were_built_on():
         "status": "review",
         "submission_generation": "3",
         "statement_generation": "2",
+        "review_verdict_revision": "0",
     }
 
 

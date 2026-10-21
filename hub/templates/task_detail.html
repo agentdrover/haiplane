@@ -106,7 +106,7 @@
        автообновление больше не заменяет. Листы действий лежат ниже, вне фрагмента,
        поэтому открытый лист и введённый текст автообновление не трогает; метка
        data-* нужна листам, чтобы заметить смену сдачи. В фрагменте нет полей ввода. #}
-    <div id="c2-live" data-status="{{ task.status.value }}" data-submission-generation="{{ card_actions.live.submission_generation }}" data-statement-generation="{{ card_actions.live.statement_generation }}"
+    <div id="c2-live" data-status="{{ task.status.value }}" data-submission-generation="{{ card_actions.live.submission_generation }}" data-statement-generation="{{ card_actions.live.statement_generation }}" data-review-verdict-revision="{{ card_actions.live.review_verdict_revision }}"
          hx-get="/tasks/{{ task.id }}" hx-select="#c2-live" hx-target="this" hx-swap="outerHTML"
          hx-trigger="{{ 'c2-refresh' if task.status.value in ('completed', 'rejected') else 'every 15s, c2-refresh' }}">
     {% include "partials/card_c2.html" %}

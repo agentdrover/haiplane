@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import functools
 import html
 from typing import Any, Awaitable, Callable
@@ -208,6 +210,76 @@ def _refuse(request: Request, task_id: int, message: str, status: int) -> Respon
     )
 
 
+#: Замки по задаче: два нажатия одного листа не идут параллельно. Сервисы
+#: коммитят до сети (диспетчер, мерж), и без замка второй запрос проходил бы
+#: тот же гард, пока первый ещё в сети (rework запустил бы задание дважды), а
+#: повтор вердикта не отличался бы от первой записи. Замок процесса: хаб
+#: работает одним процессом; записи другого процесса закрывает write-лок базы.
+_LOCKS: dict[int, list[Any]] = {}
+
+
+@contextlib.asynccontextmanager
+async def _task_lock(task_id: int):
+    entry = _LOCKS.setdefault(task_id, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0:
+            _LOCKS.pop(task_id, None)
+
+
+async def _outcome(
+    request: Request,
+    action: str,
+    note: Note | None,
+    before: dict[str, Any],
+    response: Response,
+) -> Response:
+    """Ответ листа по ответу обработчика: выполнено, повтор или отказ."""
+    task_id = int(request.path_params["task_id"])
+    db = _db(request)
+    if response.status_code >= 300 or DONE_MARK not in _body_text(response):
+        return _as_refusal(response)
+    after = dict(await repo.get_task(db, task_id) or {})
+    if action == "verdict" and _same_verdict(before, after):
+        return _note(
+            "Этот вердикт уже стоит на карточке (ревизия "
+            f"{after.get('review_verdict_revision')}): повтор ничего не записал.",
+            409,
+        )
+    extra = await note(db, task_id, await request.form()) if note else ""
+    return await done_response(db, task_id, extra)
+
+
+async def _serve(
+    request: Request,
+    action: str,
+    note: Note | None,
+    call: Callable[[], Awaitable[Response]],
+) -> Response:
+    task_id = int(request.path_params["task_id"])
+    db = _db(request)
+    sheet = is_sheet(request)
+    form = await request.form()
+    before = dict(await repo.get_task(db, task_id) or {})
+    try:
+        reason, response = await _dispatch(db, action, task_id, form, call)
+    except HTTPException as exc:
+        if sheet:
+            return _note(_detail_text(exc.detail), exc.status_code)
+        if exc.status_code == 409 and _has_expectations(form):
+            return _refuse(request, task_id, _detail_text(exc.detail), 409)
+        raise
+    if reason:
+        return _refuse(request, task_id, reason, 409)
+    if not sheet:
+        return response
+    return await _outcome(request, action, note, before, response)
+
+
 def sheet_action(action: str, *, note: Note | None = None):
     """Обернуть обработчик маршрута, к которому ведёт лист (см. модуль)."""
 
@@ -216,42 +288,21 @@ def sheet_action(action: str, *, note: Note | None = None):
         async def wrapper(*args: Any, **kwargs: Any) -> Response:
             request: Request = kwargs["request"]
             task_id = int(kwargs["task_id"])
-            db = _db(request)
-            sheet = is_sheet(request)
             form = await request.form()
-            if (sheet or "c2_sheet" in form) and not current_identity(request).is_human:
+            marked = is_sheet(request) or "c2_sheet" in form
+            if marked and not current_identity(request).is_human:
                 return _refuse(
                     request, task_id, "Лист действий доступен только человеку.", 403
                 )
-            before = dict(await repo.get_task(db, task_id) or {})
 
             async def call() -> Response:
                 return await fn(*args, **kwargs)
 
-            try:
-                reason, response = await _dispatch(db, action, task_id, form, call)
-            except HTTPException as exc:
-                if sheet:
-                    return _note(_detail_text(exc.detail), exc.status_code)
-                if exc.status_code == 409 and _has_expectations(form):
-                    return _refuse(request, task_id, _detail_text(exc.detail), 409)
-                raise
-            if reason:
-                return _refuse(request, task_id, reason, 409)
-            if not sheet:
-                return response
-            if response.status_code < 300 and DONE_MARK in _body_text(response):
-                after = dict(await repo.get_task(db, task_id) or {})
-                if action == "verdict" and _same_verdict(before, after):
-                    return _note(
-                        "Этот вердикт уже стоит на карточке (ревизия "
-                        f"{after.get('review_verdict_revision')}): повтор ничего не "
-                        "записал.",
-                        409,
-                    )
-                extra = await note(db, task_id, form) if note else ""
-                return await done_response(db, task_id, extra)
-            return _as_refusal(response)
+            if not (marked or _has_expectations(form)):
+                return await call()
+            # Снимок «до» берётся под замком: повтор видит запись первого нажатия.
+            async with _task_lock(task_id):
+                return await _serve(request, action, note, call)
 
         return wrapper
 
