@@ -2882,9 +2882,14 @@ async def _web_task_detail_page(
     # the coverage verdict over them — assembled by the SAME builder that
     # answers /review-brief. Two readers, one assembly: the card and the brief
     # cannot drift apart because there is nothing to keep in step.
+    from hub.services.brief_failure import BriefFailure
     from hub.services.review_brief import gate_evidence
 
     evidence = await gate_evidence(db, dict(row))
+    # #1622: a failed assembly says why; it is not the same as "no gate".
+    brief_failure = evidence.reason if isinstance(evidence, BriefFailure) else ""
+    if isinstance(evidence, BriefFailure):
+        evidence = None
     review_in_flight = await inflight_view(db, dict(row))
 
     steward_judgement = (
@@ -2936,6 +2941,7 @@ async def _web_task_detail_page(
             "delivered_sha": delivered_sha,
             "delivery": delivery,
             "evidence": evidence,
+            "brief_failure": brief_failure,
             "review_in_flight": review_in_flight,
             "change_map": change_map,
             "machine_review": machine_review,

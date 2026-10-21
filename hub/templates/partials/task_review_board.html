@@ -40,7 +40,7 @@
     <div class="task-review-tile task-review-tile--warn">
         <div class="task-review-tile-label">Свидетельства</div>
         <div class="task-review-tile-value">не собраны</div>
-        <div class="task-review-tile-sub">бриф по этой сдаче не построен — проверять не по чему</div>
+        <div class="task-review-tile-sub">{% if brief_failure %}бриф не собран: {{ brief_failure }}{% else %}бриф по этой сдаче не построен — проверять не по чему{% endif %}</div>
     </div>
     {% elif sr %}
     {# #1648: задача-состояние. Плитки считаются из доказательств поколения; про
