@@ -3030,10 +3030,35 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
             {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
         ],
         "cycle_times": [],
+        # #1980: JSON-only section, carried through whole.
+        "executor_autonomy": {
+            "target": 0.9,
+            "definition": "autonomous = submitted and closed by submission",
+            "hosts": {
+                "k8": {
+                    "weeks": [
+                        {
+                            "week": "2026-W43",
+                            "start": "2026-10-19",
+                            "partial": False,
+                            "orders_closed": 5,
+                            "autonomous": 2,
+                            "rate": 0.4,
+                            "by_outcome": {"submitted": 3, "failed": 2},
+                            "by_reason_code": {"agent_failed": 3},
+                        }
+                    ]
+                }
+            },
+        },
     }
     out = await hub_practice_metrics(since_days=90)
     structured = _mcp_structured(out)
     assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
+    assert (
+        structured["metrics"]["executor_autonomy"]
+        == mock_api_get.return_value["executor_autonomy"]
+    )
     text = _mcp_text(out)
     assert (
         "Wasted dispatch spend (no report): 2500000 tokens across 2 failed run(s)"
