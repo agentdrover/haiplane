@@ -453,3 +453,82 @@ def test_fingerprint_does_not_depend_on_fstring_quoting():
     assert len(one) == len(two) == 1
     assert one[0].text == two[0].text
     assert "JoinedStr" in one[0].text
+
+
+UNPROVEN_SOURCE = """\
+import time
+
+
+def test_undo(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake)
+    monkeypatch.undo()
+    t0 = time.monotonic()
+    assert time.monotonic() - t0 < 0.5
+
+
+def test_not_upper(flag):
+    elapsed = time.monotonic() - 1
+    assert not elapsed < 0.5
+
+
+def test_not_lower(flag):
+    elapsed = time.monotonic() - 1
+    assert not elapsed >= 0.5
+
+
+def test_or(flag):
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5 or flag
+
+
+def test_not_reversed(flag):
+    elapsed = time.monotonic() - 1
+    assert not 0.5 <= elapsed
+"""
+
+BOUNDED_SOURCE = """\
+import time
+
+
+def test_context(monkeypatch, fake, t0):
+    with monkeypatch.context() as mp:
+        mp.setattr(time, "monotonic", fake)
+        assert time.monotonic() - t0 < 0.5
+    assert time.monotonic() - t0 < 0.63
+
+
+def test_and(flag):
+    elapsed = time.monotonic() - 1
+    assert flag and elapsed < 0.64
+"""
+
+
+def test_unproven_forms_are_warnings_not_silence(tmp_path, capsys):
+    _write(tmp_path, UNPROVEN_SOURCE)
+    _write_ledger(tmp_path, [])
+    code, out = _run(tmp_path, capsys)
+    assert code == 0, out
+    assert "НОВОЕ МЕСТО" not in out
+    for needle, message in (
+        ("assert time.monotonic() - t0 < 0.5", "подмена отменяется"),
+        ("assert not elapsed < 0.5", "логический контекст"),
+        ("assert not elapsed >= 0.5", "логический контекст"),
+        ("assert elapsed < 0.5 or flag", "логический контекст"),
+        ("assert not 0.5 <= elapsed", "логический контекст"),
+    ):
+        line = _line_of(UNPROVEN_SOURCE, needle)
+        assert f"ПРЕДУПРЕЖДЕНИЕ src/mod.py:{line} " in out, (needle, out)
+        row = next(r for r in out.splitlines() if f"src/mod.py:{line} " in r)
+        assert message in row, row
+    assert out.count("ПРЕДУПРЕЖДЕНИЕ") == 5, out
+
+
+def test_context_scope_and_and_stay_violations(tmp_path, capsys):
+    _write(tmp_path, BOUNDED_SOURCE)
+    _write_ledger(tmp_path, [])
+    code, out = _run(tmp_path, capsys)
+    assert code != 0, out
+    for needle in ("assert time.monotonic() - t0 < 0.63", "assert flag and elapsed"):
+        line = _line_of(BOUNDED_SOURCE, needle)
+        assert f"\n  src/mod.py:{line} " in out, (needle, out)
+    assert out.count("\n  src/mod.py:") == 2, out

@@ -180,6 +180,7 @@ class Patch:
     clock: str
     start: int
     end: int  # последняя строка действия patch
+    cancelled_at: int | None = None  # undo() / stop() до конца функции
 
 
 def _own_nodes(func: ast.AST):
@@ -258,6 +259,23 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
                 in_with[id(item.context_expr)] = node.end_lineno or end_line
+    cancels = [
+        n.lineno
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in ("undo", "stop")
+    ]
+    context_end: dict[int, int] = {}  # вызов внутри ``with monkeypatch.context()``
+    for node in nodes:
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(i.context_expr, ast.Call)
+            and isinstance(i.context_expr.func, ast.Attribute)
+            and i.context_expr.func.attr == "context"
+            for i in node.items
+        ):
+            for inner in ast.walk(node):
+                context_end[id(inner)] = node.end_lineno or end_line
     pending: dict[str, str] = {}  # имя -> часы из ``p = patch(...)``
     for node in nodes:
         if (
@@ -275,8 +293,10 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
             continue
         clock = _patched_clock(node, imp)
         if clock is not None:
-            if _is_setattr(node):
-                found.append(Patch(clock, node.lineno, end_line))
+            if _is_setattr(node) and id(node) in context_end:
+                found.append(Patch(clock, node.lineno, context_end[id(node)]))
+            elif _is_setattr(node):
+                found.append(_cancellable(clock, node.lineno, end_line, cancels))
             elif id(node) in in_with:
                 found.append(Patch(clock, node.lineno, in_with[id(node)]))
             elif id(node) in decorators:
@@ -284,8 +304,16 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
             continue
         started = _started_clock(node, imp, pending)
         if started is not None:
-            found.append(Patch(started, node.lineno, end_line))
+            found.append(_cancellable(started, node.lineno, end_line, cancels))
     return found
+
+
+def _cancellable(clock: str, start: int, end_line: int, cancels: list[int]) -> Patch:
+    """Подмена, которую ``undo()`` / ``stop()`` позже может отменить."""
+    later = [line for line in cancels if line > start]
+    if not later:
+        return Patch(clock, start, end_line)
+    return Patch(clock, start, min(later), cancelled_at=min(later))
 
 
 def _is_setattr(call: ast.Call) -> bool:
@@ -319,6 +347,7 @@ class _Flow:
         self.first_read = self._first_read()
         self.sure: set[str] = set()
         self.maybe: set[str] = set()
+        self.cancelled: set[str] = set()
         self._propagate()
 
     # ссылки на часы вида ``m = time.monotonic``
@@ -372,6 +401,7 @@ class _Flow:
                 p.clock == clock
                 and p.start < self.first_read
                 and p.start < saved_at <= p.end
+                and call.lineno <= p.end
                 for p in self.patches
             )
         # Только чтение через сам объект time: from-импорт не затронут
@@ -389,20 +419,44 @@ class _Flow:
             for p in self.patches
         )
 
+    def _after_cancel(self, call: ast.Call) -> bool:
+        """Чтение после undo()/stop() подмены тех же часов: что читается - неясно."""
+        func = call.func
+        if isinstance(func, ast.Attribute):
+            clock = func.attr
+        elif isinstance(func, ast.Name) and func.id in self.aliases:
+            clock = self.aliases[func.id][0]
+        else:
+            return False
+        return any(
+            p.cancelled_at is not None
+            and p.clock == clock
+            and p.start < self.first_read
+            and call.lineno > p.cancelled_at
+            for p in self.patches
+        )
+
     def level(self, expr: ast.AST) -> str | None:
-        """``"sure"`` | ``"maybe"`` | ``None`` для выражения."""
+        """``"sure"`` | ``"cancel"`` | ``"maybe"`` | ``None`` для выражения.
+
+        ``cancel`` - часы читаются после undo()/stop() подмены: не доказано.
+        """
         result: str | None = None
         for node in ast.walk(expr):
             if isinstance(node, ast.Call):
                 kind = self._read_kind(node)
                 if kind in ("module", "alias") and not self._is_faked(node):
-                    return "sure"
-                if kind == "object":
+                    if not self._after_cancel(node):
+                        return "sure"
+                    result = "cancel"
+                if kind == "object" and result is None:
                     result = "maybe"
             elif isinstance(node, ast.Name):
                 if node.id in self.sure:
                     return "sure"
-                if node.id in self.maybe:
+                if node.id in self.cancelled:
+                    result = "cancel"
+                elif node.id in self.maybe and result is None:
                     result = "maybe"
         return result
 
@@ -429,13 +483,13 @@ class _Flow:
                     self.sure.add(target.id)
                     self.maybe.discard(target.id)
                     changed = True
-                elif (
-                    level == "maybe"
-                    and target.id not in self.sure
-                    and target.id not in self.maybe
-                ):
-                    self.maybe.add(target.id)
-                    changed = True
+                elif level in ("maybe", "cancel") and target.id not in self.sure:
+                    if level == "cancel" and target.id not in self.cancelled:
+                        self.cancelled.add(target.id)
+                        changed = True
+                    if target.id not in self.maybe:
+                        self.maybe.add(target.id)
+                        changed = True
         for target, value, node in pairs:
             if not isinstance(target, ast.Name) and self.level(value) == "sure":
                 self.warnings.append(
@@ -476,9 +530,47 @@ def _scan_function(
     for node in _own_nodes(func):
         if not isinstance(node, ast.Assert):
             continue
-        for compare in ast.walk(node.test):
-            if isinstance(compare, ast.Compare):
+        for compare, logical in _compares(node.test):
+            if logical:
+                _warn_logical(compare, node, flow, (path, qualname), scan)
+            else:
                 _scan_compare(compare, node, flow, params, (path, qualname), scan)
+
+
+def _compares(test: ast.AST, logical: bool = False):
+    """Сравнения assert с признаком «под not или внутри or»."""
+    if isinstance(test, ast.Compare):
+        yield test, logical
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        logical = True
+    elif isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        logical = True
+    for child in ast.iter_child_nodes(test):
+        yield from _compares(child, logical)
+
+
+def _warn_logical(
+    compare: ast.Compare,
+    stmt: ast.Assert,
+    flow: _Flow,
+    where: tuple[str, str],
+    scan: Scan,
+) -> None:
+    """Часы против порога < 1 с под not / or: смысл сравнения не прослежен."""
+    operands = [compare.left, *compare.comparators]
+    for left, right in zip(operands, operands[1:]):
+        for subject, bound in ((left, right), (right, left)):
+            value = _const(bound)
+            if flow.level(subject) and value is not None and value < THRESHOLD:
+                scan.warnings.append(
+                    Warn(
+                        where[0],
+                        stmt.lineno,
+                        where[1],
+                        "логический контекст не поддерживается",
+                    )
+                )
+                return
 
 
 def _scan_compare(
@@ -509,14 +601,12 @@ def _scan_compare(
             scan.places.append(Place(path, qualname, text, stmt.lineno))
             break
         else:
-            scan.warnings.append(
-                Warn(
-                    path,
-                    stmt.lineno,
-                    qualname,
-                    "часы через атрибут объекта: не прослежены",
-                )
+            message = (
+                "подмена отменяется, форма не поддерживается"
+                if level == "cancel"
+                else "часы через атрибут объекта: не прослежены"
             )
+            scan.warnings.append(Warn(path, stmt.lineno, qualname, message))
 
 
 class _FStrings(ast.NodeTransformer):
