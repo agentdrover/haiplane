@@ -59,7 +59,8 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
+from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
+from hub.services import workflow_seed
 from hub.services.ci_timing import ci_minutes_metrics
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
@@ -5721,6 +5722,9 @@ async def _complete_without_review(
 
     Всегда возвращает исход: ни один путь внутри не проваливается наружу.
     """
+    # #1953: приём до доставки; снимок task обновлён проверенным sha
+    if not await critic_orders.accept_in_transaction(db, task, pin=True, hold=True):
+        return "needs_decision"
     task_id = task["id"]
     branch = task.get("branch")
     pr_note = ""
@@ -5836,13 +5840,15 @@ async def _write_completed(
             from hub.services.lifecycle import _done_validation_gate
 
             await _done_validation_gate(db, task)
-        await repo.update_task(
+        if not await critic_orders.accept_in_transaction(
             db,
-            task_id,
-            status="completed",
+            task,
+            "completed",
+            hold=True,
             exit_code=exit_code,
             result_text=result_text,
-        )
+        ):
+            return None
         await repo.insert_event(
             db,
             kind="task_completed",
@@ -6313,12 +6319,6 @@ async def transition_after_agent_done(
 
     if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
-
-    # #1953: автоматический вход (поллер): сдача без passed критика - hold.
-    from hub.services import critic_orders
-
-    if has_done and await critic_orders.automatic_gate(db, task):
-        return "needs_decision"
 
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once

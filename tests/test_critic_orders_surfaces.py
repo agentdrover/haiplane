@@ -102,7 +102,7 @@ async def test_the_card_shows_the_last_order_and_computes_overdue_without_writin
 
 
 async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch):
-    """done: гейт прошёл на A, а при закреплении голова B - 422 sha_changed, записей нет."""
+    """done: гейт прошёл на A, а при закреплении голова B - 422 (на B passed нет), записей нет."""
     cloud = await co._cloud(world, None)
     await co._closed_order(world, cloud, co.SHA_A, "passed")
     seen: list[str] = []
@@ -115,7 +115,7 @@ async def test_done_pins_the_sha_the_critic_passed_or_refuses(world, monkeypatch
     before = await co._task_state(world, cloud.task_id)
     resp = await co._done(world, cloud)
     assert len(seen) >= 2, "закрепление должно наблюдать голову заново"
-    assert co._refused(resp) == "sha_changed"
+    assert co._refused(resp) == "no_order"
     assert await co._task_state(world, cloud.task_id) == before
 
 
@@ -243,7 +243,7 @@ async def test_every_door_pins_the_sha_the_critic_passed(world, monkeypatch):
     assert held == "needs_decision"
     status, generation, pinned, _feed = await co._task_state(world, auto.task_id)
     assert (status, generation, pinned) == ("needs_decision", before[1], before[2])
-    assert any("sha_changed" in a for a in await co._alerts(world, auto.task_id))
+    assert any("no_order" in a for a in await co._alerts(world, auto.task_id))
     # Ничего не протекло: у соседней задачи прохода поколение не тронуто.
     assert (await co._task_state(world, cloud.task_id))[1] == 1
 

@@ -161,12 +161,10 @@ async def _route_pending_report(
         # #1589: и этот вход — сдача; без гейтов конвейера он иначе остался бы
         # без предупреждений по путям.
         await lc._record_path_notices_for_done(db, task)
-        pin = (
-            {"submission_sha": task[critic_orders.CHECKED_KEY]}
-            if task.get(critic_orders.CHECKED_KEY)
-            else {}
-        )  # #1953: ревью читает код, по которому прошёл критик
-        await repo.update_task(db, task_id, status="review", review_job_id=None, **pin)
+        # #1953: статус и проверенный sha - одной записью, до коммитящих вызовов.
+        await critic_orders.accept_in_transaction(
+            db, task, "review", review_job_id=None
+        )
         await repo.add_task_update(
             db,
             task_id,
@@ -185,7 +183,7 @@ async def _route_pending_report(
             detail=mutation_activity_detail(),
         )
         return
-    await repo.update_task(db, task_id, status="completed")
+    await critic_orders.accept_in_transaction(db, task, "completed")  # #1953
     await lc.log_activity(
         db,
         "task_completed",
@@ -246,22 +244,14 @@ async def _route_done(
         await _route_pending_report(db, task, body)
     elif task["status"] in ("running", "claimed") and not task.get("job_id"):
         await _route_pair_or_claimed(db, task, (body.agent or "").strip())
+        row = await repo.get_task(db, int(task["id"]))
+        if row is not None and dict(row)["status"] in ("running", "claimed"):
+            # #1953: завершение без ревью отложено за коммит; sha критика
+            # закрепляется ЗДЕСЬ единой функцией приёма, после проверок маршрута
+            # (пустая пересдача, блокер) и до коммита done-flow.
+            if not lc.completion_requires_review(task):
+                await critic_orders.accept_in_transaction(db, task, pin=True)
     # open + done without pair-start: rejected before insert (AC-2)
-    await _pin_checked_sha(db, task)
-
-
-async def _pin_checked_sha(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
-    """#1953: завершение без ревью закрепляет sha критика - ПОСЛЕ проверок маршрута.
-
-    Раньше пин сломал бы «пустую пересдачу» (она читает прежний sha из базы) и
-    остался бы у удержанной по блокеру сдачи; отказ маршрута откатывает всё.
-    """
-    checked = task.get(critic_orders.CHECKED_KEY)
-    if not checked or lc.completion_requires_review(task):
-        return
-    row = await repo.get_task(db, int(task["id"]))
-    if row is not None and dict(row)["status"] != "needs_decision":
-        await repo.update_task(db, int(task["id"]), submission_sha=checked)
 
 
 async def _inside_savepoint(
@@ -274,7 +264,7 @@ async def _inside_savepoint(
     if body.kind == "done":
         # #1953: гейт критика - под write-локом: политику и заказы читаем здесь,
         # отказ откатывает савпоинт до строки отчёта.
-        task = await critic_orders.gate_done_report(db, task)
+        task = await critic_orders.accept_in_transaction(db, task) or task
     update_id = await _write_row_and_prevention(db, task, body, principal_id)
     await _record_finding_outcomes(db, task, body)
     await _route_done(db, task, body)

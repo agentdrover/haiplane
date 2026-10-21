@@ -3488,7 +3488,10 @@ async def run_headless_submit_gates(
     """
     state = SubmitContext(db=db, task_id=task["id"], task=task)
     await run_steps(state, HEADLESS_STEPS)
-    critic_orders.assert_pin_matches(task, state.submission_sha)  # #1953
+    # #1953: закрепляемый sha принимается той же единой функцией, под локом bump
+    await critic_orders.accept_in_transaction(
+        db, task, observed=state.submission_sha, always=True
+    )
     return state
 
 
@@ -3607,7 +3610,9 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
-        await critic_orders.submit_step(state)  # #1953: политика и заказы - под локом
+        await critic_orders.accept_in_transaction(
+            db, state.task, observed=state.submission_sha, always=True
+        )  # #1953
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
@@ -4024,7 +4029,10 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
-        await critic_orders.submit_step(state)  # #1953: политика и заказы - под локом
+        # #1953: приём облачной сдачи - единая функция, под локом
+        await critic_orders.accept_in_transaction(
+            db, task, observed=state.submission_sha, always=True
+        )
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)

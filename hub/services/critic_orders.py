@@ -50,8 +50,6 @@ REPORT_OUTCOMES = ("passed", "findings", "failed")
 #: Ключ, под которым вход done оставляет на задаче sha, по которому прошёл гейт:
 #: закрепление sha внутри транзакции сверяется с ним (то же наблюдение).
 CHECKED_KEY = "_critic_checked_sha"
-#: Метка автоматического входа (поллер): savepoint вокруг bump и закрепления sha.
-AUTO_KEY = "_critic_auto_entry"
 #: Открытых заказов на задачу.
 MAX_OPEN_PER_TASK = 1
 SUBMITTABLE = ("running", "claimed", "pending_report")
@@ -563,38 +561,70 @@ async def submit_step(state: Any) -> None:
         refuse(int(state.task_id), verdict)
 
 
-async def gate_done_report(
-    db: aiosqlite.Connection, task: dict[str, Any]
-) -> dict[str, Any]:
-    """Вход done (HTTP): отказ 422 ДО записей, либо задача с проверенным sha в ключе."""
+async def accept_in_transaction(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    target_status: str = "",
+    *,
+    observed: str = "",
+    pin: bool = False,
+    always: bool = False,
+    hold: bool = False,
+    **fields: Any,
+) -> dict[str, Any] | None:
+    """ЕДИНСТВЕННЫЙ приём облачной сдачи (#1953): проверка, статус и sha - одной операцией.
+
+    Каждый вход в review и completed зовёт её в той пишущей транзакции, что
+    меняет статус. Первой записью берётся write-lock, и только потом, под ним,
+    перечитываются политика ``critic_host``, держатель и заказы; проверяется
+    ``passed`` на наблюдённом sha (``observed``, иначе ``PREPARED_CI_SHA``
+    вызова, иначе проверенный раньше или закреплённый). Если гейт применим,
+    ``target_status`` и ``submission_sha`` пишутся ОДНИМ ``update_task``; без
+    ``target_status`` sha пишется только при ``pin``. Других записей пина критика
+    в хабе нет. Снимок ``task`` обновляется на месте и возвращается: дальнейший маршрут
+    (доставка) читает его, а не базу. Отказ - 422, а при ``hold`` - задача уходит в
+    needs_decision, возвращается ``None``. Не применимо (политика выключена,
+    держатель не облачный) - статус и ``fields`` пишутся как есть.
+    """
     from hub.services.lifecycle import PREPARED_CI_SHA
     from hub.services.orchestration import review_approved_for_current_submission
 
-    if task.get("status") not in SUBMITTABLE or review_approved_for_current_submission(
-        task
-    ):
-        return task
-    verdict = await evaluate(db, task, str(task.get(PREPARED_CI_SHA) or ""))
-    if verdict.applicable and verdict.cause:
-        refuse(int(task["id"]), verdict)
-    if not verdict.applicable:
-        return task
-    return {**task, CHECKED_KEY: verdict.sha}
-
-
-def assert_pin_matches(task: dict[str, Any], pinned_sha: str) -> None:
-    """Закрепляемый sha - тот, по которому прошёл гейт; иначе откат внутри савпоинта."""
-    checked = task.get(CHECKED_KEY)
-    if checked and pinned_sha != checked:
-        refuse(
-            int(task["id"]),
-            Verdict(
-                True,
-                "sha_changed",
-                checked,
-                f"Голова при закреплении {pinned_sha[:12] or 'не наблюдена'}.",
-            ),
+    task_id = int(task["id"])
+    async with write_transaction(db):
+        await db.execute(
+            "UPDATE tasks SET updated_at = updated_at WHERE id = ?", (task_id,)
         )
+        row = await repo.get_task(db, task_id)
+        fresh = dict(row) if row is not None else task
+        verdict = Verdict()
+        if always or (
+            fresh.get("status") in SUBMITTABLE
+            and not review_approved_for_current_submission(fresh)
+        ):
+            sha_in = observed or str(
+                task[PREPARED_CI_SHA]
+                if PREPARED_CI_SHA in task
+                else task.get(CHECKED_KEY) or task.get("submission_sha") or ""
+            )
+            verdict = await evaluate(db, fresh, sha_in)
+        if verdict.applicable and verdict.cause:
+            if hold:
+                await _hold(db, task, verdict)
+                return None
+            refuse(task_id, verdict)
+        write = dict(fields)
+        if target_status:
+            write["status"] = target_status
+        if verdict.applicable and (target_status or pin):
+            write["submission_sha"] = verdict.sha
+        if write:
+            await repo.update_task(db, task_id, **write)
+        extra = {CHECKED_KEY: verdict.sha} if verdict.applicable else {}
+        task.update(
+            write
+        )  # снимок вызывающего обновляется на месте: его читает доставка
+        task.update(extra)
+        return task
 
 
 async def _hold(
@@ -622,30 +652,6 @@ async def _hold(
     )
 
 
-async def automatic_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
-    """Автоматический вход (поллер, без HTTP): True - сдача удержана, задача в needs_decision."""
-    from hub.services.lifecycle import PREPARED_CI_SHA
-    from hub.services.orchestration import (
-        completion_requires_review,
-        review_approved_for_current_submission,
-    )
-
-    if CHECKED_KEY in task or review_approved_for_current_submission(task):
-        return False
-    verdict = await evaluate(db, task, str(task.get(PREPARED_CI_SHA) or ""))
-    if verdict.applicable and not verdict.cause:
-        # То же наблюдение сверит закрепление sha; savepoint pin_guard вернёт
-        # bump, если закрепление увидит другую голову.
-        task[CHECKED_KEY] = verdict.sha
-        task[AUTO_KEY] = True
-        if not completion_requires_review(task):  # завершение без ревью: пин здесь
-            await repo.update_task(db, int(task["id"]), submission_sha=verdict.sha)
-    if not (verdict.applicable and verdict.cause):
-        return False
-    await _hold(db, task, verdict)
-    return True
-
-
 class PinGuard:
     """Итог ``pin_guard``: сдача удержана (True) или прошла."""
 
@@ -661,8 +667,10 @@ async def pin_guard(db: aiosqlite.Connection, task: dict[str, Any]):
     прохода. Отказ откатывает bump и удерживает задачу; прочие входы (HTTP: свой
     savepoint ``done_flow``) и любые другие исключения проходят как были.
     """
+    from hub.services.orchestration import _deferred_completions
+
     guard = PinGuard()
-    if not task.get(AUTO_KEY):
+    if _deferred_completions.get() is not None:  # HTTP done-flow: 422 из савпоинта
         yield guard
         return
     await db.execute("SAVEPOINT critic_pin")
