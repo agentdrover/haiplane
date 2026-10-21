@@ -13,9 +13,12 @@ read key configured leaves a results.json behind.
 
 from __future__ import annotations
 
+import ast
+import http.client
 import importlib.util
 import io
 import json
+import subprocess
 import urllib.error
 from pathlib import Path
 
@@ -242,6 +245,111 @@ def test_no_script_logs_the_body_of_a_hub_refusal(name, call, monkeypatch, capsy
     assert call(module) is None
     shown = capsys.readouterr().out
     assert "OSError" in shown and leak not in shown
+
+
+# ---- the class guard: no raw exception in a log, a reason or a payload --------
+
+_HUB_SCRIPTS = ("ci_report_to_hub", "ci_trusted_report", "ci_report_audit_to_hub")
+
+
+def _raw_exception_uses(source: str) -> list[str]:
+    """Uses of a caught exception other than safe_failure(exc), exc.code or ``from exc``."""
+    tree = ast.parse(source)
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    caught = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler) and node.name
+    }
+    bad: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and node.id in caught):
+            continue
+        parent = parents[node]
+        ok = (
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id == "safe_failure"
+        )
+        ok = ok or (isinstance(parent, ast.Attribute) and parent.attr == "code")
+        ok = ok or isinstance(parent, ast.Raise)
+        if not ok:
+            bad.append(f"line {node.lineno}: {ast.unparse(parent)}")
+    return bad
+
+
+@pytest.mark.parametrize("name", _HUB_SCRIPTS)
+def test_no_hub_script_puts_a_raw_exception_anywhere(name):
+    source = (_SCRIPTS / f"{name}.py").read_text(encoding="utf-8")
+    assert _raw_exception_uses(source) == []
+
+
+def test_the_guard_sees_every_form_of_the_defect():
+    for bad in (
+        'log(f"x {exc}")',
+        'log("x " + str(exc))',
+        "log(repr(exc))",
+        'log(f"x {exc.args}")',
+        'reason = f"x: {exc}"',
+        "log(exc.read())",
+    ):
+        src = f"try:\n    pass\nexcept OSError as exc:\n    {bad}\n"
+        assert _raw_exception_uses(src), bad
+    fine = (
+        "try:\n    pass\nexcept OSError as exc:\n"
+        '    log(f"x {safe_failure(exc)} {exc.code}")\n    raise R() from exc\n'
+    )
+    assert _raw_exception_uses(fine) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "call"),
+    [
+        ("ci_report_to_hub", lambda m: m.hub_request("https://h/x", "t")),
+        ("ci_trusted_report", lambda m: m.hub_post("https://h/x", "t", {})),
+        ("ci_report_audit_to_hub", lambda m: m.hub_post("https://h", "t", "/x", {})),
+    ],
+)
+def test_a_broken_http_answer_is_handled_and_its_text_is_not_logged(
+    name, call, monkeypatch, capsys
+):
+    module = _load(name)
+    leak = "ochk_SECRET123"
+
+    def garbled(req, timeout=0):
+        raise http.client.BadStatusLine(leak)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", garbled)
+    assert call(module) is None, (
+        "BadStatusLine is an answer we cannot read, not a crash"
+    )
+    shown = capsys.readouterr().out
+    assert "BadStatusLine" in shown and leak not in shown
+
+
+def test_a_timed_out_command_is_not_echoed(collector, monkeypatch, capsys):
+    module = collector
+    leak = "ochk_SECRET123"
+    card = {
+        "acceptance_criteria": [
+            {"id": "AC-1", "verifiable_by": "test", "test_ref": "tests/x.py::t"}
+        ],
+        "validation_commands": ["python3 --version"],
+    }
+    monkeypatch.setattr(module.urllib.request, "urlopen", _Hub(card))
+
+    def hang(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=leak, timeout=1)
+
+    monkeypatch.setattr(module.subprocess, "run", hang)
+    assert module.main() == 0
+    doc = _results(module)
+    assert doc["validation_status"] == "unknown"
+    assert "TimeoutExpired" in doc["reason"]
+    assert leak not in module.results_path.read_text()
+    assert leak not in capsys.readouterr().out
 
 
 # ---- the refusal says why -----------------------------------------------------

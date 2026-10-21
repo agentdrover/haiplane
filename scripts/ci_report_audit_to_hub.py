@@ -29,6 +29,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# The sibling module is found next to this file, whatever the working directory
+# (the scripts are run by path, and loaded by path in the tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ci_safe_failure import NETWORK_ERRORS, safe_failure  # noqa: E402
+
 # Why a draft and not a direct write: a task created with source=agent lands in
 # ``draft`` (hub/services/lifecycle.py), so a human still decides whether the
 # bump is worth doing. Verified by code rather than assumed: POST /api/tasks
@@ -67,8 +72,8 @@ def hub_post(base: str, token: str, path: str, payload: dict) -> dict | None:
         # The code only, never the body (it names projects; the log is public
         # to everyone who can read the run).
         log(f"hub said {exc.code}")
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        log(f"hub unreachable ({type(exc).__name__})")
+    except (*NETWORK_ERRORS, json.JSONDecodeError) as exc:
+        log(f"hub unreachable ({safe_failure(exc)})")
     return None
 
 
@@ -152,7 +157,7 @@ def main() -> int:
     try:
         report = json.loads(report_path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
-        log(f"audit report unreadable ({exc}) — reporting nothing")
+        log(f"audit report unreadable ({safe_failure(exc)}) — reporting nothing")
         return 0
     if not isinstance(report, dict):
         log("audit report is not an object — reporting nothing")

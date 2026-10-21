@@ -72,6 +72,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 
+# The sibling module is found next to this file, whatever the working directory
+# (the scripts are run by path, and loaded by path in the tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ci_safe_failure import NETWORK_ERRORS, safe_failure  # noqa: E402
+
 TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # A validation entry we are willing to hand to a shell. Task text mixes real
 # commands with prose instructions for humans ("check on a live PR that…"), and
@@ -199,11 +204,9 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
         # log is readable by everyone who can read the run.
         LAST_FAILURE = f"HTTP {exc.code}"
         log(f"hub said {exc.code}")
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        cause = getattr(exc, "reason", None)
-        kind = type(cause if isinstance(cause, BaseException) else exc).__name__
-        LAST_FAILURE = f"unreachable ({kind})"
-        log(f"hub unreachable: {kind}")
+    except (*NETWORK_ERRORS, json.JSONDecodeError) as exc:
+        LAST_FAILURE = f"unreachable ({safe_failure(exc)})"
+        log(f"hub unreachable: {safe_failure(exc)}")
     return None
 
 
@@ -296,7 +299,10 @@ def ac_runner() -> list[str]:
     try:
         argv = shlex.split(raw)
     except ValueError as exc:
-        log(f"AC runner {raw!r} does not parse ({exc}) — every AC stays not_found")
+        log(
+            f"AC runner {raw!r} does not parse ({safe_failure(exc)}) — every AC "
+            "stays not_found"
+        )
         return []
     if not argv:
         log("AC runner is empty — every AC stays not_found")
@@ -400,7 +406,9 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
                 env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            log(f"pytest could not run ({exc}) — every AC stays not_found")
+            log(
+                f"pytest could not run ({safe_failure(exc)}) — every AC stays not_found"
+            )
             return {}
         missing = _missing_nodeids(proc.stdout + "\n" + proc.stderr, pending)
         if not missing:
@@ -667,7 +675,11 @@ def run_validation(
                 env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return "unknown", "\n".join(logs)[-_LOG_TAIL:], f"команда прервана: {exc}"
+            return (
+                "unknown",
+                "\n".join(logs)[-_LOG_TAIL:],
+                f"команда прервана: {safe_failure(exc)}",
+            )
         executed += 1
         logs.append(f"$ {cmd}\n{proc.stdout}{proc.stderr}")
         if proc.returncode != 0:
@@ -720,7 +732,7 @@ def _read_report(path: str) -> tuple[dict | None, str]:
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
     except (OSError, ValueError) as exc:
-        return None, str(exc)
+        return None, safe_failure(exc)
     if not isinstance(report, dict):
         return None, "expected an object"
     return report, ""
@@ -958,7 +970,7 @@ def _write_failed(task_id: int, head_sha: str, reason: str) -> int:
         # The one case that turns the step red: nothing is left to report.
         print(
             "::error title=hub-report::results.json could not be written "
-            f"({type(exc).__name__}) — the run has no report",
+            f"({safe_failure(exc)}) — the run has no report",
             flush=True,
         )
         return 1
@@ -1011,7 +1023,7 @@ def main() -> int:
         return _write_failed(
             task_id,
             head_sha,
-            f"collector_crashed: {type(exc).__name__}",
+            f"collector_crashed: {safe_failure(exc)}",
         )
     if read_token:
         path = write_results(payload, task_id)
