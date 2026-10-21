@@ -38,7 +38,7 @@ from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
-from hub.services import order_deadline
+from hub.services import memory_wait, order_deadline
 
 log = logging.getLogger("hub.services.chat_pair")
 
@@ -520,14 +520,14 @@ async def _reviewer_refusal(
 #: serialised and the code either goes before them or not at all. A slot name
 #: nobody registered keeps the manual door's old behaviour.
 _SLOT_ORDER_GUARD: Final[str] = (
-    " AND (channel <> 'slot' "
+    " AND (channel <> 'slot' "  # nosec B608 - constants only
     "OR NOT EXISTS (SELECT 1 FROM executor_hosts h WHERE h.name = chat_pair_codes.slot) "
     "OR EXISTS (SELECT 1 FROM executor_hosts h "
     "JOIN principals p ON p.id = h.principal_id "
     "JOIN executor_orders o ON o.host = h.name "
     "WHERE h.name = chat_pair_codes.slot AND h.enabled = 1 AND p.status = 'active' "
     "AND o.pair_code_id = chat_pair_codes.id "
-    "AND o.state IN ('pending', 'delivered')))"
+    f"AND {memory_wait.REDEEMABLE_SQL}))"
 )
 
 
@@ -560,7 +560,7 @@ async def _slot_order_refusal(
     orders = await fetchall(
         db,
         "SELECT 1 FROM executor_orders WHERE pair_code_id = ? "
-        "AND state IN ('pending', 'delivered')",
+        f"AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608 - constant
         (row["id"],),
     )
     if not orders:
@@ -625,7 +625,7 @@ async def _spend_code(
             "UPDATE executor_orders SET state = 'redeemed', "
             "redeemed_at = datetime('now'), first_redeemed_at = datetime('now'), "
             "retry_until = datetime('now', ?), session_id = ? "
-            "WHERE pair_code_id = ? AND state IN ('pending', 'delivered')",
+            f"WHERE pair_code_id = ? AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608
             (
                 f"+{min(int(config.HOST_REDEEM_RETRY_SECONDS), int(ttl))} seconds",
                 inserted.lastrowid,
@@ -700,7 +700,7 @@ async def redeem_code_explained(
     if row["spent"]:
         return None, _row_refusal(row, "spent")
     if row["expired"]:
-        return None, _row_refusal(row, "expired")
+        return None, _row_refusal(row, await memory_wait.why(db, row, "expired"))
     if row["status"] != "active":
         return None, _row_refusal(row, "principal_inactive")
 
@@ -726,7 +726,7 @@ async def redeem_code_explained(
         db, row, kind=kind, acting_id=acting_id, acting_username=acting_username
     )
     if session is None:
-        return None, _row_refusal(row, "spent")
+        return None, _row_refusal(row, await memory_wait.why(db, row, "spent"))
     return session, None
 
 
