@@ -32,7 +32,6 @@ world = _support.world
 keys = _support.keys
 _clean_limiter = _support._clean_limiter
 _no_cloud = _support._no_cloud
-_cursor_ready = _support._cursor_ready
 
 
 async def _one_order(world, title: str = "заказ") -> int:
@@ -222,7 +221,7 @@ async def test_no_reissue_after_start_and_stale_reports_refused(world):
     assert new["id"] == third and new["lease_id"] != old["lease_id"]
     assert (await started(world, "k9", third, new["lease_id"])).status_code == 200
     stale = await report(world, "k8", third, old["lease_id"])
-    assert stale.status_code in (403, 404, 409)
+    assert stale.status_code == 409
     assert (await order_row(world, third))["state"] == "started"
     wrong_lease = await report(world, "k9", third, old["lease_id"])
     assert wrong_lease.status_code == 409

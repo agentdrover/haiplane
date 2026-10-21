@@ -40,7 +40,6 @@ world = _support.world
 keys = _support.keys
 _clean_limiter = _support._clean_limiter
 _no_cloud = _support._no_cloud
-_cursor_ready = _support._cursor_ready
 
 ROLE_FILES = ("hub/services/role_orders.py", "hub/role_host_api.py")
 REPO = Path(__file__).resolve().parent.parent
