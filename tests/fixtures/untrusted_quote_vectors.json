@@ -1,0 +1,12 @@
+{
+  "_comment": "Один набор векторов санитизации недоверенной цитаты (#1953; общий с #1911 и #1952). forbidden_chars - коды символов, которых не должно быть в выводе; forbidden_text - подстроки, которых не должно быть.",
+  "vectors": [
+    {"name": "control", "text": "ok\u001b[31mred\u0007\u0000", "forbidden_chars": [27, 7, 0], "forbidden_text": []},
+    {"name": "bidi", "text": "a‮b⁦c⁩d", "forbidden_chars": [8238, 8294, 8297], "forbidden_text": []},
+    {"name": "zero_width", "text": "a​b‌c‍d﻿e", "forbidden_chars": [8203, 8204, 8205, 65279], "forbidden_text": []},
+    {"name": "tag_chars", "text": "x👍󠁁󠁂y", "forbidden_chars": [917569, 917570], "forbidden_text": []},
+    {"name": "code_span", "text": "run `rm -rf /` now ```fence```", "forbidden_chars": [96], "forbidden_text": []},
+    {"name": "html", "text": "<script>alert(1)</script><img src=x onerror=y>", "forbidden_chars": [60, 62], "forbidden_text": ["<script", "<img"]},
+    {"name": "markdown_link", "text": "[click](http://evil.example/x) ![i](http://e/i.png)", "forbidden_chars": [], "forbidden_text": ["[click](", "![i]("]}
+  ]
+}
