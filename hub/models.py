@@ -4389,8 +4389,7 @@ class MachineReviewView(BaseModel):
     findings_confirmed: list[MachineFinding] = Field(default_factory=list)
     findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
     # None means "never stated", not "complete" — reports written before this
-    # field existed made no such claim, and back-filling false would put words
-    # in their mouth (#549).
+    # field existed made no such claim; back-filling false would invent one (#549).
     incomplete: bool | None = None
     # #1238. Empty means the reviewer never said why — which is where every
     # report written before this field existed sits, and which must never be
@@ -4399,6 +4398,7 @@ class MachineReviewView(BaseModel):
     incomplete_reason: str = ""
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
+    ac_tests_unread: list[str] = Field(default_factory=list)  # #1933, review_oversized
     # Which profile produced this report (#807). Set by the hub from the
     # dispatch, never by the report about itself; empty means no dispatch was
     # behind it, which is NOT the same as a cheap run.
