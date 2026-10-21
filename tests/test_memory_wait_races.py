@@ -355,8 +355,8 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
 
     # Код потрачен другим - по-прежнему spent; срок кода вышел - expired.
     for how, expected in (
-        ("spent", "redeem_refused"),
-        ("spent_late", "redeem_refused"),  # потрачен И предел: потрачен сильнее
+        ("spent", "spent"),
+        ("spent_late", "spent"),  # потрачен И предел: потрачен сильнее
         ("expired", "expired"),
     ):
         task_id, other_id, code2 = await _waiting(world, "k9", f"причина {how}")
@@ -404,3 +404,42 @@ async def test_limit_crossed_between_select_and_spend_is_named_a_limit(
             json={"result": "redeem_failed"},
             headers=world.k9_auth,
         )
+
+
+async def test_limit_is_named_when_term_and_limit_coincide_and_when_the_code_is_burnt(
+    world, monkeypatch
+):
+    """Codex gen 2 P2: естественная граница (срок кода = предел) и закрытие sweep'ом между SELECT и анализом."""
+    from hub.services import chat_pair
+
+    # Срок кода и предел совпали (heartbeat у границы): ранняя проверка срока тоже говорит «предел».
+    _t, order_id, code = await _waiting(world, "k8", "естественная граница")
+    await world.db.execute(
+        "UPDATE executor_orders SET waiting_since = datetime('now', '-6 hours'), "
+        "expires_at = datetime('now', '-1 seconds') WHERE id = ?",
+        (order_id,),
+    )
+    await world.db.execute(
+        "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 seconds') "
+        "WHERE id = (SELECT pair_code_id FROM executor_orders WHERE id = ?)",
+        (order_id,),
+    )
+    await world.db.commit()
+    conn = await hub_db.connect(world.dsn)
+    try:
+        (got,) = await asyncio.gather(
+            _redeem(order_id, code)(conn), return_exceptions=True
+        )
+    finally:
+        await conn.close()
+    assert _refused(got) and _reason(got) == "memory_wait_limit", got
+    # Тот же отказ уже закрытого пределом заказа (код сожжён): причина не теряется.
+    assert await sweep(world) == 1
+    conn = await hub_db.connect(world.dsn)
+    try:
+        refusal = await chat_pair.memory_wait.why(
+            conn, {"id": (await row(world, order_id))["pair_code_id"]}, "spent"
+        )
+    finally:
+        await conn.close()
+    assert refusal == "memory_wait_limit"

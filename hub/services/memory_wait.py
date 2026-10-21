@@ -210,33 +210,43 @@ async def verdict(db: aiosqlite.Connection, order: dict[str, Any]) -> str:
     return VERDICT_EXPIRED if rows[0]["lapsed"] else ""
 
 
-#: Причины отказа траты кода, названные по условиям допуска (не ``spent``).
-SPEND_REASONS: Final[tuple[str, ...]] = ("memory_wait_limit", "expired")
+#: Причины отказа выкупа, названные по условиям допуска; ``spent`` - тоже названа.
+SPEND_REASONS: Final[tuple[str, ...]] = ("memory_wait_limit", "expired", "spent")
 
 
-async def spend_refusal(db: aiosqlite.Connection, code_row: dict[str, Any]) -> str:
-    """Почему не прошёл UPDATE траты кода: ``spent`` | ``memory_wait_limit`` | ``expired``.
+async def why(db: aiosqlite.Connection, code_row: dict[str, Any], default: str) -> str:
+    """Почему выкуп кода слота отказан: ``spent`` | ``memory_wait_limit`` | ``expired`` | ``default``.
 
-    Те же условия, что в ``REDEEMABLE_SQL``, и ОДНО чтение (один ``datetime('now')``):
-    предел 6 ч не называется ``spent``, когда граница пересеклась между первичным
-    SELECT выкупа и UPDATE. Порядок: потрачен, предел, срок; всё прочее - ``spent``
-    (как было: чужой выкуп успел первым).
+    Те же условия, что в ``REDEEMABLE_SQL``, и ОДНО чтение (один ``datetime('now')``),
+    от ЗАКАЗА, а не от строки кода: закрытие по пределу сжигает код, и от кода
+    причина пропала бы. Порядок: потрачен, предел (в том числе закрытие
+    ``memory_wait_timeout``), срок; всё прочее - ``default``. Зовут оба места
+    отказа ``chat_pair``: ранняя проверка срока кода (``default=expired``) и
+    нулевой rowcount траты (``default=spent``), чтобы граница 6 ч, где срок кода
+    и предел совпадают, называлась одним словом.
     """
     rows = await fetchall(
         db,
-        "SELECT c.redeemed_at IS NOT NULL AS spent, "
-        "c.expires_at <= datetime('now') AS code_lapsed, o.state AS state, "
+        "SELECT c.redeemed_at IS NOT NULL AS spent, o.state AS state, "
+        "o.close_reason AS close_reason, "
         f"(o.waiting_since IS NOT NULL AND o.waiting_since <= {_LIMIT_SQL}) AS over, "
-        "o.expires_at <= datetime('now') AS lapsed "
-        "FROM chat_pair_codes c LEFT JOIN executor_orders o ON o.pair_code_id = c.id "
-        "WHERE c.id = ?",  # nosec B608 - constant
+        "(o.expires_at <= datetime('now') OR c.expires_at <= datetime('now')) AS lapsed "
+        "FROM executor_orders o LEFT JOIN chat_pair_codes c ON c.id = o.pair_code_id "
+        "WHERE o.pair_code_id = ?",  # nosec B608 - constant
         (int(code_row["id"]),),
     )
-    if not rows or rows[0]["spent"] or rows[0]["state"] != STATE_WAITING_MEMORY:
+    if not rows:
+        return default
+    got = rows[0]
+    if got["spent"]:
         return "spent"
-    if rows[0]["over"]:
+    if got["close_reason"] == CLOSE_TIMEOUT:
         return "memory_wait_limit"
-    return "expired" if rows[0]["code_lapsed"] or rows[0]["lapsed"] else "spent"
+    if got["state"] != STATE_WAITING_MEMORY:
+        return default
+    if got["over"]:
+        return "memory_wait_limit"
+    return "expired" if got["lapsed"] else default
 
 
 async def notify_timeout(db: aiosqlite.Connection, order: dict[str, Any]) -> None:

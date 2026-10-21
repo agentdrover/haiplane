@@ -700,7 +700,7 @@ async def redeem_code_explained(
     if row["spent"]:
         return None, _row_refusal(row, "spent")
     if row["expired"]:
-        return None, _row_refusal(row, "expired")
+        return None, _row_refusal(row, await memory_wait.why(db, row, "expired"))
     if row["status"] != "active":
         return None, _row_refusal(row, "principal_inactive")
 
@@ -726,7 +726,7 @@ async def redeem_code_explained(
         db, row, kind=kind, acting_id=acting_id, acting_username=acting_username
     )
     if session is None:
-        return None, _row_refusal(row, await memory_wait.spend_refusal(db, row))
+        return None, _row_refusal(row, await memory_wait.why(db, row, "spent"))
     return session, None
 
 
