@@ -562,6 +562,17 @@ async def submit_step(state: Any) -> None:
         refuse(int(state.task_id), verdict)
 
 
+def _observation(task: dict[str, Any], observed: str | None) -> str:
+    """Какой sha проверять: явный (в том числе пустой!), иначе наблюдение вызова, иначе пин."""
+    from hub.services.lifecycle import PREPARED_CI_SHA
+
+    if observed is not None:
+        return observed
+    if PREPARED_CI_SHA in task:
+        return str(task[PREPARED_CI_SHA])
+    return str(task.get(CHECKED_KEY) or task.get("submission_sha") or "")
+
+
 async def accept_in_transaction(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -587,7 +598,6 @@ async def accept_in_transaction(
     needs_decision, возвращается ``None``. Не применимо (политика выключена,
     держатель не облачный) - статус и ``fields`` пишутся как есть.
     """
-    from hub.services.lifecycle import PREPARED_CI_SHA
     from hub.services.orchestration import review_approved_for_current_submission
 
     task_id = int(task["id"])
@@ -602,15 +612,7 @@ async def accept_in_transaction(
             fresh.get("status") in SUBMITTABLE
             and not review_approved_for_current_submission(fresh)
         ):
-            sha_in = (
-                observed
-                if observed is not None
-                else str(
-                    task[PREPARED_CI_SHA]
-                    if PREPARED_CI_SHA in task
-                    else task.get(CHECKED_KEY) or task.get("submission_sha") or ""
-                )
-            )
+            sha_in = _observation(task, observed)
             verdict = await evaluate(db, fresh, sha_in)
         if verdict.applicable and verdict.cause:
             if hold:
