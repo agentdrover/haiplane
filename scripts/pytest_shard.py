@@ -100,9 +100,14 @@ def _lexical_rel_path(path: Path, rootpath: Path) -> str | None:
     file outside the rootdir has its own nodeid rules, so there is no answer.
     """
     try:
-        return path.relative_to(rootpath).as_posix()
+        rel = path.relative_to(rootpath).as_posix()
     except ValueError:
         return None
+    # pytest rewrites a backslash to ``/`` in a nodeid and ``::`` splits it, so
+    # for such a name the nodeid spells another path: no answer, never a guess.
+    if "\\" in rel or "::" in rel:
+        return None
+    return rel
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -119,7 +124,8 @@ def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool 
 
     True only for a file that pytest would collect as a test module
     (``python_files``, pytest's own matcher) and that another part owns. Any
-    doubt - no spec, no matcher, a file outside the rootdir, not a file - is None:
+    doubt - no spec, no matcher, a file outside the
+    rootdir, a name the nodeid spells differently, not a file - is None:
     the file is collected as before and ``pytest_collection_modifyitems`` decides.
     """
     spec = config.stash.get(_STASH_KEY, None)

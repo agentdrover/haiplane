@@ -205,7 +205,7 @@ def test_a_bad_or_empty_shard_fails(
     # A part that keeps no file: no tests collected (5), serial and under xdist.
     owner = pytest_shard.shard_of("test_one.py", 3)
     empty = next(p for p in PARTS if p != owner)
-    for extra in ([], ["-n", "2"]):
+    for extra in ([], ["-n", "2"], ["--collect-only"]):
         _env(monkeypatch, f"{empty}/3", None)
         ret, out = _run(pytester, *extra)
         assert ret == 5, f"{extra}\n{out}"
@@ -305,26 +305,45 @@ def test_the_hook_assigns_files_like_the_nodeid_does(
     (pytester.path / "test_link.py").symlink_to("target_impl.py")
     everything = [*names, "test_link.py"]
 
-    executed: list[str] = []
-    for part in PARTS:
-        marks = tmp_path / f"marks-{part}"
-        marks.mkdir()
-        monkeypatch.setenv("IMPORT_MARKS", str(marks))
-        _env(monkeypatch, f"{part}/3", None)
-        for extra in ([], ["-n", "2"]):
-            ret, out = _run(pytester, *extra)
+    # Each file runs exactly once, in the part the nodeid assigns it to - serial,
+    # under xdist, from a subdirectory of the rootdir, and with an absolute path.
+    subdir = pytester.path / "sub1" / "deep"
+    for label, extra, cwd, args in (
+        ("serial", [], pytester.path, []),
+        ("xdist", ["-n", "2"], pytester.path, []),
+        ("subdir", [], subdir, ["--rootdir", str(pytester.path), str(pytester.path)]),
+    ):
+        executed: list[str] = []
+        monkeypatch.chdir(cwd)
+        for part in PARTS:
+            marks = tmp_path / f"marks-{label}-{part}"
+            marks.mkdir()
+            monkeypatch.setenv("IMPORT_MARKS", str(marks))
+            _env(monkeypatch, f"{part}/3", None)
+            ret, out = _run(pytester, *extra, *args)
             # An empty part is code 5; the others pass. Never anything else.
-            assert ret in (0, 5), f"{part} {extra}\n{out}"
-            for nodeid in _passed(out):
-                # The hook and the nodeid agree on whose file it is.
-                assert pytest_shard.shard_of(nodeid.split("::")[0], 3) == part, nodeid
-            if extra == []:
-                executed += _passed(out)
-    files = sorted(n.split("::")[0] for n in executed)
-    assert files == sorted(everything), files  # each file once, none lost
+            assert ret in (0, 5), f"{label} {part}\n{out}"
+            if label != "subdir":  # there the verbose ids are relative to the cwd
+                for nodeid in _passed(out):
+                    # The hook and the nodeid agree on whose file it is.
+                    shard = pytest_shard.shard_of(nodeid.split("::")[0], 3)
+                    assert shard == part, nodeid
+            else:  # the files that were imported are exactly the part's own
+                owned = {n for n in everything if pytest_shard.shard_of(n, 3) == part}
+                assert _marks(marks) == owned, (part, _marks(marks), owned)
+            executed += _passed(out)
+        files = sorted(n.split("::")[0] for n in executed)
+        if label == "subdir":
+            # Verbose ids are spelled relative to the starting directory here:
+            # count and uniqueness only; the marks above name the files.
+            assert len(files) == len(set(files)) == len(everything), (label, files)
+        else:
+            assert files == sorted(everything), (label, files)  # once, none lost
+    monkeypatch.chdir(pytester.path)
 
     # A pattern with a directory: pytest's own match decides what is a test file.
-    monkeypatch.setenv("IMPORT_MARKS", str(tmp_path / "marks-1"))
+    (tmp_path / "marks-pattern").mkdir()
+    monkeypatch.setenv("IMPORT_MARKS", str(tmp_path / "marks-pattern"))
     narrowed: list[str] = []
     for part in PARTS:
         _env(monkeypatch, f"{part}/3", None)
@@ -397,3 +416,13 @@ def test_the_hook_says_true_only_for_a_test_file_of_another_part(
     assert ask(root / "missing.py") is None  # not a file
     assert ask(outside) is None  # outside the rootdir: no nodeid rule to apply
     assert ask(root / other, _Config(root, None)) is None  # no spec: never skip
+    # A name the nodeid spells differently (backslash -> "/", "::" splits it):
+    # no answer, the late filter decides with the nodeid itself.
+    odd = root / "dir\\name"
+    odd.mkdir()
+    (odd / other).write_text("", encoding="utf-8")
+    assert ask(odd / other) is None
+    colon = root / "a::b"
+    colon.mkdir()
+    (colon / other).write_text("", encoding="utf-8")
+    assert ask(colon / other) is None
