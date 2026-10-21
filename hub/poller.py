@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
-from hub.services import critic_orders, gate_observations
+from hub.services import critic_orders, gate_observations, role_orders
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
@@ -2493,8 +2493,7 @@ class Sweep:
 SWEEPS: tuple[Sweep, ...] = (
     Sweep("policy_schedule", _sweep_policy_schedule),
     Sweep("running_dispatch", _sweep_running_dispatch),
-    # #1687: before review settlement, which reads CI evidence — the standing
-    # of the CI report (attempt, trust) is refreshed first.
+    # #1687: before review settlement (reads CI evidence): CI report standing first.
     Sweep("ci_trust", _sweep_ci_trust),
     # #1913: наблюдения для путей показа — рядом с доверием к CI, до ревью.
     Sweep("gate_observations", gate_observations.run_sweep),
@@ -2522,6 +2521,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),
     Sweep("owner_minutes", _sweep_owner_minutes),
+    Sweep("role_orders", role_orders.run_sweep),  # #1973: перед очисткой events
     Sweep("events_retention", _sweep_events_retention),
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),

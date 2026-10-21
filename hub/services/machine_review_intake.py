@@ -16,6 +16,7 @@ the data rather than in a comment.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import aiosqlite
 from fastapi import HTTPException
@@ -31,7 +32,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
-from hub.services import ci_integrity, watch_notices
+from hub.services import ci_integrity, report_binding, watch_notices
 from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
@@ -214,6 +215,33 @@ def _refuse_claimed_text_origin(origin: str, body: MachineReviewSubmit) -> None:
         )
 
 
+async def _dispatch_of_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+    claimed_id: int | None,
+    code_id: int | None = None,
+) -> tuple[Any, int | None]:
+    """Заказ отчёта: (строка заказа, id привязки) (#1946).
+
+    Привязка (id) есть только когда сессия назвала заказ и сверка задачи,
+    поколения и принципала его приняла: тогда профиль берётся у ЭТОГО заказа, а
+    не у последнего заказа поколения. Иначе прежнее правило - последний заказ
+    поколения, привязки нет. Сбой чтения заказа НЕ выдаётся за «заказа нет»:
+    он поднимается, а не отдаёт отчёт чужому заказу с чужим профилем.
+    """
+    if claimed_id is None:  # личность прочитана до привязки кода (#1946)
+        claimed_id = await report_binding.dispatch_id_of_code(db, code_id)
+    accepted = await report_binding.accepted_dispatch(
+        db, task_id, generation, principal_id, claimed_id
+    )
+    if accepted is not None:
+        return accepted, int(accepted["id"])
+    latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    return latest, None
+
+
 async def record_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -223,6 +251,8 @@ async def record_machine_review(
     username: str,
     origin: str = ORIGIN_MCP,
     expected_generation: int | None = None,
+    dispatch_id: int | None = None,
+    code_id: int | None = None,
 ) -> MachineReviewView:
     """Store one report and run everything that hangs off it (#381, #1036).
 
@@ -304,7 +334,9 @@ async def record_machine_review(
     # run's own claim about how thoroughly it ran is exactly the evidence
     # #750 showed to be worthless. No dispatch behind the report leaves the
     # profile empty, which reads as "unknown", not as "cheap".
-    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    dispatch, bound_id = await _dispatch_of_report(
+        db, task_id, generation, principal_id, dispatch_id, code_id
+    )
     if dispatch is None and principal_id is not None:
         # #1408: заказ записан отказом, а его ревьюер отчитался — заказ был.
         dispatch = await repo.reopen_refused_order_for_report(
@@ -397,6 +429,10 @@ async def record_machine_review(
         principal_id=principal_id,
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
+    await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
+    # #1946: восстановление отказанного заказа (#1408) - в ОДНОЙ точке, для
+    # заказа, к которому отчёт привязан окончательно (ранней или поздней привязкой).
+    await report_binding.reopen_order_of_report(db, new_review_id)
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу
     # dispatch_for_report; свипы такую строку уже не видят.

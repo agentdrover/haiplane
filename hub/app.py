@@ -203,6 +203,7 @@ from hub.executor_host_api import (
     refuse_registered_slot,
     router as executor_host_router,
 )
+from hub.role_host_api import router as role_host_router
 from hub.web import router as web_router
 
 logging.basicConfig(
@@ -550,6 +551,7 @@ app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
+app.include_router(role_host_router)
 app.include_router(critic_host_router)
 app.include_router(executor_slot_web_router)
 
@@ -2691,6 +2693,18 @@ async def api_submit_machine_review(
         username=identity.username,
         expected_generation=(
             identity.chat_pair_generation
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
+        # #1946: заказ, под который выдан код этой сессии; принимается интейком
+        # только после сверки задачи, поколения и принципала заказа.
+        dispatch_id=(
+            identity.chat_pair_dispatch_id
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
+        code_id=(
+            identity.chat_pair_code_id
             if identity.chat_pair_kind == "reviewer"
             else None
         ),
