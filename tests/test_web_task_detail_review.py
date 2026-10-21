@@ -13,6 +13,7 @@ page the evidence panel was judged on.
 
 from __future__ import annotations
 
+import html
 import re
 
 from httpx import AsyncClient
@@ -406,3 +407,71 @@ async def test_auto_refresh_skips_unsaved_input(client: AsyncClient, db):
     await db.commit()
     board = (await client.get(f"/tasks/{task_id}")).text
     assert "every 15s" not in board, "the review board has no auto-refresh button"
+
+
+# ---- #1812 AC-1: компоновка C2 по состояниям
+
+C2_ORDER = ["header", "recommend", "about", "happened", "risks", "checks", "details"]
+
+
+async def _c2_tasks(client: AsyncClient, db) -> dict[str, int]:
+    from tests.test_decision_brief import _task_in
+
+    return {
+        "review": await _web_task_in_review(client),
+        "draft": await _task_in(db, "draft", dor_passed=1, readiness_score=90),
+        "running_back": await _task_in(
+            db, "running", review_verdict="changes_requested"
+        ),
+        "completed": await _task_in(db, "completed"),
+    }
+
+
+def _forms(page: str) -> list[tuple[int, str]]:
+    return [
+        (m.start(), page[m.start() : page.index("</form>", m.start())])
+        for m in re.finditer(r"<form\b[^>]*method=\"post\"", page, re.I)
+    ]
+
+
+async def test_decision_card_layout_per_state(client: AsyncClient, db):
+    for state, task_id in (await _c2_tasks(client, db)).items():
+        from hub import repository as repo_module
+        from hub.services import decision_brief
+
+        # Справка считается до запроса: страница сама пересчитывает DoR черновика.
+        from hub.services.delivery_state import delivery_state
+
+        ctx = (
+            {"delivery": await delivery_state(db, task_id, fetch=False)}
+            if state == "completed"
+            else None
+        )
+        brief = await decision_brief.build(
+            db, dict(await repo_module.get_task(db, task_id)), ctx
+        )
+        page = (await client.get(f"/tasks/{task_id}")).text
+        sections = re.findall(r'data-c2-section="(\w+)"', page)
+        assert sections, f"{state}: нет блоков C2"
+        assert sections == [s for s in C2_ORDER if s in sections], (state, sections)
+        for must in ("header", "recommend", "about", "happened", "checks", "details"):
+            assert must in sections, (state, must)
+        # Проверки и подробности свёрнуты: details без open.
+        for ident in ("c2-checks", "card-details"):
+            tag = re.search(rf"<details\b[^>]*id=\"{ident}\"[^>]*>", page)
+            assert tag, (state, ident)
+            assert " open" not in tag.group(0), (state, ident)
+        # Справка стоит над раскладкой, формы действий - внутри «Подробностей».
+        details_at = page.index('id="card-details"')
+        layout_at = page.index("task-detail-layout")
+        assert page.index('data-c2-section="recommend"') < details_at < layout_at
+        forms = _forms(page)
+        assert forms, f"{state}: формы действий пропали"
+        for at, form in forms:
+            assert at > details_at, (state, "форма вне «Подробностей»")
+            assert 'name="csrf_token"' in form, (state, form[:120])
+        # Каждый факт справки печатается один раз.
+        assert page.count('id="decision-brief"') == 1
+        facts = [brief["happened"], brief["need"], *brief["recommend"]["why"]]
+        for fact in facts:
+            assert page.count(html.escape(fact)) == 1, (state, fact)
