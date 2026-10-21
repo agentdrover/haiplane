@@ -33,4 +33,20 @@ MIGRATIONS = [
             UNIQUE (task_id, submission_generation)
         )""",
     ),
+    (
+        "create_delivery_reruns_delivered_trigger",
+        """CREATE TRIGGER IF NOT EXISTS trg_delivery_reruns_delivered
+        AFTER INSERT ON pipeline_merges
+        WHEN NEW.task_id IS NOT NULL
+        BEGIN
+            UPDATE delivery_reruns
+               SET state = 'closed', outcome = 'rerun_green',
+                   closed_at = datetime('now'),
+                   history = json_insert(history, '$[#]', json_object(
+                       'at', datetime('now'), 'actor', 'hub',
+                       'event', 'rerun_green',
+                       'text', 'доставлено: PR влит гейтом'))
+             WHERE task_id = NEW.task_id AND state = 'requested';
+        END""",
+    ),
 ]

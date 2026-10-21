@@ -30,6 +30,7 @@ from tests.delivery_rerun_support import (
 )
 
 FAILED = CIProbeResult(CIProbeOutcome.failed, "checks_failed", details=f"run {RUN}")
+PASSED = CIProbeResult(CIProbeOutcome.passed, "checks_passed")
 
 
 async def _pass(conn, task_id: int):
@@ -195,3 +196,39 @@ async def test_classification_and_limit_survive_event_retention(db, monkeypatch)
 async def test_the_origin_is_recorded_only_when_the_policy_is_on(db, monkeypatch):
     rig = await rig_after_base_update(db, monkeypatch, policy="off")
     assert await rig.rows() == []
+
+
+async def test_a_terminal_close_by_another_pass_is_not_overruled_by_a_green_one(
+    db, db_dsn, monkeypatch
+):
+    from hub.services import ci_trust
+
+    rig = await rig_after_base_update(db, monkeypatch)
+    rig.red_first_attempt()
+    await rig.sweep()
+    rig.start_attempt("2", status="completed", conclusion="success")
+    await rig.report_attempt("2")
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+
+    other = await connect(db_dsn)
+    try:
+        real = ci_trust.refresh_quietly
+
+        async def refresh_while_another_pass_times_out(*args, **kwargs):
+            # Соседний проход закрыл бронь терминально, пока этот проверял отчёт.
+            await other.execute(
+                "UPDATE delivery_reruns SET state='closed', outcome='timeout'"
+            )
+            await other.commit()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(
+            ci_trust, "refresh_quietly", refresh_while_another_pass_times_out
+        )
+        ok, why = await _pass(db, rig.task_id)
+    finally:
+        await other.close()
+
+    assert not ok and why.startswith("fresh_base_ci_failed"), why
+    rig.git.merge_pr.assert_not_awaited()
+    assert (await rig.row())["outcome"] == "timeout"

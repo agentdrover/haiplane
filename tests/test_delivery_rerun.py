@@ -298,7 +298,7 @@ async def test_a_satellite_needs_an_explicit_contract(db, monkeypatch):
         await set_policy_of(db, pid, contract)
         rig.fake.attempt(
             tid,
-            "head-sat",
+            "sha-satellite",
             run_id=str(700 + expected_posts),
             # Без явного контракта действует контракт хаба (ci.yml): красный
             # именно он, так что POST останавливает только правило о контракте.
@@ -307,7 +307,7 @@ async def test_a_satellite_needs_an_explicit_contract(db, monkeypatch):
             conclusion="failure",
             event="pull_request",
         )
-        rig.git.pr_head_sha = AsyncMock(return_value="head-sat")
+        rig.git.pr_head_sha = AsyncMock(return_value="sha-satellite")
         before = rig.posts
         task = dict(await repo.get_task(db, tid))
         await delivery_rerun.gate_step(db, task, {"gh_repo": None}, ci)

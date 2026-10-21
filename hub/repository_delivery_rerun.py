@@ -187,3 +187,40 @@ async def close(
         ),
     )
     return cur.rowcount == 1
+
+
+async def supersede_stale(
+    db: aiosqlite.Connection, task_id: int
+) -> list[dict[str, Any]]:
+    """Закрыть superseded открытые брони, устаревшие относительно ЖИВОЙ задачи.
+
+    Условие внутри самого UPDATE: поколение и PR берутся из строки ``tasks`` в
+    момент записи, поэтому запоздавший вызывающий со старым снимком не снимет
+    бронь нового поколения, открытую соседним соединением.
+    """
+    stale = await fetchall(
+        db,
+        "SELECT * FROM delivery_reruns WHERE task_id=? AND state IN ('reserved', "
+        "'requested') AND (submission_generation != (SELECT submission_generation "
+        "FROM tasks WHERE id=?) OR pr_number != (SELECT COALESCE(pr_number, 0) "
+        "FROM tasks WHERE id=?))",
+        (int(task_id), int(task_id), int(task_id)),
+    )
+    closed: list[dict[str, Any]] = []
+    for row in stale:
+        if await close(db, int(row["id"]), "superseded", "поколение или PR сменились"):
+            closed.append(dict(row))
+    return closed
+
+
+async def confirm_requested(db: aiosqlite.Connection, row_id: int) -> bool:
+    """Бронь ЕЩЁ ``requested`` в момент записи: один UPDATE-проверка без изменений.
+
+    Проход, проверивший зелёную попытку, подтверждает этим, что соседний проход
+    не закрыл бронь терминальным исходом, пока он ходил к форжу.
+    """
+    cur = await db.execute(
+        "UPDATE delivery_reruns SET state='requested' WHERE id=? AND state='requested'",
+        (int(row_id),),
+    )
+    return cur.rowcount == 1

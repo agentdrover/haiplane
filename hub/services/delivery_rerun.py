@@ -116,13 +116,29 @@ def base_text(task: dict[str, Any], ci: CIProbeResult) -> str:
 # ---- происхождение и классификация ------------------------------------------
 
 
-async def policy_on(db: aiosqlite.Connection, task_id: int) -> bool:
-    """Включён ли перезапуск у проекта задачи СЕЙЧАС (читается заново)."""
-    policy = await project_policy.gate_policy_for_task(db, task_id)
+async def policy_mode(db: aiosqlite.Connection, task_id: int) -> bool | None:
+    """Включён ли перезапуск у проекта задачи СЕЙЧАС: True/False, None - не прочиталось.
+
+    ``gate_policy_for_task`` на сбое чтения отвечает ``{}``, то есть «выключено»:
+    для открытой брони это снимало бы защиту, приняв сбой за ``on -> off``.
+    """
+    try:
+        project = await repo.resolve_project_for_task(db, task_id)
+    except Exception:  # noqa: BLE001 - «не прочиталось» не равно «выключено»
+        log.exception("policy of task #%s unreadable", task_id)
+        return None
+    if project is None:
+        return False
+    policy = project_policy.gate_policy_of(project)
     return (
         project_policy.delivery_fresh_base_rerun_of(policy)
         == project_policy.DELIVERY_FRESH_BASE_RERUN_ON
     )
+
+
+async def policy_on(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Только подтверждённое ``on``: нечитаемая политика перезапуск не разрешает."""
+    return await policy_mode(db, task_id) is True
 
 
 async def record_base_update(
@@ -176,11 +192,12 @@ async def gate_step(
     """
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
-    enabled = await policy_on(db, task_id)
-    await _supersede_foreign(db, task, generation)
+    mode = await policy_mode(db, task_id)
+    enabled = mode is True
+    await _supersede_foreign(db, task)
     row = await journal.get(db, task_id, generation)
     if row is not None and row["state"] in journal.OPEN_STATES:
-        return await _open_step(db, task, ctx, row, enabled)
+        return await _open_step(db, task, ctx, row, mode)
     if row is not None and row["state"] == journal.CLOSED:
         return await _closed_step(db, task, ctx, ci, row)
     if not enabled or ci.outcome != CIProbeOutcome.failed:
@@ -190,14 +207,18 @@ async def gate_step(
     return await _first_failure(db, task, ctx, ci)
 
 
-async def _supersede_foreign(
-    db: aiosqlite.Connection, task: dict[str, Any], generation: int
-) -> None:
-    """Открытые брони чужого поколения или PR закрыть: мержа по ним нет."""
-    pr = int(task.get("pr_number") or 0)
-    for row in await journal.open_rows(db, int(task["id"])):
-        if row["submission_generation"] != generation or row["pr_number"] != pr:
-            await _close(db, task, row, "superseded", "поколение или PR сменились")
+async def _supersede_foreign(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
+    """Открытые брони чужого поколения или PR закрыть: мержа по ним нет.
+
+    «Чужое» решает ЖИВАЯ задача в самом UPDATE, а не снимок вызывающего: запоздавший
+    проход поколения N не должен снять бронь N+1, открытую соседним соединением.
+    """
+    async with write_transaction(db):
+        for row in await journal.supersede_stale(db, int(task["id"])):
+            await repo.add_task_update(
+                db, int(task["id"]), "hub", "status",
+                f"Перезапуск CI закрыт (superseded): поколение или PR сменились, run {row['run_id']}.",
+            )  # fmt: skip
 
 
 async def _closed_step(
@@ -307,6 +328,14 @@ async def _first_failure(
     head = await _pr_head(scope, task)
     if not head:
         return human_text(task, ctx, ci, None, "не выполнен: голова PR не прочитана")
+    if head != _pass_head(task):
+        # Этот проход проверял одобрение и CI на другой голове: платный запрос
+        # для головы, которую он не видел, не делаем.
+        return human_text(
+            task, ctx, ci, None,
+            f"не выполнен: голова PR {head[:12]} не та, что проверял проход "
+            f"({_pass_head(task)[:12]})",
+        )  # fmt: skip
     cur, why = await _canonical_attempt(scope, task, head)
     if cur is None:
         return human_text(task, ctx, ci, None, f"не выполнен: {why}")
@@ -366,7 +395,6 @@ async def _reserve(
     note: str,
 ) -> tuple[int | None, str]:
     """Занять POST поколения: ``(id, "")`` либо ``(None, почему нет)``. Коммит здесь."""
-    from hub.services import orchestration
 
     task_id = int(task["id"])
     pr = int(task["pr_number"])
@@ -380,7 +408,7 @@ async def _reserve(
             or int(live["submission_generation"] or 0) != generation
             or int(live["pr_number"] or 0) != pr
             or (live["submission_sha"] or "").strip() != _pass_head(task)
-            or not await orchestration.approval_stands(db, task)
+            or not await approved_now(db, task)
             or await repo.pipeline_merge_recorded(db, task_id, pr)
             or not await policy_on(db, task_id)
         ):
@@ -405,6 +433,22 @@ def _pass_head(task: dict[str, Any]) -> str:
     return (task.get("_checked_sha") or task.get("submission_sha") or "").strip()
 
 
+async def approved_now(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Действует ли ИМЕННО APPROVED на этой сдаче (опция auto_review=False не в счёт).
+
+    ``approval_stands`` пропускает и задачу без ревью вовсе; для платного POST
+    нужен настоящий вердикт, на котором держится доставка.
+    """
+    from hub.services import orchestration
+
+    live = await repo.get_task(db, int(task["id"]))
+    return (
+        live is not None
+        and orchestration.review_approved_for_current_submission(dict(live))
+        and await orchestration.approval_stands(db, task)
+    )
+
+
 async def _base_from(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     from hub.services.orchestration import gate_branch_update_from
 
@@ -425,11 +469,16 @@ async def _after_post(
     """Записать исход POST условно: закрытую бронь поздний ответ не трогает."""
     if result.outcome is CIRunRequestOutcome.requested:
         async with write_transaction(db):
-            if await journal.mark_requested(db, row_id, "GitHub принял перезапуск"):
+            marked = await journal.mark_requested(
+                db, row_id, "GitHub принял перезапуск"
+            )
+            if marked:
                 await repo.add_task_update(
                     db, int(task["id"]), "hub", "status",
                     f"Перезапуск принят: run {run_id}, новая попытка {attempt + 1}.",
                 )  # fmt: skip
+        if not marked:  # бронь закрыл другой проход: отвечаем по его исходу
+            return await _settled_answer(db, task, ctx)
         return _wait_text(
             task, "перезапуск принят, ждём новую попытку", run_id, attempt
         )
@@ -444,7 +493,7 @@ async def _after_post(
         from_states=(journal.RESERVED,),
     )  # fmt: skip
     if row is None:
-        return _wait_text(task, "бронь закрыта другим проходом")
+        return await _settled_answer(db, task, ctx)
     return human_text(task, ctx, ci, row, _history_of(row))
 
 
@@ -456,17 +505,19 @@ async def _open_step(
     task: dict[str, Any],
     ctx: dict[str, Any],
     row: dict[str, Any],
-    enabled: bool,
+    mode: bool | None,
 ) -> str:
     """Бронь открыта: проверить её на каждом проходе, мерж только по её результату."""
-    from hub.services import orchestration
-
-    if not enabled or not await orchestration.approval_stands(db, task):
-        await _close(
-            db, task, row, "superseded", "политика выключена или одобрения нет"
-        )
-        return ""
     scope, why = await _scope(db, task, ctx)
+    if mode is None:
+        # Нечитаемая политика - не «выключили»: защиту не снимаем, зовём человека.
+        return await _to_human(
+            db, task, ctx, scope, row, "read_failed", "политика проекта не прочиталась"
+        )
+    if not mode or not await approved_now(db, task):
+        return await _supersede(
+            db, task, ctx, row, "политика выключена или одобрения нет"
+        )
     if scope is None:
         return await _to_human(db, task, ctx, None, row, "read_failed", why)
     head = await _pr_head(scope, task)
@@ -475,8 +526,7 @@ async def _open_step(
             db, task, ctx, scope, row, "read_failed", "голова PR не прочитана"
         )
     if head != row["head_sha"]:
-        await _close(db, task, row, "superseded", "голова PR сменилась")
-        return ""
+        return await _supersede(db, task, ctx, row, "голова PR сменилась")
     cur, why = await _canonical_attempt(scope, task, head)
     if cur is None and why.startswith("список прогонов не прочитан"):
         return await _to_human(db, task, ctx, scope, row, "read_failed", why)
@@ -497,7 +547,11 @@ async def _reserved_step(db, task, ctx, scope, row, cur) -> str:
         and int(cur["run_attempt"] or 0) > int(row["attempt_before"])
     ):
         async with write_transaction(db):  # POST дошёл: ответ потерян, а попытка есть
-            await journal.mark_requested(db, row["id"], "новая попытка видна на форже")
+            moved = await journal.mark_requested(
+                db, row["id"], "новая попытка видна на форже"
+            )
+        if not moved:
+            return await _settled_answer(db, task, ctx)
         return _wait_text(
             task, "новая попытка видна на форже", row["run_id"], row["attempt_before"]
         )
@@ -553,14 +607,13 @@ async def _verify_green(db, task, ctx, scope, row, head, late) -> str:
                 else ci_trust.green_gap(dict(report), scope.contract)
             )
             if problem is None and row["workflow"] == scope.workflow:
-                await _close(
-                    db,
-                    task,
-                    row,
-                    "rerun_green",
-                    f"попытка {expected_key} зелёная, отчёт verified",
-                )
-                return ""
+                # Бронь НЕ закрывается: разрешение на мерж живёт ровно столько,
+                # сколько держится проверка, и повторяется на каждом проходе
+                # (следующая ручная попытка и смена контракта его отзывают).
+                # Закроет её запись доставки (триггер на pipeline_merges).
+                async with write_transaction(db):
+                    still = await journal.confirm_requested(db, row["id"])
+                return "" if still else await _settled_answer(db, task, ctx)
             gap = problem or "контракт CI изменился с момента брони"
     elif standing is not None:
         gap = f"отчёт не подтверждён: {standing.reason}"
@@ -612,6 +665,36 @@ async def _close(
     return closed
 
 
+async def _supersede(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    row: dict[str, Any],
+    text: str,
+) -> str:
+    """Бронь устарела: закрыть superseded; "" - обычные правила, мержа по ней нет."""
+    if await _close(db, task, row, "superseded", text):
+        return ""
+    return await _settled_answer(db, task, ctx)
+
+
+async def _settled_answer(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> str:
+    """Бронь закрыл другой проход раньше нас: ответить по ЕГО исходу, не по своему.
+
+    Гонка двух проходов не должна превратить чужой терминальный исход (таймаут,
+    красная попытка) в мерж: закрытая бронь отвечает одинаково всем.
+    """
+    row = await journal.get(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    if row is None or row["state"] != journal.CLOSED:
+        return _wait_text(task, "бронь меняет другой проход")
+    seen = CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    return await _closed_step(db, task, ctx, seen, row)
+
+
 async def _close_by_id(
     db, task, row_id: int, outcome: str, text: str, names, **kw: Any
 ) -> dict[str, Any] | None:
@@ -628,14 +711,18 @@ async def _to_human(
     db, task, ctx, scope: Scope | None, row: dict[str, Any], outcome: str, why: str
 ) -> str:
     """Закрыть бронь исходом к человеку и вернуть причину с готовой инструкцией."""
-    attempt = int(row["attempt_before"]) + (1 if outcome == "rerun_red" else 0)
+    # Имена - из попытки, которая УЖЕ шла: после принятого POST это before+1,
+    # пока ответа POST нет (reserved) - исходная.
+    accepted = row["state"] == journal.REQUESTED
+    attempt = int(row["attempt_before"]) + (1 if accepted else 0)
     names = await _names(scope, row["run_id"], attempt) if scope else None
     ci = CIProbeResult(
         CIProbeOutcome.failed, "checks_failed", details=f"run {row['run_id']}"
     )
     closed = await _close_by_id(db, task, row["id"], outcome, why, names)
-    fresh = closed or {**row, "outcome": outcome, "failed_jobs": json.dumps(names)}
-    return human_text(task, ctx, ci, fresh, _history_of(fresh))
+    if closed is None:
+        return await _settled_answer(db, task, ctx)
+    return human_text(task, ctx, ci, closed, _history_of(closed))
 
 
 async def _names(scope: Scope | None, run_id: str, attempt: int) -> list[str] | None:
@@ -653,7 +740,9 @@ async def _names(scope: Scope | None, run_id: str, attempt: int) -> list[str] | 
     except Exception:  # noqa: BLE001 - основная причина остаётся, список не прочитан
         log.exception("jobs of run %s attempt %s unreadable", run_id, attempt)
         return None
-    if jobs is None:
+    if not jobs:
+        # GitHub перечисляет ВСЕ job существующей попытки, в том числе зелёные:
+        # пустой список - попытки нет, а не «упавших нет».
         return None
     named = []
     for job in jobs:
@@ -670,6 +759,15 @@ def _history_of(row: dict[str, Any]) -> str:
     except ValueError:
         entries = []
     return "; ".join(str(e.get("text") or "") for e in entries if isinstance(e, dict))
+
+
+def _named(row: dict[str, Any] | None) -> bool:
+    """Есть ли в строке настоящие имена упавших job (а не «не прочитан» и «нет»)."""
+    try:
+        names = json.loads((row or {}).get("failed_jobs") or "[]")
+    except ValueError:
+        return False
+    return bool(names)
 
 
 def _names_of(row: dict[str, Any] | None) -> str:
@@ -694,11 +792,7 @@ def human_text(
     """К человеку: прежняя причина плюс история и готовый текст ``decide rework``."""
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     names = _names_of(row)
-    todo = (
-        names
-        if row is not None and not names.startswith("список")
-        else "см. упавшие job в CI"
-    )
+    todo = names if _named(row) else "причину красного CI (см. прогон)"
     return (
         f"{base_text(task, ci)}. Перезапуск: {history or 'не выполнялся'}. "
         f"Упавшие job: {names}. Готовый текст возврата (решение и /decide за "
