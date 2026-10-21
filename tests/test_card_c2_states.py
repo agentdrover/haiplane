@@ -32,9 +32,8 @@ def test_no_brief_notice_names_the_state(status, tone, label):
     assert got["tone"] == tone
     assert got["tone_label"] == label
     assert got["from_you"], "нет строки «От вас»"
-    assert got["action_target"].startswith("task-") or got["action_target"].startswith(
-        "web-"
-    )
+    # Кнопка только к форме, которая есть: у остальных состояний её нет.
+    assert got["action_target"] == ("web-answer-form" if status == "needs_info" else "")
     assert got["shape"]
 
 
@@ -70,8 +69,12 @@ async def test_page_states_without_a_brief(client, db, status, tone, label):
     assert "От вас:" in happened
     assert "Справка не собрана" not in root[: root.index('id="c2-checks"')]
     # «К действию» ведёт на форму, которая есть на странице.
-    target = re.search(r'class="c2-btn" href="#([\w-]+)"', root).group(1)
-    assert f'id="{target}"' in page, target
+    found = re.search(r'class="c2-btn" href="#([\w-]+)"', root)
+    if status != "needs_info":
+        assert found is None, "кнопка ведёт к несуществующему действию"
+    else:
+        assert f'id="{found.group(1)}"' in page, found.group(1)
+    target = found.group(1) if found else ""
     # Статус не потерян: слово статуса стоит в шапке C2, не только в бейдже героя.
     header = root[: root.index("</section>")]
     assert f">{status}<" in header

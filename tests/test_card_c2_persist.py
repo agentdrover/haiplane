@@ -30,6 +30,11 @@ async def test_script_keeps_state_by_id_and_restores_after_swap(client, db):
     # Хранилище недоступно (приватный режим): страница не падает.
     assert re.search(r"try\s*\{[^}]*sessionStorage", script)
     assert "htmx:afterSwap" in script
+    # Состояние снимается до замены: toggle асинхронен и мог не успеть.
+    assert "htmx:beforeSwap" in script
+    # Фрагмент адреса не перебивает ручное закрытие при замене.
+    assert "data-c2-forced" not in script
+    assert re.search(r"restore\(false\)", script)
     assert "toggle" in script
     # Ширина - только начальное значение: без записанного состояния.
     assert "=== undefined" in script or "== null" in script

@@ -68,31 +68,31 @@ _NO_BRIEF: dict[str, tuple[str, str, str, str]] = {
         GRAY,
         "Не начато",
         "От вас ничего не нужно: задача ждёт исполнителя.",
-        "task-controls",
+        "",
     ),
     "ci_check": (
         BLUE,
         "Идёт проверка CI",
         "От вас ничего не нужно: ждём конвейер CI.",
-        "task-controls",
+        "",
     ),
     "pending_report": (
         AMBER,
         "Ждёт отчёта и решения",
         "Нужен отчёт или ваше решение.",
-        "task-controls",
+        "",
     ),
     "failed": (
         RED,
         "Задача не выполнена",
-        "Решите, что делать дальше: перезапуск или архив.",
-        "task-controls",
+        "Решите, что делать дальше: действия - в «Подробностях».",
+        "",
     ),
     "rejected": (
         RED,
         "Отклонено",
         "От вас ничего не нужно: задача отклонена.",
-        "task-controls",
+        "",
     ),
 }
 
@@ -112,7 +112,7 @@ def no_brief_notice(task: dict[str, Any], question: str = "") -> dict[str, str]:
             "tone": GRAY,
             "label": BRIEF_MISSING,
             "need": "Справка не собралась: решайте по подробностям ниже.",
-            "target": "task-controls",
+            "target": "",
             "next_action": "",
         }
     tone, label, need, target = known

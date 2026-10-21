@@ -36,7 +36,9 @@
         {% else %}
         <p class="c2-rec-action">{{ c.tone_label }}</p>
         <p class="c2-alt">Справки для решения нет: ниже названо состояние и что от вас нужно.</p>
-        <p class="c2-act"><a class="c2-btn" href="#{{ c.action_target }}">К действию</a></p>
+        {# Кнопка только к форме, которая есть: без неё состояние названо словами. #}
+        {% set no_brief_href = '#' ~ c.action_target if c.action_target else ('#review-verdict-form' if review_board else '') %}
+        {% if no_brief_href %}<p class="c2-act"><a class="c2-btn" href="{{ no_brief_href }}">К действию</a></p>{% endif %}
         {% endif %}
     </section>
 

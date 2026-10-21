@@ -106,7 +106,7 @@
     {# #1812: ответ на действие (ошибка, одноразовый код, отказ, плашка запуска)
        не должен прятаться в свёрнутом блоке: с обратной связью он раскрыт. #}
     {% set has_feedback = implementer_error or implementer_code or approve_error or approve_message or review_error or archive_refusal or launch_plaque %}
-    <details class="c2-details" id="card-details" data-c2-section="details"{% if has_feedback %} open data-c2-forced{% endif %}>
+    <details class="c2-details" id="card-details" data-c2-section="details"{% if has_feedback %} open{% endif %}>
     <summary>Подробности</summary>
     <div class="task-detail-layout">
         <main class="task-detail-main">
