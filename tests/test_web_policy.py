@@ -874,6 +874,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
             "allow_work_types": ["bug", "chore"],
             "note": "до MS-A2",
         },
+        "critic_host": "k8",
         "steward_watch": ["needs_decision", "release"],
         "steward_approve_max_class": "r1",
         "auto_approve_max_class": "r1",

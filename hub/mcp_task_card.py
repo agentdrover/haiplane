@@ -48,6 +48,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "owner_minutes",
     "last_executor_order",
     "delivery_rerun",
+    "critic_order",
     "created_at",
     "updated_at",
 )
@@ -98,6 +99,20 @@ def delivery_rerun_lines(task: dict[str, Any]) -> list[str]:
         f"Delivery rerun: {view['state']}{outcome}, run {view.get('run_id')}, "
         f"attempt {view.get('attempt_before')}+1 (since {view.get('requested_at')})"
         f"{named}"
+    ]
+
+
+def critic_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1953: the last critic order as the hub built it; nothing when there is none."""
+    view = task.get("critic_order")
+    if not isinstance(view, dict):
+        return []
+    if view.get("unavailable"):
+        return [f"Critic order: unavailable ({view['unavailable']})"]
+    return [
+        f"Critic order #{view.get('order_id')}: sha {str(view.get('sha'))[:12]} "
+        f"{view.get('state')}/{view.get('outcome') or '-'} until "
+        f"{view.get('expires_at')}. Next: {view.get('next_step')}"
     ]
 
 

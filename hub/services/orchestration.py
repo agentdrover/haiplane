@@ -59,7 +59,8 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
+from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
+from hub.services import workflow_seed
 from hub.services import delivery_rerun
 from hub.services.ci_timing import ci_minutes_metrics
 from hub.services.cycle_split import cycle_split, empty_split
@@ -5832,6 +5833,9 @@ async def _write_completed(
             return False
         if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
             return None
+        row = await repo.get_task(db, task_id)
+        if row is not None and dict(row)["status"] == "needs_decision":
+            return None  # другой вход удержал задачу: завершение поверх удержания запрещено
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 
@@ -6314,6 +6318,10 @@ async def transition_after_agent_done(
     if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
 
+    # #1953: приём облачной сдачи - в момент принятия, до bump (он внутри приёма)
+    if has_done and not await critic_orders.accept_done(db, task):
+        return "needs_decision"
+
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
         # that PR is merged — "completed" must mean delivered, the invariant
@@ -6377,7 +6385,6 @@ async def transition_after_agent_done(
     if has_done:
         # Unreviewed done report = a work submission (#305): bumping the
         # generation invalidates any APPROVED verdict from earlier work.
-        await repo.bump_submission_generation(db, task_id)
         # #1122: гейты сдачи для headless-пути — ЗДЕСЬ, до развилки маршрутов.
         # Headless уходит в ревью двумя путями: конвейером auto-review
         # (dispatch_review, с review_job_id) и Universal Review Gate ниже. Оба

@@ -192,6 +192,9 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.delivery_fresh_base_rerun_of,
         "project_policy.delivery_fresh_base_rerun_of",
     ),
+    "critic_host": PolicyEntry(
+        project_policy.critic_host_of, "project_policy.critic_host_of"
+    ),
     "merge_is_delivery": PolicyEntry(
         project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
     ),

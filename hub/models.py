@@ -420,6 +420,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
     "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
+    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
+    "critic_host",
     # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
     # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
     "merge_is_delivery",
@@ -3306,6 +3308,7 @@ class TaskView(PlainSummaryView):
     owner_minutes: OwnerMinutesView | None = None
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
     delivery_rerun: dict[str, Any] | None = None  # #1956: история перезапуска CI
+    critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the
@@ -3539,6 +3542,9 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
     _policy.validate_delivery_fresh_base_rerun(v)
+    from hub.services.project_policy import validate_critic_host
+
+    validate_critic_host(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
