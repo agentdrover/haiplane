@@ -862,6 +862,8 @@ class TokenIdentity:
         "chat_pair_kind",
         "chat_pair_task_id",
         "chat_pair_generation",
+        "chat_pair_dispatch_id",
+        "chat_pair_code_id",
         "scopes",
         "scopes_damaged",
         "transport",
@@ -878,6 +880,8 @@ class TokenIdentity:
         chat_pair_kind: str | None = None,
         chat_pair_task_id: int | None = None,
         chat_pair_generation: int | None = None,
+        chat_pair_dispatch_id: int | None = None,
+        chat_pair_code_id: int | None = None,
         scopes: tuple[str, ...] | None = None,
         scopes_damaged: bool = False,
         transport: str = "",
@@ -891,6 +895,9 @@ class TokenIdentity:
         self.chat_pair_kind = chat_pair_kind
         self.chat_pair_task_id = chat_pair_task_id
         self.chat_pair_generation = chat_pair_generation
+        # #1946: заказ ревью, под который выдан код этой сессии (None - не знаем).
+        self.chat_pair_dispatch_id = chat_pair_dispatch_id
+        self.chat_pair_code_id = chat_pair_code_id  # #1946: код выкупа сессии
         # #1644: project slugs an API key is bound to. ``None`` = the key
         # carries no scope (legacy, unrestricted); a damaged ``api_keys.scopes``
         # sets ``scopes_damaged`` so the CI entrances can refuse (fail closed).

@@ -611,6 +611,8 @@ def _with_auth_source(
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
         chat_pair_generation=identity.chat_pair_generation,
+        chat_pair_dispatch_id=identity.chat_pair_dispatch_id,
+        chat_pair_code_id=identity.chat_pair_code_id,
         scopes=identity.scopes,
         scopes_damaged=identity.scopes_damaged,
     )
@@ -733,6 +735,8 @@ def _stamped(identity: TokenIdentity, transport: str) -> TokenIdentity:
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
         chat_pair_generation=identity.chat_pair_generation,
+        chat_pair_dispatch_id=identity.chat_pair_dispatch_id,
+        chat_pair_code_id=identity.chat_pair_code_id,
         scopes=identity.scopes,
         scopes_damaged=identity.scopes_damaged,
         transport=transport,
