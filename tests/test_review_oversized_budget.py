@@ -167,3 +167,63 @@ def test_cutouts_joined_for_the_prompt_do_not_exceed_the_ceiling():
     cuts = [x for x in out if x.startswith("=== ВЫРЕЗКА")]
     assert len(cuts) == 2
     assert len("\n".join(cuts)) + 1 <= total
+
+
+# --- круг 5: на шаге A представление AC-файла - ДЕШЁВОЕ из двух, выбранное до шага B ---
+
+
+def _big_ac(n: int = 900):
+    rows = ["def test_ac():", *["    pass #" + "x" * 153] * n]
+    return _new(F, rows), "\n".join(rows) + "\n"
+
+
+def _first_with_ceiling(ceiling: int, diffs):
+    diff, src = _big_ac()
+    spans = ac_test_spans({F: src}, [f"{F}::test_ac"])
+    results = []
+    for parts in diffs(diff):
+        out, omitted = _inline_diff_lines("".join(parts), [], None, ceiling, spans)
+        text = "\n".join(out)
+        results.append(
+            (omitted, "ВЫРЕЗКА" in text, "ac_test_unread" in text, "x = 1" in text)
+        )
+    return results
+
+
+def test_the_cheaper_representation_of_an_ac_file_is_chosen_before_plain_files():
+    """Вердикт gen 4: полный дифф дешевле вырезки; обычный файл не вытесняет AC (оба потолка, оба порядка)."""
+    diff, src = _big_ac()
+    spans = ac_test_spans({F: src}, [f"{F}::test_ac"])
+    other = _new("hub/other.py", ["x = 1" + " " * 1500])
+    full, cut = len(diff), len(cutout(spans[0]))
+    assert full < cut and len(other) + full > full + 1000
+    lo = full + 1300  # other (1618) уже не помещается рядом с полным диффом
+    hi = full + len(other) + 5
+    assert lo < cut and hi < cut + 1000
+    for ceiling, expect in ((lo, (["hub/other.py"], False, False, False)),
+                            (hi, ([], False, False, True))):  # fmt: skip
+        results = _first_with_ceiling(ceiling, lambda d: [(d, other), (other, d)])
+        assert results[0] == results[1] == expect, (ceiling, results)
+
+
+def test_a_cheaper_full_diff_keeps_room_for_the_neighbour():
+    """Машинное ревью gen 4: full 19038 < cut 20108, сосед 392, потолок = cut - вместе влезают."""
+    lines = _file(_fn("test_ac", "AC", 300))
+    ac, src = _new(F, lines), "\n".join(lines) + "\n"
+    spans = ac_test_spans({F: src}, [f"{F}::test_ac"])
+    neigh = _new("hub/neigh.py", [f"n{k} = {k}" for k in range(20)])
+    ceiling = len(cutout(spans[0]))
+    assert len(ac) + len(neigh) <= ceiling < len(cutout(spans[0])) + len(neigh)
+    for parts in ((ac, neigh), (neigh, ac)):
+        out, omitted = _inline_diff_lines("".join(parts), [], None, ceiling, spans)
+        text = "\n".join(out)
+        assert omitted == [] and "AC_0299" in text and "n19 = 19" in text
+        assert "ВЫРЕЗКА" not in text
+
+
+def test_the_step_b_docstring_tells_the_real_order():
+    from hub.services.review_oversized import fit_with_ac_cutouts
+
+    doc = fit_with_ac_cutouts.__doc__ or ""
+    assert "от меньшего к большему, затем по пути" in doc
+    assert "по порядку диффа, из остатка" not in doc
