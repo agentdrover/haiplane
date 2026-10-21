@@ -139,3 +139,11 @@ async def test_no_base_fetch_when_the_tip_is_the_approved_commit(db, monkeypatch
     assert await orchestration._approved_code_check(db, task, 77) == ("", "")
     assert not git.base_fetched
     assert git.diff_calls == []
+
+
+def test_fetch_wait_hint_does_not_promise_the_verdict_survives():
+    # Отказ fetch теперь возможен на ЛЮБОМ сдвиге головы, в том числе на
+    # авторской правке: «вердикт сохраняется» тут было бы заявлением вслепую.
+    hint = orchestration.BASE_FETCH_WAIT_HINT
+    assert "вердикт сохраняется" not in hint
+    assert hint != orchestration.BASE_FRESHNESS_WAIT_HINT
