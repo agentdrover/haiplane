@@ -1,0 +1,81 @@
+{# #1812: раскрытие блоков карточки. Состояние каждого <details> с id хранится в
+   sessionStorage по id блока и возвращается после каждой замены .main HTMX
+   (обновление раз в 15 с): ручное раскрытие и закрытие не сбрасываются.
+   - Перед заменой (htmx:beforeSwap) состояние снимается с живых узлов: запись
+     из события toggle асинхронна и могла бы не успеть.
+   - Ширина >=1101px - только начальное значение «Подробностей»: оно
+     записывается при первой загрузке и дальше не перечитывается.
+   - Ответ на действие (details пришёл с open) раскрывает блок при загрузке
+     страницы; при последующих заменах побеждает записанное состояние.
+   - Фрагмент адреса раскрывает блок с целью при загрузке, смене фрагмента и
+     клике «К действию» (переход не отменяется), но не при замене .main.
+   Хранилище может быть недоступно (приватный режим): всё в try/catch.
+   Скрипт приходит и с каждой заменой .main, поэтому обработчики ставятся один
+   раз (флаг window.hubC2); каждый запуск лишь восстанавливает состояние. #}
+<script>
+(function () {
+    var KEY = "hub-c2-open";
+    function read() {
+        try { return JSON.parse(window.sessionStorage.getItem(KEY) || "{}") || {}; }
+        catch (e) { return {}; }
+    }
+    function write(state) {
+        try { window.sessionStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* без хранилища */ }
+    }
+    function boxes() { return document.querySelectorAll(".main details[id]"); }
+    function snapshot() {
+        var state = read();
+        var all = boxes();
+        for (var i = 0; i < all.length; i++) { state[all[i].id] = all[i].open; }
+        write(state);
+    }
+    function openFor(hash) {
+        var id = hash && hash.length > 1 ? decodeURIComponent(hash.slice(1)) : "";
+        var target = id ? document.getElementById(id) : null;
+        for (var el = target; el; el = el.parentElement) {
+            if (el.tagName === "DETAILS" && !el.open) { el.open = true; }
+        }
+    }
+    function restore(initial) {
+        var state = read();
+        var wide = window.matchMedia && window.matchMedia("(min-width: 1101px)").matches;
+        var all = boxes();
+        for (var i = 0; i < all.length; i++) {
+            var box = all[i];
+            var saved = state[box.id];
+            if (initial && box.hasAttribute("open")) {
+                state[box.id] = true;       // ответ на действие: виден при загрузке
+            } else if (saved === undefined) {
+                if (box.id === "card-details") {
+                    box.open = wide;        // начальное значение, дальше не пересчитывается
+                    state[box.id] = wide;
+                }
+            } else {
+                box.open = !!saved;
+            }
+        }
+        write(state);
+        if (initial) { openFor(window.location.hash); }
+    }
+    if (!window.hubC2) {
+        window.hubC2 = { restore: restore };
+        document.addEventListener("toggle", function (e) {
+            var box = e.target;
+            if (!box || box.tagName !== "DETAILS" || !box.id) { return; }
+            var state = read();
+            state[box.id] = box.open;
+            write(state);
+        }, true);
+        document.addEventListener("htmx:beforeSwap", snapshot);
+        document.addEventListener("htmx:afterSwap", function () { window.hubC2.restore(false); });
+        window.addEventListener("hashchange", function () { openFor(window.location.hash); });
+        document.addEventListener("click", function (e) {
+            var link = e.target.closest ? e.target.closest("a.c2-btn") : null;
+            if (link) { openFor(link.getAttribute("href")); }
+        });
+        window.hubC2.restore(true);
+    } else {
+        window.hubC2.restore(false);
+    }
+})();
+</script>
