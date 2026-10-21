@@ -176,3 +176,71 @@ async def test_an_expired_unswept_order_does_not_block_the_retry(world, tip):
     tip.sha = co.SHA_B
     assert (await co._say(world, cloud, co._line(co.SHA_B))).status_code == 200
     assert (await co._orders(world, cloud.task_id))[-1]["sha"] == co.SHA_B
+
+
+# ---------------------------------------------------------------------------
+# Круг Codex: ранний пин, автоматическое завершение, повтор того же sha
+# ---------------------------------------------------------------------------
+
+
+async def test_the_pin_waits_for_the_empty_resubmission_and_blocker_checks(world, tip):
+    """Пин пишется после проверок done: доработка до B не «пустая», удержанная - не пинится."""
+    cloud = await co._cloud(world, tip, auto_review=False)
+    await _set_sha(
+        world,
+        cloud.task_id,
+        co.SHA_A,
+        review_verdict="changes_requested",
+        submission_generation=1,
+    )
+    await co._closed_order(world, cloud, co.SHA_B, "passed")
+    tip.sha = co.SHA_B
+    resp = await co._done(world, cloud)
+    assert resp.status_code == 200, resp.text
+    assert await _sha_of(world, cloud.task_id) == co.SHA_B
+
+    held = await co._cloud(world, tip, auto_review=False)
+    await _set_sha(world, held.task_id, co.SHA_A)
+    await repo.add_task_update(world.db, held.task_id, "cloud", "blocker", "жду ответа")
+    await world.db.commit()
+    await co._closed_order(world, held, co.SHA_B, "passed")
+    assert (await co._done(world, held)).status_code == 200
+    status, _generation, pinned, _feed = await co._task_state(world, held.task_id)
+    assert (status, pinned) == ("needs_decision", co.SHA_A)
+
+
+async def test_the_automatic_entry_pins_on_completion_without_review(world, tip):
+    """Прямой автоматический вход при auto_review=false: завершение с sha критика."""
+    from hub.services import orchestration
+
+    cloud = await co._cloud(world, tip, auto_review=False)
+    await _set_sha(world, cloud.task_id, co.SHA_B)
+    await co._closed_order(world, cloud, co.SHA_A, "passed")
+    row = dict(
+        (await co._rows(world.db, "SELECT * FROM tasks WHERE id=?", (cloud.task_id,)))[
+            0
+        ]
+    )
+    await orchestration.transition_after_agent_done(world.db, row, has_done=True)
+    await world.db.commit()
+    assert await _sha_of(world, cloud.task_id) == co.SHA_A
+
+
+async def test_a_same_sha_resubmission_rechecks_the_policy_under_the_lock(
+    world, tip, monkeypatch
+):
+    """Повтор того же sha из review: политику включили после шагов - 422, без решений."""
+    cloud = await co._cloud(world, tip, critic_host="")
+    await _set_sha(
+        world, cloud.task_id, co.SHA_A, status="review", submission_generation=1
+    )
+    real = lifecycle._same_sha_noop_response
+
+    async def _late(state):
+        await _flip_policy(world, "k8")
+        return await real(state)
+
+    monkeypatch.setattr(lifecycle, "_same_sha_noop_response", _late)
+    before = await co._task_state(world, cloud.task_id)
+    assert co._refused(await co._submit(world, cloud)) == "no_order"
+    assert await co._task_state(world, cloud.task_id) == before
