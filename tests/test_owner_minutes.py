@@ -855,6 +855,9 @@ async def test_accrual_pass_is_idempotent_and_restartable(
         (first,),
     )
     await db.commit()
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     from hub.poller import _sweep_events_retention
 
     await _sweep_events_retention(db)

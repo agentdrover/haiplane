@@ -2723,9 +2723,10 @@ class ProdStateView(BaseModel):
     failure #824 refused to ship.
     """
 
-    # #1420: open release alerts (project, reason, since, minutes) — empty
-    # while every release moves.
+    # #1420: open release alerts (project, reason, since, minutes); empty if all move.
     release_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    # #1973: role orders (active + terminal in 24h); [{"unavailable": ..}] = unread.
+    role_orders: list[dict[str, Any]] = Field(default_factory=list)
     # #1645: can the server reach GitHub — typed fields, see EgressStatus.
     egress: dict[str, Any] = Field(default_factory=dict)
     deployed: dict[str, str] = Field(default_factory=dict)
@@ -3284,8 +3285,7 @@ class TaskView(PlainSummaryView):
     # on purpose: a suggestion is never written into the fact column.
     release_id: int | None = None
     cause_suggestion: "DefectCauseSuggestion | None" = None
-    # #919: what the closed prod defect left behind (kind, ref / reason +
-    # revisit, recorded_by, recorded_at); None = nothing recorded.
+    # #919: what the closed prod defect left behind (kind, ref/reason, revisit..); None = none.
     defect_prevention: dict[str, str] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
@@ -3298,8 +3298,7 @@ class TaskView(PlainSummaryView):
     review_checklist: list[str] = Field(default_factory=list)
     # #1236: имя объявленного живого зонда; "" — не объявлен.
     live_probe: str = ""
-    # #1647: результат работы и способ отката; evidence — доказательства всех
-    # поколений сдачи state-задачи (у commit-задачи None).
+    # #1647: результат работы и откат; evidence — доказательства сдач state-задачи.
     result_kind: str = "commit"
     rollback: str = ""
     evidence: list["TaskEvidenceView"] | None = None
@@ -3309,6 +3308,7 @@ class TaskView(PlainSummaryView):
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
+    role_orders: list[dict[str, Any]] = Field(default_factory=list)  # #1973: card read
     critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
