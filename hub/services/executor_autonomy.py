@@ -88,15 +88,17 @@ async def executor_autonomy_metrics(
     )
     start, end = scope.bounds()
     stamps = sorted(datetime.strptime(r["closed_at"][:19], _TS_FORMAT) for r in rows)
+    grid_end = end
     cursor = _monday(start)
     if stamps and end - start > timedelta(weeks=MAX_EMPTY_LEAD_WEEKS):
         cursor = _monday(stamps[0])
     if stamps and scope.end is None:
         # Open right bound: a closed_at after "now" is selected by SQL, so the
-        # grid must reach the week of the latest selected order.
-        end = max(end, stamps[-1] + timedelta(seconds=1))
+        # grid must reach the week of the latest selected order. `end` stays the
+        # window's own bound: weeks past it are partial.
+        grid_end = max(end, stamps[-1] + timedelta(seconds=1))
     grid: list[datetime] = []
-    while cursor < end:
+    while cursor < grid_end:
         grid.append(cursor)
         cursor += timedelta(days=7)
     buckets: dict[str, dict[datetime, list[Any]]] = {}

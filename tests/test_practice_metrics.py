@@ -38,6 +38,7 @@ from tests.executor_autonomy_cases import (  # noqa: F401 - collected here (#198
     test_executor_autonomy_reason_codes,
     test_executor_autonomy_surface_parity,
     test_executor_autonomy_week_boundaries,
+    test_executor_autonomy_weeks_past_the_window_stay_partial,
     test_executor_autonomy_weekly_rate,
 )
 

@@ -397,3 +397,31 @@ async def test_executor_autonomy_future_closed_at_is_in_a_week(
     ]["weeks"]
     assert sum(w["orders_closed"] for w in weeks) == 1
     assert weeks[-1]["orders_closed"] == 1 and weeks[-1]["partial"] is True
+
+
+async def test_executor_autonomy_weeks_past_the_window_stay_partial(
+    db: aiosqlite.Connection,
+):
+    """#1980: the grid reaches a future closed_at, partial follows the window."""
+    from hub.services.executor_autonomy import executor_autonomy_metrics
+    from hub.services.metrics_scope import Scope
+
+    await _autonomy_host(db)
+    task = await _task(db, title="past the window")
+    await _autonomy_order(
+        db,
+        task,
+        closed_at="2026-11-10 10:00:00",
+        outcome="submitted",
+        close_reason="submitted",
+    )
+    await db.commit()
+    scope = Scope(start="2026-09-21 12:00:00", window_days=30)  # ends 10-21 12:00
+    weeks = (await executor_autonomy_metrics(db, scope))["hosts"]["k8"]["weeks"]
+    by_key = {w["week"]: w for w in weeks}
+    assert by_key["2026-W43"]["partial"] is True  # the window ends inside it
+    for key in ("2026-W44", "2026-W45"):
+        assert by_key[key]["partial"] is True and by_key[key]["orders_closed"] == 0
+    assert by_key["2026-W46"]["orders_closed"] == 1
+    assert by_key["2026-W46"]["partial"] is True
+    assert by_key["2026-W40"]["partial"] is False

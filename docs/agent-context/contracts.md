@@ -207,7 +207,7 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 
 ### Executor autonomy in practice metrics (#1980)
 
-`GET /api/metrics/practices` (also `oc-hub practice-metrics --json`, `hub_practice_metrics` `metrics`) carries `executor_autonomy`, JSON only (no text summary, no new argument). Code: `hub/services/executor_autonomy.py`; the section is in `MODEL_INDEPENDENT` (window and project apply, the reviewer-model filter does not), not in `UNFILTERED`.
+`GET /api/metrics/practices` (also `oc-hub practice-metrics`, `hub_practice_metrics` `metrics`) carries `executor_autonomy`, JSON only (no text summary, no new argument). Code: `hub/services/executor_autonomy.py`; the section is in `MODEL_INDEPENDENT` (window and project apply, the reviewer-model filter does not), not in `UNFILTERED`.
 
 ```json
 "executor_autonomy": {
