@@ -302,3 +302,35 @@ async def test_a_stale_identity_report_resolved_to_a_refused_stub_restores_it(
     assert report["dispatch_id"] == stub
     active = {dict(r)["id"] for r in await repo.list_active_review_dispatches(db)}
     assert stub in active, "заглушка S восстановлена и видна свипу"
+
+
+async def test_only_the_stub_of_the_reports_code_is_restored(
+    db: aiosqlite.Connection,
+):
+    """Codex: две заглушки, код привязан к A, личность с None - оживает только A."""
+    task_id, code, code_id = await _bound_later(db, "two-stubs")
+    ids = []
+    for _ in range(2):
+        cur = await db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, run_id, model, profile, status, channel, "
+            "reviewer_principal_id) VALUES (?, 1, '', '', 'm', 'lite', 'failed', "
+            "'cloud', ?)",
+            (task_id, PRINCIPAL),
+        )
+        ids.append(int(cur.lastrowid or 0))
+    first, second = ids
+    await _bind(db, code, first, task_id)
+    await record_machine_review(
+        db,
+        task_id,
+        _body(False),
+        principal_id=PRINCIPAL,
+        username="rev",
+        code_id=code_id,
+    )
+    rows = await fetchall(db, "SELECT id, status FROM review_dispatches ORDER BY id")
+    assert {dict(r)["id"]: dict(r)["status"] for r in rows} == {
+        first: "active",
+        second: "failed",
+    }
