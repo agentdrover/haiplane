@@ -138,18 +138,43 @@ async def api_role_order_report(
         raise _as_http(exc) from exc
 
 
-@router.post("/api/admin/executor-hosts/{name}/role-admissions")
-async def api_role_admission(name: str, body: RoleAdmission, request: Request) -> dict:
-    """Допустить хост к роли в проекте. Только человек (CSRF для cookie)."""
+async def _admission_change(
+    request: Request, name: str, body: RoleAdmission, revoke: bool
+) -> dict:
     identity = await _human(request, "role admission")
     db = _db(request)
     project = await repo.get_project_by_slug(db, body.project)
     if project is None:
         raise HTTPException(404, detail={"reason": "project_unknown"})
+    change = role_orders.revoke_host if revoke else role_orders.admit_host
     try:
-        await role_orders.admit_host(
-            db, name, body.role, int(project["id"]), by=identity.principal_id
+        await change(
+            db,
+            name,
+            body.role,
+            int(project["id"]),
+            by=identity.principal_id,
+            actor=identity.username,
         )
     except role_orders.RoleOrderError as exc:
         raise _as_http(exc) from exc
-    return {"host": name, "role": body.role, "project": body.project}
+    return {
+        "host": name,
+        "role": body.role,
+        "project": body.project,
+        "admitted": not revoke,
+    }
+
+
+@router.post("/api/admin/executor-hosts/{name}/role-admissions")
+async def api_role_admission(name: str, body: RoleAdmission, request: Request) -> dict:
+    """Допустить хост к роли в проекте. Только человек (CSRF для cookie); аудит всегда."""
+    return await _admission_change(request, name, body, revoke=False)
+
+
+@router.post("/api/admin/executor-hosts/{name}/role-admissions/revoke")
+async def api_role_admission_revoke(
+    name: str, body: RoleAdmission, request: Request
+) -> dict:
+    """Отозвать допуск: не начатые lease хоста возвращаются в open. Только человек."""
+    return await _admission_change(request, name, body, revoke=True)

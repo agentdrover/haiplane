@@ -7,9 +7,9 @@
 
 ``role_orders_cursor`` - единственная строка: последнее событие ленты, которое
 свип источника разобрал. Очистка событий не трогает хвост за этим курсором.
-Строку заводит первый же свип на текущем конце ленты (``_read_cursor``): старые
-``needs_decision`` задним числом роль не вызывают. Пока строки нет, очистка
-событий ведёт себя как прежде (так же устроен ``owner_minutes_state``).
+Строку заводит САМА миграция на текущем конце ленты (``MAX(events.id)``): старые
+``needs_decision`` задним числом роль не вызывают, а событие между выкатом и
+первым свипом лежит за границей и будет разобрано (#1973, круг 1).
 
 ``role_host_admissions`` - какой хост к какой роли и проекту допущен. Нет строки -
 хост заказа не получает.
@@ -58,6 +58,11 @@ MIGRATIONS = [
             id              INTEGER PRIMARY KEY CHECK (id = 1),
             cursor_event_id INTEGER NOT NULL
         )""",
+    ),
+    (
+        "seed_role_orders_cursor",
+        "INSERT OR IGNORE INTO role_orders_cursor (id, cursor_event_id) "
+        "SELECT 1, COALESCE(MAX(id), 0) FROM events",
     ),
     (
         "create_role_host_admissions",

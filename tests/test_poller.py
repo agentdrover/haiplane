@@ -568,6 +568,9 @@ async def test_events_pruning(db):
     )
     await db.commit()
 
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     removed = await repo_module.prune_events(db, keep_days=14)
     await db.commit()
 

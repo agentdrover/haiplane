@@ -89,6 +89,36 @@ def label_of(role: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _actor_text(by: int | None, actor: str) -> str:
+    """Кто изменил допуск: принципал или имя токена; пусто не бывает."""
+    return actor or (f"principal #{by}" if by is not None else "unknown transport")
+
+
+async def _audit_admission(
+    db: aiosqlite.Connection,
+    action: str,
+    host: str,
+    role: str,
+    project_id: int,
+    by: int | None,
+    actor: str,
+) -> None:
+    """Аудит изменения допуска ВСЕГДА: без принципала в БД актор - имя токена."""
+    from hub.services import admin as admin_svc
+
+    who = _actor_text(by, actor)
+    await admin_svc.write_audit(
+        db,
+        actor_id=by,
+        action=action,
+        target_type="executor_host",
+        target_id=host,
+        summary=f"{action}: host {host}, role {role}, project {project_id} by {who}",
+        detail=who,
+        commit=False,
+    )
+
+
 async def admit_host(
     db: aiosqlite.Connection,
     host: str,
@@ -96,6 +126,7 @@ async def admit_host(
     project_id: int,
     *,
     by: int | None = None,
+    actor: str = "",
 ) -> None:
     """Допустить хост к роли в проекте. Идемпотентно. Роль вне списка - 422."""
     if role not in ROLES:
@@ -111,18 +142,64 @@ async def admit_host(
             "VALUES (?, ?, ?)",
             (host, role, int(project_id)),
         )
-        if by is not None:
-            from hub.services import admin as admin_svc
+        await _audit_admission(
+            db, "role_host_admitted", host, role, project_id, by, actor
+        )
 
-            await admin_svc.write_audit(
-                db,
-                actor_id=by,
-                action="role_host_admitted",
-                target_type="executor_host",
-                target_id=host,
-                summary=f"host {host} admitted to role {role} in project {project_id}",
-                commit=False,
-            )
+
+async def _release_to_open(db: aiosqlite.Connection, order_id: int) -> None:
+    """Не начатый lease обратно в open БЕЗ траты перевыдачи (attempt не растёт)."""
+    await db.execute(
+        "UPDATE role_orders SET state = 'open', lease_id = NULL, host = NULL, "
+        "leased_at = NULL, lease_deadline = NULL WHERE id = ? AND state = 'leased'",
+        (int(order_id),),
+    )
+
+
+async def revoke_host(
+    db: aiosqlite.Connection,
+    host: str,
+    role: str,
+    project_id: int,
+    *,
+    by: int | None = None,
+    actor: str = "",
+) -> None:
+    """Отозвать допуск: не начатые lease хоста по этой роли и проекту уходят в open.
+
+    Уже ``started`` дорабатывает без перевыдачи. Допуска не было - 404: это не успех.
+    """
+    if role not in ROLES:
+        _refuse(422, "role_unknown", f"роль {role!r} не из списка {ROLES}")
+    async with write_transaction(db):
+        cursor = await db.execute(
+            "DELETE FROM role_host_admissions "
+            "WHERE host = ? AND role = ? AND project_id = ?",
+            (host, role, int(project_id)),
+        )
+        if cursor.rowcount != 1:
+            _refuse(404, "admission_unknown", "у хоста нет такого допуска")
+        await db.execute(
+            "UPDATE role_orders SET state = 'open', lease_id = NULL, host = NULL, "
+            "leased_at = NULL, lease_deadline = NULL WHERE host = ? AND role = ? "
+            "AND project_id = ? AND state = 'leased'",
+            (host, role, int(project_id)),
+        )
+        await _audit_admission(
+            db, "role_host_revoked", host, role, project_id, by, actor
+        )
+
+
+async def _is_admitted(
+    db: aiosqlite.Connection, host: str, order: aiosqlite.Row
+) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM role_host_admissions "
+        "WHERE host = ? AND role = ? AND project_id = ?",
+        (host, order["role"], order["project_id"]),
+    )
+    return bool(rows)
 
 
 async def check_host(
@@ -565,14 +642,21 @@ async def lease(
             (host, ROLE_LEASES_PER_HOST),
         )
         if len(active) >= ROLE_LEASES_PER_HOST:
-            return _lease_view(active[0]) if active[0]["state"] == "leased" else None
+            current = active[0]
+            if current["state"] != "leased":
+                return None  # работа идёт: второй заказ не выдаётся
+            if await _is_admitted(db, host, current):
+                return _lease_view(current)
+            await _release_to_open(db, int(current["id"]))  # допуск отозван
         return await _claim_first(db, host)
 
 
 def _own_or_refuse(order: aiosqlite.Row | None, host: str) -> aiosqlite.Row:
     """Заказ есть и не чужого хоста; чужой и несуществующий - один 404."""
-    if order is None or order["host"] not in (None, host):
-        _refuse(404, "role_order_not_found", "заказа нет у этого хоста")
+    if order is None:
+        _refuse(404, "role_order_not_found", "такого заказа нет")
+    if order["host"] not in (None, host):
+        _refuse(409, "role_order_reassigned", "заказ уже выдан другому хосту")
     return order
 
 
@@ -583,13 +667,21 @@ async def started(
     order_id: int,
     lease_id: str,
 ) -> dict[str, Any]:
-    """Хост начал работу: leased -> started одним условным UPDATE; повтор - no-op."""
+    """Хост начал работу: leased -> started одним условным UPDATE; повтор - no-op.
+
+    Допуск хоста к роли и проекту перечитывается В ЭТОМ ЖЕ UPDATE: отозванный
+    допуск не даёт стартовать, а не начатый lease возвращается в open без траты
+    перевыдачи.
+    """
+    revoked = False
     async with write_transaction(db):
         await check_host(db, host, principal_id)
         cursor = await db.execute(
             "UPDATE role_orders SET state = 'started', started_at = datetime('now') "
             "WHERE id = ? AND host = ? AND lease_id = ? AND state = 'leased' "
-            "AND lease_deadline > datetime('now')",
+            "AND lease_deadline > datetime('now') AND EXISTS ("
+            "SELECT 1 FROM role_host_admissions a WHERE a.host = role_orders.host "
+            "AND a.role = role_orders.role AND a.project_id = role_orders.project_id)",
             (int(order_id), host, lease_id),
         )
         order = _own_or_refuse(await _order(db, int(order_id)), host)
@@ -597,6 +689,15 @@ async def started(
             return {"id": int(order_id), "state": "started", "repeat": False}
         if order["state"] == "started" and order["lease_id"] == lease_id:
             return {"id": int(order_id), "state": "started", "repeat": True}
+        if (
+            order["state"] == "leased"
+            and order["lease_id"] == lease_id
+            and not await _is_admitted(db, host, order)
+        ):
+            await _release_to_open(db, int(order_id))
+            revoked = True
+    if revoked:
+        _refuse(409, "admission_revoked", "допуск хоста к роли отозван: lease снят")
     _refuse(
         409,
         "lease_not_valid",
