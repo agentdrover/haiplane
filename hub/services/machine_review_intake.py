@@ -32,7 +32,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
-from hub.services import ci_integrity, report_binding, watch_notices
+from hub.services import ci_integrity, report_binding, review_pin, watch_notices
 from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
@@ -242,6 +242,27 @@ async def _dispatch_of_report(
     return latest, None
 
 
+async def _intake_alerts(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    raw_count: int,
+    generation: int,
+    review_id: int,
+    principal_id: int | None,
+) -> None:
+    """Ленты приёма: нет кандидатов, снятие прежнего алерта, отказ среды.
+
+    Вынесено из ``record_machine_review`` (потолок по операторам, #1985).
+    """
+    await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _retract_no_candidates_alert(
+        db, task_id, generation, review_id, raw_count, principal_id
+    )
+    await _alert_environment_refusal(db, task_id, body)
+
+
+@review_pin.under_pin_lock
 async def record_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -262,6 +283,7 @@ async def record_machine_review(
     """
     import json as _json
 
+    body = review_pin.for_origin(body, origin)  # #1985: пин - только по контракту
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
@@ -288,6 +310,9 @@ async def record_machine_review(
             400,
             "no submission to review: submit_for_review must run at least once",
         )
+    # #1985: пин тела сверяется ПОСЛЕ ограничения сессии (403 выше) и не заменяет
+    # его; под write-локом, взятым декоратором до чтения задачи.
+    await review_pin.verify(db, task_id, generation, body)
     # raw_count is self-reported and was stored unchecked, so reports arrived
     # claiming fewer raw findings than the findings they themselves listed —
     # on production one had raw_count=0 alongside two confirmed findings
@@ -430,6 +455,7 @@ async def record_machine_review(
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
     await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
+    await review_pin.stamp(db, new_review_id, body)  # #1985, в той же транзакции
     # #1946: восстановление отказанного заказа (#1408) - в ОДНОЙ точке, для
     # заказа, к которому отчёт привязан окончательно (ранней или поздней привязкой).
     await report_binding.reopen_order_of_report(db, new_review_id)
@@ -475,11 +501,9 @@ async def record_machine_review(
         source_event_id=completed_id,
         review_id=new_review_id,
     )
-    await _alert_no_candidates(db, task_id, body, raw_count, generation)
-    await _retract_no_candidates_alert(
-        db, task_id, generation, new_review_id, raw_count, principal_id
+    await _intake_alerts(
+        db, task_id, body, raw_count, generation, new_review_id, principal_id
     )
-    await _alert_environment_refusal(db, task_id, body)
 
     # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one

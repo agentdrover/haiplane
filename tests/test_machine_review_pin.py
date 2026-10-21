@@ -18,10 +18,12 @@ from httpx import AsyncClient
 from hub import config
 from hub import db as db_module
 from hub import repository as repo
+from hub.config import TokenIdentity
 from hub.db import fetchall
 from hub.models import MachineReviewSubmit
 from hub.services import chat_pair
 from hub.services import machine_review_intake as intake
+from hub.services import review_brief_projection as proj
 from hub.services.review_dispatch import REPORT_FENCE, parse_report_block
 from tests.test_auto_verdict import _CLEAN_REVIEW, _TIP, _submitted_task
 
@@ -86,8 +88,8 @@ async def test_a_pinned_report_is_recorded_as_verified(
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert brief["machine_review"]["pin_verified"] is True
     assert brief["machine_review"]["reviewed_sha"] == _TIP
-    text = (await client.get(f"/api/tasks/{task_id}/review-brief?full=0")).text
-    assert "pin verified" in text or "pin_verified" in text
+    lines = proj._machine_lines(proj._machine_review_part(brief["machine_review"]))
+    assert "  pin verified: the hub matched the report to its submission" in lines
 
     card = await client.get(f"/tasks/{task_id}")
     assert card.status_code == 200
@@ -242,6 +244,11 @@ async def test_unpinned_senders_keep_working(
     assert plain.json()["reviewed_sha"] == ""
 
     # Reviewer chat-pair без пина тела - как раньше; пин тела совпал - проверен.
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"env-admin": TokenIdentity("env-admin", "admin", principal_id=40)},
+    )
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     auth = await _reviewer_session_headers(client, db, task_id, 1)
     resp = await client.post(
@@ -309,3 +316,25 @@ async def test_text_reports_and_carried_copies_never_claim_a_pin(
     await db.commit()
     row = [r for r in await _rows(db, task_id) if r["id"] == copied][0]
     assert (row["pin_verified"], row["reviewed_sha"]) == (0, "")
+
+
+async def test_the_mcp_tool_forwards_the_pin_and_omits_it_when_absent(
+    monkeypatch,
+) -> None:
+    """MCP шлёт пин в тело как есть, а без пина тело остаётся прежним."""
+    from unittest.mock import AsyncMock
+
+    from hub import mcp_server
+
+    post = AsyncMock(return_value={"submission_generation": 1, "pin_verified": True})
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+
+    await mcp_server.hub_submit_machine_review(
+        7, raw_count=0, incomplete=False, expected_generation=1, reviewed_sha=_TIP
+    )
+    _, sent = post.await_args.args
+    assert (sent["expected_generation"], sent["reviewed_sha"]) == (1, _TIP)
+
+    await mcp_server.hub_submit_machine_review(7, raw_count=0, incomplete=False)
+    _, sent = post.await_args.args
+    assert "expected_generation" not in sent and "reviewed_sha" not in sent
