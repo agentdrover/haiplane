@@ -38,7 +38,9 @@ async def _task_merged_at(client: AsyncClient, db, merge_sha: str) -> int:
     return task_id
 
 
-def _use_real_git(monkeypatch, workspace: str, base_branch: str = "main") -> None:
+def _use_real_git(
+    monkeypatch, workspace: str, base_branch: str = "main", gh_repo: str | None = None
+) -> None:
     """Answer delivery questions from a real repository, all of them.
 
     Both git questions are wired, not just ancestry: since #946 the state also
@@ -49,7 +51,15 @@ def _use_real_git(monkeypatch, workspace: str, base_branch: str = "main") -> Non
     from hub import app as hub_app
 
     real = GitOpsIntegration()
-    context = AsyncMock(return_value={"repo": workspace, "base_branch": base_branch})
+    # #1927: the stub carries ``gh_repo`` like the real context of a configured
+    # project (default: the hub's own repository); a stub without it let the
+    # repository cut-off of #937 pass unseen.
+    from hub import config
+
+    context_value = {"repo": workspace, "base_branch": base_branch}
+    if gh_repo or config.REPO_NAME:
+        context_value["gh_repo"] = gh_repo or config.REPO_NAME
+    context = AsyncMock(return_value=context_value)
     monkeypatch.setattr(hub_app.services, "project_git_context", context)
     monkeypatch.setattr(
         "hub.services.orchestration.project_git_context", context, raising=False
@@ -310,7 +320,8 @@ def _clean_fetch_miss_cache():
 async def test_foreign_project_skips_network(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path, monkeypatch
 ):
-    # AC-1 (#937): задача проекта с чужим repo — ранний unknown, ноль сети.
+    # AC-1 (#937, #1927): задача проекта с чужим repo и без собственного выката
+    # не сверяется с чужим релизом — ранний unknown, ноль сети.
     from hub import config
     from hub import app as hub_app
 
@@ -324,12 +335,27 @@ async def test_foreign_project_skips_network(
     monkeypatch.setattr(plugins.git_ops, "commit_exists", exists, raising=False)
     monkeypatch.setattr(plugins.git_ops, "fetch_commit", fetch, raising=False)
 
-    task_id = await _task_merged_at(client, db, "a" * 40)
+    pid = await repo.create_project(db, slug="spike-bo", name="spike-bo")
+    epic = (
+        await client.post("/api/tasks", json={"title": "E", "task_type": "epic"})
+    ).json()["id"]
+    await repo.update_task(db, epic, project_id=pid)
+    task_id = (
+        await client.post(
+            "/api/tasks", json={"title": "T", "task_type": "task", "parent_id": epic}
+        )
+    ).json()["id"]
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (?, ?, ?, ?)",
+        (pid, 4800 + task_id, task_id, "a" * 40),
+    )
+    await db.commit()
     await repo.record_release(db, deployed_sha="b" * 40, ref="main", source="ci")
 
     answer = await delivery_state(db, task_id)
     assert answer["state"] == UNKNOWN
-    assert "не применим" in answer["reason"]
+    assert "успешных выкатов не записано" in answer["reason"]
     exists.assert_not_awaited()
     fetch.assert_not_awaited()
 
