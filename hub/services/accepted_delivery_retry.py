@@ -95,6 +95,24 @@ async def note_refusal(
         )
 
 
+def refusal_line(via: str, reason: str) -> tuple[str, str]:
+    """(kind, текст) отказа в ленте: ожидание в повторе - status, не тревога.
+
+    ``deliver_on_disposition`` пишет отказ как alert «НЕ выполнена». Для самого
+    автоповтора ``base_updated`` и прочие временные причины гейта - штатное
+    ожидание, 6 попыток дали бы 6 ложных тревог; всё иное остаётся alert.
+    """
+    from hub.services.orchestration import TRANSIENT_GATE_PREFIXES
+
+    if via == RETRY_VIA and (reason or "").startswith(TRANSIENT_GATE_PREFIXES):
+        return "status", f"Автоповтор доставки: мерж ещё не состоялся — {reason}."
+    return "alert", (
+        f"Доставка по решению человека НЕ выполнена: {reason}. Условия те же, что "
+        "у гейта, и обойти их решением нельзя — PR остался открытым, задача "
+        "остаётся принятой (#1037)."
+    )
+
+
 async def _armed_row(
     db: aiosqlite.Connection, task_id: int, reason: str
 ) -> dict[str, Any] | None:
@@ -325,6 +343,7 @@ async def _stop(
             return
         if outcome == "task_missing":
             return
+        spent = await journal.attempts_of(db, int(row["id"]))  # после брони
         await repo.add_task_update(
             db,
             task_id,
@@ -342,7 +361,7 @@ async def _stop(
                 "outcome": outcome,
                 "reason": why[:500],
                 "pr": int(row["pr_number"]),
-                "attempts": int(row["attempts"]),
+                "attempts": spent,
             },
         )
     await db.commit()
@@ -358,6 +377,19 @@ async def _delivered(
     task_row = await repo.get_task(db, task_id)
     answer = await task_delivery(db, dict(task_row)) if task_row else None
     async with write_transaction(db):
+        # Порядок важен: record_delivery_discrepancy коммитит САМ (repository.py),
+        # без варианта без commit. Журнал закрываем ДО него, в той же
+        # транзакции: его commit фиксирует закрытие строки и запись реестра
+        # вместе, а сбой записи реестра откатывает и закрытие.
+        if await journal.close(db, int(row["id"]), "delivered", how, token=token):
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Автоповтор доставки: PR #{row['pr_number']} влит ({how}) теми "
+                "же условиями гейта.",
+            )
         if answer is not None:
             await repo.record_delivery_discrepancy(
                 db,
@@ -367,14 +399,5 @@ async def _delivered(
                 pr_number=answer["pr_number"],
                 delivery_path=answer["delivery_path"],
                 disposition=DELIVER,
-            )
-        if await journal.close(db, int(row["id"]), "delivered", how, token=token):
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "status",
-                f"Автоповтор доставки: PR #{row['pr_number']} влит ({how}) теми "
-                "же условиями гейта.",
             )
     await db.commit()

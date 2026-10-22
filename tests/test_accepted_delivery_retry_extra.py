@@ -254,3 +254,51 @@ async def test_rows_beyond_the_batch_are_checked_on_the_next_pass(db, monkeypatc
     assert ids[-1] in checked, "51-я строка проверена на втором проходе"
     states = await db.execute_fetchall(f"SELECT DISTINCT state FROM {TABLE}")
     assert [r[0] for r in states] == ["armed"]
+
+
+async def test_the_journal_row_is_closed_before_the_registry_write(db, monkeypatch):
+    """record_delivery_discrepancy коммитит сам: закрытие строки идёт ДО него."""
+    rig = await armed_rig(db, monkeypatch)
+    seen: list[str] = []
+    real = repo.record_delivery_discrepancy
+
+    async def spy(db_, **kw):
+        seen.append(dict((await rig.retry_rows())[0])["state"])
+        await real(db_, **kw)
+
+    monkeypatch.setattr(repo, "record_delivery_discrepancy", spy)
+    await scan_completed_deliveries(db)
+    assert seen[0] == "closed", "одна транзакция: закрытие и реестр вместе"
+
+
+async def test_the_stop_event_carries_the_spent_attempts(db, monkeypatch):
+    import json
+
+    rig = await armed_rig(db, monkeypatch)
+    rig.git.merge_pr.return_value = False
+    await scan_completed_deliveries(db)
+    (event,) = await rig.events("accepted_delivery_retry_stopped")
+    assert (
+        json.loads(event["payload"])["attempts"]
+        == 1
+        == (await rig.retry_row())["attempts"]
+    )
+
+
+async def test_a_waiting_retry_is_not_an_alert(db, monkeypatch):
+    rig = await armed_rig(db, monkeypatch)
+
+    async def alerts() -> int:
+        rows = await repo.get_task_updates(db, rig.task_id)
+        return sum(
+            1
+            for r in rows
+            if dict(r)["kind"] == "alert" and "НЕ выполнена" in dict(r)["content"]
+        )
+
+    before = await alerts()
+    for n in range(1, 4):
+        rig.head_moved_to(f"base0moved0{n}", behind_base=True)
+        await scan_completed_deliveries(db)
+    assert (await rig.retry_row())["attempts"] == 3
+    assert await alerts() == before, "base_updated из повтора - не тревога"

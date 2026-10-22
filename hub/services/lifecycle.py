@@ -6707,10 +6707,7 @@ async def deliver_on_disposition(
             db,
             task_id,
             "hub",
-            "alert",
-            f"Доставка по решению человека НЕ выполнена: {reason}. Условия те "
-            "же, что у гейта, и обойти их решением нельзя — PR остался "
-            "открытым, задача остаётся принятой (#1037).",
+            *accepted_delivery_retry.refusal_line(via, reason),  # #1999
         )
     await db.commit()
     return ok, reason, bool(delivery_pr.unusable and delivery_pr.search_unanswered)

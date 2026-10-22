@@ -105,6 +105,14 @@ async def open_rows(db: aiosqlite.Connection, limit: int) -> list[dict[str, Any]
     return [dict(r) for r in rows]
 
 
+async def attempts_of(db: aiosqlite.Connection, row_id: int) -> int:
+    """Фактическое число потраченных попыток строки (после брони)."""
+    rows = await fetchall(
+        db, "SELECT attempts FROM accepted_delivery_retries WHERE id=?", (int(row_id),)
+    )
+    return int(rows[0][0]) if rows else 0
+
+
 async def touch(db: aiosqlite.Connection, row_id: int) -> None:
     """Строка проверена в этом проходе (в том числе "ждём"): в хвост очереди."""
     await db.execute(
