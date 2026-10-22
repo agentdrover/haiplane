@@ -25,9 +25,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Any
-
 import aiosqlite
 
 from hub import repository as repo
@@ -44,18 +41,6 @@ async def commit_unless_done_flow(db: aiosqlite.Connection) -> None:
     """Закоммитить записи вызывающего; внутри done-flow - не трогать."""
     if not in_done_flow() and db.in_transaction:
         await db.commit()
-
-
-def committed_before(
-    db: aiosqlite.Connection, call: Callable[..., Awaitable[Any]]
-) -> Callable[..., Awaitable[Any]]:
-    """Сетевой вызов, которому предшествует коммит записей вызывающего."""
-
-    async def run(*args: Any, **kwargs: Any) -> Any:
-        await commit_unless_done_flow(db)
-        return await call(*args, **kwargs)
-
-    return run
 
 
 async def record_squash(db: aiosqlite.Connection, task_id: int, before: str) -> None:

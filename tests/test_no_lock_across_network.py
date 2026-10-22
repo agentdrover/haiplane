@@ -616,3 +616,30 @@ async def test_done_flow_entry_never_commits_the_foreign_transaction(
         assert view["status"] == before["status"]
         assert view["submission_generation"] == before["submission_generation"]
         assert "вне объявленной области" not in view["feed"]
+
+
+async def test_commit_failure_before_content_differs_stops_the_tail(
+    db, db_dsn, monkeypatch
+):
+    """Сбой commit перед сетью не маскируется под «не удалось сравнить» (#2005)."""
+    import sqlite3
+
+    task_id, git = await _headless_done_rig(db, monkeypatch)
+    git.dirty_paths = AsyncMock(return_value=["other/y.py"])
+    real_commit = db.commit
+    failed = []
+
+    async def commit():
+        if git.checkout.await_count and not failed:
+            failed.append(1)
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    monkeypatch.setattr(db, "commit", commit)
+    row = dict(await repo.get_task(db, task_id))
+    with pytest.raises(sqlite3.OperationalError):
+        await orchestration.transition_after_agent_done(db, row, has_done=True)
+    assert failed
+    assert git.content_differs.await_count == 0
+    assert git.push_branch.await_count == 0
+    assert git.create_pr.await_count == 0

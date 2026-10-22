@@ -62,7 +62,7 @@ from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
 from hub.services import delivery_rerun, workflow_seed
-from hub.services.route_after_done_commit import committed_before, record_squash
+from hub.services.route_after_done_commit import commit_unless_done_flow, record_squash
 from hub.services.executor_autonomy import statistics_sections
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
@@ -6093,10 +6093,10 @@ async def _route_after_done(
     # ignorance must not close a task quietly (#725). The REVIEW gate is
     # untouched either way: skipping it would let anything uncommitted
     # complete itself, a worse defect than the one being fixed.
-    # The base default belongs to git_ops (_resolve_base, #362 I4) — an
-    # empty base is passed through, never recomputed here.
+    # Base default belongs to git_ops (#362 I4); an empty base passes through.
+    await commit_unless_done_flow(db)  # #2005: a failure here stops the tail
     try:
-        differs = await committed_before(db, plugins.git_ops.content_differs)(
+        differs = await plugins.git_ops.content_differs(
             (ctx.get("base_branch") or "").strip(),
             branch,
             repo=git_repo,
