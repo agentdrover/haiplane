@@ -89,3 +89,25 @@ def test_public_reason_json_with_an_escaped_quote_in_the_path():
 
     out = public_reason(r'{"reason":"/srv/a\"b.pem","ok":true}')
     assert json.loads(out) == {"reason": "<путь>", "ok": True}
+
+
+def test_public_reason_replaces_a_bracketed_ipv6_host_whole():
+    from hub.services.brief_failure import public_reason
+
+    cred, user = "oauth2:" + "TOKEN", "u:" + "p"
+    cases = {
+        "https://[2001:db8::1]": "<remote>",
+        "https://[::1]": "<remote>",
+        "<https://[2001:db8::1]>": "<<remote>>",
+        "(https://[::1])": "(<remote>)",
+        "|host|https://[2001:db8::1]|down|": "|host|<remote>|down|",
+        "https://[::1]:8080/x?t=S ok": "<remote> ok",
+        f"https://{cred}@[2001:db8::7]/group/repo.git?token=SECOND ok": ("<remote> ok"),
+        f"<https://{cred}@[::1]>": "<<remote>>",
+        f"|a|https://{user}@[::1]:22/r|b|": "|a|<remote>|b|",
+    }
+    for text, want in cases.items():
+        out = public_reason(text)
+        assert out == want, (text, out)
+        for left in ("2001", "db8", "TOKEN", "SECOND", "::1", "8080"):
+            assert left not in out
