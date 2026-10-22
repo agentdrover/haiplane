@@ -916,6 +916,24 @@ class GitVerseForge:
     ) -> list[dict[str, Any]] | None:
         return None  # не поддерживается: GitVerse не отдаёт прогоны CI хабу
 
+    # #1956: у GitVerse нет ни попыток, ни перезапуска упавших job.
+    async def rerun_failed_jobs(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "gitverse cannot rerun failed jobs"
+        )
+
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        return None
+
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> list[dict[str, Any]] | None:

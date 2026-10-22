@@ -756,6 +756,27 @@ class NoopGitOps:
     ) -> list[dict] | None:
         return None  # не поддерживается: без форджа прогонов CI не видно
 
+    async def rerun_failed_jobs(
+        self,
+        run_id: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> CIRunRequestResult:
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "git integration is not configured"
+        )
+
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict] | None:
+        return None  # не поддерживается: без форджа job попытки не видно
+
     async def ci_run_artifacts(
         self,
         run_id: str,
@@ -1071,6 +1092,23 @@ class NoopForge:
         workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None:
         return None  # не поддерживается: без форджа прогонов CI не видно
+
+    async def rerun_failed_jobs(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "forge is not configured"
+        )
+
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        return None  # не поддерживается: без форджа job попытки не видно
 
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
