@@ -1185,6 +1185,10 @@ async def test_a_report_arriving_while_the_debt_settles_still_stops_the_order(
     await wait_for_local_runs()
     await db.commit()
 
+    # #1982: доехавший отчёт закрывает заказ СЛЕДУЮЩИМ проходом, общим путём.
+    await sweep_review_dispatches(db)
+    await db.commit()
+
     assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
     assert await _local_dispatches(db, task_id) == [], (
         "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
@@ -1354,6 +1358,10 @@ async def test_a_late_report_during_debt_settlement_settles_its_own_dispatch(
     await wait_for_local_runs()
     await db.commit()
 
+    # #1982: доехавший отчёт закрывает заказ СЛЕДУЮЩИМ проходом, общим путём.
+    await sweep_review_dispatches(db)
+    await db.commit()
+
     assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
     assert await _local_dispatches(db, task_id) == [], (
         "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
@@ -1442,6 +1450,10 @@ async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_i
 
     await sweep_review_dispatches(db)
     await wait_for_local_runs()
+    await db.commit()
+
+    # #1982: доехавший отчёт закрывает заказ СЛЕДУЮЩИМ проходом, общим путём.
+    await sweep_review_dispatches(db)
     await db.commit()
 
     assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
