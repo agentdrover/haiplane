@@ -715,10 +715,13 @@ def test_main_whoami_health_prod_state_and_readiness(capsys) -> None:
         "auth_disabled": False,
         "env_tokens_configured": True,
         "vast_enabled": False,
+        "csrf_trusted_origins": ["https://a.example", "https://b.example:8443"],
     }
     rc, api = _run_main(["health"], api_result=health)
     assert rc == 0
-    assert "Status: ok" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Status: ok" in out
+    assert "CSRF trusted origins: https://a.example, https://b.example:8443" in out
 
     rc, api = _run_main(["health", "--json"], api_result=health)
     assert rc == 0
