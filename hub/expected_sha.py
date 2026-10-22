@@ -3,7 +3,9 @@
 Одна функция разбора на REST (поле модели), CLI и MCP: три разбора разошлись бы
 ровно так, как расходятся поверхности. Значение в сообщения об ошибке не
 попадает. Файл отдельный: models.py, cli.py и lifecycle.py стоят под потолком
-размера, и поле с тремя входами в них не помещается.
+размера, и поле с тремя входами в них не помещается. Здесь же пин отчёта
+ревью (#1985): поколение и полный sha сдачи, которую смотрели, - тот же формат
+и та же причина.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import re
 import sys
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 EXPECTED_SHA_FORMAT = "ровно 40 шестнадцатеричных символов (полный sha коммита)"
 _EXPECTED_SHA_RE = re.compile(r"[0-9a-fA-F]{40}", re.ASCII)
@@ -74,3 +76,50 @@ def add_expected_sha_option(parser: argparse.ArgumentParser) -> None:
             "when it differs"
         ),
     )
+
+
+PIN_FIELDS = ("expected_generation", "reviewed_sha")
+
+
+class ReviewPinSubmit(BaseModel):
+    """Необязательный пин тела отчёта: оба поля или ни одного.
+
+    Нет обоих - прежний приём без проверки. Оба - хаб сверит их с ``submissions``
+    в транзакции записи. Одно поле - отказ: половина пина не доказывает ничего,
+    а молча принятая выглядела бы проверенной.
+    """
+
+    expected_generation: int | None = Field(default=None, ge=1)
+    reviewed_sha: str | None = None
+
+    @field_validator("reviewed_sha", mode="before")
+    @classmethod
+    def _reviewed_sha_is_a_full_sha(cls, value: Any) -> str | None:
+        return normalize_expected_sha(value)
+
+    @model_validator(mode="after")
+    def _pin_is_whole(self) -> "ReviewPinSubmit":
+        if (self.expected_generation is None) != (self.reviewed_sha is None):
+            raise ValueError(
+                "пин отчёта задаётся парой: expected_generation и reviewed_sha "
+                "вместе или ни одного"
+            )
+        return self
+
+    @classmethod
+    def from_run_text(cls, payload: dict[str, Any]) -> Any:
+        """Отчёт из текста рана (#1036): пин из текста не принимается.
+
+        Текст пишет сам ран, и пин в нём был бы словом проверяемого о себе. Поля
+        отбрасываются до разбора, чтобы одно оставшееся поле не стоило отчёта.
+        """
+        return cls(**{k: v for k, v in payload.items() if k not in PIN_FIELDS})
+
+
+class ReviewPinView(BaseModel):
+    """Пин в показе: что отчёт заявил и сверил ли хаб это при записи."""
+
+    #: Полный sha, который ревьюер заявил как проверенный; пусто - пина не было.
+    reviewed_sha: str = ""
+    #: True только если сверка с submissions прошла в транзакции записи отчёта.
+    pin_verified: bool = False

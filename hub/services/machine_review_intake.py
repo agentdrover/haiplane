@@ -32,7 +32,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
-from hub.services import ci_integrity, report_binding, watch_notices
+from hub.services import ci_integrity, report_binding, review_pin, watch_notices
 from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
@@ -242,19 +242,43 @@ async def _dispatch_of_report(
     return latest, None
 
 
-async def record_machine_review(
+async def _intake_alerts(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    raw_count: int,
+    generation: int,
+    review_id: int,
+    principal_id: int | None,
+) -> None:
+    """Ленты приёма: нет кандидатов, снятие прежнего алерта, отказ среды.
+
+    Вынесено из ``record_machine_review`` (потолок по операторам, #1985).
+    """
+    await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _retract_no_candidates_alert(
+        db, task_id, generation, review_id, raw_count, principal_id
+    )
+    await _alert_environment_refusal(db, task_id, body)
+
+
+@review_pin.under_pin_lock
+async def _store_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
     body: MachineReviewSubmit,
     *,
     principal_id: int | None,
     username: str,
-    origin: str = ORIGIN_MCP,
-    expected_generation: int | None = None,
-    dispatch_id: int | None = None,
-    code_id: int | None = None,
-) -> MachineReviewView:
-    """Store one report and run everything that hangs off it (#381, #1036).
+    origin: str,
+    expected_generation: int | None,
+    dispatch_id: int | None,
+    code_id: int | None,
+) -> tuple[MachineReviewView, dict]:
+    """Store one report and what hangs off its row (#381, #1036).
+
+    Only this part runs under the pin's write lock (#1985): the automation after
+    it keeps its own transactions and failure handling, pinned or not.
 
     ``principal_id`` is the OWNER of the report, always taken from a token or
     from the dispatch row — never from what the report says about itself
@@ -262,6 +286,7 @@ async def record_machine_review(
     """
     import json as _json
 
+    body = review_pin.for_origin(body, origin)  # #1985: пин - только по контракту
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
@@ -283,6 +308,9 @@ async def record_machine_review(
                 ),
             },
         )
+    # #1985: пин тела сверяется ПОСЛЕ ограничения сессии (403 выше) и не заменяет
+    # его; под write-локом, взятым декоратором до чтения задачи.
+    await review_pin.verify(db, task_id, generation, body)
     if generation == 0:
         raise HTTPException(
             400,
@@ -430,6 +458,7 @@ async def record_machine_review(
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
     await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
+    await review_pin.stamp(db, new_review_id, body)  # #1985, в той же транзакции
     # #1946: восстановление отказанного заказа (#1408) - в ОДНОЙ точке, для
     # заказа, к которому отчёт привязан окончательно (ранней или поздней привязкой).
     await report_binding.reopen_order_of_report(db, new_review_id)
@@ -475,11 +504,9 @@ async def record_machine_review(
         source_event_id=completed_id,
         review_id=new_review_id,
     )
-    await _alert_no_candidates(db, task_id, body, raw_count, generation)
-    await _retract_no_candidates_alert(
-        db, task_id, generation, new_review_id, raw_count, principal_id
+    await _intake_alerts(
+        db, task_id, body, raw_count, generation, new_review_id, principal_id
     )
-    await _alert_environment_refusal(db, task_id, body)
 
     # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one
@@ -541,9 +568,39 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
     await attach_ac_tests_unread(db, view)
+    return view, task
 
+
+async def record_machine_review(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    *,
+    principal_id: int | None,
+    username: str,
+    origin: str = ORIGIN_MCP,
+    expected_generation: int | None = None,
+    dispatch_id: int | None = None,
+    code_id: int | None = None,
+) -> MachineReviewView:
+    """Store one report and run everything that hangs off it (#381, #1036).
+
+    ``principal_id`` is the OWNER of the report, always taken from a token or
+    from the dispatch row - never from what the report says about itself
+    (#893, #1025). ``origin`` records how it reached us.
+    """
+    view, task = await _store_machine_review(
+        db,
+        task_id,
+        body,
+        principal_id=principal_id,
+        username=username,
+        origin=origin,
+        expected_generation=expected_generation,
+        dispatch_id=dispatch_id,
+        code_id=code_id,
+    )
     await _run_report_automation(db, task_id, task)
-
     return view
 
 
