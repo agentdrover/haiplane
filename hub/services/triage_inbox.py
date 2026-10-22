@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Final, Literal
 
@@ -219,7 +220,7 @@ async def record_owner_verdict(
 #: ``action_at`` - время самого действия, выбранного исходом (``followup_action_at``);
 #: у строк с исходом до колонки его нет, и они читаются по ``followup_at``.
 _DIGEST_ROWS_SQL: Final[str] = """
-SELECT task_id, action, created_at, followup, followup_at,
+SELECT id, task_id, action, created_at, followup, followup_at,
        COALESCE(followup_action_at, followup_at) AS action_at
 FROM executor_triage_recommendations
 WHERE (created_at >= ? AND created_at < ?)
@@ -241,6 +242,9 @@ def empty_section() -> dict[str, Any]:
         "matched": 0,
         "unmeasured": 0,
         "late": 0,
+        # id рекомендаций, чей исход вошёл в resolved/unmeasured ЭТОГО дайджеста:
+        # по ним опоздавший исход отличается от учтённого (а не по времени записи).
+        "outcome_ids": [],
     }
 
 
@@ -261,14 +265,28 @@ def section_active(section: dict[str, Any]) -> bool:
 async def _counted_in_its_day(
     db: aiosqlite.Connection, project_id: int, row: Any
 ) -> bool:
-    """Дайджест дня действия собран ПОСЛЕ обработки исхода: исход в нём уже есть."""
+    """Сохранённый дайджест дня действия содержит этот исход (по списку id).
+
+    Нет дайджеста, раздел нечитаем или id в списке нет - исход не учтён.
+    Дайджест без списка (до круга 2) читается по времени записи: он старше исхода.
+    """
     found = await fetchall(
         db,
-        "SELECT created_at FROM autopilot_digests "
+        "SELECT created_at, payload FROM autopilot_digests "
         "WHERE project_id = ? AND digest_date = ?",
         (project_id, str(row["action_at"])[:10]),
     )
-    return bool(found) and str(found[0]["created_at"]) > str(row["followup_at"])
+    if not found:
+        return False
+    try:
+        section = json.loads(found[0]["payload"] or "{}").get("triage") or {}
+    except ValueError:
+        return False
+    if section.get("state") != MEASURED:
+        return False
+    if "outcome_ids" not in section:
+        return str(found[0]["created_at"]) > str(row["followup_at"])
+    return int(row["id"]) in section["outcome_ids"]
 
 
 async def _count(
@@ -290,6 +308,7 @@ async def _count(
     if followup is None:
         return
     if start <= str(row["action_at"] or "") < end:
+        section["outcome_ids"].append(int(row["id"]))
         if followup in _UNMEASURED_FOLLOWUPS:
             section["unmeasured"] += 1
             return

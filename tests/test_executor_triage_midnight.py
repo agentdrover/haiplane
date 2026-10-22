@@ -169,3 +169,39 @@ async def test_migration_adds_the_column_and_keeps_recommendations(monkeypatch):
         ]
     finally:
         await conn.close()
+
+
+async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(world):
+    """Учтённость - по списку id в дайджесте дня действия, а не по секундам записи."""
+    first = await _acted(world)
+    await triage.sweep(world.db)
+    await world.db.execute(
+        "UPDATE executor_triage_recommendations SET followup_at = ? WHERE order_id = ?",
+        ("2026-10-21 00:00:01", first),
+    )
+    await world.db.commit()
+    built = await _digests(world, now=datetime(2026, 10, 21, 0, 0, 0, tzinfo=UTC))
+    assert built[0]["data"]["triage"]["resolved"] == 1
+    # запись дайджеста в ТУ ЖЕ секунду, что обработка: исход всё равно учтён
+    await world.db.execute(
+        "UPDATE autopilot_digests SET created_at = '2026-10-21 00:00:01'"
+    )
+    await world.db.commit()
+    sections = await triage_inbox.digest_sections(
+        world.db,
+        "2026-10-21 00:00:00",
+        "2026-10-22 00:00:00",
+    )
+    assert [s["late"] for s in sections.values()] == [0]
+    # дайджест дня действия с нечитаемым разделом исхода не содержит: он «позже»
+    await world.db.execute(
+        "UPDATE autopilot_digests SET payload = ?",
+        (json.dumps({"triage": {"state": "unavailable"}}),),
+    )
+    await world.db.commit()
+    sections = await triage_inbox.digest_sections(
+        world.db,
+        "2026-10-21 00:00:00",
+        "2026-10-22 00:00:00",
+    )
+    assert [s["late"] for s in sections.values()] == [1]
