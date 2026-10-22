@@ -26,7 +26,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Final, Literal
 
@@ -66,6 +65,10 @@ class TriageVerdictBody(BaseModel):
     """Тело ``POST /api/executor-triage/{id}/verdict``: значение вне списка - 422."""
 
     verdict: Literal["accepted", "rejected"]
+
+
+class OutcomeAlreadyCounted(Exception):
+    """Исход уже связан с другим дайджестом: транзакция записи откатывается (#1997)."""
 
 
 class VerdictError(Exception):
@@ -217,27 +220,32 @@ async def record_owner_verdict(
 # Дайджест
 # ---------------------------------------------------------------------------
 
-#: ``action_at`` - время самого действия, выбранного исходом (``followup_action_at``);
-#: у строк с исходом до колонки его нет, и они читаются по ``followup_at``.
+#: Рекомендации, созданные в сутках: счётчики ``created``/``retry``/``owner``.
 _DIGEST_ROWS_SQL: Final[str] = """
-SELECT id, task_id, action, created_at, followup, followup_at,
-       COALESCE(followup_action_at, followup_at) AS action_at
+SELECT id, task_id, action, created_at
 FROM executor_triage_recommendations
-WHERE (created_at >= ? AND created_at < ?)
-   OR (followup IS NOT NULL
-       AND COALESCE(followup_action_at, followup_at) >= ?
-       AND COALESCE(followup_action_at, followup_at) < ?)
+WHERE created_at >= ? AND created_at < ?
 """
 
-#: Исходы, чьё действие раньше этих суток: кандидаты в ``late``. Окно по времени
-#: обработки не ограничивает их: исход, пропущенный нечитаемым дайджестом, ждёт
-#: первого измеренного, а не пропадает.
-_LATE_ROWS_SQL: Final[str] = """
-SELECT id, task_id, action, created_at, followup, followup_at,
-       COALESCE(followup_action_at, followup_at) AS action_at
-FROM executor_triage_recommendations
-WHERE followup IS NOT NULL AND COALESCE(followup_action_at, followup_at) < ?
+#: Неучтённые исходы с действием до конца суток (#1997). ``action_at`` - время
+#: самого действия, выбранного исходом (``followup_action_at``); у строк с исходом
+#: до колонки его нет, и они читаются по ``followup_at``. Учтённость - строка в
+#: ``triage_digest_outcomes`` (PRIMARY KEY по рекомендации): выбор идёт LEFT JOIN
+#: по этому ключу, истории дайджестов и их JSON он не читает. Окно по времени
+#: обработки исход не ограничивает: пропущенный нечитаемым дайджестом ждёт первого
+#: измеренного, а не пропадает.
+OUTCOME_ROWS_SQL: Final[str] = """
+SELECT r.id, r.task_id, r.action, r.followup,
+       COALESCE(r.followup_action_at, r.followup_at) AS action_at
+FROM executor_triage_recommendations r
+LEFT JOIN triage_digest_outcomes l ON l.recommendation_id = r.id
+WHERE l.recommendation_id IS NULL
+  AND r.followup IS NOT NULL
+  AND COALESCE(r.followup_action_at, r.followup_at) < ?
 """
+
+#: Связь исхода с дайджестом: (id рекомендации, ``day`` | ``late``).
+Link = tuple[int, str]
 
 
 def empty_section() -> dict[str, Any]:
@@ -271,72 +279,43 @@ def section_active(section: dict[str, Any]) -> bool:
     )
 
 
-async def _counted(db: aiosqlite.Connection) -> tuple[set[int], dict[int, list]]:
-    """Что уже учтено ИЗМЕРЕННЫМИ дайджестами: (id исходов, старые дайджесты по проекту).
-
-    id глобальны: рекомендация одна, и учтённая в дайджесте проекта A остаётся
-    учтённой после переноса задачи в B. Дайджест с ``unavailable`` исходов не учёл.
-    Измеренный дайджест без ``outcome_ids`` (до круга 2) читается по дате и времени
-    записи: он учёл исходы с действием не позже его даты, обработанные до записи.
-    """
-    ids: set[int] = set()
-    legacy: dict[int, list] = {}
-    for row in await fetchall(
-        db, "SELECT project_id, digest_date, created_at, payload FROM autopilot_digests"
-    ):
-        try:
-            section = json.loads(row["payload"] or "{}").get("triage") or {}
-        except ValueError:
-            continue
-        if section.get("state") != MEASURED:
-            continue
-        if "outcome_ids" in section:
-            ids.update(int(i) for i in section["outcome_ids"])
-        else:
-            legacy.setdefault(int(row["project_id"]), []).append(
-                (str(row["digest_date"]), str(row["created_at"]))
-            )
-    return ids, legacy
+def _count_created(section: dict[str, Any], row: Any) -> None:
+    section["created"] += 1
+    retry = row["action"] in triage.RETRY_ACTIONS
+    section["retry" if retry else "owner"] += 1
 
 
-def _counted_by_legacy(entries: list | None, row: Any) -> bool:
-    return any(
-        str(row["action_at"])[:10] <= day and str(row["followup_at"]) < written
-        for day, written in entries or []
-    )
-
-
-def _count(section: dict[str, Any], row: Any, window: tuple[str, str]) -> None:
-    """Учесть строку в сутках ``window``: создание - по created_at, исход - по
-    времени ДЕЙСТВИЯ (не свипа)."""
-    start, end = window
-    if start <= str(row["created_at"]) < end:
-        section["created"] += 1
-        retry = row["action"] in triage.RETRY_ACTIONS
-        section["retry" if retry else "owner"] += 1
-    followup = row["followup"]
-    if followup is None or not start <= str(row["action_at"] or "") < end:
-        return
+def _count_outcome(section: dict[str, Any], row: Any, window_start: str) -> Link:
+    """Учесть неучтённый исход: в сутках - по времени ДЕЙСТВИЯ (не свипа), раньше -
+    как опоздавший (``late``, вне X/Y)."""
     section["outcome_ids"].append(int(row["id"]))
+    if str(row["action_at"] or "") < window_start:
+        section["late"] += 1
+        return int(row["id"]), "late"
+    followup = row["followup"]
     if followup in _UNMEASURED_FOLLOWUPS:
         section["unmeasured"] += 1
-        return
-    section["resolved"] += 1
-    section["matched"] += followup in triage.MATCHING.get(row["action"], frozenset())
+    else:
+        section["resolved"] += 1
+        section["matched"] += followup in triage.MATCHING.get(
+            row["action"], frozenset()
+        )
+    return int(row["id"]), "day"
 
 
-async def digest_sections(
+async def collect_sections(
     db: aiosqlite.Connection, day_start: str, day_end: str
-) -> dict[int, dict[str, Any]]:
-    """Раздел «разбор» по проектам за [day_start, day_end); ключ - id проекта.
+) -> tuple[dict[int, dict[str, Any]], dict[int, list[Link]]]:
+    """Раздел «разбор» по проектам за [day_start, day_end) и связи исходов к записи.
 
-    Исключение пробрасывается: вызывающий пишет ``unavailable_section`` во все
-    дайджесты вместо молчаливого нуля.
+    Ключ - id проекта. Чистое чтение: связи пишет ``record_links`` в транзакции
+    INSERT дайджеста. Исключение пробрасывается: вызывающий пишет
+    ``unavailable_section`` вместо молчаливого нуля.
     """
-    rows = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end) * 2)
-    late_rows = await fetchall(db, _LATE_ROWS_SQL, (day_start,))
-    counted_ids, legacy = await _counted(db)
+    created = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end))
+    outcomes = await fetchall(db, OUTCOME_ROWS_SQL, (day_end,))
     sections: dict[int, dict[str, Any]] = {}
+    links: dict[int, list[Link]] = {}
     owners: dict[int, int | None] = {}
 
     async def project_of(row: Any) -> int | None:
@@ -346,45 +325,57 @@ async def digest_sections(
             owners[task_id] = int(owner["id"]) if owner else None
         return owners[task_id]
 
-    for row in rows:
+    for row in created:
         project_id = await project_of(row)
         if project_id is not None:
-            _count(
-                sections.setdefault(project_id, empty_section()),
-                row,
-                (day_start, day_end),
-            )
-    for row in late_rows:
-        if int(row["id"]) in counted_ids:
-            continue  # учтённое отсеивается до поиска проекта: хвост истории дёшев
+            _count_created(sections.setdefault(project_id, empty_section()), row)
+    for row in outcomes:
         project_id = await project_of(row)
-        if project_id is None or _counted_by_legacy(legacy.get(project_id), row):
+        if project_id is None:
             continue
         section = sections.setdefault(project_id, empty_section())
-        section["late"] += 1
-        # id входит в сохраняемый раздел: следующий дайджест этот исход не берёт.
-        section["outcome_ids"].append(int(row["id"]))
-    return sections
+        links.setdefault(project_id, []).append(_count_outcome(section, row, day_start))
+    return sections, links
 
 
-async def section_map(
+async def digest_sections(
     db: aiosqlite.Connection, day_start: str, day_end: str
-) -> tuple[dict[int, dict[str, Any]], str]:
-    """(разделы по проектам, причина сбоя); сбой не превращается в ноль."""
+) -> dict[int, dict[str, Any]]:
+    """Разделы по проектам без связей: чтение для проверок и показа."""
+    return (await collect_sections(db, day_start, day_end))[0]
+
+
+async def project_section(
+    db: aiosqlite.Connection, project_id: int, day_start: str, day_end: str
+) -> tuple[dict[str, Any], list[Link]]:
+    """Раздел проекта и его связи; сбой чтения - ``unavailable`` без связей.
+
+    Нечитаемый разбор не превращается в ноль и ничего не учитывает.
+    """
     try:
-        return await digest_sections(db, day_start, day_end), ""
+        sections, links = await collect_sections(db, day_start, day_end)
     except Exception as exc:  # noqa: BLE001 - дайджест выходит без раздела разбора
         log.warning("digest triage section unreadable: %s", exc)
-        return {}, f"{type(exc).__name__}: {exc}"
+        return unavailable_section(f"{type(exc).__name__}: {exc}"), []
+    return sections.get(project_id) or empty_section(), links.get(project_id, [])
 
 
-def section_for(
-    project_id: int, sections: dict[int, dict[str, Any]], failure: str
-) -> dict[str, Any]:
-    """Раздел проекта: данные, пустой день или ``unavailable`` при сбое чтения."""
-    if failure:
-        return unavailable_section(failure)
-    return sections.get(project_id) or empty_section()
+async def record_links(
+    db: aiosqlite.Connection, digest_id: int, links: list[Link]
+) -> None:
+    """Связать исходы с дайджестом в транзакции его INSERT (#1997).
+
+    PRIMARY KEY по рекомендации - последняя страховка: занятый исход не
+    перезаписывается, а валит транзакцию целиком (дайджест не остаётся без связи).
+    """
+    for recommendation_id, kind in links:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO triage_digest_outcomes "
+            "(recommendation_id, digest_id, kind) VALUES (?, ?, ?)",
+            (recommendation_id, digest_id, kind),
+        )
+        if cursor.rowcount != 1:
+            raise OutcomeAlreadyCounted(recommendation_id)
 
 
 def unavailable_section(reason: str) -> dict[str, Any]:

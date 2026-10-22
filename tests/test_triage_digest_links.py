@@ -152,19 +152,17 @@ async def test_legacy_and_history_do_not_hide_or_slow(world, monkeypatch):
     await world.db.commit()
     await world.db.execute("PRAGMA foreign_keys = ON")
 
-    class Spy:
-        parsed: list[str] = []
+    parsed: list[str] = []
+    real_loads = json.loads
 
-        def __getattr__(self, name):
-            return getattr(json, name)
+    def spy(text, *a, **k):
+        parsed.append(str(text))
+        return real_loads(text, *a, **k)
 
-        def loads(self, text, *a, **k):
-            Spy.parsed.append(str(text))
-            return json.loads(text, *a, **k)
-
-    monkeypatch.setattr(triage_inbox, "json", Spy())
+    monkeypatch.setattr(json, "loads", spy)
     await _generate(world.db, _day(3))
-    assert not [p for p in Spy.parsed if "OLDPAYLOAD" in p]
+    monkeypatch.setattr(json, "loads", real_loads)
+    assert not [p for p in parsed if "OLDPAYLOAD" in p]
     late = [
         json.loads(r["payload"])["triage"]
         for r in await _rows(
@@ -181,4 +179,61 @@ async def test_legacy_and_history_do_not_hide_or_slow(world, monkeypatch):
     plan = await _rows(
         world.db, "EXPLAIN QUERY PLAN " + triage_inbox.OUTCOME_ROWS_SQL, ("2030",)
     )
-    assert LINKS in " ".join(r["detail"] for r in plan)
+    # учтённость проверяется поиском по ключу связей, а не чтением дайджестов
+    assert "SEARCH l USING INTEGER PRIMARY KEY" in " ".join(r["detail"] for r in plan)
+
+
+async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
+    """Вся цепочка steps на заполненной базе: связи только по outcome_ids измеренных."""
+    from hub.migrations import FROZEN_MIGRATIONS
+    from hub.migrations.steps import load_steps
+    from tests.test_db_migrations import _SCHEMA
+
+    steps = load_steps()
+    mine = [(n, q) for n, q in steps if "triage_digest_outcomes" in n]
+    assert len(mine) == 2, "нет шагов миграции #1997"
+    before = [(n, q) for n, q in steps if (n, q) not in mine]
+    monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await db_module._migrate(conn)
+        await conn.execute("PRAGMA foreign_keys = OFF")
+        await conn.execute("INSERT INTO projects (id, slug, name) VALUES (5, 'p', 'p')")
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (7, 't', '')"
+        )
+        for rec in (1, 2, 3, 4):
+            await conn.execute(
+                "INSERT INTO executor_triage_recommendations (id, order_id, task_id, "
+                "triage_class, action, followup, followup_at) "
+                "VALUES (?, ?, 7, 1, 'to_owner', 'new_order', '2026-10-20 01:00:00')",
+                (rec, rec + 100),
+            )
+        payloads = {
+            "2026-10-10": {"triage": {"state": "measured", "outcome_ids": [1, 99]}},
+            "2026-10-11": {"triage": {"state": "measured", "outcome_ids": [1, 2]}},
+            "2026-10-12": {"triage": {"state": "unavailable", "outcome_ids": [3]}},
+            "2026-10-13": {"triage": {"state": "measured"}},  # legacy
+            "2026-10-14": "не json",
+        }
+        for day, payload in payloads.items():
+            text = payload if isinstance(payload, str) else json.dumps(payload)
+            await conn.execute(
+                "INSERT INTO autopilot_digests (project_id, digest_date, payload) "
+                "VALUES (5, ?, ?)",
+                (day, text),
+            )
+        await conn.commit()
+        await conn.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *steps])
+        await db_module._migrate(conn)
+        await db_module._migrate(conn)
+        rows = await conn.execute_fetchall(
+            f"SELECT recommendation_id, digest_id FROM {LINKS} ORDER BY 1"
+        )
+        # 1 - у более раннего дайджеста; 99 нет в таблице; 3 - дайджест unavailable
+        assert [tuple(r) for r in rows] == [(1, 1), (2, 2)]
+    finally:
+        await conn.close()

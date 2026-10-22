@@ -33,7 +33,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 
 from hub import config
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
 from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
@@ -543,196 +543,213 @@ async def generate_due_digests(
         "SELECT id, slug, gate_policy FROM projects "
         "WHERE archived=0 AND status='active'",
     )
-    # #1943: разбор прогонов k8 не зависит от делегирования вердикта.
-    triage_sections, triage_failure = await triage_inbox.section_map(
-        db, day_start, day_end
-    )
     for project in projects:
-        delegates = _policy_delegates(project["gate_policy"])
-        triage_section = triage_inbox.section_for(
-            project["id"], triage_sections, triage_failure
-        )
-        if not delegates and not triage_inbox.section_active(triage_section):
-            continue
         if await _digest_exists(db, project["id"], day):
-            continue
-
-        # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out
-        # rather than generated: building SQL by concatenation is the shape
-        # every injection review has to stop and read, and here it buys
-        # nothing — a miscount raises on the first execute, so every digest
-        # test in this suite fails loudly rather than the poller failing at
-        # midnight.
-        events = await _autopilot_events(db, delegates, day_start, day_end)
-        approvals: list[dict] = []
-        verdicts: list[dict] = []
-        escalations: list[dict] = []
-        steward: list[dict] = []
-        self_approvals: list[dict] = []
-        for event in events:
-            if event["task_id"] is None:
-                continue
-            # Attribution walks the hierarchy — the same resolver as the
-            # git conveyor and the human_gates metric (#747).
-            owner = await repo.resolve_project_for_task(db, event["task_id"])
-            if owner is None or owner["id"] != project["id"]:
-                continue
-            try:
-                payload = json.loads(event["payload"] or "{}")
-            except ValueError:
-                payload = {}
-            entry = {
-                "task_id": event["task_id"],
-                "at": event["created_at"],
-                "payload": payload,
-            }
-            if event["kind"] == "task_approved" and event["actor"] == "policy":
-                approvals.append(entry)
-            elif (
-                event["kind"] == "review_verdict_recorded"
-                and event["actor"] == "policy"
-            ):
-                # Model diversity (#758): the digest shows WHO wrote and WHO
-                # reviewed — the pair the monoculture rule compares.
-                task_row = await repo.get_task(db, event["task_id"])
-                # Отчёт СВОЕГО поколения, а не самый свежий (#1234): иначе
-                # отчёт, легший после вердикта, подменяет собой тот, под
-                # которым вердикт вынесен.
-                mr = await _report_of_generation(
-                    db,
-                    event["task_id"],
-                    payload.get("submission_generation"),
-                    event["created_at"],
-                )
-                entry["models"] = {
-                    "implementer": (
-                        dict(task_row).get("submission_model", "") if task_row else ""
-                    ),
-                    "reviewer": (dict(mr).get("model", "") if mr else ""),
-                }
-                # #1234: дайджест показывал автовердикт числом и молчал о том,
-                # ЧТО стояло в отчёте под ним. Отчёт с нулём подтверждённых и
-                # непустым unresolved попадал сюда неотличимо от чистого — а
-                # это ровно те отчёты, которые 09.09.2026 пришлось разбирать
-                # вручную. Ступень берётся из той же функции, что и на
-                # карточке: одно правило на трёх читателей.
-                entry["machine_review"] = _report_outcome_of(mr)
-                verdicts.append(entry)
-            elif _is_self_approval(dict(event), payload):
-                self_approvals.append(
-                    {
-                        **entry,
-                        "generation": int(payload.get("submission_generation") or 0),
-                    }
-                )
-            elif event["kind"] == "verdict_escalated":
-                escalations.append(entry)
-            elif event["kind"] == STEWARD_JUDGEMENT and event["actor"] == "steward":
-                steward.append(await _steward_entry(db, entry, payload))
-
-        # #1420: a release that stood blocked is news for the owner even on a
-        # day the autopilot was quiet — it holds back everything merged.
-        release_blocks = await release_block_history(
-            db, project["id"], day_start, day_end
-        )
-        if not (
-            approvals
-            or verdicts
-            or escalations
-            or steward
-            or self_approvals
-            or release_blocks
-            or triage_inbox.section_active(triage_section)
-        ):
-            # The empty-day rule now covers the steward too, in both
-            # directions: a day of steward-only activity IS a day worth a
-            # digest, and a day with neither still produces nothing. An
-            # empty report read daily stops being read within a week, and
-            # that is how oversight dies quietly (#739).
-            continue
-
-        merges = await _day_merges(db, project["id"], day_start, day_end)
-        pool, oversample = _audit_pool_and_oversample(
-            approvals, verdicts, escalations, steward, self_approvals
-        )
-        sample = deterministic_sample(pool, day, oversample_ids=oversample)
-        # #878: the debt rides along with a digest that is being created for
-        # other reasons. It does NOT cause one: this digest is per-project and
-        # only exists on days with autopilot activity, while the debt is a
-        # property of the practice. Making it a trigger would have it arrive
-        # on some days and not others with no way to tell which.
-        debt = await _uncovered_category_debt(db)
-        # #1020: the human queue rides along the same way the category debt
-        # does, and for the same reason — it is a property of the practice,
-        # not of this day's autopilot activity. Riding along has a real cost
-        # to state plainly: a digest is only created for a delegating project
-        # on a day with autopilot events, so this line appears when a digest
-        # happens to exist. The reminder's dependable channel is the events
-        # feed the poller writes; the digest is the summary, not the alarm.
-        human_queue = await repo.human_queue_reminders_between(db, day_start, day_end)
-        payload = {
-            "date": day,
-            "project": project["slug"],
-            "release_blocks": release_blocks,
-            "category_debt": debt,
-            "human_queue": human_queue,
-            "findings_queue": await findings_queue_section(db),
-            "auto_approvals": approvals,
-            "auto_verdicts": verdicts,
-            "escalations": escalations,
-            STEWARD_SECTION_KEY: steward,
-            SELF_APPROVALS_KEY: self_approvals,
-            "triage": triage_section,
-            "deliveries": [dict(m) for m in merges],
-            "audit_sample": sample,
-            "audit_results": {},
-        }
-        digest_id = await repo.create_digest(
-            db,
-            project_id=project["id"],
-            digest_date=day,
-            payload=json.dumps(payload, ensure_ascii=False),
-        )
-        if digest_id is None:
-            continue
-        await repo.insert_event(
-            db,
-            kind="digest_created",
-            project_id=project["id"],
-            actor="hub",
-            payload={
-                "digest_id": digest_id,
-                "date": day,
-                "auto_approvals": len(approvals),
-                "auto_verdicts": len(verdicts),
-                "escalations": len(escalations),
-                "triage_state": triage_section["state"],
-                # Нечитаемый разбор - не ноль: счётчик остаётся пустым (#1943).
-                "triage_created": (
-                    triage_section["created"]
-                    if triage_section["state"] == triage_inbox.MEASURED
-                    else None
-                ),
-                "steward_judgements": len(steward),
-                "steward_self_approvals": len(self_approvals),
-                "audit_sample": sample,
-            },
-        )
+            continue  # дешёвый выход без write-лока: почти каждый проход поллера
+        # #1997: сбор раздела разбора, INSERT дайджеста и связи «исход -> дайджест»
+        # идут одной транзакцией BEGIN IMMEDIATE на проект: второй писатель ждёт
+        # на write-локе и видит связи первого, а не пустоту.
         await db.commit()
-        created += 1
-        log.info(
-            "digest #%s created for project %s (%s): %d approvals, "
-            "%d verdicts, %d escalations, %d steward judgements, sample %s",
-            digest_id,
-            project["slug"],
-            day,
-            len(approvals),
-            len(verdicts),
-            len(escalations),
-            len(steward),
-            sample,
-        )
+        async with write_transaction(db):
+            if await _project_digest(db, project, day, day_start, day_end):
+                created += 1
     return created
+
+
+async def _project_digest(
+    db: aiosqlite.Connection,
+    project: aiosqlite.Row,
+    day: str,
+    day_start: str,
+    day_end: str,
+) -> bool:
+    """Собрать и записать дайджест проекта за сутки; False - дайджест не нужен.
+
+    Вызывается внутри ``write_transaction``: сбор раздела разбора и запись
+    связей исходов делят с INSERT дайджеста одну транзакцию (#1997).
+    """
+    delegates = _policy_delegates(project["gate_policy"])
+    if await _digest_exists(db, project["id"], day):
+        return False
+    # #1943: разбор прогонов k8 не зависит от делегирования вердикта. Раздел
+    # собирается ВНУТРИ транзакции записи (#1997): неучтённые исходы читаются
+    # под write-локом, поэтому два дайджеста не берут один исход.
+    triage_section, triage_links = await triage_inbox.project_section(
+        db, project["id"], day_start, day_end
+    )
+    if not delegates and not triage_inbox.section_active(triage_section):
+        return False
+
+    # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out
+    # rather than generated: building SQL by concatenation is the shape
+    # every injection review has to stop and read, and here it buys
+    # nothing — a miscount raises on the first execute, so every digest
+    # test in this suite fails loudly rather than the poller failing at
+    # midnight.
+    events = await _autopilot_events(db, delegates, day_start, day_end)
+    approvals: list[dict] = []
+    verdicts: list[dict] = []
+    escalations: list[dict] = []
+    steward: list[dict] = []
+    self_approvals: list[dict] = []
+    for event in events:
+        if event["task_id"] is None:
+            return False
+        # Attribution walks the hierarchy — the same resolver as the
+        # git conveyor and the human_gates metric (#747).
+        owner = await repo.resolve_project_for_task(db, event["task_id"])
+        if owner is None or owner["id"] != project["id"]:
+            return False
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        entry = {
+            "task_id": event["task_id"],
+            "at": event["created_at"],
+            "payload": payload,
+        }
+        if event["kind"] == "task_approved" and event["actor"] == "policy":
+            approvals.append(entry)
+        elif event["kind"] == "review_verdict_recorded" and event["actor"] == "policy":
+            # Model diversity (#758): the digest shows WHO wrote and WHO
+            # reviewed — the pair the monoculture rule compares.
+            task_row = await repo.get_task(db, event["task_id"])
+            # Отчёт СВОЕГО поколения, а не самый свежий (#1234): иначе
+            # отчёт, легший после вердикта, подменяет собой тот, под
+            # которым вердикт вынесен.
+            mr = await _report_of_generation(
+                db,
+                event["task_id"],
+                payload.get("submission_generation"),
+                event["created_at"],
+            )
+            entry["models"] = {
+                "implementer": (
+                    dict(task_row).get("submission_model", "") if task_row else ""
+                ),
+                "reviewer": (dict(mr).get("model", "") if mr else ""),
+            }
+            # #1234: дайджест показывал автовердикт числом и молчал о том,
+            # ЧТО стояло в отчёте под ним. Отчёт с нулём подтверждённых и
+            # непустым unresolved попадал сюда неотличимо от чистого — а
+            # это ровно те отчёты, которые 09.09.2026 пришлось разбирать
+            # вручную. Ступень берётся из той же функции, что и на
+            # карточке: одно правило на трёх читателей.
+            entry["machine_review"] = _report_outcome_of(mr)
+            verdicts.append(entry)
+        elif _is_self_approval(dict(event), payload):
+            self_approvals.append(
+                {
+                    **entry,
+                    "generation": int(payload.get("submission_generation") or 0),
+                }
+            )
+        elif event["kind"] == "verdict_escalated":
+            escalations.append(entry)
+        elif event["kind"] == STEWARD_JUDGEMENT and event["actor"] == "steward":
+            steward.append(await _steward_entry(db, entry, payload))
+
+    # #1420: a release that stood blocked is news for the owner even on a
+    # day the autopilot was quiet — it holds back everything merged.
+    release_blocks = await release_block_history(db, project["id"], day_start, day_end)
+    if not (
+        approvals
+        or verdicts
+        or escalations
+        or steward
+        or self_approvals
+        or release_blocks
+        or triage_inbox.section_active(triage_section)
+    ):
+        # The empty-day rule now covers the steward too, in both
+        # directions: a day of steward-only activity IS a day worth a
+        # digest, and a day with neither still produces nothing. An
+        # empty report read daily stops being read within a week, and
+        # that is how oversight dies quietly (#739).
+        return False
+
+    merges = await _day_merges(db, project["id"], day_start, day_end)
+    pool, oversample = _audit_pool_and_oversample(
+        approvals, verdicts, escalations, steward, self_approvals
+    )
+    sample = deterministic_sample(pool, day, oversample_ids=oversample)
+    # #878: the debt rides along with a digest that is being created for
+    # other reasons. It does NOT cause one: this digest is per-project and
+    # only exists on days with autopilot activity, while the debt is a
+    # property of the practice. Making it a trigger would have it arrive
+    # on some days and not others with no way to tell which.
+    debt = await _uncovered_category_debt(db)
+    # #1020: the human queue rides along the same way the category debt
+    # does, and for the same reason — it is a property of the practice,
+    # not of this day's autopilot activity. Riding along has a real cost
+    # to state plainly: a digest is only created for a delegating project
+    # on a day with autopilot events, so this line appears when a digest
+    # happens to exist. The reminder's dependable channel is the events
+    # feed the poller writes; the digest is the summary, not the alarm.
+    human_queue = await repo.human_queue_reminders_between(db, day_start, day_end)
+    payload = {
+        "date": day,
+        "project": project["slug"],
+        "release_blocks": release_blocks,
+        "category_debt": debt,
+        "human_queue": human_queue,
+        "findings_queue": await findings_queue_section(db),
+        "auto_approvals": approvals,
+        "auto_verdicts": verdicts,
+        "escalations": escalations,
+        STEWARD_SECTION_KEY: steward,
+        SELF_APPROVALS_KEY: self_approvals,
+        "triage": triage_section,
+        "deliveries": [dict(m) for m in merges],
+        "audit_sample": sample,
+        "audit_results": {},
+    }
+    digest_id = await repo.create_digest(
+        db,
+        project_id=project["id"],
+        digest_date=day,
+        payload=json.dumps(payload, ensure_ascii=False),
+    )
+    if digest_id is None:
+        return False
+    await triage_inbox.record_links(db, digest_id, triage_links)
+    await repo.insert_event(
+        db,
+        kind="digest_created",
+        project_id=project["id"],
+        actor="hub",
+        payload={
+            "digest_id": digest_id,
+            "date": day,
+            "auto_approvals": len(approvals),
+            "auto_verdicts": len(verdicts),
+            "escalations": len(escalations),
+            "triage_state": triage_section["state"],
+            # Нечитаемый разбор - не ноль: счётчик остаётся пустым (#1943).
+            "triage_created": (
+                triage_section["created"]
+                if triage_section["state"] == triage_inbox.MEASURED
+                else None
+            ),
+            "steward_judgements": len(steward),
+            "steward_self_approvals": len(self_approvals),
+            "audit_sample": sample,
+        },
+    )
+    log.info(
+        "digest #%s created for project %s (%s): %d approvals, "
+        "%d verdicts, %d escalations, %d steward judgements, sample %s",
+        digest_id,
+        project["slug"],
+        day,
+        len(approvals),
+        len(verdicts),
+        len(escalations),
+        len(steward),
+        sample,
+    )
+    return True
 
 
 async def record_audit_result(
