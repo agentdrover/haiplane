@@ -488,11 +488,20 @@ def classify_followup(f: dict[str, Any]) -> str | None:
     того, когда прошёл свип. При равенстве - ``_RANK``; исход текущей секунды
     откладывается до следующего прохода (событие той же секунды ещё может прийти).
     """
+    chosen = classify_followup_at(f)
+    return chosen[1] if chosen else None
+
+
+def classify_followup_at(f: dict[str, Any]) -> tuple[str, str] | None:
+    """``(время действия, исход)`` выбранного действия; ``None`` - пока ничего (#1943).
+
+    Время - метка САМОГО действия, не свипа: по ней дайджест относит исход к суткам.
+    """
     events = [(when, _RANK[kind], kind) for when, kind in f["events"]]
     if not events:
         return None
     first = min(events)
-    return None if first[0] >= f["now"] else first[2]
+    return None if first[0] >= f["now"] else (first[0], first[2])
 
 
 def _later_order_event(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
@@ -564,14 +573,15 @@ async def _resolve_pending(db: aiosqlite.Connection) -> int:
     resolved = 0
     for raw in await fetchall(db, _PENDING_SQL):
         events = await _followup_events(db, raw, now)
-        followup = classify_followup({"events": events, "now": now})
-        if followup is None:
+        chosen = classify_followup_at({"events": events, "now": now})
+        if chosen is None:
             continue
+        action_at, followup = chosen
         cursor = await db.execute(
             "UPDATE executor_triage_recommendations SET followup = ?, "
-            "followup_at = datetime('now'), resolved_by = 'hub' "
-            "WHERE id = ? AND followup IS NULL",
-            (followup, int(raw["id"])),
+            "followup_at = datetime('now'), followup_action_at = ?, "
+            "resolved_by = 'hub' WHERE id = ? AND followup IS NULL",
+            (followup, action_at, int(raw["id"])),
         )
         resolved += int(cursor.rowcount or 0)
     return resolved

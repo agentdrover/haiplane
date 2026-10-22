@@ -291,6 +291,33 @@ def _observed_base_merge(task_view) -> BaseMergeState:
     )
 
 
+_CLEAN_MERGE_REASONS = {
+    "clean": "мерж будет чистым",
+    "blocked": "конфликта нет; PR ждёт обязательных проверок или ревью",
+    "behind": "конфликта нет; ветка отстаёт от базы",
+    "unstable": "конфликта нет; необязательные проверки красные",
+    "draft": "конфликта нет; PR в черновике",
+    "has_hooks": "мерж будет чистым",
+}
+
+
+def _clean_merge_reason(detail: str) -> str:
+    """Человеческий ``reason`` для ``state=clean`` (#1935).
+
+    ``detail`` здесь — сырой ``mergeStateStatus`` GitHub (#475: он отвечает
+    «обязательных проверок нет» одинаково и когда они прошли, и когда их не
+    запускали вовсе). Советник стюарда трижды прочитал ``clean`` вместе с
+    сырым ``blocked`` как противоречие — текст должен различать «мерж будет
+    чистым» от «конфликта нет, но PR ждёт проверок/ревью». Значение, которого
+    в таблице нет (неизвестный GitHub-статус или ответ не-GitHub форжа),
+    остаётся честным: мерж будет чистым, сырой ответ назван отдельно.
+    """
+    key = (detail or "").strip().lower()
+    if key in _CLEAN_MERGE_REASONS:
+        return _CLEAN_MERGE_REASONS[key]
+    return f"мерж будет чистым; форж: {detail}" if detail else "мерж будет чистым"
+
+
 async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
     """Спросить провайдера, сольётся ли PR чисто: дорогой ответ, только явным операциям."""
     from hub import services
@@ -314,7 +341,7 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
         return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
     value = getattr(outcome, "value", str(outcome))
     if value == "mergeable":
-        return BaseMergeState(state="clean", reason=detail or "мерж будет чистым")
+        return BaseMergeState(state="clean", reason=_clean_merge_reason(detail))
     if value != "conflicting":
         return BaseMergeState(state="unknown", reason=detail or value)
     # Имена файлов приезжают в детали от того же расчёта, что читает доставка;
