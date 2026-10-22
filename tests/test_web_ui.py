@@ -176,7 +176,10 @@ _ONCE_LIGHT_THEME_RULES = (
 # (--orange/--orange-dim and friends) already exist. If a later task adds a
 # token on purpose, update this number and say why; the point is that nobody
 # adds one by accident while recolouring a warning.
-_DECLARED_TOKEN_COUNT = 50
+# 67 (#1812): +17 on purpose - 15 status tokens of the C2 card (--c2-<tone>,
+# -bg, -ink for five tones), --c2-on-accent and --accent-hover, the latter
+# because the light theme needs its own link-hover colour.
+_DECLARED_TOKEN_COUNT = 67
 
 
 def _relative_luminance(colour: str) -> float:
