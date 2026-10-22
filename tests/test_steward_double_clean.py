@@ -230,6 +230,7 @@ def test_the_policy_keys_are_accepted_only_in_their_shape():
         "bad_class_value",
         "bad_reviewers_value",
         "unreadable_ordinary",
+        "settings_edges",
         "autopilot_key",
         "agent_approve",
         "transaction_alone",
@@ -237,6 +238,8 @@ def test_the_policy_keys_are_accepted_only_in_their_shape():
     ],
 )
 async def test_off_and_other_gates_are_unchanged(db, monkeypatch, label):
+    if label == "settings_edges":
+        return _settings_edges()
     other = _OTHER_GATES.get(label)
     if other is not None:
         return await other(db, monkeypatch)
@@ -362,6 +365,26 @@ async def _human_case(db, monkeypatch):
     assert await verdict_of(db, case.task_id) == "approved"
     payload = (await verdict_events(db, case.task_id))[0]["payload"]
     assert "double_clean" not in payload
+
+
+def _settings_edges() -> None:
+    """Таблица краёв ключей: исключение включается ровно одним сочетанием."""
+    from hub.services.steward_double_clean import settings_of
+
+    good = policy_of()
+    assert settings_of(good) is not None
+    for broken in (
+        {**good, CEILING: "R1"},  # обычный потолок нечитаем
+        {k: v for k, v in good.items() if k != CEILING},  # обычного потолка нет
+        {**good, CLEAN_CEILING: "R3"},
+        {**good, CLEAN_CEILING: None},
+        {**good, REVIEWERS: []},
+        {**good, REVIEWERS: "21"},
+        {**good, REVIEWERS: [True]},
+        {**good, CLEAN_CEILING: "r1"},  # равен обычному
+        {**good, CLEAN_CEILING: "r0"},  # ниже обычного
+    ):
+        assert settings_of(broken) is None, broken
 
 
 _OTHER_GATES = {
