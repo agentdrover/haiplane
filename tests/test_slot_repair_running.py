@@ -23,7 +23,7 @@ from hub.services import admin as admin_svc
 from hub.services import executor_launch as el
 from hub.services import executor_orders as orders
 from hub.services import launch_feedback
-from hub.services import return_running
+from hub.services import rework_admission, return_running
 from tests.test_executor_dispatch import (
     _CONFIRMED,
     _CREATED,
@@ -458,3 +458,45 @@ async def test_open_task_and_cloud_repair_keep_working(world, monkeypatch):
         fresh = dict(await repo.get_task(world.db, bare))
         assert await el._admit_rework(world.db, fresh, "o")
     assert return_running.RETURN_RUNNING_STATUSES == {"running"}
+
+
+async def test_admission_rereads_policy_run_and_verdict(world):
+    """Общий допуск сам читает режим, идущий прогон и текущесть вердикта."""
+    task_id = await _after_cr(world, "допуск")
+
+    async def why() -> str:
+        row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
+        return await rework_admission.refusal(world.db, row)
+
+    assert await why() == ""
+
+    live = await repo.create_executor_run(
+        world.db,
+        task_id=task_id,
+        submission_generation=2,
+        agent_id="bc-live",
+        run_id="r",
+        model="m",
+    )
+    assert (await why()).startswith(el.REASON_ALREADY_RUNNING)
+    await repo.update_executor_run(world.db, live, outcome="failed", finish=True)
+
+    # В находки идут только замечания этой задачи: вне области их чинит не круг.
+    mixed = json.loads(FINDINGS_JSON) + [
+        {"id": 2, "severity": "low", "message": "вынесено", "scope": "out_of_scope"}
+    ]
+    await repo.update_task(world.db, task_id, review_findings=json.dumps(mixed))
+    row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
+    assert [f["title"] for f in rework_admission.verdict_findings(row)] == [
+        HUMAN_FINDING
+    ]
+
+    # Вердикт про прежнюю сдачу уже не находка этого круга.
+    await repo.update_task(world.db, task_id, submission_generation=2)
+    assert await why() == el.REASON_NO_FINDINGS
+
+    await repo.update_project(
+        world.db, world.pid, gate_policy=json.dumps({"executor_launch": "off"})
+    )
+    await world.db.commit()
+    assert await why() == el.REASON_OFF
