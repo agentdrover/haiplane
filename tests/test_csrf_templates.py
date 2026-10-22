@@ -690,11 +690,24 @@ async def _cheap_state(client, db, bearer, ids: dict[str, int]) -> list[str]:
             submitted_by="probe",
         )
     for task_id, outcome in ((ids["running"], "running"), (ids["open"], "failed")):
-        await db.execute(
+        run = await db.execute(
             "INSERT INTO executor_runs (task_id, agent_id, run_id, outcome) "
             "VALUES (?, 'agent-x', 'run-x', ?)",
             (task_id, outcome),
         )
+    # #1943: a failed host run with a recommendation shows the triage buttons.
+    order = await db.execute(
+        "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
+        "state, expires_at, report_outcome, report_reason_code) "
+        "VALUES ('k8', ?, 2, ?, 'closed', datetime('now'), 'failed', 'setup_failed')",
+        (ids["open"], run.lastrowid),
+    )
+    await db.execute(
+        "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+        "triage_class, class_name, action) VALUES (?, ?, 1, 'infra', "
+        "'retry_after_status')",
+        (order.lastrowid, ids["open"]),
+    )
     # A review nobody has asked a machine about yet.
     await extra_task("csrf review without a machine report", "review")
     delivered = await extra_task("csrf accepted, not delivered", "completed")
