@@ -432,7 +432,15 @@ def test_public_reason_is_linear_and_never_cuts_its_input(monkeypatch) -> None:
             seen.append(len(text))
             return self.inner.sub(repl, text)
 
-    names = ("_USERINFO_URL", "_URL", "_SCP", "_JSON_PATH", "_QUOTED_PATH", "_ABS_PATH")
+    names = (
+        "_CRED_CHUNK",
+        "_URL",
+        "_SCP",
+        "_JSON_PATH",
+        "_QUOTED_PATH",
+        "_OPEN_QUOTE_PATH",
+        "_ABS_PATH",
+    )
     for name in names:
         monkeypatch.setattr(brief_failure, name, Spy(getattr(brief_failure, name)))
 
