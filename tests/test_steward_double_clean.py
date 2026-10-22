@@ -219,9 +219,16 @@ def test_the_policy_keys_are_accepted_only_in_their_shape():
         "no_ordinary_ceiling",
         "bad_class_value",
         "bad_reviewers_value",
+        "autopilot_key",
+        "agent_approve",
+        "transaction_alone",
+        "human_verdict",
     ],
 )
 async def test_off_and_other_gates_are_unchanged(db, monkeypatch, label):
+    other = _OTHER_GATES.get(label)
+    if other is not None:
+        return await other(db, monkeypatch)
     policies = {
         "keys_absent": policy_of(clean=None, reviewers=None),
         "only_class": policy_of(reviewers=None),
@@ -249,7 +256,7 @@ async def test_off_and_other_gates_are_unchanged(db, monkeypatch, label):
     assert (await apply_self_approval(db, case.task_id, 1))[0] == ESCALATED_TO_HUMAN
 
 
-async def test_the_autopilot_ceiling_has_no_exception(db, monkeypatch):
+async def _autopilot_case(db, monkeypatch):
     """auto_approve_max_class не меняется: пара и ключи стюарда ему не помогают."""
     case = await build_case(
         db,
@@ -276,7 +283,7 @@ def _risk_fact(cls: str):
     return present("risk_class", "класс", stored=cls, recomputed=cls, raised=False)
 
 
-async def test_an_agent_cannot_approve_even_with_the_exception_on(db, monkeypatch):
+async def _agent_case(db, monkeypatch):
     """#1872: approve пишет только внутренний steward_applied, не агентский вызов."""
     case = await build_case(db, monkeypatch, "dc-agent")
     project = await repo.get_project(db, case.project_id)
@@ -299,7 +306,7 @@ async def test_an_agent_cannot_approve_even_with_the_exception_on(db, monkeypatc
     assert await verdict_of(db, case.task_id) == ""
 
 
-async def test_the_transaction_never_grants_the_exception_alone(db, monkeypatch):
+async def _transaction_alone_case(db, monkeypatch):
     """Транзакционный этап без раннего решения исключения не выдаёт."""
     case = await build_case(db, monkeypatch, "dc-no-early")
 
@@ -317,7 +324,7 @@ async def test_the_transaction_never_grants_the_exception_alone(db, monkeypatch)
     assert await verdict_of(db, case.task_id) == ""
 
 
-async def test_a_human_verdict_is_not_gated_by_the_exception(db, monkeypatch):
+async def _human_case(db, monkeypatch):
     case = await build_case(db, monkeypatch, "dc-human")
 
     await record_review_verdict(
@@ -331,6 +338,14 @@ async def test_a_human_verdict_is_not_gated_by_the_exception(db, monkeypatch):
     assert await verdict_of(db, case.task_id) == "approved"
     payload = (await verdict_events(db, case.task_id))[0]["payload"]
     assert "double_clean" not in payload
+
+
+_OTHER_GATES = {
+    "autopilot_key": _autopilot_case,
+    "agent_approve": _agent_case,
+    "transaction_alone": _transaction_alone_case,
+    "human_verdict": _human_case,
+}
 
 
 # ---------------------------------------------------------------------------

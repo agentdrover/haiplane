@@ -878,6 +878,8 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "steward_watch": ["needs_decision", "release"],
         "steward_approve_max_class": "r1",
         "auto_approve_max_class": "r1",
+        "steward_approve_max_class_double_clean": "r3",  # #1986
+        "double_clean_reviewers": [21, 22],
         "ci_contract": {
             "workflow_path": ".github/workflows/tests.yml",
             "required_checks": ["tests"],
