@@ -133,3 +133,31 @@ async def test_plain_verdicts_do_not_need_the_risk_tick(client: AsyncClient):
         follow_redirects=False,
     )
     assert resp.status_code == 303
+
+
+async def test_risk_sheet_cannot_carry_another_verdict(client: AsyncClient):
+    task_id, form, data = await _risk_sheet(client)
+    resp = await client.post(
+        form.attrs["action"],
+        data={**data, "verdict": "changes_requested", "comments": ""},
+        headers=SHEET_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
+
+
+async def test_risk_sheet_keeps_the_text_vs_verdict_contradiction_guard(
+    client: AsyncClient,
+):
+    task_id, form, data = await _risk_sheet(client)
+    resp = await client.post(
+        form.attrs["action"],
+        data={
+            **data,
+            "confirm_risk": "1",
+            "comments": "CHANGES_REQUESTED: сначала исправьте",
+        },
+        headers=SHEET_HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
