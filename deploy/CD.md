@@ -597,6 +597,32 @@ middleware. Клиенты с `Authorization: Bearer` (агенты, CI, MCP, `o
   формах и HTMX-запросах) и недели без событий `csrf_would_reject`.
 - Origin сверяется с `HAIPLANE_HUB_URL`: он должен совпадать с публичным
   адресом хаба, иначе в `warn` пойдут события `origin_mismatch`.
+- `HAIPLANE_HUB_EXTRA_ORIGINS` (#1994) — необязательный список через запятую
+  других публичных адресов того же хаба (на проде `https://haiplane.com`).
+  Каждый элемент — строго `схема://хост[:порт]`: только `http` или `https`,
+  хост — DNS-имя (ASCII `[a-z0-9-]`, метки 1..63, последняя метка только
+  буквы; IP-адреса в любой записи, `[...]`, управляющие символы и пробелы
+  внутри не принимаются),
+  без масок `*`, `user:pw@`, пути, `?query` и `#fragment`, порт 1..65535.
+  Схема, хост и порт сверяются точно (`http` не равен `https`, порт значим).
+  Элемент, который не разобрался, не расширяет доверие и в логе/`/health`
+  называется только числом («2 of 5 entries ignored»), без значения. Порядок
+  проверки не меняется: есть `Origin` — смотрится только он, `Referer` только
+  без `Origin`, токен сессии нужен всегда.
+- Сменить список: правка `HAIPLANE_HUB_EXTRA_ORIGINS` в
+  `/etc/haiplane-hub/*.env` (или drop-in) и
+  `sudo systemctl restart haiplane-hub`. Проверка:
+  `curl -s https://agenthai.ru/health` — `csrf_trusted_origins` содержит
+  `HAIPLANE_HUB_URL` первым, затем элементы списка; `csrf_warning` не называет
+  `HAIPLANE_HUB_EXTRA_ORIGINS`. Тот же список печатают `oc-hub health` и
+  `hub_health`. Каждому домену нужен и свой `Host` в
+  `HAIPLANE_HUB_ALLOWED_HOSTS` (на проде там уже `agenthai.ru` и
+  `haiplane.com`, 421 иначе). Вход на каждом домене свой: cookie выдаётся без
+  `Domain`.
+- В режиме `require` каждый отказ пишет в лог (`hub.csrf`, warning) одну
+  строку: причина (`origin_mismatch`, `referer_mismatch`, `token_missing`,
+  `token_invalid`, `body_too_large`, `body_timeout`), метод и путь без query;
+  cookie и токена в строке нет, в `events` отказы не пишутся.
 
 ## Мутации и baseline в CI: по событию, а не на каждом обновлении ветки (#1606)
 
