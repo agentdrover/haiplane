@@ -320,3 +320,27 @@ async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkey
         ]
     finally:
         await conn.close()
+
+
+async def test_counted_outcome_stays_counted_when_the_task_changes_project(world):
+    """Исход, сохранённый в дайджесте проекта A, не всплывает в late проекта B."""
+    from hub import repository as repo
+
+    first = await _acted(world)
+    await triage.sweep(world.db)
+    built = await _digests(world, now=datetime(2026, 10, 21, 0, 0, 0, tzinfo=UTC))
+    assert built[0]["data"]["triage"]["resolved"] == 1
+    other = await repo.create_project(world.db, slug="moved-1943", name="moved-1943")
+    task_id = (
+        await _rows(
+            world.db,
+            "SELECT task_id FROM executor_triage_recommendations WHERE order_id = ?",
+            (first,),
+        )
+    )[0]["task_id"]
+    await repo.update_task(world.db, task_id, project_id=other)
+    await world.db.commit()
+    sections = await triage_inbox.digest_sections(
+        world.db, "2026-10-22 00:00:00", "2026-10-23 00:00:00"
+    )
+    assert sum(s["late"] for s in sections.values()) == 0
