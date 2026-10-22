@@ -15,8 +15,8 @@ Selection (each file is printed with its reason):
 * a tree guard from ``docs/agent-context/tree-guards.json``;
 * a ``tests/test_*.py`` file that contains the path of a changed file which is
   not Python (a template, a JSON ledger, a doc, a fixture or golden file under
-  ``tests/``). For a file under ``tests/`` its name alone is enough: fixtures are
-  usually joined to a directory constant, not spelled out.
+  ``tests/``). For a file under ``tests/`` its name alone is enough, as a
+  string literal: fixtures are usually joined to a directory constant.
 
 Standard library only. The exit code is pytest's.  This is a convenience for the
 author, not evidence: CI stays the authority, a miss costs one CI cycle.
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -91,23 +92,32 @@ def _is_test(path: str) -> bool:
     return path.startswith("tests/test_") and path.endswith(".py")
 
 
-def _needles(path: str) -> list[str]:
-    """What to look for in a test's text for a changed non-Python path."""
-    if path.startswith("tests/"):
-        return [path, path.rsplit("/", 1)[-1]]
-    return [path]
+def _mentions(text: str, path: str) -> bool:
+    """Whether a test's text names the changed non-Python ``path``.
+
+    The full path is looked for as it is. Under ``tests/`` the bare name is enough
+    (fixtures are usually joined to a directory constant) but only as a string
+    literal or the tail of one - ``"view.json"``, ``GOLDEN / "view.json"`` - so a
+    call such as ``response.json()`` is not a mention.
+    """
+    if path in text:
+        return True
+    if not path.startswith("tests/"):
+        return False
+    name = re.escape(path.rsplit("/", 1)[-1])
+    return re.search(rf"""(?<=["'/]){name}(?=["'])""", text) is not None
 
 
-def readers_of(root: Path, targets: list[str]) -> dict[str, str]:
-    """Test file -> the first target whose path (or, under tests/, name) it mentions."""
-    found: dict[str, str] = {}
+def readers_of(root: Path, targets: list[str]) -> dict[str, list[str]]:
+    """Test file -> EVERY target it mentions (in the order of ``targets``)."""
+    found: dict[str, list[str]] = {}
     if not targets:
         return found
     for test in sorted((root / "tests").glob("test_*.py")):
         text = test.read_text(encoding="utf-8", errors="replace")
-        hit = next((t for t in targets if any(n in text for n in _needles(t))), "")
-        if hit:
-            found[str(test.relative_to(root))] = hit
+        hits = [t for t in targets if _mentions(text, t)]
+        if hits:
+            found[str(test.relative_to(root))] = hits
     return found
 
 
@@ -120,9 +130,8 @@ def select(root: Path, changed: list[str]) -> dict[str, list[str]]:
     for path in guards(root):
         chosen.setdefault(path, []).append("tree guard")
     others = [p for p in changed if not p.endswith(".py")]
-    readers = readers_of(root, others)
-    for test, target in readers.items():
-        chosen.setdefault(test, []).append(f"reads {target}")
+    for test, hits in readers_of(root, others).items():
+        chosen.setdefault(test, []).append(f"reads {', '.join(hits)}")
     return dict(sorted(chosen.items()))
 
 

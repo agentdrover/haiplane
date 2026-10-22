@@ -210,3 +210,25 @@ def test_a_changed_file_that_no_test_mentions_is_named(
     assert rc == 0
     assert "no test mentions 1 changed file(s): docs/other.md" in out
     assert "changed hub code is not followed" in out
+
+
+def test_one_test_reading_two_changed_files_names_both_and_calls_are_not_reads(
+    tmp_path: Path,
+) -> None:
+    """Every target a test mentions is a reason (and is not reported as unmapped);
+    ``response.json()`` is a call, not a mention of a fixture called json."""
+    root = make_repo(tmp_path)
+    write(root, "tests/fixtures/vectors.json", '{"v": 3}\n')
+    write(root, "tests/golden/view.json", '{"g": 3}\n')
+    write(root, "tests/test_both.py", 'A = D / "vectors.json"\nB = G / "view.json"\n')
+    write(root, "tests/test_noise.py", "x = response.json()\ny = view.json()\n")
+    changed, _ = changed_tests.changed_files(root)
+    chosen = changed_tests.select(root, changed)
+    assert chosen["tests/test_both.py"] == [
+        "changed",
+        "reads tests/fixtures/vectors.json, tests/golden/view.json",
+    ]
+    assert chosen["tests/test_noise.py"] == [
+        "changed"
+    ]  # no "reads": it only calls json()
+    assert changed_tests.unmapped(root, changed) == []
