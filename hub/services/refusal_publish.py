@@ -13,8 +13,10 @@
   :func:`brief_failure.public_reason` (:func:`public_text`, :func:`published_update`):
   записи, сделанные до исправления, путь уже несут.
 
-Лента чистится только для записей ХАБА (agent='hub', kind='alert') с известным
-началом: авторские записи людей и агентов — содержание, их путь не утечка.
+Лента чистится только для записей ХАБА с известным началом: kind='alert',
+author_kind='hub' без принципала (так их помечает ``repo.hub_authored_updates``,
+имя agent — лишь второй ключ). Запись, поставленная запросом принципала под
+именем «hub», и запись без author_kind — авторские: путь в них содержание.
 """
 
 from __future__ import annotations
@@ -77,6 +79,8 @@ def published_update(row: Any) -> dict[str, Any]:
     if (
         data.get("kind") == "alert"
         and data.get("agent") == "hub"
+        and data.get("author_kind") == "hub"
+        and not data.get("principal_id")
         and is_refusal_alert(content)
     ):
         data["content"] = public_reason(content)

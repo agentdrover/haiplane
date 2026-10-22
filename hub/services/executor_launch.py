@@ -44,6 +44,7 @@ from hub.services import chat_pair, orchestrator_queue, owner_minutes, project_p
 from hub.db import fetchall, write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
+from hub.services.refusal_publish import safe_detail
 from hub.services.result_kind import (
     automation_not_applicable,
     task_automation_not_applicable,
@@ -474,8 +475,8 @@ async def _create(
             if not seen.asked:
                 # #1439 AC-4: «не смогли спросить» — не «агента нет». Агент мог
                 # быть создан; бронь держится до срока брошенной (_candidate).
-                return _out("", "", f"{REASON_ANSWER_BLIND}: {refusal.detail}")
-            return _out("", "", f"{REASON_ANSWER_LOST}: {refusal.detail}")
+                return _out("", "", f"{REASON_ANSWER_BLIND}: {safe_detail(refusal)}")
+            return _out("", "", f"{REASON_ANSWER_LOST}: {safe_detail(refusal)}")
         last = _refusal_text(refusal)
         if not _should_retry(refusal):
             return _out("", "", f"{REASON_CREATE_REFUSED}: {last}")

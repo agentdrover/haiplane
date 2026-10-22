@@ -305,7 +305,7 @@ async def test_the_shared_refusal_keeps_its_detail_for_the_other_consumers():
         detail=f"PermissionError: [Errno 13] Permission denied: '{SECRET}'"[:300],
     )
     assert SECRET in raw.detail
-    assert SECRET in _provider_answer(raw), "steward_shadow по-прежнему видит detail"
+    assert SECRET not in _provider_answer(raw), "steward_shadow публикует вид"
     http = cursor_cloud.Refusal(status=400, code="usage_limit_exceeded", detail="x")
     assert http.kind == "" and http.is_transport is False
 
@@ -397,3 +397,122 @@ async def test_the_refusal_alert_keeps_its_prefix_and_authored_notes_stay_whole(
     assert LEAK not in published_update(old)["content"]
     assert is_refusal_alert(REFUSAL_ALERT_PREFIXES[0] + ": x")
     assert not is_refusal_alert("Кросс-модельное ревью НЕ вызвано: не хватает")
+
+
+_STORED = (
+    f"{REFUSAL_ALERT_PREFIXES[1]}, и агента с нашей меткой у него не нашлось за "
+    f"попыток: 2 (PermissionError: [Errno 13] Permission denied: '{SECRET}'). "
+    "Вердикт остаётся человеку; детали в логе хаба (#757)."
+)
+
+
+async def _bare_task(db: aiosqlite.Connection, status: str) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="stall",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_the_inbox_stall_grounds_do_not_print_an_old_refusal_path(
+    db: aiosqlite.Connection,
+):
+    """last_stall читает алерт отказа из ленты в обход update_views (Codex P2 #1)."""
+    from hub.services.inbox_decisions import _decide_grounds
+    from hub.services.review_queue import last_stall
+
+    task_id = await _bare_task(db, "needs_decision")
+    await repo.add_task_update(db, task_id, "hub", "alert", _STORED)
+    await db.commit()
+    reason, _at = await last_stall(db, task_id, "")
+    assert LEAK not in reason and "PermissionError" in reason
+    grounds = await _decide_grounds(db, {"id": task_id, "status_entered_at": ""})
+    assert LEAK not in grounds and "PermissionError" in grounds
+
+
+async def test_the_needs_info_inbox_rows_carry_no_old_refusal_path(
+    db: aiosqlite.Connection,
+):
+    """get_inbox_data кладёт ленту needs_info-задач в ответ: тоже через публикацию."""
+    task_id = await _bare_task(db, "needs_info")
+    await repo.add_task_update(db, task_id, "hub", "alert", _STORED)
+    await db.commit()
+    data = json.dumps(await get_inbox_data(db), default=str)
+    assert LEAK not in data and "PermissionError" in data
+
+
+async def test_an_entry_called_hub_by_a_principal_keeps_its_path(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Автор решает author_kind/principal_id, а не имя agent (Codex P2 #2)."""
+    from hub.services.refusal_publish import published_update
+
+    task_id = await _bare_task(db, "review")
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", _STORED, principal_id=None, author_kind="principal"
+    )
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", _STORED, principal_id=7, author_kind="hub"
+    )
+    await repo.add_task_update(db, task_id, "hub", "alert", _STORED)
+    await db.commit()
+    shown = (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    by_len = [u["content"] for u in shown]
+    assert [LEAK in c for c in by_len] == [True, True, False], by_len
+    mine = {"kind": "alert", "agent": "hub", "author_kind": "principal"}
+    assert published_update({**mine, "content": _STORED})["content"] == _STORED
+    legacy = {"kind": "alert", "agent": "hub", "content": _STORED}
+    assert published_update(legacy)["content"] == _STORED, "без author_kind - не хаб"
+
+
+async def test_the_executor_launch_reason_names_the_kind_not_the_path(monkeypatch):
+    """executor_launch больше не кладёт сырой detail в причину (Codex P2 #3)."""
+    from hub.services import executor_launch as el
+
+    raw = cursor_cloud.Refusal(
+        kind="PermissionError",
+        detail=f"PermissionError: [Errno 13] Permission denied: '{SECRET}'",
+    )
+
+    async def refuse(**_kw):
+        return None, raw
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", refuse)
+    for asked in (True, False):
+
+        async def ask(_name, pages=3, asked=asked):
+            return cursor_cloud.Reconciliation("", "", asked)
+
+        monkeypatch.setattr(cursor_cloud, "find_agent_by_name", ask)
+        made = await el._create(1, 1, {})
+        assert LEAK not in made.failed, made.failed
+        assert "PermissionError" in made.failed
+        wanted = el.REASON_ANSWER_LOST if asked else el.REASON_ANSWER_BLIND
+        assert made.failed.startswith(wanted)
+
+
+def test_the_steward_run_refusal_payload_names_the_kind_not_the_path():
+    """steward_run_refused.payload.detail: вид отказа, не сырой текст (Codex P2 #4)."""
+    from hub.services.steward_shadow import _provider_answer
+
+    raw = cursor_cloud.Refusal(
+        kind="PermissionError",
+        detail=f"PermissionError: [Errno 13] Permission denied: '{SECRET}'",
+    )
+    assert _provider_answer(raw) == "без кода (PermissionError)"
+    body = cursor_cloud.Refusal(
+        status=400, code="usage_limit_exceeded", detail=f"в {SECRET}"
+    )
+    assert _provider_answer(body) == "HTTP 400 usage_limit_exceeded"
+    assert _provider_answer(None) == "ответа не было"
