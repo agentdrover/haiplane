@@ -102,6 +102,10 @@ def public_reason(text: str) -> str:
     return _ABS_PATH.sub("<путь>", text)
 
 
+# Отчёты, написанные ревьюером или автором: ``detail``, ``reason``, ``why``
+# внутри них — содержание («пишет в /etc/hosts вместо /etc/resolv.conf»), а не
+# диагноз хаба. Поддерево под этими ключами не обходится вовсе.
+_AUTHORED_SUBTREES = frozenset({"machine_review", "review_report", "latest_review"})
 _REASON_KEY = re.compile(r"(?:.*_)?(?:reasons?|why|details?|errors?|unavailable)")
 
 
@@ -113,6 +117,8 @@ def scrub_strings(obj: Any, *, key: str = "") -> Any:
     Модели правятся на месте, остальное собирается заново.
     """
     if isinstance(obj, Enum):
+        return obj
+    if key in _AUTHORED_SUBTREES:
         return obj
     if isinstance(obj, str):
         return public_reason(obj) if _REASON_KEY.fullmatch(key) else obj

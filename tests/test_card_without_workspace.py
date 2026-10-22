@@ -658,3 +658,60 @@ def test_a_string_enum_under_a_reason_key_stays_an_enum() -> None:
     kept = scrub_strings({"reason": TaskStatus.review, "n": 3})
 
     assert kept["reason"] is TaskStatus.review and kept["n"] == 3
+
+
+async def test_a_reviewers_text_keeps_its_paths_while_hub_reasons_are_cleaned(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Находки ревьюера — содержание: ``/etc/hosts`` в них цел и в брифе, и на карточке."""
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_evidence
+
+    task_id = await _review_task(client, db, missing_workspace, "gone-reviewer")
+    said = "Writes /etc/hosts instead of /etc/resolv.conf"
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "tokens_spent": 1,
+            "model": "m",
+            "raw_count": 3,
+            "incomplete": False,
+            "findings_confirmed": [
+                {
+                    "title": "hosts",
+                    "severity": "medium",
+                    "file": "a.py",
+                    "locator": "file",
+                    "detail": said,
+                }
+            ],
+            "findings_rejected": [{"title": "rej", "reason": said}],
+            "unresolved": [{"title": "unr", "why": said}],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    raw_base = {
+        "base": "develop",
+        "source": "x",
+        "state": review_evidence.BASE_UNVERIFIED,
+        "reason": "нет /tmp/leak-2002/clone",
+        "sha": "",
+    }
+    monkeypatch.setattr(
+        review_evidence, "resolve_diff_base", AsyncMock(return_value=raw_base)
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    review = brief["machine_review"]
+    assert review["findings_confirmed"][0]["detail"] == said
+    assert review["findings_rejected"][0]["reason"] == said
+    assert review["unresolved"][0]["why"] == said
+    assert brief["diff_base"]["reason"] == "нет <путь>"
+    assert "/etc/hosts" in page and "/etc/resolv.conf" in page
+    assert "leak-2002" not in page
