@@ -30,7 +30,6 @@ from hub.models import TaskStatus
 from hub.services import validation_run
 from hub.services.delivery_gate import undelivered_warning
 from hub.services.orchestration import (
-    BASE_FETCH_PENDING_PREFIX,
     BASE_FRESHNESS_UNKNOWN_PREFIX,
     BASE_UPDATE_PENDING_PREFIX,
     BASE_UPDATE_RETRY_PREFIX,
@@ -3691,10 +3690,6 @@ TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
     BASE_UPDATE_RETRY_PREFIX: (
         BASE_FRESHNESS_UNKNOWN_PREFIX,
         "обновление не долетело — повтор гейтом, не пересдавать (#1419)",
-    ),
-    BASE_FETCH_PENDING_PREFIX: (
-        BASE_FRESHNESS_UNKNOWN_PREFIX,
-        "база не получена в клон после слияния гейтом — повтор, не пересдавать",
     ),
 }
 
