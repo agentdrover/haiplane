@@ -621,3 +621,41 @@ async def test_headless_route_never_commits_the_generation_bump_before_the_netwo
     after = await _committed_view(db_dsn, task_id)
     assert after["submission_generation"] == before
     assert after["status"] == "running"
+
+
+async def test_failed_tail_in_a_real_tick_does_not_persist_the_generation_bump(
+    db, db_dsn, monkeypatch
+):
+    """_task_isolation откатывает хвост упавшей задачи до того, как его закоммитят (#2005).
+
+    Хвост упал после бампа поколения; следующий проход тика коммитит
+    безусловно (events_retention). Без отката бамп уезжал в базу при
+    status=running, и следующий тик бампал снова.
+    """
+    task_id, git = await _headless_done_rig(db, monkeypatch)
+    await repo.add_task_update(db, task_id, "agent", "done", "готово")
+    await db.commit()
+    job = {"status": "completed", "exit_code": 0, "result_text": "ok"}
+    plugins.dispatch.get_job = MagicMock(return_value=job)
+    before = (await _committed_view(db_dsn, task_id))["submission_generation"]
+    bumped: list[int] = []
+
+    async def push_then_fail(*_a, **_k):
+        live = await repo.get_task(db, task_id)
+        bumped.append(dict(live)["submission_generation"])
+        raise _PushFailed
+
+    git.push_branch = AsyncMock(side_effect=push_then_fail)
+    monkeypatch.setattr(
+        poller,
+        "SWEEPS",
+        (
+            poller.Sweep("running_dispatch", poller._sweep_running_dispatch),
+            poller.Sweep("events_retention", poller._sweep_events_retention),
+        ),
+    )
+    await poller._poll_once(db)
+    assert bumped and bumped[0] > before, "бамп был в сессии, хвост упал на push"
+    after = await _committed_view(db_dsn, task_id)
+    assert after["submission_generation"] == before
+    assert after["status"] == "running"
