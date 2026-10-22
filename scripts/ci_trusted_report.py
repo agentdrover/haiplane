@@ -41,6 +41,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+# The sibling module is found next to this file, whatever the working directory
+# (the scripts are run by path, and loaded by path in the tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ci_safe_failure import NETWORK_ERRORS, safe_failure  # noqa: E402
+
 EXPECTED_WORKFLOW_PATH = ".github/workflows/ci.yml"
 # The only shape of a workflow this sender may be told to report (#1848): a file
 # directly in .github/workflows/. The hub checks the SAME path against the
@@ -98,7 +103,15 @@ HubPost = Callable[[str, str, dict], dict | None]
 
 
 class Refused(Exception):
-    """The run or its artifact is not something we report. ``str(exc)`` is why."""
+    """The run or its artifact is not something we report. The message is why.
+
+    The message is written by us from fixed words and safe_failure() names, so
+    it may be logged; ``safe_message`` tells safe_failure() so.
+    """
+
+    def __init__(self, why: str = "") -> None:
+        super().__init__(why)
+        self.safe_message = why
 
 
 def log(msg: str) -> None:
@@ -224,7 +237,9 @@ def read_archive(path: Path) -> dict[str, bytes]:
     try:
         archive = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as exc:
-        raise Refused(f"the artifact is not a readable archive ({exc})") from exc
+        raise Refused(
+            f"the artifact is not a readable archive ({safe_failure(exc)})"
+        ) from exc
     with archive:
         infos = archive.infolist()
         if len(infos) > MAX_MEMBERS:
@@ -307,7 +322,7 @@ def parse_results(
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise Refused(f"results.json is not JSON ({exc})") from exc
+        raise Refused(f"results.json is not JSON ({safe_failure(exc)})") from exc
     if not isinstance(doc, dict):
         raise Refused("results.json is not an object")
     extra = sorted(set(doc) - RESULT_KEYS)
@@ -444,9 +459,11 @@ def hub_post(url: str, token: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - https URL from env
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        log(f"hub said {exc.code}: {exc.read().decode(errors='replace')[:300]}")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        log(f"hub unreachable: {exc}")
+        # The code only: a refusal body names projects (hub/services/ci_scope.py)
+        # and the log of a run is readable by everyone who can read the run.
+        log(f"hub said {exc.code}")
+    except (*NETWORK_ERRORS, ValueError) as exc:
+        log(f"hub unreachable ({safe_failure(exc)})")
     return None
 
 
@@ -543,8 +560,8 @@ def send_timing(
             reason = f"{len(jobs)} jobs, the limit is {MAX_TIMED_JOBS}"
             jobs = None
             log(f"timing_unavailable — {reason}")
-    except (Refused, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        reason = f"jobs unreadable: {exc}"
+    except (Refused, *NETWORK_ERRORS, ValueError) as exc:
+        reason = f"jobs unreadable: {safe_failure(exc)}"
         log(f"timing_unavailable — {reason}")
     task_id = int(match.group(1))
     result = post(
@@ -573,7 +590,12 @@ def send_report(
 ) -> None:
     raw = members.get(RESULTS_MEMBER)
     if raw is None:
-        log("no results.json in the artifact — no task report")
+        held = ", ".join(sorted(members)) or "nothing"
+        log(
+            f"no results.json in the artifact (it holds: {held}) — no task "
+            "report. The collector step 'Collect AC test and validation results "
+            "for the Hub' of the run writes it; read that step's log for why not"
+        )
         return
     match = TASK_BRANCH.match(facts["head_branch"])
     if match is None:
@@ -626,7 +648,7 @@ def file_audit(
     try:
         report = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise Refused(f"audit.json is not JSON ({exc})") from exc
+        raise Refused(f"audit.json is not JSON ({safe_failure(exc)})") from exc
     if not isinstance(report, dict):
         raise Refused("audit.json is not an object")
     for finding in audit.findings(report):
@@ -640,7 +662,7 @@ def _independently(step: Callable[[], None]) -> None:
     try:
         step()
     except Refused as exc:
-        log(f"not reporting this part: {exc}")
+        log(f"not reporting this part: {safe_failure(exc)}")
 
 
 def _report_artifact(
@@ -675,9 +697,12 @@ def _report_artifact(
         if audit_token:
             _independently(lambda: file_audit(members, facts, base, audit_token, post))
     except Refused as exc:
-        log(f"not reporting this run: {exc}")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        log(f"GitHub or the disk failed ({exc}) — reporting nothing (unknown)")
+        log(f"not reporting this run: {safe_failure(exc)}")
+    except (*NETWORK_ERRORS, ValueError) as exc:
+        log(
+            f"GitHub or the disk failed ({safe_failure(exc)}) — reporting "
+            "nothing (unknown)"
+        )
 
 
 def run(
@@ -692,7 +717,7 @@ def run(
     try:
         facts = run_facts(event, repository, expected_workflow(environ))
     except Refused as exc:
-        log(f"not reporting this run: {exc}")
+        log(f"not reporting this run: {safe_failure(exc)}")
         return 0
     base = (environ.get("HAIPLANE_HUB_URL") or "").rstrip("/")
     token = environ.get("HAIPLANE_HUB_CI_TOKEN") or ""
@@ -708,7 +733,7 @@ def run(
     try:
         send_timing(facts, api, repository, base, token, post)
     except Exception as exc:  # noqa: BLE001 - statistics must never fail the job
-        log(f"timing not sent: {exc}")
+        log(f"timing not sent: {safe_failure(exc)}")
     return 0
 
 
@@ -717,7 +742,7 @@ def main() -> int:
     try:
         event = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        log(f"event payload unreadable ({exc}) — reporting nothing")
+        log(f"event payload unreadable ({safe_failure(exc)}) — reporting nothing")
         return 0
     api = GitHubApi(
         os.environ.get("GITHUB_API_URL") or "https://api.github.com",
