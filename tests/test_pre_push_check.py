@@ -168,17 +168,10 @@ def test_the_bypass_variable_skips_only_this_check(clone: Path, tmp_path: Path) 
     assert proc.returncode != 0 and "dirty working tree" in proc.stderr
 
 
-def test_missing_tools_warn_and_are_not_remembered(clone: Path, tmp_path: Path) -> None:
-    git(clone, "config", KEY, "no-such-tool-xyz check-fast")
-    proc = push(clone)
-    assert proc.returncode == 0, proc.stderr
-    assert "'no-such-tool-xyz'" in proc.stderr and "not available" in proc.stderr
-    cache = Path(
-        git(clone, "rev-parse", "--git-path", "haiplane/prepush-ok").stdout.strip()
-    )
-    assert not (clone / cache).exists()
-
-    # `make` without `uv` is the same: the recipe would need it.
+def test_make_without_uv_warns_and_is_not_remembered(
+    clone: Path, tmp_path: Path
+) -> None:
+    """The default command needs make and uv; without them the push goes through."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "make").write_text("#!/bin/sh\nexit 0\n")
@@ -187,10 +180,42 @@ def test_missing_tools_warn_and_are_not_remembered(clone: Path, tmp_path: Path) 
     if shutil.which("uv", path=path):
         pytest.skip("uv is on the minimal PATH of this machine")
     git(clone, "config", KEY, "make check-fast")
-    git(clone, "commit", "-q", "--allow-empty", "-m", "again")
     proc = push(clone, env={"PATH": path})
     assert proc.returncode == 0, proc.stderr
-    assert "'make' (or uv) is not available" in proc.stderr
+    assert "make or uv is not available" in proc.stderr
+    cache = (
+        clone
+        / git(clone, "rev-parse", "--git-path", "haiplane/prepush-ok").stdout.strip()
+    )
+    assert not cache.exists()
+
+
+def test_any_other_failing_command_blocks_even_when_the_shell_cannot_find_it(
+    clone: Path,
+) -> None:
+    """Only make/uv are looked up; a command the shell cannot find is a failure."""
+    git(clone, "config", KEY, "no-such-tool-xyz check-fast")
+    proc = push(clone)
+    assert proc.returncode != 0
+    assert "rc=127" in proc.stderr and "did not find a command" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ' "sh" -c "exit 7"',
+        's"h" -c "exit 7"',
+        'CI=1 sh -c "exit 7"',
+        "  sh -c 'exit 7'",
+    ],
+)
+def test_quoting_and_assignments_in_the_command_are_the_shells_business(
+    clone: Path, command: str
+) -> None:
+    git(clone, "config", KEY, command)
+    proc = push(clone)
+    assert proc.returncode != 0
+    assert "rc=7" in proc.stderr
 
 
 def test_the_same_tree_is_checked_once(clone: Path, tmp_path: Path) -> None:
@@ -303,14 +328,6 @@ def test_another_comparison_base_is_another_question(
     assert runs(marker) == 2
 
 
-def test_a_quoted_first_word_is_left_to_the_shell(clone: Path, tmp_path: Path) -> None:
-    """The tool lookup does not parse quotes: a quoted command still runs and still blocks."""
-    git(clone, "config", KEY, '"sh" -c "exit 7"')
-    proc = push(clone)
-    assert proc.returncode != 0
-    assert "rc=7" in proc.stderr
-
-
 def test_the_configured_base_and_release_branches_are_not_checked(
     clone: Path, tmp_path: Path
 ) -> None:
@@ -325,3 +342,38 @@ def test_the_configured_base_and_release_branches_are_not_checked(
     proc = push(clone, "fix/integration")
     assert proc.returncode == 0, proc.stderr
     assert runs(marker) == 0
+
+
+def test_the_same_tree_under_another_merge_base_is_checked_again(
+    clone: Path, tmp_path: Path
+) -> None:
+    """The selection is the diff against the merge-base: the same tree, another base."""
+    marker = tmp_path / "marker"
+    git(clone, "config", KEY, marker_command(marker))
+    start = git(clone, "rev-parse", "develop").stdout.strip()
+    git(clone, "checkout", "-q", "develop")
+    (clone / "f.txt").write_text("f\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-qm", "develop moves")
+    git(clone, "push", "-q", "origin", "develop")
+    git(clone, "checkout", "-q", "-b", "task-5/a", start)  # branched BEFORE the move
+    (clone / "f.txt").write_text("f\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-qm", "the same file, the same tree")
+    assert push(clone, "task-5/a").returncode == 0
+    assert runs(marker) == 1
+    git(clone, "checkout", "-q", "-b", "task-5/b", "develop")  # branched AFTER it
+    git(
+        clone,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "same tree, base is develop itself",
+    )
+    assert (
+        git(clone, "rev-parse", "task-5/a^{tree}").stdout
+        == git(clone, "rev-parse", "task-5/b^{tree}").stdout
+    )
+    assert push(clone, "task-5/b").returncode == 0
+    assert runs(marker) == 2

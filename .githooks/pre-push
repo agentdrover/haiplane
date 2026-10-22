@@ -46,19 +46,14 @@ pre_push_check() {
     echo "WARNING: pre-push check NOT run for ${check_ref#refs/heads/}: the pushed commit is not the checked-out HEAD" >&2
     return 0
   fi
-  # The tool of a plain command is looked up here; a command that starts with a
-  # quote is left to the shell (its failure is the answer, and it blocks).
+  # The default command is `make check-fast`, which needs uv. A cloud image or a
+  # minimal PATH without them cannot run it: say so and let the push through
+  # (nothing is remembered). Any other command is the clone's own business, and
+  # its failure - including "command not found" (rc 127) - blocks.
   case "$pre_push_check_command" in
-    \"*|\'*) ;;
-    *)
-      set -f
-      # shellcheck disable=SC2086
-      set -- $pre_push_check_command
-      set +f
-      check_tool="$1"
-      if ! command -v "$check_tool" >/dev/null 2>&1 ||
-         { [ "$check_tool" = "make" ] && ! command -v uv >/dev/null 2>&1; }; then
-        echo "WARNING: pre-push check NOT run: '$check_tool' (or uv) is not available here" >&2
+    *make*)
+      if ! command -v make >/dev/null 2>&1 || ! command -v uv >/dev/null 2>&1; then
+        echo "WARNING: pre-push check NOT run: make or uv is not available here" >&2
         return 0
       fi
       ;;
@@ -69,7 +64,8 @@ pre_push_check() {
   # become several grep patterns): a hash of the tree, the commit it is compared
   # with (a rebase onto another base changes the selection) and the command.
   base_oid="$(git rev-parse --verify -q "origin/$base_branch" 2>/dev/null || true)"
-  cache_key="$(printf '%s\n%s\n%s\n' "$check_tree" "$base_oid" "$pre_push_check_command" | git hash-object --stdin)"
+  merge_base="$(git merge-base "$check_oid" "origin/$base_branch" 2>/dev/null || true)"
+  cache_key="$(printf '%s\n%s\n%s\n%s\n' "$check_tree" "$base_oid" "$merge_base" "$pre_push_check_command" | git hash-object --stdin)"
   check_clean=0
   if [ -z "$(git status --porcelain)" ]; then check_clean=1; fi
   if [ "$check_clean" = "1" ] && [ -n "$cache_file" ] && [ -f "$cache_file" ] &&
@@ -82,6 +78,7 @@ pre_push_check() {
   if sh -c "$pre_push_check_command" </dev/null >&2; then check_rc=0; else check_rc=$?; fi
   if [ "$check_rc" -ne 0 ]; then
     echo "Blocked push of ${check_ref#refs/heads/}: '$pre_push_check_command' failed (rc=$check_rc)." >&2
+    [ "$check_rc" -ne 127 ] || echo "rc 127: the shell did not find a command of the check." >&2
     echo "Fix it; HAIPLANE_SKIP_PREPUSH=1 skips this check once (CI still runs everything)." >&2
     exit 1
   fi
