@@ -61,6 +61,7 @@ from hub.services import verdict_evidence
 from hub.version import get_app_version
 from hub.services import launch_feedback
 from hub.web_executor_slot import card_hosts
+from hub.web_refusals import WebRefusalRoute, log_field_refusals
 from hub.models import (
     DeliveryAcknowledgement,
     DEFAULT_FORGE,
@@ -177,7 +178,7 @@ def _egress_text(egress: Any) -> str:
 # #1645: the egress alert line, worded once for every surface.
 TEMPLATES.env.globals["egress_text"] = _egress_text
 
-router = APIRouter()
+router = APIRouter(route_class=WebRefusalRoute)
 
 log = logging.getLogger("hub.web")
 
@@ -2860,6 +2861,7 @@ async def _web_task_detail_page(
     implementer_code: str = "",
     implementer_error: str = "",
     archive_refusal: dict[str, Any] | None = None,
+    form_values: dict[str, str] | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
     db = _db(request)
@@ -2988,6 +2990,8 @@ async def _web_task_detail_page(
             "implementer_code": implementer_code,
             "implementer_error": implementer_error,
             "archive_refusal": archive_refusal,
+            # #1995: ввод, отклонённый сервисом, возвращается в форму.
+            "form_values": form_values or {},
             "implementer_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
         },
         status_code,
@@ -3748,6 +3752,8 @@ async def web_return_to_work(
     try:
         body = TaskReturnToWork(reason=reason, abandon_active_job=abandon_active_job)
     except ValidationError as exc:
+        # #1995: тип отказа поля (missing/blank/too_long) в лог, значения нет.
+        log_field_refusals(request, exc.errors(), (await request.form()).keys())
         raise HTTPException(422, _invalid_fields_detail(exc)) from exc
     await services.return_to_work(
         _db(request), task_id, body, actor=current_identity(request).username

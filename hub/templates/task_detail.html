@@ -513,7 +513,7 @@
                 <span>По этой задаче сессии ещё не переписывались</span>
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-line-form">
                   {{ csrf_field() }}
-                    <input type="text" name="body" placeholder="Написать в канал задачи" required class="task-action-control">
+                    <input type="text" name="body"{% if form_values.get('body') %} data-hub-restored{% endif %} value="{{ form_values.get('body', '') }}" placeholder="Написать в канал задачи" required class="task-action-control">
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
                     <button type="submit" class="btn btn-secondary btn-sm">Отправить</button>
@@ -552,7 +552,7 @@
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-action-stack">
                   {{ csrf_field() }}
-                    <textarea name="body" rows="2" placeholder="Написать в канал задачи" required></textarea>
+                    <textarea name="body"{% if form_values.get('body') %} data-hub-restored{% endif %} rows="2" placeholder="Написать в канал задачи" required>{{ form_values.get('body', '') }}</textarea>
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
                     <button type="submit" class="btn btn-secondary btn-sm">Отправить</button>
@@ -608,7 +608,7 @@
                 <div class="task-sidebar-title">Task Controls</div>
 
                 {% if implementer_error %}
-                <div class="task-action-note task-action-note--warning">{{ implementer_error }}</div>
+                <div class="task-action-note task-action-note--warning" role="alert">{{ implementer_error }}</div>
                 {% endif %}
                 {% if implementer_code %}
                 <div class="task-action-stack">
@@ -638,9 +638,9 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-approve" class="task-action-stack">
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-approve">Runtime</label>
-                    <select id="task-runtime-approve" name="runtime" class="task-action-control">
-                        <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
-                        <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+                    <select id="task-runtime-approve" name="runtime"{% if form_values.get('runtime') %} data-hub-restored{% endif %} class="task-action-control">
+                        <option value="auto" {% if (form_values.get('runtime') or task.runtime.value) == 'auto' %}selected{% endif %}>Auto</option>
+                        <option value="openrouter" {% if (form_values.get('runtime') or task.runtime.value) == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                     </select>
                     {% if dispatch_available %}
                     <button class="btn btn-success task-action-btn" type="submit" name="run" value="true">Approve &amp; Run</button>
@@ -649,7 +649,7 @@
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
                   {{ csrf_field() }}
-                    <input type="text" name="comment" placeholder="Reason (optional)" class="task-action-control">
+                    <input type="text" name="comment"{% if form_values.get('comment') %} data-hub-restored{% endif %} value="{{ form_values.get('comment', '') }}" placeholder="Reason (optional)" class="task-action-control">
                     <button class="btn btn-danger task-action-btn" type="submit">Reject</button>
                 </form>
 
@@ -658,10 +658,10 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-start" class="task-action-stack">
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-start">Runtime</label>
-                    <select id="task-runtime-start" name="runtime" class="task-action-control">
-                        <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
-                        <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
-                        <option value="vast" {% if task.runtime.value == 'vast' %}selected{% endif %}>Vast.ai</option>
+                    <select id="task-runtime-start" name="runtime"{% if form_values.get('runtime') %} data-hub-restored{% endif %} class="task-action-control">
+                        <option value="auto" {% if (form_values.get('runtime') or task.runtime.value) == 'auto' %}selected{% endif %}>Auto</option>
+                        <option value="openrouter" {% if (form_values.get('runtime') or task.runtime.value) == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+                        <option value="vast" {% if (form_values.get('runtime') or task.runtime.value) == 'vast' %}selected{% endif %}>Vast.ai</option>
                     </select>
                     {% if dispatch_available %}
                     <button class="btn btn-success task-action-btn" type="submit">Start Task</button>
@@ -687,7 +687,7 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-answer" class="task-action-stack" id="web-answer-form">
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-answer">Your Answer</label>
-                    <textarea id="task-answer" name="answer" class="task-action-control task-action-textarea" required placeholder="Type your answer..."></textarea>
+                    <textarea id="task-answer" name="answer"{% if form_values.get('answer') %} data-hub-restored{% endif %} class="task-action-control task-action-textarea" required placeholder="Type your answer...">{{ form_values.get('answer', '') }}</textarea>
                     <button class="btn btn-success task-action-btn" type="submit" name="resume" value="true">Answer &amp; Resume</button>
                     <button class="btn btn-ghost task-action-btn" type="submit" name="resume" value="">Answer Only</button>
                 </form>
@@ -704,12 +704,12 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-decide" class="task-action-stack">
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-decision-summary">Decision reason / summary</label>
-                    <textarea id="task-decision-summary" name="decision_summary" class="task-action-control task-action-textarea" placeholder="Why you are accepting or sending back for rework..."></textarea>
+                    <textarea id="task-decision-summary" name="decision_summary"{% if form_values.get('decision_summary') %} data-hub-restored{% endif %} class="task-action-control task-action-textarea" placeholder="Why you are accepting or sending back for rework...">{{ form_values.get('decision_summary', '') }}</textarea>
                     <label class="task-action-label" for="task-pr-disposition">PR при принятии{% if task.pr_number %} (#{{ task.pr_number }}){% endif %}</label>
-                    {{ pr_disposition_select(task, 'task-pr-disposition', 'task-action-control') }}
+                    {{ pr_disposition_select(task, 'task-pr-disposition', 'task-action-control', form_values=form_values) }}
                     <button class="btn btn-success task-action-btn" type="submit" name="action" value="accept">Accept as Completed</button>
                     <label class="task-action-label" for="task-rework-instructions">Instructions for rework</label>
-                    <textarea id="task-rework-instructions" name="instructions" class="task-action-control task-action-textarea" placeholder="What specifically needs to be fixed..."></textarea>
+                    <textarea id="task-rework-instructions" name="instructions"{% if form_values.get('instructions') %} data-hub-restored{% endif %} class="task-action-control task-action-textarea" placeholder="What specifically needs to be fixed...">{{ form_values.get('instructions', '') }}</textarea>
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 
