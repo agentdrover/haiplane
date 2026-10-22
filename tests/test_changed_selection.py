@@ -110,7 +110,8 @@ def test_selection_by_diff(tmp_path: Path) -> None:
     # A non-Python file UNDER tests/ is looked for by its path or by its bare name
     # (fixtures are usually joined to a directory constant).
     assert chosen["tests/test_fixture_reader.py"] == [
-        "reads tests/fixtures/vectors.json"
+        "changed",
+        "reads tests/fixtures/vectors.json",
     ]
     assert chosen["tests/test_golden_reader.py"] == [
         "changed",
