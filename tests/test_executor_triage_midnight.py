@@ -205,3 +205,12 @@ async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(
         "2026-10-22 00:00:00",
     )
     assert [s["late"] for s in sections.values()] == [1]
+    # дайджеста дня действия нет вовсе: исход тоже «позже», а не потерян
+    await world.db.execute("DELETE FROM autopilot_digests")
+    await world.db.commit()
+    sections = await triage_inbox.digest_sections(
+        world.db,
+        "2026-10-21 00:00:00",
+        "2026-10-22 00:00:00",
+    )
+    assert [s["late"] for s in sections.values()] == [1]
