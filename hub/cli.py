@@ -1969,6 +1969,8 @@ def cmd_health(args: argparse.Namespace) -> int:
     print(f"Auth disabled: {result['auth_disabled']}")
     print(f"Env tokens configured: {result['env_tokens_configured']}")
     print(f"Vast enabled: {result['vast_enabled']}")
+    if isinstance(result.get("csrf_trusted_origins"), list):
+        print(f"CSRF trusted origins: {', '.join(result['csrf_trusted_origins'])}")
     _print_egress(result.get("egress"))
     return 0
 
