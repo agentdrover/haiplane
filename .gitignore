@@ -30,3 +30,6 @@ htmlcov/
 # #1620: CI exports these from uv.lock into the deploy tree; never committed.
 requirements.runtime.txt
 requirements.build.txt
+
+# #1996: trace, screenshots and server log of a failed GUI scenario.
+gui-artifacts/
