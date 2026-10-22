@@ -572,3 +572,71 @@ async def test_a_booking_with_the_rerun_policy_off_holds_nothing(db, monkeypatch
     await _pass(db, task_id)
 
     assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+
+# --- Круг 3: данные вне транзакции перехода ---------------------------------
+
+
+async def test_a_deadline_raised_before_the_lock_cancels_the_escalation(
+    db, db_dsn, monkeypatch
+):
+    """Второе соединение сохранило срок 72 ч после чтения срока 24 ч проходом."""
+    from hub.services import orchestration
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    real = orchestration.record_delivery_outcome
+
+    async def raise_deadline_first(db_, task_, write, **kw):
+        other = await aiosqlite.connect(db_dsn, uri=True)
+        try:
+            await other.execute(
+                "UPDATE projects SET gate_policy = ? WHERE slug = 'default'",
+                ('{"base_fetch_wait_hours": 72}',),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+        return await real(db_, task_, write, **kw)
+
+    monkeypatch.setattr(orchestration, "record_delivery_outcome", raise_deadline_first)
+
+    assert (await _pass(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1
+
+
+async def test_a_policy_unreadable_at_the_transition_cancels_it(db, monkeypatch):
+    from hub.services import orchestration
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    real = orchestration.record_delivery_outcome
+
+    async def corrupt_first(db_, task_, write, **kw):
+        await db_.execute("UPDATE projects SET gate_policy = '{broken'")
+        await db_.commit()
+        return await real(db_, task_, write, **kw)
+
+    monkeypatch.setattr(orchestration, "record_delivery_outcome", corrupt_first)
+
+    assert (await _pass(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_a_booking_with_an_unreadable_date_holds_nothing(db, monkeypatch):
+    async def booking(db_, task_id, gen):
+        await db_.execute(
+            "INSERT INTO delivery_reruns (task_id, submission_generation, "
+            "pr_number, state, requested_at) "
+            "VALUES (?, ?, 360, 'requested', '2026-10-01T00:00:00Z')",
+            (task_id, gen),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, booking)
+    await set_policy(db, delivery_fresh_base_rerun="on")
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
