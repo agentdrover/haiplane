@@ -649,3 +649,12 @@ def test_only_reason_keys_are_scrubbed_and_enums_stay_enums() -> None:
         "foo_reason": "<путь>",
         "text": path,
     }
+
+
+def test_a_string_enum_under_a_reason_key_stays_an_enum() -> None:
+    from hub.models import TaskStatus
+    from hub.services.brief_failure import scrub_strings
+
+    kept = scrub_strings({"reason": TaskStatus.review, "n": 3})
+
+    assert kept["reason"] is TaskStatus.review and kept["n"] == 3
