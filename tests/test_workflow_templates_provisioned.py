@@ -178,7 +178,10 @@ async def test_the_project_declares_the_test_runner_and_the_template_takes_it(
 
     await services.provision_project(db, project_id)
 
-    step = _workflow(work, CI_FILE)["jobs"]["test"]["steps"][-1]
+    # #2027: the producer ends with the artifact upload; the collector is the
+    # step that carries the runner.
+    steps = _workflow(work, CI_FILE)["jobs"]["test"]["steps"]
+    step = next(s for s in steps if "ac-runner" in s.get("with", {}))
     assert step["with"]["ac-runner"] == "pnpm test"
     assert ci_runner_of({"gate_policy": "{}"}) == ""
     assert (
@@ -304,7 +307,8 @@ async def test_a_second_provision_adds_nothing(
     assert _git(work, "rev-parse", "HEAD") == after_first
     assert _git(work, "rev-list", "--count", "HEAD") == count_first
     assert "already carries workflows" in again["provision_detail"]
-    assert len(list((work / ".github" / "workflows").iterdir())) == 2
+    # #2027: producer, stale and (default branch == base here) the sender.
+    assert len(list((work / ".github" / "workflows").iterdir())) == 3
 
 
 # --------------------------------------------------------------------------

@@ -344,12 +344,31 @@ def _seed(
     if not base:
         return SeedResult(UNAVAILABLE, "project declares no integration branch")
 
+    if forge == "github":
+        # #2027: a new GitHub project gets the pair a report can be confirmed by.
+        from hub.services import external_ci_seed
+
+        return external_ci_seed.seed_pair(
+            workspace,
+            base_branch=base,
+            release_branch=release_branch,
+            ac_runner=ac_runner,
+            push=push,
+        )
+
     files = render_all(
         base_branch=base,
         release_branch=release_branch,
         ac_runner=ac_runner,
     )
+    refusal = preflight(workspace, base)
+    if refusal is not None:
+        return refusal
+    return publish_files(workspace, base, target_dir, files, push=push)
 
+
+def preflight(workspace: str, base: str) -> SeedResult | None:
+    """The refusals that come before any write: a dirty tree, another branch."""
     rc, dirty = _git(workspace, "status", "--porcelain")
     if rc != 0:
         return SeedResult(UNAVAILABLE, f"could not read the working tree: {dirty}")
@@ -366,7 +385,18 @@ def _seed(
             f"workspace stands on {current or 'a detached HEAD'}, not {base}; "
             "workflows not seeded",
         )
+    return None
 
+
+def publish_files(
+    workspace: str,
+    base: str,
+    target_dir: str,
+    files: dict[str, str],
+    *,
+    push: bool,
+) -> SeedResult:
+    """Write ``files`` into ``target_dir``, commit them on ``base`` and push it."""
     directory = os.path.join(workspace, target_dir)
     os.makedirs(directory, exist_ok=True)
     written: list[str] = []

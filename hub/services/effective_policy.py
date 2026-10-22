@@ -25,6 +25,7 @@ from hub import config, models
 from hub import repository as repo
 from hub.services import (
     auto_approve,
+    ci_trust_warning,
     executor_dispatch,
     executor_launch,
     executor_slots,
@@ -485,6 +486,7 @@ async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, 
         "scheduled": pending,
         "scheduled_refused": [policy_change.view_row(r) for r in refused[-3:]],
         "keys": keys,
+        "ci_trust": await ci_trust_warning.ci_trust_block(db, project),
         "unknown_keys": {k: v for k, v in policy.items() if k not in REGISTRY},
         "steward": await _steward_block(db, int(project["id"])),
         "server": _server_block(),
@@ -595,6 +597,11 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
     for key, value in (data.get("unknown_keys") or {}).items():
         lines.append(f"  {key} = {_show(value)} [unknown key]")
+    trust = data.get("ci_trust") or {}
+    if trust.get("message"):
+        lines.append(
+            ("WARNING: " if trust["warning"] else "CI trust: ") + trust["message"]
+        )
     steward = data["steward"]
     lines.append(
         f"Steward: requested {steward['requested']}, effective {steward['effective']}"
