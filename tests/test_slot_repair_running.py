@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from fastapi import HTTPException
 
 from hub import config
@@ -605,3 +606,55 @@ async def test_cloud_repair_of_an_open_task_refuses_an_empty_snapshot(
     result = await _cloud(world.db, task_id, world)
     assert not result.launched and calls == []
     assert (await _footprint(world, task_id))["runs"] == 1
+
+
+@pytest.mark.parametrize("status", ["review", "fix_requested"])
+async def test_refusal_between_check_and_booking_leaves_review_untouched(
+    world, monkeypatch, status
+):
+    """Чистый отчёт перед бронью: возврат из review/fix_requested не коммитится отдельно."""
+    calls = await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(world, f"возврат из {status}", findings="machine")
+    await repo.update_task(
+        world.db, task_id, status=status, job_id="job-1", review_cycle=2
+    )
+    await world.db.commit()
+    before = await _footprint(world, task_id)
+    real = el._reserve
+
+    async def cleaned(*args, **kwargs):
+        await world.db.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, "
+            "harness_skill, findings_confirmed, unresolved) "
+            "VALUES (?, 1, 'multi-agent-review', '[]', '[]')",
+            (task_id,),
+        )
+        await world.db.commit()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(el, "_reserve", cleaned)
+    result = await _cloud(world.db, task_id, world)
+    assert not result.launched and calls == []
+    row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
+    assert row["job_id"] == "job-1"
+    assert await _footprint(world, task_id) == before
+
+
+@pytest.mark.parametrize("status", ["review", "fix_requested"])
+async def test_cloud_repair_returns_and_orders_from_review_in_one_transaction(
+    world, monkeypatch, status
+):
+    """Без отказа: возврат и бронь вместе, заказ один, статус open."""
+    calls = await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(world, f"круг из {status}", findings="machine")
+    await repo.update_task(world.db, task_id, status=status, review_cycle=2)
+    if status == "fix_requested":
+        await repo.update_task(world.db, task_id, job_id="job-1")
+    await world.db.commit()
+    result = await _cloud(world.db, task_id, world)
+    assert result.launched and len(calls) == 1
+    fp = await _footprint(world, task_id)
+    assert fp["status"] == "open" and fp["review_cycle"] == 0 and fp["runs"] == 2
+    assert "owner" in await _feed(world, task_id) or "cloud-owner" in await _feed(
+        world, task_id
+    )
