@@ -192,7 +192,7 @@ async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(
         "2026-10-21 00:00:00",
         "2026-10-22 00:00:00",
     )
-    assert [s["late"] for s in sections.values()] == [0]
+    assert sum(s["late"] for s in sections.values()) == 0
     # дайджест дня действия с нечитаемым разделом исхода не содержит: он «позже»
     await world.db.execute(
         "UPDATE autopilot_digests SET payload = ?",
@@ -256,7 +256,7 @@ async def test_outcome_missed_by_an_unavailable_day_goes_to_the_next_measured(
     again = await triage_inbox.digest_sections(
         world.db, "2026-10-23 00:00:00", "2026-10-24 00:00:00"
     )
-    assert [s["late"] for s in again.values()] == [0]
+    assert sum(s["late"] for s in again.values()) == 0
 
 
 async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkeypatch):

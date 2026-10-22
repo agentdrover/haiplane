@@ -225,9 +225,18 @@ SELECT id, task_id, action, created_at, followup, followup_at,
 FROM executor_triage_recommendations
 WHERE (created_at >= ? AND created_at < ?)
    OR (followup IS NOT NULL
-       AND (COALESCE(followup_action_at, followup_at) >= ?
-            AND COALESCE(followup_action_at, followup_at) < ?
-            OR followup_at >= ? AND followup_at < ?))
+       AND COALESCE(followup_action_at, followup_at) >= ?
+       AND COALESCE(followup_action_at, followup_at) < ?)
+"""
+
+#: Исходы, чьё действие раньше этих суток: кандидаты в ``late``. Окно по времени
+#: обработки не ограничивает их: исход, пропущенный нечитаемым дайджестом, ждёт
+#: первого измеренного, а не пропадает.
+_LATE_ROWS_SQL: Final[str] = """
+SELECT id, task_id, action, created_at, followup, followup_at,
+       COALESCE(followup_action_at, followup_at) AS action_at
+FROM executor_triage_recommendations
+WHERE followup IS NOT NULL AND COALESCE(followup_action_at, followup_at) < ?
 """
 
 
@@ -262,65 +271,58 @@ def section_active(section: dict[str, Any]) -> bool:
     )
 
 
-async def _counted_in_its_day(
-    db: aiosqlite.Connection, project_id: int, row: Any
-) -> bool:
-    """Сохранённый дайджест дня действия содержит этот исход (по списку id).
+async def _counted(db: aiosqlite.Connection) -> dict[int, tuple[set[int], list]]:
+    """Что уже учтено ИЗМЕРЕННЫМИ дайджестами: проект -> (id исходов, старые дайджесты).
 
-    Нет дайджеста, раздел нечитаем или id в списке нет - исход не учтён.
-    Дайджест без списка (до круга 2) читается по времени записи: он старше исхода.
+    Дайджест с ``unavailable`` исходов не учёл. Измеренный дайджест без
+    ``outcome_ids`` (до круга 2) читается по дате и времени записи: он учёл
+    исходы с действием не позже его даты, обработанные до его записи.
     """
-    found = await fetchall(
-        db,
-        "SELECT created_at, payload FROM autopilot_digests "
-        "WHERE project_id = ? AND digest_date = ?",
-        (project_id, str(row["action_at"])[:10]),
+    seen: dict[int, tuple[set[int], list]] = {}
+    for row in await fetchall(
+        db, "SELECT project_id, digest_date, created_at, payload FROM autopilot_digests"
+    ):
+        try:
+            section = json.loads(row["payload"] or "{}").get("triage") or {}
+        except ValueError:
+            continue
+        if section.get("state") != MEASURED:
+            continue
+        ids, legacy = seen.setdefault(int(row["project_id"]), (set(), []))
+        if "outcome_ids" in section:
+            ids.update(int(i) for i in section["outcome_ids"])
+        else:
+            legacy.append((str(row["digest_date"]), str(row["created_at"])))
+    return seen
+
+
+def _is_counted(entry: tuple[set[int], list] | None, row: Any) -> bool:
+    if entry is None:
+        return False
+    ids, legacy = entry
+    return int(row["id"]) in ids or any(
+        str(row["action_at"])[:10] <= day and str(row["followup_at"]) < written
+        for day, written in legacy
     )
-    if not found:
-        return False
-    try:
-        section = json.loads(found[0]["payload"] or "{}").get("triage") or {}
-    except ValueError:
-        return False
-    if section.get("state") != MEASURED:
-        return False
-    if "outcome_ids" not in section:
-        return str(found[0]["created_at"]) > str(row["followup_at"])
-    return int(row["id"]) in section["outcome_ids"]
 
 
-async def _count(
-    db: aiosqlite.Connection,
-    section: dict[str, Any],
-    row: Any,
-    project_id: int,
-    window: tuple[str, str],
-) -> None:
+def _count(section: dict[str, Any], row: Any, window: tuple[str, str]) -> None:
     """Учесть строку в сутках ``window``: создание - по created_at, исход - по
-    времени ДЕЙСТВИЯ; исход, обработанный в этих сутках после сборки дайджеста дня
-    действия, идёт отдельным числом ``late`` и в X/Y не входит."""
+    времени ДЕЙСТВИЯ (не свипа)."""
     start, end = window
     if start <= str(row["created_at"]) < end:
         section["created"] += 1
         retry = row["action"] in triage.RETRY_ACTIONS
         section["retry" if retry else "owner"] += 1
     followup = row["followup"]
-    if followup is None:
+    if followup is None or not start <= str(row["action_at"] or "") < end:
         return
-    if start <= str(row["action_at"] or "") < end:
-        section["outcome_ids"].append(int(row["id"]))
-        if followup in _UNMEASURED_FOLLOWUPS:
-            section["unmeasured"] += 1
-            return
-        section["resolved"] += 1
-        hit = followup in triage.MATCHING.get(row["action"], frozenset())
-        section["matched"] += hit
-    elif (
-        start <= str(row["followup_at"] or "") < end
-        and str(row["action_at"] or "") < start
-    ):
-        if not await _counted_in_its_day(db, project_id, row):
-            section["late"] += 1
+    section["outcome_ids"].append(int(row["id"]))
+    if followup in _UNMEASURED_FOLLOWUPS:
+        section["unmeasured"] += 1
+        return
+    section["resolved"] += 1
+    section["matched"] += followup in triage.MATCHING.get(row["action"], frozenset())
 
 
 async def digest_sections(
@@ -331,24 +333,35 @@ async def digest_sections(
     Исключение пробрасывается: вызывающий пишет ``unavailable_section`` во все
     дайджесты вместо молчаливого нуля.
     """
-    rows = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end) * 3)
+    rows = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end) * 2)
+    late_rows = await fetchall(db, _LATE_ROWS_SQL, (day_start,))
+    counted = await _counted(db)
     sections: dict[int, dict[str, Any]] = {}
     owners: dict[int, int | None] = {}
-    for row in rows:
+
+    async def project_of(row: Any) -> int | None:
         task_id = int(row["task_id"])
         if task_id not in owners:
             owner = await repo.resolve_project_for_task(db, task_id)
             owners[task_id] = int(owner["id"]) if owner else None
-        project_id = owners[task_id]
-        if project_id is None:
+        return owners[task_id]
+
+    for row in rows:
+        project_id = await project_of(row)
+        if project_id is not None:
+            _count(
+                sections.setdefault(project_id, empty_section()),
+                row,
+                (day_start, day_end),
+            )
+    for row in late_rows:
+        project_id = await project_of(row)
+        if project_id is None or _is_counted(counted.get(project_id), row):
             continue
-        await _count(
-            db,
-            sections.setdefault(project_id, empty_section()),
-            row,
-            project_id,
-            (day_start, day_end),
-        )
+        section = sections.setdefault(project_id, empty_section())
+        section["late"] += 1
+        # id входит в сохраняемый раздел: следующий дайджест этот исход не берёт.
+        section["outcome_ids"].append(int(row["id"]))
     return sections
 
 
