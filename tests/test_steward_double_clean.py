@@ -129,6 +129,7 @@ _BREAKS = [
     ("implementer_unknown", "identity", {"implementer": None}),
     ("ci_gap", "ci", {"ci": "fail"}),
     ("class_above_double_clean", "class", {"risk": "R4"}),
+    ("advisor_object", "advisor", {"concur": "object"}),
     ("carried_report", "carried", {"main": {"carried_from": 1}}),
 ]
 
