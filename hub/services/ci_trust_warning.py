@@ -18,19 +18,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import Counter
 from typing import Any
 
 import aiosqlite
 
-from hub import repository as repo
 from hub.db import fetchall
-from hub.services import ci_trust, metrics_scope, project_policy
+from hub.services import ci_trust, project_policy
 
-#: Сколько последних сдач проекта читается.
 log = logging.getLogger(__name__)
 
+#: Сколько последних сдач проекта читается.
 RECENT_SUBMISSIONS = 5
 GUIDE = "docs/satellite-ci-report.md"
 
@@ -50,32 +50,67 @@ def _block(state: str, message: str, **extra: Any) -> dict[str, Any]:
     }
 
 
-async def _recent_submissions(
-    db: aiosqlite.Connection, slug: str
-) -> list[tuple[int, str]]:
-    ids, _ = await metrics_scope.project_task_ids(db, slug)
-    rows = await fetchall(
-        db,
-        "SELECT task_id, sha FROM submissions WHERE sha != '' AND task_id IN "
-        "(SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT ?",
-        (ids, RECENT_SUBMISSIONS),
-    )
-    return [(int(r["task_id"]), str(r["sha"])) for r in rows]
+# Task -> owning project, the rule of ``metrics_scope.project_task_ids`` (#335):
+# the project sits on the epic, descendants inherit the nearest one, and a task
+# under no or an inactive project belongs to ``default``. One statement for ALL
+# projects, so the list page costs the same for one project and for fifty.
+_RECENT_SQL = """
+WITH RECURSIVE r(id, pid) AS (
+    SELECT id, project_id FROM tasks WHERE parent_id IS NULL
+    UNION ALL
+    SELECT t.id, COALESCE(t.project_id, r.pid) FROM tasks t JOIN r ON t.parent_id = r.id
+), owned AS (
+    SELECT s.id AS sid, s.task_id, s.sha,
+           CASE WHEN r.pid IS NULL
+                  OR r.pid IN (SELECT id FROM projects WHERE status != 'active')
+                THEN COALESCE((SELECT id FROM projects WHERE slug = 'default'), -1)
+                ELSE r.pid END AS owner
+    FROM submissions s JOIN r ON r.id = s.task_id WHERE s.sha != ''
+), ranked AS (
+    SELECT owner, task_id, sha,
+           ROW_NUMBER() OVER (PARTITION BY owner ORDER BY sid DESC) AS n
+    FROM owned
+)
+SELECT owner, task_id, sha FROM ranked WHERE n <= ? ORDER BY owner, n
+"""
 
 
-async def ci_trust_block(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
-    """Состояние подтверждаемости CI у проекта ``project`` (строка или отображение)."""
+async def _batch(
+    db: aiosqlite.Connection, projects: list[Any]
+) -> tuple[dict[int, list[tuple[int, str]]], dict[tuple[int, str], dict[str, Any]]]:
+    """Last submissions per project and the reports of their pinned commits: 2 statements."""
+    wanted = {int(p["id"]) for p in projects}
+    recent: dict[int, list[tuple[int, str]]] = {}
+    for r in await fetchall(db, _RECENT_SQL, (RECENT_SUBMISSIONS,)):
+        if int(r["owner"]) in wanted:
+            recent.setdefault(int(r["owner"]), []).append(
+                (int(r["task_id"]), str(r["sha"]))
+            )
+    pairs = sorted({pair for subs in recent.values() for pair in subs})
+    reports: dict[tuple[int, str], dict[str, Any]] = {}
+    if pairs:
+        rows = await fetchall(
+            db,
+            "SELECT r.* FROM ci_run_reports r JOIN json_each(?) j "
+            "ON r.task_id = json_extract(j.value, '$[0]') "
+            "AND r.head_sha = json_extract(j.value, '$[1]')",
+            (json.dumps([list(p) for p in pairs]),),
+        )
+        reports = {(int(r["task_id"]), str(r["head_sha"])): dict(r) for r in rows}
+    return recent, reports
+
+
+def _block_of(
+    project: Any,
+    submissions: list[tuple[int, str]],
+    stored: dict[tuple[int, str], dict[str, Any]],
+) -> dict[str, Any]:
     fingerprint = project_policy.ci_contract_of(project).fingerprint
-    submissions = await _recent_submissions(db, str(project["slug"]))
     if not submissions:
         return _block(
             NO_SUBMISSIONS, "Сдач ещё нет: подтверждаемость CI не проверялась."
         )
-    reports: list[dict[str, Any]] = []
-    for task_id, sha in submissions:
-        stored = await repo.get_ci_run_report(db, task_id, sha)
-        if stored is not None:
-            reports.append(dict(stored))
+    reports = [stored[pair] for pair in submissions if pair in stored]
     checked = len(submissions)
     if not reports:
         return _block(
@@ -101,14 +136,31 @@ async def ci_trust_block(db: aiosqlite.Connection, project: Any) -> dict[str, An
     )
 
 
+async def ci_trust_block(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
+    """Состояние подтверждаемости CI у проекта ``project`` (строка или отображение)."""
+    recent, stored = await _batch(db, [project])
+    return _block_of(project, recent.get(int(project["id"]), []), stored)
+
+
 async def blocks_by_project(
     db: aiosqlite.Connection, projects: Any
 ) -> dict[int, dict[str, Any] | None]:
-    """``{id проекта: блок}`` для страницы проектов; отказ расчёта одного - None."""
+    """``{id проекта: блок}`` для списка: запросов столько же, сколько для одного проекта.
+
+    Отказ чтения - None у всех (страница не падает); отказ расчёта одного - у него.
+    """
+    rows = list(projects)
+    try:
+        recent, stored = await _batch(db, rows)
+    except Exception:
+        log.exception("CI trust blocks could not be read")
+        return {int(p["id"]): None for p in rows}
     out: dict[int, dict[str, Any] | None] = {}
-    for project in projects:
+    for project in rows:
         try:
-            out[int(project["id"])] = await ci_trust_block(db, project)
+            out[int(project["id"])] = _block_of(
+                project, recent.get(int(project["id"]), []), stored
+            )
         except Exception:
             log.exception("CI trust block failed for project %s", project["id"])
             out[int(project["id"])] = None

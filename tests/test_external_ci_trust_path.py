@@ -328,3 +328,134 @@ async def test_only_a_final_no_provenance_of_the_projection_is_not_waited_for(
     )
     await db.commit()
     assert (await ci_wait_view(db, task)).waiting is True, "other reason: wait"
+
+
+async def test_an_old_no_provenance_report_does_not_hide_a_new_attempt(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """A completed GitHub attempt with no report is waited for, unlike a final no_provenance alone."""
+    fake = install_fake_github(monkeypatch)
+    task_id = await _ready_task(db, "ext-hidden")
+    task = dict(await repo.get_task(db, task_id))
+    await _report_without_provenance(db, task_id, SHA)
+    assert (await ci_wait_view(db, task)).waiting is False
+
+    fake.attempt(task_id, SHA, run_id="9101", status="in_progress")
+    await ci_trust.refresh_quietly(db, task_id, SHA)
+    assert (await ci_wait_view(db, task)).waiting is True, "in progress: wait"
+
+    fake.runs[("9101", "1")].update(status="completed", conclusion="success")
+    await ci_trust.refresh_quietly(db, task_id, SHA)
+    assert (await ci_wait_view(db, task)).waiting is True, "completed, no report: wait"
+
+    sent = fake.attempt(task_id, SHA, run_id="9102")
+    fake.runs.pop(("9101", "1"))
+    await accept_ci_run_report(db, task_id, **sent)
+    assert (await ci_wait_view(db, task)).waiting is False, "its report is final"
+
+
+async def test_a_retry_after_a_partial_seed_finishes_the_pair(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """The sender reached main, the producer push failed: the retry adds the producer."""
+    work, origin = _repo_pair(tmp_path)
+    project_id = await repo.create_project(db, slug="ext3", name="Ext3")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext3",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text(
+        '#!/bin/sh\nwhile read o n ref; do [ "$ref" = refs/heads/develop ] && exit 1; done\nexit 0\n'
+    )
+    hook.chmod(0o755)
+
+    first = await services.provision_project(db, project_id)
+
+    assert "could not push" in first["provision_detail"]
+    assert _tree(origin, "main") == [SENDER]
+    assert _tree(origin, "develop") == []
+    hook.unlink()
+
+    await services.provision_project(db, project_id)
+
+    assert _tree(origin, "develop") == [PRODUCER, "haiplane-stale.yml"]
+    assert _tree(origin, "main") == [SENDER]
+    assert _git(work, "status", "--porcelain") == ""
+
+
+async def _statements_for(db, projects) -> int:
+    from hub.services import ci_trust_warning
+
+    seen: list[str] = []
+    await db.set_trace_callback(seen.append)
+    try:
+        blocks = await ci_trust_warning.blocks_by_project(db, projects)
+    finally:
+        await db.set_trace_callback(None)
+    assert all(b is not None for b in blocks.values())
+    return len(seen)
+
+
+async def test_the_project_list_costs_the_same_for_one_project_and_for_many(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """No N+1: the statement count does not grow with the number of projects."""
+    install_fake_github(monkeypatch)
+    rows = []
+    for i in range(6):
+        proj = await _project(db, f"ext-n{i}", steward=True)
+        task_id = await _submitted_task(db, proj)
+        sha = f"{i + 1:x}" * 40
+        await _submission(db, task_id, sha)
+        await _report_without_provenance(db, task_id, sha)
+        rows.append(await repo.get_project(db, proj))
+
+    few = await _statements_for(db, rows[:2])
+    many = await _statements_for(db, rows)
+
+    assert few == many, (few, many)
+    from hub.services import ci_trust_warning
+
+    blocks = await ci_trust_warning.blocks_by_project(db, rows)
+    assert {b["state"] for b in blocks.values()} == {"unverified"}
+
+
+async def test_a_foreign_file_under_the_sender_name_is_left_alone(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """Only the hub's own sender (name AND mark) is ours; the same name with other content is not."""
+    work, origin = _repo_pair(tmp_path)
+    _git(work, "checkout", "main")
+    (work / WORKFLOWS).mkdir(parents=True)
+    (work / WORKFLOWS / SENDER).write_text("name: theirs\non: [push]\n", "utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "their file")
+    _git(work, "push", "origin", "main")
+    _git(work, "checkout", "develop")
+    project_id = await repo.create_project(db, slug="ext4", name="Ext4")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext4",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+
+    await services.provision_project(db, project_id)
+
+    assert _show(origin, "main", SENDER) == {"name": "theirs", True: ["push"]}
+    assert _tree(origin, "develop") == []
