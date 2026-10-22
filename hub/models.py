@@ -420,8 +420,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
     "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
-    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
-    "critic_host",
+    "critic_host",  # #1953: хост критика облачной сдачи; project_policy.critic_host_of
     # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
     # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
     "merge_is_delivery",
@@ -443,6 +442,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
     "steward_approve_max_class",
     "auto_approve_max_class",  # #1855: потолки, project_policy.*_max_class_of
+    "steward_approve_max_class_double_clean",  # #1986: читатели project_policy.*_of
+    "double_clean_reviewers",
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -3548,9 +3549,8 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
-    _validate_count(v, "deep_daily_cap")
-    _validate_count(v, "small_delta_lines")
-    _validate_count(v, "circle_deep_stop")
+    for count_key in ("deep_daily_cap", "small_delta_lines", "circle_deep_stop"):
+        _validate_count(v, count_key)
     _validate_merge_is_delivery(v)
     _validate_path_notices(v)
     _validate_release_artifacts(v)

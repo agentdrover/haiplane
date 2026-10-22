@@ -240,6 +240,28 @@ def class_ceiling_refusal(
     return None
 
 
+def exceeding_class(ceiling: str | None, fact: Any) -> RiskClass | None:
+    """Класс, на котором потолок отказывает ПО СУЩЕСТВУ, или None (#1986).
+
+    Только «класс известен и выше потолка»: нечитаемый потолок, отсутствующий
+    или повреждённый класс и ``raised`` - это не превышение, а недостача факта,
+    и исключение «двойной чистоты» на них не распространяется.
+    """
+    if ceiling is None or ceiling == STEWARD_CEILING_UNREADABLE:
+        return None
+    if fact is None or fact.state != "present" or (fact.value or {}).get("raised"):
+        return None
+    value = fact.value or {}
+    stored = _class_of(value.get("stored"))
+    recomputed = _class_of(value.get("recomputed"))
+    limit = _class_of(ceiling.upper())
+    if stored is None or recomputed is None or limit is None:
+        return None
+    order = list(RiskClass)
+    worst = max(stored, recomputed, key=order.index)
+    return worst if order.index(worst) > order.index(limit) else None
+
+
 # Факт класса ранней проверки потолка. Транзакция записи вердикта
 # (lifecycle._automation_ci_gate) сверяет потолок ещё раз по свежей политике и
 # свежему сохранённому классу, но пересчитанный по диффу класс в ней не
@@ -251,14 +273,49 @@ _EARLY_RISK: ContextVar[dict[int, tuple[int, str, Any, str]] | None] = ContextVa
 )
 
 
+# Решение «двойной чистоты» одного применения (#1986), по задачам: ``early`` -
+# аудит раннего этапа, ``applied`` - аудит, подтверждённый транзакционным
+# этапом и уходящий в запись вердикта. Живёт в том же контексте и умирает с ним.
+_CLEAN: ContextVar[dict[int, dict[str, Any]] | None] = ContextVar(
+    "steward_double_clean", default=None
+)
+STEWARD_CEILING_KEY = "steward_approve_max_class"
+
+
 @asynccontextmanager
 async def ceiling_scope() -> AsyncIterator[None]:
     """Одно применение стюарда: факт ранней проверки не переживает его."""
     token = _EARLY_RISK.set({})
+    clean_token = _CLEAN.set({})
     try:
         yield
     finally:
+        _CLEAN.reset(clean_token)
         _EARLY_RISK.reset(token)
+
+
+def _clean_slot(task_id: int) -> dict[str, Any] | None:
+    known = _CLEAN.get()
+    return None if known is None else known.setdefault(task_id, {})
+
+
+def applied_double_clean(task_id: int) -> dict[str, Any] | None:
+    """Аудит исключения, подтверждённого транзакцией этой записи вердикта, или None."""
+    return ((_CLEAN.get() or {}).get(task_id) or {}).get("applied")
+
+
+def double_clean_payload(task_id: int) -> dict[str, Any]:
+    """Поле аудита для события вердикта: пусто, если исключения не было (#1986)."""
+    audit = applied_double_clean(task_id)
+    return {"double_clean": audit} if audit else {}
+
+
+def double_clean_note(task_id: int) -> str:
+    """Строка карточки об одобрении по двойной чистоте, или пусто (#1986)."""
+    from hub.services.steward_double_clean import line
+
+    audit = applied_double_clean(task_id)
+    return f"\n{line(audit)}" if audit else ""
 
 
 async def remember_risk_fact(
@@ -301,6 +358,9 @@ async def ceiling_gate(
     from hub import repository as repo
     from hub.services.steward_evidence import present
 
+    slot = _clean_slot(task_id)
+    if slot is not None:
+        slot.pop("applied", None)
     ceiling = await current_ceiling(db, task_id, key)
     if ceiling is None:
         return None
@@ -326,7 +386,52 @@ async def ceiling_gate(
             recomputed=value.get("recomputed"),
             raised=value.get("raised"),
         )
-    return class_ceiling_refusal(ceiling, fact, key)
+    refusal = class_ceiling_refusal(ceiling, fact, key)
+    if refusal is None or key != STEWARD_CEILING_KEY:
+        return refusal
+    return await _double_clean(db, task_id, live[0], ceiling, fact, refusal, late=True)
+
+
+async def _double_clean(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    ceiling: str,
+    fact: Any,
+    refusal: tuple[str, str],
+    *,
+    late: bool,
+) -> tuple[str, str] | None:
+    """Исключение «двойной чистоты» (#1986): None - потолок не возражает.
+
+    ОДНО решение на оба этапа (``steward_double_clean.evaluate``). Ранний этап
+    запоминает аудит, транзакционный обязан получить такой же: иначе прежний
+    отказ дополняется перечнем невыполненных условий.
+    """
+    from hub.services import steward_double_clean as double_clean
+
+    worst = exceeding_class(ceiling, fact)
+    if worst is None:
+        return refusal
+    slot = _clean_slot(task_id)
+    decision = await double_clean.evaluate(
+        db,
+        task_id,
+        generation,
+        worst,
+        early=(slot or {}).get("early"),
+        late=late,
+    )
+    if not decision.enabled:
+        return refusal
+    if decision.ok:
+        if slot is not None:
+            slot["applied" if late else "early"] = decision.audit
+        return None
+    return (
+        refusal[0],
+        refusal[1] + "; двойная чистота не выполнена — " + "; ".join(decision.unmet),
+    )
 
 
 async def ceiling_refusals(
@@ -335,7 +440,15 @@ async def ceiling_refusals(
     """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
     fact = packet.facts.get("risk_class")
     await remember_risk_fact(db, task_id, packet.generation, fact)
-    refusal = class_ceiling_refusal(await current_ceiling(db, task_id), fact)
+    slot = _clean_slot(task_id)
+    if slot is not None:
+        slot.clear()  # решение прошлого прохода не переживает этот
+    ceiling = await current_ceiling(db, task_id)
+    refusal = class_ceiling_refusal(ceiling, fact)
+    if refusal is not None and ceiling is not None:
+        refusal = await _double_clean(
+            db, task_id, packet.generation, ceiling, fact, refusal, late=False
+        )
     return [refusal] if refusal else []
 
 

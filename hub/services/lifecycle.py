@@ -88,6 +88,7 @@ from hub.services.review_limit import (
     refuse_opening_over_review_limit,
 )
 from hub.services.outcomes import outcome_status_for_task
+from hub.services.steward_apply import double_clean_note, double_clean_payload
 from hub.models import (
     ACTIVE_STATUSES,
     BatchApprove,
@@ -4855,6 +4856,8 @@ def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
         )
     elif state.sha_note:
         content += f"\n{state.sha_note}"
+    if state.applied_by_steward:  # #1986: строка об одобрении по двойной чистоте
+        content += double_clean_note(state.task_id)
     if state.undisposed_note:
         content += f"\n{state.undisposed_note}"
     if state.inflight_note:
@@ -4957,6 +4960,7 @@ def _verdict_event_payload(
         payload["ghost_generation"] = ghost_generation
     if state.applied_by_steward:
         payload["source"] = STEWARD_APPLIED_SOURCE
+        payload.update(double_clean_payload(state.task_id))  # #1986
     if state.replaced is not None and state.outcome is verdict_guard.Outcome.supersede:
         payload["replaced_revision"] = state.replaced.revision
     return payload

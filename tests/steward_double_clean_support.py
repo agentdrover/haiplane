@@ -45,6 +45,7 @@ CLEAN_CEILING = "steward_approve_max_class_double_clean"
 REVIEWERS = "double_clean_reviewers"
 
 FINDING = {"title": "гонка", "severity": "high", "category": "correctness"}
+UNRESOLVED = {"title": "не судили", "why": "верификатор не ответил"}
 
 
 def policy_of(

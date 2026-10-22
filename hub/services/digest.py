@@ -243,6 +243,8 @@ STEWARD_SECTION_KEY = "steward_judgements"
 # что постановка запрещает («тихое одобрение неотличимо от подлога»).
 # Дайджест без ключа старше раздела: там «ноль» не измерялся.
 SELF_APPROVALS_KEY = "steward_self_approvals"
+# Из них одобренные по двойной чистоте (#1986): суточное число для владельца.
+DOUBLE_CLEAN_KEY = "steward_double_clean_approvals"
 
 MEASURED = "measured"
 UNMEASURED = "unmeasured"
@@ -565,6 +567,8 @@ async def generate_due_digests(
                     {
                         **entry,
                         "generation": int(payload.get("submission_generation") or 0),
+                        # #1986: одобрение по двойной чистоте считается отдельно.
+                        "double_clean": bool(payload.get("double_clean")),
                     }
                 )
             elif event["kind"] == "verdict_escalated":
@@ -639,6 +643,7 @@ async def generate_due_digests(
             "escalations": escalations,
             STEWARD_SECTION_KEY: steward,
             SELF_APPROVALS_KEY: self_approvals,
+            DOUBLE_CLEAN_KEY: sum(1 for a in self_approvals if a["double_clean"]),
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -664,6 +669,7 @@ async def generate_due_digests(
                 "escalations": len(escalations),
                 "steward_judgements": len(steward),
                 "steward_self_approvals": len(self_approvals),
+                DOUBLE_CLEAN_KEY: sum(1 for a in self_approvals if a["double_clean"]),
                 "audit_sample": sample,
             },
         )

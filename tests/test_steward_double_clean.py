@@ -28,6 +28,7 @@ from tests.steward_double_clean_support import (
     CLEAN_CEILING,
     FINDING,
     IMPLEMENTER,
+    UNRESOLVED,
     LISTED,
     OTHER,
     REVIEWERS,
@@ -105,7 +106,7 @@ _BREAKS = [
     ("incomplete", "incomplete", {"main": {"incomplete": True}}),
     ("incomplete_unclaimed", "incomplete", {"main": {"incomplete": None}}),
     ("confirmed", "confirmed", {"extra": {"confirmed": (FINDING,)}}),
-    ("unresolved", "unresolved", {"main": {"unresolved": (FINDING,)}}),
+    ("unresolved", "unresolved", {"main": {"unresolved": (UNRESOLVED,)}}),
     ("lost_dimensions", "lost_dimensions", {"extra": {"lost": ("security",)}}),
     ("self_reviewed", "self_reviewed", {"main": {"self_reviewed": True}}),
     ("main_principal_unknown", "identity", {"main": {"principal": None}}),
@@ -139,7 +140,7 @@ async def test_any_missing_condition_keeps_the_ceiling(db, monkeypatch, label):
 
     assert detail, f"{label}: потолок обязан остаться, получено {refusals}"
     if token is not None:
-        assert token in detail, f"{label}: перечень не назвал {token!r}: {detail}"
+        assert f"{token}:" in detail, f"{label}: перечень не назвал {token!r}: {detail}"
     outcome, _ = await apply_self_approval(db, case.task_id, 1)
     assert outcome == ESCALATED_TO_HUMAN, label
     assert await verdict_of(db, case.task_id) == ""
@@ -150,7 +151,7 @@ async def test_an_objecting_advisor_keeps_the_ceiling(db, monkeypatch):
 
     refusals = await apply_refusals(db, case.task_id, 1)
 
-    assert "advisor" in ceiling_detail(refusals)
+    assert "advisor:" in ceiling_detail(refusals)
     outcome, _ = await apply_self_approval(db, case.task_id, 1)
     assert outcome == ESCALATED_TO_HUMAN
     assert await verdict_of(db, case.task_id) == ""
@@ -163,7 +164,7 @@ async def test_the_exception_needs_the_main_report_beside_the_listed_one(
     case = await build_case(db, monkeypatch, "dc-single", pair=False)
     assert case.main is None
     detail = ceiling_detail(await apply_refusals(db, case.task_id, 1))
-    assert detail and "pair" in detail
+    assert detail and "pair:" in detail
 
 
 async def test_every_unmet_condition_is_listed_not_only_the_first(db, monkeypatch):
@@ -179,7 +180,7 @@ async def test_every_unmet_condition_is_listed_not_only_the_first(db, monkeypatc
     detail = ceiling_detail(await apply_refusals(db, case.task_id, 1))
 
     for token in ("incomplete", "confirmed", "ci"):
-        assert token in detail, (token, detail)
+        assert f"{token}:" in detail, (token, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +377,7 @@ async def test_detectors_catch_a_bad_double_clean_approval(db, monkeypatch):
             agent="denis",
             verdict=ReviewVerdict.changes_requested,
             comments="возвращаю",
+            supersedes_revision=1,
         ),
         expected_generation=1,
         human_caller=True,

@@ -27,6 +27,7 @@ from tests.steward_double_clean_support import (
     CLEAN_CEILING,
     FINDING,
     LISTED,
+    UNRESOLVED,
     OTHER,
     REVIEWERS,
     THIRD,
@@ -81,7 +82,7 @@ async def _third_report_lost_dimension(other, case):
 
 
 async def _third_report_unresolved_unpinned(other, case):
-    await add_report(other, case.task_id, THIRD, pinned=False, unresolved=(FINDING,))
+    await add_report(other, case.task_id, THIRD, pinned=False, unresolved=(UNRESOLVED,))
 
 
 async def _a_pair_report_turns_dirty(other, case):
@@ -141,19 +142,20 @@ async def _green_for(other, case, sha: str) -> None:
 
 
 _CANCELLING = {
-    "third_report_with_a_finding": (_third_report_with_a_finding, "confirmed"),
-    "third_report_incomplete": (_third_report_incomplete, "incomplete"),
-    "third_report_lost_dimension": (_third_report_lost_dimension, "lost_dimensions"),
+    "third_report_with_a_finding": (_third_report_with_a_finding, "confirmed:"),
+    "third_report_incomplete": (_third_report_incomplete, "incomplete:"),
+    "third_report_lost_dimension": (_third_report_lost_dimension, "lost_dimensions:"),
     "third_report_unresolved_unpinned": (
         _third_report_unresolved_unpinned,
-        "unresolved",
+        "unresolved:",
     ),
-    "a_pair_report_turns_dirty": (_a_pair_report_turns_dirty, "confirmed"),
-    "new_submission_sha": (_new_submission_sha, "sha"),
-    "new_ci_attempt": (_new_ci_attempt, "ci"),
-    "reviewers_list_changed": (_reviewers_list_changed, "policy"),
+    "a_pair_report_turns_dirty": (_a_pair_report_turns_dirty, "confirmed:"),
+    # коммит сдачи: ранняя проверка привязана к (поколение, sha) и отказывает сама
+    "new_submission_sha": (_new_submission_sha, "коммит"),
+    "new_ci_attempt": (_new_ci_attempt, "ci:"),
+    "reviewers_list_changed": (_reviewers_list_changed, "policy:"),
     "exception_switched_off": (_exception_switched_off, None),
-    "class_raised": (_ordinary_ceiling_removed_then_class_raised, "class"),
+    "class_raised": (_ordinary_ceiling_removed_then_class_raised, "class:"),
 }
 
 
@@ -280,7 +282,7 @@ async def test_a_late_second_report_does_not_switch_the_mode(db, monkeypatch):
 
     assert await _frozen(db, case.task_id) == "", "на заказе пары не было"
     detail = ceiling_detail(await apply_refusals(db, case.task_id, 1))
-    assert detail and "pair" in detail
+    assert detail and "pair:" in detail
     outcome, _ = await apply_self_approval(db, case.task_id, 1)
     assert outcome == ESCALATED_TO_HUMAN
     assert await verdict_of(db, case.task_id) == ""
