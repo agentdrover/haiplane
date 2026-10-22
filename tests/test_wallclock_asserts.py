@@ -160,6 +160,16 @@ def test_reference_saved_after_the_patch(monkeypatch, fake):
     assert m() < 0.5
 
 
+def test_same_line_patch_then_read(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake); elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+def test_same_line_patch_then_reference(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake); m = time.monotonic
+    assert m() < 0.5
+
+
 def test_not_a_clock(x):
     assert len(x) < 0.5
 
@@ -466,6 +476,18 @@ def test_undo(monkeypatch, fake):
     assert time.monotonic() - t0 < 0.5
 
 
+def test_undo_same_line(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake); monkeypatch.undo()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.53
+
+
+def test_read_on_the_undo_line(monkeypatch, fake):
+    monkeypatch.setattr(time, "monotonic", fake)
+    monkeypatch.undo(); elapsed = time.monotonic() - 1
+    assert elapsed < 0.54
+
+
 def test_not_upper(flag):
     elapsed = time.monotonic() - 1
     assert not elapsed < 0.5
@@ -515,12 +537,14 @@ def test_unproven_forms_are_warnings_not_silence(tmp_path, capsys):
         ("assert not elapsed >= 0.5", "логический контекст"),
         ("assert elapsed < 0.5 or flag", "логический контекст"),
         ("assert not 0.5 <= elapsed", "логический контекст"),
+        ("assert elapsed < 0.53", "подмена отменяется"),
+        ("assert elapsed < 0.54", "подмена отменяется"),
     ):
         line = _line_of(UNPROVEN_SOURCE, needle)
         assert f"ПРЕДУПРЕЖДЕНИЕ src/mod.py:{line} " in out, (needle, out)
         row = next(r for r in out.splitlines() if f"src/mod.py:{line} " in r)
         assert message in row, row
-    assert out.count("ПРЕДУПРЕЖДЕНИЕ") == 5, out
+    assert out.count("ПРЕДУПРЕЖДЕНИЕ") == 7, out
 
 
 def test_context_scope_and_and_stay_violations(tmp_path, capsys):
@@ -556,6 +580,13 @@ def test_a_last_patch_is_not_the_clock_one():
     assert elapsed < 0.5
 
 
+def test_e_two_assignments_on_one_line():
+    p = patch("time.monotonic"); p = patch("os.getcwd")
+    p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.52
+
+
 def test_d_last_patch_is_not_a_clock_at_all():
     p = patch("time.monotonic")
     p = patch("os.getcwd")
@@ -573,6 +604,12 @@ def test_b_last_patch_is_the_clock_one():
     p = patch("time.perf_counter")
     p = patch("time.monotonic")
     p.start()
+    elapsed = time.monotonic() - 1
+    assert elapsed < 0.5
+
+
+def test_f_assignment_and_start_on_one_line():
+    p = patch("time.monotonic"); p.start()
     elapsed = time.monotonic() - 1
     assert elapsed < 0.5
 
@@ -600,7 +637,11 @@ def test_start_enables_the_last_assigned_patch(tmp_path, capsys):
     _write_ledger(tmp_path, [])
     code, out = _run(tmp_path, capsys)
     assert code != 0, out
-    for needle in ("assert elapsed < 0.5\n", "assert elapsed < 0.51"):
+    for needle in (
+        "assert elapsed < 0.5\n",
+        "assert elapsed < 0.51",
+        "assert elapsed < 0.52",
+    ):
         line = _line_of(SECOND_PATCH_REAL, needle.strip())
         assert f"\n  src/mod.py:{line} " in out, out
     _write(tmp_path, SECOND_PATCH_FAKE)

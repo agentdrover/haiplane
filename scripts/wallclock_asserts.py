@@ -178,12 +178,29 @@ def _module_clock(node: ast.AST, imp: Imports) -> str | None:
 # --- одна функция ----------------------------------------------------------
 
 
+Pos = tuple[int, int]  # (строка, столбец): «до / после» решается по обоим
+
+
+def _pos(node: ast.AST) -> Pos:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+def _end_pos(node: ast.AST) -> Pos:
+    return (
+        getattr(node, "end_lineno", None) or 10**9,
+        getattr(node, "end_col_offset", 0),
+    )
+
+
+NEVER: Pos = (10**9, 0)
+
+
 @dataclass(frozen=True)
 class Patch:
     clock: str
-    start: int
-    end: int  # последняя строка действия patch
-    cancelled_at: int | None = None  # undo() / stop() до конца функции
+    start: Pos
+    end: Pos  # конец действия patch
+    cancelled_at: Pos | None = None  # undo() / stop() до конца функции
 
 
 def _own_nodes(func: ast.AST):
@@ -198,7 +215,7 @@ def _own_nodes(func: ast.AST):
         stack.extend(ast.iter_child_nodes(node))
     # В порядке исходника: стек отдаёт узлы в обратном порядке, а решения
     # «последнее присваивание перед p.start()» зависят от порядка.
-    found.sort(key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+    found.sort(key=_pos)
     yield from found
 
 
@@ -250,7 +267,7 @@ def _patched_by_args(args: list[ast.expr], imp: Imports) -> str | None:
     return None
 
 
-def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
+def _patches(func: ast.AST, imp: Imports, end_line: Pos) -> list[Patch]:
     """Подмены часов в функции, которые ДЕЙСТВУЮТ, с областью действия.
 
     Действует: monkeypatch.setattr с момента вызова; ``with patch(...)`` в теле
@@ -258,7 +275,7 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
     только вместе с ``.start()``. Голый вызов ``patch(...)`` ничего не
     подменяет.
     """
-    in_with: dict[int, int] = {}
+    in_with: dict[int, Pos] = {}
     decorators = {
         id(d) for d in getattr(func, "decorator_list", []) if isinstance(d, ast.Call)
     }
@@ -266,15 +283,15 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
     for node in nodes:
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
-                in_with[id(item.context_expr)] = node.end_lineno or end_line
+                in_with[id(item.context_expr)] = _end_pos(node)
     cancels = [
-        n.lineno
+        _pos(n)
         for n in nodes
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
         and n.func.attr in ("undo", "stop")
     ]
-    context_end: dict[int, int] = {}  # вызов внутри ``with monkeypatch.context()``
+    context_end: dict[int, Pos] = {}  # вызов внутри ``with monkeypatch.context()``
     for node in nodes:
         if isinstance(node, (ast.With, ast.AsyncWith)) and any(
             isinstance(i.context_expr, ast.Call)
@@ -283,10 +300,10 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
             for i in node.items
         ):
             for inner in ast.walk(node):
-                context_end[id(inner)] = node.end_lineno or end_line
+                context_end[id(inner)] = _end_pos(node)
     # имя -> присваивания (строка, часы или None): ``p.start()`` включает
     # подмену из ПОСЛЕДНЕГО присваивания этого имени перед вызовом.
-    pending: dict[str, list[tuple[int, str | None]]] = {}
+    pending: dict[str, list[tuple[Pos, str | None]]] = {}
     for node in nodes:
         if (
             isinstance(node, ast.Assign)
@@ -298,7 +315,7 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
                 if isinstance(node.value, ast.Call) and not _is_setattr(node.value)
                 else None
             )
-            pending.setdefault(node.targets[0].id, []).append((node.lineno, clock))
+            pending.setdefault(node.targets[0].id, []).append((_pos(node), clock))
     found: list[Patch] = []
     for node in nodes:
         if not isinstance(node, ast.Call):
@@ -306,23 +323,23 @@ def _patches(func: ast.AST, imp: Imports, end_line: int) -> list[Patch]:
         clock = _patched_clock(node, imp)
         if clock is not None:
             if _is_setattr(node) and id(node) in context_end:
-                found.append(Patch(clock, node.lineno, context_end[id(node)]))
+                found.append(Patch(clock, _pos(node), context_end[id(node)]))
             elif _is_setattr(node):
-                found.append(_cancellable(clock, node.lineno, end_line, cancels))
+                found.append(_cancellable(clock, _pos(node), end_line, cancels))
             elif id(node) in in_with:
-                found.append(Patch(clock, node.lineno, in_with[id(node)]))
+                found.append(Patch(clock, _pos(node), in_with[id(node)]))
             elif id(node) in decorators:
-                found.append(Patch(clock, getattr(func, "lineno", 0), end_line))
+                found.append(Patch(clock, _pos(func), end_line))
             continue
         started = _started_clock(node, imp, pending)
         if started is not None:
-            found.append(_cancellable(started, node.lineno, end_line, cancels))
+            found.append(_cancellable(started, _pos(node), end_line, cancels))
     return found
 
 
-def _cancellable(clock: str, start: int, end_line: int, cancels: list[int]) -> Patch:
+def _cancellable(clock: str, start: Pos, end_line: Pos, cancels: list[Pos]) -> Patch:
     """Подмена, которую ``undo()`` / ``stop()`` позже может отменить."""
-    later = [line for line in cancels if line > start]
+    later = [pos for pos in cancels if pos > start]
     if not later:
         return Patch(clock, start, end_line)
     return Patch(clock, start, min(later), cancelled_at=min(later))
@@ -333,14 +350,14 @@ def _is_setattr(call: ast.Call) -> bool:
 
 
 def _started_clock(
-    call: ast.Call, imp: Imports, pending: dict[str, list[tuple[int, str | None]]]
+    call: ast.Call, imp: Imports, pending: dict[str, list[tuple[Pos, str | None]]]
 ) -> str | None:
     """Часы, подмену которых включает ``p.start()`` / ``patch(...).start()``."""
     func = call.func
     if not (isinstance(func, ast.Attribute) and func.attr == "start"):
         return None
     if isinstance(func.value, ast.Name):
-        before = [a for a in pending.get(func.value.id, []) if a[0] < call.lineno]
+        before = [a for a in pending.get(func.value.id, []) if a[0] < _pos(call)]
         return max(before, key=lambda a: a[0], default=(0, None))[1]
     if isinstance(func.value, ast.Call):
         return _patched_clock(func.value, imp)
@@ -352,10 +369,9 @@ class _Flow:
 
     def __init__(self, func: ast.AST, imp: Imports) -> None:
         self.imp = imp
-        end = getattr(func, "end_lineno", None) or 10**9
-        self.patches = _patches(func, imp, end)
-        # имя -> (часы, строка присваивания, взяты ли с модуля time)
-        self.aliases: dict[str, tuple[str, int, bool]] = {}
+        self.patches = _patches(func, imp, _end_pos(func))
+        # имя -> (часы, позиция присваивания, взяты ли с модуля time)
+        self.aliases: dict[str, tuple[str, Pos, bool]] = {}
         self.warnings: list[tuple[int, str]] = []
         self._own = list(_own_nodes(func))
         self._collect_aliases()
@@ -377,7 +393,7 @@ class _Flow:
                 if clock:
                     on_module = isinstance(node.value, ast.Attribute)
                     self.aliases.setdefault(
-                        node.targets[0].id, (clock, node.lineno, on_module)
+                        node.targets[0].id, (clock, _pos(node), on_module)
                     )
 
     def _read_kind(self, call: ast.Call) -> str | None:
@@ -398,13 +414,13 @@ class _Flow:
             return "object"
         return None
 
-    def _first_read(self) -> int:
+    def _first_read(self) -> Pos:
         lines = [
-            n.lineno
+            _pos(n)
             for n in self._own
             if isinstance(n, ast.Call) and self._read_kind(n) in ("module", "alias")
         ]
-        return min(lines, default=10**9)
+        return min(lines, default=NEVER)
 
     def _is_faked(self, call: ast.Call) -> bool:
         func = call.func
@@ -416,7 +432,7 @@ class _Flow:
                 p.clock == clock
                 and p.start < self.first_read
                 and p.start < saved_at <= p.end
-                and call.lineno <= p.end
+                and _pos(call) <= p.end
                 for p in self.patches
             )
         # Только чтение через сам объект time: from-импорт не затронут
@@ -430,7 +446,7 @@ class _Flow:
         return any(
             p.clock == func.attr
             and p.start < self.first_read
-            and p.start <= call.lineno <= p.end
+            and p.start <= _pos(call) <= p.end
             for p in self.patches
         )
 
@@ -447,7 +463,7 @@ class _Flow:
             p.cancelled_at is not None
             and p.clock == clock
             and p.start < self.first_read
-            and call.lineno > p.cancelled_at
+            and _pos(call) > p.cancelled_at
             for p in self.patches
         )
 
