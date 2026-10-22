@@ -36,7 +36,13 @@ def _no_stale_form(page: Any) -> None:
 def test_htmx_is_loaded_on_the_card(page: Any, stand: Stand) -> None:
     task_id = stand.seed_review_task(title="HTMX загружен")
     _open(page, stand, task_id)
-    page.wait_for_function("typeof window.htmx === 'object'")
+    try:
+        page.wait_for_function("typeof window.htmx === 'object'")
+    except Exception as exc:  # noqa: BLE001 - Playwright TimeoutError
+        raise AssertionError(
+            "HTMX не загрузился: unpkg недоступен (страница грузит "
+            "https://unpkg.com/htmx.org@2.0.4, как прод)"
+        ) from exc
 
 
 def test_return_to_work_from_review_with_cyrillic_reason(

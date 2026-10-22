@@ -40,9 +40,6 @@ import pytest
 from hub import brand
 
 ROOT = Path(__file__).resolve().parents[2]
-#: Версия HTMX, которую грузит base.html; файл лежит рядом с тестами.
-HTMX_VERSION = "2.0.4"
-HTMX_FILE = Path(__file__).parent / "vendor" / f"htmx-{HTMX_VERSION}.min.js"
 STARTUP_SECONDS = 90.0
 
 T = TypeVar("T")
@@ -442,31 +439,30 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
 def context(
     browser: Any, stand: Stand, request: pytest.FixtureRequest
 ) -> Iterator[Any]:
-    """Контекст человека: cookie-сессия, локальный HTMX, trace на случай сбоя."""
+    """Контекст человека: cookie-сессия и trace на случай сбоя.
+
+    HTMX страница грузит с unpkg, как прод; подмены нет, и недоступный unpkg
+    называет тест test_htmx_is_loaded_on_the_card.
+    """
     ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
-    ctx.add_cookies(
-        [{"name": stand.cookie_name, "value": stand.session, "url": stand.url}]
-    )
-    if HTMX_FILE.exists():
-        body = HTMX_FILE.read_bytes()
-        ctx.route(
-            f"https://unpkg.com/htmx.org@{HTMX_VERSION}**",
-            lambda route: route.fulfill(
-                status=200, content_type="application/javascript", body=body
-            ),
-        )
-    ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
     try:
+        ctx.add_cookies(
+            [{"name": stand.cookie_name, "value": stand.session, "url": stand.url}]
+        )
+        ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
         yield ctx
     finally:
-        failed = (
-            getattr(request.node, "rep_call", None) is not None
-            and request.node.rep_call.failed
-        )
+        out = artifacts_dir()
+        out.mkdir(parents=True, exist_ok=True)
         name = request.node.name
+        # Лог сервера пишется всегда: ошибка в setup или teardown фикстур тоже
+        # его требует, а отчёт teardown самой фикстуре ещё не виден.
+        (out / f"{name}-server.log").write_text(_tail(stand.log_path, 400))
+        failed = any(
+            getattr(getattr(request.node, f"rep_{when}", None), "failed", False)
+            for when in ("setup", "call")
+        )
         if failed:
-            out = artifacts_dir()
-            out.mkdir(parents=True, exist_ok=True)
             ctx.tracing.stop(path=str(out / f"{name}-trace.zip"))
             for index, page in enumerate(ctx.pages):
                 try:
@@ -475,7 +471,6 @@ def context(
                     )
                 except Exception:  # noqa: BLE001 - снимок страницы не должен прятать сбой теста
                     pass
-            (out / f"{name}-server.log").write_text(_tail(stand.log_path, 400))
         else:
             ctx.tracing.stop()
         ctx.close()

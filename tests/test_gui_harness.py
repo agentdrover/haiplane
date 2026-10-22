@@ -13,6 +13,7 @@ Chromium. Здесь проверяются три вещи, которым бр
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import socket
@@ -180,3 +181,55 @@ def stand_exited(pid: int) -> bool:
         return False
     # Процесс ещё числится: дочерний уже собран wait(), значит это чужой pid.
     return False
+
+
+def _script(name: str):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        return importlib.import_module(name)
+    finally:
+        sys.path.remove(str(ROOT / "scripts"))
+
+
+def _git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+def test_red_test_baseline_never_names_a_browser_module(tmp_path: Path) -> None:
+    """`--ignore` не держит явный путь, а baseline называет каждый файл явно."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.test")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "tests" / "gui").mkdir(parents=True)
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a(): assert 1\n")
+    (tmp_path / "tests" / "gui" / "test_b.py").write_text("def test_b(): pass\n")
+    (tmp_path / "tests" / "gui" / "conftest.py").write_text("")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "head")
+
+    baseline = _script("red_test_baseline")
+    head = _git(tmp_path, "rev-parse", "HEAD")
+    assert baseline.changed_test_files(tmp_path, base, head) == ["tests/test_a.py"]
+
+
+def test_mutation_series_never_judges_a_mutant_by_a_browser_module(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gui").mkdir()
+    (tmp_path / "test_a.py").write_text("def test_a(): pass\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "test_c.py").write_text("def test_c(): pass\n")
+    (tmp_path / "gui" / "test_b.py").write_text("def test_b(): pass\n")
+
+    mutation = _script("mutation_changed")
+    found = {
+        p.relative_to(tmp_path).as_posix() for p in mutation.module_texts(tmp_path)
+    }
+    assert found == {"test_a.py", "sub/test_c.py"}
