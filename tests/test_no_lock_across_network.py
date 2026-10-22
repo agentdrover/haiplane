@@ -516,45 +516,6 @@ async def _headless_done_rig(db, monkeypatch, *, areas=None):
     return task_id, git
 
 
-ROUTE_VARIANTS = ("empty_areas", "foreign_warn", "squashed_sha")
-
-
-@pytest.mark.parametrize("variant", ROUTE_VARIANTS)
-async def test_route_after_done_does_not_hold_the_lock_across_the_network(
-    db, db_dsn, monkeypatch, variant
-):
-    areas = ["hub/x.py"] if variant == "foreign_warn" else []
-    task_id, git = await _headless_done_rig(db, monkeypatch, areas=areas)
-    if variant != "squashed_sha":
-        git.dirty_paths = AsyncMock(return_value=["other/y.py"])
-    else:
-        git.squash_branch = AsyncMock(return_value=True)
-        git.resolve_ref = AsyncMock(
-            side_effect=[("resolved", "before0sha"), ("resolved", "after0sha")]
-        )
-
-    def attach(stand):
-        if variant == "squashed_sha":
-            git.push_branch = AsyncMock(side_effect=stand)
-        else:
-            git.content_differs = AsyncMock(side_effect=stand)
-
-    row = dict(await repo.get_task(db, task_id))
-    seen = await _frozen_in_network(
-        attach,
-        lambda: orchestration.transition_after_agent_done(db, row, has_done=True),
-        db_dsn,
-        task_id,
-        answer=True,
-    )
-    if variant == "empty_areas":
-        assert "affected_areas" in seen["feed"], "предупреждение видно до сети"
-    elif variant == "foreign_warn":
-        assert "вне объявленной области" in seen["feed"]
-    else:
-        assert seen["squashed"] == "before0sha", "gate_squashed_sha видна до push"
-
-
 class _PushFailed(Exception):
     """Сбой git-хвоста: внешняя транзакция done-flow должна откатиться."""
 
@@ -618,28 +579,45 @@ async def test_done_flow_entry_never_commits_the_foreign_transaction(
         assert "вне объявленной области" not in view["feed"]
 
 
-async def test_commit_failure_before_content_differs_stops_the_tail(
+async def test_headless_route_never_commits_the_generation_bump_before_the_network(
     db, db_dsn, monkeypatch
 ):
-    """Сбой commit перед сетью не маскируется под «не удалось сравнить» (#2005)."""
-    import sqlite3
+    """Граница headless-входа - коммит поллера после перехода, не хвост (#2005).
 
-    task_id, git = await _headless_done_rig(db, monkeypatch)
-    git.dirty_paths = AsyncMock(return_value=["other/y.py"])
-    real_commit = db.commit
-    failed = []
+    accept_in_transaction оставляет бамп поколения незакоммиченным, чтобы сбой
+    git-хвоста откатил его. Ранний commit перед content_differs / push сохранил
+    бы бамп при упавшем хвосте, и следующий тик бампал бы снова.
+    """
+    task_id, git = await _headless_done_rig(db, monkeypatch, areas=["hub/x.py"])
+    git.dirty_paths = AsyncMock(return_value=["other/y.py"])  # warn: запись до сети
+    git.squash_branch = AsyncMock(return_value=True)
+    git.resolve_ref = AsyncMock(
+        side_effect=[("resolved", "before0sha"), ("resolved", "after0sha")]
+    )
+    before = (await _committed_view(db_dsn, task_id))["submission_generation"]
+    seen: dict[str, dict] = {}
 
-    async def commit():
-        if git.checkout.await_count and not failed:
-            failed.append(1)
-            raise sqlite3.OperationalError("database is locked")
-        await real_commit()
+    async def differs(*_a, **_k):
+        seen["differs"] = await _committed_view(db_dsn, task_id)
+        return True
 
-    monkeypatch.setattr(db, "commit", commit)
+    async def push_then_fail(*_a, **_k):
+        seen["push"] = await _committed_view(db_dsn, task_id)
+        live = await repo.get_task(db, task_id)
+        assert dict(live)["submission_generation"] > before, "бамп был в сессии"
+        raise _PushFailed
+
+    git.content_differs = AsyncMock(side_effect=differs)
+    git.push_branch = AsyncMock(side_effect=push_then_fail)
     row = dict(await repo.get_task(db, task_id))
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(_PushFailed):
         await orchestration.transition_after_agent_done(db, row, has_done=True)
-    assert failed
-    assert git.content_differs.await_count == 0
-    assert git.push_branch.await_count == 0
-    assert git.create_pr.await_count == 0
+    await db.rollback()  # конец тика поллера
+    assert set(seen) == {"differs", "push"}, "путь дошёл до обоих сетевых шагов"
+    for step, view in seen.items():
+        assert view["submission_generation"] == before, f"{step}: бамп закоммичен"
+        assert "вне объявленной области" not in view["feed"]
+        assert not view["gate_squashed_sha"]
+    after = await _committed_view(db_dsn, task_id)
+    assert after["submission_generation"] == before
+    assert after["status"] == "running"
