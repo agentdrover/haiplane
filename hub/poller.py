@@ -22,7 +22,7 @@ from hub.services import critic_orders, gate_observations, role_orders
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
-from hub.db import fetchall, log_activity
+from hub.db import committed_if_own, fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
@@ -2155,9 +2155,9 @@ async def _deliver_pair_task(db, task: dict) -> None:
         return
 
     if delivery_pr.reason:
-        # Terminal from here too — the task leaves the sweep once delivered,
-        # so this write happens at most once, and the commit below covers it.
-        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+        # Terminal, once per task; committed by its owner before the release (#2001).
+        async with committed_if_own(db):
+            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     _pair_delivery_waits.pop(task_id, None)
     # #812: delivery grew the release range. Best effort, exactly as on the
     # done path — a release that could not be prepared is a reason in the log,
