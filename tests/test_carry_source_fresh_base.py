@@ -15,13 +15,14 @@ import logging
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import TaskCreate
-from hub.services import orchestration
+from hub.services import carry_fresh_base, orchestration
 from hub.services import review_dispatch as dispatcher
 
 SOURCE = "a" * 40  # коммит, который читал ревьюер (поколение 1)
@@ -70,6 +71,13 @@ class StaleBaseGit(NoopGitOps):
         if not self.base_fetched:
             return AUTHOR + FROM_BASE  # старая база: чужое выглядит правкой
         return AUTHOR_EDIT if self.edit else AUTHOR
+
+
+@pytest.fixture(autouse=True)
+def _forget_refreshes():
+    carry_fresh_base._refreshed.clear()
+    yield
+    carry_fresh_base._refreshed.clear()
 
 
 async def _resubmitted(
@@ -181,3 +189,41 @@ async def test_same_commit_needs_no_fetch(db, monkeypatch):
 
     assert await dispatcher._carry_source(db, task) is not None
     assert git.fetches == 0
+
+
+async def test_reader_then_dispatcher_share_one_fetch(db, monkeypatch):
+    # Читатель стюарда (read_only) и диспетчер спрашивают один и тот же
+    # вопрос в одном цикле: база обновляется один раз, а не по разу на каждого.
+    git = StaleBaseGit()
+    _install(monkeypatch, git)
+    task = await _resubmitted(db)
+
+    assert await dispatcher._carry_source(db, task) is not None
+    assert await dispatcher._carry_source(db, task) is not None
+    assert await dispatcher._carry_the_report_over(db, task) is True
+    assert git.fetches == 1
+
+
+async def test_the_shared_fetch_expires(db, monkeypatch):
+    git = StaleBaseGit()
+    _install(monkeypatch, git)
+    task = await _resubmitted(db)
+    now = [1000.0]
+    monkeypatch.setattr(carry_fresh_base, "_clock", lambda: now[0])
+
+    await dispatcher._carry_source(db, task)
+    now[0] += carry_fresh_base.FRESH_BASE_TTL_SECONDS + 1
+    await dispatcher._carry_source(db, task)
+
+    assert git.fetches == 2
+
+
+async def test_a_failed_fetch_is_not_remembered(db, monkeypatch):
+    git = StaleBaseGit(base_ok=False)
+    _install(monkeypatch, git)
+    task = await _resubmitted(db)
+
+    assert await dispatcher._carry_source(db, task) is None
+    git.base_ok = True
+    assert await dispatcher._carry_source(db, task) is not None
+    assert git.fetches == 2
