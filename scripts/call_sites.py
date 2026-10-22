@@ -49,7 +49,7 @@ BLIND_SPOTS: tuple[str, ...] = (
     "алиасы импорта (from x import f as g) не находятся",
     "одноимённые символы (функции и методы разных модулей) делят одну корзину",
     "вызов и передача аргументом не различаются",
-    "индексируются только hub/ и tests/ анализируемого дерева (scripts/ и прочее — нет)",
+    "индексируются только hub/, tests/ и scripts/ анализируемого дерева (прочее — нет)",
     "чтения вида ref = f не видны",
     "из модуля раскрываются публичные функции верхнего уровня (def, async def); "
     "методы, вложенные функции и определения внутри if/try не входят",
@@ -161,7 +161,7 @@ def run_query(root: Path, targets: list[str]) -> dict[str, object]:
         base["status"] = "not_analysed"
         base["message"] = (
             "не проанализировано: в индексе нет ни одного вызова "
-            f"(каталог {root}, деревья hub/ и tests/)"
+            f"(каталог {root}, деревья hub/, tests/ и scripts/)"
         )
         return base
     answers = [_answer_target(root, index, t) for t in targets]
