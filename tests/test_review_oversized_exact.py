@@ -149,3 +149,48 @@ def test_above_the_limit_falls_back_to_greedy_and_logs_it(
     with caplog.at_level(logging.WARNING):
         _reserve_ac(small, cost, {}, [F], ceiling)
     assert not caplog.records
+
+
+def _ranges(n: int, rng: random.Random) -> dict[RangeKey, list[AcTestSpan]]:
+    out: dict[RangeKey, list[AcTestSpan]] = {}
+    for i in range(n):
+        sp = _spans(1 + i * 20, 2, rng.randint(20, 300), rng.randint(1, 6), f"r{i}")
+        out[(F, sp[0].start or 0, sp[0].end or 0)] = sp
+    return out
+
+
+def test_twelve_ranges_are_still_exact():
+    """Ровно на пределе (12 диапазонов) выбор равен полному перебору; жадный по отношению тут бы ошибся."""
+    rng = random.Random(12)
+    differs = 0
+    for _ in range(25):
+        ranges = _ranges(12, rng)
+        cost = {k: _cost(v) for k, v in ranges.items()}
+        ceiling = rng.randint(sum(cost.values()) // 4, sum(cost.values()) // 2)
+        left, placed, _full, _cov = _reserve_ac(ranges, cost, {F: ""}, [F], ceiling)
+        read, spent = sum(len(ranges[k]) for k in placed), ceiling - left
+        assert (read, spent) == _brute(ranges, {F: "x" * (ceiling + 1)}, cost, ceiling)
+        greedy, room = 0, ceiling
+        for k in sorted(ranges, key=lambda k: (-len(ranges[k]) / cost[k], cost[k])):
+            if cost[k] <= room:
+                room -= cost[k]
+                greedy += len(ranges[k])
+        assert greedy <= read
+        differs += greedy < read
+    assert differs > 0
+
+
+def test_fallback_above_the_limit_is_ratio_greedy():
+    """13 диапазонов: набор равен жадному по ссылки/стоимость (затем дешевле), посчитанному независимо."""
+    rng = random.Random(13)
+    ranges = _ranges(13, rng)
+    cost = {k: _cost(v) for k, v in ranges.items()}
+    ceiling = sum(cost.values()) // 3
+    want: set[RangeKey] = set()
+    room = ceiling
+    for k in sorted(ranges, key=lambda k: (-len(ranges[k]) / cost[k], cost[k])):
+        if cost[k] <= room:
+            want.add(k)
+            room -= cost[k]
+    _left, placed, _full, _cov = _reserve_ac(ranges, cost, {}, [F], ceiling)
+    assert placed == want
