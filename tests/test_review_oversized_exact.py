@@ -21,7 +21,9 @@ F = "tests/test_x.py"
 PLAIN = "hub/other.py"
 
 
-def _spans(start: int, n_lines: int, width: int, refs: int, tag: str) -> list[AcTestSpan]:
+def _spans(
+    start: int, n_lines: int, width: int, refs: int, tag: str
+) -> list[AcTestSpan]:
     """Один диапазон ``start..start+n_lines-1`` с ``refs`` ссылками (parametrize)."""
     lines = tuple((start + i, "x" * width) for i in range(n_lines))
     end = start + n_lines - 1
@@ -56,7 +58,7 @@ def test_c_a_b_scenario_picks_c_plus_a_and_keeps_the_plain_file(plain_first: boo
     plain = (PLAIN, _file_diff(PLAIN, 3, plain_size))
     sections = [plain, test_file] if plain_first else [test_file, plain]
     text, omitted, cuts, unread = fit_with_ac_cutouts(sections, ceiling, c + a + b)
-    assert omitted == []
+    assert omitted == [F]  # файл с AC показан вырезками, не целиком
     assert unread == [s.ref for s in b]
     assert len(cuts) == 2 and any("::a[0]" in x for x in cuts)
     assert not any("::b[0]" in x for x in cuts)
@@ -99,14 +101,22 @@ def test_exact_choice_matches_brute_force():
         ranges: dict[RangeKey, list[AcTestSpan]] = {}
         line = 1
         for i in range(rng.randint(1, 8)):
-            sp = _spans(line, rng.randint(1, 4), rng.randint(20, 300), rng.randint(1, 6), f"t{i}")
+            sp = _spans(
+                line,
+                rng.randint(1, 4),
+                rng.randint(20, 300),
+                rng.randint(1, 6),
+                f"t{i}",
+            )
             ranges[(F, line, line + len(sp[0].lines) - 1)] = sp
             line += 20
         cost = {k: _cost(v) for k, v in ranges.items()}
         hunk_to = rng.choice([0, 20, 60, 100])
         size = rng.randint(200, sum(cost.values()) + 400)
         head = f"diff --git a/{F} b/{F}\n"
-        text = head + (f"@@ -0,0 +1,{hunk_to} @@\n" if hunk_to else "") + "+" + "p" * size
+        text = (
+            head + (f"@@ -0,0 +1,{hunk_to} @@\n" if hunk_to else "") + "+" + "p" * size
+        )
         texts = {F: text}
         ceiling = rng.randint(100, sum(cost.values()) + len(text))
         left, placed, full, covered = _reserve_ac(ranges, cost, texts, [F], ceiling)
@@ -119,7 +129,9 @@ def test_exact_choice_matches_brute_force():
     assert checked == 300
 
 
-def test_above_the_limit_falls_back_to_greedy_and_logs_it(caplog: pytest.LogCaptureFixture):
+def test_above_the_limit_falls_back_to_greedy_and_logs_it(
+    caplog: pytest.LogCaptureFixture,
+):
     """13 диапазонов на файл: не перебор, а жадно по ссылки/стоимость; потолок цел, в логе пометка."""
     ranges: dict[RangeKey, list[AcTestSpan]] = {}
     for i in range(13):
