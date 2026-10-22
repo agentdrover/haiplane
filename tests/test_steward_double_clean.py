@@ -229,6 +229,7 @@ def test_the_policy_keys_are_accepted_only_in_their_shape():
         "no_ordinary_ceiling",
         "bad_class_value",
         "bad_reviewers_value",
+        "unreadable_ordinary",
         "autopilot_key",
         "agent_approve",
         "transaction_alone",
@@ -248,6 +249,7 @@ async def test_off_and_other_gates_are_unchanged(db, monkeypatch, label):
         "no_ordinary_ceiling": policy_of(ordinary=None),
         "bad_class_value": {**policy_of(), CLEAN_CEILING: "R3"},
         "bad_reviewers_value": {**policy_of(), REVIEWERS: "21"},
+        "unreadable_ordinary": {**policy_of(), CEILING: "R1"},
     }
     policy = policies[label]
     case = await build_case(db, monkeypatch, f"dc-off-{label}", policy=policy)
@@ -261,6 +263,12 @@ async def test_off_and_other_gates_are_unchanged(db, monkeypatch, label):
         # R3 выше и обычного r2: ключ ниже обычного потолка ничего не даёт.
         assert OLD_REFUSAL[0] in {c for c, _ in refusals}
         assert "двойн" not in ceiling_detail(refusals)
+        return
+    if label == "unreadable_ordinary":
+        assert ceiling_detail(refusals) == (
+            "steward_approve_max_class=unreadable: значение потолка нечитаемо, "
+            "approve не применяется"
+        )
         return
     assert ceiling_detail(refusals) == OLD_REFUSAL[1], label
     assert (await apply_self_approval(db, case.task_id, 1))[0] == ESCALATED_TO_HUMAN
