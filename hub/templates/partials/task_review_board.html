@@ -536,6 +536,14 @@
         {% if machine_review.self_reviewed %}
         <span class="badge badge-failed">саморевью</span>
         {% endif %}
+        {# #1985: пин отчёта - сдача, которую ревьюер заявил как прочитанную, и
+           сверил ли её хаб с журналом сдач при записи. Без пина отчёт не
+           доказывает, какой код он смотрел. #}
+        {% if machine_review.pin_verified %}
+        <span class="badge badge--xs">пин проверен: сдача #{{ machine_review.submission_generation }}, {{ machine_review.reviewed_sha[:12] }}</span>
+        {% else %}
+        <span class="badge badge--xs">пин не заявлен: какую сдачу смотрели, не доказано</span>
+        {% endif %}
         {# #1012: одобрить можно, не заметив, что находки никто не
            разметил — так #987 и уехал в прод. Гейт остаётся
            человеческим; он просто перестаёт молчать. #}

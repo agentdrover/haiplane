@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
-from hub.expected_sha import ExpectedShaMixin
+from hub.expected_sha import ExpectedShaMixin, ReviewPinSubmit, ReviewPinView
 from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
@@ -4075,7 +4075,7 @@ class CIIntegrityAnswer(BaseModel):
         return text[: CI_INTEGRITY_NOTE_LIMIT - 1].rstrip() + "…"
 
 
-class MachineReviewSubmit(BaseModel):
+class MachineReviewSubmit(ReviewPinSubmit):
     """Structured multi-agent review report (#381).
 
     Metrics fields (#384) are optional — a client that cannot count
@@ -4373,7 +4373,7 @@ class AuthorAnswerView(BaseModel):
     historical: bool = False
 
 
-class MachineReviewView(BaseModel):
+class MachineReviewView(ReviewPinView):
     id: int
     task_id: int
     submission_generation: int
