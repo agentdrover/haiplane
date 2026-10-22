@@ -47,6 +47,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "worktree_path",
     "owner_minutes",
     "last_executor_order",
+    "delivery_rerun",
     "role_orders",
     "critic_order",
     "created_at",
@@ -83,6 +84,25 @@ def executor_order_lines(task: dict[str, Any]) -> list[str]:
     return [
         f"After failed run: class {view.get('class')} ({view.get('class_name')}), "
         f"order #{view.get('order_id')} {view.get('outcome')} {view.get('reason_code')}"
+    ]
+
+
+def delivery_rerun_lines(task: dict[str, Any]) -> list[str]:
+    """#1956: the rerun history as the hub built it; nothing when there was none."""
+    view = task.get("delivery_rerun")
+    if not isinstance(view, dict) or not view.get("state"):
+        return []
+    outcome = f", outcome {view['outcome']}" if view.get("outcome") else ""
+    jobs = view.get("failed_jobs")
+    named = (
+        f"; failed jobs: {', '.join(jobs)}"
+        if jobs
+        else ("; failed jobs: not read" if jobs is None else "")
+    )
+    return [
+        f"Delivery rerun: {view['state']}{outcome}, run {view.get('run_id')}, "
+        f"attempt {view.get('attempt_before')}+1 (since {view.get('requested_at')})"
+        f"{named}"
     ]
 
 

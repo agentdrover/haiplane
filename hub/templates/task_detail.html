@@ -876,7 +876,12 @@
                     {% else %}
                     <dt>Роль</dt>
                     <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
-                    {% endif %}{% endfor %}{% if task.ci_fix_cycle > 0 %}
+                    {% endif %}{% endfor %}{# #1956: история автоперезапуска CI на свежей базе - собрана хабом (services/delivery_rerun.card_view). #}{% if task.delivery_rerun %}
+                    <dt>Перезапуск CI</dt>
+                    <dd data-delivery-rerun="{{ task.delivery_rerun.state }}">{{ task.delivery_rerun.state }}{% if task.delivery_rerun.outcome %} / {{ task.delivery_rerun.outcome }}{% endif %}; run {{ task.delivery_rerun.run_id }}, после попытки {{ task.delivery_rerun.attempt_before }}; с {{ task.delivery_rerun.requested_at }}{% if task.delivery_rerun.failed_jobs %}; упали: {{ task.delivery_rerun.failed_jobs | join(', ') }}{% endif %}
+                      <ul>{% for h in task.delivery_rerun.history %}<li>{{ h.at }} · {{ h.actor }} · {{ h.text }}</li>{% endfor %}</ul>
+                    </dd>
+                    {% endif %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
                     {% endif %}
