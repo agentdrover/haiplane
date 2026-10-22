@@ -364,6 +364,7 @@ def running_stand(root: Path) -> Iterator[Stand]:
     api_token = secrets.token_hex(16)
     log_path = root / "server.log"
     process: subprocess.Popen[bytes] | None = None
+    failed = False
     with log_path.open("wb") as log:
         try:
             process = subprocess.Popen(
@@ -393,9 +394,16 @@ def running_stand(root: Path) -> Iterator[Stand]:
             _wait_ready(process, stand.url, log_path)
             _seed_human(stand)
             yield stand
+        except BaseException:
+            failed = True
+            raise
         finally:
             if process is not None:
                 _stop(process)
+            if failed:
+                # Сбой подъёма (/health, сид) случается до yield: фикстуры
+                # браузера тогда ещё нет, и её finally лога не сохранит.
+                save_server_log(log_path, "stand")
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +434,12 @@ def browser() -> Iterator[Any]:
 
 def artifacts_dir() -> Path:
     return Path(os.environ.get("HAIPLANE_GUI_ARTIFACTS", ROOT / "gui-artifacts"))
+
+
+def save_server_log(log_path: Path, name: str) -> None:
+    out = artifacts_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{name}-server.log").write_text(_tail(log_path, 400))
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)

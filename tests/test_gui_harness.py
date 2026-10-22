@@ -112,8 +112,12 @@ def _free(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) != 0
 
 
-def test_stand_enforces_csrf_and_cleans_up(tmp_path: Path) -> None:
+def test_stand_enforces_csrf_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import httpx
+
+    monkeypatch.setenv("HAIPLANE_GUI_ARTIFACTS", str(tmp_path / "artifacts"))
 
     from tests.gui.conftest import running_stand
 
@@ -233,3 +237,23 @@ def test_mutation_series_never_judges_a_mutant_by_a_browser_module(
         p.relative_to(tmp_path).as_posix() for p in mutation.module_texts(tmp_path)
     }
     assert found == {"test_a.py", "sub/test_c.py"}
+
+
+def test_a_stand_that_fails_before_yield_still_saves_its_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сбой подъёма до yield: фикстуры браузера нет, лог обязан уйти в артефакты."""
+    from tests.gui import conftest as stand_module
+
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv("HAIPLANE_GUI_ARTIFACTS", str(artifacts))
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stand never became ready")
+
+    monkeypatch.setattr(stand_module, "_wait_ready", fail)
+    with pytest.raises(RuntimeError, match="never became ready"):
+        with stand_module.running_stand(tmp_path / "stand"):
+            pytest.fail("the stand must not yield")
+
+    assert (artifacts / "stand-server.log").is_file()
