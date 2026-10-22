@@ -78,6 +78,7 @@ _SKIPPED = {
 # Токены разметки блоков не «стоят в строке» оператора.
 _LAYOUT = _SKIPPED | {tokenize.INDENT, tokenize.DEDENT}
 
+_BLOB_MODES = {"100644", "100755"}
 _REF_RE = re.compile(r"(?<![\w&])#(\d{2,6})\b")
 _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 # Директивы сравниваются сегментом целиком: регистр и список кодов — как есть.
@@ -246,10 +247,15 @@ class Repo:
                 found[name] = meta.split()[0]
         return found
 
-    def list_py(self, sha: str) -> list[str]:
-        out = self._run("ls-tree", "-r", "--name-only", "-z", sha)
-        names = out.decode("utf-8", "surrogateescape").split("\0")
-        return [n for n in names if n.endswith(".py") and _plain_path(n)]
+    def list_py(self, sha: str) -> list[tuple[str, str]]:
+        """Все ``*.py`` ревизии: (путь, режим записи git)."""
+        out = self._run("ls-tree", "-r", "-z", sha)
+        found: list[tuple[str, str]] = []
+        for entry in out.decode("utf-8", "surrogateescape").split("\0"):
+            meta, _, name = entry.partition("\t")
+            if name.endswith(".py"):
+                found.append((name, meta.split()[0]))
+        return found
 
 
 def _plain_path(path: str) -> bool:
@@ -589,12 +595,12 @@ def _has_text(call: ast.Call, name: str) -> bool:
     )
 
 
-def _decorator_reason(dec: ast.expr, imports: Imports) -> str:
+def _decorator_reason(dec: ast.expr, imports: Imports, index: RepoIndex) -> str:
     call = dec if isinstance(dec, ast.Call) else None
     chain = _chain(call.func if call else dec)
     if not chain:
         return ""
-    names = imports.last_names(chain)
+    names = index.names_of(imports, chain)
     label = ".".join(chain)
     if call and _has_text(call, "description"):
         return ""  # описание задано явно: docstring наружу не уходит
@@ -610,17 +616,37 @@ def _decorator_reason(dec: ast.expr, imports: Imports) -> str:
     return ""
 
 
+def _def_paths(tree: ast.Module) -> dict[str, list[tuple[str, ...]]]:
+    """Имя определения -> его полные квалифицированные имена в файле."""
+    found: dict[str, list[tuple[str, ...]]] = {}
+
+    def visit(node: ast.AST, prefix: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, DEF_NODES):
+                qual = (*prefix, child.name)
+                found.setdefault(child.name, []).append(qual)
+                visit(child, qual)
+            else:
+                visit(child, prefix)
+
+    visit(tree, ())
+    return found
+
+
 def _doc_targets(
-    tree: ast.Module, imports: Imports, module: tuple[str, ...]
+    tree: ast.Module,
+    imports: Imports,
+    module: tuple[str, ...],
+    index: RepoIndex,
 ) -> set[tuple[str, ...]]:
     """Цепочки имён, чей docstring читают снаружи: ``x.__doc__``, ``getdoc(x)``,
     аргументы ``add_tool``/``add_api_route`` (позиционные и по ключу).
 
-    Имя, определённое в самом файле, получает путь модуля; чужая переменная
-    (``svc.method``) — маркер ``·``: её владелец неизвестен.
+    Имя, определённое в самом файле (в том числе вложенное), получает путь
+    модуля и область; чужая переменная (``svc.method``) — маркер ``·``.
     """
     found: set[tuple[str, ...]] = set()
-    defined = {n.name for n in ast.walk(tree) if isinstance(n, DEF_NODES)}
+    defs = _def_paths(tree)
 
     def add(node: ast.AST | None) -> None:
         chain = _chain(node) if node is not None else None
@@ -628,8 +654,8 @@ def _doc_targets(
             return
         for full in imports.dotted(chain):
             plain = full == chain or full == (UNRESOLVED, *chain)
-            if plain and chain[0] in defined:
-                found.add((*module, *chain))
+            if plain and chain[0] in defs:
+                found.update((*module, *q, *chain[1:]) for q in defs[chain[0]])
             elif plain and len(chain) == 1:
                 found.add((UNRESOLVED, chain[0]))
             else:
@@ -640,7 +666,7 @@ def _doc_targets(
             add(node.value)
         elif isinstance(node, ast.Call):
             chain = _chain(node.func)
-            names = imports.last_names(chain) if chain else set()
+            names = index.names_of(imports, chain) if chain else set()
             if names & _DOC_READERS or (names & _REGISTRARS and _publishes(node)):
                 for arg in (*node.args, *(kw.value for kw in node.keywords)):
                     add(arg)
@@ -666,11 +692,12 @@ def _dotted_module(path: str) -> str:
 
 def _target_hits(symbol: tuple[str, ...], target: tuple[str, ...]) -> bool:
     """Читатель ``target`` относится к символу ``symbol`` (полный путь с модулем)."""
-    if target[-1] != symbol[-1]:
+    if not target or target[-1] != symbol[-1]:
         return False
-    if target[0] != UNRESOLVED:  # путь известен: сравниваем общий хвост целиком
-        k = min(len(target), len(symbol))
-        return target[-k:] == symbol[-k:]
+    if target[0] != UNRESOLVED:
+        # Путь известен: он обязан быть хвостом пути символа (корень пакета в
+        # импорте мог быть опущен), но не длиннее его: ``pkg.m.f`` — не ``m.f``.
+        return len(target) <= len(symbol) and symbol[-len(target) :] == target
     rest = target[1:]
     if len(rest) == 1:
         return True
@@ -686,7 +713,10 @@ class RepoIndex:
 
     classes: dict[str, dict[str, set[Ref]]] = field(default_factory=dict)
     aliases: dict[str, dict[str, set[Ref]]] = field(default_factory=dict)
+    mod_aliases: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    origin: dict[str, set[str]] = field(default_factory=dict)
     doc_targets: set[tuple[str, ...]] = field(default_factory=set)
+    trees: list[tuple[str, ast.Module]] = field(default_factory=list)
 
     def add(self, path: str, tree: ast.Module) -> None:
         imports = Imports.of(tree, path)
@@ -695,67 +725,121 @@ class RepoIndex:
             if isinstance(node, ast.ClassDef):
                 local.setdefault(node.name, set()).update(_base_refs(node, imports))
         self.aliases[path] = imports.names
-        self.doc_targets |= _doc_targets(
-            tree, imports, tuple(_dotted_module(path).split("."))
-        )
+        self.mod_aliases[path] = imports.modules
+        self.trees.append((path, tree))
+
+    def names_of(self, imports: Imports, chain: tuple[str, ...]) -> set[str]:
+        """Имена конца цепочки с учётом переименований импортом по всему репозиторию."""
+        names = imports.last_names(chain)
+        for name in tuple(names):
+            names |= self.origin.get(name, set())
+        return names
+
+    def _build_origin(self) -> None:
+        origin: dict[str, set[str]] = {}
+        for aliases in self.aliases.values():
+            for local, refs in aliases.items():
+                origin.setdefault(local, set()).update(r.name for r in refs)
+        grown = True
+        while grown:  # конечное множество имён: замыкание сходится
+            grown = False
+            for names in origin.values():
+                extra = {o for n in names for o in origin.get(n, ())} - names
+                if extra:
+                    names |= extra
+                    grown = True
+        self.origin = origin
 
     def finalize(self) -> None:
-        """Достроить читателей: реэкспорт (``from m import f``) и наследование."""
-        targets = set(self.doc_targets)
-        for _ in range(4):
+        """Достроить читателей: реэкспорт, затем наследование."""
+        self._build_origin()
+        targets: set[tuple[str, ...]] = set()
+        for path, tree in self.trees:
+            targets |= _doc_targets(
+                tree,
+                Imports.of(tree, path),
+                tuple(_dotted_module(path).split(".")),
+                self,
+            )
+        while True:
             fresh = {x for t in targets for x in self._reexported(t)} - targets
             if not fresh:
                 break
             targets |= fresh
         self.doc_targets = targets | self._inherited(targets)
+        self.trees.clear()
 
     def _reexported(self, target: tuple[str, ...]) -> set[tuple[str, ...]]:
         out: set[tuple[str, ...]] = set()
         if target[0] == UNRESOLVED:
             return out
-        for cut in (1, 2):
-            if len(target) <= cut:
-                continue
+        for cut in range(1, len(target)):
             module, name = ".".join(target[:-cut]), target[-cut]
             tail = target[len(target) - cut + 1 :]
             for path in self._module_files(module):
                 for ref in self.aliases.get(path, {}).get(name, ()):
                     where = ref.module or _dotted_module(path)
                     out.add((*where.split("."), ref.name, *tail))
+                for mod in self.mod_aliases.get(path, {}).get(name, ()):
+                    out.add((*mod.split("."), *tail))
+        return out
+
+    def resolve_class(
+        self, ref: Ref, path: str, seen: frozenset[tuple[str, str]] = frozenset()
+    ) -> set[tuple[str, str]]:
+        """Определения класса (файл, имя) за ссылкой, с проходом по реэкспортам."""
+        files = [path] if not ref.module else self._module_files(ref.module)
+        out: set[tuple[str, str]] = set()
+        for p in files:
+            key = (p, ref.name)
+            if key in seen:
+                continue
+            if ref.name in self.classes.get(p, {}):
+                out.add(key)
+                continue
+            for alias in self.aliases.get(p, {}).get(ref.name, ()):
+                out |= self.resolve_class(alias, p, seen | {key})
         return out
 
     def _inherited(self, targets: set[tuple[str, ...]]) -> set[tuple[str, ...]]:
-        """``getdoc(B)`` читает docstring предка: предки читаемых классов тоже."""
-        parents: dict[str, set[str]] = {}
-        for classes in self.classes.values():
-            for name, bases in classes.items():
-                parents.setdefault(name, set()).update(b.name for b in bases)
-        read: dict[str, set[str]] = {}
-        for t in targets:
-            if t[-1] in parents:
-                read.setdefault(t[-1], set())
-            if len(t) >= 2 and t[-2] in parents:
-                read.setdefault(t[-2], set()).add(t[-1])
-        direct = set(read)
-        for _ in range(20):  # потолок на случай одноимённых классов по кругу
+        """``getdoc(B)``/``getdoc(B.f)`` читают docstring предка: предки тоже."""
+        reads: dict[tuple[str, str], set[str]] = {}
+        symbols = {
+            key: (*_dotted_module(key[0]).split("."), key[1])
+            for key in ((p, n) for p, cs in self.classes.items() for n in cs)
+        }
+        for key, symbol in symbols.items():
+            for t in targets:
+                if _target_hits(symbol, t):
+                    reads.setdefault(key, set())
+                elif len(t) >= 2 and _target_hits(symbol, t[:-1]):
+                    reads.setdefault(key, set()).add(t[-1])
+        parents = {
+            key: set().union(*(self.resolve_class(b, key[0]) for b in bases))
+            for key in reads
+            for bases in [self.classes[key[0]][key[1]]]
+        }
+        grown = True
+        while grown:
             grown = False
-            for name, members in list(read.items()):
-                for parent in parents.get(name, ()):
-                    if parent not in read:
-                        read[parent] = set()
+            for key, members in list(reads.items()):
+                for parent in parents.get(key) or self._parents_of(key):
+                    if parent not in reads:
+                        reads[parent] = set()
                         grown = True
-                    if not members <= read[parent]:
-                        read[parent] |= members
+                    if not members <= reads[parent]:
+                        reads[parent] |= members
                         grown = True
-            if not grown:
-                break
         out: set[tuple[str, ...]] = set()
-        for name, members in read.items():
-            if name in direct:
-                continue
-            out.add((UNRESOLVED, name))
-            out |= {(UNRESOLVED, name, m) for m in members}
+        for key, members in reads.items():
+            symbol = symbols[key]
+            out.add(symbol)
+            out |= {(*symbol, m) for m in members}
         return out
+
+    def _parents_of(self, key: tuple[str, str]) -> set[tuple[str, str]]:
+        bases = self.classes[key[0]][key[1]]
+        return set().union(*(self.resolve_class(b, key[0]) for b in bases))
 
     def _module_files(self, module: str) -> list[str]:
         mod = module.lstrip(".")
@@ -833,7 +917,7 @@ def _symbol_reason(
                 return f"наследник {base.name}: описание уходит в схему"
     else:
         for dec in getattr(node, "decorator_list", []):
-            reason = _decorator_reason(dec, imports)
+            reason = _decorator_reason(dec, imports, index)
             if reason:
                 return reason
     for target in index.doc_targets:
@@ -904,7 +988,9 @@ def _strip_docs(tree: ast.Module) -> str:
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, *DEF_NODES)) and _docstring_expr(node):
             node.body = node.body[1:]  # type: ignore[attr-defined]
-    tree.type_ignores = []  # привязку директив держит отдельная проверка
+    # Положение ``type: ignore`` держит проверка директив; здесь — только набор
+    # реально действующих (Python создаёт TypeIgnore лишь для комментария целиком).
+    tree.type_ignores = [ast.TypeIgnore(0, i.tag) for i in tree.type_ignores]
     return ast.dump(tree)
 
 
@@ -1061,14 +1147,19 @@ def analyze_pair(
 # ------------------------------------------------------------------------ запуск
 
 
-def build_index(repo: Repo, shas: Sequence[str], notes: list[str]) -> RepoIndex:
+def build_index(repo: Repo, shas: Sequence[str]) -> RepoIndex:
+    """Индекс контрактов по всему репозиторию. Неполный индекс — ошибка, не «чисто»:
+    непрочитанный файл мог оказаться тем, что читает docstring или задаёт схему."""
     index = RepoIndex()
     seen: set[tuple[str, bytes]] = set()  # тот же файл по тому же пути — раз
-    skipped = 0
+    incomplete: list[str] = []
     for sha in shas:
-        paths = repo.list_py(sha)
-        for path, data in repo.read_many(sha, paths).items():
+        entries = repo.list_py(sha)
+        plain = [p for p, mode in entries if mode in _BLOB_MODES and _plain_path(p)]
+        incomplete += [p for p, mode in entries if p not in plain]
+        for path, data in repo.read_many(sha, plain).items():
             if data is None:
+                incomplete.append(path)
                 continue
             key = (path, hashlib.blake2b(data).digest())
             if key in seen:
@@ -1077,9 +1168,13 @@ def build_index(repo: Repo, shas: Sequence[str], notes: list[str]) -> RepoIndex:
             try:  # байты, а не текст: разбор сам учитывает coding-cookie
                 index.add(path, ast.parse(data))
             except (SyntaxError, ValueError, RecursionError):
-                skipped += 1
-    if skipped:
-        notes.append(f"индекс контрактов: {skipped} файл(ов) не разобраны и пропущены")
+                incomplete.append(path)
+    if incomplete:
+        shown = ", ".join(sorted(set(incomplete))[:5])
+        raise CheckError(
+            f"индекс контрактов неполон ({len(set(incomplete))} файл(ов): {shown}): "
+            "не разобрано, ссылка или имя с управляющими символами"
+        )
     index.finalize()
     return index
 
@@ -1165,7 +1260,11 @@ def run_check(
         else:
             _validate(a, path, report)
     if todo:
-        index = build_index(repo, [base, head], report.notes)
+        try:
+            index = build_index(repo, [base, head])
+        except CheckError as exc:
+            report.errors.append(str(exc))
+            todo = []
         inv = repo.read_many(head, [INVARIANTS_MD]).get(INVARIANTS_MD) or b""
         for path in todo:
             try:

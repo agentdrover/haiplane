@@ -224,3 +224,17 @@ def test_real_process_exit_codes(tmp_path: Path) -> None:
     repo2, base2, head2 = _pair(repo2, {"a.py": "x = 1\n"}, {"a.py": "x = 2\n"})
     assert run_process(repo2, base2, head2, ["a.py"])[0] == 1
     assert run_process(repo2, "0" * 40, head2, ["a.py"])[0] == 2
+
+
+def test_symlinked_python_file_makes_the_index_incomplete(tmp_path: Path) -> None:
+    """Ссылка вместо .py в репозитории: индекс контрактов неполон, «чисто» нельзя."""
+    repo, base, _ = _pair(
+        tmp_path, {"m.py": "x = 1  # c\n", "real.txt": "q\n"}, {"n.txt": "z\n"}
+    )
+    (repo / "m.py").write_text("x = 1\n")
+    (repo / "link.py").symlink_to("real.txt")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "link")
+    head = _git(repo, "rev-parse", "HEAD")
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 2 and "неполон" in out, out
