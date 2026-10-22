@@ -851,6 +851,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
 
     samples = {
         "ci_runner": "make test",
+        "base_fetch_wait_hours": 36,
         "review_limit": 3,
         "review_limit_mode": "warn",
         "orchestrator_queue": "shadow",
