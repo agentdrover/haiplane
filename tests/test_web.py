@@ -1334,3 +1334,10 @@ async def test_gate_card_names_brief_failure_reason(
     gate_row = await repo.get_task(db, task_id)
     failure = await review_brief.gate_evidence(db, dict(gate_row))
     assert isinstance(failure, review_brief.BriefFailure)
+
+
+async def test_style_tokens_both_themes():
+    """AC-2 (#1812): каждый цвет из токена и есть в обеих темах (разбор CSS)."""
+    from tests.card_c2_css_support import check_style_tokens_both_themes
+
+    check_style_tokens_both_themes()
