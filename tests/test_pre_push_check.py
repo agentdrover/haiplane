@@ -123,11 +123,16 @@ def test_deletes_base_and_bot_branches_do_not_run_it(
     assert runs(marker) == 1
     assert push(clone, "--delete", "task-1/x").returncode == 0  # a delete
     git(clone, "checkout", "-q", "develop")
-    git(clone, "commit", "-q", "--allow-empty", "-m", "on base")
+    (clone / "base.txt").write_text("a new tree for the base branch\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-q", "-m", "on base")
     assert push(clone, "develop").returncode == 0  # the base branch
     git(clone, "checkout", "-q", "-b", "dependabot/uv/pkg-1.0")
+    (clone / "bot.txt").write_text("a new tree for the bot branch\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-q", "-m", "bot")
     assert push(clone, "dependabot/uv/pkg-1.0").returncode == 0  # a bot branch
-    assert runs(marker) == 1
+    assert runs(marker) == 1  # only the first push of task-1/x ran the check
 
 
 def test_a_commit_that_is_not_the_checked_out_head_is_not_counted(
@@ -198,11 +203,17 @@ def test_the_same_tree_is_checked_once(clone: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "already passed for this tree" in proc.stderr
     assert runs(marker) == 1
+    # Another tree is another question: the cache key includes the tree.
+    (clone / "changed.txt").write_text("a new tree\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-q", "-m", "a different tree")
+    assert push(clone).returncode == 0
+    assert runs(marker) == 2
     # Another command is another question: the cache key includes it.
     git(clone, "config", KEY, marker_command(marker, "true "))
     git(clone, "commit", "-q", "--allow-empty", "-m", "again")
     assert push(clone).returncode == 0
-    assert runs(marker) == 2
+    assert runs(marker) == 3
 
 
 def test_a_dirty_tree_is_never_cached(clone: Path, tmp_path: Path) -> None:
@@ -236,7 +247,10 @@ def test_a_check_cannot_swallow_the_refs_git_sends(clone: Path, tmp_path: Path) 
     """The command runs with a closed stdin: the second ref is still processed."""
     marker = tmp_path / "marker"
     git(clone, "config", KEY, marker_command(marker, "cat >/dev/null"))
-    git(clone, "branch", "task-4/w")
-    proc = push(clone, "task-1/x", "task-4/w")
-    assert proc.returncode == 0, proc.stderr
-    assert remote_has(clone, "task-4/w")
+    git(clone, "branch", "badname")  # a name the branch policy refuses
+    proc = push(clone, "task-1/x", "badname")
+    # The second ref line reached the hook (a command that ate stdin would have
+    # hidden it, and the refused name would have gone through).
+    assert proc.returncode != 0
+    assert "Blocked push from branch 'badname'" in proc.stderr
+    assert runs(marker) == 1
