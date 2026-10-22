@@ -111,21 +111,31 @@ async def test_deadline_is_one_notice_through_the_single_door(db, monkeypatch):
     assert calls == [task_id]
 
 
+async def _open_waits(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM delivery_wait_deadlines "
+        "WHERE task_id=? AND state='open'",
+        (task_id,),
+    )
+    return int(dict(rows[0])["n"])
+
+
 async def test_success_or_new_generation_clears_the_wait(db, monkeypatch):
     task_id = await _setup(db, monkeypatch)
 
-    # Успех fetch: ожидание закрыто, старый возраст не срабатывает позже.
+    # Fetch снова работает, доставка идёт дальше другой причиной: ожидание
+    # закрыто, и старый возраст позже не срабатывает.
     await _pass(db, task_id)
     await _age(db, task_id, 30)
-    monkeypatch.setattr(
-        services,
-        "merge_before_completion",
-        lambda db_, task_: _ok(),
-    )
-    await _pass(db, task_id)
+
+    async def ci_pending(db_, task_):
+        return False, services.TRANSIENT_GATE_PREFIXES[0] + " CI ещё идёт"
+
+    monkeypatch.setattr(services, "merge_before_completion", ci_pending)
+    assert (await _pass(db, task_id))["status"] == "running"
+    assert await _open_waits(db, task_id) == 0
     monkeypatch.setattr(services, "merge_before_completion", _stuck())
-    task = await _pass(db, task_id)
-    assert task["status"] == "running", "новое ожидание считается с нуля"
+    assert (await _pass(db, task_id))["status"] == "running", "отсчёт с нуля"
     assert await _needs_decision_events(db, task_id) == 0
 
     # Новое поколение сдачи: старый возраст не переносится.
@@ -137,6 +147,23 @@ async def test_success_or_new_generation_clears_the_wait(db, monkeypatch):
         db, task_id, TaskReviewVerdict(verdict="approved", agent="reviewer")
     )
     assert (await _pass(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1, "одно открытое, прежнее закрыто"
+
+
+async def test_delivery_success_closes_the_wait(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    assert await _open_waits(db, task_id) == 1
+    await _age(db, task_id, 30)
+
+    async def delivered(db_, task_):
+        return True, "already delivered"
+
+    monkeypatch.setattr(services, "merge_before_completion", delivered)
+    await _pass(db, task_id)
+
+    assert await _open_waits(db, task_id) == 0
     assert await _needs_decision_events(db, task_id) == 0
 
 
@@ -175,7 +202,3 @@ async def test_only_base_fetch_pending_gets_a_deadline(db, monkeypatch):
 
     assert dict(rows[0])["n"] == 0
     assert (await _pass(db, task_id))["status"] == "running"
-
-
-async def _ok():
-    return True, ""

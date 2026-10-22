@@ -860,6 +860,37 @@ def delivery_fresh_base_rerun_of(policy: dict) -> str:
     return DELIVERY_FRESH_BASE_RERUN_OFF
 
 
+# Срок ожидания свежей базы при доставке (#1992): сколько часов одобренная
+# задача может ждать base_fetch_pending, прежде чем уйти к человеку. Нет ключа
+# и нечитаемое значение - умолчание сервера, а не «без срока»: опечатка не
+# должна снимать предохранитель.
+BASE_FETCH_WAIT_HOURS_KEY = "base_fetch_wait_hours"
+
+
+def validate_base_fetch_wait_hours(policy: dict) -> None:
+    """Refuse a wait deadline the reader would silently replace (#1992)."""
+    key = BASE_FETCH_WAIT_HOURS_KEY
+    if key not in policy:
+        return
+    value = policy[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"gate_policy {key} must be an integer >= 1, got: {value!r}")
+
+
+def validate_delivery_policy(policy: dict) -> None:
+    """Ключи политики доставки: автоперезапуск (#1956) и срок ожидания (#1992)."""
+    validate_delivery_fresh_base_rerun(policy)
+    validate_base_fetch_wait_hours(policy)
+
+
+def base_fetch_wait_hours_of(policy: dict) -> int:
+    """Срок ожидания свежей базы, часов: ключ проекта, иначе config."""
+    value = policy.get(BASE_FETCH_WAIT_HOURS_KEY) if isinstance(policy, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return int(config.BASE_FETCH_WAIT_HOURS)
+    return value
+
+
 # Хост критика для облачной сдачи (#1953). Имя зарегистрированного хоста
 # исполнителя (k8), чей ключ забирает заказы критика. Пусто или нет ключа -
 # выключено: сдача облачной задачи идёт как до задачи. Нечитаемое значение

@@ -233,6 +233,9 @@ EXECUTOR_MODEL_PARAMS = env_get("EXECUTOR_MODEL_PARAMS", "")
 # названной причиной. Ключ политики проекта ``slot_dead_minutes`` сильнее: агент
 # слота может долго гонять тесты молча, и порог — решение проекта.
 EXECUTOR_SLOT_DEAD_MINUTES = int(env_get("EXECUTOR_SLOT_DEAD_MINUTES", "60"))
+# #1992: сколько часов одобренная задача ждёт свежую базу (base_fetch_pending),
+# прежде чем уйти к человеку. Ключ политики проекта base_fetch_wait_hours сильнее.
+BASE_FETCH_WAIT_HOURS = int(env_get("BASE_FETCH_WAIT_HOURS", "24"))
 # Повтор создания агента при 429 и usage_limit_exceeded (F0, 22–24.09): сколько
 # попыток и пауза между ними. Запуск ручной — пауза держит HTTP-запрос
 # человека, поэтому короткая.

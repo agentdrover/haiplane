@@ -192,6 +192,11 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.delivery_fresh_base_rerun_of,
         "project_policy.delivery_fresh_base_rerun_of",
     ),
+    "base_fetch_wait_hours": PolicyEntry(
+        project_policy.base_fetch_wait_hours_of,
+        "project_policy.base_fetch_wait_hours_of",
+        "BASE_FETCH_WAIT_HOURS",
+    ),
     "critic_host": PolicyEntry(
         project_policy.critic_host_of, "project_policy.critic_host_of"
     ),
