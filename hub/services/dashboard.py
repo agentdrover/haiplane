@@ -23,7 +23,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services import decisions as decisions_svc
-from hub.services import inbox_decisions, steward_breaker
+from hub.services import inbox_decisions, steward_breaker, triage_inbox
 from hub.services.lifecycle import row_to_task
 from hub.services.project_policy import clone_branch_state
 
@@ -171,6 +171,9 @@ def inbox_attention_total(data: dict[str, Any]) -> int:
         + len(data["fix_requested_tasks"])
         + len(data["stale_tasks"])
         + len(data.get("steward_breaker_banner") or [])
+        # #1943: разбор прогонов k8 ждёт ответа; нечитаемый разбор - не «чисто».
+        + len(data.get("triage_items") or [])
+        + (1 if data.get("triage_unavailable") else 0)
         # #1038: находки — счёт, а не статусный список.
         + (1 if unjudged.get("findings") else 0)
         # #897/#1198/#294: признанные расхождения вне счёта, одним определением
@@ -296,7 +299,13 @@ async def get_inbox_data(
     # nothing led to it.
     unjudged = await repo.count_unjudged_findings(db, project_id=project_id)
 
+    triage = await triage_inbox.inbox_items(
+        db, dict(scoped), cap=inbox_decisions.DECISION_CAP
+    )
     data: dict[str, Any] = {
+        "triage_items": triage["items"],
+        "triage_unavailable": triage["unavailable"],
+        "triage_note": triage["note"],
         "undelivered": undelivered,
         "unjudged_findings": unjudged,
         "decision_queue": decisions["queue"],

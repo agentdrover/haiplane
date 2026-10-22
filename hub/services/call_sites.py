@@ -37,6 +37,7 @@ import re
 import subprocess  # nosec B404
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 log = logging.getLogger("hub.call_sites")
@@ -254,8 +255,9 @@ def _walk_python(root: str, subdir: str) -> list[str]:
     return sorted(out)
 
 
-INDEX_SUBDIRS: tuple[str, ...] = ("hub", "tests")
+INDEX_SUBDIRS: tuple[str, ...] = ("hub", "tests", "scripts")
 _SKIPPED_DIRS = frozenset({"__pycache__", ".venv", "node_modules"})
+_SCRIPTS_PREFIX = "scripts/"
 
 
 def build_call_index(
@@ -548,6 +550,144 @@ def _is_touched(site: CallSite, changed: set[int]) -> bool:
     return site.line in changed
 
 
+def _script_module_names(rel: str) -> set[str]:
+    """Every dotted spelling a file under ``scripts/`` is imported by (#1935).
+
+    ``scripts/`` ships no ``__init__.py``, so a sibling script most commonly
+    imports it by its bare name (``import complexity_budget``, ``from
+    complexity_budget import ...``) — run with ``scripts/`` itself on
+    ``sys.path``. But ``scripts/`` is still a valid implicit namespace
+    package: ``import scripts.complexity_budget`` or ``from
+    scripts.complexity_budget import ...`` works too, with no ``__init__.py``
+    required. A caller using that spelling must not read as "no import", or
+    a real call falls back into the false no_callers this task removes.
+
+    A package's own ``__init__.py`` (``scripts/agent_eval/__init__.py``) is
+    imported under the PACKAGE's dotted name (``agent_eval``), never under a
+    module literally called ``__init__`` — ``import agent_eval`` is exactly
+    how ``scripts/agent_eval/{runner,scenarios}.py``'s sibling scripts reach
+    it. Stripping only the trailing ``.py`` left ``agent_eval.__init``, a
+    name nothing ever imports, so a changed symbol defined in that
+    ``__init__.py`` stayed ``no_callers`` regardless of real importers.
+    """
+    name = rel[len(_SCRIPTS_PREFIX) :] if rel.startswith(_SCRIPTS_PREFIX) else rel
+    if name.endswith("/__init__.py"):
+        name = name[: -len("/__init__.py")]
+    elif name.endswith(".py"):
+        name = name[: -len(".py")]
+    bare = name.replace("/", ".")
+    return {bare, f"scripts.{bare}"}
+
+
+def _relative_import_bases(rel: str, level: int) -> set[str]:
+    """Package(s) a relative ``from ... import`` in ``rel`` resolves against.
+
+    Mirrors ``importlib._bootstrap._resolve_name``: ``level`` dots are
+    resolved against the IMPORTING module's own containing package, never
+    against ``node.module`` read as if it were an absolute dotted name.
+    Ignoring ``level`` (the bug this fixes) makes ``from .a import helper``
+    in ``scripts/pkg/b.py`` match the unrelated top-level ``scripts/a.py``,
+    because both happen to be named ``a`` — exactly the nominal false match
+    #1935 removes elsewhere in this module.
+
+    Computed for both dotted spellings of ``rel`` (``_script_module_names``,
+    #1935) since a relative import's resolved package depends on which
+    namespace ``rel`` is considered part of.
+
+    A package's own ``__init__.py`` is, per ``importlib._bootstrap``, its
+    OWN dotted name's anchor — ``from .a import helper`` inside
+    ``scripts/pkg/__init__.py`` means "my sibling ``pkg.a``", not "my
+    parent's sibling". A regular module instead anchors at its PARENT's
+    dotted name (its own last component dropped). Critic finding on sha
+    dc24929d: treating ``__init__.py`` like a regular module stripped
+    ``pkg`` itself off, resolving ``from .a import helper`` there to the
+    unrelated top-level ``scripts/a.py`` instead of the real sibling
+    ``scripts/pkg/a.py`` — recreating the exact nominal false match #1935
+    removes for every other import form.
+    """
+    is_init = rel.endswith("/__init__.py") or os.path.basename(rel) == "__init__.py"
+    bases: set[str] = set()
+    for spelling in _script_module_names(rel):
+        package_parts = spelling.split(".") if is_init else spelling.split(".")[:-1]
+        remaining = len(package_parts) - (level - 1)
+        if remaining < 1:
+            continue  # relative import would reach beyond the top-level package
+        bases.add(".".join(package_parts[:remaining]))
+    return bases
+
+
+def _imported_modules(root: str, rel: str) -> set[str]:
+    """Dotted module names named by ``import``/``from ... import`` in one file.
+
+    ``from agent_eval import contract as ct`` (a real pattern in
+    ``scripts/agent_eval/{runner,scenarios}.py``) names the submodule
+    ``agent_eval.contract`` only through the COMBINATION of ``node.module``
+    and the imported name — ``node.module`` alone is just ``agent_eval``,
+    which cannot equal a changed symbol's full module path. Adding
+    ``module.name`` for every alias costs nothing when ``name`` is a
+    function or class rather than a submodule: that string never equals a
+    real file's module name, so it only ever adds noise, never a false match.
+
+    Relative imports (``node.level > 0``) are resolved against ``rel``'s own
+    package via ``_relative_import_bases`` instead of matching ``node.module``
+    verbatim: unresolved, ``from .a import helper`` would be read as if it
+    named the unrelated top-level ``a``.
+    """
+    try:
+        source = open(os.path.join(root, rel), encoding="utf-8").read()
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                for base in _relative_import_bases(rel, node.level):
+                    effective = f"{base}.{node.module}" if node.module else base
+                    if not effective:
+                        continue
+                    names.add(effective)
+                    for alias in node.names:
+                        names.add(f"{effective}.{alias.name}")
+            elif node.module:
+                names.add(node.module)
+                for alias in node.names:
+                    names.add(f"{node.module}.{alias.name}")
+    return names
+
+
+def _counts_as_call(
+    site: CallSite,
+    defined_in: str,
+    modules: set[str],
+    imports_of: Callable[[str], set[str]],
+) -> bool:
+    """Does this candidate site count toward the symbol defined at ``defined_in``?
+
+    Two asymmetric rules (#1935), both aimed at the same false alarm: a
+    nominal name match across ``scripts/`` and ``hub/`` reading as a real
+    call when nothing imports the other side.
+
+    A symbol defined in ``scripts/`` counts a call from another script only
+    when that script is the same file or imports the defining module (any of
+    its ``modules`` spellings) — two scripts can each define their own
+    ``main()`` with no relation at all. A symbol defined in ``hub/`` does not
+    count a call from ``scripts/`` at all: #1254's only_tests meaning (is
+    this reached by product code) is unchanged by scripts/ joining the
+    index.
+    """
+    if not defined_in.startswith(_SCRIPTS_PREFIX):
+        return not site.file.startswith(_SCRIPTS_PREFIX)
+    if not site.file.startswith(_SCRIPTS_PREFIX):
+        return True
+    if site.file == defined_in:
+        return True
+    return bool(modules & imports_of(site.file))
+
+
 def analyse(
     root: str,
     diff: str,
@@ -570,10 +710,17 @@ def analyse(
         )
 
     symbols: list[SymbolReport] = []
+    imports_cache: dict[str, set[str]] = {}
+
+    def imports_of(rel: str) -> set[str]:
+        if rel not in imports_cache:
+            imports_cache[rel] = _imported_modules(root, rel)
+        return imports_cache[rel]
 
     for symbol, defined_in, decorators in changed_symbols(
         root, ranges, test_dirs=test_dirs
     ):
+        modules = _script_module_names(defined_in)
         sites = [
             CallSite(
                 file=s.file,
@@ -587,6 +734,7 @@ def analyse(
             # A recursive call inside the function itself is not a call site
             # anyone needs to review.
             if not (s.file == defined_in and s.caller == symbol)
+            and _counts_as_call(s, defined_in, modules, imports_of)
         ]
 
         if not sites:
