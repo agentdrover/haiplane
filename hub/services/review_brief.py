@@ -984,7 +984,7 @@ async def build_review_brief(
         stacking_warning=stacking_warning,
     )
     # The publication boundary (#2002): every string of the finished brief, once.
-    scrub_strings(brief, skip=AUTHORED_TEXT)
+    scrub_strings(brief)
     # Last act before the log line and the return: total_ms is read here.
     timings = timer.finish()
     brief.timings = timings
@@ -997,18 +997,6 @@ async def build_review_brief(
         )
     return brief
 
-
-# Written by people and agents, not by the hub: a path there is content.
-AUTHORED_TEXT = frozenset(
-    {
-        "title", "description", "acceptance_criteria", "scope_in", "scope_out",
-        "scope_growth", "out_of_scope_for_review", "review_checklist",
-        "validation_commands", "constraints", "technical_hints", "outcome_metric",
-        "outcome_indicator", "outcome_deadline", "outcome_revisit_condition",
-        "redesign_rationale", "latest_submission_summary", "latest_review",
-        "machine_review", "diff_command",
-    }
-)  # fmt: skip
 
 _AREAS_DECLARED = "заявленные области: так их назвал автор задачи-причины, а не дифф"
 

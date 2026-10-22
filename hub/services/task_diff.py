@@ -132,8 +132,8 @@ async def _ask(
 
 
 def _publish(result: dict[str, Any]) -> dict[str, Any]:
-    """The one boundary of the diff view: every string but the code itself (#2002)."""
-    return scrub_strings(result, skip=frozenset({"files"}))
+    """The one boundary of the diff view: reason strings only, never the code (#2002)."""
+    return scrub_strings(result)
 
 
 def _hunk_start(header: str) -> int | None:

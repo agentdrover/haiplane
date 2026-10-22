@@ -14,6 +14,7 @@ import re
 import sqlite3
 import subprocess  # nosec B404 - only for isinstance on SubprocessError
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 _HINT = "подробности в логе хаба"
@@ -56,12 +57,19 @@ def failure_from(exc: BaseException) -> BriefFailure:
 # * Путь файловой системы — только то, что начинается с корня из белого списка
 #   (/tmp, /var, /srv, /home, /Users, /opt, /etc, /root, /private, …) или с
 #   ``~`` / ``~user``. Маршруты приложения (``/tasks/12``) путём не считаются.
-# * Текст, написанный людьми и агентами (название, описание, критерии, итог
-#   сдачи, вердикты), не чистится: там путь — содержание, а не утечка.
+# * Чистятся ТОЛЬКО строки под ключами-диагнозами (белый список по имени ключа,
+#   ``_REASON_KEY``): reason, *_reason, why, detail, error, unavailable. Всё
+#   остальное — текст людей и агентов (text, note, observation, headline, lines,
+#   description, summary) или код — не трогается: там путь — содержание, а не
+#   утечка, и чёрный список «авторских» полей всякий раз что-то пропускал.
+#   Новое поле ``foo_reason`` покрыто само. Не-строки (Enum, числа) проходят как есть.
 # * Длина режется до _MAX_SCAN до любого поиска, шаблоны без вложенных
 #   кванторов: длинная строка без «://» не должна занимать цикл событий.
 _MAX_SCAN = 4000
 _ROOTS = "tmp|var|srv|home|Users|opt|etc|root|private|usr|mnt|run|Volumes|data|proc|sys"
+_USERINFO_URL = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.\-]{0,15}://[^/\s'\"`<>]{1,256}@[^\s'\"`)<>]{1,2000}"
+)
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,15}://[^\s'\"`)<>,;]{1,2000}")
 _SCP = re.compile(r"(?<![\w.@-])[\w.\-]{1,64}@[\w.\-]{1,255}:[^\s'\"`)]{1,500}")
 _FS = rf"(?:~[\w.\-]{{0,32}}/|/(?:{_ROOTS})(?![\w.\-]))"
@@ -87,28 +95,32 @@ def public_reason(text: str) -> str:
     text = text or ""
     if len(text) > _MAX_SCAN:
         text = text[:_MAX_SCAN] + "…"
+    text = _USERINFO_URL.sub("<remote>", text)
     text = _URL.sub(_remote, text)
     text = _SCP.sub("<remote>", text)
     text = _QUOTED_PATH.sub("<путь>", text)
     return _ABS_PATH.sub("<путь>", text)
 
 
-def scrub_strings(obj: Any, *, skip: frozenset[str] = frozenset()) -> Any:
-    """``public_reason`` для КАЖДОЙ строки готового ответа: dict, list, tuple, модели.
+_REASON_KEY = re.compile(r"(?:.*_)?(?:reasons?|why|details?|errors?|unavailable)")
 
-    Ключи из ``skip`` (текст людей и агентов) обходятся вместе с поддеревом.
-    Модели pydantic правятся на месте, остальное собирается заново.
+
+def scrub_strings(obj: Any, *, key: str = "") -> Any:
+    """``public_reason`` для строк под ключами-диагнозами во всём готовом ответе.
+
+    Обходит dict, list, tuple и модели pydantic рекурсивно; строка чистится, если
+    имя ключа (или ключа списка, в котором она лежит) подходит под ``_REASON_KEY``.
+    Модели правятся на месте, остальное собирается заново.
     """
+    if isinstance(obj, Enum):
+        return obj
     if isinstance(obj, str):
-        return public_reason(obj)
+        return public_reason(obj) if _REASON_KEY.fullmatch(key) else obj
     if isinstance(obj, dict):
-        return {
-            k: v if k in skip else scrub_strings(v, skip=skip) for k, v in obj.items()
-        }
+        return {k: scrub_strings(v, key=str(k)) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return type(obj)(scrub_strings(v, skip=skip) for v in obj)
+        return type(obj)(scrub_strings(v, key=key) for v in obj)
     if hasattr(obj, "model_fields"):
         for name in type(obj).model_fields:
-            if name not in skip:
-                setattr(obj, name, scrub_strings(getattr(obj, name), skip=skip))
+            setattr(obj, name, scrub_strings(getattr(obj, name), key=name))
     return obj

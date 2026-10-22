@@ -373,6 +373,9 @@ def test_public_reason_cuts_paths_and_remotes_and_keeps_the_rest() -> None:
         public_reason("fatal: 'https://h.io/o/r.git' down") == "fatal: '<remote>' down"
     )
     assert public_reason("https://u:t@github.com/o/r/pull/1") == "<remote>"
+    for password in ("p;secret", "p,secret", "p%40secret", "p:q"):
+        url = f"https://user:{password}@host.example/org/repo.git"
+        assert public_reason(f"fatal: {url} down") == "fatal: <remote> down", password
     assert public_reason("https://evil.io/o/r/pull/1") == "<remote>"
     assert public_reason("git@github.com:org/r.git не отвечает") == (
         "<remote> не отвечает"
@@ -591,3 +594,58 @@ async def test_the_review_queue_view_is_cleaned_as_a_whole(
     assert rows, "задача в очереди"
     for text in _strings(view.model_dump(mode="json")):
         assert "/tmp" not in text and "h.io" not in text, text
+
+
+def _brief_with_authored_text(path: str):
+    from hub.models import (
+        LiveCheckState,
+        PathNoticeItem,
+        PathNoticesView,
+        ReviewBrief,
+        TaskStatus,
+        ValidationStanding,
+    )
+
+    return ReviewBrief(
+        task_id=1,
+        title=f"t {path}",
+        status=TaskStatus.review,
+        ci_integrity={"note": f"запустите {path}", "reason": f"сбой {path}"},
+        validation=ValidationStanding(
+            author_run_lines=[f"$ {path}"], headline=f"цитата «{path}»"
+        ),
+        live_check=LiveCheckState(observation=f"видел {path}", reason=f"нет {path}"),
+        path_notices=PathNoticesView(
+            generation=1,
+            state="matched",
+            text=f"Скопировать в {path}",
+            reason=f"нет {path}",
+            notices=[PathNoticeItem(text=f"Скопировать в {path}", paths=[path])],
+        ),
+    )
+
+
+def test_only_reason_keys_are_scrubbed_and_enums_stay_enums() -> None:
+    from hub.models import TaskStatus
+    from hub.services.brief_failure import scrub_strings
+
+    path = "/opt/hub/scripts/deploy.sh"
+    brief = scrub_strings(_brief_with_authored_text(path))
+
+    assert isinstance(brief.status, TaskStatus) and brief.status is TaskStatus.review
+    assert brief.title == f"t {path}"
+    assert brief.ci_integrity["note"] == f"запустите {path}"
+    assert brief.validation.author_run_lines == [f"$ {path}"]
+    assert brief.validation.headline == f"цитата «{path}»"
+    assert brief.live_check.observation == f"видел {path}"
+    assert brief.path_notices.text == f"Скопировать в {path}"
+    assert brief.path_notices.notices[0].text == f"Скопировать в {path}"
+    assert brief.path_notices.notices[0].paths == [path]
+    # а причины тех же блоков — режутся, включая будущее поле foo_reason
+    assert brief.ci_integrity["reason"] == "сбой <путь>"
+    assert brief.live_check.reason == "нет <путь>"
+    assert brief.path_notices.reason == "нет <путь>"
+    assert scrub_strings({"foo_reason": path, "text": path}) == {
+        "foo_reason": "<путь>",
+        "text": path,
+    }

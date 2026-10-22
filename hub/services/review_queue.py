@@ -258,6 +258,4 @@ async def review_queue(db, *, project_id: int | None = None) -> ReviewQueueView:
     note = ""
     if len(tasks) >= QUEUE_LIMIT:
         note = f"показаны первые {QUEUE_LIMIT} задач очереди — очередь длиннее"
-    return scrub_strings(
-        ReviewQueueView(rows=rows, note=note), skip=frozenset({"title"})
-    )
+    return scrub_strings(ReviewQueueView(rows=rows, note=note))
