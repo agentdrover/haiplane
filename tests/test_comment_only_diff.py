@@ -48,14 +48,14 @@ def _git(repo: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
-def _commit(repo: Path, files: Mapping[str, str | None], msg: str) -> str:
+def _commit(repo: Path, files: Mapping[str, str | bytes | None], msg: str) -> str:
     for rel, text in files.items():
         path = repo / rel
         if text is None:
             path.unlink()
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(text.encode("utf-8"))
+        path.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "--allow-empty", "-m", msg)
     return _git(repo, "rev-parse", "HEAD")
@@ -63,8 +63,8 @@ def _commit(repo: Path, files: Mapping[str, str | None], msg: str) -> str:
 
 def _pair(
     tmp_path: Path,
-    base: Mapping[str, str],
-    head: Mapping[str, str | None],
+    base: Mapping[str, str | bytes],
+    head: Mapping[str, str | bytes | None],
 ) -> tuple[Path, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -499,6 +499,123 @@ _CASES: dict[str, dict] = {
         "head": 'def f():\n    if True:\n        "code"\n    return 1\n',
         "kind": CLEAN,
     },
+    "fmt_off_indent_changed": {
+        "base": "def f():\n    x   = 1\n    # fmt: off\ny   = 2\n",
+        "head": "def f():\n    x   = 1\n# fmt: off\ny   = 2\n",
+        "kind": "directive",
+    },
+    "shebang_indented": {
+        "base": "#!/usr/bin/env python3\nx = 1\n",
+        "head": " #!/usr/bin/env python3\nx = 1\n",
+        "kind": "directive",
+    },
+    "line_endings_changed_in_a_script": {
+        "base": "#!/usr/bin/env python3\nx = 1\n",
+        "head": "#!/usr/bin/env python3\r\nx = 1\r\n",
+        "kind": "tokens",
+    },
+    "noqa_code_got_a_suffix": {
+        "base": "x = foo  # noqa: F821\n",
+        "head": "x = foo  # noqa: F821XYZ\n",
+        "kind": "directive",
+    },
+    "contract_local_import_does_not_shadow_the_global_one": {
+        "base": (
+            "from pydantic import BaseModel as Parent\n"
+            "class M(Parent):\n    'old'\n    x: int\n"
+            "def helper():\n    from ordinary import Parent\n"
+        ),
+        "head": (
+            "from pydantic import BaseModel as Parent\n"
+            "class M(Parent):\n    'new'\n    x: int\n"
+            "def helper():\n    from ordinary import Parent\n"
+        ),
+        "extra_both": {"ordinary.py": "class Parent:\n    pass\n"},
+        "kind": "contract_docstring",
+    },
+    "contract_class_reexported_under_an_alias": {
+        "base": "from models import Parent\nclass M(Parent):\n    'old'\n    x: int\n",
+        "head": "from models import Parent\nclass M(Parent):\n    'new'\n    x: int\n",
+        "extra_both": {"models.py": "from pydantic import BaseModel as Parent\n"},
+        "kind": "contract_docstring",
+    },
+    "contract_parent_declared_with_a_tab": {
+        "base": "from models import Parent\nclass M(Parent):\n    'old'\n    x: int\n",
+        "head": "from models import Parent\nclass M(Parent):\n    'new'\n    x: int\n",
+        "extra_both": {
+            "models.py": "from pydantic import BaseModel\nclass\tParent(BaseModel):\n    pass\n"
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_parent_in_a_latin1_file": {
+        "base": "from models import Parent\nclass M(Parent):\n    'old'\n    x: int\n",
+        "head": "from models import Parent\nclass M(Parent):\n    'new'\n    x: int\n",
+        "extra_both": {
+            "models.py": (
+                b"# coding: latin-1\nfrom pydantic import BaseModel\n"
+                b"class Parent(BaseModel): pass\n\xe9=1\n"
+            )
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_getdoc_with_a_keyword_argument": {
+        "base": 'def f():\n    "old"\n    return 1\n',
+        "head": 'def f():\n    "new"\n    return 1\n',
+        "extra_both": {
+            "tests/test_m.py": "import inspect\nimport m\nassert inspect.getdoc(object=m.f)\n"
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_package_docstring_read_by_a_test": {
+        "file": "pkg/__init__.py",
+        "base": '"old"\nx = 1\n',
+        "head": '"new"\nx = 1\n',
+        "extra_both": {
+            "tests/test_pkg.py": "import pkg\nassert pkg.__doc__ == 'old'\n"
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_decorator_imported_under_an_alias": {
+        "base": "from click import command as cmd\n@cmd()\ndef f():\n    'old'\n    return 1\n",
+        "head": "from click import command as cmd\n@cmd()\ndef f():\n    'new'\n    return 1\n",
+        "kind": "contract_docstring",
+    },
+    "another_module_symbol_read_by_a_test_is_not_a_false_red": {
+        "base": 'def f():\n    "old"\n    return 1\n',
+        "head": 'def f():\n    "new"\n    return 1\n',
+        "extra_both": {
+            "other.py": 'def f():\n    "external"\n    return 2\n',
+            "tests/test_other.py": "import other\nassert other.f.__doc__ == 'external'\n",
+        },
+        "kind": CLEAN,
+    },
+    "reexport_to_a_plain_class_is_not_a_false_red": {
+        "base": "from ordinary import Parent\nclass M(Parent):\n    'old'\n    pass\n",
+        "head": "from ordinary import Parent\nclass M(Parent):\n    'new'\n    pass\n",
+        "extra_both": {
+            "ordinary/__init__.py": "from ordinary.impl import Plain as Parent\n",
+            "ordinary/impl.py": "class Plain:\n    pass\n",
+            "unrelated.py": "from pydantic import BaseModel\nclass Parent(BaseModel):\n    pass\n",
+        },
+        "kind": CLEAN,
+    },
+    "own_class_named_like_a_library_base_is_not_a_false_red": {
+        "base": "from ordinary import BaseModel\nclass M(BaseModel):\n    'old'\n    pass\n",
+        "head": "from ordinary import BaseModel\nclass M(BaseModel):\n    'new'\n    pass\n",
+        "extra_both": {"ordinary.py": "class BaseModel:\n    pass\n"},
+        "kind": CLEAN,
+    },
+    "property_setter_with_the_same_qualname": {
+        "base": (
+            "class C:\n    @property\n    def x(self):\n        'old'\n        return 1\n"
+            "    @x.setter\n    def x(self, value):\n        'setter'\n        pass\n"
+        ),
+        "head": (
+            "class C:\n    @property\n    def x(self):\n        return 1\n"
+            "    @x.setter\n    def x(self, value):\n        pass\n"
+        ),
+        "kind": CLEAN,
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
@@ -519,11 +636,12 @@ def _case_params() -> list:
 def _run_case(tmp_path: Path, name: str) -> tuple[int, str]:
     case = _CASES[name]
     both = case.get("extra_both", {})
-    base = {"m.py": case["base"], **both}
-    head: dict[str, str | None] = {"m.py": case["head"], **both}
+    target = case.get("file", "m.py")
+    base = {target: case["base"], **both}
+    head: dict[str, str | bytes | None] = {target: case["head"], **both}
     head.update(case.get("extra_head", {}))
     repo, base_sha, head_sha = _pair(tmp_path, base, head)
-    return _run(repo, base_sha, head_sha, ["m.py"])
+    return _run(repo, base_sha, head_sha, [target])
 
 
 def _check_case(name: str, rc: int, out: str) -> None:
