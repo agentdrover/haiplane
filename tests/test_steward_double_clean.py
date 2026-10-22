@@ -106,6 +106,8 @@ async def test_a_class_within_the_ordinary_ceiling_carries_no_double_clean(
 _BREAKS = [
     ("no_pin", "pin", {"extra": {"pinned": False}}),
     ("main_no_pin", "pin", {"main": {"pinned": False}}),
+    ("sha_claimed_not_verified", "pin", {"extra": {"pinned": "claimed"}}),
+    ("pinned_to_another_sha", "pin", {"main": {"sha": "c" * 40}}),
     ("incomplete", "incomplete", {"main": {"incomplete": True}}),
     ("incomplete_unclaimed", "incomplete", {"main": {"incomplete": None}}),
     ("confirmed", "confirmed", {"extra": {"confirmed": (FINDING,)}}),

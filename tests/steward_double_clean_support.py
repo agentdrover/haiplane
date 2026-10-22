@@ -73,7 +73,7 @@ async def add_report(
     task_id: int,
     principal: int | None,
     *,
-    pinned: bool = True,
+    pinned: bool | str = True,
     sha: str = SHA,
     generation: int = 1,
     confirmed: tuple = (),
@@ -105,7 +105,11 @@ async def add_report(
         principal_id=principal,
         carried_from_review_id=carried_from,
     )
-    if pinned:
+    if pinned == "claimed":  # sha назван, но хаб пин не проверял
+        await db.execute(
+            "UPDATE machine_reviews SET reviewed_sha=? WHERE id=?", (sha, review_id)
+        )
+    elif pinned:
         await db.execute(
             "UPDATE machine_reviews SET reviewed_sha=?, pin_verified=1 WHERE id=?",
             (sha, review_id),
