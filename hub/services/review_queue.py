@@ -34,6 +34,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import ReviewQueueRow, ReviewQueueView
 from hub.services import review_evidence, state_review
+from hub.services.brief_failure import scrub_strings
 from hub.services.result_kind import NOT_APPLICABLE, automation_not_applicable
 from hub.services.lifecycle import (
     latest_review_projection,
@@ -257,4 +258,4 @@ async def review_queue(db, *, project_id: int | None = None) -> ReviewQueueView:
     note = ""
     if len(tasks) >= QUEUE_LIMIT:
         note = f"показаны первые {QUEUE_LIMIT} задач очереди — очередь длиннее"
-    return ReviewQueueView(rows=rows, note=note)
+    return scrub_strings(ReviewQueueView(rows=rows, note=note))

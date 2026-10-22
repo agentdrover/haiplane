@@ -46,6 +46,7 @@ from hub.services.result_kind import is_state
 from hub.services.return_running import RETURN_RUNNING_STATUSES, return_running_to_open
 from hub.hub_instance import mutation_activity_detail
 from hub.db import (
+    committed_if_own,
     deserialize_str_list,
     fetchall,
     log_activity,
@@ -6620,11 +6621,10 @@ async def deliver_on_disposition(
     # number that may no longer name anything mergeable.
     task, delivery_pr = await resolve_delivery_pr(db, task)
     if delivery_pr.reason:
-        # Said once, regardless of outcome — the same rule the sweep and
-        # the done-report path already follow (#767, #959): the reader
-        # must see both the closed number and its replacement, or the
-        # closed number and the absence of one.
-        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+        # Said once, regardless of outcome, as the sweep and done-report do
+        # (#767, #959): the closed number with its replacement or its absence.
+        async with committed_if_own(db):  # #2001: next is the network
+            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     if delivery_pr.unusable:
         # #959: closed, no live replacement — nothing to merge. Asking
         # GitHub would read as "merge_failed" over a PR that is not there

@@ -92,6 +92,7 @@ These are the rules most likely to be broken by “small” changes.
   `create_subtasks_bulk`, and the lifecycle completion paths (`add_update`
   done-flow, `force_complete_task`). It is NOT yet a full per-connection
   commit lock; broad commit serialization is tracked as hardening work.
+- No write lock across the network (#2001): a write made BEFORE a forge/git call on the delivery path (`deliver_on_disposition` alert, `_live_pr_for_branch` / `pr_for_delivery` / `ensure_delivery_pr` PR number, the `_approved_code_check` re-pin) is committed before the call by the owner of its transaction (`hub.db.committed_if_own`: a write on a clean connection is committed by its author; a transaction opened before the write is foreign, is neither committed nor rolled back by the block, and `delivery_rerun._reserve_and_post` still refuses a paid POST inside it). Guard: `tests/test_no_lock_across_network.py`. Known, not fixed: headless `poller._record_merge_and_tidy`, `poller._sweep_ci_check`, `orchestration._route_after_done`.
 - Approval is only valid from `draft`.
 - Approval uses an atomic conditional transition to avoid double-processing races.
 - If required DoR checks fail and `force` is not set, approval must fail with HTTP 422.
