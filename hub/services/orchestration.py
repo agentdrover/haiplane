@@ -3416,15 +3416,13 @@ async def _approved_code_check(
 
 
 async def _gate_update_base(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
-    """База в клоне — не старее той, что гейт слил в ветку (#1419); "" — да.
+    """Свежая база в клоне перед сверкой диффов (#1419, #1983); "" — получена.
 
-    Вершина ушла с закреплённой после слияния базы гейтом. Сверка #1361
-    считает дифф ветки к базе клона, и старая база там читала бы коммиты,
-    приехавшие слиянием, как правку автора — второй вердикт за механику.
-    Базу не получили — временное ожидание с причиной, не мерж и не stale.
+    Зовётся, когда вершина ушла с закреплённой: на старой базе сверка #1361
+    приняла бы приехавшие слиянием коммиты за правку автора. Fetch — всегда
+    при расхождении голов, без оглядки на события (retention 14 дней) и
+    политику. Базу не получили — временное ожидание, не мерж и не stale.
     """
-    if not await gate_branch_update_from(db, task):
-        return ""
     ctx = await project_git_context(db, task["id"])
     workspace = ctx.get("repo")
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
@@ -3437,7 +3435,7 @@ async def _gate_update_base(db: aiosqlite.Connection, task: dict[str, Any]) -> s
     if ok:
         return ""
     return (
-        f"{BASE_FETCH_PENDING_PREFIX}: гейт слил {base} в ветку, а свежую {base} "
+        f"{BASE_FETCH_PENDING_PREFIX}: вершина ветки сменилась, а свежую {base} "
         f"в клон получить не удалось ({(err or 'fetch не прошёл').strip()[:150]}) — "
         "без неё сверка с одобрением приняла бы базу за правку автора; "
         "повтор следующим циклом, мержа нет"
@@ -5427,6 +5425,11 @@ BASE_FRESHNESS_WAIT_HINT = (
     "зелёного CI на новой голове. Пересдавать НЕ нужно: слияние базы гейтом — "
     "не авторская правка, вердикт сохраняется (#1361)."
 )
+# #1983: сдвиг головы может быть и правкой автора — «вердикт сохраняется» нельзя.
+BASE_FETCH_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: хаб ждёт свежую "
+    "базу, затем сверит код с одобренным. Пересдавать не нужно."
+)
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
     (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
@@ -5442,10 +5445,10 @@ _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
             BASE_UPDATED_PREFIX,
             BASE_UPDATE_PENDING_PREFIX,
             BASE_UPDATE_RETRY_PREFIX,
-            BASE_FETCH_PENDING_PREFIX,
         ),
         BASE_FRESHNESS_WAIT_HINT,
     ),
+    (BASE_FETCH_PENDING_PREFIX, BASE_FETCH_WAIT_HINT),
     (delivery_rerun.RERUN_PREFIX, delivery_rerun.WAIT_HINT),
 )
 
