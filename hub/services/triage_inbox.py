@@ -247,11 +247,16 @@ WHERE l.digest_id IS NULL
 """
 
 #: То же для кандидатов ОДНОГО проекта под write-локом: id отобрала проба до лока.
-CLAIM_ROWS_SQL: Final[str] = (
-    OUTCOME_ROWS_SQL
-    + """  AND l.recommendation_id IN (SELECT value FROM json_each(?))
+CLAIM_ROWS_SQL: Final[str] = """
+SELECT r.id, r.task_id, r.action, r.followup,
+       COALESCE(r.followup_action_at, r.followup_at) AS action_at
+FROM triage_digest_outcomes l
+JOIN executor_triage_recommendations r ON r.id = l.recommendation_id
+WHERE l.digest_id IS NULL
+  AND r.followup IS NOT NULL
+  AND COALESCE(r.followup_action_at, r.followup_at) < ?
+  AND l.recommendation_id IN (SELECT value FROM json_each(?))
 """
-)
 
 #: Связь исхода с дайджестом: (id рекомендации, ``day`` | ``late``).
 Link = tuple[int, str]
