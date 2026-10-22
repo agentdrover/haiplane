@@ -28,12 +28,15 @@ Python она не закрывается).
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from hub.services.test_locator import PYTEST, runner_of
+
+logger = logging.getLogger(__name__)
 
 #: Префикс строки ``lost_dimensions``, которой ревьюер называет непрочитанный тест AC.
 UNREAD_PREFIX = "ac_test_unread: "
@@ -423,19 +426,48 @@ async def attach_ac_tests_unread(db: Any, view: Any) -> None:
 RangeKey = tuple[str, int, int]
 
 
-def _take_fitting(
-    keys: Sequence[RangeKey], cost: dict[RangeKey, int], budget: int
-) -> tuple[int, set[RangeKey]]:
-    """Вырезки от меньшей к большей (ничья - порядок файла): каждая, что помещается в остаток.
+#: Предел точного перебора: диапазонов в одном списке (2**12 = 4096 вариантов).
+EXACT_LIMIT = 12
 
-    Так в остаток входит наибольшее число вырезок, а не поместившаяся не блокирует остальные.
+
+def _take_fitting(
+    keys: Sequence[RangeKey],
+    cost: dict[RangeKey, int],
+    budget: int,
+    weight: dict[RangeKey, int],
+) -> tuple[int, set[RangeKey]]:
+    """Подмножество вырезок под ``budget``: максимум ссылок AC, затем минимум стоимости (#1993).
+
+    Выбор покрытия - задача о рюкзаке, жадный подбор по одному критерию даёт
+    контрпример. До ``EXACT_LIMIT`` диапазонов подмножества перебираются все;
+    при равенстве побеждает первое по порядку ``keys``. Выше предела - жадно по
+    отношению ссылки/стоимость (затем дешевле, затем порядок) с пометкой в логе.
     """
-    taken: set[RangeKey] = set()
-    for k in sorted(keys, key=lambda x: cost[x]):
-        if cost[k] <= budget:
-            taken.add(k)
-            budget -= cost[k]
-    return budget, taken
+    if len(keys) > EXACT_LIMIT:
+        logger.warning(
+            "покрытие AC: %d диапазонов выше предела %d - выбор жадно по ссылки/стоимость",
+            len(keys),
+            EXACT_LIMIT,
+        )
+        order = sorted(keys, key=lambda k: (-weight[k] / cost[k], cost[k]))
+        taken: set[RangeKey] = set()
+        for k in order:
+            if cost[k] <= budget:
+                taken.add(k)
+                budget -= cost[k]
+        return budget, taken
+    states: list[tuple[int, int, tuple[RangeKey, ...]]] = [(0, 0, ())]
+    for k in keys:
+        states += [
+            (w + weight[k], c + cost[k], chosen + (k,))
+            for w, c, chosen in states
+            if c + cost[k] <= budget
+        ]
+    best = states[0]
+    for state in states:
+        if (state[0], -state[1]) > (best[0], -best[1]):
+            best = state
+    return budget - best[1], set(best[2])
 
 
 def _reserve_ac(
@@ -447,7 +479,8 @@ def _reserve_ac(
 ) -> tuple[int, set[RangeKey], set[str], set[RangeKey]]:
     """Шаг A: представление каждого AC-файла выбрано и оплачено ДО файлов без AC (#1981).
 
-    Два плана на файл. Вырезки: помещающееся подмножество вырезок. Полный дифф:
+    Два плана на файл, оба выбираются точным перебором подмножеств (#1993).
+    Вырезки: лучшее помещающееся подмножество вырезок. Полный дифф:
     файл целиком (он САМ покрывает показанные ханками диапазоны) плюс те
     непокрытые вырезки, что поместились в остаток; не поместившаяся вырезка
     полный дифф не запрещает - непрочитанными названы только её ссылки. Берётся
@@ -456,15 +489,16 @@ def _reserve_ac(
     placed: set[RangeKey] = set()
     full: set[str] = set()
     covered_all: set[RangeKey] = set()
+    weight = {k: len(v) for k, v in ranges.items()}
     for path in ac_paths:
         keys = [k for k in ranges if k[0] == path]
-        left, cuts = _take_fitting(keys, cost, budget)
+        left, cuts = _take_fitting(keys, cost, budget, weight)
         best = (sum(len(ranges[k]) for k in cuts), left - budget, 1)
         plan: tuple[int, set[RangeKey], set[RangeKey]] = (left, cuts, set())
         if path in texts and len(texts[path]) <= budget:
             covered = {k for k in keys if shown_in(texts[path], ranges[k][0])}
             rest = [k for k in keys if k not in covered]
-            left_f, extra = _take_fitting(rest, cost, budget - len(texts[path]))
+            left_f, extra = _take_fitting(rest, cost, budget - len(texts[path]), weight)
             read = sum(len(ranges[k]) for k in covered | extra)
             if (read, left_f - budget, 0) > best:
                 plan = (left_f, extra, covered)
