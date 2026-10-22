@@ -47,7 +47,7 @@ from hub import config
 from hub import repository as repo_module
 from hub.services.author_answers import undisposed_findings
 from hub.integrations.registry import plugins
-from hub.services.brief_failure import failure_from
+from hub.services.brief_failure import failure_from, public_reason
 from hub.models import ReviewInFlight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -243,7 +243,7 @@ def sha_check_of(
     if not submission_sha or not branch:
         return "unknown", "branch tip was not pinned at submission"
     if not current_tip:
-        return "unknown", tip_reason
+        return "unknown", public_reason(tip_reason)
     if current_tip == submission_sha:
         return "match", sha_check_statement(
             "match", submission_sha, current_tip, branch

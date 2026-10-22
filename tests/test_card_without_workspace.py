@@ -349,3 +349,89 @@ async def test_an_untraversable_parent_is_unreadable_not_missing(
     assert shown["state"] == task_diff.UNREADABLE
     assert shown["state"] != task_diff.WORKSPACE_MISSING
     assert "workspace-marker-2002" not in str(shown)
+
+
+def test_public_reason_cuts_paths_and_remotes_and_keeps_the_rest() -> None:
+    from hub.services.brief_failure import public_reason
+
+    sha = "0123456789ab"
+    keep = (
+        f"{sha} task-1/x hub/web.py origin/develop и/или (tests/a.py:12) "
+        "ветка task-2002/card-without-workspace"
+    )
+    assert public_reason(keep) == keep
+    assert public_reason("нет /srv/clones/x/.git и ~/work/r") == "нет <путь> и <путь>"
+    assert public_reason("fatal: 'https://u:tok@h.io/o/r.git' down") == (
+        "fatal: '<remote>' down"
+    )
+    assert public_reason("git@github.com:org/r.git не отвечает") == (
+        "<remote> не отвечает"
+    )
+    assert public_reason("ssh://git@h/r и /var/x") == "<remote> и <путь>"
+    assert public_reason("") == ""
+
+
+def _strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from _strings(key)
+            yield from _strings(value)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _strings(value)
+
+
+async def test_no_reason_source_of_the_brief_publishes_a_path_or_a_remote(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Охранный тест третьего круга: путь и URL подставлены В КАЖДЫЙ источник причин.
+
+    Источники по одному ловились три раунда подряд; граница одна —
+    ``public_reason`` на выходе брифа. Обход рекурсивный по всем строкам.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub import services
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services.review_brief import build_review_brief
+    from hub.services.task_diff import submission_diff, submission_files
+
+    path, url, scp = (
+        "/tmp/leak-2002/clone",
+        "https://u:tok@h.io/o/r.git",
+        "git@h.io:o/r",
+    )
+    leak = f"{path} {url} {scp}"
+    task_id = await _review_task(client, db, missing_workspace, "gone-guard")
+    await repo.update_task(db, task_id, pr_number=7)
+    await db.commit()
+    _real_git(monkeypatch)
+    git = plugins.git_ops
+    monkeypatch.setattr(
+        services, "resolve_branch_tip", AsyncMock(return_value=("", f"fetch: {leak}"))
+    )
+    monkeypatch.setattr(
+        git, "resolve_ref", AsyncMock(return_value=("unavailable", leak))
+    )
+    monkeypatch.setattr(
+        git, "base_freshness", AsyncMock(return_value=("unverified", leak))
+    )
+    monkeypatch.setattr(
+        git,
+        "check_pr_mergeable",
+        AsyncMock(return_value=(MergeabilityOutcome.unknown, leak)),
+    )
+    monkeypatch.setattr(git, "branch_diff", AsyncMock(side_effect=OSError(leak)))
+    monkeypatch.setattr(git, "branch_diff_local", AsyncMock(side_effect=OSError(leak)))
+    monkeypatch.setattr(git, "commit_exists", AsyncMock(side_effect=OSError(leak)))
+
+    brief = await build_review_brief(db, task_id, observe_only=False)
+    assert brief is not None
+    dump = brief.model_dump(mode="json")
+    assert dump["sha_check_reason"], "источник tip_reason дошёл до ответа"
+    shown = [await submission_diff(db, task_id), await submission_files(db, task_id)]
+    for text in [*_strings(dump), *_strings(shown)]:
+        for bad in ("/tmp", "/var", "https://", "git@", "tok@"):
+            assert bad not in text, (bad, text[:200])

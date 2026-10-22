@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 import subprocess  # nosec B404 - only for isinstance on SubprocessError
 from dataclasses import dataclass
@@ -39,3 +40,23 @@ def _category(exc: BaseException) -> str:
 def failure_from(exc: BaseException) -> BriefFailure:
     """Type name plus a category word; the exception text never leaves the log."""
     return BriefFailure(f"{type(exc).__name__} ({_category(exc)}), {_HINT}")
+
+
+# Публикационная граница (#2002, Codex r1-r3): причины приходят из git, форджа и
+# исключений, и каждый новый источник мог принести путь клона или URL remote с
+# токеном. Источники по одному не отлавливаются; текст чистится ОДИН раз, на выходе.
+_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"`)]+")
+_SCP = re.compile(r"(?<![\w.@-])[\w.\-]+@[\w.\-]+:[^\s'\"`)]+")
+_ABS_PATH = re.compile(r"(?<![\w.~/\-])~?/[^\s'\"`),;]+")
+
+
+def public_reason(text: str) -> str:
+    """Причина без абсолютных путей и адресов remote; sha, ветки и относительные пути целы.
+
+    ``/srv/clone/x`` -> ``<путь>``, ``https://host/r`` и ``git@host:r`` -> ``<remote>``.
+    ``hub/web.py``, ``task-1/x``, ``origin/develop`` не трогаются: слэш внутри слова
+    не начало абсолютного пути.
+    """
+    text = _URL.sub("<remote>", text or "")
+    text = _SCP.sub("<remote>", text)
+    return _ABS_PATH.sub("<путь>", text)

@@ -38,6 +38,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.services import review_evidence
+from hub.services.brief_failure import public_reason
 
 log = logging.getLogger("hub")
 
@@ -60,7 +61,7 @@ _T = TypeVar("_T")
 def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {
         "state": state,
-        "reason": reason,
+        "reason": public_reason(reason),
         "files": [],
         "truncated": False,
         "shown_lines": 0,

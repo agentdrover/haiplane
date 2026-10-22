@@ -64,7 +64,7 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
-from hub.services.brief_failure import BriefFailure, failure_from
+from hub.services.brief_failure import BriefFailure, failure_from, public_reason
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
@@ -966,14 +966,20 @@ async def build_review_brief(
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,
-        diff_base=DiffBaseState(**diff_base),
-        base_merge=base_merge_state,
+        diff_base=DiffBaseState(
+            **{**diff_base, "reason": public_reason(str(diff_base.get("reason", "")))}
+        ),
+        base_merge=base_merge_state.model_copy(
+            update={"reason": public_reason(base_merge_state.reason)}
+        ),
         evidence_coverage=EvidenceCoverage(**coverage),
         submission_sha=submission_sha,
         current_branch_tip=current_tip,
         sha_check=sha_check,
         sha_check_reason=sha_check_reason,
-        call_sites=call_sites_section,
+        call_sites=call_sites_section.model_copy(
+            update={"reason": public_reason(call_sites_section.reason)}
+        ),
         review_cycle=task_view.review_cycle,
         submission_generation=task_view.submission_generation,
         review_verdict_revision=task_view.review_verdict_revision,
