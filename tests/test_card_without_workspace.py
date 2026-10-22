@@ -435,3 +435,51 @@ async def test_no_reason_source_of_the_brief_publishes_a_path_or_a_remote(
     for text in [*_strings(dump), *_strings(shown)]:
         for bad in ("/tmp", "/var", "https://", "git@", "tok@"):
             assert bad not in text, (bad, text[:200])
+
+
+async def test_the_boundary_cleans_reasons_even_when_a_source_does_not(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Граница не опирается на чистоту источников: сырой путь в готовой секции режется."""
+    from unittest.mock import AsyncMock
+
+    from hub.models import BaseMergeState, CallSiteSection
+    from hub.services import review_brief, review_evidence, task_diff
+
+    leak = "/tmp/leak-2002/clone https://u:tok@h.io/o/r.git"
+    task_id = await _review_task(client, db, missing_workspace, "gone-boundary")
+    _real_git(monkeypatch)
+    raw_base = {
+        "base": "develop",
+        "source": "x",
+        "state": review_evidence.BASE_UNVERIFIED,
+        "reason": leak,
+        "sha": "",
+    }
+    monkeypatch.setattr(
+        review_evidence, "resolve_diff_base", AsyncMock(return_value=raw_base)
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(return_value=BaseMergeState(state="unknown", reason=leak)),
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "build_call_sites_section",
+        AsyncMock(return_value=CallSiteSection(status="unknown", reason=leak)),
+    )
+
+    brief = await review_brief.build_review_brief(db, task_id, observe_only=True)
+
+    assert brief is not None
+    assert brief.diff_base.reason and brief.base_merge.reason
+    assert brief.call_sites.reason
+    for text in (
+        brief.diff_base.reason,
+        brief.base_merge.reason,
+        brief.call_sites.reason,
+    ):
+        assert "/tmp" not in text and "https://" not in text, text
+    blank = task_diff._blank(task_diff.UNREADABLE, leak)
+    assert "/tmp" not in blank["reason"] and "https://" not in blank["reason"]
