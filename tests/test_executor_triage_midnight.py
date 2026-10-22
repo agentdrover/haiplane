@@ -195,7 +195,7 @@ async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(
     assert sum(s["late"] for s in sections.values()) == 0
     # дайджест дня действия с нечитаемым разделом исхода не содержит: он «позже»
     await world.db.execute(
-        "UPDATE autopilot_digests SET payload = ?",
+        "UPDATE autopilot_digests SET payload = ?, created_at = '2026-10-22 00:00:00'",
         (json.dumps({"triage": {"state": "unavailable"}}),),
     )
     await world.db.commit()
