@@ -651,6 +651,14 @@ jobs:
       - name: MCP catalog budget
         run: uv run python scripts/mcp_catalog_budget.py
 
+      # #1989: a test that compares the real clock with a threshold under one
+      # second fails on a loaded machine without a defect in the code (#1984).
+      # The AST check fails on a NEW such assert; the old places live in
+      # docs/agent-context/wallclock-asserts.json with an owner. The step has no
+      # `if`, `continue-on-error` or `|| true`: its exit code is the gate.
+      - name: Wall-clock asserts
+        run: uv run python scripts/wallclock_asserts.py
+
       # #833: consistency is the densest family of confirmed review findings —
       # a contract changed in one place and left stale in the other two. The
       # check lays this diff over a map of surfaces that travel together and
