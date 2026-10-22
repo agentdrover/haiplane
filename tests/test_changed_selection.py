@@ -54,6 +54,7 @@ def make_repo(tmp_path: Path, base: str = "develop", remote: bool = True) -> Pat
     write(root, "tests/test_other.py")
     write(root, "tests/test_gone.py")
     write(root, "data/ledger.json", "{}\n")
+    write(root, "data/old.json", "{}\n")
     write(root, "docs/note.md", "note\n")
     write(
         root,
@@ -78,13 +79,16 @@ def test_selection_by_diff(tmp_path: Path) -> None:
     write(root, "data/ledger.json", '{"k": 1}\n')  # read by tests/test_b.py
     write(root, "tests/test_с пробелом.py")  # new, untracked, space and Cyrillic
     (root / "tests/test_gone.py").unlink()  # deleted: nothing to run
+    (root / "data/old.json").unlink()  # deleted, but a test still reads its path
+    write(root, "tests/test_reads_old.py", 'PATH = "data/old.json"\n')
     git(root, "mv", "tests/test_other.py", "tests/test_renamed.py")  # delete + add
     write(root, "docs/other.md")  # read by nobody
 
     changed, warning = changed_tests.changed_files(root)
     assert warning == ""
-    assert "tests/test_gone.py" not in changed
-    assert "tests/test_other.py" not in changed
+    assert "data/old.json" in changed  # a deleted path is kept for the readers
+    assert "tests/test_gone.py" in changed  # ...and dropped from the run by select
+    assert "tests/test_other.py" in changed  # the old name of a rename: deleted
     assert "tests/test_с пробелом.py" in changed
     assert changed == sorted(changed)
 
@@ -94,6 +98,7 @@ def test_selection_by_diff(tmp_path: Path) -> None:
     assert chosen["tests/test_renamed.py"] == ["changed"]
     assert chosen["tests/test_guard.py"] == ["tree guard"]
     assert chosen["tests/test_b.py"] == ["reads data/ledger.json"]
+    assert chosen["tests/test_reads_old.py"] == ["changed", "reads data/old.json"]
     assert "tests/test_gone.py" not in chosen
     assert "tests/test_other.py" not in chosen
     assert "tests/test_nope.py" not in chosen  # a ledger entry with no file on disk
@@ -125,13 +130,14 @@ def test_missing_base_falls_back_to_guards_with_a_reason(
     write(root, "tests/test_with_changes.py")
     changed, warning = changed_tests.changed_files(root)
     assert "origin/develop" in warning
-    assert changed == ["tests/test_with_changes.py"]  # untracked still counts
+    assert changed == []  # no guess from the working tree: the guards only
 
     rc = changed_tests.main(["--root", str(root), "--dry-run"])
     captured = capsys.readouterr()
     assert rc == 0
     assert "origin/develop" in captured.err
     assert "tests/test_guard.py" in captured.out
+    assert "tests/test_with_changes.py" not in captured.out
 
 
 def test_n_switches_at_the_threshold(

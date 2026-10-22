@@ -466,7 +466,7 @@ def _recorded_base(repo: str) -> str:
 
 def pre_push_check(repo: str) -> str:
     """The command this clone runs before a push, or '' when it did not agree to one."""
-    rc, out = _git(repo, "config", "--get", PRE_PUSH_CHECK_KEY)
+    rc, out = _git(repo, "config", "--local", "--get", PRE_PUSH_CHECK_KEY)
     return out.strip() if rc == 0 else ""
 
 

@@ -254,3 +254,74 @@ def test_a_check_cannot_swallow_the_refs_git_sends(clone: Path, tmp_path: Path) 
     assert proc.returncode != 0
     assert "Blocked push from branch 'badname'" in proc.stderr
     assert runs(marker) == 1
+
+
+def test_a_global_config_cannot_switch_the_check_on(
+    clone: Path, tmp_path: Path
+) -> None:
+    """Only the clone's own config consents: a server-side clone reads the same global."""
+    marker = tmp_path / "marker"
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(f"[haiplane]\n\tprePushCheck = {marker_command(marker)}\n")
+    env = {"GIT_CONFIG_GLOBAL": str(global_config)}
+    proc = push(clone, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert runs(marker) == 0
+
+
+def test_a_multi_line_command_gets_a_cache_hit_only_for_itself(
+    clone: Path, tmp_path: Path
+) -> None:
+    marker = tmp_path / "marker"
+    first = f"sh -c 'echo ran >> {marker}\ntrue'"
+    git(clone, "config", KEY, first)
+    assert push(clone).returncode == 0
+    assert runs(marker) == 1
+    git(clone, "config", KEY, f"sh -c 'echo ran >> {marker}\ntrue\nfalse'")
+    git(clone, "commit", "-q", "--allow-empty", "-m", "same tree")
+    proc = push(clone)
+    assert "already passed" not in proc.stderr  # the other command is not a hit
+    assert runs(marker) == 2
+
+
+def test_another_comparison_base_is_another_question(
+    clone: Path, tmp_path: Path
+) -> None:
+    """A rebase onto another base keeps the tree but changes what the check selects."""
+    marker = tmp_path / "marker"
+    git(clone, "config", KEY, marker_command(marker))
+    assert push(clone).returncode == 0
+    assert runs(marker) == 1
+    git(clone, "checkout", "-q", "develop")
+    (clone / "moved.txt").write_text("the base moved\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-qm", "base moved")
+    git(clone, "push", "-q", "origin", "develop")  # origin/develop is a new commit
+    git(clone, "checkout", "-q", "task-1/x")
+    git(clone, "commit", "-q", "--allow-empty", "-m", "same tree, other base")
+    assert push(clone).returncode == 0
+    assert runs(marker) == 2
+
+
+def test_a_quoted_first_word_is_left_to_the_shell(clone: Path, tmp_path: Path) -> None:
+    """The tool lookup does not parse quotes: a quoted command still runs and still blocks."""
+    git(clone, "config", KEY, '"sh" -c "exit 7"')
+    proc = push(clone)
+    assert proc.returncode != 0
+    assert "rc=7" in proc.stderr
+
+
+def test_the_configured_base_and_release_branches_are_not_checked(
+    clone: Path, tmp_path: Path
+) -> None:
+    """``fix/integration`` as the project's base is a base branch, not a work branch."""
+    marker = tmp_path / "marker"
+    git(clone, "config", KEY, marker_command(marker, "exit 1"))
+    git(clone, "config", "haiplane.baseBranch", "fix/integration")
+    git(clone, "checkout", "-q", "-b", "fix/integration")
+    (clone / "integration.txt").write_text("x\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-qm", "integration")
+    proc = push(clone, "fix/integration")
+    assert proc.returncode == 0, proc.stderr
+    assert runs(marker) == 0

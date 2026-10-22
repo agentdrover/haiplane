@@ -19,8 +19,10 @@ decision, written down in the ledger. ``repo_checker`` entries are kept by hand.
 Forms the detector knows (the others are invisible to it, by design):
 
 * ``<anything>.rglob(...)`` and ``<anything>.glob(...)`` - a glob with any pattern;
-* ``os.walk(...)`` - NOT ``ast.walk(...)``, which walks a syntax tree;
-* ``subprocess.<run|check_output|Popen|check_call>([..., "ls-files" | "grep", ...])``.
+* ``os.walk(...)`` under any alias (``import os as fs``, ``from os import walk``) -
+  NOT ``ast.walk(...)``, which walks a syntax tree;
+* any call that is handed the word ``"ls-files"`` or ``"grep"`` as an argument,
+  directly or inside a list (``git("ls-files")``, ``run(["git", "grep", ...])``).
 """
 
 from __future__ import annotations
@@ -31,15 +33,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LEDGER = REPO_ROOT / "docs" / "agent-context" / "tree-guards.json"
-_SPAWN = {"run", "check_output", "Popen", "check_call"}
 _GIT_WORDS = {"ls-files", "grep"}
 CRITERIA = {"walks_tree", "repo_checker"}
 
 
 def tree_walkers(source: str) -> set[str]:
     """The forms of a file-tree walk found in ``source`` (empty = none)."""
+    tree = ast.parse(source)
+    os_names, walk_names = _os_aliases(tree)
     found: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
@@ -49,26 +52,40 @@ def tree_walkers(source: str) -> set[str]:
             elif (
                 func.attr == "walk"
                 and isinstance(func.value, ast.Name)
-                and func.value.id == "os"
+                and func.value.id in os_names
             ):
                 found.add("os.walk")
-            elif func.attr in _SPAWN and _names_git_listing(node):
-                found.add("git ls-files/grep")
-        elif (
-            isinstance(func, ast.Name)
-            and func.id in _SPAWN
-            and _names_git_listing(node)
-        ):
+        elif isinstance(func, ast.Name) and func.id in walk_names:
+            found.add("os.walk")
+        if _names_git_listing(node):
             found.add("git ls-files/grep")
     return found
 
 
+def _os_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Names bound to the ``os`` module and to ``os.walk`` (any alias)."""
+    os_names: set[str] = set()
+    walk_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            os_names |= {a.asname or a.name for a in node.names if a.name == "os"}
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            walk_names |= {a.asname or a.name for a in node.names if a.name == "walk"}
+    return os_names, walk_names
+
+
 def _names_git_listing(call: ast.Call) -> bool:
-    for arg in call.args:
-        if isinstance(arg, (ast.List, ast.Tuple)):
-            words = {e.value for e in arg.elts if isinstance(e, ast.Constant)}
-            if words & _GIT_WORDS:
-                return True
+    """A call that hands ``"ls-files"`` or ``"grep"`` over as an argument.
+
+    Direct (``git("ls-files")``, ``run(["git", "grep", ...])``) or inside a list:
+    the helper that wraps git does not matter, the word does. A candidate that is
+    not git at all is classified in the ledger as an exemption.
+    """
+    for arg in [*call.args, *(kw.value for kw in call.keywords)]:
+        elements = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
+        words = {e.value for e in elements if isinstance(e, ast.Constant)}
+        if words & _GIT_WORDS:
+            return True
     return False
 
 
@@ -142,6 +159,15 @@ def test_the_detector_tells_a_tree_walk_from_a_syntax_walk() -> None:
             'import subprocess\nsubprocess.run(["git", "ls-files"], check=True)\n'
         ),
     }
+    aliases = {
+        "import os as fs\nfs.walk('hub')\n": "os.walk",
+        "from os import walk\nwalk('hub')\n": "os.walk",
+        "from os import walk as w\nw('hub')\n": "os.walk",
+        "def go():\n    return git('ls-files')\n": "git ls-files/grep",
+        "helper(['git', 'grep', '-n', 'x'])\n": "git ls-files/grep",
+    }
+    for source, form in aliases.items():
+        assert form in tree_walkers(source), source
     for form, source in positive.items():
         assert form in tree_walkers(source), (form, source)
     assert not tree_walkers("import ast\nfor n in ast.walk(tree): pass\n")

@@ -574,7 +574,10 @@ def test_the_clone_path_arms_the_hook_itself():
 
 
 def test_the_hub_never_arms_the_pre_push_check(
-    clone: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    clone: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#2000: the hub pushes from clones on its own host, where a branch's code
     must not run. Arming a clone, recording its branch policy and a push through
@@ -590,6 +593,12 @@ def test_the_hub_never_arms_the_pre_push_check(
     git_policy.record_branch_policy(str(clone), "develop", "main")
     assert _git(clone, "config", "--get", git_policy.PRE_PUSH_CHECK_KEY).returncode != 0
     assert git_policy.pre_push_check(str(clone)) == ""
+    # A global config is not this clone's consent either.
+    glob = tmp_path / "global.gitconfig"
+    glob.write_text("[haiplane]\n\tprePushCheck = make check-fast\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(glob))
+    assert git_policy.pre_push_check(str(clone)) == ""
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL")
 
     _git(clone, "checkout", "-qb", "task-1/x")
     _git(clone, "commit", "-q", "--allow-empty", "-m", "x")

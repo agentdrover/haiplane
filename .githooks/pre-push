@@ -18,12 +18,17 @@ release_branch="$(git config --get haiplane.releaseBranch 2>/dev/null || true)"
 # config key (`make hooks` sets it). Presence of a Makefile or of a target is not
 # consent: the hub pushes task branches from clones on its own host, where the
 # code of a branch must not run, and the hub never writes this key.
-pre_push_check_command="$(git config --get haiplane.prePushCheck 2>/dev/null || true)"
+# --local: a global or system config must not switch this on for a clone that did
+# not agree (a server-side clone of the hub reads the same global config).
+pre_push_check_command="$(git config --local --get haiplane.prePushCheck 2>/dev/null || true)"
 
 pre_push_check() {
   check_ref="$1"
   check_oid="$2"
   [ -n "$pre_push_check_command" ] || return 0
+  case "$check_ref" in
+    "refs/heads/$base_branch"|"refs/heads/$release_branch") return 0 ;;
+  esac
   case "$check_ref" in
     refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*) ;;
     *) return 0 ;;
@@ -41,17 +46,30 @@ pre_push_check() {
     echo "WARNING: pre-push check NOT run for ${check_ref#refs/heads/}: the pushed commit is not the checked-out HEAD" >&2
     return 0
   fi
-  # shellcheck disable=SC2086
-  set -- $pre_push_check_command
-  check_tool="$1"
-  if ! command -v "$check_tool" >/dev/null 2>&1 ||
-     { [ "$check_tool" = "make" ] && ! command -v uv >/dev/null 2>&1; }; then
-    echo "WARNING: pre-push check NOT run: '$check_tool' (or uv) is not available here" >&2
-    return 0
-  fi
+  # The tool of a plain command is looked up here; a command that starts with a
+  # quote is left to the shell (its failure is the answer, and it blocks).
+  case "$pre_push_check_command" in
+    \"*|\'*) ;;
+    *)
+      set -f
+      # shellcheck disable=SC2086
+      set -- $pre_push_check_command
+      set +f
+      check_tool="$1"
+      if ! command -v "$check_tool" >/dev/null 2>&1 ||
+         { [ "$check_tool" = "make" ] && ! command -v uv >/dev/null 2>&1; }; then
+        echo "WARNING: pre-push check NOT run: '$check_tool' (or uv) is not available here" >&2
+        return 0
+      fi
+      ;;
+  esac
   check_tree="$(git rev-parse "$check_oid^{tree}")"
   cache_file="$(git rev-parse --git-path haiplane/prepush-ok 2>/dev/null || true)"
-  cache_key="$check_tree $base_branch $pre_push_check_command"
+  # One line whatever the command holds (a multi-line command would otherwise
+  # become several grep patterns): a hash of the tree, the commit it is compared
+  # with (a rebase onto another base changes the selection) and the command.
+  base_oid="$(git rev-parse --verify -q "origin/$base_branch" 2>/dev/null || true)"
+  cache_key="$(printf '%s\n%s\n%s\n' "$check_tree" "$base_oid" "$pre_push_check_command" | git hash-object --stdin)"
   check_clean=0
   if [ -z "$(git status --porcelain)" ]; then check_clean=1; fi
   if [ "$check_clean" = "1" ] && [ -n "$cache_file" ] && [ -f "$cache_file" ] &&

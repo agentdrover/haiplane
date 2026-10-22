@@ -55,23 +55,25 @@ def changed_files(root: Path) -> tuple[list[str], str]:
     """(changed paths relative to the root, a warning or '').
 
     Changed = the working tree against the merge-base with ``origin/<base>`` plus
-    the untracked files. A rename is a deletion plus a new file. Deleted files
-    are dropped (nothing to run or read). A missing base is not "no changes":
-    the working tree is then compared with HEAD and the warning says why.
+    the untracked files. A rename is a deletion plus a new file; a deleted path is
+    kept (a test that reads it is still worth running; ``select`` drops a deleted
+    test file from the run). When the diff cannot be had - no ``origin/<base>``, no
+    common ancestor, git failing - the answer is no changed paths and a warning
+    saying why: the selection is then the tree guards only, never a guess.
     """
     base = f"origin/{base_branch(root)}"
-    warning = ""
     rc, mb = _git(root, "merge-base", "HEAD", base)
     anchor = mb.decode().strip() if rc == 0 else ""
     if not anchor:
-        warning = f"no merge-base with {base}: comparing with HEAD only"
-        anchor = "HEAD"
+        return [], f"no merge-base with {base}: only the tree guards are selected"
     rc, out = _git(root, "diff", "--name-only", "-z", "--no-renames", anchor)
-    paths = set(_split_nul(out)) if rc == 0 else set()
+    if rc != 0:
+        return [], "git diff failed: only the tree guards are selected"
+    paths = set(_split_nul(out))
     rc, out = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    if rc == 0:
-        paths |= set(_split_nul(out))
-    return sorted(p for p in paths if (root / p).is_file()), warning
+    if rc != 0:
+        return [], "git ls-files failed: only the tree guards are selected"
+    return sorted(paths | set(_split_nul(out))), ""
 
 
 def guards(root: Path) -> list[str]:
@@ -104,7 +106,7 @@ def select(root: Path, changed: list[str]) -> dict[str, list[str]]:
     """Test file -> reasons, stable order."""
     chosen: dict[str, list[str]] = {}
     for path in changed:
-        if _is_test(path):
+        if _is_test(path) and (root / path).is_file():  # a deleted test: nothing to run
             chosen.setdefault(path, []).append("changed")
     for path in guards(root):
         chosen.setdefault(path, []).append("tree guard")
