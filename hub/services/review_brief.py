@@ -770,16 +770,37 @@ async def build_review_brief(
     if any(a.verifiable_by.value == "test" for a in ac_models):
         with timer.block("test_locators"):
             ctx = await services.project_git_context(db, task_id)
-            resolved = await resolve_locators_at_ref(
-                plugins.git_ops,
-                ctx.get("repo"),
-                ac_models,
-                submission_sha=task_view.submission_sha or "",
-                branch=task_view.branch or "",
-                base=diff_base.get("base")
-                or ctx.get("base_branch")
-                or config.PAIR_BASE_BRANCH,
-            )
+            try:
+                resolved = await resolve_locators_at_ref(
+                    plugins.git_ops,
+                    ctx.get("repo"),
+                    ac_models,
+                    submission_sha=task_view.submission_sha or "",
+                    branch=task_view.branch or "",
+                    base=diff_base.get("base")
+                    or ctx.get("base_branch")
+                    or config.PAIR_BASE_BRANCH,
+                )
+            except OSError as exc:
+                # #2002: git cannot even start in a missing cwd. "Not checked" is
+                # unknown, never a false "missing"; the brief still renders.
+                log.warning("locators for #%s: git could not run: %s", task_id, exc)
+                gone = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+                why = (
+                    "not checked: the project working directory was not found"
+                    if gone
+                    else f"not checked: git could not run ({type(exc).__name__})"
+                )
+                resolved = [
+                    {
+                        "ac_id": a.id,
+                        "locator": a.test_ref,
+                        "status": "unknown",
+                        "reason": why,
+                    }
+                    for a in ac_models
+                    if a.verifiable_by.value == "test"
+                ]
         locator_resolution = [ACLocatorResolution(**r) for r in resolved]
 
     # #572: does the branch still stand where the submission pinned it? Three

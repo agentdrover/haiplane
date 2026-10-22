@@ -34,8 +34,33 @@ def missing_workspace(tmp_path) -> str:
     return path
 
 
-async def _review_task(client: AsyncClient, db, workspace: str, slug: str) -> int:
+@pytest.fixture(params=[True, False], ids=["test-ac", "no-ac"])
+def with_ac(request) -> bool:
+    """Задача с критерием verifiable_by=test (активен блок локаторов) и без него."""
+    return bool(request.param)
+
+
+async def _review_task(
+    client: AsyncClient, db, workspace: str, slug: str, with_ac: bool = True
+) -> int:
     task_id = await _web_task_in_review(client)
+    if with_ac:
+        refined = await client.post(
+            f"/api/tasks/{task_id}/refine",
+            json={
+                "acceptance_criteria": [
+                    {
+                        "id": "AC-1",
+                        "given": "workspace отсутствует",
+                        "when": "открыта карточка",
+                        "then": "карточка открывается",
+                        "verifiable_by": "test",
+                        "test_ref": "tests/test_card_without_workspace.py::test_x",
+                    }
+                ]
+            },
+        )
+        assert refined.status_code == 200, refined.text
     project_id = await repo.create_project(
         db,
         slug=slug,
@@ -65,11 +90,15 @@ async def _status(client: AsyncClient, task_id: int) -> str:
 
 
 async def test_review_card_renders_without_a_workspace(
-    client: AsyncClient, db, missing_workspace, caplog, monkeypatch
+    client: AsyncClient, db, missing_workspace, caplog, monkeypatch, with_ac
 ):
     caplog.set_level(logging.INFO, logger="hub")
-    approve_id = await _review_task(client, db, missing_workspace, "gone-approve")
-    return_id = await _review_task(client, db, missing_workspace, "gone-return")
+    approve_id = await _review_task(
+        client, db, missing_workspace, "gone-approve", with_ac
+    )
+    return_id = await _review_task(
+        client, db, missing_workspace, "gone-return", with_ac
+    )
     _real_git(monkeypatch)
 
     card = await client.get(f"/tasks/{approve_id}")
@@ -79,6 +108,7 @@ async def test_review_card_renders_without_a_workspace(
     assert fragment.status_code == 200, fragment.text[:400]
     assert UNAVAILABLE in fragment.text
     assert UNAVAILABLE in card.text, "карта изменений на карточке называет причину"
+    assert "бриф не собран" not in card.text, "блок доказательств собран"
     assert "Дифф не показан" not in fragment.text, "надпись не дублируется префиксом"
     for page in (card.text, fragment.text):
         assert "workspace-marker-2002" not in page
@@ -106,9 +136,9 @@ async def test_review_card_renders_without_a_workspace(
 
 
 async def test_other_diff_readers_survive_a_missing_workspace(
-    client: AsyncClient, db, missing_workspace, monkeypatch
+    client: AsyncClient, db, missing_workspace, monkeypatch, with_ac
 ):
-    task_id = await _review_task(client, db, missing_workspace, "gone-readers")
+    task_id = await _review_task(client, db, missing_workspace, "gone-readers", with_ac)
     _real_git(monkeypatch)
 
     brief = await client.get(f"/api/tasks/{task_id}/review-brief")
@@ -118,6 +148,10 @@ async def test_other_diff_readers_survive_a_missing_workspace(
     assert brief.status_code == 200, brief.text[:400]
     assert queue.status_code == 200, queue.text[:400]
     assert prod_state.status_code == 200, prod_state.text[:400]
+    if with_ac:
+        rows = brief.json()["locator_resolution"]
+        assert [r["status"] for r in rows] == ["unknown"]
+        assert "working directory was not found" in rows[0]["reason"]
     for body in (brief.text, queue.text):
         assert "workspace-marker-2002" not in body
         assert "gone-2002" not in body
