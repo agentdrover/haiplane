@@ -459,3 +459,41 @@ async def test_a_foreign_file_under_the_sender_name_is_left_alone(
 
     assert _show(origin, "main", SENDER) == {"name": "theirs", True: ["push"]}
     assert _tree(origin, "develop") == []
+
+
+async def test_a_sender_that_listens_to_another_workflow_is_not_ours(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """Template-made but `workflows: [Existing tests]`: foreign, nothing is added."""
+    from hub.services import satellite_ci
+
+    work, origin = _repo_pair(tmp_path)
+    _git(work, "checkout", "main")
+    (work / WORKFLOWS).mkdir(parents=True)
+    other = satellite_ci.render_sender("Existing tests", f"{WORKFLOWS}/{PRODUCER}")
+    (work / WORKFLOWS / SENDER).write_text(other, "utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "sender of another workflow")
+    _git(work, "push", "origin", "main")
+    _git(work, "checkout", "develop")
+    project_id = await repo.create_project(db, slug="ext5", name="Ext5")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext5",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+
+    result = await services.provision_project(db, project_id)
+
+    assert "none added" in result["provision_detail"]
+    assert _show(origin, "main", SENDER)[True]["workflow_run"]["workflows"] == [
+        "Existing tests"
+    ]
+    assert _tree(origin, "develop") == []

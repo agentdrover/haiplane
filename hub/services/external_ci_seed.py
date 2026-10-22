@@ -109,17 +109,17 @@ def _push_to_default(workspace: str, default: str, sender: str) -> SeedResult:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-#: First line of the sender template: the mark of a file the hub itself wrote.
-SENDER_MARK = "# Haiplane Hub: the TRUSTED half of a satellite's CI report"
-
-
 def _is_our_sender(tree: str, path: str) -> bool:
-    """The hub's own sender (owned name AND the template's mark), not somebody's CI."""
+    """The hub's own sender: the owned name AND byte-for-byte the current render.
+
+    Anything else under that name (another ``workflows:``, a copied header) is
+    somebody's file and is left alone.
+    """
     if os.path.basename(path) != brand.SEEDED_CI_REPORT:
         return False
     try:
-        with open(os.path.join(tree, path), encoding="utf-8") as handle:
-            return handle.readline().startswith(SENDER_MARK)
+        with open(os.path.join(tree, path), encoding="utf-8", newline="") as handle:
+            return handle.read() == _sender()
     except OSError:
         return False
 
