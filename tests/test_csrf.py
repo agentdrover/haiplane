@@ -29,6 +29,7 @@ from starlette.routing import Mount, Route
 from hub import brand, config
 from hub.config import TokenIdentity
 from hub.services import admin as admin_svc
+from tests import csrf_origin_support as support
 
 HUB_URL = "https://hub.example.test"
 ENV_TOKEN = "env-human-token"  # pragma: allowlist secret
@@ -945,3 +946,26 @@ async def test_a_failing_event_write_does_not_refuse_the_request(world, monkeypa
         "/__csrf_echo", headers={**_cookie(world.session_a), **world.own}
     )
     assert resp.status_code == 200, resp.text
+
+
+# #1994: HAIPLANE_HUB_EXTRA_ORIGINS. Bodies live in tests/csrf_origin_support.py.
+
+
+@pytest.mark.asyncio
+async def test_extra_public_origins_are_trusted_and_nothing_else(world, monkeypatch):
+    await support.extra_origins_trusted_and_nothing_else(world, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_bad_extra_origins_never_widen_trust(world, monkeypatch):
+    await support.bad_extra_origins_never_widen_trust(world, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_require_mode_logs_the_refusal_reason(world, monkeypatch):
+    await support.require_mode_logs_the_refusal_reason(world, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_second_domain_full_browser_flow(world, monkeypatch):
+    await support.second_domain_full_browser_flow(world, monkeypatch)

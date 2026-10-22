@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{# #1995: отказ web-кнопки без карточки задачи в пути. #}
+{% block title %}Действие не выполнено — {{ product_title }}{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Действие не выполнено</h1>
+</header>
+<div class="task-action-note task-action-note--warning" role="alert" data-reason="web_refusal">{{ message }}</div>
+<p><a class="btn btn-secondary" href="{{ back }}">Назад</a></p>
+{% endblock %}
