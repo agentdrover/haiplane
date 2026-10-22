@@ -12,11 +12,12 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
     {# #1664: a refused HTMX request answers 403 with HX-Retarget; htmx drops
-       4xx bodies by default, and then the operator would see nothing. #}
+       4xx bodies by default, and then the operator would see nothing.
+       #1995: web-кнопки отвечают так же на 400/409/422. #}
     <script>
     document.addEventListener("htmx:beforeSwap", function (e) {
         var xhr = e.detail.xhr;
-        if (xhr && xhr.status === 403 && xhr.getResponseHeader("HX-Retarget")) {
+        if (xhr && [400, 403, 409, 422].indexOf(xhr.status) >= 0 && xhr.getResponseHeader("HX-Retarget")) {
             e.detail.shouldSwap = true;
             e.detail.isError = false;
         }
@@ -37,6 +38,12 @@
             return sel.options.length ? 0 : -1;
         }
         function dirty(el) {
+            // #1995: ввод, возвращённый формой после отказа, стал defaultValue;
+            // без этой метки автообновление стёрло бы его пустой формой.
+            if (el.hasAttribute("data-hub-restored")) {
+                if (el.tagName === "SELECT" || el.type === "checkbox" || el.type === "radio") { return true; }
+                return el.value !== "";
+            }
             if (el.tagName === "SELECT") {
                 if (el.multiple) {
                     return Array.prototype.some.call(el.options, function (o) { return o.selected !== o.defaultSelected; });

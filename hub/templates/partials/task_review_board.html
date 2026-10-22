@@ -13,7 +13,7 @@
    task.status == review and no machine review is in flight. #}
 
 {% if implementer_error %}
-<div class="task-action-note task-action-note--warning">{{ implementer_error }}</div>
+<div class="task-action-note task-action-note--warning" role="alert">{{ implementer_error }}</div>
 {% endif %}
 {% if implementer_code %}
 <div class="task-action-stack">
@@ -770,7 +770,7 @@
            отклоняет. Повтор законен, когда дефект не починен, —
            тогда ревьюер отмечает это здесь и отправляет снова. #}
         <label class="task-action-label" for="review-ack-repeat">
-            <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1">
+            <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1"{% if form_values.get('acknowledge_repeat') %} checked data-hub-restored{% endif %}>
             повторяю прошлый вердикт намеренно
         </label>
         {# #1207: две кнопки — одна пара, одного размера, рядом. Раньше
