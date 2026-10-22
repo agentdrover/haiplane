@@ -51,7 +51,11 @@ HTMX_SHA384 = (
     "1c67f3b687e8b5fb21705efef27e382502f6a099"  # pragma: allowlist secret
     "a8c150a13d3838f12fa3bd9a33b4f7efc03efd382fcb4ed1ba74ca7e"  # pragma: allowlist secret
 )
-HTMX_URL_GLOB = f"https://unpkg.com/htmx.org@{HTMX_VERSION}*"
+# Перехватывается весь unpkg: запрос HTMX закреплённой версии (с /dist и без)
+# получает файл из репозитория, любой другой — отказ. Так промах шаблона не
+# уходит молча в сеть, а роняет test_htmx_is_loaded_on_the_card.
+UNPKG_GLOB = "https://unpkg.com/**"
+HTMX_URL_PREFIX = f"https://unpkg.com/htmx.org@{HTMX_VERSION}"
 
 
 def htmx_bytes() -> bytes:
@@ -480,12 +484,20 @@ def context(
     ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
     try:
         body = htmx_bytes()
-        ctx.route(
-            HTMX_URL_GLOB,
-            lambda route: route.fulfill(
-                status=200, body=body, content_type="application/javascript"
-            ),
-        )
+        served: list[str] = []
+
+        def serve_htmx(route: Any) -> None:
+            url = route.request.url
+            if url == HTMX_URL_PREFIX or url.startswith(HTMX_URL_PREFIX + "/"):
+                served.append(url)
+                route.fulfill(
+                    status=200, body=body, content_type="application/javascript"
+                )
+            else:
+                route.abort()
+
+        ctx.route(UNPKG_GLOB, serve_htmx)
+        ctx.htmx_served = served
         ctx.add_cookies(
             [{"name": stand.cookie_name, "value": stand.session, "url": stand.url}]
         )

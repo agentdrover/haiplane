@@ -42,6 +42,7 @@ def test_htmx_is_loaded_on_the_card(page: Any, stand: Stand) -> None:
         raise AssertionError(
             "HTMX не загрузился: подмена unpkg на tests/gui/vendor не сработала"
         ) from exc
+    assert page.context.htmx_served, "HTMX пришёл не из tests/gui/vendor"
 
 
 def test_return_to_work_from_review_with_cyrillic_reason(
