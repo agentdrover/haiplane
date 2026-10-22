@@ -146,8 +146,35 @@ def _json_refusal(status: int, detail: Any) -> Response:
     )
 
 
+def _accept_qualities(header: str) -> dict[str, float]:
+    """Медиатип -> q из Accept; битый q считается единицей, q=0 — «нельзя»."""
+    found: dict[str, float] = {}
+    for item in header.lower().split(","):
+        media, *params = (part.strip() for part in item.split(";"))
+        if not media:
+            continue
+        q = 1.0
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip() == "q":
+                try:
+                    q = max(0.0, min(1.0, float(value)))
+                except ValueError:
+                    q = 1.0
+        found[media] = max(q, found.get(media, 0.0))
+    return found
+
+
 def _wants_html(request: Request) -> bool:
-    return "text/html" in request.headers.get("accept", "").lower()
+    """HTML — если text/html названа явно, не запрещена (q=0) и не хуже JSON.
+
+    ``*/*`` HTML не выбирает: curl и скрипты без явного text/html получают
+    прежний JSON. JSON берёт q из явной записи, иначе из ``*/*``.
+    """
+    q = _accept_qualities(request.headers.get("accept", ""))
+    html_q = q.get("text/html", q.get("text/*", 0.0))
+    json_q = q.get("application/json", q.get("application/*", q.get("*/*", 0.0)))
+    return html_q > 0 and html_q >= json_q
 
 
 async def refusal_response(

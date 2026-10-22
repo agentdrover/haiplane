@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import logging
 
+import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
 
@@ -218,3 +219,66 @@ async def test_reason_validation_kind_is_logged(client: AsyncClient, db, caplog)
     area = page[page.index('id="task-return-reason"') :]
     tag = area[: area.index(">")]
     assert 'maxlength="5000"' in tag, tag
+
+
+async def test_accept_header_quality_decides_html_or_json(client: AsyncClient, db):
+    """Accept читается с q: q=0 — отказ от типа, HTML не хуже JSON — страница."""
+    task_id = await _open_task(client)
+    url = f"/tasks/{task_id}/web-return-to-work"
+    cases = [
+        ("application/json, text/html;q=0", "json"),
+        ("text/html;q=0.5, application/json", "json"),
+        ("text/html, application/json", "html"),
+        ("text/html,application/xhtml+xml,*/*;q=0.8", "html"),
+        ("text/html;q=bad", "html"),
+        ("*/*", "json"),
+        ("", "json"),
+    ]
+    for accept, want in cases:
+        resp = await client.post(url, data={"reason": "x"}, headers={"Accept": accept})
+        assert resp.status_code == 400, (accept, resp.text)
+        kind = (
+            "html" if resp.headers["content-type"].startswith("text/html") else "json"
+        )
+        assert kind == want, (accept, resp.headers["content-type"])
+
+
+@pytest.mark.parametrize(
+    "state, route, fields, patched",
+    [
+        (
+            "needs_decision",
+            "web-decide",
+            {
+                "action": "bogus",
+                "decision_summary": "<b>итог</b>",
+                "instructions": "<i>фикс</i>",
+            },
+            None,
+        ),
+        ("needs_info", "web-answer", {"answer": "<b>ответ</b>"}, "answer_question"),
+        ("draft", "web-reject", {"comment": "<b>причина</b>"}, "reject_task"),
+        ("open", "web-message", {"body": "<b>привет</b>"}, "send_message"),
+        ("review", "web-message", {"body": "<b>привет</b>"}, "send_message"),
+    ],
+)
+async def test_refused_card_forms_keep_the_typed_text(
+    client: AsyncClient, db, monkeypatch, state, route, fields, patched
+):
+    """Отказ не стирает ввод в форме карточки, и ввод экранирован."""
+    task_id = await _open_task(client)
+    await repo.update_task(db, task_id, status=state)
+    await db.commit()
+    if patched:
+
+        async def _refuse(*_a, **_k):
+            raise HTTPException(409, "отказ сервиса")
+
+        monkeypatch.setattr(web.services, patched, _refuse)
+    resp = await client.post(f"/tasks/{task_id}/{route}", data=fields, headers=BROWSER)
+    assert resp.status_code in (400, 409), resp.text
+    assert f"/tasks/{task_id}/{route}" in resp.text, "форма осталась"
+    for value in fields.values():
+        if "<" in value:
+            assert value not in resp.text, "ввод не экранирован"
+            assert value.replace("<", "&lt;").replace(">", "&gt;") in resp.text
