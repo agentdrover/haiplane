@@ -190,8 +190,6 @@ async def _escalate(
     pr_num = snap.get("pr_number")
     if not await _pass_is_live(db, snap, key):
         return False  # завершена, возвращена, сдана заново, PR или закрепление ушли
-    if _merge_in_gate_memory(key[0], int(pr_num or 0)):
-        return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
     if await _delivery_moved_on(db, key, int(pr_num or 0)):
         await journal.close_open(db, *key)
         return False  # доставлено соседним путём: переводить нечего
@@ -200,6 +198,11 @@ async def _escalate(
     hours = await wait_hours(db, key[0])
     if hours is None or not await journal.is_overdue(db, *key, hours):
         return False  # срок сменился или не читается: решения нет
+    # Память гейта - словарь процесса, лок SQLite её не защищает. Проверка стоит
+    # последней и без await до условного UPDATE перехода: окно остаётся только
+    # между этим UPDATE и записью статуса (известная граница, как у #1956).
+    if _merge_in_gate_memory(key[0], int(pr_num or 0)):
+        return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(
