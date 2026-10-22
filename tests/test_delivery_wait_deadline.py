@@ -356,3 +356,108 @@ async def test_repeated_passes_do_not_extend_the_clock(db, monkeypatch):
     await db.commit()
 
     assert (await _pass(db, task_id))["status"] == "needs_decision"
+
+
+# --- Находки независимого Codex (круг 2) -----------------------------------
+
+
+def _stuck_after(neighbour):
+    """Гейт отвечает base_fetch_pending, а сосед пишет своё посреди прохода."""
+
+    async def gate(db_, task_):
+        await neighbour(db_, int(task_["id"]), int(task_["submission_generation"]))
+        await db_.commit()
+        return False, f"{PREFIX}: свежую базу получить не удалось (x)"
+
+    return gate
+
+
+async def _aged_wait(db, monkeypatch, neighbour) -> int:
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    monkeypatch.setattr(services, "merge_before_completion", _stuck_after(neighbour))
+    return task_id
+
+
+async def test_a_merge_recorded_mid_pass_is_not_an_escalation(db, monkeypatch):
+    async def merge(db_, task_id, gen):
+        await db_.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+            "VALUES (1, 360, ?, 'neighbour')",
+            (task_id,),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, merge)
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] != "needs_decision"
+    assert await _needs_decision_events(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 0
+
+
+async def test_a_live_rerun_booking_is_not_an_escalation(db, monkeypatch):
+    async def booking(db_, task_id, gen):
+        await db_.execute(
+            "INSERT INTO delivery_reruns (task_id, submission_generation, "
+            "pr_number, state) VALUES (?, ?, 360, 'reserved')",
+            (task_id, gen),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, booking)
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 0
+
+
+async def test_a_stale_snapshot_neither_closes_nor_opens_the_live_wait(db, monkeypatch):
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    stale = dict(await repo.get_task(db, task_id))  # поколение 1
+    await _pass(db, task_id)
+    await services.submit_for_review(db, task_id)  # поколение 2
+    await repo.update_task(db, task_id, submission_sha="c" * 40)
+    await db.commit()
+    await services.record_review_verdict(
+        db, task_id, TaskReviewVerdict(verdict="approved", agent="reviewer")
+    )
+    await _pass(db, task_id)  # ожидание поколения 2 открыто
+    await _age(db, task_id, 5)
+    before = await db.execute_fetchall(
+        "SELECT started_at FROM delivery_wait_deadlines WHERE state='open'"
+    )
+
+    # Старый проход прошлого поколения: иная причина не закрывает чужой таймер...
+    assert await delivery_wait.settle(db, stale, "ci_pending: x", 360) is False
+    # ...а его base_fetch_pending не открывает и не двигает ожидание по живому ключу.
+    assert await delivery_wait.settle(db, stale, f"{PREFIX}: x", 360) is False
+
+    after = await db.execute_fetchall(
+        "SELECT started_at FROM delivery_wait_deadlines WHERE state='open'"
+    )
+    assert [dict(r) for r in after] == [dict(r) for r in before]
+    assert len(after) == 1
+
+
+async def test_an_escalated_wait_is_terminal_for_its_key(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    assert (await _pass(db, task_id))["status"] == "needs_decision"
+
+    # Владелец вернул задачу в running; ключ (поколение, ревизия) тот же.
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    for _ in range(3):
+        assert (await _pass(db, task_id))["status"] == "running"
+    await db.execute(
+        "UPDATE delivery_wait_deadlines SET started_at = '2000-01-01 00:00:00'"
+    )
+    await db.commit()
+    for _ in range(2):
+        await _pass(db, task_id)
+
+    assert await _needs_decision_events(db, task_id) == 1
