@@ -33,3 +33,18 @@ def release(key: tuple[int, int]) -> None:
 def held(key: tuple[int, int]) -> bool:
     """Идёт ли перевод по этой задаче и PR."""
     return key in _held
+
+
+def refuses(
+    key: tuple[int, int], snapshot: dict[str, object], row: dict[str, object]
+) -> bool:
+    """Мерж не стартует: перевод идёт, либо проход начат до перевода и задача ушла.
+
+    Второе - проход со снимком ``running``, а живая строка уже ``needs_decision``:
+    его проверки (CI, база, одобрение) относились к задаче в работе, а перевод
+    по сроку состоялся и зафиксирован. Проход с СВЕЖИМ снимком (явная доставка по
+    решению человека: decide, deliver, реестр, автоповтор) этим не блокируется.
+    """
+    return held(key) or (
+        snapshot.get("status") == "running" and row.get("status") == "needs_decision"
+    )
