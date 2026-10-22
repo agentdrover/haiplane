@@ -401,6 +401,7 @@ async def _double_clean(
     refusal: tuple[str, str],
     *,
     late: bool,
+    statement: str | None = None,
 ) -> tuple[str, str] | None:
     """Исключение «двойной чистоты» (#1986): None - потолок не возражает.
 
@@ -421,6 +422,7 @@ async def _double_clean(
         worst,
         early=(slot or {}).get("early"),
         late=late,
+        statement=statement,
     )
     if not decision.enabled:
         return refusal
@@ -435,7 +437,10 @@ async def _double_clean(
 
 
 async def ceiling_refusals(
-    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
+    db: aiosqlite.Connection,
+    task_id: int,
+    packet: EvidencePacket,
+    statement: str | None = None,
 ) -> list[tuple[str, str]]:
     """Потолок approve стюарда проекта; политика перечитывается здесь (#1855)."""
     fact = packet.facts.get("risk_class")
@@ -447,7 +452,14 @@ async def ceiling_refusals(
     refusal = class_ceiling_refusal(ceiling, fact)
     if refusal is not None and ceiling is not None:
         refusal = await _double_clean(
-            db, task_id, packet.generation, ceiling, fact, refusal, late=False
+            db,
+            task_id,
+            packet.generation,
+            ceiling,
+            fact,
+            refusal,
+            late=False,
+            statement=statement,
         )
     return [refusal] if refusal else []
 
@@ -1039,6 +1051,10 @@ async def apply_refusals(
     if mode:
         return [mode]
     not_delegated = await policy_refusal(db, task_id)
+    # #1986: отпечаток постановки снимается ДО сборки пакета (см. evaluate).
+    from hub.services.steward_double_clean import statement_digest
+
+    statement = await statement_digest(db, task_id)
     packet = await build_evidence_packet(db, task_id, generation)
     if packet is None:
         return [(REFUSED_PRECONDITION, f"задачи #{task_id} нет")]
@@ -1051,7 +1067,7 @@ async def apply_refusals(
     out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(await integrity_refusals(db, task_id))
     out.extend(precondition_refusals(packet))
-    out.extend(await ceiling_refusals(db, task_id, packet))
+    out.extend(await ceiling_refusals(db, task_id, packet, statement))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)

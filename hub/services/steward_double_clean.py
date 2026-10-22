@@ -379,7 +379,7 @@ async def _advisor(
     return []
 
 
-async def _statement(db: aiosqlite.Connection, task_id: int) -> str:
+async def statement_digest(db: aiosqlite.Connection, task_id: int) -> str:
     """Отпечаток постановки, о которой судили и согласились (только база).
 
     Те же поля, что хеш пакета берёт из брифа (``PACKET_HASH_BRIEF_FIELDS``).
@@ -421,6 +421,7 @@ async def evaluate(
     *,
     early: dict[str, Any] | None = None,
     late: bool = False,
+    statement: str | None = None,
 ) -> Decision:
     """Решение по исключению. Читает только базу (без сети), тем же соединением.
 
@@ -451,7 +452,9 @@ async def evaluate(
     attempt, ci_unmet = await _ci(db, task_id, sha)
     unmet += ci_unmet + await _advisor(db, task_id, generation)
     audit = _audit(settings, worst, generation, sha, main, extra, attempt)
-    audit["statement"] = await _statement(db, task_id)
+    # Ранний этап получает отпечаток, снятый ДО сборки пакета: правка после
+    # сборки не станет «прежней» для обоих этапов сразу.
+    audit["statement"] = statement or await statement_digest(db, task_id)
     if late:
         unmet += (
             _drift(early, audit)
