@@ -83,8 +83,8 @@
     },
     {
       "path": "hub/services/lifecycle.py",
-      "measured": 6693,
-      "max": 7028,
+      "measured": 7027,
+      "max": 7379,
       "removed_by": "unclaimed"
     },
     {
