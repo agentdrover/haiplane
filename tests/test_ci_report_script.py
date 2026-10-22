@@ -1773,7 +1773,8 @@ def test_timing_unavailable_when_jobs_cannot_be_read(trusted, tmp_path, capsys):
     assert _run(trusted, tmp_path, _finished(), down, posts) == 0
     (body,) = _timing(posts)
     assert body["state"] == "timing_unavailable" and body["jobs"] == []
-    assert "rate limited" in body["reason"]
+    # #1988: the type of the failure, never the text of the exception.
+    assert "URLError" in body["reason"] and "rate limited" not in body["reason"]
     assert body["completed_at"] == "2026-10-15T10:31:12Z"
     assert "timing_unavailable" in capsys.readouterr().out
     assert len([p for p in posts if p[0].endswith("/ci-run-report")]) == 1, (
