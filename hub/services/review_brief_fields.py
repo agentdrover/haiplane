@@ -93,6 +93,11 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "machine_review.submitted_by": (MANDATORY, ""),
     "machine_review.self_reviewed": (MANDATORY, ""),
     "machine_review.principal_id": (MANDATORY, ""),
+    "machine_review.reviewed_sha": (
+        FULL_ONLY,
+        "audit detail (#1985): the decision is pin_verified; the sha is in full",
+    ),
+    "machine_review.pin_verified": (MANDATORY, ""),
     "machine_review.ci_integrity_verdict": (MANDATORY, ""),
     "machine_review.ci_integrity_explanation": (MANDATORY, ""),
     "machine_review.dispositions": (MANDATORY, ""),

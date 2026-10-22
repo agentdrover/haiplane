@@ -80,6 +80,9 @@ FAILED_OUTCOMES: Final[tuple[str, ...]] = ("rescued", "failed")
 _SNAPSHOT_SQL: Final[str] = """
 SELECT o.id AS order_id, o.task_id, o.state, o.generation, o.report_outcome,
        o.report_reason_code, o.statement_generation AS order_statement_generation,
+       o.close_reason, o.closed_at,
+       t.review_verdict, t.review_verdict_generation, t.review_verdict_revision,
+       t.review_findings,
        t.statement_generation AS task_statement_generation,
        o.host, o.waiting_since, o.last_seen_at, o.need_mib, o.free_mib,
        t.status, t.archived, t.claimed_by, t.claim_session_id,
@@ -110,8 +113,8 @@ async def _read_snapshot(
     return dict(rows[0]) if rows else None
 
 
-def _quiet(snap: dict[str, Any]) -> bool:
-    """В задаче после неудачного прогона ничего не произошло."""
+def idle(snap: dict[str, Any]) -> bool:
+    """Задача открыта и свободна: нет держателя, живой сессии и живого прогона."""
     return (
         snap["status"] == "open"
         and not snap["archived"]
@@ -120,9 +123,15 @@ def _quiet(snap: dict[str, Any]) -> bool:
         and snap["implementer_principal_id"] is None
         and not snap["live_session"]
         and not snap["live_run"]
-        # Каноническая сдача сильнее report failed/rescued: поколение дошло до
-        # заказного (заказ создаётся на поколение сдачи + 1).
-        and int(snap["submission_generation"] or 0) < int(snap["generation"])
+    )
+
+
+def _quiet(snap: dict[str, Any]) -> bool:
+    """В задаче после неудачного прогона ничего не произошло."""
+    # Каноническая сдача сильнее report failed/rescued: поколение дошло до
+    # заказного (заказ создаётся на поколение сдачи + 1).
+    return idle(snap) and int(snap["submission_generation"] or 0) < int(
+        snap["generation"]
     )
 
 
@@ -173,6 +182,8 @@ ACTION_REFINE_AND_RETRY: Final[str] = "refine_hints_and_retry"
 ACTION_RETRY_ONCE: Final[str] = "retry_once"
 ACTION_REWRITE_OR_SPLIT: Final[str] = "rewrite_or_split"
 ACTION_TO_OWNER: Final[str] = "to_owner"
+#: Второй вход (#1947): задача вернулась с ревью, ВМ можно будить на доработку.
+ACTION_REWORK_ON_HOST: Final[str] = "rework_on_host"
 RETRY_ACTIONS: Final[tuple[str, ...]] = (
     ACTION_RETRY_AFTER_STATUS,
     ACTION_REFINE_AND_RETRY,
@@ -186,6 +197,10 @@ ACTION_TEXT: Final[dict[str, str]] = {
         "переписать AC/scope или разделить задачу; повторять только после нового DoR"
     ),
     ACTION_TO_OWNER: "решить владельцу",
+    ACTION_REWORK_ON_HOST: (
+        "разбудить ВМ на доработку по находкам (если ВМ уже удалена по 48 ч - "
+        "новый прогон)"
+    ),
 }
 
 #: Не больше двух рекомендаций «повтор» на задачу за скользящие 24 часа: третья
@@ -375,19 +390,28 @@ async def recommend_safely(
     Report хоста важнее рекомендации: если разбор упал, итог прогона всё равно
     сохранён, а свип добирает рекомендацию позже.
     """
-    await db.execute(f"SAVEPOINT {_SAVEPOINT}")
+    return await guarded(
+        db, _SAVEPOINT, recommend_for_order(db, order_id), f"order #{order_id}"
+    )
+
+
+async def guarded(
+    db: aiosqlite.Connection, point: str, work: Any, what: str
+) -> dict[str, Any] | None:
+    """Выполнить ``work`` (корутину записи) под SAVEPOINT ``point``; сбой - ``None``."""
+    await db.execute(f"SAVEPOINT {point}")
     try:
-        result = await recommend_for_order(db, order_id)
+        result = await work
     except BaseException as exc:
         # Отмена тоже откатывает точку: иначе владелец транзакции, поймавший её и
         # закоммитивший, сохранил бы рекомендацию и событие без записи ленты.
-        await db.execute(f"ROLLBACK TO {_SAVEPOINT}")
-        await db.execute(f"RELEASE {_SAVEPOINT}")
+        await db.execute(f"ROLLBACK TO {point}")
+        await db.execute(f"RELEASE {point}")
         if not isinstance(exc, Exception):
             raise
-        log.exception("executor triage #%s failed", order_id)
+        log.exception("executor triage %s failed", what)
         return None
-    await db.execute(f"RELEASE {_SAVEPOINT}")
+    await db.execute(f"RELEASE {point}")
     return result
 
 
@@ -413,6 +437,7 @@ MATCHING: Final[dict[str, frozenset[str]]] = {
     ACTION_REFINE_AND_RETRY: frozenset({"new_order"}),
     ACTION_REWRITE_OR_SPLIT: frozenset({"statement_changed"}),
     ACTION_TO_OWNER: frozenset({"statement_changed"}),
+    ACTION_REWORK_ON_HOST: frozenset({"new_order"}),
 }
 
 _PENDING_SQL: Final[str] = """
@@ -474,9 +499,22 @@ def _later_order_event(f: dict[str, Any], later: Any) -> list[tuple[str, str]]:
     """Заказ после рекомендации; поколение постановки записано в самом заказе."""
     if later is None:
         return []
-    ordered, retry = f["order_sg"], f["action"] in RETRY_ACTIONS
+    ordered = f["order_sg"]
+    # Для «повтора» и «доработки» заказ после правки постановки - всё равно заказ.
+    retry = f["action"] in RETRY_ACTIONS or f["action"] == ACTION_REWORK_ON_HOST
     bumped = ordered is not None and later[1] is not None and later[1] > ordered
     return [(later[0], "statement_changed" if bumped and not retry else "new_order")]
+
+
+def _submission_floor(f: dict[str, Any]) -> int:
+    """Поколение, с которого сдача - исход рекомендации.
+
+    Для неудачного прогона это поколение заказа. «Доработка» рекомендована ПОСЛЕ
+    сдачи заказа, поэтому сама эта сдача (и её вердикт) исходом не считается: нужна
+    следующая.
+    """
+    base = int(f["order_generation"])
+    return base + 1 if f["action"] == ACTION_REWORK_ON_HOST else base
 
 
 async def _durable_events(
@@ -485,9 +523,8 @@ async def _durable_events(
     task_id = int(f["task_id"])
     later = await fetchall(db, _LATER_ORDER_SQL, (task_id, int(f["order_id"])))
     found = _later_order_event(f, later[0] if later else None)
-    sub = (await fetchall(db, _SUBMISSION_SQL, (task_id, int(f["order_generation"]))))[
-        0
-    ][0]
+    floor = _submission_floor(f)
+    sub = (await fetchall(db, _SUBMISSION_SQL, (task_id, floor)))[0][0]
     if sub:
         found.append((sub, "submitted"))
     return found
@@ -508,7 +545,7 @@ async def _only_swept(db: aiosqlite.Connection, f: dict[str, Any]) -> bool:
     args = (int(f["task_id"]), int(f["child_floor"]))
     if await fetchall(db, _CHILD_SQL, args):
         return True
-    return int(f["submission_generation"] or 0) >= int(f["order_generation"])
+    return int(f["submission_generation"] or 0) >= _submission_floor(f)
 
 
 async def _followup_events(
@@ -604,6 +641,9 @@ async def sweep(db: aiosqlite.Connection) -> dict[str, int]:
     """Проход поллера: добрать пропущенные рекомендации и разобрать готовые."""
     async with write_transaction(db):
         created = await _recover_missing(db)
+        from hub.services import executor_triage_rework
+
+        created += await executor_triage_rework.recover_missing(db)
         resolved = await _resolve_pending(db)
     return {"created": created, "resolved": resolved}
 
