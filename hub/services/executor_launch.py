@@ -1057,7 +1057,10 @@ async def repair_executor(
         live = await _live_run(db, task_id)
         return (None, live) if live else (task_id, "")
 
+    snapshot: list[dict[str, str]] = []  # находки, прочитанные ПОД локом брони
+
     async def _admit(db: aiosqlite.Connection, fresh: dict[str, Any]) -> str:
+        snapshot[:] = await _current_findings(db, fresh)
         return await _admit_rework(db, fresh, issuer)
 
     model = config.EXECUTOR_MODEL.strip()
@@ -1077,7 +1080,7 @@ async def repair_executor(
         project,
         reserved,
         ready,
-        extra=_findings_block(findings),
+        extra=_findings_block(snapshot),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
     )
 
