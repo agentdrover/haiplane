@@ -13,7 +13,7 @@
    task.status == review and no machine review is in flight. #}
 
 {% if implementer_error %}
-<div class="task-action-note task-action-note--warning">{{ implementer_error }}</div>
+<div class="task-action-note task-action-note--warning" role="alert">{{ implementer_error }}</div>
 {% endif %}
 {% if implementer_code %}
 <div class="task-action-stack">
