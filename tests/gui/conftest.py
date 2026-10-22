@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import os
 import secrets
 import socket
@@ -40,6 +41,28 @@ import pytest
 from hub import brand
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# HTMX страницы хаба (hub/templates/base.html) — из репозитория, а не с unpkg в
+# момент прогона: сбой сети не должен красить GUI-job. Версия и хеш закреплены;
+# смена версии в шаблоне без обновления файла роняет test_gui_harness.
+HTMX_VERSION = "2.0.4"
+HTMX_FILE = Path(__file__).resolve().parent / "vendor" / f"htmx-{HTMX_VERSION}.min.js"
+HTMX_SHA384 = (
+    "1c67f3b687e8b5fb21705efef27e382502f6a099"  # pragma: allowlist secret
+    "a8c150a13d3838f12fa3bd9a33b4f7efc03efd382fcb4ed1ba74ca7e"  # pragma: allowlist secret
+)
+HTMX_URL_GLOB = f"https://unpkg.com/htmx.org@{HTMX_VERSION}*"
+
+
+def htmx_bytes() -> bytes:
+    """Файл HTMX с проверкой хеша; нет файла или хеш другой — исключение."""
+    body = HTMX_FILE.read_bytes()
+    digest = hashlib.sha384(body).hexdigest()
+    if digest != HTMX_SHA384:
+        raise AssertionError(f"{HTMX_FILE.name}: sha384 {digest} != закреплённый")
+    return body
+
+
 STARTUP_SECONDS = 90.0
 
 T = TypeVar("T")
@@ -451,11 +474,18 @@ def context(
 ) -> Iterator[Any]:
     """Контекст человека: cookie-сессия и trace на случай сбоя.
 
-    HTMX страница грузит с unpkg, как прод; подмены нет, и недоступный unpkg
-    называет тест test_htmx_is_loaded_on_the_card.
+    Запрос страницы к unpkg за HTMX отдаётся из tests/gui/vendor с проверкой
+    sha384: тот же файл, что грузит прод, без сети в момент прогона.
     """
     ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
     try:
+        body = htmx_bytes()
+        ctx.route(
+            HTMX_URL_GLOB,
+            lambda route: route.fulfill(
+                status=200, body=body, content_type="application/javascript"
+            ),
+        )
         ctx.add_cookies(
             [{"name": stand.cookie_name, "value": stand.session, "url": stand.url}]
         )

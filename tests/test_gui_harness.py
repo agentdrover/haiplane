@@ -273,3 +273,15 @@ def test_a_stand_that_exits_cleanly_still_saves_its_log(
         pass
 
     assert (artifacts / "stand-server.log").is_file()
+
+
+def test_vendored_htmx_matches_the_page_and_its_pinned_hash() -> None:
+    """Файл подмены — ровно та версия, что грузит шаблон, и с закреплённым хешем."""
+    import re
+
+    from tests.gui import conftest as stand_module
+
+    base = (ROOT / "hub" / "templates" / "base.html").read_text()
+    versions = set(re.findall(r"unpkg\.com/htmx\.org@([0-9.]+)", base))
+    assert versions == {stand_module.HTMX_VERSION}, versions
+    assert stand_module.htmx_bytes().startswith(b"var htmx=")

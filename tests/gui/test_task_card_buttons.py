@@ -40,8 +40,7 @@ def test_htmx_is_loaded_on_the_card(page: Any, stand: Stand) -> None:
         page.wait_for_function("typeof window.htmx === 'object'")
     except Exception as exc:  # noqa: BLE001 - Playwright TimeoutError
         raise AssertionError(
-            "HTMX не загрузился: unpkg недоступен (страница грузит "
-            "https://unpkg.com/htmx.org@2.0.4, как прод)"
+            "HTMX не загрузился: подмена unpkg на tests/gui/vendor не сработала"
         ) from exc
 
 
