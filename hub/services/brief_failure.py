@@ -74,17 +74,28 @@ _ROOTS = "tmp|var|srv|home|Users|opt|etc|root|private|usr|mnt|run|Volumes|data|p
 _MAXM = 2048
 _END = r"""\s'"`(){}\[\]<>|"""
 _TAIL = rf"(?:[^{_END},;]|[,;](?![\s]|$))"
-_USERINFO_URL = re.compile(
-    rf"[A-Za-z][A-Za-z0-9+.\-]{{0,15}}://[^/{_END}]{{1,256}}@{_TAIL}{{1,{_MAXM}}}"
-)
-_URL = re.compile(rf"[A-Za-z][A-Za-z0-9+.\-]{{0,15}}://{_TAIL}{{1,{_MAXM}}}")
-_SCP = re.compile(rf"(?<![\w.@-])[\w.\-]{{1,64}}@[\w.\-]{{1,255}}:{_TAIL}{{1,{_MAXM}}}")
+# Хвост, дошедший до потолка _MAXM, дочитывается до пробела или жёсткого
+# разделителя (_REST): токен длиннее потолка не публикует «?token=…» после него.
+# Две ветки без вложенных кванторов, обход линеен.
+_REST = r"""[^\s'"`<>|(){}\[\]]*"""
+
+
+def _run(low: int) -> str:
+    return rf"(?:{_TAIL}{{{_MAXM}}}{_REST}|{_TAIL}{{{low},{_MAXM - 1}}})"
+
+
+_SCHEME = r"[A-Za-z][A-Za-z0-9+.\-]{0,15}://"
+# С userinfo: всё до ПОСЛЕДНЕГО «@» токена (скобки, «|», кавычки в пароле не
+# важны), потом хост и путь. Хост в [квадратных скобках] (IPv6) - часть адреса.
+_USERINFO_URL = re.compile(rf"{_SCHEME}\S{{1,{_MAXM}}}@{_run(0)}")
+_URL = re.compile(rf"{_SCHEME}(?:\[[^\]\s]{{1,64}}\])?{_run(1)}")
+_SCP = re.compile(rf"(?<![\w.@-])[\w.\-]{{1,64}}@[\w.\-]{{1,255}}:{_run(1)}")
 _FS = rf"(?:~[\w.\-]{{0,32}}/|/(?:{_ROOTS})(?![\w.\-]))"
 # Значение JSON ("ключ": "/путь", ["/путь"]) - маркер ВНУТРИ кавычек, строка
 # остаётся строкой и json.loads её читает.
 _JSON_PATH = re.compile(rf'(?P<pre>"\s*:\s*|[\[,]\s*)"{_FS}[^"\n]{{0,{_MAXM}}}"')
 _QUOTED_PATH = re.compile(rf"(['\"`]){_FS}[^'\"`\n]{{0,{_MAXM}}}\1")
-_ABS_PATH = re.compile(rf"(?<![\w.~/\-]){_FS}{_TAIL}{{0,{_MAXM}}}")
+_ABS_PATH = re.compile(rf"(?<![\w.~/\-]){_FS}{_run(0)}")
 _PR_LINK = re.compile(
     r"https://github\.com/[\w.\-]{1,100}/[\w.\-]{1,100}/(?:pull|actions/runs)/\d{1,12}"
 )
