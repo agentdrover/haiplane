@@ -18,6 +18,7 @@ orchestration: report_done держит write-лок, ожидание на asyn
 from __future__ import annotations
 
 _held: set[tuple[int, int]] = set()
+_escalated: set[tuple[int, int, int]] = set()
 
 
 def hold(key: tuple[int, int]) -> None:
@@ -35,16 +36,26 @@ def held(key: tuple[int, int]) -> bool:
     return key in _held
 
 
-def refuses(
-    key: tuple[int, int], snapshot: dict[str, object], row: dict[str, object]
-) -> bool:
-    """Мерж не стартует: перевод идёт, либо проход начат до перевода и задача ушла.
+def mark_escalated(key: tuple[int, int], generation: int) -> None:
+    """Перевод по сроку состоялся и закоммичен: пока задача в needs_decision, не мержить.
 
-    Второе - проход со снимком ``running``, а живая строка уже ``needs_decision``:
-    его проверки (CI, база, одобрение) относились к задаче в работе, а перевод
-    по сроку состоялся и зафиксирован. Проход с СВЕЖИМ снимком (явная доставка по
-    решению человека: decide, deliver, реестр, автоповтор) этим не блокируется.
+    Прошедшие проходы автоматики (свип, отложенное завершение, headless) нельзя
+    отличить по снимку: одни заменяют его свежим чтением строки. Поэтому память
+    процесса держит факт перевода, а не вид снимка. Отметка живёт, пока живая
+    строка в needs_decision; решение человека (decide accept ставит completed до
+    доставки, rework возвращает в работу) снимает её при первом же взгляде.
     """
-    return held(key) or (
-        snapshot.get("status") == "running" and row.get("status") == "needs_decision"
-    )
+    _escalated.add((*key, generation))
+
+
+def refuses(key: tuple[int, int], row: dict[str, object]) -> bool:
+    """Мерж не стартует: перевод идёт, либо он состоялся и задача ещё у человека."""
+    if held(key):
+        return True
+    mark = (*key, int(row.get("submission_generation") or 0))  # type: ignore[call-overload]
+    if mark not in _escalated:
+        return False
+    if row.get("status") == "needs_decision":
+        return True
+    _escalated.discard(mark)  # человек решил: путь свободен
+    return False

@@ -4478,7 +4478,7 @@ async def merge_if_approval_stands(
             return MergeStep.UNPINNED, ""
         # A task that opted out of review (auto_review=False) has no approved head
         # to bind to; for it the merge stays what it was before #1706.
-        if delivery_claim.refuses(key, task, dict(row)):  # #1992: перевод по сроку
+        if delivery_claim.refuses(key, dict(row)):  # #1992: перевод по сроку
             return MergeStep.APPROVAL_GONE, ""
         if key not in _gate_merges:
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()

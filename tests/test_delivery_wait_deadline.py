@@ -783,7 +783,17 @@ async def test_a_pass_started_before_the_escalation_cannot_merge_after_it(
 
     assert step is orchestration.MergeStep.APPROVAL_GONE
     plugins.git_ops.merge_pr.assert_not_awaited()
-    # Явная доставка по решению человека берёт свежий снимок и не блокируется.
+    # Свежий снимок автоматики (отложенное завершение заменяет его перечитанной
+    # строкой) тоже не мержит, пока задача у человека.
+    fresh = dict(await repo.get_task(db, task_id))
+    step, _ = await orchestration.merge_if_approval_stands(
+        db, fresh, ctx, checked_sha=fresh["submission_sha"]
+    )
+    assert step is orchestration.MergeStep.APPROVAL_GONE
+    plugins.git_ops.merge_pr.assert_not_awaited()
+    # Решение человека (decide accept ставит completed до доставки) путь открывает.
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
     fresh = dict(await repo.get_task(db, task_id))
     step, _ = await orchestration.merge_if_approval_stands(
         db, fresh, ctx, checked_sha=fresh["submission_sha"]
