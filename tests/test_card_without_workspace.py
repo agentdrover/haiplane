@@ -749,3 +749,29 @@ async def test_a_reviewers_text_keeps_its_paths_while_hub_reasons_are_cleaned(
     assert brief["diff_base"]["reason"] == "нет <путь>"
     assert "/etc/hosts" in page and "/etc/resolv.conf" in page
     assert "leak-2002" not in page
+
+
+async def test_a_missing_git_executable_is_not_a_missing_directory(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    """Каталог на месте, git не найден: тот же FileNotFoundError — не «каталога нет»."""
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    present = tmp_path / "present-git-2002"
+    present.mkdir()
+    task_id = await _review_task(client, db, str(present), "no-git")
+    _real_git(monkeypatch)
+    no_git = FileNotFoundError(2, "No such file or directory", "git")
+    monkeypatch.setattr(
+        review_brief, "resolve_locators_at_ref", AsyncMock(side_effect=no_git)
+    )
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+
+    assert brief.status_code == 200, brief.text
+    rows = brief.json()["locator_resolution"]
+    assert rows and all(r["status"] == "unknown" for r in rows)
+    assert all("git could not run (FileNotFoundError)" in r["reason"] for r in rows)
+    assert not any("directory was not found" in r["reason"] for r in rows)

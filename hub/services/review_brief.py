@@ -70,6 +70,7 @@ from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
+from hub.services.task_diff import _is_missing
 from hub.services.test_existence import resolve_locators_at_ref
 
 log = logging.getLogger("hub")
@@ -689,7 +690,9 @@ async def _locator_resolution(
             # #2002: git cannot even start in a missing cwd. "Not checked" is
             # unknown, never a false "missing"; the brief still renders.
             log.warning("locators for #%s: git could not run: %s", task_id, exc)
-            gone = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+            # The type alone lies: Python names the git executable in the same
+            # FileNotFoundError, so ask the directory (as task_diff._ask does).
+            gone = _is_missing(str(ctx.get("repo") or ""))
             why = (
                 "not checked: the project working directory was not found"
                 if gone
