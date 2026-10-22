@@ -202,6 +202,27 @@ async def _dispatch(
     return "", await call()
 
 
+def _risk_refusal(form: Any) -> str:
+    """Лист «Принять при высоком риске»: подтверждение и причина - на сервере."""
+    if form.get("risk_ack") != "required":
+        return ""
+    if form.get("verdict") != "approved":
+        return ""
+    if not form.get("confirm_risk"):
+        return (
+            "Нужно подтверждение: отметьте, что вы прочитали высокие риски и "
+            "принимаете их. Вердикт не записан."
+        )
+    if not str(form.get("comments", "")).strip():
+        return "Нужна причина, по которой риск приемлем. Вердикт не записан."
+    return ""
+
+
+def _risk_comment(form: Any) -> str:
+    reason = str(form.get("comments", "")).strip()
+    return f"Принято при высоком риске; риск подтверждён человеком. Причина: {reason}"
+
+
 def _refuse(request: Request, task_id: int, message: str, status: int) -> Response:
     if is_sheet(request):
         return _note(message, status)
@@ -294,6 +315,13 @@ def sheet_action(action: str, *, note: Note | None = None):
                 return _refuse(
                     request, task_id, "Лист действий доступен только человеку.", 403
                 )
+
+            if marked and action == "verdict":
+                refusal = _risk_refusal(form)
+                if refusal:
+                    return _refuse(request, task_id, refusal, 422)
+                if form.get("risk_ack") == "required":
+                    kwargs["comments"] = _risk_comment(form)
 
             async def call() -> Response:
                 return await fn(*args, **kwargs)

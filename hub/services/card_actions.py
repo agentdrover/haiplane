@@ -185,7 +185,7 @@ def _verdict_sheets(
             + replace,
             route,
             "Принять при высоком риске",
-            hidden={**hidden, "verdict": "approved"},
+            hidden={**hidden, "verdict": "approved", "risk_ack": "required"},
             fields=[
                 {
                     "type": "list",

@@ -100,7 +100,9 @@ async def test_high_risk_accept_needs_a_real_reason(client: AsyncClient):
     assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
 
 
-async def test_high_risk_accept_records_confirmation_and_reason(client: AsyncClient):
+async def test_high_risk_accept_records_confirmation_and_reason(
+    client: AsyncClient, db
+):
     task_id, form, data = await _risk_sheet(client)
     resp = await client.post(
         form.attrs["action"],
@@ -114,8 +116,13 @@ async def test_high_risk_accept_records_confirmation_and_reason(client: AsyncCli
     assert resp.status_code == 200, resp.text
     review = (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"]
     assert review["verdict"] == "approved"
-    assert "риск приемлем: флаг выключен" in review["comments"]
-    assert "высокий риск" in review["comments"].lower()
+    from hub import repository as repo
+
+    feed = " ".join(
+        str(dict(u)["content"]) for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "риск приемлем: флаг выключен" in feed
+    assert "при высоком риске" in feed
 
 
 async def test_plain_verdicts_do_not_need_the_risk_tick(client: AsyncClient):
