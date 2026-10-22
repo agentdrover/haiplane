@@ -83,7 +83,10 @@ async def test_review_card_renders_without_a_workspace(
     for page in (card.text, fragment.text):
         assert "workspace-marker-2002" not in page
         assert "gone-2002" not in page
-    assert "workspace-marker-2002" in caplog.text, "путь остаётся в логе"
+    assert any(
+        "could not run" in r.getMessage() and "workspace-marker-2002" in r.getMessage()
+        for r in caplog.records
+    ), "путь остаётся в логе читателя диффа"
 
     approved = await client.post(
         f"/tasks/{approve_id}/web-review-verdict",
@@ -194,7 +197,6 @@ async def test_exception_text_never_reaches_a_reason_shown_to_a_person(
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
-    from hub import services
     from hub.services import review_brief, review_evidence
 
     task_id = await _review_task(client, db, missing_workspace, "gone-reasons")
@@ -204,7 +206,10 @@ async def test_exception_text_never_reaches_a_reason_shown_to_a_person(
 
     # review_evidence: контекст проекта (116).
     with monkeypatch.context() as patch:
-        patch.setattr(services, "project_git_context", AsyncMock(side_effect=boom))
+        patch.setattr(
+            "hub.services.orchestration.project_git_context",
+            AsyncMock(side_effect=boom),
+        )
         base = await review_evidence.resolve_diff_base(db, task_id, "b", offline=True)
     assert base["reason"] and MARKER not in base["reason"]
 
