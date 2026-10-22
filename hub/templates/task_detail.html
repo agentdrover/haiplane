@@ -673,7 +673,7 @@
                   {{ csrf_field() }}
                     <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
-                {% include "partials/slot_launch_forms.html" %}
+                {%- include "partials/slot_launch_forms.html" %}
 
                 {% elif task.status.value == 'needs_info' %}
                 <div class="task-action-state task-action-state--warning">Answer Required</div>
@@ -742,8 +742,8 @@
                         data-hub-autorefresh>
                     Refresh Status <span class="htmx-indicator">&#10227;</span>
                 </button>
-                {# #1998: после «на доработку» running без признаков работы — круг починки на слоте. #}
-                {% include "partials/slot_launch_forms.html" %}
+                {#- #1998: после «на доработку» running без признаков работы — круг починки на слоте. -#}
+                {%- include "partials/slot_launch_forms.html" %}
                 {% include "partials/return_to_work.html" %}
 
                 {% else %}

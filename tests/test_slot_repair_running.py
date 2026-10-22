@@ -278,6 +278,13 @@ async def test_busy_or_failed_issue_leaves_the_task_running(world, monkeypatch):
     await repo.update_task(world.db, broken, review_findings="{broken")
     await world.db.commit()
     await refused_with(broken, "не читаются")
+
+    # Машинные находки есть, а замечания вердикта не читаются: чинить половину
+    # молча нельзя — отказ, а не заказ с одними машинными находками.
+    half = await _after_cr(world, "порча при машинных", findings="machine")
+    await repo.update_task(world.db, half, review_findings="{broken")
+    await world.db.commit()
+    await refused_with(half, "не читаются")
     await refused_with(
         await _after_cr(world, "прогонов не было", runs=False), "не запускался"
     )
