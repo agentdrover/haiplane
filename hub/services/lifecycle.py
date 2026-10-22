@@ -5709,6 +5709,7 @@ async def return_to_work(
     body: TaskReturnToWork,
     *,
     actor: str,
+    commit: bool = True,
 ) -> TaskView:
     """Human action: take an abandoned submission back to ``open`` (#1356).
 
@@ -5823,12 +5824,14 @@ async def return_to_work(
     from hub.services import executor_triage_rework
 
     await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
-    await db.commit()
+    if commit:  # #1998: круг починки возвращает внутри транзакции брони
+        await db.commit()
     await log_activity(
         db,
         "task_returned_to_work",
         f"Task #{task_id} returned to work from {from_status} by {actor}",
         detail=mutation_activity_detail(),
+        commit=commit,
     )
 
     row = await repo.get_task(db, task_id)

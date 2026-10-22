@@ -1003,8 +1003,7 @@ async def repair_executor(
     не должна повиснуть open без исполнителя. Возврат — тот же
     ``return_to_work`` (#1356), заказ — тот же путь, что у первого запуска.
     """
-    from hub.models import TaskReturnToWork
-    from hub.services.lifecycle import return_to_work
+    from hub.services.lifecycle import RETURN_TO_WORK_STATUSES
 
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -1027,30 +1026,6 @@ async def repair_executor(
         await db.commit()
         return refusal
 
-    if task["status"] not in ("open", "running"):
-        # open — задача уже возвращена прошлым нажатием, чей заказ сорвался:
-        # возвращать нечего, круг повторяется той же кнопкой. running без
-        # держателя возвращается внутри брони (#1783), не здесь.
-        try:
-            await return_to_work(
-                db,
-                task_id,
-                TaskReturnToWork(
-                    reason=(
-                        f"круг починки облачным исполнителем по находкам сдачи "
-                        f"{task.get('submission_generation')} (#1444), нажал {issuer}"
-                    ),
-                    # fix_requested всегда несёт job_id (#1356): человек выбрал
-                    # облачного исполнителя вместо текущего задания.
-                    abandon_active_job=True,
-                ),
-                actor=issuer,
-            )
-        except HTTPException as exc:
-            # Например, живое задание у fix_requested (#1356): отказ возврата —
-            # это причина для человека, а не сырой 409 мимо формы.
-            return _refused(f"{REASON_NOT_RETURNABLE}: {exc.detail}", task_id)
-
     async def _this_task(
         db: aiosqlite.Connection, _project: Any
     ) -> tuple[int | None, str]:
@@ -1061,9 +1036,13 @@ async def repair_executor(
 
     async def _admit(db: aiosqlite.Connection, fresh: dict[str, Any]) -> str:
         snapshot[:] = await _current_findings(db, fresh)
-        return rework_admission.findings_refusal(
-            fresh, snapshot
-        ) or await _admit_rework(db, fresh, issuer)
+        if why := rework_admission.findings_refusal(fresh, snapshot):
+            return why
+        if fresh["status"] in RETURN_TO_WORK_STATUSES:
+            # Возврат review/fix_requested — ВНУТРИ брони, без своего commit: любой
+            # отказ после него откатывает и возврат (#1998, класс «отказ после commit»).
+            return await _return_for_cloud(db, fresh, issuer)
+        return await _admit_rework(db, fresh, issuer)
 
     model = config.EXECUTOR_MODEL.strip()
     reserved = await _reserve(
@@ -1085,6 +1064,24 @@ async def repair_executor(
         extra=_findings_block(snapshot),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
     )
+
+
+async def _return_for_cloud(
+    db: aiosqlite.Connection, task: dict[str, Any], issuer: str
+) -> str:
+    """review/fix_requested -> open под локом брони без commit; пусто — вернули."""
+    from hub.models import TaskReturnToWork
+    from hub.services.lifecycle import return_to_work
+
+    reason = rework_admission.return_reason(
+        task, where="облачным исполнителем", issue="#1444", who=issuer
+    )
+    body = TaskReturnToWork(reason=reason, abandon_active_job=True)
+    try:
+        await return_to_work(db, int(task["id"]), body, actor=issuer, commit=False)
+    except HTTPException as exc:
+        return f"{REASON_NOT_RETURNABLE}: {exc.detail}"
+    return ""
 
 
 async def _admit_rework(
