@@ -14,7 +14,9 @@ Selection (each file is printed with its reason):
 * a changed or new ``tests/test_*.py`` file;
 * a tree guard from ``docs/agent-context/tree-guards.json``;
 * a ``tests/test_*.py`` file that contains the path of a changed file which is
-  neither Python nor under ``tests/`` (a template, a JSON ledger, a doc).
+  not Python (a template, a JSON ledger, a doc, a fixture or golden file under
+  ``tests/``). For a file under ``tests/`` its name alone is enough: fixtures are
+  usually joined to a directory constant, not spelled out.
 
 Standard library only. The exit code is pytest's.  This is a convenience for the
 author, not evidence: CI stays the authority, a miss costs one CI cycle.
@@ -89,14 +91,21 @@ def _is_test(path: str) -> bool:
     return path.startswith("tests/test_") and path.endswith(".py")
 
 
+def _needles(path: str) -> list[str]:
+    """What to look for in a test's text for a changed non-Python path."""
+    if path.startswith("tests/"):
+        return [path, path.rsplit("/", 1)[-1]]
+    return [path]
+
+
 def readers_of(root: Path, targets: list[str]) -> dict[str, str]:
-    """Test file -> the first target whose path it mentions."""
+    """Test file -> the first target whose path (or, under tests/, name) it mentions."""
     found: dict[str, str] = {}
     if not targets:
         return found
     for test in sorted((root / "tests").glob("test_*.py")):
         text = test.read_text(encoding="utf-8", errors="replace")
-        hit = next((t for t in targets if t in text), "")
+        hit = next((t for t in targets if any(n in text for n in _needles(t))), "")
         if hit:
             found[str(test.relative_to(root))] = hit
     return found
@@ -110,12 +119,23 @@ def select(root: Path, changed: list[str]) -> dict[str, list[str]]:
             chosen.setdefault(path, []).append("changed")
     for path in guards(root):
         chosen.setdefault(path, []).append("tree guard")
-    others = [
-        p for p in changed if not p.endswith(".py") and not p.startswith("tests/")
-    ]
-    for test, target in readers_of(root, others).items():
+    others = [p for p in changed if not p.endswith(".py")]
+    readers = readers_of(root, others)
+    for test, target in readers.items():
         chosen.setdefault(test, []).append(f"reads {target}")
     return dict(sorted(chosen.items()))
+
+
+def unmapped(root: Path, changed: list[str]) -> list[str]:
+    """Changed non-Python paths that no test mentions: the selection does not cover them."""
+    mentioned = set(
+        readers_of(root, [p for p in changed if not p.endswith(".py")]).values()
+    )
+    return [
+        p
+        for p in changed
+        if not p.endswith(".py") and p not in mentioned and (root / p).exists()
+    ]
 
 
 def pytest_command(files: list[str]) -> list[str]:
@@ -149,6 +169,14 @@ def main(argv: list[str] | None = None) -> int:
     for path, reasons in chosen.items():
         print(f"  {path}  ({', '.join(reasons)})")
     print(f"test-changed: {len(chosen)} files")
+    loose = unmapped(root, changed)
+    if loose:
+        shown = ", ".join(loose[:5]) + (" ..." if len(loose) > 5 else "")
+        print(f"test-changed: no test mentions {len(loose)} changed file(s): {shown}")
+    if any(p.startswith("hub/") and p.endswith(".py") for p in changed):
+        print(
+            "test-changed: changed hub code is not followed through imports or symbols; CI decides"
+        )
     if not chosen:
         print("test-changed: nothing to run (no changed tests and no guards)")
         return 0

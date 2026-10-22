@@ -55,6 +55,8 @@ def make_repo(tmp_path: Path, base: str = "develop", remote: bool = True) -> Pat
     write(root, "tests/test_gone.py")
     write(root, "data/ledger.json", "{}\n")
     write(root, "data/old.json", "{}\n")
+    write(root, "tests/fixtures/vectors.json", "{}\n")
+    write(root, "tests/golden/view.json", "{}\n")
     write(root, "docs/note.md", "note\n")
     write(
         root,
@@ -83,6 +85,12 @@ def test_selection_by_diff(tmp_path: Path) -> None:
     write(root, "tests/test_reads_old.py", 'PATH = "data/old.json"\n')
     git(root, "mv", "tests/test_other.py", "tests/test_renamed.py")  # delete + add
     write(root, "docs/other.md")  # read by nobody
+    write(root, "tests/fixtures/vectors.json", '{"v": 2}\n')  # changed fixture
+    write(
+        root, "tests/test_fixture_reader.py", 'FILE = "tests/fixtures/vectors.json"\n'
+    )
+    write(root, "tests/golden/view.json", '{"g": 2}\n')  # changed golden file
+    write(root, "tests/test_golden_reader.py", 'NAME = GOLDEN / "view.json"\n')
 
     changed, warning = changed_tests.changed_files(root)
     assert warning == ""
@@ -99,6 +107,15 @@ def test_selection_by_diff(tmp_path: Path) -> None:
     assert chosen["tests/test_guard.py"] == ["tree guard"]
     assert chosen["tests/test_b.py"] == ["reads data/ledger.json"]
     assert chosen["tests/test_reads_old.py"] == ["changed", "reads data/old.json"]
+    # A non-Python file UNDER tests/ is looked for by its path or by its bare name
+    # (fixtures are usually joined to a directory constant).
+    assert chosen["tests/test_fixture_reader.py"] == [
+        "reads tests/fixtures/vectors.json"
+    ]
+    assert chosen["tests/test_golden_reader.py"] == [
+        "changed",
+        "reads tests/golden/view.json",
+    ]
     assert "tests/test_gone.py" not in chosen
     assert "tests/test_other.py" not in chosen
     assert "tests/test_nope.py" not in chosen  # a ledger entry with no file on disk
@@ -177,3 +194,18 @@ def test_nothing_to_run_without_guards_or_changes(tmp_path: Path) -> None:
     git(root, "add", "-A")
     git(root, "commit", "-qm", "init")
     assert changed_tests.main(["--root", str(root), "--dry-run"]) == 0
+
+
+def test_a_changed_file_that_no_test_mentions_is_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A selection that covers nothing for a change must not look like a full one."""
+    root = make_repo(tmp_path)
+    write(root, "docs/other.md", "unmentioned\n")
+    (root / "hub").mkdir()
+    write(root, "hub/code.py", "x = 1\n")
+    rc = changed_tests.main(["--root", str(root), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no test mentions 1 changed file(s): docs/other.md" in out
+    assert "changed hub code is not followed" in out
