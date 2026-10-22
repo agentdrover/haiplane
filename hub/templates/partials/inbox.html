@@ -77,6 +77,38 @@
 <div class="task-action-note task-action-note--warning inbox-steward-breaker" role="status" data-steward-breaker-task="{{ b.task_id or '' }}" data-steward-breaker-source="{{ b.source }}">{{ b.line }}.{% if b.task_id %} Снять: oc-hub steward-false-approve-clear {{ b.task_id }}.{% endif %}</div>
 {% endfor %}
 
+{# #1943: рекомендации разбора неудачных прогонов k8 (#1942). Хаб ничего не
+   запускает; кнопки пишут только owner_verdict. #}
+{% if triage_unavailable|default("") %}
+<div class="task-action-note task-action-note--warning inbox-triage-unavailable" role="status">Разбор прогонов k8: разбор не прочитан — {{ triage_unavailable }}.</div>
+{% endif %}
+{% if triage_items|default([]) %}
+<section class="inbox-group inbox-triage" id="inbox-triage">
+    <h3 class="inbox-group-title">Разбор прогона k8 <span class="inbox-count">{{ triage_items|length }}</span></h3>
+    {% if triage_note|default("") %}<div class="task-action-note task-action-note--warning" role="status">Показаны не все — {{ triage_note }}.</div>{% endif %}
+    {% for i in triage_items %}
+    <article class="inbox-item" id="inbox-triage-{{ i.recommendation_id }}" data-triage-task="{{ i.task_id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ i.task_id }}" class="inbox-item-link">#{{ i.task_id }} {{ i.title[:60] }}{% if i.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-failed">класс {{ i.class }} · {{ i.class_name }}</span>
+        </div>
+        <div class="inbox-item-meta">Рекомендация: {{ i.recommendation }}. Причина: {{ i.reason }}</div>
+        <div class="inbox-item-actions">
+            {% for value, label in [("accepted", "Разбор принят"), ("rejected", "Разбор отклонён")] %}
+            <form hx-post="/triage/{{ i.recommendation_id }}/web-verdict"
+                  hx-target="#inbox-triage-{{ i.recommendation_id }}"
+                  hx-swap="outerHTML" style="display:inline">
+              {{ csrf_field() }}
+                <input type="hidden" name="verdict" value="{{ value }}">
+                <button class="btn {% if value == 'accepted' %}btn-success{% else %}btn-secondary{% endif %} btn-xs" type="submit">{{ label }}</button>
+            </form>
+            {% endfor %}
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
 {% if drafts %}
 <details class="inbox-group inbox-drafts inbox-drafts--collapsible" id="inbox-proposals" open>
     <summary class="inbox-group-title inbox-group-title--collapsible">
