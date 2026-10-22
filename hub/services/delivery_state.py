@@ -50,7 +50,7 @@ from hub import repository as repo
 # они разошлись (находка 80fcb9c9).
 from hub.db import MIN_EVIDENCE_CHARS, MIN_SHA_CHARS
 from hub.integrations.registry import plugins
-from hub.services import defect_release
+from hub.services import accepted_delivery_retry, defect_release
 from hub.services.result_kind import is_state, state_accepted
 
 log = logging.getLogger("hub")
@@ -1377,6 +1377,7 @@ async def scan_completed_deliveries(
     reader — the inbox, REST, MCP — reads the rows it writes, which is what
     keeps "показать расхождение" from costing a network round trip per card.
     """
+    await accepted_delivery_retry.sweep(db)  # #1999: сначала автоповтор принятых
     candidates = await repo.completed_tasks_awaiting_delivery(
         db, lookback_days=lookback_days, limit=limit
     )
