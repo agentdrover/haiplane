@@ -115,6 +115,22 @@ def test_build_health_open_mode(monkeypatch):
     assert view.vast_enabled is False
 
 
+def test_build_health_lists_trusted_origins_without_the_bad_values(monkeypatch):
+    from hub import brand
+
+    monkeypatch.setenv(brand.ENV_PREFIX + "HUB_URL", "https://hub.example.test")
+    monkeypatch.setenv(
+        brand.ENV_PREFIX + "HUB_EXTRA_ORIGINS",
+        "https://second.example.test:8443,https://u:pw@bad.example",  # pragma: allowlist secret
+    )
+    view = build_health()
+    assert view.csrf_trusted_origins == [
+        "https://hub.example.test",
+        "https://second.example.test:8443",
+    ]
+    assert "1 of 2" in view.csrf_warning and "bad.example" not in view.csrf_warning
+
+
 # --- identity diagnostics: honest instance + workspace (#452) ---
 
 
