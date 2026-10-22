@@ -21,6 +21,12 @@ _held: set[tuple[int, int]] = set()
 _escalated: set[tuple[int, int]] = set()
 
 
+def reset() -> None:
+    """Забыть все отметки (тесты: каждая база начинает с тех же номеров задач)."""
+    _held.clear()
+    _escalated.clear()
+
+
 def hold(key: tuple[int, int]) -> None:
     """Поставить отметку: перевод идёт, мерж этого PR не стартует."""
     _held.add(key)
