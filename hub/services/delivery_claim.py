@@ -18,7 +18,7 @@ orchestration: report_done держит write-лок, ожидание на asyn
 from __future__ import annotations
 
 _held: set[tuple[int, int]] = set()
-_escalated: set[tuple[int, int, int]] = set()
+_escalated: set[tuple[int, int]] = set()
 
 
 def hold(key: tuple[int, int]) -> None:
@@ -36,26 +36,29 @@ def held(key: tuple[int, int]) -> bool:
     return key in _held
 
 
-def mark_escalated(key: tuple[int, int], generation: int) -> None:
-    """Перевод по сроку состоялся и закоммичен: пока задача в needs_decision, не мержить.
+def mark_escalated(task_id: int, generation: int) -> None:
+    """Перевод по сроку состоялся и закоммичен: пока задача у человека, не мержить.
 
-    Прошедшие проходы автоматики (свип, отложенное завершение, headless) нельзя
-    отличить по снимку: одни заменяют его свежим чтением строки. Поэтому память
-    процесса держит факт перевода, а не вид снимка. Отметка живёт, пока живая
-    строка в needs_decision; решение человека (decide accept ставит completed до
-    доставки, rework возвращает в работу) снимает её при первом же взгляде.
+    Автоматику нельзя отличить по снимку (отложенное завершение заменяет его
+    перечитанной строкой) и по PR (проход может получить замену PR того же
+    поколения). Поэтому процессная память держит факт перевода по (задача,
+    поколение). Отметка снимается только решением человека: ``decide accept``
+    пишет ``completed`` до доставки. Чтение ``running`` отметку не снимает и
+    ничего не запрещает: оно могло быть сделано до коммита перевода.
     """
-    _escalated.add((*key, generation))
+    _escalated.add((task_id, generation))
 
 
 def refuses(key: tuple[int, int], row: dict[str, object]) -> bool:
     """Мерж не стартует: перевод идёт, либо он состоялся и задача ещё у человека."""
     if held(key):
         return True
-    mark = (*key, int(row.get("submission_generation") or 0))  # type: ignore[call-overload]
+    mark = (key[0], int(row.get("submission_generation") or 0))  # type: ignore[call-overload]
     if mark not in _escalated:
         return False
-    if row.get("status") == "needs_decision":
+    status = row.get("status")
+    if status == "needs_decision":
         return True
-    _escalated.discard(mark)  # человек решил: путь свободен
+    if status != "running":
+        _escalated.discard(mark)  # человек решил (completed и далее): путь свободен
     return False

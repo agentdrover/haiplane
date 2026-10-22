@@ -210,7 +210,7 @@ async def _escalate(
     try:
         moved = await _transition(db, key, pr_num, detail, hours)
         if moved:  # тот же синхронный кусок, что и снятие отметки ниже
-            delivery_claim.mark_escalated(claim, key[1])
+            delivery_claim.mark_escalated(key[0], key[1])
         return moved
     finally:
         delivery_claim.release(claim)
