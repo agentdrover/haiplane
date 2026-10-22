@@ -536,3 +536,46 @@ async def test_open_task_keeps_machine_findings_when_the_verdict_is_unreadable(w
         )
     )[0]["order_text"]
     assert "Отмена не сверяет поколение" in text
+
+
+async def test_cloud_order_carries_the_findings_read_under_the_lock(world, monkeypatch):
+    """Допуск и заказ видят один снимок: вердикт заменён перед бронью — в промпте новый."""
+    calls = await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(world, "снимок находок")
+    newer = "Находка B после замены вердикта"
+    real = el._reserve
+
+    async def swapped(*args, **kwargs):
+        body = [{"id": 1, "severity": "high", "message": newer}]
+        await repo.update_task(world.db, task_id, review_findings=json.dumps(body))
+        await world.db.commit()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(el, "_reserve", swapped)
+    result = await _cloud(world.db, task_id, world)
+    assert result.launched, result
+    prompt = calls[0]["prompt_text"]
+    assert newer in prompt and HUMAN_FINDING not in prompt
+
+
+async def test_new_order_supersedes_the_old_outcome_and_the_plaque_names_it(world):
+    """Читатели после нового заказа: старый итог superseded, плашка — про новый заказ."""
+    task_id = await _after_cr(world, "второй круг")
+    assert (await _go(world.db, world, task_id)).launched
+    first = (await _rows(world.db, "SELECT id FROM executor_orders"))[0]["id"]
+    await world.db.execute(
+        "UPDATE executor_orders SET state='closed', close_reason='test'"
+    )
+    await world.db.execute(
+        "UPDATE executor_runs SET outcome='failed', finished_at=datetime('now') "
+        "WHERE outcome='running'"
+    )
+    await repo.update_task(world.db, task_id, status="running")
+    await world.db.commit()
+    second = await _go(world.db, world, task_id)
+    assert second.launched and second.order_id != first
+    old = await orders.read_order_outcome(world.db, "k8", first)
+    assert old and old["superseded"] is True
+    plaque = await launch_feedback.plaque(world.db, task_id)
+    assert plaque and f"#{second.order_id}" in plaque["headline"]
+    assert f"#{first}" not in plaque["headline"]
