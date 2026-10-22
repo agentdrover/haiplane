@@ -543,9 +543,20 @@ async def generate_due_digests(
         "SELECT id, slug, gate_policy FROM projects "
         "WHERE archived=0 AND status='active'",
     )
+    # Один проход чтения без лока: тихий проект без делегирования не берёт
+    # write-лок и не пересобирает хвост неучтённых исходов (#1997, Codex круг 2).
+    probe = await triage_inbox.probe_sections(db, day_start, day_end)
     for project in projects:
         if await _digest_exists(db, project["id"], day):
             continue  # дешёвый выход без write-лока: почти каждый проход поллера
+        if (
+            probe is not None
+            and not _policy_delegates(project["gate_policy"])
+            and not triage_inbox.section_active(
+                probe.get(project["id"]) or triage_inbox.empty_section()
+            )
+        ):
+            continue
         # #1997: сбор раздела разбора, INSERT дайджеста и связи «исход -> дайджест»
         # идут одной транзакцией BEGIN IMMEDIATE на проект: второй писатель ждёт
         # на write-локе и видит связи первого, а не пустоту.

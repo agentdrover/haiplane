@@ -345,6 +345,19 @@ async def digest_sections(
     return (await collect_sections(db, day_start, day_end))[0]
 
 
+async def probe_sections(
+    db: aiosqlite.Connection, day_start: str, day_end: str
+) -> dict[int, dict[str, Any]] | None:
+    """Разделы всех проектов ОДНИМ чтением, без write-лока: решает, у каких проектов
+    есть что собирать под транзакцией. ``None`` - чтение не удалось (проект тогда
+    идёт в транзакцию и получает ``unavailable``)."""
+    try:
+        return await digest_sections(db, day_start, day_end)
+    except Exception as exc:  # noqa: BLE001 - итог увидит транзакция записи
+        log.warning("digest triage probe unreadable: %s", exc)
+        return None
+
+
 async def project_section(
     db: aiosqlite.Connection, project_id: int, day_start: str, day_end: str
 ) -> tuple[dict[str, Any], list[Link]]:

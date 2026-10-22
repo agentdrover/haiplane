@@ -273,3 +273,24 @@ async def test_an_unreadable_section_links_nothing(world, monkeypatch):
     ]
     assert states == ["unavailable"]
     assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
+
+
+async def test_quiet_projects_do_not_rebuild_the_tail_under_the_lock(
+    world, monkeypatch
+):
+    """Тихие проекты без делегирования не собирают раздел под write-локом."""
+    await _outcome(world, "тихий")
+    for i in range(5):
+        await repo.create_project(world.db, slug=f"quiet-{i}", name=f"quiet-{i}")
+    await world.db.commit()
+    real = triage_inbox.collect_sections
+    calls: list[int] = []
+
+    async def counting(*args, **kwargs):
+        calls.append(1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(triage_inbox, "collect_sections", counting)
+    await _generate(world.db, _day(1))
+    # один пробный сбор + один под локом у единственного активного проекта
+    assert len(calls) == 2
