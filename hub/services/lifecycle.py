@@ -5715,22 +5715,21 @@ async def return_to_work(
     body: TaskReturnToWork,
     *,
     actor: str,
+    commit: bool = True,
 ) -> TaskView:
     """Human action: take an abandoned submission back to ``open`` (#1356).
 
     From ``review`` or ``fix_requested``; a commit task in ``running`` goes
     the separate way of :mod:`hub.services.return_running` (#1675), and only
-    with no sign of work. It is the rework decision
-    without the dispatch: the approval window closes through the SAME
-    :func:`close_approval_for_rework`, the claim comes off exactly as in
-    :func:`release_task` (implementer principal included), and the task is
-    open for any executor to claim. Branch, PR, submission sha, submissions
-    and findings are left alone.
+    with no sign of work. It is the rework decision without the dispatch: the
+    approval window closes through the SAME :func:`close_approval_for_rework`,
+    the claim comes off exactly as in :func:`release_task` (implementer
+    principal included), the task is open for any executor to claim. Branch,
+    PR, sha, submissions, findings stay. ``commit=False``: caller's transaction.
 
     The transition is conditional on the status that was read. The delivery
-    gate may be carrying an approved task out of ``review`` at this very
-    moment; if it got there first the return is a 409 and nothing — claim,
-    approval window, feed — has been touched.
+    gate may be carrying an approved task out of ``review`` at this very moment;
+    if it got there first the return is a 409 and nothing has been touched.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -5829,12 +5828,14 @@ async def return_to_work(
     from hub.services import executor_triage_rework
 
     await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
-    await db.commit()
+    if commit:  # #1998: False - внутри транзакции брони
+        await db.commit()
     await log_activity(
         db,
         "task_returned_to_work",
         f"Task #{task_id} returned to work from {from_status} by {actor}",
         detail=mutation_activity_detail(),
+        commit=commit,
     )
 
     row = await repo.get_task(db, task_id)
