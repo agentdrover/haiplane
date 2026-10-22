@@ -23,6 +23,13 @@
   назначьте `task:#N` или `permanent — <причина>`; формат `removed_by`
   проверяется. Замеры обновляет `--refresh-measured` (меняет только `measured`,
   `max` не трогает); `--update` пересчитывает и потолки — это решение человека.
+- Новый assert, сравнивающий настенное время с порогом меньше 1 с, красит CI
+  (`scripts/wallclock_asserts.py`, #1989): на загруженной машине такой тест
+  падает без дефекта. Подмените часы (monkeypatch) или проверяйте счётчик, а не
+  секунды. Старые места — в `docs/agent-context/wallclock-asserts.json`;
+  `--update` добавляет новое место с пустым `removed_by` (впишите руками
+  `task:#NNNN`, `permanent: <причина>` или `unclaimed: <причина>`). Запись
+  снимается удалением строки, когда места больше нет.
 - Файл .py выше порога размера красит CI (`scripts/file_size_budget.py`, #1669).
   Пороги по деревьям — в `pyproject.toml` (`[tool.haiplane.file_size]`), ledger —
   в `docs/agent-context/file-size-budget.json`. Новый файл выше порога или рост

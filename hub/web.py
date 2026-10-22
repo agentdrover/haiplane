@@ -50,6 +50,7 @@ from hub.services import admin as admin_svc
 from hub.services import card_actions, card_c2, card_sheet
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import effective_policy, policy_change, project_policy
+from hub.services import triage_inbox
 from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
@@ -2202,7 +2203,11 @@ async def web_digests(request: Request):
     """Autopilot daily digests with the audit sample (#739)."""
     import json as _json
 
-    from hub.services.digest import self_approvals_state, steward_section_state
+    from hub.services.digest import (
+        self_approvals_state,
+        steward_section_state,
+        triage_state,
+    )
 
     rows = await repo.list_digests(_db(request), limit=30)
     digests = []
@@ -2217,6 +2222,10 @@ async def web_digests(request: Request):
         # a counting filter cannot tell them apart (#1143 review).
         d["steward_state"] = steward_section_state(d["data"])
         d["self_approvals_state"] = self_approvals_state(d["data"])
+        # #1943: старый дайджест разбор не считал - «не измерялось», не ноль.
+        d["triage_state"] = triage_state(d["data"])
+        if d["triage_state"] == triage_inbox.MEASURED:
+            d["triage_line"] = triage_inbox.section_line(d["data"]["triage"])
         digests.append(d)
     return TEMPLATES.TemplateResponse(request, "digests.html", {"digests": digests})
 
@@ -3287,6 +3296,33 @@ async def web_answer_task(
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/triage/{recommendation_id}/web-verdict")
+async def web_triage_verdict(
+    recommendation_id: int,
+    request: Request,
+    verdict: str = Form(...),
+):
+    """«Разбор принят / отклонён» из Входящих (#1943); только человек."""
+    _require_human_web(request)
+    identity = current_identity(request)
+    try:
+        done = await triage_inbox.record_owner_verdict(
+            _db(request),
+            recommendation_id,
+            verdict,
+            who=identity.username,
+            principal_id=identity.principal_id,
+        )
+    except triage_inbox.VerdictError as exc:
+        raise HTTPException(exc.status, detail=exc.text) from exc
+    word = "принят" if done["owner_verdict"] == "accepted" else "отклонён"
+    return HTMLResponse(
+        f'<article class="inbox-item" id="inbox-triage-{recommendation_id}">'
+        f'<a href="/tasks/{done["task_id"]}" class="inbox-item-link">'
+        f"#{done['task_id']}</a> Разбор {word}.</article>"
+    )
 
 
 @router.post("/tasks/{task_id}/web-message")
