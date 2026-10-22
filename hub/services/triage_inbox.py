@@ -271,14 +271,16 @@ def section_active(section: dict[str, Any]) -> bool:
     )
 
 
-async def _counted(db: aiosqlite.Connection) -> dict[int, tuple[set[int], list]]:
-    """Что уже учтено ИЗМЕРЕННЫМИ дайджестами: проект -> (id исходов, старые дайджесты).
+async def _counted(db: aiosqlite.Connection) -> tuple[set[int], dict[int, list]]:
+    """Что уже учтено ИЗМЕРЕННЫМИ дайджестами: (id исходов, старые дайджесты по проекту).
 
-    Дайджест с ``unavailable`` исходов не учёл. Измеренный дайджест без
-    ``outcome_ids`` (до круга 2) читается по дате и времени записи: он учёл
-    исходы с действием не позже его даты, обработанные до его записи.
+    id глобальны: рекомендация одна, и учтённая в дайджесте проекта A остаётся
+    учтённой после переноса задачи в B. Дайджест с ``unavailable`` исходов не учёл.
+    Измеренный дайджест без ``outcome_ids`` (до круга 2) читается по дате и времени
+    записи: он учёл исходы с действием не позже его даты, обработанные до записи.
     """
-    seen: dict[int, tuple[set[int], list]] = {}
+    ids: set[int] = set()
+    legacy: dict[int, list] = {}
     for row in await fetchall(
         db, "SELECT project_id, digest_date, created_at, payload FROM autopilot_digests"
     ):
@@ -288,21 +290,19 @@ async def _counted(db: aiosqlite.Connection) -> dict[int, tuple[set[int], list]]
             continue
         if section.get("state") != MEASURED:
             continue
-        ids, legacy = seen.setdefault(int(row["project_id"]), (set(), []))
         if "outcome_ids" in section:
             ids.update(int(i) for i in section["outcome_ids"])
         else:
-            legacy.append((str(row["digest_date"]), str(row["created_at"])))
-    return seen
+            legacy.setdefault(int(row["project_id"]), []).append(
+                (str(row["digest_date"]), str(row["created_at"]))
+            )
+    return ids, legacy
 
 
-def _is_counted(entry: tuple[set[int], list] | None, row: Any) -> bool:
-    if entry is None:
-        return False
-    ids, legacy = entry
-    return int(row["id"]) in ids or any(
+def _counted_by_legacy(entries: list | None, row: Any) -> bool:
+    return any(
         str(row["action_at"])[:10] <= day and str(row["followup_at"]) < written
-        for day, written in legacy
+        for day, written in entries or []
     )
 
 
@@ -335,7 +335,7 @@ async def digest_sections(
     """
     rows = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end) * 2)
     late_rows = await fetchall(db, _LATE_ROWS_SQL, (day_start,))
-    counted = await _counted(db)
+    counted_ids, legacy = await _counted(db)
     sections: dict[int, dict[str, Any]] = {}
     owners: dict[int, int | None] = {}
 
@@ -355,8 +355,10 @@ async def digest_sections(
                 (day_start, day_end),
             )
     for row in late_rows:
+        if int(row["id"]) in counted_ids:
+            continue  # учтённое отсеивается до поиска проекта: хвост истории дёшев
         project_id = await project_of(row)
-        if project_id is None or _is_counted(counted.get(project_id), row):
+        if project_id is None or _counted_by_legacy(legacy.get(project_id), row):
             continue
         section = sections.setdefault(project_id, empty_section())
         section["late"] += 1
