@@ -2056,6 +2056,7 @@ async def test_hub_health_formats_config(mock_api_get: AsyncMock) -> None:
         "auth_disabled": False,
         "env_tokens_configured": True,
         "vast_enabled": False,
+        "csrf_trusted_origins": ["https://a.example", "https://b.example:8443"],
     }
 
     text = _mcp_text(await hub_health())
@@ -2064,6 +2065,7 @@ async def test_hub_health_formats_config(mock_api_get: AsyncMock) -> None:
     assert "Bind: 127.0.0.1:8080" in text
     assert "Auth required: True" in text
     assert "Vast enabled: False" in text
+    assert "CSRF trusted origins: https://a.example, https://b.example:8443" in text
 
 
 @pytest.mark.asyncio
