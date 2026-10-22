@@ -152,6 +152,39 @@ async def bad_extra_origins_never_widen_trust(world, monkeypatch) -> None:
         resp = await _post(world, world.session_a, token=token, Origin=origin)
         assert _refused(resp), origin
 
+    # DNS names only: brackets, control characters, spaces inside, odd labels.
+    monkeypatch.setenv(
+        EXTRA_ENV,
+        ",".join(
+            [
+                "https://[v1.evil.example]",
+                "\x01https://evil.example",
+                "https://ev il.example",
+                "https://[2001:db8::1]",
+                "https://-bad.example",
+                "https://a..b.example",
+                "https://\u00e9vil.example",
+                " https://good.example.test ",
+            ]
+        ),
+    )
+    data = await health()
+    assert data["csrf_trusted_origins"] == [own, "https://good.example.test"]
+    assert "7 of 8" in data["csrf_warning"], data["csrf_warning"]
+    for origin in (
+        "https://v1.evil.example",
+        "https://evil.example",
+        "https://[2001:db8::1]",
+        "https://[v1.evil.example]",
+        "https://bad.example",
+    ):
+        resp = await _post(world, world.session_a, token=token, Origin=origin)
+        assert _refused(resp), origin
+    resp = await _post(
+        world, world.session_a, token=token, Origin="https://good.example.test"
+    )
+    assert resp.status_code == 200, resp.text
+
     # Nothing parses: trust is exactly what it was without the variable.
     monkeypatch.setenv(EXTRA_ENV, "haiplane.com,*,https://u:p@x.example")
     data = await health()
@@ -161,9 +194,17 @@ async def bad_extra_origins_never_widen_trust(world, monkeypatch) -> None:
     assert _refused(resp)
     # One log line per distinct bad value, naming counts only.
     lines = [line for line in seen.lines if "ignored" in line]
-    assert len(lines) == 2, seen.lines
+    assert len(lines) == 3, seen.lines
     for line in seen.lines:
-        for leaked in ("pw", "leak.example", "haiplane", "wild", "zero", "x.example"):
+        for leaked in (
+            "pw",
+            "leak.example",
+            "haiplane",
+            "wild",
+            "zero",
+            "x.example",
+            "evil",
+        ):
             assert leaked not in line, line
 
 

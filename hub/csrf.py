@@ -23,7 +23,6 @@ import asyncio
 import functools
 import hashlib
 import hmac
-import ipaddress
 import logging
 import os
 import re
@@ -264,20 +263,14 @@ def _origin_triple(value: str) -> tuple[str, str, int] | None:
     return scheme, host, port
 
 
-_HOST_RE: Final = re.compile(
-    r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*"
-)
+_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+_HOST_RE: Final = re.compile(rf"{_LABEL}(\.{_LABEL})*")
 _Triple = tuple[str, str, int]
 
 
 def _is_host(host: str) -> bool:
-    if _HOST_RE.fullmatch(host):
-        return True
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return True
+    """A DNS name: ASCII letters, digits, hyphen; labels of 1..63; no IP literal."""
+    return len(host) <= 253 and bool(_HOST_RE.fullmatch(host))
 
 
 def _strict_origin(value: str) -> _Triple | None:
@@ -288,7 +281,8 @@ def _strict_origin(value: str) -> _Triple | None:
     query or fragment, only http/https, and port 1..65535 when one is written.
     """
     value = value.strip()
-    if not value or re.search(r"[\s?#@*\\]", value):
+    # Before urlsplit: it silently drops control characters and unwraps [..].
+    if not value or re.search(r"[^\x21-\x7e]|[?#@*\\\[\]]", value):
         return None
     try:
         parts = urlsplit(value)
