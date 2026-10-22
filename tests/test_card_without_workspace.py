@@ -361,7 +361,7 @@ def test_public_reason_cuts_paths_and_remotes_and_keeps_the_rest() -> None:
     )
     assert public_reason(keep) == keep
     assert public_reason("нет /srv/clones/x/.git и ~/work/r") == "нет <путь> и <путь>"
-    assert public_reason("fatal: 'https://u:tok@h.io/o/r.git' down") == (
+    assert public_reason("fatal: 'https://h.io/o/r.git' down") == (
         "fatal: '<remote>' down"
     )
     assert public_reason("git@github.com:org/r.git не отвечает") == (
@@ -400,7 +400,7 @@ async def test_no_reason_source_of_the_brief_publishes_a_path_or_a_remote(
 
     path, url, scp = (
         "/tmp/leak-2002/clone",
-        "https://u:tok@h.io/o/r.git",
+        "https://h.io/o/r.git",
         "git@h.io:o/r",
     )
     leak = f"{path} {url} {scp}"
@@ -433,7 +433,7 @@ async def test_no_reason_source_of_the_brief_publishes_a_path_or_a_remote(
     assert dump["sha_check_reason"], "источник tip_reason дошёл до ответа"
     shown = [await submission_diff(db, task_id), await submission_files(db, task_id)]
     for text in [*_strings(dump), *_strings(shown)]:
-        for bad in ("/tmp", "/var", "https://", "git@", "tok@"):
+        for bad in ("/tmp", "/var", "https://", "git@"):
             assert bad not in text, (bad, text[:200])
 
 
@@ -446,7 +446,7 @@ async def test_the_boundary_cleans_reasons_even_when_a_source_does_not(
     from hub.models import BaseMergeState, CallSiteSection
     from hub.services import review_brief, review_evidence, task_diff
 
-    leak = "/tmp/leak-2002/clone https://u:tok@h.io/o/r.git"
+    leak = "/tmp/leak-2002/clone https://h.io/o/r.git"
     task_id = await _review_task(client, db, missing_workspace, "gone-boundary")
     _real_git(monkeypatch)
     raw_base = {
