@@ -6760,7 +6760,7 @@ def parse_report_block(text: str | None) -> Any | None:
         if not isinstance(payload, dict):
             continue
         try:
-            return MachineReviewSubmit(**payload)
+            return MachineReviewSubmit.from_run_text(payload)
         except Exception:  # noqa: BLE001 - a refused report is simply not one
             log.warning("run text carried a report the contract refused")
             continue

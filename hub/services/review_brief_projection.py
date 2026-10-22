@@ -639,6 +639,12 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
         lines.append("  SELF-REVIEWED: the author reviewed their own work")
     elif mr["principal_id"] is None:
         lines.append("  independence NOT established (no reviewer principal recorded)")
+    if mr["pin_verified"]:
+        lines.append("  pin verified: the hub matched the report to its submission")
+    else:
+        lines.append(
+            "  pin NOT verified: the report does not prove which submission it read"
+        )
     if mr["second_door_channel"] or mr["second_door_reason"]:
         lines.append(
             f"  channel: {mr['second_door_channel']} ({mr['second_door_reason']})"
