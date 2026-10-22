@@ -146,19 +146,15 @@ def _negatives(row: dict[str, Any]) -> list[tuple[str, str]]:
     return out
 
 
-def _flaws(row: dict[str, Any], sha: str) -> list[tuple[str, str]]:
-    """Почему отчёт не годится в пару. Пусто - засчитывается.
+def _unclean(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """Единый предикат чистоты отчёта: изъяны, годные и для пары, и для прочих.
 
-    Строже ``_negatives``: «не заявлено» (``incomplete`` пуст) здесь не чисто,
-    а принципал, пин и происхождение обязаны быть известны.
+    Один на ВСЕ отчёты поколения (#1986, круг 2): определение «чисто» для пары
+    и для прочих отчётов не разъезжается. Неизвестное не чисто: принципал,
+    признак саморевью и полнота прогона обязаны быть заявлены, перенесённый
+    отчёт - не прогон, пустой отчёт - не ревью.
     """
     out: list[tuple[str, str]] = []
-    if (
-        row.get("pin_verified") != 1
-        or not sha
-        or str(row.get("reviewed_sha") or "").lower() != sha.lower()
-    ):
-        out.append(("pin", "нет пина, проверенного хабом, на эту сдачу и sha"))
     if row.get("carried_from_review_id") is not None:
         out.append(("carried", "отчёт перенесён с прежней сдачи, прогона не было"))
     elif not report_has_evidence(row):
@@ -175,6 +171,18 @@ def _flaws(row: dict[str, Any], sha: str) -> list[tuple[str, str]]:
         out.append(("self_reviewed", "саморевью или признак не заявлен"))
     out.extend(_negatives(row))
     return out
+
+
+def _flaws(row: dict[str, Any], sha: str) -> list[tuple[str, str]]:
+    """Почему отчёт не годится в пару: пин поверх единого предиката чистоты."""
+    out: list[tuple[str, str]] = []
+    if (
+        row.get("pin_verified") != 1
+        or not sha
+        or str(row.get("reviewed_sha") or "").lower() != sha.lower()
+    ):
+        out.append(("pin", "нет пина, проверенного хабом, на эту сдачу и sha"))
+    return out + _unclean(row)
 
 
 def _pick(
@@ -297,7 +305,7 @@ def _others(rows: list[dict[str, Any]], pair: tuple[int, int] | None) -> list[st
             continue
         out.extend(
             f"{token}: прочий отчёт #{row['id']}: {text}"
-            for token, text in _negatives(row)
+            for token, text in _unclean(row)
         )
     return out
 
