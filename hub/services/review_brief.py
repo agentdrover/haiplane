@@ -664,6 +664,50 @@ def _observed_stacking_warning(task_id: int, branch: str, sha: str = "") -> str:
     return f"{message} [сверено {gate_observations.age_phrase(seen.age_minutes)}]"
 
 
+async def _locator_resolution(
+    db, task_id: int, task_view, ac_models, diff_base: dict, timer
+) -> list[ACLocatorResolution]:
+    """Locators of the test ACs at one ref; ``[]`` when there is no test AC."""
+    from hub import services
+
+    if not any(a.verifiable_by.value == "test" for a in ac_models):
+        return []
+    with timer.block("test_locators"):
+        ctx = await services.project_git_context(db, task_id)
+        try:
+            resolved = await resolve_locators_at_ref(
+                plugins.git_ops,
+                ctx.get("repo"),
+                ac_models,
+                submission_sha=task_view.submission_sha or "",
+                branch=task_view.branch or "",
+                base=diff_base.get("base")
+                or ctx.get("base_branch")
+                or config.PAIR_BASE_BRANCH,
+            )
+        except OSError as exc:
+            # #2002: git cannot even start in a missing cwd. "Not checked" is
+            # unknown, never a false "missing"; the brief still renders.
+            log.warning("locators for #%s: git could not run: %s", task_id, exc)
+            gone = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+            why = (
+                "not checked: the project working directory was not found"
+                if gone
+                else f"not checked: git could not run ({type(exc).__name__})"
+            )
+            resolved = [
+                {
+                    "ac_id": a.id,
+                    "locator": a.test_ref,
+                    "status": "unknown",
+                    "reason": why,
+                }
+                for a in ac_models
+                if a.verifiable_by.value == "test"
+            ]
+    return [ACLocatorResolution(**r) for r in resolved]
+
+
 async def build_review_brief(
     db,
     task_id: int,
@@ -766,42 +810,9 @@ async def build_review_brief(
     # (conftest.py, plugins, the tests themselves). Only pays the git reads
     # when the brief actually has test-AC to check.
     ac_models = [services.row_to_ac(r) for r in ac_rows]
-    locator_resolution: list[ACLocatorResolution] = []
-    if any(a.verifiable_by.value == "test" for a in ac_models):
-        with timer.block("test_locators"):
-            ctx = await services.project_git_context(db, task_id)
-            try:
-                resolved = await resolve_locators_at_ref(
-                    plugins.git_ops,
-                    ctx.get("repo"),
-                    ac_models,
-                    submission_sha=task_view.submission_sha or "",
-                    branch=task_view.branch or "",
-                    base=diff_base.get("base")
-                    or ctx.get("base_branch")
-                    or config.PAIR_BASE_BRANCH,
-                )
-            except OSError as exc:
-                # #2002: git cannot even start in a missing cwd. "Not checked" is
-                # unknown, never a false "missing"; the brief still renders.
-                log.warning("locators for #%s: git could not run: %s", task_id, exc)
-                gone = isinstance(exc, (FileNotFoundError, NotADirectoryError))
-                why = (
-                    "not checked: the project working directory was not found"
-                    if gone
-                    else f"not checked: git could not run ({type(exc).__name__})"
-                )
-                resolved = [
-                    {
-                        "ac_id": a.id,
-                        "locator": a.test_ref,
-                        "status": "unknown",
-                        "reason": why,
-                    }
-                    for a in ac_models
-                    if a.verifiable_by.value == "test"
-                ]
-        locator_resolution = [ACLocatorResolution(**r) for r in resolved]
+    locator_resolution = await _locator_resolution(
+        db, task_id, task_view, ac_models, diff_base, timer
+    )
 
     # #572: does the branch still stand where the submission pinned it? Three
     # states, never collapsed — the reviewer must see "could not look" as
