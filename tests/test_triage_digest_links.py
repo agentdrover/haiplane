@@ -237,3 +237,31 @@ async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
         assert [tuple(r) for r in rows] == [(1, 1), (2, 2)]
     finally:
         await conn.close()
+
+
+async def test_an_outcome_after_the_day_is_left_for_its_own_day(world):
+    """Исход с действием ПОСЛЕ суток дайджеста не берётся им и не связывается."""
+    rec_id, _ = await _outcome(world, "будущий")
+    await world.db.execute(
+        "UPDATE executor_triage_recommendations SET followup_at = ? WHERE id = ?",
+        ("2026-10-21 12:00:00", rec_id),
+    )
+    await world.db.commit()
+    await _generate(world.db, _day(1))  # сутки 2026-10-20: создание есть, исхода нет
+    assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
+    await _generate(world.db, _day(2))  # сутки 2026-10-21: исход в своих сутках
+    links = await _rows(world.db, f"SELECT * FROM {LINKS}")
+    assert [(r["recommendation_id"], r["kind"]) for r in links] == [(rec_id, "day")]
+
+
+async def test_an_unreadable_section_links_nothing(world, monkeypatch):
+    """Дайджест с unavailable связей не создаёт: исход ждёт первого измеренного."""
+    await _outcome(world, "сбой")
+    monkeypatch.setattr(triage_inbox, "_DIGEST_ROWS_SQL", "SELECT * FROM no_such")
+    await _generate(world.db, _day(1))
+    states = [
+        json.loads(r["payload"])["triage"]["state"]
+        for r in await _rows(world.db, "SELECT payload FROM autopilot_digests")
+    ]
+    assert states == ["unavailable"]
+    assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
