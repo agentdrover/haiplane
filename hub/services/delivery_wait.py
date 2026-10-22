@@ -86,7 +86,7 @@ async def settle(
     try:
         key = _snapshot_key(task)
         if not detail.startswith(orchestration.BASE_FETCH_PENDING_PREFIX):
-            await _close_if_open(db, key)
+            await _close_if_open(db, task, key)
             return False
         return await _judge(db, task, key, detail, pr_num)
     except Exception:  # noqa: BLE001 - сбой срока не ломает доставку и не переводит
@@ -105,13 +105,13 @@ def _snapshot_key(task: dict[str, Any]) -> tuple[int, int, int, str]:
 
 
 async def _close_if_open(
-    db: aiosqlite.Connection, key: tuple[int, int, int, str]
+    db: aiosqlite.Connection, task: dict[str, Any], key: tuple[int, int, int, str]
 ) -> None:
-    """Закрыть открытое ожидание ключа прохода; чужой (живой) ключ не трогать."""
+    """Закрыть открытое ожидание ключа прохода; проход чужого ключа или PR - нет."""
     if not await journal.has_open(db, *key):
         return  # без открытого - ни записи, ни write-лока
     async with write_transaction(db):
-        if await _live_key(db, key[0]) == key:
+        if await _pass_is_live(db, task, key):
             await journal.close_open(db, *key)
 
 
@@ -128,7 +128,7 @@ async def _judge(
     async with write_transaction(db):
         # Результат прохода относится к его снимку: если живая строка уже ушла
         # на другое поколение или ревизию, проход устарел и журнала не трогает.
-        if await _live_key(db, key[0]) != key:
+        if not await _pass_is_live(db, task, key):
             return False
         await journal.open_wait(db, *key)
         if hours is None or not await journal.is_overdue(db, *key, hours):
@@ -140,6 +140,22 @@ async def _judge(
         fallback=False,
     )
     return bool(written and escalated)
+
+
+async def _pass_is_live(
+    db: aiosqlite.Connection, task: dict[str, Any], key: tuple[int, int, int, str]
+) -> bool:
+    """Проход ещё про живую задачу: тот же ключ и тот же PR, что в снимке.
+
+    Замена PR без смены поколения ключ не меняет, но причина прохода (CI,
+    fetch, мерж) относится к старому PR: такой проход журнала не трогает.
+    """
+    if await _live_key(db, key[0]) != key:
+        return False
+    live = await repo.get_task(db, key[0])
+    return live is not None and int(live["pr_number"] or 0) == int(
+        task.get("pr_number") or 0
+    )
 
 
 async def _live_key(
@@ -165,15 +181,12 @@ async def _escalate(
     hours: int,
 ) -> bool:
     """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку."""
-    live = await repo.get_task(db, key[0])
-    if await _live_key(db, key[0]) != key or live is None:
-        return False  # завершена, возвращена или сдана заново с прохода до лока
-    if int(live["pr_number"] or 0) != int(pr_num or 0):
-        return False  # PR заменён: причина прохода относится к другому PR
-    if await _delivery_moved_on(db, key, int(live["pr_number"] or 0)):
+    if not await _pass_is_live(db, {"pr_number": pr_num}, key):
+        return False  # завершена, возвращена, сдана заново или PR заменён
+    if await _delivery_moved_on(db, key, int(pr_num or 0)):
         await journal.close_open(db, *key)
         return False  # доставлено соседним путём: переводить нечего
-    if await _rerun_holds(db, key):
+    if await _rerun_holds(db, key, int(pr_num or 0)):
         return False  # живая бронь #1956 обслужит поколение; срок не продлевается
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
@@ -203,9 +216,13 @@ async def _delivery_moved_on(
 
 
 async def _rerun_holds(
-    db: aiosqlite.Connection, key: tuple[int, int, int, str]
+    db: aiosqlite.Connection, key: tuple[int, int, int, str], pr_num: int
 ) -> bool:
-    """Живая бронь автоперезапуска (#1956) этого поколения, ещё в своём сроке.
+    """Живая бронь автоперезапуска (#1956) этого поколения и PR, ещё в своём сроке.
+
+    Бронь другого PR или при выключенной политике #1956 закрывает как
+    ``superseded`` на проходе, до которого отказ fetch не доходит, - держать
+    ею срок нельзя. Политика не прочиталась - бронь держит (не «off»).
 
     Просроченная бронь не держит: её срок судит #1956 на проходе, до которого
     при отказе fetch базы дело не доходит, и бессрочная бронь превратила бы
@@ -213,8 +230,11 @@ async def _rerun_holds(
     """
     from hub.services import delivery_rerun
 
+    if await delivery_rerun.policy_mode(db, key[0]) is False:
+        return False
     return any(
         int(r["submission_generation"]) == key[1]
+        and int(r["pr_number"]) == pr_num
         and _fresh(str(r.get("requested_at") or ""), delivery_rerun.WAIT_MINUTES)
         for r in await rerun_journal.open_rows(db, key[0])
     )

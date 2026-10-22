@@ -406,6 +406,7 @@ async def test_a_live_rerun_booking_is_not_an_escalation(db, monkeypatch):
         )
 
     task_id = await _aged_wait(db, monkeypatch, booking)
+    await set_policy(db, delivery_fresh_base_rerun="on")
     await _pass(db, task_id)
 
     assert (await repo.get_task(db, task_id))["status"] == "running"
@@ -423,6 +424,7 @@ async def test_an_expired_rerun_booking_does_not_hold_the_deadline(db, monkeypat
         )
 
     task_id = await _aged_wait(db, monkeypatch, booking)
+    await set_policy(db, delivery_fresh_base_rerun="on")
     await _pass(db, task_id)
 
     assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
