@@ -264,12 +264,12 @@ def _origin_triple(value: str) -> tuple[str, str, int] | None:
 
 
 _LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
-_HOST_RE: Final = re.compile(rf"{_LABEL}(\.{_LABEL})*")
+_HOST_RE: Final = re.compile(rf"({_LABEL}\.)*[a-z]{{2,63}}")  # TLD: letters only
 _Triple = tuple[str, str, int]
 
 
 def _is_host(host: str) -> bool:
-    """A DNS name: ASCII letters, digits, hyphen; labels of 1..63; no IP literal."""
+    """A DNS name: labels of 1..63 of [a-z0-9-], the last one letters only (no IPs)."""
     return len(host) <= 253 and bool(_HOST_RE.fullmatch(host))
 
 
@@ -280,7 +280,7 @@ def _strict_origin(value: str) -> _Triple | None:
     carries: a typo here must never widen trust. No wildcard, userinfo, path,
     query or fragment, only http/https, and port 1..65535 when one is written.
     """
-    value = value.strip()
+    value = value.strip(" ")  # only U+0020: strip() also eats \x1c-\x1f
     # Before urlsplit: it silently drops control characters and unwraps [..].
     if not value or re.search(r"[^\x21-\x7e]|[?#@*\\\[\]]", value):
         return None
