@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hub import cli, mcp_server
+from hub import cli, hub_instance, mcp_server
 from hub import repository as repo
 from hub.models import ReviewBrief
 from hub.services import review_brief_projection as proj
@@ -177,6 +177,18 @@ def served(monkeypatch):
         return copy.deepcopy(box["brief"])
 
     monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    # Эхо экземпляра входит в конверт и в бюджет знаков: длина server_id - это
+    # имя хоста. Фиксируем значения, чтобы число показанных AC не зависело от
+    # машины (#1985 Nit, testing-playbook #1851).
+    monkeypatch.setattr(
+        hub_instance,
+        "instance_echo_fields",
+        lambda: {
+            "instance": "prod",
+            "base_url": "https://agenthai.ru",
+            "server_id": "vm-5c8197",
+        },
+    )
     return box
 
 
@@ -275,8 +287,8 @@ async def test_mcp_brief_fits_the_budget_and_keeps_the_mandatory_fields(
     if shape == "1664":
         # #1985: pin_verified - решающее поле machine_review и стоит знаков;
         # на границе бюджета число показанных AC зависит от длины имени хоста
-        # в конверте (server_id): 9 в CI, 8 на длинном локальном имени.
-        assert blocks["acceptance_criteria"]["shown"] in (8, 9)
+        # в конверте (server_id); эхо зафиксировано в фикстуре served.
+        assert blocks["acceptance_criteria"]["shown"] == 9
     text = _text(result)
     assert text.startswith("Review brief for task #1647")
     assert "AC-1:" in text or blocks["acceptance_criteria"]["shown"] == 0
