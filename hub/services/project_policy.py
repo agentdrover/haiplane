@@ -825,6 +825,41 @@ def local_review_fallback_of(policy: dict) -> str:
     return LOCAL_REVIEW_FALLBACK_OFF
 
 
+# Автоперезапуск упавших job канонического CI на свежей базе (#1956). Гейт слил
+# базу в ветку, CI на новой голове красный: при ``on`` хаб ОДИН раз просит форж
+# перезапустить упавшие job и мержит только по доверенному отчёту этой попытки;
+# при ``off`` (по умолчанию) всё как до правки - красный CI на свежей базе уходит
+# к человеку. Запускает платную работу на форже, поэтому нет ключа и нечитаемое
+# значение - ``off``: опечатка не должна молча включать перезапуск.
+DELIVERY_FRESH_BASE_RERUN_KEY = "delivery_fresh_base_rerun"
+DELIVERY_FRESH_BASE_RERUN_OFF = "off"
+DELIVERY_FRESH_BASE_RERUN_ON = "on"
+DELIVERY_FRESH_BASE_RERUN_MODES: tuple[str, ...] = (
+    DELIVERY_FRESH_BASE_RERUN_OFF,
+    DELIVERY_FRESH_BASE_RERUN_ON,
+)
+
+
+def validate_delivery_fresh_base_rerun(policy: dict) -> None:
+    """Refuse a rerun mode the reader would read as off by accident (#1956)."""
+    key = DELIVERY_FRESH_BASE_RERUN_KEY
+    if key in policy and policy[key] not in DELIVERY_FRESH_BASE_RERUN_MODES:
+        raise ValueError(
+            f"gate_policy {key} must be one of "
+            f"{', '.join(DELIVERY_FRESH_BASE_RERUN_MODES)}, got: {policy[key]!r}"
+        )
+
+
+def delivery_fresh_base_rerun_of(policy: dict) -> str:
+    """Включён ли автоперезапуск: нет ключа или нечитаемое значение - off."""
+    if (
+        isinstance(policy, dict)
+        and policy.get(DELIVERY_FRESH_BASE_RERUN_KEY) == DELIVERY_FRESH_BASE_RERUN_ON
+    ):
+        return DELIVERY_FRESH_BASE_RERUN_ON
+    return DELIVERY_FRESH_BASE_RERUN_OFF
+
+
 # Хост критика для облачной сдачи (#1953). Имя зарегистрированного хоста
 # исполнителя (k8), чей ключ забирает заказы критика. Пусто или нет ключа -
 # выключено: сдача облачной задачи идёт как до задачи. Нечитаемое значение

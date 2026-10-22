@@ -118,6 +118,8 @@ class Standing:
     applied: bool = False
     ac_recorded: tuple[dict, ...] = ()
     forge_down: bool = False
+    #: Версия состояния коммита, при которой записана проекция (None - не из записи).
+    version: int | None = None
 
     @property
     def verified(self) -> bool:
@@ -1197,7 +1199,7 @@ async def _write_round(
         standing = await _project(
             db, task, head_sha, list(fresh), runs, gh_repo, contract
         )
-        return replace(standing, forge_down=runs is None)
+        return replace(standing, forge_down=runs is None, version=version)
 
 
 async def _superseded(db: Any, task_id: int, head_sha: str) -> Standing:

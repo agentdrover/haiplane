@@ -946,6 +946,11 @@ async def enrich_task_view(
     # #1953: последний заказ критика облачной сдачи - sha, состояние, срок, шаг.
     task_view.critic_order = await critic_orders.card_view(db, task_view.id)
 
+    # #1956: история автоперезапуска CI на свежей базе - одна для REST, MCP, web и CLI.
+    from hub.services import delivery_rerun
+
+    task_view.delivery_rerun = await delivery_rerun.card_view(db, task_view.id)
+
     from hub.services import role_orders
 
     task_view.role_orders = await role_orders.card_view(db, task_view.id)  # #1973
@@ -5818,6 +5823,9 @@ async def return_to_work(
             "abandoned_jobs": [job for _field, job, _status in active_jobs],
         },
     )
+    from hub.services import executor_triage_rework
+
+    await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
     await db.commit()
     await log_activity(
         db,

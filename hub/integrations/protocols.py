@@ -626,6 +626,23 @@ class GitOpsPlugin(Protocol):
         forge: str = "",
         workflow_path: str = ".github/workflows/ci.yml",
     ) -> list[dict[str, Any]] | None: ...
+    # #1956: перезапуск упавших job прогона (платный POST) и имена job попытки
+    # (чтение). Первое - исход просьбы, второе - список либо None («не смогли»).
+    async def rerun_failed_jobs(
+        self,
+        run_id: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> CIRunRequestResult: ...
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> list[dict[str, Any]] | None: ...
     async def ci_run_artifacts(
         self,
         run_id: str,
@@ -1023,6 +1040,18 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         workflow_path: str = ".github/workflows/ci.yml",
+    ) -> list[dict[str, Any]] | None: ...
+    # #1956: перезапуск упавших job прогона и имена job попытки.
+    async def rerun_failed_jobs(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult: ...
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None: ...
     async def ci_run_artifacts(
         self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
