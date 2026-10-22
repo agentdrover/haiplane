@@ -51,6 +51,8 @@
         {% set ci_block = ci_trust_blocks.get(c.project.id) if ci_trust_blocks else None %}
         {% if ci_block and ci_block.state == 'unverified' %}
         <p class="task-action-note task-action-note--warning">{{ ci_block.message }}</p>
+        {% elif ci_block and ci_block.state == 'unknown' %}
+        <p class="task-action-note task-action-note--warning">{{ ci_block.message }}</p>
         {% elif ci_block and ci_block.state == 'no_reports' %}
         <p class="task-action-note">{{ ci_block.message }}</p>
         {% endif %}

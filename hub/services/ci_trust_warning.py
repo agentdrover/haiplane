@@ -38,6 +38,9 @@ NO_SUBMISSIONS = "no_submissions"
 NO_REPORTS = "no_reports"
 VERIFIED = "verified"
 UNVERIFIED = "unverified"
+#: Прочитать не удалось: это не «подтверждён» и не «нет отчётов».
+UNKNOWN = "unknown"
+UNKNOWN_MESSAGE = "Состояние CI не прочитано: ошибка чтения, повторите запрос."
 
 
 def _block(state: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -77,8 +80,13 @@ SELECT owner, task_id, sha FROM ranked WHERE n <= ? ORDER BY owner, n
 
 async def _batch(
     db: aiosqlite.Connection, projects: list[Any]
-) -> tuple[dict[int, list[tuple[int, str]]], dict[tuple[int, str], dict[str, Any]]]:
-    """Last submissions per project and the reports of their pinned commits: 2 statements."""
+) -> tuple[
+    dict[int, list[tuple[int, str]]],
+    dict[tuple[int, str], dict[str, Any]],
+    dict[tuple[int, str], list[dict[str, Any]]],
+]:
+    """Last submissions per project, the reports of their pinned commits and the
+    attempt rows behind them: 3 statements, whatever the number of projects."""
     wanted = {int(p["id"]) for p in projects}
     recent: dict[int, list[tuple[int, str]]] = {}
     for r in await fetchall(db, _RECENT_SQL, (RECENT_SUBMISSIONS,)):
@@ -88,6 +96,7 @@ async def _batch(
             )
     pairs = sorted({pair for subs in recent.values() for pair in subs})
     reports: dict[tuple[int, str], dict[str, Any]] = {}
+    attempts: dict[tuple[int, str], list[dict[str, Any]]] = {}
     if pairs:
         rows = await fetchall(
             db,
@@ -97,20 +106,53 @@ async def _batch(
             (json.dumps([list(p) for p in pairs]),),
         )
         reports = {(int(r["task_id"]), str(r["head_sha"])): dict(r) for r in rows}
-    return recent, reports
+        for r in await fetchall(
+            db,
+            "SELECT a.task_id, a.head_sha, a.run_id, a.run_attempt, a.trust_final, "
+            "a.contract_fp FROM ci_report_attempts a JOIN json_each(?) j "
+            "ON a.task_id = json_extract(j.value, '$[0]') "
+            "AND a.head_sha = json_extract(j.value, '$[1]')",
+            (json.dumps([list(p) for p in pairs]),),
+        ):
+            attempts.setdefault((int(r["task_id"]), str(r["head_sha"])), []).append(
+                dict(r)
+            )
+    return recent, reports, attempts
+
+
+def _is_final(
+    report: dict[str, Any], attempts: list[dict[str, Any]], fingerprint: str
+) -> bool:
+    """Окончательно ли неподтверждён отчёт: стюард на него больше не ждёт.
+
+    Тот же вопрос, что у ``steward_ci_wait``: строка ЕГО попытки окончательна
+    под текущим контрактом (отчёт без provenance - строка без идентификаторов).
+    """
+    key = str(report.get("attempt_key") or "")
+    for row in attempts:
+        if not int(row["trust_final"] or 0) or row["contract_fp"] != fingerprint:
+            continue
+        own = ci_trust.attempt_key(row["run_id"], row["run_attempt"])
+        if own and own == key:
+            return True
+        if not own and not key and report["trust_reason"] == ci_trust.NO_PROVENANCE:
+            return True
+    return False
 
 
 def _block_of(
     project: Any,
     submissions: list[tuple[int, str]],
     stored: dict[tuple[int, str], dict[str, Any]],
+    attempts: dict[tuple[int, str], list[dict[str, Any]]],
 ) -> dict[str, Any]:
     fingerprint = project_policy.ci_contract_of(project).fingerprint
     if not submissions:
         return _block(
             NO_SUBMISSIONS, "Сдач ещё нет: подтверждаемость CI не проверялась."
         )
-    reports = [stored[pair] for pair in submissions if pair in stored]
+    pairs = [pair for pair in submissions if pair in stored]
+    reports = [stored[pair] for pair in pairs]
     checked = len(submissions)
     if not reports:
         return _block(
@@ -120,48 +162,60 @@ def _block_of(
             checked=checked,
         )
     reasons: Counter[str] = Counter()
-    for report in reports:
+    final = True
+    for pair, report in zip(pairs, reports, strict=True):
         trust, reason = ci_trust.trust_of(report, fingerprint)
         if trust == ci_trust.VERIFIED:
             return _block(VERIFIED, "", checked=checked)
         reasons[reason or ci_trust.LEGACY] += 1
+        final = final and _is_final(report, attempts.get(pair, []), fingerprint)
     named = ", ".join(f"{reason} x{n}" for reason, n in sorted(reasons.items()))
-    return _block(
-        UNVERIFIED,
-        f"CI-отчёты есть ({len(reports)} из последних {checked} сдач), но ни один "
-        f"не подтверждён на закреплённом коммите: {named}. Стюард ждёт "
-        f"подтверждения впустую. Что настроить: {GUIDE}.",
-        reasons=dict(reasons),
-        checked=checked,
-    )
+    seen = f"CI-отчёты есть ({len(reports)} из последних {checked} сдач)"
+    if final:
+        message = (
+            f"{seen}, но не подтверждаются: {named}; стюард судит без CI. "
+            f"Что настроить: {GUIDE}."
+        )
+    else:
+        message = (
+            f"{seen}, ни один пока не подтверждён на закреплённом коммите: "
+            f"{named}; подтверждение ожидается. Если его нет, что настроить: {GUIDE}."
+        )
+    block = _block(UNVERIFIED, message, reasons=dict(reasons), checked=checked)
+    block["final"] = final
+    return block
+
+
+def _unknown() -> dict[str, Any]:
+    return _block(UNKNOWN, UNKNOWN_MESSAGE)
 
 
 async def ci_trust_block(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     """Состояние подтверждаемости CI у проекта ``project`` (строка или отображение)."""
-    recent, stored = await _batch(db, [project])
-    return _block_of(project, recent.get(int(project["id"]), []), stored)
+    return (await blocks_by_project(db, [project]))[int(project["id"])]
 
 
 async def blocks_by_project(
     db: aiosqlite.Connection, projects: Any
-) -> dict[int, dict[str, Any] | None]:
+) -> dict[int, dict[str, Any]]:
     """``{id проекта: блок}`` для списка: запросов столько же, сколько для одного проекта.
 
-    Отказ чтения - None у всех (страница не падает); отказ расчёта одного - у него.
+    Отказ чтения не выдаётся ни за «подтверждён», ни за «отчётов нет»: блок
+    ``unknown`` с фразой «состояние CI не прочитано».
     """
     rows = list(projects)
     try:
-        recent, stored = await _batch(db, rows)
+        recent, stored, attempts = await _batch(db, rows)
     except Exception:
         log.exception("CI trust blocks could not be read")
-        return {int(p["id"]): None for p in rows}
-    out: dict[int, dict[str, Any] | None] = {}
+        return {int(p["id"]): _unknown() for p in rows}
+    out: dict[int, dict[str, Any]] = {}
     for project in rows:
         try:
             out[int(project["id"])] = _block_of(
-                project, recent.get(int(project["id"]), []), stored
+                project, recent.get(int(project["id"]), []), stored, attempts
             )
         except Exception:
             log.exception("CI trust block failed for project %s", project["id"])
-            out[int(project["id"])] = None
+            out[int(project["id"])] = _unknown()
     return out

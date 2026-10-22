@@ -84,92 +84,123 @@ def _sender() -> str:
     return satellite_ci.render_sender(PRODUCER_NAME, PRODUCER_PATH)
 
 
-def _push_to_default(workspace: str, default: str, sender: str) -> SeedResult:
-    """Положить sender в default-ветку origin, не трогая ветку рабочей копии.
+def _publish_in_worktree(
+    workspace: str, branch: str, files: dict[str, str], message: str
+) -> SeedResult:
+    """Положить ``files`` в ``origin/<branch>``, не трогая общую рабочую копию.
 
-    Через временное дерево на ``origin/<default>``: рабочая копия остаётся на
-    интеграционной ветке (её могут использовать), а чужой CI на default-ветке
-    виден до записи.
+    Коммит делается во временном дереве на ``origin/<branch>`` и на временной
+    локальной ветке; общая копия (её ветку может сменить поллер или другой
+    провижининг) не читается и не пишется. Пушится ровно свой коммит полным
+    refspec на ``refs/heads/<branch>`` и проверяется, что удалённая ветка стала
+    именно им. Чужой CI на ветке виден до записи; свои же файлы (содержимое
+    совпало побайтно) повтор не трогает и не считает чужими.
     """
-    rc, out = workflow_seed._git(workspace, "fetch", "origin", default)
+    rc, out = workflow_seed._git(workspace, "fetch", "origin", branch)
     if rc != 0:
-        return SeedResult(UNAVAILABLE, f"could not fetch origin/{default}: {out}")
+        return SeedResult(
+            UNAVAILABLE,
+            f"could not push the workflows to {branch}: could not fetch "
+            f"origin/{branch}: {out}",
+        )
     tmp = tempfile.mkdtemp(prefix="haiplane-seed-")
+    local = f"hub-seed-{os.path.basename(tmp)}"
     try:
         rc, out = workflow_seed._git(
-            workspace, "worktree", "add", "--detach", tmp, f"origin/{default}"
+            workspace, "worktree", "add", "-b", local, tmp, f"origin/{branch}"
         )
         if rc != 0:
-            return SeedResult(UNAVAILABLE, f"could not open origin/{default}: {out}")
+            return SeedResult(UNAVAILABLE, f"could not open origin/{branch}: {out}")
         try:
-            return _commit_sender(tmp, default, sender)
+            return _commit_files(tmp, branch, local, files, message)
         finally:
             workflow_seed._git(workspace, "worktree", "remove", "--force", tmp)
+            workflow_seed._git(workspace, "branch", "-D", local)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _is_our_sender(tree: str, path: str) -> bool:
-    """The hub's own sender: the owned name AND byte-for-byte the current render.
+def _is_ours(tree: str, path: str, files: dict[str, str]) -> bool:
+    """A file the hub wrote: an owned name AND byte-for-byte the current render.
 
-    Anything else under that name (another ``workflows:``, a copied header) is
+    Anything else under such a name (another ``workflows:``, a copied header) is
     somebody's file and is left alone.
     """
-    if os.path.basename(path) != brand.SEEDED_CI_REPORT:
+    expected = files.get(os.path.basename(path))
+    if expected is None:
         return False
     try:
         with open(os.path.join(tree, path), encoding="utf-8", newline="") as handle:
-            return handle.read() == _sender()
+            return handle.read() == expected
     except OSError:
         return False
 
 
-def _commit_sender(tree: str, default: str, sender: str) -> SeedResult:
+def _commit_files(
+    tree: str, branch: str, local: str, files: dict[str, str], message: str
+) -> SeedResult:
     present = [
         path
         for path in workflow_seed.existing_workflows(tree)
-        if not _is_our_sender(tree, path)
+        if not _is_ours(tree, path, files)
     ]
-    if not present and _is_our_sender(
-        tree, os.path.join(WORKFLOWS_DIR, brand.SEEDED_CI_REPORT)
-    ):
-        # A retry after a partial success: the sender is already there.
-        return SeedResult(SEEDED, "", (brand.SEEDED_CI_REPORT,))
     if present:
         return SeedResult(
             PRESENT,
-            f"default branch {default} already carries workflows, none added: "
+            f"branch {branch} already carries workflows, none added: "
             + ", ".join(present),
         )
     directory = os.path.join(tree, WORKFLOWS_DIR)
     os.makedirs(directory, exist_ok=True)
-    with open(
-        os.path.join(directory, brand.SEEDED_CI_REPORT), "w", encoding="utf-8"
-    ) as f:
-        f.write(sender)
-    path = os.path.join(WORKFLOWS_DIR, brand.SEEDED_CI_REPORT)
-    rc, out = workflow_seed._git(tree, "add", "--", path)
-    if rc == 0:
-        rc, out = workflow_seed._git(
-            tree,
-            "-c",
-            f"user.name={HUB_GIT_NAME}",
-            "-c",
-            f"user.email={HUB_GIT_EMAIL}",
-            "commit",
-            "-m",
-            "ci: add the Haiplane CI report sender (hub provisioning, #2027)",
-        )
+    for name, content in files.items():
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+            handle.write(content)
+    paths = [os.path.join(WORKFLOWS_DIR, name) for name in sorted(files)]
+    rc, out = workflow_seed._git(tree, "add", "--", *paths)
     if rc != 0:
-        return SeedResult(FAILED, f"could not commit the sender: {out}")
-    rc, out = workflow_seed._git(tree, "push", "origin", f"HEAD:refs/heads/{default}")
+        return SeedResult(FAILED, f"could not stage the workflows: {out}")
+    rc, dirty = workflow_seed._git(tree, "status", "--porcelain")
+    if rc == 0 and not dirty:  # a retry: every file is already there
+        return SeedResult(SEEDED, "", tuple(sorted(files)))
+    rc, out = workflow_seed._git(
+        tree,
+        "-c",
+        f"user.name={HUB_GIT_NAME}",
+        "-c",
+        f"user.email={HUB_GIT_EMAIL}",
+        "commit",
+        "-m",
+        message,
+    )
     if rc != 0:
+        return SeedResult(FAILED, f"could not commit the workflows: {out}")
+    rc, sha = workflow_seed._git(tree, "rev-parse", "HEAD")
+    rc2, out = workflow_seed._git(
+        tree, "push", "origin", f"refs/heads/{local}:refs/heads/{branch}"
+    )
+    if rc != 0 or rc2 != 0:
         return SeedResult(
             FAILED,
-            f"could not push the sender to {default} (needs write access and the "
-            f"workflow scope): {out}",
+            f"could not push the workflows to {branch} (needs write access and "
+            f"the workflow scope): {out}",
         )
-    return SeedResult(SEEDED, "", (brand.SEEDED_CI_REPORT,))
+    rc, remote = workflow_seed._git(tree, "ls-remote", "origin", f"refs/heads/{branch}")
+    if rc != 0 or not remote.startswith(sha):
+        return SeedResult(
+            FAILED,
+            f"could not push the workflows to {branch}: the remote branch is not "
+            f"at {sha[:12]} after the push",
+        )
+    return SeedResult(SEEDED, "", tuple(sorted(files)))
+
+
+def _sync_clone(workspace: str, base: str) -> None:
+    """Best effort: fast-forward the shared clone to what was just pushed."""
+    if workflow_seed._current_branch(workspace) != base:
+        return
+    rc, dirty = workflow_seed._git(workspace, "status", "--porcelain")
+    if rc == 0 and not dirty:
+        workflow_seed._git(workspace, "merge", "--ff-only", f"origin/{base}")
 
 
 def _detail(base: str, default: str, read: bool) -> str:
@@ -208,14 +239,23 @@ def seed_pair(
     if default == base_branch:
         files[brand.SEEDED_CI_REPORT] = _sender()
     else:
-        sent = _push_to_default(workspace, default, _sender())
+        sent = _publish_in_worktree(
+            workspace,
+            default,
+            {brand.SEEDED_CI_REPORT: _sender()},
+            "ci: add the Haiplane CI report sender (hub provisioning, #2027)",
+        )
         if sent.state != SEEDED:
             return sent
-    result = workflow_seed.publish_files(
-        workspace, base_branch, WORKFLOWS_DIR, files, push=True
+    result = _publish_in_worktree(
+        workspace,
+        base_branch,
+        files,
+        "ci: add Haiplane workflows (hub provisioning, #476)",
     )
     if result.state != SEEDED:
         return result
+    _sync_clone(workspace, base_branch)
     names = (
         *result.written,
         *(() if default == base_branch else (brand.SEEDED_CI_REPORT,)),

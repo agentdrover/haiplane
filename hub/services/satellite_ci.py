@@ -1,7 +1,9 @@
 """Workflow templates of a satellite's trusted CI report (#1848).
 
-Two files, copied by the satellite's owner (not laid down by provisioning: they
-need an environment and keys only the owner can make, docs/satellite-ci-report.md):
+Two files. Provisioning of a new GitHub project lays them down itself
+(hub.services.external_ci_seed); for an existing project the owner copies them.
+Either way the environment, keys and ci_contract are the owner's
+(docs/satellite-ci-report.md):
 
 * the PRODUCER (``satellite-ci-producer.yml``): the tests job. It runs the
   branch's code, so it has no ``environment`` and no report key, only the read

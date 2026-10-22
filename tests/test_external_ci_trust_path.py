@@ -497,3 +497,149 @@ async def test_a_sender_that_listens_to_another_workflow_is_not_ours(
         "Existing tests"
     ]
     assert _tree(origin, "develop") == []
+
+
+async def test_a_branch_switch_of_the_shared_clone_does_not_misplace_the_producer(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """Between the preflight and the write someone checks out another branch."""
+    from hub.services import external_ci_seed
+
+    work, origin = _repo_pair(tmp_path)
+    _git(work, "branch", "elsewhere")
+    real = external_ci_seed.default_branch
+
+    def switching(workspace: str, fallback: str):
+        found = real(workspace, fallback)
+        _git(work, "checkout", "elsewhere")  # the network step is the window
+        return found
+
+    monkeypatch.setattr(external_ci_seed, "default_branch", switching)
+    elsewhere_before = _git(work, "rev-parse", "elsewhere")
+    project_id = await repo.create_project(db, slug="ext6", name="Ext6")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext6",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+
+    await services.provision_project(db, project_id)
+
+    assert _git(work, "rev-parse", "elsewhere") == elsewhere_before
+    assert _tree(origin, "develop") == [PRODUCER, "haiplane-stale.yml"]
+    assert _tree(origin, "main") == [SENDER]
+
+
+def test_the_seeded_templates_say_what_is_true_of_how_they_arrive():
+    """Provisioning lays the pair down itself now: no 'not laid down' / 'copy' claim."""
+    from hub.services.workflow_seed import read_template
+
+    for name in ("satellite-ci-report.yml", "satellite-ci-producer.yml"):
+        text = read_template(name)
+        assert "NOT laid down by provisioning" not in text, name
+        assert "Copy this file" not in text, name
+        assert "no more, no less" not in text, name
+    assert "provisioning of a NEW GitHub project lays this file down" in (
+        read_template("satellite-ci-report.yml")
+    )
+
+
+async def test_the_warning_words_follow_whether_the_steward_still_waits(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Final: 'не подтверждаются ... судит без CI'; not final: 'подтверждение ожидается'."""
+    install_fake_github(monkeypatch)
+    proj = await _project(db, "ext-words", steward=True)
+    task_id = await _submitted_task(db, proj)
+    await _submission(db, task_id, SHA)
+    await _report_without_provenance(db, task_id, SHA)
+
+    final = (await client.get("/api/projects/ext-words/effective-policy")).json()
+    text = final["ci_trust"]["message"]
+    assert "не подтверждаются: no_provenance" in text
+    assert "стюард судит без CI" in text
+    assert "ожидается" not in text and "впустую" not in text
+
+    await db.execute(
+        "UPDATE ci_report_attempts SET trust_final=0 WHERE task_id=?", (task_id,)
+    )
+    await db.commit()
+    waiting = (await client.get("/api/projects/ext-words/effective-policy")).json()
+    text = waiting["ci_trust"]["message"]
+    assert "подтверждение ожидается" in text
+    assert "судит без CI" not in text
+
+    # A final verdict made under another contract is not final now.
+    await db.execute(
+        "UPDATE ci_report_attempts SET trust_final=1 WHERE task_id=?", (task_id,)
+    )
+    await repo.update_project(
+        db, proj, gate_policy=json.dumps({"ci_contract": SAT_CONTRACT})
+    )
+    await db.commit()
+    moved = (await client.get("/api/projects/ext-words/effective-policy")).json()
+    assert "подтверждение ожидается" in moved["ci_trust"]["message"]
+
+
+async def test_a_read_failure_is_not_shown_as_confirmed_ci(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """The card and effective-policy say 'не прочитано', not nothing and not None."""
+    from hub.services import ci_trust_warning
+
+    await _project(db, "ext-unread", steward=True)
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ci_trust_warning, "_batch", broken)
+
+    page = (await client.get("/projects")).text
+    assert "Состояние CI не прочитано" in page
+    body = (await client.get("/api/projects/ext-unread/effective-policy")).json()
+    assert body["ci_trust"]["state"] == "unknown"
+    assert body["ci_trust"]["warning"] is False
+    assert body["ci_trust"] is not None
+
+
+async def test_a_push_that_did_not_move_the_remote_branch_is_not_success(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """The remote branch must be at the hub's own commit after the push."""
+    from hub.services import workflow_seed
+
+    work, origin = _repo_pair(tmp_path)
+    real = workflow_seed._git
+
+    def lying(workspace: str, *args: str):
+        rc, out = real(workspace, *args)
+        if args[:1] == ("ls-remote",) and args[-1] == "refs/heads/develop":
+            return rc, "0" * 40 + "\trefs/heads/develop"
+        return rc, out
+
+    monkeypatch.setattr(workflow_seed, "_git", lying)
+    project_id = await repo.create_project(db, slug="ext7", name="Ext7")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext7",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+
+    result = await services.provision_project(db, project_id)
+
+    assert "the remote branch is not at" in result["provision_detail"]
+    assert "ожидает настройки владельцем" not in result["provision_detail"]

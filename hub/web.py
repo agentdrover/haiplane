@@ -1153,7 +1153,7 @@ async def web_projects(
         except Exception:
             log.exception("review cost settings failed for project %s", r["id"])
             review_cost[int(r["id"])] = None
-    # #2027: подтверждается ли CI проекта (сбой расчёта одного проекта - None).
+    # #2027: подтверждается ли CI проекта (сбой чтения - блок unknown).
     ci_trust_blocks = await ci_trust_warning.blocks_by_project(_db(request), rows)
     # #1412: кнопка запуска исполнителя выписывает код implementer от имени
     # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).

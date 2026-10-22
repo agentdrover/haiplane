@@ -10,8 +10,8 @@
 # (satellite-ci-report.yml) from the default branch after this one completes.
 #
 # Replace the test step with the satellite's own; its `id` and outcome are the
-# only thing reported as a check, and the checks named here must be the
-# `required_checks` of the project's ci_contract in the hub - no more, no less.
+# only thing reported as a check, and the checks named here must include all the
+# `required_checks` of the project's ci_contract in the hub (more is allowed).
 name: @@WORKFLOW_NAME@@
 
 on:
