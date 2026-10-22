@@ -137,7 +137,9 @@ async def test_action_link_keeps_repair_target_and_primary_sheet(
 
     monkeypatch.setattr(web.card_actions, "for_page", real)
     page = (await client.get(f"/tasks/{task_id}")).text
-    assert 'class="c2-btn" href="#executor-repair-form"' in page, "лист не заслоняет круг"
+    assert 'class="c2-btn" href="#executor-repair-form"' in page, (
+        "лист не заслоняет круг"
+    )
 
     offered["repair"] = False
     page = (await client.get(f"/tasks/{task_id}")).text
