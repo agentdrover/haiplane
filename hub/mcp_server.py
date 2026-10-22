@@ -6222,6 +6222,12 @@ def _format_health(data: dict[str, Any]) -> str:
         if isinstance(egress, dict)
         else []
     )
+    origins = data.get("csrf_trusted_origins")
+    origins_part = (
+        [f"CSRF trusted origins: {', '.join(origins)}"]
+        if isinstance(origins, list)
+        else []
+    )
     return "\n".join(
         [
             f"Status: {data['status']}",
@@ -6231,6 +6237,7 @@ def _format_health(data: dict[str, Any]) -> str:
             f"Auth disabled: {data['auth_disabled']}",
             f"Env tokens configured: {data['env_tokens_configured']}",
             f"Vast enabled: {data['vast_enabled']}",
+            *origins_part,
             *egress_part,
         ]
     )
