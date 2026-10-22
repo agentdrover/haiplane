@@ -8,7 +8,9 @@ Two rules this script exists to obey:
 
 * It never fails the job. Every problem — no task branch, no token, hub
   unreachable, a validation entry that is prose rather than a command — prints a
-  reason and exits 0. The delivery gate (#605/#606) reads the job's outcome to
+  reason and exits 0 (#1988: in collect mode it first leaves a results.json that
+  says "unknown" and why, because a green run with no report is read by the hub
+  as a newer attempt without evidence). The delivery gate (#605/#606) reads the job's outcome to
   decide whether a PR may merge, so a reporting failure here would block merges
   for every task, not just this one.
 * It never reports a guess. What it did not run is reported as ``not_found`` for
@@ -69,6 +71,11 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+
+# The sibling module is found next to this file, whatever the working directory
+# (the scripts are run by path, and loaded by path in the tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ci_safe_failure import NETWORK_ERRORS, safe_failure  # noqa: E402
 
 TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # A validation entry we are willing to hand to a shell. Task text mixes real
@@ -172,7 +179,16 @@ def reported_commit() -> str:
     return fallback
 
 
+# #1988: why the last hub_request returned None — "HTTP 502" or "unreachable
+# (URLError)". A CODE and an exception TYPE only: the text of an exception can
+# carry anything the environment holds, and this goes into results.json, which
+# is reported onward, and into the log.
+LAST_FAILURE = ""
+
+
 def hub_request(url: str, token: str, payload: dict | None = None) -> dict | None:
+    global LAST_FAILURE
+    LAST_FAILURE = ""
     data = None
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     if payload is not None:
@@ -183,10 +199,42 @@ def hub_request(url: str, token: str, payload: dict | None = None) -> dict | Non
         with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - https URL from env
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")[:400]
-        log(f"hub said {exc.code}: {body}")
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        log(f"hub unreachable: {exc}")
+        # The code only, never the body: a 403 body names the project of the
+        # task and the projects of the key (hub/services/ci_scope.py), and this
+        # log is readable by everyone who can read the run.
+        LAST_FAILURE = f"HTTP {exc.code}"
+        log(f"hub said {exc.code}")
+    except (*NETWORK_ERRORS, json.JSONDecodeError) as exc:
+        LAST_FAILURE = f"unreachable ({safe_failure(exc)})"
+        log(f"hub unreachable: {safe_failure(exc)}")
+    return None
+
+
+# #1988: the hub restarts for a minute or two on every deploy (a 502 from nginx
+# in the live case), and one failed read of the task card used to leave the run
+# green with no results.json. A 4xx is an answer, not a hiccup: not repeated.
+_CARD_PAUSES = (3.0, 10.0, 30.0, 60.0)
+_HTTP_4XX = re.compile(r"^HTTP 4\d\d$")
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def read_card(url: str, token: str) -> dict | None:
+    """The task card, read again while the hub is only briefly unavailable."""
+    for attempt in range(len(_CARD_PAUSES) + 1):
+        card = hub_request(url, token)
+        if card is not None or _HTTP_4XX.match(LAST_FAILURE):
+            return card
+        if attempt == len(_CARD_PAUSES):
+            break
+        wait = _CARD_PAUSES[attempt]
+        if _remaining() < wait + 120:
+            log("no time left for another attempt to read the task card")
+            break
+        log(f"reading the task card again in {wait:g} s ({LAST_FAILURE or 'no data'})")
+        _pause(wait)
     return None
 
 
@@ -251,7 +299,10 @@ def ac_runner() -> list[str]:
     try:
         argv = shlex.split(raw)
     except ValueError as exc:
-        log(f"AC runner {raw!r} does not parse ({exc}) — every AC stays not_found")
+        log(
+            f"AC runner {raw!r} does not parse ({safe_failure(exc)}) — every AC "
+            "stays not_found"
+        )
         return []
     if not argv:
         log("AC runner is empty — every AC stays not_found")
@@ -355,7 +406,9 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
                 env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            log(f"pytest could not run ({exc}) — every AC stays not_found")
+            log(
+                f"pytest could not run ({safe_failure(exc)}) — every AC stays not_found"
+            )
             return {}
         missing = _missing_nodeids(proc.stdout + "\n" + proc.stderr, pending)
         if not missing:
@@ -622,7 +675,11 @@ def run_validation(
                 env=child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return "unknown", "\n".join(logs)[-_LOG_TAIL:], f"команда прервана: {exc}"
+            return (
+                "unknown",
+                "\n".join(logs)[-_LOG_TAIL:],
+                f"команда прервана: {safe_failure(exc)}",
+            )
         executed += 1
         logs.append(f"$ {cmd}\n{proc.stdout}{proc.stderr}")
         if proc.returncode != 0:
@@ -675,7 +732,7 @@ def _read_report(path: str) -> tuple[dict | None, str]:
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
     except (OSError, ValueError) as exc:
-        return None, str(exc)
+        return None, safe_failure(exc)
     if not isinstance(report, dict):
         return None, "expected an object"
     return report, ""
@@ -885,6 +942,42 @@ def write_results(payload: dict, task_id: int) -> str:
     return path
 
 
+def failed_results(head_sha: str, reason: str) -> dict:
+    """The report of a run whose collector could not do its work (#1988).
+
+    Unknown, never a guess: no AC result is claimed, validation is "unknown" with
+    the cause, the checks the job itself observed stay. The hub then holds a
+    report for this attempt that says why it proves nothing, instead of an
+    attempt with no report at all.
+    """
+    return {
+        "head_sha": head_sha,
+        "ac_results": {},
+        "validation_status": "unknown",
+        "validation_log": "",
+        "reason": reason[:1000],
+        "reported_by": "github-actions",
+        "checks": parse_checks(env_get("HUB_CI_CHECKS")),
+    }
+
+
+def _write_failed(task_id: int, head_sha: str, reason: str) -> int:
+    # A workflow command must start its line: no "[hub-report]" prefix here.
+    print(f"::error title=hub-report::{reason} — results.json says unknown", flush=True)
+    try:
+        path = write_results(failed_results(head_sha, reason), task_id)
+    except OSError as exc:
+        # The one case that turns the step red: nothing is left to report.
+        print(
+            "::error title=hub-report::results.json could not be written "
+            f"({safe_failure(exc)}) — the run has no report",
+            flush=True,
+        )
+        return 1
+    log(f"collection failed; wrote an unknown result to {path}")
+    return 0
+
+
 def main() -> int:
     base = env_get("HUB_URL").rstrip("/")
     read_token = env_get("HUB_CI_READ_TOKEN")
@@ -906,15 +999,32 @@ def main() -> int:
         log("no commit to report — a report must name its commit; reporting nothing")
         return 0
 
-    task = hub_request(f"{base}/api/tasks/{task_id}", token)
+    card_url = f"{base}/api/tasks/{task_id}"
+    task = read_card(card_url, token) if read_token else hub_request(card_url, token)
     if task is None:
+        why = LAST_FAILURE or "no answer"
         log(
-            f"could not read task #{task_id} from the hub — reporting nothing; "
-            "the hub will read this as unknown, not as failure"
+            f"could not read task #{task_id} from the hub ({why}) — reporting "
+            "nothing; the hub will read this as unknown, not as failure"
         )
+        if read_token:
+            return _write_failed(
+                task_id,
+                head_sha,
+                f"card_read_failed: {why}",
+            )
         return 0
 
-    payload = build_results(task, head_sha)
+    try:
+        payload = build_results(task, head_sha)
+    except Exception as exc:  # noqa: BLE001 - a crash must still leave a result
+        if not read_token:
+            raise
+        return _write_failed(
+            task_id,
+            head_sha,
+            f"collector_crashed: {safe_failure(exc)}",
+        )
     if read_token:
         path = write_results(payload, task_id)
         log(
