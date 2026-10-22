@@ -338,3 +338,21 @@ async def test_the_transition_is_won_once_per_wait(db, monkeypatch):
 
     assert await delivery_wait._escalate(db, key, 360, "x", 24) is False
     assert await _needs_decision_events(db, task_id) == 1
+
+
+async def test_repeated_passes_do_not_extend_the_clock(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 23)
+    poller._pair_delivery_waits.clear()  # рестарт
+    for text in ("a", "b", "c"):
+        monkeypatch.setattr(services, "merge_before_completion", _stuck(text))
+        assert (await _pass(db, task_id))["status"] == "running"
+
+    # Прошло ещё два часа: суммарно 25, и повторы ничего не сдвинули.
+    await db.execute(
+        "UPDATE delivery_wait_deadlines SET started_at = datetime(started_at, '-2 hours')"
+    )
+    await db.commit()
+
+    assert (await _pass(db, task_id))["status"] == "needs_decision"
