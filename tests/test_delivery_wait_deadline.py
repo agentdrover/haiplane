@@ -315,3 +315,26 @@ async def test_another_gate_answer_closes_the_wait_even_when_explicit(db, monkey
     monkeypatch.setattr(services, "merge_before_completion", _stuck())
     assert (await _pass(db, task_id))["status"] == "running", "отсчёт с нуля"
     assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_the_transition_is_won_once_per_wait(db, monkeypatch):
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    live = dict(await repo.get_task(db, task_id))
+    key = (
+        task_id,
+        live["submission_generation"],
+        live["review_verdict_revision"],
+        "base_fetch_pending",
+    )
+
+    assert await delivery_wait._escalate(db, key, 360, "x", 24) is True
+    # Владелец вернул задачу в running, но ожидание уже эскалировано: второй
+    # проход с тем же ключом перехода не выигрывает.
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+
+    assert await delivery_wait._escalate(db, key, 360, "x", 24) is False
+    assert await _needs_decision_events(db, task_id) == 1
