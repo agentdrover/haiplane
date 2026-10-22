@@ -658,3 +658,29 @@ async def test_cloud_repair_returns_and_orders_from_review_in_one_transaction(
     assert "owner" in await _feed(world, task_id) or "cloud-owner" in await _feed(
         world, task_id
     )
+
+
+@pytest.mark.parametrize("status", ["review", "fix_requested"])
+async def test_failure_after_the_return_rolls_the_return_back(
+    world, monkeypatch, status
+):
+    """Сбой выпуска кода после возврата: статус, цикл ревью и job_id прежние."""
+    await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(
+        world, f"сбой после возврата {status}", findings="machine"
+    )
+    await repo.update_task(
+        world.db, task_id, status=status, job_id="job-1", review_cycle=2
+    )
+    await world.db.commit()
+    before = await _footprint(world, task_id)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("code")
+
+    monkeypatch.setattr(el.chat_pair, "issue_run_code", boom)
+    with pytest.raises(RuntimeError):
+        await _cloud(world.db, task_id, world)
+    row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
+    assert row["job_id"] == "job-1"
+    assert await _footprint(world, task_id) == before
