@@ -587,36 +587,38 @@ async def _reserve(
         )
         if refusal is not None:
             return refusal
-        if admit is not None:
-            why = await admit(db, task)
-            if why:
-                return _refused(why, task_id)
-        generation = int(task.get("submission_generation") or 0) + 1
-        row_id = await repo.create_executor_run(
-            db,
-            task_id=task_id,
-            submission_generation=generation,
-            agent_id="",
-            run_id="",
-            model=model,
-            # #1446: у прогона «только сдай» свой, более низкий потолок.
-            token_ceiling=ceilings[0] if ceilings else None,
-            cents_ceiling=ceilings[1] if ceilings else None,
-        )
-        # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
-        # и поколение прогона; нажавший человек — в аудите.
-        code, _ttl = await chat_pair.issue_run_code(
-            db,
-            task_id,
-            generation,
-            issued_by_principal_id=issuer_principal_id,
-            executor_run_id=row_id,
-            commit=False,
-        )
-        if launch is not None:
-            await owner_minutes.record_order_accepted(
-                db, task_id, row_id, generation, issuer_principal_id, *launch
+        # SAVEPOINT: при внешней транзакции сбой не оставит возврат и бронь (#1998)
+        async with rework_admission.savepoint(db):
+            if admit is not None:
+                why = await admit(db, task)
+                if why:
+                    return _refused(why, task_id)
+            generation = int(task.get("submission_generation") or 0) + 1
+            row_id = await repo.create_executor_run(
+                db,
+                task_id=task_id,
+                submission_generation=generation,
+                agent_id="",
+                run_id="",
+                model=model,
+                # #1446: у прогона «только сдай» свой, более низкий потолок.
+                token_ceiling=ceilings[0] if ceilings else None,
+                cents_ceiling=ceilings[1] if ceilings else None,
             )
+            # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
+            # и поколение прогона; нажавший человек — в аудите.
+            code, _ttl = await chat_pair.issue_run_code(
+                db,
+                task_id,
+                generation,
+                issued_by_principal_id=issuer_principal_id,
+                executor_run_id=row_id,
+                commit=False,
+            )
+            if launch is not None:
+                await owner_minutes.record_order_accepted(
+                    db, task_id, row_id, generation, issuer_principal_id, *launch
+                )
     return task, generation, row_id, code
 
 

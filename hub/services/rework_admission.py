@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
@@ -24,6 +26,24 @@ from hub.services.result_kind import automation_not_applicable
 
 #: Находки вердикта, которые идут в круг починки: вне области их чинит не этот круг.
 _IN_SCOPE = "in_scope"
+
+
+@asynccontextmanager
+async def savepoint(db: aiosqlite.Connection) -> AsyncIterator[None]:
+    """SAVEPOINT вокруг допуска, возврата и брони: сбой откатывает ИХ записи.
+
+    ``write_transaction`` во вложенном вызове ничего не откатывает: если внешний
+    владелец транзакции перехватил ошибку и закоммитил, возврат в open, сброс
+    цикла и бронь без кода остались бы (#1998). Как ``_issue_atomically`` слота.
+    """
+    await db.execute("SAVEPOINT rework_reserve")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO rework_reserve")
+        await db.execute("RELEASE rework_reserve")
+        raise
+    await db.execute("RELEASE rework_reserve")
 
 
 def verdict_findings(task: dict[str, Any]) -> list[dict[str, str]]:
