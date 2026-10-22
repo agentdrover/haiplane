@@ -104,8 +104,9 @@ async def test_action_link_keeps_repair_target_and_primary_sheet(
 ):
     """#2035: «К действию» совмещает #1998 и #1813.
 
-    Без действий панели ссылка ведёт на форму круга починки (#1998), с
-    действиями - открывает главный лист панели (#1813).
+    Круг починки предложен на running с текущим вердиктом: ссылка ведёт на его
+    форму - и без действий панели, и с ними (лист панели её не заслоняет).
+    Без круга починки при действиях панели ссылка открывает главный лист.
     """
     from hub import web
 
@@ -118,11 +119,12 @@ async def test_action_link_keeps_repair_target_and_primary_sheet(
         review_verdict_generation=1,
     )
 
+    offered = {"repair": True}
+
     async def offers(_db, _task_id, _row):
-        return [], True, False  # круг починки предложен
+        return [], offered["repair"], False
 
     monkeypatch.setattr(web, "_card_executor_offers", offers)
-
     real = web.card_actions.for_page
 
     def no_actions(*args, **kwargs):
@@ -135,6 +137,10 @@ async def test_action_link_keeps_repair_target_and_primary_sheet(
 
     monkeypatch.setattr(web.card_actions, "for_page", real)
     page = (await client.get(f"/tasks/{task_id}")).text
+    assert 'class="c2-btn" href="#executor-repair-form"' in page, "лист не заслоняет круг"
+
+    offered["repair"] = False
+    page = (await client.get(f"/tasks/{task_id}")).text
     found = re.search(r'class="c2-btn" href="#(sh-[a-z-]+)" data-sheet="\1"', page)
-    assert found, "с действиями «К действию» открывает главный лист"
+    assert found, "с действиями и без круга починки - главный лист"
     assert f'id="{found.group(1)}"' in page
