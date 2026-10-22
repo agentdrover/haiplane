@@ -579,3 +579,29 @@ async def test_new_order_supersedes_the_old_outcome_and_the_plaque_names_it(worl
     plaque = await launch_feedback.plaque(world.db, task_id)
     assert plaque and f"#{second.order_id}" in plaque["headline"]
     assert f"#{first}" not in plaque["headline"]
+
+
+async def test_cloud_repair_of_an_open_task_refuses_an_empty_snapshot(
+    world, monkeypatch
+):
+    """Чистый отчёт пришёл перед бронью: под локом находок нет — заказ не покупается."""
+    calls = await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(world, "open, отчёт очистился", findings="machine")
+    await repo.update_task(world.db, task_id, status="open")
+    await world.db.commit()
+    real = el._reserve
+
+    async def cleaned(*args, **kwargs):
+        await world.db.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, "
+            "harness_skill, findings_confirmed, unresolved) "
+            "VALUES (?, 1, 'multi-agent-review', '[]', '[]')",
+            (task_id,),
+        )
+        await world.db.commit()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(el, "_reserve", cleaned)
+    result = await _cloud(world.db, task_id, world)
+    assert not result.launched and calls == []
+    assert (await _footprint(world, task_id))["runs"] == 1

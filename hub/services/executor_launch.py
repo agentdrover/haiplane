@@ -1061,7 +1061,9 @@ async def repair_executor(
 
     async def _admit(db: aiosqlite.Connection, fresh: dict[str, Any]) -> str:
         snapshot[:] = await _current_findings(db, fresh)
-        return await _admit_rework(db, fresh, issuer)
+        return rework_admission.findings_refusal(
+            fresh, snapshot
+        ) or await _admit_rework(db, fresh, issuer)
 
     model = config.EXECUTOR_MODEL.strip()
     reserved = await _reserve(
