@@ -825,8 +825,6 @@ async def _current_findings(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[dict[str, str]]:
     """Находки круга починки: машинные текущей сдачи И текущего вердикта (#1998)."""
-    if rework_admission.verdict_unreadable(task):
-        return []  # замечания вердикта не читаются: молча чинить только часть нельзя
     return await _machine_findings(db, task) + rework_admission.verdict_findings(task)
 
 
@@ -932,9 +930,8 @@ async def repair_state(
         busy = await _holderless_running_refusal(db, task)
         if busy:
             return False, busy
-    if not await _current_findings(db, task):
-        return False, rework_admission.no_findings_reason(task)
-    return True, ""
+    why = rework_admission.findings_refusal(task, await _current_findings(db, task))
+    return (False, why) if why else (True, "")
 
 
 async def repair_offered(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
@@ -1023,8 +1020,8 @@ async def repair_executor(
     if early is not None:
         return early
     findings = await _current_findings(db, task)
-    if not findings:
-        return _refused(rework_admission.no_findings_reason(task), task_id)
+    if why := rework_admission.findings_refusal(task, findings):
+        return _refused(why, task_id)
     refusal = await _budget_refusal(db, task_id, project_policy.gate_policy_of(project))
     if refusal is not None:
         await db.commit()

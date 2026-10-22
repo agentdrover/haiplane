@@ -91,13 +91,18 @@ def verdict_unreadable(task: dict[str, Any]) -> bool:
     return False
 
 
-def no_findings_reason(task: dict[str, Any]) -> str:
-    """«Нет находок» или, если дело в порче вердикта, это прямо названо."""
+def findings_refusal(task: dict[str, Any], findings: list[dict[str, str]]) -> str:
+    """Отказ круга по находкам: их нет, или замечания вердикта не читаются.
+
+    Порча — отдельная причина, а не «нет находок»: мягкий разбор отдаёт для
+    неё пустой список, и круг по одним машинным находкам молча пропустил бы
+    замечания человека.
+    """
     from hub.services.executor_launch import REASON_NO_FINDINGS
 
     if verdict_unreadable(task):
         return f"{REASON_NO_FINDINGS}: находки вердикта не читаются"
-    return REASON_NO_FINDINGS
+    return "" if findings else REASON_NO_FINDINGS
 
 
 def return_reason(task: dict[str, Any], *, where: str, issue: str, who: str) -> str:
@@ -143,6 +148,4 @@ async def refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
     if signs:
         named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
         return f"{el.REASON_NOT_RETURNABLE}: у задачи есть признаки работы: {named}"
-    if not await el._current_findings(db, task):
-        return no_findings_reason(task)
-    return ""
+    return findings_refusal(task, await el._current_findings(db, task))

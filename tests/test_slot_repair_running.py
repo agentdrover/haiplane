@@ -520,3 +520,19 @@ async def test_admission_rereads_policy_run_and_verdict(world):
     )
     await world.db.commit()
     assert await why() == el.REASON_OFF
+
+
+async def test_open_task_keeps_machine_findings_when_the_verdict_is_unreadable(world):
+    """Задача уже open: порча вердикта не отнимает у заказа машинные находки (как раньше)."""
+    task_id = await _after_cr(world, "open с порчей", findings="machine")
+    await repo.update_task(world.db, task_id, status="open", review_findings="{broken")
+    await world.db.commit()
+    assert (await _launch(world, task_id)).status_code == 200
+    text = (
+        await _rows(
+            world.db,
+            "SELECT order_text FROM executor_orders WHERE task_id = ?",
+            (task_id,),
+        )
+    )[0]["order_text"]
+    assert "Отмена не сверяет поколение" in text
