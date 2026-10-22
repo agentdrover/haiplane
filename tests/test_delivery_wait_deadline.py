@@ -213,14 +213,13 @@ async def test_a_task_completed_meanwhile_is_not_pulled_back(db, monkeypatch):
 
     task_id = await _setup(db, monkeypatch)
     await _pass(db, task_id)
+    await _age(db, task_id, 30)
     live = dict(await repo.get_task(db, task_id))
     key = (task_id, live["submission_generation"], live["review_verdict_revision"])
     await repo.update_task(db, task_id, status="completed")
     await db.commit()
 
-    moved = await delivery_wait._escalate(
-        db, (*key, "base_fetch_pending"), 360, "x", 24
-    )
+    moved = await delivery_wait._escalate(db, (*key, "base_fetch_pending"), 360, "x")
 
     assert moved is False
     assert (await repo.get_task(db, task_id))["status"] == "completed"
@@ -322,6 +321,7 @@ async def test_the_transition_is_won_once_per_wait(db, monkeypatch):
 
     task_id = await _setup(db, monkeypatch)
     await _pass(db, task_id)
+    await _age(db, task_id, 30)
     live = dict(await repo.get_task(db, task_id))
     key = (
         task_id,
@@ -330,13 +330,13 @@ async def test_the_transition_is_won_once_per_wait(db, monkeypatch):
         "base_fetch_pending",
     )
 
-    assert await delivery_wait._escalate(db, key, 360, "x", 24) is True
+    assert await delivery_wait._escalate(db, key, 360, "x") is True
     # Владелец вернул задачу в running, но ожидание уже эскалировано: второй
     # проход с тем же ключом перехода не выигрывает.
     await repo.update_task(db, task_id, status="running")
     await db.commit()
 
-    assert await delivery_wait._escalate(db, key, 360, "x", 24) is False
+    assert await delivery_wait._escalate(db, key, 360, "x") is False
     assert await _needs_decision_events(db, task_id) == 1
 
 
@@ -584,6 +584,7 @@ async def test_a_deadline_raised_before_the_lock_cancels_the_escalation(
     from hub.services import orchestration
 
     task_id = await _setup(db, monkeypatch)
+    await set_policy(db, base_fetch_wait_hours=24)  # строка проекта существует
     await _pass(db, task_id)
     await _age(db, task_id, 30)
     real = orchestration.record_delivery_outcome
@@ -611,6 +612,7 @@ async def test_a_policy_unreadable_at_the_transition_cancels_it(db, monkeypatch)
     from hub.services import orchestration
 
     task_id = await _setup(db, monkeypatch)
+    await set_policy(db, base_fetch_wait_hours=24)  # строка проекта существует
     await _pass(db, task_id)
     await _age(db, task_id, 30)
     real = orchestration.record_delivery_outcome

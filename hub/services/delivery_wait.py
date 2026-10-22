@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import logging
 from functools import partial
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
@@ -136,7 +135,7 @@ async def _judge(
     written, escalated = await orchestration.record_delivery_outcome(
         db,
         task,
-        partial(_escalate, db, key, pr_num, detail, hours),
+        partial(_escalate, db, key, pr_num, detail),
         fallback=False,
     )
     return bool(written and escalated)
@@ -178,9 +177,14 @@ async def _escalate(
     key: tuple[int, int, int, str],
     pr_num: Any,
     detail: str,
-    hours: int,
 ) -> bool:
-    """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку."""
+    """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку.
+
+    Всё, что решает переход, читается ЗДЕСЬ, под локом: ключ и PR, доставка,
+    бронь и срок. Срок, прочитанный проходом до лока, лишь предварительный:
+    второе соединение могло сохранить другой, и нечитаемая политика отменяет
+    переход так же, как не вышедший срок.
+    """
     if not await _pass_is_live(db, {"pr_number": pr_num}, key):
         return False  # завершена, возвращена, сдана заново или PR заменён
     if await _delivery_moved_on(db, key, int(pr_num or 0)):
@@ -188,6 +192,9 @@ async def _escalate(
         return False  # доставлено соседним путём: переводить нечего
     if await _rerun_holds(db, key, int(pr_num or 0)):
         return False  # живая бронь #1956 обслужит поколение; срок не продлевается
+    hours = await wait_hours(db, key[0])
+    if hours is None or not await journal.is_overdue(db, *key, hours):
+        return False  # срок сменился или не читается: решения нет
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(
@@ -235,20 +242,9 @@ async def _rerun_holds(
     return any(
         int(r["submission_generation"]) == key[1]
         and int(r["pr_number"]) == pr_num
-        and _fresh(str(r.get("requested_at") or ""), delivery_rerun.WAIT_MINUTES)
+        and not delivery_rerun.deadline_passed(r)
         for r in await rerun_journal.open_rows(db, key[0])
     )
-
-
-def _fresh(requested_at: str, minutes: int) -> bool:
-    """Бронь поставлена не раньше ``minutes`` минут назад (UTC, формат SQLite)."""
-    if not requested_at:
-        return False
-    try:
-        at = datetime.strptime(requested_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    except ValueError:
-        return True  # не разобрали - считаем живой: «не прочиталось» не снимает бронь
-    return datetime.now(UTC) - at < timedelta(minutes=minutes)
 
 
 async def _rerun_outcome_note(
