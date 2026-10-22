@@ -382,6 +382,18 @@ _CASES: dict[str, dict] = {
         },
         "kind": "contract_docstring",
     },
+    "contract_registered_by_add_tool": {
+        "base": (
+            'def hub_t():\n    """Описание."""\n    return 1\nmcp.add_tool(hub_t)\n'
+        ),
+        "head": "def hub_t():\n    return 1\nmcp.add_tool(hub_t)\n",
+        "kind": "contract_docstring",
+    },
+    "contract_cli_command_help": {
+        "base": '@app.command()\ndef run():\n    """Справка."""\n    return 1\n',
+        "head": '@app.command()\ndef run():\n    """Иначе."""\n    return 1\n',
+        "kind": "contract_docstring",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
@@ -515,3 +527,40 @@ def test_in_process_main_returns_the_same_codes(
     )
     assert rc == 1
     assert "[tokens]" in capsys.readouterr().out
+
+
+def test_ast_check_sees_a_type_comment_edit() -> None:
+    """Нормализованный AST (type_comments=True) различает правку типового комментария.
+
+    Через CLI её первой ловит проверка директив, поэтому сам AST-шаг проверяется
+    напрямую: защита в глубину не должна тихо перестать работать.
+    """
+    import comment_only_diff as cod
+
+    def parsed(text: str) -> cod.Parsed:
+        return cod.parse_source(text.encode(), "m.py")
+
+    same = cod.compare_ast(
+        "m.py",
+        parsed("x = []  # type: list[int]\n"),
+        parsed("x = []  # type: list[int]\n"),
+    )
+    assert same == []
+    changed = cod.compare_ast(
+        "m.py",
+        parsed("x = []  # type: list[int]\n"),
+        parsed("x = []  # type: list[str]\n"),
+    )
+    assert [v.kind for v in changed] == ["ast"]
+
+
+def test_directive_noise_is_not_reported_after_code_diverges(tmp_path: Path) -> None:
+    """После расхождения кода индексы-якоря сдвинуты: шум о директивах не выводится."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "a = 1\nb = 2  # noqa: E501\n"},
+        {"m.py": "a = 1; z = 0\nb = 2  # noqa: E501\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 1 and "[tokens]" in out, out
+    assert "[directive]" not in out, out
