@@ -642,3 +642,39 @@ async def test_a_booking_with_an_unreadable_date_holds_nothing(db, monkeypatch):
     await _pass(db, task_id)
 
     assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+
+# --- Круг 3, Codex: актуальность результата гейта ---------------------------
+
+
+async def test_a_pin_moved_during_the_pass_makes_its_refusal_stale(db, monkeypatch):
+    async def repin(db_, task_id, gen):
+        await db_.execute(
+            "UPDATE tasks SET submission_sha = ? WHERE id = ?", ("d" * 40, task_id)
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, repin)
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_a_merge_in_the_gate_memory_is_not_an_escalation(db, monkeypatch):
+    import asyncio
+
+    from hub.services import orchestration
+
+    async def merging(db_, task_id, gen):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(True)  # форж ответил, реестр ещё не записан
+        orchestration._gate_merges[(task_id, 360)] = fut
+
+    task_id = await _aged_wait(db, monkeypatch, merging)
+    try:
+        await _pass(db, task_id)
+    finally:
+        orchestration._gate_merges.pop((task_id, 360), None)
+
+    assert (await repo.get_task(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
