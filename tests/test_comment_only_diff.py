@@ -394,6 +394,111 @@ _CASES: dict[str, dict] = {
         "head": '@app.command()\ndef run():\n    """Иначе."""\n    return 1\n',
         "kind": "contract_docstring",
     },
+    "coding_cookie_moved_after_code": {
+        "base": '# coding: utf-8\n"""d"""\nx = 1\n',
+        "head": '"""d"""\n# coding: utf-8\nx = 1\n',
+        "kind": "directive",
+    },
+    "nosec_test_ids_changed": {
+        "base": "x = 1  # nosec: B101\n",
+        "head": "x = 1  # nosec: B102\n",
+        "kind": "directive",
+    },
+    "nosec_test_names_changed": {
+        "base": "x = 1  # nosec assert_used\n",
+        "head": "x = 1  # nosec exec_used\n",
+        "kind": "directive",
+    },
+    "type_ignore_case_changed": {
+        "base": "x = f()  # type: ignore[name-defined]\n",
+        "head": "x = f()  # type: ignore[NAME-DEFINED]\n",
+        "kind": "directive",
+    },
+    "fmt_directive_case_changed": {
+        "base": "x   = 1  # fmt: skip\n",
+        "head": "x   = 1  # fmt: SKIP\n",
+        "kind": "directive",
+    },
+    "directive_order_swapped": {
+        "base": "# fmt: off\n# fmt: on\nx = 1\n",
+        "head": "# fmt: on\n# fmt: off\nx = 1\n",
+        "kind": "directive",
+    },
+    "contract_route_with_computed_path": {
+        "base": 'P = "/x"\n@app.get(P)\nasync def h():\n    "old"\n    return 1\n',
+        "head": 'P = "/x"\n@app.get(P)\nasync def h():\n    "new"\n    return 1\n',
+        "kind": "contract_docstring",
+    },
+    "contract_route_with_description_none": {
+        "base": '@app.get("/x", description=None)\ndef h():\n    "old"\n    return 1\n',
+        "head": '@app.get("/x", description=None)\ndef h():\n    "new"\n    return 1\n',
+        "kind": "contract_docstring",
+    },
+    "contract_route_with_empty_description": {
+        "base": '@app.get("/x", description="")\ndef h():\n    "old"\n    return 1\n',
+        "head": '@app.get("/x", description="")\ndef h():\n    "new"\n    return 1\n',
+        "kind": "contract_docstring",
+    },
+    "contract_pydantic_alias_import": {
+        "base": "from pydantic import BaseModel as BM\nclass M(BM):\n    'old'\n    x: int\n",
+        "head": "from pydantic import BaseModel as BM\nclass M(BM):\n    'new'\n    x: int\n",
+        "kind": "contract_docstring",
+    },
+    "contract_parent_imported_under_alias": {
+        "base": "from models import M as Parent\nclass N(Parent):\n    'old'\n    y: int\n",
+        "head": "from models import M as Parent\nclass N(Parent):\n    'new'\n    y: int\n",
+        "extra_both": {"models.py": "class M(BaseModel):\n    x: int\n"},
+        "kind": "contract_docstring",
+    },
+    "same_class_name_elsewhere_is_not_a_false_red": {
+        "base": "class Parent: pass\nclass A(Parent):\n    'old'\n    x: int\n",
+        "head": "class Parent: pass\nclass A(Parent):\n    'new'\n    x: int\n",
+        "extra_both": {
+            "other.py": "from pydantic import BaseModel\nclass Parent(BaseModel):\n    y: int\n"
+        },
+        "kind": CLEAN,
+    },
+    "contract_module_docstring_read_by_test": {
+        "base": '"old"\nx = 1\n',
+        "head": '"new"\nx = 1\n',
+        "extra_both": {
+            "tests/test_m.py": "import inspect\nimport m\nassert inspect.getdoc(m) == 'old'\n"
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_function_read_through_an_import_alias": {
+        "base": 'def f():\n    "old"\n    return 1\n',
+        "head": 'def f():\n    "new"\n    return 1\n',
+        "extra_both": {
+            "tests/test_m.py": "from m import f as g\nassert g.__doc__ == 'old'\n"
+        },
+        "kind": "contract_docstring",
+    },
+    "contract_registered_by_keyword": {
+        "base": 'def f():\n    "old"\n    return 1\napp.add_api_route("/x", endpoint=f)\n',
+        "head": 'def f():\n    "new"\n    return 1\napp.add_api_route("/x", endpoint=f)\n',
+        "kind": "contract_docstring",
+    },
+    "contract_registered_in_another_file": {
+        "base": 'def f():\n    "old"\n    return 1\n',
+        "head": 'def f():\n    "new"\n    return 1\n',
+        "extra_both": {"app.py": "from m import f\nmcp.add_tool(f)\n"},
+        "kind": "contract_docstring",
+    },
+    "identical_helper_does_not_hide_the_test": {
+        "base": 'def f():\n    "old"\n    return 1\n',
+        "head": 'def f():\n    "new"\n    return 1\n',
+        "extra_both": {
+            "helper.py": "import inspect\nfrom m import f\nassert inspect.getdoc(f) == 'old'\n",
+            "tests/test_m.py": "import inspect\nfrom m import f\nassert inspect.getdoc(f) == 'old'\n",
+        },
+        "kind": "contract_docstring",
+    },
+    "string_in_a_nested_block_is_not_the_docstring": {
+        "base": 'def f():\n    "doc"\n    if True:\n        "code"\n    return 1\n',
+        "head": 'def f():\n    if True:\n        "code"\n    return 1\n',
+        "kind": CLEAN,
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
@@ -564,3 +669,24 @@ def test_directive_noise_is_not_reported_after_code_diverges(tmp_path: Path) -> 
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 1 and "[tokens]" in out, out
     assert "[directive]" not in out, out
+
+
+def test_unchanged_listed_file_must_still_be_checkable(tmp_path: Path) -> None:
+    """Файл списка без правок, но с ошибкой разбора, — «не проверено», не «чисто»."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"bad.py": "x = (\n", "odd.py": "# \xff\nx = 1\n", "ok.py": "y = 1  # c\n"},
+        {"ok.py": "y = 1\n"},
+    )
+    rc, out = _run(repo, base, head, ["ok.py", "bad.py"])
+    assert rc == 2 and "bad.py" in out, out
+
+
+def test_non_utf8_files_are_not_checked_as_utf8(tmp_path: Path) -> None:
+    """Cookie другой кодировки меняет значения строк: такой файл проверить нельзя."""
+    latin = "# coding: latin-1\n'doc'\nx = 'é'\n"
+    repo, base, head = _pair(
+        tmp_path, {"m.py": latin}, {"m.py": "# coding: latin-1\nx = 'é'\n"}
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 2 and "кодировка" in out, out

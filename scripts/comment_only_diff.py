@@ -49,6 +49,7 @@ import argparse
 import ast
 import bisect
 import difflib
+import hashlib
 import io
 import json
 import posixpath
@@ -57,7 +58,7 @@ import subprocess
 import sys
 import tokenize
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,19 +79,13 @@ _SKIPPED = {
 _LAYOUT = _SKIPPED | {tokenize.INDENT, tokenize.DEDENT}
 
 _REF_RE = re.compile(r"(?<![\w&])#(\d{2,6})\b")
-_CODING_RE = re.compile(r"coding[:=][ \t]*([-\w.]+)")
-_DIRECTIVES = (
-    re.compile(r"^(noqa)\b(?:\s*:\s*((?:[A-Za-z]+\d+[\s,]*)+))?", re.I),
-    re.compile(r"^(type:\s*ignore)\s*(\[[^\]]*\])?"),
-    re.compile(r"^(type:)\s*(.+)$"),
-    re.compile(r"^(pragma:)\s*(.+)$", re.I),
-    re.compile(r"^(fmt:)\s*(\S+)"),
-    re.compile(r"^(nosec)\b(?:\s+([A-Z]\d+(?:\s*,\s*[A-Z]\d+)*))?", re.I),
-    re.compile(
-        r"^(pylint|mypy|isort|ruff|flake8|yapf|pyright|pytype|nosemgrep|cython"
-        r"|pyre-ignore|pyre-fixme)\b(.*)$",
-        re.I,
-    ),
+_CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+_NOQA_RE = re.compile(r"^noqa\b(?:\s*:\s*(?:[A-Za-z]+\d+[\s,]*)+)?", re.I)
+# Остальные директивы сравниваются сегментом целиком, регистр и список — как есть.
+_WHOLE_RE = re.compile(
+    r"^(?:type:|pragma:|fmt:|nosec\b|pylint:|mypy:|isort:|ruff:|flake8:|yapf:"
+    r"|pyright:|pytype:|nosemgrep|cython:|pyre-ignore|pyre-fixme)",
+    re.I,
 )
 
 # Признаки «docstring читают снаружи» (см. модульный docstring).
@@ -249,6 +244,12 @@ class Repo:
 
 def _decode(data: bytes, path: str) -> str:
     try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+    except (SyntaxError, LookupError) as exc:
+        raise CheckError(f"{path}: кодировка файла не определена ({exc})") from exc
+    if encoding != "utf-8":
+        raise CheckError(f"{path}: кодировка {encoding}, поддержан только utf-8")
+    try:
         src = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise CheckError(f"{path}: файл не в UTF-8 ({exc})") from exc
@@ -290,7 +291,11 @@ def _collect_docs(tree: ast.Module) -> dict[str, DocSlot]:
     docs: dict[str, DocSlot] = {}
 
     def visit(node: ast.AST, prefix: str) -> None:
-        expr = _docstring_expr(node)
+        expr = (
+            _docstring_expr(node)
+            if isinstance(node, (ast.Module, *DEF_NODES))
+            else None
+        )
         if expr is not None and isinstance(expr.value, ast.Constant):
             name = prefix or MODULE
             docs[name] = DocSlot(name, expr, str(expr.value.value))
@@ -361,23 +366,25 @@ def _norm_text(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"\s*,\s*", ",", text.strip()))
 
 
-def _directives_of(comment: str, row: int) -> list[str]:
-    """Тексты директив инструментов в одном комментарии (разделитель — ``#``)."""
-    if row == 1 and comment.startswith("#!"):
+def _directives_of(comment: str, row: int, leading: bool) -> list[str]:
+    """Тексты директив инструментов в одном комментарии (разделитель — ``#``).
+
+    Shebang и coding-cookie действуют только до первого токена кода: после него
+    это обычный комментарий, и такой «перенос» cookie директивой не считается.
+    """
+    if leading and row == 1 and comment.startswith("#!"):
         return [f"shebang {comment}"]
     found: list[str] = []
-    if row <= 2:
-        cookie = _CODING_RE.search(comment)
-        if cookie and re.match(r"^#.*coding[:=]", comment):
-            found.append(f"coding {cookie.group(1).lower()}")
+    cookie = _CODING_RE.match(comment) if leading and row <= 2 else None
+    if cookie:
+        found.append(f"coding {cookie.group(1)}")
     for segment in comment.split("#")[1:]:
         seg = segment.strip()
-        for pattern in _DIRECTIVES:
-            m = pattern.match(seg)
-            if m:
-                parts = [p for p in m.groups() if p]
-                found.append(_norm_text(" ".join(parts)).lower())
-                break
+        noqa = _NOQA_RE.match(seg)
+        if noqa:
+            found.append(_norm_text(noqa.group(0)))
+        elif _WHOLE_RE.match(seg):
+            found.append(_norm_text(seg))
     return found
 
 
@@ -390,7 +397,7 @@ def _scan_tokens(
     for i, tok in enumerate(toks):
         if tok.type == tokenize.COMMENT:
             inline = last_row == tok.start[0]
-            for text in _directives_of(tok.string, tok.start[0]):
+            for text in _directives_of(tok.string, tok.start[0], last_row == 0):
                 directives.append(Directive(len(kept), inline, text, tok.start[0]))
             continue
         if tok.type not in _LAYOUT:
@@ -439,14 +446,66 @@ def _chain(node: ast.AST) -> tuple[str, ...] | None:
     return None
 
 
-def _base_names(cls: ast.ClassDef) -> list[str]:
-    names: list[str] = []
+@dataclass(frozen=True)
+class Ref:
+    """Имя класса и модуль, из которого файл его импортировал (``""`` — не импорт)."""
+
+    name: str
+    module: str = ""
+
+
+@dataclass
+class Imports:
+    names: dict[str, Ref] = field(default_factory=dict)  # локальное имя -> оригинал
+    modules: dict[str, str] = field(default_factory=dict)  # псевдоним -> модуль
+
+    @classmethod
+    def of(cls, tree: ast.Module) -> Imports:
+        found = cls()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    found.names[alias.asname or alias.name] = Ref(
+                        alias.name, node.module or ""
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    found.modules[local] = alias.name if alias.asname else local
+        return found
+
+    def dotted(self, chain: tuple[str, ...]) -> tuple[str, ...]:
+        """Цепочка имён с развёрнутым первым звеном (импорт и псевдоним)."""
+        head, rest = chain[0], chain[1:]
+        if head in self.names:
+            ref = self.names[head]
+            return (
+                (*ref.module.split("."), ref.name, *rest)
+                if ref.module
+                else (
+                    ref.name,
+                    *rest,
+                )
+            )
+        if head in self.modules:
+            return (*self.modules[head].split("."), *rest)
+        return chain
+
+    def ref(self, chain: tuple[str, ...]) -> Ref:
+        full = self.dotted(chain)
+        if len(chain) == 1 and chain[0] not in self.names:
+            return Ref(chain[0])
+        return Ref(full[-1], ".".join(full[:-1]))
+
+
+def _base_refs(cls: ast.ClassDef, imports: Imports) -> set[Ref]:
+    refs: set[Ref] = set()
     for base in cls.bases:
         node = base.value if isinstance(base, ast.Subscript) else base
         chain = _chain(node)
         if chain:
-            names.append(chain[-1])
-    return names
+            refs.add(imports.ref(chain))
+    return refs
 
 
 def _call_name(call: ast.Call) -> str:
@@ -461,11 +520,14 @@ def _kw(call: ast.Call, name: str) -> ast.expr | None:
     return None
 
 
-def _first_is_path(call: ast.Call) -> bool:
-    if call.args:
-        arg = call.args[0]
-        return isinstance(arg, ast.Constant) and isinstance(arg.value, str)
-    return _kw(call, "path") is not None
+def _has_text(call: ast.Call, name: str) -> bool:
+    """Ключ задан непустой строкой: тогда docstring наружу не уходит."""
+    value = _kw(call, name)
+    return (
+        isinstance(value, ast.Constant)
+        and isinstance(value.value, str)
+        and bool(value.value.strip())
+    )
 
 
 def _decorator_reason(dec: ast.expr) -> str:
@@ -474,98 +536,114 @@ def _decorator_reason(dec: ast.expr) -> str:
     if not chain:
         return ""
     name = chain[-1]
-    if call and _kw(call, "description") is not None:
+    label = ".".join(chain)
+    if call and _has_text(call, "description"):
         return ""  # описание задано явно: docstring наружу не уходит
     if name in _TOOL_DECORATORS:
-        return f"@{'.'.join(chain)}: описание в tools/list"
-    if name in _ROUTE_DECORATORS and call and _first_is_path(call):
+        return f"@{label}: описание в tools/list"
+    if name in _ROUTE_DECORATORS and call and (call.args or _kw(call, "path")):
         hidden = _kw(call, "include_in_schema")
         if isinstance(hidden, ast.Constant) and hidden.value is False:
             return ""
-        return f"маршрут @{'.'.join(chain)}: описание в OpenAPI"
-    if name in _CLI_DECORATORS and not (call and _kw(call, "help") is not None):
-        return f"@{'.'.join(chain)}: справка CLI"
+        return f"маршрут @{label}: описание в OpenAPI"
+    if name in _CLI_DECORATORS and not (call and _has_text(call, "help")):
+        return f"@{label}: справка CLI"
     return ""
+
+
+def _doc_targets(tree: ast.Module, imports: Imports) -> set[tuple[str, ...]]:
+    """Цепочки имён, чей docstring читают снаружи: ``x.__doc__``, ``getdoc(x)``,
+    аргументы ``add_tool``/``add_api_route`` (позиционные и по ключу)."""
+    found: set[tuple[str, ...]] = set()
+
+    def add(node: ast.AST | None) -> None:
+        chain = _chain(node) if node is not None else None
+        if chain:
+            found.add(imports.dotted(chain))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "__doc__":
+            add(node.value)
+        elif isinstance(node, ast.Call):
+            name = imports.dotted(_chain(node.func) or ("",))[-1]
+            if name in ("getdoc", "get_docstring") and node.args:
+                add(node.args[0])
+            elif name in _REGISTRARS:
+                for arg in (*node.args, *(kw.value for kw in node.keywords)):
+                    add(arg)
+    return found
+
+
+def _uses_module_doc(tree: ast.Module) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == "__doc__" for n in ast.walk(tree))
+
+
+def _dotted_module(path: str) -> str:
+    stem = path[:-3] if path.endswith(".py") else path
+    return stem.removesuffix("/__init__").replace("/", ".")
 
 
 @dataclass
 class RepoIndex:
-    """Что известно о репозитории целиком: базы классов и ссылки тестов на docstring."""
+    """Что известно о репозитории целиком: базы классов и читатели docstring."""
 
-    class_bases: dict[str, set[str]] = field(default_factory=dict)
+    classes: dict[str, dict[str, set[Ref]]] = field(default_factory=dict)
     doc_targets: set[tuple[str, ...]] = field(default_factory=set)
 
     def add(self, path: str, tree: ast.Module) -> None:
+        imports = Imports.of(tree)
+        local = self.classes.setdefault(path, {})
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
-                self.class_bases.setdefault(node.name, set()).update(_base_names(node))
-        if Path(path).name.startswith("test_") or path.startswith("tests/"):
-            self.doc_targets |= _doc_targets(tree)
+                local.setdefault(node.name, set()).update(_base_refs(node, imports))
+        self.doc_targets |= _doc_targets(tree, imports)
 
-    def is_schema(self, name: str, seen: frozenset[str] = frozenset()) -> bool:
-        if name in _SCHEMA_BASES:
+    def _candidates(self, ref: Ref, path: str) -> list[tuple[str, str]]:
+        if not ref.module:
+            return [(path, ref.name)] if ref.name in self.classes.get(path, {}) else []
+        defined = [(p, ref.name) for p, c in self.classes.items() if ref.name in c]
+        mod = ref.module.lstrip(".")
+        exact = [
+            (p, n)
+            for p, n in defined
+            if _dotted_module(p) == mod or _dotted_module(p).endswith("." + mod)
+        ]
+        return exact or defined  # реэкспорт из пакета: путь модуля не совпал
+
+    def is_schema(
+        self, ref: Ref, path: str, seen: frozenset[tuple[str, str]] = frozenset()
+    ) -> bool:
+        if ref.name in _SCHEMA_BASES:
             return True
-        if name in seen:
-            return False
-        bases = self.class_bases.get(name, set())
-        return any(self.is_schema(b, seen | {name}) for b in bases)
-
-
-def _doc_targets(tree: ast.Module) -> set[tuple[str, ...]]:
-    """Цепочки имён, чей docstring читает тест: ``x.__doc__``, ``getdoc(x)``."""
-    found: set[tuple[str, ...]] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "__doc__":
-            chain = _chain(node.value)
-            if chain:
-                found.add(chain)
-        elif isinstance(node, ast.Call) and _call_name(node) in (
-            "getdoc",
-            "get_docstring",
-        ):
-            chain = _chain(node.args[0]) if node.args else None
-            if chain:
-                found.add(chain)
-    return found
+        for key in self._candidates(ref, path):
+            if key in seen:
+                continue
+            bases = self.classes[key[0]][key[1]]
+            if any(self.is_schema(b, key[0], seen | {key}) for b in bases):
+                return True
+        return False
 
 
 def _matches_target(parts: list[str], chain: tuple[str, ...]) -> bool:
-    if chain[-1] != parts[-1]:
-        return False
-    return len(chain) < 2 or len(parts) < 2 or chain[-2] == parts[-2]
-
-
-def _in_file_references(tree: ast.Module) -> tuple[bool, set[str]]:
-    """``__doc__`` в коде модуля и имена символов, переданных в регистраторы."""
-    module_doc = False
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "__doc__":
-            module_doc = True
-        elif isinstance(node, ast.Attribute) and node.attr == "__doc__":
-            chain = _chain(node.value)
-            if chain:
-                names.add(chain[-1])
-        elif isinstance(node, ast.Call) and _call_name(node) in _REGISTRARS:
-            for arg in node.args:
-                chain = _chain(arg)
-                if chain:
-                    names.add(chain[-1])
-    return module_doc, names
+    return chain[-1] == parts[-1]
 
 
 def find_contracts(tree: ast.Module, path: str, index: RepoIndex) -> dict[str, str]:
     """Символ файла -> причина, по которой его docstring читают снаружи."""
     out: dict[str, str] = {}
-    module_doc, ref_names = _in_file_references(tree)
-    if module_doc:
+    imports = Imports.of(tree)
+    stem = Path(path).stem
+    if _uses_module_doc(tree):
         out[MODULE] = "модуль использует __doc__ (argparse description=__doc__)"
+    for chain in index.doc_targets:
+        if chain[-1] == stem and MODULE not in out:
+            out[MODULE] = f"docstring модуля читают снаружи ({'.'.join(chain)})"
 
     def visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, DEF_NODES):
                 qual = f"{prefix}.{child.name}" if prefix else child.name
-                reason = _symbol_reason(child, qual, ref_names, index)
+                reason = _symbol_reason(child, qual, path, imports, index)
                 if reason:
                     out[qual] = reason
                 visit(child, qual)
@@ -577,23 +655,21 @@ def find_contracts(tree: ast.Module, path: str, index: RepoIndex) -> dict[str, s
 
 
 def _symbol_reason(
-    node: ast.AST, qual: str, ref_names: set[str], index: RepoIndex
+    node: ast.AST, qual: str, path: str, imports: Imports, index: RepoIndex
 ) -> str:
     parts = qual.split(".")
     if isinstance(node, ast.ClassDef):
-        for base in _base_names(node):
-            if index.is_schema(base):
-                return f"наследник {base}: описание уходит в схему"
+        for base in _base_refs(node, imports):
+            if index.is_schema(base, path):
+                return f"наследник {base.name}: описание уходит в схему"
     else:
         for dec in getattr(node, "decorator_list", []):
             reason = _decorator_reason(dec)
             if reason:
                 return reason
-    if parts[-1] in ref_names:
-        return "docstring читается кодом (__doc__ / регистрация)"
     for chain in index.doc_targets:
         if _matches_target(parts, chain):
-            return f"docstring читает тест ({'.'.join(chain)})"
+            return f"docstring читают снаружи ({'.'.join(chain)})"
     return ""
 
 
@@ -717,7 +793,30 @@ def compare_directives(
                     f"директива {d.text!r} появилась или перенесена (строка {d.row} head)",
                 )
             )
-    return out
+    return out or _directive_order(path, base, head, key)
+
+
+def _directive_order(
+    path: str,
+    base: Parsed,
+    head: Parsed,
+    key: Callable[[Directive], tuple[int, bool, str]],
+) -> list[Violation]:
+    """Набор директив тот же, а порядок нет: ``fmt: off``/``fmt: on`` зависят от него."""
+    a = [key(d) for d in base.directives]
+    b = [key(d) for d in head.directives]
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return [
+                Violation(
+                    path,
+                    base.directives[i].row,
+                    "directive",
+                    f"порядок директив изменён: {base.directives[i].text!r} "
+                    f"заменена на {head.directives[i].text!r} в той же позиции",
+                )
+            ]
+    return []
 
 
 def compare_contract_docs(
@@ -789,17 +888,23 @@ def analyze_pair(
 # ------------------------------------------------------------------------ запуск
 
 
+_INDEX_MARKERS = ("class ", "__doc__", "getdoc", "get_docstring", *_REGISTRARS)
+
+
 def build_index(repo: Repo, shas: Sequence[str]) -> RepoIndex:
     index = RepoIndex()
-    seen: set[int] = set()  # один и тот же файл в двух ревизиях разбираем раз
+    seen: set[tuple[str, bytes]] = set()  # тот же файл по тому же пути — раз
     for sha in shas:
         paths = repo.list_py(sha)
         for path, data in repo.read_many(sha, paths).items():
-            if data is None or hash(data) in seen:
+            if data is None:
                 continue
-            seen.add(hash(data))
+            key = (path, hashlib.blake2b(data).digest())
+            if key in seen:
+                continue
+            seen.add(key)
             text = data.decode("utf-8", "replace")
-            if "class " not in text and "__doc__" not in text and "getdoc" not in text:
+            if not any(marker in text for marker in _INDEX_MARKERS):
                 continue
             try:
                 index.add(path, ast.parse(text))
@@ -832,6 +937,14 @@ class Report:
         return 2 if self.errors else (1 if self.violations else 0)
 
 
+def _validate(data: bytes, path: str, report: Report) -> None:
+    """Не изменённый файл списка тоже должен разбираться: иначе «чисто» ложно."""
+    try:
+        parse_source(data, path)
+    except CheckError as exc:
+        report.errors.append(str(exc))
+
+
 def run_check(
     repo: Repo, base_rev: str, head_rev: str, files: Sequence[str], allow: set[str]
 ) -> Report:
@@ -857,6 +970,8 @@ def run_check(
             report.violations.append(Violation(path, 0, "file_changed", side))
         elif a != b:
             todo.append(path)
+        else:
+            _validate(a, path, report)
     if todo:
         index = build_index(repo, [base, head])
         inv = repo.read_many(head, [INVARIANTS_MD]).get(INVARIANTS_MD) or b""
