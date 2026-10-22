@@ -546,18 +546,28 @@ async def test_a_pass_of_a_replaced_pr_does_not_touch_the_journal(db, monkeypatc
     assert after == before
 
 
-async def test_a_booking_of_another_pr_or_with_policy_off_holds_nothing(
-    db, monkeypatch
-):
-    async def other_pr(db_, task_id, gen):
+async def _booking_of(pr: int):
+    async def booking(db_, task_id, gen):
         await db_.execute(
             "INSERT INTO delivery_reruns (task_id, submission_generation, "
             "pr_number, state, requested_at) "
-            "VALUES (?, ?, 999, 'requested', datetime('now'))",
-            (task_id, gen),
+            "VALUES (?, ?, ?, 'requested', datetime('now'))",
+            (task_id, gen, pr),
         )
 
-    task_id = await _aged_wait(db, monkeypatch, other_pr)
+    return booking
+
+
+async def test_a_booking_of_another_pr_holds_nothing(db, monkeypatch):
+    task_id = await _aged_wait(db, monkeypatch, await _booking_of(999))
+    await set_policy(db, delivery_fresh_base_rerun="on")
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+
+async def test_a_booking_with_the_rerun_policy_off_holds_nothing(db, monkeypatch):
+    task_id = await _aged_wait(db, monkeypatch, await _booking_of(360))
     await set_policy(db, delivery_fresh_base_rerun="off")
     await _pass(db, task_id)
 
