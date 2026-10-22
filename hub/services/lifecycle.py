@@ -55,6 +55,7 @@ from hub.db import (
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
+    accepted_delivery_retry,
     archive_guard,
     critic_orders,
     expected_sha_gate,
@@ -6626,6 +6627,7 @@ async def deliver_on_disposition(
         ok, reason = False, delivery_pr.reason
     else:
         ok, reason = await merge_before_completion(db, task)
+        await accepted_delivery_retry.note_refusal(db, task, reason, via)  # #1999
         # #1428: PR влит, не легла только строка реестра — это доставка, а не
         # «PR остался открытым». Задача уже завершена, свип её не вернёт.
         if not ok and reason.startswith(GATE_RECORD_PENDING_PREFIX):
@@ -6792,7 +6794,8 @@ async def deliver_from_registry(
             task_id,
             reason or "not_delivered",
             f"{REGISTRY_REFUSAL_PREFIX} (#{task_id}): {reason}. Условия те же, "
-            "что у гейта; строка осталась в реестре.",
+            "что у гейта; строка осталась в реестре."
+            + await accepted_delivery_retry.refusal_note(db, task_id, reason),
         )
     task = dict(await repo.get_task(db, task_id) or {})
     answer = await task_delivery(db, task)

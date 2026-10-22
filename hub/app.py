@@ -158,6 +158,7 @@ from hub.mcp_catalog import (
     load_budget,
     load_measured,
 )
+from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import owner_minutes, policy_change, project_policy
@@ -2986,7 +2987,9 @@ async def api_deliver_delivery_discrepancy(
             detail=enrich_error_payload(
                 {
                     "reason": exc.reason,
-                    "actor_hint": "human",
+                    "actor_hint": await accepted_delivery_retry.refusal_hint(
+                        _db(request), task_id, exc.reason
+                    ),  # #1999: none, пока автоповтор вооружён
                     "message": exc.message,
                     "hint": (
                         "Строки реестра: GET /api/delivery/discrepancies."
