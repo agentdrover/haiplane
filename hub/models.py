@@ -413,22 +413,20 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
     # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
-    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
-    # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
+    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт.
+    # Читатель: project_policy.deep_reviewer_of.
     "deep_reviewer",
-    # #1653: согласие проекта на локального ревьюера ВМЕСТО отказавшего облака
-    # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
-    # Читатель: project_policy.local_review_fallback_of.
+    # #1653: согласие на локального ревьюера ВМЕСТО отказавшего облака (вторая
+    # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
+    "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
     # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
     "critic_host",
-    # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
-    # отдельного выката): срок исхода считается от даты мержа. Не гейт и
-    # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
+    # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
+    # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
     "merge_is_delivery",
     # #1589: предупреждения по путям диффа сдачи — список {pattern, text}. Не
-    # гейт, ничего не блокирует и не делегирует. Читатель:
-    # project_policy.path_notices_of.
+    # гейт, ничего не блокирует. Читатель: project_policy.path_notices_of.
     "path_notices",
     # #1591: пары «файл репо на голове релиза → серверная копия» — релиз не
     # сливается, пока копия расходится. Не гейт ревью и ничего не делегирует.
@@ -3308,6 +3306,7 @@ class TaskView(PlainSummaryView):
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
+    delivery_rerun: dict[str, Any] | None = None  # #1956: история перезапуска CI
     role_orders: list[dict[str, Any]] = Field(default_factory=list)  # #1973: card read
     critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
@@ -3542,6 +3541,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
+    _policy.validate_delivery_fresh_base_rerun(v)
     from hub.services.project_policy import validate_critic_host
 
     validate_critic_host(v)

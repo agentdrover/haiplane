@@ -21,6 +21,7 @@ from typing import Any
 from hub import brand
 from hub.config import GH_BIN, REPO_NAME
 from hub.integrations import proc
+from hub.integrations.forge import github_rerun
 from hub.integrations.protocols import (
     BaseFreshness,
     BaseFreshnessState,
@@ -1304,6 +1305,27 @@ class GitHubForge:
             repo=repo,
         )
         return None if runs is None else [self._run_facts(r) for r in runs]
+
+    async def rerun_failed_jobs(
+        self, run_id: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        """POST rerun-failed-jobs серверными credentials gh гейта (#1956)."""
+        return await github_rerun.rerun_failed_jobs(
+            _gh, run_id, repo=repo, gh_repo=gh_repo or REPO_NAME
+        )
+
+    async def ci_attempt_jobs(
+        self,
+        run_id: str,
+        attempt: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Job одной попытки: имена, итоги, упавшие шаги, без логов (#1956)."""
+        return await github_rerun.attempt_jobs(
+            self._all_pages, run_id, attempt, repo=repo, gh_repo=gh_repo or REPO_NAME
+        )
 
     async def ci_run_artifacts(
         self,
