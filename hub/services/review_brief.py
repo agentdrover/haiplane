@@ -347,7 +347,11 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
     if value == "mergeable":
         return BaseMergeState(state="clean", reason=_clean_merge_reason(detail))
     if value != "conflicting":
-        return BaseMergeState(state="unknown", reason=detail or value)
+        log.warning("base-merge probe for #%s: %s: %s", task_view.id, value, detail)
+        return BaseMergeState(
+            state="unknown",
+            reason=f"проба слияния не дала ответа ({value}) — подробности в логе хаба",
+        )
     # Имена файлов приезжают в детали от того же расчёта, что читает доставка;
     # разбираются здесь, чтобы читателю не пришлось разбирать строку глазами.
     files = [

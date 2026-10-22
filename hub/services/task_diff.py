@@ -87,6 +87,21 @@ def _failer(sha: str, base: str, fallback: str) -> Callable[[str, str], dict[str
     return fail
 
 
+def _is_missing(path: str) -> bool:
+    """Absent (or a parent is a file) — NOT "cannot look", which is another answer.
+
+    ``os.path.isdir`` folds every ``OSError`` into False, so a parent the hub may
+    not traverse read as a missing directory. Only these two errors mean absent.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 async def _ask(
     workspace: str, call: Awaitable[_T], fail: Callable[[str, str], dict[str, Any]]
 ) -> _T:
@@ -103,7 +118,7 @@ async def _ask(
         return await call
     except OSError as exc:
         log.warning("diff: git in %s could not run: %s", workspace, exc)
-        if not os.path.isdir(workspace):
+        if _is_missing(workspace):
             raise _Unavailable(
                 fail(WORKSPACE_MISSING, WORKSPACE_MISSING_REASON)
             ) from exc

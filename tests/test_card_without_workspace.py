@@ -246,3 +246,106 @@ async def test_exception_text_never_reaches_a_reason_shown_to_a_person(
     view = SimpleNamespace(id=task_id, pr_number=7)
     merge = await review_brief._ask_base_merge(db, view)
     assert merge.state == "unknown" and MARKER not in merge.reason
+
+
+async def test_a_directory_that_is_not_a_repository_leaks_no_path(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    """Codex #2002 P2: ``resolve_ref`` отвечает ``unavailable`` БЕЗ исключения.
+
+    Каталог на месте, но это не репозиторий; настоящий git. Деталь такого
+    ответа несёт путь клона, и раньше она шла прямо в причину брифа.
+    """
+    plain = tmp_path / "plain-2002" / "not-a-repo-marker-2002"
+    plain.mkdir(parents=True)
+    task_id = await _review_task(client, db, str(plain), "plain-dir")
+    _real_git(monkeypatch)
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+    from hub.services import review_evidence, task_diff
+
+    base = await review_evidence.resolve_diff_base(db, task_id, "b", offline=True)
+    shown = await task_diff.submission_diff(db, task_id)
+
+    assert brief.status_code == 200, brief.text[:400]
+    assert base["state"] == review_evidence.BASE_UNVERIFIED and base["reason"]
+    for body in (brief.text, str(base), str(shown)):
+        assert "not-a-repo-marker-2002" not in body
+        assert "plain-2002" not in body
+
+
+async def test_git_details_with_paths_never_reach_a_reason(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Остальные места, где деталь git/форджа шла в причину: свежесть, missing, проба слияния."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief, review_evidence
+
+    task_id = await _review_task(client, db, missing_workspace, "gone-details")
+    _real_git(monkeypatch)
+    leak = f"/srv/clones/{MARKER}"
+
+    cases = [
+        ("resolve_ref", ("missing", f"neither b nor origin/b exists in {leak}"), False),
+        (
+            "resolve_ref",
+            ("unavailable", f"{leak} is not a readable git repository"),
+            True,
+        ),
+    ]
+    for name, answer, offline in cases:
+        with monkeypatch.context() as patch:
+            patch.setattr(plugins.git_ops, name, AsyncMock(return_value=answer))
+            base = await review_evidence.resolve_diff_base(
+                db, task_id, "b", offline=offline
+            )
+        assert base["reason"] and MARKER not in base["reason"], answer
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            plugins.git_ops,
+            "resolve_ref",
+            AsyncMock(return_value=("resolved", "c" * 40)),
+        )
+        patch.setattr(
+            plugins.git_ops,
+            "base_freshness",
+            AsyncMock(return_value=("unverified", f"ls-remote не ответил: {leak}")),
+        )
+        base = await review_evidence.resolve_diff_base(db, task_id, "b", offline=False)
+    assert base["reason"] and MARKER not in base["reason"]
+
+    from hub.integrations.protocols import MergeabilityOutcome
+
+    patch_target = AsyncMock(return_value=(MergeabilityOutcome.unknown, leak))
+    monkeypatch.setattr(plugins.git_ops, "check_pr_mergeable", patch_target)
+    merge = await review_brief._ask_base_merge(
+        db, SimpleNamespace(id=task_id, pr_number=7)
+    )
+    assert merge.state == "unknown" and MARKER not in merge.reason
+
+
+async def test_an_untraversable_parent_is_unreadable_not_missing(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    """Codex #2002 P3: ``isdir`` глотал PermissionError и называл это «каталога нет»."""
+    from hub.services import task_diff
+
+    if os.geteuid() == 0:
+        pytest.skip("root проходит сквозь chmod 000")
+    parent = tmp_path / "locked-2002"
+    workspace = parent / "workspace-marker-2002"
+    workspace.mkdir(parents=True)
+    task_id = await _review_task(client, db, str(workspace), "locked-parent")
+    _real_git(monkeypatch)
+    parent.chmod(0)
+    try:
+        shown = await task_diff.submission_diff(db, task_id)
+    finally:
+        parent.chmod(0o755)
+
+    assert shown["state"] == task_diff.UNREADABLE
+    assert shown["state"] != task_diff.WORKSPACE_MISSING
+    assert "workspace-marker-2002" not in str(shown)

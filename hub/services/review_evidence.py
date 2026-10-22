@@ -179,20 +179,20 @@ async def resolve_diff_base(
             )
             return out
         if freshness != "current":
-            out["reason"] = (
-                f"база {out['base']} разрешена, но не сверена с remote: {why}"
-            )
+            log.warning("diff base for #%s: unverified: %s", task_id, why)
+            out["reason"] = f"база {out['base']} не сверена с remote (см. лог хаба)"
         return out
     if state == "missing":
         out["state"] = BASE_UNRESOLVED
         out["reason"] = (
             f"the base ref '{out['base']}' ({out['source']}) does not exist in "
-            f"the project workspace: {detail}. The diff cannot be taken, so "
+            "the project workspace. The diff cannot be taken, so "
             "every check that reads it is disabled below — this is one failure, "
             "not several independent unknowns"
         )
         return out
-    out["reason"] = f"the base ref '{out['base']}' could not be verified: {detail}"
+    log.warning("diff base for #%s: %s: %s", task_id, state, detail)
+    out["reason"] = f"the base ref '{out['base']}' is {state}; see the hub log"
     return out
 
 
