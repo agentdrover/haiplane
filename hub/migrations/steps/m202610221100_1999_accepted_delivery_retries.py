@@ -24,6 +24,7 @@ MIGRATIONS = [
             armed_at              TEXT    NOT NULL DEFAULT (datetime('now')),
             reserved_at           TEXT,
             token                 TEXT    NOT NULL DEFAULT '',
+            last_checked_at       TEXT,
             closed_at             TEXT,
             outcome               TEXT    NOT NULL DEFAULT '',
             history               TEXT    NOT NULL DEFAULT '[]',

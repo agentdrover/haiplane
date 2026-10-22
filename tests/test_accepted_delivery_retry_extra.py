@@ -221,3 +221,36 @@ async def test_unreadable_rows_do_not_cancel_the_rest_of_the_scan(db, monkeypatc
     monkeypatch.setattr(journal, "open_rows", AsyncMock(side_effect=RuntimeError("x")))
     await scan_completed_deliveries(db)
     assert await repo.get_delivery_discrepancy(db, rig.task_id) is not None
+
+
+async def test_rows_beyond_the_batch_are_checked_on_the_next_pass(db, monkeypatch):
+    from hub.services import accepted_delivery_retry as adr
+
+    ids = []
+    for n in range(51):
+        cur = await db.execute(
+            "INSERT INTO tasks (title, status, pr_number, submission_generation, "
+            "review_verdict, review_verdict_generation) "
+            "VALUES (?, 'completed', 5, 1, 'approved', 1)",
+            (f"t{n}",),
+        )
+        ids.append(cur.lastrowid)
+        await db.execute(
+            "INSERT INTO accepted_delivery_retries (task_id, submission_generation, "
+            "pr_number) VALUES (?, 1, 5)",
+            (cur.lastrowid,),
+        )
+    await db.commit()
+    checked: list[int] = []
+
+    async def wait(db_, task):
+        checked.append(int(task["id"]))
+        return "wait"
+
+    monkeypatch.setattr(adr, "_ci_allows_attempt", wait)
+    await adr.sweep(db)
+    assert ids[-1] not in checked and len(checked) == 50
+    await adr.sweep(db)
+    assert ids[-1] in checked, "51-я строка проверена на втором проходе"
+    states = await db.execute_fetchall(f"SELECT DISTINCT state FROM {TABLE}")
+    assert [r[0] for r in states] == ["armed"]

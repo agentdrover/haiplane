@@ -174,6 +174,9 @@ def _stop_reason(
 
 
 async def _step(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
+    async with write_transaction(db):
+        await journal.touch(db, int(row["id"]))
+    await db.commit()
     task_row = await repo.get_task(db, int(row["task_id"]))
     task = dict(task_row) if task_row else None
     stop = _stop_reason(task, row)

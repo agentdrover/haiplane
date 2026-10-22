@@ -88,16 +88,29 @@ async def latest(db: aiosqlite.Connection, task_id: int) -> dict[str, Any] | Non
 
 
 async def open_rows(db: aiosqlite.Connection, limit: int) -> list[dict[str, Any]]:
-    """Не закрытые строки; возраст считает база, а не часы проверяющего."""
+    """Не закрытые строки, давно не проверявшиеся первыми (курсор ``last_checked_at``).
+
+    Возраст считает база, а не часы проверяющего. Порядок по ``id`` оставлял
+    строки за пределом ``limit`` непроверенными навсегда.
+    """
     rows = await fetchall(
         db,
         "SELECT *, (julianday('now') - julianday(armed_at)) * 24.0 AS age_hours, "
         "(julianday('now') - julianday(COALESCE(reserved_at, armed_at))) * 86400.0 "
         "AS reserved_seconds FROM accepted_delivery_retries "
-        "WHERE state != 'closed' ORDER BY id LIMIT ?",
+        "WHERE state != 'closed' "
+        "ORDER BY last_checked_at IS NOT NULL, last_checked_at, id LIMIT ?",
         (int(limit),),
     )
     return [dict(r) for r in rows]
+
+
+async def touch(db: aiosqlite.Connection, row_id: int) -> None:
+    """Строка проверена в этом проходе (в том числе "ждём"): в хвост очереди."""
+    await db.execute(
+        "UPDATE accepted_delivery_retries SET last_checked_at=? WHERE id=?",
+        (datetime.now(UTC).isoformat(timespec="microseconds"), int(row_id)),
+    )
 
 
 async def reserve(db: aiosqlite.Connection, row_id: int, text: str) -> str | None:
