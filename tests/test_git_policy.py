@@ -571,3 +571,45 @@ def test_the_clone_path_arms_the_hook_itself():
         "cloning a workspace must arm the hook — otherwise every server clone "
         "waits for a human to remember"
     )
+
+
+def test_the_hub_never_arms_the_pre_push_check(
+    clone: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2000: the hub pushes from clones on its own host, where a branch's code
+    must not run. Arming a clone, recording its branch policy and a push through
+    the hook never set ``haiplane.prePushCheck`` or run a command; ``doctor``
+    shows the check apart from the hook's state, without running anything.
+    """
+    marker = tmp_path / "marker"
+    (clone / "Makefile").write_text(f"check-fast:\n\techo ran >> {marker}\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "makefile with a check-fast target")
+
+    git_policy.activate_quietly(str(clone), "develop", "main")
+    git_policy.record_branch_policy(str(clone), "develop", "main")
+    assert _git(clone, "config", "--get", git_policy.PRE_PUSH_CHECK_KEY).returncode != 0
+    assert git_policy.pre_push_check(str(clone)) == ""
+    # A global config is not this clone's consent either.
+    glob = tmp_path / "global.gitconfig"
+    glob.write_text("[haiplane]\n\tprePushCheck = make check-fast\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(glob))
+    assert git_policy.pre_push_check(str(clone)) == ""
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL")
+
+    _git(clone, "checkout", "-qb", "task-1/x")
+    _git(clone, "commit", "-q", "--allow-empty", "-m", "x")
+    pushed = _git(clone, "push", "origin", "task-1/x")
+    assert pushed.returncode == 0, pushed.stderr
+    assert not marker.exists()
+
+    assert git_policy.main(["doctor", str(clone)]) == 0
+    assert "pre-push check: not configured" in capsys.readouterr().out
+
+    _git(clone, "config", git_policy.PRE_PUSH_CHECK_KEY, "make check-fast")
+    assert git_policy.main(["doctor", str(clone)]) == 0
+    assert "pre-push check: configured: make check-fast" in capsys.readouterr().out
+    assert not marker.exists()  # doctor reads the key, it runs nothing
