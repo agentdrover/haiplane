@@ -50,6 +50,13 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# #1996: the browser scenarios of tests/gui need Chromium, so they are not part
+# of any default run. `--ignore` skips the directory when it is reached by
+# walking `tests/` and leaves it collectable by an explicit path, which is how
+# `make gui-test` names it. Not `-p`/`-n` here: addopts also reach the AC reporter
+# (scripts/ci_report_to_hub.py), and an ignore of one directory does not change
+# the node ids it reads.
+addopts = "--ignore=tests/gui"
 # #1666: a hung test must fail by name in minutes, not hold CI for hours.
 # "signal" (SIGALRM) interrupts the test with a stack and lets the run go on;
 # the suite's own tests use no SIGALRM and xdist runs tests in the main thread.
@@ -68,6 +75,7 @@ dev = [
     "hatchling>=1.32.4",
     "mypy>=1.19.1",
     "pip-audit>=2.10.0",
+    "playwright>=1.64.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.1.0",

@@ -130,6 +130,7 @@ def _advisor_reason(state: Any) -> tuple[str, dict[str, str]] | None:
 async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | None:
     from hub.services.steward_advisor import advisor_state
     from hub.services.steward_apply import policy_refusal
+    from hub.services.steward_double_clean import may_apply_to_class
 
     task_id, generation = int(row["task_id"]), int(row["generation"])
     if await task_automation_not_applicable(db, task_id):
@@ -144,7 +145,22 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
     ceiling = ceiling_reason(
         project_policy.steward_approve_max_class_of(policy), row["risk_class"]
     )
-    if ceiling:
+    if (
+        ceiling
+        and ceiling[0] == BLOCKED
+        and await may_apply_to_class(db, task_id, row["risk_class"])
+    ):
+        # #1986: выше обычного потолка, но не выше двойной чистоты. Пара отчётов,
+        # CI и согласие советника чтением не проверяются: непроверенное - unknown.
+        unknown.append(
+            _reason(
+                ceiling[1]["code"],
+                ceiling[1]["detail"]
+                + "; двойная чистота: условия (пара отчётов, CI, советник) "
+                "чтением не проверены",
+            )
+        )
+    elif ceiling:
         (blocked if ceiling[0] == BLOCKED else unknown).append(ceiling[1])
     advised = _advisor_reason(await advisor_state(db, task_id, generation))
     if advised:
@@ -178,6 +194,13 @@ async def delegated_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
                 "steward_shadow": steward_dispatch.steward_shadow_of(policy),
                 "steward_approve_max_class": (
                     project_policy.steward_approve_max_class_of(policy)
+                ),
+                # #1986: исключение из потолка при двойной чистоте.
+                "steward_approve_max_class_double_clean": (
+                    project_policy.steward_double_clean_ceiling_of(policy)
+                ),
+                "double_clean_reviewers": (
+                    project_policy.double_clean_reviewers_of(policy)
                 ),
             }
         )
