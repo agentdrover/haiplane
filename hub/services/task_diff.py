@@ -38,7 +38,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.services import review_evidence
-from hub.services.brief_failure import public_reason
+from hub.services.brief_failure import scrub_strings
 
 log = logging.getLogger("hub")
 
@@ -61,7 +61,7 @@ _T = TypeVar("_T")
 def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {
         "state": state,
-        "reason": public_reason(reason),
+        "reason": reason,
         "files": [],
         "truncated": False,
         "shown_lines": 0,
@@ -129,6 +129,11 @@ async def _ask(
                 f"git не запустился ({type(exc).__name__}) — подробности в логе хаба",
             )
         ) from exc
+
+
+def _publish(result: dict[str, Any]) -> dict[str, Any]:
+    """The one boundary of the diff view: every string but the code itself (#2002)."""
+    return scrub_strings(result, skip=frozenset({"files"}))
 
 
 def _hunk_start(header: str) -> int | None:
@@ -409,6 +414,10 @@ async def _empty_reason(
 
 
 async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
+    return _publish(await _submission_files(db, task_id))
+
+
+async def _submission_files(db: Any, task_id: int) -> dict[str, Any]:
     """Paths and line counts of the pinned submission (#825).
 
     The cheap half of ``submission_diff``: the change map needs to know which
@@ -462,6 +471,10 @@ async def _files_of(
 
 
 async def submission_diff(db: Any, task_id: int) -> dict[str, Any]:
+    return _publish(await _submission_diff(db, task_id))
+
+
+async def _submission_diff(db: Any, task_id: int) -> dict[str, Any]:
     """The diff of a task's pinned submission, or a stated reason for its absence."""
     blank, sha, base, workspace, fallback = await _resolve_target(db, task_id)
     if blank is not None:

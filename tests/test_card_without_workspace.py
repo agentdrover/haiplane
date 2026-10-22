@@ -357,18 +357,52 @@ def test_public_reason_cuts_paths_and_remotes_and_keeps_the_rest() -> None:
     sha = "0123456789ab"
     keep = (
         f"{sha} task-1/x hub/web.py origin/develop и/или (tests/a.py:12) "
-        "ветка task-2002/card-without-workspace"
+        "ветка task-2002/card-without-workspace /tasks/12 /api/tasks/3/diff ~5 минут "
+        "https://github.com/o/r/pull/12 https://github.com/o/r/actions/runs/99, ок"
     )
     assert public_reason(keep) == keep
     assert public_reason("нет /srv/clones/x/.git и ~/work/r") == "нет <путь> и <путь>"
-    assert public_reason("fatal: 'https://h.io/o/r.git' down") == (
-        "fatal: '<remote>' down"
+    assert public_reason("в ~alice/private/clone") == "в <путь>"
+    assert public_reason("fatal: '/srv/private clone/.git' не репозиторий") == (
+        "fatal: <путь> не репозиторий"
     )
+    assert (
+        public_reason('fatal: "/home/a b/c" и `/tmp/x y`') == "fatal: <путь> и <путь>"
+    )
+    assert (
+        public_reason("fatal: 'https://h.io/o/r.git' down") == "fatal: '<remote>' down"
+    )
+    assert public_reason("https://u:t@github.com/o/r/pull/1") == "<remote>"
+    assert public_reason("https://evil.io/o/r/pull/1") == "<remote>"
     assert public_reason("git@github.com:org/r.git не отвечает") == (
         "<remote> не отвечает"
     )
     assert public_reason("ssh://git@h/r и /var/x") == "<remote> и <путь>"
     assert public_reason("") == ""
+
+
+def test_public_reason_scans_a_bounded_prefix_only(monkeypatch) -> None:
+    """Длинная строка без «://»: объём поиска ограничен, а не время (wallclock_asserts)."""
+    from hub.services import brief_failure
+
+    seen: list[int] = []
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def sub(self, repl, text):
+            seen.append(len(text))
+            return self.inner.sub(repl, text)
+
+    for name in ("_URL", "_SCP", "_QUOTED_PATH", "_ABS_PATH"):
+        monkeypatch.setattr(brief_failure, name, Spy(getattr(brief_failure, name)))
+
+    out = brief_failure.public_reason("a" * 100_000)
+
+    assert out.endswith("…")
+    assert len(out) == brief_failure._MAX_SCAN + 1
+    assert seen and max(seen) <= brief_failure._MAX_SCAN + 1
 
 
 def _strings(node):
@@ -426,15 +460,44 @@ async def test_no_reason_source_of_the_brief_publishes_a_path_or_a_remote(
     monkeypatch.setattr(git, "branch_diff", AsyncMock(side_effect=OSError(leak)))
     monkeypatch.setattr(git, "branch_diff_local", AsyncMock(side_effect=OSError(leak)))
     monkeypatch.setattr(git, "commit_exists", AsyncMock(side_effect=OSError(leak)))
+    # statement_freshness: ошибка чтения базы несёт путь (не через граничную правку поля).
+    monkeypatch.setattr(
+        "hub.services.statement_freshness.fetchall",
+        AsyncMock(side_effect=OSError(leak)),
+    )
+    # evidence_coverage собирается из сырых причин diff_base и base_merge.
+    raw_base = {
+        "base": "develop",
+        "source": "x",
+        "state": "unverified",
+        "reason": leak,
+        "sha": "",
+    }
+    monkeypatch.setattr(
+        "hub.services.review_evidence.resolve_diff_base",
+        AsyncMock(return_value=raw_base),
+    )
 
     brief = await build_review_brief(db, task_id, observe_only=False)
     assert brief is not None
     dump = brief.model_dump(mode="json")
     assert dump["sha_check_reason"], "источник tip_reason дошёл до ответа"
     shown = [await submission_diff(db, task_id), await submission_files(db, task_id)]
+    pages = [
+        (await client.get(f"/tasks/{task_id}")).text,
+        (await client.get(f"/tasks/{task_id}/diff")).text,
+    ]
+    assert dump["statement_freshness"]["reason"], "источник freshness дошёл до ответа"
+    assert dump["evidence_coverage"]["checks_missing"], (
+        "coverage собран из сырых причин"
+    )
     for text in [*_strings(dump), *_strings(shown)]:
         for bad in ("/tmp", "/var", "https://", "git@"):
             assert bad not in text, (bad, text[:200])
+    for (
+        page
+    ) in pages:  # страницы несут свои https:// (шрифты, ссылки): ищем подстановку
+        assert "leak-2002" not in page and "h.io" not in page
 
 
 async def test_the_boundary_cleans_reasons_even_when_a_source_does_not(
@@ -481,5 +544,31 @@ async def test_the_boundary_cleans_reasons_even_when_a_source_does_not(
         brief.call_sites.reason,
     ):
         assert "/tmp" not in text and "https://" not in text, text
-    blank = task_diff._blank(task_diff.UNREADABLE, leak)
+    blank = task_diff._publish(task_diff._blank(task_diff.UNREADABLE, leak))
     assert "/tmp" not in blank["reason"] and "https://" not in blank["reason"]
+
+
+async def test_app_routes_in_a_reason_are_not_filesystem_paths(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Белый список корней: ``/tasks/12`` в причине цел (граница не «любой слэш»)."""
+    from unittest.mock import AsyncMock
+
+    from hub.models import BaseMergeState
+    from hub.services import review_brief
+
+    task_id = await _review_task(client, db, missing_workspace, "gone-routes")
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=BaseMergeState(
+                state="unknown", reason="см. /tasks/12 и /srv/clone"
+            )
+        ),
+    )
+
+    brief = await review_brief.build_review_brief(db, task_id, observe_only=True)
+
+    assert brief is not None
+    assert brief.base_merge.reason == "см. /tasks/12 и <путь>"

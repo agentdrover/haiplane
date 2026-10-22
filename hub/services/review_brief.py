@@ -64,7 +64,7 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
-from hub.services.brief_failure import BriefFailure, failure_from, public_reason
+from hub.services.brief_failure import BriefFailure, failure_from, scrub_strings
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
@@ -966,20 +966,14 @@ async def build_review_brief(
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,
-        diff_base=DiffBaseState(
-            **{**diff_base, "reason": public_reason(str(diff_base.get("reason", "")))}
-        ),
-        base_merge=base_merge_state.model_copy(
-            update={"reason": public_reason(base_merge_state.reason)}
-        ),
+        diff_base=DiffBaseState(**diff_base),
+        base_merge=base_merge_state,
         evidence_coverage=EvidenceCoverage(**coverage),
         submission_sha=submission_sha,
         current_branch_tip=current_tip,
         sha_check=sha_check,
         sha_check_reason=sha_check_reason,
-        call_sites=call_sites_section.model_copy(
-            update={"reason": public_reason(call_sites_section.reason)}
-        ),
+        call_sites=call_sites_section,
         review_cycle=task_view.review_cycle,
         submission_generation=task_view.submission_generation,
         review_verdict_revision=task_view.review_verdict_revision,
@@ -989,6 +983,8 @@ async def build_review_brief(
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
     )
+    # The publication boundary (#2002): every string of the finished brief, once.
+    scrub_strings(brief, skip=AUTHORED_TEXT)
     # Last act before the log line and the return: total_ms is read here.
     timings = timer.finish()
     brief.timings = timings
@@ -1001,6 +997,18 @@ async def build_review_brief(
         )
     return brief
 
+
+# Written by people and agents, not by the hub: a path there is content.
+AUTHORED_TEXT = frozenset(
+    {
+        "title", "description", "acceptance_criteria", "scope_in", "scope_out",
+        "scope_growth", "out_of_scope_for_review", "review_checklist",
+        "validation_commands", "constraints", "technical_hints", "outcome_metric",
+        "outcome_indicator", "outcome_deadline", "outcome_revisit_condition",
+        "redesign_rationale", "latest_submission_summary", "latest_review",
+        "machine_review", "diff_command",
+    }
+)  # fmt: skip
 
 _AREAS_DECLARED = "заявленные области: так их назвал автор задачи-причины, а не дифф"
 
