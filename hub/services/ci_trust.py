@@ -155,11 +155,33 @@ def unverified_note(reason: str) -> str:
     return f"CI-отчёт не подтверждён: {reason or LEGACY}"
 
 
-async def trusted_report(db: Any, task_id: int, head_sha: str) -> Any:
-    """The stored report of a commit when GitHub confirmed it, else None."""
+@dataclass(frozen=True)
+class Computed:
+    """A projection worked out but not saved (#1975): what a gate reads in a dry run."""
+
+    row: dict[str, Any] | None
+
+
+async def report_row(
+    db: Any, task_id: int, head_sha: str, computed: Computed | None = None
+) -> Any:
+    """The report of a commit as the gates read it: the stored row, or the computed one."""
+    if computed is not None:
+        return computed.row
+    return await repo.get_ci_run_report(db, task_id, head_sha)
+
+
+async def trusted_report(
+    db: Any, task_id: int, head_sha: str, computed: Computed | None = None
+) -> Any:
+    """The report of a commit when GitHub confirmed it, else None.
+
+    ``computed`` (a dry run, #1975) replaces the stored row by the projection the
+    refresh would have left; the verdict on it is the same predicate.
+    """
     if not head_sha:
         return None
-    row = await repo.get_ci_run_report(db, task_id, head_sha)
+    row = await report_row(db, task_id, head_sha, computed)
     if row is None:
         return None
     fp = await ci_contract.fingerprint_for_task(db, task_id)
@@ -708,6 +730,83 @@ def _under_contract(rows: Sequence[Any], contract: CiContract) -> list[dict[str,
     return out
 
 
+@dataclass(frozen=True)
+class ProjectionPlan:
+    """Which attempt the projection of a commit shows and with what trust (#1975).
+
+    Worked out from facts alone; ``_project`` saves it, ``projected_row`` shows
+    the row it would leave. One plan, two readers: a dry run cannot disagree with
+    the real refresh about what the projection says.
+    """
+
+    kind: str  # attempt: the picked attempt's body | trust: only the trust | bare
+    pick: Mapping[str, Any] | None
+    source: Mapping[str, Any]
+    trust: str
+    reason: str
+    key: str
+    stored: Mapping[str, Any] | None
+
+
+def plan_projection(
+    stored: Any,
+    rows: Sequence[Any],
+    runs: list[dict[str, Any]] | None,
+    sha: str,
+    gh_repo: str,
+    contract: CiContract,
+) -> ProjectionPlan:
+    projected_key = str(dict(stored).get("attempt_key") or "") if stored else ""
+    rows = _under_contract(rows, contract)
+    pick, trust, reason, key = _standing_attempt(
+        rows, runs, sha, gh_repo, projected_key, contract
+    )
+    source = pick if pick is not None else rows[0]
+    kind = "attempt" if pick is not None else ("trust" if stored else "bare")
+    return ProjectionPlan(
+        kind, pick, source, trust, reason, key, dict(stored) if stored else None
+    )
+
+
+_BODY_COLUMNS = (
+    "ac_results",
+    "validation_status",
+    "validation_log",
+    "reason",
+    "reported_by",
+    "checks",
+    "provenance",
+)
+
+
+def projected_row(plan: ProjectionPlan, task_id: int, sha: str) -> dict[str, Any]:
+    """The ``ci_run_reports`` row ``_project`` leaves for this plan, without writing it."""
+    src, row = plan.source, dict(plan.stored or {})
+    if plan.kind == "trust":
+        return {
+            **row,
+            "trust": plan.trust,
+            "trust_reason": plan.reason,
+            "attempt_key": plan.key,
+        }
+    row.update(task_id=task_id, head_sha=sha)
+    for col in _BODY_COLUMNS:
+        row[col] = src[col]
+    for col in ("mutations", "baseline"):
+        # A block the attempt did not carry keeps the stored one (#1606); the
+        # bare row is written without them.
+        carried = src[col] if plan.kind == "attempt" else None
+        row[col] = carried if carried is not None else row.get(col, "{}")
+    own = attempt_key(src["run_id"], src["run_attempt"])
+    row.update(
+        trust=plan.trust,
+        trust_reason=plan.reason,
+        attempt_key=(plan.key or own) if plan.kind == "attempt" else plan.key,
+        contract_fp=src["contract_fp"],
+    )
+    return row
+
+
 async def _project(
     db: Any,
     task: Mapping[str, Any],
@@ -719,13 +818,10 @@ async def _project(
 ) -> Standing:
     task_id = int(task["id"])
     stored = await repo.get_ci_run_report(db, task_id, sha)
-    projected_key = str(dict(stored).get("attempt_key") or "") if stored else ""
-    rows = _under_contract(rows, contract)
-    pick, trust, reason, key = _standing_attempt(
-        rows, runs, sha, gh_repo, projected_key, contract
-    )
-    source = pick if pick is not None else rows[0]
-    if pick is not None:
+    plan = plan_projection(stored, rows, runs, sha, gh_repo, contract)
+    pick, trust, reason = plan.pick, plan.trust, plan.reason
+    key, source = plan.key, plan.source
+    if plan.kind == "attempt":
         # The projection takes the attempt's whole body, so a reader of the old
         # one-row-per-commit table sees the current attempt and no other.
         await repo.upsert_ci_run_report(
@@ -746,7 +842,7 @@ async def _project(
             attempt_key=key or attempt_key(source["run_id"], source["run_attempt"]),
         )
         await ci_contract.stamp_projection(db, task_id, sha, source["contract_fp"])
-    elif stored is not None:
+    elif plan.kind == "trust":
         await repo.set_ci_run_report_trust(
             db, task_id, sha, trust=trust, trust_reason=reason, attempt_key=key
         )
@@ -1162,6 +1258,108 @@ async def refresh_quietly(
         except Exception:  # noqa: BLE001
             log.exception("CI trust fail-closed for task %s failed", task_id)
         return None
+
+
+async def _preview_round(
+    db: Any, task_id: int, head_sha: str, stored: dict | None, *, offline: bool
+) -> dict[str, Any] | None:
+    """One refresh worked out in memory: the same questions, the same plan, no write."""
+    contract = await ci_contract.contract_for_task(db, task_id)
+    if not contract.fingerprint:
+        raise RuntimeError(f"CI contract of task {task_id} could not be read")
+    rows = await repo.list_ci_report_attempts(db, task_id, head_sha)
+    if not rows or await repo.get_task(db, task_id) is None:
+        return stored
+    gh_args = await _forge_args(db, task_id)
+    gh_repo = str(gh_args.get("gh_repo") or config.REPO_NAME)
+    runs: list[dict[str, Any]] | None = None
+    if offline:
+        due = [
+            r
+            for r in rows
+            if not r["trust_final"] or r["contract_fp"] != contract.fingerprint
+        ]
+        verdicts = {int(r["id"]): _unavailable(r) for r in due}
+    else:
+        asked, runs = await _ask_github(rows, head_sha, gh_args, False, contract)
+        verdicts = {attempt_id: verdict for attempt_id, (verdict, _) in asked.items()}
+    seen = []
+    for row in rows:
+        item = dict(row)
+        if int(row["id"]) in verdicts:
+            trust, reason, final = verdicts[int(row["id"])]
+            item.update(
+                trust=trust,
+                trust_reason=reason,
+                trust_final=final,
+                contract_fp=contract.fingerprint,
+            )
+        seen.append(item)
+    plan = plan_projection(stored, seen, runs, head_sha, gh_repo, contract)
+    return projected_row(plan, task_id, head_sha)
+
+
+PREVIEW_POLL_SECONDS = 0.01
+
+
+async def _stored_row(db: Any, task_id: int, head_sha: str) -> dict[str, Any] | None:
+    found = await repo.get_ci_run_report(db, task_id, head_sha)
+    return dict(found) if found is not None else None
+
+
+async def preview_report(db: Any, task_id: int, head_sha: str) -> Computed:
+    """The projection ``refresh_quietly`` would leave, computed and never saved (#1975).
+
+    A dry run reads GitHub like the refresh does, and the gates then read this
+    row instead of the table. The refresh's own outcomes are mirrored: past the
+    deadline the answer is the offline one, and a check that breaks leaves the
+    stored row shown as unverified(check_failed). A refresh in flight is waited
+    for (and, past the deadline, the stored projection stands), but no lock is
+    taken, no version bumped, no transaction opened: nothing here may write.
+    """
+    head_sha = (head_sha or "").strip()
+    if not head_sha:
+        return Computed(None)
+    stored = await _stored_row(db, task_id, head_sha)
+    waiting_for_lock = False
+    try:
+        try:
+            async with asyncio.timeout(REFRESH_DEADLINE_SECONDS):
+                # A refresh of this commit in flight is waited for, as the real
+                # one waits, under the same deadline. Polled, never acquired:
+                # the preview takes no lock of its own.
+                lock = _locks.get((task_id, head_sha))
+                waiting_for_lock = True
+                while lock is not None and lock.locked():
+                    await asyncio.sleep(PREVIEW_POLL_SECONDS)
+                waiting_for_lock = False
+                stored = await _stored_row(
+                    db, task_id, head_sha
+                )  # as the refresh rereads
+                row = await _preview_round(db, task_id, head_sha, stored, offline=False)
+        except TimeoutError:
+            # Out of time waiting for somebody else's refresh: the real refresh
+            # reserved no version and saves nothing, the standing is whatever
+            # the database holds NOW (``_offline_after_timeout`` with
+            # ``reserved=None`` rereads it).
+            if waiting_for_lock:
+                stored = await _stored_row(db, task_id, head_sha)
+                row = stored
+            else:
+                row = await _preview_round(db, task_id, head_sha, stored, offline=True)
+    except Exception:  # noqa: BLE001 - mirrors refresh_quietly: fail closed
+        log.exception("CI trust preview for task %s failed", task_id)
+        row = (
+            None
+            if stored is None
+            else {
+                **stored,
+                "trust": UNVERIFIED,
+                "trust_reason": CHECK_FAILED,
+                "attempt_key": "",
+            }
+        )
+    return Computed(row)
 
 
 async def refresh_for_gate(db: Any, task: Mapping[str, Any]) -> dict[str, Any]:
