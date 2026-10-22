@@ -20,10 +20,13 @@ through and writes ``csrf_would_reject``, ``require`` answers 403.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
+import re
 import secrets
 import stat
 import time
@@ -37,7 +40,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.types import Message, Receive, Scope, Send
 
-from hub import config
+from hub import brand, config
 from hub.hub_instance import hub_base_url
 
 log = logging.getLogger("hub.csrf")
@@ -251,23 +254,126 @@ def _origin_triple(value: str) -> tuple[str, str, int] | None:
         parts = urlsplit(value.strip())
         scheme = parts.scheme.lower()
         host = (parts.hostname or "").lower()
-        port = parts.port or _DEFAULT_PORTS.get(scheme)
+        port = parts.port
     except ValueError:
         return None
-    if scheme not in _DEFAULT_PORTS or not host or port is None:
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    if scheme not in _DEFAULT_PORTS or not host or not port:
         return None
     return scheme, host, port
 
 
-def _origin_problem(request: Request) -> str:
-    """Origin, else Referer, against the public address of the hub."""
+_HOST_RE: Final = re.compile(
+    r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*"
+)
+_Triple = tuple[str, str, int]
+
+
+def _is_host(host: str) -> bool:
+    if _HOST_RE.fullmatch(host):
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _strict_origin(value: str) -> _Triple | None:
+    """``scheme://host[:port]`` and nothing else, or ``None``.
+
+    The grammar of an extra trusted origin is narrower than what ``Origin``
+    carries: a typo here must never widen trust. No wildcard, userinfo, path,
+    query or fragment, only http/https, and port 1..65535 when one is written.
+    """
+    value = value.strip()
+    if not value or re.search(r"[\s?#@*\\]", value):
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or parts.path or parts.netloc.endswith(":"):
+        return None
+    if not host or not _is_host(host) or (port is not None and port < 1):
+        return None
+    return scheme, host, port or _DEFAULT_PORTS[scheme]
+
+
+def _origin_text(triple: _Triple) -> str:
+    scheme, host, port = triple
+    shown = f"[{host}]" if ":" in host else host
+    suffix = "" if port == _DEFAULT_PORTS[scheme] else f":{port}"
+    return f"{scheme}://{shown}{suffix}"
+
+
+@dataclass(frozen=True)
+class TrustedOrigins:
+    triples: tuple[_Triple, ...]
+    ignored: int = 0  # entries of HAIPLANE_HUB_EXTRA_ORIGINS that did not parse
+    total: int = 0  # entries written there
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_extra_origins(raw: str) -> tuple[tuple[_Triple, ...], int, int]:
+    """Valid triples in the order written (deduplicated), ignored, total.
+
+    Cached per value: the warning is written once per distinct value, and it
+    never names a value (an entry may carry a password).
+    """
+    if not raw.strip():
+        return (), 0, 0
+    items = raw.split(",")
+    found: list[_Triple] = []
+    ignored = 0
+    for item in items:
+        triple = _strict_origin(item)
+        if triple is None:
+            ignored += 1
+        elif triple not in found:
+            found.append(triple)
+    if ignored:
+        log.warning(
+            "%d of %d entries in the extra trusted origins setting are not "
+            "scheme://host[:port] over http or https and are ignored",
+            ignored,
+            len(items),
+        )
+    return tuple(found), ignored, len(items)
+
+
+def trusted_origins() -> TrustedOrigins:
+    """The hub's own address, then the extra ones as written, without duplicates."""
+    extra, ignored, total = _parse_extra_origins(config.hub_extra_origins_raw())
     own = _origin_triple(hub_base_url())
+    ordered = [own] if own else []
+    ordered.extend(t for t in extra if t not in ordered)
+    return TrustedOrigins(tuple(ordered), ignored, total)
+
+
+def extra_origins_warning(trusted: TrustedOrigins | None = None) -> str:
+    trusted = trusted or trusted_origins()
+    if not trusted.ignored:
+        return ""
+    return (
+        f"{brand.ENV_PREFIX}HUB_EXTRA_ORIGINS: {trusted.ignored} of {trusted.total} "
+        "entries ignored (each must be scheme://host[:port] over http or https)"
+    )
+
+
+def _origin_problem(request: Request) -> str:
+    """Origin, else Referer, against the public addresses of the hub."""
+    trusted = trusted_origins().triples
     origin = request.headers.get("origin")
     if origin is not None:
-        return "" if own and _origin_triple(origin) == own else "origin_mismatch"
+        return "" if _origin_triple(origin) in trusted else "origin_mismatch"
     referer = request.headers.get("referer")
     if referer:
-        return "" if own and _origin_triple(referer) == own else "referer_mismatch"
+        return "" if _origin_triple(referer) in trusted else "referer_mismatch"
     return ""
 
 
@@ -502,6 +608,21 @@ async def would_reject_count_24h(db: Any) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _log_refusal(request: Request, reason: str) -> None:
+    """One line per refusal in ``require``: why, which method, which path.
+
+    Neither query, cookie nor token; the path is escaped (``%r``) and cut so a
+    crafted path cannot forge a log line. Not an event: a flood of refusals must
+    not become a flood of rows.
+    """
+    log.warning(
+        "csrf refused: reason=%s method=%s path=%.200r",
+        reason,
+        request.method,
+        request.url.path,
+    )
+
+
 class CsrfMiddleware:
     """Pure ASGI, placed after authentication: it reads ``identity`` from the scope."""
 
@@ -532,6 +653,7 @@ class CsrfMiddleware:
             return
         reason, downstream = await _judge(scope, receive)
         if reason and mode == "require":
+            _log_refusal(request, reason)
             await _refusal(request, reason)(scope, receive, send)
             return
         if reason:
@@ -541,8 +663,11 @@ class CsrfMiddleware:
 
 def health_fields() -> dict[str, Any]:
     state = secret_state()
+    trusted = trusted_origins()
+    warnings = [w for w in (secret_warning(state), extra_origins_warning(trusted)) if w]
     return {
         "csrf_mode": config.CSRF_MODE,
         "csrf_key_source": state.source,
-        "csrf_warning": secret_warning(state),
+        "csrf_warning": "; ".join(warnings),
+        "csrf_trusted_origins": [_origin_text(t) for t in trusted.triples],
     }
