@@ -1253,7 +1253,7 @@ _COMMENT_RULE_MARKERS = (
     "allowlist secret",
     "inspect.getdoc",
     "вынеси",
-    "не сокращай docstring",
+    "docstring-и не сокращай",
 )
 
 
@@ -1269,8 +1269,7 @@ async def test_prompt_carries_comment_and_budget_rule(db, monkeypatch):
     assert result.launched, result
     prompt = calls[0]["prompt_text"]
     local = (
-        Path(__file__).resolve().parents[1]
-        / "skills/local-executor-hub-repo/SKILL.md"
+        Path(__file__).resolve().parents[1] / "skills/local-executor-hub-repo/SKILL.md"
     ).read_text(encoding="utf-8")
     for name, text in (("промпт облака", prompt), ("локальный навык", local)):
         missing = [m for m in _COMMENT_RULE_MARKERS if m not in text]
