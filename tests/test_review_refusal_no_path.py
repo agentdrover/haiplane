@@ -360,7 +360,7 @@ async def test_the_refusal_alert_keeps_its_prefix_and_authored_notes_stay_whole(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
     """Признаки отказа не сдвинулись: префикс алерта, reason, второй двери нет."""
-    from hub.services.refusal_publish import is_refusal_alert, published_update
+    from hub.services.refusal_publish import published_update
 
     task_id = await _refused_task(
         client,
@@ -395,8 +395,6 @@ async def test_the_refusal_alert_keeps_its_prefix_and_authored_notes_stay_whole(
         assert published_update(authored) == authored, (author, kind)
     old = {**refusal[0], "content": refusal[0]["content"] + f" {SECRET}"}
     assert LEAK not in published_update(old)["content"]
-    assert is_refusal_alert(REFUSAL_ALERT_PREFIXES[0] + ": x")
-    assert not is_refusal_alert("Кросс-модельное ревью НЕ вызвано: не хватает")
 
 
 _STORED = (
@@ -641,3 +639,70 @@ async def test_the_other_alerts_that_embed_an_exception_text_are_read_clean(
     seen = await _surfaces_of_feed(client, monkeypatch, task_id)
     for name, text in seen.items():
         assert LEAK not in text, f"{name}: алерт хаба с путём"
+
+
+async def test_any_hub_authored_entry_is_scrubbed_and_agent_entries_are_not(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Белый список по автору: новое начало алерта хаба с путём - без пути."""
+    from hub.services.refusal_publish import published_update
+
+    task_id = await _bare_task(db, "running")
+    text = f"Совсем новый алерт без известного начала: сбой в '{SECRET}'"
+    await repo.add_task_update(db, task_id, "hub", "alert", text)
+    await repo.add_task_update(db, task_id, "hub", "status", text)
+    await repo.add_task_update(
+        db, task_id, "dev-agent", "alert", text, author_kind="principal", principal_id=3
+    )
+    await repo.add_task_update(
+        db, task_id, "hub", "report", text, author_kind="principal", principal_id=3
+    )
+    await db.commit()
+    shown = [
+        u["content"] for u in (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    ]
+    assert [LEAK in c for c in shown] == [False, False, True, True], shown
+    legacy = {"kind": "alert", "agent": "hub", "content": text}
+    assert published_update(legacy)["content"] == text, "без author_kind - не хаб"
+
+
+def test_typical_hub_lines_come_out_unchanged():
+    """public_reason не портит полезный текст хаба: sha, PR, ссылки, ветки, маршруты."""
+    from hub.services.refusal_publish import published_update
+
+    sha = "c" * 40
+    lines = [
+        f"PR #123 влит в develop, коммит {sha}.",
+        f"CI на {sha[:12]}: success (run 998877, попытка 2)",
+        "https://github.com/agentdrover/haiplane/pull/123 и "
+        "https://github.com/agentdrover/haiplane/actions/runs/4567890",
+        "base_updated: ветка task-2006/refusal-no-path влита с develop",
+        "Файлы: hub/web.py, tests/test_x.py, docs/agent-context/system-map.md",
+        "Карточка /tasks/12, API /api/tasks/12/updates, GET /v1/models",
+        "Доставка отложена: PR #7 — CI ещё идёт. Попытка 1/3.",
+    ]
+    for line in lines:
+        row = {"agent": "hub", "author_kind": "hub", "kind": "status", "content": line}
+        assert published_update(row)["content"] == line, line
+    long = ("слово " * 2000).strip()
+    row = {"agent": "hub", "author_kind": "hub", "kind": "status", "content": long}
+    assert published_update(row)["content"] == long, "длинный текст не режется"
+
+
+async def test_the_task_result_text_is_published_without_a_path(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """result_text задачи (orchestration пишет туда error) читается без пути."""
+    task_id = await _bare_task(db, "open")
+    await repo.update_task(
+        db, task_id, result_text=f"dispatch failed: OSError '{SECRET}' в /tasks/12"
+    )
+    await db.commit()
+    api = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert LEAK not in api["result_text"] and "/tasks/12" in api["result_text"]
+    card = (await client.get(f"/tasks/{task_id}")).text
+    assert LEAK not in card
+    stored = await db.execute_fetchall(
+        "SELECT result_text FROM tasks WHERE id=?", (task_id,)
+    )
+    assert SECRET in dict(stored[0])["result_text"], "в базе как записано"

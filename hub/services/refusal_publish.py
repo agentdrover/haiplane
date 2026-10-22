@@ -13,10 +13,10 @@
   :func:`brief_failure.public_reason` (:func:`public_text`, :func:`published_update`):
   записи, сделанные до исправления, путь уже несут.
 
-Лента чистится только для записей ХАБА с известным началом: kind='alert',
-author_kind='hub' без принципала (так их помечает ``repo.hub_authored_updates``,
-имя agent — лишь второй ключ). Запись, поставленная запросом принципала под
-именем «hub», и запись без author_kind — авторские: путь в них содержание.
+Лента чистится только для записей ХАБА (agent='hub', author_kind='hub' без
+принципала, как в ``repo.hub_authored_updates``), любого вида и с любым началом.
+Запись, поставленная запросом принципала под именем «hub», и запись без
+author_kind — авторские: путь в них содержание.
 """
 
 from __future__ import annotations
@@ -36,39 +36,6 @@ REFUSAL_ALERT_PREFIXES: tuple[str, ...] = (
     "Кросс-модельное ревью НЕ вызвано: провайдер отказал",
     "Кросс-модельное ревью НЕ вызвано: ответ провайдера не дошёл",
 )
-
-#: Другие алерты хаба, в которые попадает причина отказа: переспрос и его
-#: исчерпание (``cause``), отвергнутые параметры заказа.
-_RELATED_ALERT = re.compile(
-    r"\[переспрос ревью(?: исчерпан)?: сдача \d+\]|Заказ ревьюера "
-)
-
-#: Начала других алертов ХАБА, в текст которых попадает ``Refusal.detail`` или
-#: ``str(exc)`` из форджа, git и ОС (#2006, раунд 3). Список найден поиском по
-#: коду f-строк алертов с ``{exc}``/``{detail}``/``{reason}``; новый такой алерт
-#: добавляется сюда, иначе его ЗАПИСАННЫЙ текст остаётся с путём.
-#: * executor_launch.py — «Исполнитель НЕ запущен: {причина}» (в старых записях
-#:   причина несёт ``Refusal.detail``);
-#: * orchestration.py — «Доставка отложена», «Доставка не состоялась» ({detail}
-#:   отказа merge-гейта: ``merge_gate_error: {exc}``);
-#: * delivery_writes.py — «Ревью одобрено, но PR … не доставлен»;
-#: * lifecycle.py, accepted_delivery_retry.py — «Доставка по решению человека …»,
-#:   «Автоповтор остановлен», «Уборка worktree не удалась: {exc}»;
-#: * poller.py — «PR #N влит, но рабочий каталог не возвращён …: {exc}»;
-#: * orchestration.py — «Done report NOT completed», «Developer-agent dispatch
-#:   unavailable: {error}».
-_FEED_ALERT_STARTS: tuple[str, ...] = (
-    "Исполнитель НЕ запущен",
-    "Доставка отложена",
-    "Доставка не состоялась",
-    "Доставка по решению человека",
-    "Ревью одобрено, но PR",
-    "Автоповтор остановлен",
-    "Уборка worktree не удалась",
-    "Developer-agent dispatch unavailable",
-    "Done report NOT completed",
-)
-_PR_MERGED_ALERT = re.compile(r"PR #\d+ влит, но рабочий каталог")
 
 _UNNAMED = "причина не названа"
 
@@ -92,27 +59,49 @@ def public_text(text: str) -> str:
     return public_reason(text)
 
 
-def is_refusal_alert(content: str) -> bool:
-    """Алерт хаба об отказе облачного ревьюера (по началу текста)."""
+_CHUNK = 3000
+
+
+def scrub_text(text: str | None) -> str | None:
+    """``public_reason`` для текста любой длины: режется по пробелам, не по символам.
+
+    ``public_reason`` обрезает вход до 4000 знаков; для записи ленты или
+    ``result_text`` это потеряло бы хвост, поэтому текст чистится кусками по
+    границе пробела (путь внутри токена не разрезается).
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    buf = ""
+    for part in re.split(r"(\s+)", text):
+        if buf and len(buf) + len(part) > _CHUNK:
+            out.append(public_reason(buf))
+            buf = ""
+        buf += part
+    out.append(public_reason(buf))
+    return "".join(out)
+
+
+def is_hub_authored(row: Any) -> bool:
+    """Запись написана самим хабом: author_kind=hub, имя hub, без принципала."""
     return (
-        content.startswith(REFUSAL_ALERT_PREFIXES)
-        or content.startswith(_FEED_ALERT_STARTS)
-        or bool(_RELATED_ALERT.match(content) or _PR_MERGED_ALERT.match(content))
+        row.get("agent") == "hub"
+        and row.get("author_kind") == "hub"
+        and not row.get("principal_id")
     )
 
 
 def published_update(row: Any) -> dict[str, Any]:
-    """Строка ленты, готовая к показу: алерт отказа очищен, остальное цело."""
+    """Строка ленты, готовая к показу.
+
+    Белый список по АВТОРУ (#2006, раунд 4): текст хаба - машинный, авторского
+    содержания в нём нет, и любой его вид (alert, status, report) с любым
+    началом идёт через ``public_reason``. Списка начал алертов больше нет: он
+    рос с каждым раундом. Записи агентов и людей не меняются.
+    """
     data = dict(row)
-    content = str(data.get("content") or "")
-    if (
-        data.get("kind") == "alert"
-        and data.get("agent") == "hub"
-        and data.get("author_kind") == "hub"
-        and not data.get("principal_id")
-        and is_refusal_alert(content)
-    ):
-        data["content"] = public_reason(content)
+    if is_hub_authored(data):
+        data["content"] = scrub_text(str(data.get("content") or ""))
     return data
 
 
