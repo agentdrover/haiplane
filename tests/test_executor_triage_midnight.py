@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from hub.services import digest, triage_inbox
@@ -84,18 +85,16 @@ async def test_day_does_not_depend_on_when_the_sweep_ran(world):
 async def test_late_outcome_is_reported_not_lost(world):
     """День уже собран, исход обработан позже: строка «досчитано позже» дня обработки."""
     first = await _acted(world)
+    built = await _digests(world, now=datetime(2026, 10, 21, 0, 0, 0, tzinfo=UTC))
+    assert built[0]["data"]["triage"]["created"] == 1
+    assert built[0]["data"]["triage"]["resolved"] == 0
+    await world.db.execute(
+        "UPDATE autopilot_digests SET created_at = '2026-10-21 00:00:00'"
+    )
     await triage.sweep(world.db)
     await world.db.execute(
         "UPDATE executor_triage_recommendations SET followup_at = ? WHERE order_id = ?",
         ("2026-10-21 00:00:01", first),
-    )
-    await world.db.commit()
-    built = await _digests(world, now=datetime(2026, 10, 21, 0, 0, 0, tzinfo=UTC))
-    assert built and built[0]["data"]["triage"]["created"] == 1
-    # дайджест дня DAY собран до обработки исхода: в нём исхода нет
-    assert built[0]["data"]["triage"]["resolved"] == 0
-    await world.db.execute(
-        "UPDATE autopilot_digests SET created_at = ?", ("2026-10-21 00:00:00",)
     )
     await world.db.commit()
     nxt = await digest.generate_due_digests(
@@ -107,8 +106,66 @@ async def test_late_outcome_is_reported_not_lost(world):
         world.db,
         "SELECT payload FROM autopilot_digests WHERE digest_date = '2026-10-21'",
     )
-    import json
-
     section = json.loads(rows[0]["payload"])["triage"]
     assert (section["resolved"], section["late"]) == (0, 1)
     assert "досчитано позже 1" in triage_inbox.section_line(section)
+    # День действия не пересчитывается.
+    old = await _rows(
+        world.db,
+        "SELECT payload FROM autopilot_digests WHERE digest_date = ?",
+        (DAY,),
+    )
+    assert json.loads(old[0]["payload"])["triage"]["resolved"] == 0
+
+
+async def test_migration_adds_the_column_and_keeps_recommendations(monkeypatch):
+    """Вся цепочка steps на базе с данными: колонка есть, строки целы, повтор пуст."""
+    import aiosqlite
+
+    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
+    from hub.migrations.steps import load_steps
+    from tests.test_db_migrations import _SCHEMA
+
+    steps = load_steps()
+    mine = [(n, q) for n, q in steps if "followup_action_at" in n]
+    assert mine, "нет шага миграции #1943"
+    before = [(n, q) for n, q in steps if (n, q) not in mine]
+    monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await db_module._migrate(conn)
+        await conn.execute("PRAGMA foreign_keys = OFF")
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (7, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO executor_hosts (name, principal_id, public_key_pem) "
+            "VALUES ('k8', 1, 'pem')"
+        )
+        await conn.execute("INSERT INTO executor_runs (id, task_id) VALUES (9, 7)")
+        await conn.execute(
+            "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
+            "state, expires_at) VALUES ('k8', 7, 1, 9, 'closed', '2030-01-01')"
+        )
+        await conn.execute(
+            "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+            "triage_class, action, followup, followup_at) "
+            "VALUES (1, 7, 1, 'to_owner', 'new_order', '2026-10-20 01:00:00')"
+        )
+        await conn.commit()
+        await conn.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *steps])
+        await db_module._migrate(conn)
+        await db_module._migrate(conn)
+        rows = await conn.execute_fetchall(
+            "SELECT order_id, followup, followup_at, followup_action_at "
+            "FROM executor_triage_recommendations"
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "new_order", "2026-10-20 01:00:00", None)
+        ]
+    finally:
+        await conn.close()

@@ -216,11 +216,17 @@ async def record_owner_verdict(
 # Дайджест
 # ---------------------------------------------------------------------------
 
+#: ``action_at`` - время самого действия, выбранного исходом (``followup_action_at``);
+#: у строк с исходом до колонки его нет, и они читаются по ``followup_at``.
 _DIGEST_ROWS_SQL: Final[str] = """
-SELECT task_id, action, created_at, followup, followup_at
+SELECT task_id, action, created_at, followup, followup_at,
+       COALESCE(followup_action_at, followup_at) AS action_at
 FROM executor_triage_recommendations
 WHERE (created_at >= ? AND created_at < ?)
-   OR (followup IS NOT NULL AND followup_at >= ? AND followup_at < ?)
+   OR (followup IS NOT NULL
+       AND (COALESCE(followup_action_at, followup_at) >= ?
+            AND COALESCE(followup_action_at, followup_at) < ?
+            OR followup_at >= ? AND followup_at < ?))
 """
 
 
@@ -234,6 +240,7 @@ def empty_section() -> dict[str, Any]:
         "resolved": 0,
         "matched": 0,
         "unmeasured": 0,
+        "late": 0,
     }
 
 
@@ -247,22 +254,54 @@ def section_active(section: dict[str, Any]) -> bool:
         or section.get("created")
         or section.get("resolved")
         or section.get("unmeasured")
+        or section.get("late")
     )
 
 
-def _count(section: dict[str, Any], row: Any, start: str, end: str) -> None:
+async def _counted_in_its_day(
+    db: aiosqlite.Connection, project_id: int, row: Any
+) -> bool:
+    """Дайджест дня действия собран ПОСЛЕ обработки исхода: исход в нём уже есть."""
+    found = await fetchall(
+        db,
+        "SELECT created_at FROM autopilot_digests "
+        "WHERE project_id = ? AND digest_date = ?",
+        (project_id, str(row["action_at"])[:10]),
+    )
+    return bool(found) and str(found[0]["created_at"]) > str(row["followup_at"])
+
+
+async def _count(
+    db: aiosqlite.Connection,
+    section: dict[str, Any],
+    row: Any,
+    project_id: int,
+    window: tuple[str, str],
+) -> None:
+    """Учесть строку в сутках ``window``: создание - по created_at, исход - по
+    времени ДЕЙСТВИЯ; исход, обработанный в этих сутках после сборки дайджеста дня
+    действия, идёт отдельным числом ``late`` и в X/Y не входит."""
+    start, end = window
     if start <= str(row["created_at"]) < end:
         section["created"] += 1
         retry = row["action"] in triage.RETRY_ACTIONS
         section["retry" if retry else "owner"] += 1
     followup = row["followup"]
-    if followup is None or not start <= str(row["followup_at"] or "") < end:
+    if followup is None:
         return
-    if followup in _UNMEASURED_FOLLOWUPS:
-        section["unmeasured"] += 1
-        return
-    section["resolved"] += 1
-    section["matched"] += followup in triage.MATCHING.get(row["action"], frozenset())
+    if start <= str(row["action_at"] or "") < end:
+        if followup in _UNMEASURED_FOLLOWUPS:
+            section["unmeasured"] += 1
+            return
+        section["resolved"] += 1
+        hit = followup in triage.MATCHING.get(row["action"], frozenset())
+        section["matched"] += hit
+    elif (
+        start <= str(row["followup_at"] or "") < end
+        and str(row["action_at"] or "") < start
+    ):
+        if not await _counted_in_its_day(db, project_id, row):
+            section["late"] += 1
 
 
 async def digest_sections(
@@ -273,9 +312,7 @@ async def digest_sections(
     Исключение пробрасывается: вызывающий пишет ``unavailable_section`` во все
     дайджесты вместо молчаливого нуля.
     """
-    rows = await fetchall(
-        db, _DIGEST_ROWS_SQL, (day_start, day_end, day_start, day_end)
-    )
+    rows = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end) * 3)
     sections: dict[int, dict[str, Any]] = {}
     owners: dict[int, int | None] = {}
     for row in rows:
@@ -286,8 +323,12 @@ async def digest_sections(
         project_id = owners[task_id]
         if project_id is None:
             continue
-        _count(
-            sections.setdefault(project_id, empty_section()), row, day_start, day_end
+        await _count(
+            db,
+            sections.setdefault(project_id, empty_section()),
+            row,
+            project_id,
+            (day_start, day_end),
         )
     return sections
 
@@ -335,6 +376,8 @@ def section_line(section: dict[str, Any]) -> str:
         else "решений владельца для сверки пока нет"
     )
     tail = f"; не измерено {section['unmeasured']}" if section["unmeasured"] else ""
+    if section.get("late"):
+        tail += f"; досчитано позже {section['late']}"
     return (
         f"разобрано {section['created']}, рекомендован повтор {section['retry']}, "
         f"к владельцу {section['owner']}; {verdicts}{tail}"
