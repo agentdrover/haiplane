@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,22 +100,28 @@ async def open_rows(db: aiosqlite.Connection, limit: int) -> list[dict[str, Any]
     return [dict(r) for r in rows]
 
 
-async def reserve(db: aiosqlite.Connection, row_id: int, text: str) -> bool:
-    """Занять попытку ОДНИМ UPDATE: True - проход владеет попыткой.
+async def reserve(db: aiosqlite.Connection, row_id: int, text: str) -> str | None:
+    """Занять попытку ОДНИМ UPDATE: токен брони, или None - попытка не наша.
+
+    Токен пишется в строку; завершающие UPDATE (``settle``, ``close``) идут с
+    ``WHERE token=?``, поэтому прежний владелец, у которого бронь перехватили,
+    не меняет ни состояние, ни счётчик нового.
 
     Условие целиком в UPDATE: строка ``armed`` либо ``reserved`` и брошенная,
     попыток меньше лимита, срок от первого вооружения не вышел. Попытка
     тратится здесь и возвращается только явным ``release``.
     """
+    token = uuid.uuid4().hex
     cur = await db.execute(
         "UPDATE accepted_delivery_retries SET state='reserved', "
-        "attempts=attempts+1, reserved_at=datetime('now'), "
+        "attempts=attempts+1, reserved_at=datetime('now'), token=?, "
         "history=json_insert(history, '$[#]', json(?)) "
         "WHERE id=? AND attempts < ? "
         "AND armed_at > datetime('now', ?) "
         "AND (state='armed' OR (state='reserved' "
         "AND reserved_at <= datetime('now', ?)))",
         (
+            token,
             _event(text, "reserved"),
             int(row_id),
             MAX_ATTEMPTS,
@@ -122,32 +129,45 @@ async def reserve(db: aiosqlite.Connection, row_id: int, text: str) -> bool:
             f"-{STALL_SECONDS} seconds",
         ),
     )
-    return cur.rowcount == 1
+    return token if cur.rowcount == 1 else None
 
 
 async def settle(
-    db: aiosqlite.Connection, row_id: int, text: str, *, refund: bool
+    db: aiosqlite.Connection, row_id: int, text: str, *, refund: bool, token: str
 ) -> bool:
     """Попытка кончилась без исхода: reserved -> armed; ``refund`` возвращает её."""
     cur = await db.execute(
         "UPDATE accepted_delivery_retries SET state='armed', "
         "attempts=attempts - ?, history=json_insert(history, '$[#]', json(?)) "
-        "WHERE id=? AND state='reserved'",
+        "WHERE id=? AND state='reserved' AND token=?",
         (
             1 if refund else 0,
             _event(text, "refunded" if refund else "spent"),
             int(row_id),
+            token,
         ),
     )
     return cur.rowcount == 1
 
 
-async def close(db: aiosqlite.Connection, row_id: int, outcome: str, text: str) -> bool:
-    """Закрыть исходом; уже закрытая не перезаписывается."""
+async def close(
+    db: aiosqlite.Connection,
+    row_id: int,
+    outcome: str,
+    text: str,
+    *,
+    token: str = "",
+) -> bool:
+    """Закрыть исходом; уже закрытая не перезаписывается.
+
+    С ``token`` закрывает только владелец своей брони: перехваченная у него
+    строка остаётся тому, кто взял её после. Без токена (стоп до брони) - любую
+    не закрытую.
+    """
     cur = await db.execute(
         "UPDATE accepted_delivery_retries SET state='closed', outcome=?, "
         "closed_at=datetime('now'), history=json_insert(history, '$[#]', json(?)) "
-        "WHERE id=? AND state != 'closed'",
-        (outcome, _event(text, outcome), int(row_id)),
+        "WHERE id=? AND state != 'closed' AND (? = '' OR token = ?)",
+        (outcome, _event(text, outcome), int(row_id), token, token),
     )
     return cur.rowcount == 1

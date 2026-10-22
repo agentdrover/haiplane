@@ -23,6 +23,7 @@ MIGRATIONS = [
             attempts              INTEGER NOT NULL DEFAULT 0,
             armed_at              TEXT    NOT NULL DEFAULT (datetime('now')),
             reserved_at           TEXT,
+            token                 TEXT    NOT NULL DEFAULT '',
             closed_at             TEXT,
             outcome               TEXT    NOT NULL DEFAULT '',
             history               TEXT    NOT NULL DEFAULT '[]',

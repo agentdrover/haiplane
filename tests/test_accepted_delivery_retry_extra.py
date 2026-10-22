@@ -15,6 +15,8 @@ from hub import db as hub_db
 from hub import repository as repo
 from hub.services.delivery_state import scan_completed_deliveries
 from tests.accepted_delivery_retry_support import (
+    FAILED,
+    PASSED,
     RetryRig,
     accepted_task,
     approved_task,
@@ -155,3 +157,67 @@ async def test_fresh_base_rerun_is_not_doubled(db, monkeypatch):
     assert row["state"] == "armed" and row["attempts"] == 0, (
         "ожидание не тратит попытку"
     )
+
+
+async def test_a_generation_change_during_the_ci_probe_never_merges(db, monkeypatch):
+    rig = await armed_rig(db, monkeypatch)
+
+    async def probe(*args, **kwargs):
+        await repo.update_task(
+            db,
+            rig.task_id,
+            submission_generation=2,
+            review_verdict="approved",
+            review_verdict_generation=2,
+        )
+        await db.commit()
+        return PASSED
+
+    rig.git.check_pr_ci = AsyncMock(side_effect=probe)
+    await scan_completed_deliveries(db)
+    rig.git.merge_pr.assert_not_awaited()
+    row = await rig.retry_row()
+    assert (row["state"], row["outcome"]) == ("closed", "generation_changed")
+
+
+async def test_a_taken_over_reservation_is_not_touched_by_the_old_owner(
+    db, monkeypatch
+):
+    from hub import repository_accepted_delivery_retry as journal
+
+    rig = await armed_rig(db, monkeypatch)
+    row_id = (await rig.retry_row())["id"]
+    old = await journal.reserve(db, row_id, "A")
+    assert old
+    await db.execute(
+        f"UPDATE {TABLE} SET reserved_at=datetime('now', '-2 hours') WHERE id=?",
+        (row_id,),
+    )
+    new = await journal.reserve(db, row_id, "B")  # перехват зависшей брони
+    assert new and new != old
+    assert not await journal.settle(db, row_id, "A", refund=True, token=old)
+    assert not await journal.close(db, row_id, "refused", "A", token=old)
+    row = await rig.retry_row()
+    assert (row["state"], row["attempts"], row["token"]) == ("reserved", 2, new)
+    assert await journal.settle(db, row_id, "B", refund=False, token=new)
+
+
+async def test_an_unreadable_rerun_policy_waits_instead_of_stopping(db, monkeypatch):
+    from hub.services import delivery_rerun
+
+    rig = await armed_rig(db, monkeypatch)
+    rig.ci(FAILED)
+    monkeypatch.setattr(delivery_rerun, "policy_mode", AsyncMock(return_value=None))
+    await scan_completed_deliveries(db)
+    row = await rig.retry_row()
+    assert (row["state"], row["attempts"]) == ("armed", 0)
+    rig.git.merge_pr.assert_not_awaited()
+
+
+async def test_unreadable_rows_do_not_cancel_the_rest_of_the_scan(db, monkeypatch):
+    from hub import repository_accepted_delivery_retry as journal
+
+    rig = await armed_rig(db, monkeypatch)
+    monkeypatch.setattr(journal, "open_rows", AsyncMock(side_effect=RuntimeError("x")))
+    await scan_completed_deliveries(db)
+    assert await repo.get_delivery_discrepancy(db, rig.task_id) is not None

@@ -134,7 +134,13 @@ async def refusal_note(db: aiosqlite.Connection, task_id: int, reason: str) -> s
 async def sweep(db: aiosqlite.Connection, *, limit: int = 50) -> int:
     """Один проход по вооружённым строкам; число обработанных строк."""
     handled = 0
-    for row in await journal.open_rows(db, limit):
+    try:
+        rows = await journal.open_rows(db, limit)
+    except Exception:  # noqa: BLE001 - не прочитали строки: остальной скан идёт дальше
+        await db.rollback()
+        log.exception("accepted delivery retry rows unreadable")
+        return handled
+    for row in rows:
         try:
             await _step(db, row)
             handled += 1
@@ -208,19 +214,26 @@ async def _ci_allows_attempt(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         return "go"
     if ci.outcome != CIProbeOutcome.failed:
         return "wait"
-    return "go" if await _rerun_may_help(db, task) else "stop"
+    return await _rerun_verdict(db, task)
 
 
-async def _rerun_may_help(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
-    """Может ли перезапуск #1956 ещё сработать: политика on, бронь не закрыта."""
+async def _rerun_verdict(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """Красный CI: "go" - перезапуск #1956 ещё может сработать; "stop"; "wait".
+
+    Политика не прочиталась - "wait": неизвестное не равно "выключено".
+    """
     from hub.services import delivery_rerun  # поздно: цикл через orchestration
 
-    if not await delivery_rerun.policy_on(db, int(task["id"])):
-        return False
+    mode = await delivery_rerun.policy_mode(db, int(task["id"]))
+    if mode is None:
+        return "wait"
+    if not mode:
+        return "stop"
     spent = await rerun_journal.get(
         db, int(task["id"]), int(task.get("submission_generation") or 0)
     )
-    return spent is None or spent["state"] != rerun_journal.CLOSED
+    closed = spent is not None and spent["state"] == rerun_journal.CLOSED
+    return "stop" if closed else "go"
 
 
 async def _attempt(
@@ -234,11 +247,20 @@ async def _attempt(
 
     number = int(row["attempts"]) + 1
     async with write_transaction(db):
-        reserved = await journal.reserve(
+        token = await journal.reserve(
             db, int(row["id"]), f"попытка {number} из {MAX_ATTEMPTS}"
         )
     await db.commit()  # бронь закоммичена ДО сети; write-lock на форж не держим
-    if not reserved:
+    if not token:
+        return
+    # Проба CI шла по сети: задача могла стать другой сдачей. Сверка - после
+    # брони и прямо перед доставкой (deliver_on_disposition перечитает задачу).
+    now_row = await repo.get_task(db, int(task["id"]))
+    changed = _stop_reason(
+        dict(now_row) if now_row else None, {**row, "attempts": 0, "age_hours": 0}
+    )
+    if changed is not None:
+        await _stop(db, row, *changed, token=token)
         return
     try:
         ok, reason, _ = await lifecycle.deliver_on_disposition(
@@ -246,23 +268,35 @@ async def _attempt(
         )
     except Exception:
         await db.rollback()
-        await _settle(db, row, f"попытка {number}: исключение при доставке", False)
+        await _settle(
+            db, row, f"попытка {number}: исключение при доставке", False, token
+        )
         raise
     if ok:
-        await _delivered(db, row, f"попытка {number} из {MAX_ATTEMPTS}")
+        await _delivered(db, row, f"попытка {number} из {MAX_ATTEMPTS}", token)
     elif reason.startswith(BASE_UPDATED_PREFIX):
-        await _settle(db, row, f"попытка {number} из {MAX_ATTEMPTS}: {reason}", False)
+        text = f"попытка {number} из {MAX_ATTEMPTS}: {reason}"
+        await _settle(db, row, text, False, token)
     elif reason.startswith(TRANSIENT_GATE_PREFIXES):
-        await _settle(db, row, f"попытка {number} не состоялась (ждём): {reason}", True)
+        text = f"попытка {number} не состоялась (ждём): {reason}"
+        await _settle(db, row, text, True, token)
     else:
-        await _stop(db, row, reason.split(":")[0].strip()[:60] or "refused", reason)
+        outcome = reason.split(":")[0].strip()[:60] or "refused"
+        await _stop(db, row, outcome, reason, token=token)
 
 
 async def _settle(
-    db: aiosqlite.Connection, row: dict[str, Any], text: str, refund: bool
+    db: aiosqlite.Connection,
+    row: dict[str, Any],
+    text: str,
+    refund: bool,
+    token: str,
 ) -> None:
     async with write_transaction(db):
-        if await journal.settle(db, int(row["id"]), text, refund=refund) and not refund:
+        settled = await journal.settle(
+            db, int(row["id"]), text, refund=refund, token=token
+        )
+        if settled and not refund:
             await repo.add_task_update(
                 db,
                 int(row["task_id"]),
@@ -274,12 +308,17 @@ async def _settle(
 
 
 async def _stop(
-    db: aiosqlite.Connection, row: dict[str, Any], outcome: str, why: str
+    db: aiosqlite.Connection,
+    row: dict[str, Any],
+    outcome: str,
+    why: str,
+    *,
+    token: str = "",
 ) -> None:
     """Закрыть строку исходом, сказать один раз: алерт в ленту и событие."""
     task_id = int(row["task_id"])
     async with write_transaction(db):
-        if not await journal.close(db, int(row["id"]), outcome, why):
+        if not await journal.close(db, int(row["id"]), outcome, why, token=token):
             return
         if outcome == "task_missing":
             return
@@ -306,7 +345,9 @@ async def _stop(
     await db.commit()
 
 
-async def _delivered(db: aiosqlite.Connection, row: dict[str, Any], how: str) -> None:
+async def _delivered(
+    db: aiosqlite.Connection, row: dict[str, Any], how: str, token: str = ""
+) -> None:
     """PR влит: перечитать доставку ПЕРЕД записью реестра, потом закрыть строку."""
     from hub.services.delivery_state import task_delivery
 
@@ -324,7 +365,7 @@ async def _delivered(db: aiosqlite.Connection, row: dict[str, Any], how: str) ->
                 delivery_path=answer["delivery_path"],
                 disposition=DELIVER,
             )
-        if await journal.close(db, int(row["id"]), "delivered", how):
+        if await journal.close(db, int(row["id"]), "delivered", how, token=token):
             await repo.add_task_update(
                 db,
                 task_id,
