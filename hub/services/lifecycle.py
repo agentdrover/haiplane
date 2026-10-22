@@ -5815,6 +5815,9 @@ async def return_to_work(
             "abandoned_jobs": [job for _field, job, _status in active_jobs],
         },
     )
+    from hub.services import executor_triage_rework
+
+    await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
     await db.commit()
     await log_activity(
         db,
