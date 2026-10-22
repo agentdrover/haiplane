@@ -94,13 +94,20 @@ def _host(low: int) -> str:
     return rf"(?:\[[^\]\s]{{1,64}}\]{_run(0)}|{_run(low)})"
 
 
-_USERINFO_URL = re.compile(rf"{_SCHEME}\S{{1,{_MAXM}}}@{_host(0)}")
+# Userinfo - класс без пробела, «/», «@», «|», кавычек, «<>» и «{}», и запятой
+# перед пробелом: он не выходит за пределы адреса и не съедает соседние ссылки и
+# поля JSON. Скобки () и «:» в нём остаются (``user:p(secret)@``).
+_USER = r"""(?:[^\s/@|"'`<>{},]|,(?!\s))"""
+_USERINFO_URL = re.compile(rf"{_SCHEME}{_USER}{{1,{_MAXM}}}@{_host(0)}")
 _URL = re.compile(rf"{_SCHEME}{_host(1)}")
-_SCP = re.compile(rf"(?<![\w.@-])[\w.\-]{{1,64}}@[\w.\-]{{1,255}}:{_run(1)}")
+_SCP_HOST = r"(?:\[[^\]\s]{1,64}\]|[\w.\-]{1,255})"
+_SCP = re.compile(rf"(?<![\w.@-])[\w.\-]{{1,64}}@{_SCP_HOST}:{_run(1)}")
 _FS = rf"(?:~[\w.\-]{{0,32}}/|/(?:{_ROOTS})(?![\w.\-]))"
 # Значение JSON ("ключ": "/путь", ["/путь"]) - маркер ВНУТРИ кавычек, строка
 # остаётся строкой и json.loads её читает.
-_JSON_PATH = re.compile(rf'(?P<pre>"\s*:\s*|[\[,]\s*)"{_FS}[^"\n]{{0,{_MAXM}}}"')
+_JSON_PATH = re.compile(
+    rf'(?P<pre>"\s*:\s*|[\[,]\s*)"{_FS}(?:[^"\\\n]|\\.){{0,{_MAXM}}}"'
+)
 _QUOTED_PATH = re.compile(rf"(['\"`]){_FS}[^'\"`\n]{{0,{_MAXM}}}\1")
 _ABS_PATH = re.compile(rf"(?<![\w.~/\-]){_FS}{_run(0)}")
 _PR_LINK = re.compile(

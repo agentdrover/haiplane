@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 
 def test_public_reason_keeps_json_valid_with_the_marker_inside_the_quotes():
     from hub.services.brief_failure import public_reason
@@ -54,9 +52,9 @@ def test_public_reason_takes_the_whole_userinfo_url_and_the_ipv6_host():
 
     for url in (
         "https://user:p(secret)@host.example/repo",
-        'https://user:p|"q)x@host.example/repo',
+        "https://user:p(x)y@host.example/repo",
         "https://u:a@b@host.example/r",
-        "ssh://git:p[1]{2}<3>@host.example:22/r.git",
+        "ssh://git:p[1]:2@host.example:22/r.git",
     ):
         assert public_reason(f"fatal: {url} down") == "fatal: <remote> down", url
     assert public_reason("see https://[2001:db8::1]/repo ok") == "see <remote> ok"
@@ -83,14 +81,6 @@ def test_public_reason_swallows_the_tail_after_the_match_cap():
     assert public_reason(f"{near}, ok") == f"{near}, ok"
 
 
-@pytest.mark.xfail(strict=True, reason="#2006: escaped quote — separate task")
-def test_public_reason_json_with_an_escaped_quote_in_the_path():
-    from hub.services.brief_failure import public_reason
-
-    out = public_reason(r'{"reason":"/srv/a\"b.pem","ok":true}')
-    assert json.loads(out) == {"reason": "<путь>", "ok": True}
-
-
 def test_public_reason_replaces_a_bracketed_ipv6_host_whole():
     from hub.services.brief_failure import public_reason
 
@@ -111,3 +101,38 @@ def test_public_reason_replaces_a_bracketed_ipv6_host_whole():
         assert out == want, (text, out)
         for left in ("2001", "db8", "TOKEN", "SECOND", "::1", "8080"):
             assert left not in out
+
+
+def test_public_reason_userinfo_does_not_swallow_neighbouring_links_and_fields():
+    from hub.services.brief_failure import public_reason
+
+    link = "https://github.com/o/r/pull/7"
+    run = "https://github.com/o/r/actions/runs/12"
+    same = (
+        f"|pr|{link}|alice@host|",
+        f'{{"provenance":"{run}","actor":"a@b"}}',
+        f"{link}.|a@b",
+        f"{link}, затем mail me@host",
+    )
+    for text in same:
+        assert public_reason(text) == text, text
+    out = public_reason(f'{{"link":"{link}","detail":"/srv/key.pem","e":"a@b"}}')
+    assert out == f'{{"link":"{link}","detail":"<путь>","e":"a@b"}}'
+    assert public_reason("https://user:p(secret)@host.example/repo") == "<remote>"
+    assert public_reason("fatal: https://u:p,s@h.io/r down") == "fatal: <remote> down"
+
+
+def test_public_reason_replaces_a_bracketed_ipv6_scp_address():
+    from hub.services.brief_failure import public_reason
+
+    assert public_reason("git@[::1]:repo ok") == "<remote> ok"
+    assert public_reason("(git@[2001:db8::1]:o/r.git?t=S)") == "(<remote>)"
+    assert public_reason("|a|git@[::1]:r|b|") == "|a|<remote>|b|"
+
+
+def test_public_reason_json_with_an_escaped_quote_in_the_path():
+    from hub.services.brief_failure import public_reason
+
+    out = public_reason(r'{"reason":"/srv/reviewer/pri\"vate.pem","ok":true}')
+    assert json.loads(out) == {"reason": "<путь>", "ok": True}
+    assert "vate" not in out and "reviewer" not in out
