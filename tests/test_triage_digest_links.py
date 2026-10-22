@@ -95,18 +95,21 @@ async def test_an_outcome_is_counted_once_by_concurrent_digests(
     """AC-1: два соединения, разные даты; сбор и запись не должны разойтись."""
     await _outcome(world, "гонка")
     other = await db_module.connect(db_dsn)
-    real = triage_inbox.digest_sections
+    real = triage_inbox.collect_sections
+    calls: list[int] = []
 
     async def slow(db, *args, **kwargs):
-        sections = await real(db, *args, **kwargs)
+        calls.append(1)
+        collected = await real(db, *args, **kwargs)
         await asyncio.sleep(0.3)  # окно между сбором и записью
-        return sections
+        return collected
 
-    monkeypatch.setattr(triage_inbox, "digest_sections", slow)
+    monkeypatch.setattr(triage_inbox, "collect_sections", slow)
     try:
         await asyncio.gather(_generate(world.db, _day(1)), _generate(other, _day(2)))
     finally:
         await other.close()
+    assert len(calls) >= 2, "окно между сбором и записью не создано"
     assert await _taken(world.db) == 1
     links = await _rows(world.db, f"SELECT * FROM {LINKS}")
     assert len(links) == 1
@@ -217,6 +220,7 @@ async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
             "2026-10-12": {"triage": {"state": "unavailable", "outcome_ids": [3]}},
             "2026-10-13": {"triage": {"state": "measured"}},  # legacy
             "2026-10-14": "не json",
+            "2026-10-21": {"triage": {"state": "measured", "outcome_ids": [4]}},
         }
         for day, payload in payloads.items():
             text = payload if isinstance(payload, str) else json.dumps(payload)
@@ -231,10 +235,14 @@ async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
         await db_module._migrate(conn)
         await db_module._migrate(conn)
         rows = await conn.execute_fetchall(
-            f"SELECT recommendation_id, digest_id FROM {LINKS} ORDER BY 1"
+            f"SELECT recommendation_id, digest_id, kind FROM {LINKS} ORDER BY 1"
         )
         # 1 - у более раннего дайджеста; 99 нет в таблице; 3 - дайджест unavailable
-        assert [tuple(r) for r in rows] == [(1, 1), (2, 2)]
+        assert [tuple(r) for r in rows] == [
+            (1, 1, "day"),
+            (2, 2, "day"),
+            (4, 6, "late"),
+        ]
     finally:
         await conn.close()
 

@@ -10,7 +10,8 @@
 
 Заполнение старых данных: связь создаётся ТОЛЬКО для доказуемо учтённого исхода -
 его id есть в ``triage.outcome_ids`` измеренного (``state = measured``) дайджеста
-и рекомендация существует. Дайджест без ``outcome_ids`` (до круга 2 #1943) или
+и рекомендация существует. ``kind`` - ``late``, если действие исхода раньше суток
+дайджеста, иначе ``day``. Дайджест без ``outcome_ids`` (до круга 2 #1943) или
 нечитаемый ничего не подтверждает; нечитаемый JSON пропускается. Исход в списках
 двух дайджестов достаётся более раннему (INSERT OR IGNORE, порядок по id).
 """
@@ -29,15 +30,15 @@ MIGRATIONS: list[tuple[str, str]] = [
         "backfill_triage_digest_outcomes",
         "INSERT OR IGNORE INTO triage_digest_outcomes "
         "(recommendation_id, digest_id, kind) "
-        "SELECT CAST(j.value AS INTEGER), d.id, 'day' "
+        "SELECT r.id, d.id, CASE WHEN COALESCE(r.followup_action_at, r.followup_at) "
+        "< d.digest_date || ' 00:00:00' THEN 'late' ELSE 'day' END "
         "FROM autopilot_digests d, "
         "json_each(CASE WHEN json_valid(d.payload) THEN d.payload ELSE '{}' END, "
         "'$.triage.outcome_ids') j "
+        "JOIN executor_triage_recommendations r ON r.id = j.value "
         "WHERE json_extract(CASE WHEN json_valid(d.payload) THEN d.payload "
         "ELSE '{}' END, '$.triage.state') = 'measured' "
         "AND j.type = 'integer' "
-        "AND EXISTS (SELECT 1 FROM executor_triage_recommendations r "
-        "WHERE r.id = j.value) "
         "ORDER BY d.id",
     ),
 ]

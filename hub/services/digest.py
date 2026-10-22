@@ -594,12 +594,12 @@ async def _project_digest(
     self_approvals: list[dict] = []
     for event in events:
         if event["task_id"] is None:
-            return False
+            continue
         # Attribution walks the hierarchy — the same resolver as the
         # git conveyor and the human_gates metric (#747).
         owner = await repo.resolve_project_for_task(db, event["task_id"])
         if owner is None or owner["id"] != project["id"]:
-            return False
+            continue
         try:
             payload = json.loads(event["payload"] or "{}")
         except ValueError:
