@@ -572,3 +572,22 @@ async def test_app_routes_in_a_reason_are_not_filesystem_paths(
 
     assert brief is not None
     assert brief.base_merge.reason == "см. /tasks/12 и <путь>"
+
+
+async def test_the_review_queue_view_is_cleaned_as_a_whole(
+    client: AsyncClient, db, missing_workspace, monkeypatch
+):
+    """Очередь ревью: путь в любой строке готового вида режется, названия не трогаются."""
+    from hub.services import review_evidence, review_queue
+
+    task_id = await _review_task(client, db, missing_workspace, "gone-queue")
+    leak = "/tmp/leak-2002/clone https://h.io/o/r.git"
+    monkeypatch.setattr(
+        review_evidence, "sha_check_of", lambda *a, **k: ("unknown", leak)
+    )
+    view = await review_queue.review_queue(db)
+
+    rows = [r for r in view.rows if r.task_id == task_id]
+    assert rows, "задача в очереди"
+    for text in _strings(view.model_dump(mode="json")):
+        assert "/tmp" not in text and "h.io" not in text, text
