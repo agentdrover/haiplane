@@ -678,3 +678,46 @@ async def test_a_merge_in_the_gate_memory_is_not_an_escalation(db, monkeypatch):
 
     assert (await repo.get_task(db, task_id))["status"] == "running"
     assert await _needs_decision_events(db, task_id) == 0
+
+
+# --- Круг gen4: взаимное исключение мержа и эскалации -----------------------
+
+
+async def test_a_merge_entering_the_escalation_window_is_refused(db, monkeypatch):
+    """Сосед входит в мерж после последней проверки и до UPDATE перехода."""
+    from hub import repository_delivery_wait as journal_module
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    real = journal_module.escalate
+    seen: dict = {}
+
+    async def neighbour_then_escalate(*args, **kw):
+        snap = dict(await repo.get_task(db, task_id))
+        ctx = await orchestration.project_git_context(db, task_id)
+        seen["step"], _ = await orchestration.merge_if_approval_stands(
+            db, snap, ctx, checked_sha=snap["submission_sha"]
+        )
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(journal_module, "escalate", neighbour_then_escalate)
+    await _pass(db, task_id)
+
+    assert seen["step"] is not orchestration.MergeStep.MERGED
+    plugins.git_ops.merge_pr.assert_not_awaited()
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+    assert await _needs_decision_events(db, task_id) == 1
+
+
+async def test_the_claim_is_released_after_the_transition(db, monkeypatch):
+    from hub.services import delivery_claim
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    await _pass(db, task_id)
+
+    assert not delivery_claim.held((task_id, 360))
