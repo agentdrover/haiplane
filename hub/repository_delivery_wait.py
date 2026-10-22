@@ -19,10 +19,11 @@ ESCALATED = "escalated"
 async def open_wait(
     db: aiosqlite.Connection, task_id: int, generation: int, revision: int, kind: str
 ) -> None:
-    """Начать (или продолжить) ожидание; закрытое и эскалированное - заново.
+    """Начать (или продолжить) ожидание; закрытое - заново, эскалированное - нет.
 
     Открытая строка не трогается: ``started_at`` не двигается ни повтором, ни
-    рестартом. Открытые строки той же задачи с другим ключом (прежнее поколение
+    рестартом. ``escalated`` терминально для своего ключа: задача уже ушла к
+    человеку, и возврат в running с тем же ключом не заводит второй перевод. Открытые строки той же задачи с другим ключом (прежнее поколение
     или ревизия вердикта) закрываются: новая сдача начинает отсчёт с нуля.
     """
     await db.execute(
@@ -37,8 +38,8 @@ async def open_wait(
         "VALUES (?, ?, ?, ?) "
         "ON CONFLICT (task_id, submission_generation, verdict_revision, kind) "
         "DO UPDATE SET state=?, started_at=datetime('now'), closed_at=NULL "
-        "WHERE delivery_wait_deadlines.state != ?",
-        (task_id, generation, revision, kind, OPEN, OPEN),
+        "WHERE delivery_wait_deadlines.state = ?",
+        (task_id, generation, revision, kind, OPEN, CLOSED),
     )
 
 
@@ -74,21 +75,27 @@ async def escalate(
     return cur.rowcount == 1
 
 
-async def close_open(db: aiosqlite.Connection, task_id: int, kind: str) -> int:
-    """Закрыть открытое ожидание задачи (успех, иная причина); число закрытых."""
+async def close_open(
+    db: aiosqlite.Connection, task_id: int, generation: int, revision: int, kind: str
+) -> int:
+    """Закрыть открытое ожидание ЭТОГО ключа (проход того же поколения и ревизии)."""
     cur = await db.execute(
         "UPDATE delivery_wait_deadlines SET state=?, closed_at=datetime('now') "
-        "WHERE task_id=? AND kind=? AND state=?",
-        (CLOSED, task_id, kind, OPEN),
+        "WHERE task_id=? AND submission_generation=? AND verdict_revision=? "
+        "AND kind=? AND state=?",
+        (CLOSED, task_id, generation, revision, kind, OPEN),
     )
     return int(cur.rowcount)
 
 
-async def has_open(db: aiosqlite.Connection, task_id: int, kind: str) -> bool:
-    """Есть ли открытое ожидание задачи: чтение, write-лока не берёт."""
+async def has_open(
+    db: aiosqlite.Connection, task_id: int, generation: int, revision: int, kind: str
+) -> bool:
+    """Есть ли открытое ожидание этого ключа: чтение, write-лока не берёт."""
     rows = await fetchall(
         db,
-        "SELECT 1 FROM delivery_wait_deadlines WHERE task_id=? AND kind=? AND state=?",
-        (task_id, kind, OPEN),
+        "SELECT 1 FROM delivery_wait_deadlines WHERE task_id=? "
+        "AND submission_generation=? AND verdict_revision=? AND kind=? AND state=?",
+        (task_id, generation, revision, kind, OPEN),
     )
     return bool(rows)

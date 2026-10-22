@@ -36,6 +36,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub import repository_delivery_rerun as rerun_journal
 from hub import repository_delivery_wait as journal
 from hub.db import write_transaction
 from hub.services import delivery_writes, project_policy
@@ -82,36 +83,52 @@ async def settle(
 
     task_id = int(task["id"])
     try:
+        key = _snapshot_key(task)
         if not detail.startswith(orchestration.BASE_FETCH_PENDING_PREFIX):
-            await _close_if_open(db, task_id)
+            await _close_if_open(db, key)
             return False
-        return await _judge(db, task, detail, pr_num)
+        return await _judge(db, task, key, detail, pr_num)
     except Exception:  # noqa: BLE001 - сбой срока не ломает доставку и не переводит
         log.exception("Poll: delivery wait deadline of #%s not judged", task_id)
         return False
 
 
-async def _close_if_open(db: aiosqlite.Connection, task_id: int) -> None:
-    """Закрыть открытое ожидание; без открытого - ни записи, ни write-лока."""
-    if not await journal.has_open(db, task_id, KIND):
-        return
+def _snapshot_key(task: dict[str, Any]) -> tuple[int, int, int, str]:
+    """Ключ ожидания по СНИМКУ прохода: чей это результат (поколение, ревизия)."""
+    return (
+        int(task["id"]),
+        int(task.get("submission_generation") or 0),
+        int(task.get("review_verdict_revision") or 0),
+        KIND,
+    )
+
+
+async def _close_if_open(
+    db: aiosqlite.Connection, key: tuple[int, int, int, str]
+) -> None:
+    """Закрыть открытое ожидание ключа прохода; чужой (живой) ключ не трогать."""
+    if not await journal.has_open(db, *key):
+        return  # без открытого - ни записи, ни write-лока
     async with write_transaction(db):
-        await journal.close_open(db, task_id, KIND)
+        if await _live_key(db, key[0]) == key:
+            await journal.close_open(db, *key)
 
 
 async def _judge(
-    db: aiosqlite.Connection, task: dict[str, Any], detail: str, pr_num: Any
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    key: tuple[int, int, int, str],
+    detail: str,
+    pr_num: Any,
 ) -> bool:
     from hub.services import orchestration
 
-    task_id = int(task["id"])
-    hours = await wait_hours(db, task_id)
+    hours = await wait_hours(db, key[0])
     async with write_transaction(db):
-        # Живая строка и таймер читаются и пишутся под одним локом: ключ
-        # (поколение, ревизия) не может смениться между чтением и записью.
-        key = await _live_key(db, task_id)
-        if key is None:
-            return False  # устаревший снимок: свип уже не про эту задачу
+        # Результат прохода относится к его снимку: если живая строка уже ушла
+        # на другое поколение или ревизию, проход устарел и журнала не трогает.
+        if await _live_key(db, key[0]) != key:
+            return False
         await journal.open_wait(db, *key)
         if hours is None or not await journal.is_overdue(db, *key, hours):
             return False
@@ -149,6 +166,9 @@ async def _escalate(
     """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку."""
     if await _live_key(db, key[0]) != key:
         return False  # завершена, возвращена или сдана заново с прохода до лока
+    if await _delivery_moved_on(db, key, pr_num):
+        await journal.close_open(db, *key)
+        return False  # причина прохода устарела: доставлено или идёт перезапуск
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(
@@ -161,3 +181,21 @@ async def _escalate(
         HINT,
     )
     return True
+
+
+async def _delivery_moved_on(
+    db: aiosqlite.Connection, key: tuple[int, int, int, str], pr_num: Any
+) -> bool:
+    """Под локом: причина прохода устарела - PR уже доставлен или идёт бронь #1956.
+
+    Отказ ``base_fetch_pending`` получен ДО лока; за это время соседний путь
+    мог записать мерж или зарезервировать автоперезапуск CI. Переводить к
+    человеку по прочитанной раньше причине нельзя.
+    """
+    task_id, generation = key[0], key[1]
+    if pr_num and await repo.pipeline_merge_recorded(db, task_id, int(pr_num)):
+        return True
+    return any(
+        int(r["submission_generation"]) == generation
+        for r in await rerun_journal.open_rows(db, task_id)
+    )
