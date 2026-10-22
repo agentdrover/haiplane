@@ -98,3 +98,29 @@ def test_every_module_the_approval_delegates_to_is_in_both_registries():
         path = module.replace(".", "/") + ".py"
         assert path in LADDER_SURFACES, f"{path} вне LADDER_SURFACES"
         assert path in APPROVAL_DECIDERS, f"{path} вне APPROVAL_DECIDERS"
+
+
+@pytest.mark.parametrize("column", ["title", "description", "scope_in"])
+async def test_a_statement_edit_after_the_early_check_cancels_the_exception(
+    db, db_dsn, monkeypatch, column
+):
+    """Согласие советника было о прежней постановке: правка между этапами снимает исключение."""
+    case = await build_case(db, monkeypatch, f"dc3-statement-{column}")
+    other = await db_module.connect(db_dsn)
+    value = '["новое"]' if column == "scope_in" else "новое значение"
+    try:
+
+        async def edit():
+            await other.execute(
+                f"UPDATE tasks SET {column}=? WHERE id=?",  # nosec B608 - literal column
+                (value, case.task_id),
+            )
+            await other.commit()
+
+        err = await _between(db, case, edit)
+    finally:
+        await other.close()
+
+    assert err is not None, column
+    assert "statement:" in str(err.detail), (column, err.detail)
+    assert await verdict_of(db, case.task_id) == ""
