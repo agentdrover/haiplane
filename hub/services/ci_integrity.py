@@ -112,6 +112,9 @@ log = logging.getLogger("hub")
 CI_SCRIPTS: frozenset[str] = frozenset(
     {
         "scripts/ci_report_to_hub.py",
+        # #1988: imported by the three report scripts and run from the branch by
+        # the collector; changing it can put raw exception text back in reports.
+        "scripts/ci_safe_failure.py",
         "scripts/ci_report_audit_to_hub.py",
         "scripts/ci_trusted_report.py",
         "scripts/mutation_changed.py",
