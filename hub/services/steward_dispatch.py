@@ -373,14 +373,21 @@ async def order_run(
         return None
 
     ordered_model = (model or config.STEWARD_MODEL or "").strip()
+    # #1986: пара «двойной чистоты» фиксируется ЗДЕСЬ, до судьи и советника;
+    # отчёт, пришедший после заказа, режим этого поколения не включает.
+    frozen_pair = ""
+    if kind == KIND_VERDICT:
+        from hub.services.steward_double_clean import freeze_pair
+
+        frozen_pair = await freeze_pair(db, task_id, generation)
     # The order and its uniqueness are one statement: a check-then-insert
     # would be exactly the race the index exists to lose.
     try:
         cursor = await db.execute(
             "INSERT INTO steward_runs "
             "(task_id, generation, kind, status, model, project_id, created_at, "
-            "deadline_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
-            "datetime('now', ?))",
+            "deadline_at, double_clean_pair) VALUES (?, ?, ?, ?, ?, ?, ?, "
+            "datetime('now', ?), ?)",
             (
                 task_id,
                 generation,
@@ -393,6 +400,7 @@ async def order_run(
                 # работу судьи. Рабочее окно поставит захват слота (#1181).
                 # У советника срок один на старт и работу (#1601).
                 f"+{deadline_min if deadline_min is not None else config.STEWARD_START_DEADLINE_MIN} minutes",
+                frozen_pair,
             ),
         )
     except aiosqlite.IntegrityError:

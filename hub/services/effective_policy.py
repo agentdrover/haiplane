@@ -221,6 +221,14 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.auto_approve_max_class_of,
         "project_policy.auto_approve_max_class_of",
     ),
+    "steward_approve_max_class_double_clean": PolicyEntry(
+        project_policy.steward_double_clean_ceiling_of,
+        "project_policy.steward_double_clean_ceiling_of",
+    ),
+    "double_clean_reviewers": PolicyEntry(
+        project_policy.double_clean_reviewers_of,
+        "project_policy.double_clean_reviewers_of",
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
@@ -533,9 +541,12 @@ def _readiness_lines(report: dict[str, Any] | None) -> list[str]:
         lines.append(f"    criterion unmet: {refusal['code']} — {refusal['detail']}")
     for project in report["projects"]:
         ceiling = project["steward_approve_max_class"] or "none"
+        clean = project.get("steward_approve_max_class_double_clean")
         lines.append(
             f"    act scope: {project['slug']} (verdict=steward, steward_shadow "
-            f"{_show(project['steward_shadow'])}, ceiling {ceiling})"
+            f"{_show(project['steward_shadow'])}, ceiling {ceiling}"
+            + (f", double-clean up to {clean}" if clean else "")
+            + ")"
         )
     if not report["projects"]:
         lines.append("    act scope: no project delegates the verdict to the steward")
