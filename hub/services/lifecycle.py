@@ -6620,10 +6620,8 @@ async def deliver_on_disposition(
     # number that may no longer name anything mergeable.
     task, delivery_pr = await resolve_delivery_pr(db, task)
     if delivery_pr.reason:
-        # Said once, regardless of outcome — the same rule the sweep and
-        # the done-report path already follow (#767, #959): the reader
-        # must see both the closed number and its replacement, or the
-        # closed number and the absence of one.
+        # Said once, regardless of outcome, as the sweep and done-report do
+        # (#767, #959): the closed number with its replacement or its absence.
         async with committed_if_own(db):  # #2001: next is the network
             await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     if delivery_pr.unusable:
