@@ -28,6 +28,16 @@ _clean_limiter = _eo._clean_limiter
 _no_cloud = _eo._no_cloud
 
 LINKS = "triage_digest_outcomes"
+STEP_TOKENS = (
+    "triage_digest_outcomes",
+    "triage_outcome_queued",
+    "queue_triage_outcomes",
+    "recommendations_created",
+)
+
+
+def is_step_1997(name: str) -> bool:
+    return any(token in name for token in STEP_TOKENS)
 
 
 async def _outcome(world, title: str = "исход") -> tuple[int, int]:
@@ -44,6 +54,10 @@ async def _outcome(world, title: str = "исход") -> tuple[int, int]:
         )
     )[0]
     return int(row["id"]), task
+
+
+async def _counted_links(db) -> list[dict]:
+    return await _rows(db, f"SELECT * FROM {LINKS} WHERE digest_id IS NOT NULL")
 
 
 async def _generate(conn, now: datetime) -> int:
@@ -95,7 +109,7 @@ async def test_an_outcome_is_counted_once_by_concurrent_digests(
     """AC-1: два соединения, разные даты; сбор и запись не должны разойтись."""
     await _outcome(world, "гонка")
     other = await db_module.connect(db_dsn)
-    real = triage_inbox.collect_sections
+    real = triage_inbox.project_section
     calls: list[int] = []
 
     async def slow(db, *args, **kwargs):
@@ -104,7 +118,7 @@ async def test_an_outcome_is_counted_once_by_concurrent_digests(
         await asyncio.sleep(0.3)  # окно между сбором и записью
         return collected
 
-    monkeypatch.setattr(triage_inbox, "collect_sections", slow)
+    monkeypatch.setattr(triage_inbox, "project_section", slow)
     try:
         await asyncio.gather(_generate(world.db, _day(1)), _generate(other, _day(2)))
     finally:
@@ -126,22 +140,8 @@ async def test_legacy_and_history_do_not_hide_or_slow(world, monkeypatch):
         (project["id"], json.dumps(legacy)),
     )
     # 100 000 учтённых исторических исходов и старые дайджесты с маркером
-    await world.db.commit()
+    await _history(world, task_id, 100_000, 1_000_000)
     await world.db.execute("PRAGMA foreign_keys = OFF")
-    await world.db.execute(
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n "
-        "WHERE i < 100000) "
-        "INSERT INTO executor_triage_recommendations (order_id, task_id, "
-        "triage_class, action, created_at, followup, followup_at) "
-        "SELECT 1000000 + i, ?, 1, 'to_owner', '2026-01-01 00:00:00', "
-        "'new_order', '2026-01-02 00:00:00' FROM n",
-        (task_id,),
-    )
-    await world.db.execute(
-        f"INSERT INTO {LINKS} (recommendation_id, digest_id, kind) "
-        "SELECT id, 1, 'day' FROM executor_triage_recommendations "
-        "WHERE order_id >= 1000000"
-    )
     for day in range(1, 20):
         await world.db.execute(
             "INSERT INTO autopilot_digests (project_id, digest_date, payload) "
@@ -182,8 +182,8 @@ async def test_legacy_and_history_do_not_hide_or_slow(world, monkeypatch):
     plan = await _rows(
         world.db, "EXPLAIN QUERY PLAN " + triage_inbox.OUTCOME_ROWS_SQL, ("2030",)
     )
-    # учтённость проверяется поиском по ключу связей, а не чтением дайджестов
-    assert "SEARCH l USING INTEGER PRIMARY KEY" in " ".join(r["detail"] for r in plan)
+    # очередь неучтённых - частичный индекс, а не проход по истории
+    assert "idx_triage_digest_outcomes_pending" in " ".join(r["detail"] for r in plan)
 
 
 async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
@@ -193,8 +193,8 @@ async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
     from tests.test_db_migrations import _SCHEMA
 
     steps = load_steps()
-    mine = [(n, q) for n, q in steps if "triage_digest_outcomes" in n]
-    assert len(mine) == 2, "нет шагов миграции #1997"
+    mine = [(n, q) for n, q in steps if is_step_1997(n)]
+    assert len(mine) >= 6, "нет шагов миграции #1997"
     before = [(n, q) for n, q in steps if (n, q) not in mine]
     monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
     conn = await aiosqlite.connect(":memory:")
@@ -235,9 +235,14 @@ async def test_migration_links_only_provably_counted_outcomes(monkeypatch):
         await db_module._migrate(conn)
         await db_module._migrate(conn)
         rows = await conn.execute_fetchall(
-            f"SELECT recommendation_id, digest_id, kind FROM {LINKS} ORDER BY 1"
+            f"SELECT recommendation_id, digest_id, kind FROM {LINKS} "
+            "WHERE digest_id IS NOT NULL ORDER BY 1"
         )
         # 1 - у более раннего дайджеста; 99 нет в таблице; 3 - дайджест unavailable
+        queued = await conn.execute_fetchall(
+            f"SELECT recommendation_id FROM {LINKS} WHERE digest_id IS NULL ORDER BY 1"
+        )
+        assert [r[0] for r in queued] == [3]  # исход без доказанного учёта - в очередь
         assert [tuple(r) for r in rows] == [
             (1, 1, "day"),
             (2, 2, "day"),
@@ -256,9 +261,9 @@ async def test_an_outcome_after_the_day_is_left_for_its_own_day(world):
     )
     await world.db.commit()
     await _generate(world.db, _day(1))  # сутки 2026-10-20: создание есть, исхода нет
-    assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
+    assert await _counted_links(world.db) == []
     await _generate(world.db, _day(2))  # сутки 2026-10-21: исход в своих сутках
-    links = await _rows(world.db, f"SELECT * FROM {LINKS}")
+    links = await _counted_links(world.db)
     assert [(r["recommendation_id"], r["kind"]) for r in links] == [(rec_id, "day")]
 
 
@@ -272,7 +277,7 @@ async def test_an_unreadable_section_links_nothing(world, monkeypatch):
         for r in await _rows(world.db, "SELECT payload FROM autopilot_digests")
     ]
     assert states == ["unavailable"]
-    assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
+    assert await _counted_links(world.db) == []
 
 
 async def test_quiet_projects_do_not_rebuild_the_tail_under_the_lock(
@@ -283,17 +288,17 @@ async def test_quiet_projects_do_not_rebuild_the_tail_under_the_lock(
     for i in range(5):
         await repo.create_project(world.db, slug=f"quiet-{i}", name=f"quiet-{i}")
     await world.db.commit()
-    real = triage_inbox.collect_sections
+    real = triage_inbox.project_section
     calls: list[int] = []
 
     async def counting(*args, **kwargs):
         calls.append(1)
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(triage_inbox, "collect_sections", counting)
+    monkeypatch.setattr(triage_inbox, "project_section", counting)
     await _generate(world.db, _day(1))
-    # один пробный сбор + один под локом у единственного активного проекта
-    assert len(calls) == 2
+    # под локом собирается только единственный активный проект
+    assert len(calls) == 1
 
 
 async def _history(world, task_id: int, count: int, base: int = 2_000_000) -> None:
@@ -312,7 +317,8 @@ async def _history(world, task_id: int, count: int, base: int = 2_000_000) -> No
     await world.db.execute(
         f"UPDATE {LINKS} SET digest_id = 1, kind = 'day' WHERE digest_id IS NULL "
         "AND recommendation_id IN (SELECT id FROM executor_triage_recommendations "
-        "WHERE order_id >= 2000000)"
+        "WHERE order_id >= ?)",
+        (base,),
     )
     await world.db.commit()
     await world.db.execute("PRAGMA foreign_keys = ON")

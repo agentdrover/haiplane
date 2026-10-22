@@ -543,53 +543,52 @@ async def generate_due_digests(
         "SELECT id, slug, gate_policy FROM projects "
         "WHERE archived=0 AND status='active'",
     )
-    # Один проход чтения без лока: тихий проект без делегирования не берёт
-    # write-лок и не пересобирает хвост неучтённых исходов (#1997, Codex круг 2).
+    # Один проход чтения без лока (#1997): тихий проект без делегирования не берёт
+    # write-лок, а кандидаты исходов каждого проекта определены ДО транзакций.
     probe = await triage_inbox.probe_sections(db, day_start, day_end)
     for project in projects:
         if await _digest_exists(db, project["id"], day):
             continue  # дешёвый выход без write-лока: почти каждый проход поллера
-        if (
-            probe is not None
-            and not _policy_delegates(project["gate_policy"])
-            and not triage_inbox.section_active(
-                probe.get(project["id"]) or triage_inbox.empty_section()
-            )
-        ):
+        # Всё, что не зависит от учёта исходов (события, метрики практики, долг
+        # категорий, очереди), считается ДО транзакции: под write-локом остаются
+        # только исходы своего проекта, INSERT дайджеста и связи.
+        prepared = await _prepare_digest(db, project, day, day_start, day_end, probe)
+        if prepared is None:
             continue
-        # #1997: сбор раздела разбора, INSERT дайджеста и связи «исход -> дайджест»
-        # идут одной транзакцией BEGIN IMMEDIATE на проект: второй писатель ждёт
-        # на write-локе и видит связи первого, а не пустоту.
+        # Сбор раздела разбора, INSERT дайджеста и связи «исход -> дайджест» идут
+        # одной транзакцией BEGIN IMMEDIATE на проект: второй писатель ждёт на
+        # write-локе и видит связи первого, а не пустоту.
         await db.commit()
         async with write_transaction(db):
-            if await _project_digest(db, project, day, day_start, day_end):
+            if await _write_digest(
+                db, project, day, (day_start, day_end), probe, prepared
+            ):
                 created += 1
     return created
 
 
-async def _project_digest(
+async def _prepare_digest(
     db: aiosqlite.Connection,
     project: aiosqlite.Row,
     day: str,
     day_start: str,
     day_end: str,
-) -> bool:
-    """Собрать и записать дайджест проекта за сутки; False - дайджест не нужен.
+    probe: triage_inbox.Probe,
+) -> dict | None:
+    """Всё содержимое дайджеста, кроме учёта исходов; ``None`` - дайджест не нужен.
 
-    Вызывается внутри ``write_transaction``: сбор раздела разбора и запись
-    связей исходов делят с INSERT дайджеста одну транзакцию (#1997).
+    Работает БЕЗ write-лока (#1997): события дня, метрики практики, долг категорий
+    и очереди не зависят от того, какие исходы учтены. Раздел разбора здесь только
+    подсказка (по пробе) для правил «пустого дня»; настоящий собирает
+    ``_write_digest`` под локом.
     """
     delegates = _policy_delegates(project["gate_policy"])
     if await _digest_exists(db, project["id"], day):
-        return False
-    # #1943: разбор прогонов k8 не зависит от делегирования вердикта. Раздел
-    # собирается ВНУТРИ транзакции записи (#1997): неучтённые исходы читаются
-    # под write-локом, поэтому два дайджеста не берут один исход.
-    triage_section, triage_links = await triage_inbox.project_section(
-        db, project["id"], day_start, day_end
-    )
+        return None
+    # #1943: разбор прогонов k8 не зависит от делегирования вердикта.
+    triage_section = probe.section_of(project["id"])
     if not delegates and not triage_inbox.section_active(triage_section):
-        return False
+        return None
 
     # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out
     # rather than generated: building SQL by concatenation is the shape
@@ -678,7 +677,7 @@ async def _project_digest(
         # digest, and a day with neither still produces nothing. An
         # empty report read daily stops being read within a week, and
         # that is how oversight dies quietly (#739).
-        return False
+        return None
 
     merges = await _day_merges(db, project["id"], day_start, day_end)
     pool, oversample = _audit_pool_and_oversample(
@@ -711,11 +710,55 @@ async def _project_digest(
         "escalations": escalations,
         STEWARD_SECTION_KEY: steward,
         SELF_APPROVALS_KEY: self_approvals,
-        "triage": triage_section,
+        "triage": None,  # подставляет _write_digest под локом
         "deliveries": [dict(m) for m in merges],
         "audit_sample": sample,
         "audit_results": {},
     }
+    return {
+        "payload": payload,
+        "delegates": delegates,
+        "other_activity": bool(
+            approvals
+            or verdicts
+            or escalations
+            or steward
+            or self_approvals
+            or release_blocks
+        ),
+    }
+
+
+async def _write_digest(
+    db: aiosqlite.Connection,
+    project: aiosqlite.Row,
+    day: str,
+    window: tuple[str, str],
+    probe: triage_inbox.Probe,
+    prepared: dict,
+) -> bool:
+    """Под write-локом проекта: раздел разбора, INSERT дайджеста и связи (#1997).
+
+    Выбираются только исходы СВОЕГО проекта из кандидатов пробы; раздел, дайджест и
+    связи пишутся одной транзакцией, поэтому второй писатель видит чужие связи.
+    """
+    if await _digest_exists(db, project["id"], day):
+        return False
+    triage_section, triage_links = await triage_inbox.project_section(
+        db, project["id"], window[0], window[1], probe
+    )
+    active = triage_inbox.section_active(triage_section)
+    if not prepared["delegates"] and not active:
+        return False
+    if not (prepared["other_activity"] or active):
+        return False
+    payload = {**prepared["payload"], "triage": triage_section}
+    approvals = payload["auto_approvals"]
+    verdicts = payload["auto_verdicts"]
+    escalations = payload["escalations"]
+    steward = payload[STEWARD_SECTION_KEY]
+    self_approvals = payload[SELF_APPROVALS_KEY]
+    sample = payload["audit_sample"]
     digest_id = await repo.create_digest(
         db,
         project_id=project["id"],

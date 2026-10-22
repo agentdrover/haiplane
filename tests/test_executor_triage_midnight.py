@@ -126,16 +126,13 @@ async def test_migration_adds_the_column_and_keeps_recommendations(monkeypatch):
     from hub.migrations import FROZEN_MIGRATIONS
     from hub.migrations.steps import load_steps
     from tests.test_db_migrations import _SCHEMA
+    from tests.test_triage_digest_links import is_step_1997
 
     steps = load_steps()
     mine = [(n, q) for n, q in steps if "followup_action_at" in n]
     assert mine, "нет шага миграции #1943"
     # шаги #1997 читают колонку этого шага и идут после него
-    before = [
-        (n, q)
-        for n, q in steps
-        if (n, q) not in mine and "triage_digest_outcomes" not in n
-    ]
+    before = [(n, q) for n, q in steps if (n, q) not in mine and not is_step_1997(n)]
     monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
@@ -267,6 +264,7 @@ async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkey
     from hub.migrations import FROZEN_MIGRATIONS
     from hub.migrations.steps import load_steps
     from tests.test_db_migrations import _SCHEMA
+    from tests.test_triage_digest_links import is_step_1997
 
     steps = load_steps()
     new = [
@@ -275,11 +273,7 @@ async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkey
         if n.startswith("rework_on_host") or "followup_action_at" in n
     ]
     assert len(new) >= 8, "нет шагов #1947 и #1943"
-    old = [
-        (n, q)
-        for n, q in steps
-        if (n, q) not in new and "triage_digest_outcomes" not in n
-    ]
+    old = [(n, q) for n, q in steps if (n, q) not in new and not is_step_1997(n)]
     monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *old])
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row

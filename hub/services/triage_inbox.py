@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any, Final, Literal
 
 import aiosqlite
@@ -229,20 +230,28 @@ WHERE created_at >= ? AND created_at < ?
 
 #: Неучтённые исходы с действием до конца суток (#1997). ``action_at`` - время
 #: самого действия, выбранного исходом (``followup_action_at``); у строк с исходом
-#: до колонки его нет, и они читаются по ``followup_at``. Учтённость - строка в
-#: ``triage_digest_outcomes`` (PRIMARY KEY по рекомендации): выбор идёт LEFT JOIN
-#: по этому ключу, истории дайджестов и их JSON он не читает. Окно по времени
-#: обработки исход не ограничивает: пропущенный нечитаемым дайджестом ждёт первого
-#: измеренного, а не пропадает.
+#: до колонки его нет, и они читаются по ``followup_at``. Очередь неучтённых -
+#: строки ``triage_digest_outcomes`` с ``digest_id IS NULL`` (частичный индекс):
+#: строку заводит триггер при записи ``followup``, учёт закрывает ту же строку, так
+#: что объём работы идёт за числом НЕучтённых, а не всей истории. JSON старых
+#: дайджестов не читается. Окно по времени обработки исход не ограничивает:
+#: пропущенный нечитаемым дайджестом ждёт первого измеренного, а не пропадает.
 OUTCOME_ROWS_SQL: Final[str] = """
 SELECT r.id, r.task_id, r.action, r.followup,
        COALESCE(r.followup_action_at, r.followup_at) AS action_at
-FROM executor_triage_recommendations r
-LEFT JOIN triage_digest_outcomes l ON l.recommendation_id = r.id
-WHERE l.recommendation_id IS NULL
+FROM triage_digest_outcomes l
+JOIN executor_triage_recommendations r ON r.id = l.recommendation_id
+WHERE l.digest_id IS NULL
   AND r.followup IS NOT NULL
   AND COALESCE(r.followup_action_at, r.followup_at) < ?
 """
+
+#: То же для кандидатов ОДНОГО проекта под write-локом: id отобрала проба до лока.
+CLAIM_ROWS_SQL: Final[str] = (
+    OUTCOME_ROWS_SQL
+    + """  AND l.recommendation_id IN (SELECT value FROM json_each(?))
+"""
+)
 
 #: Связь исхода с дайджестом: (id рекомендации, ``day`` | ``late``).
 Link = tuple[int, str]
@@ -303,19 +312,26 @@ def _count_outcome(section: dict[str, Any], row: Any, window_start: str) -> Link
     return int(row["id"]), "day"
 
 
-async def collect_sections(
-    db: aiosqlite.Connection, day_start: str, day_end: str
-) -> tuple[dict[int, dict[str, Any]], dict[int, list[Link]]]:
-    """Раздел «разбор» по проектам за [day_start, day_end) и связи исходов к записи.
+class Probe:
+    """Что видно до write-лока: разделы по проектам, созданные и кандидаты исходов.
 
-    Ключ - id проекта. Чистое чтение: связи пишет ``record_links`` в транзакции
-    INSERT дайджеста. Исключение пробрасывается: вызывающий пишет
-    ``unavailable_section`` вместо молчаливого нуля.
+    ``failure`` непуст, если чтение не удалось: проект тогда получает
+    ``unavailable`` вместо молчаливого нуля.
     """
-    created = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end))
-    outcomes = await fetchall(db, OUTCOME_ROWS_SQL, (day_end,))
-    sections: dict[int, dict[str, Any]] = {}
-    links: dict[int, list[Link]] = {}
+
+    def __init__(self) -> None:
+        self.failure = ""
+        self.sections: dict[int, dict[str, Any]] = {}
+        self.created: dict[int, list[Any]] = {}
+        self.candidates: dict[int, list[int]] = {}
+
+    def section_of(self, project_id: int) -> dict[str, Any]:
+        if self.failure:
+            return unavailable_section(self.failure)
+        return self.sections.get(project_id) or empty_section()
+
+
+async def _project_resolver(db: aiosqlite.Connection):
     owners: dict[int, int | None] = {}
 
     async def project_of(row: Any) -> int | None:
@@ -325,67 +341,109 @@ async def collect_sections(
             owners[task_id] = int(owner["id"]) if owner else None
         return owners[task_id]
 
-    for row in created:
-        project_id = await project_of(row)
-        if project_id is not None:
-            _count_created(sections.setdefault(project_id, empty_section()), row)
-    for row in outcomes:
-        project_id = await project_of(row)
-        if project_id is None:
-            continue
-        section = sections.setdefault(project_id, empty_section())
-        links.setdefault(project_id, []).append(_count_outcome(section, row, day_start))
-    return sections, links
+    return project_of
+
+
+async def probe_sections(
+    db: aiosqlite.Connection, day_start: str, day_end: str
+) -> Probe:
+    """Один проход чтения БЕЗ write-лока: разделы всех проектов и кандидаты исходов.
+
+    Решает, у каких проектов есть что собирать, и отбирает им кандидатов: под
+    транзакцией проекта читаются только они (#1997). Сбой чтения не поднимается, а
+    записывается в ``failure``.
+    """
+    probe = Probe()
+    try:
+        created = await fetchall(db, _DIGEST_ROWS_SQL, (day_start, day_end))
+        outcomes = await fetchall(db, OUTCOME_ROWS_SQL, (day_end,))
+        project_of = await _project_resolver(db)
+        for row in created:
+            project_id = await project_of(row)
+            if project_id is not None:
+                probe.created.setdefault(project_id, []).append(row)
+                _count_created(
+                    probe.sections.setdefault(project_id, empty_section()), row
+                )
+        for row in outcomes:
+            project_id = await project_of(row)
+            if project_id is not None:
+                probe.candidates.setdefault(project_id, []).append(int(row["id"]))
+                _count_outcome(
+                    probe.sections.setdefault(project_id, empty_section()),
+                    row,
+                    day_start,
+                )
+    except Exception as exc:  # noqa: BLE001 - дайджест выходит без раздела разбора
+        log.warning("digest triage section unreadable: %s", exc)
+        return _failed(exc)
+    return probe
+
+
+def _failed(exc: Exception) -> Probe:
+    probe = Probe()
+    probe.failure = f"{type(exc).__name__}: {exc}"
+    return probe
 
 
 async def digest_sections(
     db: aiosqlite.Connection, day_start: str, day_end: str
 ) -> dict[int, dict[str, Any]]:
-    """Разделы по проектам без связей: чтение для проверок и показа."""
-    return (await collect_sections(db, day_start, day_end))[0]
-
-
-async def probe_sections(
-    db: aiosqlite.Connection, day_start: str, day_end: str
-) -> dict[int, dict[str, Any]] | None:
-    """Разделы всех проектов ОДНИМ чтением, без write-лока: решает, у каких проектов
-    есть что собирать под транзакцией. ``None`` - чтение не удалось (проект тогда
-    идёт в транзакцию и получает ``unavailable``)."""
-    try:
-        return await digest_sections(db, day_start, day_end)
-    except Exception as exc:  # noqa: BLE001 - итог увидит транзакция записи
-        log.warning("digest triage probe unreadable: %s", exc)
-        return None
+    """Разделы по проектам для проверок и показа; сбой чтения пробрасывается."""
+    probe = await probe_sections(db, day_start, day_end)
+    if probe.failure:
+        raise RuntimeError(probe.failure)
+    return probe.sections
 
 
 async def project_section(
-    db: aiosqlite.Connection, project_id: int, day_start: str, day_end: str
+    db: aiosqlite.Connection,
+    project_id: int,
+    day_start: str,
+    day_end: str,
+    probe: Probe,
 ) -> tuple[dict[str, Any], list[Link]]:
-    """Раздел проекта и его связи; сбой чтения - ``unavailable`` без связей.
+    """Раздел проекта и связи к записи - ПОД write-локом, только его исходы.
 
-    Нечитаемый разбор не превращается в ноль и ничего не учитывает.
+    Созданные берутся из пробы (они не зависят от учёта), исходы - перечитываются
+    из очереди неучтённых по id кандидатов проекта и проверяются заново: учтённый
+    другим дайджестом или перенесённый в другой проект исход не берётся. Сбой
+    чтения - ``unavailable`` без связей: нечитаемый разбор ничего не учитывает.
     """
+    if probe.failure:
+        return unavailable_section(probe.failure), []
+    section = empty_section()
+    links: list[Link] = []
     try:
-        sections, links = await collect_sections(db, day_start, day_end)
+        for row in probe.created.get(project_id, []):
+            _count_created(section, row)
+        candidates = probe.candidates.get(project_id, [])
+        if candidates:
+            rows = await fetchall(db, CLAIM_ROWS_SQL, (day_end, json.dumps(candidates)))
+            project_of = await _project_resolver(db)
+            for row in rows:
+                if await project_of(row) == project_id:
+                    links.append(_count_outcome(section, row, day_start))
     except Exception as exc:  # noqa: BLE001 - дайджест выходит без раздела разбора
         log.warning("digest triage section unreadable: %s", exc)
         return unavailable_section(f"{type(exc).__name__}: {exc}"), []
-    return sections.get(project_id) or empty_section(), links.get(project_id, [])
+    return section, links
 
 
 async def record_links(
     db: aiosqlite.Connection, digest_id: int, links: list[Link]
 ) -> None:
-    """Связать исходы с дайджестом в транзакции его INSERT (#1997).
+    """Закрыть очередь: связать исходы с дайджестом в транзакции его INSERT (#1997).
 
-    PRIMARY KEY по рекомендации - последняя страховка: занятый исход не
-    перезаписывается, а валит транзакцию целиком (дайджест не остаётся без связи).
+    Строка очереди (``digest_id IS NULL``) становится учётом. Если исход уже
+    учтён другим дайджестом или строки нет, транзакция откатывается целиком
+    (дайджест не остаётся без связи).
     """
     for recommendation_id, kind in links:
         cursor = await db.execute(
-            "INSERT OR IGNORE INTO triage_digest_outcomes "
-            "(recommendation_id, digest_id, kind) VALUES (?, ?, ?)",
-            (recommendation_id, digest_id, kind),
+            "UPDATE triage_digest_outcomes SET digest_id = ?, kind = ? "
+            "WHERE recommendation_id = ? AND digest_id IS NULL",
+            (digest_id, kind, recommendation_id),
         )
         if cursor.rowcount != 1:
             raise OutcomeAlreadyCounted(recommendation_id)
