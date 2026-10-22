@@ -77,6 +77,7 @@ SIGNATURES: dict[str, str] = {
     "layer_rules.py": "layer_rules.py",
     "migration_steps_add_only.py": "migration_steps_add_only.py",
     "mcp_catalog_budget.py": "mcp_catalog_budget.py",
+    "wallclock_asserts.py": "wallclock_asserts.py",
     "pytest": "pytest",
     "bandit": "bandit",
     "secret_scan.py": "secret_scan.py",

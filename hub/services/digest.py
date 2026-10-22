@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
 from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
+from hub.services import triage_inbox
 from hub.services.release_alert import release_block_history
 from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
 
@@ -346,6 +347,11 @@ async def _report_of_generation(
     return rows[-1] if rows else None
 
 
+def triage_state(payload: dict) -> str:
+    """Считал ли дайджест разбор прогонов k8 (#1943); старый ключа не несёт."""
+    return triage_inbox.section_state(payload)
+
+
 def self_approvals_state(payload: dict) -> str:
     """Считал ли этот дайджест самоодобрения стюарда вообще (#1231).
 
@@ -468,6 +474,61 @@ async def findings_queue_section(db: aiosqlite.Connection) -> dict:
     }
 
 
+async def _digest_exists(db: aiosqlite.Connection, project_id: int, day: str) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT id FROM autopilot_digests WHERE project_id=? AND digest_date=?",
+        (project_id, day),
+    )
+    return bool(rows)
+
+
+async def _day_merges(
+    db: aiosqlite.Connection, project_id: int, day_start: str, day_end: str
+) -> list:
+    return list(
+        await fetchall(
+            db,
+            "SELECT pr_number, task_id, merge_sha, merged_at FROM pipeline_merges "
+            "WHERE project_id=? AND merged_at >= ? AND merged_at < ?",
+            (project_id, day_start, day_end),
+        )
+    )
+
+
+async def _uncovered_category_debt(db: aiosqlite.Connection) -> list:
+    """Debt rows no task covers yet (#878); one reader for the digest."""
+    from hub.services.orchestration import build_category_debt, recurring_categories
+
+    return [
+        d
+        for d in await build_category_debt(
+            db, await recurring_categories(db, _DEBT_WINDOW)
+        )
+        if not d["covered"]
+    ]
+
+
+async def _autopilot_events(
+    db: aiosqlite.Connection, delegates: bool, day_start: str, day_end: str
+) -> list:
+    """События автопилота за сутки; проект без делегирования их не несёт (#1943)."""
+    if not delegates:
+        return []
+    # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out rather
+    # than generated: a miscount raises on the first execute, so every digest
+    # test in this suite fails loudly rather than the poller failing at midnight.
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, kind, actor, task_id, payload, created_at FROM events "
+            "WHERE kind IN (?, ?, ?, ?) AND created_at >= ? AND created_at < ? "
+            "ORDER BY id ASC",
+            (*_AUTOPILOT_EVENT_KINDS, day_start, day_end),
+        )
+    )
+
+
 async def generate_due_digests(
     db: aiosqlite.Connection, *, now: datetime | None = None
 ) -> int:
@@ -490,15 +551,18 @@ async def generate_due_digests(
         "SELECT id, slug, gate_policy FROM projects "
         "WHERE archived=0 AND status='active'",
     )
+    # #1943: разбор прогонов k8 не зависит от делегирования вердикта.
+    triage_sections, triage_failure = await triage_inbox.section_map(
+        db, day_start, day_end
+    )
     for project in projects:
-        if not _policy_delegates(project["gate_policy"]):
-            continue
-        existing = await fetchall(
-            db,
-            "SELECT id FROM autopilot_digests WHERE project_id=? AND digest_date=?",
-            (project["id"], day),
+        delegates = _policy_delegates(project["gate_policy"])
+        triage_section = triage_inbox.section_for(
+            project["id"], triage_sections, triage_failure
         )
-        if existing:
+        if not delegates and not triage_inbox.section_active(triage_section):
+            continue
+        if await _digest_exists(db, project["id"], day):
             continue
 
         # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out
@@ -507,13 +571,7 @@ async def generate_due_digests(
         # nothing — a miscount raises on the first execute, so every digest
         # test in this suite fails loudly rather than the poller failing at
         # midnight.
-        events = await fetchall(
-            db,
-            "SELECT id, kind, actor, task_id, payload, created_at FROM events "
-            "WHERE kind IN (?, ?, ?, ?) AND created_at >= ? AND created_at < ? "
-            "ORDER BY id ASC",
-            (*_AUTOPILOT_EVENT_KINDS, day_start, day_end),
-        )
+        events = await _autopilot_events(db, delegates, day_start, day_end)
         approvals: list[dict] = []
         verdicts: list[dict] = []
         escalations: list[dict] = []
@@ -599,6 +657,7 @@ async def generate_due_digests(
             or steward
             or self_approvals
             or release_blocks
+            or triage_inbox.section_active(triage_section)
         ):
             # The empty-day rule now covers the steward too, in both
             # directions: a day of steward-only activity IS a day worth a
@@ -607,12 +666,7 @@ async def generate_due_digests(
             # that is how oversight dies quietly (#739).
             continue
 
-        merges = await fetchall(
-            db,
-            "SELECT pr_number, task_id, merge_sha, merged_at FROM pipeline_merges "
-            "WHERE project_id=? AND merged_at >= ? AND merged_at < ?",
-            (project["id"], day_start, day_end),
-        )
+        merges = await _day_merges(db, project["id"], day_start, day_end)
         pool, oversample = _audit_pool_and_oversample(
             approvals, verdicts, escalations, steward, self_approvals
         )
@@ -622,18 +676,7 @@ async def generate_due_digests(
         # only exists on days with autopilot activity, while the debt is a
         # property of the practice. Making it a trigger would have it arrive
         # on some days and not others with no way to tell which.
-        from hub.services.orchestration import (
-            build_category_debt,
-            recurring_categories,
-        )
-
-        debt = [
-            d
-            for d in await build_category_debt(
-                db, await recurring_categories(db, _DEBT_WINDOW)
-            )
-            if not d["covered"]
-        ]
+        debt = await _uncovered_category_debt(db)
         # #1020: the human queue rides along the same way the category debt
         # does, and for the same reason — it is a property of the practice,
         # not of this day's autopilot activity. Riding along has a real cost
@@ -655,6 +698,7 @@ async def generate_due_digests(
             STEWARD_SECTION_KEY: steward,
             SELF_APPROVALS_KEY: self_approvals,
             **_double_clean_count(self_approvals),
+            "triage": triage_section,
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -678,6 +722,13 @@ async def generate_due_digests(
                 "auto_approvals": len(approvals),
                 "auto_verdicts": len(verdicts),
                 "escalations": len(escalations),
+                "triage_state": triage_section["state"],
+                # Нечитаемый разбор - не ноль: счётчик остаётся пустым (#1943).
+                "triage_created": (
+                    triage_section["created"]
+                    if triage_section["state"] == triage_inbox.MEASURED
+                    else None
+                ),
                 "steward_judgements": len(steward),
                 "steward_self_approvals": len(self_approvals),
                 **_double_clean_count(self_approvals),
