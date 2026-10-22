@@ -219,7 +219,7 @@ async def test_a_task_completed_meanwhile_is_not_pulled_back(db, monkeypatch):
     await repo.update_task(db, task_id, status="completed")
     await db.commit()
 
-    moved = await delivery_wait._escalate(db, (*key, "base_fetch_pending"), 360, "x")
+    moved = await delivery_wait._escalate(db, (*key, "base_fetch_pending"), live, "x")
 
     assert moved is False
     assert (await repo.get_task(db, task_id))["status"] == "completed"
@@ -330,13 +330,13 @@ async def test_the_transition_is_won_once_per_wait(db, monkeypatch):
         "base_fetch_pending",
     )
 
-    assert await delivery_wait._escalate(db, key, 360, "x") is True
+    assert await delivery_wait._escalate(db, key, live, "x") is True
     # Владелец вернул задачу в running, но ожидание уже эскалировано: второй
     # проход с тем же ключом перехода не выигрывает.
     await repo.update_task(db, task_id, status="running")
     await db.commit()
 
-    assert await delivery_wait._escalate(db, key, 360, "x") is False
+    assert await delivery_wait._escalate(db, key, live, "x") is False
     assert await _needs_decision_events(db, task_id) == 1
 
 

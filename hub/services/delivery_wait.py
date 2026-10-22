@@ -135,7 +135,7 @@ async def _judge(
     written, escalated = await orchestration.record_delivery_outcome(
         db,
         task,
-        partial(_escalate, db, key, pr_num, detail),
+        partial(_escalate, db, key, task, detail),
         fallback=False,
     )
     return bool(written and escalated)
@@ -152,8 +152,10 @@ async def _pass_is_live(
     if await _live_key(db, key[0]) != key:
         return False
     live = await repo.get_task(db, key[0])
-    return live is not None and int(live["pr_number"] or 0) == int(
-        task.get("pr_number") or 0
+    return (
+        live is not None
+        and int(live["pr_number"] or 0) == int(task.get("pr_number") or 0)
+        and (live["submission_sha"] or "") == (task.get("submission_sha") or "")
     )
 
 
@@ -175,7 +177,7 @@ async def _live_key(
 async def _escalate(
     db: aiosqlite.Connection,
     key: tuple[int, int, int, str],
-    pr_num: Any,
+    snap: dict[str, Any],
     detail: str,
 ) -> bool:
     """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку.
@@ -185,8 +187,11 @@ async def _escalate(
     второе соединение могло сохранить другой, и нечитаемая политика отменяет
     переход так же, как не вышедший срок.
     """
-    if not await _pass_is_live(db, {"pr_number": pr_num}, key):
-        return False  # завершена, возвращена, сдана заново или PR заменён
+    pr_num = snap.get("pr_number")
+    if not await _pass_is_live(db, snap, key):
+        return False  # завершена, возвращена, сдана заново, PR или закрепление ушли
+    if _merge_in_gate_memory(key[0], int(pr_num or 0)):
+        return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
     if await _delivery_moved_on(db, key, int(pr_num or 0)):
         await journal.close_open(db, *key)
         return False  # доставлено соседним путём: переводить нечего
@@ -208,6 +213,13 @@ async def _escalate(
         HINT,
     )
     return True
+
+
+def _merge_in_gate_memory(task_id: int, pr_num: int) -> bool:
+    """Мерж гейта по этому PR идёт или влит, а строка реестра ещё не записана."""
+    from hub.services import orchestration
+
+    return bool(pr_num) and (task_id, pr_num) in orchestration._gate_merges  # noqa: SLF001
 
 
 async def _delivery_moved_on(
