@@ -165,6 +165,38 @@ def test_a_submodule_imported_via_from_package_import_submodule_is_recognized(
     )
 
 
+def test_a_changed_function_in_package_init_is_recognized_as_an_import(repo: Path):
+    """Critic finding on sha 0356285527bcaf7b: ``_script_module_names``
+    stripped only the trailing ``.py``, so a symbol defined directly in
+    ``scripts/pkg/__init__.py`` (a real pattern: ``scripts/agent_eval/
+    __init__.py`` exists in this repo) was indexed under ``pkg.__init`` — a
+    name nothing imports. ``import pkg`` (how a package's own symbols are
+    actually reached) names only ``pkg``, so the real caller never matched
+    and the symbol stayed no_callers."""
+    (repo / "scripts" / "pkg").mkdir()
+    (repo / "scripts" / "pkg" / "__init__.py").write_text(
+        "def helper(value):\n    return value\n"
+    )
+    (repo / "scripts" / "b.py").write_text(
+        "import pkg\n\n\ndef main():\n    return pkg.helper(2)\n"
+    )
+    _commit(repo)
+
+    (repo / "scripts" / "pkg" / "__init__.py").write_text(
+        "def helper(value):\n    return value + 1\n"
+    )
+
+    report = call_sites.analyse(str(repo), _diff(repo))
+
+    helper = next(s for s in report.symbols if s.symbol == "helper")
+    assert helper.state != call_sites.NO_CALLERS, helper.statement()
+    by_file = {s.file for s in helper.sites}
+    assert "scripts/b.py" in by_file, (
+        "'import pkg' must count as an import of scripts/pkg/__init__.py's "
+        f"helper, under the package's own name, not 'pkg.__init': {helper.statement()}"
+    )
+
+
 def test_a_relative_import_resolves_against_the_callers_own_package(repo: Path):
     """Critic finding on sha 69701899: ``node.level`` was ignored, so a
     relative import's ``node.module`` (just ``a``, the part after the dots)

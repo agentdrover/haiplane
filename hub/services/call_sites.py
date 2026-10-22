@@ -561,9 +561,19 @@ def _script_module_names(rel: str) -> set[str]:
     scripts.complexity_budget import ...`` works too, with no ``__init__.py``
     required. A caller using that spelling must not read as "no import", or
     a real call falls back into the false no_callers this task removes.
+
+    A package's own ``__init__.py`` (``scripts/agent_eval/__init__.py``) is
+    imported under the PACKAGE's dotted name (``agent_eval``), never under a
+    module literally called ``__init__`` — ``import agent_eval`` is exactly
+    how ``scripts/agent_eval/{runner,scenarios}.py``'s sibling scripts reach
+    it. Stripping only the trailing ``.py`` left ``agent_eval.__init``, a
+    name nothing ever imports, so a changed symbol defined in that
+    ``__init__.py`` stayed ``no_callers`` regardless of real importers.
     """
     name = rel[len(_SCRIPTS_PREFIX) :] if rel.startswith(_SCRIPTS_PREFIX) else rel
-    if name.endswith(".py"):
+    if name.endswith("/__init__.py"):
+        name = name[: -len("/__init__.py")]
+    elif name.endswith(".py"):
         name = name[: -len(".py")]
     bare = name.replace("/", ".")
     return {bare, f"scripts.{bare}"}
