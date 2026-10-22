@@ -18,6 +18,7 @@ from hub.models import ReviewVerdict, TaskReviewVerdict, validated_gate_policy
 from hub.services import steward_apply
 from hub.services.lifecycle import record_review_verdict
 from hub.services.steward_apply import apply_refusals, ceiling_gate, ceiling_scope
+from hub.services.steward_double_clean import frozen_pair
 from hub.services.steward_applied import (
     APPLIED,
     ESCALATED_TO_HUMAN,
@@ -33,9 +34,11 @@ from tests.steward_double_clean_support import (
     OTHER,
     REVIEWERS,
     SHA,
+    add_report,
     build_case,
     ceiling_detail,
     feed,
+    judge_and_advise,
     policy_of,
     verdict_events,
     verdict_of,
@@ -161,10 +164,14 @@ async def test_the_exception_needs_the_main_report_beside_the_listed_one(
     db, monkeypatch
 ):
     """Один чистый отчёт - даже от принципала из списка - пары не делает."""
-    case = await build_case(db, monkeypatch, "dc-single", pair=False)
-    assert case.main is None
+    case = await build_case(db, monkeypatch, "dc-single", pair=False, order=False)
+    only = await add_report(db, case.task_id, LISTED)
+    await judge_and_advise(db, case.task_id)
+
+    assert only and await frozen_pair(db, case.task_id, 1) is None
     detail = ceiling_detail(await apply_refusals(db, case.task_id, 1))
-    assert detail and "pair:" in detail
+    assert detail and "pair:" in detail and "distinct:" in detail
+    assert (await apply_self_approval(db, case.task_id, 1))[0] == ESCALATED_TO_HUMAN
 
 
 async def test_every_unmet_condition_is_listed_not_only_the_first(db, monkeypatch):
@@ -312,6 +319,11 @@ async def _transaction_alone_case(db, monkeypatch):
 
     with pytest.raises(HTTPException) as err:
         async with ceiling_scope():
+            # Факт риска ранней проверки есть (иначе отказ случился бы раньше),
+            # а решения «двойной чистоты» ранний этап не принимал.
+            await steward_apply.remember_risk_fact(
+                db, case.task_id, 1, _risk_fact("R3")
+            )
             await record_review_verdict(
                 db,
                 case.task_id,
@@ -321,6 +333,7 @@ async def _transaction_alone_case(db, monkeypatch):
             )
 
     assert "class_above_policy_ceiling" in str(err.value.detail)
+    assert "early:" in str(err.value.detail), err.value.detail
     assert await verdict_of(db, case.task_id) == ""
 
 
@@ -442,3 +455,24 @@ async def test_the_digest_counts_double_clean_approvals(db, monkeypatch):
     payload = json.loads(dict((await repo.list_digests(db))[0])["payload"])
     assert payload["steward_double_clean_approvals"] == 1
     assert payload["steward_self_approvals"][0]["double_clean"] is True
+
+
+async def test_the_digest_of_a_plain_approval_is_unchanged(db, monkeypatch):
+    """Одобрение в пределах обычного потолка: ни ключа, ни счётчика двойной чистоты."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services.digest import generate_due_digests
+
+    case = await build_case(db, monkeypatch, "dc-digest-plain", risk="R1")
+    outcome, detail = await apply_self_approval(db, case.task_id, 1)
+    assert outcome == APPLIED, detail
+
+    await generate_due_digests(db, now=datetime.now(UTC) + timedelta(days=1))
+
+    payload = json.loads(dict((await repo.list_digests(db))[0])["payload"])
+    assert "steward_double_clean_approvals" not in payload
+    assert "double_clean" not in payload["steward_self_approvals"][0]
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='digest_created'"
+    )
+    assert "steward_double_clean_approvals" not in json.loads(events[0]["payload"])

@@ -72,6 +72,44 @@ async def test_only_the_judge_order_freezes_a_pair(db, monkeypatch):
     assert by_kind["advisor"] == "" and by_kind["verdict"] != ""
 
 
+def _legacy_hash(packet) -> str:
+    """Хеш пакета по формуле ДО #1986: тело без поля пары."""
+    import hashlib
+    import json
+
+    from hub.services import steward_evidence as ev
+
+    facts = {}
+    for source in ev.PACKET_HASH_SOURCES:
+        fact = packet.facts.get(source)
+        facts[source] = (
+            None
+            if fact is None
+            else {
+                "state": fact.state,
+                "reason": fact.reason,
+                "value": {
+                    k: v
+                    for k, v in (fact.value or {}).items()
+                    if k not in ev._PACKET_HASH_VOLATILE_KEYS
+                },
+            }
+        )
+    brief = packet.brief.model_dump(mode="json") if packet.brief else None
+    body = {
+        "generation": packet.generation,
+        "brief": (
+            {k: brief.get(k) for k in ev.PACKET_HASH_BRIEF_FIELDS}
+            if brief is not None
+            else None
+        ),
+        "facts": facts,
+        "quotes": [[q.source, q.author, q.text] for q in packet.quotes],
+    }
+    blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 async def test_the_pair_is_part_of_the_packet_hash(db, monkeypatch):
     case = await build_case(db, monkeypatch, "dcr-hash")
     packet = await build_evidence_packet(db, case.task_id, 1)
@@ -81,8 +119,8 @@ async def test_the_pair_is_part_of_the_packet_hash(db, monkeypatch):
     bare = dataclasses.replace(packet, double_clean=())
     swapped = dataclasses.replace(packet, double_clean=(case.extra, case.main))
     assert len({packet_hash(packet), packet_hash(bare), packet_hash(swapped)}) == 3
-    # Без пары хеш остаётся прежним: поле не входит в тело.
-    assert packet_hash(bare) == packet_hash(dataclasses.replace(bare, double_clean=()))
+    # Без пары хеш равен хешу по формуле до задачи: прежние согласия не умирают.
+    assert packet_hash(bare) == _legacy_hash(bare)
 
 
 async def test_the_route_keeps_the_steward_for_a_class_the_exception_can_reach(

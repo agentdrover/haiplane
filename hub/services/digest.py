@@ -567,8 +567,13 @@ async def generate_due_digests(
                     {
                         **entry,
                         "generation": int(payload.get("submission_generation") or 0),
-                        # #1986: одобрение по двойной чистоте считается отдельно.
-                        "double_clean": bool(payload.get("double_clean")),
+                        # #1986: ключ только у одобрения по двойной чистоте, чтобы
+                        # дайджест без него остался прежним.
+                        **(
+                            {"double_clean": True}
+                            if payload.get("double_clean")
+                            else {}
+                        ),
                     }
                 )
             elif event["kind"] == "verdict_escalated":
@@ -631,6 +636,8 @@ async def generate_due_digests(
         # happens to exist. The reminder's dependable channel is the events
         # feed the poller writes; the digest is the summary, not the alarm.
         human_queue = await repo.human_queue_reminders_between(db, day_start, day_end)
+        clean = sum(1 for a in self_approvals if a.get("double_clean"))
+        clean_count = {DOUBLE_CLEAN_KEY: clean} if clean else {}  # #1986: 0 не пишем
         payload = {
             "date": day,
             "project": project["slug"],
@@ -643,7 +650,7 @@ async def generate_due_digests(
             "escalations": escalations,
             STEWARD_SECTION_KEY: steward,
             SELF_APPROVALS_KEY: self_approvals,
-            DOUBLE_CLEAN_KEY: sum(1 for a in self_approvals if a["double_clean"]),
+            **clean_count,
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -669,7 +676,7 @@ async def generate_due_digests(
                 "escalations": len(escalations),
                 "steward_judgements": len(steward),
                 "steward_self_approvals": len(self_approvals),
-                DOUBLE_CLEAN_KEY: sum(1 for a in self_approvals if a["double_clean"]),
+                **clean_count,
                 "audit_sample": sample,
             },
         )

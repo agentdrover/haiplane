@@ -77,6 +77,18 @@ async def _third_report_incomplete(other, case):
     await add_report(other, case.task_id, THIRD, incomplete=True)
 
 
+async def _third_report_unclaimed(other, case):
+    await add_report(other, case.task_id, THIRD, incomplete=None)
+
+
+async def _third_report_unreadable_findings(other, case):
+    review_id = await add_report(other, case.task_id, THIRD)
+    await other.execute(
+        "UPDATE machine_reviews SET findings_confirmed='' WHERE id=?", (review_id,)
+    )
+    await other.commit()
+
+
 async def _third_report_lost_dimension(other, case):
     await add_report(other, case.task_id, THIRD, lost=("security",))
 
@@ -144,6 +156,11 @@ async def _green_for(other, case, sha: str) -> None:
 _CANCELLING = {
     "third_report_with_a_finding": (_third_report_with_a_finding, "confirmed:"),
     "third_report_incomplete": (_third_report_incomplete, "incomplete:"),
+    "third_report_unclaimed": (_third_report_unclaimed, "incomplete:"),
+    "third_report_unreadable_findings": (
+        _third_report_unreadable_findings,
+        "confirmed:",
+    ),
     "third_report_lost_dimension": (_third_report_lost_dimension, "lost_dimensions:"),
     "third_report_unresolved_unpinned": (
         _third_report_unresolved_unpinned,
@@ -224,21 +241,24 @@ async def test_a_new_clean_report_does_not_replace_the_pair(db, db_dsn, monkeypa
     assert audit["extra"]["review_id"] == case.extra
 
 
-async def test_the_record_and_the_audit_commit_or_roll_back_together(
-    db, db_dsn, monkeypatch
-):
-    """Отказ транзакции не оставляет ни вердикта, ни строки об исключении."""
+async def test_the_record_and_the_audit_commit_or_roll_back_together(db, monkeypatch):
+    """Сбой ПОСЛЕ записи вердикта откатывает вердикт, строку ленты и аудит вместе."""
+    from hub.services import lifecycle
+
     case = await build_case(db, monkeypatch, "dc-race-atomic")
-    other = await db_module.connect(db_dsn)
-    try:
+    real = lifecycle.repo.insert_event
 
-        async def dirty():
-            await add_report(other, case.task_id, THIRD, confirmed=(FINDING,))
+    async def failing(conn, *args, **kwargs):
+        if kwargs.get("kind") == "review_verdict_recorded":
+            raise RuntimeError("сбой записи события")
+        return await real(conn, *args, **kwargs)
 
-        await _between(db, case, dirty)
-    finally:
-        await other.close()
+    monkeypatch.setattr(lifecycle.repo, "insert_event", failing)
+    with pytest.raises(RuntimeError):
+        await apply_self_approval(db, case.task_id, 1)
+    monkeypatch.setattr(lifecycle.repo, "insert_event", real)
 
+    assert await verdict_of(db, case.task_id) == ""
     assert await verdict_events(db, case.task_id) == []
     rows = await db.execute_fetchall(
         "SELECT content FROM task_updates WHERE task_id=? "
@@ -246,6 +266,10 @@ async def test_the_record_and_the_audit_commit_or_roll_back_together(
         (case.task_id,),
     )
     assert list(rows) == []
+    # Положительный контроль: без сбоя те же три следа появляются вместе.
+    outcome, detail = await apply_self_approval(db, case.task_id, 1)
+    assert outcome == APPLIED, detail
+    assert (await verdict_events(db, case.task_id))[0]["payload"]["double_clean"]
 
 
 # ---------------------------------------------------------------------------

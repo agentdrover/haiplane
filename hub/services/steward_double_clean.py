@@ -104,19 +104,34 @@ async def _settings(db: aiosqlite.Connection, task_id: int) -> _Settings | None:
 
 
 def _items(raw: Any) -> list | None:
-    """Список из JSON-колонки; None - нечитаемо (это не «пусто»)."""
+    """Список из JSON-колонки; None - нечитаемо или пусто в смысле «нет данных».
+
+    ``NULL`` и пустая строка - не ``[]``: «хаб не смог прочитать» и «прочитал,
+    там пусто» разные исходы, и только второй чист.
+    """
     try:
-        value = json.loads(raw or "[]")
+        value = json.loads(raw)
     except (TypeError, ValueError):
         return None
     return value if isinstance(value, list) else None
 
 
 def _negatives(row: dict[str, Any]) -> list[tuple[str, str]]:
-    """Что делает отчёт нечистым: находки, потеря измерений, прерванный прогон."""
+    """Что делает отчёт нечистым: находки, потеря измерений, прерванный прогон.
+
+    Незаявленная полнота (``incomplete`` пуст) - тоже нечисто: отчёт, не
+    сказавший, что прогон полон, чистым не считается ни в паре, ни среди прочих.
+    """
     out: list[tuple[str, str]] = []
-    if row.get("incomplete"):
-        out.append(("incomplete", "прогон ревью не завершён"))
+    if row.get("incomplete") != 0:
+        out.append(
+            (
+                "incomplete",
+                "полнота прогона не заявлена"
+                if row.get("incomplete") is None
+                else "прогон ревью не завершён",
+            )
+        )
     for column, token in (
         ("findings_confirmed", "confirmed"),
         ("unresolved", "unresolved"),
@@ -149,8 +164,6 @@ def _flaws(row: dict[str, Any], sha: str) -> list[tuple[str, str]]:
         out.append(("identity", "принципал отчёта неизвестен"))
     if row.get("self_reviewed") != 0:
         out.append(("self_reviewed", "саморевью или признак не заявлен"))
-    if row.get("incomplete") is None:
-        out.append(("incomplete", "полнота прогона не заявлена"))
     out.extend(_negatives(row))
     return out
 
