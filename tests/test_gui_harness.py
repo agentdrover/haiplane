@@ -257,3 +257,19 @@ def test_a_stand_that_fails_before_yield_still_saves_its_log(
             pytest.fail("the stand must not yield")
 
     assert (artifacts / "stand-server.log").is_file()
+
+
+def test_a_stand_that_exits_cleanly_still_saves_its_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сбой browser.new_context() стенд видит как штатное завершение сессии:
+    лог обязан уйти в артефакты и без признака сбоя."""
+    from tests.gui.conftest import running_stand
+
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv("HAIPLANE_GUI_ARTIFACTS", str(artifacts))
+
+    with running_stand(tmp_path / "stand"):
+        pass
+
+    assert (artifacts / "stand-server.log").is_file()

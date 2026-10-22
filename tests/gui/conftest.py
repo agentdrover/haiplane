@@ -364,7 +364,6 @@ def running_stand(root: Path) -> Iterator[Stand]:
     api_token = secrets.token_hex(16)
     log_path = root / "server.log"
     process: subprocess.Popen[bytes] | None = None
-    failed = False
     with log_path.open("wb") as log:
         try:
             process = subprocess.Popen(
@@ -394,16 +393,13 @@ def running_stand(root: Path) -> Iterator[Stand]:
             _wait_ready(process, stand.url, log_path)
             _seed_human(stand)
             yield stand
-        except BaseException:
-            failed = True
-            raise
         finally:
             if process is not None:
                 _stop(process)
-            if failed:
-                # Сбой подъёма (/health, сид) случается до yield: фикстуры
-                # браузера тогда ещё нет, и её finally лога не сохранит.
-                save_server_log(log_path, "stand")
+            # Лог стенда сохраняется всегда, без признака сбоя: сбой подъёма
+            # до yield, сбой browser.new_context() и обычный прогон pytest
+            # различает по-разному, а безусловное сохранение покрывает все.
+            save_server_log(log_path, "stand")
 
 
 # ---------------------------------------------------------------------------
