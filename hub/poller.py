@@ -2070,8 +2070,8 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
-    if (not ok and await _explicit_outcome(db, task, detail)) or (
-        await delivery_wait.settle(db, task, "" if ok else detail, pr_num)
+    if (await delivery_wait.settle(db, task, "" if ok else detail, pr_num)) or (
+        not ok and await _explicit_outcome(db, task, detail)
     ):
         return  # an outcome, not a wait (#1706); or past its deadline (#1992)
     if not ok:

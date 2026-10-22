@@ -12,13 +12,18 @@
   раз тем же путём, что любой отказ гейта на pair-свипе
   (``delivery_writes.hand_pair_to_human`` -> ``emit_needs_decision``);
 * успех, иная причина отказа, новое поколение или новая ревизия вердикта
-  закрывают ожидание.
+  закрывают ожидание (иная причина - любой ответ гейта на проходе, кроме
+  «поиск замены PR не ответил»: он о гейте ничего не говорит).
 
 Только ``base_fetch_pending``. Остальные временные причины доставки срока не
 получают. Срок проверяет pair-свип поллера - единственный повторяющийся драйвер
 доставки; отчёт агента об окончании работы проходит тот же гейт, но срока не
 судит. «Не прочиталось» (политика, строка таймера) не равно «срок вышел» и не
-равно «срока нет»: ожидание продолжается по умолчанию, перевода нет.
+равно «срока нет»: нечитаемая политика или сбой таймера - ожидание
+продолжается, перевода нет; нет ключа - умолчание. Транзакцией владеет
+вызывающий: свои записи здесь идут через ``write_transaction`` и откатываются
+только если транзакцию открыли мы - чужие записи прохода (бронь #1956, события
+обновления ветки) этот модуль не откатывает.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub import repository_delivery_wait as journal
+from hub.db import write_transaction
 from hub.services import delivery_writes, project_policy
 
 log = logging.getLogger("hub")
@@ -45,14 +51,21 @@ HINT = (
 )
 
 
-async def wait_hours(db: aiosqlite.Connection, task_id: int) -> int:
-    """Срок в часах: политика ЖИВОГО проекта, иначе умолчание (не «без срока»)."""
+async def wait_hours(db: aiosqlite.Connection, task_id: int) -> int | None:
+    """Срок в часах: политика ЖИВОГО проекта; None - политика не прочиталась.
+
+    Нет проекта или нет ключа - умолчание сервера. «Не прочиталась» не равно
+    «нет ключа»: у проекта мог стоять срок длиннее, и перевод по умолчанию
+    нарушил бы его выбор.
+    """
     try:
         project = await repo.resolve_project_for_task(db, task_id)
         policy = json.loads((project["gate_policy"] if project else "") or "{}")
-    except Exception:  # noqa: BLE001 - нечитаемая политика = умолчание, не отмена срока
-        log.exception("policy of task #%s unreadable, default wait deadline", task_id)
-        policy = {}
+    except Exception:  # noqa: BLE001 - «не прочиталась» не равно «нет ключа»
+        log.exception("policy of task #%s unreadable, no deadline judgement", task_id)
+        return None
+    if not isinstance(policy, dict):
+        return None
     return project_policy.base_fetch_wait_hours_of(policy)
 
 
@@ -65,39 +78,65 @@ async def settle(
     ``base_fetch_pending`` закрывает ожидание; ``base_fetch_pending`` ведёт его
     и после срока переводит задачу.
     """
-    from hub.services import orchestration as services
+    from hub.services import orchestration
 
     task_id = int(task["id"])
     try:
-        live = await repo.get_task(db, task_id)
-        if live is None or live["status"] != "running":
-            return False  # устаревший снимок: свип уже не про эту задачу
-        if not detail.startswith(services.BASE_FETCH_PENDING_PREFIX):
-            if await journal.close_open(db, task_id, KIND):
-                await db.commit()
+        if not detail.startswith(orchestration.BASE_FETCH_PENDING_PREFIX):
+            await _close_if_open(db, task_id)
             return False
-        key = (
-            task_id,
-            int(live["submission_generation"] or 0),
-            int(live["review_verdict_revision"] or 0),
-            KIND,
-        )
-        await journal.open_wait(db, *key)
-        hours = await wait_hours(db, task_id)
-        if not await journal.is_overdue(db, *key, hours):
-            await db.commit()
-            return False
-        written, escalated = await services.record_delivery_outcome(
-            db,
-            task,
-            partial(_escalate, db, key, pr_num, detail, hours),
-            fallback=False,
-        )
-        return bool(written and escalated)
+        return await _judge(db, task, detail, pr_num)
     except Exception:  # noqa: BLE001 - сбой срока не ломает доставку и не переводит
         log.exception("Poll: delivery wait deadline of #%s not judged", task_id)
-        await db.rollback()
         return False
+
+
+async def _close_if_open(db: aiosqlite.Connection, task_id: int) -> None:
+    """Закрыть открытое ожидание; без открытого - ни записи, ни write-лока."""
+    if not await journal.has_open(db, task_id, KIND):
+        return
+    async with write_transaction(db):
+        await journal.close_open(db, task_id, KIND)
+
+
+async def _judge(
+    db: aiosqlite.Connection, task: dict[str, Any], detail: str, pr_num: Any
+) -> bool:
+    from hub.services import orchestration
+
+    task_id = int(task["id"])
+    hours = await wait_hours(db, task_id)
+    async with write_transaction(db):
+        # Живая строка и таймер читаются и пишутся под одним локом: ключ
+        # (поколение, ревизия) не может смениться между чтением и записью.
+        key = await _live_key(db, task_id)
+        if key is None:
+            return False  # устаревший снимок: свип уже не про эту задачу
+        await journal.open_wait(db, *key)
+        if hours is None or not await journal.is_overdue(db, *key, hours):
+            return False
+    written, escalated = await orchestration.record_delivery_outcome(
+        db,
+        task,
+        partial(_escalate, db, key, pr_num, detail, hours),
+        fallback=False,
+    )
+    return bool(written and escalated)
+
+
+async def _live_key(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[int, int, int, str] | None:
+    """Ключ ожидания по ЖИВОЙ строке; None - задача не в running."""
+    live = await repo.get_task(db, task_id)
+    if live is None or live["status"] != "running":
+        return None
+    return (
+        task_id,
+        int(live["submission_generation"] or 0),
+        int(live["review_verdict_revision"] or 0),
+        KIND,
+    )
 
 
 async def _escalate(
@@ -107,7 +146,9 @@ async def _escalate(
     detail: str,
     hours: int,
 ) -> bool:
-    """В транзакции с проверкой одобрения: выиграть переход и передать человеку."""
+    """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку."""
+    if await _live_key(db, key[0]) != key:
+        return False  # завершена, возвращена или сдана заново с прохода до лока
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(

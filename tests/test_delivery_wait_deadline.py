@@ -202,3 +202,116 @@ async def test_only_base_fetch_pending_gets_a_deadline(db, monkeypatch):
 
     assert dict(rows[0])["n"] == 0
     assert (await _pass(db, task_id))["status"] == "running"
+
+
+# --- Находки Codex (первый круг) -------------------------------------------
+
+
+async def test_a_task_completed_meanwhile_is_not_pulled_back(db, monkeypatch):
+    """Проверка статуса входит в атомарный переход, а не стоит перед локом."""
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    live = dict(await repo.get_task(db, task_id))
+    key = (task_id, live["submission_generation"], live["review_verdict_revision"])
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
+
+    moved = await delivery_wait._escalate(
+        db, (*key, "base_fetch_pending"), 360, "x", 24
+    )
+
+    assert moved is False
+    assert (await repo.get_task(db, task_id))["status"] == "completed"
+    assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_a_new_verdict_revision_starts_its_own_wait(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    await db.execute(
+        "UPDATE tasks SET review_verdict_revision = review_verdict_revision + 1 "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert (await _pass(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1
+
+
+async def test_an_unreadable_policy_is_not_a_deadline(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await set_policy(db, base_fetch_wait_hours=72)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+
+    async def broken(db_, task_id_):
+        raise RuntimeError("policy unreadable")
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", broken)
+
+    assert (await _pass(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_a_pass_without_a_wait_keeps_no_write_lock(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+
+    async def delivered(db_, task_):
+        return True, "already delivered"
+
+    monkeypatch.setattr(services, "merge_before_completion", delivered)
+    from hub.services import delivery_wait
+
+    assert (
+        await delivery_wait.settle(db, dict(await repo.get_task(db, task_id)), "", 360)
+        is False
+    )
+    assert db.in_transaction is False
+
+
+async def test_a_timer_failure_does_not_roll_back_the_callers_writes(db, monkeypatch):
+    from hub import repository_delivery_wait as journal
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    await db.execute("BEGIN IMMEDIATE")
+    await repo.add_task_update(db, task_id, "hub", "status", "pending gate write")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("timer failed")
+
+    monkeypatch.setattr(journal, "open_wait", boom)
+    detail = f"{PREFIX}: x"
+    assert (
+        await delivery_wait.settle(
+            db, dict(await repo.get_task(db, task_id)), detail, 360
+        )
+        is False
+    )
+
+    assert db.in_transaction, "чужая транзакция прохода жива"
+    texts = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert "pending gate write" in texts
+    await db.commit()
+
+
+async def test_another_gate_answer_closes_the_wait_even_when_explicit(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+
+    async def head_moved(db_, task_):
+        return False, "approval_head_moved: голова ушла"
+
+    monkeypatch.setattr(services, "merge_before_completion", head_moved)
+    await _pass(db, task_id)
+    assert await _open_waits(db, task_id) == 0
+
+    monkeypatch.setattr(services, "merge_before_completion", _stuck())
+    assert (await _pass(db, task_id))["status"] == "running", "отсчёт с нуля"
+    assert await _needs_decision_events(db, task_id) == 0

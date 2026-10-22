@@ -82,3 +82,13 @@ async def close_open(db: aiosqlite.Connection, task_id: int, kind: str) -> int:
         (CLOSED, task_id, kind, OPEN),
     )
     return int(cur.rowcount)
+
+
+async def has_open(db: aiosqlite.Connection, task_id: int, kind: str) -> bool:
+    """Есть ли открытое ожидание задачи: чтение, write-лока не берёт."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM delivery_wait_deadlines WHERE task_id=? AND kind=? AND state=?",
+        (task_id, kind, OPEN),
+    )
+    return bool(rows)
