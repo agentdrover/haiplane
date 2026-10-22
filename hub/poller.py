@@ -2070,10 +2070,10 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
-    if not ok and await _explicit_outcome(db, task, detail):
-        return  # an outcome, not a wait: the sweep does not come back (#1706)
-    if await delivery_wait.settle(db, task, "" if ok else detail, pr_num):
-        return  # #1992: base_fetch_pending past its deadline went to the owner
+    if (not ok and await _explicit_outcome(db, task, detail)) or (
+        await delivery_wait.settle(db, task, "" if ok else detail, pr_num)
+    ):
+        return  # an outcome, not a wait (#1706); or past its deadline (#1992)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
