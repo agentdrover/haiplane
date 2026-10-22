@@ -42,6 +42,7 @@ from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.session_project_check import SessionProjectGuard
 from hub.services.sessions import note_session_task
+from hub.services.refusal_publish import update_views
 from hub.services.result_kind import is_state
 from hub.services.return_running import RETURN_RUNNING_STATUSES, return_running_to_open
 from hub.hub_instance import mutation_activity_detail
@@ -794,7 +795,7 @@ def row_to_task(
     log_tail = None
     if d.get("job_id"):
         log_tail = plugins.dispatch.job_log_tail(d["job_id"], max_lines=20)
-    upd_list = [TaskUpdateView(**dict(u)) for u in updates] if updates else None
+    upd_list = update_views(updates) if updates else None
     # Structured task form fields (Epic #32) are stored on tasks row but
     # need JSON-decoding for list columns. structured_fields_from_row
     # returns only the keys present in the row, so absent columns fall

@@ -162,6 +162,7 @@ from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import owner_minutes, policy_change, project_policy, triage_inbox
+from hub.services.refusal_publish import update_views
 from hub.services.triage_inbox import TriageVerdictBody
 from hub.services.steward_evidence import (
     KIND_ADVISOR,
@@ -3793,7 +3794,7 @@ async def api_list_task_updates(task_id: int, request: Request):
     if not row:
         raise HTTPException(404, "task not found")
     updates = await repo.get_task_updates(db, task_id)
-    return [TaskUpdateView(**dict(u)) for u in updates]
+    return update_views(updates)
 
 
 @app.post("/api/tasks/{task_id}/refresh", response_model=TaskView)

@@ -1,0 +1,399 @@
+"""Отказ облачного ревьюера не публикует путь сервера (#2006).
+
+Остаток класса #2002: сырой текст исключения транспорта Cursor
+(``PermissionError: ... '/srv/reviewer/private.pem'``) шёл в ``Refusal.detail``
+и дальше в alert ленты, долг второй двери, headline/reason_detail, бриф, MCP,
+инбокс и карточку. Тесты проводят НАСТОЯЩИЙ отказ через ``cursor_cloud._attempt``
+и диспетчер, а читают со всех поверхностей сразу.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from types import SimpleNamespace
+from typing import Any
+
+import aiosqlite
+import httpx
+from httpx import AsyncClient
+
+from hub import mcp_server
+from hub import repository as repo
+from hub.integrations import cursor_cloud
+from hub.services import accept_proof
+from hub.services.dashboard import get_inbox_data
+from hub.services.review_availability import (
+    REFUSAL_ALERT_PREFIXES,
+    generation_review,
+    observe_outage,
+    refusal_detail,
+)
+from tests.review_dispatch_support import _DispatchRecorder, _submitted, _wire
+
+SECRET = "/srv/reviewer/private.pem"
+LEAK = "/srv/reviewer"
+
+
+class _Reply:
+    status_code = 200
+    text = "{}"
+
+    def json(self) -> dict[str, Any]:
+        return {"items": []}
+
+
+def _provider_that_fails(monkeypatch, exc: BaseException, *, reads: bool) -> None:
+    """Настоящий ``_attempt`` поверх сети, которая бросает ``exc`` на создании.
+
+    ``reads=True``: список агентов отвечает пусто (подтверждённая пустота —
+    ветка «не нашлось»); ``False``: и чтение падает тем же (ветка «вслепую»).
+    """
+
+    class _Net:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _Net:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> bool:
+            return False
+
+        async def request(self, method: str, _url: str, **_kw: Any) -> _Reply:
+            if method == "POST" or not reads:
+                raise exc
+            return _Reply()
+
+    shim = SimpleNamespace(AsyncClient=_Net, Response=httpx.Response)
+    monkeypatch.setattr(cursor_cloud, "httpx", shim)
+
+
+async def _refused_task(
+    client, db, monkeypatch, slug: str, exc: BaseException, *, reads: bool = True
+) -> int:
+    real = cursor_cloud.create_agent_attempt
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", real)
+    _provider_that_fails(monkeypatch, exc, reads=reads)
+    return await _submitted(
+        client, db, slug, policy={"review": "dispatch", "verdict": "human"}
+    )
+
+
+async def _surfaces(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, task_id: int
+) -> dict[str, str]:
+    """Каждая поверхность, где отказ виден людям и агентам, одной строкой."""
+    out: dict[str, str] = {}
+    for name, url in (
+        ("card html", f"/tasks/{task_id}"),
+        ("card htmx", f"/tasks/{task_id}"),
+        ("api task", f"/api/tasks/{task_id}"),
+        ("api updates", f"/api/tasks/{task_id}/updates"),
+        ("api brief", f"/api/tasks/{task_id}/review-brief"),
+        ("inbox partial", "/partials/inbox"),
+    ):
+        resp = await client.get(
+            url, headers={"HX-Request": "true"} if name == "card htmx" else {}
+        )
+        assert resp.status_code == 200, (name, resp.text[:300])
+        out[name] = resp.text
+
+    async def api_get(path: str, *_a: Any, **_k: Any) -> Any:
+        resp = await client.get(path)
+        assert resp.status_code == 200, (path, resp.text[:300])
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", api_get)
+    for section in ("", "verdict"):
+        brief = await mcp_server.hub_get_review_brief(task_id, section=section)
+        out[f"mcp brief {section}"] = repr(brief)
+    for full in (False, True):
+        status = await mcp_server.hub_task_status(task_id, updates=-1, full=full)
+        out[f"mcp status full={full}"] = repr(status)
+    task = dict(await repo.get_task(db, task_id))
+    out["generation_review"] = (await generation_review(db, task)).model_dump_json()
+    _proof, blockers, _views = await accept_proof.prove_accept(db, task)
+    out["accept_proof"] = repr(blockers)
+    out["inbox data"] = json.dumps(await get_inbox_data(db), default=str)
+    rows = await db.execute_fetchall(
+        "SELECT * FROM review_dispatches WHERE task_id=?",
+        (task_id,),
+    )
+    out["second-door debt"] = repr([dict(r) for r in rows])
+    return out
+
+
+def _assert_clean(surfaces: dict[str, str]) -> None:
+    for name, text in surfaces.items():
+        assert LEAK not in text, f"{name}: путь сервера опубликован"
+        assert "private.pem" not in text, f"{name}: имя файла опубликовано"
+        assert "Errno" not in text, f"{name}: сырой текст исключения опубликован"
+
+
+async def test_a_transport_refusal_publishes_its_kind_not_its_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, caplog
+):
+    """AC-1: PermissionError и ReadTimeout различимы по виду, пути нет нигде."""
+    caplog.set_level(logging.WARNING)
+    denied = await _refused_task(
+        client,
+        db,
+        monkeypatch,
+        "refusal-denied",
+        PermissionError(13, "Permission denied", SECRET),
+    )
+    timed_out = await _refused_task(
+        client, db, monkeypatch, "refusal-timeout", httpx.ReadTimeout("")
+    )
+    denied_view = await _surfaces(client, db, monkeypatch, denied)
+    timed_view = await _surfaces(client, db, monkeypatch, timed_out)
+
+    _assert_clean(denied_view)
+    _assert_clean(timed_view)
+    assert "PermissionError" in denied_view["generation_review"]
+    assert "ReadTimeout" not in denied_view["generation_review"]
+    assert "ReadTimeout" in timed_view["generation_review"]
+    assert "PermissionError" not in timed_view["generation_review"]
+    assert "PermissionError" in denied_view["card html"], "вид отказа виден в ленте"
+    assert "PermissionError" in denied_view["second-door debt"]
+    assert SECRET in caplog.text, "полный текст остаётся в журнале хаба"
+
+
+async def test_a_blind_transport_refusal_publishes_its_kind_not_its_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Вслепую (спросить агента не вышло): путь не в алерте, признак blind цел."""
+    blind = await _refused_task(
+        client,
+        db,
+        monkeypatch,
+        "refusal-blind",
+        PermissionError(13, "Permission denied", SECRET),
+        reads=False,
+    )
+    view = await _surfaces(client, db, monkeypatch, blind)
+    _assert_clean(view)
+    assert "PermissionError" in view["card html"]
+    assert "СПРОСИТЬ его" in view["card html"], "слепое состояние названо как раньше"
+    rows = await db.execute_fetchall(
+        "SELECT agent_id FROM review_dispatches WHERE task_id=?", (blind,)
+    )
+    assert [dict(r)["agent_id"] for r in rows] == [], "второй двери на слепом нет"
+
+
+async def test_a_params_refusal_alert_does_not_carry_the_response_body(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Alert об отвергнутых параметрах берёт только вид ответа, не тело."""
+    calls: list[int] = []
+    body = cursor_cloud.Refusal(
+        status=400, code="invalid_argument", detail=f"bad file {SECRET}"
+    )
+
+    async def attempt(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return None, body
+        return {"agent": {"id": "bc-1", "latestRunId": "r-1"}, "run": {}}, None
+
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", attempt)
+
+    async def params_for(model_id):
+        return [cursor_cloud.ModelParam(id="fast", value="false")]
+
+    monkeypatch.setattr(cursor_cloud, "review_params_for", params_for)
+    task_id = await _submitted(
+        client, db, "refusal-params", policy={"review": "dispatch"}
+    )
+    view = await _surfaces(client, db, monkeypatch, task_id)
+    assert "провайдер отверг: HTTP 400" in view["card html"], "alert записан"
+    stored = [dict(r)["content"] for r in await repo.get_task_updates(db, task_id)]
+    assert not [c for c in stored if LEAK in c], "писатель не кладёт тело в базу"
+    _assert_clean(view)
+
+
+async def test_a_stored_refusal_with_a_path_is_read_without_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: алерт, записанный ДО исправления, читается без пути, но как отказ."""
+    task_id = await _submitted(
+        client, db, "refusal-stored", policy={"review": "dispatch"}, verdict_auto=False
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review"
+    stored = (
+        f"{REFUSAL_ALERT_PREFIXES[1]}, и агента с нашей "
+        "меткой у него не нашлось за попыток: 2 "
+        f"(PermissionError: [Errno 13] Permission denied: '{SECRET}'). "
+        "Вердикт остаётся человеку; детали в логе хаба (#757)."
+    )
+    await repo.add_task_update(db, task_id, "hub", "alert", stored)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        "[переспрос ревью: сдача 1] Переспрос ревью 1 из 2: заказ #7 отчёта не "
+        f"дал — провайдер отказал в создании агента: PermissionError {SECRET}. "
+        "Отчёта этой сдачи нет вовсе.",
+    )
+    # Авторская запись с тем же путём - содержание, а не утечка: не трогать.
+    await repo.add_task_update(
+        db, task_id, "dev", "status", f"Читаю {SECRET} в тесте, это моя заметка"
+    )
+    stub = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="",
+        run_id="",
+        model="m",
+        profile="lite",
+        profile_assignment="rule",
+        reviewer_principal_id=None,
+        channel="cloud",
+        replaces_dispatch_id=None,
+        only_tests=None,
+    )
+    await repo.owe_second_door(
+        db, stub, f"ответ не дошёл (PermissionError: '{SECRET}')"
+    )
+    await repo.set_review_dispatch_status(db, stub, "failed")
+    await db.commit()
+
+    view = await _surfaces(client, db, monkeypatch, task_id)
+    note = f"Читаю {SECRET} в тесте, это моя заметка"
+    for name, text in view.items():
+        if name == "second-door debt":
+            continue  # строка заглушки ниже читается через _cloud_refusal_text
+        assert LEAK not in text.replace(note, ""), f"{name}: старый алерт с путём"
+    assert note in view["api updates"].replace("\\/", "/"), "авторская запись цела"
+
+    task = dict(await repo.get_task(db, task_id))
+    seen = await generation_review(db, task)
+    assert seen.reason == "provider_refused", "отказ распознан как отказ"
+    assert "PermissionError" in seen.reason_detail
+    assert LEAK not in seen.headline
+    assert refusal_detail(stored).startswith("ответ провайдера не дошёл")
+    assert LEAK not in refusal_detail(stored)
+    observed = await observe_outage(db)
+    assert observed.kind in ("below_threshold", "too_young", "outage")
+
+
+async def test_the_stored_stub_status_is_published_through_the_cloud_text():
+    """_cloud_refusal_text чистит run_status заглушки, а настоящий прогон не меняет."""
+    from hub.services.review_dispatch import _cloud_refusal_text
+
+    stub = {"agent_id": ""}
+    text = _cloud_refusal_text(stub, f"PermissionError: '{SECRET}'")
+    assert LEAK not in text
+    assert text.startswith("провайдер отказал в создании агента: ")
+    real = {"agent_id": "bc-1", "model": "m"}
+    assert "кончился статусом FINISHED" in _cloud_refusal_text(real, "FINISHED")
+
+
+async def test_the_shared_refusal_keeps_its_detail_for_the_other_consumers():
+    """Вне области (executor_launch, steward_shadow): detail прежний, kind рядом."""
+    from hub.services.steward_shadow import _provider_answer
+
+    raw = cursor_cloud.Refusal(
+        status=0,
+        kind="PermissionError",
+        detail=f"PermissionError: [Errno 13] Permission denied: '{SECRET}'"[:300],
+    )
+    assert SECRET in raw.detail
+    assert SECRET in _provider_answer(raw), "steward_shadow по-прежнему видит detail"
+    http = cursor_cloud.Refusal(status=400, code="usage_limit_exceeded", detail="x")
+    assert http.kind == "" and http.is_transport is False
+
+
+async def test_the_real_transport_refusal_keeps_detail_and_gains_a_kind(monkeypatch):
+    """_attempt: detail прежний (его читают executor_launch и steward_shadow), kind рядом."""
+    monkeypatch.setattr(cursor_cloud.config, "CURSOR_API_KEY", "test-key")
+    _provider_that_fails(
+        monkeypatch, PermissionError(13, "Permission denied", SECRET), reads=True
+    )
+    body, refusal = await cursor_cloud._attempt("POST", "/v1/agents", {})
+    assert body is None and refusal is not None
+    assert (refusal.status, refusal.code, refusal.kind) == (0, "", "PermissionError")
+    assert refusal.detail.startswith("PermissionError: [Errno 13]")
+    assert SECRET in refusal.detail, (
+        "сырой текст остался для вне-областных потребителей"
+    )
+    assert refusal.is_transport is True
+
+
+def test_the_refusal_kind_keeps_http_codes_and_limits_distinguishable():
+    from hub.services.refusal_publish import safe_detail
+
+    Refusal = cursor_cloud.Refusal
+    assert safe_detail(None) == "причина не названа"
+    assert safe_detail(
+        Refusal(status=400, code="usage_limit_exceeded", detail=SECRET)
+    ) == ("HTTP 400, usage_limit_exceeded")
+    assert safe_detail(Refusal(status=502, detail=f"gateway {SECRET}")) == "HTTP 502"
+    assert safe_detail(Refusal(kind="ReadTimeout", detail="x")) == "ReadTimeout"
+    assert safe_detail(Refusal(detail=f"сломалось в {SECRET}")) == "сломалось в <путь>"
+    assert safe_detail(Refusal(detail="CURSOR_API_KEY не задан")) == (
+        "CURSOR_API_KEY не задан"
+    )
+
+
+def test_the_headline_never_prints_a_path_from_any_reason_detail():
+    from hub.models import GenerationReview
+    from hub.services.review_availability import _headline
+
+    view = GenerationReview(
+        generation=2,
+        reason="provider_refused",
+        reason_detail=f"PermissionError '{SECRET}'",
+    )
+    line = _headline(view)
+    assert LEAK not in line and "PermissionError" in line
+    assert line.startswith("ревью у поколения 2 НЕТ: провайдер ревью отказал")
+
+
+async def test_the_refusal_alert_keeps_its_prefix_and_authored_notes_stay_whole(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Признаки отказа не сдвинулись: префикс алерта, reason, второй двери нет."""
+    from hub.services.refusal_publish import is_refusal_alert, published_update
+
+    task_id = await _refused_task(
+        client,
+        db,
+        monkeypatch,
+        "refusal-prefix",
+        PermissionError(13, "Permission denied", SECRET),
+    )
+    rows = [dict(r) for r in await repo.get_task_updates(db, task_id)]
+    alerts = [r for r in rows if r["kind"] == "alert" and r["agent"] == "hub"]
+    refusal = [a for a in alerts if a["content"].startswith(REFUSAL_ALERT_PREFIXES)]
+    assert REFUSAL_ALERT_PREFIXES == (
+        "Кросс-модельное ревью НЕ вызвано: провайдер отказал",
+        "Кросс-модельное ревью НЕ вызвано: ответ провайдера не дошёл",
+    ), "по этим началам отказ узнают сторож, очередь и SQL"
+    assert len(refusal) == 1, "ровно один алерт отказа с прежним началом"
+    assert LEAK not in refusal[0]["content"], "писатель не кладёт путь в базу"
+    assert (
+        "Вердикт остаётся человеку; детали в логе хаба (#757)."
+        in (refusal[0]["content"])
+    )
+    seen = await generation_review(db, dict(await repo.get_task(db, task_id)))
+    assert seen.reason == "provider_refused"
+    stub = await db.execute_fetchall(
+        "SELECT run_status FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert LEAK not in repr([dict(r) for r in stub]), "долг второй двери без пути"
+    # Чистятся только записи хаба-алерты; те же слова у человека не меняются.
+    said = refusal[0]["content"] + f" {SECRET}"
+    for author, kind in (("dev", "status"), ("dev", "alert"), ("hub", "status")):
+        authored = {"kind": kind, "agent": author, "content": said}
+        assert published_update(authored) == authored, (author, kind)
+    old = {**refusal[0], "content": refusal[0]["content"] + f" {SECRET}"}
+    assert LEAK not in published_update(old)["content"]
+    assert is_refusal_alert(REFUSAL_ALERT_PREFIXES[0] + ": x")
+    assert not is_refusal_alert("Кросс-модельное ревью НЕ вызвано: не хватает")
