@@ -33,6 +33,4 @@ async def carry_is_same_edit(
         if waiting:
             log.warning("carry-over of the report for #%s: %s", task["id"], waiting)
             return False, waiting
-    return await orchestration.base_merge_kept_the_verdict(
-        db, task, source_sha, pinned
-    )
+    return await orchestration.base_merge_kept_the_verdict(db, task, source_sha, pinned)
