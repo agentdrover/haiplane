@@ -593,10 +593,22 @@ def _relative_import_bases(rel: str, level: int) -> set[str]:
     Computed for both dotted spellings of ``rel`` (``_script_module_names``,
     #1935) since a relative import's resolved package depends on which
     namespace ``rel`` is considered part of.
+
+    A package's own ``__init__.py`` is, per ``importlib._bootstrap``, its
+    OWN dotted name's anchor — ``from .a import helper`` inside
+    ``scripts/pkg/__init__.py`` means "my sibling ``pkg.a``", not "my
+    parent's sibling". A regular module instead anchors at its PARENT's
+    dotted name (its own last component dropped). Critic finding on sha
+    dc24929d: treating ``__init__.py`` like a regular module stripped
+    ``pkg`` itself off, resolving ``from .a import helper`` there to the
+    unrelated top-level ``scripts/a.py`` instead of the real sibling
+    ``scripts/pkg/a.py`` — recreating the exact nominal false match #1935
+    removes for every other import form.
     """
+    is_init = rel.endswith("/__init__.py") or os.path.basename(rel) == "__init__.py"
     bases: set[str] = set()
     for spelling in _script_module_names(rel):
-        package_parts = spelling.split(".")[:-1]
+        package_parts = spelling.split(".") if is_init else spelling.split(".")[:-1]
         remaining = len(package_parts) - (level - 1)
         if remaining < 1:
             continue  # relative import would reach beyond the top-level package

@@ -256,6 +256,67 @@ def test_a_relative_import_resolves_against_the_callers_own_package(repo: Path):
     )
 
 
+def test_a_relative_import_inside_an_init_resolves_against_its_own_package(
+    repo: Path,
+):
+    """Critic finding on sha dc24929d: a package's own ``__init__.py`` is its
+    OWN dotted name's anchor for relative imports (``importlib._bootstrap``),
+    not its name with the last component dropped like a regular module.
+    ``from .a import helper`` inside ``scripts/pkg/__init__.py`` means "my
+    sibling ``pkg.a``" — treating ``__init__.py`` like ``scripts/pkg/b.py``
+    stripped ``pkg`` itself off and resolved it to the unrelated top-level
+    ``scripts/a.py`` instead of the real sibling ``scripts/pkg/a.py``."""
+    (repo / "scripts" / "pkg").mkdir()
+    (repo / "scripts" / "pkg" / "__init__.py").write_text(
+        "from .a import helper\n\n\ndef run():\n    return helper(1)\n"
+    )
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value\n"
+    )
+    (repo / "scripts" / "a.py").write_text("def helper(value):\n    return value * 2\n")
+    _commit(repo)
+
+    # Changing the real sibling scripts/pkg/a.py:helper must count
+    # scripts/pkg/__init__.py as a caller.
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value + 1\n"
+    )
+
+    report = call_sites.analyse(str(repo), _diff(repo))
+    pkg_helper = next(
+        s
+        for s in report.symbols
+        if s.symbol == "helper" and s.defined_in == "scripts/pkg/a.py"
+    )
+    assert pkg_helper.state != call_sites.NO_CALLERS, pkg_helper.statement()
+    assert "scripts/pkg/__init__.py" in {s.file for s in pkg_helper.sites}, (
+        "from .a import helper in scripts/pkg/__init__.py must resolve to "
+        "the sibling scripts/pkg/a.py, not the unrelated scripts/a.py: "
+        f"{pkg_helper.statement()}"
+    )
+
+    # Changing the UNRELATED top-level scripts/a.py:helper must NOT pick up
+    # scripts/pkg/__init__.py as a caller — that would mean the relative
+    # import resolved against __init__.py's parent instead of itself.
+    (repo / "scripts" / "pkg" / "a.py").write_text(
+        "def helper(value):\n    return value + 1\n"
+    )
+    _commit(repo)
+    (repo / "scripts" / "a.py").write_text("def helper(value):\n    return value * 3\n")
+
+    report2 = call_sites.analyse(str(repo), _diff(repo))
+    top_helper = next(
+        s
+        for s in report2.symbols
+        if s.symbol == "helper" and s.defined_in == "scripts/a.py"
+    )
+    assert top_helper.state == call_sites.NO_CALLERS, (
+        "scripts/pkg/__init__.py's relative 'from .a import helper' must "
+        "not be read as an import of the unrelated scripts/a.py: "
+        f"{top_helper.statement()}"
+    )
+
+
 # ---- AC-3: a name match alone is not an import, and hub/'s only_tests is unchanged ----
 
 
