@@ -27,11 +27,13 @@ from hub.integrations.protocols import (
     CIProbeResult,
 )
 from hub.services import lifecycle, orchestration
+from hub.services.orchestration import STACK_UNKNOWN, StackAssessment
 from tests.delivery_rerun_support import (
     TIP,
     Rig,
     approved_task,
     current,
+    set_policy,
     rig_after_base_update,
 )
 
@@ -273,6 +275,54 @@ async def test_committed_if_own_rolls_back_only_what_it_opened(db, db_dsn):
             async with committed_if_own(db):
                 raise _Rollback
         assert db.in_transaction, "чужую транзакцию вложенный блок не откатывает"
+
+
+# ---- Codex, круг 1: стопка и алерт замены перед релизом --------------------
+
+
+async def test_unchecked_stack_alert_is_committed_before_the_freshness_probe(
+    db, db_dsn, monkeypatch
+):
+    rig = await _closed_pr_rig(db, monkeypatch, state="open")
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    unchecked = StackAssessment(outcome=STACK_UNKNOWN, reason="нет репозитория")
+    monkeypatch.setattr(
+        orchestration, "assess_branch_stacking", AsyncMock(return_value=unchecked)
+    )
+    before = await rig.feed()
+    task = dict(await rig.task())
+
+    def attach(stand):
+        rig.git.pr_base_freshness = AsyncMock(side_effect=stand)
+
+    seen = await _frozen_in_network(
+        attach,
+        lambda: services.merge_before_completion(db, task),
+        db_dsn,
+        rig.task_id,
+        answer=current(task["submission_sha"]),
+    )
+    assert seen["feed"].strip() != before.strip(), "alert виден до конца сети"
+
+
+async def test_replacement_alert_is_committed_before_the_release_is_prepared(
+    db, db_dsn, monkeypatch
+):
+    rig = await _closed_pr_rig(db, monkeypatch, state="closed", replacement=NEW_PR)
+    rig.git.check_pr_ci = AsyncMock(return_value=PASSED)
+    await set_policy(db, release="auto")
+
+    def attach(stand):
+        rig.git.content_differs = AsyncMock(side_effect=stand)
+
+    seen = await _frozen_in_network(
+        attach,
+        lambda: poller._sweep_pair_delivery(db),
+        db_dsn,
+        rig.task_id,
+        answer=False,
+    )
+    assert "доставка идёт открытым PR" in seen["feed"]
 
 
 # ---- чужая транзакция никогда не коммитится --------------------------------

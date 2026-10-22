@@ -3790,11 +3790,11 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"же самое, что «стопки нет», поэтому мерж отложен"
         )
     if assessment.outcome == STACK_UNKNOWN:
-        # Merged, but never silently: the alert is the whole difference
-        # between "we looked" and "we could not look".
-        await repo.add_task_update(
-            db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
-        )
+        # Merged, never silently; committed before the next network call (#2001).
+        async with committed_if_own(db):
+            await repo.add_task_update(
+                db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
+            )
     return ""
 
 
