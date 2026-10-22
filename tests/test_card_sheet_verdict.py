@@ -161,3 +161,31 @@ async def test_risk_sheet_keeps_the_text_vs_verdict_contradiction_guard(
     )
     assert resp.status_code == 422, resp.text
     assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
+
+
+async def test_partial_state_evidence_offers_the_risk_sheet(client: AsyncClient, db):
+    """Риск, повторённый в «почему», не пропадает из выбора листа (#1813 gen2)."""
+    from hub import web
+    from hub.services import card_c2, decision_brief
+    from tests.state_support import drive_to_review, make_state_task
+
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id)
+    await db.execute(
+        "DELETE FROM task_evidence WHERE task_id=? AND ac_id='AC-2'", (task_id,)
+    )
+    await db.commit()
+    from hub import repository as repo
+
+    row = dict(await repo.get_task(db, task_id))
+    brief = await decision_brief.build(db, row, {"repair_offered": False})
+    assert any(r["severity"] == "high" for r in brief["risks"]), "исходный риск есть"
+    view = card_c2.card_view(row, brief)
+    assert not [r for r in view["risks"] if r["severity"] == "high"], (
+        "после сокращения повторов риска в показе уже нет"
+    )
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert 'id="sh-ok-risk"' in page and 'id="sh-ok"' not in page
+    form, data = sheet_form(page, "sh-ok-risk")
+    assert data["risk_ack"] == "required"
+    assert web  # импорт нужен только для явности зависимости
