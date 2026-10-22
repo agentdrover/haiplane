@@ -518,3 +518,45 @@ async def test_an_escalated_wait_is_terminal_for_its_key(db, monkeypatch):
         await _pass(db, task_id)
 
     assert await _needs_decision_events(db, task_id) == 1
+
+
+async def test_a_pass_of_a_replaced_pr_does_not_touch_the_journal(db, monkeypatch):
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    stale = dict(await repo.get_task(db, task_id))  # PR 360
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    await repo.update_task(db, task_id, pr_number=361)  # PR заменён, ключ тот же
+    await db.commit()
+    before = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT * FROM delivery_wait_deadlines")
+    ]
+
+    assert await delivery_wait.settle(db, stale, "ci_pending: x", 360) is False
+    assert await delivery_wait.settle(db, stale, f"{PREFIX}: x", 360) is False
+
+    after = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT * FROM delivery_wait_deadlines")
+    ]
+    assert after == before
+
+
+async def test_a_booking_of_another_pr_or_with_policy_off_holds_nothing(
+    db, monkeypatch
+):
+    async def other_pr(db_, task_id, gen):
+        await db_.execute(
+            "INSERT INTO delivery_reruns (task_id, submission_generation, "
+            "pr_number, state, requested_at) "
+            "VALUES (?, ?, 999, 'requested', datetime('now'))",
+            (task_id, gen),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, other_pr)
+    await set_policy(db, delivery_fresh_base_rerun="off")
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
