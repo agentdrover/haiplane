@@ -68,7 +68,7 @@ WAIT_HINT = (
 #: Итоги job и прогона, при которых перезапускать нечего.
 _GREEN = ("success", "neutral", "skipped")
 #: Исходы, с которыми задача ушла к человеку: повторный проход говорит то же.
-_HUMAN_OUTCOMES = (
+HUMAN_OUTCOMES = (
     "rerun_red",
     "post_refused",
     "post_unsupported",
@@ -329,7 +329,7 @@ async def _closed_step(
     красной новой попытке, чужой ручной попытке или истёкшему сроку мержа нет,
     решает владелец. Второго POST нет никогда.
     """
-    if row["outcome"] not in _HUMAN_OUTCOMES:
+    if row["outcome"] not in HUMAN_OUTCOMES:
         return ""
     shown = ci
     if ci.outcome != CIProbeOutcome.failed:

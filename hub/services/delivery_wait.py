@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 from functools import partial
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
@@ -164,18 +165,24 @@ async def _escalate(
     hours: int,
 ) -> bool:
     """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку."""
-    if await _live_key(db, key[0]) != key:
+    live = await repo.get_task(db, key[0])
+    if await _live_key(db, key[0]) != key or live is None:
         return False  # завершена, возвращена или сдана заново с прохода до лока
-    if await _delivery_moved_on(db, key, pr_num):
+    if int(live["pr_number"] or 0) != int(pr_num or 0):
+        return False  # PR заменён: причина прохода относится к другому PR
+    if await _delivery_moved_on(db, key, int(live["pr_number"] or 0)):
         await journal.close_open(db, *key)
-        return False  # причина прохода устарела: доставлено или идёт перезапуск
+        return False  # доставлено соседним путём: переводить нечего
+    if await _rerun_holds(db, key):
+        return False  # живая бронь #1956 обслужит поколение; срок не продлевается
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(
         db,
         key[0],
         pr_num,
-        f"{detail} — ожидание свежей базы дольше срока ({hours} ч)",
+        f"{detail} — ожидание свежей базы дольше срока ({hours} ч)"
+        + await _rerun_outcome_note(db, key),
         REASON,
         "",
         HINT,
@@ -184,18 +191,59 @@ async def _escalate(
 
 
 async def _delivery_moved_on(
-    db: aiosqlite.Connection, key: tuple[int, int, int, str], pr_num: Any
+    db: aiosqlite.Connection, key: tuple[int, int, int, str], pr_num: int
 ) -> bool:
-    """Под локом: причина прохода устарела - PR уже доставлен или идёт бронь #1956.
+    """Под локом: PR живой задачи уже доставлен (мерж записан соседним путём).
 
     Отказ ``base_fetch_pending`` получен ДО лока; за это время соседний путь
-    мог записать мерж или зарезервировать автоперезапуск CI. Переводить к
-    человеку по прочитанной раньше причине нельзя.
+    мог записать мерж. Переводить к человеку по прочитанной раньше причине
+    нельзя.
     """
-    task_id, generation = key[0], key[1]
-    if pr_num and await repo.pipeline_merge_recorded(db, task_id, int(pr_num)):
-        return True
+    return bool(pr_num) and await repo.pipeline_merge_recorded(db, key[0], pr_num)
+
+
+async def _rerun_holds(
+    db: aiosqlite.Connection, key: tuple[int, int, int, str]
+) -> bool:
+    """Живая бронь автоперезапуска (#1956) этого поколения, ещё в своём сроке.
+
+    Просроченная бронь не держит: её срок судит #1956 на проходе, до которого
+    при отказе fetch базы дело не доходит, и бессрочная бронь превратила бы
+    срок этой задачи в ничто.
+    """
+    from hub.services import delivery_rerun
+
     return any(
-        int(r["submission_generation"]) == generation
-        for r in await rerun_journal.open_rows(db, task_id)
+        int(r["submission_generation"]) == key[1]
+        and _fresh(str(r.get("requested_at") or ""), delivery_rerun.WAIT_MINUTES)
+        for r in await rerun_journal.open_rows(db, key[0])
+    )
+
+
+def _fresh(requested_at: str, minutes: int) -> bool:
+    """Бронь поставлена не раньше ``minutes`` минут назад (UTC, формат SQLite)."""
+    if not requested_at:
+        return False
+    try:
+        at = datetime.strptime(requested_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return True  # не разобрали - считаем живой: «не прочиталось» не снимает бронь
+    return datetime.now(UTC) - at < timedelta(minutes=minutes)
+
+
+async def _rerun_outcome_note(
+    db: aiosqlite.Connection, key: tuple[int, int, int, str]
+) -> str:
+    """Закрытый исход к человеку брони #1956 называется в переходе, а не теряется."""
+    from hub.services import delivery_rerun
+
+    row = await rerun_journal.get(db, key[0], key[1])
+    if row is None or row["state"] != rerun_journal.CLOSED:
+        return ""
+    if row["outcome"] not in delivery_rerun.HUMAN_OUTCOMES:
+        return ""
+    return (
+        f". Бронь автоперезапуска CI (#1956) этого поколения закрыта исходом "
+        f"{row['outcome']}, упавшие job: {row['failed_jobs']}; инструкция по "
+        "возврату — в карточке delivery_rerun"
     )
