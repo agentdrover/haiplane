@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test lint format types budget layers migration-steps security check
+.PHONY: setup hooks doctor test gui-test lint format types budget layers migration-steps security check
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:
@@ -40,6 +40,15 @@ doctor:
 # словарь, то есть not_found на каждом AC при зелёном CI.
 test:
 	uv run pytest -q -n auto
+
+# #1996: браузерные сценарии карточки задачи (Playwright, настоящий хаб в режиме
+# CSRF require). Вне `test` и `check`: им нужен Chromium (CI ставит его в job
+# GUI; локально `uv run playwright install chromium` или, чтобы ничего не
+# скачивать, HAIPLANE_GUI_CHANNEL=chrome). Путь tests/gui назван явно — обычный
+# прогон его пропускает (addopts --ignore в pyproject.toml). Последовательно:
+# сценарии делят один стенд.
+gui-test:
+	uv run pytest -q tests/gui
 
 # Зелёный lint при красном шаге CI «Check formatting» стоил трёх пересдач за
 # сутки (#1080): форматирование не входило в эту цель, поэтому неотформатиро-
