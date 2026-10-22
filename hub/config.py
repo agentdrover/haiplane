@@ -727,6 +727,17 @@ _csrf_mode_raw = (env_get("CSRF_MODE", "warn") or "warn").strip().lower()
 CSRF_MODE = _csrf_mode_raw if _csrf_mode_raw in CSRF_MODES else "warn"
 # Key of the session-bound token. Empty: a 0600 file next to the database.
 CSRF_SECRET = env_get("HUB_CSRF_SECRET", "")
+
+
+def hub_extra_origins_raw() -> str:
+    """HAIPLANE_HUB_EXTRA_ORIGINS (#1994): more public addresses of this hub.
+
+    Read per call, like HAIPLANE_HUB_URL: the value is parsed (and warned about)
+    in ``hub.csrf``, which keeps the strict grammar in one place.
+    """
+    return env_get("HUB_EXTRA_ORIGINS", "")
+
+
 # A form body is buffered up to this size to find the csrf_token field.
 CSRF_BODY_LIMIT = 1024 * 1024
 # ... and read for at most this many seconds (a slow body holds a worker).
