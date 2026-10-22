@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import aiosqlite
@@ -42,7 +43,7 @@ def verdict_findings(task: dict[str, Any]) -> list[dict[str, str]]:
     return [
         {
             "uid": "",
-            "kind": f"замечание вердикта, {f.severity.value}",
+            "kind": f"замечание вердикта №{f.id}, {f.severity.value}",
             "title": f.message,
             "where": f"{f.file}:{f.line}" if f.file and f.line else f.file,
             "text": f.recommendation,
@@ -50,6 +51,44 @@ def verdict_findings(task: dict[str, Any]) -> list[dict[str, str]]:
         for f in parse_review_findings(task.get("review_findings"))
         if f.scope.value == _IN_SCOPE
     ]
+
+
+def verdict_note(findings: list[dict[str, str]]) -> list[str]:
+    """Строка для промпта: у замечаний вердикта нет uid, их исходы — в summary сдачи.
+
+    ``finding_outcomes`` принимает только адреса машинных находок; требовать от
+    исполнителя невыполнимого значило бы получить отказ сдачи.
+    """
+    if all(f["uid"] for f in findings):
+        return []
+    return [
+        "Замечания вердикта (без uid): исправь каждое и назови номер и исход в "
+        "summary сдачи; в finding_outcomes их не передавай."
+    ]
+
+
+def verdict_unreadable(task: dict[str, Any]) -> bool:
+    """Текущий вердикт changes_requested несёт находки, которые не читаются.
+
+    Мягкий разбор отдаёт для них пустой список, и без этой проверки порча
+    выглядела бы как «находок нет».
+    """
+    from hub.models import ReviewFinding
+    from hub.services.orchestration import review_verdict_covers_current_submission
+
+    raw = task.get("review_findings")
+    if (
+        task.get("review_verdict") != "changes_requested"
+        or not raw
+        or not review_verdict_covers_current_submission(task)
+    ):
+        return False
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        [ReviewFinding(**f) for f in data]
+    except (ValueError, TypeError):
+        return True
+    return False
 
 
 def return_reason(task: dict[str, Any], *, where: str, issue: str, who: str) -> str:
@@ -96,5 +135,7 @@ async def refusal(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
         named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
         return f"{el.REASON_NOT_RETURNABLE}: у задачи есть признаки работы: {named}"
     if not await el._current_findings(db, task):
+        if verdict_unreadable(task):
+            return f"{el.REASON_NO_FINDINGS}: находки вердикта не читаются"
         return el.REASON_NO_FINDINGS
     return ""

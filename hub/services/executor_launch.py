@@ -41,6 +41,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import chat_pair, orchestrator_queue, owner_minutes, project_policy
+from hub.services import rework_admission
 from hub.db import fetchall, write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
@@ -824,8 +825,6 @@ async def _current_findings(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[dict[str, str]]:
     """Находки круга починки: машинные текущей сдачи И текущего вердикта (#1998)."""
-    from hub.services import rework_admission
-
     return await _machine_findings(db, task) + rework_admission.verdict_findings(task)
 
 
@@ -887,7 +886,7 @@ def _findings_block(findings: list[dict[str, str]]) -> str:
         if f["text"]:
             lines.append(f"  {f['text']}")
     lines.append(FINDINGS_DATA_CLOSE)
-    return "\n".join(lines)
+    return "\n".join(lines + rework_admission.verdict_note(findings))
 
 
 async def _holderless_running_refusal(
@@ -1095,7 +1094,7 @@ async def _admit_rework(
     покупается, а задача не остаётся open без исполнителя. Сетевой заказ — после
     коммита (#1428). Пустая строка — допуск.
     """
-    from hub.services import rework_admission, return_running
+    from hub.services import return_running
 
     why = await rework_admission.refusal(db, task)
     if why or task["status"] == "open":

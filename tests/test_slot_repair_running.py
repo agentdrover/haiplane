@@ -167,6 +167,7 @@ async def test_slot_repair_returns_and_orders_in_one_transaction(world, monkeypa
     page = await world.client.get(f"/tasks/{human}", headers=cookie)
     assert f"/tasks/{human}/web-executor-slot" in page.text
     assert "Запустить на k8" in page.text and "Запустить на k9" in page.text
+    assert 'class="c2-btn" href="#executor-repair-form"' in page.text
     pressed = await world.client.post(
         f"/tasks/{human}/web-executor-slot",
         data={"host": "k8", "csrf_token": csrf},
@@ -185,6 +186,8 @@ async def test_slot_repair_returns_and_orders_in_one_transaction(world, monkeypa
     )
     assert placed[0]["generation"] == 2
     assert HUMAN_FINDING in placed[0]["order_text"], "находка вердикта — в заказе"
+    assert "замечание вердикта №1" in placed[0]["order_text"]
+    assert "в finding_outcomes их не передавай" in placed[0]["order_text"]
     feed = await _feed(world, human)
     assert "owner1712" in feed and "слот k8" in feed and "круг починки" in feed
 
@@ -265,6 +268,16 @@ async def test_busy_or_failed_issue_leaves_the_task_running(world, monkeypatch):
     await refused_with(
         await _after_cr(world, "нет находок", findings="none"), "нет находок"
     )
+    parent = await _after_cr(world, "не лист")
+    child = await _task(world, "дочерняя")
+    await repo.update_task(world.db, child, parent_id=parent)
+    await world.db.commit()
+    await refused_with(parent, "не лист")
+
+    broken = await _after_cr(world, "порча находок", findings="none")
+    await repo.update_task(world.db, broken, review_findings="{broken")
+    await world.db.commit()
+    await refused_with(broken, "не читаются")
     await refused_with(
         await _after_cr(world, "прогонов не было", runs=False), "не запускался"
     )
