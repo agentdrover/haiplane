@@ -214,3 +214,109 @@ async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(
         "2026-10-22 00:00:00",
     )
     assert [s["late"] for s in sections.values()] == [1]
+
+
+async def _payload_of(world, date: str) -> dict:
+    rows = await _rows(
+        world.db, "SELECT payload FROM autopilot_digests WHERE digest_date = ?", (date,)
+    )
+    return json.loads(rows[0]["payload"])["triage"]
+
+
+async def test_outcome_missed_by_an_unavailable_day_goes_to_the_next_measured(
+    world, monkeypatch
+):
+    """Дайджест суток обработки сохранён unavailable: исход не теряется, а попадает
+    в late первого измеренного дайджеста после него - ровно один раз."""
+    first = await _acted(world)
+    built = await _digests(world, now=datetime(2026, 10, 21, 0, 0, 0, tzinfo=UTC))
+    assert built[0]["data"]["triage"]["resolved"] == 0
+    await triage.sweep(world.db)
+    await world.db.execute(
+        "UPDATE executor_triage_recommendations SET followup_at = ? WHERE order_id = ?",
+        ("2026-10-21 00:00:01", first),
+    )
+    await world.db.commit()
+    with monkeypatch.context() as broken:
+        broken.setattr(triage_inbox, "_DIGEST_ROWS_SQL", "SELECT * FROM no_such")
+        await digest.generate_due_digests(
+            world.db, now=datetime(2026, 10, 22, 1, 0, tzinfo=UTC)
+        )
+        await world.db.commit()
+    assert (await _payload_of(world, "2026-10-21"))["state"] == "unavailable"
+    # повторная генерация за те же сутки пропускается; следующие сутки измеряются
+    await digest.generate_due_digests(
+        world.db, now=datetime(2026, 10, 23, 1, 0, tzinfo=UTC)
+    )
+    await world.db.commit()
+    taken = await _payload_of(world, "2026-10-22")
+    assert taken["state"] == "measured" and taken["late"] == 1
+    assert len(taken["outcome_ids"]) == 1
+    # второй раз тот же исход не берётся
+    again = await triage_inbox.digest_sections(
+        world.db, "2026-10-23 00:00:00", "2026-10-24 00:00:00"
+    )
+    assert [s["late"] for s in again.values()] == [0]
+
+
+async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkeypatch):
+    """Старая база (до обеих миграций) с данными: после цепочки есть поля обеих, строки целы."""
+    import aiosqlite
+
+    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
+    from hub.migrations.steps import load_steps
+    from tests.test_db_migrations import _SCHEMA
+
+    steps = load_steps()
+    new = [
+        (n, q)
+        for n, q in steps
+        if n.startswith("rework_on_host") or "followup_action_at" in n
+    ]
+    assert len(new) >= 8, "нет шагов #1947 и #1943"
+    old = [(n, q) for n, q in steps if (n, q) not in new]
+    monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *old])
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await db_module._migrate(conn)
+        await conn.execute("PRAGMA foreign_keys = OFF")
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (7, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO executor_hosts (name, principal_id, public_key_pem) "
+            "VALUES ('k8', 1, 'pem')"
+        )
+        await conn.execute("INSERT INTO executor_runs (id, task_id) VALUES (9, 7)")
+        await conn.execute(
+            "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
+            "state, expires_at) VALUES ('k8', 7, 1, 9, 'closed', '2030-01-01')"
+        )
+        await conn.execute(
+            "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+            "triage_class, action, followup, followup_at, owner_verdict) "
+            "VALUES (1, 7, 1, 'to_owner', 'new_order', '2026-10-20 01:00:00', 'accepted')"
+        )
+        await conn.commit()
+        await conn.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *steps])
+        await db_module._migrate(conn)
+        cols = {
+            r["name"]
+            for r in await conn.execute_fetchall(
+                "PRAGMA table_info(executor_triage_recommendations)"
+            )
+        }
+        assert {"followup_action_at", "verdict_revision", "findings_count"} <= cols
+        rows = await conn.execute_fetchall(
+            "SELECT order_id, action, followup, followup_at, owner_verdict, "
+            "followup_action_at FROM executor_triage_recommendations"
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "to_owner", "new_order", "2026-10-20 01:00:00", "accepted", None)
+        ]
+    finally:
+        await conn.close()
