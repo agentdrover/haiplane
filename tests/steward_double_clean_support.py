@@ -82,6 +82,7 @@ async def add_report(
     incomplete: bool | None = False,
     self_reviewed: bool = False,
     carried_from: int | None = None,
+    evidence: bool = True,
 ) -> int:
     """Отчёт ревью; ``pinned`` - с пином, проверенным хабом (#1985)."""
     review_id = await repo.insert_machine_review(
@@ -90,11 +91,11 @@ async def add_report(
         submission_generation=generation,
         harness_skill="multi-agent-review",
         harness_version=1,
-        agent_count=3,
+        agent_count=3 if evidence else None,
         duration_ms=1000,
         orchestrator="cursor",
         model="grok-4.6",
-        raw_count=len(confirmed),
+        raw_count=len(confirmed) if evidence else 0,
         findings_confirmed=json.dumps(list(confirmed)),
         findings_rejected="[]",
         unresolved=json.dumps(list(unresolved)),

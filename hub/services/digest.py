@@ -356,6 +356,12 @@ def self_approvals_state(payload: dict) -> str:
     return MEASURED if SELF_APPROVALS_KEY in payload else UNMEASURED
 
 
+def _double_clean_count(self_approvals: list[dict]) -> dict[str, int]:
+    """Число одобрений по двойной чистоте (#1986); пусто, когда их нет - ноль не пишем."""
+    n = sum(1 for a in self_approvals if a.get("double_clean"))
+    return {DOUBLE_CLEAN_KEY: n} if n else {}
+
+
 def _is_self_approval(event: dict, payload: dict) -> bool:
     """Применённое стюардом одобрение — вердикт с актором steward, а не совет.
 
@@ -636,8 +642,6 @@ async def generate_due_digests(
         # happens to exist. The reminder's dependable channel is the events
         # feed the poller writes; the digest is the summary, not the alarm.
         human_queue = await repo.human_queue_reminders_between(db, day_start, day_end)
-        clean = sum(1 for a in self_approvals if a.get("double_clean"))
-        clean_count = {DOUBLE_CLEAN_KEY: clean} if clean else {}  # #1986: 0 не пишем
         payload = {
             "date": day,
             "project": project["slug"],
@@ -650,7 +654,7 @@ async def generate_due_digests(
             "escalations": escalations,
             STEWARD_SECTION_KEY: steward,
             SELF_APPROVALS_KEY: self_approvals,
-            **clean_count,
+            **_double_clean_count(self_approvals),
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -676,7 +680,7 @@ async def generate_due_digests(
                 "escalations": len(escalations),
                 "steward_judgements": len(steward),
                 "steward_self_approvals": len(self_approvals),
-                **clean_count,
+                **_double_clean_count(self_approvals),
                 "audit_sample": sample,
             },
         )

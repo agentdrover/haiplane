@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import RiskClass
 from hub.services import ci_trust, project_policy
+from hub.services.orchestration import report_has_evidence
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,14 @@ def _flaws(row: dict[str, Any], sha: str) -> list[tuple[str, str]]:
         out.append(("pin", "нет пина, проверенного хабом, на эту сдачу и sha"))
     if row.get("carried_from_review_id") is not None:
         out.append(("carried", "отчёт перенесён с прежней сдачи, прогона не было"))
+    elif not report_has_evidence(row):
+        out.append(
+            (
+                "no_data",
+                "отчёт без данных: ноль кандидатов, находок и токенов - "
+                "исполнения не видно (#750)",
+            )
+        )
     if row.get("principal_id") is None:
         out.append(("identity", "принципал отчёта неизвестен"))
     if row.get("self_reviewed") != 0:

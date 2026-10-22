@@ -132,6 +132,8 @@ _BREAKS = [
     ("ci_gap", "ci", {"ci": "fail"}),
     ("class_above_double_clean", "class", {"risk": "R4"}),
     ("advisor_object", "advisor", {"concur": "object"}),
+    ("empty_extra_report", "no_data", {"extra": {"evidence": False}}),
+    ("empty_main_report", "no_data", {"main": {"evidence": False}}),
     ("carried_report", "carried", {"main": {"carried_from": 1}}),
 ]
 
