@@ -36,7 +36,7 @@
 </div>
 {% else %}
 <div class="task-action-note task-action-note--warning">
-    Дифф не показан: {{ diff.reason }}
+    {% if diff.state == 'workspace_missing' %}{{ diff.reason }}{% else %}Дифф не показан: {{ diff.reason }}{% endif %}
     {% if diff.fallback_command %}
     <div class="u-text-muted">Прочитать самостоятельно:
         <code class="code-sm">{{ diff.fallback_command }}</code>
