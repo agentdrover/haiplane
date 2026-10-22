@@ -68,16 +68,20 @@ async def test_accepted_task_is_delivered_after_green_ci(db, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "scenario, state, outcome",
+    "scenario, state, outcome, gate_calls",
     [
-        ("author_push", "closed", "stale_approval"),
-        ("generation_changed", "closed", "generation_changed"),
-        ("approval_not_current", "closed", "approval_not_current"),
-        ("red_ci", "closed", "ci_failed"),
-        ("ci_running", "armed", ""),
+        ("author_push", "closed", "stale_approval", 2),
+        ("generation_changed", "closed", "generation_changed", 1),
+        ("approval_not_current", "closed", "approval_not_current", 1),
+        ("task_reopened", "closed", "task_not_completed", 1),
+        ("pr_changed", "closed", "pr_changed", 1),
+        ("red_ci", "closed", "ci_failed", 1),
+        ("ci_running", "armed", "", 1),
     ],
 )
-async def test_retry_never_bypasses_the_gate(db, monkeypatch, scenario, state, outcome):
+async def test_retry_never_bypasses_the_gate(
+    db, monkeypatch, scenario, state, outcome, gate_calls
+):
     rig = await armed_rig(db, monkeypatch)
     if scenario == "author_push":
         rig.head_moved_to("author0push")
@@ -96,6 +100,12 @@ async def test_retry_never_bypasses_the_gate(db, monkeypatch, scenario, state, o
     elif scenario == "approval_not_current":
         await repo.update_task(db, rig.task_id, review_verdict="changes_requested")
         await db.commit()
+    elif scenario == "task_reopened":
+        await repo.update_task(db, rig.task_id, status="running")
+        await db.commit()
+    elif scenario == "pr_changed":
+        await repo.update_task(db, rig.task_id, pr_number=78)
+        await db.commit()
     elif scenario == "red_ci":
         rig.ci(FAILED)
     else:
@@ -107,6 +117,8 @@ async def test_retry_never_bypasses_the_gate(db, monkeypatch, scenario, state, o
     rig.git.merge_pr.assert_not_awaited()
     row = await rig.retry_row()
     assert (row["state"], row["outcome"]) == (state, outcome)
+    refusals = (await _feed(rig)).count("Доставка по решению человека НЕ выполнена")
+    assert refusals == gate_calls, "до гейта доходит только то, что стоп не ловит сам"
     stops = await rig.events("accepted_delivery_retry_stopped")
     if state == "closed":
         assert len(stops) == 1, "стоп говорит один раз: событие и алерт"
