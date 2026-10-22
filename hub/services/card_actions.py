@@ -350,10 +350,20 @@ def _get(obj: Any, key: str) -> Any:
 
 
 def for_page(
-    row: Mapping[str, Any], view: Mapping[str, Any], machine_review: Any
+    row: Mapping[str, Any],
+    view: Mapping[str, Any],
+    machine_review: Any,
+    brief: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Панель и листы для страницы: рекомендация и риски берутся у вида C2."""
+    """Панель и листы для страницы.
+
+    Рекомендация - у вида C2. Риски для ВЫБОРА листа - исходные риски справки
+    (``brief``): вид C2 сокращает повторы с «почему» и мог бы убрать высокий
+    риск целиком, а лист принятия тогда оказался бы обычным. Сокращение - только
+    для показа. Справки нет - риски вида (иного источника нет).
+    """
     recommend = str((view.get("recommend") or {}).get("action") or "")
+    risks = (brief.get("risks") if brief else None) or view.get("risks") or []
     # Находки прошлой сдачи листу не предлагаются: вердикт пишется на новую.
     current = bool(_get(machine_review, "is_current"))
     confirmed = (_get(machine_review, "findings_confirmed") or []) if current else []
@@ -361,6 +371,4 @@ def for_page(
         {k: _get(f, k) for k in ("severity", "title", "file", "line")}
         for f in confirmed
     ]
-    return build(
-        dict(row), recommend=recommend, risks=view.get("risks") or [], findings=findings
-    )
+    return build(dict(row), recommend=recommend, risks=risks, findings=findings)

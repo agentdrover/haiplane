@@ -2952,7 +2952,9 @@ async def _web_task_detail_page(
             "steward_judgement": steward_judgement,
             "decision_brief": decision_brief,
             "card_c2": c2_view,
-            "card_actions": card_actions.for_page(dict(row), c2_view, machine_review),
+            "card_actions": card_actions.for_page(
+                dict(row), c2_view, machine_review, decision_brief
+            ),
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,
