@@ -516,3 +516,128 @@ def test_the_steward_run_refusal_payload_names_the_kind_not_the_path():
     )
     assert _provider_answer(body) == "HTTP 400 usage_limit_exceeded"
     assert _provider_answer(None) == "ответа не было"
+
+
+_GATE_ERROR = (
+    f"merge_gate_error: PermissionError: [Errno 13] Permission denied: '{SECRET}'"
+)
+
+
+async def test_a_stored_merge_gate_event_reaches_the_inbox_without_its_path(
+    db: aiosqlite.Connection,
+):
+    """(a) событие needs_decision с merge_gate_error: last_stall чистит detail."""
+    from hub.services.inbox_decisions import _decide_grounds
+    from hub.services.review_queue import last_stall
+
+    task_id = await _bare_task(db, "needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task_id,
+        actor="hub",
+        payload={"reason": "merge_gate", "detail": _GATE_ERROR, "via": "poller"},
+    )
+    await db.commit()
+    reason, _at = await last_stall(db, task_id, "")
+    assert LEAK not in reason and "PermissionError" in reason
+    grounds = await _decide_grounds(db, {"id": task_id, "status_entered_at": ""})
+    assert LEAK not in grounds
+    stored = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE task_id=?", (task_id,)
+    )
+    assert SECRET in dict(stored[0])["payload"], "в базе payload как записан"
+
+
+async def test_the_events_feed_serves_payloads_without_paths_and_keeps_the_rest(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """(b) /api/events и hub_wait_events: старое событие с путём; поля целы."""
+    task_id = await _bare_task(db, "review")
+    payload = {
+        "reason": "judge_unlaunchable",
+        "retryable": True,
+        "detail": f"без кода (PermissionError: [Errno 13] '{SECRET}')",
+        "model": "grok",
+    }
+    await repo.insert_event(
+        db, kind="steward_run_refused", task_id=task_id, actor="hub", payload=payload
+    )
+    await db.commit()
+    shown = (await client.get("/api/events?since=0")).json()
+    event = [e for e in shown["events"] if e["kind"] == "steward_run_refused"][0]
+    assert LEAK not in json.dumps(event, ensure_ascii=False)
+    assert event["task_id"] == task_id and event["actor"] == "hub"
+    assert event["payload"]["reason"] == "judge_unlaunchable"
+    assert event["payload"]["retryable"] is True and event["payload"]["model"] == "grok"
+    assert "PermissionError" in event["payload"]["detail"]
+
+    async def api_get(path: str, *_a: Any, **_k: Any) -> Any:
+        resp = await client.get(path)
+        assert resp.status_code == 200, (path, resp.text[:300])
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", api_get)
+    waited = await mcp_server.hub_wait_events(since=0, wait=0)
+    assert LEAK not in repr(waited) and "steward_run_refused" in repr(waited)
+    raw = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='steward_run_refused'"
+    )
+    assert SECRET in dict(raw[0])["payload"], "в базе payload как записан"
+
+
+async def test_an_old_executor_not_launched_alert_is_read_without_its_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """(c) «Исполнитель НЕ запущен: …» записан прежним executor_launch."""
+    task_id = await _bare_task(db, "running")
+    old = (
+        "Исполнитель НЕ запущен: ответ на создание агента не дошёл: "
+        f"PermissionError: [Errno 13] Permission denied: '{SECRET}'."
+    )
+    await repo.add_task_update(db, task_id, "hub", "alert", old)
+    await db.commit()
+    seen = await _surfaces_of_feed(client, monkeypatch, task_id)
+    for name, text in seen.items():
+        assert LEAK not in text, f"{name}: старый алерт с путём"
+    assert "Исполнитель НЕ запущен" in seen["api updates"]
+
+
+async def _surfaces_of_feed(client, monkeypatch, task_id: int) -> dict[str, str]:
+    async def api_get(path: str, *_a: Any, **_k: Any) -> Any:
+        resp = await client.get(path)
+        assert resp.status_code == 200, (path, resp.text[:300])
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", api_get)
+    out = {
+        "card html": (await client.get(f"/tasks/{task_id}")).text,
+        "api updates": (await client.get(f"/api/tasks/{task_id}/updates")).text,
+        "api task": (await client.get(f"/api/tasks/{task_id}")).text,
+        "mcp status": repr(await mcp_server.hub_task_status(task_id, updates=-1)),
+        "mcp status full": repr(
+            await mcp_server.hub_task_status(task_id, updates=-1, full=True)
+        ),
+    }
+    return out
+
+
+async def test_the_other_alerts_that_embed_an_exception_text_are_read_clean(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Алерты хаба с {exc}/{detail} из форджа и ОС, записанные до исправления."""
+    task_id = await _bare_task(db, "running")
+    for text in (
+        f"Доставка отложена: PR #7 — merge_gate_error: OSError '{SECRET}'. ждём",
+        f"Доставка не состоялась: PR #7 — {_GATE_ERROR}. Исправьте",
+        f"Ревью одобрено, но PR #7 не доставлен — {_GATE_ERROR}. Решение за человеком",
+        f"Доставка по решению человека НЕ выполнена: {_GATE_ERROR}. Условия те же",
+        f"Уборка worktree не удалась: PermissionError '{SECRET}'. Сдача не прервана.",
+        f"PR #7 влит, но рабочий каталог не возвращён на базовую ветку: '{SECRET}'",
+        f"Developer-agent dispatch unavailable: OSError '{SECRET}'",
+    ):
+        await repo.add_task_update(db, task_id, "hub", "alert", text)
+    await db.commit()
+    seen = await _surfaces_of_feed(client, monkeypatch, task_id)
+    for name, text in seen.items():
+        assert LEAK not in text, f"{name}: алерт хаба с путём"

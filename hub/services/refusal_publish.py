@@ -43,6 +43,33 @@ _RELATED_ALERT = re.compile(
     r"\[переспрос ревью(?: исчерпан)?: сдача \d+\]|Заказ ревьюера "
 )
 
+#: Начала других алертов ХАБА, в текст которых попадает ``Refusal.detail`` или
+#: ``str(exc)`` из форджа, git и ОС (#2006, раунд 3). Список найден поиском по
+#: коду f-строк алертов с ``{exc}``/``{detail}``/``{reason}``; новый такой алерт
+#: добавляется сюда, иначе его ЗАПИСАННЫЙ текст остаётся с путём.
+#: * executor_launch.py — «Исполнитель НЕ запущен: {причина}» (в старых записях
+#:   причина несёт ``Refusal.detail``);
+#: * orchestration.py — «Доставка отложена», «Доставка не состоялась» ({detail}
+#:   отказа merge-гейта: ``merge_gate_error: {exc}``);
+#: * delivery_writes.py — «Ревью одобрено, но PR … не доставлен»;
+#: * lifecycle.py, accepted_delivery_retry.py — «Доставка по решению человека …»,
+#:   «Автоповтор остановлен», «Уборка worktree не удалась: {exc}»;
+#: * poller.py — «PR #N влит, но рабочий каталог не возвращён …: {exc}»;
+#: * orchestration.py — «Done report NOT completed», «Developer-agent dispatch
+#:   unavailable: {error}».
+_FEED_ALERT_STARTS: tuple[str, ...] = (
+    "Исполнитель НЕ запущен",
+    "Доставка отложена",
+    "Доставка не состоялась",
+    "Доставка по решению человека",
+    "Ревью одобрено, но PR",
+    "Автоповтор остановлен",
+    "Уборка worktree не удалась",
+    "Developer-agent dispatch unavailable",
+    "Done report NOT completed",
+)
+_PR_MERGED_ALERT = re.compile(r"PR #\d+ влит, но рабочий каталог")
+
 _UNNAMED = "причина не названа"
 
 
@@ -67,8 +94,10 @@ def public_text(text: str) -> str:
 
 def is_refusal_alert(content: str) -> bool:
     """Алерт хаба об отказе облачного ревьюера (по началу текста)."""
-    return content.startswith(REFUSAL_ALERT_PREFIXES) or bool(
-        _RELATED_ALERT.match(content)
+    return (
+        content.startswith(REFUSAL_ALERT_PREFIXES)
+        or content.startswith(_FEED_ALERT_STARTS)
+        or bool(_RELATED_ALERT.match(content) or _PR_MERGED_ALERT.match(content))
     )
 
 
