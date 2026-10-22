@@ -14,6 +14,7 @@ import pytest
 from fastapi import HTTPException
 
 from hub import db as db_module
+from hub import repository as repo
 from hub.models import ReviewVerdict, TaskReviewVerdict
 from hub.services.lifecycle import record_review_verdict
 from hub.services.steward_apply import apply_refusals, ceiling_scope
@@ -270,6 +271,30 @@ async def test_the_record_and_the_audit_commit_or_roll_back_together(db, monkeyp
     outcome, detail = await apply_self_approval(db, case.task_id, 1)
     assert outcome == APPLIED, detail
     assert (await verdict_events(db, case.task_id))[0]["payload"]["double_clean"]
+
+
+async def test_a_stale_audit_never_rides_on_a_verdict_that_did_not_need_it(
+    db, monkeypatch
+):
+    """Аудит прошлого прохода шлюза не попадает в запись, которой исключение не нужно."""
+    from hub.services.steward_apply import applied_double_clean, ceiling_gate
+
+    case = await build_case(db, monkeypatch, "dc-race-stale-audit")
+
+    async with ceiling_scope():
+        assert await apply_refusals(db, case.task_id, 1) == []
+        assert await ceiling_gate(db, case.task_id, "steward_approve_max_class") is None
+        assert applied_double_clean(case.task_id) is not None
+        await set_policy(db, case.project_id, {"verdict": "steward"})  # потолка нет
+        await _write(db, case.task_id)
+
+    assert await verdict_of(db, case.task_id) == "approved"
+    payload = (await verdict_events(db, case.task_id))[0]["payload"]
+    assert "double_clean" not in payload
+    line = "\n".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, case.task_id)
+    )
+    assert "двойной чистоте" not in line.lower()
 
 
 # ---------------------------------------------------------------------------
