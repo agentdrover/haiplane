@@ -385,3 +385,51 @@ async def test_work_under_the_lock_does_not_depend_on_other_projects(
     await _generate(world.db, _day(1))
     # каждый исход определяется под локом не более одного раза (старо: проекты x исходы)
     assert 0 < under_lock[0] <= total, under_lock[0]
+
+
+async def test_a_recommendation_inserted_with_an_outcome_is_queued(world):
+    """Триггер заводит очередь и при INSERT рекомендации с готовым исходом."""
+    _, task_id = await _outcome(world, "вставка")
+    await world.db.execute("PRAGMA foreign_keys = OFF")
+    await world.db.execute(
+        "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+        "triage_class, action, followup, followup_at) "
+        "VALUES (777777, ?, 1, 'to_owner', 'new_order', '2026-10-20 05:00:00')",
+        (task_id,),
+    )
+    await world.db.commit()
+    await world.db.execute("PRAGMA foreign_keys = ON")
+    queued = await _rows(
+        world.db,
+        f"SELECT l.recommendation_id FROM {LINKS} l JOIN "
+        "executor_triage_recommendations r ON r.id = l.recommendation_id "
+        "WHERE l.digest_id IS NULL AND r.order_id = 777777",
+    )
+    assert len(queued) == 1
+
+
+async def test_closing_an_already_counted_outcome_aborts_the_digest(world):
+    """Связь с занятым исходом не перезаписывается и валит транзакцию записи."""
+    rec_id, _ = await _outcome(world, "занят")
+    await _generate(world.db, _day(1))
+    with pytest.raises(triage_inbox.OutcomeAlreadyCounted):
+        await triage_inbox.record_links(world.db, 999, [(rec_id, "late")])
+    await world.db.rollback()
+    row = (await _counted_links(world.db))[0]
+    assert row["digest_id"] != 999
+
+
+async def test_a_candidate_moved_to_another_project_is_not_taken(world):
+    """Между пробой и локом задача ушла в другой проект: старый проект её не берёт."""
+    rec_id, task_id = await _outcome(world, "ушла")
+    start, end = f"{DAY} 00:00:00", "2026-10-21 00:00:00"
+    probe = await triage_inbox.probe_sections(world.db, start, end)
+    mine = (await repo.resolve_project_for_task(world.db, task_id))["id"]
+    assert probe.candidates[mine] == [rec_id]
+    other = await repo.create_project(world.db, slug="away-1997", name="away-1997")
+    await repo.update_task(world.db, task_id, project_id=other)
+    await world.db.commit()
+    section, links = await triage_inbox.project_section(
+        world.db, mine, start, end, probe
+    )
+    assert links == [] and section["resolved"] == 0
