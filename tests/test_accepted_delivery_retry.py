@@ -131,8 +131,6 @@ async def test_retry_never_bypasses_the_gate(
 async def test_retry_limits_survive_restart(db, db_dsn, monkeypatch):
     spare = [await approved_task(db) for _ in range(2)]  # до первого стенда
     rig = await armed_rig(db, monkeypatch)
-    first_armed_at = (await rig.retry_row())["armed_at"]
-
     for n in range(1, 7):  # шесть попыток; голова каждый раз уходит вперёд
         sha = f"base0moved0{n}"
         rig.head_moved_to(sha, behind_base=True)
@@ -142,12 +140,19 @@ async def test_retry_limits_survive_restart(db, db_dsn, monkeypatch):
             "base_updated повторился"
         )
         assert rig.git.update_pr_branch.await_count == 1 + n
-    ok, reason, _ = await rig.deliver(
-        "registry_deliver"
-    )  # повторный base_updated вручную
-    assert not ok
-    assert (await rig.retry_row())["armed_at"] == first_armed_at, "срок не сброшен"
-    assert (await rig.retry_row())["attempts"] == 6, "ручной отказ не вооружает заново"
+    await db.execute(
+        "UPDATE accepted_delivery_retries SET armed_at=datetime('now', '-5 hours')"
+        " WHERE task_id=?",
+        (rig.task_id,),
+    )
+    await db.commit()
+    first_armed_at = (await rig.retry_row())["armed_at"]
+    rig.head_moved_to("base0moved0m", behind_base=True)
+    ok, reason, _ = await rig.deliver("registry_deliver")  # base_updated вручную
+    assert not ok and reason.startswith("base_updated"), reason
+    again = await rig.retry_row()
+    assert again["armed_at"] == first_armed_at, "срок не сброшен"
+    assert again["attempts"] == 6, "ручной отказ не вооружает заново"
 
     before = rig.git.update_pr_branch.await_count
     rig.head_moved_to("base0moved0x", behind_base=True)
