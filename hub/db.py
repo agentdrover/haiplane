@@ -523,6 +523,27 @@ async def write_transaction(db: aiosqlite.Connection):
         await db.commit()
 
 
+@asynccontextmanager
+async def committed_if_own(db: aiosqlite.Connection):
+    """Запись, которую нужно закоммитить ДО сетевого вызова (#2001).
+
+    Неявная транзакция открывается первой записью и держит write-лок до
+    commit: сетевой вызов за незакоммиченной записью выставляет соседних
+    писателей на «database is locked». Коммитит её тот, кто её открыл, то есть
+    запись при чистом соединении. Если транзакция была открыта ДО записи, она
+    чужая: вложенный блок её не коммитит и не откатывает, владелец решит сам.
+    """
+    own = not db.in_transaction
+    try:
+        yield
+    except BaseException:
+        if own:
+            await db.rollback()
+        raise
+    if own and db.in_transaction:
+        await db.commit()
+
+
 async def bootstrap(db: aiosqlite.Connection) -> None:
     """Схема, миграции и seed — ровно один раз, на подъёме приложения."""
     await db.executescript(_SCHEMA)
