@@ -42,7 +42,7 @@ async def test_sheet_answer_names_the_live_status_not_a_promise(client: AsyncCli
     form, data = sheet_form(page, sheet)
     resp = await client.post(
         form.attrs["action"],
-        data={**data, "verdict": "approved", "comments": "ok"},
+        data={**data, "verdict": "approved", "comments": "ok", "confirm_risk": "1"},
         headers=SHEET_HEADERS,
     )
     assert resp.status_code == 200, resp.text
@@ -67,3 +67,62 @@ async def test_sheet_refusal_is_visible_text_and_keeps_the_record_clean(
     assert 'class="c2-sheet-note"' in resp.text and "<script" not in resp.text
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["latest_review"] is None
+
+
+async def _risk_sheet(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    form, data = sheet_form(page, "sh-ok-risk")
+    assert data["risk_ack"] == "required"
+    return task_id, form, {**data, "verdict": "approved"}
+
+
+async def test_high_risk_accept_needs_the_tick_on_the_server(client: AsyncClient):
+    task_id, form, data = await _risk_sheet(client)
+    resp = await client.post(
+        form.attrs["action"],
+        data={**data, "comments": "риск приемлем"},
+        headers=SHEET_HEADERS,
+    )
+    assert resp.status_code == 422 and "подтвержд" in resp.text
+    assert 'class="c2-sheet-note"' in resp.text
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
+
+
+async def test_high_risk_accept_needs_a_real_reason(client: AsyncClient):
+    task_id, form, data = await _risk_sheet(client)
+    resp = await client.post(
+        form.attrs["action"],
+        data={**data, "confirm_risk": "1", "comments": "   "},
+        headers=SHEET_HEADERS,
+    )
+    assert resp.status_code == 422 and "причин" in resp.text
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"] is None
+
+
+async def test_high_risk_accept_records_confirmation_and_reason(client: AsyncClient):
+    task_id, form, data = await _risk_sheet(client)
+    resp = await client.post(
+        form.attrs["action"],
+        data={
+            **data,
+            "confirm_risk": "1",
+            "comments": "  риск приемлем: флаг выключен ",
+        },
+        headers=SHEET_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    review = (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"]
+    assert review["verdict"] == "approved"
+    assert "риск приемлем: флаг выключен" in review["comments"]
+    assert "высокий риск" in review["comments"].lower()
+
+
+async def test_plain_verdicts_do_not_need_the_risk_tick(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "ok"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
