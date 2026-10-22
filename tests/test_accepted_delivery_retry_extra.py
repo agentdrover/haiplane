@@ -302,3 +302,21 @@ async def test_a_waiting_retry_is_not_an_alert(db, monkeypatch):
         await scan_completed_deliveries(db)
     assert (await rig.retry_row())["attempts"] == 3
     assert await alerts() == before, "base_updated из повтора - не тревога"
+
+
+@pytest.mark.parametrize(
+    "reason, phrase",
+    [
+        ("base_updated: ветка отстала", "мерж ещё не состоялся"),
+        ("merge_unconfirmed: посадка не подтверждена", "исход мержа не подтверждён"),
+        ("merge_commit_unverified: PR уже влит", "исход мержа не подтверждён"),
+        ("merge_refusal_unverified: исход неизвестен", "исход мержа не подтверждён"),
+    ],
+)
+def test_the_waiting_line_does_not_claim_a_merge_that_may_have_happened(reason, phrase):
+    from hub.services.accepted_delivery_retry import RETRY_VIA, refusal_line
+
+    kind, text = refusal_line(RETRY_VIA, reason)
+    assert kind == "status" and phrase in text
+    if "неподтвержд" in phrase or "не подтверждён" in phrase:
+        assert "не состоялся" not in text

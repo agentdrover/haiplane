@@ -102,9 +102,24 @@ def refusal_line(via: str, reason: str) -> tuple[str, str]:
     автоповтора ``base_updated`` и прочие временные причины гейта - штатное
     ожидание, 6 попыток дали бы 6 ложных тревог; всё иное остаётся alert.
     """
-    from hub.services.orchestration import TRANSIENT_GATE_PREFIXES
+    from hub.services.orchestration import (
+        MERGE_COMMIT_UNVERIFIED_PREFIX,
+        MERGE_REFUSAL_UNVERIFIED_PREFIX,
+        MERGE_UNCONFIRMED,
+        TRANSIENT_GATE_PREFIXES,
+    )
 
     if via == RETRY_VIA and (reason or "").startswith(TRANSIENT_GATE_PREFIXES):
+        unverified = (
+            MERGE_UNCONFIRMED,
+            MERGE_COMMIT_UNVERIFIED_PREFIX,
+            MERGE_REFUSAL_UNVERIFIED_PREFIX,
+        )
+        if reason.startswith(unverified):  # мерж мог состояться: не «ещё нет»
+            return "status", (
+                f"Автоповтор доставки: исход мержа не подтверждён — {reason}; "
+                "проверим на следующем проходе."
+            )
         return "status", f"Автоповтор доставки: мерж ещё не состоялся — {reason}."
     return "alert", (
         f"Доставка по решению человека НЕ выполнена: {reason}. Условия те же, что "
