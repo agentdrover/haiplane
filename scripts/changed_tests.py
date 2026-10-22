@@ -137,9 +137,8 @@ def select(root: Path, changed: list[str]) -> dict[str, list[str]]:
 
 def unmapped(root: Path, changed: list[str]) -> list[str]:
     """Changed non-Python paths that no test mentions: the selection does not cover them."""
-    mentioned = set(
-        readers_of(root, [p for p in changed if not p.endswith(".py")]).values()
-    )
+    targets = [p for p in changed if not p.endswith(".py")]
+    mentioned = {t for hits in readers_of(root, targets).values() for t in hits}
     return [
         p
         for p in changed
