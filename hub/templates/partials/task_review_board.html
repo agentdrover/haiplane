@@ -40,7 +40,7 @@
     <div class="task-review-tile task-review-tile--warn">
         <div class="task-review-tile-label">Свидетельства</div>
         <div class="task-review-tile-value">не собраны</div>
-        <div class="task-review-tile-sub">бриф по этой сдаче не построен — проверять не по чему</div>
+        <div class="task-review-tile-sub">{% if brief_failure %}бриф не собран: {{ brief_failure }}{% else %}бриф по этой сдаче не построен — проверять не по чему{% endif %}</div>
     </div>
     {% elif sr %}
     {# #1648: задача-состояние. Плитки считаются из доказательств поколения; про
@@ -536,6 +536,14 @@
         {% if machine_review.self_reviewed %}
         <span class="badge badge-failed">саморевью</span>
         {% endif %}
+        {# #1985: пин отчёта - сдача, которую ревьюер заявил как прочитанную, и
+           сверил ли её хаб с журналом сдач при записи. Без пина отчёт не
+           доказывает, какой код он смотрел. #}
+        {% if machine_review.pin_verified %}
+        <span class="badge badge--xs">пин проверен: сдача #{{ machine_review.submission_generation }}, {{ machine_review.reviewed_sha[:12] }}</span>
+        {% else %}
+        <span class="badge badge--xs">пин не заявлен: какую сдачу смотрели, не доказано</span>
+        {% endif %}
         {# #1012: одобрить можно, не заметив, что находки никто не
            разметил — так #987 и уехал в прод. Гейт остаётся
            человеческим; он просто перестаёт молчать. #}
@@ -584,6 +592,9 @@
         {% if machine_review.lost_dimensions %}
         <span class="badge badge-failed">потеряно измерений: {{ machine_review.lost_dimensions|join(', ') }}</span>
         {% endif %}
+        {%- if machine_review.ac_tests_unread %}
+        <span class="badge badge-failed">тест AC не прочитан: {{ machine_review.ac_tests_unread|join(', ') }}</span>
+        {%- endif %}
         {% if machine_review.unresolved %}
         <details>
             <summary class="project-edit-summary">unresolved — НЕ опровергнуты, никто не смог судить</summary>

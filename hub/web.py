@@ -47,6 +47,7 @@ from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
+from hub.services import card_c2
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import effective_policy, policy_change, project_policy
 from hub.services.project_policy import FREEZE_REFUSED
@@ -2882,9 +2883,14 @@ async def _web_task_detail_page(
     # the coverage verdict over them — assembled by the SAME builder that
     # answers /review-brief. Two readers, one assembly: the card and the brief
     # cannot drift apart because there is nothing to keep in step.
+    from hub.services.brief_failure import BriefFailure
     from hub.services.review_brief import gate_evidence
 
     evidence = await gate_evidence(db, dict(row))
+    # #1622: a failed assembly says why; it is not the same as "no gate".
+    brief_failure = evidence.reason if isinstance(evidence, BriefFailure) else ""
+    if isinstance(evidence, BriefFailure):
+        evidence = None
     review_in_flight = await inflight_view(db, dict(row))
 
     steward_judgement = (
@@ -2936,11 +2942,15 @@ async def _web_task_detail_page(
             "delivered_sha": delivered_sha,
             "delivery": delivery,
             "evidence": evidence,
+            "brief_failure": brief_failure,
             "review_in_flight": review_in_flight,
             "change_map": change_map,
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
             "decision_brief": decision_brief,
+            "card_c2": await card_c2.card_context(
+                db, dict(row), task, decision_brief, delivery, review_in_flight
+            ),
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,

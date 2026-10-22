@@ -54,13 +54,13 @@
     {
       "path": "hub/models.py",
       "measured": 4992,
-      "max": 5242,
+      "max": 5249,
       "removed_by": "unclaimed"
     },
     {
       "path": "hub/poller.py",
       "measured": 2714,
-      "max": 2850,
+      "max": 2851,
       "removed_by": "unclaimed"
     },
     {
@@ -90,7 +90,7 @@
     {
       "path": "hub/services/orchestration.py",
       "measured": 6595,
-      "max": 6925,
+      "max": 6935,
       "removed_by": "unclaimed"
     },
     {

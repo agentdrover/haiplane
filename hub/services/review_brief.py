@@ -64,6 +64,7 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
+from hub.services.brief_failure import BriefFailure, failure_from
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
@@ -1119,12 +1120,16 @@ async def _late_reads(
     return late
 
 
-async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
+async def gate_evidence(
+    db, task_row: dict[str, Any]
+) -> ReviewBrief | BriefFailure | None:
     """The evidence panel for a task card, or ``None`` when there is no gate.
 
     The card pays for the assembly only where a verdict can be cast. Outside
     those statuses there is nothing to decide, and the panel would cost git
-    work to tell a reader who is not deciding anything.
+    work to tell a reader who is not deciding anything. At the gate a failed
+    assembly is ``BriefFailure`` with its cause, never ``None``: "no gate" and
+    "could not assemble" are different facts (#1622).
     """
     status = task_row.get("status")
     status = getattr(status, "value", status)
@@ -1134,4 +1139,4 @@ async def gate_evidence(db, task_row: dict[str, Any]) -> ReviewBrief | None:
         return await build_review_brief(db, int(task_row["id"]), observe_only=True)
     except Exception as exc:  # noqa: BLE001 - the card must render regardless
         log.warning("evidence panel failed for task #%s: %s", task_row.get("id"), exc)
-        return None
+        return failure_from(exc)

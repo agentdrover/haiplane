@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,53 @@ def _api(*args: Any, **kwargs: Any) -> Any:
     from hub.cli import _api as api
 
     return api(*args, **kwargs)
+
+
+def _print_role_orders(result: Any) -> None:
+    """#1973: role orders of the task as the hub built them; never recomputed here."""
+    for view in (result.get("role_orders") if isinstance(result, dict) else None) or []:
+        if view.get("unavailable"):
+            print(f"Заказы ролей: {view['unavailable']}", file=sys.stderr)
+        else:
+            print(
+                f"Роль: вызван {view.get('label')} (заказ {view.get('id')}, "
+                f"{view.get('state')})",
+                file=sys.stderr,
+            )
+
+
+def print_order_line(result: Any) -> None:
+    """#1941: the line about the last host order for ``oc-hub status``; never recomputed here."""
+    _print_role_orders(result)
+    view = result.get("last_executor_order") if isinstance(result, dict) else None
+    if not isinstance(view, dict):
+        return
+    waiting = view.get("waiting_memory")
+    if view.get("unavailable"):
+        print(f"Заказ хоста: {view['unavailable']}", file=sys.stderr)
+    elif isinstance(waiting, dict) and waiting.get("line"):
+        print(f"Заказ хоста {waiting['line']}", file=sys.stderr)  # #1972: строка хаба
+    elif view.get("after_failed_run"):
+        print(
+            f"После неудачного прогона: класс {view.get('class')} "
+            f"({view.get('class_name')})",
+            file=sys.stderr,
+        )
+
+
+def print_critic_line(result: Any) -> None:
+    """#1953: the last critic order line for ``oc-hub status``; never recomputed here."""
+    view = result.get("critic_order") if isinstance(result, dict) else None
+    if not isinstance(view, dict):
+        return
+    if view.get("unavailable"):
+        print(f"Заказ критика: {view['unavailable']}", file=sys.stderr)
+        return
+    print(
+        f"Заказ критика #{view.get('order_id')}: sha {str(view.get('sha'))[:12]} "
+        f"{view.get('state')}/{view.get('outcome') or '-'}; {view.get('next_step')}",
+        file=sys.stderr,
+    )
 
 
 def cmd_executor_host(args: argparse.Namespace) -> int:

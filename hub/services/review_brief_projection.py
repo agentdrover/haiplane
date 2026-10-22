@@ -200,6 +200,9 @@ def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
             part[f"{name}_count"] = len(value)
         else:
             part[name] = value
+    # #1933: непрочитанные тесты AC названы поимённо - счёт «потеряно измерений»
+    # не скажет, что именно из доказательств AC осталось без чтения.
+    part["ac_tests_unread"] = list(mr.get("ac_tests_unread") or [])
     for name in _DIGEST_LISTS:
         part[name] = _finding_digest(
             mr.get(name) or [], f"machine_review.{name}", "machine_review"
@@ -628,10 +631,20 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
         f"{mr['dispositions_count']}, deferred repeats {mr['deferred_repeats_count']}"
         f", closures {mr['observation_closures_count']}",
     ]
+    if mr["ac_tests_unread"]:
+        lines.append(
+            "  AC TESTS NOT READ by the reviewer: " + "; ".join(mr["ac_tests_unread"])
+        )
     if mr["self_reviewed"]:
         lines.append("  SELF-REVIEWED: the author reviewed their own work")
     elif mr["principal_id"] is None:
         lines.append("  independence NOT established (no reviewer principal recorded)")
+    if mr["pin_verified"]:
+        lines.append("  pin verified: the hub matched the report to its submission")
+    else:
+        lines.append(
+            "  pin NOT verified: the report does not prove which submission it read"
+        )
     if mr["second_door_channel"] or mr["second_door_reason"]:
         lines.append(
             f"  channel: {mr['second_door_channel']} ({mr['second_door_reason']})"

@@ -24,6 +24,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import memory_wait
 from hub.services.return_running import work_signs
 
 log = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ async def _slot_is_about_to_claim(
     if await fetchall(
         db,
         "SELECT 1 FROM executor_orders WHERE executor_run_id = ? "
-        "AND state IN ('pending', 'delivered')",
+        f"AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608 - constant
         (int(run_id),),
     ):
         return True
@@ -121,7 +122,7 @@ async def redeem_conflict(db: aiosqlite.Connection, row: dict[str, Any]) -> str:
         ordered = await fetchall(
             db,
             "SELECT 1 FROM executor_orders WHERE task_id = ? "
-            "AND state IN ('pending', 'delivered', 'redeemed')",
+            "AND state IN ('pending', 'delivered', 'waiting_memory', 'redeemed')",
             (int(task_id),),
         )
         return "по задаче выдан заказ исполнителю на слот" if ordered else ""

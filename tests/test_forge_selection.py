@@ -164,6 +164,8 @@ _FORGE_REACHING = (
     "pr_is_draft",
     "pr_state",
     "release_range",
+    "rerun_failed_jobs",  # #1956
+    "ci_attempt_jobs",  # #1956
 )
 
 

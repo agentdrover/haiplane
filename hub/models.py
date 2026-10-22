@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hub import config
 from hub.cause_task_view import CauseTaskView
-from hub.expected_sha import ExpectedShaMixin
+from hub.expected_sha import ExpectedShaMixin, ReviewPinSubmit, ReviewPinView
 from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
@@ -413,20 +413,20 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
     # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
-    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
-    # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
+    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт.
+    # Читатель: project_policy.deep_reviewer_of.
     "deep_reviewer",
-    # #1653: согласие проекта на локального ревьюера ВМЕСТО отказавшего облака
-    # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
-    # Читатель: project_policy.local_review_fallback_of.
+    # #1653: согласие на локального ревьюера ВМЕСТО отказавшего облака (вторая
+    # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
-    # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
-    # отдельного выката): срок исхода считается от даты мержа. Не гейт и
-    # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
+    "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
+    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
+    "critic_host",
+    # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
+    # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
     "merge_is_delivery",
     # #1589: предупреждения по путям диффа сдачи — список {pattern, text}. Не
-    # гейт, ничего не блокирует и не делегирует. Читатель:
-    # project_policy.path_notices_of.
+    # гейт, ничего не блокирует. Читатель: project_policy.path_notices_of.
     "path_notices",
     # #1591: пары «файл репо на голове релиза → серверная копия» — релиз не
     # сливается, пока копия расходится. Не гейт ревью и ничего не делегирует.
@@ -2721,9 +2721,10 @@ class ProdStateView(BaseModel):
     failure #824 refused to ship.
     """
 
-    # #1420: open release alerts (project, reason, since, minutes) — empty
-    # while every release moves.
+    # #1420: open release alerts (project, reason, since, minutes); empty if all move.
     release_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    # #1973: role orders (active + terminal in 24h); [{"unavailable": ..}] = unread.
+    role_orders: list[dict[str, Any]] = Field(default_factory=list)
     # #1645: can the server reach GitHub — typed fields, see EgressStatus.
     egress: dict[str, Any] = Field(default_factory=dict)
     deployed: dict[str, str] = Field(default_factory=dict)
@@ -3282,8 +3283,7 @@ class TaskView(PlainSummaryView):
     # on purpose: a suggestion is never written into the fact column.
     release_id: int | None = None
     cause_suggestion: "DefectCauseSuggestion | None" = None
-    # #919: what the closed prod defect left behind (kind, ref / reason +
-    # revisit, recorded_by, recorded_at); None = nothing recorded.
+    # #919: what the closed prod defect left behind (kind, ref/reason, revisit..); None = none.
     defect_prevention: dict[str, str] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
@@ -3296,8 +3296,7 @@ class TaskView(PlainSummaryView):
     review_checklist: list[str] = Field(default_factory=list)
     # #1236: имя объявленного живого зонда; "" — не объявлен.
     live_probe: str = ""
-    # #1647: результат работы и способ отката; evidence — доказательства всех
-    # поколений сдачи state-задачи (у commit-задачи None).
+    # #1647: результат работы и откат; evidence — доказательства сдач state-задачи.
     result_kind: str = "commit"
     rollback: str = ""
     evidence: list["TaskEvidenceView"] | None = None
@@ -3306,6 +3305,10 @@ class TaskView(PlainSummaryView):
     lifecycle_hint: str | None = None
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
+    last_executor_order: dict[str, Any] | None = None  # #1941: single read only
+    delivery_rerun: dict[str, Any] | None = None  # #1956: история перезапуска CI
+    role_orders: list[dict[str, Any]] = Field(default_factory=list)  # #1973: card read
+    critic_order: dict[str, Any] | None = None  # #1953: last critic order, one read
     # #836: the wait baseline for THIS submission, set only by
     # submit_for_review. An agent waiting for its verdict has to name the
     # fields it watches and their current values; guessing them from the
@@ -3538,6 +3541,10 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
+    _policy.validate_delivery_fresh_base_rerun(v)
+    from hub.services.project_policy import validate_critic_host
+
+    validate_critic_host(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
@@ -4068,7 +4075,7 @@ class CIIntegrityAnswer(BaseModel):
         return text[: CI_INTEGRITY_NOTE_LIMIT - 1].rstrip() + "…"
 
 
-class MachineReviewSubmit(BaseModel):
+class MachineReviewSubmit(ReviewPinSubmit):
     """Structured multi-agent review report (#381).
 
     Metrics fields (#384) are optional — a client that cannot count
@@ -4366,7 +4373,7 @@ class AuthorAnswerView(BaseModel):
     historical: bool = False
 
 
-class MachineReviewView(BaseModel):
+class MachineReviewView(ReviewPinView):
     id: int
     task_id: int
     submission_generation: int
@@ -4382,8 +4389,7 @@ class MachineReviewView(BaseModel):
     findings_confirmed: list[MachineFinding] = Field(default_factory=list)
     findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
     # None means "never stated", not "complete" — reports written before this
-    # field existed made no such claim, and back-filling false would put words
-    # in their mouth (#549).
+    # field existed made no such claim; back-filling false would invent one (#549).
     incomplete: bool | None = None
     # #1238. Empty means the reviewer never said why — which is where every
     # report written before this field existed sits, and which must never be
@@ -4392,6 +4398,7 @@ class MachineReviewView(BaseModel):
     incomplete_reason: str = ""
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
+    ac_tests_unread: list[str] = Field(default_factory=list)  # #1933, review_oversized
     # Which profile produced this report (#807). Set by the hub from the
     # dispatch, never by the report about itself; empty means no dispatch was
     # behind it, which is NOT the same as a cheap run.

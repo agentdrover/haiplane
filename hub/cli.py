@@ -14,8 +14,14 @@ from typing import Any
 
 from hub import config
 from hub import cli_owner_minutes as om_cli
+from hub import cli_review_verdict as rv_cli
 from hub import expected_sha as expected_sha_cli
-from hub.cli_executor_host import add_executor_host_parsers
+from hub import cli_delivery_rerun as rerun_cli
+from hub.cli_executor_host import (
+    add_executor_host_parsers,
+    print_critic_line,
+    print_order_line,
+)
 from hub.cli_task_fields import (
     _add_result_kind_args,
     add_plain_summary_option,
@@ -872,29 +878,6 @@ def _add_state_submit_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--expected-generation",
-        dest="expected_generation",
-        type=int,
-        default=None,
-        help=(
-            "The submission generation you judged, from the review brief "
-            "(required: state task #1647, commit task #1706)"
-        ),
-    )
-    parser.add_argument(
-        "--supersedes-revision",
-        dest="supersedes_revision",
-        type=int,
-        default=None,
-        help=(
-            "Human only (#1706): replace the verdict that stands, naming its "
-            "revision from the task card"
-        ),
-    )
-
-
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
@@ -910,7 +893,9 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
         return 2
     if not expected_sha_cli.put_expected_sha_cli(body, args):
         return 2
-    result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
+    dry = bool(getattr(args, "dry_run", False))
+    path = f"/api/tasks/{args.task_id}/submit-review" + ("?dry_run=1" if dry else "")
+    result = _api("POST", path, body)
     _print_json(result)
     return 0
 
@@ -976,40 +961,6 @@ def cmd_review_brief(args: argparse.Namespace) -> int:
     payload = answer.structuredContent or {}
     _print_json(payload.get("brief") or payload.get("page") or payload)
     return 2 if "reason" in payload else 0
-
-
-def cmd_review_verdict(args: argparse.Namespace) -> int:
-    body: dict[str, Any] = {"verdict": args.verdict}
-    if args.comments:
-        body["comments"] = args.comments
-    if args.agent:
-        body["agent"] = args.agent
-    if args.findings_json:
-        try:
-            findings = json.loads(args.findings_json)
-        except json.JSONDecodeError as exc:
-            print(f"invalid --findings-json: {exc}", file=sys.stderr)
-            return 2
-        body["findings"] = findings
-    if getattr(args, "create_tasks_for_out_of_scope", False):
-        body["create_tasks_for_out_of_scope"] = True
-    if getattr(args, "expected_generation", None) is None:
-        # #1706: the generation is the brief's, never the live one read here —
-        # a CLI that fills it in judges whatever stands now, which is the
-        # stale command this flag exists to stop.
-        print(
-            "--expected-generation is required: read the brief "
-            f"(oc-hub review-brief {args.task_id}) and repeat the command with "
-            "--expected-generation <submission_generation of the brief>",
-            file=sys.stderr,
-        )
-        return 2
-    body["expected_generation"] = args.expected_generation
-    if getattr(args, "supersedes_revision", None) is not None:
-        body["supersedes_revision"] = args.supersedes_revision
-    result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
-    _print_json(result)
-    return 0
 
 
 def cmd_steward_judgement(args: argparse.Namespace) -> int:
@@ -1119,10 +1070,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     _print_json(result)
     _print_verdict_route(result)
     om_cli.print_line(result)
+    print_order_line(result)
+    rerun_cli.print_line(result)
+    print_critic_line(result)
     return 0
 
 
 cmd_owner_minutes_day = om_cli.cmd_owner_minutes_day
+cmd_review_verdict = rv_cli.cmd_review_verdict
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -2649,6 +2604,16 @@ def build_parser() -> argparse.ArgumentParser:
             '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
         ),
     )
+    p_submit_review.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help=(
+            "Check the submission without recording it (#1975): the same refusal "
+            "as the real one (rc != 0) or would_submit and passed_steps (rc 0). "
+            "A success does not promise that the real submission passes."
+        ),
+    )
     expected_sha_cli.add_expected_sha_option(p_submit_review)
     _done_report_options(p_submit_review)
     _add_state_submit_args(p_submit_review)
@@ -2689,38 +2654,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_verdict_evidence.add_argument("task_id", type=int)
     p_verdict_evidence.set_defaults(func=cmd_verdict_evidence)
 
-    p_review_verdict = sub.add_parser(
-        "review-verdict",
-        help="Record a review verdict; never completes the task",
-    )
-    p_review_verdict.add_argument("task_id", type=int)
-    p_review_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
-    p_review_verdict.add_argument("--comments", default="", help="Review summary")
-    p_review_verdict.add_argument("--agent", default="", help="Reviewer agent name")
-    p_review_verdict.add_argument(
-        "--findings-json",
-        dest="findings_json",
-        default="",
-        help=(
-            "JSON list of findings: "
-            '[{"id":1,"severity":"high","message":"...",'
-            '"scope":"in_scope|out_of_scope","linked_task_id":123}]. '
-            "scope defaults to in_scope; changes_requested requires at "
-            "least one in_scope finding; linked_task_id references the "
-            "follow-up task for out_of_scope findings."
-        ),
-    )
-    p_review_verdict.add_argument(
-        "--create-tasks-for-out-of-scope",
-        dest="create_tasks_for_out_of_scope",
-        action="store_true",
-        help=(
-            "Auto-create DRAFT follow-up tasks for out_of_scope findings "
-            "without linked_task_id (#436); drafts still need human approval"
-        ),
-    )
-    _add_state_verdict_args(p_review_verdict)
-    p_review_verdict.set_defaults(func=cmd_review_verdict)
+    rv_cli.add_parsers(sub)
 
     p_steward_judgement = sub.add_parser(
         "steward-judgement",
@@ -2744,7 +2678,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_steward_judgement.add_argument(
         "--grounds-json",
         default="",
-        help='JSON list of grounds: [{"source":"ci_pinned_sha"}]',
+        help='JSON grounds: [{"source":"ci_pinned_sha","detail":"fact"}], detail needed',
     )
     p_steward_judgement.add_argument(
         "--closures-json",

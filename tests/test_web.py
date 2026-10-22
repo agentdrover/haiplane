@@ -1300,3 +1300,44 @@ async def test_return_to_work_form_for_running_task(client: AsyncClient, db):
     )
     assert resp.status_code == 409 and "job_id" in html.unescape(resp.text)
     assert (await client.get(f"/api/tasks/{jobbed}")).json()["status"] == "running"
+
+
+async def test_gate_card_names_brief_failure_reason(
+    client: AsyncClient, monkeypatch, db
+):
+    # AC-4 (#1622): a brief that failed to assemble is not "no gate". The card
+    # of a task in review names the cause and keeps the decision form; a task
+    # outside the gate gets no false error.
+    from hub.services import review_brief
+
+    task_id = await _web_task_in_review(client)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("git diff застрял")
+
+    monkeypatch.setattr(review_brief, "build_review_brief", _boom)
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert page.status_code == 200
+    assert "бриф не собран: RuntimeError (внутренняя ошибка)" in page.text
+    assert "git diff застрял" not in page.text, "exception text stays in the log"
+    assert "/web-review-verdict" in page.text, "decision form must stay"
+
+    outside = await client.post("/api/tasks", json={"title": "Not at the gate"})
+    quiet = await client.get(f"/tasks/{outside.json()['id']}")
+    assert quiet.status_code == 200
+    assert "бриф не собран" not in quiet.text
+    # The assembler is still broken here: outside the gate it is not even asked,
+    # so no failure object is invented for a task nobody decides on.
+    outside_row = await repo.get_task(db, outside.json()["id"])
+    assert await review_brief.gate_evidence(db, dict(outside_row)) is None
+    gate_row = await repo.get_task(db, task_id)
+    failure = await review_brief.gate_evidence(db, dict(gate_row))
+    assert isinstance(failure, review_brief.BriefFailure)
+
+
+async def test_style_tokens_both_themes():
+    """AC-2 (#1812): каждый цвет из токена и есть в обеих темах (разбор CSS)."""
+    from tests.card_c2_css_support import check_style_tokens_both_themes
+
+    check_style_tokens_both_themes()

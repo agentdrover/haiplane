@@ -5,19 +5,12 @@ from pathlib import Path
 
 from unittest.mock import AsyncMock, patch
 
-import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from hub import config
-from hub.db import (
-    _SCHEMA,
-    _migrate,
-    seed_system_roles,
-    seed_chat_pair_agent,
-    _table_exists,
-)
 from hub.integrations import git_ops as git_ops_mod
+from tests.template_db_support import open_test_db
 from tests.branch_code_support import spawn_spy  # noqa: F401 - shared fixture
 from hub.integrations.noop import (
     NoopDispatch,
@@ -180,15 +173,17 @@ def _forget_gate_merges():
     would read as "the gate already merged this PR" in the next. Same shape
     as ``_forget_pair_delivery_waits`` above.
     """
-    from hub.services import orchestration
+    from hub.services import delivery_rerun, orchestration
 
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
     orchestration._gate_branch_updates.clear()
+    delivery_rerun.forget_in_flight()  # #1956: идущие POST перезапуска тоже по (задача)
     yield
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
     orchestration._gate_branch_updates.clear()
+    delivery_rerun.forget_in_flight()
 
 
 @pytest.fixture(autouse=True)
@@ -255,27 +250,14 @@ def db_dsn(tmp_path: Path) -> str:
 
 
 @pytest.fixture
-async def db(db_dsn):
-    """Соединение к тестовой базе со схемой и миграциями."""
-    # Держатель: пока это соединение открыто, shared-cache база жива. Закрытие
-    # ПОСЛЕДНЕГО соединения к in-memory базе стирает её, поэтому фикстура
-    # закрывается последней — соединения запросов приходят и уходят внутри.
-    conn = await aiosqlite.connect(db_dsn, uri=True)
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA busy_timeout = 5000")
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA foreign_keys = ON")
-    await conn.executescript(_SCHEMA)
-    await _migrate(conn)
-    # #1811: задачи тестов - «старые» для has_plain_summary, иначе каждое
-    # одобрение в наборе требовало бы нового поля. Тесты правила сами
-    # возвращают водяной знак (см. test_readiness).
-    await conn.execute("UPDATE plain_summary_boundary SET max_task_id=999999999")
-    await conn.commit()
-    if await _table_exists(conn, "roles"):
-        await seed_system_roles(conn)
-    if await _table_exists(conn, "principals"):
-        await seed_chat_pair_agent(conn)
+async def db(db_dsn, tmp_path_factory):
+    """Соединение к тестовой базе со схемой и миграциями.
+
+    База — копия шаблона, собранного один раз на воркер (#1958); при подмене
+    сборки тестом (миграции, seed) — прежний полный путь. Устройство и
+    причины: tests/template_db_support.py.
+    """
+    conn = await open_test_db(db_dsn, tmp_path_factory.mktemp("template-db"))
     yield conn
     await conn.close()
 

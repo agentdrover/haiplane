@@ -29,6 +29,27 @@
 {% endif %}
 {% endmacro %}
 
+{% macro timeline_item(u) %}
+                    <article class="task-timeline-item task-timeline-{{ u.kind }}">
+                        <div class="task-timeline-marker"></div>
+                        <div class="task-timeline-body">
+                            <div class="task-timeline-meta">
+                                <span class="badge badge--xs badge-{{ u.kind }}">{{ u.kind }}</span>
+                                {% if u.agent %}<span>{{ u.agent }}</span>{% endif %}
+                                {# Authorship next to the display name (#559):
+                                   the name is whatever the client sent, the
+                                   principal is the fact. #}
+                                {% if u.principal_id %}<span class="badge badge--xs" title="Записано аутентифицированным принципалом">principal #{{ u.principal_id }}</span>
+                                {% elif u.author_kind == 'hub' %}<span class="badge badge--xs" title="Запись сделал сам хаб — принципала нет по природе">hub</span>
+                                {% elif u.author_kind == 'anonymous' %}<span class="badge badge--xs" title="Запрос без аутентификации — принципал неизвестен">без принципала</span>
+                                {% elif u.author_kind == 'legacy' %}<span class="badge badge--xs" title="Записано до появления поля авторства">до учёта авторства</span>{% endif %}
+                                <time>{{ u.created_at }}</time>
+                            </div>
+                            <div class="task-timeline-content u-pre-wrap">{{ u.content }}</div>
+                        </div>
+                    </article>
+{% endmacro %}
+
 <article class="task-detail-page">
     {% if task.breadcrumb %}
     <nav class="breadcrumb task-detail-breadcrumb">
@@ -42,10 +63,8 @@
 
     <header class="task-hero">
         <div class="task-hero-main">
-            <div class="task-kicker">
-                <span>Task #{{ task.id }}</span>
-                {% if task.parent_id %}<a href="/tasks/{{ task.parent_id }}">Parent #{{ task.parent_id }}</a>{% endif %}
-            </div>
+            {# Номер задачи стоит в шапке C2 (#1812): здесь он был бы второй печатью факта. #}
+            {% if task.parent_id %}<div class="task-kicker"><a href="/tasks/{{ task.parent_id }}">Parent #{{ task.parent_id }}</a></div>{% endif %}
             <h1 class="task-hero-title">
                 {% if task.archived %}<span class="badge badge-type-subtask">Archived</span>{% endif %}
                 {{ task.title }}
@@ -82,12 +101,19 @@
     </div>
     {% endif %}
 
+    {% include "partials/card_c2.html" %}
+
+    {# #1812: ответ на действие (ошибка, одноразовый код, отказ, плашка запуска)
+       не должен прятаться в свёрнутом блоке: с обратной связью он раскрыт. #}
+    {% set has_feedback = implementer_error or implementer_code or approve_error or approve_message or review_error or archive_refusal or launch_plaque %}
+    <details class="c2-details" id="card-details" data-c2-section="details"{% if has_feedback %} open{% endif %}>
+    <summary>Подробности</summary>
     <div class="task-detail-layout">
         <main class="task-detail-main">
             {% if task.result_kind != 'state' and task.status.value in ('review', 'running') and task.review_verdict and task.review_verdict_generation == task.submission_generation %}
             {% include "partials/task_verdict_replace.html" %}
             {% endif %}
-            {% if decision_brief %}{% include "partials/decision_brief.html" %}{% endif %}{% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
+            {% if launch_plaque %}<section class="task-content-card" id="launch-plaque-card"><div class="task-card-header"><h2>Запуск исполнителя</h2></div>{% with plaque=launch_plaque, task_id=task.id %}{% include "partials/launch_plaque.html" %}{% endwith %}</section>{% endif %}{% if review_board %}
             {% include "partials/task_review_board.html" %}
 
             <section class="task-content-card task-statement">
@@ -393,28 +419,23 @@
                     {% if task.updates %}<span class="section-count">{{ task.updates | length }}</span>{% endif %}
                 </div>
                 {% if task.updates %}
+                {# #1812: новые сверху; последние 3 видны, остальное в «вся лента». #}
+                {% set feed = task.updates | reverse | list %}
                 <div class="task-timeline">
-                    {% for u in task.updates %}
-                    <article class="task-timeline-item task-timeline-{{ u.kind }}">
-                        <div class="task-timeline-marker"></div>
-                        <div class="task-timeline-body">
-                            <div class="task-timeline-meta">
-                                <span class="badge badge--xs badge-{{ u.kind }}">{{ u.kind }}</span>
-                                {% if u.agent %}<span>{{ u.agent }}</span>{% endif %}
-                                {# Authorship next to the display name (#559):
-                                   the name is whatever the client sent, the
-                                   principal is the fact. #}
-                                {% if u.principal_id %}<span class="badge badge--xs" title="Записано аутентифицированным принципалом">principal #{{ u.principal_id }}</span>
-                                {% elif u.author_kind == 'hub' %}<span class="badge badge--xs" title="Запись сделал сам хаб — принципала нет по природе">hub</span>
-                                {% elif u.author_kind == 'anonymous' %}<span class="badge badge--xs" title="Запрос без аутентификации — принципал неизвестен">без принципала</span>
-                                {% elif u.author_kind == 'legacy' %}<span class="badge badge--xs" title="Записано до появления поля авторства">до учёта авторства</span>{% endif %}
-                                <time>{{ u.created_at }}</time>
-                            </div>
-                            <div class="task-timeline-content u-pre-wrap">{{ u.content }}</div>
-                        </div>
-                    </article>
+                    {% for u in feed[:3] %}
+                    {{ timeline_item(u) }}
                     {% endfor %}
                 </div>
+                {% if feed | length > 3 %}
+                <details class="c2-feed-all" id="task-feed-all">
+                    <summary>Вся лента ({{ feed | length }})</summary>
+                    <div class="task-timeline">
+                        {% for u in feed[3:] %}
+                    {{ timeline_item(u) }}
+                        {% endfor %}
+                    </div>
+                </details>
+                {% endif %}
                 {% else %}
                 <div class="empty empty-sm">
                     <div class="empty-text">No updates yet</div>
@@ -583,7 +604,7 @@
 
         <aside class="task-detail-sidebar">
             {% if not review_board %}
-            <section class="task-sidebar-card task-actions-card">
+            <section class="task-sidebar-card task-actions-card" id="task-controls">
                 <div class="task-sidebar-title">Task Controls</div>
 
                 {% if implementer_error %}
@@ -675,7 +696,7 @@
                 {% endif %}
                 {% endfor %}
                 {% endif %}
-                <form method="post" action="/tasks/{{ task.id }}/web-answer" class="task-action-stack">
+                <form method="post" action="/tasks/{{ task.id }}/web-answer" class="task-action-stack" id="web-answer-form">
                   {{ csrf_field() }}
                     <label class="task-action-label" for="task-answer">Your Answer</label>
                     <textarea id="task-answer" name="answer" class="task-action-control task-action-textarea" required placeholder="Type your answer..."></textarea>
@@ -834,7 +855,33 @@
                     <dt>Минуты владельца</dt>
                     <dd data-owner-minutes="{{ task.owner_minutes.status }}">{{ task.owner_minutes.line }}</dd>
                     {% endif %}
-                    {% if task.ci_fix_cycle > 0 %}
+                    {# #1941: проекцию последнего host-заказа собирает хаб (services/executor_triage); блок без вывода, когда сказать нечего. #}{% if task.last_executor_order %}{% if task.last_executor_order.unavailable %}
+                    <dt>Заказ хоста</dt>
+                    <dd data-order-unavailable="1">{{ task.last_executor_order.unavailable }}</dd>
+                    {% elif task.last_executor_order.waiting_memory %}
+                    <dt>Заказ хоста</dt>
+                    <dd data-waiting-memory="1">{{ task.last_executor_order.waiting_memory.line }}</dd>
+                    {% elif task.last_executor_order.after_failed_run %}
+                    <dt>После неудачного прогона</dt>
+                    <dd data-after-failed-run="{{ task.last_executor_order.class }}">класс {{ task.last_executor_order.class }} ({{ task.last_executor_order.class_name }}); заказ #{{ task.last_executor_order.order_id }}, {{ task.last_executor_order.outcome }}</dd>
+                    {% endif %}{% endif %}{# #1953: последний заказ критика облачной сдачи; sha, состояние, срок и шаг собирает хаб (services/critic_orders). #}{% if task.critic_order %}{% if task.critic_order.unavailable %}
+                    <dt>Заказ критика</dt>
+                    <dd data-critic-unavailable="1">{{ task.critic_order.unavailable }}</dd>
+                    {% else %}
+                    <dt>Заказ критика</dt>
+                    <dd data-critic-order="{{ task.critic_order.order_id }}">#{{ task.critic_order.order_id }} {{ task.critic_order.sha[:12] }}: {{ task.critic_order.state }}/{{ task.critic_order.outcome or '-' }}, до {{ task.critic_order.expires_at }}. {{ task.critic_order.next_step }}</dd>
+                    {% endif %}{% endif %}{# #1973: заказы ролей k8 по задаче #}{% for ro in task.role_orders or [] %}{% if ro.unavailable %}
+                    <dt>Роль</dt>
+                    <dd data-role-order-unavailable="1">{{ ro.unavailable }}</dd>
+                    {% else %}
+                    <dt>Роль</dt>
+                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
+                    {% endif %}{% endfor %}{# #1956: история автоперезапуска CI на свежей базе - собрана хабом (services/delivery_rerun.card_view). #}{% if task.delivery_rerun %}
+                    <dt>Перезапуск CI</dt>
+                    <dd data-delivery-rerun="{{ task.delivery_rerun.state }}">{{ task.delivery_rerun.state }}{% if task.delivery_rerun.outcome %} / {{ task.delivery_rerun.outcome }}{% endif %}; run {{ task.delivery_rerun.run_id }}, после попытки {{ task.delivery_rerun.attempt_before }}; с {{ task.delivery_rerun.requested_at }}{% if task.delivery_rerun.failed_jobs %}; упали: {{ task.delivery_rerun.failed_jobs | join(', ') }}{% endif %}
+                      <ul>{% for h in task.delivery_rerun.history %}<li>{{ h.at }} · {{ h.actor }} · {{ h.text }}</li>{% endfor %}</ul>
+                    </dd>
+                    {% endif %}{% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
                     {% endif %}
@@ -862,7 +909,7 @@
                 {% endif %}
                 {# #1444: круг починки — повторный прогон по находкам ревью. #}
                 {% if repair_offered %}
-                <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form" id="executor-repair-form">
                   {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Вернуть задачу #{{ task.id }} в работу и заказать повторный прогон исполнителя по находкам ревью? Это платный прогон.')">Повторный прогон исполнителя</button>
@@ -1036,5 +1083,7 @@
             </nav>
         </aside>
     </div>
+    </details>
 </article>
+{% include "partials/card_c2_script.html" %}
 {% endblock %}

@@ -54,7 +54,15 @@ from hub.workflow_reference import (
 )
 from mcp.types import CallToolResult
 
-from hub.mcp_task_card import bounds_lines, build_compact_view, owner_minutes_lines
+from hub.mcp_task_card import (
+    bounds_lines,
+    build_compact_view,
+    delivery_rerun_lines,
+    critic_order_lines,
+    executor_order_lines,
+    owner_minutes_lines,
+    role_order_lines,
+)
 from hub.services import review_brief_projection as brief_projection
 from hub.services import verdict_evidence
 from hub.mcp_structured import (
@@ -1414,6 +1422,10 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
     parts.extend(filter(None, [_verdict_route_line(task)]))
     parts.extend(owner_minutes_lines(task))
+    parts.extend(executor_order_lines(task))
+    parts.extend(delivery_rerun_lines(task))
+    parts.extend(role_order_lines(task))
+    parts.extend(critic_order_lines(task))
     return parts
 
 
@@ -3206,6 +3218,10 @@ async def hub_submit_review(
             " WARNING: no expected_generation — the hub cannot tell which "
             "submission you judged; pass the generation of hub_get_review_brief."
         )
+    if task.get("lifecycle_hint"):
+        # #1696: the verdict's warnings (tip moved, sha_note, undisposed and
+        # in-flight notes) reach the agent as in the sibling tools.
+        message += f"\nLifecycle: {task['lifecycle_hint']}"
     return await _task_mutation_response(
         task_id,
         message,
@@ -3849,14 +3865,13 @@ async def hub_submit_machine_review(
     model: str = "",
     agent: str = "",
     ci_integrity: dict[str, Any] | None = None,
+    expected_generation: int | None = None,
+    reviewed_sha: str | None = None,
 ) -> CallToolResult:
     """Submit a structured multi-agent review report (#381).
 
-    Bound to the current submission generation: resubmitting work makes the
-    report stale. Metrics are optional (#384).
-
-    ``incomplete`` is REQUIRED, no default (#549): "0 confirmed" means nothing
-    without it.
+    Bound to the current submission generation: resubmitting makes the report
+    stale. Metrics are optional (#384). ``incomplete`` is REQUIRED (#549).
 
     Args:
         task_id: Reviewed task.
@@ -3864,8 +3879,8 @@ async def hub_submit_machine_review(
         incomplete: True when an agent died, a dimension was lost, context was
             truncated, or a budget ran out.
         incomplete_reason: WHY (#1238): 'environment' — nothing to run tests
-            with, no diff to compare; a second run repeats it. 'profile' —
-            budget ran out; a top-up can help. Empty means not stated.
+            with; a second run repeats it. 'profile' — budget ran out; a
+            top-up can help. Empty: not stated.
         findings_confirmed: [{title, severity, locator, category?, file?,
             start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
             'lines' (file + start_line), 'file' (module known, line not),
@@ -3874,7 +3889,7 @@ async def hub_submit_machine_review(
         findings_rejected: [{title, category?, reason?}] — actually refuted.
         unresolved: [{title, why}] — nobody could judge these. Never rejected.
         lost_dimensions: names of dimensions that returned nothing.
-        harness_skill: Skill used (hub_get_skill source).
+        harness_skill: Skill used.
         harness_version: Skill version executed.
         agent_count: Total subagents in the run.
         tokens_spent: Tokens consumed by the run.
@@ -3884,6 +3899,8 @@ async def hub_submit_machine_review(
         agent: Submitting agent name.
         ci_integrity: {verdict, explanation_ru, scan_hash} — scan_hash from
             the brief's ci_integrity block, else the answer is dropped.
+        expected_generation: With reviewed_sha (full sha), the submission read
+            (#1985). Both or neither; stale: 409.
     """
     body: dict[str, Any] = {
         "raw_count": raw_count,
@@ -3904,6 +3921,8 @@ async def hub_submit_machine_review(
         ("tokens_spent", tokens_spent),
         ("duration_ms", duration_ms),
         ("ci_integrity", ci_integrity),
+        ("expected_generation", expected_generation),
+        ("reviewed_sha", reviewed_sha),
     ):
         if value is not None:
             body[key] = value
@@ -3944,7 +3963,8 @@ async def hub_submit_machine_review(
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
         f"#{result.get('submission_generation')}): {stored_raw} raw → "
-        f"{confirmed} confirmed / {rejected} rejected.{outcome_note}{self_note}",
+        f"{confirmed} confirmed / {rejected} rejected.{outcome_note}{self_note}"
+        + (" Пин сдачи проверен." if result.get("pin_verified") else ""),
         machine_review=result,
     )
 

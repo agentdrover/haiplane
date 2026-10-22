@@ -16,6 +16,7 @@ the data rather than in a comment.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import aiosqlite
 from fastapi import HTTPException
@@ -31,7 +32,8 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
-from hub.services import ci_integrity, watch_notices
+from hub.services import ci_integrity, report_binding, review_pin, watch_notices
+from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
@@ -213,17 +215,70 @@ def _refuse_claimed_text_origin(origin: str, body: MachineReviewSubmit) -> None:
         )
 
 
-async def record_machine_review(
+async def _dispatch_of_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+    claimed_id: int | None,
+    code_id: int | None = None,
+) -> tuple[Any, int | None]:
+    """Заказ отчёта: (строка заказа, id привязки) (#1946).
+
+    Привязка (id) есть только когда сессия назвала заказ и сверка задачи,
+    поколения и принципала его приняла: тогда профиль берётся у ЭТОГО заказа, а
+    не у последнего заказа поколения. Иначе прежнее правило - последний заказ
+    поколения, привязки нет. Сбой чтения заказа НЕ выдаётся за «заказа нет»:
+    он поднимается, а не отдаёт отчёт чужому заказу с чужим профилем.
+    """
+    if claimed_id is None:  # личность прочитана до привязки кода (#1946)
+        claimed_id = await report_binding.dispatch_id_of_code(db, code_id)
+    accepted = await report_binding.accepted_dispatch(
+        db, task_id, generation, principal_id, claimed_id
+    )
+    if accepted is not None:
+        return accepted, int(accepted["id"])
+    latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    return latest, None
+
+
+async def _intake_alerts(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    raw_count: int,
+    generation: int,
+    review_id: int,
+    principal_id: int | None,
+) -> None:
+    """Ленты приёма: нет кандидатов, снятие прежнего алерта, отказ среды.
+
+    Вынесено из ``record_machine_review`` (потолок по операторам, #1985).
+    """
+    await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _retract_no_candidates_alert(
+        db, task_id, generation, review_id, raw_count, principal_id
+    )
+    await _alert_environment_refusal(db, task_id, body)
+
+
+@review_pin.under_pin_lock
+async def _store_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
     body: MachineReviewSubmit,
     *,
     principal_id: int | None,
     username: str,
-    origin: str = ORIGIN_MCP,
-    expected_generation: int | None = None,
-) -> MachineReviewView:
-    """Store one report and run everything that hangs off it (#381, #1036).
+    origin: str,
+    expected_generation: int | None,
+    dispatch_id: int | None,
+    code_id: int | None,
+) -> tuple[MachineReviewView, dict]:
+    """Store one report and what hangs off its row (#381, #1036).
+
+    Only this part runs under the pin's write lock (#1985): the automation after
+    it keeps its own transactions and failure handling, pinned or not.
 
     ``principal_id`` is the OWNER of the report, always taken from a token or
     from the dispatch row — never from what the report says about itself
@@ -231,6 +286,7 @@ async def record_machine_review(
     """
     import json as _json
 
+    body = review_pin.for_origin(body, origin)  # #1985: пин - только по контракту
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
@@ -252,6 +308,9 @@ async def record_machine_review(
                 ),
             },
         )
+    # #1985: пин тела сверяется ПОСЛЕ ограничения сессии (403 выше) и не заменяет
+    # его; под write-локом, взятым декоратором до чтения задачи.
+    await review_pin.verify(db, task_id, generation, body)
     if generation == 0:
         raise HTTPException(
             400,
@@ -273,6 +332,19 @@ async def record_machine_review(
     # on the same terms. A harness that invents one would win over the derived
     # value silently, and an id nobody can reproduce identifies nothing.
     services.refuse_supplied_uid(body.unresolved, section="unresolved")
+    # #1933: ревьюер назвал непрочитанным тест AC ЭТОЙ задачи (точная сверка с её
+    # test_ref; чужой ref отчёт не меняет) строкой lost_dimensions - а
+    # сам сказал incomplete=false. Непрочитанное доказательство AC не бывает
+    # полным отчётом; признак поднимается, как raw_count ниже, а не отвергается:
+    # находки такого отчёта настоящие. Поднимается в самом body, до первого
+    # читателя: исход, событие и журнал читают body.incomplete, не локальную.
+    if not body.incomplete and await unread_for_task(db, task_id, body.lost_dimensions):
+        log.warning(
+            "machine review for task #%s names an unread AC test but says "
+            "incomplete=false; stored as incomplete",
+            task_id,
+        )
+        body = body.model_copy(update={"incomplete": True})
     # #1688: a "suspicious" answer about CI integrity is a confirmed high finding.
     body = ci_integrity.with_suspicion_finding(body)
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
@@ -290,7 +362,9 @@ async def record_machine_review(
     # run's own claim about how thoroughly it ran is exactly the evidence
     # #750 showed to be worthless. No dispatch behind the report leaves the
     # profile empty, which reads as "unknown", not as "cheap".
-    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    dispatch, bound_id = await _dispatch_of_report(
+        db, task_id, generation, principal_id, dispatch_id, code_id
+    )
     if dispatch is None and principal_id is not None:
         # #1408: заказ записан отказом, а его ревьюер отчитался — заказ был.
         dispatch = await repo.reopen_refused_order_for_report(
@@ -383,6 +457,11 @@ async def record_machine_review(
         principal_id=principal_id,
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
     )
+    await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
+    await review_pin.stamp(db, new_review_id, body)  # #1985, в той же транзакции
+    # #1946: восстановление отказанного заказа (#1408) - в ОДНОЙ точке, для
+    # заказа, к которому отчёт привязан окончательно (ранней или поздней привязкой).
+    await report_binding.reopen_order_of_report(db, new_review_id)
     # #1653: отчёт возвращает в done только ту закрытую по политике строку
     # (local_review_fallback=off), которой он принадлежит по общему правилу
     # dispatch_for_report; свипы такую строку уже не видят.
@@ -425,11 +504,9 @@ async def record_machine_review(
         source_event_id=completed_id,
         review_id=new_review_id,
     )
-    await _alert_no_candidates(db, task_id, body, raw_count, generation)
-    await _retract_no_candidates_alert(
-        db, task_id, generation, new_review_id, raw_count, principal_id
+    await _intake_alerts(
+        db, task_id, body, raw_count, generation, new_review_id, principal_id
     )
-    await _alert_environment_refusal(db, task_id, body)
 
     # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one
@@ -490,9 +567,40 @@ async def record_machine_review(
         raise HTTPException(404, "machine review not found")
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
+    await attach_ac_tests_unread(db, view)
+    return view, task
 
+
+async def record_machine_review(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    *,
+    principal_id: int | None,
+    username: str,
+    origin: str = ORIGIN_MCP,
+    expected_generation: int | None = None,
+    dispatch_id: int | None = None,
+    code_id: int | None = None,
+) -> MachineReviewView:
+    """Store one report and run everything that hangs off it (#381, #1036).
+
+    ``principal_id`` is the OWNER of the report, always taken from a token or
+    from the dispatch row - never from what the report says about itself
+    (#893, #1025). ``origin`` records how it reached us.
+    """
+    view, task = await _store_machine_review(
+        db,
+        task_id,
+        body,
+        principal_id=principal_id,
+        username=username,
+        origin=origin,
+        expected_generation=expected_generation,
+        dispatch_id=dispatch_id,
+        code_id=code_id,
+    )
     await _run_report_automation(db, task_id, task)
-
     return view
 
 

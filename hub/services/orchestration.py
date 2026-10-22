@@ -59,8 +59,10 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import base_merge, delivery_notes, watch_notices, workflow_seed
-from hub.services.ci_timing import ci_minutes_metrics
+from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
+from hub.services import workflow_seed
+from hub.services import delivery_rerun
+from hub.services.executor_autonomy import statistics_sections
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
@@ -1224,8 +1226,8 @@ async def practice_metrics(
         date_to=date_to,
     )
     result = await _practice_sections(db, scope)
-    # #1700: minutes of CI per task and class; statistics, outside compare/series.
-    result["ci_minutes"] = await ci_minutes_metrics(db, scope)
+    # #1700 ci_minutes, #1980 executor_autonomy: statistics outside compare/series.
+    result.update(await statistics_sections(db, scope))
     # #1621: always present — a 30-day number read as 14 days of events is the
     # silent case, and it has no flag that would announce it.
     result["events_history"] = events_history(
@@ -1882,9 +1884,9 @@ def _steward_gate_rows(
             {
                 "gate": "steward",
                 "project": project,
-                "applied": 0,
-                "escalated": 0,
-                "overridden_by_human": 0,
+                **dict.fromkeys(
+                    ("applied", "escalated", "refused", "overridden_by_human"), 0
+                ),
             },
         )
 
@@ -1903,6 +1905,8 @@ def _steward_gate_rows(
             applied.append(row)
         elif row["kind"] == STEWARD_ESCALATED:
             entry_for(project)["escalated"] += 1
+        elif row["kind"] == "steward_judgement_refused":
+            entry_for(project)["refused"] += 1
 
     window = timedelta(days=STEWARD_OVERRIDE_WINDOW_DAYS)
     for applied_row in applied:
@@ -3957,16 +3961,12 @@ BASE_UPDATED_PREFIX = "base_updated"
 BASE_UPDATE_PENDING_PREFIX = "base_update_pending"
 BASE_UPDATE_RETRY_PREFIX = "base_update_retry"
 BASE_FETCH_PENDING_PREFIX = "base_fetch_pending"
-# Терминальные — к человеку с причиной: конфликт при слиянии базы, отказ
-# форжа (права, защита ветки), красный CI на свежей базе. Последний нарочно
-# НЕ начинается с "ci_fail": это не красный CI автора, который он чинит на
-# конвейере (#1030), а семантический конфликт с чужой доставкой.
+# Терминальные — к человеку: конфликт слияния базы, отказ форжа, красный CI на
+# свежей базе (fresh_base_ci_failed; не "ci_fail": не красный CI автора, #1030).
 BASE_UPDATE_CONFLICT_PREFIX = "base_update_conflict"
 BASE_UPDATE_REFUSED_PREFIX = "base_update_refused"
-FRESH_BASE_CI_FAILED_PREFIX = "fresh_base_ci_failed"
-# Событие «гейт слил базу в ветку с головы X в поколении сдачи N». По нему
-# следующий цикл узнаёт и красный CI на свежей базе, и уже потраченное
-# обновление (не больше одного без нового прогона CI).
+# Событие «гейт слил базу в ветку с головы X в поколении сдачи N»: по нему цикл
+# узнаёт красный CI на свежей базе и потраченное обновление (одно на прогон CI).
 GATE_BRANCH_UPDATE_EVENT = "gate_branch_update"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
@@ -3995,6 +3995,7 @@ TRANSIENT_GATE_PREFIXES = (
     BASE_UPDATE_PENDING_PREFIX,
     BASE_UPDATE_RETRY_PREFIX,
     BASE_FETCH_PENDING_PREFIX,
+    delivery_rerun.RERUN_PREFIX,  # #1956
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -4413,6 +4414,7 @@ class MergeStep(enum.Enum):
     APPROVAL_GONE = "approval_gone"  # одобрения больше нет — форж не вызывался
     UNPINNED = "unpinned"  # коммит одобренной сдачи не закреплён — форж не вызывался
     HEAD_MOVED = "head_moved"  # закрепление ушло с головы, на которой смотрели проверки
+    RERUN_HOLD = "rerun_hold"  # бронь перезапуска CI не пускает мерж (#1956)
 
 
 def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
@@ -4467,6 +4469,8 @@ async def merge_if_approval_stands(
     """
     key = (int(task["id"]), int(task["pr_number"]))
     while True:
+        if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956, каждый круг
+            return MergeStep.RERUN_HOLD, hold
         row = await repo.get_task(db, key[0])
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):
@@ -4559,6 +4563,8 @@ async def _gate_merge_step(
         checked_sha=(task.get("_checked_sha") or task.get("submission_sha") or ""),
     )
     key = (int(task["id"]), int(task["pr_number"]))
+    if step is MergeStep.RERUN_HOLD:  # #1956: деталь - причина брони
+        return (False, merge_detail), ""
     if step is MergeStep.ALREADY:
         return (True, "already delivered"), ""
     if step is MergeStep.IN_FLIGHT:
@@ -4835,17 +4841,10 @@ async def _red_ci_detail(
     """Красный CI: авторский (чинит исполнитель) или на свежей базе (человек, #1419).
 
     Гейт слил базу в ветку этого поколения, а CI после этого красный — это
-    конфликт с чужой доставкой, а не недоделка автора: авторская правка та же
-    (иначе сверка #612/#1361 выше уже отказала бы). Решать человеку.
+    конфликт с чужой доставкой, а не недоделка автора. Решать человеку.
     """
-    if await gate_branch_update_from(db, task):
-        run = f" ({ci.details})" if ci.details else ""
-        return (
-            f"{FRESH_BASE_CI_FAILED_PREFIX}: CI красный на свежей базе — гейт "
-            f"слил базу в ветку PR #{task['pr_number']}, и прогон на новой "
-            f"голове упал: {ci.reason}{run}. Авторская правка не менялась; "
-            "это конфликт с уже доставленной работой, мержа нет"
-        )
+    if await delivery_rerun.fresh_base_origin(db, task):
+        return delivery_rerun.base_text(task, ci)
     return f"ci_{ci.outcome.value}: {ci.reason}"
 
 
@@ -4960,6 +4959,7 @@ async def _record_branch_update(
     а не этот шаг: там её отказ останавливает мерж. Запись — после сети (#1428).
     """
     await repo.mark_ci_check_started(db, task["id"])
+    await delivery_rerun.record_base_update(db, task, fresh.head_sha)
     await repo.insert_event(
         db,
         kind=GATE_BRANCH_UPDATE_EVENT,
@@ -5030,6 +5030,8 @@ async def merge_before_completion(
         ci = await plugins.git_ops.check_pr_ci(
             pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
         )
+        if rerun := await delivery_rerun.gate_step(db, task, ctx, ci):  # #1956
+            return False, rerun
         ci_refusal = await _ci_gate_refusal(db, task, ctx, ci)
         if ci_refusal:
             return False, ci_refusal
@@ -5444,6 +5446,7 @@ _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
         ),
         BASE_FRESHNESS_WAIT_HINT,
     ),
+    (delivery_rerun.RERUN_PREFIX, delivery_rerun.WAIT_HINT),
 )
 
 
@@ -5830,6 +5833,9 @@ async def _write_completed(
             return False
         if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
             return None
+        row = await repo.get_task(db, task_id)
+        if row is not None and dict(row)["status"] == "needs_decision":
+            return None  # другой вход удержал задачу: завершение поверх удержания запрещено
         if _running_deferred.get():
             from hub.services.lifecycle import _done_validation_gate
 
@@ -6312,6 +6318,10 @@ async def transition_after_agent_done(
     if has_done and (halted := await stop_empty_done(db, task, tail_pending=True)):
         return halted
 
+    # #1953: приём облачной сдачи - в момент принятия, до bump (он внутри приёма)
+    if has_done and not await critic_orders.accept_done(db, task):
+        return "needs_decision"
+
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
         # that PR is merged — "completed" must mean delivered, the invariant
@@ -6375,7 +6385,6 @@ async def transition_after_agent_done(
     if has_done:
         # Unreviewed done report = a work submission (#305): bumping the
         # generation invalidates any APPROVED verdict from earlier work.
-        await repo.bump_submission_generation(db, task_id)
         # #1122: гейты сдачи для headless-пути — ЗДЕСЬ, до развилки маршрутов.
         # Headless уходит в ревью двумя путями: конвейером auto-review
         # (dispatch_review, с review_job_id) и Universal Review Gate ниже. Оба

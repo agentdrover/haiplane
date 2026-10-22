@@ -46,6 +46,10 @@ CARD_FIELDS: tuple[str, ...] = (
     "dependencies",
     "worktree_path",
     "owner_minutes",
+    "last_executor_order",
+    "delivery_rerun",
+    "role_orders",
+    "critic_order",
     "created_at",
     "updated_at",
 )
@@ -63,6 +67,71 @@ def owner_minutes_lines(task: dict[str, Any]) -> list[str]:
     if isinstance(estimate, dict) and estimate.get("line"):
         return [f"Owner minutes: {estimate['line']}"]
     return []
+
+
+def executor_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1941: the last host order as the hub built it; nothing when it says nothing."""
+    view = task.get("last_executor_order")
+    if not isinstance(view, dict):
+        return []
+    if view.get("unavailable"):
+        return [f"Last executor order: unavailable ({view['unavailable']})"]
+    waiting = view.get("waiting_memory")
+    if isinstance(waiting, dict) and waiting.get("line"):
+        return [f"Waiting for memory: {waiting['line']}"]  # #1972: built by the hub
+    if not view.get("after_failed_run"):
+        return []
+    return [
+        f"After failed run: class {view.get('class')} ({view.get('class_name')}), "
+        f"order #{view.get('order_id')} {view.get('outcome')} {view.get('reason_code')}"
+    ]
+
+
+def delivery_rerun_lines(task: dict[str, Any]) -> list[str]:
+    """#1956: the rerun history as the hub built it; nothing when there was none."""
+    view = task.get("delivery_rerun")
+    if not isinstance(view, dict) or not view.get("state"):
+        return []
+    outcome = f", outcome {view['outcome']}" if view.get("outcome") else ""
+    jobs = view.get("failed_jobs")
+    named = (
+        f"; failed jobs: {', '.join(jobs)}"
+        if jobs
+        else ("; failed jobs: not read" if jobs is None else "")
+    )
+    return [
+        f"Delivery rerun: {view['state']}{outcome}, run {view.get('run_id')}, "
+        f"attempt {view.get('attempt_before')}+1 (since {view.get('requested_at')})"
+        f"{named}"
+    ]
+
+
+def role_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1973: role orders of the task as the hub built them; nothing when none."""
+    out: list[str] = []
+    for view in task.get("role_orders") or []:
+        if view.get("unavailable"):
+            out.append(f"Role orders: unavailable ({view['unavailable']})")
+        else:
+            out.append(
+                f"Role order: вызван {view.get('label') or view.get('role')} "
+                f"(заказ {view.get('id')}, {view.get('state')})"
+            )
+    return out
+
+
+def critic_order_lines(task: dict[str, Any]) -> list[str]:
+    """#1953: the last critic order as the hub built it; nothing when there is none."""
+    view = task.get("critic_order")
+    if not isinstance(view, dict):
+        return []
+    if view.get("unavailable"):
+        return [f"Critic order: unavailable ({view['unavailable']})"]
+    return [
+        f"Critic order #{view.get('order_id')}: sha {str(view.get('sha'))[:12]} "
+        f"{view.get('state')}/{view.get('outcome') or '-'} until "
+        f"{view.get('expires_at')}. Next: {view.get('next_step')}"
+    ]
 
 
 def excerpt(text: str, limit: int) -> tuple[str, int]:

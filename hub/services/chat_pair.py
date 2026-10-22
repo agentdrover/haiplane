@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
+from hub.services import memory_wait, order_deadline
 
 log = logging.getLogger("hub.services.chat_pair")
 
@@ -519,14 +520,14 @@ async def _reviewer_refusal(
 #: serialised and the code either goes before them or not at all. A slot name
 #: nobody registered keeps the manual door's old behaviour.
 _SLOT_ORDER_GUARD: Final[str] = (
-    " AND (channel <> 'slot' "
+    " AND (channel <> 'slot' "  # nosec B608 - constants only
     "OR NOT EXISTS (SELECT 1 FROM executor_hosts h WHERE h.name = chat_pair_codes.slot) "
     "OR EXISTS (SELECT 1 FROM executor_hosts h "
     "JOIN principals p ON p.id = h.principal_id "
     "JOIN executor_orders o ON o.host = h.name "
     "WHERE h.name = chat_pair_codes.slot AND h.enabled = 1 AND p.status = 'active' "
     "AND o.pair_code_id = chat_pair_codes.id "
-    "AND o.state IN ('pending', 'delivered')))"
+    f"AND {memory_wait.REDEEMABLE_SQL}))"
 )
 
 
@@ -559,7 +560,7 @@ async def _slot_order_refusal(
     orders = await fetchall(
         db,
         "SELECT 1 FROM executor_orders WHERE pair_code_id = ? "
-        "AND state IN ('pending', 'delivered')",
+        f"AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608 - constant
         (row["id"],),
     )
     if not orders:
@@ -593,13 +594,14 @@ async def _spend_code(
             return None
 
     token = generate_session_token()
-    ttl = config.CHAT_PAIR_TTL_SECONDS
+    ttl = await order_deadline.session_ttl(db, row)  # #1960
     inserted = await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
         " bound_generation, token_hash, expires_at, channel, slot, "
-        " executor_run_id, claimed_session) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL)",
+        " executor_run_id, claimed_session, dispatch_id, code_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, NULL, "
+        "(SELECT dispatch_id FROM chat_pair_codes WHERE id = ?), ?)",
         (
             row["principal_id"],
             acting_id,
@@ -611,6 +613,8 @@ async def _spend_code(
             row.get("channel") or "",
             row.get("slot") or "",
             row.get("executor_run_id"),
+            row["id"],  # #1946: привязку кода читает ЭТА транзакция, не прежний SELECT
+            row["id"],
         ),
     )
     if row.get("channel") == "slot":
@@ -621,7 +625,7 @@ async def _spend_code(
             "UPDATE executor_orders SET state = 'redeemed', "
             "redeemed_at = datetime('now'), first_redeemed_at = datetime('now'), "
             "retry_until = datetime('now', ?), session_id = ? "
-            "WHERE pair_code_id = ? AND state IN ('pending', 'delivered')",
+            f"WHERE pair_code_id = ? AND state IN {memory_wait.UNREDEEMED_IN_SQL}",  # nosec B608
             (
                 f"+{min(int(config.HOST_REDEEM_RETRY_SECONDS), int(ttl))} seconds",
                 inserted.lastrowid,
@@ -696,7 +700,7 @@ async def redeem_code_explained(
     if row["spent"]:
         return None, _row_refusal(row, "spent")
     if row["expired"]:
-        return None, _row_refusal(row, "expired")
+        return None, _row_refusal(row, await memory_wait.why(db, row, "expired"))
     if row["status"] != "active":
         return None, _row_refusal(row, "principal_inactive")
 
@@ -722,7 +726,7 @@ async def redeem_code_explained(
         db, row, kind=kind, acting_id=acting_id, acting_username=acting_username
     )
     if session is None:
-        return None, _row_refusal(row, "spent")
+        return None, _row_refusal(row, await memory_wait.why(db, row, "spent"))
     return session, None
 
 
@@ -1001,7 +1005,7 @@ async def resolve_session(
     rows = await fetchall(
         db,
         "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
-        "s.bound_generation, s.first_used_at, "
+        "s.bound_generation, s.first_used_at, s.dispatch_id, s.code_id, "
         "p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
@@ -1060,6 +1064,8 @@ async def resolve_session(
                 if row.get("bound_generation") is not None
                 else None
             ),
+            chat_pair_dispatch_id=row.get("dispatch_id"),
+            chat_pair_code_id=row.get("code_id"),
         )
     if kind in config.STEWARD_PAIR_KINDS:
         # #1601: тот же допуск стюарда, но вид сессии сохраняется — по нему

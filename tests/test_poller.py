@@ -568,6 +568,9 @@ async def test_events_pruning(db):
     )
     await db.commit()
 
+    from tests.role_cursor_support import read_the_feed
+
+    await read_the_feed(db)  # #1973: курсор ролей на конце ленты
     removed = await repo_module.prune_events(db, keep_days=14)
     await db.commit()
 
@@ -2726,11 +2729,14 @@ async def test_the_sweep_order_is_pinned(db):
         "executor_runs",
         "executor_slots",
         "executor_orders",
+        "critic_orders",
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",
         # #1874: начисления минут владельца читают events ДО очистки.
         "owner_minutes",
+        # #1973: заказы ролей читают events ДО очистки.
+        "role_orders",
         "events_retention",
         "stale_worktrees",
         "sessions_retention",

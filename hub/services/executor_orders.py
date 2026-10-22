@@ -45,8 +45,11 @@ from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
 from hub.services import (
     chat_pair,
+    executor_triage,
     host_redeem,
     launch_feedback,
+    memory_wait,
+    order_deadline,
     owner_minutes,
     project_policy,
 )
@@ -58,9 +61,10 @@ PAIR_CODE_PLACEHOLDER: Final[str] = "{{PAIR_CODE}}"
 
 STATE_PENDING = "pending"
 STATE_DELIVERED = "delivered"
+STATE_WAITING_MEMORY = memory_wait.STATE_WAITING_MEMORY  # #1972
 STATE_REDEEMED = "redeemed"
 STATE_CLOSED = "closed"
-_UNREDEEMED = (STATE_PENDING, STATE_DELIVERED)
+_UNREDEEMED = (STATE_PENDING, STATE_DELIVERED, STATE_WAITING_MEMORY)
 
 #: Исходы прогона слота. ``finished`` берётся у облачного опроса.
 RUN_OUTCOME_FINISHED = "finished"
@@ -72,6 +76,7 @@ CLOSE_EXPIRED = "expired"
 CLOSE_SESSION_GONE = "session_gone"
 CLOSE_HOST_DISABLED = "host_disabled"
 CLOSE_RUN_FINISHED = "run_finished"
+CLOSE_MEMORY_WAIT_TIMEOUT = memory_wait.CLOSE_TIMEOUT  # #1972
 
 ACK_REDEEMED = "redeemed"
 ACK_REDEEM_FAILED = "redeem_failed"
@@ -427,7 +432,7 @@ async def close_order(
     )
     if landed:
         reason, run_outcome = CLOSE_SUBMITTED, RUN_OUTCOME_FINISHED
-    states = only_states or (STATE_PENDING, STATE_DELIVERED, STATE_REDEEMED)
+    states = only_states or (*_UNREDEEMED, STATE_REDEEMED)
     marks = ", ".join("?" for _ in states)
     cursor = await db.execute(
         "UPDATE executor_orders SET state = 'closed', closed_at = datetime('now'), "
@@ -497,6 +502,8 @@ async def close_order(
         commit=False,
     )
     await repo.add_task_update(db, int(order["task_id"]), "hub", "status", text)
+    if reason == CLOSE_MEMORY_WAIT_TIMEOUT:  # #1972: сигнал владельцу, один раз
+        await memory_wait.notify_timeout(db, order)
     await db.execute(
         "UPDATE executor_orders SET final_entry_at = datetime('now') WHERE id = ?",
         (int(order["id"]),),
@@ -553,6 +560,14 @@ async def _settled_reason(
     run = await repo.get_executor_run(db, int(order["executor_run_id"]))
     if run is not None and dict(run)["outcome"] != "running":
         return CLOSE_RUN_FINISHED, dict(run)["outcome"], None
+    if order["state"] == STATE_WAITING_MEMORY:
+        # #1972: предел ожидания сильнее обычного срока; оба - одним снимком времени.
+        what = await memory_wait.verdict(db, order)
+        if what == memory_wait.VERDICT_TIMEOUT:
+            return CLOSE_MEMORY_WAIT_TIMEOUT, RUN_OUTCOME_EXPIRED, (order["state"],)
+        if what == memory_wait.VERDICT_EXPIRED:
+            return CLOSE_EXPIRED, RUN_OUTCOME_EXPIRED, _UNREDEEMED
+        return "", "", None
     if order["state"] in _UNREDEEMED:
         gone = await fetchall(
             db,
@@ -586,7 +601,14 @@ async def settle(db: aiosqlite.Connection, host: str | None = None) -> int:
 async def sweep_executor_orders(db: aiosqlite.Connection) -> int:
     """Проход поллера: закрыть всё, что уже не держится (п.9 постановки)."""
     async with write_transaction(db):
-        return await settle(db)
+        closed = await settle(db)
+    try:
+        # #1942: рекомендации разбора — отдельной транзакцией: их сбой не должен
+        # отменить закрытие заказов выше и не роняет проход.
+        await executor_triage.sweep(db)
+    except Exception:  # noqa: BLE001 - разбор в тени не ломает проход поллера
+        log.exception("executor triage sweep failed")
+    return closed
 
 
 # ---------------------------------------------------------------------------
@@ -894,12 +916,14 @@ async def _issue(
         commit=False,
     )
     stored = await _code_row(db, code)
+    run_seconds = order_deadline.run_seconds_for(task)  # #1960: снимок срока
     sealed = encrypt_code(host["public_key_pem"], code)
     del code
     cursor = await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
-        "pair_code_id, code_ciphertext, order_text, expires_at, code_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "pair_code_id, code_ciphertext, order_text, expires_at, code_hash, "
+        "run_seconds, statement_generation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host["name"],
             task_id,
@@ -910,6 +934,10 @@ async def _issue(
             text,
             stored["expires_at"],
             stored["code_hash"],
+            run_seconds,
+            # #1942: поколение ПОСТАНОВКИ на момент выпуска (не путать с generation —
+            # поколением сдачи); по нему считается серия неудач одной постановки.
+            int(task.get("statement_generation") or 0),
         ),
     )
     order_id = int(cursor.lastrowid or 0)
@@ -931,7 +959,8 @@ async def _issue(
         "hub",
         "status",
         f"Исполнитель заказан хабом на слот {host['name']} по нажатию человека "
-        f"(#1712): заказ #{order_id}, сдача {generation}, от {starting_ref}.",
+        f"(#1712): заказ #{order_id}, сдача {generation}, от {starting_ref}, "
+        f"срок прогона {order_deadline.hours_text(run_seconds)}.",
     )
     return order_id, row_id
 
@@ -955,6 +984,7 @@ def _order_view(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "delivered_at": row["delivered_at"],
+        "run_seconds": row["run_seconds"],
     }
 
 
@@ -971,7 +1001,7 @@ async def deliver_orders(db: aiosqlite.Connection, host: str) -> list[dict[str, 
             for r in await fetchall(
                 db,
                 "SELECT * FROM executor_orders WHERE host = ? "
-                "AND state IN ('pending', 'delivered') ORDER BY id",
+                f"AND state IN {memory_wait.UNREDEEMED_IN_SQL} ORDER BY id",  # nosec B608 - constant
                 (host,),
             )
         ]
@@ -1366,6 +1396,11 @@ async def report_outcome(
                     f"итог по заказу уже записан: {order['report_outcome']}",
                 )
             return {"id": order["id"], "outcome": outcome, "duplicate": True}
+        if outcome in ("failed", "rescued"):
+            # #1942: граница включения разбора закрепляется ДО закрытия заказа и вне
+            # SAVEPOINT рекомендации: откат разбора её не уносит, а закрытие этого
+            # заказа не может оказаться «историей» из-за ленивого создания.
+            await executor_triage.pin_activation_safely(db)
         refusal = await _branch_refusal(db, order, branch)
         if refusal:
             raise HostError(422, refusal)
@@ -1401,4 +1436,8 @@ async def report_outcome(
                 RUN_OUTCOME_ABORTED,
                 final_text=text,
             )
+            # #1942: разбор в тени после сохранённого report и возврата задачи — и
+            # когда закрыл этот вызов, и когда заказ закрыт раньше (поздний report).
+            # Свежая строка заказа читается внутри; запуска и смены статуса нет.
+            await executor_triage.recommend_safely(db, int(order["id"]))
     return {"id": order["id"], "outcome": outcome, "duplicate": False}

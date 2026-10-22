@@ -273,7 +273,10 @@ async def test_mcp_brief_fits_the_budget_and_keeps_the_mandatory_fields(
             "урезанный блок называет параметр"
         )
     if shape == "1664":
-        assert blocks["acceptance_criteria"]["shown"] == 9
+        # #1985: pin_verified - решающее поле machine_review и стоит знаков;
+        # на границе бюджета число показанных AC зависит от длины имени хоста
+        # в конверте (server_id): 9 в CI, 8 на длинном локальном имени.
+        assert blocks["acceptance_criteria"]["shown"] in (8, 9)
     text = _text(result)
     assert text.startswith("Review brief for task #1647")
     assert "AC-1:" in text or blocks["acceptance_criteria"]["shown"] == 0
@@ -766,8 +769,10 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # скан делает проход поллера, не показ). Пакет стюарда: REST-чтение
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
 # нет «Справка по CI: … не проверена»; scan_hash в блоке ci_integrity; packet_hash прежний.
-GOLDEN_REST_BRIEF = "6f7b0d8ae96649e0665c96e471d6de2f45e8c69b3a9dbd1a289426c0ac2d3df4"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "8acce84aafa35c2814e1eed4e57974cebbb8dac6f36cb9ac8d7d76018403afbb"  # pragma: allowlist secret
+# #1985: machine_review получил reviewed_sha и pin_verified (REST-бриф; пакет стюарда и packet_hash проверяются ниже).
+# #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
+GOLDEN_REST_BRIEF = "734d4f54e6b836f7159a527011c940e4c733875e644fb92b649aa27935378cc2"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "4b9eacf8f80bb2e8743d3a7f691431c0532b8ae8ec4a41ed66411748879704ab"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
@@ -1342,10 +1347,12 @@ _BAD: dict[str, tuple[str, Any]] = {
         [{"title": "u"}, {"title": "u2"}],
     ),
     "machine_review.lost_dimensions": ("machine_review.lost_dimensions", ["security"]),
+    "machine_review.ac_tests_unread": ("machine_review.ac_tests_unread", ["t.py::t"]),
     "machine_review.profile": ("machine_review.profile", "lite"),
     "machine_review.submitted_by": ("machine_review.submitted_by", "author"),
     "machine_review.self_reviewed": ("machine_review.self_reviewed", True),
     "machine_review.principal_id": ("machine_review.principal_id", None),
+    "machine_review.pin_verified": ("machine_review.pin_verified", True),
     "machine_review.ci_integrity_verdict": (
         "machine_review.ci_integrity_verdict",
         "suspicious",

@@ -15,6 +15,7 @@ from hub.actionable_errors import (
     steward_closed_vocabulary_detail,
     steward_escalate_reason_required_detail,
     steward_judgement_exists_detail,
+    steward_judgement_incomplete_detail,
     steward_unknown_finding_uid_detail,
     steward_verdict_required_detail,
 )
@@ -32,10 +33,16 @@ from hub.models import (
     StewardJudgementView,
 )
 from hub.services.finding_identity import finding_uids, unresolved_uids
+from hub.services.steward_judgement_sample import (
+    has_visible_content,
+    is_placeholder_detail,
+    steward_judgement_body_sample,
+)
 from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicable
 from hub.services.gate_events import (
     STEWARD_APPLIED,
     STEWARD_ESCALATED,
+    STEWARD_JUDGEMENT_REFUSED,
     STEWARD_JUDGEMENT,
 )
 
@@ -69,6 +76,7 @@ def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
 #: Вид заказа и событие советника (#1601). Событие своё, чтобы ответ критика не
 #: считался судейским суждением в дайджесте и в приписывании отмен.
 KIND_ADVISOR = "advisor"
+KIND_VERDICT = "verdict"
 EVENT_ADVISOR_RECORDED = "steward_advisor_recorded"
 
 
@@ -123,7 +131,9 @@ async def _served_packet_hash(db, task_id: int, generation: int, kind: str) -> s
     return str(dict(rows[0]).get("packet_hash") or "") if rows else ""
 
 
-def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
+def _counted_grounds(
+    grounds: list, *, detail_required: bool, reject_marker: bool = False
+) -> list:
     """Основания, которые засчитываются. У советника (#1671) — только с detail.
 
     Источник без конкретного факта пакета человек и хаб проверить не могут,
@@ -131,11 +141,24 @@ def _counted_grounds(grounds: list, *, detail_required: bool) -> list:
     """
     if not detail_required:
         return list(grounds)
-    return [g for g in grounds if (g.detail or "").strip()]
+    return [
+        g
+        for g in grounds
+        if (g.detail or "").strip()
+        and not (
+            reject_marker
+            and (is_placeholder_detail(g.detail) or not has_visible_content(g.detail))
+        )
+    ]
 
 
 def _downgrade_reason(
-    verdict: str, confidence: str, grounds: list, *, detail_required: bool = False
+    verdict: str,
+    confidence: str,
+    grounds: list,
+    *,
+    detail_required: bool = False,
+    reject_marker: bool = False,
 ) -> str:
     """Why a verdict is stored as an escalation, or "" when it stands.
 
@@ -151,7 +174,9 @@ def _downgrade_reason(
         return "low_confidence"
     if verdict == "escalate":
         return ""
-    if not _counted_grounds(grounds, detail_required=detail_required):
+    if not _counted_grounds(
+        grounds, detail_required=detail_required, reject_marker=reject_marker
+    ):
         return "no_grounds"
     if not confidence:
         return "no_confidence"
@@ -173,7 +198,8 @@ def _effective_verdict(
         submitted_verdict,
         confidence,
         body.grounds,
-        detail_required=body.kind == KIND_ADVISOR,
+        detail_required=body.kind in (KIND_ADVISOR, KIND_VERDICT),
+        reject_marker=body.kind == KIND_VERDICT,
     )
     if body.kind == KIND_ADVISOR:
         object_ = submitted_verdict == "object" or bool(downgrade)
@@ -193,6 +219,56 @@ def _effective_verdict(
     if escalate_reason:
         _require_member("escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS)
     return submitted_verdict, escalate_reason
+
+
+async def _require_complete_judgement(
+    db,
+    task_id: int,
+    body: StewardJudgementSubmit,
+    submitted_verdict: str,
+    confidence: str,
+) -> None:
+    """422, а не запись: approve/возврат судьи без оснований или уверенности (#1924).
+
+    Прежде такой ответ хранился эскалацией ``no_grounds`` и уходил человеку
+    (8 из 17 передач за 17-20.10). Теперь судья получает отказ с образцом в
+    том же прогоне и исправляет тело. Суждение не пишется, слот и заказ
+    открыты; не исправил до дедлайна — прогон закрывает свип, решение у
+    человека. ``low`` уверенность и escalate проходят как раньше. Страховка
+    :func:`_downgrade_reason` остаётся: ответ без оснований не применяется
+    ни по какому пути. Каждый отказ считается событием
+    ``steward_judgement_refused``; исправленное тело потом даёт обычное
+    ``steward_judgement`` на той же задаче и поколении.
+    """
+    if body.kind != KIND_VERDICT or submitted_verdict == "escalate":
+        return
+    if confidence == "low":
+        return
+    missing: list[str] = []
+    if not _counted_grounds(body.grounds, detail_required=True, reject_marker=True):
+        missing.append("grounds[].detail" if body.grounds else "grounds")
+    if not confidence:
+        missing.append("confidence")
+    if not missing:
+        return
+    await repo.insert_event(
+        db,
+        kind=STEWARD_JUDGEMENT_REFUSED,
+        task_id=task_id,
+        actor="steward",
+        payload={
+            "kind": body.kind,
+            "generation": body.generation,
+            "missing": missing,
+        },
+    )
+    await db.commit()
+    raise HTTPException(
+        422,
+        detail=steward_judgement_incomplete_detail(
+            missing, steward_judgement_body_sample(body.generation)
+        ),
+    )
 
 
 async def _emit_events(
@@ -286,6 +362,7 @@ async def record_steward_judgement(
     for closure in body.closures:
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
+    await _require_complete_judgement(db, task_id, body, submitted_verdict, confidence)
     effective_verdict, effective_reason = _effective_verdict(
         body, submitted_verdict, confidence
     )

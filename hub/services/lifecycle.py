@@ -56,6 +56,7 @@ from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     archive_guard,
+    critic_orders,
     expected_sha_gate,
     prevention_gate,
     project_policy,
@@ -934,6 +935,24 @@ async def enrich_task_view(
 
     # #1874: оценка минут владельца - один объект на карточку, REST, MCP и CLI.
     task_view.owner_minutes = await owner_minutes.task_estimate(db, task_view.id)
+
+    # #1941: последний host-заказ и «после неудачного прогона» - чистое чтение одним снимком.
+    from hub.services import executor_triage
+
+    task_view.last_executor_order = await executor_triage.last_executor_order_view(
+        db, task_view.id
+    )
+    # #1953: последний заказ критика облачной сдачи - sha, состояние, срок, шаг.
+    task_view.critic_order = await critic_orders.card_view(db, task_view.id)
+
+    # #1956: история автоперезапуска CI на свежей базе - одна для REST, MCP, web и CLI.
+    from hub.services import delivery_rerun
+
+    task_view.delivery_rerun = await delivery_rerun.card_view(db, task_view.id)
+
+    from hub.services import role_orders
+
+    task_view.role_orders = await role_orders.card_view(db, task_view.id)  # #1973
 
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
@@ -2632,6 +2651,10 @@ class SubmitContext:
     red_test_kind: str = ""
     #: #1629: запись «CI до сдачи не доказан» при warn; пусто — доказан или off.
     ci_before_alert: str = ""
+    #: #1975: пробная сдача — шаги ничего не пишут; CI-проекция вычислена, а не
+    #: прочитана из базы (``ci_computed``), гейты читают её.
+    dry_run: bool = False
+    ci_computed: Any = None
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -3116,7 +3139,9 @@ async def _step_bug_red_test(state: SubmitContext) -> None:
         return
     sha = state.submission_sha
     # #1687: the baseline counts only from a report GitHub confirmed.
-    report = await ci_trust.trusted_report(state.db, state.task_id, sha)
+    report = await ci_trust.trusted_report(
+        state.db, state.task_id, sha, state.ci_computed
+    )
     baseline = (
         red_test_gate.parse_baseline(dict(report).get("baseline"))
         if report is not None
@@ -3163,7 +3188,11 @@ async def _step_ci_before_submit(state: SubmitContext) -> None:
     if mode == RED_TEST_OFF:
         return
     sha = state.submission_sha
-    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    report = (
+        await ci_trust.report_row(state.db, state.task_id, sha, state.ci_computed)
+        if sha
+        else None
+    )
     ac_rows = [
         dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
     ]
@@ -3200,7 +3229,12 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     # tip there): the stored standing is what such a path reads, and the
     # network refresh is done by the caller BEFORE it opens the transaction.
     prepared = state.task.get(PREPARED_CI_SHA)
-    if state.submission_sha and not state.db.in_transaction:
+    if getattr(state, "dry_run", False):
+        # #1975: the same question to GitHub, answered in memory; the gates read it.
+        state.ci_computed = await ci_trust.preview_report(
+            state.db, state.task_id, state.submission_sha
+        )
+    elif state.submission_sha and not state.db.in_transaction:
         await ci_trust.refresh_quietly(state.db, state.task_id, state.submission_sha)
     elif (
         state.submission_sha
@@ -3350,6 +3384,8 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
     Step("pin_submission_sha", _step_pin_submission_sha),
+    # #1953: то же наблюдение, что закрепил шаг выше; до bump и записей.
+    Step("critic_passed", critic_orders.submit_step),
     Step(
         "same_sha_from_review_is_current",
         _step_same_sha_from_review_is_current,
@@ -3449,6 +3485,11 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step(
+        "critic_passed",
+        critic_orders.submit_step,
+        inactive_reason="нет облачного держателя; гейт done - add_update (#1953)",
+    ),
     # #1589: после закрепления коммита — пути читаются для него, а не для
     # вершины, которая успела уйти вперёд.
     Step("path_notices", _step_path_notices, refuses=False),
@@ -3471,6 +3512,8 @@ async def run_headless_submit_gates(
     """
     state = SubmitContext(db=db, task_id=task["id"], task=task)
     await run_steps(state, HEADLESS_STEPS)
+    if task.get(critic_orders.CHECKED_KEY):  # пин = принятый sha, не второе наблюдение
+        state.submission_sha = task[critic_orders.CHECKED_KEY]
     return state
 
 
@@ -3589,6 +3632,9 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        await critic_orders.accept_in_transaction(
+            db, state.task, observed=state.submission_sha, always=True
+        )  # #1953
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
@@ -3604,23 +3650,9 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # Отчёты — те же, из которых собран open_items (#1331): у поколения
         # без ревью это отчёты последнего поколения, где ревью было. Свой
         # перебор поколения здесь развёл бы «отвечено» и «открыто».
-        already_answered: set[str] = set()
-        for report in await finding_outcome.reports_owed_an_answer(
-            db, task_id, generation
-        ):
-            already_answered.update(
-                str(dict(row)["finding_uid"])
-                for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
-            )
-        open_uids = {str(found["finding_uid"]) for found in open_items}
-        pending = [
-            item
-            for item in body.finding_outcomes
-            if not (
-                item.finding_uid in already_answered
-                and item.finding_uid not in open_uids
-            )
-        ]
+        pending = await finding_outcome.items_still_to_plan(
+            db, task_id, generation, open_items, body.finding_outcomes
+        )
         try:
             outcome_writes, still_open = finding_outcome.plan_outcomes(
                 open_items, pending
@@ -4005,6 +4037,10 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
+        # #1953: приём облачной сдачи - единая функция, под локом
+        await critic_orders.accept_in_transaction(
+            db, task, observed=state.submission_sha, always=True
+        )
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
@@ -5784,6 +5820,9 @@ async def return_to_work(
             "abandoned_jobs": [job for _field, job, _status in active_jobs],
         },
     )
+    from hub.services import executor_triage_rework
+
+    await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
     await db.commit()
     await log_activity(
         db,
@@ -6166,7 +6205,11 @@ async def _task_inside_transaction(
 ) -> dict[str, Any]:
     """The task as the database holds it NOW, with what the caller prepared kept."""
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
-    for key in (PREPARED_CI_SHA, resubmission_guard.UNCOMMITTED_KEY):
+    for key in (
+        PREPARED_CI_SHA,
+        resubmission_guard.UNCOMMITTED_KEY,
+        critic_orders.CHECKED_KEY,
+    ):
         if key in task:
             fresh[key] = task[key]
     return fresh
@@ -6185,6 +6228,7 @@ async def add_update(
     body: TaskUpdateCreate,
     *,
     principal_id: int | None = None,
+    session_token: str = "",
 ) -> TaskUpdateView:
     """Add an update to a task; route done reports through shared post-done logic.
 
@@ -6211,6 +6255,12 @@ async def add_update(
     undelivered = await task_updates.finish_update(
         db, task_id, body, deferred_done, undelivered
     )
+    if body.kind != "done":
+        # #1953: строка «нужен критик: sha …» - заказ, если её написала сессия
+        # облачного держателя; после коммита записи, сеть - вне транзакции.
+        await critic_orders.request_from_feed(
+            db, task_id, body.content, session_token=session_token
+        )
     return await task_updates.view_of_update(db, task, body, update_id, undelivered)
 
 

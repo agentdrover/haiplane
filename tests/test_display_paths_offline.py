@@ -240,6 +240,11 @@ async def _world(client, db: aiosqlite.Connection, monkeypatch) -> dict[str, int
         await db.execute(
             "UPDATE tasks SET project_id=? WHERE id=?", (project["id"], other)
         )
+    # #1927: задача сверяется с выкатом СВОЕГО проекта, поэтому выкат мира
+    # принадлежит проекту сдачи (раньше его брали как «новейший любой»).
+    await db.execute(
+        "UPDATE releases SET project_id=? WHERE project_id IS NULL", (project["id"],)
+    )
     await db.commit()
     assert review["branch"]
     return {"review": review_id, "done": done, "job": with_job, "neighbour": neighbour}
