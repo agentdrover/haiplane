@@ -194,7 +194,10 @@ async def build_call_sites_section(
         report = await asyncio.to_thread(call_sites.analyse, workspace, diff)
     except Exception as exc:  # noqa: BLE001 - advisory section, never fatal
         log.warning("call-site section failed for task #%s: %s", task_id, exc)
-        return CallSiteSection(status=call_sites.UNKNOWN, reason=f"failed: {exc}")
+        return CallSiteSection(
+            status=call_sites.UNKNOWN,
+            reason=f"failed ({type(exc).__name__}); details are in the hub log",
+        )
 
     return CallSiteSection(
         status=report.status,
@@ -338,7 +341,10 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
             # в «спросили, ответа не было» они не идут, решает вызывающий.
             raise
         log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
-        return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
+        return BaseMergeState(
+            state="unknown",
+            reason=f"спросить не удалось ({type(exc).__name__}) — подробности в логе хаба",
+        )
     value = getattr(outcome, "value", str(outcome))
     if value == "mergeable":
         return BaseMergeState(state="clean", reason=_clean_merge_reason(detail))

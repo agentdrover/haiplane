@@ -113,7 +113,9 @@ async def resolve_diff_base(
         ctx = await project_git_context(db, task_id)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: no project context: %s", task_id, exc)
-        out["reason"] = f"project git context failed: {exc}"
+        out["reason"] = (
+            f"project git context failed ({type(exc).__name__}); details are in the hub log"
+        )
         return out
 
     if (pr_base or "").strip():
@@ -145,7 +147,10 @@ async def resolve_diff_base(
         state, detail = await plugins.git_ops.resolve_ref(out["base"], workspace)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: resolve failed: %s", task_id, exc)
-        out["reason"] = f"could not resolve {out['base']}: {exc}"
+        out["reason"] = (
+            f"could not resolve {out['base']} ({type(exc).__name__}); "
+            "details are in the hub log"
+        )
         return out
 
     if state == "resolved":
@@ -165,7 +170,10 @@ async def resolve_diff_base(
             )
         except Exception as exc:  # noqa: BLE001 - degradation is the contract
             log.warning("diff base for #%s: freshness failed: %s", task_id, exc)
-            out["reason"] = f"свежесть базы {out['base']} не проверена: {exc}"
+            out["reason"] = (
+                f"свежесть базы {out['base']} не проверена "
+                f"({type(exc).__name__}) — подробности в логе хаба"
+            )
             return out
         if freshness == "stale":
             out["state"] = BASE_STALE
@@ -1478,7 +1486,10 @@ async def _measure_diff(
         diff = await read(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - advisory block, never fatal
         log.warning("review report diff failed for task #%s: %s", task_row["id"], exc)
-        report.diff_note = f"объём диффа прочитать не удалось: {exc}"
+        report.diff_note = (
+            f"объём диффа прочитать не удалось ({type(exc).__name__}) — "
+            "подробности в логе хаба"
+        )
         return report
 
     if diff is None:
