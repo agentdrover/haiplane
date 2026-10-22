@@ -1,0 +1,173 @@
+"""scripts/changed_tests.py picks the tests a diff makes worth running (#2000).
+
+Real git in a temporary repository: the selection reads ``git diff`` against the
+merge-base with ``origin/<base>``, the untracked files and the tree-guard ledger,
+and a mock of git would only test an idea of git.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import changed_tests  # noqa: E402
+
+
+def git(root: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@e",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@e",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def write(root: Path, rel: str, text: str = "x\n") -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def make_repo(tmp_path: Path, base: str = "develop", remote: bool = True) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    git(root, "init", "-q", "-b", base)
+    write(root, "tests/test_a.py")
+    write(root, "tests/test_b.py", 'PATH = "data/ledger.json"\n')
+    write(root, "tests/test_guard.py")
+    write(root, "tests/test_other.py")
+    write(root, "tests/test_gone.py")
+    write(root, "data/ledger.json", "{}\n")
+    write(root, "docs/note.md", "note\n")
+    write(
+        root,
+        changed_tests.GUARDS_LEDGER,
+        '{"guards": [{"path": "tests/test_guard.py"}, {"path": "tests/test_nope.py"}]}',
+    )
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "init")
+    if remote:
+        bare = tmp_path / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        git(root, "remote", "add", "origin", str(bare))
+        git(root, "push", "-q", "origin", base)
+    git(root, "checkout", "-q", "-b", "task-1/x")
+    return root
+
+
+def test_selection_by_diff(tmp_path: Path) -> None:
+    """AC-1: changed tests, guards and readers of changed non-py files; nothing else."""
+    root = make_repo(tmp_path)
+    write(root, "tests/test_a.py", "changed\n")  # a changed test
+    write(root, "data/ledger.json", '{"k": 1}\n')  # read by tests/test_b.py
+    write(root, "tests/test_с пробелом.py")  # new, untracked, space and Cyrillic
+    (root / "tests/test_gone.py").unlink()  # deleted: nothing to run
+    git(root, "mv", "tests/test_other.py", "tests/test_renamed.py")  # delete + add
+    write(root, "docs/other.md")  # read by nobody
+
+    changed, warning = changed_tests.changed_files(root)
+    assert warning == ""
+    assert "tests/test_gone.py" not in changed
+    assert "tests/test_other.py" not in changed
+    assert "tests/test_с пробелом.py" in changed
+    assert changed == sorted(changed)
+
+    chosen = changed_tests.select(root, changed)
+    assert chosen["tests/test_a.py"] == ["changed"]
+    assert chosen["tests/test_с пробелом.py"] == ["changed"]
+    assert chosen["tests/test_renamed.py"] == ["changed"]
+    assert chosen["tests/test_guard.py"] == ["tree guard"]
+    assert chosen["tests/test_b.py"] == ["reads data/ledger.json"]
+    assert "tests/test_gone.py" not in chosen
+    assert "tests/test_other.py" not in chosen
+    assert "tests/test_nope.py" not in chosen  # a ledger entry with no file on disk
+    assert list(chosen) == sorted(chosen)
+
+    (tmp_path / "clean").mkdir()
+    clean = make_repo(tmp_path / "clean")
+    assert changed_tests.select(clean, changed_tests.changed_files(clean)[0]) == {
+        "tests/test_guard.py": ["tree guard"]
+    }
+
+
+def test_the_base_branch_comes_from_the_clone_config(tmp_path: Path) -> None:
+    """AC-1: ``haiplane.baseBranch`` decides what the diff is against."""
+    root = make_repo(tmp_path, base="main")
+    git(root, "config", "haiplane.baseBranch", "main")
+    write(root, "tests/test_a.py", "changed\n")
+    assert changed_tests.base_branch(root) == "main"
+    changed, warning = changed_tests.changed_files(root)
+    assert warning == ""
+    assert changed == ["tests/test_a.py"]
+
+
+def test_missing_base_falls_back_to_guards_with_a_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-2: no ``origin/<base>`` is not "no changes": a reason, and the guards."""
+    root = make_repo(tmp_path, remote=False)
+    write(root, "tests/test_with_changes.py")
+    changed, warning = changed_tests.changed_files(root)
+    assert "origin/develop" in warning
+    assert changed == ["tests/test_with_changes.py"]  # untracked still counts
+
+    rc = changed_tests.main(["--root", str(root), "--dry-run"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "origin/develop" in captured.err
+    assert "tests/test_guard.py" in captured.out
+
+
+def test_n_switches_at_the_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-3: few files run in-process, many on workers; the exit code is pytest's."""
+    small = [f"tests/test_{n}.py" for n in range(changed_tests.SMALL_SELECTION)]
+    big = [*small, "tests/test_one_more.py"]
+    assert changed_tests.pytest_command(small)[6:8] == ["-n", "0"]
+    assert changed_tests.pytest_command(big)[6:8] == ["-n", "4"]
+    assert changed_tests.pytest_command(big)[8:] == big
+
+    root = make_repo(tmp_path)
+    write(root, "tests/test_a.py", "changed\n")
+    calls: list[list[str]] = []
+
+    real_run = subprocess.run
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if command[0] != "uv":  # git keeps working; only pytest is replaced
+            return real_run(command, **kwargs)  # type: ignore[call-overload]
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 7)
+
+    monkeypatch.setattr(changed_tests.subprocess, "run", fake_run)
+    assert changed_tests.main(["--root", str(root)]) == 7
+    assert calls and calls[0][:3] == ["uv", "run", "pytest"]
+    assert "tests/test_a.py" in calls[0] and "tests/test_guard.py" in calls[0]
+
+
+def test_nothing_to_run_without_guards_or_changes(tmp_path: Path) -> None:
+    """No changed tests and no ledger: nothing is run and the exit code is 0."""
+    root = tmp_path / "plain"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "develop")
+    write(root, "README.md")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "init")
+    assert changed_tests.main(["--root", str(root), "--dry-run"]) == 0
