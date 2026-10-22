@@ -26,6 +26,16 @@
         <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
     </dl>
 
+    {# #1943: разбор прогонов k8 не зависит от делегирования вердикта. #}
+    <h3>Разбор прогонов k8</h3>
+    {% if d.triage_state == 'measured' %}
+    <p data-triage-line>{{ d.triage_line }}</p>
+    {% elif d.triage_state == 'unavailable' %}
+    <p class="badge badge-failed">разбор не прочитан: {{ d.data.triage.reason }}</p>
+    {% else %}
+    <p class="text-muted">не измерялось — дайджест старше раздела</p>
+    {% endif %}
+
     {% if d.data.release_blocks %}
     {# #1420: красный CI релиза — авария, а не рутина: отдельным блоком первым. #}
     <h3>Релиз был заблокирован</h3>
