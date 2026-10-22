@@ -124,3 +124,56 @@ async def test_a_statement_edit_after_the_early_check_cancels_the_exception(
     assert err is not None, column
     assert "statement:" in str(err.detail), (column, err.detail)
     assert await verdict_of(db, case.task_id) == ""
+
+
+async def test_a_statement_edit_right_after_the_packet_is_built_cancels_the_exception(
+    db, db_dsn, monkeypatch
+):
+    """Окно между сборкой пакета и снятием отпечатка: согласие о ПРЕЖНЕЙ постановке."""
+    from hub.services import steward_apply
+
+    case = await build_case(db, monkeypatch, "dc3-statement-window")
+    other = await db_module.connect(db_dsn)
+    real = steward_apply.build_evidence_packet
+
+    async def edit_after_build(conn, task_id, generation=None):
+        packet = await real(conn, task_id, generation)
+        await other.execute(
+            "UPDATE tasks SET title='правка сразу после сборки' WHERE id=?",
+            (task_id,),
+        )
+        await other.commit()
+        return packet
+
+    monkeypatch.setattr(steward_apply, "build_evidence_packet", edit_after_build)
+    try:
+        err = await _between_unchecked(db, case)
+    finally:
+        await other.close()
+
+    assert err is not None
+    assert "statement:" in str(err.detail), err.detail
+    assert await verdict_of(db, case.task_id) == ""
+
+
+async def _between_unchecked(db, case):
+    """Как ``_between``, но ранний этап не обязан быть пустым: проверяется итог записи."""
+    from fastapi import HTTPException
+
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+    from hub.services.steward_apply import ceiling_scope
+
+    async with ceiling_scope():
+        await apply_refusals(db, case.task_id, 1)
+        try:
+            await record_review_verdict(
+                db,
+                case.task_id,
+                TaskReviewVerdict(agent="steward", verdict=ReviewVerdict.approved),
+                expected_generation=1,
+                applied_by_steward=True,
+            )
+        except HTTPException as err:
+            return err
+    return None
