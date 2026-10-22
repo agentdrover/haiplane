@@ -600,6 +600,7 @@ middleware. Клиенты с `Authorization: Bearer` (агенты, CI, MCP, `o
 - `HAIPLANE_HUB_EXTRA_ORIGINS` (#1994) — необязательный список через запятую
   других публичных адресов того же хаба (на проде `https://haiplane.com`).
   Каждый элемент — строго `схема://хост[:порт]`: только `http` или `https`,
+  хост — DNS-имя (ASCII, метки 1..63; IP-литералы и `[...]` не принимаются),
   без масок `*`, `user:pw@`, пути, `?query` и `#fragment`, порт 1..65535.
   Схема, хост и порт сверяются точно (`http` не равен `https`, порт значим).
   Элемент, который не разобрался, не расширяет доверие и в логе/`/health`
@@ -607,8 +608,8 @@ middleware. Клиенты с `Authorization: Bearer` (агенты, CI, MCP, `o
   проверки не меняется: есть `Origin` — смотрится только он, `Referer` только
   без `Origin`, токен сессии нужен всегда.
 - Сменить список: правка `HAIPLANE_HUB_EXTRA_ORIGINS` в
-  `/etc/openclaw-hub/openclaw-hub.env` (или drop-in) и
-  `sudo systemctl restart openclaw-hub`. Проверка:
+  `/etc/haiplane-hub/*.env` (или drop-in) и
+  `sudo systemctl restart haiplane-hub`. Проверка:
   `curl -s https://agenthai.ru/health` — `csrf_trusted_origins` содержит
   `HAIPLANE_HUB_URL` первым, затем элементы списка; `csrf_warning` не называет
   `HAIPLANE_HUB_EXTRA_ORIGINS`. Тот же список печатают `oc-hub health` и
