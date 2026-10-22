@@ -47,7 +47,7 @@ from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
-from hub.services import card_c2
+from hub.services import card_actions, card_c2, card_sheet
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import effective_policy, policy_change, project_policy
 from hub.services import triage_inbox
@@ -2943,6 +2943,9 @@ async def _web_task_detail_page(
     ]
     pr_repo, delivered_sha, live_checks = await _card_live_checks(db, task_id)
 
+    c2_view = await card_c2.card_context(
+        db, dict(row), task, decision_brief, delivery, review_in_flight
+    )
     return _card_response(
         request,
         {
@@ -2959,8 +2962,9 @@ async def _web_task_detail_page(
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
             "decision_brief": decision_brief,
-            "card_c2": await card_c2.card_context(
-                db, dict(row), task, decision_brief, delivery, review_in_flight
+            "card_c2": c2_view,
+            "card_actions": card_actions.for_page(
+                dict(row), c2_view, machine_review, decision_brief
             ),
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
@@ -3192,6 +3196,7 @@ async def web_create_task(
 
 
 @router.post("/tasks/{task_id}/web-approve")
+@card_sheet.sheet_action("approve")
 async def web_approve_task(
     task_id: int,
     request: Request,
@@ -3247,6 +3252,7 @@ async def web_approve_task(
 
 
 @router.post("/tasks/{task_id}/web-reject")
+@card_sheet.sheet_action("reject")
 async def web_reject_task(
     task_id: int,
     request: Request,
@@ -3357,6 +3363,12 @@ async def web_send_message(
 
 
 @router.post("/tasks/{task_id}/web-decide")
+@card_sheet.sheet_action(
+    "decide",
+    note=lambda db, task_id, form: _decide_delivery_note(
+        db, task_id, str(form.get("pr_disposition", "")).strip()
+    ),
+)
 async def web_decide_task(
     task_id: int,
     request: Request,
@@ -3618,6 +3630,7 @@ def _is_verdict_refusal(exc: HTTPException) -> bool:
 
 
 @router.post("/tasks/{task_id}/web-review-verdict")
+@card_sheet.sheet_action("verdict")
 async def web_review_verdict(
     task_id: int,
     request: Request,
@@ -3741,6 +3754,7 @@ async def web_force_complete_task(
 
 
 @router.post("/tasks/{task_id}/web-return-to-work")
+@card_sheet.sheet_action("return")
 async def web_return_to_work(
     task_id: int,
     request: Request,
