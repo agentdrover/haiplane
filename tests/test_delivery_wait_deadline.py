@@ -400,7 +400,8 @@ async def test_a_live_rerun_booking_is_not_an_escalation(db, monkeypatch):
     async def booking(db_, task_id, gen):
         await db_.execute(
             "INSERT INTO delivery_reruns (task_id, submission_generation, "
-            "pr_number, state) VALUES (?, ?, 360, 'reserved')",
+            "pr_number, state, requested_at) "
+            "VALUES (?, ?, 360, 'reserved', datetime('now'))",
             (task_id, gen),
         )
 
@@ -409,7 +410,63 @@ async def test_a_live_rerun_booking_is_not_an_escalation(db, monkeypatch):
 
     assert (await repo.get_task(db, task_id))["status"] == "running"
     assert await _needs_decision_events(db, task_id) == 0
-    assert await _open_waits(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1, "срок не продлевается бронью"
+
+
+async def test_an_expired_rerun_booking_does_not_hold_the_deadline(db, monkeypatch):
+    async def booking(db_, task_id, gen):
+        await db_.execute(
+            "INSERT INTO delivery_reruns (task_id, submission_generation, "
+            "pr_number, state, requested_at) "
+            "VALUES (?, ?, 360, 'requested', datetime('now', '-3 hours'))",
+            (task_id, gen),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, booking)
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+    assert await _needs_decision_events(db, task_id) == 1
+
+
+async def test_a_replaced_pr_delivered_by_a_neighbour_is_not_an_escalation(
+    db, monkeypatch
+):
+    async def replaced(db_, task_id, gen):
+        await db_.execute("UPDATE tasks SET pr_number = 361 WHERE id = ?", (task_id,))
+        await db_.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+            "VALUES (1, 361, ?, 'neighbour')",
+            (task_id,),
+        )
+
+    task_id = await _aged_wait(db, monkeypatch, replaced)
+    await _pass(db, task_id)
+
+    assert (await repo.get_task(db, task_id))["status"] == "running"
+    assert await _needs_decision_events(db, task_id) == 0
+
+
+async def test_a_closed_rerun_outcome_is_named_in_the_escalation(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    gen = (await repo.get_task(db, task_id))["submission_generation"]
+    await db.execute(
+        "INSERT INTO delivery_reruns (task_id, submission_generation, pr_number, "
+        "state, outcome, failed_jobs) VALUES (?, ?, 360, 'closed', 'rerun_red', "
+        "'[\"tests\"]')",
+        (task_id, gen),
+    )
+    await db.commit()
+    await _age(db, task_id, 30)
+    await _pass(db, task_id)
+
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("rerun_red" in a and "tests" in a for a in alerts), alerts
 
 
 async def test_a_stale_snapshot_neither_closes_nor_opens_the_live_wait(db, monkeypatch):
