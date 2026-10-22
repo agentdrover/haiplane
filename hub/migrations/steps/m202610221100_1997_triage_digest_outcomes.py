@@ -15,6 +15,9 @@
 Внешних ключей нет намеренно: удалённый дайджест не должен возвращать исход в
 счёт.
 
+Удаление рекомендации (в том числе каскадом) снимает её строку из очереди; учтённая
+строка остаётся историей.
+
 Заполнение старых данных: учтёнными (``digest_id`` заполнен) становятся ТОЛЬКО
 доказуемо учтённые - id есть в ``triage.outcome_ids`` измеренного
 (``state = measured``) дайджеста и рекомендация существует; ``kind`` - ``late``,
@@ -79,6 +82,17 @@ MIGRATIONS: list[tuple[str, str]] = [
         BEGIN
             INSERT OR IGNORE INTO triage_digest_outcomes (recommendation_id)
             VALUES (NEW.id);
+        END""",
+    ),
+    (
+        # Удалённая рекомендация (каскадом с задачей или заказом) уходит из очереди:
+        # иначе удалённое копилось бы в частичном индексе и росло вместе с историей.
+        "trg_triage_outcome_dequeued_on_delete",
+        """CREATE TRIGGER IF NOT EXISTS trg_triage_outcome_dequeued_on_delete
+        AFTER DELETE ON executor_triage_recommendations
+        BEGIN
+            DELETE FROM triage_digest_outcomes
+            WHERE recommendation_id = OLD.id AND digest_id IS NULL;
         END""",
     ),
     (

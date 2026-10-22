@@ -32,6 +32,7 @@ STEP_TOKENS = (
     "triage_digest_outcomes",
     "triage_outcome_queued",
     "queue_triage_outcomes",
+    "triage_outcome_dequeued",
     "recommendations_created",
 )
 
@@ -433,3 +434,19 @@ async def test_a_candidate_moved_to_another_project_is_not_taken(world):
         world.db, mine, start, end, probe
     )
     assert links == [] and section["resolved"] == 0
+
+
+async def test_a_deleted_recommendation_leaves_the_queue(world):
+    """Удаление рекомендации не копит строки в очереди."""
+    rec_id, task_id = await _outcome(world, "удалённая")
+    before = await _rows(world.db, f"SELECT * FROM {LINKS} WHERE digest_id IS NULL")
+    assert [r["recommendation_id"] for r in before] == [rec_id]
+    await world.db.execute("PRAGMA foreign_keys = OFF")
+    await world.db.execute(
+        "DELETE FROM executor_triage_recommendations WHERE task_id = ?", (task_id,)
+    )
+    await world.db.execute("PRAGMA foreign_keys = ON")
+    await world.db.commit()
+    gone = await _rows(world.db, "SELECT id FROM executor_triage_recommendations")
+    assert gone == []
+    assert await _rows(world.db, f"SELECT * FROM {LINKS}") == []
