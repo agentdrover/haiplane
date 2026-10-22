@@ -368,7 +368,8 @@ def for_page(
     для показа. Справки нет - риски вида (иного источника нет).
     """
     recommend = str((view.get("recommend") or {}).get("action") or "")
-    risks = (brief.get("risks") if brief else None) or view.get("risks") or []
+    raw = brief.get("risks") if brief is not None else view.get("risks")
+    risks = raw or []
     # Находки прошлой сдачи листу не предлагаются: вердикт пишется на новую.
     current = bool(_get(machine_review, "is_current"))
     confirmed = (_get(machine_review, "findings_confirmed") or []) if current else []
