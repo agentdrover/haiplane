@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from fastapi import HTTPException
+
 from hub import config
 from hub import db as hub_db
 from hub import repository as repo
@@ -81,7 +83,9 @@ async def _after_cr(
             run_id="run-old",
             model="m",
         )
-        await repo.update_executor_run(world.db, run, outcome="finished", finish=True)
+        await repo.update_executor_run(
+            world.db, run, tokens=1000, cents=10.0, outcome="finished", finish=True
+        )
     if findings == "machine":
         await world.db.execute(
             "INSERT INTO machine_reviews (task_id, submission_generation, "
@@ -267,7 +271,7 @@ async def test_busy_or_failed_issue_leaves_the_task_running(world, monkeypatch):
 
     # Сбой выпуска при ВНЕШНЕЙ транзакции, которую потом коммитят: ни возврата,
     # ни кода, ни прогона — ни исключением, ни строковым отказом (HostError).
-    for failure in (RuntimeError("seal"), orders.HostError("ключ хоста")):
+    for failure in (RuntimeError("seal"), orders.HostError(400, "ключ хоста")):
         task_id = await _after_cr(world, f"сбой выпуска {type(failure).__name__}")
         before = await _footprint(world, task_id)
 
@@ -284,6 +288,19 @@ async def test_busy_or_failed_issue_leaves_the_task_running(world, monkeypatch):
         await world.db.commit()  # внешний владелец транзакции коммитит после отказа
         monkeypatch.undo()
         assert await _footprint(world, task_id) == before, failure
+
+    # Задача ушла из running между проверкой и возвратом: отказ, следов нет.
+    raced = await _after_cr(world, "ушла из running")
+
+    async def lost(*_a, **_k):
+        raise HTTPException(409, "left running")
+
+    before = await _footprint(world, raced)
+    monkeypatch.setattr(return_running, "apply_return_to_open", lost)
+    result = await _go(world.db, world, raced)
+    monkeypatch.undo()
+    assert not result.launched and "left running" in result.reason
+    assert await _footprint(world, raced) == before
 
 
 # ---------------------------------------------------------------------------

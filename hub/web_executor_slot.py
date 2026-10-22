@@ -25,14 +25,22 @@ from hub.services import (
 router = APIRouter()
 
 
-async def card_hosts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+async def card_hosts(db: aiosqlite.Connection, task: dict[str, Any]) -> list[str]:
     """Включённые хосты, на которые карточка предлагает запуск.
 
     Только у проекта в режиме manual: в off запуск всё равно откажет, и кнопка,
-    которая гарантированно ответит отказом, — шум на карточке.
+    которая гарантированно ответит отказом, — шум на карточке. У running
+    (круг починки после changes_requested, #1998) — ещё и только там, где его
+    допускает общее правило ``repair_state``, иначе кнопка ответила бы отказом.
     """
+    status = task.get("status")
+    if status not in ("open", "running"):
+        return []
+    task_id = int(task["id"])
     policy = await project_policy.gate_policy_for_task(db, task_id)
     if executor_launch.launch_mode_of(policy) != executor_launch.LAUNCH_MANUAL:
+        return []
+    if status == "running" and not (await executor_launch.repair_state(db, task))[0]:
         return []
     return await executor_orders.enabled_host_names(db)
 

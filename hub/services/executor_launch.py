@@ -823,6 +823,15 @@ async def _report_rows_for_repair(
 async def _current_findings(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[dict[str, str]]:
+    """Находки круга починки: машинные текущей сдачи И текущего вердикта (#1998)."""
+    from hub.services import rework_admission
+
+    return await _machine_findings(db, task) + rework_admission.verdict_findings(task)
+
+
+async def _machine_findings(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> list[dict[str, str]]:
     """Подтверждённые и неразрешённые находки последнего отчёта текущей сдачи.
 
     uid берутся из ``MachineReviewView`` — тем же вычислением, что у брифа
@@ -873,7 +882,8 @@ def _findings_block(findings: list[dict[str, str]]) -> str:
     ]
     for f in findings:
         where = f" [{f['where']}]" if f["where"] else ""
-        lines.append(f"- uid {f['uid']} ({f['kind']}){where}: {f['title']}")
+        uid = f"uid {f['uid']} " if f["uid"] else ""  # замечание вердикта без uid
+        lines.append(f"- {uid}({f['kind']}){where}: {f['title']}")
         if f["text"]:
             lines.append(f"  {f['text']}")
     lines.append(FINDINGS_DATA_CLOSE)
@@ -1079,35 +1089,23 @@ async def _admit_rework(
 ) -> str:
     """Допуск и возврат running-задачи без держателя — под write-локом брони (#1783).
 
-    Всё перечитано внутри транзакции ``_reserve``: статус, держатель, признаки
-    работы и идущий прогон (бронь соседнего нажатия или чужой claim, пришедшие
-    после быстрой проверки, видны здесь). Возврат running → open и INSERT брони
-    — одна транзакция: проигравшему гонку платный исполнитель не покупается, а
-    задача не остаётся open без исполнителя. Сетевой заказ — после коммита
-    (#1428). Пустая строка — допуск.
+    Правило допуска общее со слотом (``rework_admission.refusal``, #1998): всё
+    перечитано внутри транзакции ``_reserve``. Возврат running → open и INSERT
+    брони — одна транзакция: проигравшему гонку платный исполнитель не
+    покупается, а задача не остаётся open без исполнителя. Сетевой заказ — после
+    коммита (#1428). Пустая строка — допуск.
     """
-    from hub.services import return_running
+    from hub.services import rework_admission, return_running
 
-    if task["status"] == "open":
-        return ""
-    if task["status"] != "running":
-        # Под локом задачу успели взять или сдвинуть: бронь не покупается
-        # поверх чужого захвата.
-        return f"{REASON_NOT_RETURNABLE}: статус {task['status']} под локом брони"
-    live = await _live_run(db, int(task["id"]))
-    if live:
-        return live
-    signs = await return_running.work_signs(db, task)
-    if signs:
-        named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
-        return f"{REASON_NOT_RETURNABLE}: у задачи есть признаки работы: {named}"
+    why = await rework_admission.refusal(db, task)
+    if why or task["status"] == "open":
+        return why
     await return_running.apply_return_to_open(
         db,
         task,
         actor=issuer,
-        reason=(
-            f"круг починки облачным исполнителем по находкам сдачи "
-            f"{task.get('submission_generation')} (#1444, #1783), нажал {issuer}"
+        reason=rework_admission.return_reason(
+            task, where="облачным исполнителем", issue="#1444, #1783", who=issuer
         ),
     )
     return ""
