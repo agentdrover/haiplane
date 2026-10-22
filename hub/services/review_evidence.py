@@ -47,6 +47,7 @@ from hub import config
 from hub import repository as repo_module
 from hub.services.author_answers import undisposed_findings
 from hub.integrations.registry import plugins
+from hub.services.brief_failure import failure_from
 from hub.models import ReviewInFlight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -113,9 +114,7 @@ async def resolve_diff_base(
         ctx = await project_git_context(db, task_id)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: no project context: %s", task_id, exc)
-        out["reason"] = (
-            f"project git context failed ({type(exc).__name__}); details are in the hub log"
-        )
+        out["reason"] = f"project git context failed: {failure_from(exc).reason}"
         return out
 
     if (pr_base or "").strip():
@@ -147,10 +146,7 @@ async def resolve_diff_base(
         state, detail = await plugins.git_ops.resolve_ref(out["base"], workspace)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: resolve failed: %s", task_id, exc)
-        out["reason"] = (
-            f"could not resolve {out['base']} ({type(exc).__name__}); "
-            "details are in the hub log"
-        )
+        out["reason"] = f"could not resolve {out['base']}: {failure_from(exc).reason}"
         return out
 
     if state == "resolved":
@@ -170,10 +166,8 @@ async def resolve_diff_base(
             )
         except Exception as exc:  # noqa: BLE001 - degradation is the contract
             log.warning("diff base for #%s: freshness failed: %s", task_id, exc)
-            out["reason"] = (
-                f"свежесть базы {out['base']} не проверена "
-                f"({type(exc).__name__}) — подробности в логе хаба"
-            )
+            why = failure_from(exc).reason
+            out["reason"] = f"свежесть базы {out['base']} не проверена: {why}"
             return out
         if freshness == "stale":
             out["state"] = BASE_STALE
@@ -1486,10 +1480,8 @@ async def _measure_diff(
         diff = await read(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - advisory block, never fatal
         log.warning("review report diff failed for task #%s: %s", task_row["id"], exc)
-        report.diff_note = (
-            f"объём диффа прочитать не удалось ({type(exc).__name__}) — "
-            "подробности в логе хаба"
-        )
+        why = failure_from(exc).reason
+        report.diff_note = f"объём диффа прочитать не удалось: {why}"
         return report
 
     if diff is None:

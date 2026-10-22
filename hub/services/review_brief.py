@@ -195,8 +195,7 @@ async def build_call_sites_section(
     except Exception as exc:  # noqa: BLE001 - advisory section, never fatal
         log.warning("call-site section failed for task #%s: %s", task_id, exc)
         return CallSiteSection(
-            status=call_sites.UNKNOWN,
-            reason=f"failed ({type(exc).__name__}); details are in the hub log",
+            status=call_sites.UNKNOWN, reason=f"failed: {failure_from(exc).reason}"
         )
 
     return CallSiteSection(
@@ -342,8 +341,7 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
             raise
         log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
         return BaseMergeState(
-            state="unknown",
-            reason=f"спросить не удалось ({type(exc).__name__}) — подробности в логе хаба",
+            state="unknown", reason=f"спросить не удалось: {failure_from(exc).reason}"
         )
     value = getattr(outcome, "value", str(outcome))
     if value == "mergeable":
