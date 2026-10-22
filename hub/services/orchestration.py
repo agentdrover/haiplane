@@ -61,7 +61,7 @@ from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
 from hub.services import workflow_seed
-from hub.services import delivery_rerun
+from hub.services import delivery_claim, delivery_rerun
 from hub.services.executor_autonomy import statistics_sections
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
@@ -4348,16 +4348,14 @@ def is_base_conflict_entry(payload: dict[str, Any]) -> bool:
 
 
 # #1398: мержи гейта, идущие или прошедшие В ЭТОМ процессе, по (задача, PR).
-# Два пути доставки — report_done (соединение запроса, BEGIN IMMEDIATE на весь
-# done-flow) и поллер (своё соединение) — живут в одном цикле событий, но не
-# видят незакоммиченных записей друг друга. Будущее ставится ДО вызова форжа и
-# разрешается СРАЗУ после его ответа, до любой записи в базу: проигравший ждёт
-# его, не держа того, что нужно победителю. Лок вокруг всего гейта здесь не
-# годится — report_done держит write-лок SQLite, и победитель-поллер упёрся бы
-# в него на записи pipeline_merges, пока report_done ждёт asyncio-лок (5 с
-# busy_timeout, затем merge_gate_error по влитому PR). Успешные записи
-# остаются: между ответом форжа и коммитом строки победителем её не видно из
-# другого соединения, и только эта память отличает мерж гейта от ручного.
+# report_done (соединение запроса, BEGIN IMMEDIATE на весь done-flow) и поллер (своё соединение)
+# живут в одном цикле событий, но не видят незакоммиченных записей друг друга. Будущее ставится
+# ДО вызова форжа и разрешается СРАЗУ после его ответа, до любой записи в базу: проигравший
+# ждёт его, не держа того, что нужно победителю. Лок вокруг всего гейта не годится — report_done
+# держит write-лок SQLite, победитель-поллер упёрся бы в него на записи pipeline_merges, пока
+# report_done ждёт asyncio-лок (5 с busy_timeout, затем merge_gate_error по влитому PR). Успешные
+# записи остаются: до коммита строки победителем её не видно из другого соединения, и только
+# эта память отличает мерж гейта от ручного.
 _gate_merges: dict[tuple[int, int], asyncio.Future[bool]] = {}
 GATE_MERGE_WAIT_SECONDS = 60.0
 
@@ -4480,6 +4478,8 @@ async def merge_if_approval_stands(
             return MergeStep.UNPINNED, ""
         # A task that opted out of review (auto_review=False) has no approved head
         # to bind to; for it the merge stays what it was before #1706.
+        if delivery_claim.held(key):  # #1992: идёт перевод по сроку, форж не зовём
+            return MergeStep.APPROVAL_GONE, ""
         if key not in _gate_merges:
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             _gate_merges[key] = fut

@@ -39,7 +39,7 @@ from hub import repository as repo
 from hub import repository_delivery_rerun as rerun_journal
 from hub import repository_delivery_wait as journal
 from hub.db import write_transaction
-from hub.services import delivery_writes, project_policy
+from hub.services import delivery_claim, delivery_writes, project_policy
 
 log = logging.getLogger("hub")
 
@@ -201,8 +201,26 @@ async def _escalate(
     # Память гейта - словарь процесса, лок SQLite её не защищает. Проверка стоит
     # последней и без await до условного UPDATE перехода: окно остаётся только
     # между этим UPDATE и записью статуса (известная граница, как у #1956).
-    if _merge_in_gate_memory(key[0], int(pr_num or 0)):
+    claim = (key[0], int(pr_num or 0))
+    if _merge_in_gate_memory(*claim):
         return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
+    # Без await между проверкой и отметкой: мерж, начатый позже, увидит отметку и
+    # форж не позовёт (взаимное исключение с merge_if_approval_stands).
+    delivery_claim.hold(claim)
+    try:
+        return await _transition(db, key, pr_num, detail, hours)
+    finally:
+        delivery_claim.release(claim)
+
+
+async def _transition(
+    db: aiosqlite.Connection,
+    key: tuple[int, int, int, str],
+    pr_num: Any,
+    detail: str,
+    hours: int,
+) -> bool:
+    """Сам переход, под отметкой ``delivery_claim``: UPDATE, статус, событие."""
     if not await journal.escalate(db, *key):
         return False  # переход уже сделал другой проход
     await delivery_writes.hand_pair_to_human(

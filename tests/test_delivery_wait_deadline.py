@@ -721,3 +721,43 @@ async def test_the_claim_is_released_after_the_transition(db, monkeypatch):
     await _pass(db, task_id)
 
     assert not delivery_claim.held((task_id, 360))
+
+
+async def test_a_merge_in_flight_wins_over_the_escalation(db, monkeypatch):
+    """Обратный порядок: мерж зарегистрирован первым - эскалация уступает."""
+    import asyncio
+
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    release = asyncio.Event()
+
+    async def slow_merge(*a, **kw):
+        await release.wait()
+        return True, ""
+
+    plugins.git_ops.merge_pr_with_detail = slow_merge
+    snap = dict(await repo.get_task(db, task_id))
+    ctx = await orchestration.project_git_context(db, task_id)
+    merging = asyncio.create_task(
+        orchestration.merge_if_approval_stands(
+            db, snap, ctx, checked_sha=snap["submission_sha"]
+        )
+    )
+    try:
+        for _ in range(200):  # дать мержу зарегистрировать Future
+            if (task_id, 360) in orchestration._gate_merges:
+                break
+            await asyncio.sleep(0.01)
+        assert (task_id, 360) in orchestration._gate_merges
+        await _pass(db, task_id)
+        assert (await repo.get_task(db, task_id))["status"] == "running"
+        assert await _needs_decision_events(db, task_id) == 0
+    finally:
+        release.set()
+        step, _ = await merging
+        orchestration._gate_merges.pop((task_id, 360), None)
+    assert step is orchestration.MergeStep.MERGED
