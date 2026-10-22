@@ -8,8 +8,8 @@ require, и проверка состояния в базе отдельным �
 Задачи у сценариев независимые: стенд один на сессию, а общего состояния между
 тестами нет.
 
-Не покрыт сценарий «отказ сервиса показан по-русски»: страница отказа (#1995) на
-момент этой задачи в develop не влита.
+Отказ сервиса проверяется браузером: TestClient #1995 видит HTML и charset, но
+не то, что человек получает на экране после клика.
 """
 
 from __future__ import annotations
@@ -211,6 +211,40 @@ def test_autorefresh_is_blocked_while_typing_and_the_button_still_works(
     _no_stale_form(page)
     notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
     assert notes and REASON in notes[-1]["content"]
+
+
+def test_a_service_refusal_is_shown_in_russian(page: Any, stand: Stand) -> None:
+    task_id = stand.seed_review_task(title="отказ сервиса")
+    _open(page, stand, task_id)
+
+    page.get_by_role("link", name="К действию").click()
+    page.locator("#task-return-reason").fill(REASON)
+    # Статус меняется за спиной открытой страницы: хаб откажет при отправке.
+    stand.run(_force_status(task_id, "open"))
+    page.get_by_role("button", name="Вернуть в работу").click()
+
+    alert = page.locator('[role="alert"]').first
+    alert.wait_for(timeout=10_000)
+    text = page.locator("body").inner_text()
+    assert "Хаб отклонил запрос" in text, text[:400]
+    assert "current status: open" in text, text[:400]
+    assert '{"detail"' not in text, "браузер получил голый JSON"
+    assert "Ð" not in text and "Ñ" not in text, "кракозябры вместо кириллицы"
+    _no_stale_form(page)
+    # Задача уже open: карточка честно показывает новый статус, формы возврата
+    # на ней больше нет, поэтому сохранность ввода здесь не проверяется — её
+    # держат серверные тесты #1995 (test_refused_card_forms_keep_the_typed_text).
+    assert stand.status_of(task_id) == "open"
+
+
+def _force_status(task_id: int, status: str) -> Any:
+    async def work(conn: Any) -> None:
+        await conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
+        )
+        await conn.commit()
+
+    return work
 
 
 def _rename(task_id: int, title: str) -> Any:
