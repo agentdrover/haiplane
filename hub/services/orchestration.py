@@ -61,8 +61,8 @@ from hub.integrations.protocols import (
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, critic_orders, delivery_notes, watch_notices
-from hub.services import workflow_seed
-from hub.services import delivery_rerun
+from hub.services import delivery_rerun, workflow_seed
+from hub.services.route_after_done_commit import committed_before, record_squash
 from hub.services.executor_autonomy import statistics_sections
 from hub.services.cycle_split import cycle_split, empty_split
 from hub.services.metrics_scope import Scope
@@ -5904,7 +5904,7 @@ async def _squash_and_record(
     )
     after = await _local_tip(branch, git_repo)
     if before and after and before != after:
-        await repo.update_task(db, task["id"], gate_squashed_sha=before)
+        await record_squash(db, task["id"], before)
         log.info(
             "Task #%d: gate squashed %s (%s → %s)",
             task["id"],
@@ -6096,7 +6096,7 @@ async def _route_after_done(
     # The base default belongs to git_ops (_resolve_base, #362 I4) — an
     # empty base is passed through, never recomputed here.
     try:
-        differs = await plugins.git_ops.content_differs(
+        differs = await committed_before(db, plugins.git_ops.content_differs)(
             (ctx.get("base_branch") or "").strip(),
             branch,
             repo=git_repo,

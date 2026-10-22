@@ -1017,6 +1017,7 @@ async def _sweep_ci_check(db) -> None:
                 )
                 continue
             await repo.reset_ci_check_state(db, task["id"])
+            await db.commit()  # #2005: the pass owns it; the network is next
             if ci.outcome == CIProbeOutcome.absent:
                 # A PR with no checks is a definite answer, not a wait: skip
                 # the CI conveyor and go straight to review (#419).
@@ -1027,6 +1028,7 @@ async def _sweep_ci_check(db) -> None:
                     "status",
                     "CI checks absent on PR — skipping CI, dispatching review.",
                 )
+                await db.commit()  # #2005
                 log.info(
                     "Poll: task #%d CI absent on PR #%s, dispatching review",
                     task["id"],

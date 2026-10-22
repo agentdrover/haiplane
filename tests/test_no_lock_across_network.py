@@ -13,12 +13,13 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
 import pytest
 
-from hub import poller
+from hub import config, poller
 from hub import repository as repo
 from hub import services
 from hub.db import committed_if_own, write_transaction
@@ -26,8 +27,12 @@ from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
 )
+from hub.integrations.noop import NoopDispatch, NoopGitOps
+from hub.integrations.registry import plugins
+from hub.models import TaskUpdateCreate
 from hub.services import lifecycle, orchestration
 from hub.services.orchestration import STACK_UNKNOWN, StackAssessment
+from tests.watch_notice_support import ci_check_task
 from tests.delivery_rerun_support import (
     TIP,
     Rig,
@@ -54,7 +59,10 @@ async def _probe(dsn: str, task_id: int) -> dict:
         await conn.execute("PRAGMA busy_timeout = 500")
         await conn.execute("BEGIN IMMEDIATE")  # «database is locked», если занято
         pr = await conn.execute_fetchall(
-            "SELECT pr_number, submission_sha FROM tasks WHERE id=?", (task_id,)
+            "SELECT pr_number, submission_sha, ci_check_started_at, "
+            "ci_no_pr_attempts, gate_squashed_sha, status, submission_generation "
+            "FROM tasks WHERE id=?",
+            (task_id,),
         )
         feed = await conn.execute_fetchall(
             "SELECT content FROM task_updates WHERE task_id=?", (task_id,)
@@ -69,6 +77,11 @@ async def _probe(dsn: str, task_id: int) -> dict:
         return {
             "pr": pr[0]["pr_number"],
             "sha": pr[0]["submission_sha"],
+            "ci_started": pr[0]["ci_check_started_at"],
+            "attempts": pr[0]["ci_no_pr_attempts"],
+            "squashed": pr[0]["gate_squashed_sha"],
+            "status": pr[0]["status"],
+            "generation": pr[0]["submission_generation"],
             "feed": "\n".join(r["content"] or "" for r in feed),
             "merges": [r["pr_number"] for r in merges],
             "reruns": [r["state"] for r in reruns],
@@ -410,3 +423,196 @@ async def test_foreign_transaction_is_never_committed_by_ensure_delivery_pr(
         lambda: orchestration.ensure_delivery_pr(db, task, "task-x/x", ["a.py"]),
         marker=str(NEW_PR),
     )
+
+
+# ---- #2005: пути, оставшиеся после #2001 -----------------------------------
+
+CI_OUTCOMES = {
+    "absent": CIProbeResult(CIProbeOutcome.absent, "no_checks"),
+    "passed": PASSED,
+    "failed": CIProbeResult(CIProbeOutcome.failed, "checks_failed"),
+}
+STARTED = "2000-01-01 00:00:00"
+
+
+async def _ci_check_rig(db, monkeypatch, outcome: str) -> tuple[int, NoopGitOps]:
+    """ci_check-задача с PR; форж отвечает ``outcome``, диспетчер - заглушка."""
+    task_id = await ci_check_task(db, attempts=2)
+    await repo.update_task(db, task_id, pr_number=NEW_PR, branch=f"task-{task_id}/x")
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at=? WHERE id=?", (STARTED, task_id)
+    )
+    await db.commit()
+    git = NoopGitOps()
+    git.check_pr_ci = AsyncMock(return_value=CI_OUTCOMES[outcome])
+    git.get_ci_failure_logs = AsyncMock(return_value="log")
+    dispatch = NoopDispatch()
+    dispatch.submit_task = AsyncMock(return_value={"job_id": "j-1"})
+    monkeypatch.setattr(plugins, "git_ops", git)
+    monkeypatch.setattr(plugins, "dispatch", dispatch)
+    return task_id, git
+
+
+@pytest.mark.parametrize("outcome", ["absent", "passed", "failed"])
+async def test_ci_check_sweep_does_not_hold_the_lock_across_the_network(
+    db, db_dsn, monkeypatch, outcome
+):
+    task_id, git = await _ci_check_rig(db, monkeypatch, outcome)
+
+    def attach(stand):
+        if outcome == "failed":
+            git.get_ci_failure_logs = AsyncMock(side_effect=stand)
+        else:
+            plugins.dispatch.submit_task = AsyncMock(side_effect=stand)
+
+    seen = await _frozen_in_network(
+        attach,
+        lambda: poller._sweep_ci_check(db),
+        db_dsn,
+        task_id,
+        answer="log" if outcome == "failed" else {"job_id": "j-1"},
+    )
+    assert seen["ci_started"] is None and seen["attempts"] == 0, "сброс виден"
+    if outcome == "absent":
+        assert "CI checks absent on PR" in seen["feed"], "запись виден до сети"
+
+
+async def _headless_done_rig(db, monkeypatch, *, areas=None):
+    """Headless-задача после done: git-хвост настоящий, форж и git - заглушки."""
+    monkeypatch.setattr(config, "COMMIT_SCOPE_GATE", "warn")
+    task_id = await repo.create_task(
+        db,
+        title="Headless done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        branch=f"task-{task_id}/h",
+        job_id="dispatch-42",
+        affected_areas=json.dumps(areas or []),
+    )
+    await db.commit()
+    git = NoopGitOps()
+    git.checkout = AsyncMock(return_value=True)
+    git.dirty_paths = AsyncMock(return_value=[])
+    git.auto_commit = AsyncMock(return_value=True)
+    git.content_differs = AsyncMock(return_value=True)
+    git.squash_branch = AsyncMock(return_value=False)
+    git.push_branch = AsyncMock(return_value=True)
+    git.create_pr = AsyncMock(return_value=None)
+    git.worktree_path = MagicMock(return_value="")
+    monkeypatch.setattr(plugins, "git_ops", git)
+    monkeypatch.setattr(plugins, "dispatch", NoopDispatch())
+    return task_id, git
+
+
+ROUTE_VARIANTS = ("empty_areas", "foreign_warn", "squashed_sha")
+
+
+@pytest.mark.parametrize("variant", ROUTE_VARIANTS)
+async def test_route_after_done_does_not_hold_the_lock_across_the_network(
+    db, db_dsn, monkeypatch, variant
+):
+    areas = ["hub/x.py"] if variant == "foreign_warn" else []
+    task_id, git = await _headless_done_rig(db, monkeypatch, areas=areas)
+    if variant != "squashed_sha":
+        git.dirty_paths = AsyncMock(return_value=["other/y.py"])
+    else:
+        git.squash_branch = AsyncMock(return_value=True)
+        git.resolve_ref = AsyncMock(
+            side_effect=[("resolved", "before0sha"), ("resolved", "after0sha")]
+        )
+
+    def attach(stand):
+        if variant == "squashed_sha":
+            git.push_branch = AsyncMock(side_effect=stand)
+        else:
+            git.content_differs = AsyncMock(side_effect=stand)
+
+    row = dict(await repo.get_task(db, task_id))
+    seen = await _frozen_in_network(
+        attach,
+        lambda: orchestration.transition_after_agent_done(db, row, has_done=True),
+        db_dsn,
+        task_id,
+        answer=True,
+    )
+    if variant == "empty_areas":
+        assert "affected_areas" in seen["feed"], "предупреждение видно до сети"
+    elif variant == "foreign_warn":
+        assert "вне объявленной области" in seen["feed"]
+    else:
+        assert seen["squashed"] == "before0sha", "gate_squashed_sha видна до push"
+
+
+class _PushFailed(Exception):
+    """Сбой git-хвоста: внешняя транзакция done-flow должна откатиться."""
+
+
+async def _committed_view(dsn: str, task_id: int) -> dict:
+    """Чтение закоммитченного второй (читающей) связью, без блокировки записи."""
+    conn = await aiosqlite.connect(dsn, timeout=0.5, isolation_level=None)
+    conn.row_factory = aiosqlite.Row
+    try:
+        t = await conn.execute_fetchall(
+            "SELECT status, pr_number, gate_squashed_sha, submission_generation "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        )
+        feed = await conn.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=?", (task_id,)
+        )
+        return {
+            **dict(t[0]),
+            "feed": "\n".join(r["content"] or "" for r in feed),
+        }
+    finally:
+        await conn.close()
+
+
+async def test_done_flow_entry_never_commits_the_foreign_transaction(
+    db, db_dsn, monkeypatch
+):
+    """Исключение #2005: под done_flow лок остаётся, но откат работает (#364)."""
+    task_id, git = await _headless_done_rig(db, monkeypatch, areas=["hub/x.py"])
+    await repo.update_task(db, task_id, job_id=None)  # pair: идёт через done_flow
+    await db.commit()
+    git.dirty_paths = AsyncMock(return_value=["other/y.py"])  # warn о чужих файлах
+    git.squash_branch = AsyncMock(return_value=True)
+    git.resolve_ref = AsyncMock(
+        side_effect=[("resolved", "before0sha"), ("resolved", "after0sha")]
+    )
+    before = await _committed_view(db_dsn, task_id)
+    mid: dict = {}
+
+    async def push_then_fail(*_a, **_k):
+        assert db.in_transaction, "внешняя транзакция done-flow ещё открыта"
+        mid.update(await _committed_view(db_dsn, task_id))
+        raise _PushFailed
+
+    git.push_branch = AsyncMock(side_effect=push_then_fail)
+    marker = "DONE-MARKER-2005"
+    with pytest.raises(_PushFailed):
+        await services.add_update(
+            db,
+            task_id,
+            TaskUpdateCreate(agent="dev", kind="done", content=marker),
+        )
+    assert git.push_branch.await_count == 1, "путь дошёл до сетевого шага"
+    for view in (mid, await _committed_view(db_dsn, task_id)):
+        assert marker not in view["feed"], "чужая транзакция не закоммичена"
+        assert not view["gate_squashed_sha"]
+        assert view["pr_number"] is None
+        assert view["status"] == before["status"]
+        assert view["submission_generation"] == before["submission_generation"]
+        assert "вне объявленной области" not in view["feed"]
