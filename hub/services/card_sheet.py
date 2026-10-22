@@ -207,7 +207,7 @@ def _risk_refusal(form: Any) -> str:
     if form.get("risk_ack") != "required":
         return ""
     if form.get("verdict") != "approved":
-        return ""
+        return "Лист высокого риска записывает только «Принять»."
     if not form.get("confirm_risk"):
         return (
             "Нужно подтверждение: отметьте, что вы прочитали высокие риски и "
@@ -220,7 +220,8 @@ def _risk_refusal(form: Any) -> str:
 
 def _risk_comment(form: Any) -> str:
     reason = str(form.get("comments", "")).strip()
-    return f"Принято при высоком риске; риск подтверждён человеком. Причина: {reason}"
+    # Причина идёт первой: защита «текст против вердикта» читает начало текста.
+    return f"{reason}\n\nПринято при высоком риске; риск подтверждён человеком."
 
 
 def _refuse(request: Request, task_id: int, message: str, status: int) -> Response:
