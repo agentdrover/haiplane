@@ -25,6 +25,7 @@ from hub import repository as repo
 from hub.db import (
     deserialize_str_list,
     fetchall,
+    committed_if_own,
     get_breadcrumb,
     log_activity,
     write_transaction,
@@ -3383,20 +3384,20 @@ async def _approved_code_check(
             # to (gh pr merge --match-head-commit): re-pin it, as the gate's own
             # automerge does (#1706). Not re-read: a push after this line is
             # exactly what the bound merge refuses.
-            # Conditional on the submission and the old pin, and committed at
-            # once: a newer submission keeps ITS pin, and the write lock is not
-            # held over the network steps that follow.
-            await db.execute(
-                "UPDATE tasks SET submission_sha=?, updated_at=datetime('now') "
-                "WHERE id=? AND submission_generation=? AND submission_sha=?",
-                (
-                    current_tip,
-                    task["id"],
-                    task.get("submission_generation"),
-                    pinned,
-                ),
-            )
-            await db.commit()
+            # Conditional on the submission and the old pin, committed at once
+            # by its owner (#2001; never a foreign transaction): a newer
+            # submission keeps ITS pin, and no lock spans the network steps.
+            async with committed_if_own(db):
+                await db.execute(
+                    "UPDATE tasks SET submission_sha=?, updated_at=datetime('now') "
+                    "WHERE id=? AND submission_generation=? AND submission_sha=?",
+                    (
+                        current_tip,
+                        task["id"],
+                        task.get("submission_generation"),
+                        pinned,
+                    ),
+                )
             # The pass now stands on this head. A side key, not ``submission_sha``:
             # the CI/stacking steps below read the snapshot's pin as "what the
             # author submitted" and must keep reading it so.
@@ -4702,12 +4703,10 @@ _ALREADY_DELIVERED = (True, "already delivered")
 # задачи без проекта уникальный индекс её не отсечёт (NULL ≠ NULL).
 #
 # Память процесса, и это граница, а не недосмотр: прочного следа здесь нет.
-# «Запись не легла» случается ровно тогда, когда чужая транзакция держит лок
-# всё ожидание, — и любой след в SQLite (запись в ленте) упирается в тот же
-# лок. След в ленте к тому же подделываем: текст сдачи ложится записью хаба.
-# Перезапуск в этом окне читает влитый PR как merged_outside_gate — к
-# человеку, как до #1428. Корень — сеть под write-транзакцией done-flow;
-# он вынесен отдельной задачей.
+# «Запись не легла» случается, когда чужая транзакция держит лок всё ожидание,
+# — и любой след в SQLite упирается в тот же лок; след в ленте к тому же
+# подделываем. Перезапуск в этом окне читает влитый PR как merged_outside_gate
+# — к человеку, как до #1428. Корень — сеть под записью без commit (#2001).
 _unrecorded_gate_merges: set[tuple[int, int]] = set()
 
 
@@ -5016,10 +5015,8 @@ async def merge_before_completion(
         diverged, sha_note = await _approved_code_check(db, task, pr_num)
         if diverged:
             return False, diverged
-        # sha_note — «доставлено без сверки» — пишется ПОСЛЕ мержа, в
-        # _record_gate_delivery (#1428): запись здесь, до сети, держала
-        # write-лок соединения на всё время вызова форжа, и соседний путь
-        # гейта падал на «database is locked» по влитому PR.
+        # sha_note пишется ПОСЛЕ мержа, в _record_gate_delivery (#1428):
+        # запись до сети держала бы write-лок на весь вызов форжа.
 
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
@@ -5167,7 +5164,7 @@ async def _recorded_pr_state(
 async def _live_pr_for_branch(
     db: aiosqlite.Connection, task: dict[str, Any], branch: str
 ) -> tuple[int | None, str]:
-    """An open PR for this branch, or a cause. Records nothing by itself."""
+    """An open PR for this branch, or a cause; a found one is committed (#2001)."""
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
@@ -5181,7 +5178,8 @@ async def _live_pr_for_branch(
         return None, f"поиск открытого PR по ветке {branch} не ответил: {exc}"
     if found is None:
         return None, ""
-    await repo.update_task(db, task["id"], pr_number=int(found))
+    async with committed_if_own(db):  # #2001: the caller's next step is the network
+        await repo.update_task(db, task["id"], pr_number=int(found))
     return int(found), ""
 
 
@@ -5269,7 +5267,8 @@ async def ensure_delivery_pr(
             f"PR для ветки {branch} открыть не удалось"
             + ("" if pushed else " (push тоже не прошёл)")
         )
-    await repo.update_task(db, task_id, pr_number=int(pr))
+    async with committed_if_own(db):  # #2001
+        await repo.update_task(db, task_id, pr_number=int(pr))
     return int(pr), ""
 
 
@@ -5356,7 +5355,8 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
         return DeliveryPR(
             reason=f"открытый PR для ветки {branch} не найден — доставка не проверялась"
         )
-    await repo.update_task(db, task["id"], pr_number=found)
+    async with committed_if_own(db):  # #2001
+        await repo.update_task(db, task["id"], pr_number=found)
     return DeliveryPR(int(found))
 
 
