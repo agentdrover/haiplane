@@ -294,3 +294,88 @@ async def test_quiet_projects_do_not_rebuild_the_tail_under_the_lock(
     await _generate(world.db, _day(1))
     # один пробный сбор + один под локом у единственного активного проекта
     assert len(calls) == 2
+
+
+async def _history(world, task_id: int, count: int, base: int = 2_000_000) -> None:
+    """``count`` учтённых исторических исходов (связь с digest_id заполнена)."""
+    await world.db.commit()
+    await world.db.execute("PRAGMA foreign_keys = OFF")
+    await world.db.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n "
+        "WHERE i < ?) "
+        "INSERT INTO executor_triage_recommendations (order_id, task_id, "
+        "triage_class, action, created_at, followup, followup_at) "
+        "SELECT ? + i, ?, 1, 'to_owner', '2026-01-01 00:00:00', "
+        "'new_order', '2026-01-02 00:00:00' FROM n",
+        (count, base, task_id),
+    )
+    await world.db.execute(
+        f"UPDATE {LINKS} SET digest_id = 1, kind = 'day' WHERE digest_id IS NULL "
+        "AND recommendation_id IN (SELECT id FROM executor_triage_recommendations "
+        "WHERE order_id >= 2000000)"
+    )
+    await world.db.commit()
+    await world.db.execute("PRAGMA foreign_keys = ON")
+
+
+async def _vm_steps(world, now: datetime) -> int:
+    steps = [0]
+
+    def tick() -> int:
+        steps[0] += 1
+        return 0
+
+    await world.db.set_progress_handler(tick, 100)
+    try:
+        await _generate(world.db, now)
+    finally:
+        await world.db.set_progress_handler(None, 0)
+    return steps[0]
+
+
+async def test_work_does_not_grow_with_the_counted_history(world):
+    """AC-2: объём работы (шаги VM) не растёт с учтённым хвостом."""
+    _, task_id = await _outcome(world, "объём")
+    await _history(world, task_id, 1_000)
+    small = await _vm_steps(world, _day(1))
+    # те же выборки на хвосте в 20 раз длиннее: свежий день, один свежий исход
+    await _history(world, task_id, 20_000, 3_000_000)
+    await world.db.execute(
+        "UPDATE executor_triage_recommendations SET followup_at = '2026-10-21 12:00:00' "
+        "WHERE order_id < 2000000"
+    )
+    await world.db.commit()
+    large = await _vm_steps(world, _day(2))
+    assert large < small * 2 + 50, (small, large)
+
+
+async def test_work_under_the_lock_does_not_depend_on_other_projects(
+    world, monkeypatch
+):
+    """Класс «глобальное под локом»: под write-локом проекта определения проекта
+    считаются только для ЕГО исходов, а не для всех проектов."""
+    await _pin_old_activation(world)
+    total = 0
+    for slug in ("a-1997", "b-1997", "c-1997"):
+        pid = await repo.create_project(world.db, slug=slug, name=slug)
+        for i in range(10):
+            task = await _task(world, f"{slug}-{i}")
+            order = await _fail(world, task, CLASS1)
+            await repo.update_task(world.db, task, project_id=pid)
+            await _stamp(
+                world, order, f"{DAY} 10:00:00", "new_order", f"{DAY} 12:00:00"
+            )
+            total += 1
+    await world.db.commit()
+    real = repo.resolve_project_for_task
+    under_lock = [0]
+
+    async def counting(db, task_id, *args, **kwargs):
+        if db.in_transaction:
+            under_lock[0] += 1
+        return await real(db, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", counting)
+    await _generate(world.db, _day(1))
+    # каждый исход определяется под локом не более одного раза (старо: проекты x исходы)
+    assert 0 < under_lock[0] <= total, under_lock[0]
