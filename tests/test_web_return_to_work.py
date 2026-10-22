@@ -282,3 +282,53 @@ async def test_refused_card_forms_keep_the_typed_text(
         if "<" in value:
             assert value not in resp.text, "ввод не экранирован"
             assert value.replace("<", "&lt;").replace(">", "&gt;") in resp.text
+
+
+def _tag(page: str, marker: str) -> str:
+    start = page.rindex("<", 0, page.index(marker))
+    return page[start : page.index(">", start) + 1]
+
+
+async def test_refusal_restores_choices_and_marks_them_unsaved(client: AsyncClient, db):
+    """Выбор человека переживает отказ, а автообновление его не стирает."""
+    task_id = await _open_task(client)
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={
+            "action": "bogus",
+            "pr_disposition": "abandon",
+            "decision_summary": "итог",
+        },
+        headers=BROWSER,
+    )
+    assert resp.status_code == 400
+    page = resp.text
+    abandon = _tag(page, 'value="abandon"')
+    assert " selected" in abandon, "abandon сброшен на умолчание"
+    assert " selected" not in _tag(page, 'value="deliver"')
+    assert "data-hub-restored" in _tag(page, 'name="pr_disposition"')
+    assert "data-hub-restored" in _tag(page, 'name="decision_summary"')
+    assert "data-hub-restored" not in _tag(page, 'name="instructions"')
+
+    # Галочка «бросить job» тоже возвращается.
+    held = await _open_task(client)
+    await repo.update_task(db, held, status="fix_requested", job_id="job-x")
+    await db.commit()
+    resp = await client.post(
+        f"/tasks/{held}/web-return-to-work",
+        data={"reason": " ", "abandon_active_job": "true"},
+        headers=BROWSER,
+    )
+    assert resp.status_code == 422
+    box = _tag(resp.text, 'name="abandon_active_job"')
+    assert " checked" in box and "data-hub-restored" in box, box
+
+    # Статически: hubHasUnsavedInput считает такое поле грязным (поведение в
+    # браузере проверяет #1996).
+    shell = (await client.get("/")).text
+    rule = shell[shell.index("function dirty(el)") :]
+    rule = rule[: rule.index("window.hubHasUnsavedInput")]
+    assert 'hasAttribute("data-hub-restored")' in rule
+    assert 'el.value !== ""' in rule

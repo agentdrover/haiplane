@@ -770,7 +770,7 @@
            отклоняет. Повтор законен, когда дефект не починен, —
            тогда ревьюер отмечает это здесь и отправляет снова. #}
         <label class="task-action-label" for="review-ack-repeat">
-            <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1">
+            <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1"{% if form_values.get('acknowledge_repeat') %} checked data-hub-restored{% endif %}>
             повторяю прошлый вердикт намеренно
         </label>
         {# #1207: две кнопки — одна пара, одного размера, рядом. Раньше

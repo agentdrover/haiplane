@@ -38,6 +38,12 @@
             return sel.options.length ? 0 : -1;
         }
         function dirty(el) {
+            // #1995: ввод, возвращённый формой после отказа, стал defaultValue;
+            // без этой метки автообновление стёрло бы его пустой формой.
+            if (el.hasAttribute("data-hub-restored")) {
+                if (el.tagName === "SELECT" || el.type === "checkbox" || el.type === "radio") { return true; }
+                return el.value !== "";
+            }
             if (el.tagName === "SELECT") {
                 if (el.multiple) {
                     return Array.prototype.some.call(el.options, function (o) { return o.selected !== o.defaultSelected; });
