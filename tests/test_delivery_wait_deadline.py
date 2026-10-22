@@ -761,3 +761,32 @@ async def test_a_merge_in_flight_wins_over_the_escalation(db, monkeypatch):
         step, _ = await merging
         orchestration._gate_merges.pop((task_id, 360), None)
     assert step is orchestration.MergeStep.MERGED
+
+
+async def test_a_pass_started_before_the_escalation_cannot_merge_after_it(
+    db, monkeypatch
+):
+    """Сосед с устаревшим снимком (running) продолжает после ПОЛНОГО перехода."""
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    task_id = await _setup(db, monkeypatch)
+    old_snapshot = dict(await repo.get_task(db, task_id))  # status running
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    assert (await _pass(db, task_id))["status"] == "needs_decision"
+    ctx = await orchestration.project_git_context(db, task_id)
+
+    step, _ = await orchestration.merge_if_approval_stands(
+        db, old_snapshot, ctx, checked_sha=old_snapshot["submission_sha"]
+    )
+
+    assert step is orchestration.MergeStep.APPROVAL_GONE
+    plugins.git_ops.merge_pr.assert_not_awaited()
+    # Явная доставка по решению человека берёт свежий снимок и не блокируется.
+    fresh = dict(await repo.get_task(db, task_id))
+    step, _ = await orchestration.merge_if_approval_stands(
+        db, fresh, ctx, checked_sha=fresh["submission_sha"]
+    )
+    assert step is orchestration.MergeStep.MERGED
+    orchestration._gate_merges.pop((task_id, 360), None)
