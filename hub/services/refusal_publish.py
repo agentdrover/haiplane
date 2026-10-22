@@ -21,7 +21,6 @@ author_kind — авторские: путь в них содержание.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from hub.models import TaskUpdateView
@@ -59,27 +58,9 @@ def public_text(text: str) -> str:
     return public_reason(text)
 
 
-_CHUNK = 3000
-
-
 def scrub_text(text: str | None) -> str | None:
-    """``public_reason`` для текста любой длины: режется по пробелам, не по символам.
-
-    ``public_reason`` обрезает вход до 4000 знаков; для записи ленты или
-    ``result_text`` это потеряло бы хвост, поэтому текст чистится кусками по
-    границе пробела (путь внутри токена не разрезается).
-    """
-    if not text:
-        return text
-    out: list[str] = []
-    buf = ""
-    for part in re.split(r"(\s+)", text):
-        if buf and len(buf) + len(part) > _CHUNK:
-            out.append(public_reason(buf))
-            buf = ""
-        buf += part
-    out.append(public_reason(buf))
-    return "".join(out)
+    """``public_reason`` для необязательного текста: ``None`` и пустое проходят."""
+    return public_reason(text) if text else text
 
 
 def is_hub_authored(row: Any) -> bool:

@@ -63,18 +63,28 @@ def failure_from(exc: BaseException) -> BriefFailure:
 #   description, summary) или код — не трогается: там путь — содержание, а не
 #   утечка, и чёрный список «авторских» полей всякий раз что-то пропускал.
 #   Новое поле ``foo_reason`` покрыто само. Не-строки (Enum, числа) проходят как есть.
-# * Длина режется до _MAX_SCAN до любого поиска, шаблоны без вложенных
-#   кванторов: длинная строка без «://» не должна занимать цикл событий.
-_MAX_SCAN = 4000
+# * Вход НЕ режется (#2006): длина одного совпадения ограничена (_MAXM), шаблоны
+#   без вложенных кванторов, обход линеен. Прежняя обрезка до 4000 знаков
+#   отрезала хвост JSON вместе с закрывающими скобками.
 _ROOTS = "tmp|var|srv|home|Users|opt|etc|root|private|usr|mnt|run|Volumes|data|proc|sys"
+# Конец URL и пути (#2006): пробел, кавычка, скобки ()[]{}<>, «|» (ячейка
+# markdown-таблицы), а «,» и «;» - только перед пробелом или концом строки (внутри
+# URL они бывают). Длина ОДНОГО совпадения ограничена, а вход не режется:
+# шаблоны линейны, JSON и длинные токены не теряют хвост.
+_MAXM = 2048
+_END = r"""\s'"`(){}\[\]<>|"""
+_TAIL = rf"(?:[^{_END},;]|[,;](?![\s]|$))"
 _USERINFO_URL = re.compile(
-    r"[A-Za-z][A-Za-z0-9+.\-]{0,15}://[^/\s'\"`<>]{1,256}@[^\s'\"`)<>]{1,2000}"
+    rf"[A-Za-z][A-Za-z0-9+.\-]{{0,15}}://[^/{_END}]{{1,256}}@{_TAIL}{{1,{_MAXM}}}"
 )
-_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,15}://[^\s'\"`)<>,;]{1,2000}")
-_SCP = re.compile(r"(?<![\w.@-])[\w.\-]{1,64}@[\w.\-]{1,255}:[^\s'\"`)]{1,500}")
+_URL = re.compile(rf"[A-Za-z][A-Za-z0-9+.\-]{{0,15}}://{_TAIL}{{1,{_MAXM}}}")
+_SCP = re.compile(rf"(?<![\w.@-])[\w.\-]{{1,64}}@[\w.\-]{{1,255}}:{_TAIL}{{1,{_MAXM}}}")
 _FS = rf"(?:~[\w.\-]{{0,32}}/|/(?:{_ROOTS})(?![\w.\-]))"
-_QUOTED_PATH = re.compile(rf"(['\"`]){_FS}[^'\"`\n]{{0,500}}\1")
-_ABS_PATH = re.compile(rf"(?<![\w.~/\-]){_FS}[^\s'\"`),;]{{0,500}}")
+# Значение JSON ("ключ": "/путь", ["/путь"]) - маркер ВНУТРИ кавычек, строка
+# остаётся строкой и json.loads её читает.
+_JSON_PATH = re.compile(rf'(?P<pre>"\s*:\s*|[\[,]\s*)"{_FS}[^"\n]{{0,{_MAXM}}}"')
+_QUOTED_PATH = re.compile(rf"(['\"`]){_FS}[^'\"`\n]{{0,{_MAXM}}}\1")
+_ABS_PATH = re.compile(rf"(?<![\w.~/\-]){_FS}{_TAIL}{{0,{_MAXM}}}")
 _PR_LINK = re.compile(
     r"https://github\.com/[\w.\-]{1,100}/[\w.\-]{1,100}/(?:pull|actions/runs)/\d{1,12}"
 )
@@ -90,14 +100,12 @@ def _remote(match: re.Match[str]) -> str:
 
 def public_reason(text: str) -> str:
     """Строка без путей файловой системы и адресов remote; sha, ветки, относительные
-    пути и маршруты приложения целы. Длиннее _MAX_SCAN режется с маркером «…».
+    пути и маршруты приложения целы. Вход не режется: длина совпадения ограничена.
     """
-    text = text or ""
-    if len(text) > _MAX_SCAN:
-        text = text[:_MAX_SCAN] + "…"
-    text = _USERINFO_URL.sub("<remote>", text)
+    text = _USERINFO_URL.sub("<remote>", text or "")
     text = _URL.sub(_remote, text)
     text = _SCP.sub("<remote>", text)
+    text = _JSON_PATH.sub(r'\g<pre>"<путь>"', text)
     text = _QUOTED_PATH.sub("<путь>", text)
     return _ABS_PATH.sub("<путь>", text)
 

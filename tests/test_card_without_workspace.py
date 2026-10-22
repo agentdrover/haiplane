@@ -418,8 +418,8 @@ def test_public_reason_cuts_paths_and_remotes_and_keeps_the_rest() -> None:
     assert public_reason("") == ""
 
 
-def test_public_reason_scans_a_bounded_prefix_only(monkeypatch) -> None:
-    """Длинная строка без «://»: объём поиска ограничен, а не время (wallclock_asserts)."""
+def test_public_reason_is_linear_and_never_cuts_its_input(monkeypatch) -> None:
+    """Объём работы линеен: каждый шаблон идёт по ВСЕМУ тексту один раз, без обрезки."""
     from hub.services import brief_failure
 
     seen: list[int] = []
@@ -432,14 +432,13 @@ def test_public_reason_scans_a_bounded_prefix_only(monkeypatch) -> None:
             seen.append(len(text))
             return self.inner.sub(repl, text)
 
-    for name in ("_URL", "_SCP", "_QUOTED_PATH", "_ABS_PATH"):
+    names = ("_USERINFO_URL", "_URL", "_SCP", "_JSON_PATH", "_QUOTED_PATH", "_ABS_PATH")
+    for name in names:
         monkeypatch.setattr(brief_failure, name, Spy(getattr(brief_failure, name)))
 
-    out = brief_failure.public_reason("a" * 100_000)
-
-    assert out.endswith("…")
-    assert len(out) == brief_failure._MAX_SCAN + 1
-    assert seen and max(seen) <= brief_failure._MAX_SCAN + 1
+    text = "a" * 100_000
+    assert brief_failure.public_reason(text) == text, "вход не режется"
+    assert seen == [100_000] * len(names), "один проход каждого шаблона по всему тексту"
 
 
 def _strings(node):

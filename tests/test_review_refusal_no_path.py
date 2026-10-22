@@ -19,6 +19,7 @@ import httpx
 from httpx import AsyncClient
 
 from hub import mcp_server
+from hub.services import lifecycle
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import accept_proof
@@ -706,3 +707,76 @@ async def test_the_task_result_text_is_published_without_a_path(
         "SELECT result_text FROM tasks WHERE id=?", (task_id,)
     )
     assert SECRET in dict(stored[0])["result_text"], "в базе как записано"
+
+
+def test_public_reason_keeps_json_valid_with_the_marker_inside_the_quotes():
+    from hub.services.brief_failure import public_reason
+
+    one = public_reason('{"reason":"/srv/key.pem","ok":true}')
+    assert json.loads(one) == {"reason": "<путь>", "ok": True}
+    many = public_reason(
+        '{"a": ["/srv/my dir/x.pem", "ok"], "reason": "/home/u/k", "n": 1, '
+        '"detail": "open /srv/key.pem"}'
+    )
+    assert json.loads(many) == {
+        "a": ["<путь>", "ok"],
+        "reason": "<путь>",
+        "n": 1,
+        "detail": "open <путь>",
+    }
+
+
+def test_public_reason_ends_urls_and_paths_at_table_and_bracket_edges():
+    from hub.services.brief_failure import public_reason
+
+    link = "https://github.com/o/r/pull/7"
+    assert public_reason(f"|pr|{link}|success|") == f"|pr|{link}|success|"
+    assert public_reason("|x|https://evil.io/a|ok|") == "|x|<remote>|ok|"
+    assert public_reason("|f|/srv/a/b.pem|ok|") == "|f|<путь>|ok|"
+    assert public_reason("[a](https://evil.io/a) {/srv/x}") == "[a](<remote>) {<путь>}"
+    assert public_reason("см. https://evil.io/a, затем /srv/x; ок") == (
+        "см. <remote>, затем <путь>; ок"
+    )
+    assert public_reason("https://evil.io/a,b/c") == "<remote>"
+
+
+def test_public_reason_does_not_cut_a_long_token():
+    from hub.services.brief_failure import public_reason
+
+    blob = "x" * 4500
+    text = json.dumps({"reason": f"/srv/k.pem {blob}", "tail": [1, 2, 3]})
+    out = public_reason(text)
+    loaded = json.loads(out)
+    assert loaded["tail"] == [1, 2, 3] and loaded["reason"].endswith(blob)
+    assert public_reason(blob) == blob
+
+
+async def test_the_latest_alert_reader_publishes_without_a_path(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """_latest_alert: HTMX-заметка о доставке и баннер дашборда без пути."""
+    from hub import web
+
+    task_id = await _bare_task(db, "completed")
+    await repo.update_task(db, task_id, pr_number=7)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Доставка по решению человека НЕ выполнена: {_GATE_ERROR}.",
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{lifecycle.REGISTRY_REFUSAL_PREFIX}: OSError '{SECRET}'",
+    )
+    await db.commit()
+    note = await web._decide_delivery_note(db, task_id, web.DELIVER_DISPOSITION)
+    assert "PR #7 НЕ доставлен" in note and "PermissionError" in note
+    assert LEAK not in note
+    page = await client.get(f"/?delivery_refused={task_id}")
+    assert page.status_code == 200 and "OSError" in page.text
+    assert LEAK not in page.text
