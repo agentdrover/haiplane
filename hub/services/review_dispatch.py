@@ -6970,8 +6970,9 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         if dispatch.get("status") == SECOND_DOOR_OWED:
             # Долг, записанный прошлым проходом (или прошлой жизнью процесса):
             # облако уже отказало вслух, вторая дверь ещё не открыта.
-            await _settle_second_door(db, dispatch)
-            continue
+            if not await _settle_second_door(db, dispatch):
+                continue
+            # #1982: СВОЙ отчёт - строка идёт обычным путём ниже (агент, счёт).
         if dispatch.get("channel") == LOCAL_CHANNEL:
             # Локальный прогон досматривает своя корутина (#1180). Свипу тут
             # остаётся один случай — процесс хаба, перезапущенный посреди
@@ -7206,8 +7207,11 @@ async def _settle_second_door(
     dispatch: dict[str, Any],
     *,
     task_row: Any | None = None,
-) -> None:
+) -> bool:
     """Отдать долг второй двери и только потом закрыть строку (#1252).
+
+    True - у заказа СВОЙ отчёт (#1982): строка НЕ закрыта, её закрывает
+    обычный путь свипа - поиск агента по метке, счёт, сверка расхода.
 
     Зовётся из двух моментов одного и того же пути: сразу после записи долга
     и на возобновлении, когда предыдущая попытка не дошла до конца. Алерт об
@@ -7236,22 +7240,20 @@ async def _settle_second_door(
     task_id = int(dispatch["task_id"])
     generation = int(dispatch["submission_generation"])
     if await _dispatch_report(db, task_id, generation, dispatch) is not None:
-        await repo.set_review_dispatch_status(db, dispatch["id"], "done")
-        await db.commit()
-        return
+        return True
     if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
-        return
+        return False
     if task_row is None:
         task_row = await repo.get_task(db, task_id)
-    settled_by_its_own_report = await _second_door_after_run(
+    if await _second_door_after_run(
         db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
-    )
-    await repo.set_review_dispatch_status(
-        db, dispatch["id"], "done" if settled_by_its_own_report else "failed"
-    )
+    ):
+        return True  # #1982: отчёт доехал в гонке - тот же общий путь
+    await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
     await db.commit()
+    return False
 
 
 async def _second_door_already_opened(
