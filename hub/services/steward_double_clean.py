@@ -332,17 +332,30 @@ def _why_no_pair(
     return out
 
 
+async def _attempt(db: aiosqlite.Connection, task_id: int, sha: str) -> str:
+    report = await repo.get_ci_run_report(db, task_id, sha)
+    return str(dict(report).get("attempt_key") or "") if report else ""
+
+
 async def _ci(
     db: aiosqlite.Connection, task_id: int, sha: str
 ) -> tuple[str, list[str]]:
-    gap = await ci_trust.pass_gap(db, task_id, sha) if sha else "sha не закреплён"
+    """Попытка CI, на которой стоит зелёное, или пусто и причина.
+
+    Зелёное (``pass_gap``) и ключ попытки читаются разными запросами, поэтому
+    ключ снимается ДО и ПОСЛЕ проверки: сменившаяся между ними попытка - не та,
+    о которой сказали «зелёная», и доверия не получает.
+    """
+    if not sha:
+        return "", ["ci: sha не закреплён"]
+    before = await _attempt(db, task_id, sha)
+    gap = await ci_trust.pass_gap(db, task_id, sha)
+    after = await _attempt(db, task_id, sha)
     if gap:
         return "", [f"ci: {gap}"]
-    report = await repo.get_ci_run_report(db, task_id, sha)
-    attempt = str(dict(report).get("attempt_key") or "") if report else ""
-    if not attempt:
-        return "", ["ci: прогон и попытка CI неизвестны"]
-    return attempt, []
+    if not after or before != after:
+        return "", ["ci: попытка CI неизвестна или сменилась во время проверки"]
+    return after, []
 
 
 async def _advisor(

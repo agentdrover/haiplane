@@ -297,6 +297,29 @@ async def test_a_stale_audit_never_rides_on_a_verdict_that_did_not_need_it(
     assert "двойной чистоте" not in line.lower()
 
 
+async def test_a_ci_attempt_swapped_during_the_check_is_not_trusted(db, monkeypatch):
+    """Попытка CI меняется между «зелёным» и чтением ключа: исключения нет."""
+    from hub.services import steward_double_clean as dc
+
+    case = await build_case(db, monkeypatch, "dc-race-ci-swap")
+    real = dc.ci_trust.pass_gap
+
+    async def swapping(conn, task_id, sha):
+        gap = await real(conn, task_id, sha)
+        await conn.execute(
+            "UPDATE ci_run_reports SET attempt_key='ci:9:9' WHERE task_id=?",
+            (task_id,),
+        )
+        await conn.commit()
+        return gap
+
+    monkeypatch.setattr(dc.ci_trust, "pass_gap", swapping)
+
+    detail = ceiling_detail(await apply_refusals(db, case.task_id, 1))
+
+    assert "ci:" in detail and "сменилась" in detail, detail
+
+
 # ---------------------------------------------------------------------------
 # AC-4 - второй отчёт после заказа или после вердикта режим не включает
 # ---------------------------------------------------------------------------
