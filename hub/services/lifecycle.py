@@ -5724,8 +5724,7 @@ async def return_to_work(
     without the dispatch: the approval window closes through the SAME
     :func:`close_approval_for_rework`, the claim comes off exactly as in
     :func:`release_task` (implementer principal included), and the task is
-    open for any executor to claim. Branch, PR, submission sha, submissions
-    and findings are left alone.
+    open for any executor to claim. Branch, PR, sha, submissions, findings stay.
 
     The transition is conditional on the status that was read. The delivery
     gate may be carrying an approved task out of ``review`` at this very
@@ -5829,8 +5828,7 @@ async def return_to_work(
     from hub.services import executor_triage_rework
 
     await executor_triage_rework.recommend_safely(db, task_id)  # #1947: тень
-    if commit:  # #1998: круг починки возвращает внутри транзакции брони
-        await db.commit()
+    commit and await db.commit()  # #1998: False - внутри транзакции брони
     await log_activity(
         db,
         "task_returned_to_work",
