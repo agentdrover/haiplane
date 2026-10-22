@@ -3576,10 +3576,8 @@ async def _carry_source(
     Отдельно от записи (#1600): читатель ожидания судьи стюарда спрашивает
     «перенесёт ли диспетчер», но не переносит сам.
     """
-    from hub.services.orchestration import (
-        base_merge_kept_the_verdict,
-        report_has_evidence,
-    )
+    from hub.services.carry_fresh_base import carry_is_same_edit
+    from hub.services.orchestration import report_has_evidence
 
     pinned = (task.get("submission_sha") or "").strip()
     generation = int(task.get("submission_generation") or 0)
@@ -3592,9 +3590,8 @@ async def _carry_source(
         or not (source.get("sha") or "").strip()
     ):
         return None
-    same, why = await base_merge_kept_the_verdict(
-        db, task, source["sha"].strip(), pinned
-    )
+    # #1990: база свежая до сверки диффов; отказ fetch — без переноса.
+    same, why = await carry_is_same_edit(db, task, source["sha"].strip(), pinned)
     if not same:
         return None
     return source, why
