@@ -379,10 +379,33 @@ async def _advisor(
     return []
 
 
+async def _statement(db: aiosqlite.Connection, task_id: int) -> str:
+    """Отпечаток постановки, о которой судили и согласились (только база).
+
+    Те же поля, что хеш пакета берёт из брифа (``PACKET_HASH_BRIEF_FIELDS``).
+    Полный хеш пакета в транзакции не пересчитать (дифф и вершина ветки - сеть),
+    а согласие советника - о ТОЙ постановке: её правка между этапами снимает
+    исключение.
+    """
+    import hashlib
+
+    from hub.services.steward_evidence import PACKET_HASH_BRIEF_FIELDS
+
+    task = dict(await repo.get_task(db, task_id) or {})
+    body: dict[str, Any] = {
+        k: task.get(k) for k in PACKET_HASH_BRIEF_FIELDS if k != "acceptance_criteria"
+    }
+    body["acceptance_criteria"] = [
+        dict(r) for r in await repo.list_acceptance_criteria(db, task_id)
+    ]
+    blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _drift(early: dict[str, Any], late: dict[str, Any]) -> list[str]:
     """Что изменилось между ранним и транзакционным этапами."""
     out: list[str] = []
-    for field in ("generation", "sha", "main", "extra", "class", "policy"):
+    for field in ("generation", "sha", "main", "extra", "class", "policy", "statement"):
         if early.get(field) != late.get(field):
             out.append(f"{field}: изменилось между проверками")
     if early.get("ci") != late.get("ci"):
@@ -428,6 +451,7 @@ async def evaluate(
     attempt, ci_unmet = await _ci(db, task_id, sha)
     unmet += ci_unmet + await _advisor(db, task_id, generation)
     audit = _audit(settings, worst, generation, sha, main, extra, attempt)
+    audit["statement"] = await _statement(db, task_id)
     if late:
         unmet += (
             _drift(early, audit)
