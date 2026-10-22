@@ -684,3 +684,32 @@ async def test_failure_after_the_return_rolls_the_return_back(
     row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
     assert row["job_id"] == "job-1"
     assert await _footprint(world, task_id) == before
+
+
+@pytest.mark.parametrize("status", ["review", "fix_requested"])
+async def test_failure_under_an_outer_transaction_leaves_no_booking(
+    world, monkeypatch, status
+):
+    """Внешняя транзакция коммитится после сбоя кода: возврата и брони нет, повтор проходит."""
+    calls = await _cloud_ready(world, monkeypatch)
+    task_id = await _after_cr(world, f"внешняя транзакция {status}", findings="machine")
+    await repo.update_task(
+        world.db, task_id, status=status, job_id="job-1", review_cycle=2
+    )
+    await world.db.commit()
+    before = await _footprint(world, task_id)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("code")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(el.chat_pair, "issue_run_code", boom)
+        await world.db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RuntimeError):
+            await _cloud(world.db, task_id, world)
+        await world.db.commit()  # внешний владелец коммитит после перехваченной ошибки
+    row = dict(await repo.get_task(world.db, task_id))  # type: ignore[arg-type]
+    assert row["job_id"] == "job-1"
+    assert await _footprint(world, task_id) == before
+    again = await _cloud(world.db, task_id, world)
+    assert again.launched and len(calls) == 1
