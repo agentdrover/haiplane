@@ -450,7 +450,9 @@ async def test_web_accept_delivers_by_default(client: AsyncClient, db, monkeypat
 
     page = (await client.get(f"/tasks/{task_id}")).text
     blocks = _pr_choice_blocks(page)
-    assert len(blocks) == 1, "в форме решения есть выбор судьбы PR"
+    # #1813: форма «Подробностей» и лист «Принять» несут один и тот же выбор.
+    assert len(blocks) == 2, "выбор судьбы PR: форма решения и её лист"
+    assert {_preselected(b) for b in blocks} == {"deliver"}
     shown = _preselected(blocks[0])
     assert shown == "deliver", "открытый PR и одобрение текущей сдачи — доставить"
     assert 'value="abandon"' in blocks[0], "отказаться — видимый выбор"

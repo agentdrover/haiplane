@@ -87,9 +87,62 @@ async def test_feedback_opens_the_details(client, db):
 async def test_action_link_points_at_the_form_that_exists(client, db):
     review = await _task_in(db, "review")
     page = (await client.get(f"/tasks/{review}")).text
-    assert 'class="c2-btn" href="#review-verdict-form"' in page
+    # #1813: при наличии панели «К действию» открывает главный лист; форма
+    # «Подробностей» остаётся запасным путём без скрипта.
+    found = re.search(r'class="c2-btn" href="#(sh-[a-z-]+)" data-sheet="\1"', page)
+    assert found, "«К действию» ведёт на лист панели"
+    assert f'id="{found.group(1)}"' in page
     assert 'id="review-verdict-form"' in page
     running = await _task_in(db, "running")
     page = (await client.get(f"/tasks/{running}")).text
     assert 'class="c2-btn" href="#task-controls"' in page
     assert 'id="task-controls"' in page
+
+
+async def test_action_link_keeps_repair_target_and_primary_sheet(
+    client, db, monkeypatch
+):
+    """#2035: «К действию» совмещает #1998 и #1813.
+
+    Круг починки предложен на running с текущим вердиктом: ссылка ведёт на его
+    форму - и без действий панели, и с ними (лист панели её не заслоняет).
+    Без круга починки при действиях панели ссылка открывает главный лист.
+    """
+    from hub import web
+
+    task_id = await _task_in(
+        db,
+        "running",
+        result_kind="commit",
+        submission_generation=1,
+        review_verdict="changes_requested",
+        review_verdict_generation=1,
+    )
+
+    offered = {"repair": True}
+
+    async def offers(_db, _task_id, _row):
+        return [], offered["repair"], False
+
+    monkeypatch.setattr(web, "_card_executor_offers", offers)
+    real = web.card_actions.for_page
+
+    def no_actions(*args, **kwargs):
+        return {**real(*args, **kwargs), "actions": []}
+
+    monkeypatch.setattr(web.card_actions, "for_page", no_actions)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert 'class="c2-btn" href="#executor-repair-form"' in page
+    assert 'class="c2-btn" href="#review-replace-form"' not in page
+
+    monkeypatch.setattr(web.card_actions, "for_page", real)
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert 'class="c2-btn" href="#executor-repair-form"' in page, (
+        "лист не заслоняет круг"
+    )
+
+    offered["repair"] = False
+    page = (await client.get(f"/tasks/{task_id}")).text
+    found = re.search(r'class="c2-btn" href="#(sh-[a-z-]+)" data-sheet="\1"', page)
+    assert found, "с действиями и без круга починки - главный лист"
+    assert f'id="{found.group(1)}"' in page
