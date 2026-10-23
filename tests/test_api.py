@@ -4625,6 +4625,8 @@ async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
     client: AsyncClient, db, monkeypatch
 ):
     """P2: счётчик верит метке применения, а не имени из тела запроса."""
+    import json
+
     from hub.models import ReviewVerdict
     from hub.services import steward_applied, steward_exit
     from tests.test_auto_verdict import _submitted_task
@@ -4639,6 +4641,11 @@ async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
     assert resp.status_code == 200, resp.text
     assert await steward_exit.actual_steward_verdicts(db) == {}
 
+    project = await repo.resolve_project_for_task(db, real)
+    await repo.update_project(
+        db, project["id"], gate_policy=json.dumps({"verdict": "steward"})
+    )  # #2037: the steward's right to approve is read in the write transaction
+    await db.commit()
     await steward_applied._record(db, real, ReviewVerdict.approved, 1)
     assert await steward_exit.actual_steward_verdicts(db) == {"spike-real": 1}
 
