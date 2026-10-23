@@ -123,7 +123,7 @@
     // в момент отправки; если к ответу поля уже другие (человек правил, пока ответ
     // шёл), форма НЕ помечается отправленной, а любой ввод после метки её снимает.
     function snapshot(form) {
-        var out = [];
+        var out = new Array();
         for (var i = 0; i < form.elements.length; i++) {
             var el = form.elements[i];
             out.push([el, el.type === "checkbox" || el.type === "radio" ? el.checked : el.value]);
