@@ -78,8 +78,10 @@ _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 # (``pragma:  x``, ``note # mypy: …``, ``nosecB101``), а не только от «ключевого»
 # сегмента. Цена — правка пояснения в таком комментарии тоже красная.
 _TOOL_RE = re.compile(
-    r"noqa|type:|pragma|fmt:|nosec|pylint|mypy|isort|ruff|flake8|yapf|pyright"
-    r"|pytype|nosemgrep|cython|pyre-|nextline",
+    r"noqa|type:|pragma|fmt:|nosem|nosec|pylint|mypy|isort|ruff|flake8|yapf|pyright"
+    r"|pytype|cython|pyre-|nextline|skipcq|lgtm|codeql|sonar|noinspection"
+    r"|autopep8|vulture|bandit|trivy|black|pyflakes|pycodestyle|pydocstyle|pep8"
+    r"|coverage|pytest|hadolint|semgrep|ignore-errors|disable",
     re.I,
 )
 
@@ -303,7 +305,7 @@ def _directive_of(comment: str, row: int, leading: bool) -> str:
     Shebang и coding-cookie действуют только до первого токена кода: после него
     это обычный комментарий.
     """
-    text = comment.rstrip()
+    text = comment.rstrip(" \t\r")  # NBSP и \f в хвосте значимы
     if leading and row == 1 and text.startswith("#!"):
         return text
     if leading and row <= 2 and _CODING_RE.match(text):
@@ -334,6 +336,10 @@ def _multiline_rows(toks: list[tokenize.TokenInfo]) -> tuple[set[int], set[int]]
     return inner, opening
 
 
+def doc_rows_of(doc: DocSlot) -> range:
+    return range(doc.expr.lineno, (doc.expr.end_lineno or doc.expr.lineno) + 1)
+
+
 def _gap_mark(lines: list[str], row: int, doc_first: set[int]) -> str:
     """Что между директивой и ближайшей строкой с содержимым.
 
@@ -345,12 +351,12 @@ def _gap_mark(lines: list[str], row: int, doc_first: set[int]) -> str:
     for nxt in range(row + 1, len(lines) + 1):
         stripped = lines[nxt - 1].strip()
         if stripped and not stripped.startswith("#"):
-            doc = " <docstring>" if nxt in doc_first else ""
-            return f" <зазор {gap}>{doc}" if gap or doc else ""
+            doc = "\x00docstring" if nxt in doc_first else ""
+            return f"\x00gap={gap}{doc}" if gap or doc else ""
         if stripped.startswith("#") and _TOOL_RE.search(stripped):
-            return f" <зазор {gap}>" if gap else ""
+            return f"\x00gap={gap}" if gap else ""
         gap += 1
-    return f" <зазор {gap}>" if gap else ""
+    return f"\x00gap={gap}" if gap else ""
 
 
 def _code_lines(
@@ -363,12 +369,9 @@ def _code_lines(
     comments = {t.start[0]: t for t in toks if t.type == tokenize.COMMENT}
     first_real = next((t.start[0] for t in toks if t.type not in _LAYOUT), 10**9)
     inner, opening = _multiline_rows(toks)
-    doc_rows = {
-        r
-        for d in docs.values()
-        for r in range(d.expr.lineno, (d.expr.end_lineno or d.expr.lineno) + 1)
-    }
+    doc_rows = {r for d in docs.values() for r in doc_rows_of(d)}
     doc_first = {d.expr.lineno for d in docs.values()}
+    doc_start = {r: d.expr.lineno for d in docs.values() for r in doc_rows_of(d)}
     out: list[tuple[int, str]] = []
     for row, text in enumerate(lines, start=1):
         eol = "\r" if text.endswith("\r") else ""
@@ -380,7 +383,9 @@ def _code_lines(
         if row in doc_rows:
             if not directive:
                 continue
-            body = "<docstring>"
+            offset = row - doc_start[row]
+            where = "inline" if cut.strip() else f"col{len(cut)}"
+            body = f"\x00docstring+{offset}\x00{where}"
         elif not verbatim and not body.strip():
             if directive:  # комментарий-директива на своей строке: отступ значим
                 mark = _gap_mark(lines, row, doc_first)

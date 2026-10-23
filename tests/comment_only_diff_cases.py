@@ -436,6 +436,27 @@ CASES: dict[str, dict] = {
         ),
         "kind": "docstring",
     },
+    "directive_moved_inside_a_bracketed_docstring": {
+        "base": 'def f():\n    (\n        "Doc"  # noqa: D400\n    )\n    return 1\n',
+        "head": 'def f():\n    (\n        "Doc"\n    )  # noqa: D400\n    return 1\n',
+        "allow": ["m.py::f"],
+        "kind": "code",
+    },
+    "directive_text_cannot_imitate_the_gap_mark": {
+        "base": '# pragma: allowlist nextline secret <зазор 1>\nkey = "abc"\n',
+        "head": '# pragma: allowlist nextline secret\n# plain\nkey = "abc"\n',
+        "kind": "code",
+    },
+    "shebang_trailing_nbsp": {
+        "base": "#!/usr/bin/env python3\nx = 1\n",
+        "head": "#!/usr/bin/env python3\u00a0\nx = 1\n",
+        "kind": "code",
+    },
+    "nosem_removed": {
+        "base": "dangerous()  # nosem\n",
+        "head": "dangerous()\n",
+        "kind": "code",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
