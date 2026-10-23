@@ -59,6 +59,7 @@ from hub.services import report_binding
 from hub.services import review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
+from hub.services.refusal_publish import public_text, safe_detail
 from hub.services.model_family import family
 from hub.services.review_ac_inputs import ac_inputs
 from hub.services.review_oversized import (
@@ -4174,7 +4175,6 @@ async def _name_the_dropped_params(
             f"{cursor_cloud.model_variant(model_id, started.refused_params)} "
             f"провайдер отверг: HTTP {refused.status}"
             + (f", {refused.code}" if refused.code else "")
-            + (f" ({refused.detail[:120]})" if refused.detail else "")
             + ". Повтор без параметров прошёл — прогон идёт в варианте модели "
             "по умолчанию (у Cursor это Fast, вдвое дороже). Проверьте "
             "CURSOR_REVIEW_MODEL_PARAMS по GET /v1/models (#1417).",
@@ -4197,13 +4197,13 @@ def _lost_call_detail(started: _Started) -> str:
         return (
             "ответ провайдера не дошёл, и СПРОСИТЬ его, создался ли агент, "
             "тоже не вышло — подбирать вслепую нельзя, повторять тоже "
-            f"({refusal.detail if refusal else 'причина не названа'})"
+            f"({safe_detail(refusal)})"
         )
     if refusal is not None and refusal.is_transport:
         return (
             "ответ провайдера не дошёл, и агента с нашей меткой у него не "
             f"нашлось за попыток: {started.attempts} "
-            f"({refusal.detail or 'причина не названа'})"
+            f"({safe_detail(refusal)})"
         )
     if refusal is not None:
         return f"провайдер отказал: HTTP {refusal.status}" + (
@@ -7390,7 +7390,7 @@ def _cloud_refusal_text(dispatch: dict[str, Any], run_status: Any) -> str:
     # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
     # статуса рана, и печатается как есть, без обёртки «кончился».
     if not (dispatch.get("agent_id") or "").strip():
-        return f"провайдер отказал в создании агента: {run_status}"
+        return f"провайдер отказал в создании агента: {public_text(str(run_status))}"
     return (
         f"прогон облачного агента {dispatch['agent_id']} "
         f"({dispatch.get('model') or 'модель не названа'}) кончился "

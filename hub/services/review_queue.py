@@ -35,6 +35,7 @@ from hub.db import fetchall
 from hub.models import ReviewQueueRow, ReviewQueueView
 from hub.services import review_evidence, state_review
 from hub.services.brief_failure import scrub_strings
+from hub.services.refusal_publish import public_text, published_update
 from hub.services.result_kind import NOT_APPLICABLE, automation_not_applicable
 from hub.services.lifecycle import (
     latest_review_projection,
@@ -105,7 +106,8 @@ async def last_stall(db, task_id: int, since: str) -> tuple[str, str]:
         dict(u)
         for u in await fetchall(
             db,
-            "SELECT content, created_at FROM task_updates WHERE task_id=? "
+            "SELECT content, created_at, kind, agent, author_kind, principal_id "
+            "FROM task_updates WHERE task_id=? "
             "AND agent='hub' AND created_at >= ? ORDER BY id DESC LIMIT 50",
             (task_id, since),
         )
@@ -120,11 +122,13 @@ async def last_stall(db, task_id: int, since: str) -> tuple[str, str]:
                 payload = json.loads(event["payload"] or "{}")
             except ValueError:
                 payload = {}
-            reason = str(payload.get("detail") or payload.get("reason") or "")
+            reason = public_text(
+                str(payload.get("detail") or payload.get("reason") or "")
+            )
             if reason:
                 return reason, at
     if line is not None:
-        return str(line["content"]), str(line["created_at"])
+        return str(published_update(line)["content"]), str(line["created_at"])
     return "", ""
 
 
