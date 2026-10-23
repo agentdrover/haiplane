@@ -579,10 +579,9 @@ async def ensure_task_worktree(
     branch on origin (tracking it, so work already pushed is not lost),
     ``origin/<base>``, the local base. Both that and fetch failures go to ``notes``.
 
-    Reuses a registered worktree of ``repo`` that is already on ``branch``.
-    Refuses — changing nothing — when the path holds anything else: another
-    branch (its dirty files are named), or a directory git does not know.
-    Never deletes and never switches a branch.
+    Reuses a registered worktree of ``repo`` already on ``branch``; refuses, changing
+    nothing, when the path holds another branch (dirty files named) or a directory
+    git does not know. Never deletes and never switches a branch.
     """
     wt_path = _worktree_path(task_id, repo)
     await _git("worktree", "prune", repo=repo, check=False)
@@ -620,8 +619,6 @@ async def ensure_task_worktree(
             # Fetched base first, local as fallback; --no-track: develop is never upstream.
             ref = f"refs/remotes/origin/{base}"
             rc, *_ = await _git("rev-parse", "--verify", ref, repo=repo, check=False)
-            if rc != 0 and notes is not None:
-                notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
             start = ref if rc == 0 else base
             args = ("worktree", "add", "--no-track", "-b", branch, wt_path, start)
     rc, _, err = await _git(*args, repo=repo, check=False)
@@ -629,6 +626,8 @@ async def ensure_task_worktree(
         raise WorktreeRefused(
             f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
         )
+    if args[-1] == base and notes is not None:  # named only once git made the branch
+        notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
     return wt_path
 
 

@@ -18,6 +18,7 @@ from hub.integrations.git_ops import (
     PairBranchConflictError,
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
+    WorktreeRefused,
     _worktree_path,
     ensure_task_worktree,
 )
@@ -3868,6 +3869,19 @@ async def test_new_task_branch_starts_from_the_fetched_origin_base(tmp_path):
         text=True,
     )
     assert upstream.returncode != 0, upstream.stdout
+
+
+async def test_a_refused_worktree_names_no_local_base(tmp_path):
+    """No base anywhere: git refuses, and notes do not claim a branch was started."""
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    _run_git("git", "branch", "-m", "develop", "main", cwd=repo)
+    notes: list[str] = []
+
+    with pytest.raises(WorktreeRefused):
+        await ensure_task_worktree(2039, "task-2039/x", str(repo), "develop", notes)
+
+    assert not any("ветка начата" in n for n in notes), notes
 
 
 async def test_without_origin_base_the_local_base_is_used_and_named(tmp_path):
