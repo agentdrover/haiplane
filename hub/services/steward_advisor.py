@@ -54,6 +54,7 @@ from hub.services.result_kind import (
     automation_not_applicable,
     task_automation_not_applicable,
 )
+from hub.services import steward_advisor_skip as advisor_skip
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -218,6 +219,7 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         (KIND_ADVISOR,),
     )
     ordered = 0
+    act: bool | None = None  # режим читается один раз за проход, и только если нужен
     for row in rows:
         task_id, generation = int(dict(row)["task_id"]), int(dict(row)["generation"])
         if automation_not_applicable(dict(row)):
@@ -229,6 +231,15 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
             # #1915: потолок исчерпан — сдача у человека до reset_at. Выбор
             # модели ниже мог бы закрыть поколение строкой refused и тем самым
             # лишить завтрашнего заказа.
+            continue
+        if act is None:
+            act = await advisor_skip.acting(db)
+        skip = await advisor_skip.unapprovable_reason(db, task_id, act=act)
+        if skip is not None:
+            # #2024: approve стюарда не применится по причине вне советника —
+            # платный заказ бесполезен. Пропуск не согласие; причина видна один раз.
+            await advisor_skip.record_skip(db, task_id, generation, *skip)
+            await db.commit()  # и при повторе: INSERT..SELECT открыл транзакцию
             continue
         if await _order_one(db, task_id, generation):
             ordered += 1
@@ -553,6 +564,8 @@ class AdvisorState:
     advisor_hash: str = ""
     judge: dict[str, Any] | None = None
     advisor: dict[str, Any] | None = None
+    #: Заказ намеренно не сделан (#2024): approve не применится без советника.
+    skipped: bool = False
 
 
 async def advisor_state(
@@ -607,9 +620,15 @@ async def advisor_state(
     )
     if not runs:
         handoff = await steward_cap.cap_handoff(db, task_id, generation)
+        skipped = await advisor_skip.recorded_reason(db, task_id, generation)
         return AdvisorState(
             STATE_NOT_ORDERED,
-            reason=handoff.reason if handoff is not None else "советник не заказан",
+            reason=handoff.reason
+            if handoff is not None
+            else f"советник не заказан ({skipped})"
+            if skipped
+            else "советник не заказан",
+            skipped=bool(skipped),
             **base,
         )
     run = dict(runs[0])
@@ -689,6 +708,19 @@ def both_sides(state: AdvisorState) -> str:
     return "; ".join(parts)
 
 
+async def cap_refusal(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str] | None:
+    """Сдача передана человеку из-за суточного потолка (#1915, #2037) — или ``None``.
+
+    ЕДИНСТВЕННЫЙ читатель этого отказа для применения: его зовут и
+    ``advisor_refusal`` (ранняя проверка), и транзакция записи approve стюарда
+    (``steward_apply.write_refusal``). Причина у обоих одна и та же строка.
+    """
+    handoff = await steward_cap.cap_handoff(db, task_id, generation)
+    return None if handoff is None else (REFUSED_ADVISOR, handoff.reason)
+
+
 async def advisor_refusal(
     db: aiosqlite.Connection,
     task_id: int,
@@ -705,11 +737,11 @@ async def advisor_refusal(
     """
     from hub.services.steward_evidence import current_packet_hash, packet_hash
 
-    handoff = await steward_cap.cap_handoff(db, task_id, generation)
+    handoff = await cap_refusal(db, task_id, generation)
     if handoff is not None:
         # #1915: передано человеку из-за потолка — не применять, даже если
         # согласие советника лежит в базе. Условие то же, что у маршрута.
-        return (REFUSED_ADVISOR, handoff.reason)
+        return handoff
     state = await advisor_state(db, task_id, generation)
     sides = both_sides(state)
     if state.state != STATE_RECEIVED:
