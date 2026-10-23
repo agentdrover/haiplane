@@ -46,7 +46,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
-from hub.services import ci_contract, ci_trust
+from hub.services import ci_contract, ci_trust, evidence_states
 from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
@@ -418,11 +418,21 @@ def _locator_fact(brief: ReviewBrief | None) -> EvidenceFact:
     """How each test-bound AC's locator resolved (#505/#506)."""
     source = "ac_locator"
     resolutions = list(brief.locator_resolution) if brief else []
+    # #2026: for an AC that no test verifies a locator does not apply — said so,
+    # and nothing about whether the AC is met.
+    notes = evidence_states.manual_ac_notes(brief.acceptance_criteria if brief else [])
+    named = ", ".join(f"{n['ac_id']} ({n['verifiable_by']})" for n in notes)
+    not_applicable = (
+        f"тестовый локатор неприменим к {named}; это не отметка о выполнении этих AC"
+        if notes
+        else ""
+    )
     if not resolutions:
         return absent(
             source,
             NO_TEST_LOCATORS,
-            "у задачи нет критериев с verifiable_by=test — локаторов не о чем сообщать",
+            "у задачи нет критериев с verifiable_by=test — локаторов не о чем сообщать"
+            + (f"; {not_applicable}" if not_applicable else ""),
         )
     items = [r.model_dump() for r in resolutions]
     # ``resolvable`` is the only status that says the named test exists; the
@@ -431,9 +441,11 @@ def _locator_fact(brief: ReviewBrief | None) -> EvidenceFact:
     unresolved = [i for i in items if (i.get("status") or "") != "resolvable"]
     return present(
         source,
-        f"локаторов {len(items)}, не разрешилось {len(unresolved)}",
+        f"локаторов {len(items)}, не разрешилось {len(unresolved)}"
+        + (f"; {not_applicable}" if not_applicable else ""),
         locators=items,
         unresolved=len(unresolved),
+        not_applicable=notes,
     )
 
 
