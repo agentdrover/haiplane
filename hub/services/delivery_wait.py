@@ -45,7 +45,7 @@ import aiosqlite
 from hub import repository as repo
 from hub import repository_delivery_rerun as rerun_journal
 from hub import repository_delivery_wait as journal
-from hub.db import write_transaction
+from hub.db import fetchall, write_transaction
 from hub.services import project_policy, watch_notices
 
 log = logging.getLogger("hub")
@@ -208,6 +208,16 @@ async def _notify_owner(
         return await _write_notice(db, key, pr_num, detail, hours)
 
 
+async def _failed_notice_id(db: aiosqlite.Connection, task_id: int) -> int:
+    """Последний id события сбоя уведомления по задаче (0 - сбоев не было)."""
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE kind=? AND task_id=?",
+        (watch_notices.FAILED_EVENT, task_id),
+    )
+    return int(rows[0]["id"])
+
+
 @contextlib.asynccontextmanager
 async def _savepoint(db: aiosqlite.Connection):
     """Откат только своих записей: транзакция вызывающего может быть открыта."""
@@ -244,6 +254,7 @@ async def _write_notice(
         actor="hub",
         payload={"reason": KIND, "pr_number": pr_num, "hours": hours, "detail": detail},
     )
+    failed_before = await _failed_notice_id(db, key[0])
     await watch_notices.notify_steward(
         db,
         "stale",
@@ -251,6 +262,11 @@ async def _write_notice(
         source_key=f"{EVENT}:{key[0]}:{key[1]}:{key[2]}",
         source_event_id=event_id,
     )
+    if await _failed_notice_id(db, key[0]) != failed_before:
+        # notify_steward глотает ошибки и пишет событие сбоя: False не отличает его
+        # от «наблюдение выключено» и «уже объявлено». Сбой откатывает уведомление
+        # целиком (SAVEPOINT выше), и следующий проход донесёт его.
+        raise RuntimeError("steward notice failed")
     return True
 
 

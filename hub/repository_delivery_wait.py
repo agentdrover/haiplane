@@ -56,7 +56,7 @@ async def is_overdue(
         db,
         "SELECT 1 FROM delivery_wait_deadlines WHERE task_id=? "
         "AND submission_generation=? AND verdict_revision=? AND kind=? "
-        "AND state=? AND started_at <= datetime('now', ?)",
+        "AND state=? AND julianday(started_at) <= julianday('now', ?)",
         (task_id, generation, revision, kind, OPEN, f"-{int(hours)} hours"),
     )
     return bool(rows)
