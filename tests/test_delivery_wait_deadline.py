@@ -767,3 +767,48 @@ async def test_a_failed_notice_inside_a_callers_transaction_is_not_half_kept(
     # Следующий проход доносит уведомление.
     assert await delivery_wait.settle(db, snap, detail, 360) is True
     assert await _notices(db, task_id) == 1
+
+
+async def test_a_steward_notice_failure_rolls_the_whole_notice_back(db, monkeypatch):
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    await set_policy(
+        db, base_fetch_wait_hours=24
+    )  # строка проекта, steward_watch по умолчанию
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    snap = dict(await repo.get_task(db, task_id))
+    real = repo.insert_agent_message
+    broken = {"on": True}
+
+    async def flaky(*a, **kw):
+        if broken["on"]:
+            raise RuntimeError("message write failed")
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(repo, "insert_agent_message", flaky)
+    detail = f"{PREFIX}: x"
+
+    assert await delivery_wait.settle(db, snap, detail, 360) is False
+    assert await _notices(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1
+
+    broken["on"] = False
+    assert await delivery_wait.settle(db, snap, detail, 360) is True
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE related_task_id = ?",
+        (task_id,),
+    )
+    assert dict(rows[0])["n"] == 1
+
+
+async def test_a_corrupt_timer_value_is_not_an_overdue_wait(db, monkeypatch):
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await db.execute("UPDATE delivery_wait_deadlines SET started_at = '!invalid!'")
+    await db.commit()
+
+    await _pass(db, task_id)
+
+    assert await _notices(db, task_id) == 0
