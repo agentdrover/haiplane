@@ -1576,10 +1576,14 @@ class CIEvidenceBlock(BaseModel):
     must see "not received", not an empty field that looks like a clean result.
     ``result`` is the step's own state (ran, error, ...), ``run`` names the run
     and event it came from, or says the run is unknown for a block stored
-    before provenance existed.
+    before provenance existed. ``expectation`` (#2026) says exactly why a block
+    is missing: ``not_expected`` / ``missing_unexpectedly`` / ``other_attempt``
+    / ``origin_unconfirmed`` (``received`` for a block that came); it is for the
+    reader of the brief, no gate reads it (``hub.services.evidence_states``).
     """
 
     state: str = "not_received"
+    expectation: str = "origin_unconfirmed"
     result: str = ""
     run: str = ""
     provenance: dict[str, Any] = Field(default_factory=dict)
@@ -1895,6 +1899,8 @@ class ProfileDowngradeView(BaseModel):
     state: str = "заказан"
     channel: str = ""
     dispatch_id: int | None = None
+    #: The rules the downgrade comes from (#1414 daily cap, #1432 circle), #2026.
+    rules: list[str] = Field(default_factory=list)
     headline: str = ""
 
 
