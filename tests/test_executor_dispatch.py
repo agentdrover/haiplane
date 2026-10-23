@@ -1242,6 +1242,40 @@ async def test_the_skill_carries_every_discipline_rule(db):
     assert not missing, f"в скилле нет правил: {missing}"
 
 
+_COMMENT_RULE_MARKERS = (
+    "Комментарии и бюджет размера",
+    "история — в git",
+    "type:",
+    "noqa",
+    "pragma",
+    "fmt:",
+    "nosec",
+    "allowlist secret",
+    "inspect.getdoc",
+    "вынеси",
+    "docstring-и не сокращай",
+)
+
+
+async def test_prompt_carries_comment_and_budget_rule(db, monkeypatch):
+    """AC-1: правило комментариев и бюджета — в промпте облака (активная версия
+    из seed) и в локальном навыке."""
+    from pathlib import Path
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db, slug="exec-comment-rule")
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+    assert result.launched, result
+    prompt = calls[0]["prompt_text"]
+    local = (
+        Path(__file__).resolve().parents[1] / "skills/local-executor-hub-repo/SKILL.md"
+    ).read_text(encoding="utf-8")
+    for name, text in (("промпт облака", prompt), ("локальный навык", local)):
+        missing = [m for m in _COMMENT_RULE_MARKERS if m not in text]
+        assert not missing, f"{name}: нет {missing}"
+
+
 async def test_no_launch_without_the_discipline_skill(db, monkeypatch):
     """AC-4: активной версии скилла нет — отказ с причиной, провайдер не зван."""
     _launch_config(monkeypatch)
