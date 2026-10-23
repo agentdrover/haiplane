@@ -262,3 +262,14 @@ def test_every_removed_and_changed_comment_is_listed(tmp_path: Path) -> None:
     assert rc == 0, out
     assert "m.py:1: - # gone" in out and "m.py:3: - # old" in out, out
     assert "m.py:2: + # new" in out and "# kept" not in out, out
+
+
+def test_duplicate_comments_are_counted_not_deduplicated(tmp_path: Path) -> None:
+    """Два одинаковых комментария и один — это удалённый комментарий."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "x = 1  # same\ny = 2  # same\n"},
+        {"m.py": "x = 1  # same\ny = 2\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 0 and "m.py:2: - # same" in out and "m.py:1:" not in out, out
