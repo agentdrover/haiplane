@@ -101,7 +101,17 @@
     </div>
     {% endif %}
 
+    {# #1813: статус, справка и доступные действия - один фрагмент #c2-live. Он
+       обновляется сам (раз в 15 с, но не при недописанном вводе - защита #1996 - и после ответа листа) и ТОЛЬКО он: .main целиком
+       автообновление больше не заменяет. Листы действий лежат ниже, вне фрагмента,
+       поэтому открытый лист и введённый текст автообновление не трогает; метка
+       data-* нужна листам, чтобы заметить смену сдачи. В фрагменте нет полей ввода. #}
+    <div id="c2-live" data-status="{{ task.status.value }}" data-submission-generation="{{ card_actions.live.submission_generation }}" data-statement-generation="{{ card_actions.live.statement_generation }}" data-review-verdict-revision="{{ card_actions.live.review_verdict_revision }}"
+         hx-get="/tasks/{{ task.id }}" hx-select="#c2-live" hx-target="this" hx-swap="outerHTML" data-hub-autorefresh
+         hx-trigger="{{ 'c2-refresh' if task.status.value in ('completed', 'rejected') else 'every 15s [!window.hubHasUnsavedInput()], c2-refresh' }}">
     {% include "partials/card_c2.html" %}
+    {% include "partials/card_actions_bar.html" %}
+    </div>
 
     {# #1812: ответ на действие (ошибка, одноразовый код, отказ, плашка запуска)
        не должен прятаться в свёрнутом блоке: с обратной связью он раскрыт. #}
@@ -738,7 +748,7 @@
                         hx-select=".main"
                         hx-target=".main"
                         hx-swap="innerHTML"
-                        hx-trigger="click, every 15s [!window.hubHasUnsavedInput()]"
+                        hx-trigger="click"
                         data-hub-autorefresh>
                     Refresh Status <span class="htmx-indicator">&#10227;</span>
                 </button>
@@ -1075,5 +1085,6 @@
     </div>
     </details>
 </article>
+{% include "partials/card_sheets.html" %}
 {% include "partials/card_c2_script.html" %}
 {% endblock %}
