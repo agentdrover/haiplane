@@ -145,6 +145,7 @@ class Report:
     grown: tuple[tuple[str, int, int, int], ...] = ()  # путь, строк, замер, потолок
     near: tuple[tuple[str, int, int], ...] = ()  # путь, строк, порог
     regress: tuple[tuple[str, str], ...] = ()  # путь, причина: ledger tests вырос
+    reserve_low: tuple[tuple[str, int, int], ...] = ()  # путь, строк, потолок
     base_lines: dict[str, int | None] = field(default_factory=dict)  # new -> на базе
 
     @property
@@ -175,6 +176,10 @@ class Report:
             "grown": [
                 {"path": p, "lines": n, "measured": m, "max": x}
                 for p, n, m, x in self.grown
+            ],
+            "reserve_low": [
+                {"path": p, "lines": n, "max": x, "reserve": x - n}
+                for p, n, x in self.reserve_low
             ],
             "near": [
                 {
@@ -283,6 +288,7 @@ def check(
     stale: list[tuple[str, str]] = []
     grown: list[tuple[str, int, int, int]] = []
     near: list[tuple[str, int, int]] = []
+    reserve_low: list[tuple[str, int, int]] = []
     by_reason: dict[str, int] = {}
 
     for path, lines in sizes.items():
@@ -303,6 +309,8 @@ def check(
         measured = int(entry["measured"])
         if measured < lines <= allowed:
             grown.append((path, lines, measured, allowed))
+        if 0 <= allowed - lines and (allowed - lines) * 100 < allowed:
+            reserve_low.append((path, lines, allowed))
 
     for path in sorted(ledger):
         lines = sizes.get(path)
@@ -322,6 +330,7 @@ def check(
         by_reason=by_reason,
         grown=tuple(sorted(grown)),
         near=tuple(sorted(near)),
+        reserve_low=tuple(sorted(reserve_low)),
         regress=tuple(regress),
         base_lines=base_lines,
     )
@@ -383,6 +392,13 @@ def format_report(report: Report) -> str:
         )
         for path, n, measured, allowed in report.grown:
             lines.append(f"  {path} — {n} > замер {measured} (потолок {allowed})")
+    if report.reserve_low:
+        lines.append(
+            f"Файл из ledger: запас почти съеден ({len(report.reserve_low)}), CI не красит: "
+            "остаток меньше 1% потолка, выносите код в модуль, не ужимайте тексты:"
+        )
+        for path, n, allowed in report.reserve_low:
+            lines.append(f"  {path} — {n}/{allowed}, остаток {allowed - n}")
     if report.near:
         lines.append(
             f"Файл у порога ({len(report.near)}), CI не красит: разделите по темам "
