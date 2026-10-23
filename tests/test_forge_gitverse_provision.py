@@ -336,6 +336,11 @@ def test_seed_lands_in_the_forge_own_directory(tmp_path, forge, directory):
         forge=forge,
     )
 
+    if forge == "github":
+        # #2027: GitHub is written on the remote only, never into the shared clone.
+        assert result.state == workflow_seed.UNAVAILABLE and not result.written
+        assert not (work / directory).exists()
+        return
     assert result.written, result.detail
     written_dir = work / directory
     assert written_dir.is_dir(), f"посев не создал {directory}: {result.detail}"

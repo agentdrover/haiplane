@@ -49,7 +49,8 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import card_c2
 from hub.services import chat_pair as chat_pair_svc
-from hub.services import effective_policy, policy_change, project_policy
+from hub.services import ci_trust_warning, effective_policy, policy_change
+from hub.services import project_policy
 from hub.services.refusal_publish import published_update
 from hub.services import triage_inbox
 from hub.services.project_policy import FREEZE_REFUSED
@@ -1153,6 +1154,8 @@ async def web_projects(
         except Exception:
             log.exception("review cost settings failed for project %s", r["id"])
             review_cost[int(r["id"])] = None
+    # #2027: подтверждается ли CI проекта (сбой чтения - блок unknown).
+    ci_trust_blocks = await ci_trust_warning.blocks_by_project(_db(request), rows)
     # #1412: кнопка запуска исполнителя выписывает код implementer от имени
     # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
     csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
@@ -1191,6 +1194,7 @@ async def web_projects(
             # ничем не лучше пункта, который отказывает.
             "review_reach": reach,
             "review_cost": review_cost,
+            "ci_trust_blocks": ci_trust_blocks,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
