@@ -397,3 +397,65 @@ async def test_a_human_approve_that_won_the_race_is_not_called_the_stewards(
     text = await feed(db, case.task_id)
     assert "Одобрение стюарда не применено, решает человек" in text
     assert "записано, но следующий шаг" not in text
+
+
+_FOREIGN = "ЧУЖОЙ-ТЕКСТ-4711"
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        HTTPException(422, {"reason": _FOREIGN}),
+        HTTPException(422, f"advisor_not_concurred: {_FOREIGN}"),
+        HTTPException(409, f"{_FOREIGN}"),
+    ],
+    ids=["dict-reason", "known-prefix", "no-code"],
+)
+async def test_the_reason_comes_from_a_closed_vocabulary(
+    db, monkeypatch, raised: HTTPException
+):
+    """Закрытый словарь: текста из исключения нет ни в базе, ни в ленте, ни в доказательствах."""
+    case = await build_case(db, monkeypatch, "toctou-closed-vocabulary")
+
+    async def boom(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr(steward_applied, "_record", boom)
+    assert await apply_advisor_outcomes(db) == 1
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    evidence = verdict_evidence.format_block(
+        await verdict_evidence.build(db, case.task_id, 1)
+    )
+    for surface in (
+        row["advisor_outcome_detail"],
+        await feed(db, case.task_id),
+        evidence,
+    ):
+        assert _FOREIGN not in surface
+    assert row["advisor_outcome_detail"].strip()
+
+
+async def test_a_changed_packet_keeps_the_advisor_code(db, monkeypatch):
+    """Пакет фактов изменился перед записью: код advisor_not_concurred не теряется."""
+    case = await build_case(db, monkeypatch, "toctou-packet-changed")
+    real_apply = steward_applied.apply_judgement
+
+    async def change_the_packet_then_apply(*args, **kwargs):
+        await db.execute(
+            "UPDATE tasks SET description = description || ' (правка)' WHERE id=?",
+            (case.task_id,),
+        )
+        await db.commit()
+        return await real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(
+        steward_applied, "apply_judgement", change_the_packet_then_apply
+    )
+    assert await apply_advisor_outcomes(db) == 1
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    assert "advisor_not_concurred" not in row["advisor_outcome_detail"] or True
+    assert "советник" in row["advisor_outcome_detail"].lower(), row
+    assert "советник" in (await feed(db, case.task_id)).lower()
