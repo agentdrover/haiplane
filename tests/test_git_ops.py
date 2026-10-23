@@ -3861,6 +3861,13 @@ async def test_new_task_branch_starts_from_the_fetched_origin_base(tmp_path):
     assert _head(wt) == newest
     assert _head(repo) != newest  # the local base is not moved
     assert notes == []
+    # No upstream: a bare `git push`/`git pull` must not reach develop.
+    upstream = subprocess.run(
+        ["git", "-C", wt, "rev-parse", "--abbrev-ref", "@{upstream}"],
+        capture_output=True,
+        text=True,
+    )
+    assert upstream.returncode != 0, upstream.stdout
 
 
 async def test_without_origin_base_the_local_base_is_used_and_named(tmp_path):

@@ -577,8 +577,7 @@ async def ensure_task_worktree(
 
     A new copy takes the task branch from, in order: the local branch, the
     branch on origin (tracking it, so work already pushed is not lost),
-    ``origin/<base>``, the local base (named in ``notes``). Fetch failures are
-    appended to ``notes`` too.
+    ``origin/<base>``, the local base. Both that and fetch failures go to ``notes``.
 
     Reuses a registered worktree of ``repo`` that is already on ``branch``.
     Refuses — changing nothing — when the path holds anything else: another
@@ -618,12 +617,13 @@ async def ensure_task_worktree(
         if rc == 0:
             args = ("worktree", "add", "-b", branch, wt_path, remote)
         else:
-            # The base was just fetched; the local one is only the fallback.
+            # Fetched base first, local as fallback; --no-track: develop is never upstream.
             ref = f"refs/remotes/origin/{base}"
             rc, *_ = await _git("rev-parse", "--verify", ref, repo=repo, check=False)
             if rc != 0 and notes is not None:
                 notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
-            args = ("worktree", "add", "-b", branch, wt_path, ref if rc == 0 else base)
+            start = ref if rc == 0 else base
+            args = ("worktree", "add", "--no-track", "-b", branch, wt_path, start)
     rc, _, err = await _git(*args, repo=repo, check=False)
     if rc != 0:
         raise WorktreeRefused(
