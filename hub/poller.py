@@ -2514,8 +2514,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
     Sweep("executor_orders", _sweep_executor_orders),
-    # #1991: оборванный заказ доработки сверяется с заданиями диспетчера
-    Sweep("rework_launches", rework_launch.sweep),
+    Sweep("rework_launches", rework_launch.sweep),  # #1991: оборванный заказ
     Sweep("critic_orders", critic_orders.expire_due),  # #1953: срок заказа критика
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
