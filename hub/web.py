@@ -2967,10 +2967,8 @@ async def _web_task_detail_page(
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,
             "merge_offered": merge_offered,
-            # #1712: хосты, на которые карточка open-задачи предлагает запуск.
-            "slot_hosts": await card_hosts(db, task_id)
-            if task.status.value == "open"
-            else [],
+            # #1712, #1998: хосты, на которые карточка предлагает запуск (open и круг починки).
+            "slot_hosts": await card_hosts(db, dict(row)),
             # #1817: плашка запуска исполнителя (слот или облако).
             "launch_plaque": await launch_feedback.plaque(db, task_id),
             "finding_touch": finding_touch,

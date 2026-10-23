@@ -41,6 +41,7 @@ from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import chat_pair, orchestrator_queue, owner_minutes, project_policy
+from hub.services import rework_admission
 from hub.db import fetchall, write_transaction
 from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
@@ -587,36 +588,38 @@ async def _reserve(
         )
         if refusal is not None:
             return refusal
-        if admit is not None:
-            why = await admit(db, task)
-            if why:
-                return _refused(why, task_id)
-        generation = int(task.get("submission_generation") or 0) + 1
-        row_id = await repo.create_executor_run(
-            db,
-            task_id=task_id,
-            submission_generation=generation,
-            agent_id="",
-            run_id="",
-            model=model,
-            # #1446: у прогона «только сдай» свой, более низкий потолок.
-            token_ceiling=ceilings[0] if ceilings else None,
-            cents_ceiling=ceilings[1] if ceilings else None,
-        )
-        # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
-        # и поколение прогона; нажавший человек — в аудите.
-        code, _ttl = await chat_pair.issue_run_code(
-            db,
-            task_id,
-            generation,
-            issued_by_principal_id=issuer_principal_id,
-            executor_run_id=row_id,
-            commit=False,
-        )
-        if launch is not None:
-            await owner_minutes.record_order_accepted(
-                db, task_id, row_id, generation, issuer_principal_id, *launch
+        # SAVEPOINT: при внешней транзакции сбой не оставит возврат и бронь (#1998)
+        async with rework_admission.savepoint(db):
+            if admit is not None:
+                why = await admit(db, task)
+                if why:
+                    return _refused(why, task_id)
+            generation = int(task.get("submission_generation") or 0) + 1
+            row_id = await repo.create_executor_run(
+                db,
+                task_id=task_id,
+                submission_generation=generation,
+                agent_id="",
+                run_id="",
+                model=model,
+                # #1446: у прогона «только сдай» свой, более низкий потолок.
+                token_ceiling=ceilings[0] if ceilings else None,
+                cents_ceiling=ceilings[1] if ceilings else None,
             )
+            # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
+            # и поколение прогона; нажавший человек — в аудите.
+            code, _ttl = await chat_pair.issue_run_code(
+                db,
+                task_id,
+                generation,
+                issued_by_principal_id=issuer_principal_id,
+                executor_run_id=row_id,
+                commit=False,
+            )
+            if launch is not None:
+                await owner_minutes.record_order_accepted(
+                    db, task_id, row_id, generation, issuer_principal_id, *launch
+                )
     return task, generation, row_id, code
 
 
@@ -824,6 +827,13 @@ async def _report_rows_for_repair(
 async def _current_findings(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> list[dict[str, str]]:
+    """Находки круга починки: машинные текущей сдачи И текущего вердикта (#1998)."""
+    return await _machine_findings(db, task) + rework_admission.verdict_findings(task)
+
+
+async def _machine_findings(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> list[dict[str, str]]:
     """Подтверждённые и неразрешённые находки последнего отчёта текущей сдачи.
 
     uid берутся из ``MachineReviewView`` — тем же вычислением, что у брифа
@@ -874,11 +884,12 @@ def _findings_block(findings: list[dict[str, str]]) -> str:
     ]
     for f in findings:
         where = f" [{f['where']}]" if f["where"] else ""
-        lines.append(f"- uid {f['uid']} ({f['kind']}){where}: {f['title']}")
+        uid = f"uid {f['uid']} " if f["uid"] else ""  # замечание вердикта без uid
+        lines.append(f"- {uid}({f['kind']}){where}: {f['title']}")
         if f["text"]:
             lines.append(f"  {f['text']}")
     lines.append(FINDINGS_DATA_CLOSE)
-    return "\n".join(lines)
+    return "\n".join(lines + rework_admission.verdict_note(findings))
 
 
 async def _holderless_running_refusal(
@@ -922,9 +933,8 @@ async def repair_state(
         busy = await _holderless_running_refusal(db, task)
         if busy:
             return False, busy
-    if not await _current_findings(db, task):
-        return False, REASON_NO_FINDINGS
-    return True, ""
+    why = rework_admission.findings_refusal(task, await _current_findings(db, task))
+    return (False, why) if why else (True, "")
 
 
 async def repair_offered(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
@@ -996,8 +1006,7 @@ async def repair_executor(
     не должна повиснуть open без исполнителя. Возврат — тот же
     ``return_to_work`` (#1356), заказ — тот же путь, что у первого запуска.
     """
-    from hub.models import TaskReturnToWork
-    from hub.services.lifecycle import return_to_work
+    from hub.services.lifecycle import RETURN_TO_WORK_STATUSES
 
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -1013,36 +1022,12 @@ async def repair_executor(
     if early is not None:
         return early
     findings = await _current_findings(db, task)
-    if not findings:
-        return _refused(REASON_NO_FINDINGS, task_id)
+    if why := rework_admission.findings_refusal(task, findings):
+        return _refused(why, task_id)
     refusal = await _budget_refusal(db, task_id, project_policy.gate_policy_of(project))
     if refusal is not None:
         await db.commit()
         return refusal
-
-    if task["status"] not in ("open", "running"):
-        # open — задача уже возвращена прошлым нажатием, чей заказ сорвался:
-        # возвращать нечего, круг повторяется той же кнопкой. running без
-        # держателя возвращается внутри брони (#1783), не здесь.
-        try:
-            await return_to_work(
-                db,
-                task_id,
-                TaskReturnToWork(
-                    reason=(
-                        f"круг починки облачным исполнителем по находкам сдачи "
-                        f"{task.get('submission_generation')} (#1444), нажал {issuer}"
-                    ),
-                    # fix_requested всегда несёт job_id (#1356): человек выбрал
-                    # облачного исполнителя вместо текущего задания.
-                    abandon_active_job=True,
-                ),
-                actor=issuer,
-            )
-        except HTTPException as exc:
-            # Например, живое задание у fix_requested (#1356): отказ возврата —
-            # это причина для человека, а не сырой 409 мимо формы.
-            return _refused(f"{REASON_NOT_RETURNABLE}: {exc.detail}", task_id)
 
     async def _this_task(
         db: aiosqlite.Connection, _project: Any
@@ -1050,7 +1035,16 @@ async def repair_executor(
         live = await _live_run(db, task_id)
         return (None, live) if live else (task_id, "")
 
+    snapshot: list[dict[str, str]] = []  # находки, прочитанные ПОД локом брони
+
     async def _admit(db: aiosqlite.Connection, fresh: dict[str, Any]) -> str:
+        snapshot[:] = await _current_findings(db, fresh)
+        if why := rework_admission.findings_refusal(fresh, snapshot):
+            return why
+        if fresh["status"] in RETURN_TO_WORK_STATUSES:
+            # Возврат review/fix_requested — ВНУТРИ брони, без своего commit: любой
+            # отказ после него откатывает и возврат (#1998, класс «отказ после commit»).
+            return await _return_for_cloud(db, fresh, issuer)
         return await _admit_rework(db, fresh, issuer)
 
     model = config.EXECUTOR_MODEL.strip()
@@ -1070,9 +1064,27 @@ async def repair_executor(
         project,
         reserved,
         ready,
-        extra=_findings_block(findings),
+        extra=_findings_block(snapshot),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
     )
+
+
+async def _return_for_cloud(
+    db: aiosqlite.Connection, task: dict[str, Any], issuer: str
+) -> str:
+    """review/fix_requested -> open под локом брони без commit; пусто — вернули."""
+    from hub.models import TaskReturnToWork
+    from hub.services.lifecycle import return_to_work
+
+    reason = rework_admission.return_reason(
+        task, where="облачным исполнителем", issue="#1444", who=issuer
+    )
+    body = TaskReturnToWork(reason=reason, abandon_active_job=True)
+    try:
+        await return_to_work(db, int(task["id"]), body, actor=issuer, commit=False)
+    except HTTPException as exc:
+        return f"{REASON_NOT_RETURNABLE}: {exc.detail}"
+    return ""
 
 
 async def _admit_rework(
@@ -1080,35 +1092,23 @@ async def _admit_rework(
 ) -> str:
     """Допуск и возврат running-задачи без держателя — под write-локом брони (#1783).
 
-    Всё перечитано внутри транзакции ``_reserve``: статус, держатель, признаки
-    работы и идущий прогон (бронь соседнего нажатия или чужой claim, пришедшие
-    после быстрой проверки, видны здесь). Возврат running → open и INSERT брони
-    — одна транзакция: проигравшему гонку платный исполнитель не покупается, а
-    задача не остаётся open без исполнителя. Сетевой заказ — после коммита
-    (#1428). Пустая строка — допуск.
+    Правило допуска общее со слотом (``rework_admission.refusal``, #1998): всё
+    перечитано внутри транзакции ``_reserve``. Возврат running → open и INSERT
+    брони — одна транзакция: проигравшему гонку платный исполнитель не
+    покупается, а задача не остаётся open без исполнителя. Сетевой заказ — после
+    коммита (#1428). Пустая строка — допуск.
     """
     from hub.services import return_running
 
-    if task["status"] == "open":
-        return ""
-    if task["status"] != "running":
-        # Под локом задачу успели взять или сдвинуть: бронь не покупается
-        # поверх чужого захвата.
-        return f"{REASON_NOT_RETURNABLE}: статус {task['status']} под локом брони"
-    live = await _live_run(db, int(task["id"]))
-    if live:
-        return live
-    signs = await return_running.work_signs(db, task)
-    if signs:
-        named = ", ".join(f"{s['sign']} ({s['detail']})" for s in signs)
-        return f"{REASON_NOT_RETURNABLE}: у задачи есть признаки работы: {named}"
+    why = await rework_admission.refusal(db, task)
+    if why or task["status"] == "open":
+        return why
     await return_running.apply_return_to_open(
         db,
         task,
         actor=issuer,
-        reason=(
-            f"круг починки облачным исполнителем по находкам сдачи "
-            f"{task.get('submission_generation')} (#1444, #1783), нажал {issuer}"
+        reason=rework_admission.return_reason(
+            task, where="облачным исполнителем", issue="#1444, #1783", who=issuer
         ),
     )
     return ""

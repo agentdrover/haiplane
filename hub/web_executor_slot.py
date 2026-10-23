@@ -20,19 +20,28 @@ from hub.services import (
     executor_orders,
     launch_feedback,
     project_policy,
+    rework_admission,
 )
 
 router = APIRouter()
 
 
-async def card_hosts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+async def card_hosts(db: aiosqlite.Connection, task: dict[str, Any]) -> list[str]:
     """Включённые хосты, на которые карточка предлагает запуск.
 
     Только у проекта в режиме manual: в off запуск всё равно откажет, и кнопка,
-    которая гарантированно ответит отказом, — шум на карточке.
+    которая гарантированно ответит отказом, — шум на карточке. У running
+    (круг починки после changes_requested, #1998) — ещё и только там, где его
+    допускает общее правило ``rework_admission.refusal``, иначе кнопка ответила бы отказом.
     """
+    status = task.get("status")
+    if status not in ("open", "running"):
+        return []
+    task_id = int(task["id"])
     policy = await project_policy.gate_policy_for_task(db, task_id)
     if executor_launch.launch_mode_of(policy) != executor_launch.LAUNCH_MANUAL:
+        return []
+    if status == "running" and await rework_admission.refusal(db, task):
         return []
     return await executor_orders.enabled_host_names(db)
 
