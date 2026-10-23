@@ -229,6 +229,23 @@ async def _fed(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
     return any(tail.search(str(dict(r)["content"])) for r in rows)
 
 
+async def fed_keys(db: aiosqlite.Connection) -> set[tuple[int, int]]:
+    """(задача, поколение) всех пропусков по строкам ленты - одним запросом."""
+    rows = await fetchall(
+        db,
+        "SELECT task_id, content FROM task_updates WHERE kind='status' "
+        "AND agent='hub' AND author_kind='hub' AND instr(content, ?) > 0",
+        (MARK_PREFIX,),
+    )
+    tail = re.compile(re.escape(MARK_PREFIX) + r"(\d+) код=[a-z_]+\]$")
+    out: set[tuple[int, int]] = set()
+    for row in rows:
+        found = tail.search(str(dict(row)["content"]))
+        if found:
+            out.add((int(dict(row)["task_id"]), int(found.group(1))))
+    return out
+
+
 async def recorded_events(db: aiosqlite.Connection) -> set[tuple[int, int]]:
     """Все (задача, поколение) с событием пропуска - одним запросом для счёта."""
     rows = await fetchall(

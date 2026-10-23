@@ -137,12 +137,20 @@ class ContourCounts:
         return (self.substantive / self.denominator) if self.denominator else None
 
 
-async def _skip_recorded(
-    db: aiosqlite.Connection, item: dict[str, Any], events: set[tuple[int, int]]
-) -> bool:
-    """Советник намеренно не заказан (#2024): событие или, после чистки, лента."""
-    key = (int(item["task_id"]), int(item["generation"]))
-    return key in events or await advisor_skip.is_recorded(db, *key)
+class _SkipKeys:
+    """(задача, поколение) с записанным пропуском: события сразу, лента - лениво."""
+
+    def __init__(self, events: set[tuple[int, int]]) -> None:
+        self._events = events
+        self._fed: set[tuple[int, int]] | None = None
+
+    async def has(self, db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
+        key = (int(item["task_id"]), int(item["generation"]))
+        if key in self._events:
+            return True
+        if self._fed is None:  # событие вычищено по сроку: одна загрузка ленты
+            self._fed = await advisor_skip.fed_keys(db)
+        return key in self._fed
 
 
 async def contour_counts(
@@ -171,7 +179,7 @@ async def contour_counts(
         f"WHERE {where}",
         tuple(params),
     )
-    events = await advisor_skip.recorded_events(db)
+    skip_keys = _SkipKeys(await advisor_skip.recorded_events(db))
     c: dict[str, int] = {
         "judged": 0,
         "procedural": 0,
@@ -211,7 +219,7 @@ async def contour_counts(
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
-            elif not status and await _skip_recorded(db, item, events):
+            elif not status and await skip_keys.has(db, item):
                 c["advisor_skipped"] += 1
             else:
                 c["advisor_pending"] += 1

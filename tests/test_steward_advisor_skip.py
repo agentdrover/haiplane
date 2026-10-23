@@ -198,6 +198,10 @@ async def test_no_advisor_where_approve_cannot_apply(
     # тот же код с другим текстом - не новая причина
     assert not await record_skip(db, integrity.task_id, 1, "ci_integrity", "иначе")
 
+    # маршрут вердикта называет человека там, где стюард не применит approve
+    await _route_names_the_human(db, nopair)
+    await _route_names_the_human(db, integrity)
+
     # события чистятся по сроку: дедуп переживает это через строку ленты
     await db.execute("DELETE FROM events WHERE kind=?", (_SKIPPED,))
     await db.commit()
@@ -346,3 +350,17 @@ async def _change_after_the_order(db, monkeypatch, change: str) -> None:
         assert applied == 1 and await verdict_of(db, task_id) == "approved"
         return
     await _no_approve(db, task_id)
+
+
+async def _route_names_the_human(db: aiosqlite.Connection, case) -> None:
+    """Пропуск без ответа советника не оставляет сдачу «ждать стюарда» (#2024)."""
+    from types import SimpleNamespace
+
+    from hub.services import verdict_route
+
+    task = dict(await repo.get_task(db, case.task_id))
+    project = await repo.resolve_project_for_task(db, case.task_id)
+    stance = SimpleNamespace(code="unclean", reason="автопилот молчит")
+    route = await verdict_route._steward_route(db, task, project, stance)
+    assert (route.decider, route.final) == ("human", "human"), route
+    assert route.code == verdict_route.CODE_ADVISOR_SKIPPED
