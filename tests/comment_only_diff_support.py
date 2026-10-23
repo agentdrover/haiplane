@@ -115,7 +115,8 @@ def _run_case(tmp_path: Path, name: str) -> tuple[int, str]:
     head: dict[str, str | bytes | None] = {target: case["head"], **both}
     head.update(case.get("extra_head", {}))
     repo, base_sha, head_sha = _pair(tmp_path, base, head)
-    return _run(repo, base_sha, head_sha, [target])
+    extra = [a for name in case.get("allow", []) for a in ("--allow-docstring", name)]
+    return _run(repo, base_sha, head_sha, [target], *extra)
 
 
 def _check_case(name: str, rc: int, out: str) -> None:

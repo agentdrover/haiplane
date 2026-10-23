@@ -1,11 +1,12 @@
-"""Проверка «изменены только комментарии» держится исполнением, а не доверием (#2032).
+"""Строгая проверка «изменены только комментарии» держится исполнением (#2032).
 
 Серия чистки истории в комментариях правит сотни строк в файлах ядра. Ревью не
 отличит смену текста от смены кода, а удаление ``# type: ignore`` или правка
 контрактного docstring ломают инструменты и публичные поверхности. Инструмент
-``scripts/comment_only_diff.py`` проверяет ОГРАНИЧЕННЫЙ класс правок (токены,
-нормализованный AST, привязка директив, контрактные docstring-и); отсутствие
-изменения поведения он не доказывает.
+``scripts/comment_only_diff.py`` проверяет ОГРАНИЧЕННЫЙ класс правок: строки
+кода совпадают целиком, директивы остаются на своих строках, docstring-и
+меняются только по явному ``--allow-docstring``; отсутствие изменения поведения
+он не доказывает. Распознавание «контрактных» docstring-ов снято (круг 5).
 
 Тесты идут на временных git-репозиториях: пары ревизий — настоящие коммиты.
 Коды возврата: 0 — чисто, 1 — есть нарушения, 2 — проверить не удалось.
@@ -58,11 +59,10 @@ def test_output_names_file_line_and_kind(tmp_path: Path) -> None:
     )
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 1
-    assert "m.py:2: [directive]" in out, out
-    assert "m.py:3: [tokens]" in out, out
+    assert "m.py:2: [code]" in out, out
 
 
-def test_contract_docstring_change_passes_only_when_symbol_is_allowed(
+def test_docstring_change_passes_only_when_symbol_is_named(
     tmp_path: Path,
 ) -> None:
     """Допустимое сокращение контрактного docstring названо по полному имени."""
@@ -70,7 +70,7 @@ def test_contract_docstring_change_passes_only_when_symbol_is_allowed(
     head = '@mcp.tool()\ndef hub_t():\n    """Кратко."""\n    return 1\n'
     repo, b, h = _pair(tmp_path, {"m.py": base}, {"m.py": head})
     rc, out = _run(repo, b, h, ["m.py"])
-    assert rc == 1 and "m.py::hub_t" in out, out
+    assert rc == 1 and "m.py::hub_t" in out and "@mcp.tool()" in out, out
     rc, out = _run(repo, b, h, ["m.py"], "--allow-docstring", "m.py::hub_t")
     assert rc == 0, out
     rc, out = _run(repo, b, h, ["m.py"], "--allow-docstring", "m.py::other")
@@ -127,7 +127,7 @@ def test_in_process_main_returns_the_same_codes(
         ["--repo", str(repo), "--base", base, "--head", head, "a.py"]
     )
     assert rc == 1
-    assert "[tokens]" in capsys.readouterr().out
+    assert "[code]" in capsys.readouterr().out
 
 
 def test_ast_check_sees_a_type_comment_edit() -> None:
@@ -153,18 +153,6 @@ def test_ast_check_sees_a_type_comment_edit() -> None:
         parsed("x = []  # type: list[str]\n"),
     )
     assert [v.kind for v in changed] == ["ast"]
-
-
-def test_directive_noise_is_not_reported_after_code_diverges(tmp_path: Path) -> None:
-    """После расхождения кода индексы-якоря сдвинуты: шум о директивах не выводится."""
-    repo, base, head = _pair(
-        tmp_path,
-        {"m.py": "a = 1\nb = 2  # noqa: E501\n"},
-        {"m.py": "a = 1; z = 0\nb = 2  # noqa: E501\n"},
-    )
-    rc, out = _run(repo, base, head, ["m.py"])
-    assert rc == 1 and "[tokens]" in out, out
-    assert "[directive]" not in out, out
 
 
 def test_unchanged_listed_file_must_still_be_checkable(tmp_path: Path) -> None:
@@ -226,22 +214,22 @@ def test_real_process_exit_codes(tmp_path: Path) -> None:
     assert run_process(repo2, "0" * 40, head2, ["a.py"])[0] == 2
 
 
-def test_symlinked_python_file_makes_the_index_incomplete(tmp_path: Path) -> None:
-    """Ссылка вместо .py в репозитории: индекс контрактов неполон, «чисто» нельзя."""
-    repo, base, _ = _pair(
-        tmp_path, {"m.py": "x = 1  # c\n", "real.txt": "q\n"}, {"n.txt": "z\n"}
-    )
-    (repo / "m.py").write_text("x = 1\n")
-    (repo / "link.py").symlink_to("real.txt")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "link")
-    head = _git(repo, "rev-parse", "HEAD")
-    rc, out = _run(repo, base, head, ["m.py"])
-    assert rc == 2 and "неполон" in out, out
-
-
 def test_unchanged_unparsable_listed_file_alone_is_not_clean(tmp_path: Path) -> None:
     """Без правок других .py индекс не строится: файл списка проверяется сам."""
     repo, base, head = _pair(tmp_path, {"bad.py": "x = (\n"}, {"n.txt": "q\n"})
     rc, out = _run(repo, base, head, ["bad.py"])
     assert rc == 2 and "bad.py" in out, out
+
+
+def test_default_is_red_for_every_docstring_change_and_hint_is_not_permission(
+    tmp_path: Path,
+) -> None:
+    """Подсказка (декораторы, базы) в выводе есть, но разрешением не служит."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "class M(BaseModel):\n    'old'\n    x: int\n"},
+        {"m.py": "class M(BaseModel):\n    'new'\n    x: int\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 1 and "база BaseModel" in out and "--allow-docstring" in out, out
+    assert _run(repo, base, head, ["m.py"], "--allow-docstring", "m.py::M")[0] == 0
