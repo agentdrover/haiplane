@@ -294,7 +294,8 @@ def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
     # #2026: AC not verified by a test — a locator does not apply, nothing more.
     summary = evidence_states.manual_ac_summary(brief.get("acceptance_criteria") or [])
     if summary:
-        part["not_applicable"] = summary
+        # The note is said once, in the text line (``_checks_lines``).
+        part["not_applicable"] = {k: v for k, v in summary.items() if k != "note"}
     return part
 
 
@@ -315,11 +316,29 @@ def _freshness_part(block: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _ci_evidence_part(brief: dict[str, Any]) -> dict[str, Any]:
+    """Compact form (#2026): a missing block is ``state, expectation, run``.
+
+    The long explanation of the state stays in the full brief (section=full):
+    the mandatory part is never cut, so it must stay short.
+    """
+    out: dict[str, Any] = {}
+    for name, block in (brief.get("ci_evidence") or {}).items():
+        if not isinstance(block, dict) or block.get("state") == "received":
+            out[name] = block
+            continue
+        short = {k: block[k] for k in ("state", "expectation", "run") if block.get(k)}
+        # A block of an old shape (no expectation) keeps its reason: nothing else says why.
+        out[name] = short if block.get("expectation") else block
+    return out
+
+
 #: Top-level MANDATORY fields that are not carried as they are.
 _REDUCERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "project": lambda b: (b.get("project") or {}).get("slug") or None,
     "ac_test_results": _ac_results_part,
     "locator_resolution": _locators_part,
+    "ci_evidence": _ci_evidence_part,
     "base_merge": lambda b: _base_merge_part(b.get("base_merge")),
     "diff_base": lambda b: _diff_base_part(b.get("diff_base")),
     "verdict_route": lambda b: _verdict_route_part(b.get("verdict_route")),
@@ -700,17 +719,20 @@ def _checks_lines(proj: dict[str, Any]) -> list[str]:
         na = loc["not_applicable"]
         more = f" +{na['more']} more" if na["more"] else ""
         lines.append(
-            f"AC locators not applicable ({na['note']}): {', '.join(na['acs'])}{more}"
+            f"AC locators not applicable ({evidence_states.MANUAL_AC_NOTE}): "
+            f"{', '.join(na['acs'])}{more}"
         )
     for name in ("mutations", "baseline"):
         block = (proj["ci_evidence"] or {}).get(name) or {}
+        if block.get("expectation") and block.get("state") != "received":
+            # One short format, no repeat of the reason (#2026): the full text is in section=full.
+            lines.append(
+                f"CI {name} [{block.get('state')}] expectation={block['expectation']}"
+                + (f" | {block['run']}" if block.get("run") else "")
+            )
+            continue
         lines.append(
             f"CI {name} [{block.get('state', '?')}]: {block.get('reason', '')}"
-            + (
-                f" | {block['run']}"
-                if block.get("run") and block.get("state") != "received"
-                else ""
-            )
         )
     live = proj["live_check"] or {}
     lines.append(

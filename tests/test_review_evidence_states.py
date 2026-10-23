@@ -243,6 +243,7 @@ def test_manual_ac_and_downgrade_are_explained():
     )
     assert part["not_applicable"]["acs"] == ["AC-1=manual", "AC-3=log_check"]
     assert part["not_applicable"]["more"] == 0
+    assert "note" not in part["not_applicable"], "said once, in the text line"
     many = evidence_states.manual_ac_summary(
         [
             AcceptanceCriterion(
@@ -294,18 +295,24 @@ async def test_downgrade_headline_cites_the_rule(db):
     assert "выполнен" not in block.headline
 
 
-def test_manual_ac_note_stays_inside_the_mcp_budget():
-    """Codex round 3: the note is said once and capped, not once per AC."""
-    import json as _json
-
+@pytest.mark.parametrize("count", [5, 10, 25])
+@pytest.mark.parametrize("kind", ["manual", "test"])
+def test_explanations_stay_inside_the_mcp_budget(count, kind):
+    """Worst case: empty CI blocks of a PR run and manual AC; whole MCP answer <= 12 000, no bounds."""
     from hub.services import review_brief_projection as proj
     from tests.test_review_brief_projection import _brief
 
-    def wire(kind: str) -> int:
-        brief = _brief(ac=5)
-        for ac in brief["acceptance_criteria"]:
-            ac["verifiable_by"] = kind
-        result = proj.brief_result(brief)
-        return len(_json.dumps(result.structuredContent, ensure_ascii=False))
-
-    assert wire("manual") - wire("test") < 400
+    brief = _brief(ac=count)
+    for ac in brief["acceptance_criteria"]:
+        ac["verifiable_by"] = kind
+    block = evidence_states.missing_block(
+        "мутации", SHA, evidence_states.Origin("pull_request", "2005")
+    ).model_dump()
+    brief["ci_evidence"] = {"mutations": block, "baseline": dict(block)}
+    result = proj.brief_result(brief)
+    assert proj.result_chars(result) <= 12_000
+    assert "bounds" not in result.structuredContent
+    text = json.loads(result.content[0].text)["message"]
+    assert "CI mutations [not_received] expectation=origin_unconfirmed" in text
+    assert text.count("прогон 2005") == 2, "event and run once per block, no repeat"
+    assert "не подтверждено" not in text, "the long explanation is for section=full"

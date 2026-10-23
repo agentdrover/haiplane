@@ -288,8 +288,7 @@ async def test_mcp_brief_fits_the_budget_and_keeps_the_mandatory_fields(
         # #1985: pin_verified - решающее поле machine_review и стоит знаков;
         # на границе бюджета число показанных AC зависит от длины имени хоста
         # в конверте (server_id); эхо зафиксировано в фикстуре served.
-        # #2026: expectation в двух блоках ci_evidence отняло один AC.
-        assert blocks["acceptance_criteria"]["shown"] == 8
+        assert blocks["acceptance_criteria"]["shown"] == 9
     text = _text(result)
     assert text.startswith("Review brief for task #1647")
     assert "AC-1:" in text or blocks["acceptance_criteria"]["shown"] == 0
