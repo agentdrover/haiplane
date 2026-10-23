@@ -113,8 +113,8 @@
     },
     {
       "path": "hub/web.py",
-      "measured": 4622,
-      "max": 4854,
+      "measured": 4628,
+      "max": 4860,
       "removed_by": "unclaimed"
     },
     {
