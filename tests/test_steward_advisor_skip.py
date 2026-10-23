@@ -101,7 +101,7 @@ async def _skip_lines(db: aiosqlite.Connection, task_id: int) -> list[str]:
     return [
         dict(u)["content"]
         for u in await repo.get_task_updates(db, task_id)
-        if "советник не заказан" in dict(u)["content"]
+        if "советник не заказан" in dict(u)["content"].lower()
     ]
 
 
@@ -174,9 +174,7 @@ async def _ordered_as_before(db, monkeypatch, label: str) -> None:
         )
         await db.commit()
     elif label == "unknown_class":
-        await db.execute(
-            "UPDATE tasks SET risk_class=NULL WHERE id=?", (case.task_id,)
-        )
+        await db.execute("UPDATE tasks SET risk_class=NULL WHERE id=?", (case.task_id,))
         await db.commit()
         await set_policy(db, case.project_id, policy_of(clean=None))
 
@@ -223,7 +221,9 @@ async def _change_after_the_order(db, monkeypatch, change: str) -> None:
             "WHERE task_id=? AND kind='advisor'",
             (task_id,),
         )
-        await steward_cap.record_refusal(db, task_id, case.project_id, 1, "advisor", "x")
+        await steward_cap.record_refusal(
+            db, task_id, case.project_id, 1, "advisor", "x"
+        )
     elif change == "generation":
         await repo.update_task(db, task_id, submission_generation=2)
     await db.commit()

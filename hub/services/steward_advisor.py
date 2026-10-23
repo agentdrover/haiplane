@@ -53,6 +53,7 @@ from hub.services.result_kind import (
     automation_not_applicable,
     task_automation_not_applicable,
 )
+from hub.services import steward_advisor_skip as advisor_skip
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -228,6 +229,13 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
             # #1915: потолок исчерпан — сдача у человека до reset_at. Выбор
             # модели ниже мог бы закрыть поколение строкой refused и тем самым
             # лишить завтрашнего заказа.
+            continue
+        skip = await advisor_skip.unapprovable_reason(db, task_id)
+        if skip is not None:
+            # #2024: approve стюарда не применится по причине вне советника —
+            # платный заказ бесполезен. Пропуск не согласие; причина видна один раз.
+            if await advisor_skip.record_skip(db, task_id, generation, *skip):
+                await db.commit()
             continue
         if await _order_one(db, task_id, generation):
             ordered += 1
@@ -577,9 +585,14 @@ async def advisor_state(
     )
     if not runs:
         handoff = await steward_cap.cap_handoff(db, task_id, generation)
+        skipped = await advisor_skip.recorded_reason(db, task_id, generation)
         return AdvisorState(
             STATE_NOT_ORDERED,
-            reason=handoff.reason if handoff is not None else "советник не заказан",
+            reason=handoff.reason
+            if handoff is not None
+            else f"советник не заказан ({skipped})"
+            if skipped
+            else "советник не заказан",
             **base,
         )
     run = dict(runs[0])
