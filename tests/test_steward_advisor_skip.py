@@ -21,7 +21,7 @@ from hub import config
 from hub import repository as repo
 from hub import repository_ci_integrity as store
 from hub.db import fetchall
-from hub.services import steward_apply, steward_cap
+from hub.services import ci_integrity, steward_apply, steward_cap
 from hub.services import steward_shadow as sh
 from hub.services.steward_advisor import (
     STATE_NOT_ORDERED,
@@ -156,7 +156,16 @@ async def test_shadow_and_double_clean_still_order_the_advisor(
     db: aiosqlite.Connection, monkeypatch
 ):
     """AC-2: тень, малая выборка, достижимая двойная чистота, непрочитанное - заказ."""
-    for label in ("shadow", "sample", "double_clean", "unknown_class", "unscanned"):
+    for label in (
+        "shadow",
+        "sample",
+        "double_clean",
+        "unknown_class",
+        "unscanned",
+        "unreadable",
+        "listened_only",
+        "read_failure",
+    ):
         await _ordered_as_before(db, monkeypatch, label)
 
 
@@ -173,6 +182,23 @@ async def _ordered_as_before(db, monkeypatch, label: str) -> None:
             "DELETE FROM ci_integrity_scans WHERE task_id=?", (case.task_id,)
         )
         await db.commit()
+    elif label == "unreadable":
+        await store.save_ci_integrity_scan(
+            db, case.task_id, SHA, "unreadable", "[]", "дифф не получен"
+        )
+        await db.commit()
+    elif label == "read_failure":  # не смог прочитать - не причина пропускать
+        await _signs(db, case.task_id)
+
+        async def _broken(*_a, **_kw):
+            raise RuntimeError("база недоступна")
+
+        monkeypatch.setattr(ci_integrity, "standing_of", _broken)
+    elif label == "listened_only":  # вердикт не отдан, стюарда лишь слушают
+        await _signs(db, case.task_id)
+        await set_policy(
+            db, case.project_id, {"verdict": "human", "steward_shadow": True}
+        )
     elif label == "unknown_class":
         await db.execute("UPDATE tasks SET risk_class=NULL WHERE id=?", (case.task_id,))
         await db.commit()
