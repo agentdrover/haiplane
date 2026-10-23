@@ -122,7 +122,7 @@ def _advisor_reason(state: Any) -> tuple[str, dict[str, str]] | None:
         if state.answer == adv.ANSWER_CONCUR:
             return None
         return BLOCKED, _reason(adv.REFUSED_ADVISOR, "советник возражает")
-    if state.state in (adv.STATE_REFUSED, adv.STATE_TIMEOUT):
+    if state.state in (adv.STATE_REFUSED, adv.STATE_TIMEOUT) or state.skipped:
         return BLOCKED, _reason(adv.REFUSED_ADVISOR, detail)
     return UNKNOWN, _reason(adv.REFUSED_ADVISOR, detail)
 
