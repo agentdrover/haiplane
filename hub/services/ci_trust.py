@@ -638,9 +638,13 @@ def _standing_attempt(
         # wrong_repository, ...); a CONFIRMED one — of a run that is gone, or of
         # an older attempt — is history and is never shown as the standing.
         # VERIFIED comes back only for the current attempt, below.
-        if newest["trust"] != VERIFIED and (
-            not by_key
-            or newest["run_id"]
+        # #2027: a report with no run id (no_provenance) is tied to no run, so
+        # it cannot be the report of the attempt GitHub calls current: that
+        # attempt still has none, and the steward waits for it.
+        if (
+            newest["trust"] != VERIFIED
+            and newest["run_id"]
+            and newest["run_id"]
             not in {r["run_id"] for r in canonical_runs(runs, sha, gh_repo, contract)}
         ):
             return newest, newest["trust"], newest["trust_reason"], ""
