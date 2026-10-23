@@ -21,13 +21,16 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub.models import ReviewVerdict, TaskReviewVerdict
-from hub.services import steward_applied, steward_cap
+from hub.services import steward_applied, steward_cap, verdict_evidence
+from hub.services import steward_shadow as sh
+from hub.services.steward_advisor import apply_advisor_outcomes
 from hub.services.steward_advisor import advisor_refusal
 from hub.services.steward_apply import policy_refusal
 from hub.services.steward_applied import APPLIED, apply_self_approval
 from hub.services.lifecycle import record_review_verdict
 from tests.steward_double_clean_support import (
     build_case,
+    feed,
     policy_of,
     set_policy,
     verdict_events,
@@ -143,3 +146,127 @@ async def test_a_steward_return_for_rework_is_not_gated(db, monkeypatch):
     stored = dict(await repo.get_task(db, case.task_id))
     assert stored["review_verdict"] == ReviewVerdict.changes_requested.value
     assert json.dumps(stored["review_cycle"]) == "1"
+
+
+_REAL_ACT_GRANTED_NOW = sh.act_granted_now
+
+
+async def _real_global_act(monkeypatch) -> None:
+    """Допуск ``act`` читает НАСТОЯЩИЙ чистый предикат: окружение и критерии выхода."""
+    monkeypatch.setattr(sh, "act_granted_now", _REAL_ACT_GRANTED_NOW)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+
+    async def _no_unmet_criteria(_db):
+        return []
+
+    monkeypatch.setattr(sh, "act_refusals", _no_unmet_criteria)
+
+
+async def _switch_off(other, case, monkeypatch) -> None:
+    """Владелец выключил стюарда (HAIPLANE_STEWARD_MODE=off) после ранних проверок."""
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+
+
+async def _criteria_revoked(other, case, monkeypatch) -> None:
+    """Критерий выхода перестал выполняться (найдено ошибочное одобрение)."""
+
+    async def _unmet(_db):
+        return [("false_approve", "найдено ошибочное одобрение")]
+
+    monkeypatch.setattr(sh, "act_refusals", _unmet)
+
+
+async def test_global_act_rechecked_at_write(db, db_dsn, monkeypatch):
+    """AC-1: стюарда выключили между ранней проверкой и записью - approve не записан."""
+    # Контроль: ничего не менялось - approve записан (предикат настоящий).
+    control = await build_case(db, monkeypatch, "toctou-act-control")
+    await _real_global_act(monkeypatch)
+    result = await _apply_with_a_write_before_record(
+        db, db_dsn, control, monkeypatch, _nothing
+    )
+    assert result is not None and result[0] == APPLIED, result
+    assert await verdict_of(db, control.task_id) == ReviewVerdict.approved.value
+
+    for label, change in (("env_off", _switch_off), ("criteria", _criteria_revoked)):
+        case = await build_case(db, monkeypatch, f"toctou-act-{label}")
+        await _real_global_act(monkeypatch)
+        with pytest.raises(HTTPException) as caught:
+            await _apply_with_a_write_before_record(
+                db, db_dsn, case, monkeypatch, change
+            )
+
+        assert caught.value.status_code == 422, (label, caught.value.detail)
+        assert str(caught.value.detail).startswith("precondition_failed: "), label
+        assert "автономия act сейчас не выдана" in str(caught.value.detail), label
+        assert await verdict_of(db, case.task_id) == "", label
+        assert await verdict_events(db, case.task_id) == [], label
+
+
+async def test_the_act_predicate_writes_nothing(db, monkeypatch):
+    """Предикат допуска не пишет и не коммитит (в отличие от ``effective_mode``)."""
+    monkeypatch.setattr(sh, "act_granted_now", _REAL_ACT_GRANTED_NOW)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    assert sh.configured_mode() == "act"
+    events_before = len(await db.execute_fetchall("SELECT id FROM events"))
+    changes_before = db.total_changes
+
+    granted = await sh.act_granted_now(db)
+
+    assert granted is False, "выборка нового контура пуста - критерии не выполнены"
+    assert db.total_changes == changes_before
+    assert len(await db.execute_fetchall("SELECT id FROM events")) == events_before
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    assert await sh.act_granted_now(db) is False
+
+
+async def _poll_with_a_revoked_delegation(db, db_dsn, case, monkeypatch) -> int:
+    """Поллер применяет approve; перед ``_record`` вердикт отдан человеку."""
+    other = await db_module.connect(db_dsn)
+    real_record = steward_applied._record
+
+    async def record_after_the_owner_changes_the_policy(*args, **kwargs):
+        await _switch_to_human(other, case, monkeypatch)
+        return await real_record(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                steward_applied, "_record", record_after_the_owner_changes_the_policy
+            )
+            return await apply_advisor_outcomes(db)
+    finally:
+        await other.close()
+
+
+async def test_failed_application_reason_is_shown(db, db_dsn, monkeypatch):
+    """AC-2: причина failed - одна строка в ленте и в доказательствах, без дублей."""
+    case = await build_case(db, monkeypatch, "toctou-reason")
+
+    assert await _poll_with_a_revoked_delegation(db, db_dsn, case, monkeypatch) == 1
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    assert row["advisor_outcome_detail"].startswith("policy_not_delegated: ")
+    assert await verdict_of(db, case.task_id) == ""
+
+    def failure_lines(text: str) -> list[str]:
+        return [
+            ln for ln in text.splitlines() if "Одобрение стюарда не применено" in ln
+        ]
+
+    lines = failure_lines(await feed(db, case.task_id))
+    assert len(lines) == 1, lines
+    assert "policy_not_delegated" in lines[0]
+
+    evidence = await verdict_evidence.build(db, case.task_id, 1)
+    shown = [
+        ln
+        for ln in verdict_evidence.format_block(evidence).splitlines()
+        if "причина отказа применения" in ln
+    ]
+    assert len(shown) == 1 and "policy_not_delegated" in shown[0], shown
+
+    # Повторные тики: failed поллер не выбирает - строка не дублируется.
+    assert await apply_advisor_outcomes(db) == 0
+    assert await apply_advisor_outcomes(db) == 0
+    assert len(failure_lines(await feed(db, case.task_id))) == 1

@@ -690,7 +690,11 @@ async def _act(monkeypatch) -> None:
     async def _granted(_db):
         return "act"
 
+    async def _granted_now(_db):
+        return True
+
     monkeypatch.setattr(sh, "effective_mode", _granted)
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)  # #2040
 
 
 async def _real_packet_hash(db: aiosqlite.Connection, task_id: int) -> str:
@@ -778,10 +782,14 @@ async def test_the_applier_refuses_an_approve_without_a_concur(
 
 
 async def test_the_applier_applies_an_approve_with_a_concur_on_the_same_packet(
-    db: aiosqlite.Connection,
+    db: aiosqlite.Connection, monkeypatch
 ):
     from hub.services.steward_applied import APPLIED, apply_judgement
 
+    async def _granted_now(_db):  # #2040: the write reads the global act grant
+        return True
+
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)
     task_id = await _scenario(db, "advisor-applier-concur", "concur")
 
     assert (await apply_judgement(db, task_id, 1))[0] == APPLIED

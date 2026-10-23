@@ -1291,6 +1291,22 @@ async def effective_mode(db: aiosqlite.Connection) -> str:
     return granted
 
 
+async def act_granted_now(db: aiosqlite.Connection) -> bool:
+    """Выдан ли ``act`` СЕЙЧАС - чистое чтение для write-транзакции (#2040).
+
+    ``effective_mode`` закрепляет ошибочные одобрения и пишет объявление отказа
+    с коммитом: внутри транзакции записи вердикта это недопустимо (коммит
+    закрыл бы её посреди записи). Здесь тот же расчёт выдачи -
+    ``configured_mode`` и ``act_refusals`` через ``granted_mode`` - без записи,
+    без коммита и без сети. Не ``act`` в окружении или любой невыполненный
+    критерий выхода - ``False``.
+    """
+    asked = configured_mode()
+    if asked != "act":
+        return False
+    return granted_mode(asked, await act_refusals(db)) == "act"
+
+
 def granted_mode(asked: str, refusals: list[tuple[str, str]]) -> str:
     """The mode a request is granted given the unmet criteria.
 
