@@ -56,6 +56,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import steward_advisor_skip as advisor_skip
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 
 #: Минимум пар (approve судьи с полученным ответом советника).
@@ -152,12 +153,7 @@ async def contour_counts(
     rows = await fetchall(
         db,
         "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "  # nosec B608 - constant fragments, values are params
-        "r.status AS run_status, EXISTS (SELECT 1 FROM events e "
-        "WHERE e.kind='steward_advisor_skipped' AND e.task_id=j.task_id "
-        "AND json_extract(e.payload, '$.generation')=j.generation) "
-        "OR EXISTS (SELECT 1 FROM task_updates u WHERE u.task_id=j.task_id "
-        "AND instr(u.content, '[пропуск-советника g=' || j.generation || ' ') > 0) "
-        "AS skipped "
+        "j.task_id, j.generation, r.status AS run_status "
         "FROM steward_judgements j "
         "LEFT JOIN steward_judgements a ON a.kind='advisor' "
         "AND a.task_id=j.task_id AND a.generation=j.generation "
@@ -206,7 +202,9 @@ async def contour_counts(
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
-            elif item.get("skipped") and not status:
+            elif not status and await advisor_skip.is_recorded(
+                db, int(item["task_id"]), int(item["generation"])
+            ):
                 c["advisor_skipped"] += 1
             else:
                 c["advisor_pending"] += 1

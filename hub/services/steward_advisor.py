@@ -218,6 +218,7 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         (KIND_ADVISOR,),
     )
     ordered = 0
+    act: bool | None = None  # режим читается один раз за проход, и только если нужен
     for row in rows:
         task_id, generation = int(dict(row)["task_id"]), int(dict(row)["generation"])
         if automation_not_applicable(dict(row)):
@@ -230,7 +231,9 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
             # модели ниже мог бы закрыть поколение строкой refused и тем самым
             # лишить завтрашнего заказа.
             continue
-        skip = await advisor_skip.unapprovable_reason(db, task_id)
+        if act is None:
+            act = await advisor_skip.acting(db)
+        skip = await advisor_skip.unapprovable_reason(db, task_id, act=act)
         if skip is not None:
             # #2024: approve стюарда не применится по причине вне советника —
             # платный заказ бесполезен. Пропуск не согласие; причина видна один раз.

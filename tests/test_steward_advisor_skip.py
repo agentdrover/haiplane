@@ -25,7 +25,7 @@ from hub.services import ci_integrity, steward_apply, steward_cap
 from hub.services import steward_shadow as sh
 from hub.services.steward_act_readiness import _advisor_reason
 from hub.services.steward_exit import contour_counts
-from hub.services.steward_advisor_skip import record_skip
+from hub.services.steward_advisor_skip import mark_of, record_skip
 from hub.services.steward_advisor import (
     STATE_NOT_ORDERED,
     advisor_refusal,
@@ -138,9 +138,29 @@ async def test_no_advisor_where_approve_cannot_apply(
     await judge_and_advise(db, nopair.task_id, concur=None)
     await _mode(monkeypatch, "act")  # двойная чистота допускается, пары нет
     overclass = await _scene(db, monkeypatch, "skip-overclass", risk="R5")
+    # чужая цитата ключа в комментарии пропуском не считается
+    await repo.add_task_update(
+        db,
+        integrity.task_id,
+        "denis",
+        "status",
+        mark_of(1, "ci_integrity"),
+        author_kind="principal",
+    )
+    await db.commit()
+    assert not (await advisor_state(db, integrity.task_id, 1)).skipped
+    modes: list[int] = []
+    real_mode = sh.mode_report
+
+    async def _counted(_db):
+        modes.append(1)
+        return await real_mode(_db)
+
+    monkeypatch.setattr(sh, "mode_report", _counted)
     for _ in range(3):
         assert await order_due_advisors(db) == 0
         assert await apply_advisor_outcomes(db) == 0
+    assert len(modes) == 3, "режим читается один раз за проход, не на кандидата"
     other = await aiosqlite.connect(db_dsn, uri=True)
     other.row_factory = aiosqlite.Row
     try:
@@ -212,12 +232,14 @@ async def test_shadow_and_double_clean_still_order_the_advisor(
         "unreadable",
         "listened_only",
         "read_failure",
+        "mode_failure",
     ):
         await _ordered_as_before(db, monkeypatch, label)
 
 
 async def _ordered_as_before(db, monkeypatch, label: str) -> None:
     risk = "R3" if label == "double_clean" else "R1"
+    patch = None  # сбой чтения действует только на один тик заказа
     mode = {"shadow": "shadow", "sample": None}.get(label, "act")
     case = await _scene(db, monkeypatch, f"order-{label}", risk=risk, mode=mode)
     if label in ("shadow", "sample"):
@@ -240,7 +262,14 @@ async def _ordered_as_before(db, monkeypatch, label: str) -> None:
         async def _broken(*_a, **_kw):
             raise RuntimeError("база недоступна")
 
-        monkeypatch.setattr(ci_integrity, "standing_of", _broken)
+        patch = (ci_integrity, "standing_of", _broken)
+    elif label == "mode_failure":  # режим не прочитан - не act
+        await _signs(db, case.task_id)
+
+        async def _unread(_db):
+            raise RuntimeError("режим не прочитан")
+
+        patch = (sh, "mode_report", _unread)
     elif label == "listened_only":  # вердикт не отдан, стюарда лишь слушают
         await _signs(db, case.task_id)
         await set_policy(
@@ -251,7 +280,10 @@ async def _ordered_as_before(db, monkeypatch, label: str) -> None:
         await db.commit()
         await set_policy(db, case.project_id, policy_of(clean=None))
 
-    assert await order_due_advisors(db) == 1, label
+    with monkeypatch.context() as scoped:
+        if patch is not None:
+            scoped.setattr(*patch)
+        assert await order_due_advisors(db) == 1, label
     assert len(await _advisor_rows(db, case.task_id)) == 1
     assert await _skips(db, case.task_id) == []
 

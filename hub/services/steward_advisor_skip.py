@@ -47,19 +47,43 @@ CODE_CLASS_CEILING = "class_above_policy_ceiling"
 MARK_PREFIX = "[пропуск-советника g="
 
 
+#: Строка ленты, написанная самим хабом: комментарий человека с тем же текстом
+#: пропуском не считается.
+_HUB_LINE = (
+    "SELECT 1 FROM task_updates WHERE task_id=? AND kind='status' "
+    "AND agent='hub' AND author_kind='hub' AND instr(content, ?) > 0"
+)
+
+
 def mark_of(generation: int, code: str) -> str:
     """Стабильный ключ (поколение, код) в тексте ленты - не зависит от причины."""
     return f"{MARK_PREFIX}{generation} код={code}]"
 
 
+async def acting(db: aiosqlite.Connection) -> bool:
+    """Выдан ли режим act. Дорогое чтение: тик зовёт его один раз на проход.
+
+    Сбой чтения - не act: тогда советники заказываются как раньше.
+    """
+    from hub.services import steward_shadow
+
+    try:
+        return (await steward_shadow.mode_report(db))["effective"] == "act"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("advisor skip: mode not read: %s", exc)
+        return False
+
+
 async def unapprovable_reason(
-    db: aiosqlite.Connection, task_id: int
+    db: aiosqlite.Connection, task_id: int, *, act: bool
 ) -> tuple[str, str] | None:
     """``(код, причина)``, если approve стюарда этой сдачи не применится без советника.
 
     ``None`` — заказывать как обычно. Любой сбой чтения тоже ``None``: «не смог
     прочитать» не причина пропускать платный заказ.
     """
+    if not act:
+        return None  # тень и недостаточная выборка пар: советники нужны как раньше
     try:
         return await _reason(db, task_id)
     except Exception as exc:  # noqa: BLE001 - непрочитанное не пропускает заказ
@@ -68,11 +92,8 @@ async def unapprovable_reason(
 
 
 async def _reason(db: aiosqlite.Connection, task_id: int) -> tuple[str, str] | None:
-    from hub.services import steward_shadow
     from hub.services.steward_dispatch import verdict_delegated_to_steward
 
-    if (await steward_shadow.mode_report(db))["effective"] != "act":
-        return None  # тень и недостаточная выборка пар: советники нужны как раньше
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None or not verdict_delegated_to_steward(project):
         return None
@@ -149,8 +170,7 @@ async def record_skip(
     # сроку, лента живёт столько же, сколько задача.
     cursor = await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
-        "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS ("
-        "SELECT 1 FROM task_updates WHERE task_id=? AND instr(content, ?) > 0)",
+        "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS (" + _HUB_LINE + ")",
         (
             EVENT_SKIPPED,
             task_id,
@@ -182,9 +202,18 @@ async def recorded_reason(
         except ValueError:
             return ""
     # событие вычищено по сроку, а запись в ленте осталась
-    fed = await fetchall(
-        db,
-        "SELECT 1 FROM task_updates WHERE task_id=? AND instr(content, ?) > 0 LIMIT 1",
-        (task_id, f"{MARK_PREFIX}{generation} "),
+    return (
+        "причина записана в ленте задачи" if await _fed(db, task_id, generation) else ""
     )
-    return "причина записана в ленте задачи" if fed else ""
+
+
+async def _fed(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+    rows = await fetchall(
+        db, _HUB_LINE + " LIMIT 1", (task_id, f"{MARK_PREFIX}{generation} ")
+    )
+    return bool(rows)
+
+
+async def is_recorded(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+    """Записан ли пропуск этого поколения: событие или (после чистки) строка ленты."""
+    return bool(await recorded_reason(db, task_id, generation))
