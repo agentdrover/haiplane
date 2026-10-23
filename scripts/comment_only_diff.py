@@ -1022,8 +1022,9 @@ def compare_directives(
         base = _directives_before(base, limit)
         head = _directives_before(head, limit)
 
-    def key(d: Directive) -> tuple[int, bool, int, bool, str]:
-        return (d.anchor, d.inline, d.col, d.before_doc, d.text)
+    def key(d: Directive) -> tuple[int, int, bool, str]:
+        # ``col == -1`` — комментарий в строке оператора: отдельно «inline» не нужен.
+        return (d.anchor, d.col, d.before_doc, d.text)
 
     a = Counter(key(d) for d in base.directives)
     b = Counter(key(d) for d in head.directives)
@@ -1058,7 +1059,7 @@ def _directive_order(
     path: str,
     base: Parsed,
     head: Parsed,
-    key: Callable[[Directive], tuple[int, bool, int, bool, str]],
+    key: Callable[[Directive], tuple[int, int, bool, str]],
 ) -> list[Violation]:
     """Набор директив тот же, а порядок нет: ``fmt: off``/``fmt: on`` зависят от него."""
     a = [key(d) for d in base.directives]

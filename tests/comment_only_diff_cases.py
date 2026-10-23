@@ -715,6 +715,16 @@ CASES: dict[str, dict] = {
         },
         "kind": CLEAN,
     },
+    "string_in_an_if_body_changed": {
+        "base": 'def f():\n    if True:\n        "code"\n    return 1\n',
+        "head": 'def f():\n    if True:\n        "code2"\n    return 1\n',
+        "kind": "tokens",
+    },
+    "late_comment_that_looks_like_a_cookie_is_plain": {
+        "base": "x = 1\ny = 2\n",
+        "head": "x = 1\n# coding: latin-1 (заметка)\ny = 2\n",
+        "kind": CLEAN,
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",

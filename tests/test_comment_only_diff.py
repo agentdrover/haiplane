@@ -238,3 +238,10 @@ def test_symlinked_python_file_makes_the_index_incomplete(tmp_path: Path) -> Non
     head = _git(repo, "rev-parse", "HEAD")
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 2 and "неполон" in out, out
+
+
+def test_unchanged_unparsable_listed_file_alone_is_not_clean(tmp_path: Path) -> None:
+    """Без правок других .py индекс не строится: файл списка проверяется сам."""
+    repo, base, head = _pair(tmp_path, {"bad.py": "x = (\n"}, {"n.txt": "q\n"})
+    rc, out = _run(repo, base, head, ["bad.py"])
+    assert rc == 2 and "bad.py" in out, out
