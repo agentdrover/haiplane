@@ -396,7 +396,12 @@ async def test_auto_refresh_skips_unsaved_input(client: AsyncClient, db):
         # #1813: 15-секундное автообновление заменяет только фрагмент #c2-live;
         # кнопка «Refresh Status» - ручная замена .main (клик), без таймера.
         assert 'hx-trigger="click"' in page, status
-        assert 'hx-trigger="every 15s, c2-refresh"' in page, status
+        # #2035: таймер #c2-live несёт фильтр ввода #1996 и маркер защиты позднего
+        # ответа; c2-refresh (после действия листа) в фильтр не входит.
+        assert (
+            'hx-trigger="every 15s [!window.hubHasUnsavedInput()], c2-refresh"' in page
+        ), status
+        assert "data-hub-autorefresh" in page.split('id="c2-live"', 1)[1][:900], status
         assert "window.hubHasUnsavedInput = function" in page, status
         assert 'addEventListener("htmx:beforeSwap"' in page, status
         assert "e.detail.shouldSwap = false" in page, status
@@ -407,7 +412,7 @@ async def test_auto_refresh_skips_unsaved_input(client: AsyncClient, db):
     )
     await db.commit()
     board = (await client.get(f"/tasks/{task_id}")).text
-    assert "every 15s [!window" not in board, (
+    assert 'hx-trigger="click, every 15s' not in board, (
         "the review board has no auto-refresh button"
     )
 
