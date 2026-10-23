@@ -136,6 +136,11 @@ CASES: dict[str, dict] = {
         "head": 'x = """a\nb"""\n',
         "kind": "code",
     },
+    "blank_line_inside_a_multiline_fstring_is_content": {
+        "base": 'x = f"""a {y}\n\nb"""\n',
+        "head": 'x = f"""a {y}\nb"""\n',
+        "kind": "code",
+    },
     "indent_changed": {
         "base": "def f():\n    x = 1\n    return x\n",
         "head": "def f():\n  x = 1\n  return x\n",
@@ -378,6 +383,11 @@ CASES: dict[str, dict] = {
     "docstring_sharing_a_line_with_code_is_unsupported": {
         "base": 'def f(): "док"; return 2\n',
         "head": "def f(): return 2\n",
+        "kind": "error",
+    },
+    "cyrillic_docstring_followed_by_code_on_its_line": {
+        "base": '"дд"; x = 1\n',
+        "head": "x = 1\n",
         "kind": "error",
     },
     "lost_issue_reference": {
