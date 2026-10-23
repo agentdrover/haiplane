@@ -85,6 +85,26 @@ def _sender() -> str:
     return satellite_ci.render_sender(PRODUCER_NAME, PRODUCER_PATH)
 
 
+def _known(base_branch: str, release_branch: str, ac_runner: str) -> dict[str, str]:
+    """Every file of the pair as the hub renders it now, whichever branch it is for."""
+    return {
+        **_rendered(base_branch, release_branch, ac_runner),
+        brand.SEEDED_CI_REPORT: _sender(),
+    }
+
+
+def foreign_only(
+    workspace: str,
+    paths: list[str],
+    base_branch: str,
+    release_branch: str,
+    ac_runner: str,
+) -> list[str]:
+    """``paths`` without the hub's own files (owned path and the current bytes)."""
+    known = _known(base_branch, release_branch, ac_runner)
+    return [path for path in paths if not _is_ours(workspace, path, known)]
+
+
 def _blob_sha(text: str) -> str:
     data = text.encode("utf-8")
     return hashlib.sha1(  # nosec B324 - git's object id, not a security hash
@@ -205,8 +225,9 @@ def _is_ours(tree: str, path: str, known: dict[str, str]) -> bool:
     Anything else under such a name (another ``workflows:``, a copied header) is
     somebody's file and is left alone.
     """
-    expected = known.get(os.path.basename(path))
-    if expected is None:
+    name = os.path.basename(path)
+    expected = known.get(name)
+    if expected is None or path != os.path.join(WORKFLOWS_DIR, name):
         return False
     try:
         with open(os.path.join(tree, path), encoding="utf-8", newline="") as handle:
@@ -312,7 +333,7 @@ def seed_pair(
             "the verifiable pair is written to the remote only; a local-only "
             "seed would write into the shared clone",
         )
-    known = {**files, brand.SEEDED_CI_REPORT: _sender()}
+    known = _known(base_branch, release_branch, ac_runner)
     if default == base_branch:
         files[brand.SEEDED_CI_REPORT] = _sender()
     targets = [(base_branch, files)]

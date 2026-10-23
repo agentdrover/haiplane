@@ -332,7 +332,16 @@ def _seed(
     if not workspace or not os.path.isdir(os.path.join(workspace, ".git")):
         return SeedResult(UNAVAILABLE, "no git workspace to seed workflows into")
 
+    base = (base_branch or "").strip()
     present = existing_workflows(workspace)
+    if forge == "github" and base:
+        # #2027: the hub's own pair from an earlier seed is not somebody's CI;
+        # stopping on it would never lay the sender on the default branch.
+        from hub.services import external_ci_seed
+
+        present = external_ci_seed.foreign_only(
+            workspace, present, base, release_branch, ac_runner
+        )
     if present:
         return SeedResult(
             PRESENT,
@@ -340,7 +349,6 @@ def _seed(
         )
     target_dir = FORGE_WORKFLOWS_DIR.get(forge, WORKFLOWS_DIR)
 
-    base = (base_branch or "").strip()
     if not base:
         return SeedResult(UNAVAILABLE, "project declares no integration branch")
 

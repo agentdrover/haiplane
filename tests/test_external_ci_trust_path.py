@@ -427,6 +427,9 @@ async def test_a_reseed_after_an_unread_default_branch_lays_the_sender_on_main(
     assert _tree(origin, "develop") == sorted([PRODUCER, SENDER, "haiplane-stale.yml"])
     assert _tree(origin, "main") == []
     monkeypatch.setattr(external_ci_seed, "default_branch", real_default)
+    # The shared clone caught up with origin: its own copy now shows our files.
+    _git(work, "pull", "--ff-only", "origin", "develop")
+    assert (work / WORKFLOWS / SENDER).exists()
 
     second = await services.provision_project(db, project_id)
 
@@ -442,6 +445,24 @@ async def test_a_reseed_after_an_unread_default_branch_lays_the_sender_on_main(
         _git(origin, "rev-parse", "develop"),
         _git(origin, "rev-parse", "main"),
     ) == heads
+
+
+def test_our_sender_under_another_workflows_dir_is_somebody_else_s(tmp_path: Path):
+    """Same name and bytes, other directory: not the hub's file, nothing written."""
+    from hub.services import external_ci_seed
+
+    sender = external_ci_seed._sender()
+    other = tmp_path / ".gitverse" / "workflows"
+    other.mkdir(parents=True)
+    (other / SENDER).write_text(sender, encoding="utf-8")
+
+    result = external_ci_seed._commit_files(
+        str(tmp_path), "main", "hub-seed-x", {SENDER: sender}, "m", {SENDER: sender}
+    )
+
+    assert result.state == external_ci_seed.PRESENT, result
+    assert f".gitverse/workflows/{SENDER}" in result.detail
+    assert not (tmp_path / WORKFLOWS).exists()
 
 
 async def _statements_for(db, projects) -> int:
