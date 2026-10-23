@@ -106,7 +106,8 @@ class Violation:
 class DocSlot:
     qualname: str
     expr: ast.Expr
-    text: str
+    text: str  # значение строки (для #NNNN)
+    source: str  # исходная запись: кавычки, escape, разбиение — тоже часть правки
     hint: str  # декораторы и базы владельца: подсказка, не разрешение
 
 
@@ -245,7 +246,7 @@ def _hint(node: ast.AST) -> str:
     return ", ".join(parts)
 
 
-def _collect_docs(tree: ast.Module) -> dict[str, DocSlot]:
+def _collect_docs(tree: ast.Module, src: str) -> dict[str, DocSlot]:
     """Docstring-и по владельцам. Одноимённые определения нумеруются все — и с
     docstring-ом, и без: перенос docstring-а между ними виден."""
     docs: dict[str, DocSlot] = {}
@@ -259,7 +260,13 @@ def _collect_docs(tree: ast.Module) -> dict[str, DocSlot]:
             key = name if index == 0 else f"{name}#{index}"
             expr = _docstring_expr(node)
             if expr is not None and isinstance(expr.value, ast.Constant):
-                docs[key] = DocSlot(name, expr, str(expr.value.value), _hint(node))
+                docs[key] = DocSlot(
+                    name,
+                    expr,
+                    str(expr.value.value),
+                    ast.get_source_segment(src, expr) or "",
+                    _hint(node),
+                )
         for child in ast.iter_child_nodes(node):
             if isinstance(child, DEF_NODES):
                 visit(child, f"{prefix}.{child.name}" if prefix else child.name)
@@ -375,6 +382,12 @@ def _code_lines(
     first_real = next((t.start[0] for t in toks if t.type not in _LAYOUT), 10**9)
     inner, opening = _multiline_rows(toks)
     doc_start = {r: d.expr.lineno for d in docs.values() for r in doc_rows_of(d)}
+    string_rows = {
+        r
+        for t in toks
+        if t.type == tokenize.STRING
+        for r in range(t.start[0], t.end[0] + 1)
+    }
     # (строка, вид: code|skip|doc, текст, несёт директиву)
     entries: list[tuple[int, str, str, bool]] = []
     for row, text in enumerate(lines, start=1):
@@ -385,6 +398,11 @@ def _code_lines(
         verbatim = (row in inner or row in opening) and not com
         body = cut if verbatim else cut.rstrip(" \t\r")
         if row in doc_start:
+            if row not in string_rows and not directive and not body.strip():
+                entries.append(
+                    (row, "skip", "", False)
+                )  # пустая/комментарная строка в скобках
+                continue
             if not directive:
                 entries.append((row, "doc", "", False))
                 continue
@@ -431,7 +449,7 @@ def parse_source(data: bytes, path: str) -> Parsed:
     src = _decode(data, path)
     tree = _parse_tree(src, path)
     toks = _tokenize(src, path)
-    docs = _collect_docs(tree)
+    docs = _collect_docs(tree, src)
     _check_docstring_rows(toks, docs, src.split("\n"))
     return Parsed(src, tree, _code_lines(src, toks, docs), docs, _refs(toks, docs))
 
@@ -501,7 +519,7 @@ def compare_docstrings(
     for key in sorted(set(base.docs) | set(head.docs)):
         old, new = base.docs.get(key), head.docs.get(key)
         owner = key.split("#")[0]
-        if (old and new and old.text == new.text) or f"{path}::{owner}" in allow:
+        if (old and new and old.source == new.source) or f"{path}::{owner}" in allow:
             continue
         slot = old or new
         assert slot is not None

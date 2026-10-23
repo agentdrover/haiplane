@@ -477,6 +477,22 @@ CASES: dict[str, dict] = {
         "head": 'x: int = "bad"\ny: int = "bad"  # ty: ignore[invalid-assignment]\n',
         "kind": "code",
     },
+    "comment_removed_inside_a_bracketed_docstring_before_nextline": {
+        "base": 'def f():\n    (\n        # pragma: allowlist nextline secret\n        # ordinary\n        "secret"\n    )\n    pass\n',
+        "head": 'def f():\n    (\n        # pragma: allowlist nextline secret\n        "secret"\n    )\n    pass\n',
+        "allow": ["m.py::f"],
+        "kind": "code",
+    },
+    "docstring_escape_spelling_changed_without_allow": {
+        "base": 'def f():\n    """doc\n    \\x23 pragma: allowlist nextline secret\n    secret\n    """\n    pass\n',
+        "head": 'def f():\n    """doc\n    # pragma: allowlist nextline secret\n    secret\n    """\n    pass\n',
+        "kind": "docstring",
+    },
+    "docstring_quotes_changed_without_allow": {
+        "base": 'def f():\n    "doc"\n    pass\n',
+        "head": "def f():\n    'doc'\n    pass\n",
+        "kind": "docstring",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
