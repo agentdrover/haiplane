@@ -451,11 +451,6 @@ def _worktree_path(task_id: int, repo: str) -> str:
     return os.path.join(parent, f".{name}-worktrees", f"task-{task_id}")
 
 
-def task_worktree_path(task_id: int, repo: str) -> str:
-    """Public name of the #459 path: ``worktree prune`` compares against it (#2038)."""
-    return _worktree_path(task_id, repo)
-
-
 async def _worktree_registered(path: str, repo: str) -> bool:
     """True when ``path`` is a registered worktree of ``repo`` (#459)."""
     import os

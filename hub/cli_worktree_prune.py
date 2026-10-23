@@ -16,25 +16,44 @@ status`` ответил rc 0 и пусто. Всё остальное - «ост
 ветка, HEAD и чистота проверяются заново. Удаляет только ``git worktree remove``
 без ``--force``; локальные ветки и блокировки не трогаются.
 
-Класс риска «проверка видит чистую копию, а удаление уничтожает работу»
-(Codex, раунд 2): статус читается с ``--untracked-files=all`` (настройка
-``status.showUntrackedFiles=no`` прячет файлы и от git worktree remove); внутри
-копии не должно быть вложенного ``.git`` и чужих worktree клона; каждая запись
-reflog HEAD копии обязана быть предком submission_sha или достижима из
-refs/remotes (иначе коммит живёт только здесь); gitdir копии (HEAD, index,
-logs/HEAD) не менялся последние ``--min-idle-minutes`` минут (по умолчанию 30);
-канонический путь и его лист - не симлинки.
+Подход - белый список (раунд 3, #2038). Запреты («не должно быть X») проигрывали:
+git и файловая система хранят состояние в большем числе мест, чем перечислено.
+Поэтому копия удаляема, только если ВСЁ в ней и в её gitdir названо в явном
+списке; всё неизвестное - «оставить» с причиной:
+  * рабочее дерево: ``status --porcelain=v1 -z --untracked-files=all
+    --ignored=matching``; разрешены только ignored-пути из REGENERABLE_*
+    (.venv, __pycache__, node_modules, ...), любой другой ignored, untracked
+    или изменённый путь (.env, .claude/...) оставляет копию;
+  * index: ``ls-files -v`` - любой тег кроме H (assume-unchanged, skip-worktree)
+    прячет правки от status, копия остаётся; плюс независимый ``git diff HEAD``;
+  * gitdir копии: разрешены только GITDIR_ALLOWED (HEAD, ORIG_HEAD, FETCH_HEAD,
+    index, commondir, gitdir, logs/HEAD, AUTO_MERGE); refs/ (refs/worktree,
+    refs/bisect), logs/refs, MERGE_HEAD, REBASE_*, rebase-*, sequencer, BISECT_*,
+    CHERRY_PICK_HEAD, locked и всё прочее оставляют копию;
+  * HEAD и каждая запись его reflog - предок submission_sha или в refs/remotes;
+  * внутри копии нет вложенного ``.git`` и другого worktree клона; канонический
+    путь и его лист - не симлинки; gitdir не менялся ``--min-idle-minutes``
+    (30 по умолчанию).
 
-ПРИНЯТЫЙ ОСТАТОЧНЫЙ РИСК. Между последней проверкой и ``git worktree remove``
-остаётся окно в миллисекунды, в котором исполнитель теоретически успеет
-сделать коммит. Закрыть его целиком можно только координацией с исполнителем
-(блокировка копии), её здесь нет; окно сужено до минимума: проверка ветки, HEAD,
-reflog, статуса, вложенных репозиториев и простоя идёт последним шагом.
+Гонка. В начале финальной проверки снимается отпечаток (HEAD, число и новейшая
+запись reflog, size и mtime_ns файлов gitdir из белого списка, включая index),
+проверяются ВСЕ условия, включая обход каталога, и отпечаток снимается ещё раз
+непосредственно перед ``git worktree remove``; любое расхождение оставляет копию.
+
+ПРИНЯТЫЙ ОСТАТОЧНЫЙ РИСК: окно между вторым отпечатком и собственным удалением
+в git (вызов subprocess и обход каталога самим git). Закрыть его целиком можно
+только координацией с исполнителем (блокировка копии); её здесь нет.
+
+Отказ удаления не «оставить»: проверяются путь и gitdir, итог называется
+«удалена частично», «результат неизвестен» или «ошибка удаления», код возврата
+ненулевой. Доставку признаёт только явный ``delivered``; пустой ответ, неизвестное
+значение и ``unknown`` - «не прочитано», код возврата ненулевой.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
 import re
 import subprocess  # nosec B404 - только git, список аргументов, без shell
@@ -45,6 +64,22 @@ from typing import Any, Callable
 
 GIT_TIMEOUT_S = 60
 DEFAULT_MIN_IDLE_MINUTES = 30.0
+# Белый список gitdir копии (.git/worktrees/<имя>/): всё остальное - оставить.
+GITDIR_ALLOWED = frozenset(
+    {"HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "commondir", "gitdir"}
+    | {
+        "logs/HEAD",
+        "AUTO_MERGE",
+        "COMMIT_EDITMSG",
+    }  # EDITMSG: git пишет при каждом commit
+)
+# Игнорируемое, что пересоздаётся само: единственное, чего может не жалеть удаление.
+REGENERABLE_DIRS = frozenset(
+    {".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    | {"node_modules", "htmlcov", "dist", "build"}
+)
+REGENERABLE_GLOBS = (".coverage", "*.pyc", "*.egg-info")
+SHOWN_PATHS = 3
 _TASK_DIR = re.compile(r"^task-(\d+)$")
 _TASK_BRANCH = re.compile(r"^refs/heads/task-(\d+)/.+")
 _STRAY_SIBLING = re.compile(r"-task-\d+$")
@@ -133,7 +168,7 @@ def _canonical_id(path: str, clone: str) -> tuple[int | None, str]:
     /private/tmp). Лист ``task-N`` берётся как записан и не должен быть
     симлинком: иначе внешний worktree выдаёт себя за канонический.
     """
-    from hub.integrations.git_ops import task_worktree_path
+    from hub.integrations.git_ops import _worktree_path as task_worktree_path
 
     root = _real(os.path.dirname(task_worktree_path(0, clone)))
     leaf = os.path.abspath(path)
@@ -218,11 +253,12 @@ class _Hub:
         pid = (task.get("project") or {}).get("id")
         return next((p for p in data if p.get("id") == pid), {}), ""
 
-    def delivery(self, task_id: int) -> tuple[str, str]:
+    def delivery(self, task_id: int) -> tuple[str, str, str]:
+        """(state, ошибка чтения, пояснение хаба)."""
         data, err = _read(self.api, f"/api/tasks/{task_id}/delivery")
         if err or not isinstance(data, dict):
-            return "", err or f"GET /api/tasks/{task_id}/delivery: ответ не объект"
-        return str(data.get("state") or ""), ""
+            return "", err or f"GET /api/tasks/{task_id}/delivery: ответ не объект", ""
+        return str(data.get("state") or ""), "", str(data.get("reason") or "")
 
 
 def _unread(v: Verdict, err: str) -> None:
@@ -252,11 +288,17 @@ def _hub_verdict(v: Verdict, hub: _Hub) -> None:
 
 
 def _delivery_verdict(v: Verdict, hub: _Hub, task: dict[str, Any]) -> None:
-    state, err = hub.delivery(int(v.task_id or 0))
+    """Только явный ``delivered`` пускает дальше; пустое и неизвестное - не прочитано."""
+    state, err, note = hub.delivery(int(v.task_id or 0))
     if err:
         _unread(v, err)
+    elif state in ("pr_open", "pr_closed"):
+        v.reason = f"доставка не подтверждена хабом: {state}"
     elif state != "delivered":
-        v.reason = f"доставка не подтверждена хабом: {state or 'нет ответа'}"
+        v.reason = f"доставка не прочитана: state={state or '(нет)'}" + (
+            f", {note[:200]}" if note else ""
+        )
+        v.unread = True
     elif not task.get("submission_sha"):
         v.reason = "у задачи нет submission_sha: сверять HEAD не с чем"
     else:
@@ -295,6 +337,7 @@ def _nested_reason(v: Verdict) -> str:
         if inside != root and inside.startswith(root + os.sep):
             return f"внутри копии лежит другой worktree клона: {other}"
     for here, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if not _regenerable(d)]  # им нечего терять
         hit = [n for n in (*dirs, *files) if n == ".git" and here != root]
         if hit:
             return f"внутри копии вложенный git-репозиторий или worktree: {here}"
@@ -322,11 +365,17 @@ def _idle_reason(v: Verdict) -> str:
     return ""
 
 
-def _git_verdict(v: Verdict) -> str:
-    """HEAD <= submission_sha, reflog, чистота, вложенность, простой; "" - можно."""
-    why = _idle_reason(v)  # первым: дальнейшие git-вызовы не должны трогать gitdir
-    if why:
-        return why
+def _regenerable(path: str) -> bool:
+    """Ignored-путь, в котором есть пересоздаваемое звено (.venv, *.pyc, ...)."""
+    return any(
+        part in REGENERABLE_DIRS
+        or any(fnmatch.fnmatch(part, g) for g in REGENERABLE_GLOBS)
+        for part in path.split("/")
+        if part
+    )
+
+
+def _head_reason(v: Verdict) -> str:
     rc, head, _ = _git(v.path, "rev-parse", "HEAD")
     if rc != 0 or not head.strip():
         v.unread = True
@@ -341,24 +390,135 @@ def _git_verdict(v: Verdict) -> str:
         return (
             f"сдача {v.sha[:12]} не сверена с HEAD (git rc {rc}: {err.strip()[:120]})"
         )
-    why = _reflog_reason(v)
-    if why:
-        return why
+    return ""
+
+
+def _gitdir_files(gitdir: str) -> list[str]:
+    found: list[str] = []
+    for here, _dirs, files in os.walk(gitdir, followlinks=False):
+        for name in files:
+            full = os.path.join(here, name)
+            found.append(os.path.relpath(full, gitdir).replace(os.sep, "/"))
+    return sorted(found)
+
+
+def _gitdir_reason(v: Verdict) -> str:
+    """В gitdir копии только файлы из белого списка: refs/, MERGE_HEAD, rebase-* - нет."""
+    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir.strip():
+        v.unread = True
+        return f"gitdir копии не прочитан (git rc {rc})"
+    extra = [n for n in _gitdir_files(gitdir.strip()) if n not in GITDIR_ALLOWED]
+    if extra:
+        return "в gitdir копии есть то, чего нет в белом списке: " + ", ".join(
+            extra[:SHOWN_PATHS]
+        )
+    return ""
+
+
+def _status_records(out: str) -> list[tuple[str, str]]:
+    """Записи ``status --porcelain=v1 -z``: (XY, путь); пара переименования - одна."""
+    tokens = out.split("\0")
+    records: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if len(tok) < 4:
+            continue
+        records.append((tok[:2], tok[3:]))
+        if tok[0] in "RC":
+            i += 1  # исходный путь переименования или копии
+    return records
+
+
+def _tree_reason(v: Verdict) -> str:
+    """Рабочее дерево: ни правок, ни untracked, ignored - только пересоздаваемое."""
     rc, out, err = _git(
         v.path,
         "--no-optional-locks",  # status не должен обновлять index: он считается простоем
         "-c",
         "status.showUntrackedFiles=all",
         "status",
-        "--porcelain",
+        "--porcelain=v1",
+        "-z",
         "--untracked-files=all",
+        "--ignored=matching",
     )
     if rc != 0:
         v.unread = True
         return f"чистота не определена: git status rc {rc} {err.strip()[:120]}"
-    if out.strip():
-        return "не чисто: есть незакоммиченные или неотслеживаемые файлы"
-    return _nested_reason(v)
+    blockers = [
+        f"{code.strip()} {path}"
+        for code, path in _status_records(out)
+        if not (code == "!!" and _regenerable(path))
+    ]
+    if blockers:
+        return "не чисто, нет в белом списке пересоздаваемого: " + ", ".join(
+            blockers[:SHOWN_PATHS]
+        )
+    return ""
+
+
+def _flags_reason(v: Verdict) -> str:
+    """Теги index кроме H (assume-unchanged, skip-worktree) прячут правки от status."""
+    rc, out, err = _git(v.path, "--no-optional-locks", "ls-files", "-v", "-z")
+    if rc != 0:
+        v.unread = True
+        return f"index не прочитан: git ls-files rc {rc} {err.strip()[:120]}"
+    hidden = [t[2:] for t in out.split("\0") if len(t) > 2 and t[0] != "H"]
+    if hidden:
+        return (
+            "в index флаги assume-unchanged/skip-worktree прячут правки: "
+            + ", ".join(hidden[:SHOWN_PATHS])
+        )
+    # diff-index, а не ``git diff``: porcelain-diff обновляет index и сам освежает
+    # простой. Устаревший stat даёт ложное «правки» - это сторона «оставить».
+    rc, _, err = _git(v.path, "diff-index", "--no-ext-diff", "--quiet", "HEAD", "--")
+    if rc == 1:
+        return "не чисто: git diff-index HEAD показывает правки"
+    if rc != 0:
+        v.unread = True
+        return f"чистота не определена: git diff rc {rc} {err.strip()[:120]}"
+    return ""
+
+
+def _fingerprint(v: Verdict) -> tuple[Any, ...] | None:
+    """Отпечаток для сравнения до и после проверки; None - не снять."""
+    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
+    rc2, head, _ = _git(v.path, "rev-parse", "HEAD")
+    rc3, log, _ = _git(v.path, "reflog", "--format=%H", "HEAD")
+    if rc or rc2 or rc3:
+        return None
+    stats: list[tuple[str, int, int] | tuple[str, None]] = []
+    for name in sorted(GITDIR_ALLOWED):
+        try:
+            st = os.stat(os.path.join(gitdir.strip(), name))
+        except FileNotFoundError:
+            stats.append((name, None))
+            continue
+        except OSError:
+            return None
+        stats.append((name, st.st_size, st.st_mtime_ns))
+    entries = log.split()
+    return (head.strip(), len(entries), entries[:1], tuple(stats))
+
+
+def _git_verdict(v: Verdict) -> str:
+    """Все условия белого списка по порядку; "" - копию можно удалять."""
+    for check in (
+        _idle_reason,  # первым: дальнейшие git-вызовы не должны трогать gitdir
+        _head_reason,
+        _reflog_reason,
+        _gitdir_reason,
+        _nested_reason,
+        _flags_reason,
+        _tree_reason,
+    ):
+        why = check(v)
+        if why:
+            return why
+    return ""
 
 
 def _decide(
@@ -395,7 +555,7 @@ def _label(v: Verdict) -> str:
 
 def _strays(clone: str, entries: list[Entry]) -> list[str]:
     """Папки рядом с клоном, которых нет в git worktree list: только назвать."""
-    from hub.integrations.git_ops import task_worktree_path
+    from hub.integrations.git_ops import _worktree_path as task_worktree_path
 
     known = {_real(e.path) for e in entries}
     canonical_root = os.path.dirname(task_worktree_path(0, clone))
@@ -419,18 +579,43 @@ def _strays(clone: str, entries: list[Entry]) -> list[str]:
     return found
 
 
-def _remove(v: Verdict, clone: str) -> tuple[bool, str]:
-    """Повторная проверка и ``git worktree remove`` без --force: (удалено, текст)."""
+def _failed_remove(v: Verdict, gitdir: str, rc: int, err: str) -> str:
+    """Что осталось после неудачного remove: путь и gitdir на месте или нет."""
+    here, meta = os.path.lexists(v.path), os.path.lexists(gitdir)
+    tail = f"git rc {rc}: {err.strip()[:200]}"
+    if here and meta:
+        return f"ошибка удаления, путь и gitdir на месте (возможна частичная очистка): {tail}"
+    if here or meta:
+        return f"удалена частично ({'путь' if here else 'gitdir'} остался): {tail}"
+    return f"результат неизвестен: путь и gitdir исчезли, но git вернул ошибку: {tail}"
+
+
+def _remove(v: Verdict, clone: str) -> tuple[str, str]:
+    """Финальная проверка и ``git worktree remove`` без --force.
+
+    Возвращает (исход, текст): removed | kept | failed.
+    """
+    first = _fingerprint(v)
     rc, ref, _ = _git(v.path, "symbolic-ref", "-q", "HEAD")
-    if rc != 0 or ref.strip() != f"refs/heads/{v.branch}":
-        return False, "изменилась перед удалением: ветка копии другая"
+    if first is None or rc != 0 or ref.strip() != f"refs/heads/{v.branch}":
+        return (
+            "kept",
+            "изменилась перед удалением: ветка копии другая или отпечаток не снят",
+        )
     why = _git_verdict(v)
     if why:
-        return False, f"изменилась перед удалением: {why}"
+        return "kept", f"изменилась перед удалением: {why}"
+    second = _fingerprint(v)
+    if second != first:
+        return (
+            "kept",
+            "изменилась перед удалением: отпечаток HEAD/reflog/gitdir разошёлся",
+        )
+    _, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
     rc, _, err = _git(clone, "worktree", "remove", v.path)
     if rc != 0:
-        return False, f"git отказал в удалении (rc {rc}): {err.strip()[:200]}"
-    return True, ""
+        return "failed", _failed_remove(v, gitdir.strip(), rc, err)
+    return "removed", ""
 
 
 def run_prune(
@@ -460,9 +645,12 @@ def run_prune(
         out("dry-run: ничего не удалено; --apply убирает копии со строкой «удалить»")
         return 1 if failed else 0
     for v in (x for x in verdicts if x.remove):
-        done, why = _remove(v, clone)
-        failed = failed or v.unread or (not done and not why.startswith("изменилась"))
-        out(f"удалено  {v.path}" if done else f"оставить {v.path}{_label(v)}: {why}")
+        outcome, why = _remove(v, clone)
+        failed = failed or v.unread or outcome == "failed"
+        word = {"removed": "удалено ", "kept": "оставить", "failed": "ошибка  "}[
+            outcome
+        ]
+        out(f"{word} {v.path}{_label(v)}{': ' + why if why else ''}")
     return 1 if failed else 0
 
 
