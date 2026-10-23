@@ -23,6 +23,9 @@ from hub import repository_ci_integrity as store
 from hub.db import fetchall
 from hub.services import ci_integrity, steward_apply, steward_cap
 from hub.services import steward_shadow as sh
+from hub.services.steward_act_readiness import _advisor_reason
+from hub.services.steward_exit import contour_counts
+from hub.services.steward_advisor_skip import record_skip
 from hub.services.steward_advisor import (
     STATE_NOT_ORDERED,
     advisor_refusal,
@@ -124,6 +127,17 @@ async def test_no_advisor_where_approve_cannot_apply(
         db, monkeypatch, "skip-ceiling", risk="R3", policy=policy_of(clean=None)
     )
 
+    nopair = await build_case(
+        db,
+        monkeypatch,
+        "skip-nopair",
+        risk="R3",
+        pair=False,
+        order=False,
+    )
+    await judge_and_advise(db, nopair.task_id, concur=None)
+    await _mode(monkeypatch, "act")  # двойная чистота допускается, пары нет
+    overclass = await _scene(db, monkeypatch, "skip-overclass", risk="R5")
     for _ in range(3):
         assert await order_due_advisors(db) == 0
         assert await apply_advisor_outcomes(db) == 0
@@ -134,7 +148,15 @@ async def test_no_advisor_where_approve_cannot_apply(
     finally:
         await other.close()
 
-    for case, marker in ((integrity, "CI"), (ceiling, "потолк")):
+    counts = await contour_counts(db)
+    assert counts.advisor_skipped == 4 and counts.advisor_pending == 0
+
+    for case, marker in (
+        (integrity, "CI"),
+        (ceiling, "потолк"),
+        (nopair, "потолк"),
+        (overclass, "потолк"),
+    ):
         task_id = case.task_id
         assert await _advisor_rows(db, task_id) == [], "в steward_runs нет advisor"
         events = await _skips(db, task_id)
@@ -150,6 +172,18 @@ async def test_no_advisor_where_approve_cannot_apply(
         # привратник применения сам отказывает по той же независимой причине
         refusals = await steward_apply.apply_refusals(db, task_id)
         assert any(marker in detail for _, detail in refusals), refusals
+        blocked = _advisor_reason(state)
+        assert blocked is not None and blocked[0] == "blocked", "известный запрет"
+
+    # тот же код с другим текстом - не новая причина
+    assert not await record_skip(db, integrity.task_id, 1, "ci_integrity", "иначе")
+
+    # события чистятся по сроку: дедуп переживает это через строку ленты
+    await db.execute("DELETE FROM events WHERE kind=?", (_SKIPPED,))
+    await db.commit()
+    assert await order_due_advisors(db) == 0
+    for case in (integrity, ceiling, nopair, overclass):
+        assert len(await _skip_lines(db, case.task_id)) == 1
 
 
 async def test_shadow_and_double_clean_still_order_the_advisor(

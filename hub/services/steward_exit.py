@@ -111,6 +111,8 @@ class ContourCounts:
     advisor_timeout: int = 0
     advisor_refused: int = 0
     advisor_pending: int = 0
+    #: Советник намеренно не заказан (#2024): approve не применится без него.
+    advisor_skipped: int = 0
     #: номера задач по процедурным эскалациям — отдельной строкой в сводке
     procedural_by_reason: dict[str, int] = field(default_factory=dict)
 
@@ -150,7 +152,9 @@ async def contour_counts(
     rows = await fetchall(
         db,
         "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "  # nosec B608 - constant fragments, values are params
-        "r.status AS run_status "
+        "r.status AS run_status, EXISTS (SELECT 1 FROM events e "
+        "WHERE e.kind='steward_advisor_skipped' AND e.task_id=j.task_id "
+        "AND json_extract(e.payload, '$.generation')=j.generation) AS skipped "
         "FROM steward_judgements j "
         "LEFT JOIN steward_judgements a ON a.kind='advisor' "
         "AND a.task_id=j.task_id AND a.generation=j.generation "
@@ -171,6 +175,7 @@ async def contour_counts(
         "advisor_timeout": 0,
         "advisor_refused": 0,
         "advisor_pending": 0,
+        "advisor_skipped": 0,
     }
     by_reason: dict[str, int] = {}
     for row in rows:
@@ -198,6 +203,8 @@ async def contour_counts(
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
+            elif item.get("skipped") and not status:
+                c["advisor_skipped"] += 1
             else:
                 c["advisor_pending"] += 1
     return ContourCounts(**c, procedural_by_reason=by_reason)
@@ -582,6 +589,7 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "timeout": counts.advisor_timeout,
         "advisor_refused": counts.advisor_refused,
         "advisor_pending": counts.advisor_pending,
+        "advisor_skipped": counts.advisor_skipped,
         "judged": counts.judged,
         "judge_approve": counts.judge_approve,
         "judge_changes_requested": counts.judge_changes,

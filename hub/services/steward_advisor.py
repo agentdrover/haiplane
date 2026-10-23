@@ -531,6 +531,8 @@ class AdvisorState:
     advisor_hash: str = ""
     judge: dict[str, Any] | None = None
     advisor: dict[str, Any] | None = None
+    #: Заказ намеренно не сделан (#2024): approve не применится без советника.
+    skipped: bool = False
 
 
 async def advisor_state(
@@ -593,6 +595,7 @@ async def advisor_state(
             else f"советник не заказан ({skipped})"
             if skipped
             else "советник не заказан",
+            skipped=bool(skipped),
             **base,
         )
     run = dict(runs[0])

@@ -90,7 +90,7 @@ async def _ceiling(db: aiosqlite.Connection, task: dict) -> tuple[str, str] | No
     from hub.services import project_policy
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
     from hub.services.steward_apply import current_ceiling
-    from hub.services.steward_double_clean import may_apply_to_class
+    from hub.services.steward_double_clean import frozen_pair, may_apply_to_class
 
     key = "steward_approve_max_class"
     task_id = int(task["id"])
@@ -104,9 +104,14 @@ async def _ceiling(db: aiosqlite.Connection, task: dict) -> tuple[str, str] | No
     found = ceiling_reason(ceiling, task.get("risk_class"), key=key)
     if found is None or found[0] != BLOCKED:
         return None
-    if await may_apply_to_class(db, task_id, task.get("risk_class")):
-        return None  # двойная чистота достижима: решать её условиям и советнику
-    return CODE_CLASS_CEILING, found[1]["detail"]
+    generation = int(task.get("submission_generation") or 0)
+    if await may_apply_to_class(
+        db, task_id, task.get("risk_class")
+    ) and await frozen_pair(db, task_id, generation):
+        # Двойная чистота достижима: настройки её допускают, а пара отчётов
+        # заморожена при заказе судьи. Остальное решат её условия и советник.
+        return None
+    return CODE_CLASS_CEILING, found[1]["detail"]  # пустая пара: исключения нет
 
 
 async def record_skip(
@@ -120,35 +125,43 @@ async def record_skip(
 
     ``False`` — такая запись уже есть, ленту не повторяем.
     """
-    seen = await fetchall(
-        db,
-        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
-        "AND json_extract(payload, '$.generation')=? "
-        "AND json_extract(payload, '$.code')=? LIMIT 1",
-        (EVENT_SKIPPED, task_id, generation, code),
-    )
-    if seen:
-        return False
     project = await repo.resolve_project_for_task(db, task_id)
-    await repo.insert_event(
-        db,
-        kind=EVENT_SKIPPED,
-        task_id=task_id,
-        project_id=int(project["id"]) if project is not None else None,
-        actor="hub",
-        payload={"generation": generation, "code": code, "detail": detail},
-    )
-    await repo.add_task_update(
-        db,
-        task_id,
-        "hub",
-        "status",
+    text = (
         f"Советник не заказан для сдачи {generation}: {detail}. Одобрение стюардом "
         "невозможно независимо от ответа советника (привратник применения "
         "отказал бы по той же причине); пропуск не согласие, вердикт за "
-        "человеком. Если причина снимется, заказ восстановится сам.",
-        author_kind="hub",
+        "человеком. Если причина снимется, заказ восстановится сам."
     )
+    payload = json.dumps(
+        {"generation": generation, "code": code, "detail": detail},
+        ensure_ascii=False,
+    )
+    # Проверка и запись — один оператор: два тика не запишут причину дважды. Метка
+    # «уже записано» — событие ИЛИ строка ленты: события чистятся по сроку, лента
+    # живёт столько же, сколько задача.
+    cursor = await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS ("
+        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+        "AND json_extract(payload, '$.generation')=? "
+        "AND json_extract(payload, '$.code')=?) AND NOT EXISTS ("
+        "SELECT 1 FROM task_updates WHERE task_id=? AND content=?)",
+        (
+            EVENT_SKIPPED,
+            task_id,
+            int(project["id"]) if project is not None else None,
+            payload,
+            EVENT_SKIPPED,
+            task_id,
+            generation,
+            code,
+            task_id,
+            text,
+        ),
+    )
+    if cursor.rowcount != 1:
+        return False
+    await repo.add_task_update(db, task_id, "hub", "status", text, author_kind="hub")
     return True
 
 
