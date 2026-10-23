@@ -550,6 +550,101 @@ def test_typing_into_a_sent_sheet_withdraws_the_sent_mark(
     assert field.input_value() == "Новый текст после отправки"
 
 
+def test_programmatic_edit_after_a_sent_sheet_is_unsaved_input(
+    page: Any, stand: Stand
+) -> None:
+    """#2035 gen5: изменение значения БЕЗ событий после успеха - несохранённый ввод."""
+    task_id = stand.seed_task(title="правка без событий", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    held: list[Any] = []
+    posts: list[str] = []
+
+    def hold(route: Any) -> None:
+        if route.request.headers.get("hx-request") and route.request.method == "GET":
+            held.append(route)  # страница стоит: обновление после листа задержано
+        else:
+            if route.request.method == "POST":
+                posts.append(route.request.post_data or "")
+            route.continue_()
+
+    page.route(f"**/tasks/{task_id}", hold)
+    page.route(f"**/tasks/{task_id}/web-return-to-work", hold)
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill(REASON)
+    page.evaluate("window.marker = 'alive'")
+    page.locator('#sh-return button[type="submit"]').click()
+    stand.wait_for(
+        lambda: stand.status_of(task_id) == "open",
+        what=f"задача #{task_id} вернулась в open",
+        seconds=10,
+    )
+    page.wait_for_selector(
+        "#sh-return [data-c2-done]", state="attached", timeout=10_000
+    )
+    assert page.evaluate("window.hubHasUnsavedInput()") is False
+    assert len(posts) == 1
+
+    # Значение меняется скриптом, без input/change.
+    page.evaluate(
+        "document.getElementById('sh-return-reason').value = 'Правка скриптом'"
+    )
+    # Повторную отправку решает сравнение со снимком, а не флаг: пересылаем форму
+    # сразу после правки скриптом, ДО любой проверки ввода, которая обновила бы флаг.
+    page.evaluate("document.querySelector('#sh-return form').requestSubmit()")
+    for _ in range(40):
+        if len(posts) == 2:
+            break
+        page.wait_for_timeout(100)
+    assert len(posts) == 2, "повторная отправка после правки не ушла"
+    assert page.evaluate("window.hubHasUnsavedInput()") is True
+    for route in held:
+        route.continue_()
+
+
+def test_the_confirmed_snapshot_covers_select_checkbox_and_radio(
+    page: Any, stand: Stand
+) -> None:
+    """Сравнение со снимком: text, select, checkbox, radio - любая правка без событий."""
+    task_id = stand.seed_task(title="снимок полей", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    page.evaluate(
+        """() => {
+        const f = document.createElement('form');
+        f.id = 'probe-form';
+        f.innerHTML = '<input type="text" name="t" value="">'
+          + '<select name="s"><option value="a">a</option><option value="b">b</option></select>'
+          + '<input type="checkbox" name="c" value="1">'
+          + '<input type="radio" name="r" value="x"><input type="radio" name="r" value="y">';
+        document.getElementById('main').appendChild(f);
+        f.t.value = 'отправлено'; f.s.value = 'b'; f.c.checked = true; f.r[1].checked = true;
+        window.hubConfirmForm(f);
+    }"""
+    )
+    assert page.evaluate("window.hubHasUnsavedInput()") is False
+    for change in (
+        "f.t.value = 'иное'",
+        "f.s.value = 'a'",
+        "f.c.checked = false",
+        "f.r[0].checked = true",
+    ):
+        page.evaluate(
+            "(c) => { const f = document.getElementById('probe-form');"
+            " f.t.value = 'отправлено'; f.s.value = 'b'; f.c.checked = true;"
+            " f.r[1].checked = true; eval(c); }",
+            change,
+        )
+        assert page.evaluate("window.hubHasUnsavedInput()") is True, change
+        page.evaluate(
+            "() => { const f = document.getElementById('probe-form');"
+            " f.t.value = 'отправлено'; f.s.value = 'b'; f.c.checked = true;"
+            " f.r[1].checked = true; }"
+        )
+        assert page.evaluate("window.hubHasUnsavedInput()") is False
+
+
 def _force_status(task_id: int, status: str) -> Any:
     async def work(conn: Any) -> None:
         await conn.execute(

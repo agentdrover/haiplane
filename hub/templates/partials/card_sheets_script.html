@@ -119,26 +119,10 @@
         var meta = document.querySelector('meta[name="csrf-token"]');
         return meta ? meta.getAttribute("content") : "";
     }
-    // #2035: «отправлено» - это ровно то, что ушло в запросе. Снимок значений берётся
-    // в момент отправки; если к ответу поля уже другие (человек правил, пока ответ
-    // шёл), форма НЕ помечается отправленной, а любой ввод после метки её снимает.
-    function snapshot(form) {
-        var out = new Array();
-        for (var i = 0; i < form.elements.length; i++) {
-            var el = form.elements[i];
-            out.push([el, el.type === "checkbox" || el.type === "radio" ? el.checked : el.value]);
-        }
-        return out;
-    }
-    function unchanged(snap) {
-        for (var i = 0; i < snap.length; i++) {
-            var el = snap[i][0];
-            if ((el.type === "checkbox" || el.type === "radio" ? el.checked : el.value) !== snap[i][1]) { return false; }
-        }
-        return true;
-    }
+    // #2035: «отправлено» - подтверждённый ответом снимок значений (hubConfirmForm в
+    // base.html); сохранность ввода решает сравнение с ним, а не флаг или события.
     function send(form, submitter) {
-        var snap = snapshot(form);
+        var sentValues = window.hubFormValues(form);
         var sheet = form.closest(".c2-sheet");
         var result = sheet.querySelector(".c2-sheet-result");
         var body = new URLSearchParams(new FormData(form));
@@ -160,7 +144,7 @@
                 form.removeAttribute("aria-busy");
                 result.innerHTML = out.text;
                 if (out.ok && out.text.indexOf("data-c2-done") !== -1) {
-                    if (unchanged(snap)) { form.setAttribute("data-sent", "true"); }
+                    window.hubConfirmForm(form, sentValues);
                     var live = byId("c2-live");
                     if (live && window.htmx) { window.htmx.trigger(live, "c2-refresh"); }
                 }
@@ -182,17 +166,17 @@
         document.addEventListener("submit", function (e) {
             var form = e.target;
             if (!form.closest || !form.closest(".c2-sheet") || !window.fetch) { return; }
-            if (form.getAttribute("data-sent") === "true") { e.preventDefault(); return; }
+            if (window.hubFormConfirmed(form)) { e.preventDefault(); return; }
             if (form.getAttribute("aria-busy") === "true") { e.preventDefault(); return; }
             e.preventDefault();
             send(form, e.submitter);
         });
-        function unsend(e) {
+        function hint(e) {
             var form = e.target && e.target.form;
-            if (form && form.getAttribute("data-sent") === "true") { form.removeAttribute("data-sent"); }
+            if (form && form.closest && form.closest(".c2-sheet")) { window.hubRefreshSent(form); }
         }
-        document.addEventListener("input", unsend);
-        document.addEventListener("change", unsend);
+        document.addEventListener("input", hint);
+        document.addEventListener("change", hint);
         document.addEventListener("htmx:afterSwap", sync);
         window.addEventListener("resize", navHeight);
     }
