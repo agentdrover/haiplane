@@ -126,11 +126,13 @@ async def test_migration_adds_the_column_and_keeps_recommendations(monkeypatch):
     from hub.migrations import FROZEN_MIGRATIONS
     from hub.migrations.steps import load_steps
     from tests.test_db_migrations import _SCHEMA
+    from tests.test_triage_digest_links import is_step_1997
 
     steps = load_steps()
     mine = [(n, q) for n, q in steps if "followup_action_at" in n]
     assert mine, "нет шага миграции #1943"
-    before = [(n, q) for n, q in steps if (n, q) not in mine]
+    # шаги #1997 читают колонку этого шага и идут после него
+    before = [(n, q) for n, q in steps if (n, q) not in mine and not is_step_1997(n)]
     monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
@@ -172,7 +174,7 @@ async def test_migration_adds_the_column_and_keeps_recommendations(monkeypatch):
 
 
 async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(world):
-    """Учтённость - по списку id в дайджесте дня действия, а не по секундам записи."""
+    """Учтённость - по связи исхода с дайджестом, а не по секундам записи."""
     first = await _acted(world)
     await triage.sweep(world.db)
     await world.db.execute(
@@ -193,27 +195,22 @@ async def test_equal_second_is_not_counted_twice_and_unreadable_day_is_not_lost(
         "2026-10-22 00:00:00",
     )
     assert sum(s["late"] for s in sections.values()) == 0
-    # дайджест дня действия с нечитаемым разделом исхода не содержит: он «позже»
+    # #1997: учтённость - связь «исход -> дайджест», а не JSON: правка payload и
+    # удаление дайджеста исход не возвращают в счёт
     await world.db.execute(
         "UPDATE autopilot_digests SET payload = ?, created_at = '2026-10-22 00:00:00'",
         (json.dumps({"triage": {"state": "unavailable"}}),),
     )
     await world.db.commit()
-    sections = await triage_inbox.digest_sections(
-        world.db,
-        "2026-10-21 00:00:00",
-        "2026-10-22 00:00:00",
-    )
-    assert [s["late"] for s in sections.values()] == [1]
-    # дайджеста дня действия нет вовсе: исход тоже «позже», а не потерян
-    await world.db.execute("DELETE FROM autopilot_digests")
-    await world.db.commit()
-    sections = await triage_inbox.digest_sections(
-        world.db,
-        "2026-10-21 00:00:00",
-        "2026-10-22 00:00:00",
-    )
-    assert [s["late"] for s in sections.values()] == [1]
+    for _ in range(2):
+        sections = await triage_inbox.digest_sections(
+            world.db,
+            "2026-10-21 00:00:00",
+            "2026-10-22 00:00:00",
+        )
+        assert sum(s["late"] for s in sections.values()) == 0
+        await world.db.execute("DELETE FROM autopilot_digests")
+        await world.db.commit()
 
 
 async def _payload_of(world, date: str) -> dict:
@@ -267,6 +264,7 @@ async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkey
     from hub.migrations import FROZEN_MIGRATIONS
     from hub.migrations.steps import load_steps
     from tests.test_db_migrations import _SCHEMA
+    from tests.test_triage_digest_links import is_step_1997
 
     steps = load_steps()
     new = [
@@ -275,7 +273,7 @@ async def test_migrations_1947_and_1943_together_on_an_old_populated_base(monkey
         if n.startswith("rework_on_host") or "followup_action_at" in n
     ]
     assert len(new) >= 8, "нет шагов #1947 и #1943"
-    old = [(n, q) for n, q in steps if (n, q) not in new]
+    old = [(n, q) for n, q in steps if (n, q) not in new and not is_step_1997(n)]
     monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *old])
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
