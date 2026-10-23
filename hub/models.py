@@ -410,8 +410,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # существование. Не гейт, не делегирует. Читатель:
     # project_policy.statement_paths_of.
     "statement_paths",
-    # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
-    # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
+    # #1434: минут тишины до освобождения слота; не гейт. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
     # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт.
     # Читатель: project_policy.deep_reviewer_of.
@@ -420,6 +419,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
     "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
+    "base_fetch_wait_hours",  # #1992, читатель project_policy.*_of
     "critic_host",  # #1953: хост критика облачной сдачи; project_policy.critic_host_of
     # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
     # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
@@ -3542,7 +3542,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
-    _policy.validate_delivery_fresh_base_rerun(v)
+    _policy.validate_delivery_policy(v)
     from hub.services.project_policy import validate_critic_host
 
     validate_critic_host(v)
@@ -5129,6 +5129,15 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "no_grounds",
     "no_confidence",
 )
+#: Вид основания возражения советника (#2025): противоречие факта пакета с
+#: AC/постановкой / недостаток данных / политика / процедурное. Только
+#: аналитика контура: на применение вид не влияет.
+STEWARD_OBJECTION_KINDS: tuple[str, ...] = (
+    "fact_contradiction",
+    "data_gap",
+    "policy",
+    "procedural",
+)
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
     "human_disposition",
@@ -5149,6 +5158,23 @@ class StewardGround(BaseModel):
 
     source: str = Field(..., min_length=1, max_length=80)
     detail: str = Field("", max_length=2000)
+    #: Вид основания возражения советника (#2025), из STEWARD_OBJECTION_KINDS.
+    #: Неизвестное значение хранится пустым («не классифицировано»): вид —
+    #: аналитика, он не открывает применение и не ломает приём ответа.
+    kind: str = Field("", max_length=40)
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        return v if v in STEWARD_OBJECTION_KINDS else ""
+
+    def stored(self) -> dict[str, str]:
+        """Как основание ложится в JSON: пустой вид не пишется (#2025)."""
+        data = self.model_dump()
+        if not data["kind"]:
+            del data["kind"]
+        return data
 
 
 class StewardClosure(BaseModel):
