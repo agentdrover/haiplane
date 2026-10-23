@@ -219,6 +219,7 @@ async def test_no_advisor_where_approve_cannot_apply(
         {**policy_of(clean=None), "steward_approve_max_class": "r2"},
     )
     assert await order_due_advisors(db) == 0
+    assert not db.in_transaction, "повторный пропуск не оставил открытую транзакцию"
     assert len(await _skip_lines(db, ceiling.task_id)) == 1
 
     # цитата чужого ключа внутри причины (справка ревьюера) не гасит другой пропуск
@@ -228,7 +229,6 @@ async def test_no_advisor_where_approve_cannot_apply(
         db, integrity.task_id, 7, "class_above_policy_ceiling", "потолок"
     )
     await db.commit()
-    assert not db.in_transaction, "пропуск не оставил открытую транзакцию"
 
 
 async def test_shadow_and_double_clean_still_order_the_advisor(
