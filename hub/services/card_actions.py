@@ -260,7 +260,13 @@ def _decide_sheets(t: dict[str, Any], recommend: str) -> tuple[list, list]:
         route,
         "Вернуть на доработку",
         hidden={**guard, "action": "rework"},
-        fields=[_text("instructions", "Что исправить", required=True)],
+        fields=[
+            _text("instructions", "Что исправить", required=True),
+            _check(
+                "confirm_no_job",
+                "Прошлый заказ оборвался, задания в очереди диспетчера нет",
+            ),
+        ],
         tone="warning",
     )
     a_accept = _action("sh-accept", "Принять", "alt", recommend == ACCEPT)

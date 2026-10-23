@@ -720,6 +720,7 @@
                     <button class="btn btn-success task-action-btn" type="submit" name="action" value="accept">Accept as Completed</button>
                     <label class="task-action-label" for="task-rework-instructions">Instructions for rework</label>
                     <textarea id="task-rework-instructions" name="instructions"{% if form_values.get('instructions') %} data-hub-restored{% endif %} class="task-action-control task-action-textarea" placeholder="What specifically needs to be fixed...">{{ form_values.get('instructions', '') }}</textarea>
+                    <label class="task-action-label"><input type="checkbox" name="confirm_no_job" value="1"> Прошлый заказ доработки оборвался, и задания в очереди диспетчера нет (подтверждаю)</label>
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 

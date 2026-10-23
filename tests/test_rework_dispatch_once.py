@@ -509,3 +509,78 @@ async def test_a_late_answer_does_not_touch_a_booking_the_sweep_closed(db):
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "needs_decision" and not task["job_id"]
     assert "job-late" in await _feed(db, task_id)
+
+
+async def test_a_merge_run_waits_for_the_human_after_an_unproven_outcome(
+    db, monkeypatch
+):
+    from hub.services import executor_launch as el
+    from tests.test_executor_dispatch import (
+        _CREATED,
+        _creator,
+        _human,
+        _launch_config,
+        _task_in_base_conflict,
+    )
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_in_base_conflict(db, slug="exec-merge-unproven")
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (task_id,),
+    )
+    await db.commit()
+
+    result = await el.merge_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="owner"
+    )
+
+    assert not result.launched and "confirm_no_job" in result.reason
+    assert calls == []
+
+
+async def test_force_complete_rereads_the_task_under_the_lock(client, db, monkeypatch):
+    """Снимок до лока устарел: между чтением и записью rework записал job_id."""
+    from hub.services import rework_launch
+
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    real = rework_launch.refuse_if_reserved
+
+    async def job_lands_first(conn, tid):
+        await real(conn, tid)
+        await repo.update_task(conn, tid, status="fix_requested", job_id="job-9")
+
+    monkeypatch.setattr(rework_launch, "refuse_if_reserved", job_lands_first)
+
+    forced = await client.post(
+        f"/api/tasks/{task_id}/force-complete", json={"comment": "закрыть"}
+    )
+
+    assert forced.status_code == 409, forced.text
+    assert (await repo.get_task(db, task_id))["status"] != "completed"
+
+
+async def test_the_web_forms_can_confirm_that_no_job_exists(client, db, net):
+    """Без поля в форме человек после needs_human упёрся бы в вечный 409."""
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (task_id,),
+    )
+    await db.commit()
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert page.count('name="confirm_no_job"') >= 2  # лист и форма «Подробностей»
+
+    refused = await client.post(
+        f"/tasks/{task_id}/web-decide", data=REWORK, follow_redirects=False
+    )
+    assert refused.status_code == 409
+    net.release.set()
+    done = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={**REWORK, "confirm_no_job": "on"},
+        follow_redirects=False,
+    )
+    assert done.status_code == 303
+    assert len(net.messages) == 1

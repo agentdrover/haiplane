@@ -247,10 +247,12 @@ async def _not_leaf_refusal(
     return _refused(f"{REASON_NOT_LEAF}: #{task['id']} {why}", int(task["id"]))
 
 
-async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
+async def _live_run(
+    db: aiosqlite.Connection, task_id: int, *, rework_block: bool = True
+) -> str:
     """Причина, если по задаче уже идёт прогон; пусто — не идёт."""
-    if held := await rework_launch.reserved_row(db, task_id):
-        return f"{REASON_ALREADY_RUNNING} #{task_id} (заказ доработки, бронь №{held['id']})"
+    if rework_block and (why := await rework_launch.launch_block(db, task_id)):
+        return f"{REASON_ALREADY_RUNNING} #{task_id} ({why})"
     for row in await repo.list_executor_runs(db, task_id):
         r = dict(row)
         if r["outcome"] != OUTCOME_RUNNING:

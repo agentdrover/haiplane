@@ -85,6 +85,30 @@ async def refuse_if_reserved(db: aiosqlite.Connection, task_id: int) -> None:
         )
 
 
+async def launch_block(db: aiosqlite.Connection, task_id: int) -> str:
+    """Почему запуск исполнителя по задаче закрыт заказом доработки; пусто - не закрыт.
+
+    Закрывает и действующая бронь, и последний заказ с неустановленным исходом:
+    пока человек не подтвердил отсутствие задания (``confirm_no_job``), другая
+    дверь (прогон слияния) вторым исполнителем не пользуется.
+    """
+    held = await reserved_row(db, task_id)
+    if held is not None:
+        return f"заказ доработки, бронь №{held['id']}"
+    rows = await fetchall(
+        db,
+        "SELECT id, state FROM rework_launches WHERE task_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    if rows and rows[0]["state"] == NEEDS_HUMAN:
+        return (
+            f"исход заказа доработки (бронь №{rows[0]['id']}) не установлен: "
+            "решите rework с confirm_no_job"
+        )
+    return ""
+
+
 async def require_entry(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
     """Свежая строка задачи под write-локом, если вход needs_decision ещё не потреблён."""
     row = await repo.get_task(db, task_id)
@@ -136,7 +160,7 @@ async def reserve(
     task = await require_entry(db, task_id)
     if not confirm_no_job:
         await refuse_unconfirmed_outcome(db, task_id)
-    live = await executor_launch._live_run(db, task_id)
+    live = await executor_launch._live_run(db, task_id, rework_block=False)
     if live:
         raise _taken(task_id, live)
     try:

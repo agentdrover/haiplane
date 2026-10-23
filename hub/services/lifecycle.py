@@ -6536,6 +6536,23 @@ async def force_complete_task(
     async with write_transaction(db):
         if status == "needs_decision":
             await rework_launch.refuse_if_reserved(db, task_id)  # #1991
+        # Снимок статуса и заданий взят до лока: задача, ушедшая в работу
+        # (rework записал job_id), закрытой силой не становится.
+        fresh = dict(await repo.get_task(db, task_id) or {})
+        if (
+            fresh.get("status"),
+            fresh.get("job_id") or "",
+            fresh.get("review_job_id") or "",
+        ) != (
+            status,
+            task.get("job_id") or "",
+            task.get("review_job_id") or "",
+        ):
+            raise HTTPException(
+                409,
+                f"Task #{task_id} changed while being force-completed "
+                f"(status now {fresh.get('status')}); nothing was changed",
+            )
         await repo.add_task_update(db, task_id, "human", "done", comment)
         await prevention_gate.note_close_without_prevention(
             db, task, via="force_complete", actor="human"
