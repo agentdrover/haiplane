@@ -37,7 +37,14 @@
             }
             return sel.options.length ? 0 : -1;
         }
+        // #2035: лист MC-4 после успешной отправки хранит значения (data-sent на
+        // форме), но они уже записаны хабом - это не недописанный ввод, иначе
+        // он навсегда блокировал бы автообновление карточки.
+        function sent(el) {
+            return !!(el.form && el.form.getAttribute("data-sent") === "true");
+        }
         function dirty(el) {
+            if (sent(el)) { return false; }
             // #1995: ввод, возвращённый формой после отказа, стал defaultValue;
             // без этой метки автообновление стёрло бы его пустой формой.
             if (el.hasAttribute("data-hub-restored")) {
@@ -60,7 +67,7 @@
             var main = document.getElementById("main");
             if (!main) { return false; }
             var active = document.activeElement;
-            if (active && main.contains(active) && active.matches(FIELDS) && !SKIP[active.type]) { return true; }
+            if (active && main.contains(active) && active.matches(FIELDS) && !SKIP[active.type] && !sent(active)) { return true; }
             var fields = main.querySelectorAll(FIELDS);
             for (var i = 0; i < fields.length; i++) {
                 if (dirty(fields[i])) { return true; }

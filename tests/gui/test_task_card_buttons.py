@@ -14,6 +14,7 @@ require, и проверка состояния в базе отдельным �
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
 from playwright.sync_api import expect
@@ -27,6 +28,17 @@ REASON = "Исполнитель пропал: заберите сдачу, по
 def _open(page: Any, stand: Stand, task_id: int) -> None:
     page.goto(f"{stand.url}/tasks/{task_id}")
     page.wait_for_load_state("domcontentloaded")
+
+
+def _frozen_clock(page: Any) -> None:
+    """Часы страницы стоят, пока тест сам их не двинет.
+
+    Без паузы fake-часы Playwright идут в реальном времени: на медленном CI
+    подготовка (открытие листа) могла занять 15 с, и разрешённый запрос чистой
+    карточки попадал в seen, а тест обвинял защиту ввода."""
+    start = datetime(2026, 1, 1, 12, 0, 0)
+    page.clock.install(time=start)
+    page.clock.pause_at(start + timedelta(seconds=1))
 
 
 def _set_details(page: Any, want_open: bool) -> None:
@@ -110,6 +122,14 @@ def test_return_to_work_through_the_mc4_sheet(page: Any, stand: Stand) -> None:
         what=f"задача #{task_id} вернулась в open листом",
         seconds=10,
     )
+    # Настоящий успех листа: форма помечена отправленной (либо карточка уже
+    # перечитана), и записанный ввод больше не считается недописанным.
+    page.wait_for_function(
+        "(() => { const f = document.querySelector('#sh-return form');"
+        " return !f || f.getAttribute('data-sent') === 'true'; })()"
+    )
+    assert page.evaluate("window.hubHasUnsavedInput()") is False
+    expect(page.locator("#c2-live")).to_have_attribute("data-status", "open")
     row = stand.task(task_id)
     assert row["claimed_by"] in (None, "")
     notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
@@ -216,7 +236,7 @@ def _refresh_requests(page: Any, task_id: int) -> list[str]:
 
 def test_autorefresh_updates_a_clean_card(page: Any, stand: Stand) -> None:
     task_id = stand.seed_task(title="чистая карточка", status="running")
-    page.clock.install()
+    _frozen_clock(page)
     seen = _refresh_requests(page, task_id)
     _open(page, stand, task_id)
     page.wait_for_function("typeof window.htmx === 'object'")
@@ -237,7 +257,7 @@ def test_autorefresh_is_blocked_while_typing_and_the_button_still_works(
     page: Any, stand: Stand
 ) -> None:
     task_id = stand.seed_task(title="карточка с вводом", status="running")
-    page.clock.install()
+    _frozen_clock(page)
     seen = _refresh_requests(page, task_id)
     _open(page, stand, task_id)
     page.wait_for_function("typeof window.htmx === 'object'")
@@ -296,7 +316,7 @@ def test_autorefresh_is_blocked_while_typing_in_the_mc4_sheet(
 ) -> None:
     """Тот же контракт #1996 для поля листа MC-4: ввод не затирается и не опрашивается."""
     task_id = stand.seed_task(title="карточка с вводом в листе", status="running")
-    page.clock.install()
+    _frozen_clock(page)
     seen = _refresh_requests(page, task_id)
     _open(page, stand, task_id)
     page.wait_for_function("typeof window.htmx === 'object'")
@@ -369,6 +389,57 @@ def test_refresh_after_a_sheet_action_is_allowed_despite_typed_input(
     )
     assert seen, "обновление после действия листа не сходило за карточкой"
     assert field.input_value() == REASON
+
+
+def test_a_late_autorefresh_answer_does_not_replace_typed_input(
+    page: Any, stand: Stand
+) -> None:
+    """Запрос ушёл на чистой карточке, ответ придёт после ввода: замены нет (beforeSwap)."""
+    task_id = stand.seed_task(title="поздний ответ", status="running")
+    _frozen_clock(page)
+    held: list[Any] = []
+
+    def hold(route: Any) -> None:
+        if route.request.headers.get("hx-request"):
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route(f"**/tasks/{task_id}", hold)
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    stand.run(_rename(task_id, "Название из позднего ответа"))
+    page.clock.fast_forward(16_000)
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "автообновление чистой карточки не ушло за ответом"
+
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill(REASON)
+    held[0].continue_()
+    page.wait_for_timeout(1_500)
+
+    assert field.input_value() == REASON
+    assert "Название из позднего ответа" not in page.locator("#c2-live").inner_html()
+
+
+def test_manual_refresh_still_replaces_the_card_over_typed_input(
+    page: Any, stand: Stand
+) -> None:
+    """Ручной Refresh Status - клик, защита ввода его не гасит."""
+    task_id = stand.seed_task(title="ручное обновление", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    _open_details(page)
+    page.locator("#task-return-reason").fill(REASON)
+    stand.run(_rename(task_id, "Название после ручного обновления"))
+    page.get_by_role("button", name="Refresh Status").click()
+    expect(page.locator("h1.task-hero-title")).to_contain_text(
+        "Название после ручного обновления", timeout=10_000
+    )
 
 
 def _force_status(task_id: int, status: str) -> Any:
