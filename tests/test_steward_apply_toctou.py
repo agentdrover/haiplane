@@ -23,6 +23,7 @@ from hub import repository as repo
 from hub.models import ReviewVerdict, TaskReviewVerdict
 from hub.services import steward_applied, steward_cap, verdict_evidence
 from hub.services import steward_shadow as sh
+from hub.services.refusal_reason import CodedRefusal
 from hub.services.steward_advisor import apply_advisor_outcomes
 from hub.services.steward_advisor import advisor_refusal
 from hub.services.steward_apply import policy_refusal
@@ -408,8 +409,10 @@ _FOREIGN = "ЧУЖОЙ_ТЕКСТ_4711"
         HTTPException(422, {"reason": _FOREIGN}),
         HTTPException(422, f"advisor_not_concurred: {_FOREIGN}"),
         HTTPException(409, f"{_FOREIGN}"),
+        CodedRefusal(409, f"текст {_FOREIGN}", code=_FOREIGN),
+        CodedRefusal(409, "x", code="verdict_taken"),
     ],
-    ids=["dict-reason", "known-prefix", "no-code"],
+    ids=["dict-reason", "known-prefix", "no-code", "foreign-code", "known-code"],
 )
 async def test_the_reason_comes_from_a_closed_vocabulary(
     db, monkeypatch, raised: HTTPException
@@ -456,5 +459,50 @@ async def test_a_changed_packet_keeps_the_advisor_code(db, monkeypatch):
 
     row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
     assert row["advisor_outcome"] == "failed"
-    assert "советник" in row["advisor_outcome_detail"].lower(), row
+    assert row["advisor_outcome_detail"].startswith("advisor_not_concurred: "), row
     assert "советник" in (await feed(db, case.task_id)).lower()
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [
+        (HTTPException(422, f"ac_tests_not_green: {_FOREIGN}"), "ac_tests_not_green"),
+        (
+            HTTPException(409, {"reason": "verdict_window_closed"}),
+            "verdict_window_closed",
+        ),
+        (
+            HTTPException(422, {"reason": "verdict_repeats_previous"}),
+            "verdict_repeats_previous",
+        ),
+        (
+            CodedRefusal(422, "x", code="machine_review_required"),
+            "machine_review_required",
+        ),
+    ],
+)
+def test_the_useful_refusal_codes_have_fixed_texts(raised, code):
+    from hub.services.refusal_reason import REASON_TEXTS, reason_line
+
+    assert reason_line(raised) == f"{code}: {REASON_TEXTS[code]}"
+
+
+async def test_the_machine_review_gate_names_its_code(db, monkeypatch):
+    """Ворота обязательного машинного ревью отдают код, а не только текст."""
+    from types import SimpleNamespace
+
+    from hub.services import lifecycle
+    from hub.services.refusal_reason import reason_line
+
+    case = await build_case(db, monkeypatch, "toctou-mr-gate", pair=False, order=False)
+    monkeypatch.setattr(config, "MACHINE_REVIEW_MODE", "require")
+    task = dict(await repo.get_task(db, case.task_id))
+    state = SimpleNamespace(
+        db=db,
+        task=task,
+        body=SimpleNamespace(verdict=ReviewVerdict.approved),
+    )
+    with pytest.raises(HTTPException) as caught:
+        await lifecycle._vstep_machine_review_present(state)
+
+    assert reason_line(caught.value).startswith("machine_review_required: ")

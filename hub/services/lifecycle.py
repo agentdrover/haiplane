@@ -4493,9 +4493,10 @@ async def _vstep_machine_review_present(state: VerdictContext) -> None:
 
         gap = await machine_review_gap(state.db, state.task)
         if gap:
-            raise HTTPException(
+            raise CodedRefusal(
                 422,
                 f"machine-review обязателен для аппрува этой задачи: {gap}",
+                code="machine_review_required",
             )
 
 
