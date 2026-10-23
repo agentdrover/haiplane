@@ -87,7 +87,9 @@ def test_unlisted_files_and_unreadable_revision_fail(tmp_path: Path) -> None:
     rc, out = _run(repo, base, head, ["a.py"])
     assert rc == 1, out
     assert "[unlisted_file]" in out and "b.py" in out, out
-    assert "docs/n.md" not in out, "не-.py вне списка нарушением не является"
+    assert "docs/n.md" in out, "любой файл вне списка — нарушение, не только .py"
+    rc, out = _run(repo, base, head, ["a.py", "b.py"], "--allow-file", "docs/n.md")
+    assert rc == 1 and "docs/n.md" not in out, out
 
     rc, out = _run(repo, "0" * 40, head, ["a.py"])
     assert rc == 2, out
@@ -106,14 +108,16 @@ def test_listed_files_must_be_python_and_clean_run_says_so(tmp_path: Path) -> No
     )
     rc, out = _run(repo, base, head, ["n.md"])
     assert rc == 2, out
-    rc, out = _run(repo, base, head, ["a.py"])
+    rc, out = _run(repo, base, head, ["a.py"], "--allow-file", "n.md")
     assert rc == 0, out
     assert "ограниченн" in out, "результат — проверка ограниченного класса правок"
+    assert "НЕ проверены" in out, "граница инструмента названа в выводе"
+    assert "a.py:1: - # c" in out, "перечень удалённых комментариев"
 
 
 def test_unchanged_listed_file_is_clean(tmp_path: Path) -> None:
     repo, base, head = _pair(tmp_path, {"a.py": "x = 1\n"}, {"b.txt": "q\n"})
-    rc, out = _run(repo, base, head, ["a.py"])
+    rc, out = _run(repo, base, head, ["a.py"], "--allow-file", "b.txt")
     assert rc == 0, out
 
 
@@ -245,3 +249,16 @@ def test_ast_check_sees_a_type_ignore_that_stopped_working() -> None:
     live = parsed("x = missing  # type: ignore[name-defined]\n")
     dead = parsed("x = missing  # пояснение # type: ignore[name-defined]\n")
     assert [v.kind for v in cod.compare_ast("m.py", live, dead)] == ["ast"]
+
+
+def test_every_removed_and_changed_comment_is_listed(tmp_path: Path) -> None:
+    """При rc=0 ревью получает полный перечень: удалённые (-) и новые/изменённые (+)."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "# gone\nx = 1  # kept\ny = 2  # old\n"},
+        {"m.py": "x = 1  # kept\ny = 2  # new\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 0, out
+    assert "m.py:1: - # gone" in out and "m.py:3: - # old" in out, out
+    assert "m.py:2: + # new" in out and "# kept" not in out, out

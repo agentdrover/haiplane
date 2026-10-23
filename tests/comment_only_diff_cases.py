@@ -23,8 +23,8 @@ CASES: dict[str, dict] = {
         "head": "x = 1\ny = 2\n# c\n",
         "kind": CLEAN,
     },
-    "clean_trailing_comment_removed_and_trailing_spaces": {
-        "base": "x = 1  # c   \ny = 2   \n",
+    "clean_trailing_comment_removed_with_its_own_trailing_spaces": {
+        "base": "x = 1  # c   \ny = 2\n",
         "head": "x = 1\ny = 2\n",
         "kind": CLEAN,
     },
@@ -47,6 +47,7 @@ CASES: dict[str, dict] = {
         "base": "# причина #1234\nx = 1\n",
         "head": "x = 1\n",
         "extra_head": {"docs/agent-context/invariants.md": "см. #1234\n"},
+        "allow_files": ["docs/agent-context/invariants.md"],
         "kind": CLEAN,
     },
     "clean_allowed_docstring_change": {
@@ -135,6 +136,17 @@ CASES: dict[str, dict] = {
         "base": 'x = f"""a {y}\n\nb"""\n',
         "head": 'x = f"""a {y}\nb"""\n',
         "kind": "code",
+    },
+    "trailing_space_on_a_code_line_is_significant": {
+        "base": "y = 2   \n",
+        "head": "y = 2\n",
+        "kind": "code",
+    },
+    "other_changed_file_is_unlisted_whatever_its_type": {
+        "base": "x = 1\n",
+        "head": "x = 1\n",
+        "extra_head": {"docs/note.md": "q\n"},
+        "kind": "unlisted_file",
     },
     "indent_changed": {
         "base": "def f():\n    x = 1\n    return x\n",

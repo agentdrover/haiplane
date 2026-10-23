@@ -36,8 +36,16 @@ docstring ломает инструменты и публичные поверх
   * [ref_lost] ссылка ``#NNNN`` из комментария или docstring базы осталась в
     файле или в ``docs/agent-context/invariants.md`` ревизии head
     (вспомогательная проверка: номер не равен сохранённой причине);
-  * [unlisted_file] вне списка изменён другой .py; [file_changed] файл списка
+  * [unlisted_file] вне списка и вне ``--allow-file`` изменён любой другой файл
+    (``git diff --name-only`` по всей разнице, не только .py); [file_changed] файл списка
     добавлен или удалён; [file_mode] сменился режим файла.
+
+ГРАНИЦА инструмента. Комментарий без известной директивы (имя инструмента из
+списка в ``_TOOL_RE``) вычёркивается из сравнения как обычный текст: так же
+уходят маркеры, которых в списке нет (Coverage ``no cover: start/stop``,
+autoflake ``skip_file``, Sphinx ``#:`` и т. п.). Список не пополняется до
+полноты: при ``rc=0`` скрипт печатает ВСЕ удалённые и изменённые комментарии
+(``файл:строка: - текст`` / ``+ текст``), и их читает ревью.
 
 Коды возврата: 0 — нарушений нет; 1 — есть нарушения; 2 — проверить не удалось
 (ревизия не читается, синтаксическая ошибка, не .py, не UTF-8, ссылка, docstring
@@ -49,6 +57,7 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
+from collections import Counter
 import difflib
 import io
 import json
@@ -119,6 +128,7 @@ class Parsed:
     code: list[tuple[int, str]]  # (строка, нормализованный текст строки кода)
     docs: dict[str, DocSlot]
     refs: dict[str, int]  # номер -> первая строка в комментарии или docstring
+    comments: list[tuple[int, str]]  # все комментарии: (строка, текст)
 
 
 # --------------------------------------------------------------------------- git
@@ -151,10 +161,11 @@ class Repo:
             raise CheckError(f"ревизия {rev!r} не читается ({exc})") from exc
         return out.decode().strip()
 
-    def changed_py(self, base: str, head: str) -> list[str]:
+    def changed_files(self, base: str, head: str) -> list[str]:
+        """Все изменённые файлы любого типа (переименование = удаление + добавление)."""
         out = self._run("diff", "--name-only", "--no-renames", "-z", base, head)
         names = out.decode("utf-8", "surrogateescape").split("\0")
-        return sorted(n for n in names if n.endswith(".py"))
+        return sorted(n for n in names if n)
 
     def read_many(self, sha: str, paths: Sequence[str]) -> dict[str, bytes | None]:
         """Содержимое файлов ревизии одним ``cat-file --batch``; нет файла — None."""
@@ -422,7 +433,9 @@ def _code_lines(
         if com and not directive and row in block_rows:
             directive = com.string.rstrip(" \t\r")
         verbatim = (row in inner or row in opening) and not com
-        body = cut if verbatim else cut.rstrip(" \t\r")
+        # Пробелы в конце строки кода значимы; снимается лишь разделитель перед
+        # хвостовым комментарием и CR (он учтён в eol).
+        body = cut.rstrip(" \t") if com else (cut[:-1] if eol else cut)
         if row in doc_start:
             if row not in string_rows and not directive and not body.strip():
                 entries.append(
@@ -445,7 +458,7 @@ def _code_lines(
             (
                 row,
                 "code",
-                f"{body}{suffix}" + ("" if verbatim else eol),
+                f"{body}{suffix}{eol}",
                 bool(directive),
             )
         )
@@ -477,7 +490,14 @@ def parse_source(data: bytes, path: str) -> Parsed:
     toks = _tokenize(src, path)
     docs = _collect_docs(tree, src)
     _check_docstring_rows(toks, docs, src.split("\n"))
-    return Parsed(src, tree, _code_lines(src, toks, docs), docs, _refs(toks, docs))
+    comments = [
+        (t.start[0], t.string.rstrip(" \t\r"))
+        for t in toks
+        if t.type == tokenize.COMMENT
+    ]
+    return Parsed(
+        src, tree, _code_lines(src, toks, docs), docs, _refs(toks, docs), comments
+    )
 
 
 # ---------------------------------------------------------------------- сравнение
@@ -580,15 +600,40 @@ def compare_refs(
     ]
 
 
+def comment_changes(path: str, base: Parsed, head: Parsed) -> list[str]:
+    """Все удалённые и изменённые комментарии: ``файл:строка: текст``.
+
+    Комментарий без известной директивы проверкой не охраняется — его смотрит
+    ревью, поэтому перечень полный, а не выборочный.
+    """
+    out: list[str] = []
+    left = Counter(text for _, text in head.comments)
+    for row, text in base.comments:
+        if left[text] > 0:
+            left[text] -= 1
+        else:
+            out.append(f"{path}:{row}: - {text}")
+    left = Counter(text for _, text in base.comments)
+    for row, text in head.comments:
+        if left[text] > 0:
+            left[text] -= 1
+        else:
+            out.append(f"{path}:{row}: + {text}")
+    return out
+
+
 def analyze_pair(
     path: str,
     base_data: bytes,
     head_data: bytes,
     allow: set[str],
     invariants: str,
+    changes: list[str] | None = None,
 ) -> list[Violation]:
     base = parse_source(base_data, path)
     head = parse_source(head_data, path)
+    if changes is not None:
+        changes += comment_changes(path, base, head)
     out = compare_code(path, base, head)
     out += compare_docstrings(path, base, head, allow)
     if not out:
@@ -619,6 +664,7 @@ def _normalize_paths(files: Sequence[str]) -> list[str]:
 class Report:
     violations: list[Violation] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    comment_changes: list[str] = field(default_factory=list)
     files: int = 0
 
     @property
@@ -650,16 +696,26 @@ def _validate(data: bytes, path: str, report: Report) -> None:
 
 
 def run_check(
-    repo: Repo, base_rev: str, head_rev: str, files: Sequence[str], allow: set[str]
+    repo: Repo,
+    base_rev: str,
+    head_rev: str,
+    files: Sequence[str],
+    allow: set[str],
+    allow_files: frozenset[str] = frozenset(),
 ) -> Report:
     report = Report()
     listed = _normalize_paths(files)
     base = repo.resolve(base_rev)
     head = repo.resolve(head_rev)
-    for extra in repo.changed_py(base, head):
-        if extra not in listed:
+    for extra in repo.changed_files(base, head):
+        if extra not in listed and extra not in allow_files:
             report.violations.append(
-                Violation(extra, 0, "unlisted_file", "изменён .py вне списка файлов")
+                Violation(
+                    extra,
+                    0,
+                    "unlisted_file",
+                    "изменён файл вне списка и вне --allow-file",
+                )
             )
     old = repo.read_many(base, listed)
     new = repo.read_many(head, listed)
@@ -680,7 +736,12 @@ def run_check(
         else:
             try:
                 report.violations += analyze_pair(
-                    path, a, b, allow, inv.decode("utf-8", "replace")
+                    path,
+                    a,
+                    b,
+                    allow,
+                    inv.decode("utf-8", "replace"),
+                    report.comment_changes,
                 )
             except CheckError as exc:
                 report.errors.append(str(exc))
@@ -694,6 +755,7 @@ def _print(report: Report, as_json: bool) -> None:
             "files": report.files,
             "violations": [vars(v) for v in report.violations],
             "errors": report.errors,
+            "comment_changes": report.comment_changes,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -701,6 +763,10 @@ def _print(report: Report, as_json: bool) -> None:
         print(v.render())
     for err in report.errors:
         print(f"{err} [error]")
+    if report.comment_changes:
+        print("Удалённые (-) и добавленные или изменённые (+) комментарии:")
+        for line in report.comment_changes:
+            print(f"  {line}")
     if report.errors:
         print(
             f"НЕ ПРОВЕРЕНО: {len(report.errors)} ошибок; результат «чисто» невозможен"
@@ -709,9 +775,11 @@ def _print(report: Report, as_json: bool) -> None:
         print(f"НАРУШЕНИЙ: {len(report.violations)}")
     else:
         print(
-            f"OK: {report.files} файл(ов) — изменены только комментарии и "
-            "docstring-и, названные в --allow-docstring (проверка ограниченного "
-            "класса правок; поведение она не доказывает)"
+            f"OK: {report.files} файл(ов) — код не менялся, изменены только "
+            "комментарии и docstring-и, названные в --allow-docstring. Это "
+            "проверка ограниченного класса правок, поведение она не доказывает; "
+            "удалённые комментарии без известной директивы НЕ проверены — их "
+            "смотрит ревью по перечню выше."
         )
 
 
@@ -729,6 +797,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="ПУТЬ::ИМЯ",
         help="docstring, изменение которого разрешено явно",
     )
+    parser.add_argument(
+        "--allow-file",
+        action="append",
+        default=[],
+        metavar="ПУТЬ",
+        help="файл любого типа, который сдача вправе менять (например invariants.md)",
+    )
     parser.add_argument("--json", action="store_true", help="машиночитаемый вывод")
     parser.add_argument("files", nargs="+", help=".py-файлы, заявленные в сдаче")
     args = parser.parse_args(argv)
@@ -739,6 +814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.head,
             args.files,
             set(args.allow_docstring),
+            frozenset(args.allow_file),
         )
     except CheckError as exc:
         report = Report(errors=[str(exc)])
