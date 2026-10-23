@@ -196,7 +196,7 @@ async def test_global_act_rechecked_at_write(db, db_dsn, monkeypatch):
             )
 
         assert caught.value.status_code == 422, (label, caught.value.detail)
-        assert str(caught.value.detail).startswith("precondition_failed: "), label
+        assert str(caught.value.detail).startswith("act_revoked: "), label
         assert "автономия act сейчас не выдана" in str(caught.value.detail), label
         assert await verdict_of(db, case.task_id) == "", label
         assert await verdict_events(db, case.task_id) == [], label
@@ -365,8 +365,8 @@ async def test_the_revoked_act_reason_is_shown_to_the_owner(db, db_dsn, monkeypa
 
     row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
     assert row["advisor_outcome"] == "failed"
-    assert "автономия act сейчас не выдана" in row["advisor_outcome_detail"]
-    assert "автономия act сейчас не выдана" in await feed(db, case.task_id)
+    assert "автономия act больше не выдана" in row["advisor_outcome_detail"]
+    assert "автономия act больше не выдана" in await feed(db, case.task_id)
 
 
 async def test_a_human_approve_that_won_the_race_is_not_called_the_stewards(

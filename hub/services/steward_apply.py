@@ -46,6 +46,7 @@ import aiosqlite
 from hub import config
 from hub.db import fetchall
 from hub.services import gate_grounds as grounds
+from hub.services.refusal_reason import ACT_REVOKED
 from hub.models import RiskClass
 from hub.services.auto_approve import ladder_hits
 from hub.services.project_policy import STEWARD_CEILING_UNREADABLE
@@ -61,9 +62,6 @@ REFUSED_UNCLOSED = "unclosed_finding"
 # им же названо саморевью в громких основаниях — написание одно.
 REFUSED_SELF_AUTHORED = "self_authored"
 REFUSED_NOT_DELEGATED = "policy_not_delegated"
-#: Начало ответа ворот транзакции записи при снятом допуске ``act`` (#2040):
-#: текст пишет хаб, поэтому ``steward_advisor.failure_reason`` показывает его целиком.
-ACT_REVOKED_PREFIX = f"{REFUSED_PRECONDITION}: STEWARD_MODE="
 # #1855: класс сдачи выше потолка проекта (или не известен при заданном
 # потолке). Код из закрытого словаря #1022 (STEWARD_ESCALATE_REASONS).
 REFUSED_CLASS_CEILING = "class_above_policy_ceiling"
@@ -1020,7 +1018,7 @@ async def write_refusal(
     # ними и записью.
     if not await act_granted_now(db):
         return (
-            REFUSED_PRECONDITION,
+            ACT_REVOKED,
             f"STEWARD_MODE={config.STEWARD_MODE!r}: автономия act сейчас не "
             "выдана - применять нечего",
         )

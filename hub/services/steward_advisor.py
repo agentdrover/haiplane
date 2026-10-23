@@ -55,6 +55,7 @@ from hub.services.result_kind import (
     task_automation_not_applicable,
 )
 from hub.services import steward_advisor_skip as advisor_skip
+from hub.services.refusal_reason import reason_line
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -844,48 +845,7 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     return moved
 
 
-FAILURE_REASON_LIMIT = 300
-
-
-#: Коды отказа ворот, чьё объяснение пишет сам хаб из собственных данных
-#: (политика проекта, счётчики потолка): показывается целиком.
-_SELF_AUTHORED_REFUSALS = ("policy_not_delegated", "advisor_not_concurred")
-
-
-def failure_reason(exc: Exception) -> str:
-    """Причина неудачного применения одной строкой, безопасная для ленты (#2040).
-
-    Целиком показывается только отказ ворот хаба, объяснение которого хаб
-    пишет сам (``_SELF_AUTHORED_REFUSALS`` и отказ глобального допуска
-    ``act``). У прочих ворот в ``detail`` попадает чужой текст: значение из
-    базы, присланное отчётом CI. Для них и для всякого иного исключения
-    называется только код или тип, а подробности остаются в журнале хаба
-    (``log.warning`` выше по стеку). Без переносов, не длиннее
-    ``FAILURE_REASON_LIMIT``.
-    """
-    from fastapi import HTTPException
-
-    from hub.services.steward_apply import ACT_REVOKED_PREFIX
-
-    where = "подробности в журнале хаба"
-    if isinstance(exc, HTTPException):
-        if isinstance(exc.detail, dict):  # машинный код, не его пояснения
-            raw_code = exc.detail.get("reason") or exc.detail.get("code")
-            detail = raw_code if isinstance(raw_code, str) else ""
-        else:
-            detail = " ".join(str(exc.detail).split())
-        code = detail.split(":", 1)[0]
-        if code in _SELF_AUTHORED_REFUSALS or detail.startswith(ACT_REVOKED_PREFIX):
-            text = detail
-        elif code.isidentifier():
-            text = f"{code}, {where}"
-        else:
-            text = f"отказ {exc.status_code}, {where}"
-    else:
-        text = f"внутренняя ошибка применения ({type(exc).__name__}), {where}"
-    if len(text) > FAILURE_REASON_LIMIT:
-        text = text[: FAILURE_REASON_LIMIT - 1] + "…"
-    return text
+failure_reason = reason_line  # #2040: закрытый словарь, hub/services/refusal_reason.py
 
 
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
