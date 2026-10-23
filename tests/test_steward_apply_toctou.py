@@ -528,3 +528,35 @@ def test_a_fixed_text_is_a_general_claim_with_a_pointer_to_the_log():
         for enumeration in (",", " либо ", " или ", "(", ";"):
             assert enumeration not in claim, (code, enumeration)
     assert "журнале" in WHERE
+
+
+async def test_a_cap_handoff_is_not_called_a_missing_consent(db, db_dsn, monkeypatch):
+    """Согласие советника действительно, но сдача передана человеку из-за потолка.
+
+    Код отказа - ``steward_cap_handoff``, а не ``advisor_not_concurred``: у
+    второго текст «нет согласия», и здесь он был бы ложью.
+    """
+    from hub.services.refusal_reason import REASON_TEXTS
+
+    case = await build_case(db, monkeypatch, "toctou-cap-code")
+    assert await advisor_refusal(db, case.task_id, 1) is None, "согласие действительно"
+    other = await db_module.connect(db_dsn)
+    real_record = steward_applied._record
+
+    async def record_after_the_cap_is_spent(*args, **kwargs):
+        await _cap_handoff(other, case, monkeypatch)
+        return await real_record(*args, **kwargs)
+
+    try:
+        monkeypatch.setattr(steward_applied, "_record", record_after_the_cap_is_spent)
+        assert await apply_advisor_outcomes(db) == 1
+    finally:
+        await other.close()
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    assert row["advisor_outcome_detail"] == (
+        f"steward_cap_handoff: {REASON_TEXTS['steward_cap_handoff']}"
+    )
+    early = await advisor_refusal(db, case.task_id, 1)
+    assert early is not None and early[0] == "steward_cap_handoff", early
