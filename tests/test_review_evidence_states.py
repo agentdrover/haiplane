@@ -311,7 +311,7 @@ def test_explanations_stay_inside_the_mcp_budget(count, kind):
     brief["ci_evidence"] = {"mutations": block, "baseline": dict(block)}
     result = proj.brief_result(brief)
     assert proj.result_chars(result) <= 12_000
-    assert "bounds" not in result.structuredContent
+    assert "bounds" not in result.structuredContent["brief"]
     text = json.loads(result.content[0].text)["message"]
     assert "CI mutations [not_received] expectation=origin_unconfirmed" in text
     assert text.count("прогон 2005") == 2, "event and run once per block, no repeat"
