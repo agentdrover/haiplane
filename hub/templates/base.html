@@ -71,7 +71,9 @@
             var elt = e.detail.requestConfig && e.detail.requestConfig.elt;
             if (!elt || !elt.hasAttribute("data-hub-autorefresh")) { return; }
             var trigger = e.detail.requestConfig.triggeringEvent;
-            if (trigger && trigger.type === "click") { return; }
+            // Ручной клик и обновление после успешного действия листа (c2-refresh,
+            // #1813) разрешены: отправленный лист хранит введённые значения.
+            if (trigger && (trigger.type === "click" || trigger.type === "c2-refresh")) { return; }
             if (window.hubHasUnsavedInput()) { e.detail.shouldSwap = false; }
         });
         var waiting = null;

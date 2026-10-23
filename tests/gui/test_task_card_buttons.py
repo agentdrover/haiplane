@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from playwright.sync_api import expect
+
 from tests.gui.conftest import Stand
 
 STALE = "Форма устарела"
@@ -25,6 +27,31 @@ REASON = "Исполнитель пропал: заберите сдачу, по
 def _open(page: Any, stand: Stand, task_id: int) -> None:
     page.goto(f"{stand.url}/tasks/{task_id}")
     page.wait_for_load_state("domcontentloaded")
+
+
+def _set_details(page: Any, want_open: bool) -> None:
+    """«Подробности» на широком экране уже раскрыты, а панель действий при этом
+    скрыта: приводим блок в нужное состояние, а не переключаем вслепую."""
+    page.wait_for_function("document.getElementById('card-details') !== null")
+    if page.evaluate("document.getElementById('card-details').open") != want_open:
+        page.locator("#card-details > summary").click()
+
+
+def _open_details(page: Any) -> None:
+    """Прежние формы лежат в «Подробностях» (#1812): раскрыть и отправлять их."""
+    _set_details(page, True)
+
+
+def _open_return_sheet(page: Any) -> None:
+    """Путь MC-4 (#1813): «Другие действия» -> лист «Вернуть в работу»."""
+    # Нижняя панель прячется, пока на экране видна «К действию» (card_sheets_script):
+    # низкое окно и прокрутка вниз выводят справку из вида, и панель появляется.
+    page.set_viewport_size({"width": 1400, "height": 420})
+    page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+    page.wait_for_selector(".c2-bar:not(.c2-bar--covered)", timeout=10_000)
+    page.locator("#c2-more > summary").click()
+    page.locator('a[data-sheet="sh-return"]').click()
+    page.locator("#sh-return-reason").wait_for(state="visible")
 
 
 def _no_stale_form(page: Any) -> None:
@@ -48,12 +75,13 @@ def test_htmx_is_loaded_on_the_card(page: Any, stand: Stand) -> None:
 def test_return_to_work_from_review_with_cyrillic_reason(
     page: Any, stand: Stand
 ) -> None:
+    """Сервисный путь: прежняя форма в «Подробностях»."""
     task_id = stand.seed_review_task(title="вернуть из review")
     _open(page, stand, task_id)
 
-    page.get_by_role("link", name="К действию").click()
+    _open_details(page)
     page.locator("#task-return-reason").fill(REASON)
-    page.get_by_role("button", name="Вернуть в работу").click()
+    page.locator("#card-details").get_by_role("button", name="Вернуть в работу").click()
 
     stand.wait_for(
         lambda: stand.status_of(task_id) == "open",
@@ -61,6 +89,27 @@ def test_return_to_work_from_review_with_cyrillic_reason(
         seconds=10,
     )
     _no_stale_form(page)
+    row = stand.task(task_id)
+    assert row["claimed_by"] in (None, "")
+    notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
+    assert notes and REASON in notes[-1]["content"]
+    assert notes[-1]["agent"] == "probe-owner"
+
+
+def test_return_to_work_through_the_mc4_sheet(page: Any, stand: Stand) -> None:
+    """Путь MC-4: «Другие действия» -> лист, кириллическая причина доходит до базы."""
+    task_id = stand.seed_review_task(title="вернуть листом")
+    _open(page, stand, task_id)
+
+    _open_return_sheet(page)
+    page.locator("#sh-return-reason").fill(REASON)
+    page.locator('#sh-return button[type="submit"]').click()
+
+    stand.wait_for(
+        lambda: stand.status_of(task_id) == "open",
+        what=f"задача #{task_id} вернулась в open листом",
+        seconds=10,
+    )
     row = stand.task(task_id)
     assert row["claimed_by"] in (None, "")
     notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
@@ -176,7 +225,11 @@ def test_autorefresh_updates_a_clean_card(page: Any, stand: Stand) -> None:
     stand.run(_rename(task_id, "Название после автообновления"))
     page.clock.fast_forward(16_000)
 
-    page.get_by_text("Название после автообновления").first.wait_for(timeout=10_000)
+    # Новое название приходит в свёрнутый «Исходное название» внутри #c2-live (MC-4):
+    # видимости не требуем, проверяем текст.
+    expect(page.locator("#c2-live .c2-orig-title")).to_have_text(
+        "Название после автообновления", timeout=10_000
+    )
     assert seen, "автообновление не сходило за карточкой"
 
 
@@ -189,6 +242,7 @@ def test_autorefresh_is_blocked_while_typing_and_the_button_still_works(
     _open(page, stand, task_id)
     page.wait_for_function("typeof window.htmx === 'object'")
 
+    _open_details(page)
     field = page.locator("#task-return-reason")
     field.fill(REASON)
     assert page.evaluate("window.hubHasUnsavedInput()") is True
@@ -202,7 +256,7 @@ def test_autorefresh_is_blocked_while_typing_and_the_button_still_works(
     assert "нельзя увидеть при вводе" not in page.locator("body").inner_text()
 
     # После блокировки кнопка срабатывает и берёт набранное.
-    page.get_by_role("button", name="Вернуть в работу").click()
+    page.locator("#card-details").get_by_role("button", name="Вернуть в работу").click()
     stand.wait_for(
         lambda: stand.status_of(task_id) == "open",
         what=f"задача #{task_id} вернулась в open из running",
@@ -217,11 +271,11 @@ def test_a_service_refusal_is_shown_in_russian(page: Any, stand: Stand) -> None:
     task_id = stand.seed_review_task(title="отказ сервиса")
     _open(page, stand, task_id)
 
-    page.get_by_role("link", name="К действию").click()
+    _open_details(page)
     page.locator("#task-return-reason").fill(REASON)
     # Статус меняется за спиной открытой страницы: хаб откажет при отправке.
     stand.run(_force_status(task_id, "open"))
-    page.get_by_role("button", name="Вернуть в работу").click()
+    page.locator("#card-details").get_by_role("button", name="Вернуть в работу").click()
 
     alert = page.locator('[role="alert"]').first
     alert.wait_for(timeout=10_000)
@@ -235,6 +289,86 @@ def test_a_service_refusal_is_shown_in_russian(page: Any, stand: Stand) -> None:
     # на ней больше нет, поэтому сохранность ввода здесь не проверяется — её
     # держат серверные тесты #1995 (test_refused_card_forms_keep_the_typed_text).
     assert stand.status_of(task_id) == "open"
+
+
+def test_autorefresh_is_blocked_while_typing_in_the_mc4_sheet(
+    page: Any, stand: Stand
+) -> None:
+    """Тот же контракт #1996 для поля листа MC-4: ввод не затирается и не опрашивается."""
+    task_id = stand.seed_task(title="карточка с вводом в листе", status="running")
+    page.clock.install()
+    seen = _refresh_requests(page, task_id)
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill(REASON)
+    assert page.evaluate("window.hubHasUnsavedInput()") is True
+
+    stand.run(_rename(task_id, "Название, которого нельзя увидеть при вводе в листе"))
+    page.clock.fast_forward(16_000)
+    page.clock.run_for(1_000)
+
+    assert seen == [], "автообновление сходило за карточкой при недописанном вводе"
+    assert field.input_value() == REASON
+
+    # После ожидания лист отправляет набранную кириллицу.
+    page.locator('#sh-return button[type="submit"]').click()
+    stand.wait_for(
+        lambda: stand.status_of(task_id) == "open",
+        what=f"задача #{task_id} вернулась в open листом из running",
+        seconds=10,
+    )
+    notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
+    assert notes and REASON in notes[-1]["content"]
+
+
+def test_the_sheet_guard_refuses_a_stale_screen(page: Any, stand: Stand) -> None:
+    """Гард листа (card_sheet.py): статус сменился за спиной - отказ на листе, ввод цел."""
+    task_id = stand.seed_review_task(title="гард листа")
+    _open(page, stand, task_id)
+
+    _open_return_sheet(page)
+    page.locator("#sh-return-reason").fill(REASON)
+    stand.run(_force_status(task_id, "open"))
+    page.locator('#sh-return button[type="submit"]').click()
+
+    alert = page.locator('#sh-return .c2-sheet-result [role="alert"]')
+    alert.wait_for(timeout=10_000)
+    text = alert.inner_text()
+    assert "Состояние задачи изменилось" in text, text
+    assert "open" in text, text
+    assert page.locator("#sh-return-reason").input_value() == REASON
+    assert stand.status_of(task_id) == "open"
+    notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
+    assert not notes, "отказ не должен оставить запись о возврате"
+
+
+def test_refresh_after_a_sheet_action_is_allowed_despite_typed_input(
+    page: Any, stand: Stand
+) -> None:
+    """c2-refresh (после успешного листа, #1813) не блокируется защитой ввода."""
+    task_id = stand.seed_task(title="обновление после листа", status="running")
+    seen = _refresh_requests(page, task_id)
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill(REASON)
+    assert page.evaluate("window.hubHasUnsavedInput()") is True
+
+    stand.run(_rename(task_id, "Название после действия листа"))
+    page.evaluate(
+        "window.htmx.trigger(document.getElementById('c2-live'), 'c2-refresh')"
+    )
+
+    expect(page.locator("#c2-live .c2-orig-title")).to_have_text(
+        "Название после действия листа", timeout=10_000
+    )
+    assert seen, "обновление после действия листа не сходило за карточкой"
+    assert field.input_value() == REASON
 
 
 def _force_status(task_id: int, status: str) -> Any:
