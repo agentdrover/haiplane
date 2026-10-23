@@ -518,7 +518,7 @@ def test_a_fixed_text_is_a_general_claim_with_a_pointer_to_the_log():
 
     assert len(REASON_TEXTS) == 17
     for code, text in REASON_TEXTS.items():
-        assert text.endswith(f"точная причина в журнале хаба"), code
+        assert text.endswith("точная причина в журнале хаба"), code
         claim = text.split(" — ", 1)[0]
         assert " — " in text, code
         for enumeration in (",", " либо ", " или ", "(", ";"):
