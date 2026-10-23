@@ -19,6 +19,7 @@ from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
     _worktree_path,
+    ensure_task_worktree,
 )
 
 
@@ -3818,3 +3819,57 @@ async def test_run_bytes_cancel_kills_the_pipeline(tmp_path):
                 if seen.get(pid) and seen[pid] == started_at(pid):
                     with contextlib.suppress(ProcessLookupError, PermissionError):
                         os.kill(pid, signal.SIGKILL)
+
+
+# --- the start of a new task branch (#2039) ---
+# Real git with a bare origin: a mocked _git would not notice which ref the
+# branch was cut from.
+
+
+def _head(path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True
+    ).stdout.strip()
+
+
+async def test_new_task_branch_starts_from_the_fetched_origin_base(tmp_path):
+    origin = tmp_path / "origin.git"
+    _run_git("git", "init", "--bare", "-b", "develop", str(origin), cwd=tmp_path)
+    repo = tmp_path / "main"
+    _run_git("git", "clone", str(origin), str(repo), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "Test", cwd=repo)
+    (repo / "f.txt").write_text("x")
+    _run_git("git", "add", ".", cwd=repo)
+    _run_git("git", "commit", "-qm", "init", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+    # Someone else moves origin/develop forward; the clone's local develop stays.
+    other = tmp_path / "other"
+    _run_git("git", "clone", str(origin), str(other), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=other)
+    _run_git("git", "config", "user.name", "Test", cwd=other)
+    (other / "g.txt").write_text("y")
+    _run_git("git", "add", ".", cwd=other)
+    _run_git("git", "commit", "-qm", "ahead", cwd=other)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=other)
+    newest = _head(other)
+    assert _head(repo) != newest
+
+    notes: list[str] = []
+    wt = await ensure_task_worktree(2039, "task-2039/x", str(repo), "develop", notes)
+
+    assert _head(wt) == newest
+    assert _head(repo) != newest  # the local base is not moved
+    assert notes == []
+
+
+async def test_without_origin_base_the_local_base_is_used_and_named(tmp_path):
+    repo = tmp_path / "main"
+    _git_setup(repo)  # no remote at all
+    notes: list[str] = []
+
+    wt = await ensure_task_worktree(2039, "task-2039/x", str(repo), "develop", notes)
+
+    assert _head(wt) == _head(repo)
+    assert _current_branch(wt) == "task-2039/x"
+    assert any("локальн" in n and "develop" in n for n in notes), notes
