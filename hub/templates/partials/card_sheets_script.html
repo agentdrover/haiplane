@@ -119,7 +119,26 @@
         var meta = document.querySelector('meta[name="csrf-token"]');
         return meta ? meta.getAttribute("content") : "";
     }
+    // #2035: «отправлено» - это ровно то, что ушло в запросе. Снимок значений берётся
+    // в момент отправки; если к ответу поля уже другие (человек правил, пока ответ
+    // шёл), форма НЕ помечается отправленной, а любой ввод после метки её снимает.
+    function snapshot(form) {
+        var out = [];
+        for (var i = 0; i < form.elements.length; i++) {
+            var el = form.elements[i];
+            out.push([el, el.type === "checkbox" || el.type === "radio" ? el.checked : el.value]);
+        }
+        return out;
+    }
+    function unchanged(snap) {
+        for (var i = 0; i < snap.length; i++) {
+            var el = snap[i][0];
+            if ((el.type === "checkbox" || el.type === "radio" ? el.checked : el.value) !== snap[i][1]) { return false; }
+        }
+        return true;
+    }
     function send(form, submitter) {
+        var snap = snapshot(form);
         var sheet = form.closest(".c2-sheet");
         var result = sheet.querySelector(".c2-sheet-result");
         var body = new URLSearchParams(new FormData(form));
@@ -141,7 +160,7 @@
                 form.removeAttribute("aria-busy");
                 result.innerHTML = out.text;
                 if (out.ok && out.text.indexOf("data-c2-done") !== -1) {
-                    form.setAttribute("data-sent", "true");
+                    if (unchanged(snap)) { form.setAttribute("data-sent", "true"); }
                     var live = byId("c2-live");
                     if (live && window.htmx) { window.htmx.trigger(live, "c2-refresh"); }
                 }
@@ -168,6 +187,12 @@
             e.preventDefault();
             send(form, e.submitter);
         });
+        function unsend(e) {
+            var form = e.target && e.target.form;
+            if (form && form.getAttribute("data-sent") === "true") { form.removeAttribute("data-sent"); }
+        }
+        document.addEventListener("input", unsend);
+        document.addEventListener("change", unsend);
         document.addEventListener("htmx:afterSwap", sync);
         window.addEventListener("resize", navHeight);
     }

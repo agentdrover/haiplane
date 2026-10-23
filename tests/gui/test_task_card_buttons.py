@@ -446,6 +446,101 @@ def test_manual_refresh_still_replaces_the_card_over_typed_input(
     )
 
 
+def test_input_typed_while_the_sheet_post_is_in_flight_is_not_lost(
+    page: Any, stand: Stand
+) -> None:
+    """#2035 gen3: на сервер ушло A, пока ответ шёл, человек набрал B - B не «отправлено»."""
+    task_id = stand.seed_task(title="правка во время отправки", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    held: list[Any] = []
+
+    def hold(route: Any) -> None:
+        if route.request.method == "POST":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route(f"**/tasks/{task_id}/web-return-to-work", hold)
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill("Первая версия причины")
+    page.evaluate("window.marker = 'alive'")
+    page.locator('#sh-return button[type="submit"]').click()
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "отправка листа не ушла"
+
+    field.fill(REASON)  # правка, пока ответ задержан
+    held[0].continue_()
+    stand.wait_for(
+        lambda: stand.status_of(task_id) == "open",
+        what=f"задача #{task_id} вернулась в open",
+        seconds=10,
+    )
+    notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
+    assert notes and "Первая версия причины" in notes[-1]["content"]
+    page.wait_for_timeout(1_500)
+
+    form = page.locator("#sh-return form")
+    assert form.get_attribute("data-sent") != "true", (
+        "B ушло бы под меткой отправленного"
+    )
+    assert page.evaluate("window.hubHasUnsavedInput()") is True
+    page.keyboard.press("Escape")  # закрытие листа не должно перезагрузить страницу
+    page.wait_for_timeout(1_000)
+    assert page.evaluate("window.marker") == "alive", "страница перезагрузилась"
+    assert field.input_value() == REASON
+
+
+def test_typing_into_a_sent_sheet_withdraws_the_sent_mark(
+    page: Any, stand: Stand
+) -> None:
+    """Повторный ввод в отправленный лист снимает метку и блокирует перезагрузку."""
+    task_id = stand.seed_task(title="ввод после отправки", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    held: list[Any] = []
+
+    def hold(route: Any) -> None:
+        if route.request.headers.get("hx-request") and route.request.method == "GET":
+            held.append(route)  # обновление после листа задержано: страница стоит
+        else:
+            route.continue_()
+
+    page.route(f"**/tasks/{task_id}", hold)
+    _open_return_sheet(page)
+    field = page.locator("#sh-return-reason")
+    field.fill(REASON)
+    page.evaluate("window.marker = 'alive'")
+    page.locator('#sh-return button[type="submit"]').click()
+    stand.wait_for(
+        lambda: stand.status_of(task_id) == "open",
+        what=f"задача #{task_id} вернулась в open",
+        seconds=10,
+    )
+    form = page.locator("#sh-return form")
+    expect(form).to_have_attribute("data-sent", "true")
+    assert page.evaluate("window.hubHasUnsavedInput()") is False
+
+    field.fill("Новый текст после отправки")
+    assert form.get_attribute("data-sent") != "true"
+    assert page.evaluate("window.hubHasUnsavedInput()") is True
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    for route in held:
+        route.continue_()
+    page.wait_for_timeout(1_500)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(1_000)
+    assert page.evaluate("window.marker") == "alive", "страница перезагрузилась"
+    assert field.input_value() == "Новый текст после отправки"
+
+
 def _force_status(task_id: int, status: str) -> Any:
     async def work(conn: Any) -> None:
         await conn.execute(
