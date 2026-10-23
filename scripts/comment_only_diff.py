@@ -81,7 +81,8 @@ _TOOL_RE = re.compile(
     r"noqa|type:|pragma|fmt:|nosem|nosec|pylint|mypy|isort|ruff|flake8|yapf|pyright"
     r"|pytype|\bty:|cython|pyre-|nextline|skipcq|lgtm|codeql|sonar|noinspection"
     r"|autopep8|vulture|bandit|trivy|black|pyflakes|pycodestyle|pydocstyle|pep8"
-    r"|coverage|pytest|hadolint|semgrep|ignore-errors|disable",
+    r"|coverage|pytest|hadolint|semgrep|ignore-errors|disable|gitleaks|trufflehog"
+    r"|allowlist|nolint",
     re.I,
 )
 
@@ -343,6 +344,22 @@ def _multiline_rows(toks: list[tokenize.TokenInfo]) -> tuple[set[int], set[int]]
     return inner, opening
 
 
+def _pep723_rows(comments: dict[int, tokenize.TokenInfo]) -> set[int]:
+    """Строки блоков ``# /// script`` … ``# ///`` (PEP 723): их читает ``uv run``."""
+    rows: set[int] = set()
+    opened = False
+    for row in sorted(comments):
+        text = comments[row].string.rstrip()
+        if not opened and re.fullmatch(r"# /// [A-Za-z0-9-]+", text):
+            opened = True
+        elif opened and text == "# ///":
+            opened = False
+            rows.add(row)
+        if opened or row in rows:
+            rows.add(row)
+    return rows
+
+
 def doc_rows_of(doc: DocSlot) -> range:
     return range(doc.expr.lineno, (doc.expr.end_lineno or doc.expr.lineno) + 1)
 
@@ -379,6 +396,7 @@ def _code_lines(
     if lines and lines[-1] == "":
         lines.pop()
     comments = {t.start[0]: t for t in toks if t.type == tokenize.COMMENT}
+    block_rows = _pep723_rows(comments)
     first_real = next((t.start[0] for t in toks if t.type not in _LAYOUT), 10**9)
     inner, opening = _multiline_rows(toks)
     doc_start = {r: d.expr.lineno for d in docs.values() for r in doc_rows_of(d)}
@@ -395,6 +413,8 @@ def _code_lines(
         com = comments.get(row)
         cut = text[: com.start[1]] if com else text
         directive = _directive_of(com.string, row, row < first_real) if com else ""
+        if com and not directive and row in block_rows:
+            directive = com.string.rstrip(" \t\r")
         verbatim = (row in inner or row in opening) and not com
         body = cut if verbatim else cut.rstrip(" \t\r")
         if row in doc_start:
@@ -406,7 +426,7 @@ def _code_lines(
             if not directive:
                 entries.append((row, "doc", "", False))
                 continue
-            where = "inline" if cut.strip() else f"col{len(cut)}"
+            where = "inline" if cut.strip() else f"col{cut!r}"
             body = f"\x00docstring+{row - doc_start[row]}\x00{where}"
         elif not verbatim and not body.strip():
             if directive:  # комментарий-директива на своей строке: отступ значим

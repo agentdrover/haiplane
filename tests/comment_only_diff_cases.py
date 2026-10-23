@@ -493,6 +493,27 @@ CASES: dict[str, dict] = {
         "head": "def f():\n    'doc'\n    pass\n",
         "kind": "docstring",
     },
+    "directive_prefix_inside_a_bracketed_docstring_is_exact": {
+        "base": '(\n # pragma: allowlist nextline secret\n "secret"\n)\nx = 1\n',
+        "head": '(\n\f# pragma: allowlist nextline secret\n "secret"\n)\nx = 1\n',
+        "allow": ["m.py::<module>"],
+        "kind": "code",
+    },
+    "gitleaks_allow_moved_to_the_neighbour": {
+        "base": 'a = "one"  # gitleaks:allow\nb = "two"\n',
+        "head": 'a = "one"\nb = "two"  # gitleaks:allow\n',
+        "kind": "code",
+    },
+    "pep723_dependency_pin_changed": {
+        "base": '# /// script\n# dependencies = ["requests==2.31.0"]\n# ///\nimport requests\n',
+        "head": '# /// script\n# dependencies = ["requests==2.32.0"]\n# ///\nimport requests\n',
+        "kind": "code",
+    },
+    "pep723_block_removed": {
+        "base": '# /// script\n# requires-python = ">=3.11"\n# ///\nimport os\n',
+        "head": "import os\n",
+        "kind": "code",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
