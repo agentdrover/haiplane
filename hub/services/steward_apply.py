@@ -1011,7 +1011,7 @@ async def write_refusal(
     та же строка. Только чтение базы, сети нет.
     """
     from hub.services.steward_advisor import cap_refusal
-    from hub.services.steward_shadow import act_granted_now
+    from hub.services.steward_shadow import act_granted_now, act_unmet_now
 
     # #2040: глобальный допуск act - тот же вопрос, что у ранних проверок
     # (``effective_mode``), но чистым чтением: стюарда могли выключить между
@@ -1020,7 +1020,8 @@ async def write_refusal(
         return (
             ACT_REVOKED,
             f"STEWARD_MODE={config.STEWARD_MODE!r}: автономия act сейчас не "
-            "выдана - применять нечего",
+            "выдана - применять нечего"
+            + "".join(f" [{item}]" for item in await act_unmet_now(db)),
         )
     return await policy_refusal(db, task_id) or await cap_refusal(
         db, task_id, generation

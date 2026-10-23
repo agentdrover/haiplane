@@ -199,7 +199,9 @@ async def test_global_act_rechecked_at_write(db, db_dsn, monkeypatch):
         assert caught.value.status_code == 422, (label, caught.value.detail)
         assert str(caught.value.detail).startswith("act_revoked: "), label
         assert "автономия act сейчас не выдана" in str(caught.value.detail), label
-        if label == "criteria":  # журнал получает НЕ выполненный критерий, а не общее слово
+        if (
+            label == "criteria"
+        ):  # журнал получает НЕ выполненный критерий, а не общее слово
             assert "false_approve" in str(caught.value.detail), label
         assert await verdict_of(db, case.task_id) == "", label
         assert await verdict_events(db, case.task_id) == [], label

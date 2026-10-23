@@ -1301,10 +1301,22 @@ async def act_granted_now(db: aiosqlite.Connection) -> bool:
     без коммита и без сети. Не ``act`` в окружении или любой невыполненный
     критерий выхода - ``False``.
     """
+    return not await act_unmet_now(db)
+
+
+async def act_unmet_now(db: aiosqlite.Connection) -> list[str]:
+    """Что мешает ``act`` СЕЙЧАС - тем же чистым чтением; пусто - ``act`` выдан (#2040).
+
+    Строки для журнала хаба: режим окружения либо код и подробности каждого
+    невыполненного критерия выхода. В карточку они не идут.
+    """
     asked = configured_mode()
     if asked != "act":
-        return False
-    return granted_mode(asked, await act_refusals(db)) == "act"
+        return [f"STEWARD_MODE={asked}"]
+    refusals = await act_refusals(db)
+    if granted_mode(asked, refusals) == "act":
+        return []
+    return [f"{code}: {detail}" for code, detail in refusals]
 
 
 def granted_mode(asked: str, refusals: list[tuple[str, str]]) -> str:
