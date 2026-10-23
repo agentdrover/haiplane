@@ -42,6 +42,7 @@ from hub.integrations import cursor_cloud
 from hub.services import project_policy
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 from hub.services.model_family import same_family
+from hub.services.refusal_publish import safe_detail
 from hub.services.steward_judgement_sample import (
     steward_escalate_body_sample,
     steward_judgement_body_sample,
@@ -740,15 +741,16 @@ _NO_JUDGE_MARK = "[стюард: заказ #{run_id}]"
 def _provider_answer(denial: object) -> str:
     """Что ответил провайдер, одной строкой — то, чего в отказе не хватало.
 
-    Ключей и токенов здесь нет по устройству: ``Refusal`` несёт статус, код
-    ошибки и обрезанный фрагмент ТЕЛА ОТВЕТА — то есть что провайдер сказал
-    про наш запрос, а не то, чем запрос был подписан.
+    Публикуется статус, код ошибки и ВИД отказа транспорта; сырой текст
+    исключения и тело ответа остаются в журнале (``cursor_cloud``), потому что
+    в них бывают пути сервера (#2006).
     """
     if denial is None:
         return "ответа не было"
     status = int(getattr(denial, "status", 0) or 0)
     code = str(getattr(denial, "code", "") or "").strip() or "без кода"
-    detail = str(getattr(denial, "detail", "") or "").strip()[:200]
+    # #2006: вид отказа (имя класса исключения), не сырой текст и не тело ответа.
+    detail = "" if status else safe_detail(denial)
     answer = f"HTTP {status} {code}" if status else code
     return f"{answer} ({detail})" if detail else answer
 
