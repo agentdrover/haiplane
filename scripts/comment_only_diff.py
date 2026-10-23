@@ -19,9 +19,12 @@ docstring ломает инструменты и публичные поверх
     строки). Из сравнения выпадают пустые строки, строки из одних
     комментариев, хвостовой комментарий-не-директива и docstring-операторы.
     Любой перенос части выражения на другую строку — нарушение;
-  * директивы (``type:``, ``noqa``, ``pragma:`` в т. ч. allowlist secret,
-    ``fmt:``, ``nosec``, ``pylint:``/``mypy:``/…, shebang, coding) входят в
-    строку кода своим текстом и остаются на своей строке и в своём порядке;
+  * комментарий, где встречается имя инструмента (``noqa``, ``type:``,
+    ``pragma``, ``fmt:``, ``nosec``, ``pylint``/``mypy``/…, shebang, coding),
+    входит в строку кода ДОСЛОВНО (пробелы, регистр, префикс, хвост) и
+    остаётся на своей строке и в своём порядке; число вычеркнутых строк между
+    ``nextline``-директивой и её целью тоже сравнивается. Правка пояснения в
+    таком комментарии тоже красная;
   * [docstring] любое изменение, добавление или удаление docstring-а (первый
     ``Expr(Constant(str))`` модуля, класса, функции; f-строки, bytes и прочие
     строки — код) — нарушение, пока символ не назван в
@@ -70,10 +73,13 @@ _LAYOUT = _SKIPPED | {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE}
 
 _REF_RE = re.compile(r"(?<![\w&])#(\d{2,6})\b")
 _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
-# Директивы сравниваются сегментом комментария целиком: регистр и список — как есть.
-_WHOLE_RE = re.compile(
-    r"^(?:noqa\b|type:|pragma:|fmt:|nosec\b|pylint:|mypy:|isort:|ruff:|flake8:|yapf:"
-    r"|pyright:|pytype:|nosemgrep|cython:|pyre-ignore|pyre-fixme)",
+# Комментарий, в котором встречается имя инструмента, сравнивается ЦЕЛИКОМ и
+# дословно: действие директивы зависит от пробелов, регистра, префикса и хвоста
+# (``pragma:  x``, ``note # mypy: …``, ``nosecB101``), а не только от «ключевого»
+# сегмента. Цена — правка пояснения в таком комментарии тоже красная.
+_TOOL_RE = re.compile(
+    r"noqa|type:|pragma|fmt:|nosec|pylint|mypy|isort|ruff|flake8|yapf|pyright"
+    r"|pytype|nosemgrep|cython|pyre-|nextline",
     re.I,
 )
 
@@ -238,18 +244,20 @@ def _hint(node: ast.AST) -> str:
 
 
 def _collect_docs(tree: ast.Module) -> dict[str, DocSlot]:
+    """Docstring-и по владельцам. Одноимённые определения нумеруются все — и с
+    docstring-ом, и без: перенос docstring-а между ними виден."""
     docs: dict[str, DocSlot] = {}
+    seen: dict[str, int] = {}
 
     def visit(node: ast.AST, prefix: str) -> None:
-        expr = (
-            _docstring_expr(node)
-            if isinstance(node, (ast.Module, *DEF_NODES))
-            else None
-        )
-        if expr is not None and isinstance(expr.value, ast.Constant):
-            name = prefix or MODULE
-            key = name if name not in docs else f"{name}#{len(docs)}"  # property.setter
-            docs[key] = DocSlot(name, expr, str(expr.value.value), _hint(node))
+        name = prefix or MODULE
+        if isinstance(node, (ast.Module, *DEF_NODES)):
+            index = seen.get(name, 0)
+            seen[name] = index + 1
+            key = name if index == 0 else f"{name}#{index}"
+            expr = _docstring_expr(node)
+            if expr is not None and isinstance(expr.value, ast.Constant):
+                docs[key] = DocSlot(name, expr, str(expr.value.value), _hint(node))
         for child in ast.iter_child_nodes(node):
             if isinstance(child, DEF_NODES):
                 visit(child, f"{prefix}.{child.name}" if prefix else child.name)
@@ -289,27 +297,18 @@ def _check_docstring_rows(
                 )
 
 
-def _norm_text(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"\s*,\s*", ",", text.strip()))
-
-
-def _directives_of(comment: str, row: int, leading: bool) -> list[str]:
-    """Тексты директив инструментов в одном комментарии (разделитель — ``#``).
+def _directive_of(comment: str, row: int, leading: bool) -> str:
+    """Дословный текст комментария-директивы или пустая строка.
 
     Shebang и coding-cookie действуют только до первого токена кода: после него
     это обычный комментарий.
     """
-    if leading and row == 1 and comment.startswith("#!"):
-        return [f"shebang {comment}"]
-    found: list[str] = []
-    cookie = _CODING_RE.match(comment) if leading and row <= 2 else None
-    if cookie:
-        found.append(f"coding {cookie.group(1)}")
-    for segment in comment.split("#")[1:]:
-        seg = segment.strip()
-        if _WHOLE_RE.match(seg):
-            found.append(_norm_text(seg))
-    return found
+    text = comment.rstrip()
+    if leading and row == 1 and text.startswith("#!"):
+        return text
+    if leading and row <= 2 and _CODING_RE.match(text):
+        return text
+    return text if _TOOL_RE.search(text) else ""
 
 
 def _multiline_rows(toks: list[tokenize.TokenInfo]) -> tuple[set[int], set[int]]:
@@ -335,13 +334,23 @@ def _multiline_rows(toks: list[tokenize.TokenInfo]) -> tuple[set[int], set[int]]
     return inner, opening
 
 
-def _before_doc(lines: list[str], row: int, doc_first: set[int]) -> bool:
-    """Следующая за комментарием строка с содержимым — начало docstring-а."""
+def _gap_mark(lines: list[str], row: int, doc_first: set[int]) -> str:
+    """Что между директивой и ближайшей строкой с содержимым.
+
+    ``nextline``-директивы действуют на соседнюю строку: число вычеркнутых
+    пустых и комментарных строк между ними входит в сравнение. Если за ними
+    начало docstring-а — это тоже отмечается.
+    """
+    gap = 0
     for nxt in range(row + 1, len(lines) + 1):
         stripped = lines[nxt - 1].strip()
         if stripped and not stripped.startswith("#"):
-            return nxt in doc_first
-    return False
+            doc = " <docstring>" if nxt in doc_first else ""
+            return f" <зазор {gap}>{doc}" if gap or doc else ""
+        if stripped.startswith("#") and _TOOL_RE.search(stripped):
+            return f" <зазор {gap}>" if gap else ""
+        gap += 1
+    return f" <зазор {gap}>" if gap else ""
 
 
 def _code_lines(
@@ -365,21 +374,19 @@ def _code_lines(
         eol = "\r" if text.endswith("\r") else ""
         com = comments.get(row)
         cut = text[: com.start[1]] if com else text
-        dirs = _directives_of(com.string, row, row < first_real) if com else []
+        directive = _directive_of(com.string, row, row < first_real) if com else ""
         verbatim = (row in inner or row in opening) and not com
         body = cut if verbatim else cut.rstrip(" \t\r")
         if row in doc_rows:
-            if not dirs:
+            if not directive:
                 continue
             body = "<docstring>"
         elif not verbatim and not body.strip():
-            if dirs:  # комментарий-директива на своей строке: отступ значим
-                mark = (
-                    " <перед docstring>" if _before_doc(lines, row, doc_first) else ""
-                )
-                out.append((row, f"{cut}# {' # '.join(dirs)}{mark}{eol}"))
+            if directive:  # комментарий-директива на своей строке: отступ значим
+                mark = _gap_mark(lines, row, doc_first)
+                out.append((row, f"{cut}{directive}{mark}{eol}"))
             continue
-        suffix = f"  # {' # '.join(dirs)}" if dirs and body.strip() else ""
+        suffix = f"  {directive}" if directive and body.strip() else ""
         out.append((row, f"{body}{suffix}" + ("" if verbatim else eol)))
     return out
 

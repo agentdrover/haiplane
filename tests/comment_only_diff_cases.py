@@ -38,11 +38,6 @@ CASES: dict[str, dict] = {
         "head": 'x = """a\n\nb"""\n',
         "kind": CLEAN,
     },
-    "clean_directive_prose_in_a_separate_segment": {
-        "base": "x = 1  # история  # noqa: BLE001\n",
-        "head": "x = 1  # noqa: BLE001\n",
-        "kind": CLEAN,
-    },
     "clean_ref_kept_in_file": {
         "base": "# причина #1234 и #99\nx = 1\n",
         "head": "# #1234, #99\nx = 1\n",
@@ -246,7 +241,7 @@ CASES: dict[str, dict] = {
     "directive_prefixed_by_prose_stops_working": {
         "base": "x = missing  # type: ignore[name-defined]\n",
         "head": "x = missing  # пояснение # type: ignore[name-defined]\n",
-        "kind": "ast",
+        "kind": "code",
     },
     "shebang_removed": {
         "base": "#!/usr/bin/env python3\nx = 1\n",
@@ -389,6 +384,57 @@ CASES: dict[str, dict] = {
         "base": '"дд";\nx = 1\n',
         "head": "x = 1\n",
         "kind": "error",
+    },
+    "directive_comment_is_compared_verbatim": {
+        "base": "x = 1  # история  # noqa: BLE001\n",
+        "head": "x = 1  # noqa: BLE001\n",
+        "kind": "code",
+    },
+    "pragma_spacing_changes_its_action": {
+        "base": 'key = "abc"  # pragma: allowlist secret\n',
+        "head": 'key = "abc"  # pragma:  allowlist secret\n',
+        "kind": "code",
+    },
+    "mypy_directive_loses_its_line_start": {
+        "base": '# mypy: ignore-errors\nx: int = "bad"\n',
+        "head": '# note # mypy: ignore-errors\nx: int = "bad"\n',
+        "kind": "code",
+    },
+    "nextline_directive_separated_by_a_comment": {
+        "base": '# pragma: allowlist nextline secret\nkey = "abc"\n',
+        "head": '# pragma: allowlist nextline secret\n# note\nkey = "abc"\n',
+        "kind": "code",
+    },
+    "nextline_directive_separated_by_a_blank_line": {
+        "base": '# pragma: allowlist nextline secret\nkey = "abc"\n',
+        "head": '# pragma: allowlist nextline secret\n\nkey = "abc"\n',
+        "kind": "code",
+    },
+    "pragma_without_colon_removed": {
+        "base": "def f():  # pragma no cover\n    return 1\n",
+        "head": "def f():\n    return 1\n",
+        "kind": "code",
+    },
+    "nosec_glued_to_the_id_removed": {
+        "base": "assert True  # nosecB101\n",
+        "head": "assert True\n",
+        "kind": "code",
+    },
+    "docstring_moved_between_same_named_defs": {
+        "base": 'def f():\n    "doc"\n    pass\ndef f():\n    pass\n',
+        "head": 'def f():\n    pass\ndef f():\n    "doc"\n    pass\n',
+        "kind": "docstring",
+    },
+    "docstring_moved_from_property_getter_to_setter": {
+        "base": (
+            "class C:\n    @property\n    def x(self):\n        'doc'\n        return 1\n"
+            "    @x.setter\n    def x(self, v):\n        pass\n"
+        ),
+        "head": (
+            "class C:\n    @property\n    def x(self):\n        return 1\n"
+            "    @x.setter\n    def x(self, v):\n        'doc'\n        pass\n"
+        ),
+        "kind": "docstring",
     },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
