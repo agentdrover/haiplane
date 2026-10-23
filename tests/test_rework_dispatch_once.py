@@ -242,6 +242,11 @@ async def _crash_on_submit(db, monkeypatch, *, accepted: bool) -> tuple[int, dic
     return task_id, jobs
 
 
+async def _feed(db, task_id: int) -> str:
+    updates = await repo.get_task_updates(db, task_id)
+    return " ".join(str(dict(u)["content"]) for u in updates)
+
+
 async def _age_reservations(db, task_id: int) -> None:
     await db.execute(
         "UPDATE rework_launches SET reserved_at=? WHERE task_id=?", (LONG_AGO, task_id)
@@ -256,6 +261,8 @@ async def test_a_crash_around_submit_does_not_launch_twice(db, monkeypatch):
     task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=False)
 
     # Рестарт до сверки: повторное решение заперто бронью, а не уходит в сеть.
+    feed = await _feed(db, task_id)
+    assert "Заказ доработки оборвался" in feed and "RuntimeError" in feed
     with pytest.raises(HTTPException) as again:
         await services.decide_task(db, task_id, TaskDecide(**REWORK))
     assert again.value.status_code == 409
@@ -267,10 +274,7 @@ async def test_a_crash_around_submit_does_not_launch_twice(db, monkeypatch):
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "needs_decision" and not task["job_id"]
     assert len(jobs["calls"]) == 1, "сверка запустила задание заново"
-    feed = " ".join(
-        str(dict(u)["content"]) for u in await repo.get_task_updates(db, task_id)
-    )
-    assert "не удалось установить" in feed
+    assert "Повторного запуска нет" in await _feed(db, task_id)
     rows = await db.execute_fetchall(
         "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
     )
@@ -308,3 +312,89 @@ async def test_a_fresh_reservation_is_left_alone_by_the_sweep(db, monkeypatch):
         "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
     )
     assert [r[0] for r in rows] == ["reserved"]
+
+
+async def test_a_merge_run_is_refused_while_a_rework_is_reserved(db, monkeypatch):
+    """Прогон «слей базу» (#1445) и доработка по решению не идут на одну задачу."""
+    from hub.services import executor_launch as el
+    from tests.test_executor_dispatch import (
+        _CREATED,
+        _creator,
+        _human,
+        _launch_config,
+        _task_in_base_conflict,
+    )
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_in_base_conflict(db, slug="exec-merge-vs-rework")
+    await db.execute("INSERT INTO rework_launches (task_id) VALUES (?)", (task_id,))
+    await db.commit()
+
+    result = await el.merge_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="owner"
+    )
+
+    assert not result.launched and el.REASON_ALREADY_RUNNING in result.reason
+    assert calls == []
+
+
+async def test_a_rework_is_refused_while_a_merge_run_is_live(client, db, monkeypatch):
+    from hub.services import executor_launch as el
+    from tests.test_executor_dispatch import (
+        _CREATED,
+        _creator,
+        _human,
+        _launch_config,
+        _task_in_base_conflict,
+    )
+
+    _launch_config(monkeypatch)
+    _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_in_base_conflict(db, slug="exec-rework-vs-merge")
+    made = await el.merge_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="owner"
+    )
+    assert made.launched, made
+
+    refused = await client.post(f"/api/tasks/{task_id}/decide", json=REWORK)
+
+    assert refused.status_code == 409, refused.text
+    assert await _decisions(db, task_id) == 0
+
+
+async def test_a_state_task_rework_closes_its_booking(client, db, net):
+    """state-задача заданием не запускается: бронь не должна остаться reserved."""
+    from tests.state_support import make_state_task
+
+    task_id = await make_state_task(db)
+    await db.execute(
+        "UPDATE tasks SET status='needs_decision', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    done = await client.post(f"/api/tasks/{task_id}/decide", json=REWORK)
+
+    assert done.status_code == 200, done.text
+    assert net.messages == []
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["closed"]
+
+
+async def test_reserve_refuses_a_task_that_left_needs_decision(db):
+    """Под write-локом статус перечитывается: ушедшая из входа задача брони не получает."""
+    from hub.services import rework_launch
+
+    task_id = await _task_in(db, "running")
+
+    with pytest.raises(HTTPException) as lost:
+        await rework_launch.reserve(db, task_id)
+
+    assert lost.value.status_code == 409
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert rows[0][0] == 0

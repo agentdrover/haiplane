@@ -18,7 +18,14 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
-from hub.services import critic_orders, delivery_wait, gate_observations, role_orders
+from hub.services import (
+    critic_orders,
+    delivery_wait,
+    gate_observations,
+    orchestrator_queue,
+    rework_launch,
+    role_orders,
+)
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
@@ -2467,15 +2474,6 @@ async def _sweep_mcp_retention(db) -> None:
         )
 
 
-async def _sweep_orchestrator_queue(db) -> None:
-    # Очередь исполнения в тени (#1274): для каждого проекта с
-    # orchestrator_queue=shadow — событие «следующей взял бы #N» с причинами
-    # пропуска, только при смене ответа. Ни статуса, ни claim, ни воркспейса.
-    from hub.services.orchestrator_queue import shadow_pass
-
-    await shadow_pass(db)
-
-
 @dataclass(frozen=True)
 class Sweep:
     """One sweep in the tick: a name for the log and the coroutine to run."""
@@ -2516,6 +2514,8 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
     Sweep("executor_orders", _sweep_executor_orders),
+    # #1991: оборванный заказ доработки сверяется с заданиями диспетчера
+    Sweep("rework_launches", rework_launch.sweep),
     Sweep("critic_orders", critic_orders.expire_due),  # #1953: срок заказа критика
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
@@ -2527,7 +2527,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
     Sweep("release_deploy_watch", release_deploy_sweep),
-    Sweep("orchestrator_queue", _sweep_orchestrator_queue),
+    Sweep("orchestrator_queue", orchestrator_queue.run_sweep),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),
 )
