@@ -140,3 +140,81 @@ def test_purge_keeps_a_copy_when_its_late_refs_cannot_be_listed(
     )
     assert path.is_dir()
     assert "защитные refs не прочитаны" in capsys.readouterr().out
+
+
+def _unreachable(path: Path, msg: str) -> str:
+    return _sh(path, "commit-tree", _sh(path, "rev-parse", "HEAD^{tree}"), "-m", msg)
+
+
+def test_every_purge_pass_pins_new_work_even_when_late_refs_already_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101, age_days=8)
+    a = _commit_then_reset_away(path)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    assert len(_late_refs(w, path.name)) == 1
+    b = _unreachable(path, "b")
+    (_admin(w, path) / "FETCH_HEAD").write_text(f"{b}\t\tbranch 'x' of somewhere\n")
+    (path / "c.txt").write_text("c")
+    _sh(path, "add", "c.txt")
+    _sh(path, "commit", "-q", "-m", "c")
+    c = _sh(path, "rev-parse", "HEAD")
+    _sh(path, "reset", "-q", "--hard", "HEAD~1")
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    pinned = {_sh(w.clone, "rev-parse", r) for r in _late_refs(w, path.name)}
+    assert pinned == {a, b, c}
+    assert all(
+        r.rsplit("late-", 1)[1] == _sh(w.clone, "rev-parse", r)
+        for r in _late_refs(w, path.name)
+    )
+    (_admin(w, path) / "FETCH_HEAD").unlink()
+    _sh(path, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _sh(w.clone, "prune", "--expire=now")
+    for sha in (a, b, c):
+        assert _sh(w.clone, "cat-file", "-t", sha) == "commit"
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    assert path.is_dir()
+
+
+def test_a_failed_late_pin_rolls_back_only_this_passes_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101, age_days=8)
+    a = _commit_then_reset_away(path)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    before = _late_refs(w, path.name)
+    b, c = _unreachable(path, "b"), _unreachable(path, "c")
+    (_admin(w, path) / "FETCH_HEAD").write_text(
+        f"{b}\t\tbranch 'x' of somewhere\n{c}\t\tbranch 'y' of somewhere\n"
+    )
+    real = purge._git
+    made: list[int] = []
+
+    def flaky(cwd: Any, *args: str, **kw: Any) -> Any:
+        if args[:1] == ("update-ref",) and "/late-" in args[1] and "-d" not in args:
+            made.append(1)
+            if len(made) == 2:
+                return 1, "", "fatal: boom"
+        return real(cwd, *args, **kw)
+
+    monkeypatch.setattr(purge, "_git", flaky)
+    capsys.readouterr()
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    out = capsys.readouterr().out
+    assert path.is_dir() and len(made) >= 2
+    assert _late_refs(w, path.name) == before, "ref этого прохода откатан, прежний цел"
+    assert _sh(w.clone, "cat-file", "-t", a) == "commit"
+    line = next(x for x in out.splitlines() if path.name in x)
+    assert b[:12] in line and c[:12] in line and "откат" in line, out

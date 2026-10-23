@@ -238,7 +238,7 @@ LATE = "late-"
 
 
 def late_refs(git: Git, clone: str, name: str) -> tuple[list[str], str]:
-    """Refs работы, найденной в карантине (``late-<k>``): они держат копию от purge."""
+    """Refs работы, найденной в карантине (``late-<sha>``): они держат копию от purge."""
     rc, out, err = git(
         clone, "for-each-ref", "--format=%(refname)", f"{REF_PREFIX}/{name}/{LATE}*"
     )
@@ -247,14 +247,20 @@ def late_refs(git: Git, clone: str, name: str) -> tuple[list[str], str]:
     return out.split(), ""
 
 
-def pin_late(git: Git, clone: str, name: str, shas: list[str]) -> str:
-    """Закрепить найденные sha как ``late-<k>``; ошибка первой неудачи или пусто.
+def pin_late(git: Git, clone: str, name: str, shas: list[str]) -> tuple[list[str], str]:
+    """Закрепить sha как ``late-<полная sha>``: имя по sha идемпотентно и не затирает.
 
-    Вызывается, только когда ``late-*`` у копии ещё нет (иначе purge оставляет её
-    раньше), поэтому нумерация идёт с нуля.
+    Уже закреплённые sha сюда не попадают (их отсекает ``unpinned_shas``).
+
+    Возвращает (созданные ЭТИМ проходом refs, ошибка). При сбое созданные в этом
+    проходе откатываются, как в ``protect``; прежние ``late-*`` не трогаются.
     """
-    for k, sha in enumerate(dict.fromkeys(shas)):
-        rc, _, err = git(clone, "update-ref", f"{REF_PREFIX}/{name}/{LATE}{k}", sha)
+    created: list[str] = []
+    for sha in dict.fromkeys(shas):
+        ref = f"{REF_PREFIX}/{name}/{LATE}{sha}"
+        rc, _, uerr = git(clone, "update-ref", ref, sha)
         if rc != 0:
-            return f"git update-ref late-{k} rc {rc}: {err.strip()[:120]}"
-    return ""
+            unprotect_refs(git, clone, created)
+            return [], f"git update-ref {ref} rc {rc}: {uerr.strip()[:120]}"
+        created.append(ref)
+    return created, ""

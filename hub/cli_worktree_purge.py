@@ -153,10 +153,11 @@ def _list_entries(args: Any) -> tuple[str, list[Entry]] | None:
 def _held_work(path: str, clone: str, *, pin: bool) -> str:
     """Работа, найденная в копии после карантина; "" - можно удалять.
 
-    Те же проверки для dry-run и --apply. Не закреплённая и не достижимая из
-    refs/remotes sha (reflog с обеих сторон, ORIG/FETCH/AUTO_MERGE) оставляет копию;
-    при ``pin`` она закрепляется как ``late-<k>``, а уже закреплённые ``late-*``
-    держат копию, пока человек их не снял (restore или update-ref -d).
+    Те же проверки для dry-run и --apply, и на КАЖДОМ проходе: не закреплённая и не
+    достижимая из refs/remotes sha (reflog с обеих сторон, ORIG/FETCH/AUTO_MERGE)
+    оставляет копию; при ``pin`` она закрепляется как ``late-<sha>`` (при сбое
+    refs этого прохода откатываются). Уже существующие ``late-*`` тоже держат
+    копию, пока человек их не снял (restore или update-ref -d).
     """
     name = os.path.basename(path)
     _, gitdir, _ = _git(path, "rev-parse", "--absolute-git-dir")
@@ -165,23 +166,30 @@ def _held_work(path: str, clone: str, *, pin: bool) -> str:
     late, err = trash.late_refs(_git, clone, name)
     if err:
         return f"защитные refs не прочитаны: {err}"
-    if late:
-        return (
-            f"после карантина в копии нашлась работа ({len(late)} шт., "
-            f"{trash.REF_PREFIX}/{name}/{trash.LATE}*): проверьте её, restore "
-            "или git update-ref -d снимают метку"
-        )
     missing, err = trash.unpinned_shas(_git, clone, name, gitdir.strip())
     if err:
         return f"reflog не сверен, копию не удаляю: {err}"
-    if not missing:
+    if not late and not missing:
         return ""
-    named = ", ".join(f"{sha[:12]} ({label})" for label, sha in missing[:3])
-    note = "dry-run ничего не закрепляет"
-    if pin:
-        perr = trash.pin_late(_git, clone, name, [sha for _, sha in missing])
-        note = "закреплены как late-*" if not perr else f"закрепить не удалось: {perr}"
-    return f"коммиты без защитного ref и вне refs/remotes: {named}; {note}"
+    parts = []
+    if late:
+        parts.append(
+            f"после карантина в копии нашлась работа (уже закреплено {len(late)} шт., "
+            f"{trash.REF_PREFIX}/{name}/{trash.LATE}*): проверьте её, restore или "
+            "git update-ref -d снимают метку"
+        )
+    if missing:
+        named = ", ".join(f"{sha[:12]} ({label})" for label, sha in missing[:3])
+        note = "dry-run ничего не закрепляет"
+        if pin:
+            made, perr = trash.pin_late(_git, clone, name, [sha for _, sha in missing])
+            note = (
+                f"закреплено в этом проходе: {len(made)}"
+                if not perr
+                else f"закрепить не удалось, refs этого прохода откатаны: {perr}"
+            )
+        parts.append(f"коммиты без защитного ref и вне refs/remotes: {named}; {note}")
+    return "; ".join(parts)
 
 
 def _purge_one(entry: Entry, clone: str, out: Callable[[str], None]) -> bool:
