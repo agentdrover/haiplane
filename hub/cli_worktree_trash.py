@@ -37,9 +37,9 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})(?:\s|$)", re.M)
 Git = Callable[..., tuple[int, str, str]]
 
 
-def pseudo_ref_shas(gitdir: str) -> tuple[list[str], str]:
-    """sha из ORIG_HEAD, FETCH_HEAD, AUTO_MERGE (первое поле строки) и ошибка чтения."""
-    found: list[str] = []
+def pseudo_ref_shas(gitdir: str) -> tuple[list[tuple[str, str]], str]:
+    """(имя, sha) из ORIG_HEAD, FETCH_HEAD, AUTO_MERGE (первое поле строки) и ошибка."""
+    found: list[tuple[str, str]] = []
     for name in PSEUDO_REFS:
         try:
             with open(os.path.join(gitdir, name), encoding="utf-8") as fh:
@@ -51,7 +51,7 @@ def pseudo_ref_shas(gitdir: str) -> tuple[list[str], str]:
         shas = [m.group(1) for m in _SHA.finditer(text)]
         if text.strip() and not shas:
             return [], f"{name}: содержимое не разобрано, sha не найдено"
-        found.extend(shas)
+        found.extend((name, sha) for sha in shas)
     return found, ""
 
 
@@ -75,19 +75,34 @@ def reflog_shas(gitdir: str) -> tuple[list[str], str]:
     return found, ""
 
 
+def copy_shas(gitdir: str) -> tuple[list[tuple[str, str]], str]:
+    """ВСЕ sha, которые держит копия: обе стороны logs/HEAD и ORIG/FETCH/AUTO_MERGE.
+
+    Единственный читатель для защитных refs, проверок prune и проверки purge:
+    (источник, sha) без повторов и ошибка чтения. Нечитаемое - не «пусто».
+    """
+    logged, err = reflog_shas(gitdir)
+    if err:
+        return [], err
+    pseudo, err = pseudo_ref_shas(gitdir)
+    if err:
+        return [], err
+    seen = dict.fromkeys(logged)
+    found = [("записи reflog HEAD", sha) for sha in seen]
+    found += [(name, sha) for name, sha in pseudo if sha not in seen]
+    return found, ""
+
+
 def protect(git: Git, clone: str, path: str, name: str) -> tuple[list[str], str]:
     """Создать защитные refs для копии ``path``; при сбое откатить и вернуть ошибку."""
     rc, gitdir, _ = git(path, "rev-parse", "--absolute-git-dir")
     rc2, head, _ = git(path, "rev-parse", "HEAD")
     if rc or rc2 or not gitdir.strip():
         return [], "HEAD или gitdir копии не прочитаны"
-    logged, err = reflog_shas(gitdir.strip())
+    held, err = copy_shas(gitdir.strip())
     if err:
         return [], err
-    pseudo, err = pseudo_ref_shas(gitdir.strip())
-    if err:
-        return [], err
-    shas = list(dict.fromkeys([head.strip(), *logged, *pseudo]))
+    shas = list(dict.fromkeys([head.strip(), *(sha for _, sha in held)]))
     created: list[str] = []
     for k, sha in enumerate(shas):
         ref = f"{REF_PREFIX}/{name}/{k}"
@@ -194,9 +209,9 @@ def orphan_refs(
 
 def unpinned_shas(
     git: Git, clone: str, name: str, gitdir: str
-) -> tuple[list[str], str]:
-    """sha из сырого logs/HEAD без защитного ref копии и вне refs/remotes; ошибка чтения."""
-    logged, err = reflog_shas(gitdir)
+) -> tuple[list[tuple[str, str]], str]:
+    """(источник, sha) копии без защитного ref и вне refs/remotes; ошибка чтения."""
+    held, err = copy_shas(gitdir)
     if err:
         return [], err
     rc, out, ferr = git(
@@ -205,8 +220,8 @@ def unpinned_shas(
     if rc != 0:
         return [], f"защитные refs не прочитаны (git rc {rc}: {ferr.strip()[:120]})"
     pinned = set(out.split())
-    missing: list[str] = []
-    for sha in dict.fromkeys(logged):
+    missing: list[tuple[str, str]] = []
+    for label, sha in held:
         if sha in pinned:
             continue
         rc, listed, ferr = git(
@@ -215,5 +230,31 @@ def unpinned_shas(
         if rc != 0:
             return [], f"{sha[:12]} не сверена с refs/remotes (git rc {rc})"
         if not listed.strip():
-            missing.append(sha)
+            missing.append((label, sha))
     return missing, ""
+
+
+LATE = "late-"
+
+
+def late_refs(git: Git, clone: str, name: str) -> tuple[list[str], str]:
+    """Refs работы, найденной в карантине (``late-<k>``): они держат копию от purge."""
+    rc, out, err = git(
+        clone, "for-each-ref", "--format=%(refname)", f"{REF_PREFIX}/{name}/{LATE}*"
+    )
+    if rc != 0:
+        return [], f"git for-each-ref rc {rc}: {err.strip()[:120]}"
+    return out.split(), ""
+
+
+def pin_late(git: Git, clone: str, name: str, shas: list[str]) -> str:
+    """Закрепить найденные sha как ``late-<k>``; ошибка первой неудачи или пусто.
+
+    Вызывается, только когда ``late-*`` у копии ещё нет (иначе purge оставляет её
+    раньше), поэтому нумерация идёт с нуля.
+    """
+    for k, sha in enumerate(dict.fromkeys(shas)):
+        rc, _, err = git(clone, "update-ref", f"{REF_PREFIX}/{name}/{LATE}{k}", sha)
+        if rc != 0:
+            return f"git update-ref late-{k} rc {rc}: {err.strip()[:120]}"
+    return ""

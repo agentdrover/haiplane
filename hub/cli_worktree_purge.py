@@ -103,7 +103,9 @@ def _marker_problem(
     return marker, ""
 
 
-def _classify(entry: Entry, tdir: str, older: float) -> tuple[str, str, bool]:
+def _classify(
+    entry: Entry, tdir: str, older: float, clone: str, pin: bool
+) -> tuple[str, str, bool]:
     """(действие, текст, аномалия): purge | keep | skip; аномалия даёт rc != 0."""
     action, text, match = _structure(entry, tdir)
     if action != "proof" or match is None:
@@ -116,6 +118,9 @@ def _classify(entry: Entry, tdir: str, older: float) -> tuple[str, str, bool]:
         return "keep", "время маркера из будущего: возраст не определить", True
     if age_s / _DAY < older:
         return "keep", f"в карантине {max(age_s, 0) / _DAY:.1f} сут < {older:g}", False
+    held = _held_work(os.path.abspath(entry.path), clone, pin=pin)
+    if held:
+        return "keep", held, True
     return "purge", f"в карантине {age_s / _DAY:.1f} сут >= {older:g}", False
 
 
@@ -145,23 +150,46 @@ def _list_entries(args: Any) -> tuple[str, list[Entry]] | None:
     return clone, _parse_porcelain(text)
 
 
+def _held_work(path: str, clone: str, *, pin: bool) -> str:
+    """Работа, найденная в копии после карантина; "" - можно удалять.
+
+    Те же проверки для dry-run и --apply. Не закреплённая и не достижимая из
+    refs/remotes sha (reflog с обеих сторон, ORIG/FETCH/AUTO_MERGE) оставляет копию;
+    при ``pin`` она закрепляется как ``late-<k>``, а уже закреплённые ``late-*``
+    держат копию, пока человек их не снял (restore или update-ref -d).
+    """
+    name = os.path.basename(path)
+    _, gitdir, _ = _git(path, "rev-parse", "--absolute-git-dir")
+    if not gitdir.strip():
+        return "gitdir копии не прочитан"
+    late, err = trash.late_refs(_git, clone, name)
+    if err:
+        return f"защитные refs не прочитаны: {err}"
+    if late:
+        return (
+            f"после карантина в копии нашлась работа ({len(late)} шт., "
+            f"{trash.REF_PREFIX}/{name}/{trash.LATE}*): проверьте её, restore "
+            "или git update-ref -d снимают метку"
+        )
+    missing, err = trash.unpinned_shas(_git, clone, name, gitdir.strip())
+    if err:
+        return f"reflog не сверен, копию не удаляю: {err}"
+    if not missing:
+        return ""
+    named = ", ".join(f"{sha[:12]} ({label})" for label, sha in missing[:3])
+    note = "dry-run ничего не закрепляет"
+    if pin:
+        perr = trash.pin_late(_git, clone, name, [sha for _, sha in missing])
+        note = "закреплены как late-*" if not perr else f"закрепить не удалось: {perr}"
+    return f"коммиты без защитного ref и вне refs/remotes: {named}; {note}"
+
+
 def _purge_one(entry: Entry, clone: str, out: Callable[[str], None]) -> bool:
     """Удалить копию и снять её refs; True - всё чисто."""
     _, gitdir, _ = _git(entry.path, "rev-parse", "--absolute-git-dir")
-    name = os.path.basename(entry.path)
-    missing, err = (
-        trash.unpinned_shas(_git, clone, name, gitdir.strip())
-        if gitdir.strip()
-        else ([], "gitdir копии не прочитан")
-    )
-    if err:
-        out(f"ошибка    {entry.path}: reflog не сверен, копию не удаляю: {err}")
-        return False
-    if missing:
-        out(
-            f"оставить  {entry.path}: в reflog есть коммиты без защитного ref и вне "
-            f"refs/remotes ({', '.join(m[:12] for m in missing[:3])}): копию не удаляю"
-        )
+    why = _held_work(entry.path, clone, pin=True)
+    if why:
+        out(f"оставить  {entry.path}: {why}")
         return False
     rc, _, err = _git(clone, "worktree", "remove", "--force", entry.path)
     if rc != 0:
@@ -199,7 +227,7 @@ def run_purge(args: Any, out: Callable[[str], None] = print) -> int:
         return 1
     clone, entries = listed
     tdir, older = trash_root(clone), float(args.older_than_days)
-    plan = [(e, *_classify(e, tdir, older)) for e in entries]
+    plan = [(e, *_classify(e, tdir, older, clone, bool(args.apply))) for e in entries]
     failed = False
     for entry, action, why, anomaly in plan:
         if action != "skip":

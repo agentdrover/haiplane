@@ -104,8 +104,6 @@ SHOWN_PATHS = 3
 _TASK_DIR = re.compile(r"^task-(\d+)$")
 _TASK_BRANCH = re.compile(r"^refs/heads/task-(\d+)/.+")
 _STRAY_SIBLING = re.compile(r"-task-\d+$")
-_PSEUDO_SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})(?:\s|$)", re.M)
-PSEUDO_REFS = ("ORIG_HEAD", "FETCH_HEAD", "AUTO_MERGE")
 TRASH_DIR = ".trash"
 
 Api = Callable[..., Any]
@@ -349,45 +347,19 @@ def _reachable_reason(v: Verdict, sha: str, where: str) -> str:
 
 
 def _reflog_reason(v: Verdict) -> str:
-    """Обе sha каждой строки сырого logs/HEAD - предок сдачи или в refs/remotes."""
+    """Каждая sha, которую держит копия (reflog с обеих сторон, ORIG/FETCH/AUTO_MERGE)."""
     rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
     if rc != 0 or not gitdir.strip():
         v.unread = True
         return f"gitdir копии не прочитан (git rc {rc})"
-    shas, err = trash.reflog_shas(gitdir.strip())
+    held, err = trash.copy_shas(gitdir.strip())
     if err:
         v.unread = True
         return err
-    for sha in dict.fromkeys(shas):
-        why = _reachable_reason(v, sha, "записи reflog HEAD")
+    for label, sha in held:
+        why = _reachable_reason(v, sha, label)
         if why:
             return why
-    return ""
-
-
-def _pseudoref_reason(v: Verdict) -> str:
-    """ORIG_HEAD, FETCH_HEAD, AUTO_MERGE: каждая sha в них не живёт только здесь."""
-    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
-    if rc != 0 or not gitdir.strip():
-        v.unread = True
-        return f"gitdir копии не прочитан (git rc {rc})"
-    for name in PSEUDO_REFS:
-        try:
-            with open(os.path.join(gitdir.strip(), name), encoding="utf-8") as fh:
-                text = fh.read()
-        except FileNotFoundError:
-            continue
-        except (OSError, UnicodeDecodeError) as exc:
-            v.unread = True
-            return f"{name} не прочитан ({type(exc).__name__})"
-        shas = [m.group(1) for m in _PSEUDO_SHA.finditer(text)]
-        if text.strip() and not shas:
-            v.unread = True
-            return f"{name}: содержимое не разобрано, sha не найдено"
-        for sha in dict.fromkeys(shas):
-            why = _reachable_reason(v, sha, name)
-            if why:
-                return why
     return ""
 
 
@@ -584,7 +556,6 @@ def _git_verdict(v: Verdict) -> str:
         _head_reason,
         _reflog_reason,
         _gitdir_reason,
-        _pseudoref_reason,
         _nested_reason,
         _flags_reason,
         _tree_reason,
