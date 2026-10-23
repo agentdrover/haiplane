@@ -626,7 +626,7 @@ async def ensure_task_worktree(
         raise WorktreeRefused(
             f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
         )
-    if args[-1] == base and notes is not None:  # named only once git made the branch
+    if "--no-track" in args and args[-1] == base and notes is not None:  # after git
         notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
     return wt_path
 

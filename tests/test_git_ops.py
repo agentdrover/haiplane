@@ -3884,6 +3884,26 @@ async def test_a_refused_worktree_names_no_local_base(tmp_path):
     assert not any("ветка начата" in n for n in notes), notes
 
 
+async def test_a_task_branch_named_like_the_base_is_not_called_a_fallback(tmp_path):
+    """The branch already exists and only shares the base's name: nothing was started."""
+    origin = tmp_path / "origin.git"
+    _run_git("git", "init", "--bare", "-b", "develop", str(origin), cwd=tmp_path)
+    repo = tmp_path / "main"
+    _run_git("git", "clone", str(origin), str(repo), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "Test", cwd=repo)
+    (repo / "f.txt").write_text("x")
+    _run_git("git", "add", ".", cwd=repo)
+    _run_git("git", "commit", "-qm", "init", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+    _run_git("git", "checkout", "-qb", "main", cwd=repo)
+    notes: list[str] = []
+
+    await ensure_task_worktree(2039, "develop", str(repo), "develop", notes)
+
+    assert not any("ветка начата" in n for n in notes), notes
+
+
 async def test_without_origin_base_the_local_base_is_used_and_named(tmp_path):
     repo = tmp_path / "main"
     _git_setup(repo)  # no remote at all
