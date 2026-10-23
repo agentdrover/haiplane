@@ -6,7 +6,9 @@ worktree-копии на каноническом пути #459. Хаб подм
 
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,7 @@ class World:
         self.hooks: dict[str, Any] = {}
         self.broken: set[str] = set()
         self.down = False
+        self.fresh: set[int] = set()  # копии, чей gitdir не старят
 
     def wt(self, task_id: int) -> Path:
         return self.clone.parent / ".haiplane-worktrees" / f"task-{task_id}"
@@ -91,11 +94,26 @@ class World:
         _sh(path, "commit", "-q", "-m", name)
         return _sh(path, "rev-parse", "HEAD")
 
+    def age_all(self) -> None:
+        """Состарить gitdir копий (HEAD, index, logs/HEAD) на 2 часа."""
+        old = time.time() - 7200
+        for n in list(self.tasks):
+            if n in self.fresh or not self.wt(n).exists():
+                continue
+            gd = self.wt(n) / ".git"
+            if not gd.is_file():
+                continue
+            gitdir = Path(gd.read_text().split("gitdir:")[1].strip())
+            for name in ("HEAD", "index", "logs/HEAD"):
+                if (gitdir / name).exists():
+                    os.utime(gitdir / name, (old, old))
+
     def api(self, method: str, path: str, body: Any = None, **kw: Any) -> Any:
         self.calls.append(path)
         hook = self.hooks.get(path)
         if hook:
             hook()
+            self.age_all()
         if self.down or path in self.broken:
             raise SystemExit(1)
         if path.startswith("/api/projects"):
@@ -152,6 +170,7 @@ class World:
 
     def run(self, *argv: str, monkeypatch: pytest.MonkeyPatch) -> int:
         monkeypatch.setattr(cli, "_api", self.api)
+        self.age_all()
         parsed = cli.build_parser().parse_args(["worktree", *argv])
         return int(parsed.func(parsed))
 
@@ -247,7 +266,7 @@ def test_prune_never_removes_when_the_status_is_unknown(
     real_git = prune._git
 
     def flaky(cwd: Any, *args: str, **kw: Any) -> Any:
-        if args[:1] == ("status",) and Path(cwd).name == "task-101":
+        if "status" in args and Path(cwd).name == "task-101":
             return 128, "", "fatal: boom"
         return real_git(cwd, *args, **kw)
 
@@ -451,3 +470,251 @@ def test_prune_keeps_a_path_that_now_holds_another_repository(
     out = capsys.readouterr().out
     assert w.wt(101).is_dir()
     assert any("чужой клон" in x for x in _lines(out, 101)), out
+
+
+def test_prune_sees_untracked_files_even_when_git_is_told_to_hide_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """status.showUntrackedFiles=no прячет файлы и от git worktree remove."""
+    w = World(tmp_path)
+    w.add(101)
+    _sh(w.clone, "config", "status.showUntrackedFiles", "no")
+    (w.wt(101) / "new_source.py").write_text("work")
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert (w.wt(101) / "new_source.py").read_text() == "work"
+    assert any("не чисто" in x for x in _lines(out, 101)), out
+
+
+def test_prune_keeps_a_copy_with_a_nested_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """.claude/worktrees/ внутри копии игнорируется git, но удаление его сотрёт."""
+    w = World(tmp_path)
+    w.add(101)
+    ignore = w.wt(101) / ".git"
+    info = Path(_sh(w.wt(101), "rev-parse", "--git-path", "info/exclude"))
+    info = info if info.is_absolute() else w.wt(101) / info
+    info.parent.mkdir(parents=True, exist_ok=True)
+    info.write_text(".claude/worktrees/\n")
+    assert ignore.exists()
+    inner = w.wt(101) / ".claude" / "worktrees" / "other"
+    inner.parent.mkdir(parents=True)
+    _sh(w.clone, "worktree", "add", "-q", "-b", "task-999/inner", str(inner), "develop")
+    (inner / "wip.txt").write_text("uncommitted")
+    assert _sh(w.wt(101), "status", "--porcelain") == ""
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert (inner / "wip.txt").read_text() == "uncommitted"
+    assert any("внутри копии" in x for x in _lines(out, 101)), out
+
+
+def test_prune_keeps_a_copy_with_a_nested_repository_not_in_the_worktree_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+    info = Path(_sh(w.wt(101), "rev-parse", "--git-path", "info/exclude"))
+    info = info if info.is_absolute() else w.wt(101) / info
+    info.parent.mkdir(parents=True, exist_ok=True)
+    info.write_text("scratch/\n")
+    nested = w.wt(101) / "scratch" / "repo"
+    nested.mkdir(parents=True)
+    _sh(nested, "init", "-q")
+    (nested / "x.txt").write_text("keep")
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    assert (nested / "x.txt").read_text() == "keep"
+    assert "вложенный git-репозиторий" in capsys.readouterr().out
+
+
+def test_prune_keeps_a_copy_with_a_detached_commit_only_it_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Коммит сделан и потерян из виду (checkout --detach, затем назад): reflog помнит."""
+    w = World(tmp_path)
+    w.add(101)
+    _sh(w.wt(101), "switch", "-q", "--detach")
+    w.commit(101, "lost.txt")
+    _sh(w.wt(101), "switch", "-q", w.tasks[101]["branch"])
+    assert _sh(w.wt(101), "status", "--porcelain") == ""
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert w.wt(101).is_dir()
+    assert any("есть только в этой копии" in x for x in _lines(out, 101)), out
+
+
+def test_prune_accepts_a_reflog_commit_that_is_on_a_remote_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+    extra = w.commit(101, "pushed.txt")
+    _sh(w.wt(101), "reset", "-q", "--hard", "HEAD~1")
+    # extra живёт только в reflog копии, но уже есть на удалённой ветке
+    _sh(w.clone, "update-ref", "refs/remotes/origin/pushed-only", extra)
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    assert not w.wt(101).exists()
+
+
+def test_prune_keeps_a_recently_touched_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+    w.add(102)
+    w.fresh.add(101)  # gitdir 101 только что менялся
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert w.wt(101).is_dir() and not w.wt(102).exists()
+    assert any("менялась" in x and "мин назад" in x for x in _lines(out, 101)), out
+    # порог - параметр: с нулём та же копия уходит
+    assert (
+        w.run(
+            "prune", "--apply", "--min-idle-minutes", "0", "--repo", str(w.clone),
+            monkeypatch=monkeypatch,
+        )
+        == 0
+    )  # fmt: skip
+    assert not w.wt(101).exists()
+
+
+@pytest.mark.parametrize("name", ["HEAD", "index", "logs/HEAD"])
+def test_prune_keeps_a_copy_when_any_gitdir_file_is_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+    w.age_all()
+    gitdir = Path(_sh(w.wt(101), "rev-parse", "--absolute-git-dir"))
+    os.utime(gitdir / name, None)  # только этот файл свежий
+    monkeypatch.setattr(w, "age_all", lambda: None)  # run() не должен его состарить
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    assert w.wt(101).is_dir()
+
+
+def test_prune_looking_does_not_make_a_copy_look_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git status без --no-optional-locks переписывает index и сам освежает простой."""
+    w = World(tmp_path)
+    w.add(101)
+    w.age_all()
+    future = time.time() + 5
+    os.utime(w.wt(101) / "f.txt", (future, future))  # index станет устаревшим
+    gitdir = Path(_sh(w.wt(101), "rev-parse", "--absolute-git-dir"))
+    before = (gitdir / "index").stat().st_mtime
+    monkeypatch.setattr(w, "age_all", lambda: None)
+    w.run(
+        "prune",
+        "--min-idle-minutes",
+        "0",
+        "--repo",
+        str(w.clone),
+        monkeypatch=monkeypatch,
+    )
+    assert (gitdir / "index").stat().st_mtime == before
+
+
+def test_prune_keeps_a_copy_when_the_reflog_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+    real_git = prune._git
+
+    def flaky(cwd: Any, *args: str, **kw: Any) -> Any:
+        if "reflog" in args:
+            return 128, "", "fatal: boom"
+        return real_git(cwd, *args, **kw)
+
+    monkeypatch.setattr(prune, "_git", flaky)
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
+    )
+    assert w.wt(101).is_dir()
+    assert "reflog HEAD не прочитан" in capsys.readouterr().out
+
+
+def test_prune_keeps_a_copy_around_a_registered_worktree_without_dot_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Вложенная запись в списке клона, а её .git-файл пропал: обход его не увидит."""
+    w = World(tmp_path)
+    w.add(101)
+    info = Path(
+        _sh(
+            w.wt(101),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        )
+    )
+    info.parent.mkdir(parents=True, exist_ok=True)
+    info.write_text("nested/\n")
+    inner = w.wt(101) / "nested" / "other"
+    inner.parent.mkdir()
+    _sh(w.clone, "worktree", "add", "-q", "-b", "task-998/inner", str(inner), "develop")
+    (inner / ".git").unlink()
+    (inner / "wip.txt").write_text("keep")
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert (inner / "wip.txt").read_text() == "keep"
+    assert any("другой worktree клона" in x for x in _lines(out, 101)), out
+
+
+def test_prune_does_not_take_an_external_worktree_behind_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Канонический task-N - симлинк на внешнюю зарегистрированную копию."""
+    w = World(tmp_path)
+    w.add(102)  # чтобы существовал каталог .haiplane-worktrees
+    ext = tmp_path / "personal" / "task-101"
+    ext.parent.mkdir()
+    _sh(w.clone, "worktree", "add", "-q", "-b", "task-101/work", str(ext), "develop")
+    w.tasks[101] = {**w.tasks[102], "id": 101, "branch": "task-101/work"}
+    w.tasks[101]["submission_sha"] = _sh(ext, "rev-parse", "HEAD")
+    w.delivery[101] = {"state": "delivered"}
+    w.wt(101).symlink_to(ext)
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert ext.is_dir()
+    assert any(str(ext) in x and "канонического" in x for x in out.splitlines()), out
+
+
+def test_prune_does_not_take_a_canonical_path_that_is_itself_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import shutil
+
+    w = World(tmp_path)
+    w.add(101)
+    moved = tmp_path / "moved-101"
+    shutil.move(str(w.wt(101)), str(moved))
+    w.wt(101).symlink_to(moved)
+    gitdir_file = w.clone / ".git" / "worktrees" / "task-101" / "gitdir"
+    gitdir_file.write_text(f"{w.wt(101)}/.git\n")
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert moved.is_dir()
+    assert "симлинк" in out, out

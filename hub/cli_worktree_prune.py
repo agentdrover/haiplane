@@ -15,6 +15,21 @@ status`` ответил rc 0 и пусто. Всё остальное - «ост
 по ВСЕМ копиям собираются до первого удаления; прямо перед каждым удалением
 ветка, HEAD и чистота проверяются заново. Удаляет только ``git worktree remove``
 без ``--force``; локальные ветки и блокировки не трогаются.
+
+Класс риска «проверка видит чистую копию, а удаление уничтожает работу»
+(Codex, раунд 2): статус читается с ``--untracked-files=all`` (настройка
+``status.showUntrackedFiles=no`` прячет файлы и от git worktree remove); внутри
+копии не должно быть вложенного ``.git`` и чужих worktree клона; каждая запись
+reflog HEAD копии обязана быть предком submission_sha или достижима из
+refs/remotes (иначе коммит живёт только здесь); gitdir копии (HEAD, index,
+logs/HEAD) не менялся последние ``--min-idle-minutes`` минут (по умолчанию 30);
+канонический путь и его лист - не симлинки.
+
+ПРИНЯТЫЙ ОСТАТОЧНЫЙ РИСК. Между последней проверкой и ``git worktree remove``
+остаётся окно в миллисекунды, в котором исполнитель теоретически успеет
+сделать коммит. Закрыть его целиком можно только координацией с исполнителем
+(блокировка копии), её здесь нет; окно сужено до минимума: проверка ветки, HEAD,
+reflog, статуса, вложенных репозиториев и простоя идёт последним шагом.
 """
 
 from __future__ import annotations
@@ -24,10 +39,12 @@ import os
 import re
 import subprocess  # nosec B404 - только git, список аргументов, без shell
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 GIT_TIMEOUT_S = 60
+DEFAULT_MIN_IDLE_MINUTES = 30.0
 _TASK_DIR = re.compile(r"^task-(\d+)$")
 _TASK_BRANCH = re.compile(r"^refs/heads/task-(\d+)/.+")
 _STRAY_SIBLING = re.compile(r"-task-\d+$")
@@ -58,6 +75,8 @@ class Verdict:
     remove: bool = False
     reason: str = ""
     unread: bool = False  # причина - «не прочитано», а не «условие не выполнено»
+    others: tuple[str, ...] = ()  # остальные worktree клона (для вложенности)
+    min_idle: float = DEFAULT_MIN_IDLE_MINUTES
 
 
 def _git(cwd: Any, *args: str, **_kw: Any) -> tuple[int, str, str]:
@@ -108,14 +127,22 @@ def _current_toplevel() -> str:
 
 
 def _canonical_id(path: str, clone: str) -> tuple[int | None, str]:
-    """ID задачи из пути и причина, если путь не канонический (#459)."""
+    """ID задачи из пути и причина, если путь не канонический (#459).
+
+    realpath - только для корня ``.<клон>-worktrees`` (на macOS /tmp это
+    /private/tmp). Лист ``task-N`` берётся как записан и не должен быть
+    симлинком: иначе внешний worktree выдаёт себя за канонический.
+    """
     from hub.integrations.git_ops import task_worktree_path
 
-    match = _TASK_DIR.match(os.path.basename(path.rstrip("/")))
-    expected_dir = os.path.dirname(task_worktree_path(0, clone))
-    if match and _real(task_worktree_path(int(match.group(1)), clone)) == _real(path):
-        return int(match.group(1)), ""
-    return None, f"вне канонического пути {expected_dir}/task-N"
+    root = _real(os.path.dirname(task_worktree_path(0, clone)))
+    leaf = os.path.abspath(path)
+    match = _TASK_DIR.match(os.path.basename(leaf))
+    if not match or _real(os.path.dirname(leaf)) != root:
+        return None, f"вне канонического пути {root}/task-N"
+    if os.path.islink(leaf):
+        return None, f"канонический путь {leaf} - симлинк: внешняя копия не трогается"
+    return int(match.group(1)), ""
 
 
 def _local_verdict(entry: Entry, clone: str, current: str, is_main: bool) -> Verdict:
@@ -236,8 +263,70 @@ def _delivery_verdict(v: Verdict, hub: _Hub, task: dict[str, Any]) -> None:
         v.sha = str(task["submission_sha"])
 
 
+def _reflog_reason(v: Verdict) -> str:
+    """Каждая запись reflog HEAD - предок сдачи или есть в refs/remotes."""
+    rc, out, err = _git(v.path, "reflog", "--format=%H", "HEAD")
+    if rc != 0:
+        v.unread = True
+        return f"reflog HEAD не прочитан (git rc {rc}: {err.strip()[:120]})"
+    for sha in dict.fromkeys(out.split()):
+        rc, _, _ = _git(v.path, "merge-base", "--is-ancestor", sha, v.sha)
+        if rc == 0:
+            continue
+        if rc != 1:
+            v.unread = True
+            return f"запись reflog {sha[:12]} не сверена со сдачей (git rc {rc})"
+        rc, listed, _ = _git(
+            v.path, "for-each-ref", "--count=1", "--contains", sha, "refs/remotes"
+        )
+        if rc != 0:
+            v.unread = True
+            return f"запись reflog {sha[:12]} не сверена с refs/remotes (git rc {rc})"
+        if not listed.strip():
+            return f"коммит {sha[:12]} из reflog HEAD есть только в этой копии"
+    return ""
+
+
+def _nested_reason(v: Verdict) -> str:
+    """Вложенный .git или чужой worktree клона внутри копии: удаление их сотрёт."""
+    root = _real(v.path)
+    for other in v.others:
+        inside = _real(other)
+        if inside != root and inside.startswith(root + os.sep):
+            return f"внутри копии лежит другой worktree клона: {other}"
+    for here, dirs, files in os.walk(root, followlinks=False):
+        hit = [n for n in (*dirs, *files) if n == ".git" and here != root]
+        if hit:
+            return f"внутри копии вложенный git-репозиторий или worktree: {here}"
+    return ""
+
+
+def _idle_reason(v: Verdict) -> str:
+    """HEAD, index, logs/HEAD gitdir копии не менялись последние min_idle минут."""
+    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir.strip():
+        v.unread = True
+        return f"gitdir копии не прочитан (git rc {rc})"
+    newest = 0.0
+    for name in ("HEAD", "index", os.path.join("logs", "HEAD")):
+        try:
+            newest = max(newest, os.stat(os.path.join(gitdir.strip(), name)).st_mtime)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            v.unread = True
+            return f"{name} в gitdir копии не прочитан ({type(exc).__name__})"
+    age_min = (time.time() - newest) / 60
+    if age_min < v.min_idle:
+        return f"копия менялась {age_min:.0f} мин назад (< {v.min_idle:g}): возможно, в работе"
+    return ""
+
+
 def _git_verdict(v: Verdict) -> str:
-    """HEAD <= submission_sha и чистота; "" - можно, иначе причина."""
+    """HEAD <= submission_sha, reflog, чистота, вложенность, простой; "" - можно."""
+    why = _idle_reason(v)  # первым: дальнейшие git-вызовы не должны трогать gitdir
+    if why:
+        return why
     rc, head, _ = _git(v.path, "rev-parse", "HEAD")
     if rc != 0 or not head.strip():
         v.unread = True
@@ -252,16 +341,29 @@ def _git_verdict(v: Verdict) -> str:
         return (
             f"сдача {v.sha[:12]} не сверена с HEAD (git rc {rc}: {err.strip()[:120]})"
         )
-    rc, out, err = _git(v.path, "status", "--porcelain")
+    why = _reflog_reason(v)
+    if why:
+        return why
+    rc, out, err = _git(
+        v.path,
+        "--no-optional-locks",  # status не должен обновлять index: он считается простоем
+        "-c",
+        "status.showUntrackedFiles=all",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
     if rc != 0:
         v.unread = True
         return f"чистота не определена: git status rc {rc} {err.strip()[:120]}"
     if out.strip():
         return "не чисто: есть незакоммиченные или неотслеживаемые файлы"
-    return ""
+    return _nested_reason(v)
 
 
-def _decide(entries: list[Entry], clone: str, hub: _Hub) -> list[Verdict]:
+def _decide(
+    entries: list[Entry], clone: str, hub: _Hub, min_idle: float
+) -> list[Verdict]:
     """Фазы 1-3 по всем копиям; удалений здесь нет."""
     current = _current_toplevel()
     verdicts = sorted(
@@ -271,9 +373,11 @@ def _decide(entries: list[Entry], clone: str, hub: _Hub) -> list[Verdict]:
         ),
         key=lambda x: x.path,
     )
+    everywhere = tuple(e.path for e in entries)
     for v in verdicts:
         if v.reason:
             continue
+        v.others, v.min_idle = everywhere, min_idle
         _hub_verdict(v, hub)
         if not v.reason:
             v.reason = _git_verdict(v)
@@ -345,7 +449,8 @@ def run_prune(
         )
         return 1
     entries = _parse_porcelain(text)
-    verdicts = _decide(entries, clone, _Hub(api, refusal, clone))
+    idle = float(getattr(args, "min_idle_minutes", DEFAULT_MIN_IDLE_MINUTES))
+    verdicts = _decide(entries, clone, _Hub(api, refusal, clone), idle)
     for v in verdicts:
         out(f"{'удалить ' if v.remove else 'оставить'} {v.path}{_label(v)}: {v.reason}")
     for path in _strays(clone, entries):
@@ -365,6 +470,12 @@ def add_arguments(parser: Any) -> None:
     parser.add_argument("target", metavar="N|prune", help="task id, or 'prune'")
     parser.add_argument(
         "--repo", default="", help="Clone path (default: current git clone)"
+    )
+    parser.add_argument(
+        "--min-idle-minutes",
+        type=float,
+        default=DEFAULT_MIN_IDLE_MINUTES,
+        help="prune: keep a copy whose gitdir changed more recently (default 30)",
     )
     parser.add_argument(
         "--apply", action="store_true", help="prune: actually remove (default: list)"
