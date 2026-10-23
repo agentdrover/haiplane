@@ -235,7 +235,10 @@ def test_prune_apply_only_moves_never_removes(
     assert len(moves) == 1 and moves[0][2] == str(w.wt(101)), seen
     assert Path(moves[0][3]).parent == w.trash(), seen
     assert not [a for a in seen if a[:2] == ("worktree", "remove")]
-    assert not [a for a in seen if a[0] in ("branch", "update-ref")]
+    assert not [a for a in seen if a[0] == "branch"]
+    # update-ref - только защитные refs карантина и только создание
+    refs = [a for a in seen if a[0] == "update-ref"]
+    assert refs and all(a[1].startswith("refs/haiplane-trash/") for a in refs), refs
 
 
 def test_prune_keeps_a_copy_whose_task_has_no_submission_sha(

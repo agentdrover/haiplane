@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from hub import cli_worktree_prune as prune
-from hub import cli_worktree_purge as purge
 from tests.worktree_prune_support import World, _lines, _sh
 
 
@@ -50,109 +48,6 @@ def test_prune_apply_moves_the_copy_to_the_trash_and_keeps_it_registered(
     # ветка цела, копия отцеплена от неё: hp-hub worktree N заведёт новую
     assert w.tasks[101]["branch"] in _sh(w.clone, "branch", "--format=%(refname:short)")
     assert _sh(moved[0], "branch", "--show-current") == ""
-
-
-def _trash_copy(w: World, task_id: int, stamp: str, branch: str) -> Path:
-    w.trash().mkdir(parents=True, exist_ok=True)
-    path = w.trash() / f"task-{task_id}-{stamp}"
-    _sh(w.clone, "worktree", "add", "-q", "-b", branch, str(path), "develop")
-    return path
-
-
-def test_purge_removes_only_old_trash_copies_and_dry_run_touches_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    w = World(tmp_path)
-    now = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
-    old = _trash_copy(w, 101, "20200101T000000", "task-101/old")
-    young = _trash_copy(w, 102, now, "task-102/young")
-    junk = w.trash() / "junk"
-    _sh(w.clone, "worktree", "add", "-q", "-b", "task-9/junk", str(junk), "develop")
-    outside = w.wt(103).parent / "task-103-20200101T000000"
-    outside.parent.mkdir(exist_ok=True)
-    _sh(
-        w.clone,
-        "worktree",
-        "add",
-        "-q",
-        "-b",
-        "task-103/outside",
-        str(outside),
-        "develop",
-    )
-
-    assert w.run("purge", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
-    dry = capsys.readouterr().out
-    assert all(p.is_dir() for p in (old, young, junk, outside)), (
-        "dry-run ничего не трогает"
-    )
-    assert "сут" in dry and str(old) in dry
-    assert any("удалить" in x and "task-101" in x for x in dry.splitlines()), dry
-
-    assert (
-        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
-    )
-    out = capsys.readouterr().out
-    assert not old.exists() and young.is_dir() and junk.is_dir() and outside.is_dir()
-    assert _real(old) not in [_real(Path(p)) for p in _registered(w)]
-    assert any("вне" in x and str(outside) in x for x in out.splitlines()), out
-    assert any("шаблону" in x and "junk" in x for x in out.splitlines()), out
-
-    # порог - параметр: с нулём уходит и молодая; чужие по-прежнему нет
-    assert (
-        w.run("purge", "--apply", "--older-than-days", "0", "--repo", str(w.clone), monkeypatch=monkeypatch)
-        == 0
-    )  # fmt: skip
-    assert not young.exists() and junk.is_dir() and outside.is_dir()
-
-
-def test_purge_never_touches_canonical_copies_or_the_main_clone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    w = World(tmp_path)
-    w.add(101)
-    assert w.run("purge", "--apply", "--older-than-days", "0", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0  # fmt: skip
-    assert w.wt(101).is_dir() and w.clone.is_dir()
-
-
-def test_purge_failure_is_reported_with_a_nonzero_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    w = World(tmp_path)
-    old = _trash_copy(w, 101, "20200101T000000", "task-101/old")
-    real = purge._git
-
-    def failing(cwd: Any, *args: str, **kw: Any) -> Any:
-        if args[:2] == ("worktree", "remove"):
-            return 1, "", "error: boom"
-        return real(cwd, *args, **kw)
-
-    monkeypatch.setattr(purge, "_git", failing)
-    assert (
-        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
-    )
-    assert old.is_dir() and "ошибка" in capsys.readouterr().out
-
-
-def test_purge_removes_with_force_only_for_quarantine_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    w = World(tmp_path)
-    _trash_copy(w, 101, "20200101T000000", "task-101/old")
-    seen: list[tuple[str, ...]] = []
-    real = purge._git
-
-    def spy(cwd: Any, *args: str, **kw: Any) -> Any:
-        if args[:2] == ("worktree", "remove"):
-            seen.append(args)
-        return real(cwd, *args, **kw)
-
-    monkeypatch.setattr(purge, "_git", spy)
-    assert (
-        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
-    )
-    assert len(seen) == 1 and seen[0][:3] == ("worktree", "remove", "--force")
-    assert Path(seen[0][3]).parent.name == ".trash"
 
 
 # --- раунд 4: пункты 2a-2d ------------------------------------------------------
@@ -362,23 +257,3 @@ def test_prune_fingerprint_listing_error_after_the_checks_is_unread(
     out = capsys.readouterr().out
     assert rc != 0 and w.wt(101).is_dir() and len(calls) == 2
     assert any("отпечаток" in x and "не снят" in x for x in _lines(out, 101)), out
-
-
-def test_purge_refuses_a_trash_path_that_is_a_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import shutil
-
-    w = World(tmp_path)
-    link = _trash_copy(w, 101, "20200101T000000", "task-101/old")
-    real_dir = tmp_path / "elsewhere-101"
-    shutil.move(str(link), str(real_dir))
-    link.symlink_to(real_dir)
-    gitdir_file = w.clone / ".git" / "worktrees" / "task-101-20200101T000000" / "gitdir"
-    gitdir_file.write_text(f"{link}/.git\n")
-    assert (
-        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
-    )
-    out = capsys.readouterr().out
-    assert real_dir.is_dir()
-    assert any("симлинк" in x for x in out.splitlines()), out

@@ -20,9 +20,16 @@ status`` ответил rc 0 и пусто. Всё остальное - «ост
 копию ``git worktree move`` в ``<корень-копий>/.trash/task-N-<UTC>`` (gitdir,
 refs и содержимое целы, копия остаётся в ``git worktree list``, HEAD отцепляется
 от ветки на том же коммите, чтобы ``hp-hub worktree N`` мог завести новую копию).
-Вернуть: ``git worktree move <.trash/...> <канонический путь>`` и ``git switch
-<ветка>``. Окончательно убирает только ``hp-hub worktree purge --apply`` и только
-копии старше 7 суток (``--older-than-days``).
+Перед переносом в клоне ставятся защитные refs ``refs/haiplane-trash/<имя>/<k>``
+(HEAD, каждая запись reflog HEAD, sha из ORIG_HEAD/FETCH_HEAD/AUTO_MERGE), чтобы gc
+не убрал объекты, видимые только копии; после переноса в её gitdir пишется маркер
+(время, id задачи, старый путь, ветка, HEAD). Вернуть: ``hp-hub worktree restore
+<имя>`` (проверяет, что канонический путь свободен, двигает копию, делает
+``git switch <ветка>``, снимает refs и маркер). Окончательно убирает только
+``hp-hub worktree purge --apply``, и только копии с маркером, совпадающим с именем
+и HEAD, старше 7 суток по времени МАРКЕРА (``--older-than-days``, >= 1). Внутрь
+``.trash`` prune не заглядывает (путь не канонический), поэтому маркера нет в
+белом списке gitdir.
 
 Почему так (раунд 4). Доказать безопасность необратимого удаления проверками
 нельзя: каждый раунд ревью находил ещё одно место, где ценное состояние не
@@ -73,6 +80,8 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from hub import cli_worktree_trash as trash
 
 GIT_TIMEOUT_S = 60
 DEFAULT_MIN_IDLE_MINUTES = 30.0
@@ -700,12 +709,36 @@ def _quarantine(v: Verdict, clone: str) -> tuple[str, str]:
             "изменилась перед перемещением: отпечаток HEAD/reflog/gitdir разошёлся",
         )
     dest = _trash_dest(v, clone)
+    name = os.path.basename(dest)
+    refs, err = trash.protect(_git, clone, v.path, name)
+    if err:
+        v.unread = True
+        return "kept", f"защитные refs не созданы, копия осталась: {err}"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     rc, _, err = _git(clone, "worktree", "move", v.path, dest)
     if rc != 0:
+        if not os.path.lexists(dest):
+            trash.unprotect_refs(_git, clone, refs)  # копия не ушла: защита не нужна
         return "failed", _failed_move(v, dest, rc, err)
     rc, _, err = _git(dest, "switch", "--detach")
     note = "" if rc == 0 else f" (ветка не освобождена: {err.strip()[:120]})"
+    return _write_marker(v, dest, name, note)
+
+
+def _write_marker(v: Verdict, dest: str, name: str, note: str) -> tuple[str, str]:
+    """Маркер карантина в gitdir уже перенесённой копии: без него purge её не тронет."""
+    _, gitdir, _ = _git(dest, "rev-parse", "--absolute-git-dir")
+    _, head, _ = _git(dest, "rev-parse", "HEAD")
+    marker = trash.make_marker(
+        int(v.task_id or 0), v.path, v.branch, head.strip(), name
+    )
+    err = (
+        trash.write_marker(gitdir.strip(), marker)
+        if gitdir.strip()
+        else "gitdir не прочитан"
+    )
+    if err:
+        return "failed", f"в карантине {dest}, но {err}: purge её не тронет{note}"
     return "moved", f"{dest}{note}"
 
 
@@ -753,7 +786,12 @@ def run_prune(
 
 def add_arguments(parser: Any) -> None:
     parser.add_argument(
-        "target", metavar="N|prune|purge", help="task id, 'prune' or 'purge'"
+        "target",
+        metavar="N|prune|purge|restore",
+        help="task id, 'prune', 'purge' or 'restore <name>'",
+    )
+    parser.add_argument(
+        "name", nargs="?", default="", help="restore: имя копии в .trash"
     )
     parser.add_argument(
         "--repo", default="", help="Clone path (default: current git clone)"
@@ -766,7 +804,7 @@ def add_arguments(parser: Any) -> None:
     )
     parser.add_argument(
         "--older-than-days",
-        type=float,
+        type=trash.days_arg,
         default=7.0,
         help="purge: remove quarantine copies older than this (default 7)",
     )
@@ -783,13 +821,15 @@ def dispatch(
     """``worktree N`` как раньше; ``prune`` - в карантин, ``purge`` - из карантина."""
     if args.target == "prune":
         return run_prune(args, api=api, refusal=refusal)
-    if args.target == "purge":
-        from hub.cli_worktree_purge import run_purge
+    if args.target in ("purge", "restore"):
+        from hub import cli_worktree_purge as purge
 
-        return run_purge(args)
+        return (
+            purge.run_purge(args) if args.target == "purge" else purge.run_restore(args)
+        )
     if not str(args.target).isdigit():
         print(
-            f"worktree: нужен номер задачи, prune или purge: {args.target!r}",
+            f"worktree: нужен номер задачи, prune, purge или restore: {args.target!r}",
             file=sys.stderr,
         )
         return 2

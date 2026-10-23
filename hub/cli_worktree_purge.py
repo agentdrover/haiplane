@@ -1,15 +1,26 @@
-"""``hp-hub worktree purge`` - окончательная уборка карантина (#2038).
+"""``hp-hub worktree purge`` и ``restore`` - вторая половина карантина (#2038).
 
-``hp-hub worktree prune --apply`` не удаляет копии, а переносит их в
-``<корень-копий>/.trash/task-N-<UTC yyyymmddThhmmss>`` через ``git worktree
-move``: gitdir, refs и содержимое целы, копия остаётся в ``git worktree list``.
-Удаление необратимо, поэтому его делает только эта команда и только для копий
-из ``.trash`` старше ``--older-than-days`` (7) по времени в имени.
+``prune --apply`` переносит копию в ``<корень-копий>/.trash/task-N-<UTC>`` (``git
+worktree move``), пишет маркер в её gitdir и ставит защитные refs в клоне (см.
+``cli_worktree_trash``). Удаление необратимо, поэтому его делает только ``purge``
+и только по доказательству, а не по имени каталога. Копия удаляется, если:
 
-Список без ``--apply`` ничего не трогает и показывает возраст каждой копии.
-Путь вне ``.trash`` (в том числе симлинк и каноническое ``task-N``) purge не
-принимает: ``git worktree remove --force`` применяется только к тому, что
-именно эта команда положила в карантин.
+* путь лежит прямо в ``.trash`` и не симлинк, имя ``task-N-<UTC yyyymmddThhmmss>``;
+* маркер есть, разбирается, его id задачи и имя совпадают с именем каталога, а
+  время переноса - с временем в имени (допуск 2 минуты);
+* HEAD в маркере равен текущему HEAD копии;
+* возраст по времени МАРКЕРА не меньше ``--older-than-days`` (>= 1, конечное);
+* время маркера не из будущего (допуск 5 минут).
+
+Всё иное - «оставить» с названной причиной; сбой маркера, HEAD или времени даёт
+ненулевой код возврата. Без ``--apply`` печатается список с возрастом. Удаление -
+``git worktree remove --force``, после удачи снимаются защитные refs; неудачное
+удаление оставляет refs.
+
+``restore <имя>``: (a) канонического пути не должно быть; (b) ``git worktree move``
+копии на канонический путь; (c) ``git switch <ветка из маркера>`` в ней; (d) снятие
+refs ``refs/haiplane-trash/<имя>/*`` и маркера. Любая проверка (a) или сбой шага
+останавливают восстановление с причиной и ненулевым кодом.
 """
 
 from __future__ import annotations
@@ -22,6 +33,7 @@ import time
 from calendar import timegm
 from typing import Any, Callable
 
+from hub import cli_worktree_trash as trash
 from hub.cli_worktree_prune import (
     TRASH_DIR,
     Entry,
@@ -31,38 +43,76 @@ from hub.cli_worktree_prune import (
     trash_root,
 )
 
-_TRASH_NAME = re.compile(r"^(task-\d+)-(\d{8}T\d{6})(?:-\d+)?$")
+_TRASH_NAME = re.compile(r"^task-(\d+)-(\d{8}T\d{6})(?:-\d+)?$")
 _DAY = 86400.0
+NAME_SKEW_S = 120  # время в имени против времени маркера
+FUTURE_SKEW_S = 300  # время из будущего дальше этого - подозрительно
 
 
-def _age_days(stamp: str) -> float | None:
+def _name_epoch(stamp: str) -> int | None:
     try:
-        moved = timegm(time.strptime(stamp, "%Y%m%dT%H%M%S"))
+        return timegm(time.strptime(stamp, "%Y%m%dT%H%M%S"))
     except ValueError:
         return None
-    return (time.time() - moved) / _DAY
 
 
-def _classify(entry: Entry, trash: str, older: float) -> tuple[str, str]:
-    """(действие, текст): purge | keep | skip (не относится к карантину)."""
+def _structure(entry: Entry, tdir: str) -> tuple[str, str, re.Match[str] | None]:
+    """(действие, текст, совпадение имени): skip | keep | proof (нужна проверка маркера)."""
     path = os.path.abspath(entry.path)
     name = os.path.basename(path)
     match = _TRASH_NAME.match(name)
-    inside = _real(os.path.dirname(path)) == trash
+    inside = _real(os.path.dirname(path)) == tdir
     if not match and not inside:
-        return "skip", ""
+        return "skip", "", None
     if not inside:
-        return "keep", f"имя как у карантина, но путь вне {trash}: purge не принимает"
+        return (
+            "keep",
+            f"имя как у карантина, но путь вне {tdir}: purge не принимает",
+            None,
+        )
     if not match:
-        return "keep", f"имя не по шаблону task-N-<UTC>: {name}"
+        return "keep", f"имя не по шаблону task-N-<UTC>: {name}", None
     if os.path.islink(path):
-        return "keep", "симлинк: purge не принимает"
-    age = _age_days(match.group(2))
-    if age is None:
-        return "keep", f"время в имени не разобрано: {name}"
-    if age < older:
-        return "keep", f"в карантине {age:.1f} сут < {older:g}"
-    return "purge", f"в карантине {age:.1f} сут >= {older:g}"
+        return "keep", "симлинк: purge не принимает", None
+    return "proof", "", match
+
+
+def _marker_problem(
+    path: str, match: re.Match[str]
+) -> tuple[dict[str, Any] | None, str]:
+    """Маркер, подтверждающий имя и HEAD, или причина отказа."""
+    name = os.path.basename(path)
+    rc, gitdir, _ = _git(path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir.strip():
+        return None, "gitdir копии не прочитан"
+    marker, err = trash.read_marker(gitdir.strip())
+    if marker is None:
+        return None, err
+    if marker["task_id"] != int(match.group(1)) or marker["name"] != name:
+        return None, "маркер не про эту копию: id задачи или имя не совпадают"
+    named = _name_epoch(match.group(2))
+    if named is None or abs(named - marker["moved_epoch"]) > NAME_SKEW_S:
+        return None, "время в имени не сходится со временем маркера"
+    rc, head, _ = _git(path, "rev-parse", "HEAD")
+    if rc != 0 or head.strip() != marker["head"]:
+        return None, "HEAD копии не равен HEAD в маркере: после карантина её меняли"
+    return marker, ""
+
+
+def _classify(entry: Entry, tdir: str, older: float) -> tuple[str, str, bool]:
+    """(действие, текст, аномалия): purge | keep | skip; аномалия даёт rc != 0."""
+    action, text, match = _structure(entry, tdir)
+    if action != "proof" or match is None:
+        return action, text, False
+    marker, problem = _marker_problem(os.path.abspath(entry.path), match)
+    if marker is None:
+        return "keep", problem, True
+    age_s = time.time() - marker["moved_epoch"]
+    if age_s < -FUTURE_SKEW_S:
+        return "keep", "время маркера из будущего: возраст не определить", True
+    if age_s / _DAY < older:
+        return "keep", f"в карантине {max(age_s, 0) / _DAY:.1f} сут < {older:g}", False
+    return "purge", f"в карантине {age_s / _DAY:.1f} сут >= {older:g}", False
 
 
 def _failed_purge(path: str, gitdir: str, rc: int, err: str) -> str:
@@ -75,41 +125,125 @@ def _failed_purge(path: str, gitdir: str, rc: int, err: str) -> str:
     return f"результат неизвестен: путь и gitdir исчезли, но git вернул ошибку: {tail}"
 
 
-def run_purge(args: Any, out: Callable[[str], None] = print) -> int:
+def _list_entries(args: Any) -> tuple[str, list[Entry]] | None:
     from hub.integrations.git_ops import clone_root
 
     clone = asyncio.run(clone_root(args.repo or "."))
     if not clone:
         print(f"{args.repo or '.'} не git-клон: нечего убирать", file=sys.stderr)
-        return 1
+        return None
     rc, text, err = _git(clone, "worktree", "list", "--porcelain")
     if rc != 0:
         print(
             f"git worktree list не прочитан (rc {rc}): {err.strip()}", file=sys.stderr
         )
+        return None
+    return clone, _parse_porcelain(text)
+
+
+def _purge_one(entry: Entry, clone: str, out: Callable[[str], None]) -> bool:
+    """Удалить копию и снять её refs; True - всё чисто."""
+    _, gitdir, _ = _git(entry.path, "rev-parse", "--absolute-git-dir")
+    rc, _, err = _git(clone, "worktree", "remove", "--force", entry.path)
+    if rc != 0:
+        out(
+            f"ошибка    {entry.path}: {_failed_purge(entry.path, gitdir.strip(), rc, err)}"
+        )
+        return False
+    bad = trash.unprotect(_git, clone, os.path.basename(entry.path))
+    if bad:
+        out(f"удалено   {entry.path}, но защитные refs не сняты: {bad}")
+        return False
+    out(f"удалено   {entry.path}")
+    return True
+
+
+def run_purge(args: Any, out: Callable[[str], None] = print) -> int:
+    listed = _list_entries(args)
+    if listed is None:
         return 1
-    trash, older = trash_root(clone), float(args.older_than_days)
-    plan = [(e, *_classify(e, trash, older)) for e in _parse_porcelain(text)]
-    for entry, action, why in plan:
+    clone, entries = listed
+    tdir, older = trash_root(clone), float(args.older_than_days)
+    plan = [(e, *_classify(e, tdir, older)) for e in entries]
+    failed = False
+    for entry, action, why, anomaly in plan:
         if action != "skip":
             word = "удалить  " if action == "purge" else "оставить "
             out(f"{word} {entry.path}: {why}")
+        failed = failed or anomaly
     if not args.apply:
         out(
-            f"dry-run: ничего не удалено; --apply убирает копии со строкой «удалить» из {TRASH_DIR}"
+            "dry-run: ничего не удалено; --apply убирает копии со строкой «удалить» "
+            f"из {TRASH_DIR}"
         )
-        return 0
-    failed = False
-    for entry, action, _why in plan:
-        if action != "purge":
-            continue
-        _, gitdir, _ = _git(entry.path, "rev-parse", "--absolute-git-dir")
-        rc, _, err = _git(clone, "worktree", "remove", "--force", entry.path)
-        if rc == 0:
-            out(f"удалено   {entry.path}")
-        else:
+        return 1 if failed else 0
+    for entry, action, _why, _anomaly in plan:
+        if action == "purge" and not _purge_one(entry, clone, out):
             failed = True
-            out(
-                f"ошибка    {entry.path}: {_failed_purge(entry.path, gitdir.strip(), rc, err)}"
-            )
     return 1 if failed else 0
+
+
+def run_restore(args: Any, out: Callable[[str], None] = print) -> int:
+    """Вернуть копию из карантина на канонический путь (шаги a-d из докстринга)."""
+    from hub.integrations.git_ops import _worktree_path
+
+    listed = _list_entries(args)
+    if listed is None:
+        return 1
+    clone, entries = listed
+    name, tdir = os.path.basename(args.name.rstrip("/")), trash_root(clone)
+    found = [e for e in entries if name and os.path.basename(e.path) == name]
+    match = _TRASH_NAME.match(name)
+    if not found or not match or _real(os.path.dirname(found[0].path)) != tdir:
+        print(
+            f"restore: в {tdir} нет зарегистрированной копии {args.name!r}",
+            file=sys.stderr,
+        )
+        return 1
+    path = os.path.abspath(found[0].path)
+    marker, problem = _marker_problem(path, match)
+    if marker is None:
+        print(f"restore: {problem}", file=sys.stderr)
+        return 1
+    canonical = _worktree_path(marker["task_id"], clone)
+    if os.path.abspath(marker["old_path"]) != os.path.abspath(canonical):
+        print(
+            f"restore: старый путь {marker['old_path']} не канонический {canonical}",
+            file=sys.stderr,
+        )
+        return 1
+    if os.path.lexists(canonical):
+        print(
+            f"restore: канонический путь {canonical} уже занят (новая копия задачи?): "
+            "уберите её сами или вернитесь к ней, карантин не тронут",
+            file=sys.stderr,
+        )
+        return 1
+    rc, _, err = _git(clone, "worktree", "move", path, canonical)
+    if rc != 0:
+        print(
+            f"restore: git worktree move rc {rc}: {err.strip()[:200]}", file=sys.stderr
+        )
+        return 1
+    rc, _, err = _git(canonical, "switch", marker["branch"])
+    if rc != 0:
+        print(
+            f"restore: копия на {canonical}, но git switch {marker['branch']} rc {rc}: "
+            f"{err.strip()[:200]}; маркер и refs оставлены",
+            file=sys.stderr,
+        )
+        return 1
+    _, gitdir, _ = _git(canonical, "rev-parse", "--absolute-git-dir")
+    bad = trash.unprotect(_git, clone, name)
+    try:
+        os.remove(os.path.join(gitdir.strip(), trash.MARKER))
+    except OSError as exc:
+        bad = bad or f"маркер не снят ({type(exc).__name__})"
+    out(f"восстановлена: {canonical} (ветка {marker['branch']})")
+    if bad:
+        print(
+            f"restore: копия возвращена, но уборка следов неполна: {bad}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0

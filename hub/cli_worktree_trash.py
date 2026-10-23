@@ -1,0 +1,155 @@
+"""Карантин копий задач: маркер, защитные refs, снятие защиты (#2038, раунд 5).
+
+``hp-hub worktree prune --apply`` переносит копию в ``.trash`` (см.
+``cli_worktree_prune``), ``purge`` убирает её окончательно, ``restore`` возвращает.
+Имя каталога не доказательство того, что копию положил в карантин prune, и срок в
+имени не доказательство возраста: каталог можно создать или перенести руками.
+Поэтому каждый перенос оставляет два следа, на которые опираются purge и restore:
+
+* маркер ``<gitdir копии>/haiplane-quarantine`` (JSON: время переноса, id задачи,
+  старый путь, ветка, HEAD, имя в карантине). Файл лежит в gitdir копии и уходит
+  вместе с ней; prune внутрь ``.trash`` не заглядывает, поэтому в белом списке
+  gitdir prune для него места нет;
+* защитные refs ``refs/haiplane-trash/<имя>/<k>`` в общем клоне: HEAD, каждая
+  запись reflog HEAD, каждая sha из ORIG_HEAD, FETCH_HEAD, AUTO_MERGE. Без них gc
+  вправе убрать объекты, на которые указывает только reflog или псевдо-ref копии.
+  Refs снимает только purge после удачного ``git worktree remove`` (или restore).
+
+Функции получают ``git`` - вызываемое ``(cwd, *args) -> (rc, out, err)`` вызывающего
+модуля, чтобы подмена git в тестах действовала и здесь.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import time
+from typing import Any, Callable
+
+MARKER = "haiplane-quarantine"
+REF_PREFIX = "refs/haiplane-trash"
+PSEUDO_REFS = ("ORIG_HEAD", "FETCH_HEAD", "AUTO_MERGE")
+_SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})(?:\s|$)", re.M)
+
+Git = Callable[..., tuple[int, str, str]]
+
+
+def pseudo_ref_shas(gitdir: str) -> tuple[list[str], str]:
+    """sha из ORIG_HEAD, FETCH_HEAD, AUTO_MERGE (первое поле строки) и ошибка чтения."""
+    found: list[str] = []
+    for name in PSEUDO_REFS:
+        try:
+            with open(os.path.join(gitdir, name), encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            return [], f"{name} не прочитан ({type(exc).__name__})"
+        shas = [m.group(1) for m in _SHA.finditer(text)]
+        if text.strip() and not shas:
+            return [], f"{name}: содержимое не разобрано, sha не найдено"
+        found.extend(shas)
+    return found, ""
+
+
+def protect(git: Git, clone: str, path: str, name: str) -> tuple[list[str], str]:
+    """Создать защитные refs для копии ``path``; при сбое откатить и вернуть ошибку."""
+    rc, gitdir, _ = git(path, "rev-parse", "--absolute-git-dir")
+    rc2, head, _ = git(path, "rev-parse", "HEAD")
+    rc3, log, _ = git(path, "reflog", "--format=%H", "HEAD")
+    if rc or rc2 or rc3 or not gitdir.strip():
+        return [], "HEAD, reflog или gitdir копии не прочитаны"
+    pseudo, err = pseudo_ref_shas(gitdir.strip())
+    if err:
+        return [], err
+    shas = list(dict.fromkeys([head.strip(), *log.split(), *pseudo]))
+    created: list[str] = []
+    for k, sha in enumerate(shas):
+        ref = f"{REF_PREFIX}/{name}/{k}"
+        rc, _, err = git(clone, "update-ref", ref, sha)
+        if rc != 0:
+            unprotect_refs(git, clone, created)
+            return [], f"git update-ref {ref} rc {rc}: {err.strip()[:120]}"
+        created.append(ref)
+    return created, ""
+
+
+def unprotect_refs(git: Git, clone: str, refs: list[str]) -> str:
+    """Удалить перечисленные refs; ошибка первой неудачи или пусто."""
+    bad = ""
+    for ref in refs:
+        rc, _, err = git(clone, "update-ref", "-d", ref)
+        if rc != 0 and not bad:
+            bad = f"git update-ref -d {ref} rc {rc}: {err.strip()[:120]}"
+    return bad
+
+
+def unprotect(git: Git, clone: str, name: str) -> str:
+    """Снять все защитные refs копии ``name``."""
+    rc, out, err = git(
+        clone, "for-each-ref", "--format=%(refname)", f"{REF_PREFIX}/{name}/"
+    )
+    if rc != 0:
+        return f"git for-each-ref rc {rc}: {err.strip()[:120]}"
+    return unprotect_refs(git, clone, out.split())
+
+
+def write_marker(gitdir: str, data: dict[str, Any]) -> str:
+    """Записать маркер атомарно; ошибка или пусто."""
+    path = os.path.join(gitdir, MARKER)
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+        os.replace(path + ".tmp", path)
+    except OSError as exc:
+        return f"маркер не записан ({type(exc).__name__}: {exc})"
+    return ""
+
+
+def make_marker(
+    task_id: int, old_path: str, branch: str, head: str, name: str
+) -> dict[str, Any]:
+    now = int(time.time())
+    return {
+        "version": 1,
+        "moved_epoch": now,
+        "moved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "task_id": task_id,
+        "old_path": old_path,
+        "branch": branch,
+        "head": head,
+        "name": name,
+    }
+
+
+def read_marker(gitdir: str) -> tuple[dict[str, Any] | None, str]:
+    """Маркер копии или причина, почему ему нельзя верить."""
+    try:
+        with open(os.path.join(gitdir, MARKER), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None, "нет маркера карантина: prune эту копию не клал"
+    except (OSError, ValueError) as exc:
+        return None, f"маркер не разобран ({type(exc).__name__})"
+    fields = ("moved_epoch", "task_id", "old_path", "branch", "head", "name")
+    if not isinstance(data, dict) or any(k not in data for k in fields):
+        return None, "маркер неполный"
+    if not isinstance(data["moved_epoch"], int) or not isinstance(data["task_id"], int):
+        return None, "маркер: время или id задачи не число"
+    return data, ""
+
+
+def days_arg(value: str) -> float:
+    """Тип ``--older-than-days``: конечное число не меньше 1 (nan, inf, <1 - отказ)."""
+    try:
+        days = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"не число: {value!r}") from None
+    if not math.isfinite(days) or days < 1:
+        raise argparse.ArgumentTypeError(
+            f"нужно конечное число не меньше 1 (сутки), получено {value!r}"
+        )
+    return days
