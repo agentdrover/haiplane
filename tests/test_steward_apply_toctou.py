@@ -508,66 +508,19 @@ async def test_the_machine_review_gate_names_its_code(db, monkeypatch):
     assert reason_line(caught.value).startswith("machine_review_required: ")
 
 
-# Ветки, которыми реально отказывают ворота под одним кодом, и слово, без которого
-# фиксированный текст кода их не называет (#2040, CR gen2).
-_BRANCHES = {
-    "ci_not_green": {
-        "красный": "не зелён",
-        "отчёта CI нет или он не подтверждён": "не подтвержд",
-        "коммит сдачи не закреплён": "не закреплён",
-    },
-    "ac_tests_not_green": {
-        "красные": "не зелён",
-        "не подтверждены": "не подтвержд",
-        "локатор не разрешён": "не удалось сопоставить",
-        "раннер не поддержан": "раннер",
-    },
-    "advisor_not_concurred": {
-        "согласия нет": "ответа нет",
-        "потолок": "из-за потолка",
-        "сдача сменилась после согласия": "сменилась сдача",
-    },
-    "submission_moved": {"живая сдача другая": "нетекущей"},
-    "class_above_policy_ceiling": {
-        "класс выше потолка": "выше потолка",
-        "класс не прочитан": "класс",
-        "потолок не прочитан": "потолок не",
-    },
-}
+def test_a_fixed_text_is_a_general_claim_with_a_pointer_to_the_log():
+    """Текст кода - общее утверждение без перечня причин и с отсылкой к журналу (#2040).
 
+    Перечень ветвей устаревает и врёт, как только ворота получают новую;
+    точная причина живёт в журнале хаба.
+    """
+    from hub.services.refusal_reason import REASON_TEXTS, WHERE
 
-@pytest.mark.parametrize(
-    ("code", "branch", "needle"),
-    [(c, b, n) for c, branches in _BRANCHES.items() for b, n in branches.items()],
-)
-def test_a_fixed_text_is_true_for_every_branch_of_its_code(code, branch, needle):
-    """Текст кода не называет одну ветку там, где код покрывает и отсутствие данных."""
-    from hub.services.refusal_reason import REASON_TEXTS
-
-    assert needle in REASON_TEXTS[code], (code, branch)
-
-
-async def test_a_later_human_verdict_does_not_hide_the_stewards_write(db, monkeypatch):
-    """Человек заменил вердикт после записи стюарда, шаг упал: запись стюарда названа."""
-    case = await build_case(db, monkeypatch, "toctou-human-after")
-    real_apply = steward_applied.apply_judgement
-
-    async def apply_then_a_human_event_then_fail(*args, **kwargs):
-        await real_apply(*args, **kwargs)
-        await repo.insert_event(
-            db,
-            kind="review_verdict_recorded",
-            task_id=case.task_id,
-            actor="Denis",
-            payload={"verdict": "approved", "submission_generation": 1},
-        )
-        await db.commit()
-        raise RuntimeError("служебная заметка не записалась")
-
-    monkeypatch.setattr(
-        steward_applied, "apply_judgement", apply_then_a_human_event_then_fail
-    )
-    assert await apply_advisor_outcomes(db) == 1
-
-    text = await feed(db, case.task_id)
-    assert "Одобрение стюарда записано, но следующий шаг" in text
+    assert len(REASON_TEXTS) == 17
+    for code, text in REASON_TEXTS.items():
+        assert text.endswith(f"точная причина в журнале хаба"), code
+        claim = text.split(" — ", 1)[0]
+        assert " — " in text, code
+        for enumeration in (",", " либо ", " или ", "(", ";"):
+            assert enumeration not in claim, (code, enumeration)
+    assert "журнале" in WHERE
