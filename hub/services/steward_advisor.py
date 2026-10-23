@@ -234,8 +234,8 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         if skip is not None:
             # #2024: approve стюарда не применится по причине вне советника —
             # платный заказ бесполезен. Пропуск не согласие; причина видна один раз.
-            if await advisor_skip.record_skip(db, task_id, generation, *skip):
-                await db.commit()
+            await advisor_skip.record_skip(db, task_id, generation, *skip)
+            await db.commit()  # и при повторе: INSERT..SELECT открыл транзакцию
             continue
         if await _order_one(db, task_id, generation):
             ordered += 1

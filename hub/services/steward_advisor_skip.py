@@ -43,6 +43,13 @@ log = logging.getLogger(__name__)
 EVENT_SKIPPED = "steward_advisor_skipped"
 CODE_CI_INTEGRITY = "ci_integrity"
 CODE_CLASS_CEILING = "class_above_policy_ceiling"
+#: Начало метки в строке ленты: события чистятся по сроку, лента живёт с задачей.
+MARK_PREFIX = "[пропуск-советника g="
+
+
+def mark_of(generation: int, code: str) -> str:
+    """Стабильный ключ (поколение, код) в тексте ленты - не зависит от причины."""
+    return f"{MARK_PREFIX}{generation} код={code}]"
 
 
 async def unapprovable_reason(
@@ -130,33 +137,27 @@ async def record_skip(
         f"Советник не заказан для сдачи {generation}: {detail}. Одобрение стюардом "
         "невозможно независимо от ответа советника (привратник применения "
         "отказал бы по той же причине); пропуск не согласие, вердикт за "
-        "человеком. Если причина снимется, заказ восстановится сам."
+        "человеком. Если причина снимется, заказ восстановится сам. "
+        + mark_of(generation, code)
     )
     payload = json.dumps(
         {"generation": generation, "code": code, "detail": detail},
         ensure_ascii=False,
     )
     # Проверка и запись — один оператор: два тика не запишут причину дважды. Метка
-    # «уже записано» — событие ИЛИ строка ленты: события чистятся по сроку, лента
-    # живёт столько же, сколько задача.
+    # «уже записано» — ключ в строке ленты, а не событие: события чистятся по
+    # сроку, лента живёт столько же, сколько задача.
     cursor = await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
         "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS ("
-        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
-        "AND json_extract(payload, '$.generation')=? "
-        "AND json_extract(payload, '$.code')=?) AND NOT EXISTS ("
-        "SELECT 1 FROM task_updates WHERE task_id=? AND content=?)",
+        "SELECT 1 FROM task_updates WHERE task_id=? AND instr(content, ?) > 0)",
         (
             EVENT_SKIPPED,
             task_id,
             int(project["id"]) if project is not None else None,
             payload,
-            EVENT_SKIPPED,
             task_id,
-            generation,
-            code,
-            task_id,
-            text,
+            mark_of(generation, code),
         ),
     )
     if cursor.rowcount != 1:
@@ -175,9 +176,15 @@ async def recorded_reason(
         "AND json_extract(payload, '$.generation')=? ORDER BY id DESC LIMIT 1",
         (EVENT_SKIPPED, task_id, generation),
     )
-    if not rows:
-        return ""
-    try:
-        return str(json.loads(dict(rows[0])["payload"]).get("detail") or "")
-    except ValueError:
-        return ""
+    if rows:
+        try:
+            return str(json.loads(dict(rows[0])["payload"]).get("detail") or "")
+        except ValueError:
+            return ""
+    # событие вычищено по сроку, а запись в ленте осталась
+    fed = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND instr(content, ?) > 0 LIMIT 1",
+        (task_id, f"{MARK_PREFIX}{generation} "),
+    )
+    return "причина записана в ленте задачи" if fed else ""

@@ -184,6 +184,19 @@ async def test_no_advisor_where_approve_cannot_apply(
     assert await order_due_advisors(db) == 0
     for case in (integrity, ceiling, nopair, overclass):
         assert len(await _skip_lines(db, case.task_id)) == 1
+        assert await _skips(db, case.task_id) == [], "событие не воскресло"
+        state = await advisor_state(db, case.task_id, 1)
+        assert state.skipped, "читатели видят пропуск и после чистки событий"
+    assert (await contour_counts(db)).advisor_skipped == 4
+    # причина изменилась (потолок поднят), ключ тот же - второй записи нет
+    await set_policy(
+        db,
+        ceiling.project_id,
+        {**policy_of(clean=None), "steward_approve_max_class": "r2"},
+    )
+    assert await order_due_advisors(db) == 0
+    assert len(await _skip_lines(db, ceiling.task_id)) == 1
+    assert not db.in_transaction, "пропуск не оставил открытую транзакцию"
 
 
 async def test_shadow_and_double_clean_still_order_the_advisor(

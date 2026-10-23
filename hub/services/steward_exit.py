@@ -154,7 +154,10 @@ async def contour_counts(
         "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "  # nosec B608 - constant fragments, values are params
         "r.status AS run_status, EXISTS (SELECT 1 FROM events e "
         "WHERE e.kind='steward_advisor_skipped' AND e.task_id=j.task_id "
-        "AND json_extract(e.payload, '$.generation')=j.generation) AS skipped "
+        "AND json_extract(e.payload, '$.generation')=j.generation) "
+        "OR EXISTS (SELECT 1 FROM task_updates u WHERE u.task_id=j.task_id "
+        "AND instr(u.content, '[пропуск-советника g=' || j.generation || ' ') > 0) "
+        "AS skipped "
         "FROM steward_judgements j "
         "LEFT JOIN steward_judgements a ON a.kind='advisor' "
         "AND a.task_id=j.task_id AND a.generation=j.generation "
