@@ -388,7 +388,7 @@ async def record_steward_judgement(
         verdict=effective_verdict,
         confidence=confidence,
         escalate_reason=effective_reason,
-        grounds=json.dumps([g.model_dump() for g in body.grounds], ensure_ascii=False),
+        grounds=json.dumps([g.stored() for g in body.grounds], ensure_ascii=False),
         findings=json.dumps(body.findings, ensure_ascii=False),
         closures=json.dumps(
             [c.model_dump() for c in body.closures], ensure_ascii=False
