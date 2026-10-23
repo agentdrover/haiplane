@@ -68,10 +68,13 @@ async def acting(db: aiosqlite.Connection) -> bool:
     from hub.services import steward_shadow
 
     try:
-        return (await steward_shadow.mode_report(db))["effective"] == "act"
+        mode = (await steward_shadow.mode_report(db))["effective"]
     except Exception as exc:  # noqa: BLE001
         log.warning("advisor skip: mode not read: %s", exc)
         return False
+    if mode != "act":
+        return False
+    return True
 
 
 async def unapprovable_reason(
