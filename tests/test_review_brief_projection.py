@@ -782,9 +782,10 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
 # нет «Справка по CI: … не проверена»; scan_hash в блоке ci_integrity; packet_hash прежний.
 # #1985: machine_review получил reviewed_sha и pin_verified (REST-бриф; пакет стюарда и packet_hash проверяются ниже).
+# #2026: блок ci_evidence получил поле expectation, ProfileDowngradeView — rules: REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
-GOLDEN_REST_BRIEF = "734d4f54e6b836f7159a527011c940e4c733875e644fb92b649aa27935378cc2"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "4b9eacf8f80bb2e8743d3a7f691431c0532b8ae8ec4a41ed66411748879704ab"  # pragma: allowlist secret
+GOLDEN_REST_BRIEF = "bc11488d3164849c9cd2d13b5a931ed809bcc70d7bd392f7ff1d5b65504e75e2"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "dcef91483d86785f5e1e771aa839dcf075ffdcf2b4b286bbc9fd970a56ea15ac"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 

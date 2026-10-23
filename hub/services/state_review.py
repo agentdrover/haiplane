@@ -229,7 +229,9 @@ def state_coverage(view: StateReviewView) -> EvidenceCoverage:
 
 
 def _ci_block(reason: str) -> CIEvidenceBlock:
-    return CIEvidenceBlock(state=NOT_APPLICABLE, reason=reason)
+    return CIEvidenceBlock(
+        state=NOT_APPLICABLE, expectation=NOT_APPLICABLE, reason=reason
+    )
 
 
 async def build_state_brief(
