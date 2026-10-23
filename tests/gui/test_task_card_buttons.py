@@ -482,7 +482,13 @@ def test_input_typed_while_the_sheet_post_is_in_flight_is_not_lost(
     )
     notes = [u for u in stand.updates_of(task_id) if u["kind"] == "decision"]
     assert notes and "Первая версия причины" in notes[-1]["content"]
-    page.wait_for_timeout(1_500)
+    # Ответ листа обработан браузером и карточка перечитана - только потом проверки.
+    page.wait_for_selector(
+        "#sh-return [data-c2-done]", state="attached", timeout=10_000
+    )
+    expect(page.locator("#c2-live")).to_have_attribute(
+        "data-status", "open", timeout=10_000
+    )
 
     form = page.locator("#sh-return form")
     assert form.get_attribute("data-sent") != "true", (
@@ -532,9 +538,12 @@ def test_typing_into_a_sent_sheet_withdraws_the_sent_mark(
         if held:
             break
         page.wait_for_timeout(100)
+    assert held, "обновление после листа не ушло"
     for route in held:
         route.continue_()
-    page.wait_for_timeout(1_500)
+    page.wait_for_function(
+        "document.getElementById('c2-live').dataset.status === 'open'"
+    )
     page.keyboard.press("Escape")
     page.wait_for_timeout(1_000)
     assert page.evaluate("window.marker") == "alive", "страница перезагрузилась"
