@@ -166,3 +166,34 @@ def test_public_reason_json_with_an_escaped_quote_in_the_path():
     out = public_reason(r'{"reason":"/srv/reviewer/pri\"vate.pem","ok":true}')
     assert json.loads(out) == {"reason": "<путь>", "ok": True}
     assert "vate" not in out and "reviewer" not in out
+
+
+def test_public_reason_a_quote_inside_a_name_followed_by_a_delimiter_does_not_end_it():
+    from hub.services.brief_failure import public_reason
+
+    forms = (
+        "'/srv/a',b c' tail",
+        "'/srv/a')b c' tail",
+        "'/srv/a';b c' tail",
+        "'/srv/a'|b c' tail",
+        "'/srv/a'>b c' tail",
+        "'/srv/a':b c' tail",
+        "'/srv/a'}b c' tail",
+        "'/srv/a\\'b c' tail",
+        "'/srv/a\\' b c' tail",
+        '"/srv/a\\" b c" tail',
+        '"/srv/a\\"b c" tail',
+        '"/srv/a",b c" tail',
+        "`/srv/a`,b c` tail",
+    )
+    for text in forms:
+        out = public_reason(text)
+        assert out == "<путь> tail", (text, out)
+    # Неясно, где конец: до пробела, знаки после пути теряются (цена известна).
+    assert public_reason("'/srv/a',b c d") == "<путь> c d"
+    assert public_reason("(see '/srv/x') ok") == "(see <путь> ok"
+    # Обычные случаи не затронуты.
+    assert public_reason("fatal: '/srv/x' and 'y' ok") == "fatal: <путь> and 'y' ok"
+    assert (
+        public_reason("fatal: '/srv/private clone/.git' down") == "fatal: <путь> down"
+    )
