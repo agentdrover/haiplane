@@ -23,6 +23,7 @@ default-ветка). GitVerse и существующие проекты не м
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -82,6 +83,75 @@ def _rendered(base: str, release: str, ac_runner: str) -> dict[str, str]:
 
 def _sender() -> str:
     return satellite_ci.render_sender(PRODUCER_NAME, PRODUCER_PATH)
+
+
+def _blob_sha(text: str) -> str:
+    data = text.encode("utf-8")
+    return hashlib.sha1(  # nosec B324 - git's object id, not a security hash
+        b"blob %d\0" % len(data) + data, usedforsecurity=False
+    ).hexdigest()
+
+
+def _foreign_on(
+    workspace: str, branch: str, files: dict[str, str]
+) -> tuple[SeedResult | None, bool]:
+    """Чужой CI на ``origin/<branch>`` (не в рабочей копии) и полна ли наша часть.
+
+    Решение берётся из удалённой ветки после fetch: общая копия может отставать,
+    и чужой workflow, уже лежащий в origin, она не покажет. Свои файлы (blob
+    совпал побайтно) чужими не считаются. ``(None, True)`` - всё уже лежит.
+    """
+    rc, out = workflow_seed._git(workspace, "fetch", "origin", branch)
+    if rc != 0:
+        return (
+            SeedResult(
+                UNAVAILABLE,
+                f"could not push the workflows to {branch}: could not fetch "
+                f"origin/{branch}: {out}",
+            ),
+            False,
+        )
+    rc, out = workflow_seed._git(
+        workspace,
+        "ls-tree",
+        "-r",
+        "--full-name",
+        f"origin/{branch}",
+        "--",
+        *workflow_seed.SCANNED_WORKFLOW_DIRS,
+    )
+    if rc != 0:
+        return (
+            SeedResult(UNAVAILABLE, f"could not read origin/{branch}: {out}"),
+            False,
+        )
+    foreign: list[str] = []
+    ours: set[str] = set()
+    for line in out.splitlines():
+        meta, _, path = line.partition("\t")
+        if not path.endswith(workflow_seed.WORKFLOW_SUFFIXES):
+            continue
+        name = os.path.basename(path)
+        expected = files.get(name)
+        blob = meta.split()[2] if len(meta.split()) > 2 else ""
+        if (
+            expected is not None
+            and path == os.path.join(WORKFLOWS_DIR, name)
+            and blob == _blob_sha(expected)
+        ):
+            ours.add(name)
+        else:
+            foreign.append(path)
+    if foreign:
+        return (
+            SeedResult(
+                PRESENT,
+                f"branch {branch} already carries workflows, none added: "
+                + ", ".join(sorted(foreign)),
+            ),
+            False,
+        )
+    return None, ours == set(files)
 
 
 def _publish_in_worktree(
@@ -194,15 +264,6 @@ def _commit_files(
     return SeedResult(SEEDED, "", tuple(sorted(files)))
 
 
-def _sync_clone(workspace: str, base: str) -> None:
-    """Best effort: fast-forward the shared clone to what was just pushed."""
-    if workflow_seed._current_branch(workspace) != base:
-        return
-    rc, dirty = workflow_seed._git(workspace, "status", "--porcelain")
-    if rc == 0 and not dirty:
-        workflow_seed._git(workspace, "merge", "--ff-only", f"origin/{base}")
-
-
 def _detail(base: str, default: str, read: bool) -> str:
     where = (
         f"{default}/{WORKFLOWS_DIR}: {brand.SEEDED_CI_REPORT} (sender)"
@@ -232,13 +293,29 @@ def seed_pair(
     files = _rendered(base_branch, release_branch, ac_runner)
     default, read = default_branch(workspace, base_branch)
     if not push:
-        files[brand.SEEDED_CI_REPORT] = _sender()
-        return workflow_seed.publish_files(
-            workspace, base_branch, WORKFLOWS_DIR, files, push=False
+        return SeedResult(
+            UNAVAILABLE,
+            "the verifiable pair is written to the remote only; a local-only "
+            "seed would write into the shared clone",
         )
     if default == base_branch:
         files[brand.SEEDED_CI_REPORT] = _sender()
-    else:
+    targets = [(base_branch, files)]
+    if default != base_branch:
+        targets.append((default, {brand.SEEDED_CI_REPORT: _sender()}))
+    complete = True
+    for branch, wanted in targets:
+        refusal, whole = _foreign_on(workspace, branch, wanted)
+        if refusal is not None:
+            return refusal
+        complete = complete and whole
+    if complete:
+        return SeedResult(
+            PRESENT,
+            "repository already carries workflows, none added (the hub's own "
+            f"pair): {STATUS}. {CHECKLIST}",
+        )
+    if default != base_branch:
         sent = _publish_in_worktree(
             workspace,
             default,
@@ -255,7 +332,6 @@ def seed_pair(
     )
     if result.state != SEEDED:
         return result
-    _sync_clone(workspace, base_branch)
     names = (
         *result.written,
         *(() if default == base_branch else (brand.SEEDED_CI_REPORT,)),

@@ -162,7 +162,8 @@ def _block_of(
             checked=checked,
         )
     reasons: Counter[str] = Counter()
-    final = True
+    # A submission with no report row is still waited for by the steward.
+    final = len(pairs) == len(submissions)
     for pair, report in zip(pairs, reports, strict=True):
         trust, reason = ci_trust.trust_of(report, fingerprint)
         if trust == ci_trust.VERIFIED:

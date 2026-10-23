@@ -643,3 +643,122 @@ async def test_a_push_that_did_not_move_the_remote_branch_is_not_success(
 
     assert "the remote branch is not at" in result["provision_detail"]
     assert "ожидает настройки владельцем" not in result["provision_detail"]
+
+
+async def _provision_ext(db, work: Path, slug: str, monkeypatch) -> dict:
+    project_id = await repo.create_project(db, slug=slug, name=slug.title())
+    await repo.update_project(
+        db,
+        project_id,
+        repo=f"agentdrover/{slug}",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+    return await services.provision_project(db, project_id)
+
+
+async def test_foreign_ci_on_the_remote_is_seen_even_when_the_clone_is_behind(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """The decision comes from origin/<branch>, not from the clone's working tree."""
+    work, origin = _repo_pair(tmp_path)
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "develop", str(origin), str(other)], check=True
+    )
+    _git(other, "config", "user.name", "T")
+    _git(other, "config", "user.email", "t@example.com")
+    (other / WORKFLOWS).mkdir(parents=True)
+    (other / WORKFLOWS / "theirs.yml").write_text("name: theirs\non: [push]\n", "utf-8")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-m", "their CI")
+    _git(other, "push", "origin", "develop")
+    heads = (_git(origin, "rev-parse", "develop"), _git(origin, "rev-parse", "main"))
+    assert not (work / ".github").exists(), "the clone is behind"
+
+    result = await _provision_ext(db, work, "ext8", monkeypatch)
+
+    assert (
+        _git(origin, "rev-parse", "develop"),
+        _git(origin, "rev-parse", "main"),
+    ) == heads
+    assert _tree(origin, "main") == []
+    assert "develop" in result["provision_detail"]
+    assert "theirs.yml" in result["provision_detail"]
+    assert "ожидает настройки владельцем" not in result["provision_detail"]
+
+
+async def test_provisioning_never_changes_the_shared_clone(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """Neither HEAD nor the working tree of the clone moves, checkout injected or not."""
+    from hub.services import external_ci_seed
+
+    work, origin = _repo_pair(tmp_path)
+    _git(work, "branch", "elsewhere")
+    real = external_ci_seed.default_branch
+
+    def switching(workspace: str, fallback: str):
+        found = real(workspace, fallback)
+        _git(work, "checkout", "elsewhere")
+        return found
+
+    monkeypatch.setattr(external_ci_seed, "default_branch", switching)
+    before_develop = _git(work, "rev-parse", "develop")
+
+    await _provision_ext(db, work, "ext9", monkeypatch)
+
+    assert _git(work, "rev-parse", "--abbrev-ref", "HEAD") == "elsewhere"
+    assert _git(work, "rev-parse", "develop") == before_develop, (
+        "develop not fast-forwarded"
+    )
+    assert _git(work, "rev-parse", "elsewhere") == before_develop
+    assert _git(work, "status", "--porcelain") == ""
+    assert not (work / ".github").exists()
+    assert _tree(origin, "develop") == [PRODUCER, "haiplane-stale.yml"]
+
+
+async def test_a_submission_without_a_report_keeps_the_wording_waiting(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """The steward still waits for a submission with no report row in the window."""
+    install_fake_github(monkeypatch)
+    proj = await _project(db, "ext-gap", steward=True)
+    reported = await _submitted_task(db, proj)
+    await _submission(db, reported, SHA)
+    await _report_without_provenance(db, reported, SHA)
+    silent = await _submitted_task(db, proj)
+    await _submission(db, silent, "b" * 40)
+
+    body = (await client.get("/api/projects/ext-gap/effective-policy")).json()
+
+    assert body["ci_trust"]["state"] == "unverified"
+    assert "подтверждение ожидается" in body["ci_trust"]["message"]
+    assert "судит без CI" not in body["ci_trust"]["message"]
+
+
+async def test_provisioning_leaves_the_clone_behind_the_remote_untouched(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """No fast-forward after the push: HEAD and the working tree stay as they were."""
+    work, origin = _repo_pair(tmp_path)
+    before = (
+        _git(work, "rev-parse", "HEAD"),
+        _git(work, "rev-parse", "--abbrev-ref", "HEAD"),
+        _git(work, "status", "--porcelain"),
+    )
+
+    await _provision_ext(db, work, "ext10", monkeypatch)
+
+    assert _tree(origin, "develop") == [PRODUCER, "haiplane-stale.yml"]
+    assert (
+        _git(work, "rev-parse", "HEAD"),
+        _git(work, "rev-parse", "--abbrev-ref", "HEAD"),
+        _git(work, "status", "--porcelain"),
+    ) == before
+    assert not (work / ".github").exists()
