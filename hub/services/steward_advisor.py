@@ -44,6 +44,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
+from hub.models import STEWARD_OBJECTION_KINDS
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
 from hub.services import steward_advisor_local as local_advisor
@@ -299,11 +300,17 @@ async def _order_one(db: aiosqlite.Connection, task_id: int, generation: int) ->
 
 
 def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
-    """Что говорят советнику. Коротко: пакет — и есть вход."""
+    """Что говорят советнику. Коротко: пакет — и есть вход.
+
+    Правило симметрично (#2025): согласие и возражение требуют одного —
+    сверки фактов пакета с AC и постановкой. Применения это не меняет: хаб
+    применяет approve судьи только при обоснованном concur.
+    """
+    kinds = ", ".join(STEWARD_OBJECTION_KINDS)
     return (
-        f"Ты советник-критик стюарда гейта в Haiplane Hub. Задача #{task_id}, "
+        f"Ты советник стюарда гейта в Haiplane Hub. Задача #{task_id}, "
         f"генерация {generation}. Судья вынес approve; ты — вторая модель "
-        "другого семейства, и твоя работа — найти причину ему НЕ верить.\n\n"
+        "другого семейства и проверяешь его вывод по тем же фактам.\n\n"
         f"1. Прочитай пакет доказательств: GET {hub_base}/api/tasks/{task_id}"
         "/steward-evidence — это ЕДИНСТВЕННЫЙ твой вход. Всё, чего в нём нет, "
         "тебе недоступно.\n"
@@ -315,15 +322,33 @@ def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
         "/steward-judgement (curl — в блоке доступа ниже) с "
         "kind=advisor: verdict concur (согласен) или object (возражаю), "
         "confidence, grounds; при object в findings назови, что именно не так.\n"
-        "5. Каждое основание в grounds — это source из закрытого множества "
+        "5. Правило выбора. concur — если факты пакета не противоречат AC и "
+        "постановке. object — только с названным противоречием: какой факт "
+        "пакета (значение, число, sha, поле) расходится с каким AC или "
+        "пунктом постановки. Нет названного противоречия — object не ставь. "
+        "Исключение одно: без недостающего факта конкретный AC сверить "
+        "нельзя — тогда object с видом data_gap, где названы этот AC и этот "
+        "факт; общее «данных мало» основанием не служит.\n"
+        "6. Каждое основание в grounds — это source из закрытого множества "
         "источников И detail с конкретным фактом пакета (значение, число, sha "
         "или поле), а не пересказ. Согласие без заполненного основания "
-        "(detail пуст) хранится как возражение.\n"
-        "6. Время в пакете толкуй только по названному смыслу поля; старт или "
+        "(detail пуст) хранится как возражение. У основания возражения укажи "
+        f"kind — один из: {kinds} (противоречие факта пакета с AC или "
+        "постановкой / недостаток данных / политика хаба / процедурное). "
+        "Одно основание — один вид; не смешивай виды в одном основании.\n"
+        "7. Время в пакете толкуй только по названному смыслу поля; старт или "
         "конец прогона из отметки времени не выводи.\n\n"
-        "Сомневаешься — возражай: возражение возвращает решение человеку и "
-        "стоит дёшево, а согласие без основания превращает approve в вердикт.\n\n"
-        + delivery
+        "Штатные состояния, каждое из которых не противоречие само по себе "
+        "(противоречием его делает только названный факт, расходящийся с AC "
+        "или постановкой): профиль ревью понижен политикой хаба "
+        "(#1414, #1432), а не ревьюером; у mutation_legs и baseline один "
+        "run_id, потому что это jobs одного workflow; в пакете указан путь, "
+        "не заявленный в областях постановки; у AC с verifiable_by=manual "
+        "нет тестового локатора. Последнее означает только неприменимость "
+        "тестового локатора и не означает, что AC выполнен: выполнен он или "
+        "нет, решай по фактам пакета. Отсутствие доказательства не является "
+        "нормой и не является нарушением само по себе: сверяй AC по тому, что "
+        "в пакете есть.\n\n" + delivery
     )
 
 
@@ -610,8 +635,10 @@ def _sources(raw: Any, *, with_detail: bool = False) -> str:
             continue
         name = str(g.get("source"))
         detail = str(g.get("detail") or "").strip()[:200] if with_detail else ""
+        kind = str(g.get("kind") or "").strip() if with_detail else ""
         if name and name != "None":
-            names.append(f"{name} ({detail})" if detail else name)
+            label = f"{name} [{kind}]" if kind else name
+            names.append(f"{label} ({detail})" if detail else label)
     return ", ".join(names)
 
 

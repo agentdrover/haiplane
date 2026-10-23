@@ -57,6 +57,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import fetchall
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
+from hub.services.steward_objection import empty_kind_counts, objection_kind
 
 #: Минимум пар (approve судьи с полученным ответом советника).
 ACT_MIN_PAIRS = 20
@@ -111,6 +112,8 @@ class ContourCounts:
     advisor_timeout: int = 0
     advisor_refused: int = 0
     advisor_pending: int = 0
+    #: object по видам основания (#2025); сумма равна ``object``
+    object_by_kind: dict[str, int] = field(default_factory=dict)
     #: номера задач по процедурным эскалациям — отдельной строкой в сводке
     procedural_by_reason: dict[str, int] = field(default_factory=dict)
 
@@ -149,7 +152,8 @@ async def contour_counts(
         params.append(f"-{int(since_days)} days")
     rows = await fetchall(
         db,
-        "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "  # nosec B608 - constant fragments, values are params
+        "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "
+        "a.grounds AS adv_grounds, "  # nosec B608 - constant fragments, values are params
         "r.status AS run_status "
         "FROM steward_judgements j "
         "LEFT JOIN steward_judgements a ON a.kind='advisor' "
@@ -173,6 +177,7 @@ async def contour_counts(
         "advisor_pending": 0,
     }
     by_reason: dict[str, int] = {}
+    by_kind = empty_kind_counts()
     for row in rows:
         item = dict(row)
         c["judged"] += 1
@@ -194,13 +199,14 @@ async def contour_counts(
                 c["concur"] += 1
             elif adv == "object":
                 c["object"] += 1
+                by_kind[objection_kind(item.get("adv_grounds"))] += 1
             elif status in ("timeout", "never_started"):
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
             else:
                 c["advisor_pending"] += 1
-    return ContourCounts(**c, procedural_by_reason=by_reason)
+    return ContourCounts(**c, procedural_by_reason=by_reason, object_by_kind=by_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +585,7 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "pairs": counts.pairs,
         "concur": counts.concur,
         "object": counts.object,
+        "object_by_kind": dict(counts.object_by_kind),
         "timeout": counts.advisor_timeout,
         "advisor_refused": counts.advisor_refused,
         "advisor_pending": counts.advisor_pending,

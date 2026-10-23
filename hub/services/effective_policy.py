@@ -614,6 +614,12 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
             + f", procedural escalations {contour['procedural_escalations']}"
         )
+        # #2025: object по видам основания; сумма равна object.
+        kinds = contour.get("object_by_kind") or {}
+        lines.append(
+            "  object by kind: "
+            + (", ".join(f"{k} {v}" for k, v in kinds.items()) or "none")
+        )
         # #1865: случаи за 14 дней по источникам, включая снятые человеком.
         events = contour.get("false_approve_events_14d") or {}
         lines.append(

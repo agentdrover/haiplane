@@ -5129,6 +5129,15 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "no_grounds",
     "no_confidence",
 )
+#: Вид основания возражения советника (#2025): противоречие факта пакета с
+#: AC/постановкой / недостаток данных / политика / процедурное. Только
+#: аналитика контура: на применение вид не влияет.
+STEWARD_OBJECTION_KINDS: tuple[str, ...] = (
+    "fact_contradiction",
+    "data_gap",
+    "policy",
+    "procedural",
+)
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
     "human_disposition",
@@ -5149,6 +5158,23 @@ class StewardGround(BaseModel):
 
     source: str = Field(..., min_length=1, max_length=80)
     detail: str = Field("", max_length=2000)
+    #: Вид основания возражения советника (#2025), из STEWARD_OBJECTION_KINDS.
+    #: Неизвестное значение хранится пустым («не классифицировано»): вид —
+    #: аналитика, он не открывает применение и не ломает приём ответа.
+    kind: str = Field("", max_length=40)
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        return v if v in STEWARD_OBJECTION_KINDS else ""
+
+    def stored(self) -> dict[str, str]:
+        """Как основание ложится в JSON: пустой вид не пишется (#2025)."""
+        data = self.model_dump()
+        if not data["kind"]:
+            del data["kind"]
+        return data
 
 
 class StewardClosure(BaseModel):
