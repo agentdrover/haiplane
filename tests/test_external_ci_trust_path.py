@@ -392,6 +392,58 @@ async def test_a_retry_after_a_partial_seed_finishes_the_pair(
     assert _git(work, "status", "--porcelain") == ""
 
 
+async def test_a_reseed_after_an_unread_default_branch_lays_the_sender_on_main(
+    db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    """Our own sender left on develop is not somebody's CI: the retry puts it on main.
+
+    The first seed could not read the default branch and fell back to develop,
+    so the whole pair landed there. Once main is known, the sender on develop is
+    still byte-for-byte our render and must not block the push (review 1220).
+    """
+    from hub.services import external_ci_seed
+
+    work, origin = _repo_pair(tmp_path)
+    project_id = await repo.create_project(db, slug="ext4", name="Ext4")
+    await repo.update_project(
+        db,
+        project_id,
+        repo="agentdrover/ext4",
+        workspace_path=str(work),
+        default_branch="develop",
+        default_branch_policy=json.dumps({"release_base": "main"}),
+    )
+    await db.commit()
+    monkeypatch.setattr(
+        plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
+    )
+    real_default = external_ci_seed.default_branch
+    monkeypatch.setattr(
+        external_ci_seed, "default_branch", lambda workspace, base: ("develop", False)
+    )
+
+    await services.provision_project(db, project_id)
+
+    assert _tree(origin, "develop") == sorted([PRODUCER, SENDER, "haiplane-stale.yml"])
+    assert _tree(origin, "main") == []
+    monkeypatch.setattr(external_ci_seed, "default_branch", real_default)
+
+    second = await services.provision_project(db, project_id)
+
+    assert _tree(origin, "main") == [SENDER]
+    assert "none added" not in second["provision_detail"], second["provision_detail"]
+    assert _git(work, "status", "--porcelain") == ""
+
+    # The pair is whole now, the leftover sender on develop included: nothing more.
+    heads = (_git(origin, "rev-parse", "develop"), _git(origin, "rev-parse", "main"))
+    third = await services.provision_project(db, project_id)
+    assert "the hub's own pair" in third["provision_detail"], third["provision_detail"]
+    assert (
+        _git(origin, "rev-parse", "develop"),
+        _git(origin, "rev-parse", "main"),
+    ) == heads
+
+
 async def _statements_for(db, projects) -> int:
     from hub.services import ci_trust_warning
 

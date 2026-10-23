@@ -93,13 +93,15 @@ def _blob_sha(text: str) -> str:
 
 
 def _foreign_on(
-    workspace: str, branch: str, files: dict[str, str]
+    workspace: str, branch: str, files: dict[str, str], known: dict[str, str]
 ) -> tuple[SeedResult | None, bool]:
     """Чужой CI на ``origin/<branch>`` (не в рабочей копии) и полна ли наша часть.
 
     Решение берётся из удалённой ветки после fetch: общая копия может отставать,
     и чужой workflow, уже лежащий в origin, она не покажет. Свои файлы (blob
-    совпал побайтно) чужими не считаются. ``(None, True)`` - всё уже лежит.
+    совпал побайтно с любым рендером пары ``known``, а не только с файлами этой
+    ветки: sender, оставшийся на интеграционной ветке, тоже свой) чужими не
+    считаются. ``(None, True)`` - всё из ``files`` уже лежит.
     """
     rc, out = workflow_seed._git(workspace, "fetch", "origin", branch)
     if rc != 0:
@@ -132,7 +134,7 @@ def _foreign_on(
         if not path.endswith(workflow_seed.WORKFLOW_SUFFIXES):
             continue
         name = os.path.basename(path)
-        expected = files.get(name)
+        expected = known.get(name)
         blob = meta.split()[2] if len(meta.split()) > 2 else ""
         if (
             expected is not None
@@ -151,11 +153,15 @@ def _foreign_on(
             ),
             False,
         )
-    return None, ours == set(files)
+    return None, set(files) <= ours
 
 
 def _publish_in_worktree(
-    workspace: str, branch: str, files: dict[str, str], message: str
+    workspace: str,
+    branch: str,
+    files: dict[str, str],
+    message: str,
+    known: dict[str, str],
 ) -> SeedResult:
     """Положить ``files`` в ``origin/<branch>``, не трогая общую рабочую копию.
 
@@ -182,7 +188,7 @@ def _publish_in_worktree(
         if rc != 0:
             return SeedResult(UNAVAILABLE, f"could not open origin/{branch}: {out}")
         try:
-            return _commit_files(tmp, branch, local, files, message)
+            return _commit_files(tmp, branch, local, files, message, known)
         finally:
             workflow_seed._git(workspace, "worktree", "remove", "--force", tmp)
             workflow_seed._git(workspace, "branch", "-D", local)
@@ -190,13 +196,16 @@ def _publish_in_worktree(
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _is_ours(tree: str, path: str, files: dict[str, str]) -> bool:
-    """A file the hub wrote: an owned name AND byte-for-byte the current render.
+def _is_ours(tree: str, path: str, known: dict[str, str]) -> bool:
+    """A file the hub wrote: an owned name AND byte-for-byte a current render.
+
+    ``known`` is the whole pair, not this branch's part: the sender left on the
+    integration branch by an earlier seed is the hub's file too.
 
     Anything else under such a name (another ``workflows:``, a copied header) is
     somebody's file and is left alone.
     """
-    expected = files.get(os.path.basename(path))
+    expected = known.get(os.path.basename(path))
     if expected is None:
         return False
     try:
@@ -207,12 +216,17 @@ def _is_ours(tree: str, path: str, files: dict[str, str]) -> bool:
 
 
 def _commit_files(
-    tree: str, branch: str, local: str, files: dict[str, str], message: str
+    tree: str,
+    branch: str,
+    local: str,
+    files: dict[str, str],
+    message: str,
+    known: dict[str, str],
 ) -> SeedResult:
     present = [
         path
         for path in workflow_seed.existing_workflows(tree)
-        if not _is_ours(tree, path, files)
+        if not _is_ours(tree, path, known)
     ]
     if present:
         return SeedResult(
@@ -298,6 +312,7 @@ def seed_pair(
             "the verifiable pair is written to the remote only; a local-only "
             "seed would write into the shared clone",
         )
+    known = {**files, brand.SEEDED_CI_REPORT: _sender()}
     if default == base_branch:
         files[brand.SEEDED_CI_REPORT] = _sender()
     targets = [(base_branch, files)]
@@ -305,7 +320,7 @@ def seed_pair(
         targets.append((default, {brand.SEEDED_CI_REPORT: _sender()}))
     complete = True
     for branch, wanted in targets:
-        refusal, whole = _foreign_on(workspace, branch, wanted)
+        refusal, whole = _foreign_on(workspace, branch, wanted, known)
         if refusal is not None:
             return refusal
         complete = complete and whole
@@ -321,6 +336,7 @@ def seed_pair(
             default,
             {brand.SEEDED_CI_REPORT: _sender()},
             "ci: add the Haiplane CI report sender (hub provisioning, #2027)",
+            known,
         )
         if sent.state != SEEDED:
             return sent
@@ -329,6 +345,7 @@ def seed_pair(
         base_branch,
         files,
         "ci: add Haiplane workflows (hub provisioning, #476)",
+        known,
     )
     if result.state != SEEDED:
         return result
