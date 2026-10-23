@@ -68,7 +68,7 @@ WAIT_HINT = (
 #: Итоги job и прогона, при которых перезапускать нечего.
 _GREEN = ("success", "neutral", "skipped")
 #: Исходы, с которыми задача ушла к человеку: повторный проход говорит то же.
-_HUMAN_OUTCOMES = (
+HUMAN_OUTCOMES = (
     "rerun_red",
     "post_refused",
     "post_unsupported",
@@ -329,7 +329,7 @@ async def _closed_step(
     красной новой попытке, чужой ручной попытке или истёкшему сроку мержа нет,
     решает владелец. Второго POST нет никогда.
     """
-    if row["outcome"] not in _HUMAN_OUTCOMES:
+    if row["outcome"] not in HUMAN_OUTCOMES:
         return ""
     shown = ci
     if ci.outcome != CIProbeOutcome.failed:
@@ -682,7 +682,7 @@ async def _requested_step(db, task, ctx, scope, row, cur, head) -> str:
     """POST принят: ждать ТЕКУЩУЮ попытку before+1 и её доверенный зелёный отчёт."""
     before = int(row["attempt_before"])
     expected = before + 1
-    late = _deadline_passed(row)
+    late = deadline_passed(row)
     if cur is None or cur["run_id"] != row["run_id"]:
         return await _wait_or_timeout(
             db, task, ctx, scope, row, late, "ждём прогон перезапуска"
@@ -818,7 +818,7 @@ def _stalled(row: dict[str, Any]) -> bool:
     return (datetime.now(UTC) - at).total_seconds() > STALL_GRACE_SECONDS
 
 
-def _deadline_passed(row: dict[str, Any]) -> bool:
+def deadline_passed(row: dict[str, Any]) -> bool:
     try:
         at = datetime.strptime(str(row["requested_at"]), "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=UTC
