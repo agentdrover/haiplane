@@ -367,3 +367,33 @@ async def test_the_revoked_act_reason_is_shown_to_the_owner(db, db_dsn, monkeypa
     assert row["advisor_outcome"] == "failed"
     assert "автономия act сейчас не выдана" in row["advisor_outcome_detail"]
     assert "автономия act сейчас не выдана" in await feed(db, case.task_id)
+
+
+async def test_a_human_approve_that_won_the_race_is_not_called_the_stewards(
+    db, db_dsn, monkeypatch
+):
+    """Человек одобрил между проверкой и записью: алерт не приписывает запись стюарду."""
+    case = await build_case(db, monkeypatch, "toctou-human-wins")
+    other = await db_module.connect(db_dsn)
+    real_record = steward_applied._record
+
+    async def record_after_a_human_approves(*args, **kwargs):
+        await record_review_verdict(
+            other,
+            case.task_id,
+            TaskReviewVerdict(agent="Denis", verdict=ReviewVerdict.approved),
+        )
+        return await real_record(*args, **kwargs)
+
+    try:
+        monkeypatch.setattr(steward_applied, "_record", record_after_a_human_approves)
+        assert await apply_advisor_outcomes(db) == 1
+    finally:
+        await other.close()
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    assert "verdict_already_stands" in row["advisor_outcome_detail"]
+    text = await feed(db, case.task_id)
+    assert "Одобрение стюарда не применено, решает человек" in text
+    assert "записано, но следующий шаг" not in text

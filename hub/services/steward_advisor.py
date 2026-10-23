@@ -837,7 +837,11 @@ def failure_reason(exc: Exception) -> str:
 
     where = "подробности в журнале хаба"
     if isinstance(exc, HTTPException):
-        detail = " ".join(str(exc.detail).split())
+        if isinstance(exc.detail, dict):  # машинный код, не его пояснения
+            raw_code = exc.detail.get("reason") or exc.detail.get("code")
+            detail = raw_code if isinstance(raw_code, str) else ""
+        else:
+            detail = " ".join(str(exc.detail).split())
         code = detail.split(":", 1)[0]
         if code in _SELF_AUTHORED_REFUSALS or detail.startswith(ACT_REVOKED_PREFIX):
             text = detail
@@ -853,12 +857,32 @@ def failure_reason(exc: Exception) -> str:
 
 
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
-    """Записан ли approve этой сдачи: сбой мог случиться уже после записи вердикта."""
-    task = await repo.get_task(db, int(item["task_id"]))
-    stored = dict(task) if task is not None else {}
-    return stored.get("review_verdict") == "approved" and stored.get(
-        "review_verdict_generation"
-    ) == int(item["generation"])
+    """Записал ли approve ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
+
+    Признак - последнее событие вердикта задачи: актор и источник стюарда
+    (``steward_applied``), approved, то же поколение. Вердикт человека,
+    легший в гонке раньше (``verdict_already_stands``), под признак не
+    подпадает, хотя поколение у него то же.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT actor, payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id DESC LIMIT 1",
+        (int(item["task_id"]),),
+    )
+    if not rows:
+        return False
+    row = dict(rows[0])
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("source") == "steward_applied"
+        and payload.get("verdict") == "approved"
+        and payload.get("submission_generation") == int(item["generation"])
+    )
 
 
 async def _finish_outcome(
