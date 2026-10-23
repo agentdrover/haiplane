@@ -729,3 +729,41 @@ async def test_a_merge_in_the_gate_memory_is_not_an_escalation(db, monkeypatch):
 
     assert (await repo.get_task(db, task_id))["status"] == "running"
     assert await _notices(db, task_id) == 0
+
+
+async def test_a_failed_notice_inside_a_callers_transaction_is_not_half_kept(
+    db, monkeypatch
+):
+    """Сбой записи уведомления откатывает notified, но не записи вызывающего."""
+    from hub.services import delivery_wait
+
+    task_id = await _setup(db, monkeypatch)
+    await _pass(db, task_id)
+    await _age(db, task_id, 30)
+    snap = dict(await repo.get_task(db, task_id))
+    real = repo.insert_event
+    calls = {"n": 0}
+
+    async def flaky(*a, **kw):
+        if kw.get("kind") == "delivery_wait_deadline" and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("event write failed")
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(repo, "insert_event", flaky)
+    await db.execute("BEGIN IMMEDIATE")
+    await repo.add_task_update(db, task_id, "hub", "status", "caller pending write")
+    detail = f"{PREFIX}: x"
+
+    assert await delivery_wait.settle(db, snap, detail, 360) is False
+    await db.commit()  # вызывающий фиксирует свою транзакцию
+
+    texts = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert "caller pending write" in texts
+    assert await _notices(db, task_id) == 0
+    assert await _open_waits(db, task_id) == 1, "notified не остался без уведомления"
+    assert not any("base_fetch_wait_hours" in t for t in texts), "alert не остался"
+
+    # Следующий проход доносит уведомление.
+    assert await delivery_wait.settle(db, snap, detail, 360) is True
+    assert await _notices(db, task_id) == 1
