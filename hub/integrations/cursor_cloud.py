@@ -106,6 +106,10 @@ class Refusal:
     code: str = ""
     #: Короткий фрагмент ответа — для человека в журнале, не для решений.
     detail: str = ""
+    #: Имя класса исключения транспорта (``ReadTimeout``, ``PermissionError``) -
+    #: безопасный вид отказа для публикации (#2006): у транспорта status=0 и
+    #: code="", а различимым его делает только тип. Пуст у ответа провайдера.
+    kind: str = ""
 
     @property
     def is_transport(self) -> bool:
@@ -182,7 +186,7 @@ async def _attempt(
             f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
         )
         log.warning("cursor cloud %s %s failed: %s", method, path, detail)
-        return None, Refusal(detail=detail[:300])
+        return None, Refusal(kind=type(exc).__name__, detail=detail[:300])
 
 
 def _error_code(resp: httpx.Response) -> str:

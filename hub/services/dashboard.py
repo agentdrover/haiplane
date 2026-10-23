@@ -25,6 +25,7 @@ from hub.models import (
 from hub.services import decisions as decisions_svc
 from hub.services import inbox_decisions, steward_breaker, triage_inbox
 from hub.services.lifecycle import row_to_task
+from hub.services.refusal_publish import published_update
 from hub.services.project_policy import clone_branch_state
 
 log = logging.getLogger("hub")
@@ -280,7 +281,7 @@ async def get_inbox_data(
         tv = row_to_task(r)
         d = tv.model_dump()
         update_rows = await repo.get_task_updates(db, tv.id)
-        d["updates"] = [dict(u) for u in update_rows]
+        d["updates"] = [published_update(u) for u in update_rows]
         questions.append(d)
 
     # #897: completed tasks whose PR is still open. Read from stored answers,

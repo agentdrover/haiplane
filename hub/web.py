@@ -50,6 +50,7 @@ from hub.services import admin as admin_svc
 from hub.services import card_c2
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import effective_policy, policy_change, project_policy
+from hub.services.refusal_publish import published_update
 from hub.services import triage_inbox
 from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
@@ -2966,10 +2967,8 @@ async def _web_task_detail_page(
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,
             "merge_offered": merge_offered,
-            # #1712: хосты, на которые карточка open-задачи предлагает запуск.
-            "slot_hosts": await card_hosts(db, task_id)
-            if task.status.value == "open"
-            else [],
+            # #1712, #1998: хосты, на которые карточка предлагает запуск (open и круг починки).
+            "slot_hosts": await card_hosts(db, dict(row)),
             # #1817: плашка запуска исполнителя (слот или облако).
             "launch_plaque": await launch_feedback.plaque(db, task_id),
             "finding_touch": finding_touch,
@@ -3415,7 +3414,8 @@ async def _latest_alert(db: aiosqlite.Connection, task_id: int, prefix: str) -> 
         row = dict(u)
         content = str(row.get("content") or "")
         if row.get("kind") == "alert" and content.startswith(prefix):
-            found = content
+            # Узнаём по сырому тексту, показываем очищенный (#2006).
+            found = str(published_update(row)["content"])
     return found
 
 
