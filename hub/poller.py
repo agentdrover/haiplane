@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
-from hub.services import critic_orders, gate_observations, role_orders
+from hub.services import critic_orders, delivery_wait, gate_observations, role_orders
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
@@ -2070,8 +2070,10 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
-    if not ok and await _explicit_outcome(db, task, detail):
-        return  # an outcome, not a wait: the sweep does not come back (#1706)
+    if (await delivery_wait.settle(db, task, "" if ok else detail, pr_num)) or (
+        not ok and await _explicit_outcome(db, task, detail)
+    ):
+        return  # an outcome, not a wait (#1706); or past its deadline (#1992)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
