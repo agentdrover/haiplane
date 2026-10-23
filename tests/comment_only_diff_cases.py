@@ -386,7 +386,7 @@ CASES: dict[str, dict] = {
         "kind": "error",
     },
     "cyrillic_docstring_followed_by_code_on_its_line": {
-        "base": '"дд"; x = 1\n',
+        "base": '"дд";\nx = 1\n',
         "head": "x = 1\n",
         "kind": "error",
     },
