@@ -995,6 +995,25 @@ async def policy_refusal(
     )
 
 
+async def write_refusal(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str] | None:
+    """Право на автономное одобрение, как оно есть СЕЙЧАС (#2037): отказ или ``None``.
+
+    Зовётся внутри write-транзакции, что записывает approve стюарда
+    (``lifecycle._automation_ci_gate``): ранние проверки читали делегирование и
+    cap-handoff до неё, а между ними и записью вердикт могли забрать себе
+    (``verdict=human``) или сдачу передали человеку из-за потолка. Читатели те
+    же, что у ранних проверок (``policy_refusal`` и ``cap_refusal``), без копий
+    условий; причина отказа - та же строка. Только чтение базы, сети нет.
+    """
+    from hub.services.steward_advisor import cap_refusal
+
+    return await policy_refusal(db, task_id) or await cap_refusal(
+        db, task_id, generation
+    )
+
+
 async def text_origin_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None
 ) -> list[tuple[str, str]]:

@@ -657,6 +657,19 @@ def both_sides(state: AdvisorState) -> str:
     return "; ".join(parts)
 
 
+async def cap_refusal(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str] | None:
+    """Сдача передана человеку из-за суточного потолка (#1915, #2037) — или ``None``.
+
+    ЕДИНСТВЕННЫЙ читатель этого отказа для применения: его зовут и
+    ``advisor_refusal`` (ранняя проверка), и транзакция записи approve стюарда
+    (``steward_apply.write_refusal``). Причина у обоих одна и та же строка.
+    """
+    handoff = await steward_cap.cap_handoff(db, task_id, generation)
+    return None if handoff is None else (REFUSED_ADVISOR, handoff.reason)
+
+
 async def advisor_refusal(
     db: aiosqlite.Connection,
     task_id: int,
@@ -673,11 +686,11 @@ async def advisor_refusal(
     """
     from hub.services.steward_evidence import current_packet_hash, packet_hash
 
-    handoff = await steward_cap.cap_handoff(db, task_id, generation)
+    handoff = await cap_refusal(db, task_id, generation)
     if handoff is not None:
         # #1915: передано человеку из-за потолка — не применять, даже если
         # согласие советника лежит в базе. Условие то же, что у маршрута.
-        return (REFUSED_ADVISOR, handoff.reason)
+        return handoff
     state = await advisor_state(db, task_id, generation)
     sides = both_sides(state)
     if state.state != STATE_RECEIVED:

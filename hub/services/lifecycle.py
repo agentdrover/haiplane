@@ -4546,6 +4546,16 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
             f"вердикт о сдаче {state.expected_generation} не записан: поколение "
             "уже другое",
         )
+    if state.applied_by_steward:
+        # #2037: право стюарда на одобрение (делегирование verdict и cap-handoff)
+        # перечитывается ЗДЕСЬ: ранняя проверка могла устареть до записи.
+        from hub.services.steward_apply import write_refusal
+
+        revoked = await write_refusal(
+            state.db, state.task_id, state.expected_generation
+        )
+        if revoked:
+            raise HTTPException(422, f"{revoked[0]}: {revoked[1]}")
     sha = (task.get("submission_sha") or "").strip()
     gap = (
         await ci_trust.pass_gap(state.db, state.task_id, sha)
