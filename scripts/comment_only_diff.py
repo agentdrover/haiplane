@@ -57,7 +57,6 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
-from collections import Counter
 import difflib
 import io
 import json
@@ -128,7 +127,7 @@ class Parsed:
     code: list[tuple[int, str]]  # (строка, нормализованный текст строки кода)
     docs: dict[str, DocSlot]
     refs: dict[str, int]  # номер -> первая строка в комментарии или docstring
-    comments: list[tuple[int, str]]  # все комментарии: (строка, текст)
+    comments: list[tuple[int, str, str]]  # (строка, текст, код слева от него)
 
 
 # --------------------------------------------------------------------------- git
@@ -324,7 +323,7 @@ def _directive_of(comment: str, row: int, leading: bool) -> str:
     Shebang и coding-cookie действуют только до первого токена кода: после него
     это обычный комментарий.
     """
-    text = comment.rstrip(" \t\r")  # NBSP и \f в хвосте значимы
+    text = comment.rstrip("\r")  # пробелы, NBSP и \f в хвосте директивы значимы
     if leading and row == 1 and text.startswith("#!"):
         return text
     if leading and row <= 2 and _CODING_RE.match(text):
@@ -431,7 +430,7 @@ def _code_lines(
         cut = text[: com.start[1]] if com else text
         directive = _directive_of(com.string, row, row < first_real) if com else ""
         if com and not directive and row in block_rows:
-            directive = com.string.rstrip(" \t\r")
+            directive = com.string.rstrip("\r")
         verbatim = (row in inner or row in opening) and not com
         # Пробелы в конце строки кода значимы; снимается лишь разделитель перед
         # хвостовым комментарием и CR (он учтён в eol).
@@ -490,8 +489,13 @@ def parse_source(data: bytes, path: str) -> Parsed:
     toks = _tokenize(src, path)
     docs = _collect_docs(tree, src)
     _check_docstring_rows(toks, docs, src.split("\n"))
+    lines = src.split("\n")
     comments = [
-        (t.start[0], t.string.rstrip(" \t\r"))
+        (
+            t.start[0],
+            t.string.rstrip("\r"),
+            lines[t.start[0] - 1][: t.start[1]].rstrip(),
+        )
         for t in toks
         if t.type == tokenize.COMMENT
     ]
@@ -607,17 +611,16 @@ def comment_changes(path: str, base: Parsed, head: Parsed) -> list[str]:
     ревью, поэтому перечень полный, а не выборочный.
     """
     out: list[str] = []
-    left = Counter(text for _, text in head.comments)
-    for row, text in base.comments:
-        if left[text] > 0:
-            left[text] -= 1
-        else:
+    # Комментарий узнаётся по тексту И по коду слева: перестановка и дубликаты видны.
+    old = [(text, owner) for _, text, owner in base.comments]
+    new = [(text, owner) for _, text, owner in head.comments]
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        for row, text, _ in base.comments[i1:i2]:
             out.append(f"{path}:{row}: - {text}")
-    left = Counter(text for _, text in base.comments)
-    for row, text in head.comments:
-        if left[text] > 0:
-            left[text] -= 1
-        else:
+        for row, text, _ in head.comments[j1:j2]:
             out.append(f"{path}:{row}: + {text}")
     return out
 

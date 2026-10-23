@@ -273,3 +273,31 @@ def test_duplicate_comments_are_counted_not_deduplicated(tmp_path: Path) -> None
     )
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 0 and "m.py:2: - # same" in out and "m.py:1:" not in out, out
+
+
+def test_swapped_comments_and_directive_whitespace_are_reported(tmp_path: Path) -> None:
+    """Перестановка комментариев — в перечне; хвостовой пробел директивы — красный."""
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "x = 1  # A\ny = 2  # B\n"},
+        {"m.py": "x = 1  # B\ny = 2  # A\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 0 and "m.py:1: - # A" in out and "m.py:1: + # B" in out, out
+    repo2 = tmp_path / "second"
+    repo2.mkdir()
+    repo2, base2, head2 = _pair(
+        repo2, {"m.py": "x = 1  # noqa: E501 \t\n"}, {"m.py": "x = 1  # noqa: E501\n"}
+    )
+    rc, out = _run(repo2, base2, head2, ["m.py"])
+    assert rc == 1 and "[code]" in out, out
+
+
+def test_duplicate_comment_removal_names_the_right_line(tmp_path: Path) -> None:
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "x = 1  # same\ny = 2  # same\n"},
+        {"m.py": "x = 1\ny = 2  # same\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 0 and "m.py:1: - # same" in out and "m.py:2:" not in out, out
