@@ -233,3 +233,15 @@ def test_default_is_red_for_every_docstring_change_and_hint_is_not_permission(
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 1 and "база BaseModel" in out and "--allow-docstring" in out, out
     assert _run(repo, base, head, ["m.py"], "--allow-docstring", "m.py::M")[0] == 0
+
+
+def test_ast_check_sees_a_type_ignore_that_stopped_working() -> None:
+    """Python создаёт TypeIgnore лишь для комментария целиком; AST это различает."""
+    import comment_only_diff as cod
+
+    def parsed(text: str) -> cod.Parsed:
+        return cod.parse_source(text.encode(), "m.py")
+
+    live = parsed("x = missing  # type: ignore[name-defined]\n")
+    dead = parsed("x = missing  # пояснение # type: ignore[name-defined]\n")
+    assert [v.kind for v in cod.compare_ast("m.py", live, dead)] == ["ast"]
