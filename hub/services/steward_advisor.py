@@ -816,18 +816,22 @@ FAILURE_REASON_LIMIT = 300
 
 
 def failure_reason(exc: Exception) -> str:
-    """Причина неудачного применения одной строкой: код и слова отказа (#2040).
+    """Причина неудачного применения одной строкой, безопасная для ленты (#2040).
 
-    Отказ транзакции записи - ``HTTPException`` с ``detail`` вида
-    ``код: причина``; прочее исключение называется типом и текстом. Без
-    переносов и не длиннее ``FAILURE_REASON_LIMIT``.
+    Слова отказа показываются только у ``HTTPException``: это ответ ворот хаба
+    вида ``код: причина``, написанный самим хабом. Текст прочего исключения
+    произвольный (путь, запрос, токен в сообщении сторонней библиотеки), в
+    карточку и в доказательства он не попадает: называется только тип, а
+    подробности остаются в журнале хаба (``log.warning`` выше по стеку).
+    Без переносов и не длиннее ``FAILURE_REASON_LIMIT``.
     """
     from fastapi import HTTPException
 
-    text = (
-        exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
-    )
-    one_line = " ".join(str(text).split())
+    if isinstance(exc, HTTPException):
+        text = str(exc.detail)
+    else:
+        text = f"внутренняя ошибка применения ({type(exc).__name__}), подробности в журнале хаба"
+    one_line = " ".join(text.split())
     if len(one_line) > FAILURE_REASON_LIMIT:
         one_line = one_line[: FAILURE_REASON_LIMIT - 1] + "…"
     return one_line

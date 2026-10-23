@@ -209,10 +209,35 @@ async def test_the_act_predicate_writes_nothing(db, monkeypatch):
     assert sh.configured_mode() == "act"
     events_before = len(await db.execute_fetchall("SELECT id FROM events"))
     changes_before = db.total_changes
+    statements: list[str] = []
+    real_execute = db.execute
 
-    granted = await sh.act_granted_now(db)
+    async def spy(sql, *args, **kwargs):
+        statements.append(str(sql))
+        return await real_execute(sql, *args, **kwargs)
+
+    async def no_commit(*_args, **_kwargs):
+        raise AssertionError("предикат допуска не имеет права коммитить")
+
+    async def no_rollback(*_args, **_kwargs):
+        raise AssertionError("предикат допуска не имеет права откатывать")
+
+    real_fetch = db.execute_fetchall
+
+    async def spy_fetch(sql, *args, **kwargs):
+        statements.append(str(sql))
+        return await real_fetch(sql, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(db, "execute", spy)
+        scoped.setattr(db, "execute_fetchall", spy_fetch)
+        scoped.setattr(db, "commit", no_commit)
+        scoped.setattr(db, "rollback", no_rollback)
+        granted = await sh.act_granted_now(db)
 
     assert granted is False, "выборка нового контура пуста - критерии не выполнены"
+    assert statements, "предикат читал базу"
+    assert all(s.lstrip().upper().startswith(("SELECT", "WITH")) for s in statements)
     assert db.total_changes == changes_before
     assert len(await db.execute_fetchall("SELECT id FROM events")) == events_before
     monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
@@ -270,3 +295,30 @@ async def test_failed_application_reason_is_shown(db, db_dsn, monkeypatch):
     assert await apply_advisor_outcomes(db) == 0
     assert await apply_advisor_outcomes(db) == 0
     assert len(failure_lines(await feed(db, case.task_id))) == 1
+
+
+async def test_failure_reason_never_carries_an_arbitrary_exception_text(
+    db, db_dsn, monkeypatch
+):
+    """Текст чужого исключения (токен, путь) не попадает ни в базу, ни в ленту, ни в доказательства."""
+    secret = "Bearer sk-SECRET-TOKEN-0123456789"
+    case = await build_case(db, monkeypatch, "toctou-secret")
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError(f"upstream said {secret}")
+
+    monkeypatch.setattr(steward_applied, "_record", boom)
+    assert await apply_advisor_outcomes(db) == 1
+
+    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    assert "RuntimeError" in row["advisor_outcome_detail"]
+    evidence = verdict_evidence.format_block(
+        await verdict_evidence.build(db, case.task_id, 1)
+    )
+    for surface in (
+        row["advisor_outcome_detail"],
+        await feed(db, case.task_id),
+        evidence,
+    ):
+        assert secret not in surface and "SECRET" not in surface
