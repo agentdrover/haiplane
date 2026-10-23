@@ -399,7 +399,7 @@ async def test_a_human_approve_that_won_the_race_is_not_called_the_stewards(
     assert "записано, но следующий шаг" not in text
 
 
-_FOREIGN = "ЧУЖОЙ-ТЕКСТ-4711"
+_FOREIGN = "ЧУЖОЙ_ТЕКСТ_4711"
 
 
 @pytest.mark.parametrize(
@@ -456,6 +456,5 @@ async def test_a_changed_packet_keeps_the_advisor_code(db, monkeypatch):
 
     row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
     assert row["advisor_outcome"] == "failed"
-    assert "advisor_not_concurred" not in row["advisor_outcome_detail"] or True
     assert "советник" in row["advisor_outcome_detail"].lower(), row
     assert "советник" in (await feed(db, case.task_id)).lower()
