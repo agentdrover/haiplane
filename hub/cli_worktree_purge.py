@@ -21,6 +21,10 @@ worktree move``), пишет маркер в её gitdir и ставит защ�
 копии на канонический путь; (c) ``git switch <ветка из маркера>`` в ней; (d) снятие
 refs ``refs/haiplane-trash/<имя>/*`` и маркера. Любая проверка (a) или сбой шага
 останавливают восстановление с причиной и ненулевым кодом.
+
+Охват. Модель угроз - случайная потеря работы кооперативными исполнителями. Процесс
+с тем же uid, который хочет уничтожить работу (подделать маркер), не покрыт: он и
+так может удалить копию сам (решение по #2038, раунд 6).
 """
 
 from __future__ import annotations
@@ -158,6 +162,22 @@ def _purge_one(entry: Entry, clone: str, out: Callable[[str], None]) -> bool:
     return True
 
 
+def _drop_orphans(
+    clone: str, orphans: dict[str, list[str]], out: Callable[[str], None]
+) -> bool:
+    """Удалить осиротевшие refs (только их); True - всё чисто."""
+    clean = True
+    for name, refs in orphans.items():
+        bad = trash.unprotect_refs(_git, clone, refs)
+        out(
+            f"ошибка    осиротевшие refs {name} не сняты: {bad}"
+            if bad
+            else f"сняты     осиротевшие refs {name}"
+        )
+        clean = clean and not bad
+    return clean
+
+
 def run_purge(args: Any, out: Callable[[str], None] = print) -> int:
     listed = _list_entries(args)
     if listed is None:
@@ -171,16 +191,30 @@ def run_purge(args: Any, out: Callable[[str], None] = print) -> int:
             word = "удалить  " if action == "purge" else "оставить "
             out(f"{word} {entry.path}: {why}")
         failed = failed or anomaly
+    live = {
+        os.path.basename(e.path)
+        for e in entries
+        if _real(os.path.dirname(e.path)) == tdir
+    }
+    orphans, orphan_err = trash.orphan_refs(_git, clone, live)
+    if orphan_err:
+        out(f"ошибка    защитные refs не прочитаны: {orphan_err}")
+        failed = True
+    for name, refs in orphans.items():
+        out(
+            f"осиротевшие refs: {name} ({len(refs)} шт.): "
+            f"копии нет среди зарегистрированных в {TRASH_DIR}"
+        )
     if not args.apply:
         out(
             "dry-run: ничего не удалено; --apply убирает копии со строкой «удалить» "
-            f"из {TRASH_DIR}"
+            f"из {TRASH_DIR} и осиротевшие refs"
         )
         return 1 if failed else 0
     for entry, action, _why, _anomaly in plan:
         if action == "purge" and not _purge_one(entry, clone, out):
             failed = True
-    return 1 if failed else 0
+    return 1 if (failed or not _drop_orphans(clone, orphans, out)) else 0
 
 
 def run_restore(args: Any, out: Callable[[str], None] = print) -> int:
@@ -219,17 +253,32 @@ def run_restore(args: Any, out: Callable[[str], None] = print) -> int:
             file=sys.stderr,
         )
         return 1
+    busy = f"refs/heads/{marker['branch']}"
+    if any(e.branch == busy for e in entries):
+        print(
+            f"restore: ветка {marker['branch']} уже checked out в другой копии: "
+            "карантин не тронут",
+            file=sys.stderr,
+        )
+        return 1
     rc, _, err = _git(clone, "worktree", "move", path, canonical)
     if rc != 0:
         print(
             f"restore: git worktree move rc {rc}: {err.strip()[:200]}", file=sys.stderr
         )
         return 1
-    rc, _, err = _git(canonical, "switch", marker["branch"])
+    rc, _, err = _git(canonical, "switch", "--no-overwrite-ignore", marker["branch"])
     if rc != 0:
+        back, _, berr = _git(clone, "worktree", "move", canonical, path)
+        state = (
+            f"копия возвращена в карантин {path}"
+            if back == 0
+            else f"ОБРАТНЫЙ перенос не удался (rc {back}: {berr.strip()[:120]}), "
+            f"копия на {canonical}"
+        )
         print(
-            f"restore: копия на {canonical}, но git switch {marker['branch']} rc {rc}: "
-            f"{err.strip()[:200]}; маркер и refs оставлены",
+            f"restore: git switch {marker['branch']} rc {rc}: {err.strip()[:200]}; "
+            f"{state}; маркер и refs оставлены",
             file=sys.stderr,
         )
         return 1

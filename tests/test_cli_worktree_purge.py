@@ -489,3 +489,191 @@ def test_restore_refuses_a_marked_copy_that_is_not_inside_the_trash(
         != 0
     )
     assert outside.is_dir() and not w.wt(101).exists()
+
+
+# --- раунд 6 ------------------------------------------------------------------
+def test_protective_refs_pin_the_old_value_of_the_first_reflog_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Первая сохранившаяся строка logs/HEAD «A -> B»: A нигде больше не лежит."""
+    w = World(tmp_path)
+    w.add(101)
+    tree = _sh(w.wt(101), "rev-parse", "HEAD^{tree}")
+    lost = _sh(w.wt(101), "commit-tree", tree, "-m", "only-in-old-value")
+    head = _sh(w.wt(101), "rev-parse", "HEAD")
+    zero = "0" * 40
+    ident = "T <t@example.com> 1700000000 +0000"
+    log = _admin(w, w.wt(101)) / "logs" / "HEAD"
+    log.write_text(f"{lost} {head} {ident}\treset: a\n{zero} {head} {ident}\tx: b\n")
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    dest = next(p for p in w.trash().iterdir())
+    pinned = [_sh(w.clone, "rev-parse", r) for r in _refs(w, dest.name)]
+    assert lost in pinned and head in pinned
+    assert all(p != zero for p in pinned)
+
+
+def test_prune_keeps_the_copy_when_the_raw_reflog_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    w.add(101)
+
+    def deny(path: Any, *a: Any, **kw: Any) -> Any:
+        if str(path).endswith("logs/HEAD"):
+            raise PermissionError("denied")
+        return open(path, *a, **kw)
+
+    monkeypatch.setattr(trash, "open", deny, raising=False)
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
+    )
+    out = capsys.readouterr().out
+    assert w.wt(101).is_dir() and _refs(w) == []
+    assert any("logs/HEAD" in x and "не прочитан" in x for x in _lines(out, 101)), out
+
+
+def _branch_one_commit_ahead(w: World, path: Path, branch: str, filename: str) -> None:
+    """Ветка уходит вперёд на коммит с файлом filename; копия остаётся на старом HEAD."""
+    (path / filename).write_text("tracked on the branch")
+    _sh(path, "add", filename)
+    _sh(path, "commit", "-q", "-m", "ahead")
+    ahead = _sh(path, "rev-parse", "HEAD")
+    _sh(path, "reset", "-q", "--hard", "HEAD~1")
+    _sh(w.clone, "update-ref", f"refs/heads/{branch}", ahead)
+
+
+def test_restore_does_not_overwrite_an_ignored_file_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101)
+    _branch_one_commit_ahead(w, path, "task-101/old", "data.txt")
+    info = Path(
+        _sh(
+            w.clone, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+    )
+    info.parent.mkdir(parents=True, exist_ok=True)
+    info.write_text("data.txt\n")
+    (path / "data.txt").write_text("my ignored notes")
+    assert (
+        w.run("restore", path.name, "--repo", str(w.clone), monkeypatch=monkeypatch)
+        == 1
+    )
+    assert (path / "data.txt").read_text() == "my ignored notes"
+    assert path.is_dir() and not w.wt(101).exists()
+    assert (_admin(w, path) / trash.MARKER).exists() and _refs(w, path.name) != []
+    assert str(path.resolve()) in _registered(w)
+    assert "switch" in capsys.readouterr().err
+
+
+def test_restore_refuses_when_the_branch_is_checked_out_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101)
+    other = tmp_path / "other-checkout"
+    _sh(w.clone, "worktree", "add", "-q", str(other), "task-101/old")
+    moves: list[tuple[str, ...]] = []
+    real = purge._git
+
+    def spy(cwd: Any, *args: str, **kw: Any) -> Any:
+        if args[:2] == ("worktree", "move"):
+            moves.append(args)
+        return real(cwd, *args, **kw)
+
+    monkeypatch.setattr(purge, "_git", spy)
+    assert (
+        w.run("restore", path.name, "--repo", str(w.clone), monkeypatch=monkeypatch)
+        == 1
+    )
+    assert moves == [] and path.is_dir() and not w.wt(101).exists()
+    assert "task-101/old" in capsys.readouterr().err
+
+
+def test_restore_moves_the_copy_back_when_the_switch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101)
+    real = purge._git
+
+    def failing(cwd: Any, *args: str, **kw: Any) -> Any:
+        if "switch" in args:
+            return 1, "", "fatal: boom"
+        return real(cwd, *args, **kw)
+
+    monkeypatch.setattr(purge, "_git", failing)
+    assert (
+        w.run("restore", path.name, "--repo", str(w.clone), monkeypatch=monkeypatch)
+        == 1
+    )
+    assert path.is_dir() and not w.wt(101).exists()
+    assert (_admin(w, path) / trash.MARKER).exists() and _refs(w, path.name) != []
+    assert str(path.resolve()) in _registered(w)
+    assert "возвращена в карантин" in capsys.readouterr().err
+
+
+def test_purge_names_and_drops_orphan_protective_refs_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    gone = _quarantined(w, 101)
+    kept = _quarantined(w, 102, age_days=0.5)
+    shutil.rmtree(gone)
+    _sh(w.clone, "worktree", "prune")
+    orphan_refs, live_refs = _refs(w, gone.name), _refs(w, kept.name)
+    assert orphan_refs and live_refs
+
+    assert w.run("purge", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert _refs(w, gone.name) == orphan_refs, "dry-run ничего не трогает"
+    assert any("осиротевшие refs" in x and gone.name in x for x in out.splitlines()), (
+        out
+    )
+    assert kept.name not in "\n".join(x for x in out.splitlines() if "осиротевшие" in x)
+
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    assert _refs(w, gone.name) == [] and _refs(w, kept.name) == live_refs
+    assert kept.is_dir()
+
+
+def test_purge_orphan_ref_delete_failure_is_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    gone = _quarantined(w, 101)
+    shutil.rmtree(gone)
+    _sh(w.clone, "worktree", "prune")
+    real = purge._git
+
+    def failing(cwd: Any, *args: str, **kw: Any) -> Any:
+        if args[:2] == ("update-ref", "-d"):
+            return 1, "", "fatal: boom"
+        return real(cwd, *args, **kw)
+
+    monkeypatch.setattr(purge, "_git", failing)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
+    )
+    assert _refs(w, gone.name) != []
+
+
+def test_purge_reports_an_unreadable_list_of_protective_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    real = purge._git
+
+    def failing(cwd: Any, *args: str, **kw: Any) -> Any:
+        if args[:1] == ("for-each-ref",):
+            return 1, "", "fatal: boom"
+        return real(cwd, *args, **kw)
+
+    monkeypatch.setattr(purge, "_git", failing)
+    assert w.run("purge", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
+    assert "защитные refs не прочитаны" in capsys.readouterr().out

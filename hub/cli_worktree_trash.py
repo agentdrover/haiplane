@@ -55,17 +55,39 @@ def pseudo_ref_shas(gitdir: str) -> tuple[list[str], str]:
     return found, ""
 
 
+def reflog_shas(gitdir: str) -> tuple[list[str], str]:
+    """Старое и новое значение каждой строки сырого logs/HEAD (кроме нулевой sha).
+
+    ``git reflog --format=%H`` отдаёт только новые значения: старое значение
+    первой сохранившейся строки нигде больше может не лежать.
+    """
+    path = os.path.join(gitdir, "logs", "HEAD")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], f"logs/HEAD не прочитан ({type(exc).__name__})"
+    found: list[str] = []
+    for line in text.splitlines():
+        for sha in line.split("\t", 1)[0].split()[:2]:
+            if _SHA.match(sha) and set(sha) != {"0"}:
+                found.append(sha)
+    return found, ""
+
+
 def protect(git: Git, clone: str, path: str, name: str) -> tuple[list[str], str]:
     """Создать защитные refs для копии ``path``; при сбое откатить и вернуть ошибку."""
     rc, gitdir, _ = git(path, "rev-parse", "--absolute-git-dir")
     rc2, head, _ = git(path, "rev-parse", "HEAD")
-    rc3, log, _ = git(path, "reflog", "--format=%H", "HEAD")
-    if rc or rc2 or rc3 or not gitdir.strip():
-        return [], "HEAD, reflog или gitdir копии не прочитаны"
+    if rc or rc2 or not gitdir.strip():
+        return [], "HEAD или gitdir копии не прочитаны"
+    logged, err = reflog_shas(gitdir.strip())
+    if err:
+        return [], err
     pseudo, err = pseudo_ref_shas(gitdir.strip())
     if err:
         return [], err
-    shas = list(dict.fromkeys([head.strip(), *log.split(), *pseudo]))
+    shas = list(dict.fromkeys([head.strip(), *logged, *pseudo]))
     created: list[str] = []
     for k, sha in enumerate(shas):
         ref = f"{REF_PREFIX}/{name}/{k}"
@@ -153,3 +175,18 @@ def days_arg(value: str) -> float:
             f"нужно конечное число не меньше 1 (сутки), получено {value!r}"
         )
     return days
+
+
+def orphan_refs(
+    git: Git, clone: str, live: set[str]
+) -> tuple[dict[str, list[str]], str]:
+    """Защитные refs копий, которых нет среди зарегистрированных в .trash."""
+    rc, out, err = git(clone, "for-each-ref", "--format=%(refname)", f"{REF_PREFIX}/")
+    if rc != 0:
+        return {}, f"git for-each-ref rc {rc}: {err.strip()[:120]}"
+    found: dict[str, list[str]] = {}
+    for ref in out.split():
+        parts = ref[len(REF_PREFIX) + 1 :].split("/")
+        if len(parts) == 2 and parts[0] not in live:
+            found.setdefault(parts[0], []).append(ref)
+    return found, ""
