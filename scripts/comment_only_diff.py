@@ -82,7 +82,7 @@ _TOOL_RE = re.compile(
     r"|pytype|\bty:|cython|pyre-|nextline|skipcq|lgtm|codeql|sonar|noinspection"
     r"|autopep8|vulture|bandit|trivy|black|pyflakes|pycodestyle|pydocstyle|pep8"
     r"|coverage|pytest|hadolint|semgrep|ignore-errors|disable|gitleaks|trufflehog"
-    r"|allowlist|nolint",
+    r"|allowlist|nolint|pyrefly|zuban|ignore|suppress",
     re.I,
 )
 
@@ -345,18 +345,24 @@ def _multiline_rows(toks: list[tokenize.TokenInfo]) -> tuple[set[int], set[int]]
 
 
 def _pep723_rows(comments: dict[int, tokenize.TokenInfo]) -> set[int]:
-    """Строки блоков ``# /// script`` … ``# ///`` (PEP 723): их читает ``uv run``."""
+    """Строки блоков ``# /// script`` … ``# ///`` (PEP 723): их читает ``uv run``.
+
+    Блок кончается на ПОСЛЕДНЕМ ``# ///`` непрерывной цепочки комментарных строк
+    (так читает uv): ``# ///`` внутри многострочного значения его не закрывает.
+    """
     rows: set[int] = set()
-    opened = False
     for row in sorted(comments):
-        text = comments[row].string.rstrip()
-        if not opened and re.fullmatch(r"# /// [A-Za-z0-9-]+", text):
-            opened = True
-        elif opened and text == "# ///":
-            opened = False
-            rows.add(row)
-        if opened or row in rows:
-            rows.add(row)
+        if row in rows or not re.fullmatch(
+            r"# /// [A-Za-z0-9-]+", comments[row].string.rstrip()
+        ):
+            continue
+        last, cur = None, row + 1
+        while cur in comments and comments[cur].string.startswith("#"):
+            if comments[cur].string.rstrip() == "# ///":
+                last = cur
+            cur += 1
+        if last is not None:
+            rows.update(range(row, last + 1))
     return rows
 
 

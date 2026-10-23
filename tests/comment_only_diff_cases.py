@@ -514,6 +514,16 @@ CASES: dict[str, dict] = {
         "head": "import os\n",
         "kind": "code",
     },
+    "pep723_marker_inside_a_multiline_value": {
+        "base": '# /// script\n# [tool.example]\n# note = """\n# ///\n# """\n# [tool.uv]\n# index-url = "https://pypi.org/simple"\n# ///\nprint(1)\n',
+        "head": '# /// script\n# [tool.example]\n# note = """\n# ///\n# """\n# [tool.uv]\n# index-url = "https://example.com/simple"\n# ///\nprint(1)\n',
+        "kind": "code",
+    },
+    "pyrefly_ignore_removed": {
+        "base": 'x: int = "bad"  # pyrefly: ignore[bad-assignment]\n',
+        "head": 'x: int = "bad"\n',
+        "kind": "code",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",
