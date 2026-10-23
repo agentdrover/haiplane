@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from typing import Any
@@ -203,6 +204,31 @@ async def _notify_owner(
         return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
     if not await orchestration.approval_stands(db, snap):
         return False  # одобрения нет: сообщать об «одобренной» работе нельзя
+    async with _savepoint(db):  # notified без полного уведомления не остаётся
+        return await _write_notice(db, key, pr_num, detail, hours)
+
+
+@contextlib.asynccontextmanager
+async def _savepoint(db: aiosqlite.Connection):
+    """Откат только своих записей: транзакция вызывающего может быть открыта."""
+    await db.execute("SAVEPOINT delivery_wait_notice")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO SAVEPOINT delivery_wait_notice")
+        await db.execute("RELEASE SAVEPOINT delivery_wait_notice")
+        raise
+    await db.execute("RELEASE SAVEPOINT delivery_wait_notice")
+
+
+async def _write_notice(
+    db: aiosqlite.Connection,
+    key: tuple[int, int, int, str],
+    pr_num: int,
+    detail: str,
+    hours: int,
+) -> bool:
+    """Переход open -> notified и вся запись уведомления: либо целиком, либо ничего."""
     if not await journal.notify_once(db, *key):
         return False  # уведомление по этому ключу уже ушло
     text = (
