@@ -15,6 +15,7 @@ from typing import Any
 from hub import config
 from hub import cli_owner_minutes as om_cli
 from hub import cli_review_verdict as rv_cli
+from hub import cli_worktree_prune as wt_prune
 from hub import expected_sha as expected_sha_cli
 from hub import cli_delivery_rerun as rerun_cli
 from hub.cli_executor_host import (
@@ -3504,15 +3505,21 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_worktree_entry(args: argparse.Namespace) -> int:
+    """``worktree N`` or ``worktree prune`` (#2038); the logic lives in the module."""
+    return wt_prune.dispatch(
+        args, create=cmd_worktree, api=_api, refusal=_worktree_refusal
+    )
+
+
 def _add_worktree_parser(sub: Any) -> None:
     """Kept out of build_parser, which sits at its complexity ceiling (#1515)."""
     p = sub.add_parser(
         "worktree",
-        help="Create/reuse the task worktree at the hub's rule path and print it",
+        help="N: create/reuse the task worktree and print it; prune: list/remove delivered ones",
     )
-    p.add_argument("task_id", type=int)
-    p.add_argument("--repo", default="", help="Clone path (default: current git clone)")
-    p.set_defaults(func=cmd_worktree)
+    wt_prune.add_arguments(p)
+    p.set_defaults(func=cmd_worktree_entry)
 
 
 def main() -> int:

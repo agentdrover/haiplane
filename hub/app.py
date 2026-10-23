@@ -3052,6 +3052,19 @@ async def _enforce_ci_scope(db, identity, project_slug, *, entrance: str) -> Non
         ) from None
 
 
+@app.get("/api/tasks/{task_id}/delivery")
+async def api_task_delivery(task_id: int, request: Request):
+    """Did this task's work reach the base branch (#2038).
+
+    The one-task reader of ``task_delivery`` for ``hp-hub worktree prune``: it
+    deletes a local copy only on the hub's own ``delivered``, never on a guess
+    from git. Read-only; not on the chat-pair, implementer or steward route
+    lists, so only a full principal reads it.
+    """
+    db = _db(request)
+    return await services.task_delivery(db, await _require_task(db, task_id))
+
+
 @app.post("/api/deploys", response_model=DeployView)
 async def api_record_deploy(
     body: DeployCallback,
