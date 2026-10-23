@@ -193,6 +193,11 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.delivery_fresh_base_rerun_of,
         "project_policy.delivery_fresh_base_rerun_of",
     ),
+    "base_fetch_wait_hours": PolicyEntry(
+        project_policy.base_fetch_wait_hours_of,
+        "project_policy.base_fetch_wait_hours_of",
+        "BASE_FETCH_WAIT_HOURS",
+    ),
     "critic_host": PolicyEntry(
         project_policy.critic_host_of, "project_policy.critic_host_of"
     ),
@@ -620,6 +625,12 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
                 for item in contour["false_approve_tasks"]
             )
             + f", procedural escalations {contour['procedural_escalations']}"
+        )
+        # #2025: object по видам основания; сумма равна object.
+        kinds = contour.get("object_by_kind") or {}
+        lines.append(
+            "  object by kind: "
+            + (", ".join(f"{k} {v}" for k, v in kinds.items()) or "none")
         )
         # #1865: случаи за 14 дней по источникам, включая снятые человеком.
         events = contour.get("false_approve_events_14d") or {}
