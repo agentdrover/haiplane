@@ -857,7 +857,8 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
 
     # #828: the cost the PROVIDER billed, only over reports that carry it. The
     # harness's own figure is never substituted (the two disagreed 34x, #818; a
-    # plausible number nobody re-checks repeats #516); both stay visible.
+    # plausible number nobody re-checks repeats #516); both stay visible, and
+    # neither is corrected into the other: it is not established which is wrong.
     confirmed_with_provider = totals["confirmed_with_provider"] or 0
     totals["provider_tokens_per_confirmed"] = (
         round(totals["provider_tokens_total"] / confirmed_with_provider)
@@ -5809,7 +5810,8 @@ async def _route_after_done(
     #
     # Three answers, only one skips: content that does not differ means the CI
     # gate has no subject. "Could not compare" keeps the old path (#725). The
-    # REVIEW gate is untouched either way. The base default belongs to git_ops
+    # REVIEW gate is untouched either way: skipping it would let anything
+    # uncommitted complete itself. The base default belongs to git_ops
     # (_resolve_base, #362 I4): an empty base is passed through.
     try:
         differs = await plugins.git_ops.content_differs(
