@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 RECEIVED = "received"
 NOT_EXPECTED = "not_expected"
@@ -50,19 +50,38 @@ def _provenance(stored: Mapping[str, Any] | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def event_of(stored: Mapping[str, Any] | None) -> str:
-    """The event kind the stored report of the current attempt names, or ''."""
-    return str(_provenance(stored).get("event") or "")
+#: The workflow whose ``evidence`` step the rules above describe.
+HUB_WORKFLOW = ".github/workflows/ci.yml"
+#: The project whose repository is the hub's own (the one that workflow belongs to).
+HUB_PROJECT = "default"
 
 
-def run_id_of(stored: Mapping[str, Any] | None) -> str:
-    return str(_provenance(stored).get("run_id") or "")
+class Origin(NamedTuple):
+    """Where an absent block's attempt came from: its event and run, and whether
+    the event rules above apply to that project's CI at all."""
+
+    event: str = ""
+    run_id: str = ""
+    rules_known: bool = True
 
 
-def expectation_of(event: str) -> str:
-    if event in _EXPECTED:
+def origin_of(stored: Mapping[str, Any] | None, project_slug: str) -> Origin:
+    """The origin read from the stored report of the current attempt.
+
+    The rules describe the hub's own ``ci.yml``; a satellite's workflow (its own
+    path, or no evidence step at all) is not covered, and nothing is claimed.
+    """
+    prov = _provenance(stored)
+    known = project_slug == HUB_PROJECT and prov.get("workflow_path") == HUB_WORKFLOW
+    return Origin(str(prov.get("event") or ""), str(prov.get("run_id") or ""), known)
+
+
+def expectation_of(origin: Origin) -> str:
+    if not origin.rules_known:
+        return ORIGIN_UNCONFIRMED
+    if origin.event in _EXPECTED:
         return MISSING_UNEXPECTEDLY
-    if event in _NOT_EXPECTED:
+    if origin.event in _NOT_EXPECTED:
         return NOT_EXPECTED
     return ORIGIN_UNCONFIRMED
 
@@ -71,11 +90,12 @@ def _where(event: str, run_id: str) -> str:
     return f"прогон {run_id or '?'} ({event or 'событие неизвестно'})"
 
 
-def missing_block(label: str, pinned: str, event: str = "", run_id: str = ""):
+def missing_block(label: str, pinned: str, origin: Origin = Origin()):
     """The block for a ``label`` result the current attempt carries none of."""
     from hub.models import CIEvidenceBlock
 
-    kind = expectation_of(event)
+    event, run_id = origin.event, origin.run_id
+    kind = expectation_of(origin)
     head = f"не получено: {label} для коммита {pinned[:12]}"
     where = _where(event, run_id)
     if kind == MISSING_UNEXPECTEDLY:
@@ -87,6 +107,11 @@ def missing_block(label: str, pinned: str, event: str = "", run_id: str = ""):
         why = (
             f"{where}: шаг на этом событии {label} не считает (ci.yml, шаг evidence) — "
             f"не ожидался; {_NOT_A_RESULT}"
+        )
+    elif event and not origin.rules_known:
+        why = (
+            f"{where}: правила шага известны для CI самого хаба ({HUB_WORKFLOW}), "
+            f"для этого CI — нет; ожидался ли шаг, не подтверждено; {_NOT_A_RESULT}"
         )
     elif event:
         why = (
@@ -104,11 +129,78 @@ def missing_block(label: str, pinned: str, event: str = "", run_id: str = ""):
     )
 
 
-def unconfirmed_block(reason: str):
-    """A block whose origin the hub cannot confirm (no commit, unconfirmed report, odd shape)."""
+def unconfirmed_block(reason: str, origin: Origin = Origin()):
+    """A block whose origin the hub cannot confirm (no commit, unconfirmed report, odd shape).
+
+    The event and the run, when the stored report names them, stay beside the
+    reason — said to be unconfirmed, not dropped.
+    """
     from hub.models import CIEvidenceBlock
 
-    return CIEvidenceBlock(expectation=ORIGIN_UNCONFIRMED, reason=reason)
+    where = _where(origin.event, origin.run_id) if origin.event or origin.run_id else ""
+    return CIEvidenceBlock(
+        expectation=ORIGIN_UNCONFIRMED,
+        run=f"{where} (не подтверждено)" if where else "",
+        reason=reason,
+    )
+
+
+# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
+_STEP_STATES = {
+    "мутации": frozenset(
+        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+    ),
+    "baseline": frozenset({"ran", "no_tests", "error"}),
+}
+
+
+def evidence_block(label: str, raw: str | None, pinned: str, origin=None):
+    """One stored evidence block as the brief reads it (#1606).
+
+    ``origin`` is the event and run of the current attempt's report: it says
+    whether an empty block was to be expected (#2026, ``evidence_states``).
+    """
+    from hub.models import CIEvidenceBlock
+
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or not data:
+        return missing_block(label, pinned, origin or Origin())
+    if data.get("state") not in _STEP_STATES[label]:
+        # Provenance alone does not make an object the step's report.
+        return unconfirmed_block(
+            f"не получено: {label} для коммита {pinned[:12]} пришли в "
+            "нераспознанном виде (нет известного state) — результатом не считаются",
+            origin or Origin(),
+        )
+    prov = data.get("provenance")
+    prov = prov if isinstance(prov, dict) and prov else {}
+    if prov:
+        run = (
+            f"прогон {prov.get('run_id') or '?'} "
+            f"({prov.get('event') or 'событие неизвестно'}), "
+            f"{prov.get('at') or 'время неизвестно'}"
+        )
+        if prov.get("run_url"):
+            run += f", {prov['run_url']}"
+    else:
+        run = "прогон неизвестен"
+    adopted = data.get("adopted_from_run")
+    if adopted:
+        # #1919: the provenance above is the run that REPORTED; the numbers were
+        # counted by the dispatch run on the same head. The file says so itself,
+        # so this is the run's own word, not something the hub verified.
+        run += f"; усыновлено из dispatch-прогона {adopted} (со слов прогона)"
+    return CIEvidenceBlock(
+        state="received",
+        expectation=RECEIVED,
+        result=str(data.get("state") or ""),
+        run=run,
+        provenance=prov,
+        reason=str(data.get("reason") or ""),
+    )
 
 
 def manual_ac_notes(acs: Iterable[Any]) -> list[dict[str, str]]:

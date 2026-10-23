@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from hub import repository as repo
-from hub.models import AcceptanceCriterion, ReviewBrief
+from hub.models import ACLocatorResolution, AcceptanceCriterion, ReviewBrief
 from hub.services import (
     ci_trust,
     evidence_states,
@@ -27,6 +27,7 @@ from tests.ci_trust_support import FakeGitHub, install_fake_github
 from tests.test_ci_evidence_other_attempt import _task, baseline, mutations
 
 SHA = "a" * 40
+ci_yml = ".github/workflows/ci.yml"
 GH: FakeGitHub = FakeGitHub()
 
 
@@ -92,6 +93,44 @@ async def test_missing_result_states_are_exact(db):
     assert block.expectation == "origin_unconfirmed"
     assert "отчёта CI" in block.reason
 
+    # An unconfirmed report, no pinned commit, a block in an unknown shape.
+    unconfirmed = await _task(db)
+    await _attempt(
+        db, unconfirmed, run_id="2006", mutations=mutations(), artifact=False
+    )
+    both = await _evidence(db, unconfirmed)
+    for block in (both.mutations, both.baseline):
+        assert (block.state, block.expectation) == (
+            "not_received",
+            "origin_unconfirmed",
+        )
+        assert "не получено" in block.reason
+    no_sha = await review_evidence.ci_evidence_state(db, {"id": silent})
+    assert no_sha.mutations.expectation == "origin_unconfirmed"
+    assert "не закреплён" in no_sha.baseline.reason
+    odd = evidence_states.evidence_block(
+        "мутации",
+        json.dumps({"state": "weird"}),
+        SHA,
+        evidence_states.Origin("workflow_dispatch", "9"),
+    )
+    assert (odd.state, odd.expectation) == ("not_received", "origin_unconfirmed")
+    assert "нераспознанном виде" in odd.reason
+    assert "workflow_dispatch" in odd.run and "9" in odd.run
+    assert "workflow_dispatch" in both.mutations.run, (
+        "an unconfirmed report keeps its event"
+    )
+
+    # A satellite's CI: the hub's rules for the step are not known there.
+    foreign = evidence_states.missing_block(
+        "мутации", SHA, evidence_states.Origin("workflow_dispatch", "5", False)
+    )
+    assert foreign.expectation == "origin_unconfirmed"
+    assert "для этого CI — нет" in foreign.reason
+    other = await _task(db)
+    await _attempt(db, other, run_id="2007", path=".github/workflows/tests.yml")
+    assert (await _evidence(db, other)).mutations.expectation == "origin_unconfirmed"
+
     # The gates are untouched: the projection is still the current attempt.
     projection = dict(await repo.get_ci_run_report(db, borrowed, SHA))
     assert projection["attempt_key"] == "ci:2004:1"
@@ -109,11 +148,31 @@ def test_event_kinds_decide_the_expectation():
         "": "origin_unconfirmed",
         "schedule": "origin_unconfirmed",
     }.items():
-        block = evidence_states.missing_block("мутации", SHA, event, "77")
+        block = evidence_states.missing_block(
+            "мутации", SHA, evidence_states.Origin(event, "77")
+        )
         assert block.expectation == want, event
         assert block.state == "not_received"
         assert block.reason.startswith("не получено")
         assert "выполнено" not in block.reason.replace("не отметка «выполнено»", "")
+
+
+def test_rules_are_known_only_for_the_hubs_own_ci():
+    stored = {
+        "provenance": json.dumps(
+            {"event": "workflow_dispatch", "run_id": "3", "workflow_path": ci_yml}
+        )
+    }
+    assert evidence_states.origin_of(stored, "default") == (
+        "workflow_dispatch",
+        "3",
+        True,
+    )
+    assert not evidence_states.origin_of(stored, "satellite").rules_known
+    other = {"provenance": stored["provenance"].replace("ci.yml", "tests.yml")}
+    assert not evidence_states.origin_of(other, "default").rules_known
+    assert evidence_states.origin_of({}, "default") == ("", "", False)
+    assert evidence_states.origin_of({"provenance": "{bad"}, "default").event == ""
 
 
 def _acs():
@@ -148,6 +207,17 @@ def test_manual_ac_and_downgrade_are_explained():
     fact = steward_evidence._locator_fact(brief)
     assert "тестовый локатор неприменим" in fact.detail
     assert "AC-1" in fact.detail and "AC-2" not in fact.detail.split("неприменим")[1]
+
+    mixed = ReviewBrief.model_construct(
+        locator_resolution=[
+            ACLocatorResolution(ac_id="AC-2", locator="t::a", status="resolvable")
+        ],
+        acceptance_criteria=_acs(),
+    )
+    fact = steward_evidence._locator_fact(mixed)
+    assert fact.is_present and fact.value["unresolved"] == 0
+    assert [n["ac_id"] for n in fact.value["not_applicable"]] == ["AC-1", "AC-3"]
+    assert "тестовый локатор неприменим к AC-1" in fact.detail
 
     part = review_brief_projection._locators_part(
         {

@@ -14,7 +14,7 @@ import json
 from typing import Any
 
 from hub.services.ci_trust import borrowed_evidence_blocks
-from hub.services.evidence_states import OTHER_ATTEMPT
+from hub.services.evidence_states import OTHER_ATTEMPT, evidence_block
 
 
 def _is_empty(raw: str | None) -> bool:
@@ -25,25 +25,24 @@ def _is_empty(raw: str | None) -> bool:
     return not isinstance(data, dict) or not data
 
 
-async def blocks_of_the_commit(db: Any, task_id: int, pinned: str, stored: dict):
+async def blocks_of_the_commit(
+    db: Any, task_id: int, pinned: str, stored: dict, origin: Any = None
+):
     """``(mutations, baseline)`` for the brief: the current attempt's block, or — if it has none — the one another attempt counted.
 
     A current block of any content wins. ``stored`` is the confirmed projection
     row (empty when there is none: nothing is borrowed then). Both blocks are
-    decided from one snapshot.
+    decided from one snapshot. ``origin`` is the event and run of the current
+    attempt's report (``evidence_states.Origin``, #2026).
     """
-    from hub.services.evidence_states import event_of, run_id_of
-    from hub.services.review_evidence import _evidence_block
-
-    event, run_id = event_of(stored), run_id_of(stored)
     found = await borrowed_evidence_blocks(db, task_id, pinned, stored)
     out = []
     for column, label in (("mutations", "мутации"), ("baseline", "baseline")):
-        block = _evidence_block(label, stored.get(column), pinned, event, run_id)
+        block = evidence_block(label, stored.get(column), pinned, origin)
         if column in found and _is_empty(stored.get(column)):
             source = found[column]
             block = _signed(
-                _evidence_block(label, source.raw, pinned),
+                evidence_block(label, source.raw, pinned),
                 source.run_id,
                 source.run_attempt,
                 column,

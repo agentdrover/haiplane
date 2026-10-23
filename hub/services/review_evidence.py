@@ -547,70 +547,10 @@ _CHECK_MEANING: dict[str, str] = {
 }
 
 
-# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
-_EVIDENCE_STATES = {
-    "мутации": frozenset(
-        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
-    ),
-    "baseline": frozenset({"ran", "no_tests", "error"}),
-}
-
-
-def _evidence_block(
-    label: str, raw: str | None, pinned: str, event: str = "", run_id: str = ""
-):
-    """One stored evidence block as the brief reads it (#1606).
-
-    ``event`` / ``run_id`` are those of the current attempt's report: they say
-    whether an empty block was to be expected (#2026, ``evidence_states``).
-    """
-    from hub.models import CIEvidenceBlock
-    from hub.services import evidence_states
-
-    try:
-        data = json.loads(raw or "{}")
-    except ValueError:
-        data = {}
-    if not isinstance(data, dict) or not data:
-        return evidence_states.missing_block(label, pinned, event, run_id)
-    if data.get("state") not in _EVIDENCE_STATES[label]:
-        # Provenance alone does not make an object the step's report.
-        return evidence_states.unconfirmed_block(
-            f"не получено: {label} для коммита {pinned[:12]} пришли в "
-            "нераспознанном виде (нет известного state) — результатом не считаются"
-        )
-    prov = data.get("provenance")
-    prov = prov if isinstance(prov, dict) and prov else {}
-    if prov:
-        run = (
-            f"прогон {prov.get('run_id') or '?'} "
-            f"({prov.get('event') or 'событие неизвестно'}), "
-            f"{prov.get('at') or 'время неизвестно'}"
-        )
-        if prov.get("run_url"):
-            run += f", {prov['run_url']}"
-    else:
-        run = "прогон неизвестен"
-    adopted = data.get("adopted_from_run")
-    if adopted:
-        # #1919: the provenance above is the run that REPORTED; the numbers were
-        # counted by the dispatch run on the same head. The file says so itself,
-        # so this is the run's own word, not something the hub verified.
-        run += f"; усыновлено из dispatch-прогона {adopted} (со слов прогона)"
-    return CIEvidenceBlock(
-        state="received",
-        expectation=evidence_states.RECEIVED,
-        result=str(data.get("state") or ""),
-        run=run,
-        provenance=prov,
-        reason=str(data.get("reason") or ""),
-    )
-
-
 async def ci_evidence_state(db, task: dict):
     """Mutation and baseline evidence stored for the pinned commit (#1606)."""
     from hub.models import CIEvidenceState
-    from hub.services.evidence_states import unconfirmed_block
+    from hub.services.evidence_states import HUB_PROJECT, origin_of, unconfirmed_block
 
     pinned = (task.get("submission_sha") or "").strip()
     if not pinned:
@@ -618,20 +558,27 @@ async def ci_evidence_state(db, task: dict):
         return CIEvidenceState(
             mutations=unconfirmed_block(why), baseline=unconfirmed_block(why)
         )
-    from hub.services.ci_trust import trusted_report, unconfirmed_reason
+    from hub.services.ci_trust import report_row, trusted_report, unconfirmed_reason
 
+    task_id = int(task.get("id") or 0)
+    project = await repo_module.resolve_project_for_task(db, task_id)
+    # No project row at all is the legacy single-project hub: the hub's own.
+    slug = str(project["slug"]) if project is not None else HUB_PROJECT
     # #1687: mutations and baseline are evidence only from a confirmed report.
-    row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    row = await trusted_report(db, task_id, pinned)
     if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
         text = f"не получено: {why}"
+        # The report is not confirmed, but the event and run it names stay visible.
+        origin = origin_of(dict(await report_row(db, task_id, pinned) or {}), slug)
         return CIEvidenceState(
-            mutations=unconfirmed_block(text), baseline=unconfirmed_block(text)
+            mutations=unconfirmed_block(text, origin),
+            baseline=unconfirmed_block(text, origin),
         )
     stored = dict(row) if row is not None else {}
     from hub.services.ci_evidence_other import blocks_of_the_commit
 
     mutations, baseline = await blocks_of_the_commit(
-        db, int(task.get("id") or 0), pinned, stored
+        db, task_id, pinned, stored, origin_of(stored, slug)
     )
     return CIEvidenceState(mutations=mutations, baseline=baseline)
 
