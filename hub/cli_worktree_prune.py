@@ -16,38 +16,50 @@ status`` ответил rc 0 и пусто. Всё остальное - «ост
 ветка, HEAD и чистота проверяются заново. Удаляет только ``git worktree remove``
 без ``--force``; локальные ветки и блокировки не трогаются.
 
-Подход - белый список (раунд 3, #2038). Запреты («не должно быть X») проигрывали:
-git и файловая система хранят состояние в большем числе мест, чем перечислено.
-Поэтому копия удаляема, только если ВСЁ в ней и в её gitdir названо в явном
-списке; всё неизвестное - «оставить» с причиной:
+Два шага, оба обратимы до второго. ``prune --apply`` НЕ удаляет: он переносит
+копию ``git worktree move`` в ``<корень-копий>/.trash/task-N-<UTC>`` (gitdir,
+refs и содержимое целы, копия остаётся в ``git worktree list``, HEAD отцепляется
+от ветки на том же коммите, чтобы ``hp-hub worktree N`` мог завести новую копию).
+Вернуть: ``git worktree move <.trash/...> <канонический путь>`` и ``git switch
+<ветка>``. Окончательно убирает только ``hp-hub worktree purge --apply`` и только
+копии старше 7 суток (``--older-than-days``).
+
+Почему так (раунд 4). Доказать безопасность необратимого удаления проверками
+нельзя: каждый раунд ревью находил ещё одно место, где ценное состояние не
+видно проверке. Поэтому проверки остаются, но шаг обратим.
+
+Проверки - белый список: копия уходит в карантин, только если ВСЁ в ней и в её
+gitdir названо в явном списке; всё неизвестное - «оставить» с причиной:
   * рабочее дерево: ``status --porcelain=v1 -z --untracked-files=all
-    --ignored=matching``; разрешены только ignored-пути из REGENERABLE_*
-    (.venv, __pycache__, node_modules, ...), любой другой ignored, untracked
-    или изменённый путь (.env, .claude/...) оставляет копию;
+    --ignored=matching``; разрешены только ignored-пути из REGENERABLE_* (имя
+    каталога не доказательство, поэтому карантин, а не удаление); любой другой
+    ignored, untracked или изменённый путь (.env, .claude/...) оставляет копию;
   * index: ``ls-files -v`` - любой тег кроме H (assume-unchanged, skip-worktree)
-    прячет правки от status, копия остаётся; плюс независимый ``git diff HEAD``;
-  * gitdir копии: разрешены только GITDIR_ALLOWED (HEAD, ORIG_HEAD, FETCH_HEAD,
-    index, commondir, gitdir, logs/HEAD, AUTO_MERGE); refs/ (refs/worktree,
-    refs/bisect), logs/refs, MERGE_HEAD, REBASE_*, rebase-*, sequencer, BISECT_*,
-    CHERRY_PICK_HEAD, locked и всё прочее оставляют копию;
+    прячет правки от status, копия остаётся; плюс независимый ``git diff-index``;
+  * gitdir копии: только GITDIR_ALLOWED; refs/ (refs/worktree, refs/bisect),
+    logs/refs, MERGE_HEAD, REBASE_*, rebase-*, sequencer, BISECT_*,
+    CHERRY_PICK_HEAD, locked и всё прочее оставляют копию; каждая sha в
+    ORIG_HEAD, FETCH_HEAD и AUTO_MERGE - предок сдачи или в refs/remotes;
   * HEAD и каждая запись его reflog - предок submission_sha или в refs/remotes;
-  * внутри копии нет вложенного ``.git`` и другого worktree клона; канонический
-    путь и его лист - не симлинки; gitdir не менялся ``--min-idle-minutes``
-    (30 по умолчанию).
+  * внутри копии нет вложенного ``.git`` (обход не пропускает ни .venv, ни
+    node_modules) и другого worktree клона; канонический путь и его лист - не
+    симлинки; gitdir не менялся ``--min-idle-minutes`` (30 по умолчанию).
+Любая ошибка чтения (git, обход каталога, снятие отпечатка) - «не прочитано»:
+копия остаётся, код возврата ненулевой.
 
 Гонка. В начале финальной проверки снимается отпечаток (HEAD, число и новейшая
-запись reflog, size и mtime_ns файлов gitdir из белого списка, включая index),
-проверяются ВСЕ условия, включая обход каталога, и отпечаток снимается ещё раз
-непосредственно перед ``git worktree remove``; любое расхождение оставляет копию.
+запись reflog, ПОЛНЫЙ список файлов gitdir с размером и mtime_ns), проверяются
+ВСЕ условия, включая обход каталога, и отпечаток снимается ещё раз
+непосредственно перед ``git worktree move``; расхождение оставляет копию.
 
-ПРИНЯТЫЙ ОСТАТОЧНЫЙ РИСК: окно между вторым отпечатком и собственным удалением
-в git (вызов subprocess и обход каталога самим git). Закрыть его целиком можно
-только координацией с исполнителем (блокировка копии); её здесь нет.
+ПРИНЯТЫЙ ОСТАТОЧНЫЙ РИСК: окно между вторым отпечатком и самим переносом. Оно
+больше не теряет данные: перенос не удаляет ничего, а сделанное в окне лежит в
+карантине целиком до purge.
 
-Отказ удаления не «оставить»: проверяются путь и gitdir, итог называется
-«удалена частично», «результат неизвестен» или «ошибка удаления», код возврата
-ненулевой. Доставку признаёт только явный ``delivered``; пустой ответ, неизвестное
-значение и ``unknown`` - «не прочитано», код возврата ненулевой.
+Неудачный перенос не «оставить»: проверяются старое место и карантин, итог
+называется «ошибка перемещения», «результат неизвестен» и т. п., код возврата
+ненулевой. Доставку признаёт только явный ``delivered``; пустой ответ,
+неизвестное значение и ``unknown`` - «не прочитано», код возврата ненулевой.
 """
 
 from __future__ import annotations
@@ -83,6 +95,9 @@ SHOWN_PATHS = 3
 _TASK_DIR = re.compile(r"^task-(\d+)$")
 _TASK_BRANCH = re.compile(r"^refs/heads/task-(\d+)/.+")
 _STRAY_SIBLING = re.compile(r"-task-\d+$")
+_PSEUDO_SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})(?:\s|$)", re.M)
+PSEUDO_REFS = ("ORIG_HEAD", "FETCH_HEAD", "AUTO_MERGE")
+TRASH_DIR = ".trash"
 
 Api = Callable[..., Any]
 Refusal = Callable[[dict[str, Any], dict[str, Any], str], str]
@@ -305,6 +320,25 @@ def _delivery_verdict(v: Verdict, hub: _Hub, task: dict[str, Any]) -> None:
         v.sha = str(task["submission_sha"])
 
 
+def _reachable_reason(v: Verdict, sha: str, where: str) -> str:
+    """sha - предок сдачи или есть в refs/remotes; иначе причина (он только здесь)."""
+    rc, _, _ = _git(v.path, "merge-base", "--is-ancestor", sha, v.sha)
+    if rc == 0:
+        return ""
+    if rc != 1:
+        v.unread = True
+        return f"{where} {sha[:12]} не сверена со сдачей (git rc {rc})"
+    rc, listed, _ = _git(
+        v.path, "for-each-ref", "--count=1", "--contains", sha, "refs/remotes"
+    )
+    if rc != 0:
+        v.unread = True
+        return f"{where} {sha[:12]} не сверена с refs/remotes (git rc {rc})"
+    if not listed.strip():
+        return f"коммит {sha[:12]} из {where} есть только в этой копии"
+    return ""
+
+
 def _reflog_reason(v: Verdict) -> str:
     """Каждая запись reflog HEAD - предок сдачи или есть в refs/remotes."""
     rc, out, err = _git(v.path, "reflog", "--format=%H", "HEAD")
@@ -312,35 +346,53 @@ def _reflog_reason(v: Verdict) -> str:
         v.unread = True
         return f"reflog HEAD не прочитан (git rc {rc}: {err.strip()[:120]})"
     for sha in dict.fromkeys(out.split()):
-        rc, _, _ = _git(v.path, "merge-base", "--is-ancestor", sha, v.sha)
-        if rc == 0:
+        why = _reachable_reason(v, sha, "записи reflog HEAD")
+        if why:
+            return why
+    return ""
+
+
+def _pseudoref_reason(v: Verdict) -> str:
+    """ORIG_HEAD, FETCH_HEAD, AUTO_MERGE: каждая sha в них не живёт только здесь."""
+    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir.strip():
+        v.unread = True
+        return f"gitdir копии не прочитан (git rc {rc})"
+    for name in PSEUDO_REFS:
+        try:
+            with open(os.path.join(gitdir.strip(), name), encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
             continue
-        if rc != 1:
+        except (OSError, UnicodeDecodeError) as exc:
             v.unread = True
-            return f"запись reflog {sha[:12]} не сверена со сдачей (git rc {rc})"
-        rc, listed, _ = _git(
-            v.path, "for-each-ref", "--count=1", "--contains", sha, "refs/remotes"
-        )
-        if rc != 0:
+            return f"{name} не прочитан ({type(exc).__name__})"
+        shas = [m.group(1) for m in _PSEUDO_SHA.finditer(text)]
+        if text.strip() and not shas:
             v.unread = True
-            return f"запись reflog {sha[:12]} не сверена с refs/remotes (git rc {rc})"
-        if not listed.strip():
-            return f"коммит {sha[:12]} из reflog HEAD есть только в этой копии"
+            return f"{name}: содержимое не разобрано, sha не найдено"
+        for sha in dict.fromkeys(shas):
+            why = _reachable_reason(v, sha, name)
+            if why:
+                return why
     return ""
 
 
 def _nested_reason(v: Verdict) -> str:
-    """Вложенный .git или чужой worktree клона внутри копии: удаление их сотрёт."""
+    """Вложенный .git (где угодно, и в .venv тоже) или другой worktree клона внутри."""
     root = _real(v.path)
     for other in v.others:
         inside = _real(other)
         if inside != root and inside.startswith(root + os.sep):
             return f"внутри копии лежит другой worktree клона: {other}"
-    for here, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [d for d in dirs if not _regenerable(d)]  # им нечего терять
+    errors: list[OSError] = []
+    for here, dirs, files in os.walk(root, onerror=errors.append, followlinks=False):
         hit = [n for n in (*dirs, *files) if n == ".git" and here != root]
         if hit:
             return f"внутри копии вложенный git-репозиторий или worktree: {here}"
+    if errors:
+        v.unread = True
+        return f"обход копии не прочитан до конца: {errors[0]}"
     return ""
 
 
@@ -393,13 +445,21 @@ def _head_reason(v: Verdict) -> str:
     return ""
 
 
-def _gitdir_files(gitdir: str) -> list[str]:
-    found: list[str] = []
-    for here, _dirs, files in os.walk(gitdir, followlinks=False):
+def _gitdir_listing(gitdir: str) -> tuple[list[tuple[str, int, int]], list[OSError]]:
+    """Все файлы gitdir: (путь, размер, mtime_ns) и ошибки обхода."""
+    errors: list[OSError] = []
+    rows: list[tuple[str, int, int]] = []
+    for here, _dirs, files in os.walk(gitdir, onerror=errors.append, followlinks=False):
         for name in files:
             full = os.path.join(here, name)
-            found.append(os.path.relpath(full, gitdir).replace(os.sep, "/"))
-    return sorted(found)
+            try:
+                st = os.lstat(full)
+            except OSError as exc:
+                errors.append(exc)
+                continue
+            rel = os.path.relpath(full, gitdir).replace(os.sep, "/")
+            rows.append((rel, st.st_size, st.st_mtime_ns))
+    return sorted(rows), errors
 
 
 def _gitdir_reason(v: Verdict) -> str:
@@ -408,7 +468,11 @@ def _gitdir_reason(v: Verdict) -> str:
     if rc != 0 or not gitdir.strip():
         v.unread = True
         return f"gitdir копии не прочитан (git rc {rc})"
-    extra = [n for n in _gitdir_files(gitdir.strip()) if n not in GITDIR_ALLOWED]
+    rows, errors = _gitdir_listing(gitdir.strip())
+    if errors:
+        v.unread = True
+        return f"gitdir копии не прочитан до конца: {errors[0]}"
+    extra = [n for n, _size, _mtime in rows if n not in GITDIR_ALLOWED]
     if extra:
         return "в gitdir копии есть то, чего нет в белом списке: " + ", ".join(
             extra[:SHOWN_PATHS]
@@ -484,24 +548,20 @@ def _flags_reason(v: Verdict) -> str:
 
 
 def _fingerprint(v: Verdict) -> tuple[Any, ...] | None:
-    """Отпечаток для сравнения до и после проверки; None - не снять."""
+    """Отпечаток до и после проверки: HEAD, reflog и ПОЛНЫЙ список файлов gitdir.
+
+    None - не снять (git или обход вернули ошибку): вызывающий ставит unread.
+    """
     rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
     rc2, head, _ = _git(v.path, "rev-parse", "HEAD")
     rc3, log, _ = _git(v.path, "reflog", "--format=%H", "HEAD")
     if rc or rc2 or rc3:
         return None
-    stats: list[tuple[str, int, int] | tuple[str, None]] = []
-    for name in sorted(GITDIR_ALLOWED):
-        try:
-            st = os.stat(os.path.join(gitdir.strip(), name))
-        except FileNotFoundError:
-            stats.append((name, None))
-            continue
-        except OSError:
-            return None
-        stats.append((name, st.st_size, st.st_mtime_ns))
+    rows, errors = _gitdir_listing(gitdir.strip())
+    if errors:
+        return None
     entries = log.split()
-    return (head.strip(), len(entries), entries[:1], tuple(stats))
+    return (head.strip(), len(entries), entries[:1], tuple(rows))
 
 
 def _git_verdict(v: Verdict) -> str:
@@ -511,6 +571,7 @@ def _git_verdict(v: Verdict) -> str:
         _head_reason,
         _reflog_reason,
         _gitdir_reason,
+        _pseudoref_reason,
         _nested_reason,
         _flags_reason,
         _tree_reason,
@@ -579,43 +640,73 @@ def _strays(clone: str, entries: list[Entry]) -> list[str]:
     return found
 
 
-def _failed_remove(v: Verdict, gitdir: str, rc: int, err: str) -> str:
-    """Что осталось после неудачного remove: путь и gitdir на месте или нет."""
-    here, meta = os.path.lexists(v.path), os.path.lexists(gitdir)
+def trash_root(clone: str) -> str:
+    """``<корень-копий>/.trash``: карантин рядом с каноническими путями."""
+    from hub.integrations.git_ops import _worktree_path as task_worktree_path
+
+    return os.path.join(_real(os.path.dirname(task_worktree_path(0, clone))), TRASH_DIR)
+
+
+def _trash_dest(v: Verdict, clone: str) -> str:
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    base = os.path.join(trash_root(clone), f"task-{v.task_id}-{stamp}")
+    dest, n = base, 0
+    while os.path.lexists(dest):
+        n += 1
+        dest = f"{base}-{n}"
+    return dest
+
+
+def _failed_move(v: Verdict, dest: str, rc: int, err: str) -> str:
+    """Где копия после неудачного move: на старом месте, в карантине, нигде."""
+    here, there = os.path.lexists(v.path), os.path.lexists(dest)
     tail = f"git rc {rc}: {err.strip()[:200]}"
-    if here and meta:
-        return f"ошибка удаления, путь и gitdir на месте (возможна частичная очистка): {tail}"
-    if here or meta:
-        return f"удалена частично ({'путь' if here else 'gitdir'} остался): {tail}"
-    return f"результат неизвестен: путь и gitdir исчезли, но git вернул ошибку: {tail}"
+    if here and not there:
+        return f"ошибка перемещения, копия на месте: {tail}"
+    if there and not here:
+        return f"результат неизвестен: копия уже в {dest}, git вернул ошибку (git worktree repair): {tail}"
+    if here and there:
+        return f"ошибка перемещения: путь и карантин оба существуют, проверьте вручную: {tail}"
+    return f"результат неизвестен: копии нет ни на месте, ни в {dest}: {tail}"
 
 
-def _remove(v: Verdict, clone: str) -> tuple[str, str]:
-    """Финальная проверка и ``git worktree remove`` без --force.
+def _unread_outcome(v: Verdict, what: str) -> tuple[str, str]:
+    v.unread = True
+    return "kept", f"изменилась перед перемещением: {what}"
 
-    Возвращает (исход, текст): removed | kept | failed.
+
+def _quarantine(v: Verdict, clone: str) -> tuple[str, str]:
+    """Финальная проверка и ``git worktree move`` в .trash (обратимо, 7 суток).
+
+    Возвращает (исход, текст): moved | kept | failed. Копия остаётся
+    зарегистрированной в клоне; HEAD в карантине отцепляется от ветки задачи
+    (тот же коммит), чтобы ``hp-hub worktree N`` мог завести новую копию.
     """
     first = _fingerprint(v)
+    if first is None:
+        return _unread_outcome(v, "отпечаток не снят (git или обход вернули ошибку)")
     rc, ref, _ = _git(v.path, "symbolic-ref", "-q", "HEAD")
-    if first is None or rc != 0 or ref.strip() != f"refs/heads/{v.branch}":
-        return (
-            "kept",
-            "изменилась перед удалением: ветка копии другая или отпечаток не снят",
-        )
+    if rc != 0 or ref.strip() != f"refs/heads/{v.branch}":
+        return "kept", "изменилась перед перемещением: ветка копии другая"
     why = _git_verdict(v)
     if why:
-        return "kept", f"изменилась перед удалением: {why}"
+        return "kept", f"изменилась перед перемещением: {why}"
     second = _fingerprint(v)
+    if second is None:
+        return _unread_outcome(v, "второй отпечаток не снят")
     if second != first:
         return (
             "kept",
-            "изменилась перед удалением: отпечаток HEAD/reflog/gitdir разошёлся",
+            "изменилась перед перемещением: отпечаток HEAD/reflog/gitdir разошёлся",
         )
-    _, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
-    rc, _, err = _git(clone, "worktree", "remove", v.path)
+    dest = _trash_dest(v, clone)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    rc, _, err = _git(clone, "worktree", "move", v.path, dest)
     if rc != 0:
-        return "failed", _failed_remove(v, gitdir.strip(), rc, err)
-    return "removed", ""
+        return "failed", _failed_move(v, dest, rc, err)
+    rc, _, err = _git(dest, "switch", "--detach")
+    note = "" if rc == 0 else f" (ветка не освобождена: {err.strip()[:120]})"
+    return "moved", f"{dest}{note}"
 
 
 def run_prune(
@@ -637,25 +728,33 @@ def run_prune(
     idle = float(getattr(args, "min_idle_minutes", DEFAULT_MIN_IDLE_MINUTES))
     verdicts = _decide(entries, clone, _Hub(api, refusal, clone), idle)
     for v in verdicts:
-        out(f"{'удалить ' if v.remove else 'оставить'} {v.path}{_label(v)}: {v.reason}")
+        word = "в карантин" if v.remove else "оставить  "
+        out(f"{word} {v.path}{_label(v)}: {v.reason}")
     for path in _strays(clone, entries):
         out(f"оставить {path}: вне git worktree list клона, не удаляю")
     failed = any(v.unread for v in verdicts)
     if not args.apply:
-        out("dry-run: ничего не удалено; --apply убирает копии со строкой «удалить»")
+        out(
+            "dry-run: ничего не удалено и не перемещено; --apply отправляет копии "
+            f"со строкой «в карантин» в {TRASH_DIR}, hp-hub worktree purge убирает "
+            "их через 7 суток"
+        )
         return 1 if failed else 0
     for v in (x for x in verdicts if x.remove):
-        outcome, why = _remove(v, clone)
+        outcome, why = _quarantine(v, clone)
         failed = failed or v.unread or outcome == "failed"
-        word = {"removed": "удалено ", "kept": "оставить", "failed": "ошибка  "}[
-            outcome
-        ]
-        out(f"{word} {v.path}{_label(v)}{': ' + why if why else ''}")
+        if outcome == "moved":
+            out(f"в карантине: {why} (#{v.task_id}, было {v.path})")
+        else:
+            word = {"kept": "оставить  ", "failed": "ошибка    "}[outcome]
+            out(f"{word} {v.path}{_label(v)}: {why}")
     return 1 if failed else 0
 
 
 def add_arguments(parser: Any) -> None:
-    parser.add_argument("target", metavar="N|prune", help="task id, or 'prune'")
+    parser.add_argument(
+        "target", metavar="N|prune|purge", help="task id, 'prune' or 'purge'"
+    )
     parser.add_argument(
         "--repo", default="", help="Clone path (default: current git clone)"
     )
@@ -666,23 +765,36 @@ def add_arguments(parser: Any) -> None:
         help="prune: keep a copy whose gitdir changed more recently (default 30)",
     )
     parser.add_argument(
-        "--apply", action="store_true", help="prune: actually remove (default: list)"
+        "--older-than-days",
+        type=float,
+        default=7.0,
+        help="purge: remove quarantine copies older than this (default 7)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="prune: move to quarantine; purge: remove (default: only list)",
     )
 
 
 def dispatch(
     args: Any, *, create: Callable[[Any], int], api: Api, refusal: Refusal
 ) -> int:
-    """``worktree N`` как раньше; ``worktree prune`` - уборка."""
+    """``worktree N`` как раньше; ``prune`` - в карантин, ``purge`` - из карантина."""
     if args.target == "prune":
         return run_prune(args, api=api, refusal=refusal)
+    if args.target == "purge":
+        from hub.cli_worktree_purge import run_purge
+
+        return run_purge(args)
     if not str(args.target).isdigit():
         print(
-            f"worktree: нужен номер задачи или prune: {args.target!r}", file=sys.stderr
+            f"worktree: нужен номер задачи, prune или purge: {args.target!r}",
+            file=sys.stderr,
         )
         return 2
     if args.apply:
-        print("worktree: --apply только для prune", file=sys.stderr)
+        print("worktree: --apply только для prune и purge", file=sys.stderr)
         return 2
     args.task_id = int(args.target)
     return create(args)

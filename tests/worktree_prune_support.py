@@ -60,6 +60,9 @@ class World:
     def wt(self, task_id: int) -> Path:
         return self.clone.parent / ".haiplane-worktrees" / f"task-{task_id}"
 
+    def trash(self) -> Path:
+        return self.clone.parent / ".haiplane-worktrees" / ".trash"
+
     def add(self, task_id: int, *, branch: str | None = None) -> Path:
         path = self.wt(task_id)
         path.parent.mkdir(exist_ok=True)

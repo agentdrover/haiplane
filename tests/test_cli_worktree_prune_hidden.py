@@ -294,7 +294,6 @@ def test_prune_keeps_ignored_files_but_not_regenerable_ones(
         (w.wt(103) / rel).parent.mkdir(parents=True, exist_ok=True)
         (w.wt(103) / rel).write_text("x")
     (w.wt(103) / ".coverage").write_text("x")
-    (w.wt(103) / "node_modules" / "m" / ".git").write_text("gitdir: nowhere")
     assert (
         w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
     )
@@ -404,8 +403,8 @@ def test_prune_takes_a_second_snapshot_right_before_remove(
     assert any("изменилась" in x for x in _lines(out, 101)), out
 
 
-@pytest.mark.parametrize("mode", ["refused", "gone", "partial"])
-def test_prune_reports_a_failed_remove_as_what_it_is(
+@pytest.mark.parametrize("mode", ["refused", "moved_anyway", "both", "vanished"])
+def test_prune_reports_a_failed_move_as_what_it_is(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -415,14 +414,16 @@ def test_prune_reports_a_failed_remove_as_what_it_is(
 
     w = World(tmp_path)
     w.add(101)
-    gitdir = _gitdir(w, 101)
     real = prune._git
 
     def failing(cwd: Any, *args: str, **kw: Any) -> Any:
-        if args[:2] == ("worktree", "remove"):
-            if mode == "gone":
+        if args[:2] == ("worktree", "move"):
+            dest = Path(args[3])
+            if mode == "moved_anyway":
                 real(cwd, *args, **kw)
-            elif mode == "partial":
+            elif mode == "both":
+                dest.mkdir(parents=True)
+            elif mode == "vanished":
                 shutil.rmtree(w.wt(101))
             return 1, "", "error: boom"
         return real(cwd, *args, **kw)
@@ -431,16 +432,15 @@ def test_prune_reports_a_failed_remove_as_what_it_is(
     assert (
         w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
     )
-    lines = _lines(capsys.readouterr().out, 101)
-    last = lines[-1]
+    last = _lines(capsys.readouterr().out, 101)[-1]
     assert "оставить" not in last, last
     expect = {
-        "refused": "ошибка удаления",
-        "gone": "результат неизвестен",
-        "partial": "удалена частично",
+        "refused": "копия на месте",
+        "moved_anyway": "результат неизвестен: копия уже в",
+        "both": "оба существуют",
+        "vanished": "копии нет ни на месте",
     }
     assert expect[mode] in last, last
-    assert gitdir.exists() == (mode != "gone")
 
 
 @pytest.mark.parametrize(

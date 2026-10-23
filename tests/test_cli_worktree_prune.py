@@ -31,7 +31,7 @@ def test_prune_removes_only_delivered_clean_worktrees(
     out = capsys.readouterr().out
     assert all(w.wt(n).is_dir() for n in SLUGS), "dry-run ничего не удаляет"
     for n in (101, 102):
-        assert any("удалить" in x for x in _lines(out, n)), (n, out)
+        assert any("в карантин" in x for x in _lines(out, n)), (n, out)
     expect = {
         103: "после сдачи", 104: "не чисто", 105: "running", 106: "running",
         107: "pr_open", 108: "detached", 109: "ID", 111: "текущ",
@@ -213,10 +213,10 @@ def test_delivery_route_is_outside_chat_pair_allowlists() -> None:
         assert ("GET", "/api/tasks/{task_id}/delivery") not in table
 
 
-def test_prune_removes_with_plain_git_worktree_remove_only(
+def test_prune_apply_only_moves_never_removes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Без --force, без удаления веток: ровно ``git worktree remove <путь>``."""
+    """--apply = ровно ``git worktree move <путь> <.trash/...>``; ни remove, ни веток."""
     w = World(tmp_path)
     w.add(101)
     seen: list[tuple[str, ...]] = []
@@ -231,8 +231,10 @@ def test_prune_removes_with_plain_git_worktree_remove_only(
     assert (
         w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
     )
-    removes = [a for a in seen if a[:2] == ("worktree", "remove")]
-    assert removes == [("worktree", "remove", str(w.wt(101)))], seen
+    moves = [a for a in seen if a[:2] == ("worktree", "move")]
+    assert len(moves) == 1 and moves[0][2] == str(w.wt(101)), seen
+    assert Path(moves[0][3]).parent == w.trash(), seen
+    assert not [a for a in seen if a[:2] == ("worktree", "remove")]
     assert not [a for a in seen if a[0] in ("branch", "update-ref")]
 
 
