@@ -72,7 +72,9 @@ def origin_of(stored: Mapping[str, Any] | None, project_slug: str) -> Origin:
     path, or no evidence step at all) is not covered, and nothing is claimed.
     """
     prov = _provenance(stored)
-    known = project_slug == HUB_PROJECT and prov.get("workflow_path") == HUB_WORKFLOW
+    # The documented ``@<ref>`` suffix of a run's path is ignored, as in ci_contract.
+    path = str(prov.get("workflow_path") or "").split("@", 1)[0]
+    known = project_slug == HUB_PROJECT and path == HUB_WORKFLOW
     return Origin(str(prov.get("event") or ""), str(prov.get("run_id") or ""), known)
 
 

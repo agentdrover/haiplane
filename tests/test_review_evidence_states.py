@@ -117,6 +117,20 @@ async def test_missing_result_states_are_exact(db):
     assert (odd.state, odd.expectation) == ("not_received", "origin_unconfirmed")
     assert "нераспознанном виде" in odd.reason
     assert "workflow_dispatch" in odd.run and "9" in odd.run
+    text = "\n".join(
+        review_brief_projection._checks_lines(
+            {
+                "prepass": {},
+                "validation": {},
+                "ac_test_results": {"current": 0, "stale": 0, "negative": []},
+                "locator_resolution": {"unresolved": []},
+                "ci_evidence": {"mutations": odd.model_dump(), "baseline": {}},
+                "live_check": {},
+                "statement_freshness": None,
+            }
+        )
+    )
+    assert "| прогон 9 (workflow_dispatch) (не подтверждено)" in text
     assert "workflow_dispatch" in both.mutations.run, (
         "an unconfirmed report keeps its event"
     )
@@ -169,6 +183,8 @@ def test_rules_are_known_only_for_the_hubs_own_ci():
         True,
     )
     assert not evidence_states.origin_of(stored, "satellite").rules_known
+    suffixed = {"provenance": stored["provenance"].replace("ci.yml", "ci.yml@refs/x")}
+    assert evidence_states.origin_of(suffixed, "default").rules_known
     other = {"provenance": stored["provenance"].replace("ci.yml", "tests.yml")}
     assert not evidence_states.origin_of(other, "default").rules_known
     assert evidence_states.origin_of({}, "default") == ("", "", False)

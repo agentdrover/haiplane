@@ -708,6 +708,11 @@ def _checks_lines(proj: dict[str, Any]) -> list[str]:
         block = (proj["ci_evidence"] or {}).get(name) or {}
         lines.append(
             f"CI {name} [{block.get('state', '?')}]: {block.get('reason', '')}"
+            + (
+                f" | {block['run']}"
+                if block.get("run") and block.get("state") != "received"
+                else ""
+            )
         )
     live = proj["live_check"] or {}
     lines.append(
