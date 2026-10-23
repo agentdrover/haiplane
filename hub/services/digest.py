@@ -244,6 +244,8 @@ STEWARD_SECTION_KEY = "steward_judgements"
 # что постановка запрещает («тихое одобрение неотличимо от подлога»).
 # Дайджест без ключа старше раздела: там «ноль» не измерялся.
 SELF_APPROVALS_KEY = "steward_self_approvals"
+# Из них одобренные по двойной чистоте (#1986): суточное число для владельца.
+DOUBLE_CLEAN_KEY = "steward_double_clean_approvals"
 
 MEASURED = "measured"
 UNMEASURED = "unmeasured"
@@ -358,6 +360,12 @@ def self_approvals_state(payload: dict) -> str:
     никто не смотрел.
     """
     return MEASURED if SELF_APPROVALS_KEY in payload else UNMEASURED
+
+
+def _double_clean_count(self_approvals: list[dict]) -> dict[str, int]:
+    """Число одобрений по двойной чистоте (#1986); пусто, когда их нет - ноль не пишем."""
+    n = sum(1 for a in self_approvals if a.get("double_clean"))
+    return {DOUBLE_CLEAN_KEY: n} if n else {}
 
 
 def _is_self_approval(event: dict, payload: dict) -> bool:
@@ -653,6 +661,9 @@ async def _prepare_digest(
                 {
                     **entry,
                     "generation": int(payload.get("submission_generation") or 0),
+                    # #1986: ключ только у одобрения по двойной чистоте, чтобы
+                    # дайджест без него остался прежним.
+                    **({"double_clean": True} if payload.get("double_clean") else {}),
                 }
             )
         elif event["kind"] == "verdict_escalated":
@@ -710,6 +721,7 @@ async def _prepare_digest(
         "escalations": escalations,
         STEWARD_SECTION_KEY: steward,
         SELF_APPROVALS_KEY: self_approvals,
+        **_double_clean_count(self_approvals),
         "triage": None,  # подставляет _write_digest под локом
         "deliveries": [dict(m) for m in merges],
         "audit_sample": sample,
@@ -788,6 +800,7 @@ async def _write_digest(
             ),
             "steward_judgements": len(steward),
             "steward_self_approvals": len(self_approvals),
+            **_double_clean_count(self_approvals),
             "audit_sample": sample,
         },
     )

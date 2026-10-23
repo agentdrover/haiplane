@@ -45,6 +45,7 @@ CODE_STEWARD_OFF = "steward_off"
 CODE_REVIEWER_PENDING = "reviewer_pending"
 CODE_STEWARD_SHADOW = "steward_shadow"
 CODE_STEWARD_ACT = "steward_act"
+CODE_ADVISOR_SKIPPED = "steward_advisor_skipped"
 CODE_NOT_IN_REVIEW = "not_in_review"
 
 # Коды стойки, после которых стюарда спрашивать не о чем: сдачи, отчёта или
@@ -211,8 +212,18 @@ async def _steward_route(
     )
     ceiling_condition = ""
     if found is not None and found[0] == BLOCKED:
-        return _human(found[1]["code"], found[1]["detail"], mode)
-    if found is not None:
+        from hub.services.steward_double_clean import may_apply_to_class
+
+        if not await may_apply_to_class(db, int(task["id"]), task.get("risk_class")):
+            return _human(found[1]["code"], found[1]["detail"], mode)
+        # #1986: выше потолка, но в пределах класса двойной чистоты: судит стюард,
+        # а применится ли, решат пара отчётов, CI и советник (чтением не проверить).
+        ceiling_condition = (
+            "; класс выше потолка проекта допустим только при двойной чистоте "
+            "(steward_approve_max_class_double_clean: два чистых отчёта с пином, "
+            "CI без разрыва, согласие советника; пара фиксируется при заказе)"
+        )
+    elif found is not None:
         ceiling_condition = (
             "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
             "дифф при показе не читался)"
@@ -221,6 +232,14 @@ async def _steward_route(
     if handoff is not None:
         # #1915: одно условие с диспетчером, заказом советника и применением.
         return _human(steward_cap.CODE_DAILY_CAP, handoff.reason, mode)
+    from hub.services.steward_advisor import advisor_state
+
+    advisor = await advisor_state(db, int(task["id"]), generation)
+    if advisor.skipped:
+        # #2024: заказ советника пропущен по причине вне советника (например,
+        # у double-clean нет замороженной пары): стюард не применит approve,
+        # вердикт за человеком. Заказ вернётся, если причина снимется.
+        return _human(CODE_ADVISOR_SKIPPED, advisor.reason, mode)
     return VerdictRoute(
         DECIDER_STEWARD,
         DECIDER_STEWARD,

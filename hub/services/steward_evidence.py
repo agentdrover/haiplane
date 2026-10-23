@@ -156,6 +156,10 @@ class EvidencePacket:
     #: она ровно так и потерялась.
     diff_base: str = ""
     diff_base_source: str = ""
+    #: Пара отчётов «двойной чистоты», зафиксированная на заказе суждения
+    #: (#1986): id основного и дополнительного. Пусто - пары нет. Входит в
+    #: хеш пакета, чтобы судья и советник согласились о ТОЙ ЖЕ паре.
+    double_clean: tuple[int, ...] = ()
 
     def fact(self, source: str) -> EvidenceFact:
         _check_source(source)
@@ -669,12 +673,15 @@ async def build_evidence_packet(
             await dependency_fact(db, task_id),
         ]
     }
+    from hub.services.steward_double_clean import frozen_pair
+
     return EvidencePacket(
         task_id=task_id,
         generation=generation,
         brief=brief,
         facts=facts,
         quotes=_quotes(task, brief, facts["machine_review_report"]),
+        double_clean=tuple(await frozen_pair(db, task_id, generation) or ()),
     )
 
 
@@ -1001,7 +1008,7 @@ def packet_hash(packet: EvidencePacket) -> str:
             },
         }
     brief = packet.brief.model_dump(mode="json") if packet.brief else None
-    body = {
+    body: dict[str, Any] = {
         "generation": packet.generation,
         "brief": (
             {k: brief.get(k) for k in PACKET_HASH_BRIEF_FIELDS}
@@ -1011,6 +1018,8 @@ def packet_hash(packet: EvidencePacket) -> str:
         "facts": facts,
         "quotes": [[q.source, q.author, q.text] for q in packet.quotes],
     }
+    if packet.double_clean:  # без пары хеш прежний байт в байт (#1986)
+        body["double_clean"] = list(packet.double_clean)
     blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1082,6 +1091,11 @@ def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
         ],
         "injection_suspected": packet.injection_suspected,
         "injection_signals": packet.injection_signals,
+        **(
+            {"double_clean_pair": list(packet.double_clean)}
+            if packet.double_clean
+            else {}
+        ),
     }
 
 
