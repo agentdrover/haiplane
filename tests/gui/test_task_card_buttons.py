@@ -590,6 +590,10 @@ def test_programmatic_edit_after_a_sent_sheet_is_unsaved_input(
     page.evaluate(
         "document.getElementById('sh-return-reason').value = 'Правка скриптом'"
     )
+    # Повторное открытие листа пересчитывает кнопку по сравнению со снимком.
+    # (без Escape: закрытие листа само проверяет ввод и обновило бы признак)
+    page.evaluate("window.hubSheets.open('sh-return')")
+    expect(page.locator('#sh-return button[type="submit"]')).to_be_visible()
     # Повторную отправку решает сравнение со снимком, а не флаг: пересылаем форму
     # сразу после правки скриптом, ДО любой проверки ввода, которая обновила бы флаг.
     page.evaluate("document.querySelector('#sh-return form').requestSubmit()")
@@ -643,6 +647,45 @@ def test_the_confirmed_snapshot_covers_select_checkbox_and_radio(
             " f.r[1].checked = true; }"
         )
         assert page.evaluate("window.hubHasUnsavedInput()") is False
+
+
+def test_snapshot_distinguishes_empty_choice_and_changed_values(
+    page: Any, stand: Stand
+) -> None:
+    """Пустой выбор и выбор пустой опции различаются; смена value при том же checked."""
+    task_id = stand.seed_task(title="снимок: тонкие случаи", status="running")
+    _open(page, stand, task_id)
+    page.wait_for_function("typeof window.htmx === 'object'")
+    page.evaluate(
+        """() => {
+        const f = document.createElement('form');
+        f.id = 'probe-form';
+        f.innerHTML = '<select name="m" multiple><option value="">нет</option>'
+          + '<option value="z">z</option></select>'
+          + '<input type="radio" name="r" value="a" checked>'
+          + '<input type="checkbox" name="c" value="1" checked>';
+        document.getElementById('main').appendChild(f);
+        for (const o of f.m.options) { o.selected = false; }
+        window.hubConfirmForm(f);
+    }"""
+    )
+    assert page.evaluate("window.hubHasUnsavedInput()") is False
+    for change in (
+        "f.m.options[0].selected = true",
+        "f.r.value = 'b'",
+        "f.c.value = '2'",
+    ):
+        page.evaluate(
+            "(c) => { const f = document.getElementById('probe-form'); eval(c); }",
+            change,
+        )
+        assert page.evaluate("window.hubHasUnsavedInput()") is True, change
+        page.evaluate(
+            "() => { const f = document.getElementById('probe-form');"
+            " for (const o of f.m.options) { o.selected = false; }"
+            " f.r.value = 'a'; f.c.value = '1'; }"
+        )
+        assert page.evaluate("window.hubHasUnsavedInput()") is False, change
 
 
 def _force_status(task_id: int, status: str) -> Any:

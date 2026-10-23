@@ -83,6 +83,9 @@
         var prev = openSheet();
         if (prev && prev !== sheet) { prev.classList.remove("is-open"); }
         sheet.classList.add("is-open");
+        // Кнопка отправки следует за сравнением со снимком и при открытии листа.
+        var sheetForm = sheet.querySelector("form");
+        if (sheetForm && window.hubRefreshSent) { window.hubRefreshSent(sheetForm); }
         var first = sheet.querySelector("textarea, input:not([type=hidden]), select, button");
         if (first && first.focus) { first.focus(); }
     }

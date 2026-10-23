@@ -42,10 +42,12 @@
         // от снимка, проверяемое при каждом вызове; ни флаг, ни события input/change
         // источником истины не служат (значение могут поменять скриптом без событий).
         function fieldValue(el) {
-            if (el.type === "checkbox" || el.type === "radio") { return String(el.checked); }
+            // Однозначная сериализация: пустой выбор и выбор пустой опции различаются;
+            // у checkbox/radio в запрос идёт и checked, и value.
+            if (el.type === "checkbox" || el.type === "radio") { return JSON.stringify([el.checked, el.value]); }
             if (el.tagName === "SELECT" && el.multiple) {
-                return Array.prototype.filter.call(el.options, function (o) { return o.selected; })
-                    .map(function (o) { return o.value; }).join("\u0000");
+                return JSON.stringify(Array.prototype.filter.call(el.options, function (o) { return o.selected; })
+                    .map(function (o) { return o.value; }));
             }
             return String(el.value);
         }
