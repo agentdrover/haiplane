@@ -576,13 +576,12 @@ async def ensure_task_worktree(
     """Create or reuse the task's worktree at the #459 path; return the path.
 
     A new copy takes the task branch from, in order: the local branch, the
-    branch on origin (tracking it, so work already pushed is not lost), the
-    base. Fetch failures are appended to ``notes``.
+    branch on origin (tracking it, so work already pushed is not lost),
+    ``origin/<base>``, the local base. Both that and fetch failures go to ``notes``.
 
-    Reuses a registered worktree of ``repo`` that is already on ``branch``.
-    Refuses — changing nothing — when the path holds anything else: another
-    branch (its dirty files are named), or a directory git does not know.
-    Never deletes and never switches a branch.
+    Reuses a registered worktree of ``repo`` already on ``branch``; refuses, changing
+    nothing, when the path holds another branch (dirty files named) or a directory
+    git does not know. Never deletes and never switches a branch.
     """
     wt_path = _worktree_path(task_id, repo)
     await _git("worktree", "prune", repo=repo, check=False)
@@ -617,14 +616,18 @@ async def ensure_task_worktree(
         if rc == 0:
             args = ("worktree", "add", "-b", branch, wt_path, remote)
         else:
-            rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
-            start = base if rc == 0 else f"origin/{base}"
-            args = ("worktree", "add", "-b", branch, wt_path, start)
+            # Fetched base first, local as fallback; --no-track: develop is never upstream.
+            ref = f"refs/remotes/origin/{base}"
+            rc, *_ = await _git("rev-parse", "--verify", ref, repo=repo, check=False)
+            start = ref if rc == 0 else base
+            args = ("worktree", "add", "--no-track", "-b", branch, wt_path, start)
     rc, _, err = await _git(*args, repo=repo, check=False)
     if rc != 0:
         raise WorktreeRefused(
             f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
         )
+    if "--no-track" in args and args[-1] == base and notes is not None:  # after git
+        notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
     return wt_path
 
 
