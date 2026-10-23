@@ -153,10 +153,13 @@ async def _pass_is_live(
     if await _live_key(db, key[0]) != key:
         return False
     live = await repo.get_task(db, key[0])
+    # Закрепление: снимок или голова, на которую проход сам его перезакрепил
+    # (``_checked_sha`` ставит _approved_code_check); чужое перезакрепление - нет.
+    pins = {x for x in (task.get("submission_sha"), task.get("_checked_sha")) if x}
     return (
         live is not None
         and int(live["pr_number"] or 0) == int(task.get("pr_number") or 0)
-        and (live["submission_sha"] or "") == (task.get("submission_sha") or "")
+        and (live["submission_sha"] or "") in (pins or {""})
     )
 
 
@@ -208,14 +211,17 @@ async def _notify_owner(
         return await _write_notice(db, key, pr_num, detail, hours)
 
 
-async def _failed_notice_id(db: aiosqlite.Connection, task_id: int) -> int:
-    """Последний id события сбоя уведомления по задаче (0 - сбоев не было)."""
-    rows = await fetchall(
-        db,
-        "SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE kind=? AND task_id=?",
-        (watch_notices.FAILED_EVENT, task_id),
-    )
-    return int(rows[0]["id"])
+async def _silence_is_legal(
+    db: aiosqlite.Connection, task_id: int, source_key: str
+) -> bool:
+    """notify_steward ничего не отправил законно: уже объявлено, нет проекта, повод выключен."""
+    if await fetchall(db, "SELECT 1 FROM watch_notices WHERE key=?", (source_key,)):
+        return True  # дедуп: этот источник уже объявлен
+    project, _ = await repo.resolve_project_with_source(db, task_id)
+    if project is None:
+        return True
+    policy = project_policy.gate_policy_of(project)
+    return "stale" not in project_policy.steward_watch_of(policy)
 
 
 @contextlib.asynccontextmanager
@@ -254,19 +260,19 @@ async def _write_notice(
         actor="hub",
         payload={"reason": KIND, "pr_number": pr_num, "hours": hours, "detail": detail},
     )
-    failed_before = await _failed_notice_id(db, key[0])
-    await watch_notices.notify_steward(
+    source_key = f"{EVENT}:{key[0]}:{key[1]}:{key[2]}"
+    sent = await watch_notices.notify_steward(
         db,
         "stale",
         task_id=key[0],
-        source_key=f"{EVENT}:{key[0]}:{key[1]}:{key[2]}",
+        source_key=source_key,
         source_event_id=event_id,
     )
-    if await _failed_notice_id(db, key[0]) != failed_before:
-        # notify_steward глотает ошибки и пишет событие сбоя: False не отличает его
-        # от «наблюдение выключено» и «уже объявлено». Сбой откатывает уведомление
-        # целиком (SAVEPOINT выше), и следующий проход донесёт его.
-        raise RuntimeError("steward notice failed")
+    if not sent and not await _silence_is_legal(db, key[0], source_key):
+        # notify_steward глотает ошибки и возвращает False, как при «наблюдение
+        # выключено» и «уже объявлено». Иное молчание - сбой: откат SAVEPOINT выше
+        # возвращает ожидание в open, и следующий проход донесёт уведомление.
+        raise RuntimeError("steward notice was not delivered")
     return True
 
 
