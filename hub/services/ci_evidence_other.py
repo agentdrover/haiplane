@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 from hub.services.ci_trust import borrowed_evidence_blocks
+from hub.services.evidence_states import OTHER_ATTEMPT
 
 
 def _is_empty(raw: str | None) -> bool:
@@ -31,12 +32,14 @@ async def blocks_of_the_commit(db: Any, task_id: int, pinned: str, stored: dict)
     row (empty when there is none: nothing is borrowed then). Both blocks are
     decided from one snapshot.
     """
+    from hub.services.evidence_states import event_of, run_id_of
     from hub.services.review_evidence import _evidence_block
 
+    event, run_id = event_of(stored), run_id_of(stored)
     found = await borrowed_evidence_blocks(db, task_id, pinned, stored)
     out = []
     for column, label in (("mutations", "мутации"), ("baseline", "baseline")):
-        block = _evidence_block(label, stored.get(column), pinned)
+        block = _evidence_block(label, stored.get(column), pinned, event, run_id)
         if column in found and _is_empty(stored.get(column)):
             source = found[column]
             block = _signed(
@@ -56,5 +59,9 @@ def _signed(block, run_id: str, run_attempt: str, column: str):
     if column == "baseline":
         reason += " (гейт red-test багов его не учитывает)"
     return block.model_copy(
-        update={"run": f"{block.run}; {source} (не текущая попытка)", "reason": reason}
+        update={
+            "run": f"{block.run}; {source} (не текущая попытка)",
+            "reason": reason,
+            "expectation": OTHER_ATTEMPT,
+        }
     )

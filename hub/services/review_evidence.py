@@ -556,28 +556,28 @@ _EVIDENCE_STATES = {
 }
 
 
-def _evidence_block(label: str, raw: str | None, pinned: str):
-    """One stored evidence block as the brief reads it (#1606)."""
+def _evidence_block(
+    label: str, raw: str | None, pinned: str, event: str = "", run_id: str = ""
+):
+    """One stored evidence block as the brief reads it (#1606).
+
+    ``event`` / ``run_id`` are those of the current attempt's report: they say
+    whether an empty block was to be expected (#2026, ``evidence_states``).
+    """
     from hub.models import CIEvidenceBlock
+    from hub.services import evidence_states
 
     try:
         data = json.loads(raw or "{}")
     except ValueError:
         data = {}
     if not isinstance(data, dict) or not data:
-        return CIEvidenceBlock(
-            reason=(
-                f"не получено: {label} для коммита {pinned[:12]} CI не присылал "
-                "(шаг не запускался на обновлении ветки — это не результат)"
-            )
-        )
+        return evidence_states.missing_block(label, pinned, event, run_id)
     if data.get("state") not in _EVIDENCE_STATES[label]:
         # Provenance alone does not make an object the step's report.
-        return CIEvidenceBlock(
-            reason=(
-                f"не получено: {label} для коммита {pinned[:12]} пришли в "
-                "нераспознанном виде (нет известного state) — результатом не считаются"
-            )
+        return evidence_states.unconfirmed_block(
+            f"не получено: {label} для коммита {pinned[:12]} пришли в "
+            "нераспознанном виде (нет известного state) — результатом не считаются"
         )
     prov = data.get("provenance")
     prov = prov if isinstance(prov, dict) and prov else {}
@@ -599,6 +599,7 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
         run += f"; усыновлено из dispatch-прогона {adopted} (со слов прогона)"
     return CIEvidenceBlock(
         state="received",
+        expectation=evidence_states.RECEIVED,
         result=str(data.get("state") or ""),
         run=run,
         provenance=prov,
@@ -608,13 +609,14 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
 
 async def ci_evidence_state(db, task: dict):
     """Mutation and baseline evidence stored for the pinned commit (#1606)."""
-    from hub.models import CIEvidenceBlock, CIEvidenceState
+    from hub.models import CIEvidenceState
+    from hub.services.evidence_states import unconfirmed_block
 
     pinned = (task.get("submission_sha") or "").strip()
     if not pinned:
         why = "не получено: коммит сдачи не закреплён"
         return CIEvidenceState(
-            mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
+            mutations=unconfirmed_block(why), baseline=unconfirmed_block(why)
         )
     from hub.services.ci_trust import trusted_report, unconfirmed_reason
 
@@ -623,8 +625,7 @@ async def ci_evidence_state(db, task: dict):
     if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
         text = f"не получено: {why}"
         return CIEvidenceState(
-            mutations=CIEvidenceBlock(reason=text),
-            baseline=CIEvidenceBlock(reason=text),
+            mutations=unconfirmed_block(text), baseline=unconfirmed_block(text)
         )
     stored = dict(row) if row is not None else {}
     from hub.services.ci_evidence_other import blocks_of_the_commit

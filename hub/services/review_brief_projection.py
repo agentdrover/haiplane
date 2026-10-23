@@ -25,6 +25,7 @@ from typing import Any
 
 from mcp.types import CallToolResult
 
+from hub.services import evidence_states
 from hub.services.review_brief_fields import MANDATORY, TEXT, fields_of
 from hub.mcp_structured import structured_echo_result, structured_error_result
 
@@ -281,7 +282,7 @@ def _ac_results_part(brief: dict[str, Any]) -> dict[str, Any]:
 
 def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
     rows = brief.get("locator_resolution") or []
-    return {
+    part = {
         "total": len(rows),
         "rows": _rows(rows, "locator_resolution"),
         "unresolved": [
@@ -290,6 +291,11 @@ def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
             if r.get("status") != "resolvable"
         ],
     }
+    # #2026: AC not verified by a test — a locator does not apply, nothing more.
+    notes = evidence_states.manual_ac_notes(brief.get("acceptance_criteria") or [])
+    if notes:
+        part["not_applicable"] = notes
+    return part
 
 
 def _verdict_route_part(route: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -689,6 +695,14 @@ def _checks_lines(proj: dict[str, Any]) -> list[str]:
         lines.append(
             "AC locators not resolved: "
             + ", ".join(f"{r['ac_id']}={r['status']}" for r in loc["unresolved"])
+        )
+    if loc.get("not_applicable"):
+        lines.append(
+            "AC locators not applicable: "
+            + "; ".join(
+                f"{r['ac_id']}={r['verifiable_by']} ({r['note']})"
+                for r in loc["not_applicable"]
+            )
         )
     for name in ("mutations", "baseline"):
         block = (proj["ci_evidence"] or {}).get(name) or {}

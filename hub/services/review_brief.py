@@ -64,6 +64,7 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
+from hub.services.evidence_states import downgrade_rules
 from hub.services.brief_failure import BriefFailure, failure_from, scrub_strings
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
@@ -488,13 +489,17 @@ async def profile_downgrade_of(
         return None
     state = "отчёт получен" if reported else "заказан"
     channel = dispatch.get("channel") or "cloud"
+    rules = downgrade_rules(reasons)
+    cited = f" (правило {', '.join(rules)})" if rules else ""
     return ProfileDowngradeView(
         reasons=reasons,
         state=state,
         channel=channel,
         dispatch_id=int(dispatch["id"]),
+        rules=rules,
         headline=(
-            f"Требовался deep — {state} lite (канал {channel}): " + "; ".join(reasons)
+            f"Требовался deep — {state} lite (канал {channel}){cited}: "
+            + "; ".join(reasons)
         ),
     )
 
