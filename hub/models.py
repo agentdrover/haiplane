@@ -1576,10 +1576,14 @@ class CIEvidenceBlock(BaseModel):
     must see "not received", not an empty field that looks like a clean result.
     ``result`` is the step's own state (ran, error, ...), ``run`` names the run
     and event it came from, or says the run is unknown for a block stored
-    before provenance existed.
+    before provenance existed. ``expectation`` (#2026) says exactly why a block
+    is missing: ``not_expected`` / ``missing_unexpectedly`` / ``other_attempt``
+    / ``origin_unconfirmed`` (``received`` for a block that came); it is for the
+    reader of the brief, no gate reads it (``hub.services.evidence_states``).
     """
 
     state: str = "not_received"
+    expectation: str = "origin_unconfirmed"
     result: str = ""
     run: str = ""
     provenance: dict[str, Any] = Field(default_factory=dict)
@@ -1895,6 +1899,8 @@ class ProfileDowngradeView(BaseModel):
     state: str = "заказан"
     channel: str = ""
     dispatch_id: int | None = None
+    #: The rules the downgrade comes from (#1414 daily cap, #1432 circle), #2026.
+    rules: list[str] = Field(default_factory=list)
     headline: str = ""
 
 
@@ -5129,6 +5135,15 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "no_grounds",
     "no_confidence",
 )
+#: Вид основания возражения советника (#2025): противоречие факта пакета с
+#: AC/постановкой / недостаток данных / политика / процедурное. Только
+#: аналитика контура: на применение вид не влияет.
+STEWARD_OBJECTION_KINDS: tuple[str, ...] = (
+    "fact_contradiction",
+    "data_gap",
+    "policy",
+    "procedural",
+)
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
     "human_disposition",
@@ -5149,6 +5164,23 @@ class StewardGround(BaseModel):
 
     source: str = Field(..., min_length=1, max_length=80)
     detail: str = Field("", max_length=2000)
+    #: Вид основания возражения советника (#2025), из STEWARD_OBJECTION_KINDS.
+    #: Неизвестное значение хранится пустым («не классифицировано»): вид —
+    #: аналитика, он не открывает применение и не ломает приём ответа.
+    kind: str = Field("", max_length=40)
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        return v if v in STEWARD_OBJECTION_KINDS else ""
+
+    def stored(self) -> dict[str, str]:
+        """Как основание ложится в JSON: пустой вид не пишется (#2025)."""
+        data = self.model_dump()
+        if not data["kind"]:
+            del data["kind"]
+        return data
 
 
 class StewardClosure(BaseModel):
