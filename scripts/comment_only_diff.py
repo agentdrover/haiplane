@@ -127,7 +127,9 @@ class Parsed:
     code: list[tuple[int, str]]  # (строка, нормализованный текст строки кода)
     docs: dict[str, DocSlot]
     refs: dict[str, int]  # номер -> первая строка в комментарии или docstring
-    comments: list[tuple[int, str, str]]  # (строка, текст, код слева от него)
+    comments: list[
+        tuple[int, str, str, int]
+    ]  # (строка, текст, код слева, номер строки кода)
 
 
 # --------------------------------------------------------------------------- git
@@ -162,7 +164,15 @@ class Repo:
 
     def changed_files(self, base: str, head: str) -> list[str]:
         """Все изменённые файлы любого типа (переименование = удаление + добавление)."""
-        out = self._run("diff", "--name-only", "--no-renames", "-z", base, head)
+        out = self._run(
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",  # diff.ignoreSubmodules не прячет gitlink
+            "-z",
+            base,
+            head,
+        )
         names = out.decode("utf-8", "surrogateescape").split("\0")
         return sorted(n for n in names if n)
 
@@ -490,11 +500,18 @@ def parse_source(data: bytes, path: str) -> Parsed:
     docs = _collect_docs(tree, src)
     _check_docstring_rows(toks, docs, src.split("\n"))
     lines = src.split("\n")
+    code_before = [0]  # строк с кодом до каждой строки: без пустых и комментарных
+    for line in lines:
+        stripped = line.strip()
+        code_before.append(
+            code_before[-1] + bool(stripped and not stripped.startswith("#"))
+        )
     comments = [
         (
             t.start[0],
             t.string.rstrip("\r"),
             lines[t.start[0] - 1][: t.start[1]].rstrip(),
+            code_before[t.start[0] - 1],
         )
         for t in toks
         if t.type == tokenize.COMMENT
@@ -611,16 +628,17 @@ def comment_changes(path: str, base: Parsed, head: Parsed) -> list[str]:
     ревью, поэтому перечень полный, а не выборочный.
     """
     out: list[str] = []
-    # Комментарий узнаётся по тексту И по коду слева: перестановка и дубликаты видны.
-    old = [(text, owner) for _, text, owner in base.comments]
-    new = [(text, owner) for _, text, owner in head.comments]
+    # Комментарий узнаётся по тексту, коду слева и номеру строки кода: перестановка,
+    # дубликаты и перенос через строку кода видны.
+    old = [(text, owner, n) for _, text, owner, n in base.comments]
+    new = [(text, owner, n) for _, text, owner, n in head.comments]
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
-        for row, text, _ in base.comments[i1:i2]:
+        for row, text, _, _ in base.comments[i1:i2]:
             out.append(f"{path}:{row}: - {text}")
-        for row, text, _ in head.comments[j1:j2]:
+        for row, text, _, _ in head.comments[j1:j2]:
             out.append(f"{path}:{row}: + {text}")
     return out
 

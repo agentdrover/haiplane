@@ -301,3 +301,37 @@ def test_duplicate_comment_removal_names_the_right_line(tmp_path: Path) -> None:
     )
     rc, out = _run(repo, base, head, ["m.py"])
     assert rc == 0 and "m.py:1: - # same" in out and "m.py:2:" not in out, out
+
+
+def test_identical_comments_on_identical_code_and_moved_standalone_comment(
+    tmp_path: Path,
+) -> None:
+    repo, base, head = _pair(
+        tmp_path,
+        {"m.py": "x = 1  # same\nx = 1  # same\n"},
+        {"m.py": "x = 1\nx = 1  # same\n"},
+    )
+    rc, out = _run(repo, base, head, ["m.py"])
+    assert rc == 0 and "m.py:1: - # same" in out and "m.py:2:" not in out, out
+    repo2 = tmp_path / "second"
+    repo2.mkdir()
+    repo2, base2, head2 = _pair(
+        repo2, {"m.py": "# A\nx = 1\n"}, {"m.py": "x = 1\n# A\n"}
+    )
+    rc, out = _run(repo2, base2, head2, ["m.py"])
+    assert rc == 0 and "m.py:1: - # A" in out and "m.py:2: + # A" in out, out
+
+
+def test_changed_submodule_is_unlisted_even_when_git_config_ignores_it(
+    tmp_path: Path,
+) -> None:
+    repo, base, _ = _pair(tmp_path, {"m.py": "x = 1\n"}, {"n.txt": "q\n"})
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},vendor")
+    _git(repo, "commit", "-q", "-m", "gitlink a")
+    mid = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "update-index", "--cacheinfo", f"160000,{'b' * 40},vendor")
+    _git(repo, "commit", "-q", "-m", "gitlink b")
+    head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "config", "diff.ignoreSubmodules", "all")
+    rc, out = _run(repo, mid, head, ["m.py"])
+    assert rc == 1 and "vendor" in out and "[unlisted_file]" in out, out
