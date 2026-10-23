@@ -457,6 +457,26 @@ CASES: dict[str, dict] = {
         "head": "dangerous()\n",
         "kind": "code",
     },
+    "comment_inserted_after_a_backslash_continuation": {
+        "base": "x = missing \\\n# noqa: F821\ny = 1\n",
+        "head": "x = missing \\\n# ordinary\n# noqa: F821\ny = 1\n",
+        "kind": "code",
+    },
+    "comment_inserted_after_a_directive_on_a_docstring_line": {
+        "base": 'def f():\n    "doc"  # pylint: disable-next=undefined-variable\n    return missing\n',
+        "head": 'def f():\n    "doc"  # pylint: disable-next=undefined-variable\n    # ordinary\n    return missing\n',
+        "kind": "code",
+    },
+    "comment_inserted_after_a_trailing_directive": {
+        "base": "x = 1  # pylint: disable-next=undefined-variable\ny = missing\n",
+        "head": "x = 1  # pylint: disable-next=undefined-variable\n# ordinary\ny = missing\n",
+        "kind": "code",
+    },
+    "ty_ignore_moved_to_the_neighbour": {
+        "base": 'x: int = "bad"  # ty: ignore[invalid-assignment]\ny: int = "bad"\n',
+        "head": 'x: int = "bad"\ny: int = "bad"  # ty: ignore[invalid-assignment]\n',
+        "kind": "code",
+    },
     "lost_issue_reference": {
         "base": "# причина #1234\nx = 1\n",
         "head": "# причина\nx = 1\n",

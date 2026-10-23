@@ -79,7 +79,7 @@ _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 # сегмента. Цена — правка пояснения в таком комментарии тоже красная.
 _TOOL_RE = re.compile(
     r"noqa|type:|pragma|fmt:|nosem|nosec|pylint|mypy|isort|ruff|flake8|yapf|pyright"
-    r"|pytype|cython|pyre-|nextline|skipcq|lgtm|codeql|sonar|noinspection"
+    r"|pytype|\bty:|cython|pyre-|nextline|skipcq|lgtm|codeql|sonar|noinspection"
     r"|autopep8|vulture|bandit|trivy|black|pyflakes|pycodestyle|pydocstyle|pep8"
     r"|coverage|pytest|hadolint|semgrep|ignore-errors|disable",
     re.I,
@@ -340,23 +340,28 @@ def doc_rows_of(doc: DocSlot) -> range:
     return range(doc.expr.lineno, (doc.expr.end_lineno or doc.expr.lineno) + 1)
 
 
-def _gap_mark(lines: list[str], row: int, doc_first: set[int]) -> str:
-    """Что между директивой и ближайшей строкой с содержимым.
+def _gap_mark(entries: list[tuple[int, str, str, bool]], idx: int) -> str:
+    """Соседство директивы с вычеркнутыми строками.
 
-    ``nextline``-директивы действуют на соседнюю строку: число вычеркнутых
-    пустых и комментарных строк между ними входит в сравнение. Если за ними
-    начало docstring-а — это тоже отмечается.
+    ``nextline``, ``\\``-продолжение и ``fmt: off`` зависят от физической
+    смежности: число вычеркнутых пустых и комментарных строк до и после
+    строки с директивой входит в сравнение. Docstring-строки прозрачны, но
+    если сразу за директивой начинается docstring, это тоже отмечается.
     """
-    gap = 0
-    for nxt in range(row + 1, len(lines) + 1):
-        stripped = lines[nxt - 1].strip()
-        if stripped and not stripped.startswith("#"):
-            doc = "\x00docstring" if nxt in doc_first else ""
-            return f"\x00gap={gap}{doc}" if gap or doc else ""
-        if stripped.startswith("#") and _TOOL_RE.search(stripped):
-            return f"\x00gap={gap}" if gap else ""
-        gap += 1
-    return f"\x00gap={gap}" if gap else ""
+    before = 0
+    for _, kind, _, _ in reversed(entries[:idx]):
+        if kind == "code":
+            break
+        before += kind == "skip"
+    after, doc = 0, False
+    for _, kind, _, _ in entries[idx + 1 :]:
+        if kind == "code":
+            break
+        if kind == "doc":
+            doc = True
+            break
+        after += 1
+    return f"\x00gap={before},{after}" + ("\x00docstring" if doc else "")
 
 
 def _code_lines(
@@ -369,10 +374,9 @@ def _code_lines(
     comments = {t.start[0]: t for t in toks if t.type == tokenize.COMMENT}
     first_real = next((t.start[0] for t in toks if t.type not in _LAYOUT), 10**9)
     inner, opening = _multiline_rows(toks)
-    doc_rows = {r for d in docs.values() for r in doc_rows_of(d)}
-    doc_first = {d.expr.lineno for d in docs.values()}
     doc_start = {r: d.expr.lineno for d in docs.values() for r in doc_rows_of(d)}
-    out: list[tuple[int, str]] = []
+    # (строка, вид: code|skip|doc, текст, несёт директиву)
+    entries: list[tuple[int, str, str, bool]] = []
     for row, text in enumerate(lines, start=1):
         eol = "\r" if text.endswith("\r") else ""
         com = comments.get(row)
@@ -380,19 +384,34 @@ def _code_lines(
         directive = _directive_of(com.string, row, row < first_real) if com else ""
         verbatim = (row in inner or row in opening) and not com
         body = cut if verbatim else cut.rstrip(" \t\r")
-        if row in doc_rows:
+        if row in doc_start:
             if not directive:
+                entries.append((row, "doc", "", False))
                 continue
-            offset = row - doc_start[row]
             where = "inline" if cut.strip() else f"col{len(cut)}"
-            body = f"\x00docstring+{offset}\x00{where}"
+            body = f"\x00docstring+{row - doc_start[row]}\x00{where}"
         elif not verbatim and not body.strip():
             if directive:  # комментарий-директива на своей строке: отступ значим
-                mark = _gap_mark(lines, row, doc_first)
-                out.append((row, f"{cut}{directive}{mark}{eol}"))
+                entries.append((row, "code", f"{cut}{directive}{eol}", True))
+            else:
+                entries.append((row, "skip", "", False))
             continue
         suffix = f"  {directive}" if directive and body.strip() else ""
-        out.append((row, f"{body}{suffix}" + ("" if verbatim else eol)))
+        entries.append(
+            (
+                row,
+                "code",
+                f"{body}{suffix}" + ("" if verbatim else eol),
+                bool(directive),
+            )
+        )
+    out: list[tuple[int, str]] = []
+    for idx, (row, kind, text, has_directive) in enumerate(entries):
+        if kind != "code":
+            continue
+        if has_directive:
+            text += _gap_mark(entries, idx)
+        out.append((row, text))
     return out
 
 
