@@ -241,7 +241,18 @@ def test_manual_ac_and_downgrade_are_explained():
             "acceptance_criteria": [a.model_dump(mode="json") for a in _acs()],
         }
     )
-    assert [n["ac_id"] for n in part["not_applicable"]] == ["AC-1", "AC-3"]
+    assert part["not_applicable"]["acs"] == ["AC-1=manual", "AC-3=log_check"]
+    assert part["not_applicable"]["more"] == 0
+    many = evidence_states.manual_ac_summary(
+        [
+            AcceptanceCriterion(
+                id=f"AC-{i}", given="g", when="w", then="t", verifiable_by="manual"
+            )
+            for i in range(1, 15)
+        ]
+    )
+    assert many is not None and len(many["acs"]) == 10 and many["more"] == 4
+    assert evidence_states.manual_ac_summary([]) is None
     assert part["unresolved"] == []
     assert "not_applicable" not in review_brief_projection._locators_part(
         {"locator_resolution": [], "acceptance_criteria": []}
@@ -259,10 +270,8 @@ def test_manual_ac_and_downgrade_are_explained():
         }
     )
     shown = "\n".join(lines)
-    assert (
-        "AC locators not applicable: AC-1=manual (тестовый локатор неприменим" in shown
-    )
-    assert "AC-3=log_check" in shown
+    assert "AC locators not applicable (тестовый локатор неприменим" in shown
+    assert "не отметка об их выполнении): AC-1=manual, AC-3=log_check" in shown
 
     cap = ["deep по правилу (риск), но суточный потолок 2 исчерпан — lite"]
     circle = ["круг: 3 захода, deep приостановлен до решения человека"]
@@ -283,3 +292,20 @@ async def test_downgrade_headline_cites_the_rule(db):
     assert block.rules == ["#1414"]
     assert "правило #1414" in block.headline
     assert "выполнен" not in block.headline
+
+
+def test_manual_ac_note_stays_inside_the_mcp_budget():
+    """Codex round 3: the note is said once and capped, not once per AC."""
+    import json as _json
+
+    from hub.services import review_brief_projection as proj
+    from tests.test_review_brief_projection import _brief
+
+    def wire(kind: str) -> int:
+        brief = _brief(ac=5)
+        for ac in brief["acceptance_criteria"]:
+            ac["verifiable_by"] = kind
+        result = proj.brief_result(brief)
+        return len(_json.dumps(result.structuredContent, ensure_ascii=False))
+
+    assert wire("manual") - wire("test") < 400

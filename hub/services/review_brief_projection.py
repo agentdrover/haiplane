@@ -292,9 +292,9 @@ def _locators_part(brief: dict[str, Any]) -> dict[str, Any]:
         ],
     }
     # #2026: AC not verified by a test — a locator does not apply, nothing more.
-    notes = evidence_states.manual_ac_notes(brief.get("acceptance_criteria") or [])
-    if notes:
-        part["not_applicable"] = notes
+    summary = evidence_states.manual_ac_summary(brief.get("acceptance_criteria") or [])
+    if summary:
+        part["not_applicable"] = summary
     return part
 
 
@@ -697,12 +697,10 @@ def _checks_lines(proj: dict[str, Any]) -> list[str]:
             + ", ".join(f"{r['ac_id']}={r['status']}" for r in loc["unresolved"])
         )
     if loc.get("not_applicable"):
+        na = loc["not_applicable"]
+        more = f" +{na['more']} more" if na["more"] else ""
         lines.append(
-            "AC locators not applicable: "
-            + "; ".join(
-                f"{r['ac_id']}={r['verifiable_by']} ({r['note']})"
-                for r in loc["not_applicable"]
-            )
+            f"AC locators not applicable ({na['note']}): {', '.join(na['acs'])}{more}"
         )
     for name in ("mutations", "baseline"):
         block = (proj["ci_evidence"] or {}).get(name) or {}

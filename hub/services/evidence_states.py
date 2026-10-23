@@ -205,6 +205,22 @@ def evidence_block(label: str, raw: str | None, pinned: str, origin=None):
     )
 
 
+#: Said once per brief, not per AC: the MCP brief has a character budget.
+MANUAL_AC_NOTE = (
+    "тестовый локатор неприменим к этим AC; это не отметка об их выполнении"
+)
+_SUMMARY_CAP = 10
+
+
+def manual_ac_summary(acs: Iterable[Any]) -> dict[str, Any] | None:
+    """The compact form for the brief: ids with their kind, the note once, a cap."""
+    notes = manual_ac_notes(acs)
+    if not notes:
+        return None
+    shown = [f"{n['ac_id']}={n['verifiable_by']}" for n in notes[:_SUMMARY_CAP]]
+    return {"acs": shown, "more": len(notes) - len(shown), "note": MANUAL_AC_NOTE}
+
+
 def manual_ac_notes(acs: Iterable[Any]) -> list[dict[str, str]]:
     """Per AC that is not verified by a test: only that a test locator does not apply.
 
