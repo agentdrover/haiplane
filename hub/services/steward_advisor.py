@@ -851,30 +851,31 @@ failure_reason = reason_line  # #2040: закрытый словарь, hub/serv
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
     """Записал ли approve ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
 
-    Признак - последнее событие вердикта задачи: актор и источник стюарда
-    (``steward_applied``), approved, то же поколение. Вердикт человека,
-    легший в гонке раньше (``verdict_already_stands``), под признак не
-    подпадает, хотя поколение у него то же.
+    Признак - событие вердикта задачи с источником стюарда
+    (``steward_applied``), approved, то же поколение; последующий вердикт
+    человека его не скрывает. Вердикт человека, легший в гонке раньше
+    (``verdict_already_stands``), под признак не подпадает: у него нет
+    источника стюарда.
     """
     rows = await fetchall(
         db,
-        "SELECT actor, payload FROM events WHERE kind='review_verdict_recorded' "
-        "AND task_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id DESC",
         (int(item["task_id"]),),
     )
-    if not rows:
-        return False
-    row = dict(rows[0])
-    try:
-        payload = json.loads(row["payload"] or "{}")
-    except ValueError:
-        return False
-    return (
-        isinstance(payload, dict)
-        and payload.get("source") == "steward_applied"
-        and payload.get("verdict") == "approved"
-        and payload.get("submission_generation") == int(item["generation"])
-    )
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("source") == "steward_applied"
+            and payload.get("verdict") == "approved"
+            and payload.get("submission_generation") == int(item["generation"])
+        ):
+            return True
+    return False
 
 
 async def _finish_outcome(

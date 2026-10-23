@@ -545,3 +545,29 @@ def test_a_fixed_text_is_true_for_every_branch_of_its_code(code, branch, needle)
     from hub.services.refusal_reason import REASON_TEXTS
 
     assert needle in REASON_TEXTS[code], (code, branch)
+
+
+async def test_a_later_human_verdict_does_not_hide_the_stewards_write(db, monkeypatch):
+    """Человек заменил вердикт после записи стюарда, шаг упал: запись стюарда названа."""
+    case = await build_case(db, monkeypatch, "toctou-human-after")
+    real_apply = steward_applied.apply_judgement
+
+    async def apply_then_a_human_event_then_fail(*args, **kwargs):
+        await real_apply(*args, **kwargs)
+        await repo.insert_event(
+            db,
+            kind="review_verdict_recorded",
+            task_id=case.task_id,
+            actor="Denis",
+            payload={"verdict": "approved", "submission_generation": 1},
+        )
+        await db.commit()
+        raise RuntimeError("служебная заметка не записалась")
+
+    monkeypatch.setattr(
+        steward_applied, "apply_judgement", apply_then_a_human_event_then_fail
+    )
+    assert await apply_advisor_outcomes(db) == 1
+
+    text = await feed(db, case.task_id)
+    assert "Одобрение стюарда записано, но следующий шаг" in text
