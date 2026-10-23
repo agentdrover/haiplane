@@ -61,6 +61,9 @@ REFUSED_UNCLOSED = "unclosed_finding"
 # им же названо саморевью в громких основаниях — написание одно.
 REFUSED_SELF_AUTHORED = "self_authored"
 REFUSED_NOT_DELEGATED = "policy_not_delegated"
+#: Начало ответа ворот транзакции записи при снятом допуске ``act`` (#2040):
+#: текст пишет хаб, поэтому ``steward_advisor.failure_reason`` показывает его целиком.
+ACT_REVOKED_PREFIX = f"{REFUSED_PRECONDITION}: STEWARD_MODE="
 # #1855: класс сдачи выше потолка проекта (или не известен при заданном
 # потолке). Код из закрытого словаря #1022 (STEWARD_ESCALATE_REASONS).
 REFUSED_CLASS_CEILING = "class_above_policy_ceiling"

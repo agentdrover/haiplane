@@ -815,26 +815,50 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
 FAILURE_REASON_LIMIT = 300
 
 
+#: Коды отказа ворот, чьё объяснение пишет сам хаб из собственных данных
+#: (политика проекта, счётчики потолка): показывается целиком.
+_SELF_AUTHORED_REFUSALS = ("policy_not_delegated", "advisor_not_concurred")
+
+
 def failure_reason(exc: Exception) -> str:
     """Причина неудачного применения одной строкой, безопасная для ленты (#2040).
 
-    Слова отказа показываются только у ``HTTPException``: это ответ ворот хаба
-    вида ``код: причина``, написанный самим хабом. Текст прочего исключения
-    произвольный (путь, запрос, токен в сообщении сторонней библиотеки), в
-    карточку и в доказательства он не попадает: называется только тип, а
-    подробности остаются в журнале хаба (``log.warning`` выше по стеку).
-    Без переносов и не длиннее ``FAILURE_REASON_LIMIT``.
+    Целиком показывается только отказ ворот хаба, объяснение которого хаб
+    пишет сам (``_SELF_AUTHORED_REFUSALS`` и отказ глобального допуска
+    ``act``). У прочих ворот в ``detail`` попадает чужой текст: значение из
+    базы, присланное отчётом CI. Для них и для всякого иного исключения
+    называется только код или тип, а подробности остаются в журнале хаба
+    (``log.warning`` выше по стеку). Без переносов, не длиннее
+    ``FAILURE_REASON_LIMIT``.
     """
     from fastapi import HTTPException
 
+    from hub.services.steward_apply import ACT_REVOKED_PREFIX
+
+    where = "подробности в журнале хаба"
     if isinstance(exc, HTTPException):
-        text = str(exc.detail)
+        detail = " ".join(str(exc.detail).split())
+        code = detail.split(":", 1)[0]
+        if code in _SELF_AUTHORED_REFUSALS or detail.startswith(ACT_REVOKED_PREFIX):
+            text = detail
+        elif code.isidentifier():
+            text = f"{code}, {where}"
+        else:
+            text = f"отказ {exc.status_code}, {where}"
     else:
-        text = f"внутренняя ошибка применения ({type(exc).__name__}), подробности в журнале хаба"
-    one_line = " ".join(text.split())
-    if len(one_line) > FAILURE_REASON_LIMIT:
-        one_line = one_line[: FAILURE_REASON_LIMIT - 1] + "…"
-    return one_line
+        text = f"внутренняя ошибка применения ({type(exc).__name__}), {where}"
+    if len(text) > FAILURE_REASON_LIMIT:
+        text = text[: FAILURE_REASON_LIMIT - 1] + "…"
+    return text
+
+
+async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
+    """Записан ли approve этой сдачи: сбой мог случиться уже после записи вердикта."""
+    task = await repo.get_task(db, int(item["task_id"]))
+    stored = dict(task) if task is not None else {}
+    return stored.get("review_verdict") == "approved" and stored.get(
+        "review_verdict_generation"
+    ) == int(item["generation"])
 
 
 async def _finish_outcome(
@@ -858,13 +882,18 @@ async def _finish_outcome(
         (outcome, detail, item["id"], _OUTCOME_CLAIMED, stamp),
     )
     if final.rowcount == 1 and outcome == OUTCOME_FAILED and detail:
+        recorded = await _approve_recorded(db, item)
+        head = (
+            "Одобрение стюарда записано, но следующий шаг применения не выполнен"
+            if recorded
+            else "Одобрение стюарда не применено, решает человек"
+        )
         await repo.add_task_update(
             db,
             int(item["task_id"]),
             "hub",
             "alert",
-            "Одобрение стюарда не применено, решает человек: сдача "
-            f"{item['generation']}, причина - {detail}",
+            f"{head}: сдача {item['generation']}, причина - {detail}",
             author_kind="hub",
         )
     await db.commit()

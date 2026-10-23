@@ -297,28 +297,73 @@ async def test_failed_application_reason_is_shown(db, db_dsn, monkeypatch):
     assert len(failure_lines(await feed(db, case.task_id))) == 1
 
 
-async def test_failure_reason_never_carries_an_arbitrary_exception_text(
-    db, db_dsn, monkeypatch
+async def test_failure_reason_never_carries_foreign_text(db, db_dsn, monkeypatch):
+    """Чужой текст (исключение, значение из базы в ответе ворот) не попадает в базу, ленту, доказательства."""
+    marker = "ЧУЖОЙ-ТЕКСТ-МАРКЕР-4711"
+    for label, raised in (
+        ("plain", RuntimeError(f"upstream said {marker}")),
+        ("gate", HTTPException(422, f"ci_not_green: lint={marker}")),
+    ):
+        case = await build_case(db, monkeypatch, f"toctou-foreign-{label}")
+
+        async def boom(*_args, _raised=raised, **_kwargs):
+            raise _raised
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(steward_applied, "_record", boom)
+            assert await apply_advisor_outcomes(db) == 1
+
+        row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+        assert row["advisor_outcome"] == "failed", label
+        shown = row["advisor_outcome_detail"]
+        assert ("RuntimeError" if label == "plain" else "ci_not_green") in shown, label
+        evidence = verdict_evidence.format_block(
+            await verdict_evidence.build(db, case.task_id, 1)
+        )
+        for surface in (shown, await feed(db, case.task_id), evidence):
+            assert marker not in surface, label
+
+
+async def test_a_failure_after_the_approve_is_recorded_is_not_called_unapplied(
+    db, monkeypatch
 ):
-    """Текст чужого исключения (токен, путь) не попадает ни в базу, ни в ленту, ни в доказательства."""
-    secret = "Bearer sk-SECRET-TOKEN-0123456789"
-    case = await build_case(db, monkeypatch, "toctou-secret")
+    """Сбой ПОСЛЕ записи вердикта: в ленте не сказано, что одобрение не применено."""
+    case = await build_case(db, monkeypatch, "toctou-after-record")
+    real_apply = steward_applied.apply_judgement
 
-    async def boom(*_args, **_kwargs):
-        raise RuntimeError(f"upstream said {secret}")
+    async def apply_then_fail(*args, **kwargs):
+        await real_apply(*args, **kwargs)
+        raise RuntimeError("служебная заметка не записалась")
 
-    monkeypatch.setattr(steward_applied, "_record", boom)
+    monkeypatch.setattr(steward_applied, "apply_judgement", apply_then_fail)
     assert await apply_advisor_outcomes(db) == 1
+
+    assert await verdict_of(db, case.task_id) == ReviewVerdict.approved.value
+    text = await feed(db, case.task_id)
+    assert "Одобрение стюарда записано, но следующий шаг применения не выполнен" in text
+    assert "не применено, решает человек" not in text
+
+
+async def test_the_revoked_act_reason_is_shown_to_the_owner(db, db_dsn, monkeypatch):
+    """Стюарда выключили перед записью: в карточке названо ЭТО, а не «внутренняя ошибка»."""
+    case = await build_case(db, monkeypatch, "toctou-act-reason")
+    await _real_global_act(monkeypatch)
+    other = await db_module.connect(db_dsn)
+    real_record = steward_applied._record
+
+    async def record_after_the_owner_switches_it_off(*args, **kwargs):
+        await _switch_off(other, case, monkeypatch)
+        return await real_record(*args, **kwargs)
+
+    try:
+        monkeypatch.setattr(
+            steward_applied, "_record", record_after_the_owner_switches_it_off
+        )
+        assert await apply_advisor_outcomes(db) == 1
+    finally:
+        await other.close()
 
     row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
     assert row["advisor_outcome"] == "failed"
-    assert "RuntimeError" in row["advisor_outcome_detail"]
-    evidence = verdict_evidence.format_block(
-        await verdict_evidence.build(db, case.task_id, 1)
-    )
-    for surface in (
-        row["advisor_outcome_detail"],
-        await feed(db, case.task_id),
-        evidence,
-    ):
-        assert secret not in surface and "SECRET" not in surface
+    assert "автономия act сейчас не выдана" in row["advisor_outcome_detail"]
+    assert "автономия act сейчас не выдана" in await feed(db, case.task_id)
