@@ -55,7 +55,7 @@ from hub.services.result_kind import (
     task_automation_not_applicable,
 )
 from hub.services import steward_advisor_skip as advisor_skip
-from hub.services.refusal_reason import reason_line
+from hub.services.refusal_reason import CAP_HANDOFF, reason_line
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -719,7 +719,7 @@ async def cap_refusal(
     (``steward_apply.write_refusal``). Причина у обоих одна и та же строка.
     """
     handoff = await steward_cap.cap_handoff(db, task_id, generation)
-    return None if handoff is None else (REFUSED_ADVISOR, handoff.reason)
+    return None if handoff is None else (CAP_HANDOFF, handoff.reason)
 
 
 async def advisor_refusal(
