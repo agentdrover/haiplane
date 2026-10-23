@@ -216,6 +216,14 @@ async def test_no_advisor_where_approve_cannot_apply(
     )
     assert await order_due_advisors(db) == 0
     assert len(await _skip_lines(db, ceiling.task_id)) == 1
+
+    # цитата чужого ключа внутри причины (справка ревьюера) не гасит другой пропуск
+    quoted = f"справка: {mark_of(7, 'class_above_policy_ceiling')}"
+    assert await record_skip(db, integrity.task_id, 7, "ci_integrity", quoted)
+    assert await record_skip(
+        db, integrity.task_id, 7, "class_above_policy_ceiling", "потолок"
+    )
+    await db.commit()
     assert not db.in_transaction, "пропуск не оставил открытую транзакцию"
 
 

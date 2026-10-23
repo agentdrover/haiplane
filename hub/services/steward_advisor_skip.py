@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import aiosqlite
 
@@ -51,8 +52,11 @@ MARK_PREFIX = "[пропуск-советника g="
 #: пропуском не считается.
 _HUB_LINE = (
     "SELECT 1 FROM task_updates WHERE task_id=? AND kind='status' "
-    "AND agent='hub' AND author_kind='hub' AND instr(content, ?) > 0"
+    "AND agent='hub' AND author_kind='hub'"
 )
+#: Ключ - ПОСЛЕДНЯЯ служебная метка строки: цитата ключа внутри причины (справка
+#: ревьюера попадает в текст) пропуском не считается.
+_ENDS_WITH_MARK = " AND substr(content, -length(?)) = ?"
 
 
 def mark_of(generation: int, code: str) -> str:
@@ -173,13 +177,17 @@ async def record_skip(
     # сроку, лента живёт столько же, сколько задача.
     cursor = await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
-        "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS (" + _HUB_LINE + ")",
+        "SELECT ?, ?, ?, 'hub', ? WHERE NOT EXISTS ("
+        + _HUB_LINE
+        + _ENDS_WITH_MARK
+        + ")",
         (
             EVENT_SKIPPED,
             task_id,
             int(project["id"]) if project is not None else None,
             payload,
             task_id,
+            mark_of(generation, code),
             mark_of(generation, code),
         ),
     )
@@ -212,9 +220,24 @@ async def recorded_reason(
 
 async def _fed(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
     rows = await fetchall(
-        db, _HUB_LINE + " LIMIT 1", (task_id, f"{MARK_PREFIX}{generation} ")
+        db,
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='status' "
+        "AND agent='hub' AND author_kind='hub' AND instr(content, ?) > 0",
+        (task_id, f"{MARK_PREFIX}{generation} "),
     )
-    return bool(rows)
+    tail = re.compile(re.escape(MARK_PREFIX) + f"{generation} код=[a-z_]+\\]$")
+    return any(tail.search(str(dict(r)["content"])) for r in rows)
+
+
+async def recorded_events(db: aiosqlite.Connection) -> set[tuple[int, int]]:
+    """Все (задача, поколение) с событием пропуска - одним запросом для счёта."""
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT task_id, json_extract(payload, '$.generation') AS g "
+        "FROM events WHERE kind=?",
+        (EVENT_SKIPPED,),
+    )
+    return {(int(dict(r)["task_id"]), int(dict(r)["g"])) for r in rows}
 
 
 async def is_recorded(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:

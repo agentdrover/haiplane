@@ -137,6 +137,14 @@ class ContourCounts:
         return (self.substantive / self.denominator) if self.denominator else None
 
 
+async def _skip_recorded(
+    db: aiosqlite.Connection, item: dict[str, Any], events: set[tuple[int, int]]
+) -> bool:
+    """Советник намеренно не заказан (#2024): событие или, после чистки, лента."""
+    key = (int(item["task_id"]), int(item["generation"]))
+    return key in events or await advisor_skip.is_recorded(db, *key)
+
+
 async def contour_counts(
     db: aiosqlite.Connection, since_days: int | None = None
 ) -> ContourCounts:
@@ -163,6 +171,7 @@ async def contour_counts(
         f"WHERE {where}",
         tuple(params),
     )
+    events = await advisor_skip.recorded_events(db)
     c: dict[str, int] = {
         "judged": 0,
         "procedural": 0,
@@ -202,9 +211,7 @@ async def contour_counts(
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
-            elif not status and await advisor_skip.is_recorded(
-                db, int(item["task_id"]), int(item["generation"])
-            ):
+            elif not status and await _skip_recorded(db, item, events):
                 c["advisor_skipped"] += 1
             else:
                 c["advisor_pending"] += 1
