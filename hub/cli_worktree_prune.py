@@ -349,12 +349,16 @@ def _reachable_reason(v: Verdict, sha: str, where: str) -> str:
 
 
 def _reflog_reason(v: Verdict) -> str:
-    """Каждая запись reflog HEAD - предок сдачи или есть в refs/remotes."""
-    rc, out, err = _git(v.path, "reflog", "--format=%H", "HEAD")
-    if rc != 0:
+    """Обе sha каждой строки сырого logs/HEAD - предок сдачи или в refs/remotes."""
+    rc, gitdir, _ = _git(v.path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir.strip():
         v.unread = True
-        return f"reflog HEAD не прочитан (git rc {rc}: {err.strip()[:120]})"
-    for sha in dict.fromkeys(out.split()):
+        return f"gitdir копии не прочитан (git rc {rc})"
+    shas, err = trash.reflog_shas(gitdir.strip())
+    if err:
+        v.unread = True
+        return err
+    for sha in dict.fromkeys(shas):
         why = _reachable_reason(v, sha, "записи reflog HEAD")
         if why:
             return why

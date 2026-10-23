@@ -492,26 +492,55 @@ def test_restore_refuses_a_marked_copy_that_is_not_inside_the_trash(
 
 
 # --- раунд 6 ------------------------------------------------------------------
-def test_protective_refs_pin_the_old_value_of_the_first_reflog_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Первая сохранившаяся строка logs/HEAD «A -> B»: A нигде больше не лежит."""
-    w = World(tmp_path)
-    w.add(101)
-    tree = _sh(w.wt(101), "rev-parse", "HEAD^{tree}")
-    lost = _sh(w.wt(101), "commit-tree", tree, "-m", "only-in-old-value")
+def _hand_written_reflog(w: World, lost: str) -> str:
+    """logs/HEAD: первая сохранившаяся строка «lost -> HEAD», потом нулевая."""
     head = _sh(w.wt(101), "rev-parse", "HEAD")
     zero = "0" * 40
     ident = "T <t@example.com> 1700000000 +0000"
     log = _admin(w, w.wt(101)) / "logs" / "HEAD"
     log.write_text(f"{lost} {head} {ident}\treset: a\n{zero} {head} {ident}\tx: b\n")
+    return head
+
+
+def _unreachable_commit_of(w: World) -> str:
+    tree = _sh(w.wt(101), "rev-parse", "HEAD^{tree}")
+    return _sh(w.wt(101), "commit-tree", tree, "-m", "only-in-old-value")
+
+
+def test_prune_keeps_a_copy_whose_first_reflog_line_old_value_is_only_here(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A -> B, A нигде больше нет: raw logs/HEAD проверяет и старое значение."""
+    w = World(tmp_path)
+    w.add(101)
+    lost = _unreachable_commit_of(w)
+    _hand_written_reflog(w, lost)
+    assert (
+        w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    out = capsys.readouterr().out
+    assert w.wt(101).is_dir() and not w.trash().exists()
+    assert any(
+        lost[:12] in x and "только в этой копии" in x for x in _lines(out, 101)
+    ), out
+
+
+def test_protective_refs_pin_the_old_value_of_the_first_reflog_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A достижим из refs/remotes: копия уходит, и A закреплён защитным ref."""
+    w = World(tmp_path)
+    w.add(101)
+    lost = _unreachable_commit_of(w)
+    _sh(w.clone, "update-ref", "refs/remotes/origin/keepalive", lost)
+    head = _hand_written_reflog(w, lost)
     assert (
         w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
     )
     dest = next(p for p in w.trash().iterdir())
     pinned = [_sh(w.clone, "rev-parse", r) for r in _refs(w, dest.name)]
     assert lost in pinned and head in pinned
-    assert all(p != zero for p in pinned)
+    assert all(p != "0" * 40 for p in pinned)
 
 
 def test_prune_keeps_the_copy_when_the_raw_reflog_cannot_be_read(
@@ -677,3 +706,61 @@ def test_purge_reports_an_unreadable_list_of_protective_refs(
     monkeypatch.setattr(purge, "_git", failing)
     assert w.run("purge", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
     assert "защитные refs не прочитаны" in capsys.readouterr().out
+
+
+def _commit_then_reset_away(w: World, path: Path) -> str:
+    """Коммит в карантине, затем reset --hard к HEAD маркера: HEAD прежний, reflog помнит."""
+    (path / "late.txt").write_text("late work")
+    _sh(path, "add", "late.txt")
+    _sh(path, "commit", "-q", "-m", "late")
+    late = _sh(path, "rev-parse", "HEAD")
+    _sh(path, "reset", "-q", "--hard", "HEAD~1")
+    return late
+
+
+def test_purge_keeps_a_copy_with_a_commit_made_and_reset_away_in_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101, age_days=8)
+    late = _commit_then_reset_away(w, path)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    out = capsys.readouterr().out
+    assert path.is_dir() and _sh(path, "cat-file", "-t", late) == "commit"
+    assert _refs(w, path.name) != []
+    assert any(late[:12] in x and path.name in x for x in out.splitlines()), out
+
+
+def test_purge_accepts_a_quarantine_commit_that_is_on_a_remote_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101, age_days=8)
+    late = _commit_then_reset_away(w, path)
+    _sh(w.clone, "update-ref", "refs/remotes/origin/late", late)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 0
+    )
+    assert not path.exists()
+
+
+def test_purge_keeps_a_copy_whose_raw_reflog_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = World(tmp_path)
+    path = _quarantined(w, 101, age_days=8)
+
+    def deny(p: Any, *a: Any, **kw: Any) -> Any:
+        if str(p).endswith("logs/HEAD"):
+            raise PermissionError("denied")
+        return open(p, *a, **kw)
+
+    monkeypatch.setattr(trash, "open", deny, raising=False)
+    assert (
+        w.run("purge", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) == 1
+    )
+    out = capsys.readouterr().out
+    assert path.is_dir() and _refs(w, path.name) != []
+    assert any("logs/HEAD" in x and "не прочитан" in x for x in out.splitlines()), out

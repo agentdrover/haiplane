@@ -148,6 +148,21 @@ def _list_entries(args: Any) -> tuple[str, list[Entry]] | None:
 def _purge_one(entry: Entry, clone: str, out: Callable[[str], None]) -> bool:
     """Удалить копию и снять её refs; True - всё чисто."""
     _, gitdir, _ = _git(entry.path, "rev-parse", "--absolute-git-dir")
+    name = os.path.basename(entry.path)
+    missing, err = (
+        trash.unpinned_shas(_git, clone, name, gitdir.strip())
+        if gitdir.strip()
+        else ([], "gitdir копии не прочитан")
+    )
+    if err:
+        out(f"ошибка    {entry.path}: reflog не сверен, копию не удаляю: {err}")
+        return False
+    if missing:
+        out(
+            f"оставить  {entry.path}: в reflog есть коммиты без защитного ref и вне "
+            f"refs/remotes ({', '.join(m[:12] for m in missing[:3])}): копию не удаляю"
+        )
+        return False
     rc, _, err = _git(clone, "worktree", "remove", "--force", entry.path)
     if rc != 0:
         out(

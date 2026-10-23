@@ -173,21 +173,18 @@ def test_prune_looking_does_not_make_a_copy_look_busy(
 def test_prune_keeps_a_copy_when_the_reflog_cannot_be_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    from hub import cli_worktree_trash as trash
+
     w = World(tmp_path)
     w.add(101)
-    real_git = prune._git
-
-    def flaky(cwd: Any, *args: str, **kw: Any) -> Any:
-        if "reflog" in args:
-            return 128, "", "fatal: boom"
-        return real_git(cwd, *args, **kw)
-
-    monkeypatch.setattr(prune, "_git", flaky)
+    monkeypatch.setattr(
+        trash, "reflog_shas", lambda gitdir: ([], "logs/HEAD не прочитан (test)")
+    )
     assert (
         w.run("prune", "--apply", "--repo", str(w.clone), monkeypatch=monkeypatch) != 0
     )
     assert w.wt(101).is_dir()
-    assert "reflog HEAD не прочитан" in capsys.readouterr().out
+    assert "logs/HEAD не прочитан" in capsys.readouterr().out
 
 
 def test_prune_keeps_a_copy_around_a_registered_worktree_without_dot_git(

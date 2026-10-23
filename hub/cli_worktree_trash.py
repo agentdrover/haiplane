@@ -190,3 +190,30 @@ def orphan_refs(
         if len(parts) == 2 and parts[0] not in live:
             found.setdefault(parts[0], []).append(ref)
     return found, ""
+
+
+def unpinned_shas(
+    git: Git, clone: str, name: str, gitdir: str
+) -> tuple[list[str], str]:
+    """sha из сырого logs/HEAD без защитного ref копии и вне refs/remotes; ошибка чтения."""
+    logged, err = reflog_shas(gitdir)
+    if err:
+        return [], err
+    rc, out, ferr = git(
+        clone, "for-each-ref", "--format=%(objectname)", f"{REF_PREFIX}/{name}/"
+    )
+    if rc != 0:
+        return [], f"защитные refs не прочитаны (git rc {rc}: {ferr.strip()[:120]})"
+    pinned = set(out.split())
+    missing: list[str] = []
+    for sha in dict.fromkeys(logged):
+        if sha in pinned:
+            continue
+        rc, listed, ferr = git(
+            clone, "for-each-ref", "--count=1", "--contains", sha, "refs/remotes"
+        )
+        if rc != 0:
+            return [], f"{sha[:12]} не сверена с refs/remotes (git rc {rc})"
+        if not listed.strip():
+            missing.append(sha)
+    return missing, ""
