@@ -85,6 +85,11 @@ def _workflow(work: Path, name: str) -> dict:
     return yaml.safe_load(text)
 
 
+def _workflow_at(origin: Path, branch: str, name: str) -> dict:
+    """A workflow as it is on the remote (#2027: the shared clone is not written)."""
+    return yaml.safe_load(_git(origin, "show", f"{branch}:.github/workflows/{name}"))
+
+
 def _triggers(document: dict) -> dict:
     return document.get(True, document.get("on"))
 
@@ -138,20 +143,18 @@ async def test_provisioning_lays_the_workflows_into_a_repository_that_has_none(
     result = await services.provision_project(db, project_id)
 
     assert result["provision_status"] == "ok"
-    for name in (CI_FILE, STALE_FILE):
-        assert (work / ".github" / "workflows" / name).is_file(), (
-            f"{name} must reach the working tree"
-        )
+    # #2027: the shared clone is never written; the files live on the remote.
+    assert not (work / ".github").exists()
 
     pushed = _git(origin, "ls-tree", "-r", "--name-only", "master")
     assert f".github/workflows/{CI_FILE}" in pushed
     assert f".github/workflows/{STALE_FILE}" in pushed
 
-    ci = _workflow(work, CI_FILE)
+    ci = _workflow_at(origin, "master", CI_FILE)
     assert _triggers(ci)["push"]["branches"][0] == "master", (
         "the seeded workflow must name the branch the PROJECT integrates on"
     )
-    assert "@@" not in (work / ".github" / "workflows" / CI_FILE).read_text(), (
+    assert "@@" not in _git(origin, "show", f"master:.github/workflows/{CI_FILE}"), (
         "an unresolved placeholder is a ref pattern that matches nothing: the "
         "workflow sits there looking installed and never runs"
     )
@@ -164,7 +167,7 @@ async def test_the_project_declares_the_test_runner_and_the_template_takes_it(
     the answer from the project instead of guessing one. An undeclared runner
     falls back to the shared action's documented default, never to a build
     command invented for a repository nobody read."""
-    work, _ = _repo_pair(tmp_path, "main")
+    work, origin = _repo_pair(tmp_path, "main")
     project_id = await _project(
         db,
         slug="pnpm-shop",
@@ -178,7 +181,10 @@ async def test_the_project_declares_the_test_runner_and_the_template_takes_it(
 
     await services.provision_project(db, project_id)
 
-    step = _workflow(work, CI_FILE)["jobs"]["test"]["steps"][-1]
+    # #2027: the producer ends with the artifact upload; the collector is the
+    # step that carries the runner.
+    steps = _workflow_at(origin, "main", CI_FILE)["jobs"]["test"]["steps"]
+    step = next(s for s in steps if "ac-runner" in s.get("with", {}))
     assert step["with"]["ac-runner"] == "pnpm test"
     assert ci_runner_of({"gate_policy": "{}"}) == ""
     assert (
@@ -289,22 +295,25 @@ async def test_a_second_provision_adds_nothing(
     """The constraint on the task, stated as the thing that would go wrong:
     the Provision button is pressed again and the repository grows a second
     commit — or a second copy — every time."""
-    work, _ = _repo_pair(tmp_path, "master")
+    work, origin = _repo_pair(tmp_path, "master")
     project_id = await _project(db, workspace_path=str(work), default_branch="master")
     monkeypatch.setattr(
         plugins.git_ops, "clone_repo", AsyncMock(return_value=(True, "verified"))
     )
 
     await services.provision_project(db, project_id)
-    after_first = _git(work, "rev-parse", "HEAD")
-    count_first = _git(work, "rev-list", "--count", "HEAD")
+    after_first = _git(origin, "rev-parse", "master")
+    count_first = _git(origin, "rev-list", "--count", "master")
 
     again = await services.provision_project(db, project_id)
 
-    assert _git(work, "rev-parse", "HEAD") == after_first
-    assert _git(work, "rev-list", "--count", "HEAD") == count_first
+    assert _git(origin, "rev-parse", "master") == after_first
+    assert _git(origin, "rev-list", "--count", "master") == count_first
     assert "already carries workflows" in again["provision_detail"]
-    assert len(list((work / ".github" / "workflows").iterdir())) == 2
+    # #2027: producer, stale and (default branch == base here) the sender.
+    assert (
+        _git(origin, "ls-tree", "-r", "--name-only", "master").count("workflows/") == 3
+    )
 
 
 # --------------------------------------------------------------------------
