@@ -38,7 +38,7 @@ def _frozen_clock(page: Any) -> None:
     карточки попадал в seen, а тест обвинял защиту ввода."""
     start = datetime(2026, 1, 1, 12, 0, 0)
     page.clock.install(time=start)
-    page.clock.pause_at(start + timedelta(seconds=1))
+    page.clock.pause_at(start + timedelta(hours=1))
 
 
 def _set_details(page: Any, want_open: bool) -> None:
@@ -408,6 +408,9 @@ def test_a_late_autorefresh_answer_does_not_replace_typed_input(
     page.route(f"**/tasks/{task_id}", hold)
     _open(page, stand, task_id)
     page.wait_for_function("typeof window.htmx === 'object'")
+    page.evaluate(
+        "document.addEventListener('htmx:afterRequest', () => { window.lateDone = true; })"
+    )
     stand.run(_rename(task_id, "Название из позднего ответа"))
     page.clock.fast_forward(16_000)
     for _ in range(40):
@@ -420,7 +423,8 @@ def test_a_late_autorefresh_answer_does_not_replace_typed_input(
     field = page.locator("#sh-return-reason")
     field.fill(REASON)
     held[0].continue_()
-    page.wait_for_timeout(1_500)
+    # Ответ обработан htmx (beforeSwap уже отработал), только потом проверяем.
+    page.wait_for_function("window.lateDone === true", timeout=10_000)
 
     assert field.input_value() == REASON
     assert "Название из позднего ответа" not in page.locator("#c2-live").inner_html()
