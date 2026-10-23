@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 
 import aiosqlite
-import pytest
 
 from hub import config
 from hub import repository as repo
@@ -153,14 +152,16 @@ async def test_no_advisor_where_approve_cannot_apply(
         assert any(marker in detail for _, detail in refusals), refusals
 
 
-@pytest.mark.parametrize(
-    "label", ["shadow", "sample", "double_clean", "unknown_class", "unscanned"]
-)
 async def test_shadow_and_double_clean_still_order_the_advisor(
-    db: aiosqlite.Connection, monkeypatch, label: str
+    db: aiosqlite.Connection, monkeypatch
 ):
     """AC-2: тень, малая выборка, достижимая двойная чистота, непрочитанное - заказ."""
-    risk = {"double_clean": "R3", "unknown_class": ""}.get(label, "R1")
+    for label in ("shadow", "sample", "double_clean", "unknown_class", "unscanned"):
+        await _ordered_as_before(db, monkeypatch, label)
+
+
+async def _ordered_as_before(db, monkeypatch, label: str) -> None:
+    risk = "R3" if label == "double_clean" else "R1"
     mode = {"shadow": "shadow", "sample": None}.get(label, "act")
     case = await _scene(db, monkeypatch, f"order-{label}", risk=risk, mode=mode)
     if label in ("shadow", "sample"):
@@ -173,6 +174,10 @@ async def test_shadow_and_double_clean_still_order_the_advisor(
         )
         await db.commit()
     elif label == "unknown_class":
+        await db.execute(
+            "UPDATE tasks SET risk_class=NULL WHERE id=?", (case.task_id,)
+        )
+        await db.commit()
         await set_policy(db, case.project_id, policy_of(clean=None))
 
     assert await order_due_advisors(db) == 1, label
@@ -195,12 +200,12 @@ async def test_skip_lifts_and_no_forbidden_approve(
     assert len(await _advisor_rows(db, temp.task_id)) == 1
     assert len(await _skips(db, temp.task_id)) == 1, "запись причины не растёт"
 
+    for change in ("integrity", "class", "policy", "generation", "cap"):
+        await _change_after_the_order(db, monkeypatch, change)
 
-@pytest.mark.parametrize("change", ["integrity", "class", "policy", "cap", "generation"])
-async def test_a_change_after_the_order_never_records_an_approve(
-    db: aiosqlite.Connection, monkeypatch, change: str
-):
-    """AC-3: после заказа и concur меняются integrity, класс, политика, cap, поколение."""
+
+async def _change_after_the_order(db, monkeypatch, change: str) -> None:
+    """После заказа и concur меняются integrity, класс, политика, cap, поколение."""
     case = await build_case(db, monkeypatch, f"after-{change}", risk="R1")
     await _mode(monkeypatch, "act")
     task_id = case.task_id
@@ -213,6 +218,11 @@ async def test_a_change_after_the_order_never_records_an_approve(
         await set_policy(db, case.project_id, {"verdict": "human"})
     elif change == "cap":
         monkeypatch.setattr(config, "STEWARD_ADVISOR_DAILY_CAP", "0")
+        await db.execute(  # заказ старше отказа: иначе он «заказан после отказа»
+            "UPDATE steward_runs SET created_at=datetime('now','-5 seconds') "
+            "WHERE task_id=? AND kind='advisor'",
+            (task_id,),
+        )
         await steward_cap.record_refusal(db, task_id, case.project_id, 1, "advisor", "x")
     elif change == "generation":
         await repo.update_task(db, task_id, submission_generation=2)
