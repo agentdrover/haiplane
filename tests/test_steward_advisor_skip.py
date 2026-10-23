@@ -224,7 +224,7 @@ async def test_skip_lifts_and_no_forbidden_approve(
     assert len(await _advisor_rows(db, temp.task_id)) == 1
     assert len(await _skips(db, temp.task_id)) == 1, "запись причины не растёт"
 
-    for change in ("integrity", "class", "policy", "generation", "cap"):
+    for change in ("control", "integrity", "class", "policy", "generation", "cap"):
         await _change_after_the_order(db, monkeypatch, change)
 
 
@@ -254,5 +254,8 @@ async def _change_after_the_order(db, monkeypatch, change: str) -> None:
         await repo.update_task(db, task_id, submission_generation=2)
     await db.commit()
 
-    await apply_advisor_outcomes(db)
+    applied = await apply_advisor_outcomes(db)
+    if change == "control":
+        assert applied == 1 and await verdict_of(db, task_id) == "approved"
+        return
     await _no_approve(db, task_id)
