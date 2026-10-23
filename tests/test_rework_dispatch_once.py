@@ -91,6 +91,10 @@ async def _assert_launched_once(db, net: Network, task_id: int) -> None:
     assert task["status"] == "fix_requested" and task["job_id"] == "job-1"
     assert await _decisions(db, task_id) == 1
     assert await _decided_events(db, task_id) == 1
+    booked = await db.execute_fetchall(
+        "SELECT state, job_id FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [tuple(r) for r in booked] == [("launched", "job-1")]
 
 
 async def test_two_concurrent_reworks_launch_once(client, db, net):
@@ -398,3 +402,21 @@ async def test_reserve_refuses_a_task_that_left_needs_decision(db):
         "SELECT COUNT(*) FROM rework_launches WHERE task_id=?", (task_id,)
     )
     assert rows[0][0] == 0
+
+
+async def test_the_sweep_closes_a_booking_of_a_task_that_moved_on(db, monkeypatch):
+    """Задача ушла из needs_decision другим путём: бронь закрывается без заказа."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=False)
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+    await _age_reservations(db, task_id)
+
+    await rework_launch.sweep(db)
+
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["closed"]
+    assert len(jobs["calls"]) == 1
